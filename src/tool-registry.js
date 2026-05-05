@@ -185,6 +185,25 @@ export function registerCoreTools(registry, runtime) {
   });
 
   registry.register({
+    name: "send_message",
+    description: "Proactively send a message to a user via a channel (sms, telegram, or local). Use during autopilot pulses or when you decide to reach out unprompted. Returns delivery status.",
+    parameters: {
+      type: "object",
+      properties: {
+        channel: { type: "string", enum: ["sms", "telegram", "local"], description: "Channel to deliver via." },
+        target: { type: "string", description: "Channel target — phone number for SMS, chat id for Telegram." },
+        text: { type: "string", description: "Message body. Keep it short and useful." }
+      },
+      required: ["channel", "target", "text"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.channels?.deliver) throw new Error("Channels are not bound to runtime.");
+      return runtime.channels.deliver({ channel: args.channel, target: args.target, text: args.text });
+    }
+  });
+
+  registry.register({
     name: "list_sessions",
     description: "List recent conversations across channels.",
     parameters: {

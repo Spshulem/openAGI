@@ -8,6 +8,7 @@ import { FileBackedMemorySystem } from "./file-backed-memory-system.js";
 import { FileBackedPropagationController } from "./file-backed-propagation-controller.js";
 import { createAbiIntegration, IntegrationRegistry } from "./integration-registry.js";
 import { fileURLToPath } from "node:url";
+import { BudgetGuard } from "./budget-guard.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemorySystem } from "./memory-system.js";
 import { PropagationController } from "./propagation-controller.js";
@@ -15,6 +16,12 @@ import { SkillRegistry } from "./skills.js";
 import { registerCoreTools, ToolRegistry } from "./tool-registry.js";
 import { registerDefaultWorkflows, WorkflowRegistry } from "./workflow-registry.js";
 import { createId, nowIso } from "./utils.js";
+
+const AUTOPILOT_DEFAULT_PROMPT = `Autopilot pulse. Look at what's recent — sessions, memory, scheduled jobs, MCP tools you have access to.
+Decide if anything needs action right now: a follow-up to send, a memory to record, a schedule to set, a check to run.
+- If yes: take the action by calling tools (use \`send_message\` to reach the user, \`schedule_message\` to defer, \`remember\` for facts).
+- If nothing needs doing, reply with exactly one short sentence describing what you observed and "standing by".
+Do not invent work. Be conservative — fewer actions, higher signal.`;
 
 export class AbiRuntime {
   constructor(options = {}) {
@@ -37,6 +44,7 @@ export class AbiRuntime {
     this.tools = options.tools ?? new ToolRegistry();
     this.mcp.bindToolRegistry(this.tools);
     this.skills = options.skills ?? null;
+    this.budget = options.budget ?? new BudgetGuard(options.budgetOptions ?? {});
     this.outputs = [];
     this.feedback = [];
 
@@ -151,8 +159,38 @@ export class AbiRuntime {
       if (job.task === "prompt") {
         return this.runScheduledPrompt(job);
       }
+      if (job.task === "autopilot") {
+        return this.runAutopilot(job);
+      }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);
+  }
+
+  async runAutopilot(job) {
+    if (!this.agentHost) return { skipped: true, reason: "agent-host-disabled" };
+    try {
+      this.budget.check();
+    } catch (error) {
+      return { skipped: true, reason: error.message };
+    }
+    const input = job.input ?? {};
+    const sessionId = input.sessionId ?? `autopilot:${job.id}`;
+    const prompt = input.prompt ?? AUTOPILOT_DEFAULT_PROMPT;
+    const result = await this.agentHost.handleMessage({
+      channel: "autopilot",
+      from: "autopilot",
+      agentId: input.agentId ?? "main",
+      sessionId,
+      text: prompt,
+      metadata: {
+        scheduledJobId: job.id,
+        scheduledJobName: job.name,
+        firedAt: nowIso()
+      },
+      origin: "autopilot"
+    });
+    result.autopilot = true;
+    return result;
   }
 
   async runScheduledPrompt(job) {
@@ -226,7 +264,7 @@ export function createDefaultRuntime(options = {}) {
         store: options.agentStore,
         storeOptions: options.agentStoreOptions,
         modelProvider: options.modelProvider,
-        modelProviderOptions: options.modelProviderOptions
+        modelProviderOptions: { ...(options.modelProviderOptions ?? {}), budgetGuard: runtime.budget }
       });
   }
   runtime.mcp.registerServer({
@@ -248,6 +286,7 @@ export function createDurableRuntime(options = {}) {
     ...options,
     skillsDir: options.skillsDir ?? path.join(dataDir, "skills"),
     mcpOptions: { logDir: mcpLogDir, ...(options.mcpOptions ?? {}) },
+    budgetOptions: { storePath: path.join(dataDir, "budget", "usage.json"), ...(options.budgetOptions ?? {}) },
     memory: options.memory ?? new FileBackedMemorySystem({ ...(options.memoryOptions ?? {}), dir: path.join(dataDir, "memory") }),
     cron: options.cron ?? new FileBackedCronScheduler({ storePath: path.join(dataDir, "cron", "jobs.json") }),
     propagation:

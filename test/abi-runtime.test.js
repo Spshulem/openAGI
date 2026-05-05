@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  BudgetGuard,
   createDefaultRuntime,
   createDurableRuntime,
   createHostedInterface,
@@ -254,6 +255,46 @@ test("skills loader exposes bundled skills as tools", () => {
   assert.ok(names.includes("recap"), "expected 'recap' skill bundled");
   const toolNames = runtime.tools.list().map((t) => t.name);
   assert.ok(toolNames.some((n) => n.startsWith("skill_")), "expected at least one skill_* tool");
+});
+
+test("budget guard records anthropic usage and computes USD", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-budget-"));
+  const guard = new BudgetGuard({ storePath: path.join(dir, "usage.json"), dailyUsdLimit: 100 });
+  guard.record({ input_tokens: 1_000_000, output_tokens: 500_000 }, "claude-sonnet-4-6");
+  const snap = guard.status();
+  // 1M input @ $3 + 0.5M output @ $15 = $3 + $7.50 = $10.50
+  assert.ok(Math.abs(snap.spentUsd - 10.5) < 0.001, `expected ~10.5 got ${snap.spentUsd}`);
+  assert.equal(snap.calls, 1);
+});
+
+test("budget guard throws when daily limit exceeded", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-budget-"));
+  const guard = new BudgetGuard({ storePath: path.join(dir, "usage.json"), dailyUsdLimit: 1 });
+  guard.record({ input_tokens: 1_000_000, output_tokens: 0 }, "claude-sonnet-4-6"); // $3 spend
+  assert.throws(() => guard.check(), /Daily budget reached/);
+});
+
+test("autopilot task type fires through agent host", async () => {
+  const runtime = createDefaultRuntime();
+  runtime.cron.addJob({
+    id: "auto-test",
+    name: "auto",
+    enabled: true,
+    task: "autopilot",
+    intervalMs: 60000,
+    nextRunAt: new Date(Date.now() - 1000).toISOString(),
+    input: { agentId: "main" }
+  });
+  const results = await runtime.tick(new Date());
+  const fired = results.find((r) => r.job.task === "autopilot");
+  assert.ok(fired);
+  assert.ok(fired.result.reply, "autopilot should produce a reply");
+  assert.equal(fired.result.autopilot, true);
+});
+
+test("send_message tool exists in registry", () => {
+  const runtime = createDefaultRuntime();
+  assert.ok(runtime.tools.has("send_message"));
 });
 
 test("file-backed propagation persists specialist workspaces", () => {

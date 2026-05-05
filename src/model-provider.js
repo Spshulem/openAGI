@@ -55,6 +55,7 @@ export class OpenAIResponsesProvider {
     this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? 6;
+    this.budgetGuard = options.budgetGuard ?? null;
   }
 
   isConfigured() {
@@ -63,6 +64,7 @@ export class OpenAIResponsesProvider {
 
   async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {} }) {
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
+    this.budgetGuard?.check();
 
     const baseInput = [
       ...messages.slice(-12).map((message) => ({
@@ -133,6 +135,7 @@ export class OpenAIResponsesProvider {
       });
       const json = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(json?.error?.message ?? `OpenAI request failed with ${response.status}`);
+      this.budgetGuard?.record(json.usage, this.model);
       return json;
     } finally {
       clearTimeout(timeout);
@@ -149,6 +152,7 @@ export class AnthropicProvider {
     this.maxTokens = options.maxTokens ?? 4096;
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? 6;
+    this.budgetGuard = options.budgetGuard ?? null;
   }
 
   isConfigured() {
@@ -157,6 +161,7 @@ export class AnthropicProvider {
 
   async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {} }) {
     if (!this.apiKey) throw new Error("ANTHROPIC_API_KEY is not configured.");
+    this.budgetGuard?.check();
 
     const tools = toolRegistry?.toAnthropicTools?.() ?? [];
     const system = [
@@ -237,6 +242,7 @@ export class AnthropicProvider {
       });
       const json = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(json?.error?.message ?? `Anthropic request failed with ${response.status}`);
+      this.budgetGuard?.record(json.usage, this.model);
       return json;
     } finally {
       clearTimeout(timeout);
@@ -246,9 +252,10 @@ export class AnthropicProvider {
 
 export function createModelProvider(options = {}) {
   if (options.forceDeterministic === true) return new DeterministicModelProvider();
-  const anthropic = new AnthropicProvider(options.anthropic ?? {});
+  const budgetGuard = options.budgetGuard ?? null;
+  const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   if (anthropic.isConfigured()) return anthropic;
-  const openai = new OpenAIResponsesProvider(options.openai ?? {});
+  const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
   if (openai.isConfigured()) return openai;
   return new DeterministicModelProvider();
 }

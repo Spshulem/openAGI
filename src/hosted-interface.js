@@ -115,6 +115,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
       }
 
+      if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+
       if (method === "GET" && pathname === "/cron") return sendJson(res, 200, runtime.cron.listJobs());
       if (method === "POST" && pathname === "/cron") {
         const body = await readJson(req);
@@ -148,7 +150,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const id = decodeURIComponent(pathname.split("/")[2]);
         const job = runtime.cron.listJobs().find((j) => j.id === id);
         if (!job) return sendJson(res, 404, { error: "unknown-job" });
-        const result = await runtime.runScheduledPrompt(job);
+        const result =
+          job.task === "autopilot"
+            ? await runtime.runAutopilot(job)
+            : await runtime.runScheduledPrompt(job);
         events.emit("cron", { op: "run", id, result });
         return sendJson(res, 200, { result });
       }
@@ -454,6 +459,7 @@ function renderApp() {
       <button data-tab="mcp">MCP</button>
       <button data-tab="agents">Agents</button>
       <button data-tab="channels">Channels</button>
+      <button data-tab="budget">Budget</button>
     </nav>
   </header>
   <div class="body">
@@ -537,6 +543,9 @@ async function switchTab(tab) {
   } else if (tab === "channels") {
     sidebar.style.display = "none";
     await renderChannels();
+  } else if (tab === "budget") {
+    sidebar.style.display = "none";
+    await renderBudget();
   }
   renderTab();
 }
@@ -683,11 +692,19 @@ function openCronComposer() {
     <div class="pane">
       <h2>New schedule</h2>
       <form class="form" id="cronForm">
-        <div><label>Name</label><input name="name" placeholder="reminder" required></div>
-        <div><label>Prompt</label><textarea name="prompt" rows="3" placeholder="Tell me a one-line motivational sentence." required></textarea></div>
+        <div><label>Type</label>
+          <select name="task">
+            <option value="prompt">prompt — runs once, replies to channel</option>
+            <option value="autopilot">autopilot — proactive pulse, agent decides if it acts</option>
+          </select>
+        </div>
+        <div><label>Name</label><input name="name" placeholder="morning-brief" required></div>
+        <div><label>Prompt (leave blank for autopilot to use the default review prompt)</label>
+          <textarea name="prompt" rows="3" placeholder="For autopilot: optional custom pulse prompt. For prompt: what the agent should run."></textarea>
+        </div>
         <div class="row" style="gap: 8px;">
           <div class="grow"><label>Delay (seconds)</label><input name="delaySeconds" type="number" min="30" placeholder="60"></div>
-          <div class="grow"><label>Interval (seconds)</label><input name="intervalSeconds" type="number" min="30" placeholder="3600"></div>
+          <div class="grow"><label>Interval (seconds)</label><input name="intervalSeconds" type="number" min="30" placeholder="600"></div>
           <div class="grow"><label>Daily at</label><input name="dailyAt" placeholder="09:00"></div>
         </div>
         <div class="row" style="gap: 8px;">
@@ -706,8 +723,10 @@ function openCronComposer() {
     const obj = Object.fromEntries(fd.entries());
     if (obj.delaySeconds) obj.delaySeconds = Number(obj.delaySeconds);
     if (obj.intervalSeconds) obj.intervalSeconds = Number(obj.intervalSeconds);
+    const task = obj.task || "prompt";
+    obj.task = task;
     obj.input = {
-      prompt: obj.prompt,
+      prompt: obj.prompt || undefined,
       channel: obj.channel,
       target: obj.target || null,
       agentId: "main"
@@ -903,6 +922,40 @@ async function renderChannels() {
   });
 }
 
+async function renderBudget() {
+  const b = await fetchJson("/budget");
+  const pct = Math.min(100, (b.spentUsd / Math.max(b.dailyUsdLimit, 0.0001)) * 100);
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>Budget</h2>
+      <div class="card">
+        <div class="row between"><span class="name">Today (\${escapeHtml(b.today)})</span><span class="badge \${pct > 90 ? 'err' : pct > 70 ? 'warn' : 'ok'}">\${pct.toFixed(0)}% of limit</span></div>
+        <div style="margin-top:10px; height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden;">
+          <div style="width: \${pct}%; height: 100%; background: var(--accent);"></div>
+        </div>
+        <div class="row" style="gap: 16px; margin-top: 12px;">
+          <div><span class="desc">Spent</span><div style="font-size: 22px; font-weight: 700;">$\${b.spentUsd.toFixed(4)}</div></div>
+          <div><span class="desc">Remaining</span><div style="font-size: 22px; font-weight: 700;">$\${b.remainingUsd.toFixed(4)}</div></div>
+          <div><span class="desc">Daily limit</span><div style="font-size: 22px; font-weight: 700;">$\${b.dailyUsdLimit.toFixed(2)}</div></div>
+          <div><span class="desc">Calls</span><div style="font-size: 22px; font-weight: 700;">\${b.calls}</div></div>
+        </div>
+        <h3>Tokens today</h3>
+        <pre>input: \${b.tokens.input}\\noutput: \${b.tokens.output}\\ncache_read: \${b.tokens.cacheRead}\\ncache_write: \${b.tokens.cacheWrite}</pre>
+      </div>
+      <h3>Last 14 days</h3>
+      <div id="budgetHistory" class="grid"></div>
+      <p class="desc" style="margin-top: 12px;">Limit is set via <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code>.</p>
+    </div>
+  \`;
+  const hist = $("budgetHistory");
+  for (const d of b.history ?? []) {
+    const c = document.createElement("div");
+    c.className = "card";
+    c.innerHTML = \`<div class="row between"><span class="name">\${escapeHtml(d.date)}</span><span>$\${d.usd.toFixed(4)} · \${d.calls} call\${d.calls===1?"":"s"}</span></div>\`;
+    hist.appendChild(c);
+  }
+}
+
 async function fetchJson(path) {
   const r = await fetch(path);
   if (!r.ok) throw new Error(\`\${path} -> \${r.status}\`);
@@ -917,11 +970,12 @@ function escapeHtml(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":
 
 async function refreshHealth() {
   try {
-    const h = await fetchJson("/health");
+    const [h, b] = await Promise.all([fetchJson("/health"), fetchJson("/budget").catch(() => null)]);
     state.health = h;
     const m = h.status.memory ?? {};
     const provider = h.status.agentHost?.provider ?? "—";
-    $("status").textContent = \`runtime online · \${provider} \${h.status.agentHost?.providerConfigured ? "✓" : "(no key)"} · short \${m.short || 0} / medium \${m.medium || 0} / long \${m.long || 0}\`;
+    const budget = b ? \` · $\${b.spentUsd.toFixed(2)} / $\${b.dailyUsdLimit.toFixed(2)}\` : "";
+    $("status").textContent = \`runtime online · \${provider} \${h.status.agentHost?.providerConfigured ? "✓" : "(no key)"} · short \${m.short || 0} / medium \${m.medium || 0} / long \${m.long || 0}\${budget}\`;
   } catch {
     $("status").textContent = "runtime offline";
   }

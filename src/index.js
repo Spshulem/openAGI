@@ -1,5 +1,6 @@
 export { AbiRuntime, createDefaultRuntime, createDurableRuntime } from "./abi-runtime.js";
 export { AgentHost } from "./agent-host.js";
+export { BudgetGuard } from "./budget-guard.js";
 export { FileBackedAgentStore, InMemoryAgentStore } from "./agent-store.js";
 export { ChannelManager, TelegramChannel } from "./channels.js";
 export { CronScheduler, createDailyAdaptationReviewJob, createDailyPersonaResearchJob } from "./cron-scheduler.js";
