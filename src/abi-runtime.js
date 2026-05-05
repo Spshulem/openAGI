@@ -9,6 +9,7 @@ import { FileBackedPropagationController } from "./file-backed-propagation-contr
 import { createAbiIntegration, IntegrationRegistry } from "./integration-registry.js";
 import { fileURLToPath } from "node:url";
 import { BudgetGuard } from "./budget-guard.js";
+import { registerRizeIntegration } from "./integrations/rize.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemorySystem } from "./memory-system.js";
 import { PropagationController } from "./propagation-controller.js";
@@ -61,6 +62,8 @@ export class AbiRuntime {
       if (userDir) dirs.push(userDir);
       this.skills = new SkillRegistry({ runtime: this, dirs });
     }
+
+    if (options.integrations !== false) registerRizeIntegration(this);
   }
 
   processIntegrationEvent(source, payload) {

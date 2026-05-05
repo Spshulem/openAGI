@@ -297,6 +297,22 @@ test("send_message tool exists in registry", () => {
   assert.ok(runtime.tools.has("send_message"));
 });
 
+test("Rize integration registers tools when API key is set", async () => {
+  const { RizeClient, registerRizeIntegration } = await import("../src/index.js");
+  const runtime = createDefaultRuntime();
+  const beforeCount = runtime.tools.list().length;
+  // No key → no tools
+  const noop = registerRizeIntegration(runtime, { client: new RizeClient({ apiKey: null }) });
+  assert.equal(noop.registered, false);
+  assert.equal(runtime.tools.list().length, beforeCount);
+  // With key → 3 tools
+  const result = registerRizeIntegration(runtime, { client: new RizeClient({ apiKey: "TEST_KEY" }) });
+  assert.equal(result.registered, true);
+  for (const t of ["rize_query", "rize_today_summary", "rize_recent_sessions"]) {
+    assert.ok(runtime.tools.has(t), `expected tool ${t}`);
+  }
+});
+
 test("file-backed propagation persists specialist workspaces", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-agents-"));
   const storePath = path.join(dir, "specialists.json");

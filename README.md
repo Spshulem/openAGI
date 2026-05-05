@@ -93,6 +93,31 @@ curl -s -X POST http://127.0.0.1:43210/mcp/connect/filesystem
 
 On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly.
 
+## Integrations
+
+Integrations are plug-in modules in `src/integrations/<name>.js`. Each one self-registers tools on the runtime when its credentials are present in env, and silently no-ops otherwise. **No keys live in source.**
+
+Bundled:
+
+| Integration | Env | Tools | Use |
+|---|---|---|---|
+| Rize.io (time tracking) | `RIZE_API_KEY` | `rize_query`, `rize_today_summary`, `rize_recent_sessions` | "What did I work on today?" |
+
+To add another (e.g. Toggl, Linear, GitHub via API), copy `src/integrations/rize.js` as a template:
+
+```js
+export function registerYourIntegration(runtime, options = {}) {
+  const client = options.client ?? new YourClient(options);
+  if (!client.isConfigured()) return { registered: false, reason: "API key not set" };
+  runtime.tools.register({ name: "your_tool", parameters: {...}, handler: async (args) => client.something(args) });
+  return { registered: true };
+}
+```
+
+Then add one line to `src/abi-runtime.js` constructor: `registerYourIntegration(this);`
+
+For SaaS that ships an MCP server, you don't need an integration module — just point at it from `.openagi/mcp.json` and the agent gets every tool automatically.
+
 ## Skills
 
 Skills are markdown templates the agent can run as sub-prompts. Three are bundled (`recap`, `morning-brief`, `remind`). Add your own at `.openagi/skills/<name>/SKILL.md`:
