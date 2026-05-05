@@ -1,0 +1,950 @@
+import http from "node:http";
+import { EventEmitter } from "node:events";
+import { createDefaultRuntime } from "./abi-runtime.js";
+import { ChannelManager } from "./channels.js";
+
+export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
+  const host = options.host ?? "127.0.0.1";
+  const port = options.port ?? 43210;
+  const channels =
+    options.channels ??
+    (runtime.agentHost
+      ? new ChannelManager({
+          agentHost: runtime.agentHost,
+          runtime,
+          dir: options.channelsDir,
+          telegramToken: options.telegramToken,
+          twilioAccountSid: options.twilioAccountSid,
+          twilioAuthToken: options.twilioAuthToken,
+          twilioFromNumber: options.twilioFromNumber
+        })
+      : null);
+
+  const events = new EventEmitter();
+  events.setMaxListeners(50);
+
+  const sseClients = new Set();
+  function broadcast(event, data) {
+    const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    for (const res of sseClients) {
+      try { res.write(payload); } catch { /* dropped */ }
+    }
+  }
+  events.on("message", (data) => broadcast("message", data));
+  events.on("cron", (data) => broadcast("cron", data));
+  events.on("mcp", (data) => broadcast("mcp", data));
+
+  if (runtime.agentHost) {
+    const original = runtime.agentHost.handleMessage.bind(runtime.agentHost);
+    runtime.agentHost.handleMessage = async (input) => {
+      const result = await original(input);
+      events.emit("message", {
+        sessionId: result.session.id,
+        agent: result.agent,
+        reply: result.reply,
+        toolCalls: result.output?.scrutiny?.action ? [] : []
+      });
+      return result;
+    };
+  }
+
+  let tickerHandle = null;
+  const tickerMs = options.tickerMs ?? Number.parseInt(process.env.OPENAGI_TICKER_MS ?? "10000", 10);
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
+      const pathname = url.pathname;
+      const method = req.method;
+
+      if (method === "GET" && pathname === "/") return sendHtml(res, 200, renderApp());
+      if (method === "GET" && pathname === "/health") return sendJson(res, 200, { ok: true, status: runtime.status() });
+      if (method === "GET" && pathname === "/memory") return sendJson(res, 200, runtime.memory.snapshot());
+      if (method === "GET" && pathname === "/agents") return sendJson(res, 200, runtime.agentHost?.store.listAgents() ?? runtime.propagation.list());
+      if (method === "GET" && pathname === "/specialists") return sendJson(res, 200, runtime.propagation.list());
+      if (method === "GET" && pathname === "/sessions") return sendJson(res, 200, runtime.agentHost?.store.listSessions() ?? []);
+      if (method === "GET" && pathname.startsWith("/sessions/")) {
+        const id = decodeURIComponent(pathname.slice("/sessions/".length));
+        return sendJson(res, 200, runtime.agentHost?.store.getSession(id) ?? { error: "agent-host-disabled" });
+      }
+      if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
+      if (method === "GET" && pathname === "/channels") return sendJson(res, 200, channels?.status() ?? { enabled: false });
+      if (method === "GET" && pathname === "/tools") return sendJson(res, 200, runtime.tools.list());
+
+      if (method === "GET" && pathname === "/events") return handleSse(req, res, sseClients);
+
+      if (method === "POST" && pathname === "/ingest") {
+        const body = await readJson(req);
+        const outputs = runtime.processIntegrationEvent(body.source ?? "abi", body.payload ?? body);
+        return sendJson(res, 200, { outputs });
+      }
+
+      if (method === "POST" && pathname === "/message") {
+        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJson(req);
+        const result = await channels.handleLocalMessage(body);
+        return sendJson(res, 200, result);
+      }
+
+      if (method === "POST" && pathname === "/channels/telegram/webhook") {
+        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJson(req);
+        const result = await channels.handleTelegramWebhook(body);
+        return sendJson(res, 200, result);
+      }
+
+      if (method === "POST" && pathname === "/channels/twilio/webhook") {
+        if (!channels) return sendXml(res, 503, twiml("OpenAGI agent host is disabled."));
+        const form = await readForm(req);
+        const result = await channels.handleSmsMessage({
+          from: form.From ?? form.from ?? "sms",
+          text: form.Body ?? form.body ?? "",
+          metadata: { messageSid: form.MessageSid, accountSid: form.AccountSid }
+        });
+        return sendXml(res, 200, twiml(result.reply));
+      }
+
+      if (method === "POST" && pathname === "/channels/sms/send") {
+        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJson(req);
+        try {
+          const result = await channels.sms.sendSms(body.to, body.text);
+          return sendJson(res, 200, { ok: true, result });
+        } catch (error) {
+          return sendJson(res, 400, { ok: false, error: error.message });
+        }
+      }
+
+      if (method === "GET" && pathname === "/cron") return sendJson(res, 200, runtime.cron.listJobs());
+      if (method === "POST" && pathname === "/cron") {
+        const body = await readJson(req);
+        const job = runtime.cron.addJob({
+          id: body.id,
+          name: body.name ?? "manual-prompt",
+          enabled: body.enabled ?? true,
+          task: body.task ?? "prompt",
+          replace: true,
+          input: body.input ?? {
+            prompt: body.prompt ?? "(empty)",
+            channel: body.channel ?? "local",
+            target: body.target ?? null,
+            agentId: body.agentId ?? "main",
+            sessionId: body.sessionId
+          },
+          intervalMs: body.intervalSeconds ? body.intervalSeconds * 1000 : body.intervalMs,
+          dailyAt: body.dailyAt,
+          nextRunAt: body.delaySeconds ? new Date(Date.now() + body.delaySeconds * 1000).toISOString() : body.nextRunAt
+        });
+        events.emit("cron", { op: "add", job });
+        return sendJson(res, 200, job);
+      }
+      if (method === "DELETE" && pathname.startsWith("/cron/")) {
+        const id = decodeURIComponent(pathname.slice("/cron/".length));
+        const removed = runtime.cron.removeJob(id);
+        events.emit("cron", { op: "remove", id });
+        return sendJson(res, 200, { removed });
+      }
+      if (method === "POST" && pathname.match(/^\/cron\/[^/]+\/run$/)) {
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const job = runtime.cron.listJobs().find((j) => j.id === id);
+        if (!job) return sendJson(res, 404, { error: "unknown-job" });
+        const result = await runtime.runScheduledPrompt(job);
+        events.emit("cron", { op: "run", id, result });
+        return sendJson(res, 200, { result });
+      }
+
+      if (method === "GET" && pathname === "/skills") return sendJson(res, 200, runtime.skills?.list() ?? []);
+      if (method === "POST" && pathname === "/skills/reload") {
+        runtime.skills?.reload();
+        return sendJson(res, 200, runtime.skills?.list() ?? []);
+      }
+      if (method === "POST" && pathname.match(/^\/skills\/[^/]+\/run$/)) {
+        const name = decodeURIComponent(pathname.split("/")[2]);
+        const body = await readJson(req);
+        try {
+          const result = await runtime.skills.run(name, { input: body.input ?? "", args: body.args ?? {} }, body.context ?? {});
+          return sendJson(res, 200, result);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+
+      if (method === "GET" && pathname === "/mcp") return sendJson(res, 200, runtime.mcp.listServers());
+      if (method === "GET" && pathname === "/mcp/tools") return sendJson(res, 200, runtime.mcp.listTools());
+      if (method === "POST" && pathname.match(/^\/mcp\/connect\/[^/]+$/)) {
+        const name = decodeURIComponent(pathname.split("/")[3]);
+        try {
+          const status = await runtime.mcp.connect(name);
+          events.emit("mcp", { op: "connect", name });
+          return sendJson(res, 200, status);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+      if (method === "POST" && pathname.match(/^\/mcp\/disconnect\/[^/]+$/)) {
+        const name = decodeURIComponent(pathname.split("/")[3]);
+        await runtime.mcp.disconnect(name);
+        events.emit("mcp", { op: "disconnect", name });
+        return sendJson(res, 200, { ok: true });
+      }
+      if (method === "POST" && pathname === "/mcp/connect-all") {
+        const results = await runtime.mcp.connectAll();
+        events.emit("mcp", { op: "connect-all", results });
+        return sendJson(res, 200, results);
+      }
+      if (method === "POST" && pathname === "/mcp/call") {
+        const body = await readJson(req);
+        try {
+          const result = await runtime.mcp.callTool(body.server, body.tool, body.args ?? {});
+          return sendJson(res, 200, result);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+      if (method === "POST" && pathname === "/mcp/register") {
+        const body = await readJson(req);
+        const server = runtime.mcp.registerServer(body);
+        return sendJson(res, 200, server);
+      }
+
+      if (method === "POST" && pathname === "/tick") {
+        const body = await readJson(req);
+        const results = await runtime.tick(body.now ? new Date(body.now) : new Date());
+        return sendJson(res, 200, { results });
+      }
+
+      return sendJson(res, 404, { error: "not-found" });
+    } catch (error) {
+      return sendJson(res, 500, { error: error.message });
+    }
+  });
+
+  return {
+    runtime,
+    channels,
+    events,
+    server,
+    listen() {
+      return new Promise((resolve) => {
+        server.listen(port, host, () => {
+          channels?.start();
+          if (tickerMs > 0) {
+            tickerHandle = setInterval(() => {
+              runtime.tick().catch(() => { /* swallow */ });
+            }, tickerMs);
+          }
+          const address = server.address();
+          const actualPort = typeof address === "object" && address ? address.port : port;
+          resolve({ host, port: actualPort, url: `http://${host}:${actualPort}` });
+        });
+      });
+    },
+    close() {
+      return new Promise((resolve, reject) => {
+        if (tickerHandle) clearInterval(tickerHandle);
+        for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
+        sseClients.clear();
+        channels?.stop();
+        runtime.mcp?.disconnectAll?.().catch(() => {});
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  };
+}
+
+function handleSse(req, res, clients) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive"
+  });
+  res.write(`event: hello\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
+  clients.add(res);
+  const heartbeat = setInterval(() => {
+    try { res.write(": ping\n\n"); } catch { /* dropped */ }
+  }, 15000);
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    clients.delete(res);
+  });
+}
+
+function sendHtml(res, status, value) {
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(value) });
+  res.end(value);
+}
+
+function sendJson(res, status, value) {
+  const body = JSON.stringify(value, null, 2);
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body) });
+  res.end(body);
+}
+
+function sendXml(res, status, value) {
+  res.writeHead(status, { "content-type": "text/xml; charset=utf-8", "content-length": Buffer.byteLength(value) });
+  res.end(value);
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      if (chunks.length === 0) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+      catch (error) { reject(error); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function readForm(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      const params = new URLSearchParams(text);
+      resolve(Object.fromEntries(params.entries()));
+    });
+    req.on("error", reject);
+  });
+}
+
+function twiml(message) {
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(String(message ?? "").slice(0, 1400))}</Message></Response>`;
+}
+
+function escapeXml(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function renderApp() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenAGI</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0e1411;
+      --panel: #161d19;
+      --panel-2: #1d2722;
+      --text: #e8efea;
+      --muted: #8da59a;
+      --line: #2a352f;
+      --accent: #6fe1b1;
+      --accent-soft: #14322a;
+      --user: #2c4338;
+      --assistant: #1d2722;
+      --warn: #f0b454;
+      --err: #f08080;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      height: 100vh;
+      overflow: hidden;
+    }
+    .app { display: grid; grid-template-rows: 48px 1fr; height: 100vh; }
+    header {
+      display: flex; align-items: center; gap: 16px;
+      padding: 0 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    header h1 { font-size: 14px; font-weight: 700; margin: 0; letter-spacing: 0.02em; }
+    header .status { color: var(--muted); font-size: 12px; }
+    nav { display: flex; gap: 4px; margin-left: auto; }
+    nav button {
+      background: transparent; border: 1px solid transparent; color: var(--muted);
+      padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    }
+    nav button.active { color: var(--text); background: var(--panel-2); border-color: var(--line); }
+    nav button:hover { color: var(--text); }
+
+    .body { display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
+    .sidebar {
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+      display: flex; flex-direction: column; min-height: 0;
+    }
+    .sidebar header.sub { height: 40px; padding: 0 12px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; }
+    .sidebar h2 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .sidebar .add { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--line); border-radius: 4px; padding: 2px 8px; font-size: 12px; cursor: pointer; }
+    .sidebar ul { list-style: none; margin: 0; padding: 4px; overflow: auto; flex: 1; }
+    .sidebar li {
+      padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 2px;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    .sidebar li:hover { background: var(--panel-2); }
+    .sidebar li.active { background: var(--panel-2); border: 1px solid var(--line); }
+    .sidebar li .title { color: var(--text); font-weight: 600; font-size: 13px; }
+    .sidebar li .preview { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .main { display: flex; flex-direction: column; min-height: 0; }
+    .thread { flex: 1; overflow: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 700px; padding: 10px 12px; border-radius: 10px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }
+    .msg.user { background: var(--user); align-self: flex-end; }
+    .msg.assistant { background: var(--assistant); border: 1px solid var(--line); align-self: flex-start; }
+    .msg .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+    .composer { border-top: 1px solid var(--line); padding: 12px 16px; background: var(--panel); display: flex; gap: 8px; align-items: flex-end; }
+    .composer textarea {
+      flex: 1; min-height: 38px; max-height: 200px; resize: none;
+      background: var(--bg); color: var(--text); border: 1px solid var(--line);
+      border-radius: 8px; padding: 9px 12px; font: inherit; outline: none;
+    }
+    .composer textarea:focus { border-color: var(--accent); }
+    .composer button {
+      background: var(--accent); color: #002219; border: 0;
+      padding: 9px 14px; border-radius: 8px; font-weight: 700; cursor: pointer;
+    }
+    .composer button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .pane { flex: 1; overflow: auto; padding: 16px 20px; }
+    .pane h2 { margin: 0 0 12px; font-size: 18px; }
+    .pane h3 { margin: 18px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+    .grid { display: grid; gap: 10px; }
+    .grid.two { grid-template-columns: 1fr 1fr; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    .card .name { font-weight: 700; }
+    .card .desc { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row.between { justify-content: space-between; }
+    .row > .grow { flex: 1; }
+    .badge { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
+    .badge.ok { color: var(--accent); }
+    .badge.warn { color: var(--warn); }
+    .badge.err { color: var(--err); }
+    pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
+    input, select, textarea {
+      background: var(--bg); color: var(--text); border: 1px solid var(--line);
+      border-radius: 6px; padding: 6px 10px; font: inherit; outline: none;
+    }
+    input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+    button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+    button.secondary:hover { border-color: var(--accent); color: var(--accent); }
+    .form { display: grid; gap: 8px; }
+    .form label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 2px; }
+    .ok { color: var(--accent); }
+    .err { color: var(--err); }
+    .empty { color: var(--muted); padding: 16px; text-align: center; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>OpenAGI</h1>
+    <span id="status" class="status">connecting…</span>
+    <nav id="nav">
+      <button data-tab="chat" class="active">Chat</button>
+      <button data-tab="memory">Memory</button>
+      <button data-tab="cron">Cron</button>
+      <button data-tab="skills">Skills</button>
+      <button data-tab="mcp">MCP</button>
+      <button data-tab="agents">Agents</button>
+      <button data-tab="channels">Channels</button>
+    </nav>
+  </header>
+  <div class="body">
+    <aside class="sidebar" id="sidebar">
+      <header class="sub">
+        <h2 id="sidebarTitle">Sessions</h2>
+        <button class="add" id="newSession">+ New</button>
+      </header>
+      <ul id="sidebarList"></ul>
+    </aside>
+    <section class="main" id="main"></section>
+  </div>
+</div>
+<script>
+const state = {
+  tab: "chat",
+  sessionId: null,
+  sessions: [],
+  agentId: "main",
+  channel: "local",
+  from: "browser",
+  messages: [],
+  health: null
+};
+
+const $ = (id) => document.getElementById(id);
+const main = $("main");
+const sidebar = $("sidebar");
+const sidebarList = $("sidebarList");
+const sidebarTitle = $("sidebarTitle");
+const newBtn = $("newSession");
+
+document.querySelectorAll("nav button").forEach((btn) => {
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+});
+
+newBtn.addEventListener("click", () => {
+  if (state.tab === "chat") {
+    state.sessionId = null;
+    state.messages = [];
+    state.from = "browser-" + Date.now();
+    renderTab();
+  } else if (state.tab === "cron") {
+    openCronComposer();
+  } else if (state.tab === "skills") {
+    refreshSkills(true);
+  } else if (state.tab === "mcp") {
+    openMcpComposer();
+  }
+});
+
+async function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  if (tab === "chat") {
+    sidebar.style.display = "";
+    sidebarTitle.textContent = "Sessions";
+    newBtn.textContent = "+ New";
+    await refreshSessions();
+  } else if (tab === "cron") {
+    sidebar.style.display = "";
+    sidebarTitle.textContent = "Schedules";
+    newBtn.textContent = "+ Schedule";
+    await refreshCron();
+  } else if (tab === "skills") {
+    sidebar.style.display = "";
+    sidebarTitle.textContent = "Skills";
+    newBtn.textContent = "↻ Reload";
+    await refreshSkills();
+  } else if (tab === "mcp") {
+    sidebar.style.display = "";
+    sidebarTitle.textContent = "MCP Servers";
+    newBtn.textContent = "+ Register";
+    await refreshMcp();
+  } else if (tab === "agents") {
+    sidebar.style.display = "none";
+    await renderAgents();
+  } else if (tab === "memory") {
+    sidebar.style.display = "none";
+    await renderMemory();
+  } else if (tab === "channels") {
+    sidebar.style.display = "none";
+    await renderChannels();
+  }
+  renderTab();
+}
+
+function renderTab() {
+  if (state.tab === "chat") return renderChat();
+  // for other tabs, sidebar interaction drives main pane
+}
+
+async function refreshSessions() {
+  const sessions = await fetchJson("/sessions");
+  state.sessions = sessions;
+  sidebarList.innerHTML = "";
+  if (sessions.length === 0) {
+    sidebarList.innerHTML = '<li class="empty">No sessions yet</li>';
+  }
+  for (const s of sessions) {
+    const li = document.createElement("li");
+    li.className = state.sessionId === s.id ? "active" : "";
+    li.innerHTML = \`<div class="title">\${escapeHtml(s.id)}</div><div class="preview">\${escapeHtml(s.lastMessage || "")}</div>\`;
+    li.addEventListener("click", () => loadSession(s.id));
+    sidebarList.appendChild(li);
+  }
+}
+
+async function loadSession(id) {
+  state.sessionId = id;
+  const session = await fetchJson("/sessions/" + encodeURIComponent(id));
+  state.messages = session.messages ?? [];
+  state.channel = state.messages[0]?.channel ?? "local";
+  state.from = state.messages[0]?.from ?? "browser";
+  await refreshSessions();
+  renderChat();
+}
+
+function renderChat() {
+  main.innerHTML = \`
+    <div class="thread" id="thread"></div>
+    <form class="composer" id="composer">
+      <textarea id="input" placeholder="Message your OpenAGI agent…" rows="1"></textarea>
+      <button type="submit" id="send">Send</button>
+    </form>
+  \`;
+  const thread = $("thread");
+  if (state.messages.length === 0) {
+    thread.innerHTML = '<div class="empty">Start a new conversation. Try "Remind me in 60 seconds to drink water" or "Remember that my standup is 9am Mondays".</div>';
+  }
+  for (const m of state.messages) appendMessage(m, false);
+  thread.scrollTop = thread.scrollHeight;
+  const input = $("input");
+  input.focus();
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(200, input.scrollHeight) + "px";
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      $("composer").requestSubmit();
+    }
+  });
+  $("composer").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    input.style.height = "auto";
+    appendMessage({ role: "user", content: text, from: state.from, channel: state.channel, createdAt: new Date().toISOString() });
+    const sendBtn = $("send");
+    sendBtn.disabled = true;
+    try {
+      const result = await postJson("/message", {
+        text,
+        channel: state.channel,
+        from: state.from,
+        agentId: state.agentId,
+        sessionId: state.sessionId
+      });
+      state.sessionId = result.session.id;
+      appendMessage({ role: "assistant", content: result.reply, from: "openagi", channel: state.channel, createdAt: result.createdAt, metadata: result.model });
+      refreshSessions();
+    } catch (err) {
+      appendMessage({ role: "assistant", content: "[error] " + err.message });
+    } finally {
+      sendBtn.disabled = false;
+    }
+  });
+}
+
+function appendMessage(msg, autoscroll = true) {
+  const thread = $("thread");
+  if (!thread) return;
+  const div = document.createElement("div");
+  div.className = "msg " + (msg.role === "user" ? "user" : "assistant");
+  const meta = msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
+  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${escapeHtml(msg.content ?? "")}\`;
+  thread.appendChild(div);
+  if (autoscroll) thread.scrollTop = thread.scrollHeight;
+}
+
+async function refreshCron() {
+  const jobs = await fetchJson("/cron");
+  sidebarList.innerHTML = jobs.length === 0 ? '<li class="empty">No schedules</li>' : "";
+  for (const j of jobs) {
+    const li = document.createElement("li");
+    li.innerHTML = \`<div class="title">\${escapeHtml(j.name)}</div><div class="preview">\${j.intervalMs ? \`every \${(j.intervalMs/1000).toFixed(0)}s\` : j.dailyAt ? \`daily \${j.dailyAt}\` : "—"} · next \${escapeHtml(new Date(j.nextRunAt).toLocaleString())}</div>\`;
+    li.addEventListener("click", () => renderCronDetail(j));
+    sidebarList.appendChild(li);
+  }
+  if (jobs.length > 0) renderCronDetail(jobs[0]);
+  else openCronComposer();
+}
+
+function renderCronDetail(job) {
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>\${escapeHtml(job.name)}</h2>
+      <div class="row" style="gap:6px; margin-bottom: 8px;">
+        <span class="badge \${job.enabled ? 'ok' : 'warn'}">\${job.enabled ? "enabled" : "disabled"}</span>
+        <span class="badge">task: \${escapeHtml(job.task)}</span>
+        <span class="badge">next: \${escapeHtml(new Date(job.nextRunAt).toLocaleString())}</span>
+      </div>
+      <h3>Input</h3>
+      <pre>\${escapeHtml(JSON.stringify(job.input ?? {}, null, 2))}</pre>
+      <div class="row" style="gap:8px; margin-top: 16px;">
+        <button class="secondary" id="runJob">Run now</button>
+        <button class="secondary" id="deleteJob">Delete</button>
+      </div>
+      <pre id="jobResult" class="ok" style="margin-top: 12px;"></pre>
+    </div>
+  \`;
+  $("runJob").addEventListener("click", async () => {
+    const res = await postJson(\`/cron/\${encodeURIComponent(job.id)}/run\`, {});
+    $("jobResult").textContent = JSON.stringify(res, null, 2);
+  });
+  $("deleteJob").addEventListener("click", async () => {
+    await fetch(\`/cron/\${encodeURIComponent(job.id)}\`, { method: "DELETE" });
+    refreshCron();
+  });
+}
+
+function openCronComposer() {
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>New schedule</h2>
+      <form class="form" id="cronForm">
+        <div><label>Name</label><input name="name" placeholder="reminder" required></div>
+        <div><label>Prompt</label><textarea name="prompt" rows="3" placeholder="Tell me a one-line motivational sentence." required></textarea></div>
+        <div class="row" style="gap: 8px;">
+          <div class="grow"><label>Delay (seconds)</label><input name="delaySeconds" type="number" min="30" placeholder="60"></div>
+          <div class="grow"><label>Interval (seconds)</label><input name="intervalSeconds" type="number" min="30" placeholder="3600"></div>
+          <div class="grow"><label>Daily at</label><input name="dailyAt" placeholder="09:00"></div>
+        </div>
+        <div class="row" style="gap: 8px;">
+          <div class="grow"><label>Channel</label>
+            <select name="channel"><option value="local">local</option><option value="sms">sms</option><option value="telegram">telegram</option></select>
+          </div>
+          <div class="grow"><label>Target (phone/chatId)</label><input name="target" placeholder="+15555550123"></div>
+        </div>
+        <div class="row"><button type="submit">Schedule</button></div>
+      </form>
+    </div>
+  \`;
+  $("cronForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const obj = Object.fromEntries(fd.entries());
+    if (obj.delaySeconds) obj.delaySeconds = Number(obj.delaySeconds);
+    if (obj.intervalSeconds) obj.intervalSeconds = Number(obj.intervalSeconds);
+    obj.input = {
+      prompt: obj.prompt,
+      channel: obj.channel,
+      target: obj.target || null,
+      agentId: "main"
+    };
+    delete obj.prompt; delete obj.channel; delete obj.target;
+    await postJson("/cron", obj);
+    await refreshCron();
+  });
+}
+
+async function refreshSkills(reload = false) {
+  if (reload) await postJson("/skills/reload", {});
+  const skills = await fetchJson("/skills");
+  sidebarList.innerHTML = skills.length === 0 ? '<li class="empty">No skills loaded</li>' : "";
+  for (const s of skills) {
+    const li = document.createElement("li");
+    li.innerHTML = \`<div class="title">\${escapeHtml(s.name)}</div><div class="preview">\${escapeHtml(s.description ?? "")}</div>\`;
+    li.addEventListener("click", () => renderSkillDetail(s));
+    sidebarList.appendChild(li);
+  }
+  if (skills.length > 0) renderSkillDetail(skills[0]);
+  else main.innerHTML = '<div class="pane"><div class="empty">No skills found. Drop SKILL.md files into .openagi/skills/&lt;name&gt;/</div></div>';
+}
+
+function renderSkillDetail(skill) {
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>\${escapeHtml(skill.name)}</h2>
+      <p class="muted">\${escapeHtml(skill.description ?? "")}</p>
+      <h3>Run</h3>
+      <form class="form" id="skillForm">
+        <div><label>Input</label><textarea name="input" rows="3" placeholder="Free-text input"></textarea></div>
+        <div><button type="submit">Run skill</button></div>
+      </form>
+      <h3>Output</h3>
+      <pre id="skillOut" class="ok"></pre>
+    </div>
+  \`;
+  $("skillForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const input = e.target.input.value;
+    const out = $("skillOut");
+    out.textContent = "running…";
+    try {
+      const res = await postJson(\`/skills/\${encodeURIComponent(skill.name)}/run\`, { input });
+      out.textContent = res.output ?? JSON.stringify(res, null, 2);
+    } catch (err) {
+      out.textContent = "[error] " + err.message;
+    }
+  });
+}
+
+async function refreshMcp() {
+  const servers = await fetchJson("/mcp");
+  sidebarList.innerHTML = servers.length === 0 ? '<li class="empty">No MCP servers registered</li>' : "";
+  for (const s of servers) {
+    const li = document.createElement("li");
+    li.innerHTML = \`<div class="title">\${escapeHtml(s.name)} \${s.connected ? '<span class="badge ok">live</span>' : '<span class="badge">idle</span>'}</div><div class="preview">\${(s.tools ?? []).join(", ") || "—"}</div>\`;
+    li.addEventListener("click", () => renderMcpDetail(s));
+    sidebarList.appendChild(li);
+  }
+  if (servers.length > 0) renderMcpDetail(servers[0]);
+}
+
+function renderMcpDetail(server) {
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>\${escapeHtml(server.name)}</h2>
+      <div class="row" style="gap: 6px;">
+        <span class="badge \${server.connected ? 'ok' : ''}">\${server.connected ? "connected" : "disconnected"}</span>
+        <span class="badge">trust: \${escapeHtml(server.trustLevel)}</span>
+        <span class="badge">transport: \${escapeHtml(server.transport)}</span>
+      </div>
+      <h3>Command</h3>
+      <pre>\${escapeHtml((server.command ?? "—") + " " + (server.args ?? []).join(" "))}</pre>
+      <h3>Tools</h3>
+      <pre>\${escapeHtml((server.tools ?? []).join("\\n") || "(none)")}</pre>
+      <div class="row" style="gap: 8px; margin-top: 12px;">
+        <button id="connBtn">\${server.connected ? "Disconnect" : "Connect"}</button>
+        <button class="secondary" id="callBtn">Call tool…</button>
+      </div>
+      <pre id="mcpOut" class="ok" style="margin-top: 12px;"></pre>
+    </div>
+  \`;
+  $("connBtn").addEventListener("click", async () => {
+    const path = server.connected ? "disconnect" : "connect";
+    try {
+      const res = await postJson(\`/mcp/\${path}/\${encodeURIComponent(server.name)}\`, {});
+      $("mcpOut").textContent = JSON.stringify(res, null, 2);
+      refreshMcp();
+    } catch (err) {
+      $("mcpOut").textContent = "[error] " + err.message;
+    }
+  });
+  $("callBtn").addEventListener("click", () => {
+    const tool = prompt("Tool name?");
+    if (!tool) return;
+    const args = prompt("JSON args?", "{}");
+    postJson("/mcp/call", { server: server.name, tool, args: JSON.parse(args || "{}") })
+      .then((r) => $("mcpOut").textContent = JSON.stringify(r, null, 2))
+      .catch((e) => $("mcpOut").textContent = "[error] " + e.message);
+  });
+}
+
+function openMcpComposer() {
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>Register MCP server</h2>
+      <form class="form" id="mcpForm">
+        <div><label>Name</label><input name="name" required></div>
+        <div><label>Command</label><input name="command" placeholder="npx" required></div>
+        <div><label>Args (one per line)</label><textarea name="args" rows="3" placeholder="-y\n@modelcontextprotocol/server-filesystem\n/tmp"></textarea></div>
+        <div><label>Trust level</label><select name="trustLevel"><option>trusted</option><option>untrusted</option></select></div>
+        <div><button type="submit">Register</button></div>
+      </form>
+    </div>
+  \`;
+  $("mcpForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const obj = Object.fromEntries(fd.entries());
+    obj.args = (obj.args ?? "").split("\\n").map((s) => s.trim()).filter(Boolean);
+    await postJson("/mcp/register", obj);
+    refreshMcp();
+  });
+}
+
+async function renderAgents() {
+  const agents = await fetchJson("/agents");
+  main.innerHTML = '<div class="pane"><h2>Agents</h2><div class="grid" id="agentList"></div></div>';
+  const list = $("agentList");
+  for (const a of agents) {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = \`<div class="row between"><span class="name">\${escapeHtml(a.name)}</span><span class="badge">\${escapeHtml(a.role)}</span></div><div class="desc">\${escapeHtml(a.scope || a.systemPrompt || "—")}</div>\`;
+    list.appendChild(card);
+  }
+}
+
+async function renderMemory() {
+  const snap = await fetchJson("/memory");
+  main.innerHTML = '<div class="pane"><h2>Memory</h2><h3>Short</h3><div id="ms"></div><h3>Medium</h3><div id="mm"></div><h3>Long</h3><div id="ml"></div></div>';
+  fillMemory($("ms"), snap.short);
+  fillMemory($("mm"), snap.medium);
+  fillMemory($("ml"), snap.long);
+}
+
+function fillMemory(container, items) {
+  container.innerHTML = "";
+  if (!items || items.length === 0) {
+    container.innerHTML = '<div class="empty">(none)</div>';
+    return;
+  }
+  for (const m of items) {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = \`<div class="row between"><span class="name">\${escapeHtml(m.id)}</span><span class="badge">strength \${(m.strength ?? 0).toFixed(2)}</span></div><div class="desc">\${escapeHtml(m.content)}</div>\`;
+    container.appendChild(card);
+  }
+}
+
+async function renderChannels() {
+  const ch = await fetchJson("/channels");
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>Channels</h2>
+      <div class="grid two">
+        <div class="card"><div class="name">Local · \${ch.local?.mode ?? ""}</div><div class="desc">Browser HTTP + SSE.</div></div>
+        <div class="card"><div class="name">SMS / Twilio</div><div class="desc">\${ch.sms?.outboundConfigured ? '<span class="ok">outbound ready</span>' : '<span class="warn">outbound disabled — set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER</span>'} · from \${escapeHtml(ch.sms?.fromNumber ?? "—")}</div></div>
+        <div class="card"><div class="name">Telegram</div><div class="desc">\${ch.telegram?.configured ? "configured" : "no token"} · polling: \${ch.telegram?.polling ? "on" : "off"}</div></div>
+      </div>
+      <h3>Send SMS test</h3>
+      <form class="form" id="smsForm">
+        <div class="row" style="gap: 8px;">
+          <div class="grow"><label>To</label><input name="to" placeholder="+15555550123" required></div>
+          <div class="grow"><label>Body</label><input name="text" placeholder="Hello from OpenAGI" required></div>
+          <div><button type="submit">Send</button></div>
+        </div>
+      </form>
+      <pre id="smsOut" class="ok"></pre>
+    </div>
+  \`;
+  $("smsForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const obj = Object.fromEntries(fd.entries());
+    try {
+      const res = await postJson("/channels/sms/send", obj);
+      $("smsOut").textContent = JSON.stringify(res, null, 2);
+    } catch (err) {
+      $("smsOut").textContent = "[error] " + err.message;
+    }
+  });
+}
+
+async function fetchJson(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(\`\${path} -> \${r.status}\`);
+  return r.json();
+}
+async function postJson(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}) });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? \`\${path} -> \${r.status}\`);
+  return r.json();
+}
+function escapeHtml(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]); }
+
+async function refreshHealth() {
+  try {
+    const h = await fetchJson("/health");
+    state.health = h;
+    const m = h.status.memory ?? {};
+    const provider = h.status.agentHost?.provider ?? "—";
+    $("status").textContent = \`runtime online · \${provider} \${h.status.agentHost?.providerConfigured ? "✓" : "(no key)"} · short \${m.short || 0} / medium \${m.medium || 0} / long \${m.long || 0}\`;
+  } catch {
+    $("status").textContent = "runtime offline";
+  }
+}
+
+const evt = new EventSource("/events");
+evt.addEventListener("message", (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    if (state.tab === "chat" && data.sessionId === state.sessionId && data.reply) {
+      // already shown via direct response, skip
+    } else {
+      refreshSessions();
+    }
+  } catch {}
+});
+evt.addEventListener("cron", () => { if (state.tab === "cron") refreshCron(); });
+evt.addEventListener("mcp", () => { if (state.tab === "mcp") refreshMcp(); });
+
+setInterval(refreshHealth, 5000);
+refreshHealth();
+switchTab("chat");
+</script>
+</body>
+</html>`;
+}

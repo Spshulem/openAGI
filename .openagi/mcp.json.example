@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy or rename to mcp.json. The runtime auto-loads .openagi/mcp.json on startup.",
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "trustLevel": "trusted"
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"],
+      "trustLevel": "trusted"
+    }
+  }
+}

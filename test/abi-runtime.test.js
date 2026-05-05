@@ -1,0 +1,282 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import {
+  createDefaultRuntime,
+  createDurableRuntime,
+  createHostedInterface,
+  FileBackedCronScheduler,
+  FileBackedMemorySystem,
+  FileBackedPropagationController,
+  MemorySystem,
+  PropagationController,
+  ToolRegistry,
+  registerCoreTools
+} from "../src/index.js";
+
+test("runtime processes ABI signal through memory and propagation", () => {
+  const runtime = createDefaultRuntime();
+  const [output] = runtime.processIntegrationEvent("abi", {
+    summary: "Repeated high-risk task should be evaluated for specialization.",
+    content: "The system repeatedly re-solves the same task with similar context gathering and similar failure modes.",
+    domain: "general",
+    taskType: "adaptation-review",
+    citations: ["call:a", "call:b", "ticket:c"],
+    impact: 0.9,
+    externalPressure: 0.78,
+    novelty: 0.68,
+    repetition: 0.82,
+    risk: 0.64,
+    specificity: 0.8,
+    requiresSpecialist: true
+  });
+
+  assert.equal(output.workflow.id, "adaptive-review");
+  assert.equal(output.action, "propagate");
+  assert.equal(output.memory.tier, "medium");
+  assert.equal(output.propagation.reason, "specialist-created");
+  assert.equal(runtime.propagation.list().length, 1);
+});
+
+test("memory promotes high-risk short-term items during decay", () => {
+  const memory = new MemorySystem({
+    ttlMs: {
+      short: 1,
+      medium: 100000,
+      long: Number.POSITIVE_INFINITY
+    }
+  });
+
+  memory.remember(
+    {
+      content: "High-risk customer commitment should not be forgotten.",
+      risk: 0.8,
+      novelty: 0.6,
+      repetition: 0.3
+    },
+    {
+      tier: "short",
+      now: "2026-04-30T00:00:00.000Z"
+    }
+  );
+
+  const result = memory.decay(new Date("2026-04-30T00:00:01.000Z"));
+  assert.equal(result.promoted.length, 1);
+  assert.equal(result.promoted[0].tier, "medium");
+});
+
+test("propagation reuses existing specialist for same bounded task", () => {
+  const propagation = new PropagationController();
+  const signal = {
+    domain: "general",
+    taskType: "adaptation-review",
+    summary: "Daily adaptation review",
+    repetition: 0.9,
+    risk: 0.4,
+    novelty: 0.5
+  };
+  const workflow = { id: "adaptive-review", goal: "Daily adaptation review" };
+
+  const first = propagation.propagate({ signal, workflow, scrutiny: { reasons: ["repeated"] } });
+  const second = propagation.propagate({ signal, workflow, scrutiny: { reasons: ["still repeated"] } });
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.reason, "existing-specialist-activated");
+  assert.equal(propagation.list().length, 1);
+  assert.equal(propagation.list()[0].activationCount, 2);
+});
+
+test("hosted interface exposes runtime health", async () => {
+  const app = createHostedInterface(createDefaultRuntime(), { port: 0 });
+  const address = await app.listen();
+  try {
+    const root = await fetch(`${address.url}/`);
+    assert.equal(root.status, 200);
+    assert.match(await root.text(), /OpenAGI/);
+
+    const response = await fetch(`${address.url}/health`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.status.integrations[0].name, "abi");
+
+    const messageResponse = await fetch(`${address.url}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        from: "test",
+        text: "Remember this repeated task and decide if it needs a specialist."
+      })
+    });
+    assert.equal(messageResponse.status, 200);
+    const messageBody = await messageResponse.json();
+    assert.match(messageBody.reply, /[Ss]aved to memory/);
+    assert.equal(messageBody.session.messageCount, 2);
+
+    const smsResponse = await fetch(`${address.url}/channels/twilio/webhook`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        From: "+15555550123",
+        Body: "Schedule a repeated risky task as a specialist."
+      })
+    });
+    assert.equal(smsResponse.status, 200);
+    assert.match(await smsResponse.text(), /<Response><Message>/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("file-backed memory persists across instances", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-memory-"));
+  const first = new FileBackedMemorySystem({ dir });
+  const item = first.remember({
+    content: "Repeated high-risk tasks need bounded specialists and compressed memory.",
+    risk: 0.5,
+    novelty: 0.7,
+    repetition: 0.8,
+    tags: ["specialization"]
+  });
+
+  const second = new FileBackedMemorySystem({ dir });
+  const hits = second.retrieve("repeated high-risk specialists memory");
+
+  assert.equal(second.byTier(item.tier).length, 1);
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].item.content, /Repeated high-risk/);
+});
+
+test("file-backed cron persists jobs and run state", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cron-"));
+  const storePath = path.join(dir, "jobs.json");
+  const first = new FileBackedCronScheduler({ storePath });
+  first.addJob({
+    id: "quick",
+    name: "Quick run",
+    enabled: true,
+    task: "test",
+    intervalMs: 1000,
+    nextRunAt: "2026-04-30T00:00:00.000Z"
+  });
+
+  const second = new FileBackedCronScheduler({ storePath });
+  assert.equal(second.listJobs().length, 1);
+
+  const results = await second.runDue(async (job) => ({ task: job.task }), new Date("2026-04-30T00:00:01.000Z"));
+  assert.equal(results.length, 1);
+
+  const third = new FileBackedCronScheduler({ storePath });
+  assert.equal(third.listJobs()[0].lastRunAt, "2026-04-30T00:00:01.000Z");
+});
+
+test("durable runtime reloads memory and does not duplicate default cron", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-runtime-"));
+  const first = createDurableRuntime({ dataDir });
+  first.processIntegrationEvent("abi", {
+    summary: "Repeated task asks for adaptation review.",
+    content: "The same high-risk task recurs every day.",
+    domain: "general",
+    taskType: "adaptation-review",
+    repetition: 0.9,
+    novelty: 0.6,
+    risk: 0.5,
+    requiresSpecialist: true
+  });
+
+  const second = createDurableRuntime({ dataDir });
+  assert.equal(second.memory.byTier("medium").length, 1);
+  assert.equal(second.propagation.list().length, 1);
+  assert.equal(second.agentHost.store.listAgents().some((agent) => agent.role === "specialist"), true);
+  assert.equal(second.cron.listJobs().filter((job) => job.id === "daily-adaptation-review").length, 1);
+});
+
+test("core tools registered with runtime", () => {
+  const runtime = createDefaultRuntime();
+  const names = runtime.tools.list().map((t) => t.name);
+  for (const required of ["remember", "recall", "schedule_message", "list_skills", "run_skill", "list_mcp_tools"]) {
+    assert.ok(names.includes(required), `missing tool: ${required}`);
+  }
+});
+
+test("remember tool writes to memory and recall finds it", async () => {
+  const runtime = createDefaultRuntime();
+  const remember = await runtime.tools.invoke("remember", { content: "The team standup is 9am Mondays.", importance: "high" });
+  assert.equal(remember.ok, true);
+  const recall = await runtime.tools.invoke("recall", { query: "standup Mondays" });
+  assert.equal(recall.ok, true);
+  assert.ok(recall.result.count >= 1);
+  assert.match(recall.result.items[0].content, /standup/);
+});
+
+test("schedule_message creates a prompt-typed cron job", async () => {
+  const runtime = createDefaultRuntime();
+  const out = await runtime.tools.invoke("schedule_message", {
+    prompt: "Hello",
+    delaySeconds: 60,
+    channel: "local",
+    target: "browser"
+  }, { channel: "local", from: "browser", agentId: "main", sessionId: "test" });
+  assert.equal(out.ok, true);
+  const job = runtime.cron.listJobs().find((j) => j.id === out.result.id);
+  assert.ok(job);
+  assert.equal(job.task, "prompt");
+  assert.equal(job.input.prompt, "Hello");
+  assert.equal(job.input.channel, "local");
+});
+
+test("scheduled prompt fires through agent host and produces a reply", async () => {
+  const runtime = createDefaultRuntime();
+  await runtime.tools.invoke("schedule_message", {
+    prompt: "Reminder fired",
+    delaySeconds: 60,
+    channel: "local",
+    target: "tester"
+  }, { channel: "local", from: "tester", agentId: "main", sessionId: null });
+  // back-date the job so it is due immediately
+  const job = runtime.cron.listJobs().find((j) => j.task === "prompt");
+  assert.ok(job);
+  job.nextRunAt = new Date(Date.now() - 1000).toISOString();
+  const results = await runtime.tick(new Date());
+  assert.ok(results.length >= 1, "expected at least one fired job");
+  const fired = results.find((r) => r.job.task === "prompt");
+  assert.ok(fired);
+  assert.ok(fired.result.reply, "scheduled prompt should have a reply");
+});
+
+test("skills loader exposes bundled skills as tools", () => {
+  const runtime = createDefaultRuntime();
+  assert.ok(runtime.skills, "runtime.skills should exist");
+  const names = runtime.skills.list().map((s) => s.name);
+  assert.ok(names.includes("recap"), "expected 'recap' skill bundled");
+  const toolNames = runtime.tools.list().map((t) => t.name);
+  assert.ok(toolNames.some((n) => n.startsWith("skill_")), "expected at least one skill_* tool");
+});
+
+test("file-backed propagation persists specialist workspaces", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-agents-"));
+  const storePath = path.join(dir, "specialists.json");
+  const workspaceRoot = path.join(dir, "workspaces");
+  const first = new FileBackedPropagationController({ storePath, workspaceRoot });
+  const result = first.propagate({
+    signal: {
+      domain: "general",
+      taskType: "adaptation-review",
+      summary: "Daily adaptation review",
+      repetition: 0.9
+    },
+    workflow: { id: "adaptive-review", goal: "Daily review" },
+    scrutiny: { reasons: ["repeated"] },
+    tools: [{ name: "query-recordings" }]
+  });
+
+  assert.equal(result.created, true);
+  assert.ok(fs.existsSync(path.join(result.specialist.workspaceDir, "AGENTS.md")));
+
+  const second = new FileBackedPropagationController({ storePath, workspaceRoot });
+  assert.equal(second.list().length, 1);
+  assert.equal(second.list()[0].name, "general-adaptation-review-specialist");
+});

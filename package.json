@@ -1,0 +1,15 @@
+{
+  "name": "openagi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Generic ABI runtime scaffold for directional adaptive scrutiny, tiered memory, and propagation.",
+  "scripts": {
+    "demo": "node examples/abi-demo.js",
+    "serve": "node examples/hosted-server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
