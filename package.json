@@ -7,6 +7,8 @@
   "scripts": {
     "demo": "node examples/abi-demo.js",
     "serve": "node examples/hosted-server.js",
+    "tunnel": "./scripts/tunnel.sh",
+    "install-launchd": "./scripts/install-launchd.sh",
     "test": "node --test"
   },
   "engines": {

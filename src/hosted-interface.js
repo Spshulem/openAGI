@@ -112,7 +112,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, runtime.agentHost?.store.getSession(id) ?? { error: "agent-host-disabled" });
       }
       if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
-      if (method === "GET" && pathname === "/channels") return sendJson(res, 200, channels?.status() ?? { enabled: false });
+      if (method === "GET" && pathname === "/channels") {
+        const status = channels?.status() ?? { enabled: false };
+        return sendJson(res, 200, { ...status, publicUrl, twilioWebhook: publicUrl ? `${publicUrl.replace(/\/$/, "")}/channels/twilio/webhook` : null });
+      }
       if (method === "GET" && pathname === "/tools") return sendJson(res, 200, runtime.tools.list());
 
       if (method === "GET" && pathname === "/events") return handleSse(req, res, sseClients);
@@ -1053,10 +1056,14 @@ function fillMemory(container, items) {
 
 async function renderChannels() {
   const ch = await fetchJson("/channels");
+  const tunnelBlock = ch.publicUrl
+    ? \`<div class="card"><div class="name">Public URL</div><div class="desc"><code>\${escapeHtml(ch.publicUrl)}</code></div><div class="desc" style="margin-top:6px;">Twilio webhook: <code>\${escapeHtml(ch.twilioWebhook)}</code></div></div>\`
+    : \`<div class="card"><div class="name warn">No public URL</div><div class="desc">Run <code>npm run tunnel</code>, then set <code>OPENAGI_PUBLIC_URL</code> in .openagi/.env and restart.</div></div>\`;
   main.innerHTML = \`
     <div class="pane">
       <h2>Channels</h2>
-      <div class="grid two">
+      \${tunnelBlock}
+      <div class="grid two" style="margin-top:12px;">
         <div class="card"><div class="name">Local · \${ch.local?.mode ?? ""}</div><div class="desc">Browser HTTP + SSE.</div></div>
         <div class="card"><div class="name">SMS / Twilio</div><div class="desc">\${ch.sms?.outboundConfigured ? '<span class="ok">outbound ready</span>' : '<span class="warn">outbound disabled — set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER</span>'} · from \${escapeHtml(ch.sms?.fromNumber ?? "—")}</div></div>
         <div class="card"><div class="name">Telegram</div><div class="desc">\${ch.telegram?.configured ? "configured" : "no token"} · polling: \${ch.telegram?.polling ? "on" : "off"}</div></div>

@@ -42,7 +42,13 @@ The daemon ticks every 10s by default (`OPENAGI_TICKER_MS`) so scheduled prompts
 
 ## Twilio bidirectional SMS
 
-You'll need a Twilio account, a phone number, and a public URL for the webhook (use `ngrok http 43210` locally).
+> Full step-by-step including tunnel + auth + Telegram + launchd: [`docs/setup/remote-channels.md`](docs/setup/remote-channels.md). Quick version below.
+
+You'll need a Twilio account, a phone number, and a public URL for the webhook. Spin one up with:
+
+```bash
+npm run tunnel    # cloudflared (preferred) or ngrok, auto-detected
+```
 
 1. Drop credentials into `.openagi/.env`:
     ```bash
