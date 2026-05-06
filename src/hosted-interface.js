@@ -176,6 +176,38 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
 
+      if (method === "GET" && pathname === "/scrutiny/weights") {
+        const weights = {};
+        if (runtime.scrutiny?.judges) {
+          for (const [name, judge] of Object.entries(runtime.scrutiny.judges)) {
+            weights[name] = { weights: judge.weights, thresholds: judge.thresholds };
+          }
+        } else if (runtime.scrutiny?.weights) {
+          weights.single = { weights: runtime.scrutiny.weights, thresholds: runtime.scrutiny.thresholds };
+        }
+        return sendJson(res, 200, { weights, fitter: runtime.scrutinyFitter?.status?.() ?? null });
+      }
+      if (method === "GET" && pathname === "/scrutiny/pending") {
+        return sendJson(res, 200, runtime.scrutinyFitter?.pending ?? null);
+      }
+      if (method === "POST" && pathname.match(/^\/scrutiny\/pending\/\d+\/apply$/)) {
+        const cycle = Number.parseInt(pathname.split("/")[3], 10);
+        const result = runtime.scrutinyFitter?.applyPending(cycle);
+        if (!result) return sendJson(res, 404, { error: "no pending proposal for cycle" });
+        return sendJson(res, 200, result);
+      }
+      if (method === "POST" && pathname === "/scrutiny/fit") {
+        return sendJson(res, 200, runtime.scrutinyFitter?.fit() ?? { error: "no fitter" });
+      }
+      if (method === "POST" && pathname === "/scrutiny/judge") {
+        try {
+          const result = await runtime.scrutinyJudge.judge();
+          return sendJson(res, 200, result);
+        } catch (error) {
+          return sendJson(res, 500, { error: error.message });
+        }
+      }
+
       if (method === "GET" && pathname === "/outcomes") {
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
         const kind = url.searchParams.get("kind");

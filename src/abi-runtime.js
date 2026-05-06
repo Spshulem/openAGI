@@ -14,6 +14,8 @@ import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemoryCondenser } from "./memory-condenser.js";
 import { OutcomeStore } from "./outcome-store.js";
+import { ScrutinyFitter } from "./scrutiny-fitter.js";
+import { ScrutinyJudge } from "./scrutiny-judge.js";
 import { ScrutinyPanel } from "./scrutiny-panel.js";
 import { SpecialistRouter } from "./specialist-router.js";
 import { VectorStore } from "./vector-store.js";
@@ -49,6 +51,14 @@ No generalities. Cite specific session ids, job names, specialist ids.`;
 function nextSundayEvening() {
   const d = new Date();
   d.setHours(20, 0, 0, 0);
+  const daysUntilSunday = (7 - d.getDay()) % 7;
+  d.setDate(d.getDate() + (daysUntilSunday === 0 ? 7 : daysUntilSunday));
+  return d;
+}
+
+function nextSundayMorning(hour = 5) {
+  const d = new Date();
+  d.setHours(hour, 0, 0, 0);
   const daysUntilSunday = (7 - d.getDay()) % 7;
   d.setDate(d.getDate() + (daysUntilSunday === 0 ? 7 : daysUntilSunday));
   return d;
@@ -91,6 +101,8 @@ export class AbiRuntime {
     if (typeof this.propagation.bindVectorStore === "function") this.propagation.bindVectorStore(this.vectorStore);
     this.specialistRouter = options.specialistRouter ?? new SpecialistRouter({ vectorStore: this.vectorStore, ...(options.routerOptions ?? {}) });
     this.condenser = options.condenser ?? new MemoryCondenser({ runtime: this, ...(options.condenserOptions ?? {}) });
+    this.scrutinyFitter = options.scrutinyFitter ?? new ScrutinyFitter({ runtime: this, ...(options.scrutinyFitterOptions ?? {}) });
+    this.scrutinyJudge = options.scrutinyJudge ?? new ScrutinyJudge({ runtime: this, ...(options.scrutinyJudgeOptions ?? {}) });
     this.outputs = [];
     this.feedback = [];
 
@@ -122,6 +134,22 @@ export class AbiRuntime {
         enabled: true,
         task: "retirement-sweep",
         dailyAt: "04:00"
+      });
+      this.cron.addJob({
+        id: "weekly-scrutiny-fit",
+        name: "Weekly scrutiny weight fit",
+        enabled: true,
+        task: "scrutiny-fit",
+        intervalMs: 7 * 24 * 60 * 60 * 1000,
+        nextRunAt: nextSundayMorning().toISOString()
+      });
+      this.cron.addJob({
+        id: "weekly-scrutiny-judge",
+        name: "Weekly LLM judge of scrutiny calibration",
+        enabled: true,
+        task: "scrutiny-judge",
+        intervalMs: 7 * 24 * 60 * 60 * 1000,
+        nextRunAt: nextSundayMorning(2).toISOString()
       });
       registerCoreTools(this.tools, this);
     }
@@ -242,6 +270,12 @@ export class AbiRuntime {
       if (job.task === "retirement-sweep") {
         const retired = this.propagation.retirementSweep?.() ?? [];
         return { retired: retired.map((s) => ({ id: s.id, name: s.name, reason: s.retirementReason })) };
+      }
+      if (job.task === "scrutiny-fit") {
+        return this.scrutinyFitter.fit({ now });
+      }
+      if (job.task === "scrutiny-judge") {
+        return this.scrutinyJudge.judge();
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);

@@ -8,6 +8,7 @@ import {
   HashBagEmbedder,
   MemoryCondenser,
   OutcomeStore,
+  ScrutinyFitter,
   ScrutinyPanel,
   SpecialistRouter,
   VectorStore,
@@ -621,6 +622,57 @@ test("specialist router blends keyword and semantic signals", async () => {
   assert.equal(decision.route, true, `route should fire; got score=${decision.candidate?.score}, breakdown=${JSON.stringify(decision.candidate?.breakdown)}`);
   assert.ok(decision.candidate.breakdown.semanticScore !== null);
   assert.ok(decision.candidate.breakdown.semanticScore > 0);
+});
+
+test("scrutiny fitter stages proposals during warmup, auto-applies after", () => {
+  const runtime = createDefaultRuntime();
+  // Seed 60 synthetic resolved outcomes correlating high evidence with high quality.
+  for (let i = 0; i < 60; i += 1) {
+    const dims = {
+      environment: Math.random(),
+      company: Math.random(),
+      evidence: 0.3 + Math.random() * 0.7,
+      memory: Math.random(),
+      uncertainty: Math.random()
+    };
+    const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
+    // Quality strongly correlated with evidence
+    runtime.outcomes.resolve(o.id, Math.min(1, dims.evidence + 0.05 * Math.random()), "system-inferred");
+  }
+
+  const fitter = new ScrutinyFitter({ runtime, dir: fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fit-")), warmupCycles: 1 });
+  runtime.scrutinyFitter = fitter;
+  const before = { ...runtime.scrutiny.judges.pragmatic.weights };
+
+  const r1 = fitter.fit(); // cycle 1: warmup, stages
+  assert.equal(r1.autoApplied, false);
+  assert.equal(fitter.pending.proposals.length, 1);
+
+  const r2 = fitter.fit(); // cycle 2: > warmup, auto-applies
+  assert.equal(r2.autoApplied, true);
+  // Evidence weight should have moved upward (positive correlation with quality)
+  assert.ok(runtime.scrutiny.judges.pragmatic.weights.evidence > before.evidence,
+    `expected evidence weight to grow, got before=${before.evidence}, after=${runtime.scrutiny.judges.pragmatic.weights.evidence}`);
+});
+
+test("scrutiny fitter judge signal averages with correlation deltas", () => {
+  const runtime = createDefaultRuntime();
+  for (let i = 0; i < 50; i += 1) {
+    const dims = { environment: 0.5, company: 0.5, evidence: 0.5, memory: 0.5, uncertainty: 0.5 };
+    const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
+    runtime.outcomes.resolve(o.id, 0.7, "system-inferred");
+  }
+  const fitter = new ScrutinyFitter({ runtime, dir: fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fit2-")), warmupCycles: 0 });
+  runtime.scrutinyFitter = fitter;
+  fitter.addJudgeSignal({
+    judge: "pragmatic",
+    deltas: { environment: 0, company: 0, evidence: 0.05, memory: 0, uncertainty: -0.02 }
+  });
+  const before = runtime.scrutiny.judges.pragmatic.weights.evidence;
+  const r = fitter.fit();
+  assert.equal(r.autoApplied, true);
+  // Evidence weight should grow because the judge nudged it up.
+  assert.ok(runtime.scrutiny.judges.pragmatic.weights.evidence > before);
 });
 
 test("file-backed propagation persists specialist workspaces", () => {
