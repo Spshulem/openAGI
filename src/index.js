@@ -20,6 +20,7 @@ export { FileBackedPropagationController } from "./file-backed-propagation-contr
 export { createAbiIntegration, IntegrationRegistry, normalizeSignal } from "./integration-registry.js";
 export { McpRegistry } from "./mcp-registry.js";
 export { McpStdioClient } from "./mcp-client.js";
+export { MemoryCondenser } from "./memory-condenser.js";
 export { OutcomeStore } from "./outcome-store.js";
 export { ScrutinyPanel } from "./scrutiny-panel.js";
 export { SpecialistRouter } from "./specialist-router.js";

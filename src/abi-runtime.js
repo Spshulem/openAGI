@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { BudgetGuard } from "./budget-guard.js";
 import { registerRizeIntegration } from "./integrations/rize.js";
 import { McpRegistry } from "./mcp-registry.js";
+import { MemoryCondenser } from "./memory-condenser.js";
 import { OutcomeStore } from "./outcome-store.js";
 import { ScrutinyPanel } from "./scrutiny-panel.js";
 import { SpecialistRouter } from "./specialist-router.js";
@@ -53,12 +54,20 @@ export class AbiRuntime {
     this.budget = options.budget ?? new BudgetGuard(options.budgetOptions ?? {});
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
     this.specialistRouter = options.specialistRouter ?? new SpecialistRouter(options.routerOptions ?? {});
+    this.condenser = options.condenser ?? new MemoryCondenser({ runtime: this, ...(options.condenserOptions ?? {}) });
     this.outputs = [];
     this.feedback = [];
 
     if (options.registerDefaults !== false) {
       this.integrations.register(createAbiIntegration());
       this.cron.addJob(createDailyAdaptationReviewJob());
+      this.cron.addJob({
+        id: "daily-memory-condense",
+        name: "Daily memory condensation",
+        enabled: true,
+        task: "condense",
+        dailyAt: "03:30"
+      });
       registerCoreTools(this.tools, this);
     }
 
@@ -171,6 +180,9 @@ export class AbiRuntime {
       }
       if (job.task === "autopilot") {
         return this.runAutopilot(job);
+      }
+      if (job.task === "condense") {
+        return this.condenser.condense({ now });
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);

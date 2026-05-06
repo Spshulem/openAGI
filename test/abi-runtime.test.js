@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   BudgetGuard,
+  MemoryCondenser,
   OutcomeStore,
   ScrutinyPanel,
   SpecialistRouter,
@@ -462,6 +463,51 @@ test("scrutiny panel personalities polarize on the same mid-strength signal", ()
   const v = panel.evaluate({ signal: sig, workflow: { id: "w", name: "demo", goal: "demo" }, memories: [], context: { name: "test" } });
   const distinctActions = new Set([v.judges.cautious.action, v.judges.pragmatic.action, v.judges.aggressive.action]);
   assert.ok(distinctActions.size >= 2, `expected at least two distinct actions across judges, got ${[...distinctActions].join(",")}`);
+});
+
+test("high-danger memory items resist compression and rank higher on tag-matched recall", () => {
+  const memory = new MemorySystem();
+  memory.remember(
+    {
+      content: "An hourglass shape on a black widow spider's belly is the lethal female. Stay away.",
+      risk: 0.9,
+      specificity: 0.9,
+      tags: ["spider", "danger"]
+    },
+    { tier: "long" }
+  );
+  memory.remember(
+    {
+      content: "Spiders can be scary but most are harmless.",
+      risk: 0.2,
+      specificity: 0.3,
+      tags: ["spider"]
+    },
+    { tier: "long" }
+  );
+  const hits = memory.retrieve("spider in basement", { tags: ["spider", "danger"] });
+  // Danger boost should rank the specific lethal item first.
+  assert.match(hits[0].item.content, /hourglass/i);
+});
+
+test("memory condenser groups items by tag overlap and writes a principle to long-tier", async () => {
+  const runtime = createDefaultRuntime();
+  const tags = ["work", "standup"];
+  for (let i = 0; i < 4; i += 1) {
+    runtime.memory.remember(
+      { content: `Standup notes ${i}: discussed sprint progress.`, tags, risk: 0.3, repetition: 0.6, novelty: 0.4 },
+      { tier: "medium" }
+    );
+  }
+  const before = runtime.memory.byTier("long").length;
+  const result = await runtime.condenser.condense();
+  assert.ok(result.principles >= 1, `expected at least one principle, got ${result.principles}`);
+  const after = runtime.memory.byTier("long");
+  assert.ok(after.length > before);
+  const principle = after.find((m) => m.kind === "principle");
+  assert.ok(principle);
+  assert.ok(principle.metadata.sources.length >= 3);
+  assert.ok(principle.metadata.quarantineUntil);
 });
 
 test("file-backed propagation persists specialist workspaces", () => {

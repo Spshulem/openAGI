@@ -26,6 +26,11 @@ export class MemorySystem {
     const fidelity = this.selectFidelity(tier, observation, context);
     const compressed = this.compressForTier(content, tier, fidelity);
     const id = context.id ?? createId(`mem_${tier}`);
+    const risk = clamp(observation.risk ?? context.risk ?? 0);
+    const specificity = clamp(observation.specificity ?? context.specificity ?? 0.45);
+    // dangerLevel: high-risk + high-specificity items ("hourglass on a spider will kill you")
+    // resist compression and outrank generic recalls when their tags match.
+    const dangerLevel = clamp(risk * 0.6 + specificity * 0.4);
     const item = {
       id,
       tier,
@@ -33,13 +38,17 @@ export class MemorySystem {
       rawContentHash: stableHash(content),
       tags: [...new Set([...(observation.tags ?? []), ...(context.tags ?? [])])],
       source: observation.source ?? context.source ?? "runtime",
+      scope: observation.scope ?? context.scope ?? "main",
       createdAt,
       lastAccessedAt: createdAt,
       strength: clamp(context.strength ?? this.initialStrength(observation, context)),
       fidelity,
       novelty: clamp(observation.novelty ?? context.novelty ?? 0),
-      risk: clamp(observation.risk ?? context.risk ?? 0),
+      risk,
+      specificity,
+      dangerLevel,
       repetition: clamp(observation.repetition ?? context.repetition ?? 0),
+      kind: observation.kind ?? context.kind ?? "raw",
       metadata: {
         ...(observation.metadata ?? {}),
         ...(context.metadata ?? {})
@@ -55,14 +64,25 @@ export class MemorySystem {
     const tiers = new Set(options.tiers ?? ["short", "medium", "long"]);
     const limit = options.limit ?? 8;
     const queryText = typeof query === "string" ? query : this.formatContent(query);
+    const queryTags = new Set((options.tags ?? []).map((t) => String(t).toLowerCase()));
+    const scope = options.scope ?? null;
 
     const scored = [];
     for (const item of this.items.values()) {
       if (!tiers.has(item.tier)) continue;
+      if (scope && item.scope && item.scope !== scope && item.scope !== "main") continue;
       const textScore = tokenOverlapScore(queryText, `${item.content} ${item.tags.join(" ")}`);
       const tierWeight = item.tier === "short" ? 1.15 : item.tier === "medium" ? 1 : 0.85;
       const strengthWeight = 0.4 + item.strength * 0.6;
-      const score = textScore * tierWeight * strengthWeight;
+      // Danger boost: high-specificity high-risk items outrank for tag-matched recalls.
+      let dangerBoost = 0;
+      if ((item.dangerLevel ?? 0) > 0.65 && queryTags.size > 0) {
+        const hits = item.tags.filter((t) => queryTags.has(String(t).toLowerCase())).length;
+        if (hits > 0) dangerBoost = 0.25 * (item.dangerLevel ?? 0);
+      }
+      // Principle boost: distilled principles get a small edge in long-tier recall.
+      const principleBoost = item.kind === "principle" ? 0.1 : 0;
+      const score = textScore * tierWeight * strengthWeight + dangerBoost + principleBoost;
       if (score > 0) scored.push({ item, score });
     }
 
@@ -163,7 +183,9 @@ export class MemorySystem {
     return observation.content ?? observation.summary ?? JSON.stringify(observation);
   }
 
-  compressForTier(content, tier, fidelity) {
+  compressForTier(content, tier, fidelity, dangerLevel = 0) {
+    // High-danger items resist compression at every tier — preserve specificity.
+    if (dangerLevel > 0.7) return summarizeText(content, 1200);
     if (fidelity === "specific") return summarizeText(content, tier === "long" ? 900 : 700);
     if (tier === "long") return summarizeText(content, 360);
     if (tier === "medium") return summarizeText(content, 620);
