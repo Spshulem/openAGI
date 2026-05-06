@@ -13,9 +13,22 @@ export class AgentHost {
   async handleMessage(input) {
     const channel = input.channel ?? "local";
     const from = input.from ?? "user";
-    const agentId = input.agentId ?? "main";
+    let agentId = input.agentId ?? "main";
     const text = String(input.text ?? input.message ?? "").trim();
     if (!text) throw new Error("Message text is required.");
+
+    // Specialist routing: see if any active specialist's bounded scope matches.
+    // The caller can opt out by passing input.routeTo === false (used by sub-agents to avoid loops).
+    let routing = null;
+    if (input.routeTo !== false && this.runtime.specialistRouter && agentId === "main") {
+      const tags = ["message", channel];
+      const specialists = this.runtime.propagation?.list?.() ?? [];
+      const decision = this.runtime.specialistRouter.decide(text, tags, specialists);
+      routing = decision;
+      if (decision.route && decision.candidate) {
+        agentId = decision.candidate.specialist.id;
+      }
+    }
 
     const agent = this.store.getAgent(agentId);
     const sessionId = this.store.sessionKey({ channel, from, agentId, sessionId: input.sessionId });
@@ -74,7 +87,17 @@ export class AgentHost {
       scrutinyAction: output.scrutiny.action,
       scrutinyDimensions: output.scrutiny.dimensions,
       toolCalls: (modelResult.toolCalls ?? []).map((c) => ({ name: c.name, ok: c.result?.ok ?? false })),
-      metadata: { specialistId: agent.role === "specialist" ? agent.id : null, scrutinyScore: output.scrutiny.score }
+      metadata: {
+        specialistId: agent.role === "specialist" ? agent.id : null,
+        scrutinyScore: output.scrutiny.score,
+        routing: routing ? {
+          mode: routing.mode,
+          routed: routing.route,
+          candidateId: routing.candidate?.specialist?.id ?? null,
+          score: routing.candidate?.score ?? null,
+          threshold: routing.threshold
+        } : null
+      }
     }) ?? null;
 
     const sessionAfter = this.store.appendMessage(sessionId, {
@@ -192,16 +215,22 @@ Answer the user plainly. If a specialist was created, mention its name and scope
   }
 
   ensureSpecialistAgent(specialist, parentId) {
+    const allowedToolList = (specialist.allowedTools ?? []).join(", ") || "all available tools";
     return this.store.ensureAgent({
       id: specialist.id,
       name: specialist.name,
       role: "specialist",
       parentId,
       scope: specialist.boundedScope,
-      systemPrompt: `You are ${specialist.name}. Stay inside this bounded scope: ${specialist.boundedScope}`,
-      metadata: {
-        specialist
-      }
+      systemPrompt: `You are ${specialist.name}, a propagated specialist agent.
+
+**Bounded scope:** ${specialist.boundedScope}
+**Parent goal:** ${specialist.parentGoal}
+**Success metric:** ${specialist.successMetric}
+**Tools you can call:** ${allowedToolList}
+
+Stay inside the bounded scope. If the user's request falls outside it, say so and recommend they go back to the main agent. Be concise — your job is to do this one thing well, repeatedly.`,
+      metadata: { specialist }
     });
   }
 

@@ -12,6 +12,8 @@ import { BudgetGuard } from "./budget-guard.js";
 import { registerRizeIntegration } from "./integrations/rize.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { OutcomeStore } from "./outcome-store.js";
+import { ScrutinyPanel } from "./scrutiny-panel.js";
+import { SpecialistRouter } from "./specialist-router.js";
 import { MemorySystem } from "./memory-system.js";
 import { PropagationController } from "./propagation-controller.js";
 import { SkillRegistry } from "./skills.js";
@@ -39,7 +41,9 @@ export class AbiRuntime {
     this.integrations = options.integrations ?? new IntegrationRegistry();
     this.workflows = options.workflows ?? registerDefaultWorkflows(new WorkflowRegistry());
     this.memory = options.memory ?? new MemorySystem(options.memoryOptions);
-    this.scrutiny = options.scrutiny ?? new DirectionalAdaptiveScrutiny(options.scrutinyOptions);
+    this.scrutiny = options.scrutiny ?? (options.scrutinyMode === "single"
+      ? new DirectionalAdaptiveScrutiny(options.scrutinyOptions)
+      : new ScrutinyPanel(options.scrutinyOptions));
     this.propagation = options.propagation ?? new PropagationController(options.propagationOptions);
     this.cron = options.cron ?? new CronScheduler();
     this.mcp = options.mcp ?? new McpRegistry(options.mcpOptions ?? {});
@@ -48,6 +52,7 @@ export class AbiRuntime {
     this.skills = options.skills ?? null;
     this.budget = options.budget ?? new BudgetGuard(options.budgetOptions ?? {});
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
+    this.specialistRouter = options.specialistRouter ?? new SpecialistRouter(options.routerOptions ?? {});
     this.outputs = [];
     this.feedback = [];
 

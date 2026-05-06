@@ -2,6 +2,7 @@ import { clamp } from "./utils.js";
 
 export class DirectionalAdaptiveScrutiny {
   constructor(options = {}) {
+    this.style = options.style ?? "pragmatic"; // cautious | pragmatic | aggressive
     this.weights = {
       environment: 0.28,
       company: 0.26,
@@ -105,7 +106,13 @@ export class DirectionalAdaptiveScrutiny {
     if (score >= this.thresholds.act && risk < 0.8) return "act";
     if (risk >= 0.8 && memories.length === 0) return "ask";
     if (novelty >= 0.75 && score >= this.thresholds.ask) return "ask";
-    if (score >= this.thresholds.ask) return signal.defaultAction ?? "act";
+    if (score >= this.thresholds.ask) {
+      // Style-differentiated fallback when score is between ask and act:
+      // cautious hedges ('ask'), aggressive presses ahead ('act'), pragmatic uses signal default.
+      if (this.style === "cautious") return "ask";
+      if (this.style === "aggressive") return "act";
+      return signal.defaultAction ?? "act";
+    }
     if (score >= this.thresholds.watch) return "watch";
     return "ignore";
   }

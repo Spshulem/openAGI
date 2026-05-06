@@ -21,6 +21,8 @@ export { createAbiIntegration, IntegrationRegistry, normalizeSignal } from "./in
 export { McpRegistry } from "./mcp-registry.js";
 export { McpStdioClient } from "./mcp-client.js";
 export { OutcomeStore } from "./outcome-store.js";
+export { ScrutinyPanel } from "./scrutiny-panel.js";
+export { SpecialistRouter } from "./specialist-router.js";
 export { MemorySystem } from "./memory-system.js";
 export { AnthropicProvider, createModelProvider, DeterministicModelProvider, OpenAIResponsesProvider } from "./model-provider.js";
 export { PropagationController } from "./propagation-controller.js";

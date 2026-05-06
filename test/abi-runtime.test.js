@@ -6,6 +6,8 @@ import test from "node:test";
 import {
   BudgetGuard,
   OutcomeStore,
+  ScrutinyPanel,
+  SpecialistRouter,
   checkAuth,
   createDefaultRuntime,
   createDurableRuntime,
@@ -395,6 +397,71 @@ test("agent turn writes an outcome record into runtime.outcomes", async () => {
   assert.ok(recent.length >= 1);
   assert.equal(recent[0].kind, "agent-reply");
   assert.equal(recent[0].channel, "local");
+});
+
+test("specialist router scores by text and tag overlap, respects threshold", () => {
+  const router = new SpecialistRouter({ threshold: 0.4 });
+  const specialists = [
+    {
+      id: "s1",
+      name: "calendar-helper",
+      boundedScope: "Schedule meetings and check calendar availability for the user.",
+      activationCount: 3,
+      lastActivatedAt: new Date().toISOString(),
+      metadata: { tags: ["calendar", "meeting"] },
+      status: "available"
+    },
+    {
+      id: "s2",
+      name: "code-reviewer",
+      boundedScope: "Review pull requests and suggest improvements.",
+      activationCount: 5,
+      lastActivatedAt: new Date().toISOString(),
+      metadata: { tags: ["code", "review"] },
+      status: "available"
+    }
+  ];
+  const calendar = router.decide("Can you find time on my calendar for a meeting?", ["message", "calendar"], specialists);
+  assert.equal(calendar.route, true);
+  assert.equal(calendar.candidate.specialist.id, "s1");
+
+  const irrelevant = router.decide("What's the weather like?", ["message"], specialists);
+  assert.equal(irrelevant.route, false);
+});
+
+test("specialist router off mode never routes", () => {
+  const router = new SpecialistRouter({ mode: "off" });
+  const decision = router.decide("anything", [], [{ id: "s", boundedScope: "anything", activationCount: 1, status: "available" }]);
+  assert.equal(decision.route, false);
+});
+
+test("scrutiny panel produces three verdicts and a consensus action", () => {
+  const panel = new ScrutinyPanel();
+  // Strong signal — at minimum the panel should converge on act or propagate (no 'ask').
+  const easy = panel.evaluate({
+    signal: { impact: 0.85, risk: 0.2, novelty: 0.4, repetition: 0.3, specificity: 0.85, citations: ["a", "b", "c"], confidence: 0.85, urgency: 0.6 },
+    workflow: { id: "w", name: "demo", goal: "demo" },
+    memories: [{ score: 0.8 }],
+    context: { name: "test" }
+  });
+  assert.ok(["act", "propagate"].includes(easy.action), `expected act/propagate, got ${easy.action}`);
+  assert.ok(["unanimous", "majority"].includes(easy.agreement));
+  assert.ok(easy.judges.cautious && easy.judges.pragmatic && easy.judges.aggressive);
+});
+
+test("scrutiny panel personalities polarize on the same mid-strength signal", () => {
+  const panel = new ScrutinyPanel();
+  // Mid-strength: between ask and act thresholds for at least one judge.
+  // Aggressive (act=0.58) should push toward act, cautious (act=0.78) hedges to ask.
+  const sig = {
+    impact: 0.7, urgency: 0.6, externalPressure: 0.6,
+    risk: 0.35, novelty: 0.5, repetition: 0.45,
+    specificity: 0.5, confidence: 0.5, ambiguity: 0.45,
+    citations: ["a"], goalAlignment: 0.7, strategicFit: 0.65, policyFit: 0.7, internalPressure: 0.55
+  };
+  const v = panel.evaluate({ signal: sig, workflow: { id: "w", name: "demo", goal: "demo" }, memories: [], context: { name: "test" } });
+  const distinctActions = new Set([v.judges.cautious.action, v.judges.pragmatic.action, v.judges.aggressive.action]);
+  assert.ok(distinctActions.size >= 2, `expected at least two distinct actions across judges, got ${[...distinctActions].join(",")}`);
 });
 
 test("file-backed propagation persists specialist workspaces", () => {
