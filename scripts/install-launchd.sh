@@ -45,6 +45,9 @@ cat > "${PLIST}" <<EOF
     <string>${NODE_BIN}</string>
     <string>${PROJECT_DIR}/examples/hosted-server.js</string>
   </array>
+  <!-- WARNING: this launchd agent runs the dev daemon from ${PROJECT_DIR}/.openagi/.env
+       which has its OWN auth token. If you also run OpenAGI.app, you'll have two
+       daemons fighting over port 43210 with mismatched tokens. Pick one path. -->
   <key>WorkingDirectory</key>
   <string>${PROJECT_DIR}</string>
   <key>RunAtLoad</key>

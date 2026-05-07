@@ -111,6 +111,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (auth.setCookie) extraCookies.push(buildSetCookie(getAuthToken()));
       }
 
+      // Sign-in: server-side cookie set, then redirect. Works without JS.
+      // Public route — the token in the body IS the credential.
+      if (method === "POST" && pathname === "/sign-in") {
+        const form = await readForm(req);
+        const expected = getAuthToken();
+        const token = form.token ?? "";
+        const next = (form.next && form.next.startsWith("/") && !form.next.startsWith("//")) ? form.next : "/";
+        if (!expected || token !== expected) {
+          return sendHtml(res, 401, renderLoginPage("invalid token", next));
+        }
+        res.writeHead(302, {
+          Location: next,
+          "Set-Cookie": buildSetCookie(expected)
+        });
+        return res.end();
+      }
+
       // Setup wizard handlers — work both during first-run (auth-bypassed)
       // and after-auth (so users can re-edit env from the dashboard's Settings).
       if (method === "GET" && pathname === "/setup") {
@@ -516,26 +533,14 @@ button{background:#6fe1b1;color:#002219;border:0;padding:9px 14px;border-radius:
 .err{color:#f08080;margin-bottom:10px;font-size:12px}
 .hint{color:#8da59a;font-size:12px;margin-top:14px}
 .hint code{background:#0e1411;padding:2px 5px;border-radius:3px;border:1px solid #2a352f}</style></head>
-<body><form method="GET" action="/setup-redirect" id="loginForm">
+<body><form method="POST" action="/sign-in" id="loginForm" enctype="application/x-www-form-urlencoded">
 <h1>OpenAGI</h1><p>This daemon requires authentication.</p>
 ${reason ? `<div class="err">${escapeHtmlForLogin(reason)}</div>` : ""}
-<input name="token" placeholder="Bearer token" autofocus required>
+<input name="token" placeholder="Bearer token" autofocus required spellcheck="false" autocapitalize="off">
 <input type="hidden" name="next" value="${escapeHtmlForLogin(safeNext)}">
 <button type="submit">Sign in</button>
-<div class="hint">Find your token in <code>.openagi/.env</code> as <code>OPENAGI_AUTH_TOKEN</code>.<br>Or run: <code>grep OPENAGI_AUTH_TOKEN .openagi/.env</code></div>
+<div class="hint">Find your token in your data dir's <code>.env</code> as <code>OPENAGI_AUTH_TOKEN</code>.<br>If you're running the macOS app, click the menubar icon → <strong>Copy auth token</strong>.</div>
 </form>
-<script>
-document.getElementById("loginForm").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const token = fd.get("token");
-  const next = fd.get("next") || "/";
-  // Set the cookie ourselves so we can land directly on the requested path
-  // without a query-string redirect that leaks the token in history.
-  document.cookie = "openagi_token=" + encodeURIComponent(token) + "; path=/; max-age=2592000; SameSite=Strict";
-  window.location.replace(next);
-});
-</script>
 </body></html>`;
 }
 

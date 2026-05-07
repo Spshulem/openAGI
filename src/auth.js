@@ -37,8 +37,10 @@ export function clearCookie() {
 
 export function isPublicRoute(pathname) {
   // Webhooks self-authenticate; /health stays open as a liveness check.
+  // /sign-in is the path you use to GET auth — must be reachable unauthenticated.
   return (
     pathname === "/health" ||
+    pathname === "/sign-in" ||
     pathname === "/channels/twilio/webhook" ||
     pathname === "/channels/telegram/webhook"
   );
