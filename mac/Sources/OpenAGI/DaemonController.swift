@@ -40,6 +40,14 @@ final class DaemonController {
       NSLog("OpenAGI: missing JS entrypoint at \(entrypoint.path)")
       return
     }
+    // If something is already listening on 43210 and answering /health like
+    // OpenAGI, just adopt it instead of spawning a duplicate that will fail
+    // with EADDRINUSE in a tight restart loop. Common when the user runs
+    // `npm run serve` in a terminal alongside the .app.
+    if isExistingDaemonHealthy() {
+      NSLog("OpenAGI: existing daemon detected on 127.0.0.1:43210; adopting it")
+      return
+    }
 
     if !FileManager.default.fileExists(atPath: logFile.path) {
       FileManager.default.createFile(atPath: logFile.path, contents: nil)
@@ -101,5 +109,26 @@ final class DaemonController {
   func restart() {
     stop()
     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
+  }
+
+  /// Probe http://127.0.0.1:43210/health synchronously. Returns true only when
+  /// it answers with `ok: true` so we don't shadow some unrelated service on
+  /// the same port — we'd rather fail loudly than collide with it silently.
+  private func isExistingDaemonHealthy() -> Bool {
+    guard let url = URL(string: "http://127.0.0.1:43210/health") else { return false }
+    let semaphore = DispatchSemaphore(value: 0)
+    var found = false
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 1.0
+    let task = URLSession.shared.dataTask(with: req) { data, _, _ in
+      defer { semaphore.signal() }
+      guard let data = data,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let ok = json["ok"] as? Bool, ok else { return }
+      found = true
+    }
+    task.resume()
+    _ = semaphore.wait(timeout: .now() + 1.5)
+    return found
   }
 }

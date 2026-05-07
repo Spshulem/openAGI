@@ -55,6 +55,11 @@ mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 cp "${BIN}" "${APP}/Contents/MacOS/OpenAGI"
 chmod +x "${APP}/Contents/MacOS/OpenAGI"
 
+# Add @executable_path/../Frameworks to rpath so dyld finds Sparkle.framework
+# inside the bundle. Idempotent: ignore the "already present" error on re-runs.
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+  "${APP}/Contents/MacOS/OpenAGI" 2>/dev/null || true
+
 # Info.plist with placeholders substituted
 sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUILD__/${BUILD_NUM}/g" \
   "${MAC_DIR}/Resources/Info.plist" > "${APP}/Contents/Info.plist"

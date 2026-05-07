@@ -94,7 +94,9 @@ struct TrayMenu: View {
       if !state.findings.isEmpty {
         Text("⚠ \(state.findings.count) finding(s)").disabled(true).font(.caption)
       }
-      Button("Check for updates…") { UpdateController.shared.checkForUpdates() }
+      Button(UpdateController.shared.isEnabled ? "Check for updates…" : "About auto-updates…") {
+        UpdateController.shared.checkForUpdates()
+      }
       Divider()
       Button("Quit OpenAGI") {
         DaemonController.shared.stop()
