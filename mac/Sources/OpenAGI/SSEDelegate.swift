@@ -20,7 +20,8 @@ final class SSEDelegate: NSObject, URLSessionDataDelegate {
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
     // Reconnect after a backoff. The poller catches up state in the meantime.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+    Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 5_000_000_000)
       AppState.shared.startSSE()
     }
   }

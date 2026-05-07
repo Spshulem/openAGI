@@ -72,7 +72,8 @@ final class AppState: ObservableObject {
     return out
   }
 
-  static func dataDir() -> URL {
+  // Non-isolated so DaemonController (and any future non-main-actor code) can call it.
+  nonisolated static func dataDir() -> URL {
     let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
     let dir = support.appendingPathComponent("OpenAGI", isDirectory: true)
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
