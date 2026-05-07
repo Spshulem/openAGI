@@ -77,8 +77,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const pathname = url.pathname;
       const method = req.method;
 
-      // First-run setup wizard. Bypasses auth (no token exists yet) but only
-      // surfaces if neither a provider key nor an auth token is configured.
+      // Setup wizard. Available always (so you can re-run /setup to change keys),
+      // but on first run it bypasses the auth gate since no token exists yet.
       const setupActive = isFirstRun();
       const setupRoutes = pathname === "/setup" || pathname === "/setup/save" || pathname === "/setup/test";
 
@@ -86,36 +86,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         res.writeHead(302, { Location: "/setup" });
         return res.end();
       }
-      if (setupActive && method === "GET" && pathname === "/setup") {
-        return sendHtml(res, 200, renderWizard());
-      }
-      if (setupActive && method === "POST" && pathname === "/setup/save") {
-        const body = await readJson(req);
-        const dataDir = process.env.OPENAGI_DATA_DIR ?? ".openagi";
-        const result = saveEnv({ dataDir, values: body });
-        // Re-init Anthropic/OpenAI clients on the agent host so the new keys take effect immediately.
-        try {
-          const { createModelProvider } = await import("./model-provider.js");
-          if (runtime.agentHost) {
-            runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
-          }
-        } catch { /* swallow */ }
-        return sendJson(res, 200, result);
-      }
-      if (setupActive && method === "POST" && pathname === "/setup/test") {
-        const body = await readJson(req);
-        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
-        try {
-          const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup" });
-          return sendJson(res, 200, { reply: turn.reply, model: turn.model });
-        } catch (error) {
-          return sendJson(res, 500, { error: error.message });
-        }
-      }
 
-      // Auth gate. Webhooks bypass and self-validate below; /health stays open.
+      // Auth gate. Webhooks self-validate, /health stays open, setup routes
+      // bypass auth ONLY during first-run (no token exists yet).
       const extraCookies = [];
-      if (!isPublicRoute(pathname) && !setupRoutes) {
+      const setupBypass = setupActive && setupRoutes;
+      if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
           if (method === "GET" && pathname === "/" && getAuthToken()) {
@@ -128,6 +104,34 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return res.end(JSON.stringify({ error: "unauthorized", reason: auth.reason ?? "auth required" }));
         }
         if (auth.setCookie) extraCookies.push(buildSetCookie(getAuthToken()));
+      }
+
+      // Setup wizard handlers — work both during first-run (auth-bypassed)
+      // and after-auth (so users can re-edit env from the dashboard's Settings).
+      if (method === "GET" && pathname === "/setup") {
+        return sendHtml(res, 200, renderWizard(), extraCookies);
+      }
+      if (method === "POST" && pathname === "/setup/save") {
+        const body = await readJson(req);
+        const dataDir = process.env.OPENAGI_DATA_DIR ?? ".openagi";
+        const result = saveEnv({ dataDir, values: body });
+        try {
+          const { createModelProvider } = await import("./model-provider.js");
+          if (runtime.agentHost) {
+            runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+          }
+        } catch { /* swallow */ }
+        return sendJson(res, 200, result);
+      }
+      if (method === "POST" && pathname === "/setup/test") {
+        const body = await readJson(req);
+        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup" });
+          return sendJson(res, 200, { reply: turn.reply, model: turn.model });
+        } catch (error) {
+          return sendJson(res, 500, { error: error.message });
+        }
       }
 
       if (method === "GET" && pathname === "/" && extraCookies.length) {

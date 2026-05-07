@@ -47,19 +47,47 @@ export function readExistingEnv(dataDir) {
 export function saveEnv({ dataDir, values }) {
   const file = envFilePath(dataDir);
   ensureDir(path.dirname(file));
-  const safeKeys = WIZARD_FIELDS.filter((k) => values[k] !== undefined && values[k] !== null && String(values[k]).length > 0);
+
+  // Merge: read existing env (if any), overlay the new values, write back.
+  // Only allow-listed keys can be set this way. Other keys already in the
+  // file are preserved verbatim (including comments / unknown vars from
+  // hand-edits).
+  const existing = parseEnvText(readExistingEnv(dataDir));
+  const incoming = {};
+  for (const key of WIZARD_FIELDS) {
+    if (values[key] === undefined || values[key] === null) continue;
+    const v = String(values[key]).replace(/\n/g, " ").trim();
+    if (v.length === 0) continue;
+    incoming[key] = v;
+    process.env[key] = v;
+  }
+
+  const merged = { ...existing, ...incoming };
   const lines = [
     `# Written by OpenAGI setup wizard at ${new Date().toISOString()}`,
     "# Edit by hand or rerun /setup to change values.",
     ""
   ];
-  for (const key of safeKeys) {
-    const value = String(values[key]).replace(/\n/g, " ").trim();
-    lines.push(`${key}=${value}`);
-    process.env[key] = value;
+  for (const [k, v] of Object.entries(merged)) {
+    lines.push(`${k}=${v}`);
   }
   writeTextAtomic(file, `${lines.join("\n")}\n`, 0o600);
-  return { written: file, keys: safeKeys };
+  return { written: file, keys: Object.keys(incoming), totalKeys: Object.keys(merged).length };
+}
+
+function parseEnvText(text) {
+  const out = {};
+  if (!text) return out;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1).trim();
+    out[key] = value;
+  }
+  return out;
 }
 
 export function renderWizard({ proposedToken } = {}) {
