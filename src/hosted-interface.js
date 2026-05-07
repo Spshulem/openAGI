@@ -1,4 +1,6 @@
 import http from "node:http";
+import fsSync from "node:fs";
+import path from "node:path";
 import { EventEmitter } from "node:events";
 import { createDefaultRuntime } from "./abi-runtime.js";
 import {
@@ -52,6 +54,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     runtime.tunnelWatcher.on("tunnel-url", (data) => events.emit("tunnel", { op: "url", ...data }));
     runtime.tunnelWatcher.on("tunnel-changed", (data) => events.emit("tunnel", { op: "changed", ...data }));
     runtime.tunnelWatcher.start();
+  }
+
+  // Pending OAuth URLs per server, surfaced in the dashboard MCP tab.
+  const pendingOauth = new Map();
+  if (runtime.mcp) {
+    runtime.mcp.onOauthRequired = ({ name, url }) => {
+      pendingOauth.set(name, { url, at: new Date().toISOString() });
+      events.emit("mcp", { op: "oauth-required", name, url });
+    };
   }
 
   if (runtime.agentHost) {
@@ -408,17 +419,42 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
       }
 
-      if (method === "GET" && pathname === "/mcp") return sendJson(res, 200, runtime.mcp.listServers());
+      if (method === "GET" && pathname === "/mcp") {
+        const servers = runtime.mcp.listServers().map((s) => ({
+          ...s,
+          connecting: runtime.mcp.isConnecting?.(s.name) ?? false,
+          pendingAuthUrl: pendingOauth.get(s.name)?.url ?? null
+        }));
+        return sendJson(res, 200, servers);
+      }
       if (method === "GET" && pathname === "/mcp/tools") return sendJson(res, 200, runtime.mcp.listTools());
       if (method === "POST" && pathname.match(/^\/mcp\/connect\/[^/]+$/)) {
         const name = decodeURIComponent(pathname.split("/")[3]);
-        try {
-          const status = await runtime.mcp.connect(name);
-          events.emit("mcp", { op: "connect", name });
-          return sendJson(res, 200, status);
-        } catch (error) {
-          return sendJson(res, 400, { error: error.message });
+        // Fire-and-forget so the OAuth dance doesn't block the HTTP response.
+        // Dashboard polls /mcp and listens for SSE 'mcp' events to learn when
+        // it's done (or if an OAuth URL needs to be opened).
+        if (!runtime.mcp.isConnecting?.(name)) {
+          runtime.mcp.connect(name)
+            .then((status) => {
+              pendingOauth.delete(name);
+              events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
+            })
+            .catch((error) => {
+              events.emit("mcp", { op: "connect-error", name, error: error.message });
+            });
+          events.emit("mcp", { op: "connecting", name });
         }
+        return sendJson(res, 202, { name, status: "connecting" });
+      }
+      if (method === "POST" && pathname.match(/^\/mcp\/clear-auth\/[^/]+$/)) {
+        const name = decodeURIComponent(pathname.split("/")[3]);
+        pendingOauth.delete(name);
+        // Wipe cached OAuth tokens so the next connect starts a fresh flow.
+        try {
+          const authPath = path.join(process.env.OPENAGI_DATA_DIR ?? ".openagi", "mcp", "auth", `${name}.json`);
+          if (fsSync.existsSync(authPath)) fsSync.unlinkSync(authPath);
+        } catch { /* ignore */ }
+        return sendJson(res, 200, { ok: true });
       }
       if (method === "POST" && pathname.match(/^\/mcp\/disconnect\/[^/]+$/)) {
         const name = decodeURIComponent(pathname.split("/")[3]);
@@ -740,6 +776,11 @@ function renderApp() {
     .mem-content::after { content: ""; position: absolute; bottom: 0; left: 0; right: 0; height: 1.6em; background: linear-gradient(transparent, var(--panel)); pointer-events: none; }
     .mem-tags { display: flex; gap: 4px; flex-wrap: wrap; }
     .chip { background: var(--bg); color: var(--muted); padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); white-space: nowrap; }
+
+    /* OAuth banner */
+    .warn-banner { border-color: var(--warn); background: rgba(240,180,84,0.08); margin: 12px 0; }
+    .btn-primary { background: var(--accent); color: #002219; padding: 8px 14px; border-radius: 6px; font-weight: 700; text-decoration: none; display: inline-block; }
+    .btn-primary:hover { opacity: 0.9; }
     .row { display: flex; gap: 8px; align-items: center; }
     .row.between { justify-content: space-between; }
     .row > .grow { flex: 1; }
@@ -1207,20 +1248,37 @@ async function refreshMcp() {
 }
 
 function renderMcpDetail(server) {
+  const transportLabel = server.transport === "http" ? \`http · \${escapeHtml(server.auth || "none")}\` : escapeHtml(server.transport);
+  const endpoint = server.transport === "http"
+    ? \`<pre>\${escapeHtml(server.url || "(no url)")}</pre>\`
+    : \`<pre>\${escapeHtml((server.command ?? "—") + " " + (server.args ?? []).join(" "))}</pre>\`;
+  const oauthBanner = server.pendingAuthUrl
+    ? \`<div class="card warn-banner"><div class="row between" style="align-items:center;">
+        <div><span class="name">⚠ OAuth required</span><div class="desc">Click below to authorize this server in your browser. The dashboard will refresh once it's done.</div></div>
+        <a class="btn-primary" href="\${escapeHtml(server.pendingAuthUrl)}" target="_blank" rel="noopener">Open in browser</a>
+       </div></div>\`
+    : "";
+  const connectingBanner = server.connecting && !server.connected
+    ? \`<div class="card"><div class="row between" style="align-items:center;"><span class="name">⏳ Connecting…</span><span class="muted">waiting for handshake</span></div></div>\`
+    : "";
   main.innerHTML = \`
     <div class="pane">
       <h2>\${escapeHtml(server.name)}</h2>
-      <div class="row" style="gap: 6px;">
+      <div class="row" style="gap: 6px;flex-wrap:wrap;">
         <span class="badge \${server.connected ? 'ok' : ''}">\${server.connected ? "connected" : "disconnected"}</span>
         <span class="badge">trust: \${escapeHtml(server.trustLevel)}</span>
-        <span class="badge">transport: \${escapeHtml(server.transport)}</span>
+        <span class="badge">transport: \${transportLabel}</span>
+        \${server.pendingAuthUrl ? '<span class="badge warn">awaiting auth</span>' : ""}
       </div>
-      <h3>Command</h3>
-      <pre>\${escapeHtml((server.command ?? "—") + " " + (server.args ?? []).join(" "))}</pre>
+      \${oauthBanner}
+      \${connectingBanner}
+      <h3>Endpoint</h3>
+      \${endpoint}
       <h3>Tools</h3>
-      <pre>\${escapeHtml((server.tools ?? []).join("\\n") || "(none)")}</pre>
-      <div class="row" style="gap: 8px; margin-top: 12px;">
-        <button id="connBtn">\${server.connected ? "Disconnect" : "Connect"}</button>
+      <pre>\${escapeHtml((server.tools ?? []).join("\\n") || "(none — connect to discover)")}</pre>
+      <div class="row" style="gap: 8px; margin-top: 12px;flex-wrap:wrap;">
+        <button id="connBtn" \${server.connecting ? "disabled" : ""}>\${server.connected ? "Disconnect" : "Connect"}</button>
+        \${server.transport === "http" && server.auth === "oauth" ? \`<button class="secondary" id="clearAuthBtn">Re-auth (clear cached token)</button>\` : ""}
         <button class="secondary" id="callBtn">Call tool…</button>
       </div>
       <pre id="mcpOut" class="ok" style="margin-top: 12px;"></pre>
@@ -1230,11 +1288,17 @@ function renderMcpDetail(server) {
     const path = server.connected ? "disconnect" : "connect";
     try {
       const res = await postJson(\`/mcp/\${path}/\${encodeURIComponent(server.name)}\`, {});
-      $("mcpOut").textContent = JSON.stringify(res, null, 2);
+      $("mcpOut").textContent = res.status === "connecting" ? "Connecting in background — watch this page for the auth URL or tool list." : JSON.stringify(res, null, 2);
       refreshMcp();
     } catch (err) {
       $("mcpOut").textContent = "[error] " + err.message;
     }
+  });
+  const clearBtn = $("clearAuthBtn");
+  if (clearBtn) clearBtn.addEventListener("click", async () => {
+    if (!confirm("Clear cached OAuth token for " + server.name + "? Next Connect will run the auth flow again.")) return;
+    await postJson(\`/mcp/clear-auth/\${encodeURIComponent(server.name)}\`, {});
+    refreshMcp();
   });
   $("callBtn").addEventListener("click", () => {
     const tool = prompt("Tool name?");
@@ -1250,21 +1314,68 @@ function openMcpComposer() {
   main.innerHTML = \`
     <div class="pane">
       <h2>Register MCP server</h2>
+      <p class="muted">Three shapes are supported. Pick one:</p>
+      <div class="grid" style="margin-bottom:14px;">
+        <label class="opt"><input type="radio" name="kind" value="stdio" checked> stdio · spawn a local process</label>
+        <label class="opt"><input type="radio" name="kind" value="http-oauth"> http + OAuth · hosted MCP with browser-based auth</label>
+        <label class="opt"><input type="radio" name="kind" value="http-bearer"> http + bearer · hosted MCP with a static API key</label>
+      </div>
+
       <form class="form" id="mcpForm">
-        <div><label>Name</label><input name="name" required></div>
-        <div><label>Command</label><input name="command" placeholder="npx" required></div>
-        <div><label>Args (one per line)</label><textarea name="args" rows="3" placeholder="-y\n@modelcontextprotocol/server-filesystem\n/tmp"></textarea></div>
+        <div><label>Name</label><input name="name" placeholder="e.g. buildbetter" required></div>
+
+        <div data-kind="stdio">
+          <label>Command</label><input name="command" placeholder="npx">
+        </div>
+        <div data-kind="stdio">
+          <label>Args (one per line)</label>
+          <textarea name="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/tmp"></textarea>
+        </div>
+
+        <div data-kind="http-oauth http-bearer">
+          <label>URL</label>
+          <input name="url" placeholder="https://mcp.example.com/mcp">
+        </div>
+        <div data-kind="http-bearer">
+          <label>API key (or \${ENV_VAR})</label>
+          <input name="apiKey" placeholder="\${MY_MCP_KEY}">
+        </div>
+
         <div><label>Trust level</label><select name="trustLevel"><option>trusted</option><option>untrusted</option></select></div>
-        <div><button type="submit">Register</button></div>
+        <div class="row" style="gap:8px;"><button type="submit">Register</button><button type="button" class="secondary" id="cancelBtn">Cancel</button></div>
       </form>
     </div>
   \`;
+  const updateKindVisibility = () => {
+    const kind = document.querySelector('input[name="kind"]:checked').value;
+    document.querySelectorAll('[data-kind]').forEach((el) => {
+      el.style.display = el.dataset.kind.split(" ").includes(kind) ? "" : "none";
+    });
+  };
+  document.querySelectorAll('input[name="kind"]').forEach((r) => r.addEventListener("change", updateKindVisibility));
+  updateKindVisibility();
+  $("cancelBtn").addEventListener("click", () => refreshMcp());
   $("mcpForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const obj = Object.fromEntries(fd.entries());
-    obj.args = (obj.args ?? "").split("\\n").map((s) => s.trim()).filter(Boolean);
-    await postJson("/mcp/register", obj);
+    const kind = fd.get("kind");
+    const body = { name: fd.get("name"), trustLevel: fd.get("trustLevel") };
+    if (kind === "stdio") {
+      body.command = fd.get("command");
+      body.args = (fd.get("args") ?? "").split("\\n").map((s) => s.trim()).filter(Boolean);
+    } else if (kind === "http-oauth") {
+      body.url = fd.get("url");
+      body.auth = "oauth";
+    } else if (kind === "http-bearer") {
+      body.url = fd.get("url");
+      body.auth = "bearer";
+      body.apiKey = fd.get("apiKey");
+    }
+    if (!body.name) { alert("name required"); return; }
+    if (kind === "stdio" && !body.command) { alert("command required"); return; }
+    if (kind !== "stdio" && !body.url) { alert("url required"); return; }
+    if (kind === "http-bearer" && !body.apiKey) { alert("apiKey required"); return; }
+    await postJson("/mcp/register", body);
     refreshMcp();
   });
 }
@@ -1758,7 +1869,19 @@ evt.addEventListener("message", (e) => {
   } catch {}
 });
 evt.addEventListener("cron", () => { if (state.tab === "cron") refreshCron(); });
-evt.addEventListener("mcp", () => { if (state.tab === "mcp") refreshMcp(); });
+evt.addEventListener("mcp", (e) => {
+  if (state.tab === "mcp") refreshMcp();
+  // Surface OAuth-required as a system notification if the page is unfocused
+  try {
+    const data = JSON.parse(e.data);
+    if (data.op === "oauth-required" && document.hidden) {
+      // Best-effort browser notification
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification("OpenAGI · OAuth required", { body: data.name + " — open the MCP tab to authorize." });
+      }
+    }
+  } catch {}
+});
 
 setInterval(refreshHealth, 5000);
 refreshHealth();

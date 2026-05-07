@@ -12,6 +12,9 @@ export class McpRegistry {
     this.logDir = options.logDir;
     this.dataDir = options.dataDir ?? (options.logDir ? path.dirname(path.dirname(options.logDir)) : ".openagi");
     this.toolRegistry = options.toolRegistry ?? null;
+    // Set by hosted-interface so OAuth-required surfaces in the dashboard SSE.
+    this.onOauthRequired = options.onOauthRequired ?? null;
+    this.connecting = new Map(); // name → Promise (in-flight connect)
   }
 
   bindToolRegistry(toolRegistry) {
@@ -121,7 +124,19 @@ export class McpRegistry {
     return out;
   }
 
+  isConnecting(name) {
+    return this.connecting.has(name);
+  }
+
   async connect(name) {
+    if (this.connecting.has(name)) return this.connecting.get(name);
+    const promise = this.doConnect(name);
+    this.connecting.set(name, promise);
+    promise.finally(() => this.connecting.delete(name));
+    return promise;
+  }
+
+  async doConnect(name) {
     const server = this.servers.get(name);
     if (!server) throw new Error(`Unknown MCP server: ${name}`);
     if (!server.enabled) throw new Error(`MCP server ${name} is disabled.`);
@@ -146,11 +161,20 @@ export class McpRegistry {
         let oauth = null;
         let bearerToken = null;
         if (server.auth === "oauth") {
+          const onAuthUrl = ({ url }) => {
+            if (this.onOauthRequired) this.onOauthRequired({ name: server.name, url });
+            // also keep the stderr banner so headless daemons can be unblocked
+            const banner = "\n──────────────────────────────────────────────────────────────────\n" +
+              `OAuth required for MCP server: ${server.name}\nOpen this URL in a browser to authorize:\n${url}\n` +
+              "──────────────────────────────────────────────────────────────────\n";
+            try { process.stderr.write(banner); } catch { /* ignore */ }
+          };
           oauth = new McpOAuthClient({
             name: server.name,
             resourceUrl: deriveResourceUrl(server.url),
             scope: server.scope,
-            dataDir: this.dataDir
+            dataDir: this.dataDir,
+            printAuthUrlFn: onAuthUrl
           });
         } else if (server.auth === "bearer") {
           if (!server.apiKey) throw new Error(`MCP server '${name}' has auth=bearer but no apiKey.`);
