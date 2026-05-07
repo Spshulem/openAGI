@@ -54,6 +54,17 @@ curl -fsSL https://raw.githubusercontent.com/buildbetter/openagi/main/scripts/in
 
 Auto-detects Docker vs. native systemd, installs Node if missing, sets up the service, prints the wizard URL.
 
+### Updates
+
+```bash
+npm run update                  # auto-detects mode (docker/systemd/launchd/source) and updates in place
+npm run install-update-timer    # Linux: install a weekly auto-update timer (Sundays 04:00)
+```
+
+For Docker users who want fully unattended auto-update, run [Watchtower](https://containrrr.dev/watchtower/) alongside the OpenAGI container.
+
+Mac native `.app` builds (when shipped) update via Sparkle automatically.
+
 ### Test it
 
 ```bash
