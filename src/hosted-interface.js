@@ -262,6 +262,38 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
 
+      // ─── Ambient capture / observations ─────────────────────────────────
+      if (method === "POST" && pathname === "/observations") {
+        const body = await readJson(req);
+        const observations = Array.isArray(body) ? body : (Array.isArray(body.observations) ? body.observations : [body]);
+        try {
+          const result = await runtime.observations.record(observations);
+          return sendJson(res, 200, result);
+        } catch (error) {
+          return sendJson(res, 500, { error: error.message });
+        }
+      }
+      if (method === "GET" && pathname === "/observations/search") {
+        const query = url.searchParams.get("q") ?? null;
+        const since = url.searchParams.get("since") ?? null;
+        const until = url.searchParams.get("until") ?? null;
+        const app = url.searchParams.get("app") ?? null;
+        const limit = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
+        const results = await runtime.observations.search({ query, since, until, app, limit });
+        return sendJson(res, 200, results);
+      }
+      if (method === "GET" && pathname === "/observations/timeline") {
+        const since = url.searchParams.get("since") ?? null;
+        return sendJson(res, 200, await runtime.observations.timelineByHour({ since }));
+      }
+      if (method === "GET" && pathname === "/observations/stats") {
+        return sendJson(res, 200, await runtime.observations.stats());
+      }
+      if (method === "POST" && pathname === "/observations/prune") {
+        const body = await readJson(req).catch(() => ({}));
+        return sendJson(res, 200, await runtime.observations.prune(body));
+      }
+
       if (method === "GET" && pathname === "/admin/provider") {
         const provider = runtime.agentHost?.modelProvider;
         return sendJson(res, 200, {
@@ -821,6 +853,7 @@ function renderApp() {
       <button data-tab="scrutiny">Scrutiny</button>
       <button data-tab="vocab">Vocab</button>
       <button data-tab="health">Health</button>
+      <button data-tab="activity">Activity</button>
       <button id="setupBtn" title="Open setup wizard">⚙ Setup</button>
     </nav>
   </header>
@@ -1000,6 +1033,9 @@ async function switchTab(tab) {
   } else if (tab === "health") {
     showSidebar(false);
     await renderHealth();
+  } else if (tab === "activity") {
+    showSidebar(false);
+    await renderActivity();
   }
   renderTab();
 }
@@ -1838,6 +1874,124 @@ async function renderHealth() {
       <div class="grid">\${mcpCards}</div>
     </div>
   \`;
+}
+
+async function renderActivity() {
+  const stats = await fetchJson("/observations/stats").catch(() => ({}));
+  state.activityFilter = state.activityFilter || { query: "" };
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>Activity <span class="muted" style="font-weight:400;font-size:14px;">· \${stats.mode === "sqlite" ? \`\${stats.activity ?? 0} events · \${stats.frames ?? 0} frames\` : \`mode: \${escapeHtml(stats.mode ?? "—")}\`}</span></h2>
+
+      \${stats.mode !== "sqlite" && stats.mode !== "fallback-jsonl"
+        ? '<div class="card warn-banner"><div class="name">Capture not running</div><div class="desc">Install the Mac app and grant Screen Recording + Accessibility permissions, or this view will be empty. Activity events appear as soon as the Mac app starts pushing.</div></div>'
+        : ""}
+
+      <div class="row" style="gap:10px;margin:14px 0;">
+        <input type="search" id="actSearch" placeholder="Search OCR text or window titles…" value="\${escapeHtml(state.activityFilter.query)}" style="flex:1;">
+        <select id="actSince" style="width:160px;">
+          <option value="">All time</option>
+          <option value="1h">Last hour</option>
+          <option value="6h">Last 6 hours</option>
+          <option value="24h" selected>Last 24 hours</option>
+          <option value="7d">Last 7 days</option>
+        </select>
+      </div>
+
+      <h3>Timeline (last 24h)</h3>
+      <div id="timeline" class="card" style="padding:14px;"></div>
+
+      <h3>Results</h3>
+      <div id="actResults" class="grid"></div>
+    </div>
+  \`;
+  const reload = async () => {
+    const since = sinceFromOption($("actSince").value);
+    const q = $("actSearch").value.trim();
+    state.activityFilter.query = q;
+    const results = await fetchJson("/observations/search?" + new URLSearchParams({
+      ...(q ? { q } : {}),
+      ...(since ? { since } : {}),
+      limit: "60"
+    }).toString());
+    renderActivityResults(results);
+  };
+  const reloadTimeline = async () => {
+    const tl = await fetchJson("/observations/timeline?since=" + encodeURIComponent(new Date(Date.now() - 24*3600*1000).toISOString()));
+    renderTimeline(tl);
+  };
+  $("actSearch").addEventListener("input", debounce(reload, 250));
+  $("actSince").addEventListener("change", reload);
+  await Promise.all([reload(), reloadTimeline()]);
+}
+
+function sinceFromOption(value) {
+  if (!value) return null;
+  const m = { "1h": 1, "6h": 6, "24h": 24, "7d": 24 * 7 };
+  const hours = m[value];
+  if (!hours) return null;
+  return new Date(Date.now() - hours * 3600 * 1000).toISOString();
+}
+
+function renderActivityResults(results) {
+  const list = $("actResults");
+  if (!list) return;
+  if (!results || results.length === 0) {
+    list.innerHTML = '<div class="empty">No matching activity yet.</div>';
+    return;
+  }
+  list.innerHTML = results.map((r) => {
+    const meta = [r.app, r.window].filter(Boolean).map(escapeHtml).join(" · ");
+    const when = r.at ? new Date(r.at).toLocaleString() : "";
+    const snippet = r.snippet || r.text || r.window || r.event || "";
+    return \`<div class="card">
+      <div class="row between"><span class="name">\${escapeHtml(meta) || "(no app)"}</span><span class="muted" style="font-size:11px;">\${escapeHtml(when)}</span></div>
+      <div class="desc" style="margin-top:6px;line-height:1.5;">\${snippet}</div>
+    </div>\`;
+  }).join("");
+}
+
+function renderTimeline(rows) {
+  const host = $("timeline");
+  if (!host) return;
+  if (!rows || rows.length === 0) { host.innerHTML = '<div class="muted">No data in this window.</div>'; return; }
+  // Group by hour, then show per-app stacked bars
+  const byHour = new Map();
+  const apps = new Set();
+  for (const r of rows) {
+    if (!byHour.has(r.hour)) byHour.set(r.hour, {});
+    byHour.get(r.hour)[r.app || "—"] = r.n;
+    apps.add(r.app || "—");
+  }
+  const sortedHours = [...byHour.keys()].sort();
+  const max = Math.max(...rows.map((r) => r.n));
+  const palette = ["#6fe1b1", "#f0b454", "#a98ef5", "#7ab8ff", "#f08080", "#94a9b1"];
+  const appColor = {};
+  [...apps].forEach((a, i) => appColor[a] = palette[i % palette.length]);
+  host.innerHTML = \`
+    <div style="display:grid;grid-template-columns:repeat(\${sortedHours.length},1fr);gap:2px;align-items:end;height:80px;">
+      \${sortedHours.map((h) => {
+        const cell = byHour.get(h);
+        const total = Object.values(cell).reduce((a, b) => a + b, 0);
+        const stack = Object.entries(cell).map(([app, n]) =>
+          \`<div style="height:\${(n / max) * 100}%;background:\${appColor[app]};" title="\${escapeHtml(app)}: \${n}"></div>\`
+        ).join("");
+        return \`<div title="\${escapeHtml(h)}: \${total}" style="display:flex;flex-direction:column-reverse;height:100%;">\${stack}</div>\`;
+      }).join("")}
+    </div>
+    <div style="display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-top:6px;">
+      <span>\${escapeHtml(sortedHours[0] ?? "")}</span>
+      <span>\${escapeHtml(sortedHours.at(-1) ?? "")}</span>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;">
+      \${[...apps].map((a) => \`<span class="chip" style="border-color:\${appColor[a]};color:\${appColor[a]};">\${escapeHtml(a)}</span>\`).join("")}
+    </div>
+  \`;
+}
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
 async function fetchJson(path) {

@@ -84,9 +84,29 @@ struct TrayMenu: View {
       }
       Button("Open dashboard…") { state.openDashboard() }
       Button("Open health audit…") { state.openDashboard(path: "/?tab=health") }
+      Button("Open activity log…") { state.openDashboard(path: "/?tab=activity") }
       Button("Settings…") { state.openDashboard(path: "/setup") }
       Button("Copy auth token") { copyAuthToken() }
+
+      Divider()
+      Menu("Capture") {
+        Button(captureLabel()) { CaptureController.shared.toggleEnabled() }
+        Button("Pause for 1 hour") { CaptureController.shared.togglePause(durationHours: 1) }
+        Button("Pause until tomorrow") { CaptureController.shared.togglePause(durationHours: 12) }
+        if CaptureSettings.shared.pausedUntil != nil {
+          Button("Resume capture") { CaptureSettings.shared.pausedUntil = nil; CaptureController.shared.apply() }
+        }
+        Divider()
+        Button("Privacy settings…") { PrivacyWindowController.shared.show() }
+      }
     }
+  }
+
+  private func captureLabel() -> String {
+    if CaptureSettings.shared.enabled {
+      return "Disable capture"
+    }
+    return "Enable capture (asks for permission)"
   }
 
   private func copyAuthToken() {

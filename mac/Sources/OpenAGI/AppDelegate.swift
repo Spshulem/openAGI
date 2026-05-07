@@ -18,11 +18,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       AppState.shared.startPolling()
       AppState.shared.startSSE()
       UpdateController.shared.start()
+      CaptureController.shared.start()
     }
   }
 
   nonisolated func applicationWillTerminate(_ notification: Notification) {
-    DaemonController.shared.stop()
+    Task { @MainActor in
+      CaptureController.shared.stop()
+      _ = await CaptureBridge.flushNow()
+      DaemonController.shared.stop()
+    }
   }
 
   // Tap a notification → open the dashboard, deep-linked when possible.

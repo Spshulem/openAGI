@@ -208,6 +208,33 @@ export function registerCoreTools(registry, runtime) {
   });
 
   registry.register({
+    name: "recall_activity",
+    description: "Search the user's ambient capture log (window titles + app focus events + OCR text from screen frames). Use this when the user asks about what they were doing at a specific time, or to ground 'where did I leave off' questions. Returns rows with timestamp, app, window, and matching snippet.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Free-text search across OCR text and window titles. Empty returns recent activity." },
+        since: { type: "string", description: "ISO 8601 lower bound (inclusive)." },
+        until: { type: "string", description: "ISO 8601 upper bound (inclusive)." },
+        app: { type: "string", description: "Filter to a specific app (e.g. 'com.apple.Safari' or 'Linear')." },
+        limit: { type: "integer", minimum: 1, maximum: 200 }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.observations) return { error: "no observation store" };
+      const results = await runtime.observations.search({
+        query: args.query ?? null,
+        since: args.since ?? null,
+        until: args.until ?? null,
+        app: args.app ?? null,
+        limit: args.limit ?? 25
+      });
+      return { count: results.length, results };
+    }
+  });
+
+  registry.register({
     name: "list_sessions",
     description: "List recent conversations across channels.",
     parameters: {

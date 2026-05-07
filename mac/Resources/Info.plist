@@ -21,13 +21,21 @@
   <key>CFBundleVersion</key>
   <string>__BUILD__</string>
   <key>LSMinimumSystemVersion</key>
-  <string>13.0</string>
+  <string>14.0</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSHumanReadableCopyright</key>
   <string>Released under MIT license.</string>
+
+  <!-- Capture permission usage strings. macOS shows these when prompting. -->
+  <key>NSAppleEventsUsageDescription</key>
+  <string>OpenAGI uses AppleEvents to read window titles for ambient activity tracking. No keystrokes are captured.</string>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>OpenAGI uses Accessibility to read the title of the active window so it can label captured frames. No keystrokes are captured.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>OpenAGI captures periodic screenshots locally for OCR + recall. Frames stay on this Mac. Excluded apps (e.g. password managers) are never captured.</string>
 
   <!-- Sparkle. Replace SUPublicEDKey with the EdDSA public key generated locally:
        generate_keys-bin (from Sparkle release) → prints public key.

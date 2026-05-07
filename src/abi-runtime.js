@@ -13,6 +13,7 @@ import { registerRizeIntegration } from "./integrations/rize.js";
 import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemoryCondenser } from "./memory-condenser.js";
+import { ObservationStore } from "./observation-store.js";
 import { OutcomeStore } from "./outcome-store.js";
 import { Introspector } from "./introspector.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
@@ -92,6 +93,7 @@ export class AbiRuntime {
     this.skills = options.skills ?? null;
     this.budget = options.budget ?? new BudgetGuard(options.budgetOptions ?? {});
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
+    this.observations = options.observations ?? new ObservationStore(options.observationOptions ?? {});
     // When an outcome resolves, push the quality into the matching specialist's running mean.
     this.outcomes.onResolve = (outcome) => {
       const specialistId = outcome.metadata?.specialistId;
@@ -421,6 +423,7 @@ export function createDurableRuntime(options = {}) {
     mcpOptions: { logDir: mcpLogDir, dataDir, ...(options.mcpOptions ?? {}) },
     budgetOptions: { storePath: path.join(dataDir, "budget", "usage.json"), ...(options.budgetOptions ?? {}) },
     outcomeOptions: { dir: path.join(dataDir, "outcomes"), ...(options.outcomeOptions ?? {}) },
+    observationOptions: { dir: path.join(dataDir, "observations"), ...(options.observationOptions ?? {}) },
     vectorStoreOptions: { dir: path.join(dataDir, "vectors"), ...(options.vectorStoreOptions ?? {}) },
     tunnelWatcherOptions: { dataDir, ...(options.tunnelWatcherOptions ?? {}) },
     memory: options.memory ?? new FileBackedMemorySystem({ ...(options.memoryOptions ?? {}), dir: path.join(dataDir, "memory") }),

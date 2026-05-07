@@ -1043,6 +1043,40 @@ test("OAuth client discovery falls back to openid-configuration when oauth-autho
   }
 });
 
+test("observation store records activity + frames and surfaces stats", async () => {
+  const { ObservationStore } = await import("../src/index.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-obs-"));
+  const store = new ObservationStore({ dir });
+  await store.ready;
+  await store.record([
+    { kind: "activity", at: "2026-05-08T12:00:00Z", app: "Linear", window: "Linear · Roadmap", event: "focus" },
+    { kind: "activity", at: "2026-05-08T12:01:00Z", app: "Slack", window: "Slack · #general", event: "focus" },
+    { kind: "frame", at: "2026-05-08T12:00:30Z", app: "Linear", window: "Linear · Roadmap", frameId: "f1", ocrText: "OpenAGI roadmap quarterly review", confidence: 0.9 }
+  ]);
+  const stats = await store.stats();
+  // Either sqlite or fallback-jsonl, both acceptable; in both cases counts > 0.
+  if (stats.mode === "sqlite") {
+    assert.ok(stats.activity >= 2);
+    assert.ok(stats.frames >= 1);
+  } else {
+    assert.ok(stats.observations >= 3);
+  }
+});
+
+test("recall_activity tool returns observations matching a query", async () => {
+  const runtime = createDefaultRuntime();
+  await runtime.observations.ready;
+  await runtime.observations.record([
+    { kind: "activity", at: "2026-05-08T09:30:00Z", app: "Calendar", window: "Standup · 9am Mondays", event: "focus" },
+    { kind: "activity", at: "2026-05-08T10:00:00Z", app: "Linear", window: "Linear · Sprint 7", event: "focus" }
+  ]);
+  const tool = runtime.tools.get("recall_activity");
+  assert.ok(tool, "recall_activity tool should be registered");
+  const result = await runtime.tools.invoke("recall_activity", { query: "standup", limit: 5 });
+  assert.equal(result.ok, true);
+  assert.ok(result.result.count >= 1);
+});
+
 test("file-backed propagation persists specialist workspaces", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-agents-"));
   const storePath = path.join(dir, "specialists.json");
