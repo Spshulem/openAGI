@@ -16,6 +16,7 @@ import { MemoryCondenser } from "./memory-condenser.js";
 import { ObservationStore } from "./observation-store.js";
 import { OutcomeStore } from "./outcome-store.js";
 import { Introspector } from "./introspector.js";
+import { PatternMiner } from "./pattern-miner.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
 import { ScrutinyJudge } from "./scrutiny-judge.js";
 import { ScrutinyPanel } from "./scrutiny-panel.js";
@@ -111,6 +112,7 @@ export class AbiRuntime {
     this.vocabulary = options.vocabulary ?? new VocabularyCurator({ runtime: this, ...(options.vocabularyOptions ?? {}) });
     this.introspector = options.introspector ?? new Introspector({ runtime: this });
     this.tunnelWatcher = options.tunnelWatcher ?? new TunnelWatcher(options.tunnelWatcherOptions ?? {});
+    this.patternMiner = options.patternMiner ?? new PatternMiner({ runtime: this, dataDir: options.dataDir, ...(options.patternMinerOptions ?? {}) });
     this.outputs = [];
     this.feedback = [];
 
@@ -158,6 +160,13 @@ export class AbiRuntime {
         task: "scrutiny-judge",
         intervalMs: 7 * 24 * 60 * 60 * 1000,
         nextRunAt: nextSundayMorning(2).toISOString()
+      });
+      this.cron.addJob({
+        id: "nightly-pattern-mine",
+        name: "Nightly activity pattern miner",
+        enabled: true,
+        task: "pattern-mine",
+        dailyAt: "02:30"
       });
       registerCoreTools(this.tools, this);
     }
@@ -300,6 +309,9 @@ export class AbiRuntime {
       }
       if (job.task === "scrutiny-judge") {
         return this.scrutinyJudge.judge();
+      }
+      if (job.task === "pattern-mine") {
+        return this.patternMiner.mine({ now });
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);

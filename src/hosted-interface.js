@@ -436,6 +436,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/skills") return sendJson(res, 200, runtime.skills?.list() ?? []);
+      if (method === "GET" && pathname === "/skills/suggested") return sendJson(res, 200, runtime.patternMiner?.list() ?? []);
+      if (method === "POST" && pathname === "/skills/mine") {
+        try { return sendJson(res, 200, await runtime.patternMiner.mine()); }
+        catch (error) { return sendJson(res, 500, { error: error.message }); }
+      }
+      if (method === "POST" && pathname.match(/^\/skills\/suggested\/[^/]+\/accept$/)) {
+        const id = decodeURIComponent(pathname.split("/")[3]);
+        try { return sendJson(res, 200, runtime.patternMiner.accept(id)); }
+        catch (error) { return sendJson(res, 400, { error: error.message }); }
+      }
+      if (method === "POST" && pathname.match(/^\/skills\/suggested\/[^/]+\/reject$/)) {
+        const id = decodeURIComponent(pathname.split("/")[3]);
+        const body = await readJson(req).catch(() => ({}));
+        const r = runtime.patternMiner.reject(id, body.reason);
+        if (!r) return sendJson(res, 404, { error: "unknown candidate" });
+        return sendJson(res, 200, r);
+      }
       if (method === "POST" && pathname === "/skills/reload") {
         runtime.skills?.reload();
         return sendJson(res, 200, runtime.skills?.list() ?? []);
@@ -1003,6 +1020,7 @@ async function switchTab(tab) {
     showSidebar(true);
     sidebarTitle.textContent = "Skills";
     newBtn.textContent = "↻ Reload";
+    state.skillsMineButton = true;
     await refreshSkills();
   } else if (tab === "mcp") {
     showSidebar(true);
@@ -1231,16 +1249,95 @@ function openCronComposer() {
 
 async function refreshSkills(reload = false) {
   if (reload) await postJson("/skills/reload", {});
-  const skills = await fetchJson("/skills");
-  sidebarList.innerHTML = skills.length === 0 ? '<li class="empty">No skills loaded</li>' : "";
+  const [skills, suggested] = await Promise.all([
+    fetchJson("/skills"),
+    fetchJson("/skills/suggested").catch(() => [])
+  ]);
+  const pendingSuggested = suggested.filter((s) => s.status === "pending");
+
+  sidebarList.innerHTML = "";
+  if (pendingSuggested.length > 0) {
+    const header = document.createElement("li");
+    header.style.color = "var(--accent)";
+    header.style.fontSize = "11px";
+    header.style.padding = "6px 10px 2px";
+    header.textContent = \`✨ Suggested · \${pendingSuggested.length}\`;
+    sidebarList.appendChild(header);
+    for (const s of pendingSuggested) {
+      const li = document.createElement("li");
+      li.style.borderLeft = "2px solid var(--accent)";
+      li.innerHTML = \`<div class="title">\${escapeHtml(s.proposal.name)}</div><div class="preview">\${escapeHtml(s.proposal.description ?? s.sequence.apps.join(" → "))}</div>\`;
+      li.addEventListener("click", () => renderSuggestedDetail(s));
+      sidebarList.appendChild(li);
+    }
+    const sep = document.createElement("li");
+    sep.style.color = "var(--muted)";
+    sep.style.fontSize = "11px";
+    sep.style.padding = "10px 10px 2px";
+    sep.textContent = "Active";
+    sidebarList.appendChild(sep);
+  }
+  if (skills.length === 0 && pendingSuggested.length === 0) {
+    sidebarList.innerHTML = '<li class="empty">No skills loaded</li>';
+  }
   for (const s of skills) {
     const li = document.createElement("li");
     li.innerHTML = \`<div class="title">\${escapeHtml(s.name)}</div><div class="preview">\${escapeHtml(s.description ?? "")}</div>\`;
     li.addEventListener("click", () => renderSkillDetail(s));
     sidebarList.appendChild(li);
   }
-  if (skills.length > 0) renderSkillDetail(skills[0]);
-  else main.innerHTML = '<div class="pane"><div class="empty">No skills found. Drop SKILL.md files into .openagi/skills/&lt;name&gt;/</div></div>';
+
+  if (pendingSuggested.length > 0) renderSuggestedDetail(pendingSuggested[0]);
+  else if (skills.length > 0) renderSkillDetail(skills[0]);
+  else main.innerHTML = '<div class="pane"><div class="empty">No skills loaded yet. Drop a SKILL.md into <code>.openagi/skills/&lt;name&gt;/</code>, or wait for the nightly pattern miner to surface routines.</div></div>';
+}
+
+function renderSuggestedDetail(candidate) {
+  const seq = candidate.sequence;
+  main.innerHTML = \`
+    <div class="pane">
+      <div class="row" style="gap:6px;margin-bottom:6px;">
+        <span class="badge ok">✨ suggested</span>
+        <span class="badge">confidence \${(seq.confidence ?? 0).toFixed(2)}</span>
+        <span class="badge">\${seq.count}× in last 14d</span>
+        <span class="badge">~\${String(seq.startHour ?? 0).padStart(2, "0")}:00</span>
+      </div>
+      <h2>\${escapeHtml(candidate.proposal.name)}</h2>
+      <p class="muted">\${escapeHtml(candidate.proposal.description ?? "")}</p>
+
+      <h3>Detected sequence</h3>
+      <div class="row" style="gap:8px;flex-wrap:wrap;">\${seq.apps.map((a) => \`<span class="chip" style="font-size:13px;padding:6px 12px;">\${escapeHtml(a)}</span>\`).join('<span class="muted" style="align-self:center;">→</span>')}</div>
+
+      <h3>Proposed skill body</h3>
+      <pre style="white-space:pre-wrap;">\${escapeHtml(candidate.proposal.body ?? "")}</pre>
+
+      \${candidate.proposal.scheduleHint ? \`<h3>Suggested schedule</h3><p>\${escapeHtml(candidate.proposal.scheduleHint)}</p>\` : ""}
+
+      <div class="row" style="gap:8px;margin-top:14px;">
+        <button id="acceptSug">✓ Accept — write SKILL.md</button>
+        <button class="secondary" id="rejectSug">✗ Reject</button>
+      </div>
+      <pre id="sugOut" class="ok" style="margin-top:12px;display:none;"></pre>
+    </div>
+  \`;
+  const showOut = (text, cls) => {
+    const o = $("sugOut");
+    o.style.display = "block";
+    o.className = cls === "err" ? "err" : "ok";
+    o.textContent = text;
+  };
+  $("acceptSug").addEventListener("click", async () => {
+    try {
+      const result = await postJson(\`/skills/suggested/\${encodeURIComponent(candidate.id)}/accept\`, {});
+      showOut("Accepted: " + JSON.stringify(result, null, 2));
+      setTimeout(() => refreshSkills(true), 800);
+    } catch (e) { showOut("[err] " + e.message, "err"); }
+  });
+  $("rejectSug").addEventListener("click", async () => {
+    if (!confirm("Reject this suggestion?")) return;
+    await postJson(\`/skills/suggested/\${encodeURIComponent(candidate.id)}/reject\`, {});
+    refreshSkills();
+  });
 }
 
 function renderSkillDetail(skill) {

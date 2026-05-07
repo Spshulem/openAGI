@@ -1077,6 +1077,29 @@ test("recall_activity tool returns observations matching a query", async () => {
   assert.ok(result.result.count >= 1);
 });
 
+test("pattern miner detects repeating sequences and writes a candidate", async () => {
+  const { PatternMiner, DeterministicModelProvider } = await import("../src/index.js");
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-mine-"));
+  const runtime = createDefaultRuntime({
+    modelProvider: new DeterministicModelProvider()
+  });
+
+  const days = ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04"];
+  for (const day of days) {
+    await runtime.observations.record([
+      { kind: "activity", at: `${day}T09:00:00Z`, app: "Calendar", event: "focus" },
+      { kind: "activity", at: `${day}T09:01:00Z`, app: "Linear", event: "focus" },
+      { kind: "activity", at: `${day}T09:02:00Z`, app: "Slack", event: "focus" }
+    ]);
+  }
+  const miner = new PatternMiner({ runtime, dataDir, minOccurrences: 3, minConfidence: 0.3 });
+  const result = await miner.mine({ now: new Date("2026-05-05T00:00:00Z") });
+  assert.ok(result.candidates >= 1, `expected at least one candidate, got ${result.candidates ?? 0} (mined: ${result.mined})`);
+  const list = miner.list();
+  assert.ok(list.length >= 1);
+  assert.ok(list[0].sequence.apps.length >= 3);
+});
+
 test("file-backed propagation persists specialist workspaces", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-agents-"));
   const storePath = path.join(dir, "specialists.json");
