@@ -281,5 +281,162 @@ export function registerCoreTools(registry, runtime) {
     }
   });
 
+  // ─── Admin tools — let the agent manage its own setup ───────────────────
+
+  registry.register({
+    name: "register_mcp_server",
+    description: "Add a new MCP server to the registry. Three transport+auth shapes: stdio (spawn a local process), http+bearer (URL with static API key), http+oauth (URL with browser-based OAuth). After registering, the user typically needs to call connect_mcp_server.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Unique server name." },
+        transport: { type: "string", enum: ["stdio", "http"], description: "stdio or http." },
+        // stdio
+        command: { type: "string", description: "stdio: command to spawn (e.g. 'npx')." },
+        args: { type: "array", items: { type: "string" }, description: "stdio: command arguments." },
+        // http
+        url: { type: "string", description: "http: MCP endpoint URL." },
+        auth: { type: "string", enum: ["none", "bearer", "oauth"], description: "http: auth mode." },
+        apiKey: { type: "string", description: "http+bearer: API key. Use ${ENV_VAR} for env var expansion." },
+        clientId: { type: "string", description: "http+oauth: pre-registered client ID for servers without dynamic registration." },
+        scope: { type: "string", description: "http+oauth: requested scopes." },
+        trustLevel: { type: "string", enum: ["trusted", "untrusted"], description: "Default trusted." }
+      },
+      required: ["name"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.mcp?.registerServer) throw new Error("MCP registry not available.");
+      const server = runtime.mcp.registerServer({
+        name: args.name,
+        transport: args.transport,
+        command: args.command,
+        args: args.args ?? [],
+        url: args.url,
+        auth: args.auth,
+        apiKey: args.apiKey,
+        clientId: args.clientId,
+        scope: args.scope,
+        trustLevel: args.trustLevel ?? "trusted"
+      });
+      return { name: server.name, transport: server.transport, auth: server.auth };
+    }
+  });
+
+  registry.register({
+    name: "connect_mcp_server",
+    description: "Spawn / connect to a registered MCP server and discover its tools. For OAuth servers, this triggers the browser-based auth flow; the user will need to complete it in their browser. Returns immediately; check list_mcp_tools afterward to see what's available.",
+    parameters: {
+      type: "object",
+      properties: { name: { type: "string", description: "Registered server name." } },
+      required: ["name"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.mcp?.connect) throw new Error("MCP registry not available.");
+      // Fire and forget — OAuth can take minutes.
+      runtime.mcp.connect(args.name).catch(() => { /* surfaced via SSE */ });
+      return { name: args.name, status: "connecting", note: "If this server uses OAuth, an auth URL will appear in the dashboard's MCP tab." };
+    }
+  });
+
+  registry.register({
+    name: "disconnect_mcp_server",
+    description: "Close the connection to an MCP server (kills the stdio child or drops the HTTP session).",
+    parameters: {
+      type: "object",
+      properties: { name: { type: "string" } },
+      required: ["name"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.mcp?.disconnect) throw new Error("MCP registry not available.");
+      const ok = await runtime.mcp.disconnect(args.name);
+      return { name: args.name, disconnected: ok };
+    }
+  });
+
+  registry.register({
+    name: "list_cron_jobs",
+    description: "List all scheduled jobs (prompt schedules, autopilot pulses, system tasks).",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    handler: async () => runtime.cron.listJobs()
+  });
+
+  registry.register({
+    name: "cancel_cron_job",
+    description: "Remove a scheduled cron job by id. Use list_cron_jobs first to find the id.",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false
+    },
+    handler: async (args) => ({ id: args.id, removed: runtime.cron.removeJob(args.id) })
+  });
+
+  registry.register({
+    name: "get_audit",
+    description: "Get a structural health snapshot of the runtime: specialist counts, memory tier saturation, outcome quality (7d/30d), upcoming cron jobs, MCP servers, and any actionable findings (warn/err severity). Use this when the user asks 'how are you doing' or 'what's wrong'.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    handler: async () => runtime.introspector?.audit() ?? { error: "no introspector" }
+  });
+
+  registry.register({
+    name: "get_budget",
+    description: "Get today's LLM spend, daily limit, calls, and token counts. Returns 14 days of history.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    handler: async () => runtime.budget?.status?.() ?? { error: "no budget" }
+  });
+
+  registry.register({
+    name: "set_provider",
+    description: "Switch the primary model provider live. 'auto' picks whichever has a key (Anthropic preferred), 'anthropic' forces Claude, 'openai' forces ChatGPT/GPT-5. Use this if the user wants to switch models mid-conversation or you detect repeated failures with the current one.",
+    parameters: {
+      type: "object",
+      properties: {
+        preference: { type: "string", enum: ["auto", "anthropic", "openai"] }
+      },
+      required: ["preference"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      process.env.OPENAGI_PROVIDER = args.preference;
+      const { createModelProvider } = await import("./model-provider.js");
+      if (runtime.agentHost) {
+        runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+      }
+      // Persist
+      try {
+        const { saveEnv } = await import("./setup-wizard.js");
+        saveEnv({ values: { OPENAGI_PROVIDER: args.preference } });
+      } catch { /* ignore */ }
+      return {
+        preference: args.preference,
+        current: runtime.agentHost?.modelProvider?.constructor?.name,
+        model: runtime.agentHost?.modelProvider?.model
+      };
+    }
+  });
+
+  registry.register({
+    name: "retire_specialist",
+    description: "Retire a propagated specialist by id. Use this when the user explicitly says a specialist isn't useful, or when get_audit shows a low-quality specialist.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        reason: { type: "string", description: "Short reason logged with the retirement." }
+      },
+      required: ["id"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const sp = runtime.propagation?.retire?.(args.id, args.reason ?? "agent-initiated");
+      if (!sp) return { error: "unknown specialist" };
+      return { id: sp.id, status: sp.status, reason: sp.retirementReason };
+    }
+  });
+
   return registry;
 }

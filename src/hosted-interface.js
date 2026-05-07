@@ -1315,13 +1315,13 @@ function openMcpComposer() {
     <div class="pane">
       <h2>Register MCP server</h2>
       <p class="muted">Three shapes are supported. Pick one:</p>
-      <div class="grid" style="margin-bottom:14px;">
-        <label class="opt"><input type="radio" name="kind" value="stdio" checked> stdio · spawn a local process</label>
-        <label class="opt"><input type="radio" name="kind" value="http-oauth"> http + OAuth · hosted MCP with browser-based auth</label>
-        <label class="opt"><input type="radio" name="kind" value="http-bearer"> http + bearer · hosted MCP with a static API key</label>
-      </div>
-
       <form class="form" id="mcpForm">
+        <div class="grid" style="margin-bottom:14px;">
+          <label class="opt"><input type="radio" name="kind" value="stdio" checked> stdio · spawn a local process</label>
+          <label class="opt"><input type="radio" name="kind" value="http-oauth"> http + OAuth · hosted MCP with browser-based auth</label>
+          <label class="opt"><input type="radio" name="kind" value="http-bearer"> http + bearer · hosted MCP with a static API key</label>
+        </div>
+
         <div><label>Name</label><input name="name" placeholder="e.g. buildbetter" required></div>
 
         <div data-kind="stdio">
@@ -1340,43 +1340,79 @@ function openMcpComposer() {
           <label>API key (or \${ENV_VAR})</label>
           <input name="apiKey" placeholder="\${MY_MCP_KEY}">
         </div>
+        <div data-kind="http-oauth">
+          <label>Pre-registered Client ID <span class="muted">· optional, only if your auth server doesn't support dynamic registration</span></label>
+          <input name="clientId" placeholder="${ENV_OR_LITERAL}">
+        </div>
+        <div data-kind="http-oauth">
+          <label>Client secret <span class="muted">· optional, only for confidential clients</span></label>
+          <input type="password" name="clientSecret" autocomplete="off">
+        </div>
 
         <div><label>Trust level</label><select name="trustLevel"><option>trusted</option><option>untrusted</option></select></div>
-        <div class="row" style="gap:8px;"><button type="submit">Register</button><button type="button" class="secondary" id="cancelBtn">Cancel</button></div>
+        <div class="row" style="gap:8px;"><button type="submit" id="registerSubmit">Register</button><button type="button" class="secondary" id="cancelBtn">Cancel</button></div>
+        <pre id="mcpRegOut" class="ok" style="display:none;margin-top:10px;"></pre>
       </form>
     </div>
   \`;
+  const showOut = (text, cls) => {
+    const el = $("mcpRegOut");
+    el.style.display = "block";
+    el.className = cls === "err" ? "err" : "ok";
+    el.textContent = text;
+  };
   const updateKindVisibility = () => {
-    const kind = document.querySelector('input[name="kind"]:checked').value;
-    document.querySelectorAll('[data-kind]').forEach((el) => {
+    const checked = document.querySelector('#mcpForm input[name="kind"]:checked');
+    const kind = checked ? checked.value : "stdio";
+    document.querySelectorAll("[data-kind]").forEach((el) => {
       el.style.display = el.dataset.kind.split(" ").includes(kind) ? "" : "none";
     });
   };
-  document.querySelectorAll('input[name="kind"]').forEach((r) => r.addEventListener("change", updateKindVisibility));
+  document.querySelectorAll('#mcpForm input[name="kind"]').forEach((r) =>
+    r.addEventListener("change", updateKindVisibility));
   updateKindVisibility();
   $("cancelBtn").addEventListener("click", () => refreshMcp());
+
   $("mcpForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    const kind = fd.get("kind");
-    const body = { name: fd.get("name"), trustLevel: fd.get("trustLevel") };
+    const kind = fd.get("kind") || "stdio";
+    const body = {
+      name: (fd.get("name") || "").trim(),
+      trustLevel: fd.get("trustLevel") || "trusted"
+    };
     if (kind === "stdio") {
-      body.command = fd.get("command");
-      body.args = (fd.get("args") ?? "").split("\\n").map((s) => s.trim()).filter(Boolean);
+      body.command = (fd.get("command") || "").trim();
+      body.args = (fd.get("args") || "").split("\\n").map((s) => s.trim()).filter(Boolean);
     } else if (kind === "http-oauth") {
-      body.url = fd.get("url");
+      body.url = (fd.get("url") || "").trim();
       body.auth = "oauth";
+      const clientId = (fd.get("clientId") || "").trim();
+      const clientSecret = (fd.get("clientSecret") || "").trim();
+      if (clientId) body.clientId = clientId;
+      if (clientSecret) body.clientSecret = clientSecret;
     } else if (kind === "http-bearer") {
-      body.url = fd.get("url");
+      body.url = (fd.get("url") || "").trim();
       body.auth = "bearer";
-      body.apiKey = fd.get("apiKey");
+      body.apiKey = (fd.get("apiKey") || "").trim();
     }
-    if (!body.name) { alert("name required"); return; }
-    if (kind === "stdio" && !body.command) { alert("command required"); return; }
-    if (kind !== "stdio" && !body.url) { alert("url required"); return; }
-    if (kind === "http-bearer" && !body.apiKey) { alert("apiKey required"); return; }
-    await postJson("/mcp/register", body);
-    refreshMcp();
+    if (!body.name) { showOut("name is required", "err"); return; }
+    if (kind === "stdio" && !body.command) { showOut("command is required for stdio", "err"); return; }
+    if ((kind === "http-oauth" || kind === "http-bearer") && !body.url) { showOut("url is required for http", "err"); return; }
+    if (kind === "http-bearer" && !body.apiKey) { showOut("apiKey is required for http+bearer", "err"); return; }
+
+    const btn = $("registerSubmit");
+    btn.disabled = true;
+    btn.textContent = "Registering…";
+    try {
+      const result = await postJson("/mcp/register", body);
+      showOut("Registered ✓ — " + JSON.stringify(result, null, 2));
+      setTimeout(() => refreshMcp(), 600);
+    } catch (err) {
+      showOut("Registration failed: " + (err.message || String(err)), "err");
+      btn.disabled = false;
+      btn.textContent = "Register";
+    }
   });
 }
 
