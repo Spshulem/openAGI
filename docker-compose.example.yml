@@ -1,0 +1,53 @@
+# OpenAGI Docker Compose example.
+#
+#   1. Copy .env.example to .env (next to this file) and fill in keys.
+#   2. docker compose -f docker-compose.example.yml up -d
+#   3. Visit http://localhost:43210/setup on first run.
+#
+# To run on a Linux SBC (Raspberry Pi, pamir.ai, Jetson):
+#   - Pull the arm64 image: docker pull openagi/openagi:latest (multi-arch, auto-selected).
+#   - Same compose file, no changes.
+
+services:
+  openagi:
+    image: openagi/openagi:latest
+    container_name: openagi
+    ports:
+      - "43210:43210"
+    volumes:
+      - openagi-data:/data
+    environment:
+      OPENAGI_DATA_DIR: /data
+      OPENAGI_AUTH_TOKEN: ${OPENAGI_AUTH_TOKEN:-}
+      OPENAGI_PUBLIC_URL: ${OPENAGI_PUBLIC_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5}
+      OPENAGI_DAILY_USD_LIMIT: ${OPENAGI_DAILY_USD_LIMIT:-10}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-}
+      RIZE_API_KEY: ${RIZE_API_KEY:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:43210/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: cloudflared quick-tunnel as a sidecar so SMS/Telegram webhooks reach the daemon.
+  # Comment out if you don't need a public URL.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: openagi-tunnel
+    command: tunnel --no-autoupdate --url http://openagi:43210
+    depends_on:
+      - openagi
+    restart: unless-stopped
+
+volumes:
+  openagi-data:

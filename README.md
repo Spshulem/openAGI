@@ -10,18 +10,55 @@ Channels -> Signals -> Workflows -> Directional Adaptive Scrutiny
 -> Outputs -> Feedback
 ```
 
-## Quick start
+## Install
+
+### Mac / Linux desktop / Linux server (from source)
 
 ```bash
-npm install      # no deps yet (Node 22+)
-cp .env.example .openagi/.env   # paste your keys
-npm run serve    # http://127.0.0.1:43210
+git clone https://github.com/buildbetter/openagi
+cd openagi
+npm run serve     # http://127.0.0.1:43210/setup
 ```
 
-Open the dashboard, send a message, or:
+Open `http://127.0.0.1:43210/`. The first-run wizard collects keys and runs a smoke test.
+
+For always-on:
+
+```bash
+npm run install-launchd     # macOS — auto-start at login + auto-restart
+npm run install-systemd     # Linux — same, via systemd (sudo for system-wide; pass 'user' for rootless)
+```
+
+### Docker / Linux SBC (Raspberry Pi, pamir.ai, Jetson)
+
+```bash
+docker run -d --name openagi \
+  -p 43210:43210 -v openagi-data:/data \
+  ghcr.io/buildbetter/openagi:latest
+```
+
+Visit `http://<host>:43210/` for the wizard. Multi-arch image (`linux/amd64` + `linux/arm64`).
+
+Or with compose:
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.example.yml up -d
+```
+
+### Linux one-line installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/buildbetter/openagi/main/scripts/install.sh | sh
+```
+
+Auto-detects Docker vs. native systemd, installs Node if missing, sets up the service, prints the wizard URL.
+
+### Test it
 
 ```bash
 curl -s http://127.0.0.1:43210/message \
+  -H "authorization: Bearer $OPENAGI_AUTH_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"text":"remind me in 60 seconds to drink water","from":"me"}'
 ```

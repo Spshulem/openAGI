@@ -9,14 +9,16 @@ import {
   verifyTwilioSignature
 } from "./auth.js";
 import { ChannelManager } from "./channels.js";
+import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 43210;
-  const authToken = options.authToken ?? process.env.OPENAGI_AUTH_TOKEN ?? null;
-  const publicUrl = options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null;
-  const twilioAuthToken = options.twilioAuthToken ?? process.env.TWILIO_AUTH_TOKEN ?? null;
-  const telegramSecret = options.telegramSecret ?? process.env.TELEGRAM_WEBHOOK_SECRET ?? null;
+  // Read these dynamically so the setup wizard can update them mid-flight.
+  const getAuthToken = () => options.authToken ?? process.env.OPENAGI_AUTH_TOKEN ?? null;
+  const getPublicUrl = () => options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null;
+  const getTwilioAuthToken = () => options.twilioAuthToken ?? process.env.TWILIO_AUTH_TOKEN ?? null;
+  const getTelegramSecret = () => options.telegramSecret ?? process.env.TELEGRAM_WEBHOOK_SECRET ?? null;
   const channels =
     options.channels ??
     (runtime.agentHost
@@ -68,12 +70,48 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const pathname = url.pathname;
       const method = req.method;
 
+      // First-run setup wizard. Bypasses auth (no token exists yet) but only
+      // surfaces if neither a provider key nor an auth token is configured.
+      const setupActive = isFirstRun();
+      const setupRoutes = pathname === "/setup" || pathname === "/setup/save" || pathname === "/setup/test";
+
+      if (setupActive && method === "GET" && pathname === "/") {
+        res.writeHead(302, { Location: "/setup" });
+        return res.end();
+      }
+      if (setupActive && method === "GET" && pathname === "/setup") {
+        return sendHtml(res, 200, renderWizard());
+      }
+      if (setupActive && method === "POST" && pathname === "/setup/save") {
+        const body = await readJson(req);
+        const dataDir = process.env.OPENAGI_DATA_DIR ?? ".openagi";
+        const result = saveEnv({ dataDir, values: body });
+        // Re-init Anthropic/OpenAI clients on the agent host so the new keys take effect immediately.
+        try {
+          const { createModelProvider } = await import("./model-provider.js");
+          if (runtime.agentHost) {
+            runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+          }
+        } catch { /* swallow */ }
+        return sendJson(res, 200, result);
+      }
+      if (setupActive && method === "POST" && pathname === "/setup/test") {
+        const body = await readJson(req);
+        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup" });
+          return sendJson(res, 200, { reply: turn.reply, model: turn.model });
+        } catch (error) {
+          return sendJson(res, 500, { error: error.message });
+        }
+      }
+
       // Auth gate. Webhooks bypass and self-validate below; /health stays open.
       const extraCookies = [];
-      if (!isPublicRoute(pathname)) {
-        const auth = checkAuth(req, url, authToken);
+      if (!isPublicRoute(pathname) && !setupRoutes) {
+        const auth = checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
-          if (method === "GET" && pathname === "/" && authToken) {
+          if (method === "GET" && pathname === "/" && getAuthToken()) {
             return sendHtml(res, 401, renderLoginPage(auth.reason ?? "auth required"));
           }
           res.writeHead(401, {
@@ -82,7 +120,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           });
           return res.end(JSON.stringify({ error: "unauthorized", reason: auth.reason ?? "auth required" }));
         }
-        if (auth.setCookie) extraCookies.push(buildSetCookie(authToken));
+        if (auth.setCookie) extraCookies.push(buildSetCookie(getAuthToken()));
       }
 
       if (method === "GET" && pathname === "/" && extraCookies.length) {
@@ -114,7 +152,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
       if (method === "GET" && pathname === "/channels") {
         const status = channels?.status() ?? { enabled: false };
-        return sendJson(res, 200, { ...status, publicUrl, twilioWebhook: publicUrl ? `${publicUrl.replace(/\/$/, "")}/channels/twilio/webhook` : null });
+        const pub = getPublicUrl();
+        return sendJson(res, 200, { ...status, publicUrl: pub, twilioWebhook: pub ? `${pub.replace(/\/$/, "")}/channels/twilio/webhook` : null });
       }
       if (method === "GET" && pathname === "/tools") return sendJson(res, 200, runtime.tools.list());
 
@@ -137,7 +176,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
         const tg = verifyTelegramSecret({
           headerValue: req.headers["x-telegram-bot-api-secret-token"],
-          expected: telegramSecret
+          expected: getTelegramSecret()
         });
         if (!tg.ok) return sendJson(res, 401, { error: "unauthorized", reason: tg.reason });
         const body = await readJson(req);
@@ -148,9 +187,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "POST" && pathname === "/channels/twilio/webhook") {
         if (!channels) return sendXml(res, 503, twiml("OpenAGI agent host is disabled."));
         const form = await readForm(req);
-        const fullUrl = (publicUrl ?? `http://${req.headers.host ?? `${host}:${port}`}`).replace(/\/$/, "") + req.url;
+        const fullUrl = (getPublicUrl() ?? `http://${req.headers.host ?? `${host}:${port}`}`).replace(/\/$/, "") + req.url;
         const tw = verifyTwilioSignature({
-          authToken: twilioAuthToken,
+          authToken: getTwilioAuthToken(),
           fullUrl,
           params: form,
           signature: req.headers["x-twilio-signature"]

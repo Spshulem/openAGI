@@ -9,6 +9,9 @@
     "serve": "node examples/hosted-server.js",
     "tunnel": "./scripts/tunnel.sh",
     "install-launchd": "./scripts/install-launchd.sh",
+    "install-systemd": "./scripts/install-systemd.sh",
+    "docker:build": "docker build -t openagi:local .",
+    "docker:run": "docker run --rm -p 43210:43210 -v openagi-data:/data openagi:local",
     "test": "node --test"
   },
   "engines": {

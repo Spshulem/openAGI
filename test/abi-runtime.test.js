@@ -769,6 +769,55 @@ test("introspector audit returns structural findings", () => {
   assert.ok(Array.isArray(audit.findings));
 });
 
+test("setup wizard saves env atomically and is detected as first-run before keys exist", async () => {
+  const { saveEnv, isFirstRun } = await import("../src/setup-wizard.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-wizard-"));
+  // Save without provider key first → still first run
+  const savedAnthropic = process.env.ANTHROPIC_API_KEY;
+  const savedAuth = process.env.OPENAGI_AUTH_TOKEN;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.OPENAGI_AUTH_TOKEN;
+  assert.equal(isFirstRun(), true);
+
+  const result = saveEnv({
+    dataDir: dir,
+    values: {
+      ANTHROPIC_API_KEY: "sk-test-key",
+      OPENAGI_AUTH_TOKEN: "abc123",
+      OPENAGI_DAILY_USD_LIMIT: 5
+    }
+  });
+  assert.equal(result.keys.includes("ANTHROPIC_API_KEY"), true);
+  const written = fs.readFileSync(path.join(dir, ".env"), "utf8");
+  assert.match(written, /ANTHROPIC_API_KEY=sk-test-key/);
+  assert.match(written, /OPENAGI_AUTH_TOKEN=abc123/);
+  assert.equal(process.env.ANTHROPIC_API_KEY, "sk-test-key");
+  assert.equal(isFirstRun(), false);
+
+  // Restore env
+  if (savedAnthropic) process.env.ANTHROPIC_API_KEY = savedAnthropic;
+  else delete process.env.ANTHROPIC_API_KEY;
+  if (savedAuth) process.env.OPENAGI_AUTH_TOKEN = savedAuth;
+  else delete process.env.OPENAGI_AUTH_TOKEN;
+});
+
+test("setup wizard rejects unknown keys (allowlist only)", async () => {
+  const { saveEnv } = await import("../src/setup-wizard.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-wizard-allow-"));
+  const result = saveEnv({
+    dataDir: dir,
+    values: {
+      ANTHROPIC_API_KEY: "sk-x",
+      MALICIOUS_KEY: "trying",
+      PATH: "/etc/passwd"
+    }
+  });
+  assert.equal(result.keys.includes("MALICIOUS_KEY"), false);
+  assert.equal(result.keys.includes("PATH"), false);
+  assert.equal(result.keys.includes("ANTHROPIC_API_KEY"), true);
+});
+
 test("file-backed propagation persists specialist workspaces", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-agents-"));
   const storePath = path.join(dir, "specialists.json");
