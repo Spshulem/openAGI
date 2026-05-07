@@ -66,7 +66,10 @@ export class OpenAIResponsesProvider {
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
     this.budgetGuard?.check();
 
-    const baseInput = [
+    // Stateless tool loop — accumulates the full conversation in `input` each
+    // hop instead of chaining via `previous_response_id`. Required for orgs
+    // with Zero Data Retention enabled (which reject previous_response_id).
+    const conversationInput = [
       ...messages.slice(-12).map((message) => ({
         role: message.role === "assistant" ? "assistant" : "user",
         content: message.content
@@ -78,37 +81,42 @@ export class OpenAIResponsesProvider {
     const toolList = tools.length > 0 ? tools : toolRegistry?.toOpenAITools?.() ?? [];
     const toolCalls = [];
 
-    let nextRequest = {
-      model: this.model,
-      instructions: baseInstructions,
-      input: baseInput
-    };
-    if (toolList.length > 0) nextRequest.tools = toolList;
-
     let response;
     for (let hop = 0; hop < this.maxToolHops; hop += 1) {
-      response = await this.postResponses(nextRequest);
+      const body = {
+        model: this.model,
+        instructions: baseInstructions,
+        input: conversationInput
+      };
+      if (toolList.length > 0) body.tools = toolList;
+      response = await this.postResponses(body);
+
       const calls = extractFunctionCalls(response);
       if (calls.length === 0) break;
 
-      const outputs = [];
+      // Append the assistant's function_call items so the model can see its own
+      // last turn on the next hop (replaces what previous_response_id would've done).
+      for (const item of response.output ?? []) {
+        if (item.type === "function_call") {
+          conversationInput.push({
+            type: "function_call",
+            call_id: item.call_id,
+            name: item.name,
+            arguments: item.arguments
+          });
+        }
+      }
+
       for (const call of calls) {
         const parsedArgs = safeParseJson(call.arguments) ?? {};
         const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: call.name, arguments: parsedArgs, result: invocation });
-        outputs.push({
+        conversationInput.push({
           type: "function_call_output",
           call_id: call.call_id,
           output: JSON.stringify(invocation.ok ? invocation.result : { error: invocation.error })
         });
       }
-
-      nextRequest = {
-        model: this.model,
-        previous_response_id: response.id,
-        input: outputs
-      };
-      if (toolList.length > 0) nextRequest.tools = toolList;
     }
 
     return {
@@ -254,8 +262,15 @@ export function createModelProvider(options = {}) {
   if (options.forceDeterministic === true) return new DeterministicModelProvider();
   const budgetGuard = options.budgetGuard ?? null;
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
-  if (anthropic.isConfigured()) return anthropic;
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
+
+  // Explicit preference wins. anthropic | openai | auto (default).
+  const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
+  if (preference === "openai" && openai.isConfigured()) return openai;
+  if (preference === "anthropic" && anthropic.isConfigured()) return anthropic;
+
+  // auto: anthropic first if configured, then openai, then deterministic.
+  if (anthropic.isConfigured()) return anthropic;
   if (openai.isConfigured()) return openai;
   return new DeterministicModelProvider();
 }

@@ -9,6 +9,7 @@ import { generateToken } from "./auth.js";
 // redirects to the wizard.
 
 const WIZARD_FIELDS = [
+  "OPENAGI_PROVIDER",
   "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
   "OPENAI_API_KEY", "OPENAI_MODEL",
   "OPENAGI_AUTH_TOKEN",
@@ -125,22 +126,27 @@ export function renderWizard({ proposedToken } = {}) {
 
     <div class="step">
       <h2>2 / 6 · model</h2>
-      <h3>Anthropic <span class="pill">recommended</span></h3>
-      <p>Claude Sonnet 4.6 powers the agent's tool-use loop. Get a key at <a href="https://console.anthropic.com/" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
+      <h3>Pick a primary provider</h3>
+      <p>You can supply both — but pick which one drives chat and tool calls. Switch later from the dashboard.</p>
+      <div class="grid">
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="auto" checked> Auto · use whichever has a key (Anthropic preferred)</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="anthropic"> Anthropic · Claude Sonnet 4.6</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai"> OpenAI · ChatGPT (GPT-5)</label>
+      </div>
+
+      <h3 style="margin-top:14px;">Anthropic key</h3>
+      <p>Get one at <a href="https://console.anthropic.com/" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
       <label>ANTHROPIC_API_KEY</label>
       <input type="password" name="ANTHROPIC_API_KEY" placeholder="sk-ant-…" autocomplete="off">
       <label style="margin-top:8px;">Model</label>
       <input type="text" name="ANTHROPIC_MODEL" value="claude-sonnet-4-6">
 
-      <details style="margin-top:12px;">
-        <summary>OpenAI (fallback)</summary>
-        <div style="padding-top:10px;">
-          <label>OPENAI_API_KEY</label>
-          <input type="password" name="OPENAI_API_KEY" placeholder="sk-proj-…" autocomplete="off">
-          <label style="margin-top:8px;">Model</label>
-          <input type="text" name="OPENAI_MODEL" value="gpt-5">
-        </div>
-      </details>
+      <h3 style="margin-top:14px;">OpenAI / ChatGPT key</h3>
+      <p>Get one at <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">platform.openai.com</a>. Works with Zero Data Retention orgs.</p>
+      <label>OPENAI_API_KEY</label>
+      <input type="password" name="OPENAI_API_KEY" placeholder="sk-proj-…" autocomplete="off">
+      <label style="margin-top:8px;">Model</label>
+      <input type="text" name="OPENAI_MODEL" value="gpt-5">
     </div>
 
     <div class="step">

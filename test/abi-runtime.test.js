@@ -848,6 +848,79 @@ test("tunnel watcher detects new cloudflared URL and persists to .env", async ()
   assert.equal(process.env.OPENAGI_PUBLIC_URL, "https://abc-def-ghi.trycloudflare.com");
 });
 
+test("OpenAI provider tool loop never sends previous_response_id (ZDR-safe)", async () => {
+  const { OpenAIResponsesProvider } = await import("../src/index.js");
+  const provider = new OpenAIResponsesProvider({ apiKey: "test-key", maxToolHops: 3 });
+
+  const sentBodies = [];
+  // Stub postResponses with a 2-hop tool conversation
+  let hop = 0;
+  provider.postResponses = async (body) => {
+    sentBodies.push(JSON.parse(JSON.stringify(body)));
+    hop += 1;
+    if (hop === 1) {
+      return {
+        id: "resp_1",
+        output: [
+          { type: "function_call", call_id: "call_a", name: "remember", arguments: '{"content":"x"}' }
+        ]
+      };
+    }
+    return { id: "resp_2", output_text: "Done." };
+  };
+
+  const fakeRegistry = {
+    invoke: async (name) => ({ ok: true, result: { id: "mem_1", tier: "short" } }),
+    toOpenAITools: () => [{ type: "function", name: "remember", description: "", parameters: {} }]
+  };
+
+  const result = await provider.generate({
+    input: "remember x",
+    messages: [],
+    toolRegistry: fakeRegistry,
+    agent: { id: "main", name: "main" }
+  });
+
+  assert.equal(result.text, "Done.");
+  assert.ok(sentBodies.length >= 2, "expected at least 2 hops");
+  for (const body of sentBodies) {
+    assert.equal(body.previous_response_id, undefined, "must not use previous_response_id (ZDR breaks it)");
+  }
+  // Second hop should carry the function_call AND function_call_output items
+  const second = sentBodies[1];
+  assert.ok(second.input.some((i) => i.type === "function_call" && i.call_id === "call_a"));
+  assert.ok(second.input.some((i) => i.type === "function_call_output" && i.call_id === "call_a"));
+});
+
+test("createModelProvider respects OPENAGI_PROVIDER preference", async () => {
+  const { createModelProvider } = await import("../src/model-provider.js");
+  const original = process.env.OPENAGI_PROVIDER;
+  const aOriginal = process.env.ANTHROPIC_API_KEY;
+  const oOriginal = process.env.OPENAI_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "fake-ant";
+  process.env.OPENAI_API_KEY = "fake-oai";
+
+  process.env.OPENAGI_PROVIDER = "auto";
+  let p = createModelProvider();
+  assert.equal(p.constructor.name, "AnthropicProvider");
+
+  process.env.OPENAGI_PROVIDER = "openai";
+  p = createModelProvider();
+  assert.equal(p.constructor.name, "OpenAIResponsesProvider");
+
+  process.env.OPENAGI_PROVIDER = "anthropic";
+  p = createModelProvider();
+  assert.equal(p.constructor.name, "AnthropicProvider");
+
+  // Restore
+  if (original) process.env.OPENAGI_PROVIDER = original;
+  else delete process.env.OPENAGI_PROVIDER;
+  if (aOriginal) process.env.ANTHROPIC_API_KEY = aOriginal;
+  else delete process.env.ANTHROPIC_API_KEY;
+  if (oOriginal) process.env.OPENAI_API_KEY = oOriginal;
+  else delete process.env.OPENAI_API_KEY;
+});
+
 test("file-backed propagation persists specialist workspaces", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-agents-"));
   const storePath = path.join(dir, "specialists.json");

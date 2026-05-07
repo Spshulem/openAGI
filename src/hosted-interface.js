@@ -224,6 +224,44 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+
+      if (method === "GET" && pathname === "/admin/provider") {
+        const provider = runtime.agentHost?.modelProvider;
+        return sendJson(res, 200, {
+          current: provider?.constructor?.name ?? null,
+          model: provider?.model ?? null,
+          configured: provider?.isConfigured?.() ?? false,
+          preference: process.env.OPENAGI_PROVIDER ?? "auto",
+          available: {
+            anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+            openai: Boolean(process.env.OPENAI_API_KEY)
+          }
+        });
+      }
+      if (method === "POST" && pathname === "/admin/provider") {
+        const body = await readJson(req);
+        const choice = String(body.preference ?? "").toLowerCase();
+        if (!["auto", "anthropic", "openai"].includes(choice)) {
+          return sendJson(res, 400, { error: "preference must be one of: auto, anthropic, openai" });
+        }
+        process.env.OPENAGI_PROVIDER = choice;
+        try {
+          const { createModelProvider } = await import("./model-provider.js");
+          if (runtime.agentHost) {
+            runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+          }
+        } catch { /* swallow */ }
+        // Also persist to .env so it survives restart.
+        try {
+          const { saveEnv } = await import("./setup-wizard.js");
+          saveEnv({ values: { OPENAGI_PROVIDER: choice } });
+        } catch { /* fall back to runtime-only */ }
+        return sendJson(res, 200, {
+          preference: choice,
+          current: runtime.agentHost?.modelProvider?.constructor?.name ?? null,
+          model: runtime.agentHost?.modelProvider?.model ?? null
+        });
+      }
       if (method === "GET" && pathname === "/audit") return sendJson(res, 200, runtime.introspector?.audit?.() ?? null);
       if (method === "GET" && pathname === "/vocabulary") {
         return sendJson(res, 200, {
@@ -1359,15 +1397,43 @@ function escapeHtml(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":
 
 async function refreshHealth() {
   try {
-    const [h, b] = await Promise.all([fetchJson("/health"), fetchJson("/budget").catch(() => null)]);
+    const [h, b, p] = await Promise.all([
+      fetchJson("/health"),
+      fetchJson("/budget").catch(() => null),
+      fetchJson("/admin/provider").catch(() => null)
+    ]);
     state.health = h;
     const m = h.status.memory ?? {};
     const provider = h.status.agentHost?.provider ?? "—";
     const budget = b ? \` · $\${b.spentUsd.toFixed(2)} / $\${b.dailyUsdLimit.toFixed(2)}\` : "";
     $("status").textContent = \`runtime online · \${provider} \${h.status.agentHost?.providerConfigured ? "✓" : "(no key)"} · short \${m.short || 0} / medium \${m.medium || 0} / long \${m.long || 0}\${budget}\`;
+    if (p) renderProviderSwitch(p);
   } catch {
     $("status").textContent = "runtime offline";
   }
+}
+
+function renderProviderSwitch(p) {
+  let host = document.getElementById("providerSwitch");
+  if (!host) {
+    host = document.createElement("span");
+    host.id = "providerSwitch";
+    host.style.marginLeft = "12px";
+    host.style.fontSize = "12px";
+    document.querySelector("header .status")?.parentElement?.appendChild(host);
+  }
+  const opts = [
+    \`<option value="auto" \${p.preference === "auto" ? "selected" : ""}>auto</option>\`,
+    \`<option value="anthropic" \${p.preference === "anthropic" ? "selected" : ""} \${!p.available?.anthropic ? "disabled" : ""}>Anthropic\${p.available?.anthropic ? "" : " (no key)"}</option>\`,
+    \`<option value="openai" \${p.preference === "openai" ? "selected" : ""} \${!p.available?.openai ? "disabled" : ""}>OpenAI / ChatGPT\${p.available?.openai ? "" : " (no key)"}</option>\`
+  ].join("");
+  host.innerHTML = \`<label style="color:var(--muted);">model: <select id="providerSelect" style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 6px;font-size:12px;">\${opts}</select></label>\`;
+  document.getElementById("providerSelect").addEventListener("change", async (e) => {
+    try {
+      await postJson("/admin/provider", { preference: e.target.value });
+      refreshHealth();
+    } catch (err) { alert("Switch failed: " + err.message); }
+  });
 }
 
 const evt = new EventSource("/events");
