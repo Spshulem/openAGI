@@ -196,6 +196,17 @@ if [[ "${DMG:-0}" == "1" ]]; then
       --hide-extension "OpenAGI.app" \
       "${DMG_PATH}" "${APP}" || true
     echo "▶ DMG: ${DMG_PATH}"
+
+    # Codesign the DMG container itself. Without this, even a stapled
+    # notarization ticket won't satisfy Gatekeeper: spctl says
+    # "source=no usable signature" because the .dmg file has no embedded
+    # signature of its own. Apple's docs require this for distributable
+    # disk images.
+    if [[ -n "${SIGN_USED:-}" ]]; then
+      echo "▶ Codesigning DMG container"
+      codesign --force --timestamp --sign "${SIGN_IDENTITY}" "${DMG_PATH}"
+      codesign --verify --verbose=2 "${DMG_PATH}" 2>&1 | tail -3
+    fi
   fi
 fi
 
