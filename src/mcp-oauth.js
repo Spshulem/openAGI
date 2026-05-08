@@ -235,7 +235,7 @@ export class McpOAuthClient {
     }
     const body = {
       client_name: "OpenAGI",
-      client_uri: "https://github.com/buildbetter/openagi",
+      client_uri: "https://github.com/Spshulem/openAGI",
       redirect_uris: redirectUriCandidates(),
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],

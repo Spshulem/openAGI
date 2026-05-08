@@ -45,7 +45,7 @@
        generate_keys-bin (from Sparkle release) → prints public key.
        SUFeedURL points at the appcast.xml served from your release artifact host. -->
   <key>SUFeedURL</key>
-  <string>https://github.com/buildbetter/openagi/releases/latest/download/appcast.xml</string>
+  <string>https://github.com/Spshulem/openAGI/releases/latest/download/appcast.xml</string>
   <key>SUPublicEDKey</key>
   <string>__SPARKLE_PUBLIC_KEY__</string>
   <key>SUEnableAutomaticChecks</key>

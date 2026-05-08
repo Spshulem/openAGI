@@ -7,15 +7,15 @@
 #   - Else → print manual steps
 #
 # Use:
-#   curl -fsSL https://raw.githubusercontent.com/buildbetter/openagi/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/install.sh | sh
 #
 # Or with options:
-#   curl -fsSL https://raw.githubusercontent.com/buildbetter/openagi/main/scripts/install.sh | OPENAGI_FORCE=docker sh
+#   curl -fsSL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/install.sh | OPENAGI_FORCE=docker sh
 #
 # Tested on: Raspberry Pi OS (bookworm), Ubuntu 22.04+, Debian 12, Armbian, pamir.ai box.
 set -eu
 
-REPO="${OPENAGI_REPO:-https://github.com/buildbetter/openagi.git}"
+REPO="${OPENAGI_REPO:-https://github.com/Spshulem/openAGI.git}"
 INSTALL_DIR="${OPENAGI_INSTALL_DIR:-/opt/openagi}"
 MODE="${OPENAGI_FORCE:-auto}"
 

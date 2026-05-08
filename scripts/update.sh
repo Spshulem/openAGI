@@ -9,7 +9,7 @@
 #
 # Use:
 #   ./scripts/update.sh
-#   curl -fsSL https://raw.githubusercontent.com/buildbetter/openagi/main/scripts/update.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/update.sh | sh
 set -eu
 
 PROJECT_DIR="${OPENAGI_INSTALL_DIR:-/opt/openagi}"

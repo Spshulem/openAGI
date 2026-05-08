@@ -1499,7 +1499,7 @@ function openMcpComposer() {
           <label class="opt"><input type="radio" name="kind" value="http-bearer"> http + bearer · hosted MCP with a static API key</label>
         </div>
 
-        <div><label>Name</label><input name="name" placeholder="e.g. buildbetter" required></div>
+        <div><label>Name</label><input name="name" placeholder="e.g. filesystem" required></div>
 
         <div data-kind="stdio">
           <label>Command</label><input name="command" placeholder="npx">

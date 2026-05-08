@@ -4,6 +4,12 @@
   "private": true,
   "type": "module",
   "description": "Generic ABI runtime scaffold for directional adaptive scrutiny, tiered memory, and propagation.",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Spshulem/openAGI.git"
+  },
+  "homepage": "https://github.com/Spshulem/openAGI",
   "scripts": {
     "demo": "node examples/abi-demo.js",
     "serve": "node examples/hosted-server.js",

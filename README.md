@@ -15,7 +15,7 @@ Channels -> Signals -> Workflows -> Directional Adaptive Scrutiny
 ### Mac / Linux desktop / Linux server (from source)
 
 ```bash
-git clone https://github.com/buildbetter/openagi
+git clone https://github.com/Spshulem/openAGI
 cd openagi
 npm run serve     # http://127.0.0.1:43210/setup
 ```
@@ -34,7 +34,7 @@ npm run install-systemd     # Linux — same, via systemd (sudo for system-wide;
 ```bash
 docker run -d --name openagi \
   -p 43210:43210 -v openagi-data:/data \
-  ghcr.io/buildbetter/openagi:latest
+  ghcr.io/spshulem/openagi:latest
 ```
 
 Visit `http://<host>:43210/` for the wizard. Multi-arch image (`linux/amd64` + `linux/arm64`).
@@ -49,7 +49,7 @@ docker compose -f docker-compose.example.yml up -d
 ### Linux one-line installer
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/buildbetter/openagi/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/install.sh | sh
 ```
 
 Auto-detects Docker vs. native systemd, installs Node if missing, sets up the service, prints the wizard URL.
@@ -309,4 +309,9 @@ test/
 
 ## License
 
-MIT.
+PolyForm Noncommercial License 1.0.0 — see [LICENSE](LICENSE).
+
+You can use, fork, run, and modify OpenAGI freely for personal, research, hobby,
+educational, government, and other noncommercial purposes. Commercial use
+(including using OpenAGI as part of a paid product or revenue-generating service)
+requires a separate license — open an issue or reach out if you want one.

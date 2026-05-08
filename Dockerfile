@@ -17,9 +17,9 @@ COPY test ./test
 RUN node --test || (echo "tests failed in build" && exit 1)
 
 FROM node:22-alpine
-LABEL org.opencontainers.image.source="https://github.com/buildbetter/openagi"
+LABEL org.opencontainers.image.source="https://github.com/Spshulem/openAGI"
 LABEL org.opencontainers.image.description="OpenAGI: always-on local agent host with directional adaptive scrutiny, tiered memory, and bounded propagation."
-LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 
 # Run as non-root.
 RUN addgroup -g 1001 openagi && adduser -D -u 1001 -G openagi openagi

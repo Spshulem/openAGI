@@ -28,7 +28,7 @@ build_unit() {
   cat <<EOF
 [Unit]
 Description=OpenAGI agent host
-Documentation=https://github.com/buildbetter/openagi
+Documentation=https://github.com/Spshulem/openAGI
 After=network-online.target
 Wants=network-online.target
 
