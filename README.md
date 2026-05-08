@@ -30,34 +30,50 @@ Everything lives under `~/.openagi/` on your machine. No accounts. No telemetry.
 
 ---
 
-## Why it's different
+## The three innovations
 
-### 1. Proactive, not reactive _(the whole point)_
-Other local agents are answer-machines: you have to know what to ask. OpenAGI runs in the background and **starts the conversation** — "I noticed you do X every morning, want me to handle it?" "Heads up about your 3pm." "I built you a skill for that thing you keep doing." It detects routines from your screen activity, scans your chat history for recurring intents, and pushes proposed skills to the dashboard (and a Mac notification) when it finds one. You're not a prompt engineer — you're someone with patterns, and the agent figures them out.
+Stronger reasoning and prediction alone aren't going to produce AGI. A system that can perform emergent tasks and interact with the world without intervention needs three things working together. OpenAGI is built around them.
 
-### 2. Watches you work _(so it can act on its own)_
-Turn on local screen capture and OpenAGI logs window focus + frame OCR every ~30s. Each night the **pattern miner** clusters repeating activity sequences and asks the LLM to propose a skill name + description + body. The **session miner** does the same for chat history — recurring requests become drafted skills. Powered by **ScreenCaptureKit + Vision OCR + SQLite FTS5** on macOS, entirely on-device. Off by default, opt-in per workspace, default-deny exclusion list (1Password, banking, private windows, 2FA / OTP screens).
+> The full thinking is in **[WHITEPAPER.md](WHITEPAPER.md)** — a personal essay on why these three, why now, and how they map to the code. If you want the marketing-friendly version, keep scrolling. If you want the manifesto, read that.
 
-### 3. Remembers you
-Every conversation, every correction, every decision lives in tiered memory — short-term for working context, medium for repeated patterns, long-term **Lava** for durable truths. The agent doesn't reset between sessions. Corrections you make once never have to be made twice. The seven-axis **Scrutiny layer** scores every signal before acting (`act / ask / watch / ignore / propagate`). Risky or repeated tasks spawn bounded specialists — specialization without sprawl.
+### 1. Directional Adaptive Scrutiny — `src/directional-adaptive-scrutiny.js`
 
-### 4. Yours
-Everything OpenAGI sees, learns, and remembers lives in `~/.openagi/` on your machine. No accounts. No telemetry. No remote dependencies beyond the model API key you choose to provide. Use any LLM — OpenAI, Anthropic, or any provider speaking the OpenAI Responses API. Swap models any time. The agent you raise belongs to you.
+A scrutinizer with **direction but no fixed outcome**, predictable in its logic, diverse in what it can evaluate, and capable of polarized verdicts. Today's reinforcement learning is monolithic — one objective, one right answer. Real environments are *cyclical, diverse, and extreme,* and that's what produces emergent intelligence. OpenAGI scores every incoming signal on seven axes (`urgency / impact / novelty / repetition / risk / confidence / specificity`) and decides one of five things: `act`, `ask`, `watch`, `ignore`, `propagate`. That decision drives everything downstream.
+
+### 2. Tiered Memory — `src/memory-system.js`
+
+Short-term (RAM — what you need right now), medium-term (day-to-day), long-term **Lava** (durable truths reasoned from feeling, not logic). Memory decays. Repeated raw items get condensed into principles. Compression isn't a performance optimization — it's evolutionary pressure. Perfect memory is a curse, not a gift; a system that can't forget can't progress. Most LLMs only have RAM and long-term storage with nothing managing what flows where. OpenAGI manages it: durable JSONL+snapshot stores for each tier, a condenser that promotes/demotes, and a recall layer that reasons about *fidelity*, not just hits.
+
+### 3. Propagation — `src/propagation-controller.js`
+
+Specialization through **division, not multiplication.** When a task becomes repetitive *or* novel-but-high-risk, the system spawns a bounded specialist with its own scope, memory, and tools — and the main system goes on autopilot for that lane. Multiplying the agent 1:1 is cancerous (creates complexity without value); dividing creates depth without sprawl. Specialists that don't earn their keep get retired by the daily quality sweep. Whether you look at synapses, hierarchies, or companies, the goal is the same: specialize repetitive tasks, recover the cycles for the things that matter.
+
+---
+
+## What this looks like to you
+
+The three innovations above are the engine. The user-visible behavior that falls out of them:
+
+- **Proactive.** The agent runs in the background, watches your activity (opt-in), and reaches out — "I noticed a routine," "Heads up," "I drafted a skill." It starts the conversation. Other local agents wait for prompts.
+- **Persistent.** Conversations, corrections, and decisions stick across sessions. Corrections you make once never have to be made twice.
+- **Specialized over time.** As your patterns become clear, OpenAGI propagates specialists — by month three, the boring half of your work is being handled by sub-agents that aren't asking you for input.
+- **Local + private.** Everything lives under `~/.openagi/`. No accounts, no telemetry, no cloud component. Bring your own LLM (OpenAI, Anthropic, anything that speaks the OpenAI Responses API).
 
 ---
 
 ## How OpenAGI compares
 
-The headline row is the first one: **proactive vs. reactive**. Everything else is plumbing.
+The highlighted rows are the bet — Scrutiny, tiered Memory, and Propagation, plus the proactive behavior they enable. Everything below the line is plumbing every local agent has by now.
 
 |                                            | OpenAGI | OpenClaw | AutoGPT | Operator | Claude.ai | Devin |
 |--------------------------------------------|:-------:|:--------:|:-------:|:--------:|:---------:|:-----:|
 |                                            | _local_ | _local_  | _local_ | _cloud_  |  _cloud_  | _cloud_ |
+| **Directional Adaptive Scrutiny**           | **✅**  |    —     |    —    |    —     |     —     |   —   |
+| **Tiered Memory (short / medium / Lava)**   | **✅**  |    —     |    —    |    —     |     —     |   —   |
+| **Propagation — bounded specialists**       | **✅**  |    —     |    —    |    —     |     —     |   —   |
 | **Reaches out to you (proactive)**          | **✅**  |    —     |    —    |    —     |     —     |   —   |
 | **Watches your work, learns patterns**      | **✅**  |    —     |    —    |    —     |     —     |   —   |
 | **Auto-drafts skills from observed routines** | **✅**  |    —     |    —    |    —     |     —     |   —   |
-| **Scores every signal before acting**       | **✅**  |    —     |    —    |    —     |     —     |   —   |
-| **Bounded specialists (propagation)**       | **✅**  |    —     |    —    |    —     |     —     |   —   |
 | Runs on your machine                        |   ✅    |    ✅    |    ✅   |    —     |     —     |   —   |
 | Your data never leaves                      |   ✅    |    ✅    | partial |    —     |     —     |   —   |
 | Bring your own LLM                          | ✅ any  |    ✅    |    ✅   |    —     |     —     |   —   |
@@ -67,7 +83,9 @@ The headline row is the first one: **proactive vs. reactive**. Everything else i
 | Source-available                            |   ✅    |    ✅    |    ✅   |    —     |     —     |   —   |
 | No telemetry, no accounts                   |   ✅    |    ✅    |    ✅   |    —     |     —     |   —   |
 
-OpenClaw and PicoClaw nailed the local-first daemon shape — durable memory, MCP registry, channels. But they're still answer-machines: you have to drive them. The hard problem in agents isn't running locally, it's **knowing what's worth saying without being asked**. That's the gap OpenAGI closes — the five highlighted rows are the bet, everything else is table stakes.
+OpenClaw and PicoClaw nailed the local-first daemon shape — durable memory, MCP registry, channels. But they're still answer-machines: you have to drive them. Cloud agents (Operator, Claude.ai, Devin) sit dormant too. The hard problem in agents isn't running locally; it's **a system that scrutinizes signals, manages memory at three fidelities, and specializes through division.** Once those three loops are running, *reaching out first* isn't a feature you bolt on — it's what falls out.
+
+If you want the long form on why these three (and not, say, "more parameters") get you closer to AGI, read **[WHITEPAPER.md](WHITEPAPER.md)**.
 
 ---
 
