@@ -32,6 +32,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify required secrets are configured
+        # Fails fast with a clear error if any secret is missing or empty,
+        # so we don't waste 10+ minutes on a notarization that can't sign.
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          missing=()
+          for name in \
+            APPLE_DEVELOPER_ID_CERT_P12_BASE64 \
+            APPLE_DEVELOPER_ID_CERT_PASSWORD \
+            APPLE_ID \
+            APPLE_APP_PASSWORD \
+            APPLE_TEAM_ID \
+            SPARKLE_ED_PRIVATE_KEY; do
+            value="$(printenv "$name" || true)"
+            if [ -z "$value" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            printf '::error::Missing required secrets: %s\n' "${missing[*]}"
+            echo "::error::See docs/RELEASE.md for how to extract each."
+            exit 1
+          fi
+          echo "✓ all 6 release secrets are configured"
+
       - name: Resolve version from tag
         id: ver
         run: |

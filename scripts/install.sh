@@ -82,8 +82,19 @@ install_via_mac_dmg() {
   curl -fL --progress-bar -o "$DMG" "$DMG_URL"
 
   color_yellow "▶ Verifying signature + notarization"
+  # Strict: refuse to install a DMG that Gatekeeper can't validate.
+  # Override only with OPENAGI_TRUST_UNSIGNED=1 (e.g. for ad-hoc-signed
+  # local builds you've sideloaded into a dummy release).
   if ! spctl --assess --type install "$DMG" >/dev/null 2>&1; then
-    color_yellow "  spctl couldn't verify the DMG itself; will check the .app after install."
+    if [ "${OPENAGI_TRUST_UNSIGNED:-0}" != "1" ]; then
+      color_red "  ✗ Gatekeeper rejected the DMG (not signed + notarized by a Developer ID we trust)."
+      color_red "  This DMG was downloaded from $DMG_URL"
+      color_red "  Refusing to install. To override (only do this if you know what you're doing):"
+      color_red "    curl -fsSL openagi.sh | OPENAGI_TRUST_UNSIGNED=1 sh"
+      rm -rf "$TMP"
+      return 1
+    fi
+    color_yellow "  ⚠ spctl rejected the DMG, continuing anyway because OPENAGI_TRUST_UNSIGNED=1"
   fi
 
   color_yellow "▶ Mounting"
@@ -113,7 +124,15 @@ install_via_mac_dmg() {
   if spctl --assess --verbose=4 "/Applications/OpenAGI.app" >/dev/null 2>&1; then
     color_green "  ✓ Gatekeeper says: signed + notarized."
   else
-    color_yellow "  ⚠ App is installed but not yet Gatekeeper-validated. Right-click → Open the first time."
+    if [ "${OPENAGI_TRUST_UNSIGNED:-0}" != "1" ]; then
+      color_red "  ✗ Installed app failed Gatekeeper assessment. Rolling back."
+      rm -rf "/Applications/OpenAGI.app"
+      if [ -d "/Applications/OpenAGI.app.bak" ]; then
+        mv "/Applications/OpenAGI.app.bak" "/Applications/OpenAGI.app"
+      fi
+      return 1
+    fi
+    color_yellow "  ⚠ App is installed but not Gatekeeper-validated (OPENAGI_TRUST_UNSIGNED=1). Right-click → Open the first time."
   fi
 
   color_green "▶ Launching OpenAGI"
