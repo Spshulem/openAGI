@@ -31,8 +31,7 @@ struct TrayLabel: View {
     guard let url = Bundle.main.url(forResource: "MenuIcon", withExtension: "png"),
           let img = NSImage(contentsOf: url) else { return nil }
     img.isTemplate = true
-    // The source PNG has ~15% transparent padding so the visible glyph ends
-    // up sitting at ~18pt inside a 22pt box — matches Apple's menu bar feel.
+    // Source is auto-cropped during build, so the full 22pt box is glyph.
     img.size = NSSize(width: 22, height: 22)
     return img
   }()

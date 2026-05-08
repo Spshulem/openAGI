@@ -60,12 +60,30 @@ rm -rf "${ICONSET}"
 # only need the source to have transparent background. The build is a simple
 # downscale to 22pt (1x) and 44pt (2x).
 echo "▶ Building MenuIcon"
-# 26pt @1x / 52px @2x. The source PNG has built-in transparent padding so
-# the visible glyph ends up around 18pt — matches the rest of the menu bar.
-sips --setProperty format png --resampleHeightWidth 26 26 \
-     "${MENU_SRC}" --out "${OUT_DIR}/MenuIcon.png" >/dev/null
-sips --setProperty format png --resampleHeightWidth 52 52 \
-     "${MENU_SRC}" --out "${OUT_DIR}/MenuIcon@2x.png" >/dev/null
+# Auto-crop transparent padding so the glyph fills its bounding box, then
+# downscale. Without this step macOS shows ~15% empty padding around the
+# logo and it reads as smaller than every other menu bar item.
+CROPPED="$(mktemp -t menuicon-cropped).png"
+python3 - "${MENU_SRC}" "${CROPPED}" <<'PY'
+import sys
+from PIL import Image
+src, dst = sys.argv[1], sys.argv[2]
+img = Image.open(src).convert("RGBA")
+bbox = img.getbbox()
+if bbox: img = img.crop(bbox)
+# Re-square so menu bar centers it correctly.
+w, h = img.size
+side = max(w, h)
+canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+canvas.save(dst, "PNG")
+PY
+# 24pt @1x / 48px @2x — fills the menu bar like a standard item.
+sips --setProperty format png --resampleHeightWidth 24 24 \
+     "${CROPPED}" --out "${OUT_DIR}/MenuIcon.png" >/dev/null
+sips --setProperty format png --resampleHeightWidth 48 48 \
+     "${CROPPED}" --out "${OUT_DIR}/MenuIcon@2x.png" >/dev/null
+rm -f "${CROPPED}"
 
 echo "▶ Done."
 ls -lh "${OUT_DIR}/AppIcon.icns" "${OUT_DIR}/MenuIcon.png" "${OUT_DIR}/MenuIcon@2x.png"
