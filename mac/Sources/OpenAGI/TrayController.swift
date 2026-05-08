@@ -31,8 +31,8 @@ struct TrayLabel: View {
     guard let url = Bundle.main.url(forResource: "MenuIcon", withExtension: "png"),
           let img = NSImage(contentsOf: url) else { return nil }
     img.isTemplate = true
-    // Source is auto-cropped during build, so the full 22pt box is glyph.
-    img.size = NSSize(width: 22, height: 22)
+    // Source is auto-cropped during build, so the full box is glyph.
+    img.size = NSSize(width: 26, height: 26)
     return img
   }()
 }

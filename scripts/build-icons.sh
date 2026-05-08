@@ -78,10 +78,10 @@ canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
 canvas.paste(img, ((side - w) // 2, (side - h) // 2))
 canvas.save(dst, "PNG")
 PY
-# 24pt @1x / 48px @2x — fills the menu bar like a standard item.
-sips --setProperty format png --resampleHeightWidth 24 24 \
+# 28pt @1x / 56px @2x — pushes the glyph to the top of the menu bar slot.
+sips --setProperty format png --resampleHeightWidth 28 28 \
      "${CROPPED}" --out "${OUT_DIR}/MenuIcon.png" >/dev/null
-sips --setProperty format png --resampleHeightWidth 48 48 \
+sips --setProperty format png --resampleHeightWidth 56 56 \
      "${CROPPED}" --out "${OUT_DIR}/MenuIcon@2x.png" >/dev/null
 rm -f "${CROPPED}"
 
