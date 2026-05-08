@@ -157,6 +157,7 @@ struct TrayMenu: View {
       if !state.findings.isEmpty {
         Text("⚠ \(state.findings.count) finding(s)").disabled(true).font(.caption)
       }
+      Text("OpenAGI \(Self.versionString)").disabled(true).font(.caption)
       Button(UpdateController.shared.isEnabled ? "Check for updates…" : "About auto-updates…") {
         UpdateController.shared.checkForUpdates()
       }
@@ -167,4 +168,15 @@ struct TrayMenu: View {
       }
     }
   }
+
+  // Bundle short version + build number, stamped by build-mac-app.sh.
+  // Shown in the menu so it's never ambiguous which build is running
+  // (especially useful when alternating between local dev builds and
+  // the released .dmg from /Applications).
+  private static let versionString: String = {
+    let info = Bundle.main.infoDictionary
+    let v = (info?["CFBundleShortVersionString"] as? String) ?? "?"
+    let b = (info?["CFBundleVersion"] as? String) ?? ""
+    return b.isEmpty || b == "__BUILD__" ? "v\(v)" : "v\(v) (\(b))"
+  }()
 }
