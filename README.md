@@ -1,8 +1,8 @@
 # OpenAGI
 
-**A local agent that reaches out to you — instead of waiting to be asked.**
+**A local, always-on agent that remembers, watches, and learns from your patterns — and reaches out to you instead of waiting to be asked.**
 
-> Most agents sit there and wait for a prompt. OpenAGI watches what you actually do, learns the patterns, and pings you with what it can take off your plate.
+> Most agents sit there and wait for a prompt. OpenAGI runs as a daemon on your machine, picks up on the things you do over and over, and pings you with what it can take off your plate.
 
 **Website:** [openagi.sh](https://openagi.sh) · **Install:** `curl -fsSL openagi.sh | sh` · **Source:** [github.com/Spshulem/openAGI](https://github.com/Spshulem/openAGI)
 
