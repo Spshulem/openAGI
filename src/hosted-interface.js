@@ -1034,7 +1034,18 @@ function renderMarkdown(input) {
   return "<p>" + s + "</p>";
 }
 
-newBtn.addEventListener("click", () => {
+function showToast(msg, ok = true) {
+  const t = document.createElement("div");
+  t.style.cssText = "position:fixed;top:20px;right:20px;z-index:99;padding:10px 14px;border-radius:6px;font-size:13px;max-width:360px;box-shadow:0 4px 12px rgba(0,0,0,.3);font-family:inherit;line-height:1.4;" +
+    (ok
+      ? "background:#1a3a2a;color:#7be59c;border:1px solid #2d5b40;"
+      : "background:#3a1a1a;color:#f08a8a;border:1px solid #5b2d2d;");
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 4500);
+}
+
+newBtn.addEventListener("click", async () => {
   if (state.tab === "chat") {
     state.sessionId = null;
     state.messages = [];
@@ -1043,7 +1054,28 @@ newBtn.addEventListener("click", () => {
   } else if (state.tab === "cron") {
     openCronComposer();
   } else if (state.tab === "skills") {
-    refreshSkills(true);
+    // Triggers both miners (pattern + session) and shows scanned/found
+    // counts so the user sees the system working even when nothing landed.
+    const original = newBtn.textContent;
+    newBtn.disabled = true;
+    newBtn.textContent = "Mining…";
+    try {
+      const result = await postJson("/skills/mine", {});
+      const p = result.pattern ?? {};
+      const s = result.session ?? {};
+      const totalNew = (p.candidates ?? 0) + (s.candidates ?? 0);
+      const summary = totalNew > 0
+        ? \`✨ \${totalNew} new candidate\${totalNew > 1 ? "s" : ""} — Pattern: \${p.candidates ?? 0}/\${p.mined ?? 0} · Session: \${s.candidates ?? 0}/\${s.mined ?? 0}\`
+        : \`Mining done — Pattern: scanned \${p.mined ?? 0}, no new clusters · Session: scanned \${s.mined ?? 0}, no new clusters\`;
+      showToast(summary, true);
+      newBtn.textContent = totalNew > 0 ? \`✓ \${totalNew} new\` : "✓ Done";
+      setTimeout(() => { newBtn.textContent = original; newBtn.disabled = false; }, 2400);
+      await refreshSkills(true);
+    } catch (err) {
+      showToast("Mine failed: " + (err.message || String(err)), false);
+      newBtn.textContent = "✗ Error";
+      setTimeout(() => { newBtn.textContent = original; newBtn.disabled = false; }, 2400);
+    }
   } else if (state.tab === "mcp") {
     openMcpComposer();
   }
@@ -1071,7 +1103,7 @@ async function switchTab(tab) {
   } else if (tab === "skills") {
     showSidebar(true);
     sidebarTitle.textContent = "Skills";
-    newBtn.textContent = "↻ Reload";
+    newBtn.textContent = "✨ Mine now";
     state.skillsMineButton = true;
     await refreshSkills();
   } else if (tab === "mcp") {
