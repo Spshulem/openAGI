@@ -18,6 +18,7 @@ import { OutcomeStore } from "./outcome-store.js";
 import { Introspector } from "./introspector.js";
 import { PatternMiner } from "./pattern-miner.js";
 import { SessionMiner } from "./session-miner.js";
+import { ProactiveObserver } from "./proactive-observer.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
 import { SkillReplay } from "./skill-replay.js";
 import { ScrutinyJudge } from "./scrutiny-judge.js";
@@ -116,6 +117,7 @@ export class AbiRuntime {
     this.tunnelWatcher = options.tunnelWatcher ?? new TunnelWatcher(options.tunnelWatcherOptions ?? {});
     this.patternMiner = options.patternMiner ?? new PatternMiner({ runtime: this, dataDir: options.dataDir, ...(options.patternMinerOptions ?? {}) });
     this.sessionMiner = options.sessionMiner ?? new SessionMiner({ runtime: this, dataDir: options.dataDir, ...(options.sessionMinerOptions ?? {}) });
+    this.proactiveObserver = options.proactiveObserver ?? new ProactiveObserver({ runtime: this, dataDir: options.dataDir, ...(options.proactiveObserverOptions ?? {}) });
     this.skillReplay = options.skillReplay ?? new SkillReplay({ runtime: this, dataDir: options.dataDir, ...(options.skillReplayOptions ?? {}) });
     this.outputs = [];
     this.feedback = [];
@@ -187,6 +189,15 @@ export class AbiRuntime {
         enabled: true,
         task: "session-mine",
         intervalMs: 60 * 60 * 1000
+      });
+      // Proactive observer — fast cadence so the agent reacts within
+      // minutes when it sees something worth saying.
+      this.cron.addJob({
+        id: "proactive-observer",
+        name: "Proactive observer (continuous skill/MCP suggester)",
+        enabled: true,
+        task: "proactive-observe",
+        intervalMs: 10 * 60 * 1000
       });
       registerCoreTools(this.tools, this);
     }
@@ -357,6 +368,11 @@ export class AbiRuntime {
       if (job.task === "session-mine") {
         const result = await this.sessionMiner.mine({ now });
         this.events?.emit?.("miner-result", { source: "session-miner", at: nowIso(), ...result });
+        return result;
+      }
+      if (job.task === "proactive-observe") {
+        const result = await this.proactiveObserver.observe({ now });
+        this.events?.emit?.("miner-result", { source: "proactive-observer", at: nowIso(), ...result });
         return result;
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };

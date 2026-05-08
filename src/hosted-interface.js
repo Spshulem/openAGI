@@ -54,6 +54,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("skill-candidate", (data) => broadcast("skill-candidate", data));
   events.on("miner-result", (data) => broadcast("miner-result", data));
   events.on("cron-catchup", (data) => broadcast("cron-catchup", data));
+  events.on("proactive-suggestion", (data) => broadcast("proactive-suggestion", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
@@ -480,6 +481,39 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "GET" && pathname === "/skills/replay-jobs") {
         return sendJson(res, 200, runtime.skillReplay.list({ status: url.searchParams.get("status") }));
+      }
+      if (method === "GET" && pathname === "/proactive/suggestions") {
+        if (!runtime.proactiveObserver?.list) return sendJson(res, 503, { error: "no observer" });
+        return sendJson(res, 200, runtime.proactiveObserver.list({ status: url.searchParams.get("status") }));
+      }
+      if (method === "POST" && pathname === "/proactive/observe") {
+        if (!runtime.proactiveObserver?.observe) return sendJson(res, 503, { error: "no observer" });
+        try {
+          const result = await runtime.proactiveObserver.observe({ force: true });
+          return sendJson(res, 200, result);
+        } catch (error) { return sendJson(res, 500, { error: error.message }); }
+      }
+      if (method === "POST" && pathname.match(/^\/proactive\/suggestions\/[^/]+\/(accept|reject|dismiss)$/)) {
+        const parts = pathname.split("/");
+        const id = decodeURIComponent(parts[3]);
+        const action = parts[4];
+        const status = action === "accept" ? "accepted" : action === "reject" ? "rejected" : "dismissed";
+        const candidate = runtime.proactiveObserver.resolve(id, status);
+        if (!candidate) return sendJson(res, 404, { error: "unknown suggestion" });
+
+        // For MCP suggestions, accepting auto-registers + connects the server.
+        if (status === "accepted" && candidate.category === "mcp" && candidate.mcpRegister && runtime.mcp?.registerServer) {
+          try {
+            const reg = candidate.mcpRegister;
+            const name = candidate.mcpId ?? candidate.title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+            runtime.mcp.registerServer({ name, ...reg });
+            runtime.mcp.connect?.(name).catch(() => { /* OAuth path surfaces via SSE */ });
+            return sendJson(res, 200, { ...candidate, registered: name });
+          } catch (error) {
+            return sendJson(res, 200, { ...candidate, registerError: error.message });
+          }
+        }
+        return sendJson(res, 200, candidate);
       }
       if (method === "GET" && pathname === "/observations/recent-context") {
         if (!runtime.observations?.getRecentContext) return sendJson(res, 503, { error: "no observation store" });
@@ -2334,6 +2368,23 @@ evt.addEventListener("skill-candidate", (e) => {
       new Notification("OpenAGI learned a new skill candidate", {
         body: (data.name || "untitled") + (data.description ? " — " + data.description : "")
       });
+    }
+  } catch {}
+});
+
+// Proactive suggestion — the observer noticed something it can help with.
+// Show as a high-prominence toast (clickable to accept/reject) and fire a
+// browser notification so the user sees it even if the dashboard isn't
+// foregrounded. The Mac app's SSE delegate will also fire a native
+// notification.
+evt.addEventListener("proactive-suggestion", (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    const tag = data.category === "mcp" ? "✨ MCP" : data.category === "skill" ? "✨ Skill" : data.category === "automation" ? "✨ Auto" : "✨ FYI";
+    const body = (data.title || "Suggestion") + (data.rationale ? " — " + data.rationale : "");
+    showToast(tag + ": " + body, true);
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification("OpenAGI noticed something", { body });
     }
   } catch {}
 });

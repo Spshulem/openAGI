@@ -198,6 +198,30 @@ final class AppState: ObservableObject {
       }()
       notify(title: title, body: body, path: "/?tab=skills")
     }
+    if event == "proactive-suggestion" {
+      // Proactive observer noticed something — fire a richer notification
+      // since these are real-time, not nightly batches. Tap → dashboard.
+      let parsed = parseSkillCandidate(data)
+      let category = parseField(data, "category") ?? "fyi"
+      let prefix: String = {
+        switch category {
+        case "mcp": return "✨ Connect"
+        case "skill": return "✨ Skill idea"
+        case "automation": return "✨ Auto"
+        default: return "✨ FYI"
+        }
+      }()
+      let title = "\(prefix): \(parsed.name ?? "OpenAGI noticed something")"
+      let body = parseField(data, "rationale") ?? parsed.description ?? "Open the dashboard to review."
+      notify(title: title, body: body, path: "/?tab=skills")
+    }
+  }
+
+  private func parseField(_ data: String, _ key: String) -> String? {
+    guard let json = try? JSONSerialization.jsonObject(with: Data(data.utf8)) as? [String: Any] else {
+      return nil
+    }
+    return json[key] as? String
   }
 
   private func parseSkillCandidate(_ data: String) -> (name: String?, description: String?) {
