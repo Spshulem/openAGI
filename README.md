@@ -1,64 +1,109 @@
 # OpenAGI
 
-**An always-on, local-first agent that remembers, watches, and learns your patterns.**
+**A local agent that reaches out to you — instead of waiting to be asked.**
 
-> Local. Private. Always learning. Bring your own LLM. Your data never leaves your machine.
+> Most agents sit there and wait for a prompt. OpenAGI watches what you actually do, learns the patterns, and pings you with what it can take off your plate.
 
-**Website:** [openagi.sh](https://openagi.sh) · **Source:** [github.com/Spshulem/openAGI](https://github.com/Spshulem/openAGI)
-
-OpenAGI is a daemon that runs on your laptop, server, or Raspberry Pi. It hosts a chat UI, executes tools, schedules prompts, watches your screen activity (opt-in), and detects repeating patterns over days — then proposes auto-generated skills you can accept with one click. Everything lives under `~/.openagi/` on your machine. No accounts. No telemetry. No cloud component.
+**Website:** [openagi.sh](https://openagi.sh) · **Install:** `curl -fsSL openagi.sh | sh` · **Source:** [github.com/Spshulem/openAGI](https://github.com/Spshulem/openAGI)
 
 ```text
-Channels → Signals → Workflows → Directional Adaptive Scrutiny
-       → Agent Layer + Tools → Tiered Memory → Propagation
-       → Outputs → Feedback
+[Mon · 7:42 am]
+↗ I noticed a morning routine.
+  For the past 5 weekdays you:
+    · check #incidents in Slack
+    · pull yesterday's deploys from GitHub
+    · draft a standup note
+  I can run this every morning at 7:30 am and have it waiting.
+  → approved · saved as /morning-standup
+
+[Mon · 2:31 pm]
+↗ Prep for your 3 pm with Acme Corp.
+  4 tickets in last 30 days about CSV export limits.
+  Mentioned competitor "Vellum" last call.
+  Renewal in 6 weeks — expansion potential.
+  Brief drafted. Want me to open it?
 ```
+
+That's the difference. OpenClaw, AutoGPT, even cloud agents like Claude.ai and Devin sit dormant until you type something. OpenAGI is **proactive** — it runs as a daemon, reads your activity, and surfaces things on its own. The first hour you have it installed, it's already noticing patterns. The first week, it's drafting skills. By month two it's doing the boring half of your work without being asked.
+
+Everything lives under `~/.openagi/` on your machine. No accounts. No telemetry. No cloud component. Bring your own LLM (OpenAI, Anthropic, Ollama).
 
 ---
 
-## Three pillars
+## Why it's different
 
-### 1. Remembers you
+### 1. Proactive, not reactive _(the whole point)_
+Other local agents are answer-machines: you have to know what to ask. OpenAGI runs in the background and **starts the conversation** — "I noticed you do X every morning, want me to handle it?" "Heads up about your 3pm." "I built you a skill for that thing you keep doing." It detects routines from your screen activity, scans your chat history for recurring intents, and pushes proposed skills to the dashboard (and a Mac notification) when it finds one. You're not a prompt engineer — you're someone with patterns, and the agent figures them out.
+
+### 2. Watches you work _(so it can act on its own)_
+Turn on local screen capture and OpenAGI logs window focus + frame OCR every ~30s. Each night the **pattern miner** clusters repeating activity sequences and asks the LLM to propose a skill name + description + body. The **session miner** does the same for chat history — recurring requests become drafted skills. Powered by **ScreenCaptureKit + Vision OCR + SQLite FTS5** on macOS, entirely on-device. Off by default, opt-in per workspace, default-deny exclusion list (1Password, banking, private windows, 2FA / OTP screens).
+
+### 3. Remembers you
 Every conversation, every correction, every decision lives in tiered memory — short-term for working context, medium for repeated patterns, long-term **Lava** for durable truths. The agent doesn't reset between sessions. Corrections you make once never have to be made twice. The seven-axis **Scrutiny layer** scores every signal before acting (`act / ask / watch / ignore / propagate`). Risky or repeated tasks spawn bounded specialists — specialization without sprawl.
 
-### 2. Watches you work _(killer feature)_
-Turn on local screen capture and OpenAGI starts noticing the things you do over and over: the file you keep moving, the report you build every Friday, the script you run after every deploy. Once it sees a pattern enough times, it drafts a skill for it and surfaces it in the dashboard with one-click accept/reject. Powered by **ScreenCaptureKit + Vision OCR + SQLite FTS5** on macOS — entirely on-device. Off by default, opt-in per workspace, default-deny exclusion list (1Password, banking, private windows).
-
-### 3. Yours
+### 4. Yours
 Everything OpenAGI sees, learns, and remembers lives in `~/.openagi/` on your machine. No accounts. No telemetry. No remote dependencies beyond the model API key you choose to provide. Use any LLM — OpenAI, Anthropic, or any provider speaking the OpenAI Responses API. Swap models any time. The agent you raise belongs to you.
 
 ---
 
 ## How OpenAGI compares
 
+The headline row is the first one: **proactive vs. reactive**. Everything else is plumbing.
+
 |                                            | OpenAGI | OpenClaw | AutoGPT | Operator | Claude.ai | Devin |
 |--------------------------------------------|:-------:|:--------:|:-------:|:--------:|:---------:|:-----:|
 |                                            | _local_ | _local_  | _local_ | _cloud_  |  _cloud_  | _cloud_ |
+| **Reaches out to you (proactive)**          | **✅**  |    —     |    —    |    —     |     —     |   —   |
+| **Watches your work, learns patterns**      | **✅**  |    —     |    —    |    —     |     —     |   —   |
+| **Auto-drafts skills from observed routines** | **✅**  |    —     |    —    |    —     |     —     |   —   |
+| **Scores every signal before acting**       | **✅**  |    —     |    —    |    —     |     —     |   —   |
+| **Bounded specialists (propagation)**       | **✅**  |    —     |    —    |    —     |     —     |   —   |
 | Runs on your machine                        |   ✅    |    ✅    |    ✅   |    —     |     —     |   —   |
 | Your data never leaves                      |   ✅    |    ✅    | partial |    —     |     —     |   —   |
 | Bring your own LLM                          | ✅ any  |    ✅    |    ✅   |    —     |     —     |   —   |
-| **Watches you, learns patterns**            | **✅**  |    —     |    —    |    —     |     —     |   —   |
-| **Adaptive Scrutiny decision layer**        | **✅**  |    —     |    —    |    —     |     —     |   —   |
-| **Bounded specialists (propagation)**       | **✅**  |    —     |    —    |    —     |     —     |   —   |
 | Persistent memory across sessions           | ✅ tiered | ✅ md   |    —    | limited  | limited   | limited |
 | Multi-channel (SMS / Telegram / HTTP)       |   ✅    |    ✅    |    —    |    —     |     —     |   —   |
 | MCP server support                          |   ✅    |    ✅    |    —    |  some    |    —      |   —   |
 | Source-available                            |   ✅    |    ✅    |    ✅   |    —     |     —     |   —   |
 | No telemetry, no accounts                   |   ✅    |    ✅    |    ✅   |    —     |     —     |   —   |
 
-OpenAGI builds on the local-first foundation that [OpenClaw](https://github.com/openclaw/openclaw) and PicoClaw shipped first — durable memory, MCP registry, daemon shape. The differentiation is the three highlighted rows: **watching you work**, **scoring every signal before acting**, and **bounded specialization**.
+OpenClaw and PicoClaw nailed the local-first daemon shape — durable memory, MCP registry, channels. But they're still answer-machines: you have to drive them. The hard problem in agents isn't running locally, it's **knowing what's worth saying without being asked**. That's the gap OpenAGI closes — the five highlighted rows are the bet, everything else is table stakes.
 
 ---
 
-## Quickstart (60 seconds)
+## Get started
 
+One command. Then leave it running. The proactive part needs time to watch.
+
+**Linux / Raspberry Pi / SBC:**
 ```bash
-git clone https://github.com/Spshulem/openAGI && cd openAGI
-npm install
-npm run serve
+curl -fsSL openagi.sh | sh
 ```
 
-Open `http://127.0.0.1:43210/`. The first-run wizard asks for an OpenAI or Anthropic key (or skip — runs in deterministic mode without one), runs a smoke test, and you're chatting.
+**macOS / from source:**
+```bash
+git clone https://github.com/Spshulem/openAGI && cd openAGI && npm install && npm run serve
+```
+
+**Docker:**
+```bash
+docker run -d --name openagi -p 43210:43210 -v openagi-data:/data ghcr.io/spshulem/openagi:latest
+```
+
+Open `http://127.0.0.1:43210/`. Drop in an OpenAI or Anthropic key in the wizard (or skip and run in deterministic mode while you poke around). That's all the setup — there's nothing else to configure to get the proactive value flowing.
+
+### What happens next, with no further input from you
+
+| When | What you'll see |
+|------|-----------------|
+| Right away | Chat UI, MCP tab, Skills tab, Memory tab, Activity tab. Tools like `remember`, `recall`, `schedule_message` already work. |
+| After 1 chat | The agent remembers. Ask it later "what did we decide about X" — it knows. |
+| First night _(03:30 UTC)_ | **Session miner** runs across your chat history, clusters recurring intents, drafts skills you might want, drops them in the Suggested tab. |
+| First night _(02:30 UTC)_ | If you've enabled Mac screen capture, the **pattern miner** runs across your activity, finds repeating app sequences (e.g. "Slack → GitHub → Notion every 9am"), drafts a skill, surfaces it. |
+| Each Mac notification | "OpenAGI learned a new skill" — click to review, accept with one click, and it's saved as a real `SKILL.md` the agent can run. |
+| Ongoing | Schedule a prompt with `schedule_message` and OpenAGI texts/Telegrams you when it fires. |
+
+The whole point is you don't sit there typing prompts. You install it, you go back to work, and it tells you what's worth doing.
 
 ---
 
