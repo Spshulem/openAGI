@@ -123,29 +123,55 @@ if [[ -n "${SIGN_USED}" ]]; then
   SIGN_IDENTITY="${SIGN_USED}"
   echo "▶ Signing with: ${SIGN_IDENTITY}"
 
-  # Sign the bundled Node binary FIRST with its own entitlements that allow
+  # All codesign calls below pass --timestamp so the signature includes
+  # an Apple-issued secure timestamp. Notarization rejects signatures
+  # without it.
+  CS_FLAGS=(--force --options runtime --timestamp --sign "${SIGN_IDENTITY}")
+
+  # Sign Sparkle's nested helpers FIRST — Sparkle.framework ships with
+  # pre-signed inner binaries (Updater.app / Autoupdate / Downloader.xpc /
+  # Installer.xpc) that aren't tied to our Developer ID. Notarization
+  # rejects those without re-signing. Order matters: deepest first, then
+  # parent bundles, then the framework itself.
+  SPARKLE_FW="${APP}/Contents/Frameworks/Sparkle.framework"
+  if [[ -d "${SPARKLE_FW}" ]]; then
+    SP="${SPARKLE_FW}/Versions/B"
+    [[ -e "${SP}/Autoupdate" ]] && \
+      codesign "${CS_FLAGS[@]}" "${SP}/Autoupdate"
+    [[ -e "${SP}/Updater.app/Contents/MacOS/Updater" ]] && \
+      codesign "${CS_FLAGS[@]}" "${SP}/Updater.app/Contents/MacOS/Updater"
+    [[ -d "${SP}/Updater.app" ]] && \
+      codesign "${CS_FLAGS[@]}" "${SP}/Updater.app"
+    [[ -e "${SP}/XPCServices/Downloader.xpc/Contents/MacOS/Downloader" ]] && \
+      codesign "${CS_FLAGS[@]}" "${SP}/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
+    [[ -d "${SP}/XPCServices/Downloader.xpc" ]] && \
+      codesign "${CS_FLAGS[@]}" "${SP}/XPCServices/Downloader.xpc"
+    [[ -e "${SP}/XPCServices/Installer.xpc/Contents/MacOS/Installer" ]] && \
+      codesign "${CS_FLAGS[@]}" "${SP}/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+    [[ -d "${SP}/XPCServices/Installer.xpc" ]] && \
+      codesign "${CS_FLAGS[@]}" "${SP}/XPCServices/Installer.xpc"
+    codesign "${CS_FLAGS[@]}" "${SPARKLE_FW}"
+  fi
+
+  # Sign the bundled Node binary with its own entitlements that allow
   # JIT — V8 requires writeable+executable memory pages and macOS hardened
   # runtime kills it with SIGTRAP otherwise.
   NODE_BINARY="${APP}/Contents/Resources/node/bin/node"
   if [[ -f "${NODE_BINARY}" ]]; then
-    codesign --force --options runtime \
+    codesign --force --options runtime --timestamp \
       --entitlements "${MAC_DIR}/Resources/node-entitlements.plist" \
       --sign "${SIGN_IDENTITY}" "${NODE_BINARY}"
   fi
   # Sign other nested executables (npm/npx are scripts; just sign anything binary).
   find "${APP}/Contents/Resources/node" -type f -perm +111 ! -path "*/node" -exec \
-    codesign --force --options runtime --sign "${SIGN_IDENTITY}" {} \; 2>/dev/null || true
-  if [[ -d "${APP}/Contents/Frameworks/Sparkle.framework" ]]; then
-    codesign --force --options runtime --sign "${SIGN_IDENTITY}" \
-      "${APP}/Contents/Frameworks/Sparkle.framework"
-  fi
-  # Sign the .app bundle WITHOUT --deep so we don't clobber the special
-  # entitlements we just put on Node. Sign frameworks and main executable
-  # explicitly above.
-  codesign --force --options runtime --sign "${SIGN_IDENTITY}" \
+    codesign "${CS_FLAGS[@]}" {} \; 2>/dev/null || true
+
+  # Sign the main executable + bundle WITHOUT --deep so we don't clobber
+  # the special entitlements we just put on Node. Sign explicitly above.
+  codesign --force --options runtime --timestamp --sign "${SIGN_IDENTITY}" \
     --entitlements "${MAC_DIR}/Resources/entitlements.plist" \
     "${APP}/Contents/MacOS/OpenAGI"
-  codesign --force --options runtime --sign "${SIGN_IDENTITY}" \
+  codesign --force --options runtime --timestamp --sign "${SIGN_IDENTITY}" \
     --entitlements "${MAC_DIR}/Resources/entitlements.plist" "${APP}"
   codesign --verify --strict --verbose=2 "${APP}" 2>&1 | tail -3
 else
