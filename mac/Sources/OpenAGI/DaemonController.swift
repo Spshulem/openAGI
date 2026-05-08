@@ -111,6 +111,27 @@ final class DaemonController {
     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
   }
 
+  /// POST /tick to the daemon. Used after wake-from-sleep so any cron jobs
+  /// that were due during the sleep window run within ~1s instead of
+  /// waiting up to OPENAGI_TICKER_MS for the resumed setInterval to fire.
+  @MainActor
+  func kickTick() async {
+    guard let url = URL(string: "http://127.0.0.1:43210/tick") else { return }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = "{}".data(using: .utf8)
+    if let token = AppState.shared.authToken(), !token.isEmpty {
+      req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+    req.timeoutInterval = 3.0
+    do {
+      _ = try await URLSession.shared.data(for: req)
+    } catch {
+      NSLog("OpenAGI kickTick: \(error.localizedDescription)")
+    }
+  }
+
   /// Probe http://127.0.0.1:43210/health synchronously. Returns true only when
   /// it answers with `ok: true` so we don't shadow some unrelated service on
   /// the same port — we'd rather fail loudly than collide with it silently.

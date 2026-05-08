@@ -53,6 +53,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("replay", (data) => broadcast("replay", data));
   events.on("skill-candidate", (data) => broadcast("skill-candidate", data));
   events.on("miner-result", (data) => broadcast("miner-result", data));
+  events.on("cron-catchup", (data) => broadcast("cron-catchup", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
@@ -2334,6 +2335,20 @@ evt.addEventListener("skill-candidate", (e) => {
         body: (data.name || "untitled") + (data.description ? " — " + data.description : "")
       });
     }
+  } catch {}
+});
+
+// Cron catch-up: jobs that should've run during a sleep window are
+// firing now. Surface a toast so the user knows the system noticed.
+evt.addEventListener("cron-catchup", (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    const n = data.count ?? 0;
+    const names = (data.jobs ?? []).slice(0, 3).map((j) => j.name).join(", ");
+    const extra = (data.jobs?.length ?? 0) > 3 ? " (+" + (data.jobs.length - 3) + " more)" : "";
+    const word = n === 1 ? "job" : "jobs";
+    const tail = names ? ": " + names : "";
+    showToast("✓ Caught up " + n + " missed cron " + word + tail + extra, true);
   } catch {}
 });
 

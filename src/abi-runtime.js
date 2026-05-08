@@ -290,6 +290,25 @@ export class AbiRuntime {
 
   async tick(now = new Date()) {
     this.memory.decay(now);
+
+    // If any due jobs are >5min overdue, this tick is catching up after
+    // a sleep / suspended-process window. Emit a 'cron-catchup' event so
+    // the dashboard can show a "✓ Caught up N missed jobs" toast and the
+    // user can see the system is doing the right thing rather than
+    // wondering why scheduled prompts didn't fire on time.
+    const due = this.cron.dueJobs(now);
+    const overdue = due.filter((j) => {
+      const next = new Date(j.nextRunAt).getTime();
+      return next > 0 && (now.getTime() - next) > 5 * 60 * 1000;
+    });
+    if (overdue.length > 0) {
+      this.events?.emit?.("cron-catchup", {
+        at: nowIso(),
+        count: overdue.length,
+        jobs: overdue.map((j) => ({ id: j.id, name: j.name, lateBySeconds: Math.round((now.getTime() - new Date(j.nextRunAt).getTime()) / 1000) }))
+      });
+    }
+
     return this.cron.runDue(async (job) => {
       if (job.task === "daily-adaptation-review") {
         return this.processSignal({
