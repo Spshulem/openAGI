@@ -52,6 +52,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("tunnel", (data) => broadcast("tunnel", data));
   events.on("replay", (data) => broadcast("replay", data));
   events.on("skill-candidate", (data) => broadcast("skill-candidate", data));
+  events.on("miner-result", (data) => broadcast("miner-result", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
@@ -480,8 +481,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, runtime.skillReplay.list({ status: url.searchParams.get("status") }));
       }
       if (method === "POST" && pathname === "/skills/mine") {
-        try { return sendJson(res, 200, await runtime.patternMiner.mine()); }
-        catch (error) { return sendJson(res, 500, { error: error.message }); }
+        // "Mine now" runs both miners so the user gets both activity-pattern
+        // and chat-session candidates without having to know which is which.
+        try {
+          const [patternResult, sessionResult] = await Promise.all([
+            runtime.patternMiner.mine().catch((err) => ({ error: err.message })),
+            runtime.sessionMiner.mine().catch((err) => ({ error: err.message }))
+          ]);
+          runtime.events?.emit?.("miner-result", { source: "pattern-miner", manual: true, ...patternResult });
+          runtime.events?.emit?.("miner-result", { source: "session-miner", manual: true, ...sessionResult });
+          return sendJson(res, 200, { pattern: patternResult, session: sessionResult });
+        } catch (error) { return sendJson(res, 500, { error: error.message }); }
       }
       if (method === "POST" && pathname.match(/^\/skills\/suggested\/[^/]+\/accept$/)) {
         const id = decodeURIComponent(pathname.split("/")[3]);

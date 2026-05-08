@@ -203,6 +203,90 @@ I think the system will figure this part out.
 
 ---
 
+## The system, in pictures
+
+### The whole pipeline
+
+Every signal that enters the runtime travels this loop. Each box is a real file in `src/`.
+
+```mermaid
+flowchart TD
+    Integrations --> Signals
+    Signals --> Workflows
+    Workflows --> DAS["Directional Adaptive Scrutiny"]
+    DAS --> Agent["Agent Layer<br/>Decision Making"]
+    Agent --> Memory["Multi-Tiered Memory"]
+    Memory --> CustomContext["Custom Context"]
+    Memory --> Propagation
+    CustomContext --> Outputs
+    Propagation --> Outputs
+    Outputs --> Feedback["Feedback Loop"]
+    Feedback -.cycle.-> Integrations
+    Feedback -.-> Signals
+    Feedback -.-> Memory
+```
+
+### How a decision gets made
+
+Each decision passes through scrutiny + organizational feedback. In OpenAGI, the "Cultural / Organizational" layer runs **asynchronously** — outcomes are recorded, and a weekly LLM-as-judge nudges scrutiny weights based on what worked. (A future iteration could make this synchronous, gating each decision on org policy.)
+
+```mermaid
+flowchart TD
+    Env["Business Environment<br/>Market trends · Customer feedback · Competitors"]
+    Env --> Agent["Agent (Decision Making)"]
+    Agent --> DAS["Directional Adaptive Scrutiny"]
+    DAS --> Cultural["Cultural Feedback &<br/>Organizational Scrutiny<br/>Policies · Goals · Team Input"]
+    Cultural --> Decision["Decision or Action Output"]
+    Decision --> Update["Memory Update Process"]
+    Update --> Mem["Update Memory<br/>Short / Medium / Long-Term"]
+    Update --> Loop["Feedback Loop<br/>(data input)"]
+    Loop --> Future(["Agent — Future Decisions"])
+    Loop -.-> Cultural
+    Loop -.-> Agent
+```
+
+### How memory tiers are accessed
+
+Every retrieve hits all three tiers in parallel and the memory manager handles decay, promotion, and condensation in the background.
+
+```mermaid
+flowchart TD
+    Input["Business Data Input"] --> Agent["Agent (Decision-Making)"]
+    Agent --> Access["Access Memory Tiers"]
+    Access --> Short["Short-Term Memory"]
+    Access --> Medium["Medium-Term Memory"]
+    Access --> Long["Long-Term Memory<br/>(Lava)"]
+    Short --> MemMgr["Memory Management<br/>(decay · promote · condense)"]
+    Medium --> MemMgr
+    Long --> MemMgr
+    MemMgr -.-> Agent
+    MemMgr --> Decision["Decision or Action Output"]
+    Decision --> Updates["Updates to Environment / Business Data"]
+    Updates --> FB(["Feedback Loop"])
+    FB --> Input
+```
+
+### When a specialist gets spawned
+
+Propagation only fires when the system both fails to find existing knowledge **and** judges the task as repetitive or novel-but-high-risk. Multiplication is cancer; division is the goal. Thresholds (configurable in `propagation-controller.js`): repetition ≥ 0.72, or risk × novelty ≥ 0.62.
+
+```mermaid
+flowchart TD
+    Start([Start]) --> Receive["Agent Receives New Task"]
+    Receive --> Check{"Knowledge in<br/>Short / Medium Memory?"}
+    Check -->|Yes| Use["Use Existing Knowledge<br/>to Perform Task"]
+    Use --> EndProc([End of Process])
+    Check -->|No| Nature{"Repetitive?<br/>Novel & High Risk?"}
+    Nature -->|Yes| Spawn["Create Specialized<br/>Sub-Agent (Propagation)"]
+    Spawn --> Perform["Perform Task with<br/>Specialized Sub-Agent"]
+    Perform --> Update["Update Memory System<br/>with New Knowledge"]
+    Nature -->|No| Store["Store in Medium-Term Memory<br/>for Future Reference"]
+    Store --> Update
+    Update --> Receive
+```
+
+---
+
 ## Why this matters for OpenAGI
 
 These three concepts are why OpenAGI exists, and why the codebase is structured the way it is:

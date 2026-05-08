@@ -20,10 +20,11 @@ import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 
 const DEFAULT_LOOKBACK_DAYS = 21;
-const MIN_OCCURRENCES = 3;
+const MIN_OCCURRENCES = 2;
 const MIN_KEYWORDS = 2;
 const MAX_USER_MESSAGES = 800;
 const SUGGESTED_DIR = "skills-suggested";
+const JACCARD_OVERLAP_THRESHOLD = 0.5;
 
 const STOP_WORDS = new Set([
   "a","an","and","the","is","are","was","were","be","been","being","of","to","in","on","at",
@@ -158,22 +159,60 @@ export class SessionMiner {
   }
 }
 
+// Cluster messages by Jaccard similarity of their keyword sets. Two messages
+// land in the same cluster when their token sets overlap by ≥50% — looser
+// than the prior exact-fingerprint match, so paraphrased restatements of
+// the same intent ("fix dashboard 500" / "dashboard error 500" / "the
+// dashboard is broken with a 500") cluster together.
 function clusterByKeywords(messages, minCount) {
-  const groups = new Map();
+  const clusters = [];
   for (const msg of messages) {
     const tokens = tokenize(msg.text);
     if (tokens.length < MIN_KEYWORDS) continue;
-    const fingerprint = tokens.slice().sort().join(" ");
-    if (!groups.has(fingerprint)) {
-      groups.set(fingerprint, { keywords: tokens, fingerprint, count: 0, samples: [] });
+    const tokenSet = new Set(tokens);
+    let best = null;
+    let bestScore = 0;
+    for (const cluster of clusters) {
+      const score = jaccardSimilarity(tokenSet, cluster.keywordSet);
+      if (score >= JACCARD_OVERLAP_THRESHOLD && score > bestScore) {
+        best = cluster;
+        bestScore = score;
+      }
     }
-    const g = groups.get(fingerprint);
-    g.count += 1;
-    if (g.samples.length < 3) g.samples.push({ sessionId: msg.sessionId, text: msg.text, at: msg.at });
+    if (best) {
+      best.count += 1;
+      if (best.samples.length < 3) best.samples.push({ sessionId: msg.sessionId, text: msg.text, at: msg.at });
+      for (const t of tokens) {
+        best.keywordSet.add(t);
+        best.keywordCounts.set(t, (best.keywordCounts.get(t) ?? 0) + 1);
+      }
+    } else {
+      clusters.push({
+        keywordSet: tokenSet,
+        keywordCounts: new Map(tokens.map((t) => [t, 1])),
+        count: 1,
+        samples: [{ sessionId: msg.sessionId, text: msg.text, at: msg.at }]
+      });
+    }
   }
-  return [...groups.values()]
-    .filter((g) => g.count >= minCount)
+  // Recompute each cluster's representative keywords (top-6 most common)
+  // so the LLM proposal sees the dominant terms, not whatever the first
+  // message happened to use.
+  for (const c of clusters) {
+    const sorted = [...c.keywordCounts.entries()].sort((a, b) => b[1] - a[1]);
+    c.keywords = sorted.slice(0, 6).map(([k]) => k);
+    c.fingerprint = c.keywords.slice().sort().join(" ");
+  }
+  return clusters
+    .filter((c) => c.count >= minCount)
     .sort((a, b) => b.count - a.count);
+}
+
+function jaccardSimilarity(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const x of a) if (b.has(x)) intersection += 1;
+  return intersection / (a.size + b.size - intersection);
 }
 
 function tokenize(text) {

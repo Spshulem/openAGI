@@ -179,6 +179,15 @@ export class AbiRuntime {
         task: "session-mine",
         dailyAt: "03:30"
       });
+      // Lighter hourly pass so new patterns surface within ~hour of forming
+      // rather than waiting until the nightly run.
+      this.cron.addJob({
+        id: "hourly-session-mine",
+        name: "Hourly chat-session skill miner",
+        enabled: true,
+        task: "session-mine",
+        intervalMs: 60 * 60 * 1000
+      });
       registerCoreTools(this.tools, this);
     }
 
@@ -322,10 +331,14 @@ export class AbiRuntime {
         return this.scrutinyJudge.judge();
       }
       if (job.task === "pattern-mine") {
-        return this.patternMiner.mine({ now });
+        const result = await this.patternMiner.mine({ now });
+        this.events?.emit?.("miner-result", { source: "pattern-miner", at: nowIso(), ...result });
+        return result;
       }
       if (job.task === "session-mine") {
-        return this.sessionMiner.mine({ now });
+        const result = await this.sessionMiner.mine({ now });
+        this.events?.emit?.("miner-result", { source: "session-miner", at: nowIso(), ...result });
+        return result;
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);
