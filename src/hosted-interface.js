@@ -501,12 +501,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             },
             {
               id: "buildbetter",
-              name: "BuildBetter",
+              name: "BuildBetter (direct API)",
               kind: "task-source",
               configured: Boolean(runtime.buildBetterTaskSource?.isConfigured?.()),
               envKeys: ["BUILDBETTER_API_KEY", "BUILDBETTER_USER_EMAIL", "BUILDBETTER_USER_NAME"],
               lastSyncedAt: runtime.buildBetterTaskSource?.lastSyncedAt ?? null,
-              description: "Action items + commitments from recent calls become tasks."
+              description: "Action items from your recent calls auto-flow into tasks. Polls every 15 min. Alternative: connect the BuildBetter MCP from the MCP tab for on-demand search instead of always-on polling."
             },
             {
               id: "rize",
@@ -518,11 +518,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             },
             {
               id: "inbox",
-              name: "Inbox folder",
+              name: "Inbox folder (reMarkable / Obsidian / file drop)",
               kind: "task-source",
               configured: true,
               envKeys: [],
-              description: "Always on. Drop .md/.txt files into ~/Library/Application Support/OpenAGI/inbox/ for tasks."
+              description: "Drop any .md or .txt file into ~/Library/Application Support/OpenAGI/inbox/ and OpenAGI parses task lines (- [ ] foo, TODO: foo) into your task list. For reMarkable: point your reMarkable Cloud → Dropbox sync at this folder. For Obsidian/Bear: export there. Files move to /processed after parsing."
             }
           ],
           channels: [
@@ -1622,14 +1622,42 @@ function renderSkillDetail(skill) {
 
 async function refreshMcp() {
   const servers = await fetchJson("/mcp");
-  sidebarList.innerHTML = servers.length === 0 ? '<li class="empty">No MCP servers registered</li>' : "";
+  sidebarList.innerHTML = "";
+  // Always-visible Register button at the top of the MCP sidebar so the
+  // user has an unambiguous entry point — separate from the magical
+  // tab-aware newBtn at the very top of the sidebar.
+  const addItem = document.createElement("li");
+  addItem.style.cssText = "border-bottom:1px solid var(--line); padding:8px 10px; cursor:pointer;";
+  addItem.innerHTML = '<div class="title" style="color:var(--accent);">+ Register new MCP</div><div class="preview" style="font-size:11px;">stdio · http+bearer · http+oauth</div>';
+  addItem.addEventListener("click", () => openMcpComposer());
+  sidebarList.appendChild(addItem);
+
+  if (servers.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "empty";
+    empty.textContent = "No MCP servers registered yet — click + Register above.";
+    sidebarList.appendChild(empty);
+  }
   for (const s of servers) {
     const li = document.createElement("li");
     li.innerHTML = \`<div class="title">\${escapeHtml(s.name)} \${s.connected ? '<span class="badge ok">live</span>' : '<span class="badge">idle</span>'}</div><div class="preview">\${(s.tools ?? []).join(", ") || "—"}</div>\`;
     li.addEventListener("click", () => renderMcpDetail(s));
     sidebarList.appendChild(li);
   }
-  if (servers.length > 0) renderMcpDetail(servers[0]);
+  // Show a hero "Register your first MCP" CTA in the main pane when empty.
+  if (servers.length === 0) {
+    main.innerHTML = \`
+      <div class="pane">
+        <h2>No MCP servers yet</h2>
+        <p>MCP (Model Context Protocol) servers give the agent extra tools — connect Linear, GitHub, your filesystem, etc.</p>
+        <p>Click the <strong>+ Register new MCP</strong> button on the left, or use a known catalog suggestion the proactive observer surfaces.</p>
+        <button id="emptyRegBtn" style="margin-top:12px;">+ Register new MCP</button>
+      </div>
+    \`;
+    document.getElementById("emptyRegBtn")?.addEventListener("click", () => openMcpComposer());
+  } else {
+    renderMcpDetail(servers[0]);
+  }
 }
 
 function renderMcpDetail(server) {
@@ -2334,10 +2362,39 @@ async function renderTasks() {
     return stats[q][b] ?? 0;
   };
 
+  // Sources sub-section: who's feeding tasks into this list.
+  const sourcesData = await fetchJson("/integrations/status").catch(() => ({ sources: [] }));
+  const taskSources = (sourcesData.sources ?? []).filter((s) => s.kind === "task-source");
+  const sourcesPanel = \`
+    <details style="margin-bottom:14px;" \${taskSources.every((s) => s.configured) ? "" : "open"}>
+      <summary style="cursor:pointer; padding:6px 8px; border:1px solid var(--line); border-radius:6px;">
+        Task sources — \${taskSources.filter((s) => s.configured).length}/\${taskSources.length} configured
+      </summary>
+      <div class="grid two" style="gap:10px; margin-top:10px;">
+        \${taskSources.map((s) => \`
+          <div class="card" style="padding:10px 12px;">
+            <div class="row between" style="align-items:flex-start;">
+              <div>
+                <div class="name">\${escapeHtml(s.name)}</div>
+                <div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(s.description)}</div>
+              </div>
+              \${s.configured ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>'}
+            </div>
+            \${s.envKeys?.length > 0 ? \`<div class="muted" style="font-size:11px; margin-top:6px;">env: <code>\${s.envKeys.map(escapeHtml).join("</code> · <code>")}</code></div>\` : ""}
+            \${s.lastSyncedAt ? \`<div class="muted" style="font-size:11px; margin-top:2px;">last sync: \${escapeHtml(new Date(s.lastSyncedAt).toLocaleString())}</div>\` : ""}
+          </div>
+        \`).join("")}
+      </div>
+      <p class="muted" style="font-size:11px; margin-top:10px;">Set credentials at <a href="/setup">/setup</a> step 5, or in <code>.openagi/.env</code>. Or configure on-demand MCPs (Linear, BuildBetter, Notion, etc.) from the <a href="/?tab=mcp">MCP tab</a>.</p>
+    </details>
+  \`;
+
   main.innerHTML = \`
     <div class="pane">
       <h2>Tasks</h2>
       <p class="muted">Two queues — user todo (what you should do) and agent queue (what OpenAGI is working on).</p>
+
+      \${sourcesPanel}
 
       <form class="form" id="taskForm" style="margin:12px 0 18px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
         <input name="title" placeholder="Add a task..." required style="flex:2; min-width:240px;">

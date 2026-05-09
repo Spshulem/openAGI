@@ -72,6 +72,21 @@ export const MCP_CATALOG = [
     }
   },
   {
+    id: "rize",
+    name: "Rize.io",
+    description: "Time-tracking + activity API. On-demand 'what was I working on yesterday?' / project-time-aggregation queries via MCP.",
+    matches: {
+      bundleIds: ["io.rize"],
+      hostnames: ["rize.io", "my.rize.io"],
+      keywords: ["rize", "rize.io"]
+    },
+    register: {
+      url: "https://mcp.rize.io/sse",
+      transport: "http",
+      auth: "oauth"
+    }
+  },
+  {
     id: "buildbetter",
     name: "BuildBetter",
     description: "Search calls, read transcripts, list action items / commitments / signals from your BuildBetter workspace. Useful when you want on-demand call recall — pair with the BuildBetter direct API source for automatic action-item ingestion into tasks.",
