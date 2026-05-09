@@ -1196,6 +1196,7 @@ function renderApp() {
     <nav id="nav">
       <button data-tab="chat" class="active">Chat</button>
       <button data-tab="tasks">Tasks</button>
+      <button data-tab="suggestions">Suggestions</button>
       <button data-tab="memory">Memory</button>
       <button data-tab="cron">Cron</button>
       <button data-tab="skills">Skills</button>
@@ -1430,6 +1431,9 @@ async function switchTab(tab) {
   } else if (tab === "integrations") {
     showSidebar(false);
     await renderIntegrations();
+  } else if (tab === "suggestions") {
+    showSidebar(false);
+    await renderSuggestions();
   }
   renderTab();
 }
@@ -2419,6 +2423,90 @@ async function renderHealth() {
   \`;
 }
 
+async function renderSuggestions() {
+  // Live view of everything the proactive observer has proposed and is
+  // waiting on the user to accept/reject. Tasks → Tasks tab, MCPs →
+  // auto-register, automations → notes, knowledge → just FYI.
+  const list = await fetchJson("/proactive/suggestions?status=pending").catch(() => []);
+  if (!Array.isArray(list) || list.length === 0) {
+    main.innerHTML = \`
+      <div class="pane">
+        <h2>Suggestions</h2>
+        <p class="muted">Nothing new to surface right now. The proactive observer runs every 10 minutes and proposes one concrete next thing — a task, a skill, an MCP to connect, or a small automation — when it sees something worth saying.</p>
+        <p class="muted">If you want to force a run now: <code>POST /proactive/observe</code>.</p>
+      </div>
+    \`;
+    return;
+  }
+
+  const card = (s) => {
+    const icon = ({ task: "📋", skill: "✨", mcp: "🔌", automation: "⚙️", knowledge: "💡" })[s.category] ?? "🔔";
+    const proposedAt = s.proposedAt ? new Date(s.proposedAt).toLocaleString() : "";
+    const meta = [];
+    if (s.category === "task") {
+      meta.push(\`queue: \${s.taskQueue ?? "user"}\`);
+      meta.push(\`bucket: \${s.taskBucket ?? "today"}\`);
+    } else if (s.category === "mcp" && s.mcpId) {
+      meta.push(\`catalog id: \${s.mcpId}\`);
+    }
+    return \`
+      <div class="card" style="padding:14px; margin-bottom:10px;" data-suggestion-id="\${s.id}">
+        <div class="row between" style="align-items:flex-start; gap:8px;">
+          <div style="flex:1; min-width:0;">
+            <div style="display:flex; gap:8px; align-items:center;">
+              <span style="font-size:18px;">\${icon}</span>
+              <span style="font-weight:600;">\${escapeHtml(s.title || "(untitled)")}</span>
+              <span class="badge">\${escapeHtml(s.category || "?")}</span>
+            </div>
+            <div class="muted" style="margin-top:6px; font-size:12px;">\${escapeHtml(s.rationale || "")}</div>
+            \${meta.length > 0 ? \`<div class="muted" style="margin-top:4px; font-size:11px;">\${meta.map(escapeHtml).join(" · ")}</div>\` : ""}
+            \${proposedAt ? \`<div class="muted" style="margin-top:4px; font-size:11px;">proposed \${escapeHtml(proposedAt)}</div>\` : ""}
+          </div>
+        </div>
+        <div class="row" style="gap:8px; margin-top:10px;">
+          <button data-action="accept">Accept</button>
+          <button data-action="dismiss" class="secondary">Dismiss</button>
+          <button data-action="reject" class="secondary">Reject</button>
+        </div>
+      </div>
+    \`;
+  };
+
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>Suggestions <span class="badge">\${list.length}</span></h2>
+      <p class="muted">Proactive observer proposed these from your recent on-screen activity. Accept routes to the right place — tasks land in the Tasks tab, MCPs auto-register, skills become drafts.</p>
+      \${list.map(card).join("")}
+    </div>
+  \`;
+
+  document.querySelectorAll("[data-suggestion-id]").forEach((el) => {
+    const id = el.dataset.suggestionId;
+    el.querySelectorAll("[data-action]").forEach((b) => {
+      b.addEventListener("click", async () => {
+        const action = b.dataset.action;
+        try {
+          const res = await postJson(\`/proactive/suggestions/\${id}/\${action}\`, {});
+          if (action === "accept" && res.taskId) {
+            showToast("✓ Task added — opening Tasks", true);
+            setTimeout(() => switchTab("tasks"), 600);
+          } else if (action === "accept" && res.registered) {
+            showToast(\`✓ MCP \${res.registered} connected — opening MCP tab\`, true);
+            setTimeout(() => switchTab("mcp"), 600);
+          } else if (action === "accept") {
+            showToast("✓ Accepted", true);
+          } else {
+            showToast(\`Suggestion \${action}d\`, true);
+          }
+          await renderSuggestions();
+        } catch (err) {
+          showToast("Action failed: " + err.message, false);
+        }
+      });
+    });
+  });
+}
+
 async function renderIntegrations() {
   const data = await fetchJson("/integrations/status").catch(() => ({ integrations: [] }));
   const integrations = data.integrations ?? [];
@@ -2922,7 +3010,17 @@ setInterval(refreshHealth, 5000);
 refreshHealth();
 setInterval(refreshAmbientBadge, 15000);
 refreshAmbientBadge();
-switchTab("chat");
+
+// Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
+// to specific tabs and we need to land on them. Defaults to chat.
+const VALID_TABS = new Set(["chat","tasks","memory","cron","skills","mcp","integrations","agents","channels","budget","outcomes","scrutiny","vocab","health","activity","suggestions"]);
+const initialTab = (() => {
+  try {
+    const t = new URLSearchParams(window.location.search).get("tab");
+    return t && VALID_TABS.has(t) ? t : "chat";
+  } catch { return "chat"; }
+})();
+switchTab(initialTab);
 </script>
 </body>
 </html>`;

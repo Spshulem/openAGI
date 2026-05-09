@@ -226,21 +226,25 @@ final class AppState: ObservableObject {
       notify(title: title, body: body, path: "/?tab=tasks")
     }
     if event == "proactive-suggestion" {
-      // Proactive observer noticed something — fire a richer notification
-      // since these are real-time, not nightly batches. Tap → dashboard.
+      // Proactive observer noticed something. Notification body shows
+      // the rationale; tap → /?tab=suggestions where the user can
+      // accept/dismiss/reject. Suggestions tab routes accept actions
+      // to the right destination (tasks → Tasks tab, mcp → MCP tab).
       let parsed = parseSkillCandidate(data)
       let category = parseField(data, "category") ?? "fyi"
       let prefix: String = {
         switch category {
-        case "mcp": return "✨ Connect"
+        case "task": return "📋 Task idea"
+        case "mcp": return "🔌 Connect"
         case "skill": return "✨ Skill idea"
-        case "automation": return "✨ Auto"
-        default: return "✨ FYI"
+        case "automation": return "⚙️ Auto"
+        case "knowledge": return "💡 FYI"
+        default: return "🔔"
         }
       }()
       let title = "\(prefix): \(parsed.name ?? "OpenAGI noticed something")"
-      let body = parseField(data, "rationale") ?? parsed.description ?? "Open the dashboard to review."
-      notify(title: title, body: body, path: "/?tab=skills")
+      let body = parseField(data, "rationale") ?? parsed.description ?? "Open Suggestions to review."
+      notify(title: title, body: body, path: "/?tab=suggestions")
     }
   }
 
