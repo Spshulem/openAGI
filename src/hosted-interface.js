@@ -55,6 +55,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("miner-result", (data) => broadcast("miner-result", data));
   events.on("cron-catchup", (data) => broadcast("cron-catchup", data));
   events.on("proactive-suggestion", (data) => broadcast("proactive-suggestion", data));
+  events.on("task-updated", (data) => broadcast("task-updated", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
@@ -481,6 +482,43 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "GET" && pathname === "/skills/replay-jobs") {
         return sendJson(res, 200, runtime.skillReplay.list({ status: url.searchParams.get("status") }));
+      }
+      if (method === "GET" && pathname === "/tasks") {
+        if (!runtime.tasks?.list) return sendJson(res, 503, { error: "no task store" });
+        const queue = url.searchParams.get("queue") || undefined;
+        const bucket = url.searchParams.get("bucket") || undefined;
+        const status = url.searchParams.get("status") || undefined;
+        const limit = url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : undefined;
+        return sendJson(res, 200, {
+          tasks: runtime.tasks.list({ queue, bucket, status, limit }),
+          stats: runtime.tasks.stats()
+        });
+      }
+      if (method === "POST" && pathname === "/tasks") {
+        if (!runtime.tasks?.add) return sendJson(res, 503, { error: "no task store" });
+        const body = await readJson(req);
+        try {
+          const task = runtime.tasks.add(body, { source: body.source ?? "manual", queue: body.queue ?? "user" });
+          return sendJson(res, 200, task);
+        } catch (error) { return sendJson(res, 400, { error: error.message }); }
+      }
+      if (method === "PATCH" && pathname.match(/^\/tasks\/[^/]+$/)) {
+        if (!runtime.tasks?.update) return sendJson(res, 503, { error: "no task store" });
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const body = await readJson(req);
+        const task = runtime.tasks.update(id, body);
+        return task ? sendJson(res, 200, task) : sendJson(res, 404, { error: "unknown task" });
+      }
+      if (method === "POST" && pathname.match(/^\/tasks\/[^/]+\/complete$/)) {
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const body = await readJson(req).catch(() => ({}));
+        const task = runtime.tasks.complete(id, body.completedVia ?? "manual");
+        return task ? sendJson(res, 200, task) : sendJson(res, 404, { error: "unknown task" });
+      }
+      if (method === "DELETE" && pathname.match(/^\/tasks\/[^/]+$/)) {
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const ok = runtime.tasks.remove(id);
+        return sendJson(res, ok ? 200 : 404, { ok, id });
       }
       if (method === "GET" && pathname === "/proactive/suggestions") {
         if (!runtime.proactiveObserver?.list) return sendJson(res, 503, { error: "no observer" });
@@ -952,6 +990,7 @@ function renderApp() {
     <span id="status" class="status">connecting…</span>
     <nav id="nav">
       <button data-tab="chat" class="active">Chat</button>
+      <button data-tab="tasks">Tasks</button>
       <button data-tab="memory">Memory</button>
       <button data-tab="cron">Cron</button>
       <button data-tab="skills">Skills</button>
@@ -1179,6 +1218,9 @@ async function switchTab(tab) {
   } else if (tab === "activity") {
     showSidebar(false);
     await renderActivity();
+  } else if (tab === "tasks") {
+    showSidebar(false);
+    await renderTasks();
   }
   renderTab();
 }
@@ -2127,6 +2169,107 @@ async function renderHealth() {
   \`;
 }
 
+async function renderTasks() {
+  state.taskFilter = state.taskFilter || { queue: "user", bucket: "all" };
+  const data = await fetchJson("/tasks?limit=200").catch(() => ({ tasks: [], stats: {} }));
+  const tasks = data.tasks ?? [];
+  const stats = data.stats ?? {};
+  const filterQ = state.taskFilter.queue;
+  const filterB = state.taskFilter.bucket;
+  const filtered = tasks.filter((t) => {
+    if (filterQ !== "all" && t.queue !== filterQ) return false;
+    if (filterB !== "all" && t.bucket !== filterB) return false;
+    return true;
+  });
+
+  const bucketCount = (q, b) => {
+    if (!stats[q]) return 0;
+    return stats[q][b] ?? 0;
+  };
+
+  main.innerHTML = \`
+    <div class="pane">
+      <h2>Tasks</h2>
+      <p class="muted">Two queues — user todo (what you should do) and agent queue (what OpenAGI is working on).</p>
+
+      <form class="form" id="taskForm" style="margin:12px 0 18px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+        <input name="title" placeholder="Add a task..." required style="flex:2; min-width:240px;">
+        <select name="queue" style="flex:0 0 auto;">
+          <option value="user">user</option>
+          <option value="agent">agent</option>
+        </select>
+        <select name="bucket" style="flex:0 0 auto;">
+          <option value="today">today</option>
+          <option value="this_week" selected>this week</option>
+          <option value="someday">someday</option>
+        </select>
+        <button type="submit">+ Add</button>
+      </form>
+
+      <div class="row" style="gap:6px; flex-wrap:wrap; margin-bottom:12px;">
+        <span class="muted" style="font-size:12px; align-self:center; margin-right:8px;">queue:</span>
+        \${["all", "user", "agent"].map((q) => \`<button class="chip \${filterQ === q ? "on" : ""}" data-qf="\${q}">\${q}\${q !== "all" ? \` (\${(stats[q]?.total ?? 0)})\` : ""}</button>\`).join("")}
+        <span class="muted" style="font-size:12px; align-self:center; margin:0 8px;">bucket:</span>
+        \${["all", "today", "this_week", "someday", "done"].map((b) => \`<button class="chip \${filterB === b ? "on" : ""}" data-bf="\${b}">\${b.replace("_", " ")}\${b !== "all" && filterQ !== "all" ? \` (\${bucketCount(filterQ, b)})\` : ""}</button>\`).join("")}
+      </div>
+
+      \${filtered.length === 0 ? \`<div class="empty">No tasks. Add one above, or just say things like "remind me to X" in chat — I'll auto-create them.</div>\` : ""}
+
+      <ul class="taskList" style="list-style:none; padding:0; margin:0;">
+        \${filtered.map((t) => \`
+          <li data-task-id="\${t.id}" class="task" style="display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-bottom:1px solid var(--line);">
+            <input type="checkbox" \${t.status === "completed" ? "checked" : ""} data-action="toggle" style="margin-top:3px;">
+            <div style="flex:1; min-width:0;">
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <span class="title" style="\${t.status === "completed" ? "text-decoration:line-through; color:var(--muted);" : ""}">\${escapeHtml(t.title)}</span>
+                <span class="badge" style="font-size:10px;">\${t.queue}</span>
+                <span class="badge" style="font-size:10px;">\${t.bucket.replace("_", " ")}</span>
+                \${t.priority >= 70 ? \`<span class="badge err" style="font-size:10px;">P\${t.priority}</span>\` : ""}
+                \${t.source && t.source !== "manual" ? \`<span class="badge" style="font-size:10px;">\${escapeHtml(t.source)}</span>\` : ""}
+              </div>
+              \${t.description ? \`<div class="muted" style="font-size:12px; margin-top:4px;">\${escapeHtml(t.description.slice(0, 240))}</div>\` : ""}
+            </div>
+            <button data-action="delete" class="secondary" style="align-self:flex-start; font-size:11px; padding:2px 8px;">×</button>
+          </li>
+        \`).join("")}
+      </ul>
+    </div>
+  \`;
+
+  $("taskForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const body = { title: fd.get("title"), queue: fd.get("queue") || "user", bucket: fd.get("bucket") || "today" };
+    try {
+      await postJson("/tasks", body);
+      e.target.reset();
+      await renderTasks();
+    } catch (err) {
+      showToast("Add task failed: " + err.message, false);
+    }
+  });
+
+  document.querySelectorAll("[data-qf]").forEach((b) => b.addEventListener("click", () => { state.taskFilter.queue = b.dataset.qf; renderTasks(); }));
+  document.querySelectorAll("[data-bf]").forEach((b) => b.addEventListener("click", () => { state.taskFilter.bucket = b.dataset.bf; renderTasks(); }));
+
+  document.querySelectorAll(".task").forEach((el) => {
+    const id = el.dataset.taskId;
+    el.querySelector('[data-action="toggle"]')?.addEventListener("change", async (e) => {
+      if (e.target.checked) {
+        await fetch(\`/tasks/\${id}/complete\`, { method: "POST", headers: { "content-type": "application/json" }, credentials: "include", body: "{}" });
+      } else {
+        await fetch(\`/tasks/\${id}\`, { method: "PATCH", headers: { "content-type": "application/json" }, credentials: "include", body: JSON.stringify({ status: "pending", bucket: "today" }) });
+      }
+      await renderTasks();
+    });
+    el.querySelector('[data-action="delete"]')?.addEventListener("click", async () => {
+      if (!confirm("Delete this task?")) return;
+      await fetch(\`/tasks/\${id}\`, { method: "DELETE", credentials: "include" });
+      await renderTasks();
+    });
+  });
+}
+
 async function renderActivity() {
   const stats = await fetchJson("/observations/stats").catch(() => ({}));
   state.activityFilter = state.activityFilter || { query: "" };
@@ -2387,6 +2530,11 @@ evt.addEventListener("proactive-suggestion", (e) => {
       new Notification("OpenAGI noticed something", { body });
     }
   } catch {}
+});
+
+// Tasks updated — refresh tasks tab if visible, otherwise quiet.
+evt.addEventListener("task-updated", () => {
+  if (state.tab === "tasks") renderTasks();
 });
 
 // Cron catch-up: jobs that should've run during a sleep window are

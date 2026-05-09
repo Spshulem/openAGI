@@ -464,6 +464,109 @@ export function registerCoreTools(registry, runtime) {
     }
   });
 
+  // ─── Tasks (user todo list + agent queue) ──────────────────────────────
+
+  registry.register({
+    name: "add_task",
+    description: "Add a task to the user's todo list (default) or the agent's own queue. Use queue='agent' when YOU are committing to do this task yourself; use queue='user' when the human should do it. Bucket buckets: today, this_week, someday, done.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short title (max 200 chars)." },
+        description: { type: "string", description: "Optional longer description / notes." },
+        queue: { type: "string", enum: ["user", "agent"], description: "Default 'user'. Use 'agent' to enqueue work for yourself." },
+        bucket: { type: "string", enum: ["today", "this_week", "someday", "done"], description: "Default 'today'." },
+        priority: { type: "integer", minimum: 0, maximum: 100, description: "0-100, higher is more urgent. Default 50." },
+        category: { type: "string" },
+        tags: { type: "array", items: { type: "string" } },
+        dueDate: { type: "string", description: "ISO 8601 due date (optional)." },
+        sourceMeta: { type: "object", description: "Where this task came from — e.g. {sessionId, snippet}." }
+      },
+      required: ["title"],
+      additionalProperties: false
+    },
+    handler: async (args, context) => {
+      if (!runtime.tasks?.add) throw new Error("task store not available");
+      const queue = args.queue === "agent" ? "agent" : "user";
+      const sourceMeta = args.sourceMeta ?? (context.sessionId ? { sessionId: context.sessionId } : null);
+      const task = runtime.tasks.add({ ...args, sourceMeta }, { source: "agent", queue });
+      return { id: task.id, queue: task.queue, bucket: task.bucket, title: task.title };
+    }
+  });
+
+  registry.register({
+    name: "list_tasks",
+    description: "List tasks. Filter by queue (user/agent), bucket (today/this_week/someday/done), or status (pending/in_progress/blocked/completed/cancelled).",
+    parameters: {
+      type: "object",
+      properties: {
+        queue: { type: "string", enum: ["user", "agent"] },
+        bucket: { type: "string", enum: ["today", "this_week", "someday", "done"] },
+        status: { type: "string", enum: ["pending", "in_progress", "blocked", "completed", "cancelled"] },
+        limit: { type: "integer", minimum: 1, maximum: 200 }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.tasks?.list) return { error: "task store not available" };
+      const tasks = runtime.tasks.list(args);
+      return { count: tasks.length, tasks };
+    }
+  });
+
+  registry.register({
+    name: "complete_task",
+    description: "Mark a task as completed. Moves it to the 'done' bucket.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        completedVia: { type: "string", description: "Why/how it was completed (e.g. 'manual', 'observed-rize-activity', 'linear-webhook')." }
+      },
+      required: ["id"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const task = runtime.tasks.complete(args.id, args.completedVia ?? "agent");
+      return task ? { id: task.id, status: task.status } : { error: "unknown task" };
+    }
+  });
+
+  registry.register({
+    name: "move_task",
+    description: "Update a task — change bucket, priority, status, due date, etc. without completing it.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        bucket: { type: "string", enum: ["today", "this_week", "someday", "done"] },
+        priority: { type: "integer", minimum: 0, maximum: 100 },
+        status: { type: "string", enum: ["pending", "in_progress", "blocked", "completed", "cancelled"] },
+        dueDate: { type: "string" },
+        title: { type: "string" },
+        description: { type: "string" },
+        tags: { type: "array", items: { type: "string" } }
+      },
+      required: ["id"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const { id, ...patch } = args;
+      const task = runtime.tasks.update(id, patch);
+      return task ? task : { error: "unknown task" };
+    }
+  });
+
+  registry.register({
+    name: "agent_pick_next",
+    description: "Pop the next task from the agent's own queue. Returns the highest-priority pending task in the agent queue, or null if the queue is empty.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    handler: async () => {
+      const task = runtime.tasks.agentPickNext?.() ?? null;
+      return task ? { task } : { task: null, reason: "agent queue empty" };
+    }
+  });
+
   registry.register({
     name: "retire_specialist",
     description: "Retire a propagated specialist by id. Use this when the user explicitly says a specialist isn't useful, or when get_audit shows a low-quality specialist.",

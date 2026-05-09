@@ -1,6 +1,7 @@
 import { InMemoryAgentStore } from "./agent-store.js";
 import { createModelProvider } from "./model-provider.js";
 import { createId, nowIso } from "./utils.js";
+import { detectTaskInChat } from "./task-store.js";
 
 export class AgentHost {
   constructor(options = {}) {
@@ -32,6 +33,22 @@ export class AgentHost {
 
     const agent = this.store.getAgent(agentId);
     const sessionId = this.store.sessionKey({ channel, from, agentId, sessionId: input.sessionId });
+
+    // Auto-task detection — if the user said "remind me to X" / "todo: X" /
+    // "I need to X", create a task in the user queue without requiring them
+    // to invoke add_task. Best-effort; failures don't block the chat reply.
+    if (this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot") {
+      const detected = detectTaskInChat(text);
+      if (detected) {
+        try {
+          this.runtime.tasks.add(
+            { title: detected.title, sourceMeta: { sessionId, snippet: text.slice(0, 200), trigger: detected.trigger } },
+            { source: "chat", queue: "user" }
+          );
+        } catch { /* swallow */ }
+      }
+    }
+
     const sessionBefore = this.store.appendMessage(sessionId, {
       role: "user",
       content: text,
