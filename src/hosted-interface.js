@@ -1790,7 +1790,7 @@ function renderMcpDetail(server) {
        </div></div>\`
     : "";
   const connectingBanner = server.connecting && !server.connected
-    ? \`<div class="card"><div class="row between" style="align-items:center;"><span class="name">⏳ Connecting…</span><span class="muted">waiting for handshake</span></div></div>\`
+    ? \`<div class="card"><div class="row" style="align-items:center; gap:10px; flex-wrap:wrap;"><span class="name">⏳ Connecting…</span><span class="muted" style="flex:1; min-width:0;">waiting for handshake</span></div></div>\`
     : "";
   main.innerHTML = \`
     <div class="pane">
