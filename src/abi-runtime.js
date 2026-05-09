@@ -10,6 +10,8 @@ import { createAbiIntegration, IntegrationRegistry } from "./integration-registr
 import { fileURLToPath } from "node:url";
 import { BudgetGuard } from "./budget-guard.js";
 import { registerRizeIntegration } from "./integrations/rize.js";
+import { registerLinearTaskSource } from "./integrations/linear-tasks.js";
+import { registerInboxWatcher } from "./integrations/inbox-watcher.js";
 import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemoryCondenser } from "./memory-condenser.js";
@@ -212,7 +214,15 @@ export class AbiRuntime {
       this.skills = new SkillRegistry({ runtime: this, dirs });
     }
 
-    if (options.integrations !== false) registerRizeIntegration(this);
+    if (options.integrations !== false) {
+      registerRizeIntegration(this);
+      // Linear is env-gated — silently no-ops if LINEAR_API_KEY isn't set.
+      registerLinearTaskSource(this);
+      // Inbox watcher always runs — it just polls a local dir; if nothing's
+      // dropped in there it returns { processed: 0 } and moves on. Sources
+      // like reMarkable / Obsidian / Bear can sync into .openagi/inbox/.
+      registerInboxWatcher(this);
+    }
   }
 
   processIntegrationEvent(source, payload) {
@@ -376,6 +386,14 @@ export class AbiRuntime {
         const result = await this.proactiveObserver.observe({ now });
         this.events?.emit?.("miner-result", { source: "proactive-observer", at: nowIso(), ...result });
         return result;
+      }
+      if (job.task === "linear-task-sync") {
+        if (!this.linearTaskSource?.sync) return { skipped: true, reason: "no linear source" };
+        return this.linearTaskSource.sync({ now });
+      }
+      if (job.task === "inbox-sweep") {
+        if (!this.inboxWatcher?.sweep) return { skipped: true, reason: "no inbox watcher" };
+        return this.inboxWatcher.sweep();
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);
