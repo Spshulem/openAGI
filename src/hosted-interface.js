@@ -485,66 +485,190 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/skills/replay-jobs") {
         return sendJson(res, 200, runtime.skillReplay.list({ status: url.searchParams.get("status") }));
       }
+      if (method === "POST" && pathname === "/integrations/connect-mcp") {
+        // One-click register + connect for catalog entries. Used by the
+        // unified Integrations tab so the user doesn't have to fill in
+        // the MCP register form for known servers.
+        const body = await readJson(req).catch(() => ({}));
+        const catalogId = body.catalogId;
+        if (!catalogId) return sendJson(res, 400, { error: "catalogId required" });
+        const { MCP_CATALOG } = await import("./mcp-catalog.js");
+        const entry = MCP_CATALOG.find((e) => e.id === catalogId);
+        if (!entry) return sendJson(res, 404, { error: "not in catalog" });
+        if (!entry.register) return sendJson(res, 400, { error: "catalog entry has no register info" });
+        try {
+          const server = runtime.mcp.registerServer({ name: entry.id, ...entry.register });
+          if (runtime.mcp?.connect) {
+            runtime.mcp.connect(server.name).catch(() => { /* OAuth path surfaces via SSE */ });
+          }
+          return sendJson(res, 200, { name: server.name, transport: server.transport });
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
       if (method === "GET" && pathname === "/integrations/status") {
-        // Live status of every source/integration the runtime knows about.
-        // Used by the Integrations dashboard tab to show cards + last-sync.
-        const status = {
-          sources: [
-            {
-              id: "linear",
-              name: "Linear",
-              kind: "task-source",
-              configured: Boolean(runtime.linearTaskSource?.isConfigured?.()),
-              envKeys: ["LINEAR_API_KEY"],
-              lastSyncedAt: runtime.linearTaskSource?.lastSyncedAt ?? null,
-              description: "Assigned issues poll into your task list every 5 min."
-            },
-            {
-              id: "buildbetter",
-              name: "BuildBetter (direct API)",
-              kind: "task-source",
-              configured: Boolean(runtime.buildBetterTaskSource?.isConfigured?.()),
-              envKeys: ["BUILDBETTER_API_KEY", "BUILDBETTER_USER_EMAIL", "BUILDBETTER_USER_NAME"],
-              lastSyncedAt: runtime.buildBetterTaskSource?.lastSyncedAt ?? null,
-              description: "Action items from your recent calls auto-flow into tasks. Polls every 15 min. Alternative: connect the BuildBetter MCP from the MCP tab for on-demand search instead of always-on polling."
-            },
-            {
-              id: "rize",
-              name: "Rize.io",
-              kind: "activity-source",
-              configured: Boolean(process.env.RIZE_API_KEY),
-              envKeys: ["RIZE_API_KEY"],
-              description: "Time-tracking source. Adds rize_today_summary / rize_query / rize_recent_sessions agent tools."
-            },
-            {
-              id: "inbox",
-              name: "Inbox folder (reMarkable / Obsidian / file drop)",
-              kind: "task-source",
-              configured: true,
-              envKeys: [],
-              description: "Drop any .md or .txt file into ~/Library/Application Support/OpenAGI/inbox/ and OpenAGI parses task lines (- [ ] foo, TODO: foo) into your task list. For reMarkable: point your reMarkable Cloud → Dropbox sync at this folder. For Obsidian/Bear: export there. Files move to /processed after parsing."
-            }
-          ],
-          channels: [
-            {
-              id: "twilio",
-              name: "Twilio SMS",
-              kind: "channel",
-              configured: Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
-              envKeys: ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER"],
-              description: "Two-way SMS — text the agent, get texts back."
-            },
-            {
-              id: "telegram",
-              name: "Telegram",
-              kind: "channel",
-              configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
-              envKeys: ["TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_POLLING"],
-              description: "Bot from BotFather. Webhook or long-polling."
-            }
-          ]
-        };
-        return sendJson(res, 200, status);
+        // Unified integrations view. Every source/channel/MCP catalog
+        // entry shows up here, with whichever paths apply (API key vs.
+        // MCP) so the user has ONE place to configure everything.
+        const registeredMcps = new Set(
+          (runtime.mcp?.listServers?.() ?? []).map((s) => (s.name ?? "").toLowerCase())
+        );
+        const mcpInCatalog = (id) => registeredMcps.has(id) || registeredMcps.has(id.replace(/-/g, ""));
+        const integrations = [
+          {
+            id: "linear",
+            name: "Linear",
+            description: "Sync your assigned issues as tasks; let the agent search/create issues from chat.",
+            paths: [
+              {
+                kind: "api",
+                label: "Direct API (auto-poll)",
+                configured: Boolean(runtime.linearTaskSource?.isConfigured?.()),
+                envKeys: ["LINEAR_API_KEY"],
+                lastSyncedAt: runtime.linearTaskSource?.lastSyncedAt ?? null,
+                feeds: "tasks",
+                detail: "Polls every 5 min. Assigned issues become tasks. Lin priority maps to bucket+priority."
+              },
+              {
+                kind: "mcp",
+                label: "MCP (on-demand)",
+                catalogId: "linear",
+                configured: mcpInCatalog("linear")
+              }
+            ]
+          },
+          {
+            id: "buildbetter",
+            name: "BuildBetter",
+            description: "Pull call action items / commitments / follow-ups as tasks. On-demand call search via MCP.",
+            paths: [
+              {
+                kind: "api",
+                label: "Direct API (auto-poll)",
+                configured: Boolean(runtime.buildBetterTaskSource?.isConfigured?.()),
+                envKeys: ["BUILDBETTER_API_KEY", "BUILDBETTER_USER_EMAIL", "BUILDBETTER_USER_NAME"],
+                lastSyncedAt: runtime.buildBetterTaskSource?.lastSyncedAt ?? null,
+                feeds: "tasks",
+                detail: "Polls every 15 min. action_item / commitment / follow_up extractions become tasks."
+              },
+              {
+                kind: "mcp",
+                label: "MCP (on-demand)",
+                catalogId: "buildbetter",
+                configured: mcpInCatalog("buildbetter")
+              }
+            ]
+          },
+          {
+            id: "rize",
+            name: "Rize.io",
+            description: "Time-tracking. Lets the agent answer 'what did I work on today?' and surface productivity patterns.",
+            paths: [
+              {
+                kind: "api",
+                label: "Direct API (agent tools)",
+                configured: Boolean(process.env.RIZE_API_KEY),
+                envKeys: ["RIZE_API_KEY"],
+                feeds: "agent-tools",
+                detail: "Adds rize_today_summary / rize_query / rize_recent_sessions agent tools."
+              },
+              {
+                kind: "mcp",
+                label: "MCP (on-demand)",
+                catalogId: "rize",
+                configured: mcpInCatalog("rize")
+              }
+            ]
+          },
+          {
+            id: "remarkable",
+            name: "reMarkable",
+            description: "Pull notes + handwritten content from your reMarkable tablet, plus parse task checkboxes.",
+            paths: [
+              {
+                kind: "folder",
+                label: "Inbox folder (Dropbox sync)",
+                configured: true,
+                feeds: "tasks",
+                detail: "Drop .md/.txt files into ~/Library/Application Support/OpenAGI/inbox/ — sweeps every 30s for - [ ] checkboxes + TODO: lines. reMarkable → Dropbox sync → this folder is the canonical path. Also works for Obsidian/Bear."
+              },
+              {
+                kind: "mcp",
+                label: "reMarkable MCP",
+                catalogId: "remarkable",
+                configured: mcpInCatalog("remarkable")
+              }
+            ]
+          },
+          {
+            id: "twilio",
+            name: "Twilio SMS",
+            kind: "channel",
+            description: "Two-way SMS — text the agent, get texts back. Outbound for proactive sends.",
+            paths: [
+              {
+                kind: "api",
+                label: "API credentials",
+                configured: Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN),
+                envKeys: ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER"]
+              }
+            ]
+          },
+          {
+            id: "telegram",
+            name: "Telegram",
+            kind: "channel",
+            description: "Bot conversations. Webhook or long-polling.",
+            paths: [
+              {
+                kind: "api",
+                label: "Bot token",
+                configured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
+                envKeys: ["TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_POLLING"]
+              }
+            ]
+          },
+          {
+            id: "github",
+            name: "GitHub",
+            description: "Search repos / read PRs / browse code via MCP.",
+            paths: [
+              {
+                kind: "mcp",
+                label: "GitHub MCP",
+                catalogId: "github",
+                configured: mcpInCatalog("github")
+              }
+            ]
+          },
+          {
+            id: "notion",
+            name: "Notion",
+            description: "Read pages + database content via MCP.",
+            paths: [
+              {
+                kind: "mcp",
+                label: "Notion MCP",
+                catalogId: "notion",
+                configured: mcpInCatalog("notion")
+              }
+            ]
+          },
+          {
+            id: "slack",
+            name: "Slack",
+            description: "Read messages + post to channels via MCP.",
+            paths: [
+              {
+                kind: "mcp",
+                label: "Slack MCP",
+                catalogId: "slack",
+                configured: mcpInCatalog("slack")
+              }
+            ]
+          }
+        ];
+        return sendJson(res, 200, { integrations });
       }
       if (method === "GET" && pathname === "/tasks") {
         if (!runtime.tasks?.list) return sendJson(res, 503, { error: "no task store" });
@@ -1629,7 +1753,20 @@ async function refreshMcp() {
   const addItem = document.createElement("li");
   addItem.style.cssText = "border-bottom:1px solid var(--line); padding:8px 10px; cursor:pointer;";
   addItem.innerHTML = '<div class="title" style="color:var(--accent);">+ Register new MCP</div><div class="preview" style="font-size:11px;">stdio · http+bearer · http+oauth</div>';
-  addItem.addEventListener("click", () => openMcpComposer());
+  addItem.addEventListener("click", () => {
+    // Defensive: log + toast on click so even if openMcpComposer
+    // throws, the user (and console) sees what happened. Several
+    // bug reports about "nothing happens" — instrument so next time
+    // it's diagnosable.
+    console.log("[OpenAGI] MCP +Register clicked");
+    try {
+      openMcpComposer();
+      console.log("[OpenAGI] openMcpComposer returned, composerOpen =", composerOpen);
+    } catch (err) {
+      console.error("[OpenAGI] openMcpComposer threw:", err);
+      showToast("MCP composer error — check console: " + (err.message || err), false);
+    }
+  });
   sidebarList.appendChild(addItem);
 
   if (servers.length === 0) {
@@ -2283,29 +2420,43 @@ async function renderHealth() {
 }
 
 async function renderIntegrations() {
-  const data = await fetchJson("/integrations/status").catch(() => ({ sources: [], channels: [] }));
-  const card = (it) => {
-    const status = it.configured
-      ? \`<span class="badge ok">configured</span>\`
-      : \`<span class="badge">not configured</span>\`;
-    const lastSync = it.lastSyncedAt
-      ? \`<div class="muted" style="font-size:11px;">Last sync: \${escapeHtml(new Date(it.lastSyncedAt).toLocaleString())}</div>\`
+  const data = await fetchJson("/integrations/status").catch(() => ({ integrations: [] }));
+  const integrations = data.integrations ?? [];
+
+  const pathBlock = (it, p) => {
+    const status = p.configured
+      ? '<span class="badge ok">on</span>'
+      : '<span class="badge">off</span>';
+    const lastSync = p.lastSyncedAt
+      ? \`<div class="muted" style="font-size:11px; margin-top:4px;">last sync: \${escapeHtml(new Date(p.lastSyncedAt).toLocaleString())}</div>\`
       : "";
-    const envBlock = it.envKeys?.length > 0
-      ? \`<div class="muted" style="font-size:11px; margin-top:6px;">env: <code>\${it.envKeys.map(escapeHtml).join("</code> · <code>")}</code></div>\`
+    const envBlock = p.envKeys?.length > 0
+      ? \`<div class="muted" style="font-size:11px; margin-top:4px;">env: <code>\${p.envKeys.map(escapeHtml).join("</code> · <code>")}</code></div>\`
       : "";
+    let actions = "";
+    if (p.kind === "api" && p.envKeys?.length > 0 && !p.configured) {
+      actions = \`<a class="btn-secondary" href="/setup" style="font-size:11px; padding:3px 8px; border-radius:4px; border:1px solid var(--line); text-decoration:none;">Add credentials in /setup</a>\`;
+    } else if (p.kind === "mcp" && !p.configured) {
+      actions = \`<button class="add-mcp-btn" data-catalog-id="\${escapeHtml(p.catalogId)}" data-int-id="\${escapeHtml(it.id)}" style="font-size:11px; padding:3px 8px;">+ Connect this MCP</button>\`;
+    } else if (p.kind === "mcp" && p.configured) {
+      actions = \`<a href="/?tab=mcp" style="font-size:11px;">Manage in MCP tab →</a>\`;
+    } else if (p.kind === "folder" && p.configured) {
+      actions = \`<a href="/?tab=tasks" style="font-size:11px;">View tasks →</a>\`;
+    }
     return \`
-      <div class="card" style="padding:14px;">
-        <div class="row between" style="align-items:flex-start;">
-          <div>
-            <div class="name" style="font-weight:600;">\${escapeHtml(it.name)}</div>
-            <div class="muted" style="font-size:11px; text-transform:uppercase; margin-top:1px;">\${escapeHtml(it.kind)}</div>
+      <div style="border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-top:6px;">
+        <div class="row between" style="align-items:center; gap:8px;">
+          <div style="flex:1; min-width:0;">
+            <div style="font-weight:500; font-size:13px;">\${escapeHtml(p.label)}</div>
+            \${p.detail ? \`<div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(p.detail)}</div>\` : ""}
+            \${envBlock}
+            \${lastSync}
           </div>
-          \${status}
+          <div style="display:flex; gap:8px; align-items:center; flex-shrink:0;">
+            \${status}
+            \${actions}
+          </div>
         </div>
-        <div class="desc" style="margin-top:8px;">\${escapeHtml(it.description ?? "")}</div>
-        \${lastSync}
-        \${envBlock}
       </div>
     \`;
   };
@@ -2313,35 +2464,41 @@ async function renderIntegrations() {
   main.innerHTML = \`
     <div class="pane">
       <h2>Integrations</h2>
-      <p class="muted">Sources feed your task list and activity log. Channels are how messages reach you. Edit env vars at <a href="/setup">/setup</a> or in <code>.openagi/.env</code> directly, then restart the daemon.</p>
+      <p class="muted">Every source, channel, and MCP in one place. Each row shows all the paths you can use — direct API, MCP, or file-drop. Click "+ Connect this MCP" to register one with one click, or set credentials in <a href="/setup">/setup</a> step 5 / <code>.openagi/.env</code>.</p>
 
-      <h3 style="margin-top:18px;">Sources</h3>
-      <div class="grid two" style="gap:10px;">
-        \${(data.sources ?? []).map(card).join("")}
-      </div>
-
-      <h3 style="margin-top:24px;">Channels</h3>
-      <div class="grid two" style="gap:10px;">
-        \${(data.channels ?? []).map(card).join("")}
-      </div>
-
-      <h3 style="margin-top:24px;">MCP catalog</h3>
-      <p class="muted">When the proactive observer sees you using one of these in screen activity, it'll suggest connecting the MCP. You can also register manually in the MCP tab.</p>
-      <div id="mcpCatalogPreview"></div>
+      \${integrations.map((it) => \`
+        <div class="card" style="padding:14px; margin-bottom:12px;">
+          <div class="row between" style="align-items:flex-start; gap:10px;">
+            <div style="flex:1; min-width:0;">
+              <div style="font-weight:600; font-size:15px;">\${escapeHtml(it.name)}</div>
+              <div class="muted" style="font-size:12px; margin-top:3px;">\${escapeHtml(it.description ?? "")}</div>
+            </div>
+            \${(it.paths ?? []).some((p) => p.configured) ? '<span class="badge ok">active</span>' : '<span class="badge">inactive</span>'}
+          </div>
+          \${(it.paths ?? []).map((p) => pathBlock(it, p)).join("")}
+        </div>
+      \`).join("")}
     </div>
   \`;
 
-  // Show a preview of the MCP catalog matched against current activity.
-  fetchJson("/observations/recent-context?minutes=15")
-    .then(async (ctx) => {
-      // Server-side has the catalog match logic; we'd need a dedicated
-      // endpoint for the catalog dump. For now, just show that the
-      // observer will surface them — link out to the docs / proactive tab.
-      const host = $("mcpCatalogPreview");
-      const apps = (ctx.apps ?? []).slice(0, 4).map((a) => a.app).join(", ");
-      host.innerHTML = \`<div class="card"><div class="desc">Recent activity: \${escapeHtml(apps || "(no recent activity — capture is off or quiet)")}.</div><div class="desc" style="margin-top:6px;">Connected MCPs are visible in the <a href="/?tab=mcp">MCP tab</a>.</div></div>\`;
-    })
-    .catch(() => {});
+  document.querySelectorAll(".add-mcp-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const catalogId = btn.dataset.catalogId;
+      const intId = btn.dataset.intId;
+      btn.disabled = true;
+      btn.textContent = "Connecting...";
+      try {
+        const result = await postJson("/integrations/connect-mcp", { catalogId });
+        showToast(\`✓ Registered \${result.name ?? catalogId} MCP — opening MCP tab.\`, true);
+        // If OAuth, the MCP page will show the auth URL via SSE.
+        setTimeout(() => switchTab("mcp"), 800);
+      } catch (err) {
+        showToast(\`Connect failed: \${err.message}\`, false);
+        btn.disabled = false;
+        btn.textContent = "+ Connect this MCP";
+      }
+    });
+  });
 }
 
 async function renderTasks() {
@@ -2362,39 +2519,10 @@ async function renderTasks() {
     return stats[q][b] ?? 0;
   };
 
-  // Sources sub-section: who's feeding tasks into this list.
-  const sourcesData = await fetchJson("/integrations/status").catch(() => ({ sources: [] }));
-  const taskSources = (sourcesData.sources ?? []).filter((s) => s.kind === "task-source");
-  const sourcesPanel = \`
-    <details style="margin-bottom:14px;" \${taskSources.every((s) => s.configured) ? "" : "open"}>
-      <summary style="cursor:pointer; padding:6px 8px; border:1px solid var(--line); border-radius:6px;">
-        Task sources — \${taskSources.filter((s) => s.configured).length}/\${taskSources.length} configured
-      </summary>
-      <div class="grid two" style="gap:10px; margin-top:10px;">
-        \${taskSources.map((s) => \`
-          <div class="card" style="padding:10px 12px;">
-            <div class="row between" style="align-items:flex-start;">
-              <div>
-                <div class="name">\${escapeHtml(s.name)}</div>
-                <div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(s.description)}</div>
-              </div>
-              \${s.configured ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>'}
-            </div>
-            \${s.envKeys?.length > 0 ? \`<div class="muted" style="font-size:11px; margin-top:6px;">env: <code>\${s.envKeys.map(escapeHtml).join("</code> · <code>")}</code></div>\` : ""}
-            \${s.lastSyncedAt ? \`<div class="muted" style="font-size:11px; margin-top:2px;">last sync: \${escapeHtml(new Date(s.lastSyncedAt).toLocaleString())}</div>\` : ""}
-          </div>
-        \`).join("")}
-      </div>
-      <p class="muted" style="font-size:11px; margin-top:10px;">Set credentials at <a href="/setup">/setup</a> step 5, or in <code>.openagi/.env</code>. Or configure on-demand MCPs (Linear, BuildBetter, Notion, etc.) from the <a href="/?tab=mcp">MCP tab</a>.</p>
-    </details>
-  \`;
-
   main.innerHTML = \`
     <div class="pane">
       <h2>Tasks</h2>
-      <p class="muted">Two queues — user todo (what you should do) and agent queue (what OpenAGI is working on).</p>
-
-      \${sourcesPanel}
+      <p class="muted">Two queues — user todo (what you should do) and agent queue (what OpenAGI is working on). Configure task sources (Linear, BuildBetter, reMarkable, Rize) on the <a href="/?tab=integrations">Integrations</a> tab.</p>
 
       <form class="form" id="taskForm" style="margin:12px 0 18px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
         <input name="title" placeholder="Add a task..." required style="flex:2; min-width:240px;">

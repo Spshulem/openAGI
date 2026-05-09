@@ -102,6 +102,21 @@ export const MCP_CATALOG = [
     }
   },
   {
+    id: "remarkable",
+    name: "reMarkable",
+    description: "Read your reMarkable tablet's documents + handwritten notes. Implementation: github.com/SamMorrowDrums/remarkable-mcp. Pairs well with the inbox folder for full bidirectional task sync.",
+    matches: {
+      bundleIds: [],
+      hostnames: ["my.remarkable.com", "remarkable.com"],
+      keywords: ["remarkable", "rmapi"]
+    },
+    register: {
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@sammorrowdrums/remarkable-mcp"]
+    }
+  },
+  {
     id: "filesystem-tmp",
     name: "Filesystem (read-only on /tmp)",
     description: "Lets the agent read scratch files in /tmp for grounding.",
