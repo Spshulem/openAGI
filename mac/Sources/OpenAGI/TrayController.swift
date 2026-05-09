@@ -44,12 +44,40 @@ struct TrayMenu: View {
     Group {
       headerSection
       Divider()
+      tasksSection
+      Divider()
       sessionsSection
       Divider()
       actionsSection
       Divider()
       footerSection
     }
+  }
+
+  // Top user tasks, today + this_week pending. Click → dashboard tasks tab.
+  @ViewBuilder private var tasksSection: some View {
+    if state.topTasks.isEmpty {
+      Text("No pending tasks").disabled(true).font(.caption)
+      Button("+ Add task…") { state.openDashboard(path: "/?tab=tasks") }
+    } else {
+      Text("Top tasks").disabled(true).font(.caption)
+      ForEach(state.topTasks) { t in
+        Button(taskLabel(t)) { state.openDashboard(path: "/?tab=tasks") }
+      }
+      Button("View all tasks…") { state.openDashboard(path: "/?tab=tasks") }
+    }
+  }
+
+  private func taskLabel(_ t: AppState.TaskSummary) -> String {
+    let prefix: String = {
+      switch t.bucket {
+      case "today": return "● "
+      case "this_week": return "○ "
+      default: return "  "
+      }
+    }()
+    let trim = t.title.count > 60 ? String(t.title.prefix(60)) + "…" : t.title
+    return prefix + trim
   }
 
   // Status header

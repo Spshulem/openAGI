@@ -203,6 +203,26 @@ export class AbiRuntime {
         task: "proactive-observe",
         intervalMs: 10 * 60 * 1000
       });
+      // Morning task digest — local 8am, fires a notification with the
+      // pending today bucket so the user starts the day knowing what's
+      // queued. Skipped silently if there are zero pending tasks.
+      this.cron.addJob({
+        id: "daily-task-digest",
+        name: "Daily morning task digest",
+        enabled: true,
+        task: "task-digest",
+        dailyAt: "08:00"
+      });
+      // Due-date reminders — every 15 min, check if any task crossed its
+      // dueDate since the last check. Fires a 'task-reminder' event the
+      // SSE relay + Mac notify pipeline picks up.
+      this.cron.addJob({
+        id: "task-reminders",
+        name: "Due-date reminders for user tasks",
+        enabled: true,
+        task: "task-reminders",
+        intervalMs: 15 * 60 * 1000
+      });
       registerCoreTools(this.tools, this);
     }
 
@@ -395,8 +415,63 @@ export class AbiRuntime {
         if (!this.inboxWatcher?.sweep) return { skipped: true, reason: "no inbox watcher" };
         return this.inboxWatcher.sweep();
       }
+      if (job.task === "task-digest") {
+        return this.runTaskDigest({ now });
+      }
+      if (job.task === "task-reminders") {
+        return this.runTaskReminders({ now });
+      }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);
+  }
+
+  // Morning digest: roll up pending today-bucket user tasks into one
+  // notification. Skipped silently when there's nothing pending.
+  runTaskDigest({ now = new Date() } = {}) {
+    if (!this.tasks?.list) return { skipped: true, reason: "no task store" };
+    const todayPending = this.tasks.list({ queue: "user", bucket: "today", status: "pending", limit: 12 });
+    if (todayPending.length === 0) return { skipped: true, reason: "no pending tasks today" };
+    const titles = todayPending.slice(0, 6).map((t) => t.title);
+    const more = todayPending.length > 6 ? ` (+${todayPending.length - 6} more)` : "";
+    this.events?.emit?.("task-reminder", {
+      kind: "digest",
+      at: nowIso(),
+      count: todayPending.length,
+      title: `${todayPending.length} task${todayPending.length === 1 ? "" : "s"} for today`,
+      body: titles.join(" · ") + more
+    });
+    return { fired: 1, count: todayPending.length };
+  }
+
+  // Due-date reminders: tasks whose dueDate just crossed (since the last
+  // tick) get a reminder. Uses sourceMeta.lastReminderAt to avoid spamming
+  // the same task every 15 min.
+  runTaskReminders({ now = new Date() } = {}) {
+    if (!this.tasks?.list) return { skipped: true, reason: "no task store" };
+    const cutoffMs = now.getTime();
+    const reminderWindowMs = 6 * 60 * 60 * 1000; // don't re-remind within 6h
+    let fired = 0;
+    for (const t of this.tasks.list({ status: "pending", limit: 200 })) {
+      if (!t.dueDate) continue;
+      const dueMs = Date.parse(t.dueDate);
+      if (!Number.isFinite(dueMs)) continue;
+      if (dueMs > cutoffMs) continue; // not yet due
+      const lastReminded = t.sourceMeta?.lastReminderAt ? Date.parse(t.sourceMeta.lastReminderAt) : 0;
+      if (Number.isFinite(lastReminded) && cutoffMs - lastReminded < reminderWindowMs) continue;
+      this.events?.emit?.("task-reminder", {
+        kind: "due",
+        at: nowIso(),
+        taskId: t.id,
+        title: `Due: ${t.title}`,
+        body: t.description ? t.description.slice(0, 200) : "",
+        dueDate: t.dueDate
+      });
+      this.tasks.update(t.id, {
+        sourceMeta: { ...(t.sourceMeta ?? {}), lastReminderAt: nowIso() }
+      });
+      fired += 1;
+    }
+    return { fired };
   }
 
   async runAutopilot(job) {

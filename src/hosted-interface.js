@@ -56,6 +56,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("cron-catchup", (data) => broadcast("cron-catchup", data));
   events.on("proactive-suggestion", (data) => broadcast("proactive-suggestion", data));
   events.on("task-updated", (data) => broadcast("task-updated", data));
+  events.on("task-reminder", (data) => broadcast("task-reminder", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
@@ -549,6 +550,24 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 200, { ...candidate, registered: name });
           } catch (error) {
             return sendJson(res, 200, { ...candidate, registerError: error.message });
+          }
+        }
+        // For task suggestions, accepting creates the task in the right
+        // queue + bucket. The proposal title becomes the task title.
+        if (status === "accepted" && candidate.category === "task" && runtime.tasks?.add) {
+          try {
+            const task = runtime.tasks.add(
+              {
+                title: candidate.title,
+                description: candidate.rationale,
+                bucket: candidate.taskBucket ?? "today",
+                sourceMeta: { suggestionId: id, observedApps: candidate.context?.apps }
+              },
+              { source: "proactive-observer", queue: candidate.taskQueue ?? "user" }
+            );
+            return sendJson(res, 200, { ...candidate, taskId: task.id });
+          } catch (error) {
+            return sendJson(res, 200, { ...candidate, taskCreateError: error.message });
           }
         }
         return sendJson(res, 200, candidate);
@@ -2216,7 +2235,15 @@ async function renderTasks() {
       \${filtered.length === 0 ? \`<div class="empty">No tasks. Add one above, or just say things like "remind me to X" in chat — I'll auto-create them.</div>\` : ""}
 
       <ul class="taskList" style="list-style:none; padding:0; margin:0;">
-        \${filtered.map((t) => \`
+        \${filtered.map((t) => {
+          const isOverdue = t.dueDate && Date.parse(t.dueDate) < Date.now() && t.status !== "completed";
+          const dueDateStr = t.dueDate ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+          const sourceBadge = t.source && t.source !== "manual"
+            ? (t.sourceUrl
+                ? \`<a class="badge" href="\${escapeHtml(t.sourceUrl)}" target="_blank" rel="noopener" style="font-size:10px; text-decoration:none;">\${escapeHtml(t.source)} ↗</a>\`
+                : \`<span class="badge" style="font-size:10px;">\${escapeHtml(t.source)}</span>\`)
+            : "";
+          return \`
           <li data-task-id="\${t.id}" class="task" style="display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-bottom:1px solid var(--line);">
             <input type="checkbox" \${t.status === "completed" ? "checked" : ""} data-action="toggle" style="margin-top:3px;">
             <div style="flex:1; min-width:0;">
@@ -2225,13 +2252,16 @@ async function renderTasks() {
                 <span class="badge" style="font-size:10px;">\${t.queue}</span>
                 <span class="badge" style="font-size:10px;">\${t.bucket.replace("_", " ")}</span>
                 \${t.priority >= 70 ? \`<span class="badge err" style="font-size:10px;">P\${t.priority}</span>\` : ""}
-                \${t.source && t.source !== "manual" ? \`<span class="badge" style="font-size:10px;">\${escapeHtml(t.source)}</span>\` : ""}
+                \${dueDateStr ? \`<span class="badge \${isOverdue ? "err" : ""}" style="font-size:10px;">\${isOverdue ? "⏰ overdue " : "due "}\${dueDateStr}</span>\` : ""}
+                \${sourceBadge}
               </div>
               \${t.description ? \`<div class="muted" style="font-size:12px; margin-top:4px;">\${escapeHtml(t.description.slice(0, 240))}</div>\` : ""}
+              \${t.sourceMeta?.identifier ? \`<div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(t.sourceMeta.identifier)}\${t.sourceMeta.team ? " · " + escapeHtml(t.sourceMeta.team) : ""}\${t.sourceMeta.project ? " · " + escapeHtml(t.sourceMeta.project) : ""}</div>\` : ""}
+              \${t.sourceMeta?.file ? \`<div class="muted" style="font-size:11px; margin-top:2px;">📎 \${escapeHtml(t.sourceMeta.file)} (line \${t.sourceMeta.line})</div>\` : ""}
             </div>
             <button data-action="delete" class="secondary" style="align-self:flex-start; font-size:11px; padding:2px 8px;">×</button>
           </li>
-        \`).join("")}
+        \`}).join("")}
       </ul>
     </div>
   \`;
@@ -2535,6 +2565,17 @@ evt.addEventListener("proactive-suggestion", (e) => {
 // Tasks updated — refresh tasks tab if visible, otherwise quiet.
 evt.addEventListener("task-updated", () => {
   if (state.tab === "tasks") renderTasks();
+});
+
+// Task reminder (morning digest or due-date) — toast + browser notif.
+evt.addEventListener("task-reminder", (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    showToast((data.kind === "digest" ? "📋 " : "⏰ ") + data.title + (data.body ? " — " + data.body : ""), true);
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification(data.title, { body: data.body || "" });
+    }
+  } catch {}
 });
 
 // Cron catch-up: jobs that should've run during a sleep window are

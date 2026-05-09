@@ -27,11 +27,13 @@ const SYSTEM_PROMPT = [
   "Your job: propose ONE concrete next thing the agent could do for them. Be useful or stay silent.",
   "Output STRICT JSON, one of these shapes:",
   '  {"pass": true, "reason": "<short>"}                                           // nothing actionable yet',
+  '  {"category": "task", "title": "<short>", "rationale": "<why>", "queue": "user"|"agent", "bucket": "today"|"this_week"|"someday"}    // a clear todo item',
   '  {"category": "skill", "title": "<short>", "rationale": "<why>", "draftBody": "<markdown body>"}',
   '  {"category": "mcp", "title": "Connect <name> MCP", "rationale": "<why>", "mcpId": "<catalog id>"}    // only when MCP is in the candidate list',
   '  {"category": "automation", "title": "<short>", "rationale": "<why>", "steps": ["<action 1>", "<action 2>"]}',
   '  {"category": "knowledge", "title": "<short>", "rationale": "<why>"}',
   "Be specific. Reference actual content (branch names, ticket numbers, channel names) you saw in the OCR snippets. Don't quote them verbatim — refer naturally.",
+  "Prefer 'task' for concrete one-off todos (a PR they need to review, an email to send, a ticket to follow up on). Prefer 'skill' for repeatable routines.",
   "Be honest: if the activity is too generic / one-off / mid-task to suggest anything good, just pass."
 ].join("\n");
 
@@ -149,6 +151,8 @@ export class ProactiveObserver {
       mcpRegister: proposal.mcpRegister ?? null,
       draftBody: proposal.draftBody ?? null,
       steps: proposal.steps ?? null,
+      taskQueue: proposal.queue ?? "user",
+      taskBucket: proposal.bucket ?? "today",
       context: { apps: ctx.apps?.slice(0, 5) ?? [], snippetCount: ctx.snippets?.length ?? 0 },
       status: "pending"
     });
@@ -183,6 +187,12 @@ export class ProactiveObserver {
         lines.push(`  - id=${c.entry.id} · ${c.entry.name} · trigger: ${c.trigger}`);
         lines.push(`    "${c.entry.description}"`);
       }
+    }
+    // Existing tasks so the LLM doesn't propose duplicates.
+    const recentTasks = (this.runtime?.tasks?.list?.({ status: "pending", limit: 12 }) ?? [])
+      .map((t) => `  - [${t.queue}/${t.bucket}] ${t.title}`);
+    if (recentTasks.length > 0) {
+      lines.push("", "User's existing pending tasks (don't re-propose these):", ...recentTasks);
     }
     if (recentSession) {
       lines.push("", "Recent things the user typed in chat:");

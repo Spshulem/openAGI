@@ -51,6 +51,28 @@ export class Introspector {
     if (outcomeAgg7 && outcomeAgg7.avgQuality !== null && outcomeAgg7.avgQuality < 0.45) findings.push({ severity: "warn", area: "outcomes", note: `7-day avg outcome quality is ${outcomeAgg7.avgQuality}.` });
     if (channels && channels.sms?.outboundConfigured === false) findings.push({ severity: "info", area: "channels", note: "Twilio outbound not configured." });
 
+    // Stale today-bucket tasks. If a task has been in 'today' >3 days
+    // pending, it almost certainly belongs in this_week or someday now.
+    const tasks = r.tasks?.list?.({ queue: "user", bucket: "today", status: "pending", limit: 200 }) ?? [];
+    const staleCutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const stale = tasks.filter((t) => Date.parse(t.createdAt ?? "") < staleCutoff);
+    if (stale.length > 0) {
+      findings.push({
+        severity: "info",
+        area: "tasks",
+        note: `${stale.length} task${stale.length === 1 ? "" : "s"} stuck in today >3d — consider moving to this_week or someday.`
+      });
+    }
+    const overdue = (r.tasks?.list?.({ status: "pending", limit: 200 }) ?? [])
+      .filter((t) => t.dueDate && Date.parse(t.dueDate) < Date.now() - 24 * 60 * 60 * 1000);
+    if (overdue.length > 0) {
+      findings.push({
+        severity: "warn",
+        area: "tasks",
+        note: `${overdue.length} task${overdue.length === 1 ? "" : "s"} >1d past dueDate.`
+      });
+    }
+
     return {
       at: new Date().toISOString(),
       specialists: { active: active.length, retired: retired.length, dormant: dormant.length, lowQuality: lowQuality.length, total: specialists.length },

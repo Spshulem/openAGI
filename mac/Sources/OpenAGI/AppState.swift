@@ -24,6 +24,7 @@ final class AppState: ObservableObject {
   @Published var spentLimit: Double = 10
   @Published var findings: [Finding] = []
   @Published var recentSessions: [SessionSummary] = []
+  @Published var topTasks: [TaskSummary] = []
   @Published var paused: Bool = false
 
   private var pollTimer: Timer?
@@ -52,6 +53,20 @@ final class AppState: ObservableObject {
       case lastMessage
       case updatedAt
     }
+  }
+
+  struct TaskSummary: Identifiable, Codable {
+    let id: String
+    let title: String
+    let bucket: String
+    let priority: Int
+    let queue: String
+    let source: String?
+    let sourceUrl: String?
+  }
+
+  struct TasksResponse: Codable {
+    let tasks: [TaskSummary]?
   }
 
   // MARK: — Auth
@@ -145,6 +160,12 @@ final class AppState: ObservableObject {
     } catch {
       // Quietly skip; not critical.
     }
+    do {
+      let r: TasksResponse = try await get("/tasks?queue=user&status=pending&limit=5")
+      topTasks = Array((r.tasks ?? []).prefix(5))
+    } catch {
+      // Quietly skip; not critical.
+    }
     if status != .healthy { Task { await self.fetchAuditAndNotify() } }
   }
 
@@ -197,6 +218,12 @@ final class AppState: ObservableObject {
         return name
       }()
       notify(title: title, body: body, path: "/?tab=skills")
+    }
+    if event == "task-reminder" {
+      // Morning digest or due-date reminder — fire native notification.
+      let title = parseField(data, "title") ?? "OpenAGI"
+      let body = parseField(data, "body") ?? ""
+      notify(title: title, body: body, path: "/?tab=tasks")
     }
     if event == "proactive-suggestion" {
       // Proactive observer noticed something — fire a richer notification

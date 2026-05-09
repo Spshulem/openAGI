@@ -1158,3 +1158,60 @@ test("file-backed propagation persists specialist workspaces", () => {
   assert.equal(second.list().length, 1);
   assert.equal(second.list()[0].name, "general-adaptation-review-specialist");
 });
+
+test("TaskStore: add → list → complete → bucket auto-promotes to done", async () => {
+  const { TaskStore } = await import("../src/task-store.js");
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tasks-"));
+  const store = new TaskStore({ dataDir });
+
+  const a = store.add({ title: "Buy milk", priority: 80 });
+  const b = store.add({ title: "Ship", bucket: "this_week" }, { queue: "agent" });
+  store.add({ title: "Get bread" });
+
+  assert.equal(store.list({ queue: "user" }).length, 2);
+  assert.equal(store.list({ queue: "agent" }).length, 1);
+
+  const next = store.agentPickNext();
+  assert.equal(next?.id, b.id, "agent_pick_next should pop the agent-queued task");
+
+  store.complete(a.id);
+  const completed = store.list({ status: "completed" });
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].bucket, "done", "completed tasks auto-move to done bucket");
+});
+
+test("TaskStore: replays JSONL on cold start when no snapshot", async () => {
+  const { TaskStore } = await import("../src/task-store.js");
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "tasks-replay-"));
+  const a = new TaskStore({ dataDir });
+  const t = a.add({ title: "Persistent" });
+  assert.ok(a.get(t.id));
+  // Wipe the snapshot but keep the JSONL log
+  fs.unlinkSync(path.join(dataDir, "tasks", "snapshot.json"));
+  const b = new TaskStore({ dataDir });
+  assert.ok(b.get(t.id), "task should survive snapshot deletion via JSONL replay");
+  assert.equal(b.get(t.id).title, "Persistent");
+});
+
+test("detectTaskInChat: explicit prefix + intent forms", async () => {
+  const { detectTaskInChat } = await import("../src/task-store.js");
+  assert.equal(detectTaskInChat("remind me to buy milk").title, "buy milk");
+  assert.equal(detectTaskInChat("todo: ship release").title, "ship release");
+  assert.equal(detectTaskInChat("I need to call my mom").title, "call my mom");
+  assert.equal(detectTaskInChat("don't forget to email Sarah").title, "email Sarah");
+  assert.equal(detectTaskInChat("just thinking out loud"), null);
+  assert.equal(detectTaskInChat("hi"), null, "too short");
+  assert.equal(detectTaskInChat("I should go"), null, "intent form needs ≥3 words after");
+});
+
+test("inbox parseTaskLine: GitHub checkboxes + explicit prefixes", async () => {
+  const { parseTaskLine } = await import("../src/integrations/inbox-watcher.js");
+  assert.deepEqual(parseTaskLine("- [ ] Buy milk"), { completed: false, title: "Buy milk" });
+  assert.deepEqual(parseTaskLine("- [x] Ship"), { completed: true, title: "Ship" });
+  assert.deepEqual(parseTaskLine("* [ ] Review PR #42"), { completed: false, title: "Review PR #42" });
+  assert.deepEqual(parseTaskLine("TODO: call mom"), { completed: false, title: "call mom" });
+  assert.deepEqual(parseTaskLine("REMINDER: take out trash"), { completed: false, title: "take out trash" });
+  assert.equal(parseTaskLine("## Heading"), null);
+  assert.equal(parseTaskLine("just text"), null);
+  assert.equal(parseTaskLine(""), null);
+});
