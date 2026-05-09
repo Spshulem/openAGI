@@ -57,6 +57,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("proactive-suggestion", (data) => broadcast("proactive-suggestion", data));
   events.on("task-updated", (data) => broadcast("task-updated", data));
   events.on("task-reminder", (data) => broadcast("task-reminder", data));
+  events.on("task-auto-changed", (data) => broadcast("task-auto-changed", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
@@ -2565,6 +2566,19 @@ evt.addEventListener("proactive-suggestion", (e) => {
 // Tasks updated — refresh tasks tab if visible, otherwise quiet.
 evt.addEventListener("task-updated", () => {
   if (state.tab === "tasks") renderTasks();
+});
+
+// Auto-changed task (observation-driven completion or in-progress).
+// Surface as a toast so the user sees what we did and can revert.
+evt.addEventListener("task-auto-changed", (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    const verb = data.action === "complete" ? "Completed" : "Started";
+    const icon = data.action === "complete" ? "✓" : "▶";
+    const conf = data.confidence ? \` (\${Math.round(data.confidence * 100)}%)\` : "";
+    showToast(\`\${icon} Auto-\${verb.toLowerCase()}: \${data.title}\${conf}\${data.evidence ? " — " + data.evidence : ""}\`, true);
+    if (state.tab === "tasks") renderTasks();
+  } catch {}
 });
 
 // Task reminder (morning digest or due-date) — toast + browser notif.

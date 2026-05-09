@@ -12,6 +12,7 @@ import { BudgetGuard } from "./budget-guard.js";
 import { registerRizeIntegration } from "./integrations/rize.js";
 import { registerLinearTaskSource } from "./integrations/linear-tasks.js";
 import { registerInboxWatcher } from "./integrations/inbox-watcher.js";
+import { registerBuildBetterTaskSource } from "./integrations/buildbetter-tasks.js";
 import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemoryCondenser } from "./memory-condenser.js";
@@ -223,6 +224,17 @@ export class AbiRuntime {
         task: "task-reminders",
         intervalMs: 15 * 60 * 1000
       });
+      // Observation-driven task lifecycle — every 15 min, scan recent
+      // OCR against pending tasks and auto-complete / mark in-progress
+      // when there's strong evidence. Conservative thresholds; the user
+      // can always revert via the dashboard.
+      this.cron.addJob({
+        id: "task-activity-scan",
+        name: "Auto-detect task completion / progress from screen",
+        enabled: true,
+        task: "task-activity-scan",
+        intervalMs: 15 * 60 * 1000
+      });
       registerCoreTools(this.tools, this);
     }
 
@@ -238,6 +250,10 @@ export class AbiRuntime {
       registerRizeIntegration(this);
       // Linear is env-gated — silently no-ops if LINEAR_API_KEY isn't set.
       registerLinearTaskSource(this);
+      // BuildBetter is env-gated too. Needs BUILDBETTER_API_KEY plus either
+      // BUILDBETTER_USER_EMAIL or BUILDBETTER_USER_NAME so it knows which
+      // attendee's action items to pull.
+      registerBuildBetterTaskSource(this);
       // Inbox watcher always runs — it just polls a local dir; if nothing's
       // dropped in there it returns { processed: 0 } and moves on. Sources
       // like reMarkable / Obsidian / Bear can sync into .openagi/inbox/.
@@ -411,6 +427,10 @@ export class AbiRuntime {
         if (!this.linearTaskSource?.sync) return { skipped: true, reason: "no linear source" };
         return this.linearTaskSource.sync({ now });
       }
+      if (job.task === "buildbetter-task-sync") {
+        if (!this.buildBetterTaskSource?.sync) return { skipped: true, reason: "no buildbetter source" };
+        return this.buildBetterTaskSource.sync({ now });
+      }
       if (job.task === "inbox-sweep") {
         if (!this.inboxWatcher?.sweep) return { skipped: true, reason: "no inbox watcher" };
         return this.inboxWatcher.sweep();
@@ -420,6 +440,12 @@ export class AbiRuntime {
       }
       if (job.task === "task-reminders") {
         return this.runTaskReminders({ now });
+      }
+      if (job.task === "task-activity-scan") {
+        if (!this.proactiveObserver?.scanTasksAgainstActivity) return { skipped: true, reason: "no observer" };
+        const result = await this.proactiveObserver.scanTasksAgainstActivity({ now });
+        this.events?.emit?.("miner-result", { source: "task-activity-scan", at: nowIso(), ...result });
+        return result;
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);

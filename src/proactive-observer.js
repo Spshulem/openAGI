@@ -259,6 +259,137 @@ export class ProactiveObserver {
   }
 }
 
+// Scan recent activity against pending tasks and decide whether any
+// should be auto-completed (e.g. user shipped the PR they had as a
+// task) or moved to in_progress (e.g. user is actively on the ticket).
+//
+// Conservative thresholds — auto-complete only at high confidence,
+// move-to-in-progress at medium. Everything is logged via task-updated
+// SSE events so the user sees what we did and can revert.
+const TASK_SCAN_SYSTEM_PROMPT = [
+  "You review a list of the user's pending tasks against what was recently on their screen.",
+  "For each task, decide if there's STRONG evidence in the OCR snippets that it just got done, or that the user is actively working on it.",
+  "Output STRICT JSON: {\"updates\": [{\"taskId\": \"...\", \"action\": \"complete\"|\"in_progress\", \"confidence\": 0-1, \"evidence\": \"<short>\"}]} — empty updates array is fine.",
+  "Be conservative. 'complete' requires explicit evidence (PR merged, ticket closed, message sent). 'in_progress' requires the user actively working on it (editor open, commits being made, in a related call).",
+  "Don't propose updates without specific OCR text supporting them — quote a fragment in the evidence field."
+].join("\n");
+
+ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = new Date() } = {}) {
+  if (!this.runtime?.tasks?.list) return { skipped: true, reason: "no task store" };
+  if (!this.runtime?.observations?.getRecentContext) return { skipped: true, reason: "no observation store" };
+
+  const ctx = await this.runtime.observations.getRecentContext({
+    minutes: 30,
+    maxChars: 2400,
+    maxSnippets: 10
+  });
+  if ((ctx.snippets?.length ?? 0) < 2) {
+    return { skipped: true, reason: "insufficient activity" };
+  }
+
+  const candidates = this.runtime.tasks
+    .list({ status: "pending", limit: 30 })
+    .filter((t) => t.queue === "user");
+  if (candidates.length === 0) return { skipped: true, reason: "no pending user tasks" };
+
+  const provider = this.runtime.agentHost?.modelProvider;
+  if (!provider?.isConfigured?.() || provider.constructor.name === "DeterministicModelProvider") {
+    // Without an LLM we can't reliably decide. Skip rather than hallucinate.
+    return { skipped: true, reason: "no LLM provider for task scan" };
+  }
+
+  const prompt = [
+    "Pending tasks:",
+    ...candidates.map((t) => `  - id=${t.id} · "${t.title}"${t.description ? ` (${t.description.slice(0, 120)})` : ""}`),
+    "",
+    "Recent on-screen activity (apps + OCR snippets):",
+    ...(ctx.apps ?? []).slice(0, 5).map((a) => `  - app: ${a.app} (${a.n} focus events)`),
+    ...(ctx.snippets ?? []).slice(0, 10).map((s) => `  - [${s.app}] ${s.text}`),
+    "",
+    "Which tasks just got done or are actively being worked on?"
+  ].join("\n");
+
+  let raw;
+  try {
+    const result = await provider.generate({
+      input: prompt,
+      agent: { id: "task-scanner", name: "task-scanner" },
+      memoryHits: [],
+      messages: [],
+      tools: [],
+      toolRegistry: null,
+      instructions: TASK_SCAN_SYSTEM_PROMPT,
+      context: {}
+    });
+    raw = result.text ?? "";
+  } catch (err) {
+    return { skipped: true, reason: `llm error: ${err.message ?? String(err)}` };
+  }
+
+  let parsed;
+  try {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start < 0 || end <= start) throw new Error("no json");
+    parsed = JSON.parse(raw.slice(start, end + 1));
+  } catch {
+    return { skipped: true, reason: "could not parse llm output" };
+  }
+
+  const updates = Array.isArray(parsed?.updates) ? parsed.updates : [];
+  let completed = 0;
+  let inProgressed = 0;
+  const applied = [];
+
+  for (const u of updates) {
+    if (!u?.taskId) continue;
+    const task = this.runtime.tasks.get(u.taskId);
+    if (!task || task.status === "completed") continue;
+    const confidence = Number(u.confidence ?? 0);
+
+    if (u.action === "complete" && confidence >= 0.7) {
+      this.runtime.tasks.complete(task.id, "observed");
+      // Annotate with evidence so the user can sanity-check.
+      this.runtime.tasks.update(task.id, {
+        sourceMeta: {
+          ...(task.sourceMeta ?? {}),
+          autoCompletedEvidence: u.evidence,
+          autoCompletedConfidence: confidence
+        }
+      });
+      this.runtime?.events?.emit?.("task-auto-changed", {
+        action: "complete",
+        taskId: task.id,
+        title: task.title,
+        evidence: u.evidence,
+        confidence
+      });
+      completed += 1;
+      applied.push({ id: task.id, action: "complete" });
+    } else if (u.action === "in_progress" && confidence >= 0.5 && task.status !== "in_progress") {
+      this.runtime.tasks.update(task.id, {
+        status: "in_progress",
+        sourceMeta: {
+          ...(task.sourceMeta ?? {}),
+          inProgressEvidence: u.evidence,
+          inProgressConfidence: confidence
+        }
+      });
+      this.runtime?.events?.emit?.("task-auto-changed", {
+        action: "in_progress",
+        taskId: task.id,
+        title: task.title,
+        evidence: u.evidence,
+        confidence
+      });
+      inProgressed += 1;
+      applied.push({ id: task.id, action: "in_progress" });
+    }
+  }
+
+  return { scanned: candidates.length, completed, inProgressed, applied };
+};
+
 function parseProposal(text) {
   if (!text) return null;
   const start = text.indexOf("{");

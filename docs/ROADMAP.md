@@ -35,6 +35,36 @@ The agent's value compounds with how much of your activity it sees. Right now if
 
 ---
 
+## reMarkable: covered by the inbox watcher today
+
+A direct reMarkable connector (PDF generation + Dropbox upload + Vision
+OCR for round-trip checkmark sync) is not currently shipped. We
+deliberately chose a simpler, more general path: the **inbox watcher**
+at `.openagi/inbox/`.
+
+Today's reMarkable flow:
+
+1. Set up your reMarkable Cloud → Dropbox sync
+2. Point the Dropbox folder at `~/Library/Application Support/OpenAGI/inbox/`
+3. Write tasks on your reMarkable using GitHub-style checkboxes:
+   ```
+   - [ ] Buy milk
+   - [x] Ship release
+   TODO: call mom
+   ```
+4. Sync → file lands in inbox folder → OpenAGI's `InboxWatcher` picks
+   it up within 30 seconds → tasks appear in the user queue
+5. Files move to `inbox/processed/<timestamp>-<name>` after parsing so
+   they don't re-import
+
+Same pattern works for Obsidian, Bear, paper notes scanned via the
+Notes app, etc. — anything that ends up as a file.
+
+A "full" reMarkable port (PDF round-trip, Vision OCR for checkmark
+detection from annotated pages, ~500 lines + 3 native deps) is on the
+list if there's demand, but the inbox approach delivers most of the
+value with 130 lines and zero deps.
+
 ## Other items currently in the README's roadmap
 
 | Item | Effort | Notes |
