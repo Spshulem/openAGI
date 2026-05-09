@@ -510,6 +510,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Unified integrations view. Every source/channel/MCP catalog
         // entry shows up here, with whichever paths apply (API key vs.
         // MCP) so the user has ONE place to configure everything.
+        const { MCP_CATALOG, CATEGORIES } = await import("./mcp-catalog.js");
         const registeredMcps = new Set(
           (runtime.mcp?.listServers?.() ?? []).map((s) => (s.name ?? "").toLowerCase())
         );
@@ -628,47 +629,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               }
             ]
           },
-          {
-            id: "github",
-            name: "GitHub",
-            description: "Search repos / read PRs / browse code via MCP.",
-            paths: [
-              {
-                kind: "mcp",
-                label: "GitHub MCP",
-                catalogId: "github",
-                configured: mcpInCatalog("github")
-              }
-            ]
-          },
-          {
-            id: "notion",
-            name: "Notion",
-            description: "Read pages + database content via MCP.",
-            paths: [
-              {
-                kind: "mcp",
-                label: "Notion MCP",
-                catalogId: "notion",
-                configured: mcpInCatalog("notion")
-              }
-            ]
-          },
-          {
-            id: "slack",
-            name: "Slack",
-            description: "Read messages + post to channels via MCP.",
-            paths: [
-              {
-                kind: "mcp",
-                label: "Slack MCP",
-                catalogId: "slack",
-                configured: mcpInCatalog("slack")
-              }
-            ]
-          }
         ];
-        return sendJson(res, 200, { integrations });
+        // featured ids already shown as full multi-path cards above —
+        // skip them in the browse-catalog section to avoid duplication.
+        const featuredIds = new Set(integrations.map((i) => i.id));
+        const catalog = MCP_CATALOG
+          .filter((entry) => !featuredIds.has(entry.id))
+          .map((entry) => ({
+            id: entry.id,
+            name: entry.name,
+            description: entry.description,
+            category: entry.category,
+            authType: entry.authType,
+            status: entry.status,
+            connectable: entry.status === "available" && Boolean(entry.register),
+            configured: mcpInCatalog(entry.id)
+          }));
+        return sendJson(res, 200, { integrations, catalog, categories: CATEGORIES });
       }
       if (method === "GET" && pathname === "/tasks") {
         if (!runtime.tasks?.list) return sendJson(res, 503, { error: "no task store" });
@@ -2508,8 +2485,42 @@ async function renderSuggestions() {
 }
 
 async function renderIntegrations() {
-  const data = await fetchJson("/integrations/status").catch(() => ({ integrations: [] }));
+  const data = await fetchJson("/integrations/status").catch(() => ({ integrations: [], catalog: [], categories: [] }));
   const integrations = data.integrations ?? [];
+  const catalog = data.catalog ?? [];
+  const categories = data.categories ?? [];
+
+  const catalogCard = (e) => {
+    let badge;
+    if (e.configured) {
+      badge = '<span class="badge ok">on</span>';
+    } else if (e.status === "coming-soon") {
+      badge = '<span class="badge">soon</span>';
+    } else {
+      badge = '<span class="badge">off</span>';
+    }
+    let action;
+    if (e.configured) {
+      action = \`<a href="/?tab=mcp" style="font-size:11px;">Manage →</a>\`;
+    } else if (e.connectable) {
+      action = \`<button class="add-mcp-btn" data-catalog-id="\${escapeHtml(e.id)}" data-int-id="\${escapeHtml(e.id)}" style="font-size:11px; padding:3px 8px;">+ Connect</button>\`;
+    } else {
+      const auth = e.authType === "oauth" ? "OAuth coming soon" : "Coming soon";
+      action = \`<span class="muted" style="font-size:11px;">\${auth}</span>\`;
+    }
+    return \`
+      <div class="card" style="padding:10px 12px;">
+        <div class="row between" style="align-items:flex-start; gap:8px;">
+          <div style="flex:1; min-width:0;">
+            <div style="font-weight:500; font-size:13px;">\${escapeHtml(e.name)}</div>
+            <div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(e.description ?? "")}</div>
+          </div>
+          \${badge}
+        </div>
+        <div style="margin-top:6px;">\${action}</div>
+      </div>
+    \`;
+  };
 
   const pathBlock = (it, p) => {
     const status = p.configured
@@ -2585,6 +2596,23 @@ async function renderIntegrations() {
           \${(it.paths ?? []).map((p) => pathBlock(it, p)).join("")}
         </div>
       \`).join("")}
+
+      \${catalog.length > 0 ? \`
+        <h2 style="margin-top:30px;">Browse MCP catalog</h2>
+        <p class="muted">More servers — connect with one click when an integration is "available", or watch this list for OAuth-pending entries.</p>
+        \${categories.map((cat) => {
+          const inCat = catalog.filter((e) => e.category === cat.id);
+          if (inCat.length === 0) return "";
+          return \`
+            <div style="margin-top:18px;">
+              <h3 style="font-size:13px; text-transform:uppercase; letter-spacing:0.5px; color:var(--muted); margin-bottom:8px;">\${escapeHtml(cat.name)}</h3>
+              <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:10px;">
+                \${inCat.map((e) => catalogCard(e)).join("")}
+              </div>
+            </div>
+          \`;
+        }).join("")}
+      \` : ""}
     </div>
   \`;
 

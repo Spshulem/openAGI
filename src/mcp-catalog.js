@@ -1,141 +1,356 @@
-// Curated catalog of known MCP servers, keyed by app bundle id / hostname /
-// keyword that signals "this user is engaging with X — they could probably
-// benefit from connecting X's MCP." Used by the ProactiveObserver to surface
-// "want to add this MCP?" suggestions.
+// Curated catalog of known MCP servers, used for two purposes:
 //
-// Conservative on purpose — only includes servers we're confident actually
-// exist + map cleanly to a detectable app or domain. Better to miss a
-// suggestion than spam the user with bogus ones.
+//   1. Proactive observer auto-suggest — when it sees a matching app
+//      bundle id, hostname, or keyword in OCR, it can propose
+//      "Connect this MCP" via category="mcp" suggestion.
+//
+//   2. Manual browse + connect from the Integrations dashboard tab.
+//
+// Each entry:
+//   - id              stable slug, used as MCP server name when registered
+//   - name            display name
+//   - description     one-line summary
+//   - category        for UI grouping
+//   - authType        "api-key" | "oauth" — what the user has to set up
+//   - status          "available" | "coming-soon" — coming-soon entries
+//                     are listed but not connectable yet
+//   - matches         optional — bundle ids / hostnames / keywords for
+//                     proactive observer auto-suggest
+//   - register        optional — { transport, url, auth, command, args }
+//                     for one-click registration via /integrations/connect-mcp.
+//                     Coming-soon entries can leave this null.
+
+export const CATEGORIES = [
+  { id: "project-management", name: "Project Management" },
+  { id: "analytics", name: "Analytics & Product Intelligence" },
+  { id: "developer-tools", name: "Developer Tools" },
+  { id: "crm", name: "CRM & Customer" },
+  { id: "design-docs", name: "Design & Docs" },
+  { id: "communication", name: "Communication" },
+  { id: "calls-meetings", name: "Calls & Meetings" },
+  { id: "filesystem", name: "Filesystem" }
+];
 
 export const MCP_CATALOG = [
+  // ─── Project Management ─────────────────────────────────────────────
   {
     id: "linear",
     name: "Linear",
-    description: "Read/create/update issues, projects, sprints from your Linear workspace.",
+    description: "Manage Linear issues, projects, and cycles.",
+    category: "project-management",
+    authType: "oauth",
+    status: "available",
     matches: {
       bundleIds: ["com.linear", "com.linear.linear"],
       hostnames: ["linear.app", "linear.app/team"],
       keywords: ["linear", "linear.app", "issue tracker"]
     },
-    register: {
-      url: "https://mcp.linear.app/sse",
-      transport: "http",
-      auth: "oauth"
-    }
+    register: { url: "https://mcp.linear.app/mcp", transport: "http", auth: "oauth" }
   },
   {
-    id: "notion",
-    name: "Notion",
-    description: "Read pages, databases, search workspace content via Notion's API.",
-    matches: {
-      bundleIds: ["notion.id"],
-      hostnames: ["notion.so", "notion.site"],
-      keywords: ["notion"]
-    },
-    register: {
-      url: "https://mcp.notion.com/sse",
-      transport: "http",
-      auth: "oauth"
-    }
+    id: "jira",
+    name: "Jira & Confluence",
+    description: "Access Jira issues and Confluence pages via Atlassian.",
+    category: "project-management",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["atlassian.net", "jira.com", "confluence.com"], keywords: ["jira", "confluence"] }
   },
+  {
+    id: "asana",
+    name: "Asana",
+    description: "Manage Asana tasks, projects, and workflows.",
+    category: "project-management",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["asana.com"], keywords: ["asana"] }
+  },
+  {
+    id: "monday",
+    name: "monday.com",
+    description: "Access monday.com boards, items, and automations.",
+    category: "project-management",
+    authType: "api-key",
+    status: "coming-soon",
+    matches: { hostnames: ["monday.com"], keywords: ["monday.com"] }
+  },
+  {
+    id: "clickup",
+    name: "ClickUp",
+    description: "Manage ClickUp tasks, spaces, and docs.",
+    category: "project-management",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["clickup.com", "app.clickup.com"], keywords: ["clickup"] }
+  },
+
+  // ─── Analytics & Product Intelligence ───────────────────────────────
+  {
+    id: "posthog",
+    name: "PostHog",
+    description: "Query PostHog analytics data and insights.",
+    category: "analytics",
+    authType: "api-key",
+    status: "available",
+    matches: { hostnames: ["posthog.com", "app.posthog.com"], keywords: ["posthog"] },
+    register: { url: "https://mcp.posthog.com/sse", transport: "http", auth: "bearer" }
+  },
+  {
+    id: "mixpanel",
+    name: "Mixpanel",
+    description: "Access Mixpanel analytics, funnels, and retention data.",
+    category: "analytics",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["mixpanel.com"], keywords: ["mixpanel"] }
+  },
+  {
+    id: "amplitude",
+    name: "Amplitude",
+    description: "Query Amplitude analytics and behavioral data.",
+    category: "analytics",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["amplitude.com"], keywords: ["amplitude"] }
+  },
+  {
+    id: "pendo",
+    name: "Pendo",
+    description: "Access Pendo product analytics and user guides.",
+    category: "analytics",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["pendo.io"], keywords: ["pendo"] }
+  },
+  {
+    id: "datadog",
+    name: "Datadog",
+    description: "Query Datadog monitoring, metrics, and dashboards.",
+    category: "analytics",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["datadoghq.com"], keywords: ["datadog"] }
+  },
+  {
+    id: "statsig",
+    name: "Statsig",
+    description: "Access Statsig feature flags and experiment results.",
+    category: "analytics",
+    authType: "api-key",
+    status: "coming-soon",
+    matches: { hostnames: ["statsig.com", "console.statsig.com"], keywords: ["statsig"] }
+  },
+  {
+    id: "sentry",
+    name: "Sentry",
+    description: "Query Sentry error tracking and performance data.",
+    category: "analytics",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["sentry.io"], keywords: ["sentry"] }
+  },
+
+  // ─── Developer Tools ────────────────────────────────────────────────
   {
     id: "github",
     name: "GitHub",
-    description: "Search repos, read PRs/issues, browse code without leaving the agent.",
+    description: "Access GitHub repos, issues, PRs, and actions.",
+    category: "developer-tools",
+    authType: "api-key",
+    status: "available",
     matches: {
       bundleIds: ["com.github.GitHubDesktop"],
       hostnames: ["github.com"],
       keywords: ["github", "pull request", "PR #"]
     },
-    register: {
-      url: "https://api.githubcopilot.com/mcp/",
-      transport: "http",
-      auth: "oauth"
-    }
+    register: { url: "https://api.githubcopilot.com/mcp/", transport: "http", auth: "oauth" }
   },
   {
-    id: "slack",
-    name: "Slack",
-    description: "Read messages, post to channels, search history.",
-    matches: {
-      bundleIds: ["com.tinyspeck.slackmacgap"],
-      hostnames: ["slack.com", "app.slack.com"],
-      keywords: ["slack", "DM ", "channel #"]
-    },
-    register: {
-      // Slack itself doesn't run a hosted MCP yet; this is a placeholder for
-      // the most common community implementation. Update when official ships.
-      url: null,
-      transport: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-slack"]
-    }
+    id: "stripe",
+    name: "Stripe",
+    description: "Access Stripe payments, customers, and subscriptions.",
+    category: "developer-tools",
+    authType: "api-key",
+    status: "available",
+    matches: { hostnames: ["stripe.com", "dashboard.stripe.com"], keywords: ["stripe"] },
+    register: { url: "https://mcp.stripe.com/", transport: "http", auth: "bearer" }
   },
   {
-    id: "rize",
-    name: "Rize.io",
-    description: "Time-tracking + activity API. On-demand 'what was I working on yesterday?' / project-time-aggregation queries via MCP.",
-    matches: {
-      bundleIds: ["io.rize"],
-      hostnames: ["rize.io", "my.rize.io"],
-      keywords: ["rize", "rize.io"]
-    },
-    register: {
-      url: "https://mcp.rize.io/sse",
-      transport: "http",
-      auth: "oauth"
-    }
+    id: "vercel",
+    name: "Vercel",
+    description: "Manage Vercel deployments, projects, and domains.",
+    category: "developer-tools",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["vercel.com"], keywords: ["vercel"] }
   },
   {
-    id: "buildbetter",
-    name: "BuildBetter",
-    description: "Search calls, read transcripts, list action items / commitments / signals from your BuildBetter workspace. Useful when you want on-demand call recall — pair with the BuildBetter direct API source for automatic action-item ingestion into tasks.",
-    matches: {
-      bundleIds: [],
-      hostnames: ["buildbetter.app", "app.buildbetter.app"],
-      keywords: ["buildbetter", "action item", "call summary", "interview"]
-    },
-    register: {
-      url: "https://mcp.buildbetter.app/sse",
-      transport: "http",
-      auth: "oauth"
-    }
+    id: "gitlab",
+    name: "GitLab",
+    description: "Access GitLab projects, merge requests, and pipelines.",
+    category: "developer-tools",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["gitlab.com"], keywords: ["gitlab"] }
+  },
+  {
+    id: "cloudflare",
+    name: "Cloudflare",
+    description: "Manage Cloudflare workers, pages, and DNS.",
+    category: "developer-tools",
+    authType: "api-key",
+    status: "coming-soon",
+    matches: { hostnames: ["cloudflare.com", "dash.cloudflare.com"], keywords: ["cloudflare"] }
+  },
+  {
+    id: "supabase",
+    name: "Supabase",
+    description: "Access Supabase databases, auth, and storage.",
+    category: "developer-tools",
+    authType: "api-key",
+    status: "coming-soon",
+    matches: { hostnames: ["supabase.com", "app.supabase.com"], keywords: ["supabase"] }
+  },
+  {
+    id: "neon",
+    name: "Neon",
+    description: "Manage Neon serverless Postgres databases and branches.",
+    category: "developer-tools",
+    authType: "api-key",
+    status: "coming-soon",
+    matches: { hostnames: ["neon.tech", "console.neon.tech"], keywords: ["neon"] }
+  },
+
+  // ─── CRM & Customer ─────────────────────────────────────────────────
+  {
+    id: "hubspot",
+    name: "HubSpot",
+    description: "Access HubSpot CRM contacts, deals, and marketing data.",
+    category: "crm",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["hubspot.com", "app.hubspot.com"], keywords: ["hubspot"] }
+  },
+  {
+    id: "intercom",
+    name: "Intercom",
+    description: "Query Intercom conversations and customer data.",
+    category: "crm",
+    authType: "api-key",
+    status: "coming-soon",
+    matches: { hostnames: ["intercom.com", "app.intercom.com"], keywords: ["intercom"] }
+  },
+  {
+    id: "attio",
+    name: "Attio",
+    description: "Access Attio CRM records and workflows.",
+    category: "crm",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["attio.com", "app.attio.com"], keywords: ["attio"] }
+  },
+
+  // ─── Design & Docs ──────────────────────────────────────────────────
+  {
+    id: "notion",
+    name: "Notion",
+    description: "Read pages, databases, search workspace content via Notion's API.",
+    category: "design-docs",
+    authType: "oauth",
+    status: "available",
+    matches: { bundleIds: ["notion.id"], hostnames: ["notion.so", "notion.site"], keywords: ["notion"] },
+    register: { url: "https://mcp.notion.com/sse", transport: "http", auth: "oauth" }
+  },
+  {
+    id: "figma",
+    name: "Figma",
+    description: "Access Figma designs, components, and variables.",
+    category: "design-docs",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["figma.com"], keywords: ["figma"] }
+  },
+  {
+    id: "miro",
+    name: "Miro",
+    description: "Access Miro boards, frames, and sticky notes.",
+    category: "design-docs",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["miro.com"], keywords: ["miro"] }
+  },
+  {
+    id: "webflow",
+    name: "Webflow",
+    description: "Manage Webflow sites, collections, and CMS items.",
+    category: "design-docs",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { hostnames: ["webflow.com"], keywords: ["webflow"] }
   },
   {
     id: "remarkable",
     name: "reMarkable",
-    description: "Read your reMarkable tablet's documents + handwritten notes. Implementation: github.com/SamMorrowDrums/remarkable-mcp. Pairs well with the inbox folder for full bidirectional task sync.",
-    matches: {
-      bundleIds: [],
-      hostnames: ["my.remarkable.com", "remarkable.com"],
-      keywords: ["remarkable", "rmapi"]
-    },
-    register: {
-      transport: "stdio",
-      command: "npx",
-      args: ["-y", "@sammorrowdrums/remarkable-mcp"]
-    }
+    description: "Read your reMarkable tablet's documents + handwritten notes (via SamMorrowDrums/remarkable-mcp).",
+    category: "design-docs",
+    authType: "api-key",
+    status: "available",
+    matches: { hostnames: ["my.remarkable.com", "remarkable.com"], keywords: ["remarkable", "rmapi"] },
+    register: { transport: "stdio", command: "npx", args: ["-y", "@sammorrowdrums/remarkable-mcp"] }
   },
+
+  // ─── Communication ──────────────────────────────────────────────────
+  {
+    id: "slack",
+    name: "Slack",
+    description: "Access Slack channels, messages, and user data.",
+    category: "communication",
+    authType: "oauth",
+    status: "coming-soon",
+    matches: { bundleIds: ["com.tinyspeck.slackmacgap"], hostnames: ["slack.com", "app.slack.com"], keywords: ["slack"] },
+    register: { transport: "stdio", command: "npx", args: ["-y", "@modelcontextprotocol/server-slack"] }
+  },
+
+  // ─── Calls & Meetings ───────────────────────────────────────────────
+  {
+    id: "buildbetter",
+    name: "BuildBetter",
+    description: "Search calls, read transcripts, list action items / commitments / signals from your BuildBetter workspace.",
+    category: "calls-meetings",
+    authType: "oauth",
+    status: "available",
+    matches: { hostnames: ["buildbetter.app", "app.buildbetter.app"], keywords: ["buildbetter", "action item", "interview"] },
+    register: { url: "https://mcp.buildbetter.app/sse", transport: "http", auth: "oauth" }
+  },
+  {
+    id: "rize",
+    name: "Rize.io",
+    description: "Time-tracking + activity API. On-demand 'what was I working on yesterday?' queries via MCP.",
+    category: "calls-meetings",
+    authType: "oauth",
+    status: "available",
+    matches: { bundleIds: ["io.rize"], hostnames: ["rize.io", "my.rize.io"], keywords: ["rize", "rize.io"] },
+    register: { url: "https://mcp.rize.io/sse", transport: "http", auth: "oauth" }
+  },
+
+  // ─── Filesystem ─────────────────────────────────────────────────────
   {
     id: "filesystem-tmp",
     name: "Filesystem (read-only on /tmp)",
     description: "Lets the agent read scratch files in /tmp for grounding.",
-    matches: {
-      bundleIds: [],
-      hostnames: [],
-      keywords: ["pbcopy", "/tmp/", "scratch"]
-    },
-    register: {
-      transport: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-    }
+    category: "filesystem",
+    authType: "api-key",
+    status: "available",
+    matches: { keywords: ["pbcopy", "/tmp/", "scratch"] },
+    register: { transport: "stdio", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] }
   }
 ];
 
 // Given recent activity rows (apps + OCR snippets), return the MCP catalog
 // entries whose match-criteria fire. Each result includes the trigger
 // (which bundleId / keyword) so the proposal prompt can reference it.
+// Only matches "available" entries — coming-soon are listed in the UI
+// but not auto-suggested.
 export function matchCatalog(activity, snippets, alreadyRegistered = new Set()) {
   const hits = [];
   const seenIds = new Set();
@@ -143,20 +358,21 @@ export function matchCatalog(activity, snippets, alreadyRegistered = new Set()) 
   const apps = new Set((activity ?? []).map((a) => (a.app ?? "").toLowerCase()));
 
   for (const entry of MCP_CATALOG) {
+    if (entry.status !== "available") continue;
     if (alreadyRegistered.has(entry.id) || alreadyRegistered.has(entry.name.toLowerCase())) continue;
     if (seenIds.has(entry.id)) continue;
 
     let trigger = null;
-    for (const bid of entry.matches.bundleIds ?? []) {
+    for (const bid of entry.matches?.bundleIds ?? []) {
       if (apps.has(bid.toLowerCase())) { trigger = `app: ${bid}`; break; }
     }
     if (!trigger) {
-      for (const host of entry.matches.hostnames ?? []) {
+      for (const host of entry.matches?.hostnames ?? []) {
         if (ocrText.includes(host.toLowerCase())) { trigger = `host: ${host}`; break; }
       }
     }
     if (!trigger) {
-      for (const kw of entry.matches.keywords ?? []) {
+      for (const kw of entry.matches?.keywords ?? []) {
         if (ocrText.includes(kw.toLowerCase())) { trigger = `keyword: ${kw}`; break; }
       }
     }
