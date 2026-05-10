@@ -1548,6 +1548,32 @@ function renderChat() {
   // backend endpoints the Suggestions tab does.
   renderChatDeepLink();
   const input = $("input");
+  // ?compose=<intent> seeds the input with a starter sentence so the user
+  // can finish typing and Enter — agent picks up via add_task /
+  // connect_catalog_mcp / etc tools. Used by the menu-bar "+ Add task"
+  // button so its click drops you straight into a conversation rather
+  // than a structured form.
+  const composeIntent = new URLSearchParams(window.location.search).get("compose");
+  if (composeIntent && state.messages.length === 0) {
+    const seed = ({
+      "add-task": "Add a task: ",
+      "add-mcp": "Connect this MCP: ",
+      "schedule": "Remind me to ",
+      "remember": "Remember that "
+    })[composeIntent];
+    if (seed) {
+      input.value = seed;
+      input.dispatchEvent(new Event("input"));
+      // Move caret to end so the user starts typing in the right spot.
+      requestAnimationFrame(() => {
+        input.setSelectionRange(seed.length, seed.length);
+      });
+      // Strip the query so reload / re-render doesn't re-seed.
+      const url = new URL(window.location.href);
+      url.searchParams.delete("compose");
+      history.replaceState(null, "", url.toString());
+    }
+  }
   input.focus();
   input.addEventListener("input", () => {
     input.style.height = "auto";

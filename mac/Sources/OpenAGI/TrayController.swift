@@ -54,11 +54,13 @@ struct TrayMenu: View {
     }
   }
 
-  // Top user tasks, today + this_week pending. Click → dashboard tasks tab.
+  // Top user tasks, today + this_week pending. "+ Add task" drops the user
+  // into chat with a draft message so they can describe the task in natural
+  // language and the agent's add_task tool routes it. Top-task entries +
+  // "View all" still go to the Tasks tab for the structured view.
   @ViewBuilder private var tasksSection: some View {
     if state.topTasks.isEmpty {
       Text("No pending tasks").disabled(true).font(.caption)
-      Button("+ Add task…") { state.openDashboard(path: "/?tab=tasks") }
     } else {
       Text("Top tasks").disabled(true).font(.caption)
       ForEach(state.topTasks) { t in
@@ -66,6 +68,7 @@ struct TrayMenu: View {
       }
       Button("View all tasks…") { state.openDashboard(path: "/?tab=tasks") }
     }
+    Button("+ Add task…") { state.openDashboard(path: "/?tab=chat&compose=add-task") }
   }
 
   private func taskLabel(_ t: AppState.TaskSummary) -> String {
