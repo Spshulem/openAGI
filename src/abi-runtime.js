@@ -615,7 +615,12 @@ export function createDurableRuntime(options = {}) {
   const runtime = createDefaultRuntime({
     ...options,
     skillsDir: options.skillsDir ?? path.join(dataDir, "skills"),
-    mcpOptions: { logDir: mcpLogDir, dataDir, ...(options.mcpOptions ?? {}) },
+    mcpOptions: {
+      logDir: mcpLogDir,
+      dataDir,
+      configPath: options.mcpConfigPath ?? path.join(dataDir, "mcp.json"),
+      ...(options.mcpOptions ?? {})
+    },
     budgetOptions: { storePath: path.join(dataDir, "budget", "usage.json"), ...(options.budgetOptions ?? {}) },
     outcomeOptions: { dir: path.join(dataDir, "outcomes"), ...(options.outcomeOptions ?? {}) },
     observationOptions: { dir: path.join(dataDir, "observations"), ...(options.observationOptions ?? {}) },

@@ -92,6 +92,8 @@ export const MCP_CATALOG = [
     category: "analytics",
     authType: "api-key",
     status: "available",
+    apiKeyEnvVar: "POSTHOG_MCP_API_KEY",
+    apiKeyHelp: "Personal API key from PostHog → Settings → User API keys.",
     matches: { hostnames: ["posthog.com", "app.posthog.com"], keywords: ["posthog"] },
     register: { url: "https://mcp.posthog.com/sse", transport: "http", auth: "bearer" }
   },
@@ -172,6 +174,8 @@ export const MCP_CATALOG = [
     category: "developer-tools",
     authType: "api-key",
     status: "available",
+    apiKeyEnvVar: "STRIPE_MCP_API_KEY",
+    apiKeyHelp: "Restricted API key from Stripe → Developers → API keys (sk_live_… or rk_live_…).",
     matches: { hostnames: ["stripe.com", "dashboard.stripe.com"], keywords: ["stripe"] },
     register: { url: "https://mcp.stripe.com/", transport: "http", auth: "bearer" }
   },

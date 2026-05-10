@@ -20,7 +20,10 @@ const WIZARD_FIELDS = [
   "LINEAR_API_KEY",
   "BUILDBETTER_API_KEY", "BUILDBETTER_USER_EMAIL", "BUILDBETTER_USER_NAME",
   "OPENAGI_PUBLIC_URL",
-  "OPENAGI_DAILY_USD_LIMIT"
+  "OPENAGI_DAILY_USD_LIMIT",
+  // Per-MCP bearer keys, declared by catalog entries via apiKeyEnvVar.
+  // Kept in this allowlist so the wizard's /setup/save can write them.
+  ...MCP_CATALOG.filter((e) => e.apiKeyEnvVar).map((e) => e.apiKeyEnvVar)
 ];
 
 export function isFirstRun() {
@@ -317,6 +320,16 @@ export function renderWizard({ proposedToken } = {}) {
     btn.textContent = "✓ copied"; setTimeout(() => btn.textContent = orig, 1500);
   });
 
+  // Reveal the inline API-key input when its parent MCP checkbox is ticked.
+  document.querySelectorAll('input[data-mcp-toggle]').forEach((cb) => {
+    const id = cb.dataset.mcpToggle;
+    const field = document.querySelector('.mcp-key-field[data-for="' + CSS.escape(id) + '"]');
+    if (!field) return;
+    cb.addEventListener("change", () => {
+      field.style.display = cb.checked ? "" : "none";
+    });
+  });
+
   document.getElementById("form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -370,8 +383,36 @@ export function renderWizard({ proposedToken } = {}) {
         (mcpResults.some((r) => !r.ok) ? '\\n<span class="err">Failed:</span> ' + mcpResults.filter((r) => !r.ok).map((r) => r.catalogId + " (" + r.error + ")").join(", ") : "");
       const target = checkedMcps.length > 0 ? "/?tab=integrations" : "/";
 
-      out.innerHTML = '<span class="ok">✓ Agent reply:</span>\\n\\n' + (testBody.reply ?? "(empty)") + mcpSummary + '\\n\\n<span class="ok">Setup complete. Loading dashboard…</span>';
-      setTimeout(() => { window.location.href = target; }, 1500);
+      // Bounce the daemon so existing integrations (Linear/BuildBetter/Twilio
+      // etc) re-read their .env values. The Mac app's DaemonController auto-
+      // respawns. For bare-metal users running 'npm run serve', they'll need
+      // to relaunch — we surface a fallback message after a generous timeout.
+      out.innerHTML = '<span class="ok">✓ Agent reply:</span>\\n\\n' + (testBody.reply ?? "(empty)") + mcpSummary + '\\n\\n<span class="ok">Restarting daemon to apply new settings…</span>';
+      try {
+        await fetch("/control/restart", {
+          method: "POST",
+          headers: { "content-type": "application/json", "authorization": "Bearer " + obj.OPENAGI_AUTH_TOKEN },
+          body: "{}"
+        });
+      } catch { /* the daemon exits before flushing — expected */ }
+
+      // Poll /health until the new process answers, then redirect. Fall
+      // back to a manual link after 30s so the user isn't stuck.
+      const deadline = Date.now() + 30000;
+      let backUp = false;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 500));
+        try {
+          const h = await fetch("/health", { cache: "no-store" });
+          if (h.ok) { backUp = true; break; }
+        } catch { /* still down, keep polling */ }
+      }
+      if (backUp) {
+        out.innerHTML += '\\n<span class="ok">✓ Daemon back up. Loading dashboard…</span>';
+        setTimeout(() => { window.location.href = target; }, 600);
+      } else {
+        out.innerHTML += '\\n<span class="err">Daemon didn\\'t come back automatically.</span> Open it from the menu bar (or relaunch your terminal serve), then <a href="' + target + '">continue to dashboard</a>.';
+      }
     } catch (err) {
       out.innerHTML = '<span class="err">Error:</span> ' + (err.message ?? err);
       btn.disabled = false;
@@ -405,17 +446,30 @@ function renderMcpCatalogStep() {
 
 function renderMcpCard(entry) {
   const connectable = entry.status === "available" && Boolean(entry.register);
-  const id = `mcp_${entry.id}`;
+  const checkboxId = `mcp_${entry.id}`;
   if (connectable) {
-    const auth = entry.authType === "oauth" ? "OAuth" : "API key";
+    const isOauth = entry.authType === "oauth";
+    const authPill = isOauth ? "OAuth" : "API key";
+    // For bearer-auth entries we need an inline password field. Hide it
+    // unless the parent checkbox is checked (no point asking for a key
+    // the user hasn't opted into).
+    const keyField = entry.apiKeyEnvVar
+      ? `
+        <div class="mcp-key-field" data-for="${escapeHtml(checkboxId)}" style="display:none; padding-left:24px; width:100%;">
+          <label style="font-size:11px; color:#8da59a; margin-bottom:3px;">${escapeHtml(entry.apiKeyEnvVar)}${entry.apiKeyHelp ? ` <span class="sub">— ${escapeHtml(entry.apiKeyHelp)}</span>` : ""}</label>
+          <input type="password" name="${escapeHtml(entry.apiKeyEnvVar)}" autocomplete="off" placeholder="paste your key" style="font-size:12px; padding:6px 9px;">
+        </div>
+      `
+      : "";
     return `
       <label class="opt" style="display:flex; gap:10px; align-items:flex-start; flex-direction:column;">
         <div style="display:flex; gap:8px; align-items:center; width:100%;">
-          <input type="checkbox" name="${escapeHtml(id)}" value="1">
+          <input type="checkbox" name="${escapeHtml(checkboxId)}" value="1" data-mcp-toggle="${escapeHtml(checkboxId)}">
           <span style="font-weight:600; flex:1;">${escapeHtml(entry.name)}</span>
-          <span class="pill" style="background:#0e1411; color:#8da59a;">${escapeHtml(auth)}</span>
+          <span class="pill" style="background:#0e1411; color:#8da59a;">${escapeHtml(authPill)}</span>
         </div>
         <div class="sub" style="font-size:11px; line-height:1.4; padding-left:24px;">${escapeHtml(entry.description ?? "")}</div>
+        ${keyField}
       </label>
     `;
   }

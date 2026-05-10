@@ -3,7 +3,7 @@ import path from "node:path";
 import { McpStdioClient } from "./mcp-client.js";
 import { McpHttpClient } from "./mcp-http-client.js";
 import { McpOAuthClient } from "./mcp-oauth.js";
-import { ensureDir, readJsonFile } from "./file-utils.js";
+import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 
 // Whitelist of executables permitted as the `command` for stdio MCP servers.
 // Anything not in this set is rejected at registerServer() — closes the
@@ -30,6 +30,19 @@ export class McpRegistry {
     this.permittedEnvKeys = options.permittedEnvKeys instanceof Set
       ? options.permittedEnvKeys
       : new Set(loadDotenvKeys(this.dataDir));
+    // When set, registerServer() persists the current set of registrations
+    // back to this path so they survive a daemon restart. loadConfigFile()
+    // skips writing (the file is the source of truth, not the destination).
+    this.configPath = options.configPath ?? null;
+    this._suppressPersist = false;
+  }
+
+  /// Allow runtime to whitelist a new env-var name (e.g. when a wizard
+  /// step adds STRIPE_MCP_API_KEY to .env mid-session, and a follow-up
+  /// registerServer call needs to expand `${STRIPE_MCP_API_KEY}` against it).
+  allowEnvKey(name) {
+    if (!name) return;
+    this.permittedEnvKeys.add(String(name));
   }
 
   bindToolRegistry(toolRegistry) {
@@ -89,7 +102,37 @@ export class McpRegistry {
       enabled: server.enabled ?? true
     };
     this.servers.set(normalized.name, normalized);
+    if (!this._suppressPersist) this._persist(server);
     return normalized;
+  }
+
+  /// Save the un-expanded server specs to configPath (if set). We keep the
+  /// `${VAR}` indirection so secrets stay in .env, not duplicated into the
+  /// JSON. Called automatically from registerServer; no-op if the registry
+  /// wasn't constructed with a configPath.
+  _persist(originalSpec) {
+    if (!this.configPath) return;
+    try {
+      const existing = readJsonFile(this.configPath, null) ?? {};
+      const servers = existing.servers ?? existing.mcpServers ?? {};
+      // Round-trip what the caller passed (with `${VAR}` placeholders intact)
+      // so we never write the expanded secret back to disk.
+      const spec = {
+        ...(originalSpec ?? {}),
+        // Drop fields that aren't valid in the file schema.
+        name: undefined
+      };
+      for (const k of Object.keys(spec)) {
+        if (spec[k] === undefined) delete spec[k];
+      }
+      servers[originalSpec.name] = spec;
+      const out = existing.mcpServers ? { ...existing, mcpServers: servers } : { ...existing, servers };
+      writeJsonAtomic(this.configPath, out);
+    } catch (error) {
+      // Persistence is best-effort — if .openagi/ isn't writable we still
+      // keep the in-memory registration so the user gets value this session.
+      try { process.stderr.write(`MCP persist failed: ${error.message}\n`); } catch { /* ignore */ }
+    }
   }
 
   loadConfigFile(filePath) {
@@ -98,6 +141,8 @@ export class McpRegistry {
     if (!config) return [];
     const registered = [];
     const servers = config.servers ?? config.mcpServers ?? {};
+    this._suppressPersist = true;
+    try {
     for (const [name, spec] of Object.entries(servers)) {
       // Skip comment-only entries (keys like "_comment", "//", "//2").
       if (name.startsWith("_") || name === "//" || /^\/\/\d*$/.test(name)) continue;
@@ -126,6 +171,9 @@ export class McpRegistry {
           transport: spec.transport
         })
       );
+    }
+    } finally {
+      this._suppressPersist = false;
     }
     return registered;
   }

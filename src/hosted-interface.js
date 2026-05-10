@@ -497,7 +497,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!entry) return sendJson(res, 404, { error: "not in catalog" });
         if (!entry.register) return sendJson(res, 400, { error: "catalog entry has no register info" });
         try {
-          const server = runtime.mcp.registerServer({ name: entry.id, ...entry.register });
+          const spec = { name: entry.id, ...entry.register };
+          // For bearer-auth catalog entries, point the apiKey at an env var
+          // so the actual secret stays in .env and gets re-read on restart.
+          // Whitelist that var on the registry first so registerServer's
+          // ${VAR} expansion accepts it.
+          if (entry.register.auth === "bearer" && entry.apiKeyEnvVar) {
+            runtime.mcp.allowEnvKey?.(entry.apiKeyEnvVar);
+            spec.apiKey = `\${${entry.apiKeyEnvVar}}`;
+          }
+          const server = runtime.mcp.registerServer(spec);
           if (runtime.mcp?.connect) {
             runtime.mcp.connect(server.name).catch(() => { /* OAuth path surfaces via SSE */ });
           }
@@ -505,6 +514,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         } catch (error) {
           return sendJson(res, 400, { error: error.message });
         }
+      }
+      if (method === "POST" && pathname === "/control/restart") {
+        // Bounce the daemon so .env changes pick up. The Mac app's
+        // DaemonController has a terminationHandler that respawns after a
+        // short backoff; bare-metal `npm run serve` users will need to
+        // re-launch manually. The endpoint returns 202 immediately, then
+        // schedules the exit so the response can flush.
+        sendJson(res, 202, { restarting: true });
+        setTimeout(() => process.exit(0), 200);
+        return;
       }
       if (method === "GET" && pathname === "/integrations/status") {
         // Unified integrations view. Every source/channel/MCP catalog
@@ -642,6 +661,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             category: entry.category,
             authType: entry.authType,
             status: entry.status,
+            apiKeyEnvVar: entry.apiKeyEnvVar ?? null,
+            apiKeyHelp: entry.apiKeyHelp ?? null,
+            apiKeyConfigured: entry.apiKeyEnvVar ? Boolean(process.env[entry.apiKeyEnvVar]) : true,
             connectable: entry.status === "available" && Boolean(entry.register),
             configured: mcpInCatalog(entry.id)
           }));
