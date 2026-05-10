@@ -1089,6 +1089,8 @@ function renderApp() {
   <style>
     :root {
       color-scheme: light dark;
+      /* Legacy tokens — kept so existing inline-styled components don't
+         drift visually while we migrate them to the shadcn-vocab layer. */
       --bg: #0e1411;
       --panel: #161d19;
       --panel-2: #1d2722;
@@ -1101,6 +1103,49 @@ function renderApp() {
       --assistant: #1d2722;
       --warn: #f0b454;
       --err: #f08080;
+
+      /* shadcn-vocab tokens. We've adopted the same names openclaw uses
+         (which mirror shadcn) so future tabs / components have a stable
+         palette + spacing scale to lean on. New work should reach for
+         these first; legacy components keep using the originals above
+         until they're migrated. */
+      --background: var(--bg);
+      --foreground: var(--text);
+      --card: var(--panel);
+      --card-foreground: var(--text);
+      --popover: #1a221d;
+      --popover-foreground: var(--text);
+      --primary: var(--accent);
+      --primary-foreground: #002219;
+      --secondary: var(--panel-2);
+      --secondary-foreground: var(--text);
+      --muted-bg: var(--panel-2);
+      --muted-foreground: var(--muted);
+      --accent-bg: var(--accent-soft);
+      --accent-foreground: var(--accent);
+      --destructive: #b3463a;
+      --destructive-foreground: #ffd9d4;
+      --border: var(--line);
+      --input: var(--panel-2);
+      --ring: rgba(111, 225, 177, 0.45);
+
+      /* Spacing scale (4px grid) and radius / typography — used by
+         the primitive classes below. */
+      --space-1: 4px;
+      --space-2: 8px;
+      --space-3: 12px;
+      --space-4: 16px;
+      --space-5: 24px;
+      --space-6: 32px;
+      --radius-sm: 4px;
+      --radius: 8px;
+      --radius-lg: 12px;
+      --font-size-xs: 11px;
+      --font-size-sm: 12px;
+      --font-size-base: 14px;
+      --font-size-lg: 16px;
+      --shadow-sm: 0 1px 2px rgba(0,0,0,.25);
+      --shadow: 0 4px 12px rgba(0,0,0,.30);
     }
     * { box-sizing: border-box; }
     body {
@@ -1244,6 +1289,121 @@ function renderApp() {
     .ok { color: var(--accent); }
     .err { color: var(--err); }
     .empty { color: var(--muted); padding: 16px; text-align: center; }
+
+    /* ─── Primitive components (shadcn-style, vanilla CSS) ───────────────
+       Every new feature should compose these instead of inline styles. */
+
+    .ui-section { margin-top: var(--space-5); }
+    .ui-section:first-child { margin-top: 0; }
+    .ui-section-header { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); }
+    .ui-section-header h3 { margin: 0; font-size: var(--font-size-base); font-weight: 600; }
+    .ui-section-header .ui-section-meta { color: var(--muted-foreground); font-weight: 400; font-size: var(--font-size-sm); }
+
+    .ui-card {
+      background: var(--card);
+      color: var(--card-foreground);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--space-3) var(--space-4);
+    }
+    .ui-card.ui-card-elev { box-shadow: var(--shadow-sm); }
+
+    .ui-empty {
+      color: var(--muted-foreground);
+      background: var(--muted-bg);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+      padding: var(--space-4);
+      text-align: center;
+      font-size: var(--font-size-sm);
+    }
+
+    .ui-btn {
+      display: inline-flex; align-items: center; gap: var(--space-2); justify-content: center;
+      background: var(--primary); color: var(--primary-foreground);
+      border: 1px solid transparent; border-radius: var(--radius-sm);
+      padding: 6px 12px; font-size: var(--font-size-sm); font-weight: 600;
+      cursor: pointer; transition: opacity .12s ease, background .12s ease;
+      font-family: inherit;
+    }
+    .ui-btn:hover:not(:disabled) { opacity: 0.9; }
+    .ui-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .ui-btn:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
+    .ui-btn-secondary {
+      background: var(--secondary); color: var(--secondary-foreground);
+      border: 1px solid var(--border);
+    }
+    .ui-btn-secondary:hover:not(:disabled) { background: var(--card); }
+    .ui-btn-ghost {
+      background: transparent; color: var(--foreground);
+      border: 1px solid transparent;
+    }
+    .ui-btn-ghost:hover:not(:disabled) { background: var(--muted-bg); }
+    .ui-btn-destructive {
+      background: var(--destructive); color: var(--destructive-foreground);
+    }
+    .ui-btn-sm { padding: 3px 9px; font-size: var(--font-size-xs); }
+
+    .ui-input, .ui-textarea, .ui-select {
+      background: var(--input); color: var(--foreground);
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 6px 10px; font-size: var(--font-size-sm); font-family: inherit;
+      width: 100%; outline: none;
+    }
+    .ui-input:focus, .ui-textarea:focus, .ui-select:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--ring); }
+    .ui-textarea { resize: vertical; min-height: 36px; line-height: 1.4; }
+
+    .ui-badge {
+      display: inline-flex; align-items: center; gap: 3px;
+      font-size: var(--font-size-xs); padding: 2px 7px; border-radius: 999px;
+      background: var(--muted-bg); color: var(--muted-foreground);
+      border: 1px solid var(--border); white-space: nowrap;
+    }
+    .ui-badge-accent { background: var(--accent-bg); color: var(--accent-foreground); border-color: var(--accent-bg); }
+    .ui-badge-warn { color: var(--warn); }
+    .ui-badge-err { color: var(--err); border-color: rgba(240,128,128,.3); }
+
+    .ui-divider { border: 0; border-top: 1px solid var(--border); margin: var(--space-4) 0; }
+
+    .ui-row { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
+    .ui-stack { display: flex; flex-direction: column; gap: var(--space-2); }
+    .ui-grow { flex: 1; min-width: 0; }
+    .ui-muted { color: var(--muted-foreground); }
+    .ui-meta { font-size: var(--font-size-xs); color: var(--muted-foreground); }
+
+    .ui-kbd {
+      display: inline-block; font-family: ui-monospace, Menlo, monospace;
+      font-size: 10px; padding: 1px 5px; border-radius: 3px;
+      background: var(--muted-bg); border: 1px solid var(--border); color: var(--muted-foreground);
+    }
+
+    /* Task list — rows have a clear hover affordance and a settled
+       baseline grid (10px vertical pad keeps line-height aligned with
+       checkbox baseline). */
+    .ui-task-list { list-style: none; padding: 0; margin: 0; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .ui-task-row {
+      display: flex; gap: var(--space-3); align-items: flex-start;
+      padding: 10px var(--space-3); border-bottom: 1px solid var(--border);
+      transition: background .12s ease;
+    }
+    .ui-task-row:last-child { border-bottom: 0; }
+    .ui-task-row:hover { background: var(--muted-bg); }
+    .ui-task-check { margin-top: 4px; cursor: pointer; }
+    .ui-task-title { font-weight: 500; font-size: var(--font-size-sm); }
+
+    /* Page-chat composer (Tasks/Memory/Suggestions inline send-to-agent) */
+    .page-chat .page-chat-input { /* already laid out inline; promote to token-driven */
+      background: var(--input); color: var(--foreground);
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+    }
+    .page-chat .page-chat-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--ring); outline: none; }
+    .page-chat .page-chat-send {
+      background: var(--primary); color: var(--primary-foreground);
+      border: 0; border-radius: var(--radius-sm); padding: 6px 14px;
+      font-weight: 600; font-size: var(--font-size-sm); cursor: pointer;
+    }
+    .page-chat .page-chat-send:hover:not(:disabled) { opacity: 0.9; }
+    .page-chat .page-chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -3086,25 +3246,26 @@ async function renderTasks() {
     const dueDateStr = t.dueDate ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
     const sourceBadge = t.source && t.source !== "manual"
       ? (t.sourceUrl
-          ? \`<a class="badge" href="\${escapeHtml(t.sourceUrl)}" target="_blank" rel="noopener" style="font-size:10px; text-decoration:none;">\${escapeHtml(t.source)} ↗</a>\`
-          : \`<span class="badge" style="font-size:10px;">\${escapeHtml(t.source)}</span>\`)
+          ? \`<a class="ui-badge" href="\${escapeHtml(t.sourceUrl)}" target="_blank" rel="noopener" style="text-decoration:none;">\${escapeHtml(t.source)} ↗</a>\`
+          : \`<span class="ui-badge">\${escapeHtml(t.source)}</span>\`)
       : "";
+    const titleStyle = t.status === "completed" ? "text-decoration:line-through; color:var(--muted-foreground);" : "";
     return \`
-      <li data-task-id="\${t.id}" class="task" style="display:flex; gap:10px; align-items:flex-start; padding:10px 12px; border-bottom:1px solid var(--line);">
-        <input type="checkbox" \${t.status === "completed" ? "checked" : ""} data-action="toggle" style="margin-top:3px;">
-        <div style="flex:1; min-width:0;">
-          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            <span class="title" style="\${t.status === "completed" ? "text-decoration:line-through; color:var(--muted);" : ""}">\${escapeHtml(t.title)}</span>
-            <span class="badge" style="font-size:10px;">\${t.bucket.replace("_", " ")}</span>
-            \${t.priority >= 70 ? \`<span class="badge err" style="font-size:10px;">P\${t.priority}</span>\` : ""}
-            \${dueDateStr ? \`<span class="badge \${isOverdue ? "err" : ""}" style="font-size:10px;">\${isOverdue ? "⏰ overdue " : "due "}\${dueDateStr}</span>\` : ""}
+      <li data-task-id="\${t.id}" class="task ui-task-row">
+        <input type="checkbox" \${t.status === "completed" ? "checked" : ""} data-action="toggle" class="ui-task-check">
+        <div class="ui-grow">
+          <div class="ui-row" style="gap: var(--space-2);">
+            <span class="ui-task-title" style="\${titleStyle}">\${escapeHtml(t.title)}</span>
+            <span class="ui-badge">\${t.bucket.replace("_", " ")}</span>
+            \${t.priority >= 70 ? \`<span class="ui-badge ui-badge-err">P\${t.priority}</span>\` : ""}
+            \${dueDateStr ? \`<span class="ui-badge \${isOverdue ? "ui-badge-err" : ""}">\${isOverdue ? "⏰ overdue " : "due "}\${dueDateStr}</span>\` : ""}
             \${sourceBadge}
           </div>
-          \${t.description ? \`<div class="muted" style="font-size:12px; margin-top:4px;">\${escapeHtml(t.description.slice(0, 240))}</div>\` : ""}
-          \${t.sourceMeta?.identifier ? \`<div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(t.sourceMeta.identifier)}\${t.sourceMeta.team ? " · " + escapeHtml(t.sourceMeta.team) : ""}\${t.sourceMeta.project ? " · " + escapeHtml(t.sourceMeta.project) : ""}</div>\` : ""}
-          \${t.sourceMeta?.file ? \`<div class="muted" style="font-size:11px; margin-top:2px;">📎 \${escapeHtml(t.sourceMeta.file)} (line \${t.sourceMeta.line})</div>\` : ""}
+          \${t.description ? \`<div class="ui-meta" style="margin-top:4px;">\${escapeHtml(t.description.slice(0, 240))}</div>\` : ""}
+          \${t.sourceMeta?.identifier ? \`<div class="ui-meta" style="margin-top:2px;">\${escapeHtml(t.sourceMeta.identifier)}\${t.sourceMeta.team ? " · " + escapeHtml(t.sourceMeta.team) : ""}\${t.sourceMeta.project ? " · " + escapeHtml(t.sourceMeta.project) : ""}</div>\` : ""}
+          \${t.sourceMeta?.file ? \`<div class="ui-meta" style="margin-top:2px;">📎 \${escapeHtml(t.sourceMeta.file)} (line \${t.sourceMeta.line})</div>\` : ""}
         </div>
-        <button data-action="delete" class="secondary" style="align-self:flex-start; font-size:11px; padding:2px 8px;">×</button>
+        <button data-action="delete" class="ui-btn ui-btn-ghost ui-btn-sm" title="Delete">×</button>
       </li>
     \`;
   };
@@ -3118,25 +3279,35 @@ async function renderTasks() {
   main.innerHTML = \`
     <div class="pane">
       <h2>Tasks</h2>
-      <p class="muted">Talk to the agent below to add, complete, or rearrange tasks. Or click checkboxes directly. <strong>My tasks</strong> are what you should do; <strong>Agent tasks</strong> are what OpenAGI is working on for you.</p>
+      <p class="ui-muted">Talk to the agent below to add, complete, or rearrange tasks. Or click checkboxes directly. <strong>My tasks</strong> are what you should do; <strong>Agent tasks</strong> are what OpenAGI is working on for you.</p>
 
       <div id="tasksPageChat"></div>
 
-      <div class="row" style="gap:6px; flex-wrap:wrap; margin-bottom:14px;">
-        <span class="muted" style="font-size:12px; align-self:center; margin-right:4px;">bucket:</span>
-        \${["all", "today", "this_week", "someday", "done"].map((b) => \`<button class="chip \${filterB === b ? "on" : ""}" data-bf="\${b}">\${b.replace("_", " ")}</button>\`).join("")}
+      <div class="ui-row" style="margin-bottom: var(--space-4);">
+        <span class="ui-meta">bucket:</span>
+        \${["all", "today", "this_week", "someday", "done"].map((b) => \`<button class="ui-btn \${filterB === b ? "" : "ui-btn-ghost"} ui-btn-sm" data-bf="\${b}">\${b.replace("_", " ")}</button>\`).join("")}
       </div>
 
-      <h3 style="margin:18px 0 6px;">My tasks <span class="muted" style="font-weight:400; font-size:13px;">· \${userTotal} total</span></h3>
-      \${userTasks.length === 0 ? \`<div class="empty" style="padding:14px;">Nothing here. Try saying "remind me to call Sarah tomorrow" or "add a task to fix the mouse bug".</div>\` : \`
-        <ul class="taskList" style="list-style:none; padding:0; margin:0;">\${userTasks.map(taskRow).join("")}</ul>
-      \`}
+      <section class="ui-section">
+        <div class="ui-section-header">
+          <h3>My tasks</h3>
+          <span class="ui-section-meta">· \${userTotal} total</span>
+        </div>
+        \${userTasks.length === 0
+          ? \`<div class="ui-empty">Nothing here. Try saying "remind me to call Sarah tomorrow" or "add a task to fix the mouse bug".</div>\`
+          : \`<ul class="ui-task-list">\${userTasks.map(taskRow).join("")}</ul>\`}
+      </section>
 
-      <h3 style="margin:24px 0 6px;">Agent tasks <span class="muted" style="font-weight:400; font-size:13px;">· \${agentTotal} total</span></h3>
-      <p class="muted" style="font-size:12px; margin:0 0 6px;">Things OpenAGI has committed to do for you (or that the proactive observer queued).</p>
-      \${agentTasks.length === 0 ? \`<div class="empty" style="padding:14px;">No agent tasks. The agent will queue work here when it picks something up via the proactive observer or via "OpenAGI, please look into X" in chat.</div>\` : \`
-        <ul class="taskList" style="list-style:none; padding:0; margin:0;">\${agentTasks.map(taskRow).join("")}</ul>
-      \`}
+      <section class="ui-section">
+        <div class="ui-section-header">
+          <h3>Agent tasks</h3>
+          <span class="ui-section-meta">· \${agentTotal} total</span>
+        </div>
+        <p class="ui-meta" style="margin: 0 0 var(--space-2);">Things OpenAGI has committed to do for you (or that the proactive observer queued).</p>
+        \${agentTasks.length === 0
+          ? \`<div class="ui-empty">No agent tasks. The agent will queue work here when it picks something up via the proactive observer or via "OpenAGI, please look into X" in chat.</div>\`
+          : \`<ul class="ui-task-list">\${agentTasks.map(taskRow).join("")}</ul>\`}
+      </section>
     </div>
   \`;
 
