@@ -240,10 +240,11 @@ final class AppState: ObservableObject {
       notify(title: title, body: body, path: "/?tab=tasks")
     }
     if event == "proactive-suggestion" {
-      // Proactive observer noticed something. Notification body shows
-      // the rationale; tap → /?tab=suggestions where the user can
-      // accept/dismiss/reject. Suggestions tab routes accept actions
-      // to the right destination (tasks → Tasks tab, mcp → MCP tab).
+      // Proactive observer noticed something. Tap → chat tab with the
+      // suggestion's id passed through, so chat can render an inline
+      // approve/dismiss card AND seed the input with a sensible draft
+      // ("yes, add it"). User stays in conversation rather than getting
+      // bounced to a separate Suggestions tab.
       let parsed = parseSkillCandidate(data)
       let category = parseField(data, "category") ?? "fyi"
       let prefix: String = {
@@ -257,9 +258,23 @@ final class AppState: ObservableObject {
         }
       }()
       let title = "\(prefix): \(parsed.name ?? "OpenAGI noticed something")"
-      let body = parseField(data, "rationale") ?? parsed.description ?? "Open Suggestions to review."
-      notify(title: title, body: body, path: "/?tab=suggestions")
+      let body = parseField(data, "rationale") ?? parsed.description ?? "Tap to review in chat."
+      let suggestionId = parseField(data, "id") ?? ""
+      let pathPart = suggestionId.isEmpty ? "/?tab=chat" : "/?tab=chat&suggestion=\(urlEncode(suggestionId))"
+      notify(title: title, body: body, path: pathPart)
     }
+    if event == "pending-action" {
+      // Agent queued something that needs approval (gated tool). Land in
+      // chat with the action id so the inline approval card renders.
+      let summary = parseField(data, "summary") ?? "Agent action awaiting approval"
+      let actionId = parseField(data, "id") ?? ""
+      let pathPart = actionId.isEmpty ? "/?tab=chat" : "/?tab=chat&pending=\(urlEncode(actionId))"
+      notify(title: "🤖 Agent wants to: \(summary)", body: "Tap to approve or deny.", path: pathPart)
+    }
+  }
+
+  private func urlEncode(_ s: String) -> String {
+    s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? s
   }
 
   private func parseField(_ data: String, _ key: String) -> String? {
@@ -288,9 +303,17 @@ final class AppState: ObservableObject {
   // MARK: — Actions
 
   func openDashboard(path: String = "/") {
+    // path may already carry a query (e.g. "/?tab=chat&suggestion=abc"), so
+    // we have to merge ?token correctly — otherwise URL becomes
+    // "/?tab=chat&suggestion=abc?token=…" which the browser reads as
+    // a single query name, breaks the tab routing, and lands on chat
+    // with no context.
     let token = authToken() ?? ""
-    let url = URL(string: "http://127.0.0.1:43210\(path)?token=\(token)")!
-    NSWorkspace.shared.open(url)
+    let separator: String = path.contains("?") ? "&" : "?"
+    let urlString = "http://127.0.0.1:43210\(path)\(separator)token=\(token)"
+    if let url = URL(string: urlString) {
+      NSWorkspace.shared.open(url)
+    }
   }
 
   func notify(title: String, body: String, path: String) {

@@ -58,7 +58,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("task-updated", (data) => broadcast("task-updated", data));
   events.on("task-reminder", (data) => broadcast("task-reminder", data));
   events.on("task-auto-changed", (data) => broadcast("task-auto-changed", data));
+  events.on("pending-action", (data) => broadcast("pending-action", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
+  if (runtime.pendingActions?.bindEvents) runtime.pendingActions.bindEvents(events);
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -1526,6 +1528,7 @@ async function loadSession(id) {
 
 function renderChat() {
   main.innerHTML = \`
+    <div id="chat-deeplink" style="margin-bottom:8px;"></div>
     <div class="thread" id="thread"></div>
     <form class="composer" id="composer">
       <textarea id="input" placeholder="Message your OpenAGI agent…" rows="1"></textarea>
@@ -1538,6 +1541,12 @@ function renderChat() {
   }
   for (const m of state.messages) appendMessage(m, false);
   thread.scrollTop = thread.scrollHeight;
+  // Render a deep-link panel above the thread when the user arrived
+  // here via a notification with ?suggestion=<id> or ?pending=<id>.
+  // The panel is the in-chat surface for proactive suggestions and
+  // agent-action approvals — clicking buttons here calls the same
+  // backend endpoints the Suggestions tab does.
+  renderChatDeepLink();
   const input = $("input");
   input.focus();
   input.addEventListener("input", () => {
@@ -1576,6 +1585,109 @@ function renderChat() {
       sendBtn.disabled = false;
     }
   });
+}
+
+async function renderChatDeepLink() {
+  const host = document.getElementById("chat-deeplink");
+  if (!host) return;
+  const qs = new URLSearchParams(window.location.search);
+  const suggestionId = qs.get("suggestion");
+  const pendingId = qs.get("pending");
+  if (!suggestionId && !pendingId) {
+    host.innerHTML = "";
+    return;
+  }
+  // Loading shimmer while we fetch.
+  host.innerHTML = '<div class="card" style="padding:12px;"><span class="muted">Loading…</span></div>';
+  try {
+    if (suggestionId) {
+      const all = await fetchJson("/proactive/suggestions").catch(() => []);
+      const sug = Array.isArray(all) ? all.find((s) => s.id === suggestionId) : null;
+      if (!sug || sug.status !== "pending") {
+        host.innerHTML = \`<div class="card" style="padding:10px 14px;"><span class="muted">This suggestion has already been \${escapeHtml(sug?.status ?? "removed")}.</span></div>\`;
+        return;
+      }
+      const icon = ({ task: "📋", skill: "✨", mcp: "🔌", automation: "⚙️", knowledge: "💡" })[sug.category] ?? "🔔";
+      host.innerHTML = \`
+        <div class="card" style="padding:14px;">
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span style="font-size:18px;">\${icon}</span>
+            <span style="font-weight:600;">\${escapeHtml(sug.title || "OpenAGI noticed something")}</span>
+            <span class="badge">\${escapeHtml(sug.category || "fyi")}</span>
+          </div>
+          <div class="muted" style="margin-top:6px; font-size:12px;">\${escapeHtml(sug.rationale || "")}</div>
+          <div class="row" style="gap:8px; margin-top:10px;">
+            <button id="dl-accept">Accept</button>
+            <button id="dl-dismiss" class="secondary">Dismiss</button>
+            <button id="dl-reject" class="secondary">Reject</button>
+          </div>
+        </div>
+      \`;
+      const handle = async (action) => {
+        try {
+          const res = await postJson(\`/proactive/suggestions/\${encodeURIComponent(suggestionId)}/\${action}\`, {});
+          if (action === "accept" && res.taskId) {
+            showToast("✓ Task added — opening Tasks", true);
+            setTimeout(() => switchTab("tasks"), 600);
+          } else if (action === "accept" && res.registered) {
+            showToast(\`✓ MCP \${res.registered} connected — opening MCP tab\`, true);
+            setTimeout(() => switchTab("mcp"), 600);
+          } else {
+            showToast(\`Suggestion \${action}d\`, true);
+          }
+          host.innerHTML = "";
+          // Strip the suggestion query so reload doesn't re-render the card.
+          const url = new URL(window.location.href);
+          url.searchParams.delete("suggestion");
+          history.replaceState(null, "", url.toString());
+        } catch (err) {
+          showToast(\`\${action} failed: \${err.message}\`, false);
+        }
+      };
+      document.getElementById("dl-accept").addEventListener("click", () => handle("accept"));
+      document.getElementById("dl-dismiss").addEventListener("click", () => handle("dismiss"));
+      document.getElementById("dl-reject").addEventListener("click", () => handle("reject"));
+    } else if (pendingId) {
+      const list = await fetchJson("/pending-actions").catch(() => ({ actions: [] }));
+      const action = (list.actions ?? []).find((a) => a.id === pendingId);
+      if (!action || action.status !== "pending") {
+        host.innerHTML = \`<div class="card" style="padding:10px 14px;"><span class="muted">This agent action has already been \${escapeHtml(action?.status ?? "removed")}.</span></div>\`;
+        return;
+      }
+      host.innerHTML = \`
+        <div class="card" style="padding:14px;">
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span style="font-size:18px;">🤖</span>
+            <span style="font-weight:600;">\${escapeHtml(action.summary || action.toolName)}</span>
+            <span class="badge">\${escapeHtml(action.toolName)}</span>
+          </div>
+          \${action.reason ? \`<div class="muted" style="margin-top:6px; font-size:12px;">\${escapeHtml(action.reason)}</div>\` : ""}
+          <details style="margin-top:6px;"><summary class="muted" style="font-size:11px;">view args</summary><pre style="font-size:11px; margin-top:4px;">\${escapeHtml(JSON.stringify(action.args, null, 2))}</pre></details>
+          <div class="row" style="gap:8px; margin-top:10px;">
+            <button id="dl-approve">Approve & run</button>
+            <button id="dl-deny" class="secondary">Deny</button>
+          </div>
+        </div>
+      \`;
+      const handle = async (decision) => {
+        try {
+          const res = await postJson(\`/pending-actions/\${encodeURIComponent(pendingId)}/\${decision}\`, {});
+          const summary = res?.result?.note ?? res?.result?.message ?? \`Action \${decision}d.\`;
+          showToast(\`✓ \${summary}\`, true);
+          host.innerHTML = "";
+          const url = new URL(window.location.href);
+          url.searchParams.delete("pending");
+          history.replaceState(null, "", url.toString());
+        } catch (err) {
+          showToast(\`\${decision} failed: \${err.message}\`, false);
+        }
+      };
+      document.getElementById("dl-approve").addEventListener("click", () => handle("approve"));
+      document.getElementById("dl-deny").addEventListener("click", () => handle("deny"));
+    }
+  } catch (err) {
+    host.innerHTML = \`<div class="card" style="padding:10px 14px;"><span class="err">Failed to load: \${escapeHtml(err.message)}</span></div>\`;
+  }
 }
 
 function appendMessage(msg, autoscroll = true) {

@@ -18,8 +18,15 @@ export class PendingActionStore {
     this.dir = dir ?? path.join(process.cwd(), ".openagi", "pending-actions");
     ensureDir(this.dir);
     this.actions = new Map();
+    this.events = null;
     this._loadSnapshot();
     this._replayJournal();
+  }
+
+  /// Late-bound: hosted-interface creates the event bus, then calls this
+  /// so subsequent enqueue/decide calls broadcast over SSE → Mac app.
+  bindEvents(events) {
+    this.events = events;
   }
 
   list({ status } = {}) {
@@ -49,6 +56,13 @@ export class PendingActionStore {
     };
     this.actions.set(action.id, action);
     this._appendJournal({ op: "enqueue", action });
+    this.events?.emit?.("pending-action", {
+      id: action.id,
+      toolName: action.toolName,
+      summary: action.summary,
+      reason: action.reason,
+      createdAt: action.createdAt
+    });
     return action;
   }
 
