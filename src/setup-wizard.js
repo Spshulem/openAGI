@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir, writeTextAtomic } from "./file-utils.js";
 import { generateToken } from "./auth.js";
+import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
 // configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
@@ -124,6 +125,7 @@ export function renderWizard({ proposedToken } = {}) {
     .row { display:flex; gap:10px; }
     .row > * { flex: 1; }
     .grid { display: grid; gap: 6px; margin-bottom: 12px; }
+    .mcp-grid { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 8px; }
     .opt {
       display: flex; align-items: center; gap: 10px; padding: 8px 10px;
       border: 1px solid #2a352f; border-radius: 6px; cursor: pointer;
@@ -155,7 +157,7 @@ export function renderWizard({ proposedToken } = {}) {
 
   <form id="form">
     <div class="step">
-      <h2>1 / 7</h2>
+      <h2>1 / 8</h2>
       <h3>Welcome</h3>
       <p>OpenAGI is an always-on local agent: chat, scheduled prompts, MCP tools, SMS/Telegram channels, automatic task tracking from your calls/issues/notes.<br>
       Everything runs on this machine. State stays in <code>${escapeHtml(envFilePath().replace(/\\/g, "/"))}</code>.</p>
@@ -163,7 +165,7 @@ export function renderWizard({ proposedToken } = {}) {
     </div>
 
     <div class="step">
-      <h2>2 / 7 · model</h2>
+      <h2>2 / 8 · model</h2>
       <h3>Pick a primary provider</h3>
       <p>You can supply both — but pick which one drives chat and tool calls. Switch later from the dashboard.</p>
       <div class="grid">
@@ -188,7 +190,7 @@ export function renderWizard({ proposedToken } = {}) {
     </div>
 
     <div class="step">
-      <h2>3 / 7 · auth</h2>
+      <h2>3 / 8 · auth</h2>
       <h3>Bearer token</h3>
       <p>This is the password for your dashboard. Save it now — you'll need it to log in. We auto-generated a strong one for you, or paste your own.</p>
       <div class="token" id="tokenView">${escapeHtml(token)}</div>
@@ -200,7 +202,7 @@ export function renderWizard({ proposedToken } = {}) {
     </div>
 
     <div class="step">
-      <h2>4 / 7 · channels</h2>
+      <h2>4 / 8 · channels</h2>
       <h3>Where can the agent reach you? <span class="sub">all optional</span></h3>
       <p class="sub">Channels are how messages get to/from you. (Data sources — where tasks come from — live in step 5.)</p>
 
@@ -224,7 +226,7 @@ export function renderWizard({ proposedToken } = {}) {
     </div>
 
     <div class="step">
-      <h2>5 / 7 · sources</h2>
+      <h2>5 / 8 · sources</h2>
       <h3>Where do tasks + activity come from? <span class="sub">all optional</span></h3>
       <p class="sub">Sources feed the task system + activity log. The agent uses these to know what's on your plate. You can edit any of these later from <code>Integrations</code> in the dashboard.</p>
 
@@ -265,7 +267,14 @@ export function renderWizard({ proposedToken } = {}) {
     </div>
 
     <div class="step">
-      <h2>6 / 7 · public access</h2>
+      <h2>6 / 8 · MCPs <span class="sub">optional, but easy to add later</span></h2>
+      <h3>Connect tools the agent can use</h3>
+      <p class="sub">MCP servers give the agent extra tools (read your Linear issues, search Stripe customers, query PostHog, etc). Check the ones you want and we'll register them when you save. OAuth handshakes will run once you visit the dashboard.</p>
+      ${renderMcpCatalogStep()}
+    </div>
+
+    <div class="step">
+      <h2>7 / 8 · public access</h2>
       <h3>Tunnel <span class="sub">required for SMS/Telegram webhooks</span></h3>
       <p>If you want Twilio or Telegram webhooks to reach this machine, expose it via a tunnel. <code>cloudflared</code> on macOS: <code>brew install cloudflared</code>; on Linux: <a href="https://pkg.cloudflare.com/index.html" target="_blank" rel="noopener">pkg.cloudflare.com</a>.</p>
       <p>Then run <code>npm run tunnel</code> in another terminal and paste the URL it prints below.</p>
@@ -274,7 +283,7 @@ export function renderWizard({ proposedToken } = {}) {
     </div>
 
     <div class="step">
-      <h2>7 / 7 · spending</h2>
+      <h2>8 / 8 · spending</h2>
       <h3>Daily budget</h3>
       <p>Hard ceiling on LLM spend per day. Provider calls throw <code>BUDGET_EXCEEDED</code> past this. Default $10/day.</p>
       <label>OPENAGI_DAILY_USD_LIMIT</label>
@@ -337,8 +346,32 @@ export function renderWizard({ proposedToken } = {}) {
       const testBody = await testRes.json();
       if (!testRes.ok) throw new Error(testBody.error ?? "test failed");
 
-      out.innerHTML = '<span class="ok">✓ Agent reply:</span>\\n\\n' + (testBody.reply ?? "(empty)") + '\\n\\n<span class="ok">Setup complete. Loading dashboard…</span>';
-      setTimeout(() => { window.location.href = "/"; }, 1500);
+      // Register every MCP the user checked. OAuth-shaped ones will surface
+      // their auth URLs on /?tab=mcp and /?tab=integrations once we land.
+      const checkedMcps = Array.from(document.querySelectorAll('input[name^="mcp_"]:checked'))
+        .map((el) => el.name.replace(/^mcp_/, ""));
+      const mcpResults = [];
+      for (const catalogId of checkedMcps) {
+        try {
+          const r = await fetch("/integrations/connect-mcp", {
+            method: "POST",
+            headers: { "content-type": "application/json", "authorization": "Bearer " + obj.OPENAGI_AUTH_TOKEN },
+            body: JSON.stringify({ catalogId })
+          });
+          const rb = await r.json();
+          mcpResults.push({ catalogId, ok: r.ok, name: rb.name, error: rb.error });
+        } catch (err) {
+          mcpResults.push({ catalogId, ok: false, error: err.message });
+        }
+      }
+      const mcpSummary = mcpResults.length === 0 ? "" :
+        '\\n\\n<span class="ok">MCPs registered:</span> ' +
+        mcpResults.filter((r) => r.ok).map((r) => r.name ?? r.catalogId).join(", ") +
+        (mcpResults.some((r) => !r.ok) ? '\\n<span class="err">Failed:</span> ' + mcpResults.filter((r) => !r.ok).map((r) => r.catalogId + " (" + r.error + ")").join(", ") : "");
+      const target = checkedMcps.length > 0 ? "/?tab=integrations" : "/";
+
+      out.innerHTML = '<span class="ok">✓ Agent reply:</span>\\n\\n' + (testBody.reply ?? "(empty)") + mcpSummary + '\\n\\n<span class="ok">Setup complete. Loading dashboard…</span>';
+      setTimeout(() => { window.location.href = target; }, 1500);
     } catch (err) {
       out.innerHTML = '<span class="err">Error:</span> ' + (err.message ?? err);
       btn.disabled = false;
@@ -350,6 +383,53 @@ export function renderWizard({ proposedToken } = {}) {
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+}
+
+// Renders the MCP catalog as a checkbox grid, grouped by category.
+// "available" entries get a checkbox; "coming-soon" entries are listed
+// so the user knows they're on the roadmap, but disabled.
+function renderMcpCatalogStep() {
+  return CATEGORIES.map((cat) => {
+    const inCat = MCP_CATALOG.filter((e) => e.category === cat.id);
+    if (inCat.length === 0) return "";
+    return `
+      <div style="margin-top:14px;">
+        <h3 style="font-size:11px; text-transform:uppercase; letter-spacing:0.5px; color:#8da59a; margin-bottom:8px;">${escapeHtml(cat.name)}</h3>
+        <div class="grid mcp-grid">
+          ${inCat.map((entry) => renderMcpCard(entry)).join("")}
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderMcpCard(entry) {
+  const connectable = entry.status === "available" && Boolean(entry.register);
+  const id = `mcp_${entry.id}`;
+  if (connectable) {
+    const auth = entry.authType === "oauth" ? "OAuth" : "API key";
+    return `
+      <label class="opt" style="display:flex; gap:10px; align-items:flex-start; flex-direction:column;">
+        <div style="display:flex; gap:8px; align-items:center; width:100%;">
+          <input type="checkbox" name="${escapeHtml(id)}" value="1">
+          <span style="font-weight:600; flex:1;">${escapeHtml(entry.name)}</span>
+          <span class="pill" style="background:#0e1411; color:#8da59a;">${escapeHtml(auth)}</span>
+        </div>
+        <div class="sub" style="font-size:11px; line-height:1.4; padding-left:24px;">${escapeHtml(entry.description ?? "")}</div>
+      </label>
+    `;
+  }
+  // coming-soon — show but disabled
+  return `
+    <label class="opt" style="display:flex; gap:10px; align-items:flex-start; flex-direction:column; opacity:0.55; cursor:not-allowed;">
+      <div style="display:flex; gap:8px; align-items:center; width:100%;">
+        <input type="checkbox" disabled>
+        <span style="font-weight:600; flex:1;">${escapeHtml(entry.name)}</span>
+        <span class="pill" style="background:#0e1411; color:#8da59a;">soon</span>
+      </div>
+      <div class="sub" style="font-size:11px; line-height:1.4; padding-left:24px;">${escapeHtml(entry.description ?? "")}</div>
+    </label>
+  `;
 }
 
 export const SETUP_FIELDS = WIZARD_FIELDS;
