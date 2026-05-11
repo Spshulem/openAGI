@@ -22,6 +22,7 @@ export { FileBackedPropagationController } from "./file-backed-propagation-contr
 export { createAbiIntegration, IntegrationRegistry, normalizeSignal } from "./integration-registry.js";
 export { McpRegistry } from "./mcp-registry.js";
 export { PendingActionStore } from "./pending-actions.js";
+export { ComputerUseLog } from "./computer-use-log.js";
 export { McpStdioClient } from "./mcp-client.js";
 export { McpHttpClient } from "./mcp-http-client.js";
 export { McpOAuthClient } from "./mcp-oauth.js";

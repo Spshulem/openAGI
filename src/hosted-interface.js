@@ -61,6 +61,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("pending-action", (data) => broadcast("pending-action", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
   if (runtime.pendingActions?.bindEvents) runtime.pendingActions.bindEvents(events);
+  if (runtime.computerUseLog?.bindEvents) runtime.computerUseLog.bindEvents(events);
+  events.on("computer-use", (data) => broadcast("computer-use", data));
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -575,6 +577,24 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           error: body.reason ?? "denied by user"
         });
         return sendJson(res, 200, { id, status: "denied" });
+      }
+      if (method === "GET" && pathname === "/computer-use/log") {
+        if (!runtime.computerUseLog) return sendJson(res, 503, { error: "no computer-use log" });
+        const limit = Number(url.searchParams.get("limit") ?? 100);
+        const sessions = runtime.computerUseLog.listSessions();
+        const actions = runtime.computerUseLog.listActions({ limit });
+        return sendJson(res, 200, {
+          enabled: process.env.OPENAGI_COMPUTER_USE === "1" || process.env.OPENAGI_COMPUTER_USE === "true",
+          stats: runtime.computerUseLog.stats(),
+          sessions,
+          actions
+        });
+      }
+      if (method === "POST" && pathname.startsWith("/computer-use/sessions/") && pathname.endsWith("/abort")) {
+        const id = decodeURIComponent(pathname.slice("/computer-use/sessions/".length, -"/abort".length));
+        const session = runtime.computerUseLog?.endSession(id, { reason: "aborted via dashboard", status: "aborted" });
+        if (!session) return sendJson(res, 404, { error: "unknown session" });
+        return sendJson(res, 200, { id, status: session.status });
       }
       if (method === "POST" && pathname === "/control/restart") {
         // Bounce the daemon so .env changes pick up. The Mac app's
@@ -1535,6 +1555,7 @@ function renderApp() {
           <div class="nav-more-section">
             <div class="nav-more-label">Diagnostics</div>
             <button data-tab="activity" title="Ambient capture log — what you were doing on screen (if capture is enabled).">Activity</button>
+            <button data-tab="computer-use" title="Computer use (beta) — every action the agent intended to take, with the reasoning it gave.">Computer Use</button>
             <button data-tab="budget" title="Today's LLM spend + 14-day history.">Budget</button>
             <button data-tab="outcomes" title="Quality scores for completed agent work, 7d + 30d rolling.">Outcomes</button>
             <button data-tab="health" title="Memory saturation, specialist health, MCP status, upcoming cron.">Health</button>
@@ -1856,6 +1877,9 @@ async function switchTab(tab) {
   } else if (tab === "activity") {
     showSidebar(false);
     await renderActivity();
+  } else if (tab === "computer-use") {
+    showSidebar(false);
+    await renderComputerUse();
   } else if (tab === "tasks") {
     showSidebar(false);
     await renderTasks();
@@ -3583,6 +3607,89 @@ async function renderTasks() {
   });
 }
 
+async function renderComputerUse() {
+  // Computer-use beta — the agent's intent + reasoning log. Shows every
+  // action the agent decided to take in a session, with the reasoning
+  // it gave. Phase 1a: actions are stubbed (logged but not executed);
+  // phase 1b will execute real input via the Mac app.
+  const data = await fetchJson("/computer-use/log?limit=200").catch(() => ({ sessions: [], actions: [], stats: {} }));
+  const { sessions = [], actions = [], stats = {}, enabled = false } = data;
+  const active = sessions.find((s) => s.status === "active");
+
+  const sessionCard = (s) => {
+    const sActions = actions.filter((a) => a.sessionId === s.id);
+    const isActive = s.status === "active";
+    const statusBadge = isActive
+      ? '<span class="ui-badge ui-badge-accent">active</span>'
+      : s.status === "aborted"
+        ? '<span class="ui-badge ui-badge-err">aborted</span>'
+        : '<span class="ui-badge">' + escapeHtml(s.status) + '</span>';
+    return \`
+      <div class="ui-card" style="margin-bottom: var(--space-3);">
+        <div class="ui-row" style="justify-content: space-between;">
+          <div class="ui-grow">
+            <div style="font-weight: 600;">\${escapeHtml(s.goal || "(no goal stated)")}</div>
+            <div class="ui-meta">Started \${escapeHtml(new Date(s.startedAt).toLocaleString())} · approved by \${escapeHtml(s.approvedBy ?? "?")} · \${sActions.length} action\${sActions.length === 1 ? "" : "s"}</div>
+            \${s.endedAt ? \`<div class="ui-meta">Ended \${escapeHtml(new Date(s.endedAt).toLocaleString())}\${s.endReason ? " · " + escapeHtml(s.endReason) : ""}</div>\` : ""}
+          </div>
+          <div>\${statusBadge}</div>
+        </div>
+        \${isActive ? \`<div style="margin-top: var(--space-2);"><button class="ui-btn ui-btn-destructive ui-btn-sm" data-abort="\${escapeHtml(s.id)}">⛔ Stop session</button></div>\` : ""}
+        \${sActions.length > 0 ? \`
+          <details \${isActive ? "open" : ""} style="margin-top: var(--space-2);">
+            <summary class="ui-meta" style="cursor: pointer;">\${sActions.length} action\${sActions.length === 1 ? "" : "s"}</summary>
+            <ol style="margin: var(--space-2) 0 0; padding-left: var(--space-4);">
+              \${sActions.slice().reverse().map((a) => \`
+                <li style="margin-bottom: var(--space-2);">
+                  <div><strong>\${escapeHtml(a.kind)}</strong> \${escapeHtml(JSON.stringify(a.args)).slice(0, 140)}</div>
+                  \${a.reasoning ? \`<div class="ui-meta">"\${escapeHtml(a.reasoning)}"</div>\` : '<div class="ui-meta" style="opacity:0.6;">(no reasoning given)</div>'}
+                  <div class="ui-meta">\${escapeHtml(a.status)} · \${escapeHtml(new Date(a.createdAt).toLocaleTimeString())}</div>
+                </li>
+              \`).join("")}
+            </ol>
+          </details>
+        \` : ""}
+      </div>
+    \`;
+  };
+
+  main.innerHTML = \`
+    <div class="pane">
+      <h2 style="margin-bottom: var(--space-2);">Computer Use <span class="ui-badge">beta</span></h2>
+      \${enabled ? "" : \`
+        <div class="ui-card ui-card-elev" style="background: var(--accent-bg); border-color: var(--accent-bg); margin-bottom: var(--space-4);">
+          <strong>Off.</strong> Computer-use tools are gated behind <code>OPENAGI_COMPUTER_USE=1</code> in <code>.openagi/.env</code>. Restart the daemon after setting it. This is phase 1a — actions are logged with reasoning but NOT executed (Mac CGEvent integration ships in phase 1b).
+        </div>
+      \`}
+      <p class="ui-muted">Every action the agent intends to take is recorded here with its stated reasoning. Sessions are user-approved (via the standard approval gate). You can abort an active session at any time.</p>
+
+      <div class="ui-row" style="gap: var(--space-2); margin: var(--space-3) 0;">
+        <span class="ui-badge">\${stats.sessions ?? 0} sessions</span>
+        <span class="ui-badge ui-badge-accent">\${stats.active ?? 0} active</span>
+        <span class="ui-badge">\${stats.actions ?? 0} actions</span>
+      </div>
+
+      \${sessions.length === 0
+        ? \`<div class="ui-empty">No sessions yet. When the agent decides to use the computer, it has to call <code>start_computer_use_session</code> with a goal — you approve, then it can act.</div>\`
+        : sessions.map(sessionCard).join("")}
+    </div>
+  \`;
+
+  document.querySelectorAll("[data-abort]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.abort;
+      if (!confirm("Abort this computer-use session? The agent will be told to stop.")) return;
+      try {
+        await postJson(\`/computer-use/sessions/\${encodeURIComponent(id)}/abort\`, {});
+        showToast("Session aborted.", true);
+        await renderComputerUse();
+      } catch (err) {
+        showToast("Abort failed: " + err.message, false);
+      }
+    });
+  });
+}
+
 async function renderActivity() {
   const stats = await fetchJson("/observations/stats").catch(() => ({}));
   state.activityFilter = state.activityFilter || { query: "" };
@@ -3915,7 +4022,7 @@ refreshAmbientBadge();
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","memory","cron","skills","mcp","integrations","agents","channels","budget","outcomes","scrutiny","vocab","health","activity","suggestions"]);
+const VALID_TABS = new Set(["chat","tasks","memory","cron","skills","mcp","integrations","agents","channels","budget","outcomes","scrutiny","vocab","health","activity","suggestions","computer-use"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");

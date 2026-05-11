@@ -1390,6 +1390,71 @@ test("PendingActionStore: enqueue + decide + replay across instances", async () 
   fs.rmSync(dir, { recursive: true });
 });
 
+test("ComputerUseLog: session lifecycle + action recording with reasoning", async () => {
+  const { ComputerUseLog } = await import("../src/computer-use-log.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cu-"));
+  const log = new ComputerUseLog({ dir });
+
+  const session = log.startSession({ goal: "Reply to my last email", approvedBy: "user" });
+  assert.equal(session.status, "active");
+  assert.equal(session.goal, "Reply to my last email");
+
+  // Recording requires an active session.
+  const action = log.recordAction({
+    sessionId: session.id,
+    kind: "click",
+    args: { x: 100, y: 200, button: "left" },
+    reasoning: "Clicking the Reply button in the toolbar"
+  });
+  assert.equal(action.status, "pending");
+  assert.equal(action.reasoning, "Clicking the Reply button in the toolbar");
+  assert.equal(action.args.x, 100);
+
+  log.markActionResult(action.id, { status: "executed", result: { ok: true } });
+  assert.equal(log.listActions({ sessionId: session.id })[0].status, "executed");
+
+  // Cannot record into a closed session.
+  log.endSession(session.id, { reason: "test", status: "ended" });
+  assert.throws(() => log.recordAction({
+    sessionId: session.id,
+    kind: "type",
+    args: { text: "hi" },
+    reasoning: "—"
+  }), /not active/);
+
+  // Replay from a fresh instance recovers everything.
+  const log2 = new ComputerUseLog({ dir });
+  const recovered = log2.getSession(session.id);
+  assert.equal(recovered.status, "ended");
+  assert.equal(recovered.endReason, "test");
+  assert.equal(log2.listActions({ sessionId: session.id }).length, 1);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("computer-use tools register only when OPENAGI_COMPUTER_USE flag is set", async () => {
+  const { createDefaultRuntime } = await import("../src/index.js");
+
+  const wasSet = process.env.OPENAGI_COMPUTER_USE;
+  delete process.env.OPENAGI_COMPUTER_USE;
+  const noFlag = createDefaultRuntime();
+  const noFlagNames = noFlag.tools.list().map((t) => t.name);
+  assert.equal(noFlagNames.includes("start_computer_use_session"), false, "tools absent by default");
+
+  process.env.OPENAGI_COMPUTER_USE = "1";
+  const withFlag = createDefaultRuntime();
+  const withFlagNames = withFlag.tools.list().map((t) => t.name);
+  for (const name of ["start_computer_use_session", "computer_click", "computer_type", "computer_key", "computer_screenshot", "end_computer_use_session"]) {
+    assert.ok(withFlagNames.includes(name), `expected tool ${name} to be registered when flag is on`);
+  }
+  // start_computer_use_session is gated by needsConfirmation.
+  const startTool = withFlag.tools.get("start_computer_use_session");
+  assert.equal(startTool.needsConfirmation, true, "session start requires user approval");
+
+  if (wasSet === undefined) delete process.env.OPENAGI_COMPUTER_USE;
+  else process.env.OPENAGI_COMPUTER_USE = wasSet;
+});
+
 test("register_mcp_server.summarize: stdio call exposes command + args", async () => {
   const { summarizeRegisterMcpServer } = await import("../src/tool-registry.js");
   const summary = summarizeRegisterMcpServer({

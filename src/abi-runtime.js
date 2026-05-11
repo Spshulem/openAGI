@@ -25,6 +25,8 @@ import { SessionMiner } from "./session-miner.js";
 import { ProactiveObserver } from "./proactive-observer.js";
 import { TaskStore } from "./task-store.js";
 import { PendingActionStore } from "./pending-actions.js";
+import { ComputerUseLog } from "./computer-use-log.js";
+import { registerComputerUseTools } from "./integrations/computer-use.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
 import { SkillReplay } from "./skill-replay.js";
 import { ScrutinyJudge } from "./scrutiny-judge.js";
@@ -122,6 +124,12 @@ export class AbiRuntime {
       ...(options.pendingActionStoreOptions ?? {})
     });
     this.tools.bindPendingActions(this.pendingActions);
+    // Computer-use log is always allocated so the dashboard can render the
+    // log surface even when the feature is off (showing zero sessions).
+    // The actual tools only register when OPENAGI_COMPUTER_USE=1.
+    this.computerUseLog = options.computerUseLog ?? new ComputerUseLog({
+      dir: options.dataDir ? path.join(options.dataDir, "computer-use") : undefined
+    });
     this.skills = options.skills ?? null;
     this.budget = options.budget ?? new BudgetGuard(options.budgetOptions ?? {});
     this.outcomes = options.outcomes ?? new OutcomeStore(options.outcomeOptions ?? {});
@@ -271,6 +279,15 @@ export class AbiRuntime {
         intervalMs: 15 * 60 * 1000
       });
       registerCoreTools(this.tools, this);
+      // Computer-use tools register only when explicitly opted-in via env
+      // (OPENAGI_COMPUTER_USE=1). Default install doesn't expose them so
+      // an LLM can't accidentally try to drive the user's screen.
+      const computerUseEnabled = process.env.OPENAGI_COMPUTER_USE === "1"
+        || process.env.OPENAGI_COMPUTER_USE === "true"
+        || process.env.OPENAGI_COMPUTER_USE === "yes";
+      if (computerUseEnabled) {
+        registerComputerUseTools(this.tools, this);
+      }
     }
 
     if (options.skills !== false && !this.skills) {
