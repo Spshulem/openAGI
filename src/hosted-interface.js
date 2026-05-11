@@ -1196,13 +1196,46 @@ function renderApp() {
     header h1 { font-size: 14px; font-weight: 700; margin: 0; letter-spacing: 0.02em; }
     header .status { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
     header .status .status-pill { white-space: nowrap; padding: 2px 8px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); }
-    nav { display: flex; gap: 4px; margin-left: auto; }
+    nav { display: flex; gap: 4px; margin-left: auto; align-items: center; }
     nav button {
       background: transparent; border: 1px solid transparent; color: var(--muted);
       padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+      font-family: inherit;
     }
     nav button.active { color: var(--text); background: var(--panel-2); border-color: var(--line); }
     nav button:hover { color: var(--text); }
+
+    /* "More ▾" dropdown — clusters the 11 secondary tabs (build +
+       diagnostics) so the primary nav stays under control. Hides
+       behind a click; outside-click closes. */
+    .nav-more { position: relative; }
+    .nav-more-btn {
+      background: transparent; border: 1px solid transparent; color: var(--muted);
+      padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+      font-family: inherit;
+    }
+    .nav-more-btn:hover, .nav-more.open .nav-more-btn { color: var(--text); background: var(--panel-2); border-color: var(--line); }
+    .nav-more-panel {
+      position: absolute; right: 0; top: calc(100% + 6px); z-index: 50;
+      background: var(--popover); color: var(--popover-foreground);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: var(--space-2); min-width: 220px;
+      display: flex; flex-direction: column; gap: var(--space-3);
+    }
+    .nav-more-panel[hidden] { display: none; }
+    .nav-more-section { display: flex; flex-direction: column; gap: 2px; }
+    .nav-more-label {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--muted-foreground); padding: 4px 8px 2px;
+    }
+    .nav-more-panel button {
+      text-align: left; padding: 6px 10px; border-radius: var(--radius-sm);
+      color: var(--text); background: transparent; border: 1px solid transparent;
+      width: 100%; font-size: 13px; cursor: pointer; font-family: inherit;
+    }
+    .nav-more-panel button:hover { background: var(--muted-bg); }
+    .nav-more-panel button.active { background: var(--accent-bg); color: var(--accent-foreground); }
 
     .body { display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
     .body.no-sidebar { grid-template-columns: 1fr; }
@@ -1407,6 +1440,45 @@ function renderApp() {
       background: var(--muted-bg); border: 1px solid var(--border); color: var(--muted-foreground);
     }
 
+    /* Toasts stack in the top-right and fade out at the end of their
+       lifetime. Replaces the ad-hoc inline-styled toast we used before. */
+    .ui-toast-stack {
+      position: fixed; top: 20px; right: 20px; z-index: 99;
+      display: flex; flex-direction: column; gap: var(--space-2);
+      max-width: 360px; pointer-events: none;
+    }
+    .ui-toast {
+      padding: 10px 14px; border-radius: var(--radius); font-size: 13px;
+      line-height: 1.4; box-shadow: var(--shadow); pointer-events: auto;
+      transition: opacity .35s ease, transform .35s ease;
+    }
+    .ui-toast-ok { background: #1a3a2a; color: #7be59c; border: 1px solid #2d5b40; }
+    .ui-toast-err { background: #3a1a1a; color: #f08a8a; border: 1px solid #5b2d2d; }
+    .ui-toast-leaving { opacity: 0; transform: translateX(8px); }
+
+    /* (?) help marker for obscure terms. Hover shows a small tooltip with
+       an explanation. Use uiHelp(text) to render. */
+    .ui-help {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: var(--muted-bg); border: 1px solid var(--border);
+      color: var(--muted-foreground); font-size: 10px; font-weight: 700;
+      margin-left: 4px; cursor: help; position: relative; user-select: none;
+      vertical-align: middle;
+    }
+    .ui-help:hover { color: var(--accent-foreground); background: var(--accent-bg); border-color: var(--accent-bg); }
+    .ui-help:hover .ui-help-tip { display: block; }
+    .ui-help .ui-help-tip {
+      display: none; position: absolute; bottom: calc(100% + 6px); left: 50%;
+      transform: translateX(-50%); z-index: 100;
+      background: var(--popover); color: var(--popover-foreground);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 8px 10px; font-size: 12px; font-weight: 400;
+      width: max-content; max-width: 280px;
+      box-shadow: var(--shadow); cursor: default; line-height: 1.4;
+      text-align: left; white-space: normal;
+    }
+
     /* Task list — rows have a clear hover affordance and a settled
        baseline grid (10px vertical pad keeps line-height aligned with
        checkbox baseline). */
@@ -1442,23 +1514,36 @@ function renderApp() {
     <h1>OpenAGI</h1>
     <span id="status" class="status">connecting…</span>
     <nav id="nav">
-      <button data-tab="chat" class="active">Chat</button>
-      <button data-tab="tasks">Tasks</button>
-      <button data-tab="suggestions">Suggestions</button>
-      <button data-tab="memory">Memory</button>
-      <button data-tab="cron">Cron</button>
-      <button data-tab="skills">Skills</button>
-      <button data-tab="mcp">MCP</button>
-      <button data-tab="integrations">Integrations</button>
-      <button data-tab="agents">Agents</button>
-      <button data-tab="channels">Channels</button>
-      <button data-tab="budget">Budget</button>
-      <button data-tab="outcomes">Outcomes</button>
-      <button data-tab="scrutiny">Scrutiny</button>
-      <button data-tab="vocab">Vocab</button>
-      <button data-tab="health">Health</button>
-      <button data-tab="activity">Activity</button>
-      <button id="setupBtn" title="Open setup wizard">⚙ Setup</button>
+      <!-- Primary tabs — the 5 everyday surfaces. Keeps the nav readable
+           on narrow windows; the other 11 tabs live behind "More ▾". -->
+      <button data-tab="chat" class="active" title="Talk to your agent in natural language.">Chat</button>
+      <button data-tab="tasks" title="My tasks + agent tasks. The agent's own queue gets drained every 30 min by the autopilot pulse.">Tasks</button>
+      <button data-tab="suggestions" title="Things the proactive observer noticed + agent actions awaiting your approval.">Suggestions</button>
+      <button data-tab="memory" title="Short, medium, and long-term memory. Promotion happens automatically.">Memory</button>
+      <button data-tab="integrations" title="Connect MCPs (Linear, GitHub, Stripe, …), sources (BuildBetter, Rize, inbox folder), and channels (SMS, Telegram).">Integrations</button>
+      <div class="nav-more" id="navMore">
+        <button id="navMoreBtn" class="nav-more-btn" type="button" title="Build + diagnostic tabs">More ▾</button>
+        <div class="nav-more-panel" id="navMorePanel" hidden>
+          <div class="nav-more-section">
+            <div class="nav-more-label">Build</div>
+            <button data-tab="mcp" title="Register custom MCP servers or manage already-registered ones.">MCP</button>
+            <button data-tab="skills" title="Reusable named prompts. Mined from your activity, or hand-authored.">Skills</button>
+            <button data-tab="cron" title="Scheduled prompts + the agent's autopilot pulse cron jobs.">Cron</button>
+            <button data-tab="channels" title="SMS / Telegram / webhook channels the agent can deliver through.">Channels</button>
+            <button data-tab="agents" title="Specialists the propagation controller has spawned for repeated tasks.">Agents</button>
+          </div>
+          <div class="nav-more-section">
+            <div class="nav-more-label">Diagnostics</div>
+            <button data-tab="activity" title="Ambient capture log — what you were doing on screen (if capture is enabled).">Activity</button>
+            <button data-tab="budget" title="Today's LLM spend + 14-day history.">Budget</button>
+            <button data-tab="outcomes" title="Quality scores for completed agent work, 7d + 30d rolling.">Outcomes</button>
+            <button data-tab="health" title="Memory saturation, specialist health, MCP status, upcoming cron.">Health</button>
+            <button data-tab="scrutiny" title="Directional Adaptive Scrutiny — the 7-axis scorer's calibration + recent verdicts.">Scrutiny</button>
+            <button data-tab="vocab" title="Vocabulary curator — how the agent thinks about your domain.">Vocab</button>
+          </div>
+        </div>
+      </div>
+      <button id="setupBtn" title="Re-run the setup wizard or edit credentials">⚙ Setup</button>
     </nav>
   </header>
   <div class="body">
@@ -1492,8 +1577,34 @@ const sidebarTitle = $("sidebarTitle");
 const newBtn = $("newSession");
 
 document.querySelectorAll("nav button[data-tab]").forEach((btn) => {
-  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+  btn.addEventListener("click", () => {
+    switchTab(btn.dataset.tab);
+    // Close the More dropdown if the click came from inside it, so the
+    // user lands on the new tab with the panel out of the way.
+    document.getElementById("navMore")?.classList.remove("open");
+    const panel = document.getElementById("navMorePanel");
+    if (panel) panel.hidden = true;
+  });
 });
+// More dropdown: toggle on click, close on outside click or Escape.
+(function initNavMore() {
+  const wrap = document.getElementById("navMore");
+  const btn = document.getElementById("navMoreBtn");
+  const panel = document.getElementById("navMorePanel");
+  if (!wrap || !btn || !panel) return;
+  function toggle(open) {
+    const next = typeof open === "boolean" ? open : panel.hidden;
+    panel.hidden = !next;
+    wrap.classList.toggle("open", next);
+  }
+  btn.addEventListener("click", (e) => { e.stopPropagation(); toggle(); });
+  document.addEventListener("click", (e) => {
+    if (!wrap.contains(e.target)) toggle(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") toggle(false);
+  });
+})();
 document.getElementById("setupBtn")?.addEventListener("click", () => {
   window.location.href = "/setup";
 });
@@ -1634,13 +1745,21 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
 }
 
 function showToast(msg, ok = true) {
+  // Stack toasts when multiple fire close together — the toast-stack
+  // container is shared so they don't pile up at one position.
+  let host = document.getElementById("toastStack");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "toastStack";
+    host.className = "ui-toast-stack";
+    document.body.appendChild(host);
+  }
   const t = document.createElement("div");
-  t.style.cssText = "position:fixed;top:20px;right:20px;z-index:99;padding:10px 14px;border-radius:6px;font-size:13px;max-width:360px;box-shadow:0 4px 12px rgba(0,0,0,.3);font-family:inherit;line-height:1.4;" +
-    (ok
-      ? "background:#1a3a2a;color:#7be59c;border:1px solid #2d5b40;"
-      : "background:#3a1a1a;color:#f08a8a;border:1px solid #5b2d2d;");
+  t.className = "ui-toast " + (ok ? "ui-toast-ok" : "ui-toast-err");
   t.textContent = msg;
-  document.body.appendChild(t);
+  host.appendChild(t);
+  // Fade-out at 4s, remove at 4.5s so the transition has time.
+  setTimeout(() => t.classList.add("ui-toast-leaving"), 4000);
   setTimeout(() => t.remove(), 4500);
 }
 
@@ -2574,15 +2693,15 @@ function renderMemoryView() {
   main.innerHTML = \`
     <div class="pane">
       <div class="row between" style="margin-bottom:14px;align-items:center;flex-wrap:wrap;gap:10px;">
-        <h2 style="margin:0;">Memory <span class="muted" style="font-weight:400;font-size:14px;">· \${total} total · \${principles} principle\${principles===1?"":"s"}</span></h2>
+        <h2 style="margin:0;">Memory <span class="muted" style="font-weight:400;font-size:14px;">· \${total} total · \${principles} principle\${principles===1?"":"s"}\${uiHelp("Principles are durable rules promoted from repeated raw memories. They live in long-tier and resist decay.")}</span></h2>
       </div>
       <div id="memoryPageChat"></div>
       <div class="row" style="gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
         <div class="tier-pills">
           <button data-tier="all" class="\${f.tier==='all'?'active':''}">All <span class="count">\${total}</span></button>
-          <button data-tier="short" class="\${f.tier==='short'?'active':''}">Short <span class="count">\${counts.short}</span></button>
-          <button data-tier="medium" class="\${f.tier==='medium'?'active':''}">Medium <span class="count">\${counts.medium}</span></button>
-          <button data-tier="long" class="\${f.tier==='long'?'active':''}">Long <span class="count">\${counts.long}</span></button>
+          <button data-tier="short" class="\${f.tier==='short'?'active':''}" title="RAM — what you need right now. Decays fastest.">Short <span class="count">\${counts.short}</span></button>
+          <button data-tier="medium" class="\${f.tier==='medium'?'active':''}" title="Day-to-day. Promoted from short-tier when repeated; demoted to long if it sticks.">Medium <span class="count">\${counts.medium}</span></button>
+          <button data-tier="long" class="\${f.tier==='long'?'active':''}" title="Lava — durable truths. Raw items + condensed principles that survived multiple reinforcements.">Long <span class="count">\${counts.long}</span></button>
         </div>
         <input type="search" id="memSearch" placeholder="search content or tags…" value="\${escapeHtml(f.query)}" style="flex:1;min-width:240px;">
       </div>
@@ -3593,6 +3712,15 @@ async function postJson(path, body) {
   return r.json();
 }
 function escapeHtml(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]); }
+
+// Inline help marker — renders a (?) chip with a hover tooltip. Use it for
+// obscure terms in dense panes so users don't have to leave the page to
+// understand what something means. Returns markup; caller composes it
+// into the surrounding template literal.
+//   Memory tier <span ...>${uiHelp("Short is RAM, medium is day-to-day, long is durable principles.")}</span>
+function uiHelp(text) {
+  return \`<span class="ui-help" tabindex="0" aria-label="\${escapeHtml(text)}">?<span class="ui-help-tip">\${escapeHtml(text)}</span></span>\`;
+}
 
 async function refreshHealth() {
   try {
