@@ -29,7 +29,7 @@
   Brief drafted. Want me to open it?
 ```
 
-That's the difference. Hermes Agent, OpenClaw, even cloud agents like Claude.ai and Devin sit dormant until you type something. OpenAGI is **proactive** — it runs as a daemon, reads your activity, and surfaces things on its own. The first hour you have it installed, it's already noticing patterns. The first week, it's drafting skills. By month two it's doing the boring half of your work without being asked.
+That's the difference. Hermes Agent, OpenClaw, SwarmClaw, even cloud agents like Claude.ai and Operator sit dormant until you type something. OpenAGI is **proactive** — it runs as a daemon, reads your activity, and surfaces things on its own. The first hour you have it installed, it's already noticing patterns. The first week, it's drafting skills. By month two it's doing the boring half of your work without being asked.
 
 Everything lives under `~/.openagi/` on your machine. No accounts. No telemetry. No cloud component. Bring your own LLM (OpenAI, Anthropic, Ollama).
 
@@ -70,28 +70,28 @@ The three innovations above are the engine. The user-visible behavior that falls
 
 The highlighted rows are the bet — Scrutiny, tiered Memory, Propagation, the corrections loop, and the proactive behavior they enable. Everything below the line is table stakes for any local-agent runtime now.
 
-|                                                | OpenAGI | Hermes Agent  | OpenClaw   | Operator | Claude.ai | Devin |
-|------------------------------------------------|:-------:|:-------------:|:----------:|:--------:|:---------:|:-----:|
-|                                                | _local_ |    _local_    |  _local_   | _cloud_  |  _cloud_  | _cloud_ |
-| **Directional Adaptive Scrutiny**              | **✅**  |       —       |     —      |    —     |     —     |   —   |
-| **Tiered Memory (short / medium / Lava)**      | **✅**  |       —       |     —      |    —     |     —     |   —   |
-| **Propagation — bounded specialists**          | **✅**  | parallel only |     —      |    —     |     —     |   —   |
-| **Corrections lock in, never repeat**          | **✅**  |       —       |     —      |    —     |     —     |   —   |
-| **Reaches out to you (proactive)**             | **✅**  |       —       |     —      |    —     |     —     |   —   |
-| **Watches your work, learns patterns**         | **✅**  |       —       |     —      |    —     |     —     |   —   |
-| **Auto-drafts skills from observed routines**  | **✅**  |       —       |     —      |    —     |     —     |   —   |
-| Runs on your machine                           |   ✅    |      ✅       |    ✅      |    —     |     —     |   —   |
-| Your data never leaves                         |   ✅    |      ✅       |    ✅      |    —     |     —     |   —   |
-| Bring your own LLM                             | ✅ any  |   ✅ 200+    |    ✅      |    —     |     —     |   —   |
-| Persistent memory across sessions              | ✅ tiered | ✅ FTS5     | ✅ markdown | limited | limited   | limited |
-| Multi-channel (SMS / Telegram / HTTP)          |   ✅    |      ✅       |    ✅      |    —     |     —     |   —   |
-| MCP server support                             |   ✅    |      ✅       |    ✅      |  some    |     —     |   —   |
-| Skills system                                  |   ✅    |      ✅       |    ✅      |    —     |     —     |   —   |
-| Cron / scheduled tasks                         |   ✅    |      ✅       |    ✅      |    —     |     —     |   —   |
-| Source-available                               |   ✅    |      ✅       |    ✅      |    —     |     —     |   —   |
-| No telemetry, no accounts                      |   ✅    |      ✅       |    ✅      |    —     |     —     |   —   |
+|                                                | OpenAGI | Hermes Agent  | OpenClaw    | SwarmClaw       | Operator | Claude.ai |
+|------------------------------------------------|:-------:|:-------------:|:-----------:|:---------------:|:--------:|:---------:|
+|                                                | _local_ |    _local_    |   _local_   |     _local_     | _cloud_  |  _cloud_  |
+| **Directional Adaptive Scrutiny**              | **✅**  |       —       |      —      |        —        |    —     |     —     |
+| **Tiered Memory (short / medium / Lava)**      | **✅**  |       —       |      —      |        —        |    —     |     —     |
+| **Propagation — bounded specialists**          | **✅ auto-spawn** | parallel only |  —  | manual org chart |    —     |     —     |
+| **Corrections lock in, never repeat**          | **✅**  |       —       |      —      |        —        |    —     |     —     |
+| **Reaches out to you (proactive)**             | **✅**  |       —       |      —      |        —        |    —     |     —     |
+| **Watches your work, learns patterns**         | **✅**  |       —       |      —      |        —        |    —     |     —     |
+| **Auto-drafts skills from observed routines**  | **✅**  |       —       |      —      |        —        |    —     |     —     |
+| Runs on your machine                           |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
+| Your data never leaves                         |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
+| Bring your own LLM                             | ✅ any  |   ✅ 200+    |     ✅      |     ✅ 23+      |    —     |     —     |
+| Persistent memory across sessions              | ✅ tiered | ✅ FTS5     | ✅ markdown |    ✅ durable   | limited  | limited   |
+| Multi-channel (SMS / Telegram / HTTP)          |   ✅    |      ✅       |     ✅      |  dashboard only |    —     |     —     |
+| MCP server support                             |   ✅    |      ✅       |     ✅      |       ✅        |   some   |     —     |
+| Skills system                                  |   ✅    |      ✅       |     ✅      |    ✅ reviewed  |    —     |     —     |
+| Cron / scheduled tasks                         |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
+| Source-available                               |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
+| No telemetry, no accounts                      |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
 
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearch) is the closest direct competitor — same daemon shape, MCP, durable memory, BYO LLM, multi-channel I/O, scheduled tasks. It absorbed OpenClaw (literally ships `hermes claw migrate`) and now leads the open-source local-agent space. But it's still an answer-machine: you start every conversation. Hermes spawns **parallel subagents per turn**; OpenAGI spawns **persistent specialists per domain**. Cloud agents (Operator, Claude.ai, Devin) sit dormant too. The hard problem in agents isn't running locally; it's **a system that scrutinizes signals, manages memory at three fidelities, specializes through division, and locks in your corrections.** Once those four loops are running, *reaching out first* isn't a feature you bolt on — it's what falls out.
+The three direct competitors all sit in the local-first daemon space. [Hermes Agent](https://github.com/NousResearch/hermes-agent) (NousResearch, 142k+ stars) is the current leader and absorbed OpenClaw via `hermes claw migrate`. [OpenClaw](https://github.com/openclaw/openclaw) (formerly Moltbot / Clawdbot) is the original daemon shape — messaging gateway + memory + skills. [SwarmClaw](https://github.com/swarmclawai/swarmclaw) is the newest, dashboard-first multi-agent runtime with manually-configured org charts of persistent agents that delegate to each other. All three are answer-machines: you start every conversation. They handle propagation differently — Hermes spawns **parallel subagents per turn**, SwarmClaw uses **manually-configured org charts**, OpenAGI **auto-spawns persistent specialists** when Scrutiny decides the task warrants one. Cloud agents (Operator, Claude.ai) sit dormant too. The hard problem in agents isn't running locally; it's **a system that scrutinizes signals, manages memory at three fidelities, specializes through division, and locks in your corrections.** Once those four loops are running, *reaching out first* isn't a feature you bolt on — it's what falls out.
 
 If you want the long form on why these (and not, say, "more parameters") get you closer to AGI, read **[WHITEPAPER.md](WHITEPAPER.md)**.
 
