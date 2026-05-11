@@ -2095,30 +2095,33 @@ function renderCronDetail(job) {
 function openCronComposer() {
   main.innerHTML = \`
     <div class="pane">
-      <h2>New schedule</h2>
+      <h2 style="margin-bottom: var(--space-2);">New schedule</h2>
+      <p class="ui-muted" style="margin-bottom: var(--space-4);">Use this for one-off reminders, recurring agent pulses, or scheduled prompts. The agent's default pulse runs every 30 min — add custom ones here.</p>
       <form class="form" id="cronForm">
-        <div><label>Type</label>
-          <select name="task">
+        <div style="margin-bottom: var(--space-3);">
+          <label>Type</label>
+          <select class="ui-select" name="task">
             <option value="prompt">prompt — runs once, replies to channel</option>
             <option value="autopilot">autopilot — proactive pulse, agent decides if it acts</option>
           </select>
         </div>
-        <div><label>Name</label><input name="name" placeholder="morning-brief" required></div>
-        <div><label>Prompt (leave blank for autopilot to use the default review prompt)</label>
-          <textarea name="prompt" rows="3" placeholder="For autopilot: optional custom pulse prompt. For prompt: what the agent should run."></textarea>
+        <div style="margin-bottom: var(--space-3);"><label>Name</label><input class="ui-input" name="name" placeholder="morning-brief" required></div>
+        <div style="margin-bottom: var(--space-3);">
+          <label>Prompt (leave blank for autopilot to use the default review prompt)</label>
+          <textarea class="ui-textarea" name="prompt" rows="3" placeholder="For autopilot: optional custom pulse prompt. For prompt: what the agent should run."></textarea>
         </div>
-        <div class="row" style="gap: 8px;">
-          <div class="grow"><label>Delay (seconds)</label><input name="delaySeconds" type="number" min="30" placeholder="60"></div>
-          <div class="grow"><label>Interval (seconds)</label><input name="intervalSeconds" type="number" min="30" placeholder="600"></div>
-          <div class="grow"><label>Daily at</label><input name="dailyAt" placeholder="09:00"></div>
+        <div class="ui-row" style="gap: var(--space-2); margin-bottom: var(--space-3);">
+          <div class="ui-grow"><label>Delay (seconds)</label><input class="ui-input" name="delaySeconds" type="number" min="30" placeholder="60"></div>
+          <div class="ui-grow"><label>Interval (seconds)</label><input class="ui-input" name="intervalSeconds" type="number" min="30" placeholder="600"></div>
+          <div class="ui-grow"><label>Daily at</label><input class="ui-input" name="dailyAt" placeholder="09:00"></div>
         </div>
-        <div class="row" style="gap: 8px;">
-          <div class="grow"><label>Channel</label>
-            <select name="channel"><option value="local">local</option><option value="sms">sms</option><option value="telegram">telegram</option></select>
+        <div class="ui-row" style="gap: var(--space-2); margin-bottom: var(--space-4);">
+          <div class="ui-grow"><label>Channel</label>
+            <select class="ui-select" name="channel"><option value="local">local</option><option value="sms">sms</option><option value="telegram">telegram</option></select>
           </div>
-          <div class="grow"><label>Target (phone/chatId)</label><input name="target" placeholder="+15555550123"></div>
+          <div class="ui-grow"><label>Target (phone/chatId)</label><input class="ui-input" name="target" placeholder="+15555550123"></div>
         </div>
-        <div class="row"><button type="submit">Schedule</button></div>
+        <button class="ui-btn" type="submit">Schedule</button>
       </form>
     </div>
   \`;
@@ -2238,15 +2241,22 @@ function renderSuggestedDetail(candidate) {
 function renderSkillDetail(skill) {
   main.innerHTML = \`
     <div class="pane">
-      <h2>\${escapeHtml(skill.name)}</h2>
-      <p class="muted">\${escapeHtml(skill.description ?? "")}</p>
-      <h3>Run</h3>
-      <form class="form" id="skillForm">
-        <div><label>Input</label><textarea name="input" rows="3" placeholder="Free-text input"></textarea></div>
-        <div><button type="submit">Run skill</button></div>
-      </form>
-      <h3>Output</h3>
-      <pre id="skillOut" class="ok"></pre>
+      <h2 style="margin-bottom: var(--space-2);">\${escapeHtml(skill.name)}</h2>
+      <p class="ui-muted" style="margin-bottom: var(--space-4);">\${escapeHtml(skill.description ?? "")}</p>
+      <div class="ui-section">
+        <div class="ui-section-header"><h3>Run</h3></div>
+        <form class="form" id="skillForm">
+          <div style="margin-bottom: var(--space-3);">
+            <label>Input</label>
+            <textarea class="ui-textarea" name="input" rows="3" placeholder="Free-text input"></textarea>
+          </div>
+          <button class="ui-btn" type="submit">Run skill</button>
+        </form>
+      </div>
+      <div class="ui-section">
+        <div class="ui-section-header"><h3>Output</h3></div>
+        <pre id="skillOut" class="ok"></pre>
+      </div>
     </div>
   \`;
   $("skillForm").addEventListener("submit", async (e) => {
@@ -2384,45 +2394,66 @@ function openMcpComposer() {
   composerOpen = true;
   main.innerHTML = \`
     <div class="pane">
-      <h2>Register MCP server</h2>
-      <p class="muted">Three shapes are supported. Pick one:</p>
+      <h2 style="margin-bottom: var(--space-2);">Register MCP server</h2>
+      <p class="ui-muted" style="margin-bottom: var(--space-4);">For one-click hosted MCPs (Stripe, GitHub, Linear, etc) use the <a href="/?tab=integrations">Integrations</a> catalog. This form is for custom servers — stdio processes or hosted URLs not in the catalog.</p>
       <form class="form" id="mcpForm">
-        <div class="grid" style="margin-bottom:14px;">
-          <label class="opt"><input type="radio" name="kind" value="stdio" checked> stdio · spawn a local process</label>
-          <label class="opt"><input type="radio" name="kind" value="http-oauth"> http + OAuth · hosted MCP with browser-based auth</label>
-          <label class="opt"><input type="radio" name="kind" value="http-bearer"> http + bearer · hosted MCP with a static API key</label>
+        <div class="ui-section" style="margin-top: 0;">
+          <div class="ui-section-header"><h3>Transport</h3></div>
+          <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
+            <label class="opt"><input type="radio" name="kind" value="stdio" checked> <span><strong>stdio</strong><br><span class="ui-meta">spawn a local process</span></span></label>
+            <label class="opt"><input type="radio" name="kind" value="http-oauth"> <span><strong>http + OAuth</strong><br><span class="ui-meta">hosted with browser auth</span></span></label>
+            <label class="opt"><input type="radio" name="kind" value="http-bearer"> <span><strong>http + bearer</strong><br><span class="ui-meta">hosted with static API key</span></span></label>
+          </div>
         </div>
 
-        <div><label>Name</label><input name="name" placeholder="e.g. filesystem" required></div>
+        <div class="ui-section">
+          <div class="ui-section-header"><h3>Server</h3></div>
+          <div style="margin-bottom: var(--space-3);">
+            <label>Name</label>
+            <input class="ui-input" name="name" placeholder="e.g. filesystem" required>
+          </div>
 
-        <div data-kind="stdio">
-          <label>Command</label><input name="command" placeholder="npx">
-        </div>
-        <div data-kind="stdio">
-          <label>Args (one per line)</label>
-          <textarea name="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/tmp"></textarea>
+          <div data-kind="stdio" style="margin-bottom: var(--space-3);">
+            <label>Command</label>
+            <input class="ui-input" name="command" placeholder="npx">
+          </div>
+          <div data-kind="stdio">
+            <label>Args (one per line)</label>
+            <textarea class="ui-textarea" name="args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/tmp"></textarea>
+          </div>
+
+          <div data-kind="http-oauth http-bearer" style="margin-bottom: var(--space-3);">
+            <label>URL</label>
+            <input class="ui-input" name="url" placeholder="https://mcp.example.com/mcp">
+          </div>
+          <div data-kind="http-bearer">
+            <label>API key (or \\\${ENV_VAR})</label>
+            <input class="ui-input" name="apiKey" placeholder="\\\${MY_MCP_KEY}">
+          </div>
+          <div data-kind="http-oauth" style="margin-bottom: var(--space-3);">
+            <label>Pre-registered Client ID <span class="ui-meta">· optional, only if your auth server doesn't support dynamic registration</span></label>
+            <input class="ui-input" name="clientId" placeholder="\\\${OAUTH_CLIENT_ID} or literal">
+          </div>
+          <div data-kind="http-oauth">
+            <label>Client secret <span class="ui-meta">· optional, only for confidential clients</span></label>
+            <input class="ui-input" type="password" name="clientSecret" autocomplete="off">
+          </div>
         </div>
 
-        <div data-kind="http-oauth http-bearer">
-          <label>URL</label>
-          <input name="url" placeholder="https://mcp.example.com/mcp">
-        </div>
-        <div data-kind="http-bearer">
-          <label>API key (or \\\${ENV_VAR})</label>
-          <input name="apiKey" placeholder="\\\${MY_MCP_KEY}">
-        </div>
-        <div data-kind="http-oauth">
-          <label>Pre-registered Client ID <span class="muted">· optional, only if your auth server doesn't support dynamic registration</span></label>
-          <input name="clientId" placeholder="\\\${OAUTH_CLIENT_ID} or literal">
-        </div>
-        <div data-kind="http-oauth">
-          <label>Client secret <span class="muted">· optional, only for confidential clients</span></label>
-          <input type="password" name="clientSecret" autocomplete="off">
+        <div class="ui-section">
+          <div class="ui-section-header"><h3>Trust level</h3></div>
+          <select class="ui-select" name="trustLevel">
+            <option>trusted</option>
+            <option>untrusted</option>
+          </select>
+          <div class="ui-meta" style="margin-top: var(--space-1);">Trusted servers can be called automatically; untrusted require explicit approval per call.</div>
         </div>
 
-        <div><label>Trust level</label><select name="trustLevel"><option>trusted</option><option>untrusted</option></select></div>
-        <div class="row" style="gap:8px;"><button type="submit" id="registerSubmit">Register</button><button type="button" class="secondary" id="cancelBtn">Cancel</button></div>
-        <pre id="mcpRegOut" class="ok" style="display:none;margin-top:10px;"></pre>
+        <div class="ui-row" style="margin-top: var(--space-4);">
+          <button class="ui-btn" type="submit" id="registerSubmit">Register</button>
+          <button class="ui-btn ui-btn-ghost" type="button" id="cancelBtn">Cancel</button>
+        </div>
+        <pre id="mcpRegOut" class="ok" style="display:none;margin-top: var(--space-3);"></pre>
       </form>
     </div>
   \`;
@@ -3125,11 +3156,11 @@ async function renderIntegrations() {
   const catalogCard = (e) => {
     let badge;
     if (e.configured) {
-      badge = '<span class="badge ok">on</span>';
+      badge = '<span class="ui-badge ui-badge-accent">on</span>';
     } else if (e.status === "coming-soon") {
-      badge = '<span class="badge">soon</span>';
+      badge = '<span class="ui-badge">soon</span>';
     } else {
-      badge = '<span class="badge">off</span>';
+      badge = '<span class="ui-badge">off</span>';
     }
     // Bearer-auth entries need an API key. Reveal an inline input here
     // when the env var isn't set yet — the click handler reads the value
@@ -3138,32 +3169,32 @@ async function renderIntegrations() {
     const keyFieldId = \`cat-key-\${e.id}\`;
     let action;
     if (e.configured) {
-      action = \`<a href="/?tab=mcp" style="font-size:11px;">Manage →</a>\`;
+      action = \`<a class="ui-btn ui-btn-ghost ui-btn-sm" href="/?tab=mcp">Manage →</a>\`;
     } else if (e.connectable) {
-      action = \`<button class="add-mcp-btn" data-catalog-id="\${escapeHtml(e.id)}" data-int-id="\${escapeHtml(e.id)}" \${needsKey ? \`data-key-field-id="\${keyFieldId}"\` : ""} style="font-size:11px; padding:3px 8px;">+ Connect</button>\`;
+      action = \`<button class="ui-btn ui-btn-sm add-mcp-btn" data-catalog-id="\${escapeHtml(e.id)}" data-int-id="\${escapeHtml(e.id)}" \${needsKey ? \`data-key-field-id="\${keyFieldId}"\` : ""}>+ Connect</button>\`;
     } else {
       const auth = e.authType === "oauth" ? "OAuth coming soon" : "Coming soon";
-      action = \`<span class="muted" style="font-size:11px;">\${auth}</span>\`;
+      action = \`<span class="ui-meta">\${auth}</span>\`;
     }
     const keyField = needsKey
       ? \`
-        <div style="margin-top:8px;">
-          <label style="display:block; font-size:10px; color:var(--muted); margin-bottom:3px;">\${escapeHtml(e.apiKeyEnvVar)}\${e.apiKeyHelp ? \` — \${escapeHtml(e.apiKeyHelp)}\` : ""}</label>
-          <input type="password" id="\${keyFieldId}" autocomplete="off" placeholder="paste your key" style="width:100%; padding:5px 7px; font-size:12px;">
+        <div style="margin-top: var(--space-2);">
+          <label style="display:block; font-size:10px; color: var(--muted-foreground); margin-bottom: 3px;">\${escapeHtml(e.apiKeyEnvVar)}\${e.apiKeyHelp ? \` — \${escapeHtml(e.apiKeyHelp)}\` : ""}</label>
+          <input class="ui-input" type="password" id="\${keyFieldId}" autocomplete="off" placeholder="paste your key" style="font-size: 12px;">
         </div>
       \`
       : "";
     return \`
-      <div class="card" style="padding:10px 12px;">
-        <div class="row between" style="align-items:flex-start; gap:8px;">
-          <div style="flex:1; min-width:0;">
-            <div style="font-weight:500; font-size:13px;">\${escapeHtml(e.name)}</div>
-            <div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(e.description ?? "")}</div>
+      <div class="ui-card" style="display: flex; flex-direction: column; gap: var(--space-2);">
+        <div style="display: flex; align-items: flex-start; gap: var(--space-2);">
+          <div class="ui-grow">
+            <div style="font-weight: 600; font-size: 13px;">\${escapeHtml(e.name)}</div>
+            <div class="ui-meta" style="margin-top: 2px;">\${escapeHtml(e.description ?? "")}</div>
           </div>
           \${badge}
         </div>
         \${keyField}
-        <div style="margin-top:6px;">\${action}</div>
+        <div>\${action}</div>
       </div>
     \`;
   };
