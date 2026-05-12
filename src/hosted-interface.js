@@ -590,6 +590,40 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           actions
         });
       }
+      if (method === "POST" && pathname === "/computer-use/toggle") {
+        // Flip OPENAGI_COMPUTER_USE on or off without a daemon restart.
+        // Persists to .openagi/.env, mutates process.env, then registers
+        // or unregisters the tools dynamically against the live registry.
+        // Off-flip ends any active session so the agent doesn't reference
+        // a tool that no longer exists on its next turn.
+        const body = await readJson(req).catch(() => ({}));
+        const enable = Boolean(body.enable);
+        const { saveEnv } = await import("./setup-wizard.js");
+        const { registerComputerUseTools, unregisterComputerUseTools } = await import("./integrations/computer-use.js");
+        const dataDir = process.env.OPENAGI_DATA_DIR ?? path.join(process.cwd(), ".openagi");
+        // saveEnv writes only allowlisted keys; OPENAGI_COMPUTER_USE has
+        // to be in WIZARD_FIELDS (added in this commit) for the write to
+        // land in .env.
+        if (enable) {
+          saveEnv({ dataDir, values: { OPENAGI_COMPUTER_USE: "1" } });
+          process.env.OPENAGI_COMPUTER_USE = "1";
+        } else {
+          saveEnv({ dataDir, values: {}, clear: ["OPENAGI_COMPUTER_USE"] });
+          // saveEnv's clear path also strips process.env, but be explicit:
+          delete process.env.OPENAGI_COMPUTER_USE;
+        }
+        if (enable) {
+          registerComputerUseTools(runtime.tools, runtime);
+        } else {
+          // Close any active session before removing tools.
+          const active = runtime.computerUseLog?.listSessions?.({ status: "active" }) ?? [];
+          for (const s of active) {
+            runtime.computerUseLog.endSession(s.id, { reason: "disabled via toggle", status: "aborted" });
+          }
+          unregisterComputerUseTools(runtime.tools);
+        }
+        return sendJson(res, 200, { enabled: enable, tools: enable ? "registered" : "unregistered" });
+      }
       if (method === "POST" && pathname.startsWith("/computer-use/sessions/") && pathname.endsWith("/abort")) {
         const id = decodeURIComponent(pathname.slice("/computer-use/sessions/".length, -"/abort".length));
         const session = runtime.computerUseLog?.endSession(id, { reason: "aborted via dashboard", status: "aborted" });
@@ -3655,12 +3689,19 @@ async function renderComputerUse() {
 
   main.innerHTML = \`
     <div class="pane">
-      <h2 style="margin-bottom: var(--space-2);">Computer Use <span class="ui-badge">beta</span></h2>
-      \${enabled ? "" : \`
-        <div class="ui-card ui-card-elev" style="background: var(--accent-bg); border-color: var(--accent-bg); margin-bottom: var(--space-4);">
-          <strong>Off.</strong> Computer-use tools are gated behind <code>OPENAGI_COMPUTER_USE=1</code> in <code>.openagi/.env</code>. Restart the daemon after setting it. This is phase 1a — actions are logged with reasoning but NOT executed (Mac CGEvent integration ships in phase 1b).
+      <div class="ui-row" style="justify-content: space-between; align-items: flex-start; margin-bottom: var(--space-3);">
+        <div>
+          <h2 style="margin: 0;">Computer Use <span class="ui-badge">beta</span></h2>
+          <div class="ui-meta" style="margin-top: 2px;">Phase 1a — actions are logged with reasoning but NOT executed yet (Mac CGEvent integration ships in phase 1b).</div>
         </div>
-      \`}
+        <button
+          id="computerUseToggle"
+          class="ui-btn \${enabled ? "" : "ui-btn-ghost"} ui-btn-sm"
+          data-enabled="\${enabled ? "1" : "0"}"
+          title="Toggle computer-use tools on or off without restarting the daemon. Off-flips any active session and unregisters the tools so the agent stops seeing them."
+        >\${enabled ? "✓ Enabled" : "Disabled"}</button>
+      </div>
+
       <p class="ui-muted">Every action the agent intends to take is recorded here with its stated reasoning. Sessions are user-approved (via the standard approval gate). You can abort an active session at any time.</p>
 
       <div class="ui-row" style="gap: var(--space-2); margin: var(--space-3) 0;">
@@ -3688,6 +3729,30 @@ async function renderComputerUse() {
       }
     });
   });
+
+  const toggleBtn = document.getElementById("computerUseToggle");
+  if (toggleBtn) {
+    toggleBtn.addEventListener("click", async () => {
+      const wasEnabled = toggleBtn.dataset.enabled === "1";
+      const enable = !wasEnabled;
+      // Enabling is one click; disabling needs a quick confirm because
+      // it'll abort any active session.
+      if (!enable && (stats.active ?? 0) > 0) {
+        if (!confirm("Disable computer-use? This will abort " + stats.active + " active session(s).")) return;
+      }
+      toggleBtn.disabled = true;
+      toggleBtn.textContent = enable ? "Enabling…" : "Disabling…";
+      try {
+        await postJson("/computer-use/toggle", { enable });
+        showToast(enable ? "✓ Computer-use enabled. Tools registered." : "Computer-use disabled. Tools removed.", true);
+        await renderComputerUse();
+      } catch (err) {
+        showToast("Toggle failed: " + err.message, false);
+        toggleBtn.disabled = false;
+        toggleBtn.textContent = wasEnabled ? "✓ Enabled" : "Disabled";
+      }
+    });
+  }
 }
 
 async function renderActivity() {

@@ -26,7 +26,7 @@ import { ProactiveObserver } from "./proactive-observer.js";
 import { TaskStore } from "./task-store.js";
 import { PendingActionStore } from "./pending-actions.js";
 import { ComputerUseLog } from "./computer-use-log.js";
-import { registerComputerUseTools } from "./integrations/computer-use.js";
+import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
 import { SkillReplay } from "./skill-replay.js";
 import { ScrutinyJudge } from "./scrutiny-judge.js";
@@ -281,11 +281,10 @@ export class AbiRuntime {
       registerCoreTools(this.tools, this);
       // Computer-use tools register only when explicitly opted-in via env
       // (OPENAGI_COMPUTER_USE=1). Default install doesn't expose them so
-      // an LLM can't accidentally try to drive the user's screen.
-      const computerUseEnabled = process.env.OPENAGI_COMPUTER_USE === "1"
-        || process.env.OPENAGI_COMPUTER_USE === "true"
-        || process.env.OPENAGI_COMPUTER_USE === "yes";
-      if (computerUseEnabled) {
+      // an LLM can't accidentally try to drive the user's screen. The
+      // dashboard's toggle can flip this at runtime without a restart;
+      // see /computer-use/toggle in hosted-interface.js.
+      if (isComputerUseEnabled()) {
         registerComputerUseTools(this.tools, this);
       }
     }

@@ -20,6 +20,7 @@ const WIZARD_FIELDS = [
   "LINEAR_API_KEY",
   "BUILDBETTER_API_KEY", "BUILDBETTER_USER_EMAIL", "BUILDBETTER_USER_NAME",
   "IMESSAGE_ENABLED", "IMESSAGE_SELF_HANDLE", "IMESSAGE_INTERVAL_MS", "IMESSAGE_MODE", "IMESSAGE_BACKFILL_DAYS",
+  "OPENAGI_COMPUTER_USE",
   "OPENAGI_PUBLIC_URL",
   "OPENAGI_DAILY_USD_LIMIT",
   // Per-MCP bearer keys, declared by catalog entries via apiKeyEnvVar.
@@ -51,14 +52,15 @@ export function readExistingEnv(dataDir) {
   }
 }
 
-export function saveEnv({ dataDir, values }) {
+export function saveEnv({ dataDir, values, clear = [] }) {
   const file = envFilePath(dataDir);
   ensureDir(path.dirname(file));
 
   // Merge: read existing env (if any), overlay the new values, write back.
   // Only allow-listed keys can be set this way. Other keys already in the
   // file are preserved verbatim (including comments / unknown vars from
-  // hand-edits).
+  // hand-edits). Empty-string values are SKIPPED (wizard's blank-field =
+  // "don't change") — use the `clear` list to remove a key explicitly.
   const existing = parseEnvText(readExistingEnv(dataDir));
   const incoming = {};
   for (const key of WIZARD_FIELDS) {
@@ -70,6 +72,11 @@ export function saveEnv({ dataDir, values }) {
   }
 
   const merged = { ...existing, ...incoming };
+  for (const key of clear) {
+    if (!WIZARD_FIELDS.includes(key)) continue; // still allowlisted
+    delete merged[key];
+    delete process.env[key];
+  }
   const lines = [
     `# Written by OpenAGI setup wizard at ${new Date().toISOString()}`,
     "# Edit by hand or rerun /setup to change values.",

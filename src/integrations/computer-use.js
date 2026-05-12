@@ -26,6 +26,42 @@
 
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. There is no real input synthesis yet — this is the planning / logging phase only.";
 
+// Tool names that this module registers. Kept here in one place so the
+// dynamic unregister path (used by the dashboard toggle) can remove
+// exactly what was added without guessing.
+export const COMPUTER_USE_TOOL_NAMES = [
+  "start_computer_use_session",
+  "end_computer_use_session",
+  "computer_screenshot",
+  "computer_click",
+  "computer_type",
+  "computer_key",
+  "computer_scroll",
+  "computer_move"
+];
+
+/// Reads the current enabled state from process.env. NOT cached — so when
+/// the dashboard toggle writes IMESSAGE-style to .env and updates
+/// process.env, the next check reflects the new value immediately.
+export function isComputerUseEnabled() {
+  const v = process.env.OPENAGI_COMPUTER_USE;
+  return v === "1" || v === "true" || v === "yes";
+}
+
+/// Remove all computer-use tools from the registry. Caller is expected
+/// to also close any active session so the agent doesn't leave a dangling
+/// reference. Returns the number of tools actually unregistered.
+export function unregisterComputerUseTools(registry) {
+  let count = 0;
+  for (const name of COMPUTER_USE_TOOL_NAMES) {
+    if (registry.has?.(name)) {
+      registry.unregister(name);
+      count += 1;
+    }
+  }
+  return count;
+}
+
 export function registerComputerUseTools(registry, runtime) {
   if (!runtime.computerUseLog) return { registered: false, reason: "no computer-use log bound" };
 

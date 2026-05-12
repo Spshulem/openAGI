@@ -1432,6 +1432,75 @@ test("ComputerUseLog: session lifecycle + action recording with reasoning", asyn
   fs.rmSync(dir, { recursive: true });
 });
 
+test("computer-use: dynamic register + unregister via toggle helpers", async () => {
+  const { ToolRegistry } = await import("../src/tool-registry.js");
+  const {
+    registerComputerUseTools,
+    unregisterComputerUseTools,
+    COMPUTER_USE_TOOL_NAMES,
+    isComputerUseEnabled
+  } = await import("../src/integrations/computer-use.js");
+  const { ComputerUseLog } = await import("../src/computer-use-log.js");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cu-toggle-"));
+  const registry = new ToolRegistry();
+  const fakeRuntime = {
+    tools: registry,
+    computerUseLog: new ComputerUseLog({ dir }),
+    observations: { search: async () => [] }
+  };
+
+  // isComputerUseEnabled reads process.env live, not cached.
+  const wasSet = process.env.OPENAGI_COMPUTER_USE;
+  delete process.env.OPENAGI_COMPUTER_USE;
+  assert.equal(isComputerUseEnabled(), false, "off when env not set");
+  process.env.OPENAGI_COMPUTER_USE = "1";
+  assert.equal(isComputerUseEnabled(), true, "on after env flip");
+
+  // Register adds all tools.
+  registerComputerUseTools(registry, fakeRuntime);
+  for (const name of COMPUTER_USE_TOOL_NAMES) {
+    assert.ok(registry.has(name), `expected ${name} present after register`);
+  }
+
+  // Unregister removes exactly those tools.
+  const removed = unregisterComputerUseTools(registry);
+  assert.equal(removed, COMPUTER_USE_TOOL_NAMES.length, "unregister returns count");
+  for (const name of COMPUTER_USE_TOOL_NAMES) {
+    assert.equal(registry.has(name), false, `expected ${name} absent after unregister`);
+  }
+
+  if (wasSet === undefined) delete process.env.OPENAGI_COMPUTER_USE;
+  else process.env.OPENAGI_COMPUTER_USE = wasSet;
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("saveEnv: clear list removes the key from .env and process.env", async () => {
+  const { saveEnv, readExistingEnv } = await import("../src/setup-wizard.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-saveenv-clear-"));
+
+  // Set a key, confirm it lands in .env.
+  saveEnv({ dataDir: dir, values: { OPENAGI_COMPUTER_USE: "1" } });
+  let text = readExistingEnv(dir);
+  assert.match(text, /OPENAGI_COMPUTER_USE=1/, "value written");
+  assert.equal(process.env.OPENAGI_COMPUTER_USE, "1");
+
+  // Clear it.
+  saveEnv({ dataDir: dir, values: {}, clear: ["OPENAGI_COMPUTER_USE"] });
+  text = readExistingEnv(dir);
+  assert.doesNotMatch(text, /OPENAGI_COMPUTER_USE=/, "value removed from .env");
+  assert.equal(process.env.OPENAGI_COMPUTER_USE, undefined, "value removed from process.env");
+
+  // clear with a non-allowlisted key is a no-op (safe — can't be tricked
+  // into deleting arbitrary env vars).
+  process.env.AWS_SECRET_KEY = "decoy";
+  saveEnv({ dataDir: dir, values: {}, clear: ["AWS_SECRET_KEY"] });
+  assert.equal(process.env.AWS_SECRET_KEY, "decoy", "non-allowlisted key not cleared");
+  delete process.env.AWS_SECRET_KEY;
+
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("computer-use tools register only when OPENAGI_COMPUTER_USE flag is set", async () => {
   const { createDefaultRuntime } = await import("../src/index.js");
 
