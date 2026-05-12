@@ -107,6 +107,15 @@ export class ProactiveObserver {
 
     const prompt = this.buildPrompt(ctx, candidates, recentSession);
     let raw;
+    // Story 3: prepend the user's recent preference signal to the system
+    // prompt so the observer learns from accept/reject history instead
+    // of proposing the same shape of thing repeatedly. Null when there
+    // aren't enough samples yet (first ~3 interactions teach nothing).
+    const preferenceLine = this.runtime?.suggestionFeedback?.preferenceSummary?.() ?? null;
+    const instructions = preferenceLine
+      ? SYSTEM_PROMPT + "\n\n" + preferenceLine
+      : SYSTEM_PROMPT;
+
     try {
       const result = await provider.generate({
         input: prompt,
@@ -115,7 +124,7 @@ export class ProactiveObserver {
         messages: [],
         tools: [],
         toolRegistry: null,
-        instructions: SYSTEM_PROMPT,
+        instructions,
         context: {}
       });
       raw = result.text ?? "";
@@ -126,6 +135,12 @@ export class ProactiveObserver {
     const proposal = parseProposal(raw);
     if (!proposal || proposal.pass === true) {
       return { skipped: true, reason: proposal?.reason ?? "no proposal" };
+    }
+    // Story 3: respect user-muted categories absolutely — even if the
+    // observer's LLM proposes one, we silently drop it rather than
+    // surface a card the user said they didn't want.
+    if (proposal.category && this.runtime?.suggestionFeedback?.isMuted?.(proposal.category)) {
+      return { skipped: true, reason: `category '${proposal.category}' is muted by user preference` };
     }
 
     if (this.alreadyProposedRecently(proposal, now)) {

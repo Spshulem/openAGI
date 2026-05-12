@@ -918,6 +918,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         return sendJson(res, 200, candidate);
       }
+      if (method === "GET" && pathname === "/proactive/preferences") {
+        if (!runtime.suggestionFeedback) return sendJson(res, 503, { error: "no feedback module" });
+        return sendJson(res, 200, {
+          preferences: runtime.suggestionFeedback.readPreferences(),
+          stats: runtime.suggestionFeedback.computeStats(),
+          summary: runtime.suggestionFeedback.preferenceSummary(),
+          multipliers: runtime.suggestionFeedback.categoryMultipliers()
+        });
+      }
+      if (method === "POST" && pathname === "/proactive/preferences/mute") {
+        if (!runtime.suggestionFeedback) return sendJson(res, 503, { error: "no feedback module" });
+        const body = await readJson(req).catch(() => ({}));
+        if (!body.category) return sendJson(res, 400, { error: "category required" });
+        const muted = body.muted !== false;
+        const prefs = runtime.suggestionFeedback.setMuted(body.category, muted);
+        return sendJson(res, 200, { preferences: prefs });
+      }
       if (method === "GET" && pathname.startsWith("/proactive/suggestions/") && pathname.endsWith("/outcome")) {
         // Story 2: did the thing this suggestion proposed actually pan out?
         // Returns the suggestion record + a summary of every outcome that

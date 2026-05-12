@@ -1390,6 +1390,71 @@ test("PendingActionStore: enqueue + decide + replay across instances", async () 
   fs.rmSync(dir, { recursive: true });
 });
 
+test("SuggestionFeedback: stats, preferenceSummary, multipliers, mute", async () => {
+  const { SuggestionFeedback } = await import("../src/suggestion-feedback.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-feedback-"));
+  const now = Date.now();
+  const sample = (status, category, daysAgo = 1) => ({
+    id: "s" + Math.random(),
+    category,
+    status,
+    proposedAt: new Date(now - daysAgo * 86400000).toISOString()
+  });
+
+  // Fake proactiveObserver.list — returns whatever we give it.
+  const suggestions = [
+    sample("accepted", "task"),
+    sample("accepted", "task"),
+    sample("accepted", "task"),
+    sample("rejected", "task"),
+    sample("rejected", "skill"),
+    sample("rejected", "skill"),
+    sample("rejected", "skill"),
+    sample("accepted", "skill"),
+    // One outside window — should not count.
+    sample("accepted", "task", 60)
+  ];
+  const fakeRuntime = {
+    proactiveObserver: { list: () => suggestions }
+  };
+  const feedback = new SuggestionFeedback({ runtime: fakeRuntime, dataDir: dir, windowDays: 30 });
+
+  const stats = feedback.computeStats();
+  assert.equal(stats.total, 8, "8 in-window resolved");
+  assert.equal(stats.byCategory.task.accepted, 3);
+  assert.equal(stats.byCategory.task.rejected, 1);
+  assert.equal(stats.byCategory.skill.accepted, 1);
+  assert.equal(stats.byCategory.skill.rejected, 3);
+
+  const summary = feedback.preferenceSummary();
+  assert.ok(summary, "summary not null when n >= 3");
+  assert.match(summary, /task: 3\/4 accepted .* propose more/);
+  assert.match(summary, /skill: 1\/4 accepted .* propose only when strongly indicated/);
+
+  const mult = feedback.categoryMultipliers();
+  assert.ok(mult.task > 1.0, "task category boosted (75% accept rate)");
+  assert.ok(mult.skill < 1.0, "skill category dampened (25% accept rate)");
+
+  // Mute → multiplier hard-zero + isMuted true.
+  feedback.setMuted("skill", true);
+  assert.equal(feedback.isMuted("skill"), true);
+  assert.equal(feedback.categoryMultipliers().skill, 0);
+  const mutedSummary = feedback.preferenceSummary();
+  assert.match(mutedSummary, /muted these categories.*skill/);
+  // Unmute.
+  feedback.setMuted("skill", false);
+  assert.equal(feedback.isMuted("skill"), false);
+
+  // Too few samples → null summary.
+  const emptyFeedback = new SuggestionFeedback({
+    runtime: { proactiveObserver: { list: () => [sample("accepted", "task")] } },
+    dataDir: dir
+  });
+  assert.equal(emptyFeedback.preferenceSummary(), null, "n=1 < threshold → null");
+
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("OutcomeStore: bySuggestion + aggregateBySuggestion link runs back to proposal", async () => {
   const { OutcomeStore } = await import("../src/outcome-store.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-outcome-lineage-"));

@@ -27,6 +27,7 @@ import { TaskStore } from "./task-store.js";
 import { PendingActionStore } from "./pending-actions.js";
 import { ComputerUseLog } from "./computer-use-log.js";
 import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
+import { SuggestionFeedback } from "./suggestion-feedback.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
 import { SkillReplay } from "./skill-replay.js";
 import { ScrutinyJudge } from "./scrutiny-judge.js";
@@ -154,6 +155,10 @@ export class AbiRuntime {
     this.patternMiner = options.patternMiner ?? new PatternMiner({ runtime: this, dataDir: options.dataDir, ...(options.patternMinerOptions ?? {}) });
     this.sessionMiner = options.sessionMiner ?? new SessionMiner({ runtime: this, dataDir: options.dataDir, ...(options.sessionMinerOptions ?? {}) });
     this.proactiveObserver = options.proactiveObserver ?? new ProactiveObserver({ runtime: this, dataDir: options.dataDir, ...(options.proactiveObserverOptions ?? {}) });
+    // Story 3: closes the suggestion → outcome → next-suggestion loop.
+    // Reads resolved suggestion history + user mute preferences, feeds
+    // a compact summary into the observer's system prompt each pass.
+    this.suggestionFeedback = options.suggestionFeedback ?? new SuggestionFeedback({ runtime: this, dataDir: options.dataDir });
     this.tasks = options.tasks ?? new TaskStore({ runtime: this, dataDir: options.dataDir, ...(options.taskStoreOptions ?? {}) });
     this.skillReplay = options.skillReplay ?? new SkillReplay({ runtime: this, dataDir: options.dataDir, ...(options.skillReplayOptions ?? {}) });
     this.outputs = [];
