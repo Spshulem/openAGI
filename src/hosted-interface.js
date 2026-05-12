@@ -897,6 +897,25 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 200, { ...candidate, taskCreateError: error.message });
           }
         }
+        // Story 1: accepting a skill suggestion materializes it into a
+        // real SKILL.md file under the user skills dir, then reloads
+        // the registry so it shows up in list_skills + as a skill_<name>
+        // tool immediately. The lineage (sourceSuggestionId) is stamped
+        // into the file's frontmatter so Story 2 can score outcomes
+        // back against the proposal that birthed it.
+        if (status === "accepted" && candidate.category === "skill" && runtime.skills?.reload) {
+          try {
+            const { createSkillFromSuggestion } = await import("./skill-materialize.js");
+            const result = createSkillFromSuggestion({
+              runtime,
+              suggestion: candidate
+            });
+            runtime.skills.reload();
+            return sendJson(res, 200, { ...candidate, skillSlug: result.slug, skillPath: result.path });
+          } catch (error) {
+            return sendJson(res, 200, { ...candidate, skillCreateError: error.message });
+          }
+        }
         return sendJson(res, 200, candidate);
       }
       if (method === "GET" && pathname === "/observations/recent-context") {

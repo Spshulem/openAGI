@@ -1390,6 +1390,57 @@ test("PendingActionStore: enqueue + decide + replay across instances", async () 
   fs.rmSync(dir, { recursive: true });
 });
 
+test("skill-materialize: accepted skill suggestion writes SKILL.md with stamped lineage", async () => {
+  const { createSkillFromSuggestion, slugify, dedupeSlug } = await import("../src/skill-materialize.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-skill-mat-"));
+  const bundled = path.join(dir, "bundled");
+  const userDir = path.join(dir, "user");
+  fs.mkdirSync(bundled, { recursive: true });
+  fs.mkdirSync(userDir, { recursive: true });
+
+  const fakeRuntime = { skills: { dirs: [bundled, userDir], reload: () => {} } };
+  const suggestion = {
+    id: "sug-abc-123",
+    title: "Morning Standup Brief",
+    rationale: "User reviews Slack + GitHub every morning at 9am",
+    category: "skill",
+    draftBody: "Compose a morning standup for the user.\n\n1. Call recall for...\n"
+  };
+  const result = createSkillFromSuggestion({ runtime: fakeRuntime, suggestion });
+  assert.equal(result.slug, "morning-standup-brief");
+
+  const written = fs.readFileSync(result.path, "utf8");
+  assert.match(written, /name: morning-standup-brief/);
+  assert.match(written, /sourceSuggestionId: sug-abc-123/, "lineage stamped into frontmatter");
+  assert.match(written, /createdBy: proactive-observer/);
+  assert.match(written, /1\. Call recall for/, "draftBody preserved");
+
+  // Slugify edge cases.
+  assert.equal(slugify("Already-kebab-OK"), "already-kebab-ok");
+  assert.equal(slugify("emoji 🚀 trimmed"), "emoji-trimmed");
+  assert.equal(slugify(""), "untitled-skill");
+  assert.equal(slugify(null), "untitled-skill");
+
+  // Dedupe.
+  assert.equal(dedupeSlug(userDir, "fresh-name"), "fresh-name");
+  assert.equal(dedupeSlug(userDir, "morning-standup-brief"), "morning-standup-brief-2", "existing slug gets -2");
+
+  // Refuse if no draftBody (observer proposed an automation, not a skill).
+  assert.throws(() => createSkillFromSuggestion({
+    runtime: fakeRuntime,
+    suggestion: { id: "x", title: "noop", category: "skill" }
+  }), /draftBody/);
+
+  // Refuse if runtime has only bundled (no writable user dir).
+  const noUserRuntime = { skills: { dirs: [bundled], reload: () => {} } };
+  assert.throws(() => createSkillFromSuggestion({
+    runtime: noUserRuntime,
+    suggestion: { id: "x", title: "t", category: "skill", draftBody: "b" }
+  }), /no user skills directory/);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("ComputerUseLog: session lifecycle + action recording with reasoning", async () => {
   const { ComputerUseLog } = await import("../src/computer-use-log.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cu-"));
