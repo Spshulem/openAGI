@@ -1390,6 +1390,92 @@ test("PendingActionStore: enqueue + decide + replay across instances", async () 
   fs.rmSync(dir, { recursive: true });
 });
 
+test("task-store: goals as parents — addGoal, linkTaskToGoal, goalProgress rollup", async () => {
+  const { TaskStore } = await import("../src/task-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-goals-"));
+  const store = new TaskStore({ dataDir: dir });
+
+  const goal = store.addGoal({ title: "Ship OpenAGI v0.2", dueDate: "2026-06-30T00:00:00Z" });
+  assert.equal(goal.status, "active");
+  assert.match(goal.id, /^goal_/);
+
+  // Create 3 tasks under the goal; complete 1.
+  const t1 = store.add({ title: "Write docs", parentGoalId: goal.id });
+  const t2 = store.add({ title: "Wire UI", parentGoalId: goal.id });
+  const t3 = store.add({ title: "Add tests", parentGoalId: goal.id });
+  store.complete(t1.id, "manual");
+
+  const progress = store.goalProgress(goal.id);
+  assert.equal(progress.total, 3);
+  assert.equal(progress.done, 1);
+  assert.equal(progress.percent, 33.3);
+
+  // Link an unlinked task afterwards.
+  const t4 = store.add({ title: "Cut release" });
+  assert.equal(store.tasks.get(t4.id).parentGoalId, null);
+  store.linkTaskToGoal(t4.id, goal.id);
+  assert.equal(store.tasks.get(t4.id).parentGoalId, goal.id);
+  assert.equal(store.goalProgress(goal.id).total, 4);
+
+  // Nested goal rollup: parent goal's progress includes child goal's tasks.
+  const childGoal = store.addGoal({ title: "Docs site", parentGoalId: goal.id });
+  store.add({ title: "Sub-doc 1", parentGoalId: childGoal.id });
+  const sub2 = store.add({ title: "Sub-doc 2", parentGoalId: childGoal.id });
+  store.complete(sub2.id, "manual");
+  const parentRoll = store.goalProgress(goal.id);
+  assert.equal(parentRoll.total, 6, "rollup absorbs sub-goal's 2 tasks");
+  assert.equal(parentRoll.done, 2, "1 parent done + 1 sub done");
+  assert.equal(parentRoll.hasSubGoals, true);
+
+  // Persistence: re-instantiate, goals + links survive.
+  const store2 = new TaskStore({ dataDir: dir });
+  assert.equal(store2.getGoal(goal.id).title, "Ship OpenAGI v0.2");
+  assert.equal(store2.tasks.get(t1.id).parentGoalId, goal.id);
+
+  // Unlink via goalId=null.
+  store2.linkTaskToGoal(t4.id, null);
+  assert.equal(store2.tasks.get(t4.id).parentGoalId, null);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("daily-recap: groups completed tasks by parent goal when goals exist", async () => {
+  const { computeDailyRecap, renderDailyRecapMarkdown } = await import("../src/daily-recap.js");
+  const goalA = { id: "goal_a", title: "Ship v0.2" };
+  const goalB = { id: "goal_b", title: "Hire" };
+  const todayAt = (h) => new Date(`2026-05-13T${String(h).padStart(2, "0")}:00:00Z`).toISOString();
+  const fakeRuntime = {
+    tasks: {
+      list: ({ status }) => status === "completed" ? [
+        { id: "t1", title: "Write docs", queue: "user", parentGoalId: "goal_a", updatedAt: todayAt(10) },
+        { id: "t2", title: "Interview prep", queue: "user", parentGoalId: "goal_b", updatedAt: todayAt(11) },
+        { id: "t3", title: "Quick fix", queue: "user", parentGoalId: null, updatedAt: todayAt(12) },
+        { id: "t4", title: "Add tests", queue: "user", parentGoalId: "goal_a", updatedAt: todayAt(13) }
+      ] : [],
+      getGoal: (id) => ({ goal_a: goalA, goal_b: goalB })[id] ?? null,
+      goalProgress: (id) => ({
+        goal_a: { goalId: "goal_a", total: 5, done: 2, percent: 40 },
+        goal_b: { goalId: "goal_b", total: 4, done: 1, percent: 25 }
+      })[id] ?? null
+    },
+    outcomes: { recent: () => [] },
+    pendingActions: { list: () => [] },
+    computerUseLog: { listActions: () => [] },
+    observations: { _recentCache: null },
+    proactiveObserver: { list: () => [] },
+    agentHost: { store: { listSessions: () => [] } }
+  };
+  const recap = computeDailyRecap(fakeRuntime, { date: new Date("2026-05-13T18:00:00Z"), timezone: "UTC" });
+  assert.equal(recap.tasksByGoal.goal_a.tasks.length, 2);
+  assert.equal(recap.tasksByGoal.goal_b.tasks.length, 1);
+  assert.equal(recap.tasksByGoal._unassigned.tasks.length, 1);
+
+  const md = renderDailyRecapMarkdown(recap);
+  assert.match(md, /Ship v0\.2.*40%/s);
+  assert.match(md, /Hire.*25%/s);
+  assert.match(md, /no goal/);
+});
+
 test("task-store: month/quarter/year buckets exist, auto-bucket from dueDate, migration rebuckets someday", async () => {
   const { TaskStore, BUCKETS, bucketFromDueDate } = await import("../src/task-store.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-buckets-"));

@@ -26,6 +26,12 @@ export const QUEUES = ["user", "agent"];
 
 const TASK_DIR = "tasks";
 
+// Story 11: Goal record. A Goal is a parent that tasks can hang off,
+// has its own due date and status, and rolls up child task progress
+// into a single completion percentage. Goals can nest (a goal can have
+// a parentGoalId pointing at another goal — useful for quarter→year).
+export const GOAL_STATUSES = ["active", "completed", "cancelled", "deferred"];
+
 export class TaskStore {
   constructor(options = {}) {
     this.runtime = options.runtime ?? null;
@@ -33,6 +39,7 @@ export class TaskStore {
     this.taskDir = path.join(this.dataDir, TASK_DIR);
     ensureDir(this.taskDir);
     this.tasks = new Map(); // id → task
+    this.goals = new Map(); // id → goal
     this.loadFromDisk();
     // Story 8: one-shot migration. Tasks already in "someday" with a real
     // dueDate get re-bucketed to the right horizon. Pending tasks only —
@@ -62,6 +69,9 @@ export class TaskStore {
     const snap = readJsonFile(snapshotPath, null);
     if (snap?.tasks) {
       for (const t of snap.tasks) this.tasks.set(t.id, t);
+      // Story 11: goals persist alongside tasks in the same snapshot.
+      // Older snapshots without a `goals` array are forward-compatible.
+      for (const g of snap.goals ?? []) this.goals.set(g.id, g);
       return;
     }
     // Replay JSONL if no snapshot.
@@ -103,6 +113,8 @@ export class TaskStore {
       status: STATUSES.includes(input.status) ? input.status : "pending",
       dueDate: input.dueDate ?? null,
       scheduledFor: input.scheduledFor ?? null,
+      // Story 11: link to a parent goal so rollup progress works.
+      parentGoalId: input.parentGoalId ?? null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
       completedAt: null,
@@ -111,6 +123,11 @@ export class TaskStore {
     if (!task.title) throw new Error("task requires a title");
     this.tasks.set(id, task);
     this.appendEvent(queue, { op: "create", task });
+    // Snapshot after every add so a fresh load (which short-circuits on
+    // snapshot presence) sees the latest state. Pre-existing bug: without
+    // this, tasks added after a snapshot write would be invisible on
+    // reload — surfaced by Story 11's addGoal+task sequence.
+    this.snapshot();
     this.runtime?.events?.emit?.("task-updated", { op: "create", task });
     return task;
   }
@@ -135,9 +152,14 @@ export class TaskStore {
     if (patch.dueDate !== undefined) next.dueDate = patch.dueDate;
     if (patch.scheduledFor !== undefined) next.scheduledFor = patch.scheduledFor;
     if (patch.sourceMeta !== undefined) next.sourceMeta = patch.sourceMeta;
+    // Story 11: parentGoalId patches let linkTaskToGoal flip the link.
+    // null is a meaningful value (unlink), so use 'in patch' rather than
+    // an undefined check to allow explicit null.
+    if ("parentGoalId" in patch) next.parentGoalId = patch.parentGoalId ?? null;
     next.updatedAt = nowIso();
     this.tasks.set(id, next);
     this.appendEvent(next.queue, { op: "update", id, patch });
+    this.snapshot();
     this.runtime?.events?.emit?.("task-updated", { op: "update", task: next });
     return next;
   }
@@ -252,8 +274,88 @@ export class TaskStore {
   snapshot() {
     writeJsonAtomic(path.join(this.taskDir, "snapshot.json"), {
       writtenAt: nowIso(),
-      tasks: [...this.tasks.values()]
+      tasks: [...this.tasks.values()],
+      goals: [...this.goals.values()]
     });
+  }
+
+  // ─── Story 11: goals ─────────────────────────────────────────────────
+
+  addGoal(input) {
+    const id = createId("goal");
+    const goal = {
+      id,
+      title: String(input.title ?? "").trim(),
+      description: input.description ?? "",
+      dueDate: input.dueDate ?? null,
+      status: GOAL_STATUSES.includes(input.status) ? input.status : "active",
+      parentGoalId: input.parentGoalId ?? null,
+      createdAt: nowIso(),
+      updatedAt: nowIso()
+    };
+    if (!goal.title) throw new Error("goal requires a title");
+    this.goals.set(id, goal);
+    this.appendEvent("goals", { op: "goal-create", goal });
+    this.snapshot();
+    return goal;
+  }
+
+  updateGoal(id, patch) {
+    const cur = this.goals.get(id);
+    if (!cur) return null;
+    const next = { ...cur, ...patch, id: cur.id, updatedAt: nowIso() };
+    if (patch.status !== undefined && !GOAL_STATUSES.includes(patch.status)) {
+      throw new Error(`unknown goal status: ${patch.status}`);
+    }
+    this.goals.set(id, next);
+    this.appendEvent("goals", { op: "goal-update", id, patch });
+    this.snapshot();
+    return next;
+  }
+
+  listGoals({ status, parentGoalId } = {}) {
+    let out = [...this.goals.values()];
+    if (status) out = out.filter((g) => g.status === status);
+    if (parentGoalId !== undefined) out = out.filter((g) => g.parentGoalId === parentGoalId);
+    return out.sort((a, b) => (a.dueDate ?? "9999").localeCompare(b.dueDate ?? "9999"));
+  }
+
+  getGoal(id) {
+    return this.goals.get(id) ?? null;
+  }
+
+  /// Link a task to a goal (or unlink with goalId=null). Returns the
+  /// updated task or null when the task doesn't exist.
+  linkTaskToGoal(taskId, goalId) {
+    const t = this.tasks.get(taskId);
+    if (!t) return null;
+    if (goalId && !this.goals.has(goalId)) throw new Error(`unknown goal: ${goalId}`);
+    return this.update(taskId, { parentGoalId: goalId ?? null });
+  }
+
+  /// Compute rollup progress for a goal: how many child tasks done /
+  /// total. Recurses one level into child goals (their rolled-up
+  /// totals count too) so a quarter goal can summarize its monthly
+  /// children's tasks. Returns null when goal doesn't exist.
+  goalProgress(goalId) {
+    const goal = this.goals.get(goalId);
+    if (!goal) return null;
+    const children = [...this.tasks.values()].filter((t) => t.parentGoalId === goalId);
+    let total = children.length;
+    let done = children.filter((t) => t.status === "completed").length;
+    // Sub-goals: count their tasks toward this goal's rollup.
+    const subGoals = this.listGoals({ parentGoalId: goalId });
+    for (const sub of subGoals) {
+      const subRoll = this.goalProgress(sub.id);
+      if (subRoll) { total += subRoll.total; done += subRoll.done; }
+    }
+    return {
+      goalId,
+      total,
+      done,
+      percent: total === 0 ? null : Number(((done / total) * 100).toFixed(1)),
+      hasSubGoals: subGoals.length > 0
+    };
   }
 }
 

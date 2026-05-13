@@ -525,7 +525,8 @@ export function registerCoreTools(registry, runtime) {
         category: { type: "string" },
         tags: { type: "array", items: { type: "string" } },
         dueDate: { type: "string", description: "ISO 8601 due date (optional)." },
-        sourceMeta: { type: "object", description: "Where this task came from — e.g. {sessionId, snippet}." }
+        sourceMeta: { type: "object", description: "Where this task came from — e.g. {sessionId, snippet}." },
+        parentGoalId: { type: "string", description: "Optional — link the task to a parent goal. Use list_goals first to find the right id." }
       },
       required: ["title"],
       additionalProperties: false
@@ -600,6 +601,58 @@ export function registerCoreTools(registry, runtime) {
       const task = runtime.tasks.update(id, patch);
       return task ? task : { error: "unknown task" };
     }
+  });
+
+  registry.register({
+    name: "add_goal",
+    description: "Create a Goal that tasks can be grouped under for rollup tracking. Goals have a title, optional description, optional dueDate, and optional parentGoalId (goals can nest, e.g. a quarter goal contains monthly goals).",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        description: { type: "string" },
+        dueDate: { type: "string", description: "ISO 8601 date." },
+        parentGoalId: { type: "string", description: "Optional — links this goal under a parent goal for nested rollups." }
+      },
+      required: ["title"],
+      additionalProperties: false
+    },
+    handler: async (args) => runtime.tasks.addGoal(args)
+  });
+
+  registry.register({
+    name: "list_goals",
+    description: "List goals with optional status filter. Use to see what longer-term threads exist before adding more tasks — a task linked to an existing goal is more useful than a free-floating one.",
+    parameters: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["active", "completed", "cancelled", "deferred"] },
+        includeProgress: { type: "boolean", description: "If true, include rollup {done, total, percent} per goal. Default false for cheaper calls." }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const goals = runtime.tasks.listGoals({ status: args.status });
+      if (args.includeProgress) {
+        return goals.map((g) => ({ ...g, progress: runtime.tasks.goalProgress(g.id) }));
+      }
+      return goals;
+    }
+  });
+
+  registry.register({
+    name: "link_task_to_goal",
+    description: "Link an existing task to a goal so it counts toward that goal's rollup progress. Pass goalId=null to unlink. Use after creating a related task without specifying parentGoalId at creation time.",
+    parameters: {
+      type: "object",
+      properties: {
+        taskId: { type: "string" },
+        goalId: { type: "string", description: "Goal id to link to. null to unlink." }
+      },
+      required: ["taskId"],
+      additionalProperties: false
+    },
+    handler: async (args) => runtime.tasks.linkTaskToGoal(args.taskId, args.goalId)
   });
 
   registry.register({

@@ -26,12 +26,17 @@ export function computeDailyRecap(runtime, { date = new Date(), timezone } = {})
   const sessions = pullSessions(runtime, startISO, endISO);
   const unblocked = pullUnblocked(runtime, startISO, endISO);
 
+  // Story 11: bucket completed tasks by parent goal so the recap can
+  // say "you moved 4 tasks forward on OpenAGI v0.2 today" instead of
+  // listing them flat. tasksByGoal: { goalId: {goal, tasks[]} | "_unassigned"}
+  const tasksByGoal = groupCompletedByGoal(runtime, completedTasks);
   return {
     date: label,
     dateISO: startISO.slice(0, 10),
     timezone: tz,
     range: { from: startISO, to: endISO },
     completedTasks,
+    tasksByGoal,
     skillRuns,
     approvedActions,
     computerActions,
@@ -66,11 +71,30 @@ export function renderDailyRecapMarkdown(recap) {
 
   if (recap.completedTasks.length > 0) {
     lines.push("\n### ✅ Completed");
-    for (const t of recap.completedTasks.slice(0, 10)) {
-      const queue = t.queue === "agent" ? " _(agent queue)_" : "";
-      lines.push(`- ${t.title}${queue}`);
+    // Story 11: render goal-grouped if any tasks have a parent goal,
+    // otherwise fall back to the flat list (less noise for users
+    // without goals set up).
+    const goalGroups = recap.tasksByGoal ?? {};
+    const hasGoalGrouping = Object.keys(goalGroups).some((k) => k !== "_unassigned" && goalGroups[k]?.tasks?.length > 0);
+    if (hasGoalGrouping) {
+      for (const [goalId, group] of Object.entries(goalGroups)) {
+        if (!group?.tasks?.length) continue;
+        const heading = goalId === "_unassigned"
+          ? "_no goal_"
+          : `**${group.goal?.title ?? "(goal)"}**${group.progress ? ` _(${group.progress.percent}%)_` : ""}`;
+        lines.push(`\n_${heading}_`);
+        for (const t of group.tasks.slice(0, 8)) {
+          const queue = t.queue === "agent" ? " _(agent queue)_" : "";
+          lines.push(`- ${t.title}${queue}`);
+        }
+      }
+    } else {
+      for (const t of recap.completedTasks.slice(0, 10)) {
+        const queue = t.queue === "agent" ? " _(agent queue)_" : "";
+        lines.push(`- ${t.title}${queue}`);
+      }
+      if (recap.completedTasks.length > 10) lines.push(`- … and ${recap.completedTasks.length - 10} more`);
     }
-    if (recap.completedTasks.length > 10) lines.push(`- … and ${recap.completedTasks.length - 10} more`);
   }
 
   if (recap.skillRuns.length > 0) {
@@ -115,6 +139,29 @@ export function renderDailyRecapMarkdown(recap) {
 }
 
 // ─── source pulls ───────────────────────────────────────────────────
+
+function groupCompletedByGoal(runtime, completedTasks) {
+  // Story 11. Buckets keyed by goalId with {goal, tasks[], progress?}.
+  // Unassigned tasks land in "_unassigned". When no goals exist at all,
+  // returns {} so the caller's hasGoalGrouping check falls through to
+  // the flat-list rendering.
+  if (!runtime?.tasks?.getGoal) return {};
+  const out = {};
+  for (const t of completedTasks) {
+    const key = t.parentGoalId ?? "_unassigned";
+    if (!out[key]) {
+      out[key] = { tasks: [] };
+      if (key !== "_unassigned") {
+        out[key].goal = runtime.tasks.getGoal(key);
+        if (runtime.tasks.goalProgress) {
+          out[key].progress = runtime.tasks.goalProgress(key);
+        }
+      }
+    }
+    out[key].tasks.push(t);
+  }
+  return out;
+}
 
 function pullCompletedTasks(runtime, startISO, endISO) {
   if (!runtime?.tasks?.list) return [];
