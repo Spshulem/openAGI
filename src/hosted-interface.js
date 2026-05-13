@@ -3341,7 +3341,9 @@ async function renderSuggestions() {
       ? '<span class="ui-badge" title="Detected by activity pattern miner — observed multiple times.">pattern</span>'
       : s.source === "session-miner"
         ? '<span class="ui-badge" title="Detected by chat-session miner — recurring across conversations.">session</span>'
-        : "";
+        : s.source === "weekly-observer"
+          ? '<span class="ui-badge" title="Mid-horizon observer — multi-day project thread, not a single moment.">7-day</span>'
+          : "";
     // Story 5: when high-confidence signals bypass the judge's pass=true
     // veto, badge it so the user knows the LLM tried to skip this but
     // the deterministic confidence floor kept it.

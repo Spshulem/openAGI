@@ -92,7 +92,12 @@ function normalize(raw, filePath, forceSource = null) {
     else if (raw.id.startsWith("ses_")) source = "session-miner";
     else source = "unknown";
   }
-  if (source === "observer") {
+  // Story 10: proactive-observer in long-horizon mode tags its persisted
+  // candidate with `source: "weekly-observer"` directly on the record.
+  // That overrides our id-prefix guess so the dashboard can distinguish
+  // "noticed something just now" from "noticed a multi-day thread."
+  if (raw.source === "weekly-observer") source = "weekly-observer";
+  if (source === "observer" || source === "weekly-observer") {
     return pickEnvelope({ ...raw, source });
   }
   // Miner candidates: lift proposal.{name, description, body} into the

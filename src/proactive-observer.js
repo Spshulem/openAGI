@@ -22,6 +22,22 @@ const DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000; // 6h — don't repeat the same pro
 const MIN_INTERVAL_MS = 8 * 60 * 1000;        // back off if we just ran (handles overlapping cron + dispatch)
 const MIN_SNIPPETS = 2;                       // need real activity, not silence
 
+// Story 10: long-horizon system prompt. Same JSON output schema as the
+// default observer, different framing — looking across days, not minutes.
+// Emphasizes stalled threads, multi-day projects, follow-ups that have
+// gone cold. Surfaced as source: "weekly-observer" via persist().
+const LONG_HORIZON_SYSTEM_PROMPT = [
+  "You are OpenAGI's long-horizon observer. The user gave you screen-capture access; you can see ~7 days of their app activity and OCR text.",
+  "Your job: spot ONE multi-day thread worth surfacing. Stalled work, half-finished projects, follow-ups that went cold, a ticket they opened Tuesday and haven't touched since. Be useful or stay silent.",
+  "Output STRICT JSON, one of these shapes:",
+  '  {"pass": true, "reason": "<short>"}                                           // nothing multi-day worth surfacing',
+  '  {"category": "task", "title": "<short>", "rationale": "<why>", "queue": "user"|"agent", "bucket": "today"|"this_week"|"someday"}    // a follow-up that needs to happen',
+  '  {"category": "skill", "title": "<short>", "rationale": "<why>", "draftBody": "<markdown body>"}',
+  '  {"category": "knowledge", "title": "<short>", "rationale": "<why>"}',
+  "Be specific. Reference the actual thread: the ticket / branch / channel / person you saw recurring.",
+  "Don't surface single-occurrence activity — the regular 10-min observer handles that. Only surface things that span at least 2 days or have a stalled-momentum quality."
+].join("\n");
+
 const SYSTEM_PROMPT = [
   "You are OpenAGI's proactive observer. The user gave you screen-capture access; you can see what apps they used and what OCR text was on screen in the last ~10 minutes.",
   "Your job: propose ONE concrete next thing the agent could do for them. Be useful or stay silent.",
@@ -50,7 +66,7 @@ export class ProactiveObserver {
   /**
    * Run one observer pass. Returns { suggested, skipped, reason } summary.
    */
-  async observe({ now = new Date(), force = false } = {}) {
+  async observe({ now = new Date(), force = false, mode = "default" } = {}) {
     if (!force && Date.now() - this.lastRunAt < MIN_INTERVAL_MS) {
       return { skipped: true, reason: "rate-limited" };
     }
@@ -60,10 +76,17 @@ export class ProactiveObserver {
       return { skipped: true, reason: "no observation store" };
     }
 
+    // Story 10: mid-horizon mode looks back 7 days and emphasizes
+    // multi-day project threads + stalled work, rather than the
+    // 15-minute "what's happening right now" pass.
+    const isLongHorizon = mode === "long-horizon";
+    const lookbackMinutes = isLongHorizon ? 7 * 24 * 60 : this.lookbackMinutes;
+    const maxSnippets = isLongHorizon ? 20 : 8;
+    const maxChars = isLongHorizon ? 5000 : 2000;
     const ctx = await this.runtime.observations.getRecentContext({
-      minutes: this.lookbackMinutes,
-      maxChars: 2000,
-      maxSnippets: 8
+      minutes: lookbackMinutes,
+      maxChars,
+      maxSnippets
     });
 
     if ((ctx.snippets?.length ?? 0) < MIN_SNIPPETS) {
@@ -117,7 +140,7 @@ export class ProactiveObserver {
     // OCR window — multi-day narrative context for "is this part of a
     // larger thread?" reasoning.
     const retroBlock = composeRetroContext(this.runtime);
-    let instructions = SYSTEM_PROMPT;
+    let instructions = isLongHorizon ? LONG_HORIZON_SYSTEM_PROMPT : SYSTEM_PROMPT;
     if (retroBlock) instructions += "\n\n" + retroBlock;
     if (preferenceLine) instructions += "\n\n" + preferenceLine;
 
@@ -163,7 +186,7 @@ export class ProactiveObserver {
     }
 
     return this.persist({
-      source: "proactive-observer",
+      source: isLongHorizon ? "weekly-observer" : "proactive-observer",
       category: proposal.category,
       title: proposal.title,
       rationale: proposal.rationale,
@@ -173,7 +196,7 @@ export class ProactiveObserver {
       steps: proposal.steps ?? null,
       taskQueue: proposal.queue ?? "user",
       taskBucket: proposal.bucket ?? "today",
-      context: { apps: ctx.apps?.slice(0, 5) ?? [], snippetCount: ctx.snippets?.length ?? 0 },
+      context: { apps: ctx.apps?.slice(0, 5) ?? [], snippetCount: ctx.snippets?.length ?? 0, mode },
       status: "pending"
     });
   }

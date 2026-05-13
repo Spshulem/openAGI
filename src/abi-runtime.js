@@ -284,6 +284,17 @@ export class AbiRuntime {
         nextRunAt: nextSundayEvening().toISOString(),
         input: { agentId: "main" }
       });
+      // Story 10: mid-horizon observer. Daily at 17:30 (right before
+      // the evening recap so its proposals appear in today's themes).
+      // Different prompt + 7-day lookback; output tagged
+      // source: "weekly-observer" so the dashboard can distinguish.
+      this.cron.addJob({
+        id: "weekly-project-scan",
+        name: "Mid-horizon observer — 7-day project threads",
+        enabled: true,
+        task: "weekly-project-scan",
+        dailyAt: "17:30"
+      });
       // Due-date reminders — every 15 min, check if any task crossed its
       // dueDate since the last check. Fires a 'task-reminder' event the
       // SSE relay + Mac notify pipeline picks up.
@@ -530,6 +541,12 @@ export class AbiRuntime {
       }
       if (job.task === "weekly-retrospective") {
         return this.runWeeklyRetrospective({ now });
+      }
+      if (job.task === "weekly-project-scan") {
+        if (!this.proactiveObserver?.observe) return { skipped: true, reason: "no observer" };
+        const result = await this.proactiveObserver.observe({ now, mode: "long-horizon", force: true });
+        this.events?.emit?.("miner-result", { source: "weekly-observer", at: nowIso(), ...result });
+        return result;
       }
       if (job.task === "task-reminders") {
         return this.runTaskReminders({ now });
