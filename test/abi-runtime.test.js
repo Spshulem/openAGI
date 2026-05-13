@@ -1390,6 +1390,44 @@ test("PendingActionStore: enqueue + decide + replay across instances", async () 
   fs.rmSync(dir, { recursive: true });
 });
 
+test("task-store: month/quarter/year buckets exist, auto-bucket from dueDate, migration rebuckets someday", async () => {
+  const { TaskStore, BUCKETS, bucketFromDueDate } = await import("../src/task-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-buckets-"));
+
+  assert.deepEqual(BUCKETS, ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"]);
+
+  const now = new Date("2026-05-13T12:00:00Z");
+  // Pure helper covers the boundaries.
+  assert.equal(bucketFromDueDate(null, now), null);
+  assert.equal(bucketFromDueDate("2026-05-13T18:00:00Z", now), "today", "<2 days = today");
+  assert.equal(bucketFromDueDate("2026-05-19T12:00:00Z", now), "this_week", "<7 days");
+  assert.equal(bucketFromDueDate("2026-06-10T12:00:00Z", now), "this_month", "<35 days");
+  assert.equal(bucketFromDueDate("2026-07-15T12:00:00Z", now), "this_quarter", "<95 days");
+  assert.equal(bucketFromDueDate("2026-10-15T12:00:00Z", now), "this_year", "<365 days");
+  assert.equal(bucketFromDueDate("2028-01-01T12:00:00Z", now), "someday", "beyond a year");
+
+  // Auto-bucket from dueDate on add (no explicit bucket).
+  const store = new TaskStore({ dataDir: dir });
+  const t = store.add({ title: "Quarterly review", dueDate: "2026-08-01T12:00:00Z" });
+  assert.equal(t.bucket, "this_quarter", "auto-bucketed from due date");
+
+  // Migration: write a pre-existing someday task with a due date,
+  // then re-instantiate to trigger rebucketFromDueDatesOnce.
+  // Use a future date a few months out so the test isn't sensitive to
+  // the wall-clock moving day-to-day in CI; this puts us solidly in
+  // "this_quarter" territory either way.
+  const someYearFromNow = new Date(Date.now() + 60 * 86_400_000).toISOString();
+  const old = store.add({ title: "Stuck in someday", bucket: "someday", dueDate: someYearFromNow });
+  assert.equal(store.tasks.get(old.id).bucket, "someday", "kept where put initially");
+  // Force rebucket as if on next boot.
+  const moved = store.rebucketFromDueDatesOnce();
+  assert.ok(moved >= 1, "migration moved at least one task");
+  const moved_bucket = store.tasks.get(old.id).bucket;
+  assert.ok(["this_month", "this_quarter"].includes(moved_bucket), `60-day-out task should rebucket to month or quarter, got ${moved_bucket}`);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("daily-recap: aggregates completed tasks, skill runs, agent actions for the day", async () => {
   const { computeDailyRecap, renderDailyRecapMarkdown } = await import("../src/daily-recap.js");
   const now = new Date("2026-05-13T18:00:00Z");

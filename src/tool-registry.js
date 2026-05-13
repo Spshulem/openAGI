@@ -513,14 +513,14 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "add_task",
-    description: "Add a task to the user's todo list (default) or the agent's own queue. Use queue='agent' when YOU are committing to do this task yourself; use queue='user' when the human should do it. Bucket buckets: today, this_week, someday, done.",
+    description: "Add a task to the user's todo list (default) or the agent's own queue. Use queue='agent' when YOU are committing to do this task yourself; use queue='user' when the human should do it. Buckets: today, this_week, this_month, this_quarter, this_year, someday, done — pick the one matching the realistic horizon.",
     parameters: {
       type: "object",
       properties: {
         title: { type: "string", description: "Short title (max 200 chars)." },
         description: { type: "string", description: "Optional longer description / notes." },
         queue: { type: "string", enum: ["user", "agent"], description: "Default 'user'. Use 'agent' to enqueue work for yourself." },
-        bucket: { type: "string", enum: ["today", "this_week", "someday", "done"], description: "Default 'today'." },
+        bucket: { type: "string", enum: ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"], description: "Default 'today'." },
         priority: { type: "integer", minimum: 0, maximum: 100, description: "0-100, higher is more urgent. Default 50." },
         category: { type: "string" },
         tags: { type: "array", items: { type: "string" } },
@@ -541,12 +541,12 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_tasks",
-    description: "List tasks. Filter by queue (user/agent), bucket (today/this_week/someday/done), or status (pending/in_progress/blocked/completed/cancelled).",
+    description: "List tasks. Filter by queue (user/agent), bucket (today / this_week / this_month / this_quarter / this_year / someday / done), or status (pending/in_progress/blocked/completed/cancelled).",
     parameters: {
       type: "object",
       properties: {
         queue: { type: "string", enum: ["user", "agent"] },
-        bucket: { type: "string", enum: ["today", "this_week", "someday", "done"] },
+        bucket: { type: "string", enum: ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"] },
         status: { type: "string", enum: ["pending", "in_progress", "blocked", "completed", "cancelled"] },
         limit: { type: "integer", minimum: 1, maximum: 200 }
       },
@@ -584,7 +584,7 @@ export function registerCoreTools(registry, runtime) {
       type: "object",
       properties: {
         id: { type: "string" },
-        bucket: { type: "string", enum: ["today", "this_week", "someday", "done"] },
+        bucket: { type: "string", enum: ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"] },
         priority: { type: "integer", minimum: 0, maximum: 100 },
         status: { type: "string", enum: ["pending", "in_progress", "blocked", "completed", "cancelled"] },
         dueDate: { type: "string" },

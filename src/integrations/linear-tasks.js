@@ -157,6 +157,12 @@ function pickBucket(dueDateIso, now = new Date()) {
   const days = (due - now.getTime()) / (24 * 3600 * 1000);
   if (days < 1.5) return "today";
   if (days < 7) return "this_week";
+  // Story 8: tasks with a real due date land in the appropriate medium-
+  // horizon bucket instead of all collapsing into "someday." 35d ≈ this
+  // month, 95d ≈ this quarter, 365d ≈ this year, beyond that → someday.
+  if (days < 35) return "this_month";
+  if (days < 95) return "this_quarter";
+  if (days < 365) return "this_year";
   return "someday";
 }
 

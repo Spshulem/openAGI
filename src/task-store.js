@@ -16,7 +16,11 @@ import fs from "node:fs";
 import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 
-export const BUCKETS = ["today", "this_week", "someday", "done"];
+// Story 8: order matters — sort + filter UI traverses this top-to-bottom.
+// today / this_week stay at the top, done at the bottom; month/quarter/
+// year sit between this_week and someday so longer-horizon work has a
+// real home instead of vanishing into the someday graveyard.
+export const BUCKETS = ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"];
 export const STATUSES = ["pending", "in_progress", "blocked", "completed", "cancelled"];
 export const QUEUES = ["user", "agent"];
 
@@ -30,6 +34,27 @@ export class TaskStore {
     ensureDir(this.taskDir);
     this.tasks = new Map(); // id → task
     this.loadFromDisk();
+    // Story 8: one-shot migration. Tasks already in "someday" with a real
+    // dueDate get re-bucketed to the right horizon. Pending tasks only —
+    // don't touch completed/cancelled ones for archeological integrity.
+    this.rebucketFromDueDatesOnce();
+  }
+
+  rebucketFromDueDatesOnce() {
+    const now = new Date();
+    let moved = 0;
+    for (const t of this.tasks.values()) {
+      if (t.bucket !== "someday") continue;
+      if (t.status === "completed" || t.status === "cancelled") continue;
+      const target = bucketFromDueDate(t.dueDate, now);
+      if (target && target !== "someday") {
+        t.bucket = target;
+        t.updatedAt = nowIso();
+        moved += 1;
+      }
+    }
+    if (moved > 0) this.snapshot();
+    return moved;
   }
 
   loadFromDisk() {
@@ -56,12 +81,18 @@ export class TaskStore {
   add(input, { source = "manual", queue = "user" } = {}) {
     if (!QUEUES.includes(queue)) throw new Error(`unknown queue: ${queue}`);
     const id = createId("task");
+    // Story 8: auto-bucket from dueDate when caller didn't pick one.
+    // Prevents the "everything is someday" pile-up for tasks with a
+    // real future date.
+    const autoBucket = input.bucket === undefined && input.dueDate
+      ? bucketFromDueDate(input.dueDate)
+      : null;
     const task = {
       id,
       queue,
       title: String(input.title ?? "").trim(),
       description: input.description ?? "",
-      bucket: BUCKETS.includes(input.bucket) ? input.bucket : "today",
+      bucket: BUCKETS.includes(input.bucket) ? input.bucket : (autoBucket ?? "today"),
       priority: clamp(Number(input.priority ?? 50), 0, 100),
       category: input.category ?? null,
       tags: Array.isArray(input.tags) ? input.tags : [],
@@ -184,8 +215,8 @@ export class TaskStore {
   // Roll up summary stats for dashboards / health.
   stats() {
     const out = {
-      user: { total: 0, today: 0, this_week: 0, someday: 0, done: 0, pending: 0, completed: 0 },
-      agent: { total: 0, today: 0, this_week: 0, someday: 0, done: 0, pending: 0, completed: 0 }
+      user: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 },
+      agent: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 }
     };
     for (const t of this.tasks.values()) {
       const slot = out[t.queue];
@@ -257,4 +288,19 @@ export function detectTaskInChat(text) {
 
 function cleanupTitle(s) {
   return s.replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+// Story 8: pick a bucket from a due date. Symmetric with the Linear
+// integration's pickBucket but exported so any source can use it.
+export function bucketFromDueDate(dueDateIso, now = new Date()) {
+  if (!dueDateIso) return null;
+  const due = Date.parse(dueDateIso);
+  if (!Number.isFinite(due)) return null;
+  const days = (due - now.getTime()) / (24 * 3600 * 1000);
+  if (days < 1.5) return "today";
+  if (days < 7) return "this_week";
+  if (days < 35) return "this_month";
+  if (days < 95) return "this_quarter";
+  if (days < 365) return "this_year";
+  return "someday";
 }

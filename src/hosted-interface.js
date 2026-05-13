@@ -3720,7 +3720,7 @@ async function renderTasks() {
 
       <div class="ui-row" style="margin-bottom: var(--space-4);">
         <span class="ui-meta">bucket:</span>
-        \${["all", "today", "this_week", "someday", "done"].map((b) => \`<button class="ui-btn \${filterB === b ? "" : "ui-btn-ghost"} ui-btn-sm" data-bf="\${b}">\${b.replace("_", " ")}</button>\`).join("")}
+        \${["all", "today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"].map((b) => \`<button class="ui-btn \${filterB === b ? "" : "ui-btn-ghost"} ui-btn-sm" data-bf="\${b}">\${b.replace(/_/g, " ")}</button>\`).join("")}
       </div>
 
       <section class="ui-section">
