@@ -272,6 +272,18 @@ export class AbiRuntime {
         task: "daily-recap",
         dailyAt: "18:00"
       });
+      // Story 9: Sunday rollup. Pulls the last 7 daily retros from
+      // long-tier memory and condenses into one "week of <date>"
+      // entry the observer can lean on for multi-week narrative.
+      this.cron.addJob({
+        id: "weekly-retrospective",
+        name: "Weekly retrospective — roll up 7 daily retros",
+        enabled: true,
+        task: "weekly-retrospective",
+        intervalMs: 7 * 24 * 60 * 60 * 1000,
+        nextRunAt: nextSundayEvening().toISOString(),
+        input: { agentId: "main" }
+      });
       // Due-date reminders — every 15 min, check if any task crossed its
       // dueDate since the last check. Fires a 'task-reminder' event the
       // SSE relay + Mac notify pipeline picks up.
@@ -516,6 +528,9 @@ export class AbiRuntime {
       if (job.task === "daily-recap") {
         return this.runDailyRecap({ now });
       }
+      if (job.task === "weekly-retrospective") {
+        return this.runWeeklyRetrospective({ now });
+      }
       if (job.task === "task-reminders") {
         return this.runTaskReminders({ now });
       }
@@ -594,6 +609,49 @@ export class AbiRuntime {
       markdown
     });
     return { fired: 1, date: recap.date, counts: recap.counts };
+  }
+
+  // Story 9: weekly rollup. Pulls daily retros from memory written by
+  // runDailyRecap, condenses into one "week of X" entry. Without this,
+  // the observer would see at most yesterday's daily — with it, the
+  // observer has a continuous multi-week narrative.
+  runWeeklyRetrospective({ now = new Date() } = {}) {
+    if (!this.memory?.retrieve || !this.memory?.remember) {
+      return { skipped: true, reason: "no memory system" };
+    }
+    const since = new Date(now.getTime() - 7 * 86_400_000);
+    // Pull recent daily-retros via tag-based retrieval. The recall
+    // memory layer does fuzzy retrieval — we accept whatever comes
+    // back tagged with "retro" + "daily" since the last 7 days.
+    const hits = this.memory.retrieve("daily retrospective recap", { limit: 14 });
+    const daily = hits
+      .map((h) => h.item ?? h)
+      .filter((m) => Array.isArray(m.tags) && m.tags.includes("daily") && m.tags.includes("retro"))
+      .filter((m) => new Date(m.metadata?.recordedAt ?? m.createdAt ?? 0) >= since)
+      .slice(0, 7);
+    if (daily.length === 0) return { skipped: true, reason: "no daily retros in last week" };
+    const summary = [
+      `## Week of ${now.toISOString().slice(0, 10)} (rolled up from ${daily.length} daily retros)`,
+      "",
+      ...daily.map((m, i) => {
+        const head = (m.content ?? "").split("\n")[0] ?? "";
+        return `- Day ${i + 1}: ${head.replace(/^##\s*/, "").slice(0, 200)}`;
+      })
+    ].join("\n");
+    this.memory.remember(
+      {
+        source: "weekly-retrospective",
+        scope: "main",
+        content: summary,
+        tags: ["retro", "weekly", `week-of-${now.toISOString().slice(0, 10)}`],
+        kind: "weekly-retrospective",
+        risk: 0.5,
+        repetition: 0.3,
+        novelty: 0.6
+      },
+      { source: "weekly-retrospective", strength: 0.75 }
+    );
+    return { fired: 1, daysCovered: daily.length };
   }
 
   // Due-date reminders: tasks whose dueDate just crossed (since the last

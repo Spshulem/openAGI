@@ -112,9 +112,14 @@ export class ProactiveObserver {
     // of proposing the same shape of thing repeatedly. Null when there
     // aren't enough samples yet (first ~3 interactions teach nothing).
     const preferenceLine = this.runtime?.suggestionFeedback?.preferenceSummary?.() ?? null;
-    const instructions = preferenceLine
-      ? SYSTEM_PROMPT + "\n\n" + preferenceLine
-      : SYSTEM_PROMPT;
+    // Story 9: prepend the last 3 daily retros + last 2 weekly retros
+    // from long-tier memory so the observer sees beyond the 15-minute
+    // OCR window — multi-day narrative context for "is this part of a
+    // larger thread?" reasoning.
+    const retroBlock = composeRetroContext(this.runtime);
+    let instructions = SYSTEM_PROMPT;
+    if (retroBlock) instructions += "\n\n" + retroBlock;
+    if (preferenceLine) instructions += "\n\n" + preferenceLine;
 
     try {
       const result = await provider.generate({
@@ -416,4 +421,33 @@ function parseProposal(text) {
     if (!obj.category || !obj.title) return null;
     return obj;
   } catch { return null; }
+}
+
+// Story 9: build the retro context block prepended to the observer's
+// system prompt. Pulls the most recent daily + weekly retros from
+// long-tier memory and renders them compactly so the LLM can spot
+// "this is a follow-up to Tuesday" without having to call recall.
+function composeRetroContext(runtime) {
+  const mem = runtime?.memory;
+  if (!mem?.byTier) return null;
+  const longTier = mem.byTier("long") ?? [];
+  const dailies = longTier
+    .filter((m) => Array.isArray(m.tags) && m.tags.includes("retro") && m.tags.includes("daily"))
+    .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))
+    .slice(0, 3);
+  const weeklies = longTier
+    .filter((m) => Array.isArray(m.tags) && m.tags.includes("retro") && m.tags.includes("weekly"))
+    .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))
+    .slice(0, 2);
+  if (dailies.length === 0 && weeklies.length === 0) return null;
+  const lines = ["Recent retros (use these to spot multi-day threads):"];
+  for (const w of weeklies) {
+    const head = (w.content ?? "").split("\n")[0] ?? "";
+    lines.push(`[week] ${head.replace(/^##\s*/, "").slice(0, 200)}`);
+  }
+  for (const d of dailies) {
+    const head = (d.content ?? "").split("\n")[0] ?? "";
+    lines.push(`[day] ${head.replace(/^##\s*/, "").slice(0, 200)}`);
+  }
+  return lines.join("\n");
 }
