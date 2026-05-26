@@ -1,8 +1,14 @@
 // Computer-use beta integration. Wires Anthropic's `computer_*` tool
-// vocabulary into OpenAGI's ToolRegistry. Phase 1a (this version) only
-// LOGS the agent's intent + reasoning — it does NOT actually synthesize
-// mouse / keyboard events yet. Real input synthesis lives in the Mac app
-// behind macOS Accessibility permission and ships in phase 1b.
+// vocabulary into OpenAGI's ToolRegistry. This build does NOT synthesize
+// mouse / keyboard events — real input synthesis lives in the Mac app
+// behind macOS Accessibility permission and ships in a later phase.
+//
+// IMPORTANT (production honesty): the input-synthesis tools (click, type,
+// key, scroll, move) record the agent's intent to the audit log and then
+// THROW. They never report fake success — an agent calling computer_click
+// gets an explicit "execution not available in this build" error so it
+// knows the action did not happen. Only session management and the
+// (real-data) screenshot/OCR readback actually function.
 //
 // The tools are registered behind a feature flag (OPENAGI_COMPUTER_USE=1)
 // so the default install is unaffected. Tool list:
@@ -24,7 +30,9 @@
 // produced in its assistant text turn alongside the tool call — captured
 // via a separate `reasoning` param that the agent is instructed to fill.
 
-const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. There is no real input synthesis yet — this is the planning / logging phase only.";
+const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis (click/type/key/scroll/move) is NOT available in this build — those calls are logged and then refused, so do not assume they succeed.";
+
+const EXECUTION_UNAVAILABLE = "computer-use input synthesis is not available in this build. The intent was recorded to the audit log but NOT performed. Do not assume the action succeeded.";
 
 // Tool names that this module registers. Kept here in one place so the
 // dynamic unregister path (used by the dashboard toggle) can remove
@@ -114,7 +122,7 @@ export function registerComputerUseTools(registry, runtime) {
 
   registry.register({
     name: "computer_screenshot",
-    description: "Take a screenshot of the user's screen. Returns the most recent OCR snippet + active app (this is the phase 1a stub — phase 1b will return image bytes via the Mac app).",
+    description: "Read the current screen state. Returns the most recent OCR text + active app from the observation store (real data). This build does not return raw image bytes — image transport ships with the Mac app in a later phase.",
     parameters: {
       type: "object",
       properties: {
@@ -135,25 +143,26 @@ export function registerComputerUseTools(registry, runtime) {
       const text = snippets.map((s) => s.text ?? "").filter(Boolean).join("\n").slice(0, 1200);
       const app = snippets[0]?.app ?? "(unknown)";
       runtime.computerUseLog.markActionResult(action.id, {
-        status: "stubbed",
+        status: "executed",
         result: { app, textSample: text.slice(0, 240) }
       });
       return {
-        stubbed: true,
         actionId: action.id,
         app,
         ocrSample: text || "(no recent OCR — capture may not be running)",
-        note: "Phase 1a stub: real screenshot bytes ship in phase 1b once Mac app CGImage transport is wired."
+        note: "Real OCR readback. Raw screenshot image bytes are not available in this build (ships with the Mac app)."
       };
     }
   });
 
-  // Helper to register a "would-have-done" action tool. All input synthesis
-  // tools share the same shape: record intent + reasoning, return stubbed.
-  function registerStubAction(name, description, paramShape) {
+  // Helper to register an input-synthesis action tool. Production honesty:
+  // the intent + reasoning are recorded to the audit log, the action is
+  // marked "unavailable", and then the handler THROWS so the agent receives
+  // an explicit failure instead of a fabricated success. No silent stub.
+  function registerUnavailableAction(name, description, paramShape) {
     registry.register({
       name,
-      description,
+      description: description + " NOTE: not executable in this build — the call is logged and then refused.",
       parameters: {
         type: "object",
         properties: {
@@ -171,34 +180,33 @@ export function registerComputerUseTools(registry, runtime) {
           args: actionArgs,
           reasoning: reasoning ?? null
         });
-        runtime.computerUseLog.markActionResult(action.id, { status: "stubbed", result: { wouldHave: actionArgs } });
-        return {
-          stubbed: true,
-          actionId: action.id,
-          note: "Logged. Phase 1a stub — no input synthesized. Phase 1b will execute this for real once Mac app CGEvent ships."
-        };
+        runtime.computerUseLog.markActionResult(action.id, {
+          status: "unavailable",
+          result: { reason: "input synthesis not available in this build" }
+        });
+        throw new Error(EXECUTION_UNAVAILABLE);
       }
     });
   }
 
-  registerStubAction("computer_click", "Click at (x, y) coordinates on the user's screen. Coordinates are screen-space pixels with (0,0) at top-left.", {
+  registerUnavailableAction("computer_click", "Click at (x, y) coordinates on the user's screen. Coordinates are screen-space pixels with (0,0) at top-left.", {
     x: { type: "integer", description: "Screen x (pixels)." },
     y: { type: "integer", description: "Screen y (pixels)." },
     button: { type: "string", enum: ["left", "right", "middle"], description: "Default left." }
   });
-  registerStubAction("computer_type", "Type a string into the focused app.", {
+  registerUnavailableAction("computer_type", "Type a string into the focused app.", {
     text: { type: "string", description: "Text to type. Use computer_key for non-printable keys." }
   });
-  registerStubAction("computer_key", "Press a key chord. Examples: 'cmd+a', 'enter', 'esc', 'cmd+shift+t'.", {
+  registerUnavailableAction("computer_key", "Press a key chord. Examples: 'cmd+a', 'enter', 'esc', 'cmd+shift+t'.", {
     chord: { type: "string", description: "Key chord, plus-separated. Modifiers: cmd, shift, alt, ctrl. Then the key name." }
   });
-  registerStubAction("computer_scroll", "Scroll at (x, y).", {
+  registerUnavailableAction("computer_scroll", "Scroll at (x, y).", {
     x: { type: "integer" },
     y: { type: "integer" },
     deltaX: { type: "integer", description: "Horizontal scroll delta in lines." },
     deltaY: { type: "integer", description: "Vertical scroll delta in lines. Negative = down." }
   });
-  registerStubAction("computer_move", "Move the mouse to (x, y) without clicking.", {
+  registerUnavailableAction("computer_move", "Move the mouse to (x, y) without clicking.", {
     x: { type: "integer" },
     y: { type: "integer" }
   });

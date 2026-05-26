@@ -2857,3 +2857,41 @@ test("daily-planner: LLM synthesis pulls calendar + tasks and returns focus + ag
 
   fs.rmSync(dir, { recursive: true });
 });
+
+test("computer-use: input-synthesis tools refuse honestly (record intent, then throw — no fake success)", async () => {
+  const { ToolRegistry } = await import("../src/tool-registry.js");
+  const { registerComputerUseTools } = await import("../src/integrations/computer-use.js");
+  const { ComputerUseLog } = await import("../src/computer-use-log.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cu-honest-"));
+  const registry = new ToolRegistry();
+  const log = new ComputerUseLog({ dir });
+  registerComputerUseTools(registry, { tools: registry, computerUseLog: log, observations: { search: async () => [] } });
+
+  // Open a session (this genuinely works).
+  const start = await registry.get("start_computer_use_session").handler({ goal: "do a thing" });
+  assert.ok(start.sessionId);
+
+  // computer_click must THROW — never report success.
+  await assert.rejects(
+    () => registry.get("computer_click").handler({ x: 10, y: 20, reasoning: "click the button" }),
+    /not available in this build/
+  );
+
+  // But the intent must still be recorded to the audit log, marked unavailable.
+  const actions = log.listActions({ sessionId: start.sessionId });
+  const click = actions.find((a) => a.kind === "click");
+  assert.ok(click, "click intent recorded for audit");
+  assert.equal(click.status, "unavailable");
+  assert.equal(click.args.x, 10);
+
+  // computer_type + computer_key likewise refuse.
+  await assert.rejects(() => registry.get("computer_type").handler({ text: "hi", reasoning: "type" }), /not available/);
+  await assert.rejects(() => registry.get("computer_key").handler({ chord: "cmd+a", reasoning: "select" }), /not available/);
+
+  // computer_screenshot returns REAL data (no fake-success flag).
+  const shot = await registry.get("computer_screenshot").handler({ reasoning: "look" });
+  assert.equal(shot.stubbed, undefined, "no 'stubbed' fake-success flag");
+  assert.ok("ocrSample" in shot, "returns real OCR readback");
+
+  fs.rmSync(dir, { recursive: true });
+});
