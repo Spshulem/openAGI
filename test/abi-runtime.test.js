@@ -2900,3 +2900,69 @@ test("computer-use: input-synthesis tools refuse honestly (record intent, then t
 
   fs.rmSync(dir, { recursive: true });
 });
+
+test("daily-planner: queuePlanActions bridges agentWillDo into draft-only agent-queue tasks", async () => {
+  const { queuePlanActions, listQueuedPlanActions } = await import("../src/daily-planner.js");
+  const { TaskStore } = await import("../src/task-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-plan-action-"));
+  const tasks = new TaskStore({ dataDir: dir });
+  const runtime = { tasks };
+
+  const plan = {
+    dateISO: "2026-05-25",
+    agentWillDo: [
+      { action: "Draft the Acme follow-up", detail: "based on yesterday's call" },
+      { action: "Prepare board deck outline", detail: "" }
+    ]
+  };
+
+  const queued = queuePlanActions(runtime, plan);
+  assert.equal(queued, 2);
+
+  // Landed on the AGENT queue, today bucket, tagged + lineage stamped.
+  const agentTasks = tasks.list({ queue: "agent", limit: 50 });
+  assert.equal(agentTasks.length, 2);
+  const acme = agentTasks.find((t) => t.title === "Draft the Acme follow-up");
+  assert.equal(acme.queue, "agent");
+  assert.equal(acme.bucket, "today");
+  assert.ok(acme.tags.includes("plan-action"));
+  assert.equal(acme.sourceMeta.fromPlanDate, "2026-05-25");
+  // Draft-only guard is in the description.
+  assert.match(acme.description, /DRAFT or prepared artifact only/);
+  assert.match(acme.description, /Do NOT send, publish/);
+  // agentWillDo items get their queuedTaskId stamped.
+  assert.equal(plan.agentWillDo[0].queuedTaskId, acme.id);
+
+  // Re-running the planner the same day does NOT duplicate.
+  const again = queuePlanActions(runtime, plan);
+  assert.equal(again, 0, "dedup per plan-date + title");
+  assert.equal(tasks.list({ queue: "agent", limit: 50 }).length, 2);
+
+  // listQueuedPlanActions reflects live status.
+  tasks.complete(acme.id, "agent");
+  const reflected = listQueuedPlanActions(runtime, "2026-05-25");
+  assert.equal(reflected.length, 2);
+  assert.equal(reflected.find((a) => a.id === acme.id).status, "completed");
+
+  // User-queue tasks are untouched by all this.
+  assert.equal(tasks.list({ queue: "user", limit: 50 }).length, 0);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("daily-planner: read-only compute does NOT queue actions (only the cron path does)", async () => {
+  const { computeDailyPlan } = await import("../src/daily-planner.js");
+  const { TaskStore } = await import("../src/task-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-plan-readonly-"));
+  const tasks = new TaskStore({ dataDir: dir });
+  const runtime = {
+    tasks,
+    tools: { get: () => undefined },
+    agentHost: { modelProvider: { isConfigured: () => true, generate: async () => ({ text: JSON.stringify({ focus: [], agentWillDo: [{ action: "Draft something", detail: "" }], timeSensitive: [], note: null }) }) } }
+  };
+  // computeDailyPlan must not create any tasks — it's read-only.
+  await computeDailyPlan(runtime, { date: new Date(), useLLM: true });
+  assert.equal(tasks.list({ queue: "agent", limit: 50 }).length, 0, "compute alone queues nothing");
+
+  fs.rmSync(dir, { recursive: true });
+});

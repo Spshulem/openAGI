@@ -54,6 +54,57 @@ export async function computeDailyPlan(runtime, { date = new Date(), timezone, u
   };
 }
 
+// Bridge plan → action. Each agentWillDo item becomes a task on the
+// AGENT queue so the autopilot pulse works it into a draft the user can
+// review. A draft-only guard is baked into every task description so
+// nothing is sent/published/scheduled-externally autonomously — outbound
+// tools (send_message etc.) are also approval-gated independently. Deduped
+// per plan-date so re-running the planner doesn't stack duplicates.
+// Mutates each agentWillDo item with { queuedTaskId }. Returns the count.
+export function queuePlanActions(runtime, plan) {
+  if (!runtime?.tasks?.add || !Array.isArray(plan.agentWillDo)) return 0;
+  const existing = runtime.tasks.list({ queue: "agent", limit: 300 })
+    .filter((t) => t.sourceMeta?.fromPlanDate === plan.dateISO);
+  let queued = 0;
+  for (const item of plan.agentWillDo) {
+    if (!item.action) continue;
+    const dup = existing.find((t) => t.title === item.action);
+    if (dup) { item.queuedTaskId = dup.id; continue; }
+    const task = runtime.tasks.add(
+      {
+        title: item.action,
+        description: [
+          item.detail ?? "",
+          "",
+          "— Prepared by the daily planner. Produce a DRAFT or prepared artifact only.",
+          "Do NOT send, publish, schedule externally, or take any irreversible action.",
+          "Leave the result for the user to review and approve."
+        ].join("\n").trim(),
+        bucket: "today",
+        priority: 65,
+        tags: ["plan-action"],
+        sourceMeta: { fromPlanDate: plan.dateISO, kind: "plan-action" }
+      },
+      { source: "daily-plan", queue: "agent" }
+    );
+    item.queuedTaskId = task.id;
+    queued += 1;
+  }
+  return queued;
+}
+
+// Real state of the agent tasks the planner queued for a given day, with
+// their live status (pending / in_progress / completed). The dashboard
+// renders this instead of the proposed agentWillDo so it shows what the
+// agent has ACTUALLY drafted vs still owes — honest even after the plan
+// is recomputed.
+export function listQueuedPlanActions(runtime, dateISO) {
+  if (!runtime?.tasks?.list) return [];
+  return runtime.tasks.list({ queue: "agent", limit: 300 })
+    .filter((t) => t.sourceMeta?.fromPlanDate === dateISO && t.sourceMeta?.kind === "plan-action")
+    .map((t) => ({ id: t.id, title: t.title, status: t.status }));
+}
+
 export function renderDailyPlanMarkdown(plan) {
   const lines = [`## Your day — ${plan.date}`];
   if (plan.note) lines.push(`_${plan.note}_`);

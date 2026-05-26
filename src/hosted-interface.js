@@ -1034,10 +1034,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "GET" && pathname === "/plan/daily") {
         // Morning planner: forward-looking "what should I do today."
-        const { computeDailyPlan, renderDailyPlanMarkdown } = await import("./daily-planner.js");
+        // Read-only: never queues actions as a side effect (the cron does
+        // that). We attach the REAL status of any actions the cron already
+        // queued for this day so the dashboard shows drafted vs pending.
+        const { computeDailyPlan, renderDailyPlanMarkdown, listQueuedPlanActions } = await import("./daily-planner.js");
         const dateParam = url.searchParams.get("date");
         const date = dateParam ? new Date(dateParam + "T12:00:00") : new Date();
         const plan = await computeDailyPlan(runtime, { date });
+        plan.queuedActions = listQueuedPlanActions(runtime, plan.dateISO);
         return sendJson(res, 200, { plan, markdown: renderDailyPlanMarkdown(plan) });
       }
       if (method === "GET" && pathname === "/observations/recent-context") {
@@ -3841,7 +3845,18 @@ async function renderToday() {
       \${(plan.timeSensitive?.length ?? 0) === 0 ? "" : \`<div class="ui-row" style="flex-wrap:wrap; gap:var(--space-1); margin-bottom:var(--space-2);">\${plan.timeSensitive.map((s) => \`<span class="ui-badge ui-badge-accent">⚠️ \${escapeHtml(s)}</span>\`).join("")}</div>\`}
       \${(plan.calendar?.length ?? 0) === 0 ? "" : \`<div class="ui-meta" style="margin-bottom:6px;">📅 \${plan.calendar.slice(0,6).map((e) => escapeHtml((e.allDay ? "all day" : new Date(e.start).toISOString().slice(11,16)) + " " + e.summary)).join(" · ")}</div>\`}
       \${(plan.focus?.length ?? 0) === 0 ? "" : \`<div style="font-weight:600; margin:4px 0;">🎯 Focus</div><ul class="ui-stack" style="list-style:none; padding-left:0; gap:4px;">\${plan.focus.map((f) => \`<li>\${escapeHtml(f.title)}\${f.why ? \` <span class="ui-meta">— \${escapeHtml(f.why)}</span>\` : ""}</li>\`).join("")}</ul>\`}
-      \${(plan.agentWillDo?.length ?? 0) === 0 ? "" : \`<div style="font-weight:600; margin:8px 0 4px;">🤖 I'll handle</div><ul class="ui-stack" style="list-style:none; padding-left:0; gap:4px;">\${plan.agentWillDo.map((a) => \`<li>\${escapeHtml(a.action)}\${a.detail ? \` <span class="ui-meta">— \${escapeHtml(a.detail)}</span>\` : ""}</li>\`).join("")}</ul>\`}
+      \${(() => {
+        // Prefer the REAL queued agent tasks (with live status) over the
+        // freshly-recomputed proposal, so the user sees drafted vs pending.
+        const queued = plan.queuedActions ?? [];
+        const statusIcon = (s) => s === "completed" ? "✅" : s === "in_progress" ? "⏳" : "•";
+        const statusLabel = (s) => s === "completed" ? "drafted" : s === "in_progress" ? "working" : "queued";
+        if (queued.length) {
+          return \`<div style="font-weight:600; margin:8px 0 4px;">🤖 I'll handle</div><ul class="ui-stack" style="list-style:none; padding-left:0; gap:4px;">\${queued.map((a) => \`<li>\${statusIcon(a.status)} \${escapeHtml(a.title)} <span class="ui-meta">— \${statusLabel(a.status)}</span></li>\`).join("")}</ul>\`;
+        }
+        if ((plan.agentWillDo?.length ?? 0) === 0) return "";
+        return \`<div style="font-weight:600; margin:8px 0 4px;">🤖 I'll handle</div><ul class="ui-stack" style="list-style:none; padding-left:0; gap:4px;">\${plan.agentWillDo.map((a) => \`<li>\${escapeHtml(a.action)}\${a.detail ? \` <span class="ui-meta">— \${escapeHtml(a.detail)}</span>\` : ""}</li>\`).join("")}</ul>\`;
+      })()}
     </section>
   \`;
 

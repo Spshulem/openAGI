@@ -62,6 +62,7 @@ const AGENT_PULSE_PROMPT = `Agent autopilot pulse. Drain your queue.
 
 1. Call \`agent_pick_next\` to get the highest-priority task you've committed to do.
 2. If there's a task: work on it. Use tools as needed (\`recall\`, \`run_mcp_tool\`, \`send_message\`, \`schedule_message\`, etc). When the task is done, call \`complete_task\` with the task id. If it's still in progress or needs to be deferred, call \`move_task\` to update its status / bucket / due date.
+   - DRAFT-ONLY tasks (tagged \`plan-action\`, or whose description says "produce a draft only"): prepare the artifact and leave it for the user — write the draft into your reply and/or save it, but do NOT send, publish, or schedule anything externally. Mark \`complete_task\` once the draft is ready for review.
 3. If the queue is empty (\`{task: null}\`): you don't need to invent work. Glance at recent sessions only if something obviously needs a follow-up — otherwise reply "standing by" in one sentence and stop.
 
 The user is not in this conversation — the only output that matters is what you DO via tools, not what you say. Take no action if you have no committed work; do not summarize, do not editorialize.`;
@@ -653,12 +654,18 @@ export class AbiRuntime {
   }
 
   async runDailyPlan({ now = new Date() } = {}) {
-    const { computeDailyPlan, renderDailyPlanMarkdown } = await import("./daily-planner.js");
+    const { computeDailyPlan, renderDailyPlanMarkdown, queuePlanActions } = await import("./daily-planner.js");
     const plan = await computeDailyPlan(this, { date: now });
     // Skip a truly empty day rather than firing a hollow notification.
     if (plan.counts.events === 0 && plan.counts.focus === 0) {
       return { skipped: true, reason: "nothing scheduled and no pending tasks" };
     }
+    // Plan → action: queue the agent's "I'll handle" items as draft-only
+    // agent-queue tasks. The 30-min autopilot pulse drains them into drafts
+    // for review; nothing outbound happens without approval. Only the cron
+    // path queues — the read-only tool/endpoint never mutates as a side
+    // effect.
+    const queuedActions = queuePlanActions(this, plan);
     const markdown = renderDailyPlanMarkdown(plan);
     // Persist so the evening recap + observer can compare plan vs actual.
     try {
@@ -690,7 +697,7 @@ export class AbiRuntime {
       body: headline || "Open day.",
       markdown
     });
-    return { fired: 1, date: plan.date, counts: plan.counts };
+    return { fired: 1, date: plan.date, queuedActions, counts: plan.counts };
   }
 
   // Story 9: weekly rollup. Pulls daily retros from memory written by
