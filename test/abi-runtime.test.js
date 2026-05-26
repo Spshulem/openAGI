@@ -1099,8 +1099,13 @@ test("recall_activity tool returns observations matching a query", async () => {
 test("pattern miner detects repeating sequences and writes a candidate", async () => {
   const { PatternMiner, DeterministicModelProvider } = await import("../src/index.js");
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-mine-"));
+  // Isolate the observation store to this temp dir — otherwise it shares
+  // the real ~/.openagi/observations DB and the test's 12 seeded events get
+  // drowned by thousands of unrelated real ones (the mined sequence then
+  // never clears the confidence bar).
   const runtime = createDefaultRuntime({
-    modelProvider: new DeterministicModelProvider()
+    modelProvider: new DeterministicModelProvider(),
+    observationOptions: { dir: path.join(dataDir, "observations") }
   });
 
   const days = ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04"];
