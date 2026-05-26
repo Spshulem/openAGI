@@ -280,6 +280,16 @@ export class AbiRuntime {
         task: "daily-recap",
         dailyAt: "18:00"
       });
+      // Morning counterpart: "here's what I'm going to do today + what I
+      // can help with." Reads calendar, pending/carried-over tasks, call
+      // commitments, and goals; fires a "daily-plan" event for the Mac app.
+      this.cron.addJob({
+        id: "daily-plan-morning",
+        name: "Daily morning plan — what you're going to do today",
+        enabled: true,
+        task: "daily-plan",
+        dailyAt: "08:00"
+      });
       // Story 9: Sunday rollup. Pulls the last 7 daily retros from
       // long-tier memory and condenses into one "week of <date>"
       // entry the observer can lean on for multi-week narrative.
@@ -550,6 +560,9 @@ export class AbiRuntime {
       if (job.task === "daily-recap") {
         return this.runDailyRecap({ now });
       }
+      if (job.task === "daily-plan") {
+        return this.runDailyPlan({ now });
+      }
       if (job.task === "weekly-retrospective") {
         return this.runWeeklyRetrospective({ now });
       }
@@ -637,6 +650,47 @@ export class AbiRuntime {
       markdown
     });
     return { fired: 1, date: recap.date, counts: recap.counts };
+  }
+
+  async runDailyPlan({ now = new Date() } = {}) {
+    const { computeDailyPlan, renderDailyPlanMarkdown } = await import("./daily-planner.js");
+    const plan = await computeDailyPlan(this, { date: now });
+    // Skip a truly empty day rather than firing a hollow notification.
+    if (plan.counts.events === 0 && plan.counts.focus === 0) {
+      return { skipped: true, reason: "nothing scheduled and no pending tasks" };
+    }
+    const markdown = renderDailyPlanMarkdown(plan);
+    // Persist so the evening recap + observer can compare plan vs actual.
+    try {
+      this.memory?.remember?.(
+        {
+          source: "daily-plan",
+          scope: "main",
+          content: markdown,
+          tags: ["plan", "daily", `day-${plan.dateISO}`],
+          kind: "daily-plan",
+          risk: 0.4,
+          repetition: 0.3,
+          novelty: 0.6
+        },
+        { source: "daily-plan", strength: 0.6 }
+      );
+    } catch { /* best-effort */ }
+    const headline = [
+      plan.counts.events ? `${plan.counts.events} event${plan.counts.events === 1 ? "" : "s"}` : null,
+      plan.counts.focus ? `${plan.counts.focus} focus` : null,
+      plan.counts.agentWillDo ? `${plan.counts.agentWillDo} I'll handle` : null
+    ].filter(Boolean).join(" · ");
+    this.events?.emit?.("daily-plan", {
+      kind: "morning",
+      at: nowIso(),
+      date: plan.dateISO,
+      dateLabel: plan.date,
+      title: `Your day · ${plan.date}`,
+      body: headline || "Open day.",
+      markdown
+    });
+    return { fired: 1, date: plan.date, counts: plan.counts };
   }
 
   // Story 9: weekly rollup. Pulls daily retros from memory written by

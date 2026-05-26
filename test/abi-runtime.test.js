@@ -2777,3 +2777,83 @@ test("reconciliation-calibration: a learned-low threshold auto-completes what us
 
   fs.rmSync(dir, { recursive: true });
 });
+
+test("daily-planner: deterministic fallback surfaces overdue + focus from tasks (no LLM)", async () => {
+  const { computeDailyPlan, renderDailyPlanMarkdown } = await import("../src/daily-planner.js");
+  const { TaskStore } = await import("../src/task-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-plan-"));
+  const tasks = new TaskStore({ dataDir: dir });
+
+  const today = new Date();
+  const twoDaysAgo = new Date(today.getTime() - 2 * 86_400_000).toISOString();
+  tasks.add({ title: "Overdue thing", bucket: "today", dueDate: twoDaysAgo, priority: 60 }, { source: "manual", queue: "user" });
+  tasks.add({ title: "This week thing", bucket: "this_week", priority: 70 }, { source: "manual", queue: "user" });
+  tasks.add({ title: "Someday thing", bucket: "someday", priority: 90 }, { source: "manual", queue: "user" });
+
+  const runtime = {
+    tasks,
+    tools: { get: () => undefined }, // no calendar
+    agentHost: { modelProvider: { isConfigured: () => false } } // force deterministic
+  };
+
+  const plan = await computeDailyPlan(runtime, { date: today, useLLM: false });
+  assert.equal(plan.synthesized, false);
+  // Overdue surfaces as time-sensitive.
+  assert.ok(plan.timeSensitive.some((s) => /Overdue: Overdue thing/.test(s)));
+  // Focus pulls today/this_week, not someday.
+  const titles = plan.focus.map((f) => f.title);
+  assert.ok(titles.includes("Overdue thing"));
+  assert.ok(titles.includes("This week thing"));
+  assert.ok(!titles.includes("Someday thing"), "someday excluded from today's focus");
+  // No agent suggestions without an LLM.
+  assert.equal(plan.agentWillDo.length, 0);
+
+  const md = renderDailyPlanMarkdown(plan);
+  assert.match(md, /Your day/);
+  assert.match(md, /🎯 Focus/);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("daily-planner: LLM synthesis pulls calendar + tasks and returns focus + agent actions", async () => {
+  const { computeDailyPlan } = await import("../src/daily-planner.js");
+  const { TaskStore } = await import("../src/task-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-plan2-"));
+  const tasks = new TaskStore({ dataDir: dir });
+  const t = tasks.add({ title: "Reply to Acme", bucket: "today", priority: 80 }, { source: "manual", queue: "user" });
+
+  let seenPrompt = null;
+  const runtime = {
+    tasks,
+    tools: {
+      get: (name) => name === "calendar_events_between"
+        ? { handler: async () => ([{ summary: "Standup", start: new Date().toISOString(), end: new Date().toISOString(), allDay: false }]) }
+        : undefined
+    },
+    agentHost: {
+      modelProvider: {
+        isConfigured: () => true,
+        generate: async ({ input }) => {
+          seenPrompt = input;
+          return { text: JSON.stringify({
+            focus: [{ title: "Reply to Acme", taskId: t.id, why: "promised yesterday" }],
+            agentWillDo: [{ action: "Draft the Acme reply", detail: "based on the thread" }],
+            timeSensitive: ["Acme reply due today"],
+            note: "Light meeting load — good focus day."
+          }) };
+        }
+      }
+    }
+  };
+
+  const plan = await computeDailyPlan(runtime, { date: new Date(), useLLM: true });
+  assert.equal(plan.synthesized, true);
+  assert.match(seenPrompt, /Standup/, "calendar fed into prompt");
+  assert.match(seenPrompt, /Reply to Acme/, "tasks fed into prompt");
+  assert.equal(plan.focus[0].title, "Reply to Acme");
+  assert.equal(plan.agentWillDo[0].action, "Draft the Acme reply");
+  assert.equal(plan.note, "Light meeting load — good focus day.");
+  assert.equal(plan.counts.events, 1);
+
+  fs.rmSync(dir, { recursive: true });
+});

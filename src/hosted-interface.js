@@ -62,6 +62,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("task-auto-changed", (data) => broadcast("task-auto-changed", data));
   events.on("pending-action", (data) => broadcast("pending-action", data));
   events.on("daily-recap", (data) => broadcast("daily-recap", data));
+  events.on("daily-plan", (data) => broadcast("daily-plan", data));
   events.on("task-unblocked", (data) => broadcast("task-unblocked", data));
   if (runtime.skillReplay) runtime.skillReplay.bindEvents(events);
   if (runtime.pendingActions?.bindEvents) runtime.pendingActions.bindEvents(events);
@@ -1030,6 +1031,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           recap,
           markdown: renderDailyRecapMarkdown(recap)
         });
+      }
+      if (method === "GET" && pathname === "/plan/daily") {
+        // Morning planner: forward-looking "what should I do today."
+        const { computeDailyPlan, renderDailyPlanMarkdown } = await import("./daily-planner.js");
+        const dateParam = url.searchParams.get("date");
+        const date = dateParam ? new Date(dateParam + "T12:00:00") : new Date();
+        const plan = await computeDailyPlan(runtime, { date });
+        return sendJson(res, 200, { plan, markdown: renderDailyPlanMarkdown(plan) });
       }
       if (method === "GET" && pathname === "/observations/recent-context") {
         if (!runtime.observations?.getRecentContext) return sendJson(res, 503, { error: "no observation store" });
@@ -3811,15 +3820,30 @@ async function renderToday() {
   const qsDate = new URLSearchParams(window.location.search).get("date");
   const today = new Date().toISOString().slice(0, 10);
   const date = qsDate || today;
-  const [data, clarifications] = await Promise.all([
+  const [data, clarifications, planResp] = await Promise.all([
     fetchJson("/recap/daily?date=" + encodeURIComponent(date)).catch(() => null),
-    fetchJson("/tasks/clarifications?status=pending").catch(() => [])
+    fetchJson("/tasks/clarifications?status=pending").catch(() => []),
+    date === new Date().toISOString().slice(0, 10) ? fetchJson("/plan/daily").catch(() => null) : Promise.resolve(null)
   ]);
   if (!data) {
     main.innerHTML = '<div class="pane"><h2>Today</h2><div class="ui-empty">Couldn\\'t load today\\'s recap.</div></div>';
     return;
   }
   const r = data.recap;
+
+  // "Your day" — the morning plan. Only for today; collapses when empty.
+  const plan = planResp?.plan ?? null;
+  const showPlan = date === today && plan && (plan.focus?.length || plan.agentWillDo?.length || plan.calendar?.length || plan.timeSensitive?.length);
+  const planHtml = !showPlan ? "" : \`
+    <section class="ui-section" id="planSection">
+      <div class="ui-section-header"><h3>🗓 Your day</h3>\${plan.synthesized ? '<span class="ui-section-meta">· planned</span>' : ""}</div>
+      \${plan.note ? \`<div class="ui-meta" style="margin-bottom: var(--space-2);">\${escapeHtml(plan.note)}</div>\` : ""}
+      \${(plan.timeSensitive?.length ?? 0) === 0 ? "" : \`<div class="ui-row" style="flex-wrap:wrap; gap:var(--space-1); margin-bottom:var(--space-2);">\${plan.timeSensitive.map((s) => \`<span class="ui-badge ui-badge-accent">⚠️ \${escapeHtml(s)}</span>\`).join("")}</div>\`}
+      \${(plan.calendar?.length ?? 0) === 0 ? "" : \`<div class="ui-meta" style="margin-bottom:6px;">📅 \${plan.calendar.slice(0,6).map((e) => escapeHtml((e.allDay ? "all day" : new Date(e.start).toISOString().slice(11,16)) + " " + e.summary)).join(" · ")}</div>\`}
+      \${(plan.focus?.length ?? 0) === 0 ? "" : \`<div style="font-weight:600; margin:4px 0;">🎯 Focus</div><ul class="ui-stack" style="list-style:none; padding-left:0; gap:4px;">\${plan.focus.map((f) => \`<li>\${escapeHtml(f.title)}\${f.why ? \` <span class="ui-meta">— \${escapeHtml(f.why)}</span>\` : ""}</li>\`).join("")}</ul>\`}
+      \${(plan.agentWillDo?.length ?? 0) === 0 ? "" : \`<div style="font-weight:600; margin:8px 0 4px;">🤖 I'll handle</div><ul class="ui-stack" style="list-style:none; padding-left:0; gap:4px;">\${plan.agentWillDo.map((a) => \`<li>\${escapeHtml(a.action)}\${a.detail ? \` <span class="ui-meta">— \${escapeHtml(a.detail)}</span>\` : ""}</li>\`).join("")}</ul>\`}
+    </section>
+  \`;
 
   // "Needs your call" — the clarification queue. Only shown for today (the
   // questions are about what just happened, not a historical date).
@@ -3867,6 +3891,8 @@ async function renderToday() {
         <span class="ui-badge">\${r.counts.approvedActions ?? 0} agent actions</span>
         \${r.activity?.hoursTracked ? \`<span class="ui-badge">\${r.activity.hoursTracked}h tracked</span>\` : ""}
       </div>
+
+      \${planHtml}
 
       \${clarifyHtml}
 
@@ -4334,6 +4360,18 @@ evt.addEventListener("task-auto-changed", (e) => {
     const srcs = Array.isArray(data.sources) && data.sources.length ? \` · via \${data.sources.join("+")}\` : "";
     showToast(\`\${icon} Auto-\${verb.toLowerCase()}: \${data.title}\${conf}\${data.evidence ? " — " + data.evidence : ""}\${srcs}\`, true);
     if (state.tab === "tasks") renderTasks();
+  } catch {}
+});
+
+// Morning plan ready — toast + browser notification; refresh Today if open.
+evt.addEventListener("daily-plan", (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    showToast("🗓 " + (data.title || "Your day is planned") + (data.body ? " — " + data.body : ""), true);
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification(data.title || "Your day", { body: data.body || "" });
+    }
+    if (state.tab === "today") renderToday();
   } catch {}
 });
 

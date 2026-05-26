@@ -686,6 +686,26 @@ export function registerCoreTools(registry, runtime) {
     }
   });
 
+  registry.register({
+    name: "daily_plan",
+    description: "Answer 'what should I do today?' Returns a forward-looking plan synthesized from the user's calendar, pending + carried-over tasks, recent call commitments, and active goals: a focus list, what the agent can take off their plate, and time-sensitive items. Pass a date (YYYY-MM-DD) to plan a specific day; defaults to today. format='markdown' for a chat reply, 'json' for the raw structure.",
+    parameters: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "YYYY-MM-DD. Defaults to today (user's local timezone)." },
+        format: { type: "string", enum: ["markdown", "json"], description: "Output format. Default 'markdown'." }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const { computeDailyPlan, renderDailyPlanMarkdown } = await import("./daily-planner.js");
+      const date = args.date ? new Date(args.date + "T12:00:00") : new Date();
+      const plan = await computeDailyPlan(runtime, { date });
+      if (args.format === "json") return plan;
+      return { markdown: renderDailyPlanMarkdown(plan), counts: plan.counts };
+    }
+  });
+
   // ─── Catalog-aware integration tools (require user approval) ───────────
 
   registry.register({
