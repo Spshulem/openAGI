@@ -89,6 +89,22 @@ export class DraftStore {
     return this._resolve(id, "discarded");
   }
 
+  /// Mark a draft as actually sent, recording how. Only the send endpoint
+  /// calls this, AFTER a real transport confirmed delivery. Accepts a
+  /// pending OR approved draft (you can send straight from review).
+  markSent(id, { channel, target, result } = {}) {
+    const d = this.items.get(id);
+    if (!d || (d.status !== "pending" && d.status !== "approved")) return null;
+    d.status = "sent";
+    d.reviewedAt = d.reviewedAt ?? nowIso();
+    d.sentAt = nowIso();
+    d.sentVia = { channel: channel ?? null, target: target ?? null };
+    if (result !== undefined) d.sendResult = result;
+    this.snapshot();
+    this.runtime?.events?.emit?.("draft-resolved", { draft: d, status: "sent" });
+    return d;
+  }
+
   _resolve(id, status) {
     const d = this.items.get(id);
     if (!d || d.status !== "pending") return null;

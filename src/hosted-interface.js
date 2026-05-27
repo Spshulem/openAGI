@@ -901,6 +901,35 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const draft = action === "approve" ? runtime.drafts.approve(id) : runtime.drafts.discard(id);
         return draft ? sendJson(res, 200, draft) : sendJson(res, 404, { error: "unknown or already-resolved draft" });
       }
+      if (method === "POST" && pathname.match(/^\/drafts\/[^/]+\/send$/)) {
+        // Explicit user-initiated send: route the draft body through a REAL
+        // outbound transport (sms / telegram). This is the only path that
+        // transmits externally; it's a deliberate dashboard action, not the
+        // agent. We only mark the draft "sent" if delivery actually confirms.
+        if (!runtime.drafts?.get) return sendJson(res, 503, { error: "no draft store" });
+        if (!runtime.channels?.deliver) return sendJson(res, 503, { error: "no outbound channels" });
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const draft = runtime.drafts.get(id);
+        if (!draft) return sendJson(res, 404, { error: "unknown draft" });
+        if (draft.status === "sent") return sendJson(res, 409, { error: "draft already sent" });
+        if (draft.status === "discarded") return sendJson(res, 409, { error: "draft was discarded" });
+        const body = await readJson(req).catch(() => ({}));
+        const channel = body.channel;
+        const target = body.target ?? draft.recipient;
+        if (!["sms", "telegram"].includes(channel)) {
+          return sendJson(res, 400, { error: "send requires channel 'sms' or 'telegram' (email has no native transport — copy the approved draft into your mail client)" });
+        }
+        if (!target) return sendJson(res, 400, { error: "no target/recipient for this send" });
+        let result;
+        try {
+          result = await runtime.channels.deliver({ channel, target, text: draft.body, refId: draft.id });
+        } catch (error) { return sendJson(res, 502, { error: error.message }); }
+        if (result?.delivered === false) {
+          return sendJson(res, 502, { error: result.reason ?? "delivery failed", result });
+        }
+        const sent = runtime.drafts.markSent(id, { channel, target, result });
+        return sendJson(res, 200, { sent, result });
+      }
       if (method === "POST" && pathname.match(/^\/tasks\/clarifications\/[^/]+\/dismiss$/)) {
         if (!runtime.clarifications?.dismiss) return sendJson(res, 503, { error: "no clarification store" });
         const id = decodeURIComponent(pathname.split("/")[3]);
@@ -3849,12 +3878,18 @@ async function renderToday() {
   const today = new Date().toISOString().slice(0, 10);
   const date = qsDate || today;
   const isTodayView = date === new Date().toISOString().slice(0, 10);
-  const [data, clarifications, planResp, drafts] = await Promise.all([
+  const [data, clarifications, planResp, drafts, chStatus] = await Promise.all([
     fetchJson("/recap/daily?date=" + encodeURIComponent(date)).catch(() => null),
     fetchJson("/tasks/clarifications?status=pending").catch(() => []),
     isTodayView ? fetchJson("/plan/daily").catch(() => null) : Promise.resolve(null),
-    isTodayView ? fetchJson("/drafts?status=pending").catch(() => []) : Promise.resolve([])
+    isTodayView ? fetchJson("/drafts?status=pending").catch(() => []) : Promise.resolve([]),
+    isTodayView ? fetchJson("/channels").catch(() => null) : Promise.resolve(null)
   ]);
+  // Which real outbound transports exist? Only offer "Send" for these;
+  // email has no native channel (the user copies it into their mail client).
+  const sendChannels = [];
+  if (chStatus?.sms?.outboundConfigured) sendChannels.push("sms");
+  if (chStatus?.telegram?.configured) sendChannels.push("telegram");
   if (!data) {
     main.innerHTML = '<div class="pane"><h2>Today</h2><div class="ui-empty">Couldn\\'t load today\\'s recap.</div></div>';
     return;
@@ -3920,11 +3955,16 @@ async function renderToday() {
           <li class="ui-card" data-draft="\${escapeHtml(d.id)}" style="padding: var(--space-3);">
             <div style="font-weight:600;">\${draftKindIcon[d.kind] || "📝"} \${escapeHtml(d.title)}\${d.recipient ? \` <span class="ui-meta">→ \${escapeHtml(d.recipient)}</span>\` : ""}</div>
             <textarea class="ui-input" data-draft-body="\${escapeHtml(d.id)}" rows="6" style="width:100%; margin:var(--space-2) 0; font-family:inherit;">\${escapeHtml(d.body)}</textarea>
-            <div class="ui-meta" style="margin-bottom:6px;">Draft only — nothing has been sent. Approving marks it ready; you do the send.</div>
-            <div class="ui-row" style="gap: var(--space-2); flex-wrap:wrap;">
+            <div class="ui-meta" style="margin-bottom:6px;">Draft only — nothing has been sent. Approving marks it ready; sending transmits via a real channel.</div>
+            <div class="ui-row" style="gap: var(--space-2); flex-wrap:wrap; align-items:center;">
               <button class="ui-btn ui-btn-accent" data-draft-action="approve" data-id="\${escapeHtml(d.id)}">Approve</button>
               <button class="ui-btn" data-draft-action="save" data-id="\${escapeHtml(d.id)}">Save edits</button>
               <button class="ui-btn ui-btn-ghost" data-draft-action="discard" data-id="\${escapeHtml(d.id)}">Discard</button>
+              \${sendChannels.length === 0 ? "" : \`
+                <span class="ui-meta" style="margin-left:auto;">Send via</span>
+                <input class="ui-input" data-draft-target="\${escapeHtml(d.id)}" placeholder="\${d.recipient ? escapeHtml(d.recipient) : "recipient"}" style="width:auto; min-width:120px;">
+                \${sendChannels.map((ch) => \`<button class="ui-btn" data-draft-send="\${escapeHtml(ch)}" data-id="\${escapeHtml(d.id)}">\${ch === "sms" ? "📱 SMS" : "✈️ Telegram"}</button>\`).join("")}
+              \`}
             </div>
           </li>
         \`).join("")}
@@ -4039,6 +4079,35 @@ async function renderToday() {
         await fetch("/drafts/" + encodeURIComponent(id) + "/" + action, { method: "POST", credentials: "include" });
         showToast(action === "approve" ? "Approved — ready to use." : "Discarded.", true);
       } catch { showToast("Couldn't update the draft.", false); }
+      renderToday();
+    });
+  });
+
+  // Send a draft through a real channel — explicit, confirmed, transmits.
+  main.querySelectorAll("[data-draft-send]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-id");
+      const channel = btn.getAttribute("data-draft-send");
+      const targetEl = main.querySelector('[data-draft-target="' + id + '"]');
+      const bodyEl = main.querySelector('[data-draft-body="' + id + '"]');
+      const target = (targetEl && targetEl.value.trim()) || "";
+      if (!target) { showToast("Enter a recipient first.", false); return; }
+      if (!confirm("Send this draft via " + channel + " to " + target + "? This transmits for real.")) return;
+      try {
+        // Persist any edits to the body first so we send what's on screen.
+        if (bodyEl) {
+          await fetch("/drafts/" + encodeURIComponent(id), {
+            method: "PATCH", headers: { "content-type": "application/json" }, credentials: "include",
+            body: JSON.stringify({ body: bodyEl.value })
+          });
+        }
+        const resp = await fetch("/drafts/" + encodeURIComponent(id) + "/send", {
+          method: "POST", headers: { "content-type": "application/json" }, credentials: "include",
+          body: JSON.stringify({ channel, target })
+        });
+        if (resp.ok) showToast("Sent via " + channel + ".", true);
+        else { const e = await resp.json().catch(() => ({})); showToast("Send failed: " + (e.error || resp.status), false); }
+      } catch { showToast("Send failed.", false); }
       renderToday();
     });
   });

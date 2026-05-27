@@ -3112,3 +3112,71 @@ test("draft-store: discard path + save_draft tool produces a reviewable draft (n
 
   fs.rmSync(dir, { recursive: true });
 });
+
+test("draft-store: markSent records transport + only from pending/approved", async () => {
+  const { DraftStore } = await import("../src/draft-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-draft-send-"));
+  const events = [];
+  const store = new DraftStore({ dir: path.join(dir, "drafts"), runtime: { events: { emit: (n, d) => events.push({ n, d }) } } });
+
+  const d = store.add({ title: "Ping", body: "running late", kind: "message", recipient: "+15551234" });
+  const sent = store.markSent(d.id, { channel: "sms", target: "+15551234", result: { delivered: true, sid: "SM123" } });
+  assert.equal(sent.status, "sent");
+  assert.equal(sent.sentVia.channel, "sms");
+  assert.equal(sent.sendResult.sid, "SM123");
+  assert.ok(sent.sentAt);
+  assert.equal(events.find((e) => e.n === "draft-resolved")?.d.status, "sent");
+
+  // Can't send an already-sent (or discarded) draft.
+  assert.equal(store.markSent(d.id, { channel: "sms", target: "x" }), null);
+  const d2 = store.add({ title: "x", body: "y" });
+  store.discard(d2.id);
+  assert.equal(store.markSent(d2.id, { channel: "sms", target: "x" }), null);
+
+  // Sent drafts drop out of the pending list.
+  assert.equal(store.list({ status: "pending" }).some((x) => x.id === d.id), false);
+  assert.equal(store.list({ status: "sent" }).some((x) => x.id === d.id), true);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("drafts: send endpoint routes through a real channel and marks sent only on delivery", async () => {
+  const { createHostedInterface } = await import("../src/hosted-interface.js");
+  const { DraftStore } = await import("../src/draft-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-draft-ep-"));
+  const drafts = new DraftStore({ dir: path.join(dir, "drafts"), runtime: { events: { emit: () => {} } } });
+  const delivered = [];
+  const fakeRuntime = {
+    drafts,
+    channels: {
+      deliver: async ({ channel, target, text }) => {
+        delivered.push({ channel, target, text });
+        return { delivered: true, sid: "SM_ok" };
+      }
+    },
+    events: { on: () => {}, emit: () => {} }
+  };
+  const app = createHostedInterface(fakeRuntime, { port: 0 });
+  const address = await app.listen();
+
+  const d = drafts.add({ title: "Heads up", body: "on my way", kind: "message", recipient: "+15550000" });
+
+  // Bad channel rejected (email has no transport).
+  let resp = await fetch(`${address.url}/drafts/${d.id}/send`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "email", target: "x@y.com" })
+  });
+  assert.equal(resp.status, 400);
+  assert.equal(drafts.get(d.id).status, "pending", "not sent on bad channel");
+
+  // Real channel delivers + marks sent.
+  resp = await fetch(`${address.url}/drafts/${d.id}/send`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "sms", target: "+15550000" })
+  });
+  assert.equal(resp.status, 200);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].text, "on my way");
+  assert.equal(drafts.get(d.id).status, "sent");
+
+  await app.close();
+  fs.rmSync(dir, { recursive: true });
+});
