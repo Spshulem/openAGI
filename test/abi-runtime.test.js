@@ -2360,6 +2360,70 @@ test("McpRegistry persist surfaces filesystem errors instead of swallowing", asy
   fs.rmSync(dir, { recursive: true });
 });
 
+test("proactive-observer: task proposals materialize into real tasks", async () => {
+  const { ProactiveObserver } = await import("../src/proactive-observer.js");
+  const { TaskStore } = await import("../src/task-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-observer-task-"));
+  const tasks = new TaskStore({ dataDir: dir });
+  const events = [];
+
+  const runtime = {
+    dataDir: dir,
+    tasks,
+    events: { emit: (name, data) => events.push({ name, data }) },
+    mcp: { listServers: () => [] },
+    agentHost: {
+      store: { listSessions: () => [] },
+      modelProvider: {
+        isConfigured: () => true,
+        generate: async () => ({
+          text: JSON.stringify({
+            category: "task",
+            title: "Review PR #42 before standup",
+            rationale: "The PR was open repeatedly and standup is coming up.",
+            queue: "agent",
+            bucket: "today"
+          })
+        })
+      }
+    },
+    observations: {
+      getRecentContext: async () => ({
+        apps: [{ app: "Chrome", n: 4 }],
+        snippets: [
+          { app: "Chrome", text: "GitHub Pull Request #42" },
+          { app: "Calendar", text: "Engineering standup" }
+        ]
+      })
+    }
+  };
+  tasks.runtime = runtime;
+
+  const observer = new ProactiveObserver({ runtime, dataDir: dir });
+  const result = await observer.observe({ force: true, now: new Date("2026-05-26T17:00:00Z") });
+
+  assert.equal(result.suggested, 1);
+  assert.equal(result.candidate.status, "accepted");
+  assert.equal(result.candidate.taskAutoCreated, true);
+  assert.ok(result.candidate.taskId);
+
+  const queued = tasks.list({ queue: "agent", limit: 10 });
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].title, "Review PR #42 before standup");
+  assert.equal(queued[0].source, "proactive-observer");
+  assert.equal(queued[0].sourceMeta.suggestionId, result.candidate.id);
+  assert.match(queued[0].description, /Produce a draft only/);
+  assert.ok(queued[0].tags.includes("draft-only"));
+
+  assert.equal(observer.list().length, 0, "auto-created task suggestions should not sit pending");
+  assert.equal(observer.list({ status: null }).length, 1, "resolved suggestion remains in history");
+  assert.ok(events.some((e) => e.name === "task-updated" && e.data.op === "create"));
+  assert.ok(events.some((e) => e.name === "task-reminder" && e.data.kind === "created" && e.data.taskId === queued[0].id));
+  assert.equal(events.some((e) => e.name === "proactive-suggestion"), false);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("proactive-observer: multi-source reconciliation fuses OCR + Rize + BuildBetter evidence", async () => {
   const { ProactiveObserver } = await import("../src/proactive-observer.js");
   const { TaskStore } = await import("../src/task-store.js");
@@ -2963,6 +3027,88 @@ test("daily-planner: read-only compute does NOT queue actions (only the cron pat
   // computeDailyPlan must not create any tasks — it's read-only.
   await computeDailyPlan(runtime, { date: new Date(), useLLM: true });
   assert.equal(tasks.list({ queue: "agent", limit: 50 }).length, 0, "compute alone queues nothing");
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("draft-store: save → edit → approve lifecycle, with events + persistence", async () => {
+  const { DraftStore } = await import("../src/draft-store.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-drafts-"));
+  const events = [];
+  const runtime = { events: { emit: (name, data) => events.push({ name, data }) } };
+  const store = new DraftStore({ dir: path.join(dir, "drafts"), runtime });
+
+  const d = store.add({ title: "Follow-up to Acme", body: "Hi there,\n\nThanks for the call.", kind: "email", recipient: "acme@example.com", taskId: "task_1" });
+  assert.match(d.id, /^draft_/);
+  assert.equal(d.status, "pending");
+  assert.equal(d.kind, "email");
+  assert.equal(events.find((e) => e.name === "draft-created")?.data.id, d.id);
+
+  // Unknown kind collapses to "other"; empty body rejected.
+  assert.equal(store.add({ title: "x", body: "y", kind: "telepathy" }).kind, "other");
+  assert.throws(() => store.add({ title: "x", body: "   " }), /requires a body/);
+
+  // Edit the body before approving.
+  const edited = store.edit(d.id, { body: "Hi there,\n\nThanks — sending the contract today." });
+  assert.match(edited.body, /sending the contract/);
+  assert.ok(edited.editedAt);
+
+  // List shows pending only by default.
+  assert.equal(store.list({ status: "pending" }).some((x) => x.id === d.id), true);
+
+  // Approve resolves it (does NOT send — just marks approved).
+  const approved = store.approve(d.id);
+  assert.equal(approved.status, "approved");
+  assert.equal(store.list({ status: "pending" }).some((x) => x.id === d.id), false);
+  assert.equal(events.find((e) => e.name === "draft-resolved")?.data.status, "approved");
+
+  // Can't re-resolve an approved draft.
+  assert.equal(store.approve(d.id), null);
+  assert.equal(store.edit(d.id, { body: "late edit" }), null, "can't edit a resolved draft");
+
+  // Persistence round-trip.
+  const store2 = new DraftStore({ dir: path.join(dir, "drafts"), runtime });
+  assert.equal(store2.get(d.id).status, "approved");
+  assert.match(store2.get(d.id).body, /sending the contract/);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("draft-store: discard path + save_draft tool produces a reviewable draft (never sends)", async () => {
+  const { DraftStore } = await import("../src/draft-store.js");
+  const { ToolRegistry, registerCoreTools } = await import("../src/tool-registry.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-drafts2-"));
+  const drafts = new DraftStore({ dir: path.join(dir, "drafts"), runtime: { events: { emit: () => {} } } });
+
+  const registry = new ToolRegistry();
+  const fakeRuntime = {
+    drafts,
+    memory: { remember: () => ({}), retrieve: () => [] },
+    cron: { addJob: () => ({}), listJobs: () => [], removeJob: () => false },
+    mcp: { listServers: () => [], listTools: () => [], registerServer: () => ({}), connect: () => Promise.resolve(), disconnect: () => Promise.resolve() },
+    channels: { deliver: () => ({}) },
+    introspector: { audit: () => ({}) },
+    budget: { status: () => ({}) },
+    skills: { list: () => [], run: () => ({}) },
+    skillReplay: { run: () => ({}) },
+    propagation: { retire: () => null },
+    tasks: { add: () => ({}), list: () => [], get: () => null, complete: () => null, update: () => null }
+  };
+  registerCoreTools(registry, fakeRuntime);
+
+  const saveDraft = registry.get("save_draft");
+  assert.ok(saveDraft, "save_draft tool registered");
+  const result = await saveDraft.handler({ title: "Board deck outline", body: "1. Metrics\n2. Roadmap", kind: "outline", taskId: "task_9" });
+  assert.match(result.draftId, /^draft_/);
+  assert.match(result.note, /NOT been sent/i);
+  const saved = drafts.get(result.draftId);
+  assert.equal(saved.title, "Board deck outline");
+  assert.equal(saved.taskId, "task_9");
+  assert.equal(saved.status, "pending");
+
+  // Discard works.
+  const discarded = drafts.discard(saved.id);
+  assert.equal(discarded.status, "discarded");
 
   fs.rmSync(dir, { recursive: true });
 });

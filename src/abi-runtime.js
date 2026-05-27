@@ -28,6 +28,7 @@ import { TaskStore } from "./task-store.js";
 import { PendingActionStore } from "./pending-actions.js";
 import { ComputerUseLog } from "./computer-use-log.js";
 import { ClarificationStore } from "./clarification-store.js";
+import { DraftStore } from "./draft-store.js";
 import { registerComputerUseTools, isComputerUseEnabled } from "./integrations/computer-use.js";
 import { SuggestionFeedback } from "./suggestion-feedback.js";
 import { ScrutinyFitter } from "./scrutiny-fitter.js";
@@ -168,6 +169,11 @@ export class AbiRuntime {
     this.clarifications = options.clarifications ?? new ClarificationStore({
       runtime: this,
       dir: options.dataDir ? `${options.dataDir}/clarifications` : undefined
+    });
+    // Where the agent's draft-only work lands for human review.
+    this.drafts = options.drafts ?? new DraftStore({
+      runtime: this,
+      dir: options.dataDir ? `${options.dataDir}/drafts` : undefined
     });
     this.skillReplay = options.skillReplay ?? new SkillReplay({ runtime: this, dataDir: options.dataDir, ...(options.skillReplayOptions ?? {}) });
     this.outputs = [];

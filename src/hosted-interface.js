@@ -58,6 +58,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("task-updated", (data) => broadcast("task-updated", data));
   events.on("clarification-created", (data) => broadcast("clarification-created", data));
   events.on("clarification-resolved", (data) => broadcast("clarification-resolved", data));
+  events.on("draft-created", (data) => broadcast("draft-created", data));
+  events.on("draft-resolved", (data) => broadcast("draft-resolved", data));
   events.on("task-reminder", (data) => broadcast("task-reminder", data));
   events.on("task-auto-changed", (data) => broadcast("task-auto-changed", data));
   events.on("pending-action", (data) => broadcast("pending-action", data));
@@ -876,6 +878,28 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const result = runtime.clarifications.answer(id, body.answer);
           return result ? sendJson(res, 200, result) : sendJson(res, 404, { error: "unknown or already-resolved clarification" });
         } catch (error) { return sendJson(res, 400, { error: error.message }); }
+      }
+      // Drafts review queue — agent-produced artifacts awaiting approval.
+      // ids are Map keys, never fs paths → no traversal surface.
+      if (method === "GET" && pathname === "/drafts") {
+        if (!runtime.drafts?.list) return sendJson(res, 503, { error: "no draft store" });
+        const status = url.searchParams.get("status");
+        return sendJson(res, 200, runtime.drafts.list({ status: status === "null" ? null : (status ?? "pending") }));
+      }
+      if (method === "PATCH" && pathname.match(/^\/drafts\/[^/]+$/)) {
+        if (!runtime.drafts?.edit) return sendJson(res, 503, { error: "no draft store" });
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const body = await readJson(req).catch(() => ({}));
+        const draft = runtime.drafts.edit(id, body);
+        return draft ? sendJson(res, 200, draft) : sendJson(res, 404, { error: "unknown or already-resolved draft" });
+      }
+      if (method === "POST" && pathname.match(/^\/drafts\/[^/]+\/(approve|discard)$/)) {
+        if (!runtime.drafts) return sendJson(res, 503, { error: "no draft store" });
+        const parts = pathname.split("/");
+        const id = decodeURIComponent(parts[2]);
+        const action = parts[3];
+        const draft = action === "approve" ? runtime.drafts.approve(id) : runtime.drafts.discard(id);
+        return draft ? sendJson(res, 200, draft) : sendJson(res, 404, { error: "unknown or already-resolved draft" });
       }
       if (method === "POST" && pathname.match(/^\/tasks\/clarifications\/[^/]+\/dismiss$/)) {
         if (!runtime.clarifications?.dismiss) return sendJson(res, 503, { error: "no clarification store" });
@@ -3824,10 +3848,12 @@ async function renderToday() {
   const qsDate = new URLSearchParams(window.location.search).get("date");
   const today = new Date().toISOString().slice(0, 10);
   const date = qsDate || today;
-  const [data, clarifications, planResp] = await Promise.all([
+  const isTodayView = date === new Date().toISOString().slice(0, 10);
+  const [data, clarifications, planResp, drafts] = await Promise.all([
     fetchJson("/recap/daily?date=" + encodeURIComponent(date)).catch(() => null),
     fetchJson("/tasks/clarifications?status=pending").catch(() => []),
-    date === new Date().toISOString().slice(0, 10) ? fetchJson("/plan/daily").catch(() => null) : Promise.resolve(null)
+    isTodayView ? fetchJson("/plan/daily").catch(() => null) : Promise.resolve(null),
+    isTodayView ? fetchJson("/drafts?status=pending").catch(() => []) : Promise.resolve([])
   ]);
   if (!data) {
     main.innerHTML = '<div class="pane"><h2>Today</h2><div class="ui-empty">Couldn\\'t load today\\'s recap.</div></div>';
@@ -3883,6 +3909,29 @@ async function renderToday() {
     </section>
   \`;
 
+  // "Drafts for review" — agent-produced artifacts awaiting approval.
+  const draftKindIcon = { email: "✉️", message: "💬", doc: "📄", outline: "🗒", reply: "↩️", other: "📝" };
+  const showDrafts = date === today && Array.isArray(drafts) && drafts.length > 0;
+  const draftsHtml = !showDrafts ? "" : \`
+    <section class="ui-section" id="draftsSection">
+      <div class="ui-section-header"><h3>📝 Drafts for review</h3><span class="ui-section-meta">· \${drafts.length}</span></div>
+      <ul class="ui-stack" style="list-style:none; padding-left:0; gap: var(--space-2);">
+        \${drafts.map((d) => \`
+          <li class="ui-card" data-draft="\${escapeHtml(d.id)}" style="padding: var(--space-3);">
+            <div style="font-weight:600;">\${draftKindIcon[d.kind] || "📝"} \${escapeHtml(d.title)}\${d.recipient ? \` <span class="ui-meta">→ \${escapeHtml(d.recipient)}</span>\` : ""}</div>
+            <textarea class="ui-input" data-draft-body="\${escapeHtml(d.id)}" rows="6" style="width:100%; margin:var(--space-2) 0; font-family:inherit;">\${escapeHtml(d.body)}</textarea>
+            <div class="ui-meta" style="margin-bottom:6px;">Draft only — nothing has been sent. Approving marks it ready; you do the send.</div>
+            <div class="ui-row" style="gap: var(--space-2); flex-wrap:wrap;">
+              <button class="ui-btn ui-btn-accent" data-draft-action="approve" data-id="\${escapeHtml(d.id)}">Approve</button>
+              <button class="ui-btn" data-draft-action="save" data-id="\${escapeHtml(d.id)}">Save edits</button>
+              <button class="ui-btn ui-btn-ghost" data-draft-action="discard" data-id="\${escapeHtml(d.id)}">Discard</button>
+            </div>
+          </li>
+        \`).join("")}
+      </ul>
+    </section>
+  \`;
+
   const section = (title, rows, renderRow) => rows.length === 0 ? "" : \`
     <section class="ui-section">
       <div class="ui-section-header"><h3>\${title}</h3><span class="ui-section-meta">· \${rows.length}</span></div>
@@ -3910,6 +3959,8 @@ async function renderToday() {
       \${planHtml}
 
       \${clarifyHtml}
+
+      \${draftsHtml}
 
       \${section("✅ Completed", r.completedTasks, (t) => \`<li>\${escapeHtml(t.title)}\${t.queue === "agent" ? ' <span class="ui-meta">(agent)</span>' : ""}</li>\`)}
       \${section("✨ Skills run", r.skillRuns, (s) => \`<li>\${escapeHtml(s.skill ?? "(unknown)")}\${typeof s.qualityScore === "number" ? \` <span class="ui-meta">quality \${s.qualityScore.toFixed(2)}</span>\` : ""}</li>\`)}
@@ -3956,6 +4007,38 @@ async function renderToday() {
         });
         showToast("Thanks — updated.", true);
       } catch { showToast("Couldn't save that.", false); }
+      renderToday();
+    });
+  });
+
+  // Draft review actions. "Save edits" PATCHes the body without resolving;
+  // approve/discard resolve. Approving never sends — it only marks ready.
+  main.querySelectorAll("[data-draft-action]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-id");
+      const action = btn.getAttribute("data-draft-action");
+      const bodyEl = main.querySelector('[data-draft-body="' + id + '"]');
+      try {
+        if (action === "save") {
+          await fetch("/drafts/" + encodeURIComponent(id), {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ body: bodyEl ? bodyEl.value : undefined })
+          });
+          showToast("Draft saved.", true);
+          return; // keep it in the queue for further edits / approval
+        }
+        // Approve persists any in-progress edits first, then resolves.
+        if (action === "approve" && bodyEl) {
+          await fetch("/drafts/" + encodeURIComponent(id), {
+            method: "PATCH", headers: { "content-type": "application/json" }, credentials: "include",
+            body: JSON.stringify({ body: bodyEl.value })
+          });
+        }
+        await fetch("/drafts/" + encodeURIComponent(id) + "/" + action, { method: "POST", credentials: "include" });
+        showToast(action === "approve" ? "Approved — ready to use." : "Discarded.", true);
+      } catch { showToast("Couldn't update the draft.", false); }
       renderToday();
     });
   });
@@ -4390,6 +4473,19 @@ evt.addEventListener("daily-plan", (e) => {
   } catch {}
 });
 
+// A draft is ready for review — agent finished a draft-only task. Toast +
+// refresh Today so the draft card appears immediately.
+evt.addEventListener("draft-created", (e) => {
+  try {
+    const data = JSON.parse(e.data);
+    showToast("📝 Draft ready to review: " + (data.title || "untitled"), true);
+    if ("Notification" in window && Notification.permission === "granted") {
+      new Notification("Draft ready to review", { body: data.title || "" });
+    }
+    if (state.tab === "today") renderToday();
+  } catch {}
+});
+
 // Clarification queued — the agent needs your call on a task. Toast +
 // refresh the Today tab if it's open so the question appears immediately.
 evt.addEventListener("clarification-created", (e) => {
@@ -4403,11 +4499,12 @@ evt.addEventListener("clarification-created", (e) => {
   } catch {}
 });
 
-// Task reminder (morning digest or due-date) — toast + browser notif.
+// Task notification (created, morning digest, or due-date) — toast + browser notif.
 evt.addEventListener("task-reminder", (e) => {
   try {
     const data = JSON.parse(e.data);
-    showToast((data.kind === "digest" ? "📋 " : "⏰ ") + data.title + (data.body ? " — " + data.body : ""), true);
+    const icon = data.kind === "digest" || data.kind === "created" ? "📋 " : "⏰ ";
+    showToast(icon + data.title + (data.body ? " — " + data.body : ""), true);
     if ("Notification" in window && Notification.permission === "granted") {
       new Notification(data.title, { body: data.body || "" });
     }

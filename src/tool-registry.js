@@ -706,6 +706,28 @@ export function registerCoreTools(registry, runtime) {
     }
   });
 
+  registry.register({
+    name: "save_draft",
+    description: "Save a draft artifact (email, message, doc, outline, reply) for the user to review — instead of sending or publishing it. THIS IS HOW YOU COMPLETE DRAFT-ONLY WORK: produce the content, save it here, and the user reviews/approves/edits it later. Never send, publish, or schedule the content yourself; saving a draft does NOT send it. Link it to the originating task via taskId.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Short label for the draft, e.g. 'Follow-up to Acme re pricing'." },
+        body: { type: "string", description: "The full draft content." },
+        kind: { type: "string", enum: ["email", "message", "doc", "outline", "reply", "other"], description: "What kind of artifact this is." },
+        recipient: { type: "string", description: "Intended recipient, if applicable (display only — nothing is sent)." },
+        taskId: { type: "string", description: "The task this draft fulfills, if any." }
+      },
+      required: ["title", "body"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.drafts?.add) throw new Error("no draft store available");
+      const draft = runtime.drafts.add(args);
+      return { draftId: draft.id, status: draft.status, note: "Draft saved for review. It has NOT been sent — the user will review and approve it." };
+    }
+  });
+
   // ─── Catalog-aware integration tools (require user approval) ───────────
 
   registry.register({
