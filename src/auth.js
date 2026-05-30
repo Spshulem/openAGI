@@ -42,7 +42,8 @@ export function isPublicRoute(pathname) {
     pathname === "/health" ||
     pathname === "/sign-in" ||
     pathname === "/channels/twilio/webhook" ||
-    pathname === "/channels/telegram/webhook"
+    pathname === "/channels/telegram/webhook" ||
+    pathname === "/webhooks/buildbetter"
   );
 }
 
@@ -82,6 +83,17 @@ export function verifyTwilioSignature({ authToken, fullUrl, params, signature })
 export function verifyTelegramSecret({ headerValue, expected }) {
   if (!expected) return { ok: true, reason: "no telegram secret configured" };
   return safeEqual(headerValue, expected) ? { ok: true } : { ok: false, reason: "telegram secret mismatch" };
+}
+
+// Webhook shared-secret check for inbound BuildBetter pings. Unlike the
+// telegram check, a MISSING expected secret fails closed — the webhook
+// triggers outbound API calls, so we won't accept unauthenticated pings.
+// The secret may arrive in the X-BuildBetter-Webhook-Secret header or a
+// ?secret= query param (some webhook UIs only allow URL config).
+export function verifyBuildBetterWebhook({ headerValue, queryValue, expected }) {
+  if (!expected) return { ok: false, reason: "no webhook secret configured" };
+  const provided = headerValue ?? queryValue ?? null;
+  return safeEqual(provided, expected) ? { ok: true } : { ok: false, reason: "webhook secret mismatch" };
 }
 
 export function generateToken(bytes = 32) {

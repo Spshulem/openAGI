@@ -3180,3 +3180,66 @@ test("drafts: send endpoint routes through a real channel and marks sent only on
   await app.close();
   fs.rmSync(dir, { recursive: true });
 });
+
+test("auth: verifyBuildBetterWebhook fails closed without a secret, matches header or query", async () => {
+  const { verifyBuildBetterWebhook } = await import("../src/auth.js");
+  // No configured secret → reject (fail closed; this triggers outbound calls).
+  assert.equal(verifyBuildBetterWebhook({ headerValue: "x", expected: null }).ok, false);
+  // Header match.
+  assert.equal(verifyBuildBetterWebhook({ headerValue: "s3cret", expected: "s3cret" }).ok, true);
+  // Query-param match (for webhook UIs that only take a URL).
+  assert.equal(verifyBuildBetterWebhook({ queryValue: "s3cret", expected: "s3cret" }).ok, true);
+  // Mismatch.
+  assert.equal(verifyBuildBetterWebhook({ headerValue: "nope", expected: "s3cret" }).ok, false);
+});
+
+test("buildbetter: triggerSync coalesces concurrent pings into one in-flight + one trailing run", async () => {
+  const { BuildBetterTaskSource } = await import("../src/integrations/buildbetter-tasks.js");
+  const src = new BuildBetterTaskSource({ runtime: {}, apiKey: "k", userEmail: "u@x.com" });
+  let active = 0, maxActive = 0, runs = 0;
+  src.sync = async () => {
+    active += 1; maxActive = Math.max(maxActive, active); runs += 1;
+    await new Promise((r) => setTimeout(r, 10));
+    active -= 1;
+    return { created: 0 };
+  };
+  // Fire 5 pings nearly simultaneously.
+  const results = await Promise.all([src.triggerSync(), src.triggerSync(), src.triggerSync(), src.triggerSync(), src.triggerSync()]);
+  assert.equal(maxActive, 1, "never more than one sync in flight");
+  // First call runs once + at most one trailing run for the burst → 2 syncs total.
+  assert.ok(runs <= 2, `coalesced to <=2 syncs, got ${runs}`);
+  assert.ok(results.some((r) => r.coalesced), "some pings were coalesced");
+});
+
+test("webhooks: /webhooks/buildbetter requires secret, then triggers a sync (202)", async () => {
+  const { createHostedInterface } = await import("../src/hosted-interface.js");
+  let synced = 0;
+  const runtime = {
+    buildBetterTaskSource: { triggerSync: async () => { synced += 1; return { created: 1 }; } },
+    events: { on: () => {}, emit: () => {} }
+  };
+  const app = createHostedInterface(runtime, { port: 0, buildBetterWebhookSecret: "hook-secret" });
+  const address = await app.listen();
+
+  // No secret → 401.
+  let resp = await fetch(`${address.url}/webhooks/buildbetter`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(resp.status, 401);
+
+  // Correct secret via header → 202 + sync triggered.
+  resp = await fetch(`${address.url}/webhooks/buildbetter`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-buildbetter-webhook-secret": "hook-secret" },
+    body: JSON.stringify({ event: "call.processed" })
+  });
+  assert.equal(resp.status, 202);
+
+  // Secret via query param also works.
+  resp = await fetch(`${address.url}/webhooks/buildbetter?secret=hook-secret`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(resp.status, 202);
+
+  // Give the fire-and-forget syncs a tick to run.
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(synced >= 1, "sync triggered by webhook");
+
+  await app.close();
+});

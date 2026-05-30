@@ -9,7 +9,8 @@ import {
   checkOrigin,
   isPublicRoute,
   verifyTelegramSecret,
-  verifyTwilioSignature
+  verifyTwilioSignature,
+  verifyBuildBetterWebhook
 } from "./auth.js";
 import { ChannelManager } from "./channels.js";
 import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
@@ -236,7 +237,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/channels") {
         const status = channels?.status() ?? { enabled: false };
         const pub = getPublicUrl();
-        return sendJson(res, 200, { ...status, publicUrl: pub, twilioWebhook: pub ? `${pub.replace(/\/$/, "")}/channels/twilio/webhook` : null });
+        const base = pub ? pub.replace(/\/$/, "") : null;
+        const bbSecret = options.buildBetterWebhookSecret ?? process.env.BUILDBETTER_WEBHOOK_SECRET ?? null;
+        return sendJson(res, 200, {
+          ...status,
+          publicUrl: pub,
+          twilioWebhook: base ? `${base}/channels/twilio/webhook` : null,
+          // The URL to paste into BuildBetter's webhook config. Only useful
+          // once a public URL + webhook secret are set; secret goes in the
+          // query string so webhook UIs that only take a URL still work.
+          buildBetterWebhook: base && bbSecret ? `${base}/webhooks/buildbetter?secret=${encodeURIComponent(bbSecret)}` : null,
+          buildBetterWebhookReady: Boolean(base && bbSecret)
+        });
       }
       if (method === "GET" && pathname === "/tools") return sendJson(res, 200, runtime.tools.list());
 
@@ -265,6 +277,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const body = await readJson(req);
         const result = await channels.handleTelegramWebhook(body);
         return sendJson(res, 200, result);
+      }
+
+      if (method === "POST" && pathname === "/webhooks/buildbetter") {
+        // Near-real-time push: BuildBetter pings here when a call finishes /
+        // an extraction lands, and we trigger a sync immediately instead of
+        // waiting for the 15-min poll. Fails closed without a configured
+        // secret. The payload itself is advisory — we re-pull via the API
+        // (which dedupes), so a spoofed body can't inject tasks.
+        const expected = options.buildBetterWebhookSecret ?? process.env.BUILDBETTER_WEBHOOK_SECRET ?? null;
+        const bb = verifyBuildBetterWebhook({
+          headerValue: req.headers["x-buildbetter-webhook-secret"],
+          queryValue: url.searchParams.get("secret"),
+          expected
+        });
+        if (!bb.ok) return sendJson(res, 401, { error: "unauthorized", reason: bb.reason });
+        await readJson(req).catch(() => ({})); // drain body; we don't trust it for ingestion
+        const source = runtime.buildBetterTaskSource;
+        if (!source?.triggerSync) return sendJson(res, 503, { error: "buildbetter source not configured" });
+        // Don't block the webhook response on the full sync — ack fast,
+        // sync in the background (BuildBetter expects a quick 200).
+        source.triggerSync().then(
+          (r) => runtime.events?.emit?.("integration-sync", { source: "buildbetter", trigger: "webhook", ...r }),
+          (err) => runtime.events?.emit?.("integration-sync", { source: "buildbetter", trigger: "webhook", error: err?.message })
+        );
+        return sendJson(res, 202, { accepted: true });
       }
 
       if (method === "POST" && pathname === "/channels/twilio/webhook") {
@@ -3047,8 +3084,11 @@ function timeAgo(iso) {
 
 async function renderChannels() {
   const ch = await fetchJson("/channels");
+  const bbWebhookLine = ch.buildBetterWebhook
+    ? \`<div class="desc" style="margin-top:6px;">BuildBetter webhook: <code>\${escapeHtml(ch.buildBetterWebhook)}</code> <span class="sub">— paste into BuildBetter to sync calls instantly</span></div>\`
+    : (ch.publicUrl ? \`<div class="desc" style="margin-top:6px;" class="sub">BuildBetter webhook: set <code>BUILDBETTER_WEBHOOK_SECRET</code> to enable instant call sync.</div>\` : "");
   const tunnelBlock = ch.publicUrl
-    ? \`<div class="card"><div class="name">Public URL</div><div class="desc"><code>\${escapeHtml(ch.publicUrl)}</code></div><div class="desc" style="margin-top:6px;">Twilio webhook: <code>\${escapeHtml(ch.twilioWebhook)}</code></div></div>\`
+    ? \`<div class="card"><div class="name">Public URL</div><div class="desc"><code>\${escapeHtml(ch.publicUrl)}</code></div><div class="desc" style="margin-top:6px;">Twilio webhook: <code>\${escapeHtml(ch.twilioWebhook)}</code></div>\${bbWebhookLine}</div>\`
     : \`<div class="card"><div class="name warn">No public URL</div><div class="desc">Run <code>npm run tunnel</code>, then set <code>OPENAGI_PUBLIC_URL</code> in .openagi/.env and restart.</div></div>\`;
   main.innerHTML = \`
     <div class="pane">

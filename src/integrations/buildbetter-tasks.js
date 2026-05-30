@@ -21,6 +21,11 @@ export class BuildBetterTaskSource {
     this.userEmail = options.userEmail ?? process.env.BUILDBETTER_USER_EMAIL ?? null;
     this.userName = options.userName ?? process.env.BUILDBETTER_USER_NAME ?? null;
     this.lastSyncedAt = null;
+    // Coalescing state for webhook-triggered syncs: if a sync is already
+    // running when a ping arrives, we don't start a second — we just flag
+    // that one more run is owed, and run it once when the current finishes.
+    this._syncing = false;
+    this._syncPending = false;
   }
 
   isConfigured() {
@@ -171,6 +176,27 @@ export class BuildBetterTaskSource {
 
     this.lastSyncedAt = now.toISOString();
     return { scanned: extractions.length, calls: calls.length, created };
+  }
+
+  // Webhook entry point: coalesce concurrent pings into a single in-flight
+  // sync plus at most one trailing run, so a burst of extraction events for
+  // one call doesn't fan out into a burst of BuildBetter API calls.
+  async triggerSync({ now = new Date() } = {}) {
+    if (this._syncing) {
+      this._syncPending = true;
+      return { coalesced: true };
+    }
+    this._syncing = true;
+    try {
+      let result = await this.sync({ now });
+      while (this._syncPending) {
+        this._syncPending = false;
+        result = await this.sync({ now: new Date() });
+      }
+      return result;
+    } finally {
+      this._syncing = false;
+    }
   }
 }
 
