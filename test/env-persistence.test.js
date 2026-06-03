@@ -23,3 +23,12 @@ test("saveEnv writes under OPENAGI_DATA_DIR and survives a reload", () => {
   _resetDataDirCache();
   fs.rmSync(tmp, { recursive: true, force: true });
 });
+
+test("envFilePath() returns absolute ~/.openagi/.env when OPENAGI_DATA_DIR is unset", () => {
+  const prev = process.env.OPENAGI_DATA_DIR;
+  delete process.env.OPENAGI_DATA_DIR;
+  _resetDataDirCache();
+  assert.equal(envFilePath(), path.join(os.homedir(), ".openagi", ".env"));
+  if (prev !== undefined) process.env.OPENAGI_DATA_DIR = prev;
+  _resetDataDirCache();
+});
