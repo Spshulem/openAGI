@@ -8,6 +8,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 const ALLOWED_ACTIONS = new Set([
   "open_app",
@@ -25,7 +26,7 @@ const ALLOWED_ACTIONS = new Set([
 export class SkillReplay {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.dataDir = options.dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi";
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.replayDir = path.join(this.dataDir, "replay");
     ensureDir(this.replayDir);
     this.events = options.events ?? null; // EventEmitter from hosted-interface

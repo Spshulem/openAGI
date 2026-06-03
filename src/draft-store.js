@@ -1,6 +1,7 @@
 import path from "node:path";
 import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Where the agent's draft-only work lands for human review — the surface
 // that makes "a drafted email is waiting for you" real instead of buried
@@ -23,7 +24,7 @@ export const DRAFT_KINDS = ["email", "message", "doc", "outline", "reply", "othe
 
 export class DraftStore {
   constructor({ dir, runtime } = {}) {
-    this.dir = dir ?? path.join(process.cwd(), ".openagi", "drafts");
+    this.dir = dir ?? path.join(resolveDataDir(), "drafts");
     this.runtime = runtime ?? null;
     ensureDir(this.dir);
     this.items = new Map();

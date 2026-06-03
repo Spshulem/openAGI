@@ -16,6 +16,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 let sqlite3Module = null;
 async function loadSqlite() {
@@ -31,7 +32,7 @@ async function loadSqlite() {
 
 export class ObservationStore {
   constructor(options = {}) {
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "observations");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "observations");
     this.dbPath = path.join(this.dir, "index.db");
     ensureDir(this.dir);
     this.db = null;

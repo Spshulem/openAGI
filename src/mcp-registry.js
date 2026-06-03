@@ -4,6 +4,7 @@ import { McpStdioClient } from "./mcp-client.js";
 import { McpHttpClient } from "./mcp-http-client.js";
 import { McpOAuthClient } from "./mcp-oauth.js";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Whitelist of executables permitted as the `command` for stdio MCP servers.
 // Anything not in this set is rejected at registerServer() — closes the
@@ -408,7 +409,7 @@ function expandEnv(obj, allowedKeys) {
 // We deliberately don't read process.env directly — only what the user has
 // explicitly placed in this file is eligible for ${VAR} substitution.
 function loadDotenvKeys(dataDir) {
-  const file = path.join(dataDir ?? ".openagi", ".env");
+  const file = path.join(dataDir ?? resolveDataDir(), ".env");
   let text;
   try { text = fs.readFileSync(file, "utf8"); } catch { return []; }
   const keys = [];

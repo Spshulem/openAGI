@@ -2,11 +2,12 @@ import path from "node:path";
 import { CronScheduler } from "./cron-scheduler.js";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 export class FileBackedCronScheduler extends CronScheduler {
   constructor(options = {}) {
     super();
-    this.storePath = options.storePath ?? path.join(process.cwd(), ".openagi", "cron", "jobs.json");
+    this.storePath = options.storePath ?? path.join(resolveDataDir(), "cron", "jobs.json");
     ensureDir(path.dirname(this.storePath));
     if (options.autoLoad !== false) this.load();
   }

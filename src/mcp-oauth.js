@@ -17,6 +17,7 @@ import { spawn } from "node:child_process";
 import { randomBytes, createHash } from "node:crypto";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 const DEFAULT_SCOPE = "openid profile email offline_access";
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000; // 5 min for the user to click through
@@ -27,7 +28,7 @@ export class McpOAuthClient {
     this.name = options.name ?? "mcp";
     this.resourceUrl = stripTrailingSlash(options.resourceUrl);
     this.scope = options.scope ?? DEFAULT_SCOPE;
-    this.dataDir = options.dataDir ?? path.join(process.cwd(), ".openagi");
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.cachePath = path.join(this.dataDir, "mcp", "auth", `${this.name}.json`);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.printAuthUrlFn = options.printAuthUrlFn ?? defaultPrintAuthUrl;

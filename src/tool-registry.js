@@ -1,4 +1,5 @@
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 export class ToolRegistry {
   constructor() {
@@ -800,8 +801,7 @@ export function registerCoreTools(registry, runtime) {
         const existing = process.env[entry.apiKeyEnvVar] ?? "";
         if (incoming) {
           const { saveEnv } = await import("./setup-wizard.js");
-          const path = await import("node:path");
-          const dataDir = process.env.OPENAGI_DATA_DIR ?? path.join(process.cwd(), ".openagi");
+          const dataDir = resolveDataDir();
           saveEnv({ dataDir, values: { [entry.apiKeyEnvVar]: incoming } });
         } else if (!existing) {
           throw new Error(`Catalog entry '${entry.id}' uses ${entry.apiKeyEnvVar} which isn't set. Ask the user for their key, then call this tool again with apiKey set.`);

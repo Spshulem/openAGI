@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { createDefaultRuntime } from "./abi-runtime.js";
+import { resolveDataDir } from "./data-dir.js";
 import {
   buildSetCookie,
   checkAuth,
@@ -186,7 +187,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname === "/setup/save") {
         const body = await readJson(req);
-        const dataDir = process.env.OPENAGI_DATA_DIR ?? ".openagi";
+        const dataDir = resolveDataDir();
         const result = saveEnv({ dataDir, values: body });
         try {
           const { createModelProvider } = await import("./model-provider.js");
@@ -561,7 +562,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             const existing = process.env[entry.apiKeyEnvVar] ?? "";
             if (incoming) {
               const { saveEnv } = await import("./setup-wizard.js");
-              const dataDir = process.env.OPENAGI_DATA_DIR ?? path.join(process.cwd(), ".openagi");
+              const dataDir = resolveDataDir();
               saveEnv({ dataDir, values: { [entry.apiKeyEnvVar]: incoming } });
             } else if (!existing) {
               return sendJson(res, 400, {
@@ -644,7 +645,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const enable = Boolean(body.enable);
         const { saveEnv } = await import("./setup-wizard.js");
         const { registerComputerUseTools, unregisterComputerUseTools } = await import("./integrations/computer-use.js");
-        const dataDir = process.env.OPENAGI_DATA_DIR ?? path.join(process.cwd(), ".openagi");
+        const dataDir = resolveDataDir();
         // saveEnv writes only allowlisted keys; OPENAGI_COMPUTER_USE has
         // to be in WIZARD_FIELDS (added in this commit) for the write to
         // land in .env.
@@ -1212,7 +1213,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         pendingOauth.delete(name);
         // Wipe cached OAuth tokens so the next connect starts a fresh flow.
         try {
-          const authPath = path.join(process.env.OPENAGI_DATA_DIR ?? ".openagi", "mcp", "auth", `${name}.json`);
+          const authPath = path.join(resolveDataDir(), "mcp", "auth", `${name}.json`);
           if (fsSync.existsSync(authPath)) fsSync.unlinkSync(authPath);
         } catch { /* ignore */ }
         return sendJson(res, 200, { ok: true });

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { resolveDataDir } from "./data-dir.js";
 import { AgentHost } from "./agent-host.js";
 import { FileBackedAgentStore } from "./agent-store.js";
 import { CronScheduler, createDailyAdaptationReviewJob } from "./cron-scheduler.js";
@@ -890,7 +891,7 @@ export function createDefaultRuntime(options = {}) {
 }
 
 export function createDurableRuntime(options = {}) {
-  const dataDir = options.dataDir ?? path.join(process.cwd(), ".openagi");
+  const dataDir = options.dataDir ?? resolveDataDir();
   const mcpLogDir = path.join(dataDir, "mcp", "logs");
   const runtime = createDefaultRuntime({
     ...options,

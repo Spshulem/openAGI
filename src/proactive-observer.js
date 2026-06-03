@@ -17,6 +17,7 @@ import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { matchCatalog } from "./mcp-catalog.js";
 import { buildReconciliationCalibration } from "./reconciliation-calibration.js";
+import { resolveDataDir } from "./data-dir.js";
 
 const SUGGEST_DIR = "proactive/suggestions";
 const DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000; // 6h — don't repeat the same proposal within a 6h window
@@ -57,7 +58,7 @@ const SYSTEM_PROMPT = [
 export class ProactiveObserver {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.dataDir = options.dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi";
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.suggestDir = path.join(this.dataDir, SUGGEST_DIR);
     this.lookbackMinutes = options.lookbackMinutes ?? 15;
     this.lastRunAt = 0;

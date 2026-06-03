@@ -1,5 +1,6 @@
 import path from "node:path";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 const DEFAULT_PRICES = {
   "claude-sonnet-4-6": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
@@ -12,7 +13,7 @@ const DEFAULT_PRICES = {
 
 export class BudgetGuard {
   constructor(options = {}) {
-    this.storePath = options.storePath ?? path.join(process.cwd(), ".openagi", "budget", "usage.json");
+    this.storePath = options.storePath ?? path.join(resolveDataDir(), "budget", "usage.json");
     this.dailyUsdLimit = options.dailyUsdLimit ?? Number.parseFloat(process.env.OPENAGI_DAILY_USD_LIMIT ?? "10");
     this.prices = { ...DEFAULT_PRICES, ...(options.prices ?? {}) };
     ensureDir(path.dirname(this.storePath));
