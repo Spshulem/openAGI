@@ -20,7 +20,7 @@ export class McpRegistry {
     this.servers = new Map();
     this.clients = new Map();
     this.logDir = options.logDir;
-    this.dataDir = options.dataDir ?? (options.logDir ? path.dirname(path.dirname(options.logDir)) : ".openagi");
+    this.dataDir = options.dataDir ?? (options.logDir ? path.dirname(path.dirname(options.logDir)) : resolveDataDir());
     this.toolRegistry = options.toolRegistry ?? null;
     // Set by hosted-interface so OAuth-required surfaces in the dashboard SSE.
     this.onOauthRequired = options.onOauthRequired ?? null;
