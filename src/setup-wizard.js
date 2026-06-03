@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { ensureDir, writeTextAtomic } from "./file-utils.js";
 import { generateToken } from "./auth.js";
 import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
 // configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
@@ -41,7 +42,7 @@ export function isFirstRun() {
 }
 
 export function envFilePath(dataDir) {
-  return path.join(dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi", ".env");
+  return path.join(dataDir ?? resolveDataDir(), ".env");
 }
 
 export function readExistingEnv(dataDir) {

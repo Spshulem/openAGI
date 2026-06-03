@@ -1,13 +1,13 @@
 import path from "node:path";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { loadEnvFile } from "../src/file-utils.js";
+import { resolveDataDir } from "../src/data-dir.js";
 
-const dataDir = process.env.OPENAGI_DATA_DIR ?? ".openagi";
+const dataDir = resolveDataDir();
 
-// Load env in priority order — explicit data dir wins over the conventional fallbacks.
-loadEnvFile(path.join(dataDir, ".env"));
-loadEnvFile(".env");
-loadEnvFile(".openagi/.env");
+// Load env in priority order — canonical data dir wins over local-dev overrides.
+loadEnvFile(path.join(dataDir, ".env")); // canonical (loadEnvFile is first-wins)
+loadEnvFile(".env");                      // optional local-dev override in cwd
 
 const port = Number.parseInt(process.env.PORT ?? "43210", 10);
 const host = process.env.HOST ?? "127.0.0.1";
