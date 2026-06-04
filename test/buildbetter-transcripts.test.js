@@ -40,3 +40,53 @@ test("ingestMode defaults to signals", () => {
   assert.equal(src.ingestMode, "signals");
   if (prev !== undefined) process.env.BUILDBETTER_INGEST_MODE = prev;
 });
+
+test("getTranscript assembles speaker-labeled lines, falling back to Speaker N", async () => {
+  const src = new BuildBetterTaskSource({ apiKey: "k", userEmail: "me@x.com" });
+  src.query = async () => ({
+    interview: [{
+      id: 7,
+      monologues: [
+        { speaker: 0, text: "Hello there", attendee: { person: { first_name: "Ada", last_name: "Lovelace" } } },
+        { speaker: 1, text: "Hi", attendee: null }
+      ]
+    }]
+  });
+  const t = await src.getTranscript(7);
+  assert.equal(t, "Ada Lovelace: Hello there\nSpeaker 1: Hi");
+});
+
+test("getTranscript returns empty string when there are no monologues", async () => {
+  const src = new BuildBetterTaskSource({ apiKey: "k", userEmail: "me@x.com" });
+  src.query = async () => ({ interview: [{ id: 7, monologues: [] }] });
+  assert.equal(await src.getTranscript(7), "");
+});
+
+test("sync dispatches by ingestMode", async () => {
+  const calls = [];
+  const make = (mode) => {
+    const src = new BuildBetterTaskSource({ apiKey: "k", userEmail: "me@x.com", ingestMode: mode });
+    src.syncSignals = async () => { calls.push(`${mode}:signals`); return { created: 0 }; };
+    src.syncTranscripts = async () => { calls.push(`${mode}:transcripts`); return { created: 0 }; };
+    return src;
+  };
+  await make("signals").sync({ now: new Date("2026-06-02T00:00:00Z") });
+  await make("transcripts").sync({ now: new Date("2026-06-02T00:00:00Z") });
+  await make("both").sync({ now: new Date("2026-06-02T00:00:00Z") });
+  assert.deepEqual(calls, [
+    "signals:signals",
+    "transcripts:transcripts",
+    "both:signals", "both:transcripts"
+  ]);
+});
+
+test("syncTranscripts does not refetch an already-ingested transcript", async () => {
+  const observations = fakeObservations();
+  const src = new BuildBetterTaskSource({ apiKey: "k", userEmail: "me@x.com", runtime: { observations } });
+  src.getRecentCalls = async () => [{ id: 7, name: "Acme", started_at: "2026-06-01T10:00:00Z" }];
+  let fetchCount = 0;
+  src.getTranscript = async () => { fetchCount += 1; return "some transcript text"; };
+  await src.syncTranscripts({ now: new Date("2026-06-02T00:00:00Z") });
+  await src.syncTranscripts({ now: new Date("2026-06-02T00:05:00Z") });
+  assert.equal(fetchCount, 1, "transcript fetched once; second run skips via existsRef");
+});

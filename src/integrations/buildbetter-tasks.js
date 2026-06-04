@@ -187,7 +187,6 @@ export class BuildBetterTaskSource {
       query Transcript($id: bigint!) {
         interview(where: { id: { _eq: $id } }, limit: 1) {
           id
-          transcript_status
           monologues(order_by: { start_sec: asc }) {
             speaker
             text
@@ -222,6 +221,7 @@ export class BuildBetterTaskSource {
     }
 
     let created = 0;
+    let failed = 0;
     for (const call of calls) {
       const ref = `buildbetter:call:${call.id}`;
       if (await this.runtime.observations.existsRef(ref)) continue;
@@ -229,6 +229,7 @@ export class BuildBetterTaskSource {
       try {
         text = await this.getTranscript(call.id);
       } catch (err) {
+        failed += 1;
         continue; // skip this call; retry next sweep
       }
       if (!text) continue;
@@ -242,7 +243,7 @@ export class BuildBetterTaskSource {
       });
       created += 1;
     }
-    return { scanned: calls.length, created };
+    return { scanned: calls.length, created, failed };
   }
 
   // Mode-aware dispatcher invoked by the cron handler and triggerSync().
