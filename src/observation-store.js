@@ -185,10 +185,13 @@ export class ObservationStore {
     if (this.fallback) {
       try {
         const rows = fs.readFileSync(this.fallbackPath, "utf8").split("\n").filter(Boolean).map(JSON.parse);
-        return rows.some((o) => o.ref === ref);
+        return rows.some((o) => o.kind === "transcript" && o.ref === ref);
       } catch { return false; }
     }
-    const row = this.db.prepare(`SELECT 1 FROM texts WHERE ref = ? LIMIT 1`).get(ref);
+    // `ref` is UNINDEXED in the FTS5 table so this is a small scan; fine for the
+    // handful of transcript rows a sync checks. Scoped to kind='transcript' so the
+    // dedup check never collides with activity/frame refs.
+    const row = this.db.prepare(`SELECT 1 FROM texts WHERE kind = 'transcript' AND ref = ? LIMIT 1`).get(ref);
     return Boolean(row);
   }
 
