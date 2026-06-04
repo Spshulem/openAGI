@@ -117,6 +117,11 @@ export class ObservationStore {
           const uid = o.frameId ? String(o.frameId) : createId("frm");
           insertFrame.run(uid, o.at ?? nowIso(), o.app ?? null, o.window ?? null, o.thumbnail ?? null, typeof o.confidence === "number" ? o.confidence : null);
           if (o.ocrText) insertText.run("frame", uid, o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.ocrText);
+        } else if (o.kind === "transcript") {
+          // Long-form text (e.g. a BuildBetter call transcript) recorded so it's
+          // searchable via the same FTS path as OCR/activity (and thus recall_activity).
+          const ref = o.ref ? String(o.ref) : createId("txt");
+          if (o.text) insertText.run("transcript", ref, o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.text);
         }
         count += 1;
       }
@@ -137,7 +142,7 @@ export class ObservationStore {
       let out = rows;
       if (query) {
         const q = query.toLowerCase();
-        out = out.filter((o) => (o.ocrText || "").toLowerCase().includes(q) || (o.window || "").toLowerCase().includes(q));
+        out = out.filter((o) => (o.ocrText || "").toLowerCase().includes(q) || (o.window || "").toLowerCase().includes(q) || (o.text || "").toLowerCase().includes(q));
       }
       if (app) out = out.filter((o) => o.app === app);
       if (since) out = out.filter((o) => (o.at ?? "") >= since);
@@ -172,6 +177,19 @@ export class ObservationStore {
     if (until) { where += " AND at <= ?"; params.push(until); }
     params.push(limit);
     return this.db.prepare(`SELECT 'activity' AS kind, app, window, at, event FROM activity WHERE ${where} ORDER BY at DESC LIMIT ?`).all(...params);
+  }
+
+  async existsRef(ref) {
+    await this.ready;
+    if (!ref) return false;
+    if (this.fallback) {
+      try {
+        const rows = fs.readFileSync(this.fallbackPath, "utf8").split("\n").filter(Boolean).map(JSON.parse);
+        return rows.some((o) => o.ref === ref);
+      } catch { return false; }
+    }
+    const row = this.db.prepare(`SELECT 1 FROM texts WHERE ref = ? LIMIT 1`).get(ref);
+    return Boolean(row);
   }
 
   // Build a compact "what was the user just doing" digest the agent host
