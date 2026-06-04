@@ -16,6 +16,7 @@ import { registerInboxWatcher } from "./integrations/inbox-watcher.js";
 import { registerIMessagePoller } from "./integrations/imessage-poller.js";
 import { registerBuildBetterTaskSource } from "./integrations/buildbetter-tasks.js";
 import { registerCalendarIntegration } from "./integrations/calendar.js";
+import { registerWebSearchTools } from "./integrations/web-search.js";
 import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemoryCondenser } from "./memory-condenser.js";
@@ -381,6 +382,9 @@ export class AbiRuntime {
       // The source attaches to runtime even when disabled so the dashboard
       // can render the toggle + permission status.
       registerIMessagePoller(this);
+      // Web search tools (web_search / fetch_url). Always registered; web_search
+      // returns a clear "no provider configured" error until a key is set.
+      registerWebSearchTools(this);
     }
   }
 
