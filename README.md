@@ -436,6 +436,34 @@ Additional defenses:
 
 See `.env.example`. All keys read from `.env` and `~/.openagi/.env` (override the location with `OPENAGI_DATA_DIR`).
 
+### Web search
+
+The agent gains two tools — `web_search` and `fetch_url` — once at least one provider key is set. With no key configured, `web_search` returns a clear "no provider configured" error and `fetch_url` still works via a plain HTTP fetch.
+
+| Variable | Provider |
+|---|---|
+| `EXA_API_KEY` | [Exa](https://exa.ai) (default first choice) |
+| `TAVILY_API_KEY` | [Tavily](https://tavily.com) |
+| `BRAVE_API_KEY` | [Brave Search](https://brave.com/search/api/) |
+| `SERPAPI_API_KEY` | [SerpApi](https://serpapi.com) |
+| `FIRECRAWL_API_KEY` | [Firecrawl](https://firecrawl.dev) |
+| `PERPLEXITY_API_KEY` | [Perplexity](https://www.perplexity.ai/api) |
+| `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` | Google Custom Search (alternative to the above) |
+
+`WEB_SEARCH_PROVIDER` — optional. Force a specific provider (`exa`, `tavily`, `firecrawl`, `brave`, `perplexity`, or `serpapi`). When unset the agent auto-selects the first configured provider in priority order `exa → tavily → brave → serpapi → firecrawl → perplexity`, falling back to the next on error.
+
+### BuildBetter
+
+Set `BUILDBETTER_API_KEY`, `BUILDBETTER_USER_EMAIL`, and `BUILDBETTER_USER_NAME` to enable the BuildBetter integration.
+
+`BUILDBETTER_INGEST_MODE` controls what the integration ingests:
+
+| Value | Behavior |
+|---|---|
+| `signals` _(default)_ | Action items from calls become agent tasks |
+| `transcripts` | Call transcripts are stored as searchable memory (queryable via `recall_activity`) |
+| `both` | Both of the above |
+
 ## Tests
 
 ```bash

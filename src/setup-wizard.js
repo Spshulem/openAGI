@@ -25,6 +25,10 @@ const WIZARD_FIELDS = [
   "OPENAGI_COMPUTER_USE",
   "OPENAGI_PUBLIC_URL",
   "OPENAGI_DAILY_USD_LIMIT",
+  "EXA_API_KEY", "TAVILY_API_KEY", "FIRECRAWL_API_KEY", "BRAVE_API_KEY",
+  "PERPLEXITY_API_KEY", "SERPAPI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CSE_ID",
+  "WEB_SEARCH_PROVIDER",
+  "BUILDBETTER_INGEST_MODE",
   // Per-MCP bearer keys, declared by catalog entries via apiKeyEnvVar.
   // Kept in this allowlist so the wizard's /setup/save can write them.
   ...MCP_CATALOG.filter((e) => e.apiKeyEnvVar).map((e) => e.apiKeyEnvVar)
