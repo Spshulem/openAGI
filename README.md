@@ -232,7 +232,7 @@ npm run tunnel    # cloudflared (preferred) or ngrok, auto-detected
 
 ### Twilio bidirectional SMS
 
-1. Drop credentials into `.openagi/.env`:
+1. Drop credentials into `~/.openagi/.env`:
     ```bash
     TWILIO_ACCOUNT_SID=AC...
     TWILIO_AUTH_TOKEN=...
@@ -254,7 +254,7 @@ npm run tunnel    # cloudflared (preferred) or ngrok, auto-detected
 
 ### Telegram
 
-Create a bot via [@BotFather](https://t.me/BotFather), drop the token in `.openagi/.env`:
+Create a bot via [@BotFather](https://t.me/BotFather), drop the token in `~/.openagi/.env`:
 
 ```bash
 TELEGRAM_BOT_TOKEN=...
@@ -310,7 +310,7 @@ Drop a config at `.openagi/mcp.json`:
 
 Three transport+auth shapes are supported: **stdio** (spawn local process), **http+bearer** (URL with static API key), **http+oauth** (URL with browser-based OAuth — supports both dynamic registration and pre-registered clients).
 
-For the bearer shape, reference your secrets via `.openagi/.env` only — `${VAR}` substitution is allowlisted to keys defined in that file (closes the env-var exfiltration class). Restart the daemon and click **Connect** in the MCP tab — or:
+For the bearer shape, reference your secrets via `~/.openagi/.env` only — `${VAR}` substitution is allowlisted to keys defined in that file (closes the env-var exfiltration class). Restart the daemon and click **Connect** in the MCP tab — or:
 
 ```bash
 curl -s -X POST http://127.0.0.1:43210/mcp/connect/filesystem \
@@ -397,7 +397,7 @@ Webhooks self-validate instead:
 Additional defenses:
 
 - **Cross-origin POST blocked** — any browser request whose `Origin` doesn't match `Host` is rejected with 403, regardless of auth state.
-- **MCP register hardening** — `command` is allowlisted to known runners (`npx`, `node`, `bun`, `deno`, `python3`, `uvx`, `docker`); URL hosts may not be loopback / RFC1918 / link-local / cloud-metadata; `${VAR}` substitution is allowlisted to keys explicitly declared in `.openagi/.env`.
+- **MCP register hardening** — `command` is allowlisted to known runners (`npx`, `node`, `bun`, `deno`, `python3`, `uvx`, `docker`); URL hosts may not be loopback / RFC1918 / link-local / cloud-metadata; `${VAR}` substitution is allowlisted to keys explicitly declared in `~/.openagi/.env`.
 
 ---
 
@@ -434,7 +434,7 @@ Additional defenses:
 
 ## Environment
 
-See `.env.example`. All keys read from `.env` and `.openagi/.env`.
+See `.env.example`. All keys read from `.env` and `~/.openagi/.env` (override the location with `OPENAGI_DATA_DIR`).
 
 ## Tests
 

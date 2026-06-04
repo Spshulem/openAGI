@@ -37,6 +37,7 @@ Type=simple
 ExecStart=${NODE_BIN} ${PROJECT_DIR}/examples/hosted-server.js
 WorkingDirectory=${PROJECT_DIR}
 EnvironmentFile=-${PROJECT_DIR}/.openagi/.env
+Environment=OPENAGI_DATA_DIR=${HOME}/.openagi
 Restart=on-failure
 RestartSec=10s
 StandardOutput=journal
@@ -47,7 +48,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=${PROJECT_DIR}/.openagi
+ReadWritePaths=${PROJECT_DIR}/.openagi ${HOME}/.openagi
 
 [Install]
 WantedBy=${1:-multi-user.target}
