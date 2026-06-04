@@ -39,3 +39,27 @@ test("web_search returns a clear error when nothing is configured", async () => 
   const { result } = await tools.invoke("web_search", { query: "hi" });
   assert.match(result.error, /no web search provider/i);
 });
+
+test("web_search honors WEB_SEARCH_PROVIDER as the default and doesn't double-try it", async () => {
+  const calls = [];
+  const tools = new ToolRegistry();
+  registerWebSearchTools({ tools }, {
+    providers: [
+      fakeProvider("exa", async () => { calls.push("exa"); throw new Error("exa down"); }),
+      fakeProvider("tavily", async () => { calls.push("tavily"); throw new Error("tavily down"); }),
+      fakeProvider("brave", async () => { calls.push("brave"); return [{ title: "B", url: "u", snippet: "s" }]; })
+    ]
+  });
+  const prev = process.env.WEB_SEARCH_PROVIDER;
+  process.env.WEB_SEARCH_PROVIDER = "tavily";
+  try {
+    const { result } = await tools.invoke("web_search", { query: "hi" });
+    // tavily is tried first (env default), fails, then exa, then brave succeeds.
+    assert.equal(calls[0], "tavily", "env-default provider must be tried first");
+    assert.equal(result.provider, "brave");
+    // tavily appears exactly once despite being both env-default and in the list.
+    assert.equal(calls.filter((c) => c === "tavily").length, 1, "env default must not be tried twice");
+  } finally {
+    if (prev !== undefined) process.env.WEB_SEARCH_PROVIDER = prev; else delete process.env.WEB_SEARCH_PROVIDER;
+  }
+});
