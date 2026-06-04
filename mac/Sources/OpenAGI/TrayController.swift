@@ -206,6 +206,10 @@ struct TrayMenu: View {
       Button(UpdateController.shared.isEnabled ? "Check for updates…" : "About auto-updates…") {
         UpdateController.shared.checkForUpdates()
       }
+      Toggle("Open at Login", isOn: Binding(
+        get: { LoginItem.isEnabled },
+        set: { LoginItem.setEnabled($0) }
+      ))
       Divider()
       Button("Quit OpenAGI") {
         DaemonController.shared.stop()

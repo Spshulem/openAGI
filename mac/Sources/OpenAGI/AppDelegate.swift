@@ -14,6 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       UNUserNotificationCenter.current().delegate = self
       UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
+      LoginItem.registerOnFirstLaunchIfNeeded()
+
       DaemonController.shared.start()
       AppState.shared.startPolling()
       AppState.shared.startSSE()
