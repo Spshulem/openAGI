@@ -18,6 +18,18 @@ import { ensureDir } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 
+// Cap the `text` returned by search() for long-form transcript rows so a
+// single hit can't dump an entire call transcript into a tool result. The
+// FTS `snippet` already carries the match context; full text stays in the DB.
+const TRANSCRIPT_SEARCH_TEXT_CAP = 1000;
+
+function capTranscriptText(row) {
+  if (row && row.kind === "transcript" && typeof row.text === "string" && row.text.length > TRANSCRIPT_SEARCH_TEXT_CAP) {
+    return { ...row, text: row.text.slice(0, TRANSCRIPT_SEARCH_TEXT_CAP) + "…" };
+  }
+  return row;
+}
+
 let sqlite3Module = null;
 async function loadSqlite() {
   if (sqlite3Module) return sqlite3Module;
@@ -147,7 +159,7 @@ export class ObservationStore {
       if (app) out = out.filter((o) => o.app === app);
       if (since) out = out.filter((o) => (o.at ?? "") >= since);
       if (until) out = out.filter((o) => (o.at ?? "") <= until);
-      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(0, limit);
+      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(0, limit).map(capTranscriptText);
     }
 
     if (query) {
@@ -167,7 +179,7 @@ export class ObservationStore {
       if (since) params.push(since);
       if (until) params.push(until);
       params.push(limit);
-      return rows.all(...params);
+      return rows.all(...params).map(capTranscriptText);
     }
     // No query → return recent activity by default.
     const params = [];
