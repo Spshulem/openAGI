@@ -287,6 +287,18 @@ Privacy posture (non-negotiable):
 
 ---
 
+## Floating widget — Quick Ask
+
+Press **⌥Space** (or click the tray icon → **Quick Ask**) to summon a small always-on-top pill that expands into an ask box over any app.
+
+**Screen context.** On each ask, the widget does an on-device OCR grab of the focused window using the same ScreenCaptureKit pipeline as the pattern miner. The capture exclusion list applies — 1Password, banking sites, 2FA screens, and private windows are never read. Requires **Screen Recording** permission; without it, the ask still works but the panel shows "no screen context."
+
+**Proactive nudges.** Suggestions from the agent's scrutiny layer surface as a badge on the pill. Open the nudge list to send it to chat or dismiss it.
+
+**Toggle.** Enable or disable the whole feature from the tray via **Enable Quick Ask** (on by default).
+
+---
+
 ## MCP servers
 
 Drop a config at `.openagi/mcp.json`:
