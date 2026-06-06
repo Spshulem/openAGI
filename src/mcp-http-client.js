@@ -53,8 +53,11 @@ export class McpHttpClient {
     };
   }
 
-  async connect() {
+  async connect({ interactive = true } = {}) {
     if (this.connected) return { tools: this.tools, serverInfo: this.serverInfo };
+    // Applies for the duration of this connect's requests; controls whether an
+    // OAuth token miss may open a browser (true) or must fail fast (false).
+    this._interactiveAuth = interactive;
     if (this.logDir) ensureDir(this.logDir);
     try {
       this.serverInfo = await this.request(
@@ -113,7 +116,7 @@ export class McpHttpClient {
     };
     if (this.bearerToken) headers.authorization = `Bearer ${this.bearerToken}`;
     if (this.oauth) {
-      const token = await this.oauth.ensureToken();
+      const token = await this.oauth.ensureToken({ interactive: this._interactiveAuth ?? true });
       headers.authorization = `Bearer ${token}`;
     }
     if (this.sessionId) headers["mcp-session-id"] = this.sessionId;

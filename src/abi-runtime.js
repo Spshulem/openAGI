@@ -929,5 +929,13 @@ export function createDurableRuntime(options = {}) {
   });
   const mcpConfigPath = options.mcpConfigPath ?? path.join(dataDir, "mcp.json");
   runtime.mcp.loadConfigFile(mcpConfigPath);
+  // Reconnect previously-authorized MCP servers on boot, silently — servers
+  // with a cached OAuth token / bearer key / stdio command come back "live"
+  // instead of showing "idle" until someone clicks Connect. Never opens a
+  // browser: OAuth servers without a usable token just stay idle. Non-blocking
+  // and best-effort so a slow/dead server can't hold up startup.
+  if (options.autoConnectMcp !== false && runtime.mcp?.connectAll) {
+    Promise.resolve().then(() => runtime.mcp.connectAll({ silent: true })).catch(() => {});
+  }
   return runtime;
 }
