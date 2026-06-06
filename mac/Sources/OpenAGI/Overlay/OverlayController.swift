@@ -31,14 +31,16 @@ final class OverlayController {
     if panel?.isVisible == true {
       OverlayState.shared.expanded.toggle()
       sizeToContent()
+      if OverlayState.shared.expanded { panel?.makeKey() }
     } else {
       OverlayState.shared.expanded = true
       show(); sizeToContent()
+      panel?.makeKey()
     }
   }
 
   private func makePanel() -> NSPanel {
-    let p = NSPanel(
+    let p = KeyableOverlayPanel(
       contentRect: NSRect(x: 0, y: 0, width: 320, height: 60),
       styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
       backing: .buffered, defer: false)
@@ -85,4 +87,11 @@ final class OverlayController {
     UserDefaults.standard.set(Double(p.frame.origin.x), forKey: Self.frameKey)
     UserDefaults.standard.set(Double(p.frame.origin.y), forKey: "openagi.overlay.originY")
   }
+}
+
+// Borderless NSPanels return false for canBecomeKey by default; override so the
+// Quick Ask field can receive keystrokes. .nonactivatingPanel keeps the owning
+// app from activating, so summoning never steals focus from the user's app.
+final class KeyableOverlayPanel: NSPanel {
+  override var canBecomeKey: Bool { true }
 }
