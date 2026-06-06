@@ -105,7 +105,7 @@ export class AgentHost {
         }
       })),
       messages: sessionBefore.messages,
-      instructions: this.instructionsForAgent(agent, output, intuitions, ambientContext),
+      instructions: this.instructionsForAgent(agent, output, intuitions, ambientContext, input.metadata?.screenContext ?? null),
       tools,
       toolRegistry,
       context: {
@@ -241,7 +241,7 @@ export class AgentHost {
     };
   }
 
-  instructionsForAgent(agent, output, intuitions = [], ambientContext = null) {
+  instructionsForAgent(agent, output, intuitions = [], ambientContext = null, screenContext = null) {
     const intuitionBlock = intuitions.length > 0
       ? `\nIntuitions (distilled long-term principles, may apply):\n${intuitions.map((i) => `- (${i.score.toFixed(2)}) ${i.text}`).join("\n")}\n`
       : "";
@@ -264,6 +264,8 @@ export class AgentHost {
       ambientBlock = lines.join("\n") + "\n";
     }
 
+    const screenBlock = formatScreenContextBlock(screenContext);
+
     return `${agent.systemPrompt ? `${agent.systemPrompt}\n\n` : ""}You are ${agent.name}, an always-on OpenAGI agent.
 
 Your job is to help through the ABI loop:
@@ -274,7 +276,7 @@ Your job is to help through the ABI loop:
 Current decision: ${output.scrutiny.action}
 Reasons:
 ${output.scrutiny.reasons.map((reason) => `- ${reason}`).join("\n")}
-${intuitionBlock}${ambientBlock}
+${intuitionBlock}${ambientBlock}${screenBlock}
 Answer the user plainly. If a specialist was created, mention its name and scope.`;
   }
 
@@ -307,6 +309,18 @@ Stay inside the bounded scope. If the user's request falls outside it, say so an
       sessions: this.store.listSessions()
     };
   }
+}
+
+// Format the fresh focused-window context the floating widget attaches to a
+// message (metadata.screenContext = { app, window, text }) into a labeled
+// prompt block. Returns "" when absent/empty. Pure + exported for testing.
+export function formatScreenContextBlock(screenContext) {
+  if (!screenContext || typeof screenContext.text !== "string" || !screenContext.text.trim()) return "";
+  const where = screenContext.window
+    ? `${screenContext.app || "?"} · ${screenContext.window}`
+    : (screenContext.app || "active window");
+  const body = screenContext.text.slice(0, 4000);
+  return `\nActive window the user is looking at right now (${where}):\n${body}\nGround your answer in this if it's relevant; don't quote it back verbatim.\n`;
 }
 
 // Maps a provider class to a short user-facing label. Avoids leaking
