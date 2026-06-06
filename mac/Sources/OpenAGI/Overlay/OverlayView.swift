@@ -57,6 +57,25 @@ struct OverlayView: View {
         Button("Continue in chat") { app.openDashboard(path: "/?tab=chat") }
           .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
       }
+      if !app.nudges.isEmpty {
+        Divider()
+        Text("Nudges").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+        ForEach(app.nudges.prefix(4)) { n in
+          HStack(alignment: .top, spacing: 6) {
+            VStack(alignment: .leading, spacing: 1) {
+              Text(n.title).font(.system(size: 11, weight: .medium))
+              if !n.body.isEmpty { Text(n.body).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2) }
+            }
+            Spacer()
+            Button(action: { app.openDashboard(path: "/?tab=chat&suggestion=\(n.id)") }) {
+              Image(systemName: "arrow.up.right.square")
+            }.buttonStyle(.plain).help("Review in chat")
+            Button(action: { app.nudges.removeAll { $0.id == n.id } }) {
+              Image(systemName: "xmark")
+            }.buttonStyle(.plain).help("Dismiss")
+          }
+        }
+      }
     }
     .padding(12)
     .frame(width: 320)
