@@ -206,6 +206,11 @@ struct TrayMenu: View {
       Button(UpdateController.shared.isEnabled ? "Check for updates…" : "About auto-updates…") {
         UpdateController.shared.checkForUpdates()
       }
+      Button("Quick Ask  ⌥Space") { OverlayController.shared.toggle() }
+      Toggle("Enable Quick Ask", isOn: Binding(
+        get: { OverlayController.isEnabled },
+        set: { OverlayController.setEnabled($0) }
+      ))
       Toggle("Open at Login", isOn: Binding(
         get: { LoginItem.isEnabled },
         set: { LoginItem.setEnabled($0) }

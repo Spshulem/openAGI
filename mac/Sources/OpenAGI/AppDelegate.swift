@@ -22,6 +22,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       UpdateController.shared.start()
       CaptureController.shared.start()
       ReplayController.shared.start()
+      OverlayController.shared.startIfEnabled()
+      HotkeyManager.shared.onHotkey = { OverlayController.shared.toggle() }
+      HotkeyManager.shared.register()
 
       // Wake observer: the moment macOS resumes from sleep we (1) probe
       // /health to see if the daemon survived the sleep cycle, restart
@@ -52,6 +55,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       ReplayController.shared.stop()
       CaptureController.shared.stop()
       _ = await CaptureBridge.flushNow()
+      OverlayController.shared.persistPosition()
+      HotkeyManager.shared.unregister()
       DaemonController.shared.stop()
     }
   }
