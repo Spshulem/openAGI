@@ -3,6 +3,7 @@ import SwiftUI
 struct OverlayView: View {
   @ObservedObject var state = OverlayState.shared
   @ObservedObject var app = AppState.shared
+  @FocusState private var fieldFocused: Bool
   var onCollapse: () -> Void = {}
 
   var body: some View {
@@ -42,6 +43,7 @@ struct OverlayView: View {
       }
       TextField("Ask about what you're looking at…", text: $state.question)
         .textFieldStyle(.roundedBorder)
+        .focused($fieldFocused)
         .disabled(app.status == .down)
         .onSubmit { Task { await state.ask() } }
       if let note = state.contextNote {
@@ -80,5 +82,7 @@ struct OverlayView: View {
     .padding(12)
     .frame(width: 320)
     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+    .onAppear { fieldFocused = true }
+    .onChange(of: state.expanded) { _, expanded in if expanded { fieldFocused = true } }
   }
 }
