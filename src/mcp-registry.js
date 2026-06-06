@@ -234,15 +234,18 @@ export class McpRegistry {
     return this.connecting.has(name);
   }
 
-  async connect(name) {
+  async connect(name, { silent = false } = {}) {
     if (this.connecting.has(name)) return this.connecting.get(name);
-    const promise = this.doConnect(name);
+    const promise = this.doConnect(name, { silent });
     this.connecting.set(name, promise);
-    promise.finally(() => this.connecting.delete(name));
+    // The caller awaits `promise` and handles its rejection; this cleanup chain
+    // is separate, so swallow its copy of the rejection to avoid an
+    // unhandledRejection when a connect fails (e.g. silent boot reconnect).
+    promise.finally(() => this.connecting.delete(name)).catch(() => {});
     return promise;
   }
 
-  async doConnect(name) {
+  async doConnect(name, { silent = false } = {}) {
     const server = this.servers.get(name);
     if (!server) throw new Error(`Unknown MCP server: ${name}`);
     if (!server.enabled) throw new Error(`MCP server ${name} is disabled.`);
@@ -302,12 +305,13 @@ export class McpRegistry {
       }
       this.clients.set(name, client);
     }
-    await client.connect();
+    // silent → never open a browser for OAuth; fail fast if a token isn't cached.
+    await client.connect({ interactive: !silent });
     this.exposeAsTools(server.name);
     return client.status();
   }
 
-  async connectAll() {
+  async connectAll({ silent = false } = {}) {
     const results = [];
     for (const [name, server] of this.servers) {
       if (!server.enabled) continue;
@@ -315,10 +319,10 @@ export class McpRegistry {
       if (server.transport === "http" && !server.url) continue;
       if (server.transport !== "stdio" && server.transport !== "http") continue;
       try {
-        const status = await this.connect(name);
+        const status = await this.connect(name, { silent });
         results.push({ name, ok: true, status });
       } catch (error) {
-        results.push({ name, ok: false, error: error.message });
+        results.push({ name, ok: false, error: error.message, code: error.code ?? null });
       }
     }
     return results;

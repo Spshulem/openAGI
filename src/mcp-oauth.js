@@ -64,7 +64,7 @@ export class McpOAuthClient {
    * Return a valid access token. Uses cached if not expired, refreshes if it
    * has a refresh_token, otherwise runs the full authorization code flow.
    */
-  async ensureToken() {
+  async ensureToken({ interactive = true } = {}) {
     const cache = this.loadCache() ?? {};
     if (cache.access_token && !this.isExpired(cache)) {
       return cache.access_token;
@@ -77,6 +77,14 @@ export class McpOAuthClient {
         // fall through to full flow
         cache.refresh_token = null;
       }
+    }
+    // Non-interactive callers (e.g. silent reconnect on daemon boot) must never
+    // trigger the browser flow — surface a typed error so the caller can leave
+    // the server "idle" with a Connect button instead of popping a window.
+    if (!interactive) {
+      const err = new Error(`OAuth authorization required for ${this.name}`);
+      err.code = "OAUTH_INTERACTIVE_REQUIRED";
+      throw err;
     }
     await this.authorize();
     return this.loadCache().access_token;
