@@ -26,6 +26,14 @@ final class AppState: ObservableObject {
   @Published var recentSessions: [SessionSummary] = []
   @Published var topTasks: [TaskSummary] = []
   @Published var paused: Bool = false
+  @Published var nudges: [Nudge] = []
+
+  struct Nudge: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let body: String
+    let category: String
+  }
 
   private var pollTimer: Timer?
   private var sseTask: URLSessionDataTask?
@@ -262,6 +270,15 @@ final class AppState: ObservableObject {
       let suggestionId = parseField(data, "id") ?? ""
       let pathPart = suggestionId.isEmpty ? "/?tab=chat" : "/?tab=chat&suggestion=\(urlEncode(suggestionId))"
       notify(title: title, body: body, path: pathPart)
+      let nudge = Nudge(
+        id: suggestionId.isEmpty ? UUID().uuidString : suggestionId,
+        title: parsed.name ?? "OpenAGI noticed something",
+        body: body,
+        category: category
+      )
+      nudges.removeAll { $0.id == nudge.id }
+      nudges.insert(nudge, at: 0)
+      if nudges.count > 20 { nudges = Array(nudges.prefix(20)) }
     }
     if event == "daily-recap" {
       // Story 7: evening "what did you get done today" notification.
@@ -332,6 +349,24 @@ final class AppState: ObservableObject {
     content.userInfo = ["path": path]
     let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
     UNUserNotificationCenter.current().add(req)
+  }
+
+  struct MessageReply: Decodable { let reply: String? }
+
+  // Send a question to the agent from the floating widget, attaching fresh
+  // focused-window context. Returns the agent's reply text.
+  func askOverlay(text: String, screenContext: ScreenContext?) async throws -> String {
+    var meta: [String: Any] = [:]
+    if let s = screenContext, !s.text.isEmpty {
+      var sc: [String: Any] = ["app": s.app, "text": s.text]
+      if let w = s.window { sc["window"] = w }
+      meta["screenContext"] = sc
+    }
+    let payload: [String: Any] = ["text": text, "channel": "overlay", "metadata": meta]
+    let body = try JSONSerialization.data(withJSONObject: payload)
+    let data = try await post("/message", body: body)
+    let decoded = try JSONDecoder().decode(MessageReply.self, from: data)
+    return decoded.reply ?? "(no reply)"
   }
 
   func togglePause() async {
