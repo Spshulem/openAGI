@@ -13,6 +13,12 @@ import Vision
 // exclusion check (so private windows / banking sites are skipped before
 // OCR runs).
 
+struct ScreenContext {
+  let app: String
+  let window: String?
+  let text: String
+}
+
 @MainActor
 final class ScreenCapturer {
   static let shared = ScreenCapturer()
@@ -93,6 +99,47 @@ final class ScreenCapturer {
       }
     } catch {
       NSLog("OpenAGI capture: \(error.localizedDescription)")
+    }
+  }
+
+  // On-demand grab for the floating widget: OCR the current screen (dominated by
+  // the frontmost window) and return the text. Honors the same exclusion list as
+  // ambient capture, and returns nil when excluded or when capture/permission is
+  // unavailable — callers then proceed without screen context.
+  func captureFocusedText() async -> ScreenContext? {
+    let app = NSWorkspace.shared.frontmostApplication
+    let bundleId = app?.bundleIdentifier
+    let appName = app?.localizedName ?? bundleId ?? "(unknown)"
+    let windowTitle = Self.frontmostWindowTitle()
+
+    if CaptureSettings.shared.isExcluded(bundleId: bundleId, windowTitle: windowTitle) {
+      return nil
+    }
+
+    do {
+      let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+      guard let display = content.displays.first else { return nil }
+      let filter = SCContentFilter(display: display, excludingWindows: [])
+      let cfg = SCStreamConfiguration()
+      cfg.width = display.width
+      cfg.height = display.height
+      cfg.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+      cfg.queueDepth = 1
+      cfg.scalesToFit = true
+      cfg.showsCursor = false
+
+      let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+      let text: String = await withCheckedContinuation { cont in
+        ocrQueue.async {
+          Self.runOcr(image: cgImage) { ocrText, _ in cont.resume(returning: ocrText) }
+        }
+      }
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty { return ScreenContext(app: appName, window: windowTitle, text: "") }
+      return ScreenContext(app: appName, window: windowTitle, text: String(trimmed.prefix(8000)))
+    } catch {
+      NSLog("OpenAGI overlay capture: \(error.localizedDescription)")
+      return nil
     }
   }
 
