@@ -1,13 +1,17 @@
 import path from "node:path";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { loadEnvFile } from "../src/file-utils.js";
-import { resolveDataDir } from "../src/data-dir.js";
+import { resolveDataDir, _resetDataDirCache } from "../src/data-dir.js";
 
+// A bootstrap .env in the cwd may itself set OPENAGI_DATA_DIR, so it MUST be
+// loaded before the data dir is resolved (resolveDataDir memoizes its result).
+// Reset the cache first in case an import already resolved it, then resolve and
+// load the canonical <dataDir>/.env for the remaining keys (loadEnvFile is
+// first-wins, so the bootstrap file stays authoritative for OPENAGI_DATA_DIR).
+loadEnvFile(".env");
+_resetDataDirCache();
 const dataDir = resolveDataDir();
-
-// Load env in priority order — canonical data dir wins over local-dev overrides.
-loadEnvFile(path.join(dataDir, ".env")); // canonical (loadEnvFile is first-wins)
-loadEnvFile(".env");                       // fills in keys absent from the canonical file (cwd, local dev)
+loadEnvFile(path.join(dataDir, ".env"));
 
 const port = Number.parseInt(process.env.PORT ?? "43210", 10);
 const host = process.env.HOST ?? "127.0.0.1";
