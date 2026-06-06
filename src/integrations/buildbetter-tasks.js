@@ -1,16 +1,33 @@
 // BuildBetter → TaskStore source. Pulls action items / commitments /
 // follow-ups from the user's recent calls (extractions tagged action_item,
 // follow_up, task, commitment, priority). Polls every 15 min.
-// Env-gated — silently no-ops if BUILDBETTER_API_KEY is unset.
 //
-// User identity (whose attendee the action item is "for") comes from
-// BUILDBETTER_USER_EMAIL or BUILDBETTER_USER_NAME. If neither is set,
-// the integration registers but warns once and stays idle.
+// Auth — two paths, in precedence order:
+//   1. BUILDBETTER_API_KEY  → X-BuildBetter-Api-Key header.
+//   2. The BuildBetter MCP OAuth connection (from the dashboard MCP tab) →
+//      Authorization: Bearer <token>, silently refreshed, no browser needed.
+//      With no API key set at all, connecting BuildBetter once via MCP is
+//      enough for this poller to run.
+//
+// User identity (whose attendee the action item is "for") is auto-derived
+// from the API key / OAuth session via the `me` GraphQL query. It only falls
+// back to BUILDBETTER_USER_EMAIL / BUILDBETTER_USER_NAME when `me` can't
+// pinpoint a single user (e.g. an org-scoped key).
 //
 // Adapted from autolist's apps/api/src/lib/integrations/buildbetter.ts
 // to OpenAGI's task store + integration registry pattern.
 
+import { McpOAuthClient } from "../mcp-oauth.js";
+import { resolveDataDir } from "../data-dir.js";
+
 const BUILDBETTER_ENDPOINT = "https://api.buildbetter.app/v1/graphql";
+// Origin of the BuildBetter MCP server, used to build the OAuth client that
+// reads the token cached under <dataDir>/mcp/auth/buildbetter.json. The actual
+// silent refresh uses the discovery metadata stored in that cache, so this
+// only needs to be correct enough to satisfy the constructor — prod and
+// staging tokens both refresh fine once the cache exists.
+const BUILDBETTER_MCP_RESOURCE_URL = "https://mcp.buildbetter.app";
+const ME_QUERY = "query Me { me { person { first_name last_name email } } }";
 const POLL_INTERVAL_MS = 15 * 60 * 1000;
 const LOOKBACK_DAYS = 7;
 
@@ -20,6 +37,17 @@ export class BuildBetterTaskSource {
     this.apiKey = options.apiKey ?? process.env.BUILDBETTER_API_KEY ?? null;
     this.userEmail = options.userEmail ?? process.env.BUILDBETTER_USER_EMAIL ?? null;
     this.userName = options.userName ?? process.env.BUILDBETTER_USER_NAME ?? null;
+    // OAuth fallback (option 2): reuse the BuildBetter MCP connection. The
+    // client is built lazily so we never touch the filesystem / construct it
+    // when an API key is set. dataDir + resourceUrl come from the MCP registry
+    // when available so we read the exact same token cache the MCP client wrote.
+    this.dataDir = options.dataDir ?? resolveDataDir();
+    this.oauthResourceUrl = options.oauthResourceUrl ?? BUILDBETTER_MCP_RESOURCE_URL;
+    this.oauthClient = options.oauthClient ?? null;
+    this._oauthTried = false;
+    // Identity auto-derivation (option 1): once we've successfully asked `me`,
+    // don't ask again this process — even if it returned no user.
+    this._identityResolved = false;
     this.lastSyncedAt = null;
     // Coalescing state for webhook-triggered syncs: if a sync is already
     // running when a ping arrives, we don't start a second — we just flag
@@ -31,17 +59,98 @@ export class BuildBetterTaskSource {
   }
 
   isConfigured() {
-    return Boolean(this.apiKey) && Boolean(this.userEmail || this.userName);
+    // Identity is auto-derived now, so auth alone is enough: an API key, or a
+    // previously-completed BuildBetter MCP OAuth connection.
+    return Boolean(this.apiKey) || this._hasOAuthCache();
+  }
+
+  // Lazily build the OAuth client. Returns null if it can't be constructed.
+  _oauth() {
+    if (this.oauthClient) return this.oauthClient;
+    if (this._oauthTried) return null;
+    this._oauthTried = true;
+    try {
+      this.oauthClient = new McpOAuthClient({
+        name: "buildbetter",
+        resourceUrl: this.oauthResourceUrl,
+        dataDir: this.dataDir
+      });
+    } catch {
+      this.oauthClient = null;
+    }
+    return this.oauthClient;
+  }
+
+  // Sync probe: is there a usable cached OAuth token/refresh token on disk?
+  _hasOAuthCache() {
+    const client = this._oauth();
+    if (!client) return false;
+    try {
+      const cache = client.loadCache();
+      return Boolean(cache?.access_token || cache?.refresh_token);
+    } catch {
+      return false;
+    }
+  }
+
+  // Silently obtain a Bearer token from the cached OAuth connection. Never
+  // triggers the interactive browser flow — if there's no cache, returns null
+  // so a headless poller degrades gracefully instead of hanging on consent.
+  async _oauthToken() {
+    const client = this._oauth();
+    if (!client) return null;
+    let cache;
+    try { cache = client.loadCache(); } catch { return null; }
+    if (!cache) return null;
+    try {
+      if (cache.access_token && !client.isExpired(cache)) return cache.access_token;
+      if (cache.refresh_token && cache.discovery && cache.client) {
+        await client.refresh(cache);
+        return client.loadCache()?.access_token ?? null;
+      }
+    } catch {
+      // refresh failed (revoked / network) — treat OAuth as unavailable.
+    }
+    return null;
+  }
+
+  // Resolve auth headers: API key wins (preserves existing setups), else the
+  // reused MCP OAuth token. Returns null when neither is available.
+  async authHeaders() {
+    // BuildBetter's exact header spelling per their docs.
+    if (this.apiKey) return { "X-BuildBetter-Api-Key": this.apiKey };
+    const token = await this._oauthToken();
+    if (token) return { authorization: `Bearer ${token}` };
+    return null;
+  }
+
+  // Best-effort: fill userEmail / userName from the authenticated session via
+  // the `me` query. No-op once we already have an identity, or once we've
+  // asked successfully (an org-scoped key legitimately returns no user — we
+  // don't keep re-asking, we just fall back to the env-provided identity).
+  async ensureIdentity() {
+    if (this.userEmail || this.userName) return;
+    if (this._identityResolved) return;
+    try {
+      const data = await this.query(ME_QUERY);
+      this._identityResolved = true; // we successfully asked; don't repeat
+      const p = data?.me?.person;
+      if (p?.email) this.userEmail = p.email;
+      const fullName = [p?.first_name, p?.last_name].filter(Boolean).join(" ").trim();
+      if (!this.userEmail && fullName) this.userName = fullName;
+    } catch {
+      // transient (network / auth) — leave unresolved so we retry next sync.
+    }
   }
 
   async query(graphql, variables = {}) {
+    const auth = await this.authHeaders();
+    if (!auth) {
+      throw new Error("BuildBetter: no auth (set BUILDBETTER_API_KEY or connect BuildBetter from the MCP tab)");
+    }
     const res = await fetch(BUILDBETTER_ENDPOINT, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        // BuildBetter's exact header spelling per their docs.
-        "X-BuildBetter-Api-Key": this.apiKey
-      },
+      headers: { "content-type": "application/json", ...auth },
       body: JSON.stringify({ query: graphql, variables })
     });
     if (!res.ok) throw new Error(`BuildBetter API ${res.status}`);
@@ -52,6 +161,8 @@ export class BuildBetterTaskSource {
 
   // Step 1: find recent calls the user attended.
   async getRecentCalls(sinceIso) {
+    // Auto-derive who "you" are before filtering by attendee.
+    await this.ensureIdentity();
     const query = `
       query RecentCalls($since: timestamptz!, $limit: Int!) {
         interview(
@@ -117,9 +228,10 @@ export class BuildBetterTaskSource {
    * Run one sync pass. Returns { created, updated, scanned } or skip reason.
    */
   async syncSignals({ now = new Date() } = {}) {
-    if (!this.apiKey) return { skipped: true, reason: "BUILDBETTER_API_KEY not set" };
-    if (!this.userEmail && !this.userName) return { skipped: true, reason: "BUILDBETTER_USER_EMAIL or BUILDBETTER_USER_NAME required" };
+    if (!(await this.authHeaders())) return { skipped: true, reason: "no BuildBetter auth (set BUILDBETTER_API_KEY or connect BuildBetter via MCP)" };
     if (!this.runtime?.tasks?.add) return { skipped: true, reason: "task store not available" };
+    await this.ensureIdentity();
+    if (!this.userEmail && !this.userName) return { skipped: true, reason: "could not determine your BuildBetter identity (set BUILDBETTER_USER_EMAIL or BUILDBETTER_USER_NAME)" };
 
     const sinceIso = new Date(now.getTime() - LOOKBACK_DAYS * 86400 * 1000).toISOString();
 
@@ -209,7 +321,7 @@ export class BuildBetterTaskSource {
 
   // Record one transcript observation per recent call, deduped by ref.
   async syncTranscripts({ now = new Date() } = {}) {
-    if (!this.apiKey) return { skipped: true, reason: "BUILDBETTER_API_KEY not set" };
+    if (!(await this.authHeaders())) return { skipped: true, reason: "no BuildBetter auth (set BUILDBETTER_API_KEY or connect BuildBetter via MCP)" };
     if (!this.runtime?.observations?.record) return { skipped: true, reason: "no observation store" };
 
     const sinceIso = new Date(now.getTime() - LOOKBACK_DAYS * 86400 * 1000).toISOString();
@@ -281,13 +393,19 @@ export class BuildBetterTaskSource {
 }
 
 export function registerBuildBetterTaskSource(runtime, options = {}) {
-  const source = options.source ?? new BuildBetterTaskSource({ runtime, ...options });
+  // Reuse the MCP registry's view of the BuildBetter server (if connected) so
+  // the OAuth fallback reads the exact token cache the MCP client wrote.
+  const rec = runtime?.mcp?.servers?.get?.("buildbetter");
+  const source = options.source ?? new BuildBetterTaskSource({
+    runtime,
+    dataDir: runtime?.mcp?.dataDir,
+    oauthResourceUrl: rec?.resourceUrl ?? (rec?.url ? originOf(rec.url) : undefined),
+    ...options
+  });
   if (!source.isConfigured()) {
     return {
       registered: false,
-      reason: source.apiKey
-        ? "BUILDBETTER_USER_EMAIL or BUILDBETTER_USER_NAME required"
-        : "BUILDBETTER_API_KEY not set"
+      reason: "no BuildBetter auth — set BUILDBETTER_API_KEY or connect BuildBetter from the MCP tab"
     };
   }
   if (runtime.cron?.addJob) {
@@ -301,4 +419,9 @@ export function registerBuildBetterTaskSource(runtime, options = {}) {
   }
   runtime.buildBetterTaskSource = source;
   return { registered: true };
+}
+
+// Origin (scheme + host) of an MCP server URL, for the OAuth resource id.
+function originOf(u) {
+  try { return new URL(u).origin; } catch { return BUILDBETTER_MCP_RESOURCE_URL; }
 }
