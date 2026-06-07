@@ -106,7 +106,8 @@ final class ScreenCapturer {
   // the frontmost window) and return the text. Honors the same exclusion list as
   // ambient capture, and returns nil when excluded or when capture/permission is
   // unavailable — callers then proceed without screen context.
-  func captureFocusedText() async -> ScreenContext? {
+  func captureFocusedText(excludingWindowNumber: Int? = nil) async -> ScreenContext? {
+    if !CaptureSettings.shared.isActiveNow() { return nil }
     let app = NSWorkspace.shared.frontmostApplication
     let bundleId = app?.bundleIdentifier
     let appName = app?.localizedName ?? bundleId ?? "(unknown)"
@@ -119,7 +120,11 @@ final class ScreenCapturer {
     do {
       let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
       guard let display = content.displays.first else { return nil }
-      let filter = SCContentFilter(display: display, excludingWindows: [])
+      var excluded: [SCWindow] = []
+      if let wn = excludingWindowNumber {
+        excluded = content.windows.filter { $0.windowID == CGWindowID(wn) }
+      }
+      let filter = SCContentFilter(display: display, excludingWindows: excluded)
       let cfg = SCStreamConfiguration()
       cfg.width = display.width
       cfg.height = display.height
