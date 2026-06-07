@@ -338,6 +338,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      if (method === "GET" && pathname === "/budget/ledger") {
+        const ledger = runtime.budget?.ledger;
+        if (!ledger) return sendJson(res, 200, { error: "no-ledger" });
+        const days = Math.max(1, Math.min(90, Number.parseInt(url.searchParams.get("days") ?? "30", 10) || 30));
+        return sendJson(res, 200, { days, entries: ledger.query({ days }), analytics: ledger.analytics({ days }) });
+      }
 
       // ─── Ambient capture / observations ─────────────────────────────────
       if (method === "POST" && pathname === "/observations") {
