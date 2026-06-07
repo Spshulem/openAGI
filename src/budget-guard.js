@@ -1,6 +1,8 @@
 import path from "node:path";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { nowIso } from "./utils.js";
+import { CreditLedger } from "./credit-ledger.js";
 
 const DEFAULT_PRICES = {
   "claude-sonnet-4-6": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
@@ -18,6 +20,7 @@ export class BudgetGuard {
     this.prices = { ...DEFAULT_PRICES, ...(options.prices ?? {}) };
     ensureDir(path.dirname(this.storePath));
     this.state = readJsonFile(this.storePath, { version: 1, days: {} });
+    this.ledger = options.ledger ?? new CreditLedger({ storePath: path.join(path.dirname(this.storePath), "ledger.jsonl") });
   }
 
   todayKey() {
@@ -54,7 +57,7 @@ export class BudgetGuard {
     }
   }
 
-  record(usage, model) {
+  record(usage, model, meta = {}) {
     if (!usage) return null;
     const today = this.todayKey();
     if (!this.state.days[today]) this.state.days[today] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, calls: 0 };
@@ -74,6 +77,20 @@ export class BudgetGuard {
     day.cacheWrite += tokens.cacheWrite;
     day.usd += usd;
     day.calls += 1;
+
+    try {
+      this.ledger?.record({
+        at: nowIso(),
+        model,
+        tokens,
+        usd,
+        channel: meta.channel ?? null,
+        agentId: meta.agentId ?? null,
+        sessionId: meta.sessionId ?? null,
+        from: meta.from ?? null,
+        tools: Array.isArray(meta.tools) ? meta.tools : []
+      });
+    } catch { /* ledger is best-effort; never break a reply over it */ }
 
     this.persist();
     return { added: usd, today: day.usd, limit: this.dailyUsdLimit };
