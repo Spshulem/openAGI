@@ -89,7 +89,7 @@ export class OpenAIResponsesProvider {
         input: conversationInput
       };
       if (toolList.length > 0) body.tools = toolList;
-      response = await this.postResponses(body, context, toolCalls);
+      response = await this.postResponses(body, context);
 
       const calls = extractFunctionCalls(response);
       if (calls.length === 0) break;
@@ -128,7 +128,7 @@ export class OpenAIResponsesProvider {
     };
   }
 
-  async postResponses(body, context = {}, toolCalls = []) {
+  async postResponses(body, context = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -205,7 +205,7 @@ export class AnthropicProvider {
         system,
         messages: convo,
         ...(tools.length > 0 ? { tools } : {})
-      }, context, toolCalls);
+      }, context);
 
       convo.push({ role: "assistant", content: response.content });
 
@@ -241,7 +241,7 @@ export class AnthropicProvider {
     };
   }
 
-  async postMessages(body, context = {}, toolCalls = []) {
+  async postMessages(body, context = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
