@@ -27,7 +27,10 @@ final class OverlayController {
 
   func hide() { panel?.orderOut(nil) }
 
+  var panelWindowNumber: Int? { panel?.windowNumber }
+
   func toggle() {
+    guard Self.isEnabled else { return }
     if panel?.isVisible == true {
       OverlayState.shared.expanded.toggle()
       sizeToContent()
@@ -51,7 +54,10 @@ final class OverlayController {
     p.backgroundColor = .clear
     p.hasShadow = true
     p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-    let host = NSHostingView(rootView: OverlayView(onCollapse: { [weak self] in self?.sizeToContent() }))
+    let host = NSHostingView(rootView: OverlayView(
+      onCollapse: { [weak self] in self?.sizeToContent() },
+      onExpand: { [weak self] in DispatchQueue.main.async { self?.sizeToContent() } }
+    ))
     host.translatesAutoresizingMaskIntoConstraints = true
     p.contentView = host
     return p

@@ -16,7 +16,7 @@ final class OverlayState: ObservableObject {
     let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !q.isEmpty else { return }
     isLoading = true; error = nil; answer = ""
-    let ctx = await ScreenCapturer.shared.captureFocusedText()
+    let ctx = await ScreenCapturer.shared.captureFocusedText(excludingWindowNumber: OverlayController.shared.panelWindowNumber)
     if let ctx, !ctx.text.isEmpty {
       contextNote = "reading \(ctx.app)"
     } else {

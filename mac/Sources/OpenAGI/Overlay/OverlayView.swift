@@ -5,6 +5,7 @@ struct OverlayView: View {
   @ObservedObject var app = AppState.shared
   @FocusState private var fieldFocused: Bool
   var onCollapse: () -> Void = {}
+  var onExpand: () -> Void = {}
 
   var body: some View {
     if state.expanded {
@@ -15,7 +16,7 @@ struct OverlayView: View {
   }
 
   private var pill: some View {
-    Button(action: { state.expanded = true }) {
+    Button(action: { state.expanded = true; onExpand() }) {
       ZStack {
         Circle().fill(Color.accentColor).frame(width: 16, height: 16)
         if !app.nudges.isEmpty {
