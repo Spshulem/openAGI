@@ -16,11 +16,22 @@ export class CreditLedger {
     this.storePath = options.storePath ?? path.join(resolveDataDir(), "budget", "ledger.jsonl");
     this.retentionDays = options.retentionDays ?? RETENTION_DAYS;
     this.compactBytes = options.compactBytes ?? COMPACT_BYTES;
+    // Next size at which compaction runs. Re-armed above the post-compaction
+    // size so a ledger whose retained 30-day window legitimately exceeds
+    // compactBytes doesn't read+rewrite the whole file on every append.
+    this._nextCompactBytes = this.compactBytes;
     ensureDir(path.dirname(this.storePath));
   }
 
+  // Calendar-day cutoff (UTC, matching BudgetGuard.todayKey): the start of the
+  // day that is (days-1) days before `now`. So days=1 means "today" (since UTC
+  // midnight), days=7 means "today + the previous 6 days" — not a rolling N×24h
+  // window, which would bleed yesterday's evening spend into a "today" query.
   _cutoff(days, now) {
-    return new Date(now.getTime() - days * 86400 * 1000).toISOString();
+    const d = new Date(now.getTime());
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(d.getUTCDate() - (days - 1));
+    return d.toISOString();
   }
 
   _readAll() {
@@ -54,10 +65,16 @@ export class CreditLedger {
   _maybeCompact(now) {
     let size = 0;
     try { size = fs.statSync(this.storePath).size; } catch { return; }
-    if (size < this.compactBytes) return;
+    if (size < this._nextCompactBytes) return;
     const cutoff = this._cutoff(this.retentionDays, now);
     const kept = this._readAll().filter((r) => (r.at ?? "") >= cutoff);
     fs.writeFileSync(this.storePath, kept.map((r) => JSON.stringify(r)).join("\n") + (kept.length ? "\n" : ""));
+    // Re-arm: only compact again after the file roughly doubles past the
+    // retained size, so a large-but-legitimate window amortizes the rewrite
+    // instead of compacting on every subsequent append.
+    let newSize = 0;
+    try { newSize = fs.statSync(this.storePath).size; } catch { /* ignore */ }
+    this._nextCompactBytes = Math.max(this.compactBytes, newSize * 2);
   }
 
   query({ days = this.retentionDays, now = new Date() } = {}) {

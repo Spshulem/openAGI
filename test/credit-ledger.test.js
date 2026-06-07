@@ -62,3 +62,37 @@ test("tolerates a missing/corrupt file", () => {
   fs.writeFileSync(L.storePath, "not json\n{bad\n");
   assert.deepEqual(L.query(), []);
 });
+
+test("days=1 means today (UTC calendar day), not a rolling 24h window", () => {
+  const L = tmpLedger();
+  // now = today 08:00 UTC. An entry at yesterday 23:00 is within the last 24h
+  // but is NOT today — it must be excluded from a days=1 ("today") query.
+  L.record(entry({ at: "2026-06-05T23:00:00.000Z" })); // yesterday evening
+  L.record(entry({ at: "2026-06-06T02:00:00.000Z" })); // today, early
+  const now = new Date("2026-06-06T08:00:00.000Z");
+  const rows = L.query({ days: 1, now });
+  assert.equal(rows.length, 1, "only today's entry");
+  assert.equal(rows[0].at, "2026-06-06T02:00:00.000Z");
+  assert.equal(L.analytics({ days: 1, now }).totalCalls, 1);
+});
+
+test("days=7 includes today plus the previous 6 calendar days", () => {
+  const L = tmpLedger();
+  L.record(entry({ at: "2026-05-31T10:00:00.000Z" })); // 6 days before the 6th — included
+  L.record(entry({ at: "2026-05-30T10:00:00.000Z" })); // 7 days before — excluded
+  const now = new Date("2026-06-06T08:00:00.000Z");
+  const rows = L.query({ days: 7, now });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].at, "2026-05-31T10:00:00.000Z");
+});
+
+test("re-arms the compaction threshold so it doesn't rewrite on every append", () => {
+  const L = tmpLedger({ compactBytes: 1 }); // would compact on every append without re-arming
+  const now = new Date("2026-06-06T10:00:00.000Z");
+  L.record(entry({ at: "2026-06-06T09:00:00.000Z" }), { now });
+  L.record(entry({ at: "2026-06-06T09:30:00.000Z" }), { now });
+  // After compacting a retained (non-empty) window, the next threshold must
+  // climb above compactBytes so subsequent appends within the headroom skip the
+  // full read+rewrite.
+  assert.ok(L._nextCompactBytes > 1, `expected re-armed threshold > 1, got ${L._nextCompactBytes}`);
+});
