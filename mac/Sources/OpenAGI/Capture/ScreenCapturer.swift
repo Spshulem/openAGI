@@ -119,7 +119,19 @@ final class ScreenCapturer {
 
     do {
       let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-      guard let display = content.displays.first else { return nil }
+      // Pick the display the frontmost window is actually on — on multi-monitor
+      // setups the focused window may not be on the primary display, and grabbing
+      // displays.first would OCR the wrong monitor. Match the front app's
+      // on-screen window (preferring the AX focused-window title, else its
+      // largest window) and use the display containing that window's center.
+      let frontPid = app?.processIdentifier
+      let appWindows = content.windows.filter { $0.owningApplication?.processID == frontPid && $0.isOnScreen }
+      let frontWindow = appWindows.first { ($0.title ?? "") == (windowTitle ?? "") && !(windowTitle ?? "").isEmpty }
+        ?? appWindows.max { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) }
+      let display = frontWindow.flatMap { w in
+        content.displays.first { $0.frame.contains(CGPoint(x: w.frame.midX, y: w.frame.midY)) }
+      } ?? content.displays.first
+      guard let display else { return nil }
       var excluded: [SCWindow] = []
       if let wn = excludingWindowNumber {
         excluded = content.windows.filter { $0.windowID == CGWindowID(wn) }
