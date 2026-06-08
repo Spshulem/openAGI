@@ -402,12 +402,15 @@ export function registerBuildBetterTaskSource(runtime, options = {}) {
     oauthResourceUrl: rec?.resourceUrl ?? (rec?.url ? originOf(rec.url) : undefined),
     ...options
   });
-  if (!source.isConfigured()) {
-    return {
-      registered: false,
-      reason: "no BuildBetter auth — set BUILDBETTER_API_KEY or connect BuildBetter from the MCP tab"
-    };
-  }
+  // Register the source + cron even when no credentials exist yet. Auth can
+  // arrive mid-session — the user connects BuildBetter from the MCP tab and an
+  // OAuth token cache appears — and the poller + webhook must start working
+  // without a daemon restart. sync() self-gates on authHeaders(), so an
+  // unconfigured source just no-ops each tick (a cheap cache check) until
+  // credentials show up. Previously this returned early and left
+  // runtime.buildBetterTaskSource unset, so a later MCP login was ignored
+  // until restart (the cron reported "no buildbetter source", webhook 503'd).
+  runtime.buildBetterTaskSource = source;
   if (runtime.cron?.addJob) {
     runtime.cron.addJob({
       id: "buildbetter-task-sync",
@@ -417,8 +420,7 @@ export function registerBuildBetterTaskSource(runtime, options = {}) {
       intervalMs: POLL_INTERVAL_MS
     });
   }
-  runtime.buildBetterTaskSource = source;
-  return { registered: true };
+  return { registered: true, idle: !source.isConfigured() };
 }
 
 // Origin (scheme + host) of an MCP server URL, for the OAuth resource id.
