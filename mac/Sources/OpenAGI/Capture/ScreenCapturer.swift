@@ -134,7 +134,13 @@ final class ScreenCapturer {
       guard let display else { return nil }
       var excluded: [SCWindow] = []
       if let wn = excludingWindowNumber {
-        excluded = content.windows.filter { $0.windowID == CGWindowID(wn) }
+        excluded += content.windows.filter { $0.windowID == CGWindowID(wn) }
+      }
+      // Also cut out any window belonging to an excluded app/title, so OCR never
+      // reads e.g. 1Password sitting beside the focused app on the same display
+      // (the frontmost-only privacy check above doesn't cover other visible windows).
+      excluded += content.windows.filter { w in
+        CaptureSettings.shared.isExcluded(bundleId: w.owningApplication?.bundleIdentifier, windowTitle: w.title)
       }
       let filter = SCContentFilter(display: display, excludingWindows: excluded)
       let cfg = SCStreamConfiguration()
