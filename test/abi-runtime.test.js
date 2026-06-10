@@ -674,6 +674,77 @@ test("scrutiny fitter stages proposals during warmup, auto-applies after", () =>
     `expected evidence weight to grow, got before=${before.evidence}, after=${runtime.scrutiny.judges.pragmatic.weights.evidence}`);
 });
 
+test("fitted scrutiny weights persist to disk and restore into a fresh panel", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fit-persist-"));
+  const runtime = createDefaultRuntime();
+  for (let i = 0; i < 60; i += 1) {
+    const dims = {
+      environment: Math.random(),
+      company: Math.random(),
+      evidence: 0.3 + Math.random() * 0.7,
+      memory: Math.random(),
+      uncertainty: Math.random()
+    };
+    const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
+    runtime.outcomes.resolve(o.id, Math.min(1, dims.evidence + 0.05 * Math.random()), "system-inferred");
+  }
+  const fitter = new ScrutinyFitter({ runtime, dir, warmupCycles: 0 });
+  const r = fitter.fit();
+  assert.equal(r.autoApplied, true);
+  const applied = { ...runtime.scrutiny.judges.pragmatic.weights };
+
+  // Persisted: weights.json holds the applied weights, history has one audit
+  // line per judge with from/to.
+  const saved = JSON.parse(fs.readFileSync(path.join(dir, "weights.json"), "utf8"));
+  assert.deepEqual(saved.judges.pragmatic, applied);
+  assert.equal(saved.source, "auto-fit");
+  const history = fs.readFileSync(path.join(dir, "weight-history.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(history.length, 3, "one history line per judge");
+  assert.ok(history.every((h) => h.source === "auto-fit" && h.from && h.to));
+
+  // Restart simulation: a fresh runtime boots with hardcoded default weights;
+  // constructing the fitter on the same dir must restore the calibration.
+  const reboot = createDefaultRuntime();
+  assert.notDeepEqual(reboot.scrutiny.judges.pragmatic.weights, applied, "fresh panel starts at defaults");
+  const fitter2 = new ScrutinyFitter({ runtime: reboot, dir });
+  assert.ok(fitter2.restoredWeightsAt, "restore should report the appliedAt stamp");
+  assert.deepEqual(reboot.scrutiny.judges.pragmatic.weights, applied, "weights survive restart");
+  assert.deepEqual(reboot.scrutiny.judges.cautious.weights, saved.judges.cautious);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("manually applying a staged warmup proposal persists the same way", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fit-manual-"));
+  const runtime = createDefaultRuntime();
+  for (let i = 0; i < 50; i += 1) {
+    const dims = { environment: 0.5, company: 0.5, evidence: 0.4 + (i % 2) * 0.4, memory: 0.5, uncertainty: 0.5 };
+    const o = runtime.outcomes.record({ kind: "agent-reply", scrutinyAction: "act", scrutinyDimensions: dims });
+    runtime.outcomes.resolve(o.id, dims.evidence, "system-inferred");
+  }
+  const fitter = new ScrutinyFitter({ runtime, dir, warmupCycles: 5 });
+  const r = fitter.fit(); // staged, not applied
+  assert.equal(r.autoApplied, false);
+
+  const entry = fitter.applyPending(1);
+  assert.ok(entry?.applied);
+  const saved = JSON.parse(fs.readFileSync(path.join(dir, "weights.json"), "utf8"));
+  assert.equal(saved.source, "manual-apply");
+  assert.deepEqual(saved.judges.pragmatic, runtime.scrutiny.judges.pragmatic.weights);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("fitter restore is a no-op without a weights file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fit-empty-"));
+  const runtime = createDefaultRuntime();
+  const defaults = { ...runtime.scrutiny.judges.pragmatic.weights };
+  const fitter = new ScrutinyFitter({ runtime, dir });
+  assert.equal(fitter.restoredWeightsAt, null);
+  assert.deepEqual(runtime.scrutiny.judges.pragmatic.weights, defaults);
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("scrutiny fitter judge signal averages with correlation deltas", () => {
   const runtime = createDefaultRuntime();
   for (let i = 0; i < 50; i += 1) {

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
+import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 
@@ -27,12 +27,18 @@ export class ScrutinyFitter {
     this.dir = options.dir ?? path.join(resolveDataDir(), "scrutiny");
     this.statePath = path.join(this.dir, "fitter-state.json");
     this.pendingPath = path.join(this.dir, "pending-changes.json");
+    this.weightsPath = path.join(this.dir, "weights.json");
+    this.historyPath = path.join(this.dir, "weight-history.jsonl");
     this.minSamples = options.minSamples ?? DEFAULT_MIN_SAMPLES;
     this.maxDeltaPerCycle = options.maxDeltaPerCycle ?? DEFAULT_MAX_DELTA;
     this.warmupCycles = options.warmupCycles ?? DEFAULT_WARMUP;
     ensureDir(this.dir);
     this.state = readJsonFile(this.statePath, { version: 1, cycles: 0, lastRunAt: null, judgeSignals: [] });
     this.pending = readJsonFile(this.pendingPath, { version: 1, proposals: [] });
+    // Judge weights are constructed from hardcoded defaults every boot;
+    // without this restore, every fitted adjustment would silently vanish
+    // on daemon restart and calibration could never accumulate.
+    this.restoredWeightsAt = this.restoreWeights();
   }
 
   status() {
@@ -42,8 +48,61 @@ export class ScrutinyFitter {
       autoApply: this.state.cycles >= this.warmupCycles,
       lastRunAt: this.state.lastRunAt,
       pendingProposals: this.pending.proposals.length,
-      pendingJudgeSignals: this.state.judgeSignals.length
+      pendingJudgeSignals: this.state.judgeSignals.length,
+      restoredWeightsAt: this.restoredWeightsAt
     };
+  }
+
+  /**
+   * Load the last-applied weights from disk into the live judges. Called at
+   * construction (after the panel exists on the runtime). Judges present in
+   * the file but absent from the panel (or vice versa) are skipped, so an
+   * older weights file degrades gracefully. Returns the file's appliedAt
+   * timestamp when something was restored, else null.
+   */
+  restoreWeights() {
+    const judges = this.runtime?.scrutiny?.judges;
+    if (!judges) return null;
+    const saved = readJsonFile(this.weightsPath, null);
+    if (!saved?.judges) return null;
+    let restored = false;
+    for (const [name, weights] of Object.entries(saved.judges)) {
+      const judge = judges[name];
+      if (!judge || typeof weights !== "object") continue;
+      const sane = DIMENSIONS.every((dim) => typeof weights[dim] === "number" && Number.isFinite(weights[dim]));
+      if (!sane) continue;
+      judge.weights = { ...weights };
+      restored = true;
+    }
+    return restored ? (saved.appliedAt ?? null) : null;
+  }
+
+  /**
+   * Apply proposal weights to the live judges AND persist: weights.json so
+   * the calibration survives restarts, plus an append-only audit line per
+   * judge in weight-history.jsonl ("why did my agent's judgment change").
+   */
+  _applyAndPersist(proposals, { source, cycle, at = nowIso() } = {}) {
+    const judges = this.runtime?.scrutiny?.judges ?? {};
+    const applied = {};
+    for (const [judgeName, proposal] of Object.entries(proposals)) {
+      const judge = judges[judgeName];
+      if (!judge) continue;
+      judge.weights = { ...proposal.to };
+      applied[judgeName] = { ...proposal.to };
+      appendJsonLine(this.historyPath, {
+        at,
+        source,
+        cycle,
+        judge: judgeName,
+        from: proposal.from,
+        to: proposal.to
+      });
+    }
+    if (Object.keys(applied).length > 0) {
+      writeJsonAtomic(this.weightsPath, { version: 1, appliedAt: at, source, cycle, judges: applied });
+    }
+    return applied;
   }
 
   addJudgeSignal({ judge, deltas, note = null, source = "llm-judge" }) {
@@ -86,9 +145,7 @@ export class ScrutinyFitter {
 
     const autoApply = this.state.cycles > this.warmupCycles;
     if (autoApply) {
-      for (const [judgeName, proposal] of Object.entries(proposals)) {
-        this.runtime.scrutiny.judges[judgeName].weights = proposal.to;
-      }
+      this._applyAndPersist(proposals, { source: "auto-fit", cycle: this.state.cycles, at: this.state.lastRunAt });
     } else {
       this.pending.proposals.push({
         cycle: this.state.cycles,
@@ -117,12 +174,9 @@ export class ScrutinyFitter {
   applyPending(cycle) {
     const entry = this.pending.proposals.find((p) => p.cycle === cycle);
     if (!entry || entry.applied) return null;
-    for (const [judgeName, proposal] of Object.entries(entry.proposals)) {
-      const judge = this.runtime.scrutiny.judges?.[judgeName];
-      if (judge) judge.weights = proposal.to;
-    }
-    entry.applied = true;
     entry.appliedAt = nowIso();
+    this._applyAndPersist(entry.proposals, { source: "manual-apply", cycle: entry.cycle, at: entry.appliedAt });
+    entry.applied = true;
     this.persistPending();
     return entry;
   }
