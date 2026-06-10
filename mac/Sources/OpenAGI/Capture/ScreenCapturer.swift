@@ -13,6 +13,12 @@ import Vision
 // exclusion check (so private windows / banking sites are skipped before
 // OCR runs).
 
+struct ScreenContext {
+  let app: String
+  let window: String?
+  let text: String
+}
+
 @MainActor
 final class ScreenCapturer {
   static let shared = ScreenCapturer()
@@ -93,6 +99,83 @@ final class ScreenCapturer {
       }
     } catch {
       NSLog("OpenAGI capture: \(error.localizedDescription)")
+    }
+  }
+
+  // On-demand grab for the floating widget: OCR the current screen (dominated by
+  // the frontmost window) and return the text. Honors the same exclusion list as
+  // ambient capture, and returns nil when excluded or when capture/permission is
+  // unavailable — callers then proceed without screen context.
+  func captureFocusedText(excludingWindowNumber: Int? = nil) async -> ScreenContext? {
+    if !CaptureSettings.shared.isActiveNow() { return nil }
+    let app = NSWorkspace.shared.frontmostApplication
+    let bundleId = app?.bundleIdentifier
+    let appName = app?.localizedName ?? bundleId ?? "(unknown)"
+    let windowTitle = Self.frontmostWindowTitle()
+
+    if CaptureSettings.shared.isExcluded(bundleId: bundleId, windowTitle: windowTitle) {
+      return nil
+    }
+
+    do {
+      let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+      // Pick the display the frontmost window is actually on — on multi-monitor
+      // setups the focused window may not be on the primary display, and grabbing
+      // displays.first would OCR the wrong monitor. Match the front app's
+      // on-screen window (preferring the AX focused-window title, else its
+      // largest window) and use the display containing that window's center.
+      let frontPid = app?.processIdentifier
+      let appWindows = content.windows.filter { $0.owningApplication?.processID == frontPid && $0.isOnScreen }
+      let frontWindow = appWindows.first { ($0.title ?? "") == (windowTitle ?? "") && !(windowTitle ?? "").isEmpty }
+        ?? appWindows.max { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) }
+      let display = frontWindow.flatMap { w in
+        content.displays.first { $0.frame.contains(CGPoint(x: w.frame.midX, y: w.frame.midY)) }
+      } ?? content.displays.first
+      guard let display else { return nil }
+      let filter: SCContentFilter
+      let cfg = SCStreamConfiguration()
+      if let frontWindow {
+        // We matched the focused window: capture JUST that window. A
+        // display-level grab would OCR every other (non-excluded) window
+        // sharing the monitor — side-by-side Mail/Slack/docs text — and
+        // attribute it to the focused app, misgrounding the answer.
+        filter = SCContentFilter(desktopIndependentWindow: frontWindow)
+        let scale = CGFloat(filter.pointPixelScale)
+        cfg.width = max(1, Int(frontWindow.frame.width * scale))
+        cfg.height = max(1, Int(frontWindow.frame.height * scale))
+      } else {
+        // No window match — fall back to the whole display, minus the overlay
+        // and any window belonging to an excluded app/title, so OCR never
+        // reads e.g. 1Password sitting beside the focused app on the display
+        // (the frontmost-only privacy check above doesn't cover other windows).
+        var excluded: [SCWindow] = []
+        if let wn = excludingWindowNumber {
+          excluded += content.windows.filter { $0.windowID == CGWindowID(wn) }
+        }
+        excluded += content.windows.filter { w in
+          CaptureSettings.shared.isExcluded(bundleId: w.owningApplication?.bundleIdentifier, windowTitle: w.title)
+        }
+        filter = SCContentFilter(display: display, excludingWindows: excluded)
+        cfg.width = display.width
+        cfg.height = display.height
+      }
+      cfg.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+      cfg.queueDepth = 1
+      cfg.scalesToFit = true
+      cfg.showsCursor = false
+
+      let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+      let text: String = await withCheckedContinuation { cont in
+        ocrQueue.async {
+          Self.runOcr(image: cgImage) { ocrText, _ in cont.resume(returning: ocrText) }
+        }
+      }
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      if trimmed.isEmpty { return ScreenContext(app: appName, window: windowTitle, text: "") }
+      return ScreenContext(app: appName, window: windowTitle, text: String(trimmed.prefix(8000)))
+    } catch {
+      NSLog("OpenAGI overlay capture: \(error.localizedDescription)")
+      return nil
     }
   }
 

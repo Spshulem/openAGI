@@ -27,7 +27,14 @@ export class McpOAuthClient {
     if (!options.resourceUrl) throw new Error("McpOAuthClient requires resourceUrl");
     this.name = options.name ?? "mcp";
     this.resourceUrl = stripTrailingSlash(options.resourceUrl);
-    this.scope = options.scope ?? DEFAULT_SCOPE;
+    // The scope we'd *prefer*. The scope actually requested is narrowed at
+    // discovery time to what the server advertises as supported — servers that
+    // advertise none (e.g. Rize) get no scope param at all, instead of a
+    // hardcoded set they'd reject with `invalid_scope`. A scope passed
+    // explicitly (e.g. from a catalog entry) is treated as authoritative and
+    // sent as-is.
+    this.preferredScope = options.scope ?? DEFAULT_SCOPE;
+    this.scopeExplicit = options.scope != null;
     this.dataDir = options.dataDir ?? resolveDataDir();
     this.cachePath = path.join(this.dataDir, "mcp", "auth", `${this.name}.json`);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -57,7 +64,7 @@ export class McpOAuthClient {
    * Return a valid access token. Uses cached if not expired, refreshes if it
    * has a refresh_token, otherwise runs the full authorization code flow.
    */
-  async ensureToken() {
+  async ensureToken({ interactive = true } = {}) {
     const cache = this.loadCache() ?? {};
     if (cache.access_token && !this.isExpired(cache)) {
       return cache.access_token;
@@ -71,6 +78,14 @@ export class McpOAuthClient {
         cache.refresh_token = null;
       }
     }
+    // Non-interactive callers (e.g. silent reconnect on daemon boot) must never
+    // trigger the browser flow — surface a typed error so the caller can leave
+    // the server "idle" with a Connect button instead of popping a window.
+    if (!interactive) {
+      const err = new Error(`OAuth authorization required for ${this.name}`);
+      err.code = "OAUTH_INTERACTIVE_REQUIRED";
+      throw err;
+    }
     await this.authorize();
     return this.loadCache().access_token;
   }
@@ -83,10 +98,32 @@ export class McpOAuthClient {
   /**
    * Authorization code + PKCE flow. Returns once tokens are saved to cache.
    */
+  // Narrow the requested scope to what this server actually supports. RFC 9728
+  // (protected resource) and RFC 8414 (auth server) both may advertise
+  // `scopes_supported`. We request the intersection of our preferred scopes
+  // with what's advertised; if the server advertises nothing, we omit `scope`
+  // entirely and let the server apply its own default. Returns null = "omit".
+  resolveScope(discovery) {
+    if (this.scopeExplicit) return this.preferredScope; // caller forced it
+    // Prefer the resource's advertised scopes, but fall through to the auth
+    // server's when the resource advertises an EMPTY list (an empty array is
+    // not nullish, so a plain `??` would wrongly stop at it).
+    const resourceScopes = discovery?.resourceMeta?.scopes_supported;
+    const serverScopes = discovery?.serverMeta?.scopes_supported;
+    const supported = (Array.isArray(resourceScopes) && resourceScopes.length) ? resourceScopes
+      : (Array.isArray(serverScopes) && serverScopes.length) ? serverScopes
+      : null;
+    if (!supported) return null;
+    const want = this.preferredScope.split(/\s+/).filter(Boolean);
+    const inter = want.filter((s) => supported.includes(s));
+    return inter.length ? inter.join(" ") : null;
+  }
+
   async authorize() {
     const discovery = await this.discover();
+    const scope = this.resolveScope(discovery);
     const cache = this.loadCache() ?? {};
-    const client = this.staticClient ?? cache.client ?? (await this.registerClient(discovery));
+    const client = this.staticClient ?? cache.client ?? (await this.registerClient(discovery, scope));
 
     const codeVerifier = base64url(randomBytes(48));
     const codeChallenge = base64url(createHash("sha256").update(codeVerifier).digest());
@@ -103,7 +140,9 @@ export class McpOAuthClient {
     authUrl.searchParams.set("code_challenge", codeChallenge);
     authUrl.searchParams.set("code_challenge_method", "S256");
     authUrl.searchParams.set("state", state);
-    authUrl.searchParams.set("scope", this.scope);
+    // Only send `scope` when we have one the server supports — sending an
+    // unsupported scope (or a hardcoded default) is what triggers invalid_scope.
+    if (scope) authUrl.searchParams.set("scope", scope);
     authUrl.searchParams.set("resource", this.resourceUrl);
 
     this.printAuthUrlFn({ name: this.name, url: authUrl.toString() });
@@ -180,7 +219,7 @@ export class McpOAuthClient {
       refresh_token: tokens.refresh_token ?? this.loadCache()?.refresh_token ?? null,
       token_type: tokens.token_type ?? "Bearer",
       expires_at,
-      scope: tokens.scope ?? this.scope,
+      scope: tokens.scope ?? this.preferredScope,
       discovery,
       client
     });
@@ -230,20 +269,29 @@ export class McpOAuthClient {
    * Dynamic client registration (RFC 7591). Returns the registered client
    * descriptor, including client_id (and client_secret if confidential).
    */
-  async registerClient(discovery) {
+  async registerClient(discovery, scope = null) {
     if (!discovery.serverMeta.registration_endpoint) {
       throw new Error("Authorization server has no registration_endpoint and no static client_id was provided");
     }
+    // Only register grant types the server actually supports — Rize, for
+    // example, advertises authorization_code only, so registering
+    // refresh_token can be rejected.
+    const supportedGrants = discovery.serverMeta.grant_types_supported;
+    const grant_types = Array.isArray(supportedGrants)
+      ? ["authorization_code", "refresh_token"].filter((g) => supportedGrants.includes(g))
+      : ["authorization_code", "refresh_token"];
+    if (!grant_types.includes("authorization_code")) grant_types.push("authorization_code");
     const body = {
       client_name: "OpenAGI",
       client_uri: "https://github.com/Spshulem/openAGI",
       redirect_uris: redirectUriCandidates(),
-      grant_types: ["authorization_code", "refresh_token"],
+      grant_types,
       response_types: ["code"],
       token_endpoint_auth_method: "none",
-      scope: this.scope,
       application_type: "native"
     };
+    // Only advertise a scope at registration if we have a server-supported one.
+    if (scope) body.scope = scope;
     const response = await fetch(discovery.serverMeta.registration_endpoint, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
