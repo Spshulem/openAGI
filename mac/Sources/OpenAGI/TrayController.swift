@@ -105,7 +105,7 @@ struct TrayMenu: View {
       if state.providerConfigured {
         Text("Model: \(state.providerName)").disabled(true)
       } else {
-        Button("Open setup wizard…") { state.openDashboard(path: "/setup") }
+        Button("⚠ Finish setup — agent has no model key") { state.openDashboard(path: "/setup") }
       }
       Text("Today: $\(formatUsd(state.spentToday)) / $\(formatUsd(state.spentLimit))")
         .disabled(true)
@@ -125,6 +125,9 @@ struct TrayMenu: View {
   }
 
   private var statusLine: String {
+    // An unconfigured agent isn't "online" in any sense the user cares
+    // about — say so before anything else.
+    if state.status == .healthy && !state.providerConfigured { return "● setup needed" }
     switch state.status {
     case .healthy: return "● online"
     case .degraded: return "● needs attention"
