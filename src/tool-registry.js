@@ -78,6 +78,15 @@ export class ToolRegistry {
     if (!tool) {
       return { ok: false, error: `Unknown tool: ${name}` };
     }
+    // Specialist bounds: a propagated specialist may only call tools inside
+    // its allowlist (its scoped MCP tools + the core set agent-host grants).
+    // Same advisory-list / enforced-gate split as the scrutiny policies.
+    if (Array.isArray(context?.__allowedTools) && !context.__allowedTools.includes(name)) {
+      return {
+        ok: false,
+        error: `Tool ${name} is outside this specialist's bounded scope. Recommend the user take this to the main agent.`
+      };
+    }
     // Scrutiny 'watch' policy: read-only turns hard-block side-effecting
     // tools (defense in depth — the filtered tool list is advisory to the
     // model, this gate is not).

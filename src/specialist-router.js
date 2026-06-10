@@ -102,10 +102,19 @@ function scoreMatch(text, tags, specialist) {
   const ageDays = lastActivated > 0 ? (Date.now() - lastActivated) / (1000 * 60 * 60 * 24) : 9999;
   const recencyPenalty = ageDays > 60 ? 0.1 : ageDays > 30 ? 0.05 : 0;
 
+  // Outcome-quality feedback ("the individual then scrutinizes the
+  // creation"): once a specialist has enough resolved outcomes, its mean
+  // quality moves routing — proven specialists attract more work, struggling
+  // ones repel it before the retirement sweep catches them. ±0.15 swing.
+  let qualityAdjust = 0;
+  if ((specialist.outcomeSamples ?? 0) >= 3 && typeof specialist.meanOutcomeQuality === "number") {
+    qualityAdjust = (specialist.meanOutcomeQuality - 0.5) * 0.3;
+  }
+
   // Both signals weight equally; bonus when both fire (corroboration is itself a match signal).
   const baseScore = textScore * 0.5 + tagScore * 0.5;
   const corroborationBonus = textScore > 0.1 && tagScore > 0.1 ? 0.1 : 0;
-  const combined = baseScore + corroborationBonus + activationBoost - recencyPenalty;
+  const combined = baseScore + corroborationBonus + activationBoost + qualityAdjust - recencyPenalty;
 
   return {
     score: Math.max(0, Math.min(1, combined)),
@@ -113,6 +122,7 @@ function scoreMatch(text, tags, specialist) {
     tagScore,
     corroborationBonus,
     activationBoost,
+    qualityAdjust,
     recencyPenalty
   };
 }

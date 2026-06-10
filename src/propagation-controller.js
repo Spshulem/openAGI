@@ -1,4 +1,24 @@
-import { clamp, createId, nowIso, stableHash, summarizeText } from "./utils.js";
+import { clamp, createId, nowIso, stableHash, summarizeText, tokenOverlapScore } from "./utils.js";
+
+// A specialist's allowedTools used to be "every tool that existed at spawn
+// time" — a bound that bounds nothing. Division that inherits the whole
+// generalist toolset is just multiplication with a themed name. Instead:
+// keep only the tools whose name/description overlaps the bounded scope,
+// capped, ranked by overlap. (Core internal tools — recall/remember/task
+// ops — are granted at the enforcement layer in agent-host, not here.)
+const MAX_SCOPE_TOOLS = 10;
+export function selectScopedTools(tools, scopeText) {
+  const scored = [];
+  for (const tool of tools ?? []) {
+    const name = typeof tool === "string" ? tool : tool?.name;
+    if (!name) continue;
+    const description = typeof tool === "object" ? (tool.description ?? "") : "";
+    const score = tokenOverlapScore(scopeText, `${name.replace(/[_-]/g, " ")} ${description}`);
+    if (score > 0.05) scored.push({ name, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return [...new Set(scored.slice(0, MAX_SCOPE_TOOLS).map((entry) => entry.name))];
+}
 
 export class PropagationController {
   constructor(options = {}) {
@@ -72,7 +92,10 @@ export class PropagationController {
       parentGoal: workflow?.goal ?? signal.goal ?? "Improve outcome from signal evidence.",
       boundedScope: summarizeText(signal.specialistScope ?? signal.summary ?? signal.content ?? "Investigate and act on this signal class.", 240),
       successMetric: signal.successMetric ?? workflow?.successMetric ?? "Produces cited, actionable recommendations with lower repeated parent effort.",
-      allowedTools: tools.map((tool) => (typeof tool === "string" ? tool : tool.name)).filter(Boolean),
+      allowedTools: selectScopedTools(
+        tools,
+        `${signal.specialistScope ?? ""} ${signal.summary ?? ""} ${signal.content ?? ""} ${workflow?.goal ?? ""}`
+      ),
       status: "available",
       createdAt: nowIso(),
       lastActivatedAt: nowIso(),
