@@ -16,6 +16,19 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
+
+// Cap the `text` returned by search() for long-form transcript rows so a
+// single hit can't dump an entire call transcript into a tool result. The
+// FTS `snippet` already carries the match context; full text stays in the DB.
+const TRANSCRIPT_SEARCH_TEXT_CAP = 1000;
+
+function capTranscriptText(row) {
+  if (row && row.kind === "transcript" && typeof row.text === "string" && row.text.length > TRANSCRIPT_SEARCH_TEXT_CAP) {
+    return { ...row, text: row.text.slice(0, TRANSCRIPT_SEARCH_TEXT_CAP) + "…" };
+  }
+  return row;
+}
 
 let sqlite3Module = null;
 async function loadSqlite() {
@@ -31,7 +44,7 @@ async function loadSqlite() {
 
 export class ObservationStore {
   constructor(options = {}) {
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "observations");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "observations");
     this.dbPath = path.join(this.dir, "index.db");
     ensureDir(this.dir);
     this.db = null;
@@ -116,6 +129,11 @@ export class ObservationStore {
           const uid = o.frameId ? String(o.frameId) : createId("frm");
           insertFrame.run(uid, o.at ?? nowIso(), o.app ?? null, o.window ?? null, o.thumbnail ?? null, typeof o.confidence === "number" ? o.confidence : null);
           if (o.ocrText) insertText.run("frame", uid, o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.ocrText);
+        } else if (o.kind === "transcript") {
+          // Long-form text (e.g. a BuildBetter call transcript) recorded so it's
+          // searchable via the same FTS path as OCR/activity (and thus recall_activity).
+          const ref = o.ref ? String(o.ref) : createId("txt");
+          if (o.text) insertText.run("transcript", ref, o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.text);
         }
         count += 1;
       }
@@ -136,12 +154,12 @@ export class ObservationStore {
       let out = rows;
       if (query) {
         const q = query.toLowerCase();
-        out = out.filter((o) => (o.ocrText || "").toLowerCase().includes(q) || (o.window || "").toLowerCase().includes(q));
+        out = out.filter((o) => (o.ocrText || "").toLowerCase().includes(q) || (o.window || "").toLowerCase().includes(q) || (o.text || "").toLowerCase().includes(q));
       }
       if (app) out = out.filter((o) => o.app === app);
       if (since) out = out.filter((o) => (o.at ?? "") >= since);
       if (until) out = out.filter((o) => (o.at ?? "") <= until);
-      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(0, limit);
+      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(0, limit).map(capTranscriptText);
     }
 
     if (query) {
@@ -161,7 +179,7 @@ export class ObservationStore {
       if (since) params.push(since);
       if (until) params.push(until);
       params.push(limit);
-      return rows.all(...params);
+      return rows.all(...params).map(capTranscriptText);
     }
     // No query → return recent activity by default.
     const params = [];
@@ -171,6 +189,22 @@ export class ObservationStore {
     if (until) { where += " AND at <= ?"; params.push(until); }
     params.push(limit);
     return this.db.prepare(`SELECT 'activity' AS kind, app, window, at, event FROM activity WHERE ${where} ORDER BY at DESC LIMIT ?`).all(...params);
+  }
+
+  async existsRef(ref) {
+    await this.ready;
+    if (!ref) return false;
+    if (this.fallback) {
+      try {
+        const rows = fs.readFileSync(this.fallbackPath, "utf8").split("\n").filter(Boolean).map(JSON.parse);
+        return rows.some((o) => o.kind === "transcript" && o.ref === ref);
+      } catch { return false; }
+    }
+    // `ref` is UNINDEXED in the FTS5 table so this is a small scan; fine for the
+    // handful of transcript rows a sync checks. Scoped to kind='transcript' so the
+    // dedup check never collides with activity/frame refs.
+    const row = this.db.prepare(`SELECT 1 FROM texts WHERE kind = 'transcript' AND ref = ? LIMIT 1`).get(ref);
+    return Boolean(row);
   }
 
   // Build a compact "what was the user just doing" digest the agent host

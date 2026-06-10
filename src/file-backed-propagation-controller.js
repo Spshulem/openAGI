@@ -2,11 +2,12 @@ import path from "node:path";
 import { ensureDir, readJsonFile, safeFilename, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
 import { PropagationController } from "./propagation-controller.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 export class FileBackedPropagationController extends PropagationController {
   constructor(options = {}) {
     super(options);
-    this.storePath = options.storePath ?? path.join(process.cwd(), ".openagi", "agents", "specialists.json");
+    this.storePath = options.storePath ?? path.join(resolveDataDir(), "agents", "specialists.json");
     this.workspaceRoot = options.workspaceRoot ?? path.join(path.dirname(this.storePath), "workspaces");
     this.vectorStore = options.vectorStore ?? null;
     ensureDir(path.dirname(this.storePath));

@@ -17,6 +17,7 @@ import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { matchCatalog } from "./mcp-catalog.js";
 import { buildReconciliationCalibration } from "./reconciliation-calibration.js";
+import { resolveDataDir } from "./data-dir.js";
 
 const SUGGEST_DIR = "proactive/suggestions";
 const DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000; // 6h — don't repeat the same proposal within a 6h window
@@ -57,7 +58,7 @@ const SYSTEM_PROMPT = [
 export class ProactiveObserver {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.dataDir = options.dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi";
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.suggestDir = path.join(this.dataDir, SUGGEST_DIR);
     this.lookbackMinutes = options.lookbackMinutes ?? 15;
     this.lastRunAt = 0;
@@ -269,15 +270,74 @@ export class ProactiveObserver {
       proposedAt: nowIso(),
       ...record
     };
+    const task = this.materializeTaskSuggestion(candidate);
+    if (task) {
+      candidate.status = "accepted";
+      candidate.resolvedAt = nowIso();
+      candidate.taskId = task.id;
+      candidate.taskAutoCreated = true;
+      candidate.note = "Auto-created task from proactive observer.";
+    }
     writeJsonAtomic(path.join(this.suggestDir, `${id}.json`), candidate);
-    this.runtime?.events?.emit?.("proactive-suggestion", {
-      id,
-      category: candidate.category,
-      title: candidate.title,
-      rationale: candidate.rationale,
-      mcpId: candidate.mcpId
-    });
+    if (task) {
+      this.runtime?.events?.emit?.("task-reminder", {
+        kind: "created",
+        at: nowIso(),
+        taskId: task.id,
+        queue: task.queue,
+        bucket: task.bucket,
+        title: `Task added: ${task.title}`,
+        body: task.description ? task.description.slice(0, 200) : ""
+      });
+    } else {
+      this.runtime?.events?.emit?.("proactive-suggestion", {
+        id,
+        category: candidate.category,
+        title: candidate.title,
+        rationale: candidate.rationale,
+        mcpId: candidate.mcpId
+      });
+    }
     return { suggested: 1, candidate };
+  }
+
+  materializeTaskSuggestion(candidate) {
+    if (candidate?.category !== "task") return null;
+    if (!candidate.title || !this.runtime?.tasks?.add) return null;
+    const queue = candidate.taskQueue === "agent" ? "agent" : "user";
+    try {
+      const existing = this.runtime.tasks.list?.({ limit: 500 }) ?? [];
+      const duplicate = existing.find((t) => t.sourceMeta?.suggestionId === candidate.id);
+      if (duplicate) return duplicate;
+
+      const descriptionParts = [];
+      if (candidate.rationale) descriptionParts.push(candidate.rationale);
+      if (queue === "agent") {
+        descriptionParts.push(
+          "Produce a draft only. Do NOT send, publish, schedule externally, or take any irreversible action without user approval.",
+          "Leave the result for the user to review."
+        );
+      }
+
+      return this.runtime.tasks.add(
+        {
+          title: candidate.title,
+          description: descriptionParts.join("\n\n").trim(),
+          bucket: candidate.taskBucket ?? "today",
+          priority: queue === "agent" ? 60 : 50,
+          tags: queue === "agent" ? ["observer-proposed", "draft-only"] : ["observer-proposed"],
+          sourceMeta: {
+            suggestionId: candidate.id,
+            autoMaterialized: true,
+            observedApps: candidate.context?.apps ?? null,
+            source: candidate.source ?? "proactive-observer"
+          }
+        },
+        { source: candidate.source ?? "proactive-observer", queue }
+      );
+    } catch {
+      return null;
+    }
   }
 
   list({ status = "pending" } = {}) {

@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir, readJsonFile, safeFilename, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 export class InMemoryAgentStore {
   constructor(options = {}) {
@@ -75,7 +76,7 @@ export class InMemoryAgentStore {
 export class FileBackedAgentStore extends InMemoryAgentStore {
   constructor(options = {}) {
     super({ ensureDefault: false });
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "agent-host");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "agent-host");
     this.agentsPath = path.join(this.dir, "agents.json");
     this.sessionsDir = path.join(this.dir, "sessions");
     ensureDir(this.sessionsDir);

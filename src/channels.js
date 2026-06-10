@@ -1,12 +1,13 @@
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import path from "node:path";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 export class ChannelManager {
   constructor(options = {}) {
     this.agentHost = options.agentHost;
     this.runtime = options.runtime ?? options.agentHost?.runtime;
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "channels");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "channels");
     ensureDir(this.dir);
     this.eventsPath = path.join(this.dir, "events.jsonl");
     this.telegram = new TelegramChannel({
@@ -94,7 +95,7 @@ export class TelegramChannel {
   constructor(options = {}) {
     this.agentHost = options.agentHost;
     this.token = options.token;
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "channels", "telegram");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "channels", "telegram");
     this.statePath = path.join(this.dir, "state.json");
     this.eventsPath = path.join(this.dir, "events.jsonl");
     this.pollTimer = null;
@@ -200,7 +201,7 @@ export class SmsChannel {
     this.accountSid = options.accountSid;
     this.authToken = options.authToken;
     this.fromNumber = options.fromNumber;
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "channels", "sms");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "channels", "sms");
     this.eventsPath = path.join(this.dir, "events.jsonl");
     ensureDir(this.dir);
   }

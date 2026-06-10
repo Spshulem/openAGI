@@ -14,6 +14,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { ensureDir, writeTextAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 const QUICK_TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 const POLL_MS = 2000;
@@ -21,7 +22,7 @@ const POLL_MS = 2000;
 export class TunnelWatcher extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.dataDir = options.dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi";
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.logPath = options.logPath ?? path.join(this.dataDir, "tunnel.log");
     this.envPath = options.envPath ?? path.join(this.dataDir, ".env");
     this.timer = null;

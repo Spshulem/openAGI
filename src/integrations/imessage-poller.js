@@ -24,6 +24,7 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
 import { ensureDir, writeJsonAtomic, readJsonFile } from "../file-utils.js";
+import { resolveDataDir } from "../data-dir.js";
 
 const DEFAULT_INTERVAL_MS = 60 * 1000;
 const DEFAULT_DB_PATH = path.join(os.homedir(), "Library", "Messages", "chat.db");
@@ -42,7 +43,7 @@ async function loadSqlite() {
 export class IMessagePollerSource {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.dataDir = options.dataDir ?? path.join(process.cwd(), ".openagi");
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.dbPath = options.dbPath ?? process.env.IMESSAGE_DB_PATH ?? DEFAULT_DB_PATH;
     this.selfHandle = options.selfHandle ?? process.env.IMESSAGE_SELF_HANDLE ?? null;
     this.intervalMs = options.intervalMs ?? (Number(process.env.IMESSAGE_INTERVAL_MS) || DEFAULT_INTERVAL_MS);

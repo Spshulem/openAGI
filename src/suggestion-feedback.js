@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Story 3: closes the "self-improving" loop. Reads the proactive-observer's
 // resolved suggestions (accepted / rejected / dismissed) and produces:
@@ -20,7 +21,7 @@ const MIN_SAMPLES_FOR_SIGNAL = 3;
 export class SuggestionFeedback {
   constructor({ runtime, dataDir, windowDays = DEFAULT_WINDOW_DAYS } = {}) {
     this.runtime = runtime;
-    this.dataDir = dataDir ?? path.join(process.cwd(), ".openagi");
+    this.dataDir = dataDir ?? resolveDataDir();
     this.windowDays = windowDays;
     this.prefsPath = path.join(this.dataDir, "preferences.json");
     ensureDir(path.dirname(this.prefsPath));

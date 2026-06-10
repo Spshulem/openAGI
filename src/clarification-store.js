@@ -1,6 +1,7 @@
 import path from "node:path";
 import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // The "ask me when you can't decide" queue — the trust valve for the
 // living todo. When task reconciliation (proactive-observer) lands in the
@@ -25,7 +26,7 @@ const VALID_ANSWERS = ["yes", "in_progress", "no", "dropped"];
 
 export class ClarificationStore {
   constructor({ dir, runtime } = {}) {
-    this.dir = dir ?? path.join(process.cwd(), ".openagi", "clarifications");
+    this.dir = dir ?? path.join(resolveDataDir(), "clarifications");
     this.runtime = runtime ?? null;
     ensureDir(this.dir);
     this.items = new Map();

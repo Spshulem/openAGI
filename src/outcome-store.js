@@ -1,6 +1,7 @@
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Append-only JSONL log + atomic snapshot of recent outcomes.
 // Outcome kinds: agent-reply, tool-call, cron-fire, autopilot-fire, sent-message, specialist-action.
@@ -10,7 +11,7 @@ const SNAPSHOT_LIMIT = 2000; // keep last N resolved + all pending
 
 export class OutcomeStore {
   constructor(options = {}) {
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "outcomes");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "outcomes");
     this.eventsPath = path.join(this.dir, "events.jsonl");
     this.snapshotPath = path.join(this.dir, "snapshot.json");
     ensureDir(this.dir);

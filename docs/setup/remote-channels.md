@@ -42,7 +42,7 @@ Same deal — copy the `https://*.ngrok-free.app` URL.
 
 This is required for Twilio signature verification (Twilio computes the HMAC over the URL it dialed, and the daemon must reconstruct the same URL).
 
-In `.openagi/.env`:
+In `~/.openagi/.env`:
 
 ```
 OPENAGI_PUBLIC_URL=https://abc-def-ghi.trycloudflare.com
@@ -61,7 +61,7 @@ Or if you're running it foreground: kill + `npm run serve`.
 
 You need a Twilio account, a phone number, and these three keys.
 
-### 3a. Drop creds into `.openagi/.env`
+### 3a. Drop creds into `~/.openagi/.env`
 
 ```
 TWILIO_ACCOUNT_SID=AC...
@@ -127,7 +127,7 @@ Talk to [@BotFather](https://t.me/BotFather), `/newbot`, copy the token.
 
 ### 4b. Set creds
 
-In `.openagi/.env`:
+In `~/.openagi/.env`:
 
 ```
 TELEGRAM_BOT_TOKEN=12345:ABC...
@@ -167,7 +167,7 @@ npm run install-launchd uninstall
 ## Verification checklist
 
 - [ ] `curl https://<tunnel>/health` returns 200.
-- [ ] `OPENAGI_PUBLIC_URL` is set in `.openagi/.env` and the daemon was restarted after.
+- [ ] `OPENAGI_PUBLIC_URL` is set in `~/.openagi/.env` and the daemon was restarted after.
 - [ ] Twilio console webhook points at `<tunnel>/channels/twilio/webhook`.
 - [ ] Texting your Twilio number triggers a TwiML reply.
 - [ ] `/channels` in the dashboard shows `outboundConfigured: true`.

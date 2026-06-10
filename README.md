@@ -232,7 +232,7 @@ npm run tunnel    # cloudflared (preferred) or ngrok, auto-detected
 
 ### Twilio bidirectional SMS
 
-1. Drop credentials into `.openagi/.env`:
+1. Drop credentials into `~/.openagi/.env`:
     ```bash
     TWILIO_ACCOUNT_SID=AC...
     TWILIO_AUTH_TOKEN=...
@@ -254,7 +254,7 @@ npm run tunnel    # cloudflared (preferred) or ngrok, auto-detected
 
 ### Telegram
 
-Create a bot via [@BotFather](https://t.me/BotFather), drop the token in `.openagi/.env`:
+Create a bot via [@BotFather](https://t.me/BotFather), drop the token in `~/.openagi/.env`:
 
 ```bash
 TELEGRAM_BOT_TOKEN=...
@@ -287,6 +287,18 @@ Privacy posture (non-negotiable):
 
 ---
 
+## Floating widget — Quick Ask
+
+Press **⌥Space** (or click the tray icon → **Quick Ask**) to summon a small always-on-top pill that expands into an ask box over any app.
+
+**Screen context.** On each ask, the widget does an on-device OCR grab of the focused window using the same ScreenCaptureKit pipeline as the pattern miner. The capture exclusion list applies — 1Password, banking sites, 2FA screens, and private windows are never read. Requires **Screen Recording** permission; without it, the ask still works but the panel shows "no screen context."
+
+**Proactive nudges.** Suggestions from the agent's scrutiny layer surface as a badge on the pill. Open the nudge list to send it to chat or dismiss it.
+
+**Toggle.** Enable or disable the whole feature from the tray via **Enable Quick Ask** (on by default).
+
+---
+
 ## MCP servers
 
 Drop a config at `.openagi/mcp.json`:
@@ -310,7 +322,7 @@ Drop a config at `.openagi/mcp.json`:
 
 Three transport+auth shapes are supported: **stdio** (spawn local process), **http+bearer** (URL with static API key), **http+oauth** (URL with browser-based OAuth — supports both dynamic registration and pre-registered clients).
 
-For the bearer shape, reference your secrets via `.openagi/.env` only — `${VAR}` substitution is allowlisted to keys defined in that file (closes the env-var exfiltration class). Restart the daemon and click **Connect** in the MCP tab — or:
+For the bearer shape, reference your secrets via `~/.openagi/.env` only — `${VAR}` substitution is allowlisted to keys defined in that file (closes the env-var exfiltration class). Restart the daemon and click **Connect** in the MCP tab — or:
 
 ```bash
 curl -s -X POST http://127.0.0.1:43210/mcp/connect/filesystem \
@@ -397,7 +409,7 @@ Webhooks self-validate instead:
 Additional defenses:
 
 - **Cross-origin POST blocked** — any browser request whose `Origin` doesn't match `Host` is rejected with 403, regardless of auth state.
-- **MCP register hardening** — `command` is allowlisted to known runners (`npx`, `node`, `bun`, `deno`, `python3`, `uvx`, `docker`); URL hosts may not be loopback / RFC1918 / link-local / cloud-metadata; `${VAR}` substitution is allowlisted to keys explicitly declared in `.openagi/.env`.
+- **MCP register hardening** — `command` is allowlisted to known runners (`npx`, `node`, `bun`, `deno`, `python3`, `uvx`, `docker`); URL hosts may not be loopback / RFC1918 / link-local / cloud-metadata; `${VAR}` substitution is allowlisted to keys explicitly declared in `~/.openagi/.env`.
 
 ---
 
@@ -434,7 +446,35 @@ Additional defenses:
 
 ## Environment
 
-See `.env.example`. All keys read from `.env` and `.openagi/.env`.
+See `.env.example`. All keys read from `.env` and `~/.openagi/.env` (override the location with `OPENAGI_DATA_DIR`).
+
+### Web search
+
+The agent gains two tools — `web_search` and `fetch_url` — once at least one provider key is set. With no key configured, `web_search` returns a clear "no provider configured" error and `fetch_url` still works via a plain HTTP fetch.
+
+| Variable | Provider |
+|---|---|
+| `EXA_API_KEY` | [Exa](https://exa.ai) (default first choice) |
+| `TAVILY_API_KEY` | [Tavily](https://tavily.com) |
+| `BRAVE_API_KEY` | [Brave Search](https://brave.com/search/api/) |
+| `SERPAPI_API_KEY` | [SerpApi](https://serpapi.com) |
+| `FIRECRAWL_API_KEY` | [Firecrawl](https://firecrawl.dev) |
+| `PERPLEXITY_API_KEY` | [Perplexity](https://www.perplexity.ai/api) |
+| `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` | Google Custom Search (alternative to the above) |
+
+`WEB_SEARCH_PROVIDER` — optional. Force a specific provider (`exa`, `tavily`, `firecrawl`, `brave`, `perplexity`, or `serpapi`). When unset the agent auto-selects the first configured provider in priority order `exa → tavily → brave → serpapi → firecrawl → perplexity`, falling back to the next on error.
+
+### BuildBetter
+
+Set `BUILDBETTER_API_KEY`, `BUILDBETTER_USER_EMAIL`, and `BUILDBETTER_USER_NAME` to enable the BuildBetter integration.
+
+`BUILDBETTER_INGEST_MODE` controls what the integration ingests:
+
+| Value | Behavior |
+|---|---|
+| `signals` _(default)_ | Action items from calls become agent tasks |
+| `transcripts` | Call transcripts are stored as searchable memory (queryable via `recall_activity`) |
+| `both` | Both of the above |
 
 ## Tests
 

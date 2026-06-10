@@ -2,6 +2,7 @@ import path from "node:path";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { cosine } from "./embeddings.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Namespaced cosine vector store. File-backed for persistence across restarts.
 // Namespaces: "principle" (distilled long-term memory), "specialist" (bounded
@@ -10,7 +11,7 @@ import { nowIso } from "./utils.js";
 export class VectorStore {
   constructor(options = {}) {
     this.embedder = options.embedder;
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "vectors");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "vectors");
     this.path = options.path ?? path.join(this.dir, "store.json");
     ensureDir(this.dir);
     const snap = readJsonFile(this.path, { version: 1, entries: [] });

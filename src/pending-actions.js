@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir, writeJsonAtomic, readJsonFile, appendJsonLine } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // File-backed queue of agent-initiated actions awaiting human approval.
 // When the agent invokes a tool flagged `needsConfirmation: true`, the
@@ -15,7 +16,7 @@ import { createId, nowIso } from "./utils.js";
 
 export class PendingActionStore {
   constructor({ dir } = {}) {
-    this.dir = dir ?? path.join(process.cwd(), ".openagi", "pending-actions");
+    this.dir = dir ?? path.join(resolveDataDir(), "pending-actions");
     ensureDir(this.dir);
     this.actions = new Map();
     this.events = null;
