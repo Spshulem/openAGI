@@ -122,6 +122,7 @@ export function registerComputerUseTools(registry, runtime) {
 
   registry.register({
     name: "computer_screenshot",
+    sideEffects: false,
     description: "Read the current screen state. Returns the most recent OCR text + active app from the observation store (real data). This build does not return raw image bytes — image transport ships with the Mac app in a later phase.",
     parameters: {
       type: "object",
