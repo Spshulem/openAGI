@@ -36,9 +36,16 @@ const ASSIGNED_ISSUES_QUERY = `
 export class LinearTaskSource {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.apiKey = options.apiKey ?? process.env.LINEAR_API_KEY ?? null;
+    this._apiKey = options.apiKey ?? null;
     this.includeCompleted = options.includeCompleted ?? false;
     this.lastSyncedAt = null;
+  }
+
+  // Read the env live (not a constructor snapshot) so a key added after boot
+  // — setup-wizard save, manual .env edit — starts syncing on the next cron
+  // tick without a daemon restart.
+  get apiKey() {
+    return this._apiKey ?? process.env.LINEAR_API_KEY ?? null;
   }
 
   isConfigured() {
@@ -64,7 +71,14 @@ export class LinearTaskSource {
    * Poll Linear and reconcile against the OpenAGI TaskStore.
    * Returns { created, updated, completed } counts.
    */
-  async sync({ now = new Date() } = {}) {
+  async sync(opts = {}) {
+    const result = await this._sync(opts);
+    // Surfaced via /integrations/status so skip reasons are visible.
+    this.lastSyncResult = { at: new Date().toISOString(), ...result };
+    return result;
+  }
+
+  async _sync({ now = new Date() } = {}) {
     if (!this.isConfigured()) return { skipped: true, reason: "LINEAR_API_KEY not set" };
     if (!this.runtime?.tasks?.add) return { skipped: true, reason: "task store not available" };
 
@@ -168,11 +182,11 @@ function pickBucket(dueDateIso, now = new Date()) {
 
 export function registerLinearTaskSource(runtime, options = {}) {
   const source = options.source ?? new LinearTaskSource({ runtime, ...options });
-  if (!source.isConfigured()) {
-    return { registered: false, reason: "LINEAR_API_KEY not set" };
-  }
-  // Add a cron job for periodic sync. Idempotent — addJob skips duplicates
-  // by id.
+  // Register the source + cron job even when LINEAR_API_KEY is missing at
+  // boot (same pattern as the BuildBetter source): sync() self-gates on
+  // isConfigured(), which reads the env live, so a key added later via the
+  // setup wizard is picked up on the next 5-min tick — previously the cron
+  // job was never installed and Linear stayed dead until a restart.
   if (runtime.cron?.addJob) {
     runtime.cron.addJob({
       id: "linear-task-sync",
@@ -183,5 +197,5 @@ export function registerLinearTaskSource(runtime, options = {}) {
     });
   }
   runtime.linearTaskSource = source;
-  return { registered: true };
+  return { registered: true, idle: !source.isConfigured() };
 }

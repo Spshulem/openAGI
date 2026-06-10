@@ -264,8 +264,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
         const body = await readJson(req);
-        const result = await channels.handleLocalMessage(body);
-        return sendJson(res, 200, result);
+        // Chat must return a structured error, not a generic 500: the
+        // dashboard needs to distinguish "budget cap hit" / "provider auth
+        // failed" / "network blip" to show something actionable.
+        try {
+          const result = await channels.handleLocalMessage(body);
+          return sendJson(res, 200, result);
+        } catch (error) {
+          const code = error?.code === "BUDGET_EXCEEDED" || /budget/i.test(error?.message ?? "") ? "budget" : "agent-error";
+          return sendJson(res, 500, { error: error.message ?? String(error), code });
+        }
       }
 
       if (method === "POST" && pathname === "/channels/telegram/webhook") {
@@ -722,6 +730,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 configured: Boolean(runtime.linearTaskSource?.isConfigured?.()),
                 envKeys: ["LINEAR_API_KEY"],
                 lastSyncedAt: runtime.linearTaskSource?.lastSyncedAt ?? null,
+                lastSync: runtime.linearTaskSource?.lastSyncResult ?? null,
                 feeds: "tasks",
                 detail: "Polls every 5 min. Assigned issues become tasks. Lin priority maps to bucket+priority."
               },
@@ -744,6 +753,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 configured: Boolean(runtime.buildBetterTaskSource?.isConfigured?.()),
                 envKeys: ["BUILDBETTER_API_KEY", "BUILDBETTER_USER_EMAIL", "BUILDBETTER_USER_NAME"],
                 lastSyncedAt: runtime.buildBetterTaskSource?.lastSyncedAt ?? null,
+                lastSync: runtime.buildBetterTaskSource?.lastSyncResult ?? null,
                 feeds: "tasks",
                 detail: "Polls every 15 min. action_item / commitment / follow_up extractions become tasks."
               },
@@ -3926,9 +3936,34 @@ async function renderTasks() {
   const userTotal = stats.user?.total ?? 0;
   const agentTotal = stats.agent?.total ?? 0;
 
+  // Zero tasks EVER is almost always "no source is connected", not "inbox
+  // zero". Diagnose it loudly instead of showing two empty sections: which
+  // task sources are configured, and the last sync's skip reason when not.
+  let gettingStarted = "";
+  if (userTotal === 0 && agentTotal === 0) {
+    const integ = await fetchJson("/integrations/status").catch(() => null);
+    const taskSources = (integ?.integrations ?? []).filter((s) => ["linear", "buildbetter"].includes(s.id));
+    const rows = taskSources.map((s) => {
+      const api = (s.paths ?? []).find((p) => p.kind === "api");
+      const ok = Boolean(api?.configured);
+      const reason = api?.lastSync?.skipped ? api.lastSync.reason : (api?.lastSync?.signals?.skipped ? api.lastSync.signals.reason : null);
+      const status = ok
+        ? (reason ? \`connected — last sync skipped: \${escapeHtml(reason)}\` : "connected")
+        : \`not connected (\${(api?.envKeys ?? []).slice(0, 1).map(escapeHtml).join("")} or MCP)\`;
+      return \`<li style="margin:2px 0;"><strong>\${escapeHtml(s.name)}</strong>: <span class="\${ok && !reason ? "" : "ui-muted"}">\${status}</span></li>\`;
+    }).join("");
+    gettingStarted = \`
+      <div class="card" style="margin-bottom: var(--space-4); border-left: 3px solid var(--warn, #d4a72c); padding: var(--space-3);">
+        <div style="font-weight:600; margin-bottom:4px;">No tasks yet — here's why</div>
+        <ul style="margin:4px 0 8px 16px; padding:0; font-size:13px;">\${rows || "<li>No task sources detected.</li>"}</ul>
+        <div class="ui-meta">Connect a source in <a href="/?tab=integrations">Integrations</a>, drop .md/.txt files in ~/.openagi/inbox, or just tell the agent below: "remind me to…"</div>
+      </div>\`;
+  }
+
   main.innerHTML = \`
     <div class="pane">
       <h2>Tasks</h2>
+      \${gettingStarted}
       <p class="ui-muted">Talk to the agent below to add, complete, or rearrange tasks. Or click checkboxes directly. <strong>My tasks</strong> are what you should do; <strong>Agent tasks</strong> are what OpenAGI is working on for you.</p>
 
       <div id="tasksPageChat"></div>

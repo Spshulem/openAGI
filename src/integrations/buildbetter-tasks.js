@@ -30,13 +30,17 @@ const LOOKBACK_DAYS = 7;
 export class BuildBetterTaskSource {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.apiKey = options.apiKey ?? process.env.BUILDBETTER_API_KEY ?? null;
-    this.userEmail = options.userEmail ?? process.env.BUILDBETTER_USER_EMAIL ?? null;
-    this.userName = options.userName ?? process.env.BUILDBETTER_USER_NAME ?? null;
+    this._apiKey = options.apiKey ?? null;
+    this._userEmail = options.userEmail ?? null;
+    this._userName = options.userName ?? null;
     // Identity auto-derivation (option 1): once we've successfully asked `me`,
     // don't ask again this process — even if it returned no user.
     this._identityResolved = false;
     this.lastSyncedAt = null;
+    // The most recent sync outcome (including skip reasons), surfaced via
+    // /integrations/status so "why are there zero tasks" is answerable from
+    // the dashboard instead of invisible inside cron tick results.
+    this.lastSyncResult = null;
     // Coalescing state for webhook-triggered syncs: if a sync is already
     // running when a ping arrives, we don't start a second — we just flag
     // that one more run is owed, and run it once when the current finishes.
@@ -45,6 +49,16 @@ export class BuildBetterTaskSource {
     const mode = (options.ingestMode ?? process.env.BUILDBETTER_INGEST_MODE ?? "signals").toLowerCase();
     this.ingestMode = ["signals", "transcripts", "both"].includes(mode) ? mode : "signals";
   }
+
+  // Credentials/identity read the env LIVE (not a constructor snapshot) so
+  // values added after boot — setup-wizard save, manual .env edit — take
+  // effect on the next sync tick without a daemon restart. ensureIdentity()
+  // still assigns through the setters when it derives identity from `me`.
+  get apiKey() { return this._apiKey ?? process.env.BUILDBETTER_API_KEY ?? null; }
+  get userEmail() { return this._userEmail ?? process.env.BUILDBETTER_USER_EMAIL ?? null; }
+  set userEmail(value) { this._userEmail = value; }
+  get userName() { return this._userName ?? process.env.BUILDBETTER_USER_NAME ?? null; }
+  set userName(value) { this._userName = value; }
 
   isConfigured() {
     // Identity is auto-derived now, so auth alone is enough: an API key, or a
@@ -312,6 +326,7 @@ export class BuildBetterTaskSource {
     if (this.ingestMode === "transcripts" || this.ingestMode === "both") {
       out.transcripts = await this.syncTranscripts({ now });
     }
+    this.lastSyncResult = { at: new Date().toISOString(), ...out };
     return out;
   }
 
