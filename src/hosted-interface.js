@@ -338,6 +338,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/budget") return sendJson(res, 200, runtime.budget?.status?.() ?? { error: "no-budget" });
+      if (method === "GET" && pathname === "/budget/ledger") {
+        const ledger = runtime.budget?.ledger;
+        if (!ledger) return sendJson(res, 200, { error: "no-ledger" });
+        // Cap at the ledger's retention window so the reported `days` always
+        // matches the data actually returned (query/analytics clamp the same way).
+        const maxDays = ledger.retentionDays ?? 30;
+        const requested = Math.max(1, Number.parseInt(url.searchParams.get("days") ?? "30", 10) || 30);
+        const days = Math.min(maxDays, requested);
+        return sendJson(res, 200, { days, requestedDays: requested, retentionDays: maxDays, entries: ledger.query({ days }), analytics: ledger.analytics({ days }) });
+      }
 
       // ─── Ambient capture / observations ─────────────────────────────────
       if (method === "POST" && pathname === "/observations") {
@@ -1827,7 +1837,7 @@ function renderApp() {
             <button data-tab="today" title="What you got done today — completed tasks, skills run, actions approved, time tracked, themes.">Today</button>
             <button data-tab="activity" title="Ambient capture log — what you were doing on screen (if capture is enabled).">Activity</button>
             <button data-tab="computer-use" title="Computer use (beta) — every action the agent intended to take, with the reasoning it gave.">Computer Use</button>
-            <button data-tab="budget" title="Today's LLM spend + 14-day history.">Budget</button>
+            <button data-tab="budget" title="Today's LLM spend + 14-day history.">Credits</button>
             <button data-tab="outcomes" title="Quality scores for completed agent work, 7d + 30d rolling.">Outcomes</button>
             <button data-tab="health" title="Memory saturation, specialist health, MCP status, upcoming cron.">Health</button>
             <button data-tab="scrutiny" title="Directional Adaptive Scrutiny — the 7-axis scorer's calibration + recent verdicts.">Scrutiny</button>
@@ -3130,7 +3140,7 @@ async function renderBudget() {
   const stateClass = pct > 90 ? "err" : pct > 70 ? "warn" : "ok";
   main.innerHTML = \`
     <div class="pane">
-      <h2>Budget</h2>
+      <h2>Credits</h2>
       <div class="card">
         <div class="row between" style="align-items:center;">
           <span class="name">Today · \${escapeHtml(b.today)}</span>
@@ -3156,6 +3166,14 @@ async function renderBudget() {
       <h3>Last 14 days</h3>
       <div id="budgetHistory" class="grid"></div>
       <p class="desc" style="margin-top:12px;">Limit is set via <code>OPENAGI_DAILY_USD_LIMIT</code> in <code>.openagi/.env</code>.</p>
+      <h3>Spend over time (30 days)</h3>
+      <div id="creditChart" class="card"></div>
+      <h3>By activity (30 days)</h3>
+      <div id="creditByActivity" class="grid"></div>
+      <h3>By model (30 days)</h3>
+      <div id="creditByModel" class="grid"></div>
+      <h3>Audit log</h3>
+      <div id="creditLog"></div>
     </div>
   \`;
   const hist = $("budgetHistory");
@@ -3164,6 +3182,43 @@ async function renderBudget() {
     c.className = "card";
     c.innerHTML = \`<div class="row between"><span class="name">\${escapeHtml(d.date)}</span><span class="muted">\${d.calls} call\${d.calls===1?"":"s"}</span></div><div class="stat-value">$\${d.usd.toFixed(4)}</div>\`;
     hist.appendChild(c);
+  }
+  const led = await fetchJson("/budget/ledger?days=30").catch(() => null);
+  if (led && !led.error) {
+    const days = led.analytics.byDay;
+    const maxUsd = Math.max(0.0001, ...days.map((d) => d.usd));
+    const bw = 100 / Math.max(days.length, 1);
+    const bars = days.map((d, i) => {
+      const h = Math.max(1, (d.usd / maxUsd) * 90);
+      return \`<rect x="\${(i * bw).toFixed(2)}" y="\${(100 - h).toFixed(2)}" width="\${(bw * 0.8).toFixed(2)}" height="\${h.toFixed(2)}"><title>\${escapeHtml(d.date)}: $\${d.usd.toFixed(4)} (\${d.calls})</title></rect>\`;
+    }).join("");
+    $("creditChart").innerHTML = \`<svg viewBox="0 0 100 100" preserveAspectRatio="none" style="width:100%;height:120px;fill:var(--accent);">\${bars}</svg>\`;
+
+    const fill = (id, items, key) => {
+      const el = $(id); el.innerHTML = "";
+      for (const it of items) {
+        const c = document.createElement("div"); c.className = "card";
+        c.innerHTML = \`<div class="row between"><span class="name">\${escapeHtml(String(it[key]))}</span><span class="muted">\${it.calls} call\${it.calls === 1 ? "" : "s"}</span></div><div class="stat-value">$\${it.usd.toFixed(4)}</div>\`;
+        el.appendChild(c);
+      }
+    };
+    fill("creditByActivity", led.analytics.byActivity, "activity");
+    fill("creditByModel", led.analytics.byModel, "model");
+
+    const log = $("creditLog");
+    log.innerHTML = "";
+    for (const e of led.entries.slice(0, 200)) {
+      const t = (e.at || "").slice(0, 16).replace("T", " ");
+      const tools = (e.tools || []).join(", ");
+      const row = document.createElement("div"); row.className = "card";
+      row.innerHTML = \`<div class="row between"><span class="name">\${escapeHtml(e.model || "?")}</span><span class="stat-value">$\${Number(e.usd || 0).toFixed(4)}</span></div><div class="muted" style="font-size:11px;">\${escapeHtml(t)} · \${escapeHtml(e.channel || "?")}\${e.agentId ? " · " + escapeHtml(e.agentId) : ""}\${tools ? " · " + escapeHtml(tools) : ""}</div>\`;
+      log.appendChild(row);
+    }
+    if (led.entries.length > 200) {
+      const more = document.createElement("p"); more.className = "desc";
+      more.textContent = "Showing the most recent 200 of " + led.entries.length + " calls.";
+      log.appendChild(more);
+    }
   }
 }
 
