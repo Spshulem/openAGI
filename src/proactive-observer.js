@@ -270,13 +270,19 @@ export class ProactiveObserver {
       proposedAt: nowIso(),
       ...record
     };
-    const task = this.materializeTaskSuggestion(candidate);
+    // Proposal-first: task suggestions surface as suggestion cards (notification
+    // + Suggestions tab) for the user to accept, like every other category —
+    // accepting materializes the task (hosted-interface accept endpoint).
+    // OPENAGI_AUTO_TASKS=1 restores the old behavior of silently creating the
+    // task the moment the observer proposes it.
+    const autoCreate = process.env.OPENAGI_AUTO_TASKS === "1";
+    const task = autoCreate ? materializeTaskFromSuggestion(this.runtime, candidate) : null;
     if (task) {
       candidate.status = "accepted";
       candidate.resolvedAt = nowIso();
       candidate.taskId = task.id;
       candidate.taskAutoCreated = true;
-      candidate.note = "Auto-created task from proactive observer.";
+      candidate.note = "Auto-created task from proactive observer (OPENAGI_AUTO_TASKS=1).";
     }
     writeJsonAtomic(path.join(this.suggestDir, `${id}.json`), candidate);
     if (task) {
@@ -302,42 +308,7 @@ export class ProactiveObserver {
   }
 
   materializeTaskSuggestion(candidate) {
-    if (candidate?.category !== "task") return null;
-    if (!candidate.title || !this.runtime?.tasks?.add) return null;
-    const queue = candidate.taskQueue === "agent" ? "agent" : "user";
-    try {
-      const existing = this.runtime.tasks.list?.({ limit: 500 }) ?? [];
-      const duplicate = existing.find((t) => t.sourceMeta?.suggestionId === candidate.id);
-      if (duplicate) return duplicate;
-
-      const descriptionParts = [];
-      if (candidate.rationale) descriptionParts.push(candidate.rationale);
-      if (queue === "agent") {
-        descriptionParts.push(
-          "Produce a draft only. Do NOT send, publish, schedule externally, or take any irreversible action without user approval.",
-          "Leave the result for the user to review."
-        );
-      }
-
-      return this.runtime.tasks.add(
-        {
-          title: candidate.title,
-          description: descriptionParts.join("\n\n").trim(),
-          bucket: candidate.taskBucket ?? "today",
-          priority: queue === "agent" ? 60 : 50,
-          tags: queue === "agent" ? ["observer-proposed", "draft-only"] : ["observer-proposed"],
-          sourceMeta: {
-            suggestionId: candidate.id,
-            autoMaterialized: true,
-            observedApps: candidate.context?.apps ?? null,
-            source: candidate.source ?? "proactive-observer"
-          }
-        },
-        { source: candidate.source ?? "proactive-observer", queue }
-      );
-    } catch {
-      return null;
-    }
+    return materializeTaskFromSuggestion(this.runtime, candidate);
   }
 
   list({ status = "pending" } = {}) {
@@ -723,4 +694,46 @@ function composeRetroContext(runtime) {
     lines.push(`[day] ${head.replace(/^##\s*/, "").slice(0, 200)}`);
   }
   return lines.join("\n");
+}
+
+// Create (or return the existing) task for a task-category suggestion.
+// Shared by the observer's OPENAGI_AUTO_TASKS=1 path and the dashboard's
+// accept endpoint, so both produce identical tasks (same dedup by
+// suggestionId, same draft-only guardrails for agent-queue tasks).
+export function materializeTaskFromSuggestion(runtime, candidate) {
+  if (candidate?.category !== "task") return null;
+  if (!candidate.title || !runtime?.tasks?.add) return null;
+  const queue = candidate.taskQueue === "agent" ? "agent" : "user";
+  try {
+    const existing = runtime.tasks.list?.({ limit: 500 }) ?? [];
+    const duplicate = existing.find((t) => t.sourceMeta?.suggestionId === candidate.id);
+    if (duplicate) return duplicate;
+
+    const descriptionParts = [];
+    if (candidate.rationale) descriptionParts.push(candidate.rationale);
+    if (queue === "agent") {
+      descriptionParts.push(
+        "Produce a draft only. Do NOT send, publish, schedule externally, or take any irreversible action without user approval.",
+        "Leave the result for the user to review."
+      );
+    }
+
+    return runtime.tasks.add(
+      {
+        title: candidate.title,
+        description: descriptionParts.join("\n\n").trim(),
+        bucket: candidate.taskBucket ?? "today",
+        priority: queue === "agent" ? 60 : 50,
+        tags: queue === "agent" ? ["observer-proposed", "draft-only"] : ["observer-proposed"],
+        sourceMeta: {
+          suggestionId: candidate.id,
+          observedApps: candidate.context?.apps ?? null,
+          source: candidate.source ?? "proactive-observer"
+        }
+      },
+      { source: candidate.source ?? "proactive-observer", queue }
+    );
+  } catch {
+    return null;
+  }
 }
