@@ -295,7 +295,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!bb.ok) return sendJson(res, 401, { error: "unauthorized", reason: bb.reason });
         await readJson(req).catch(() => ({})); // drain body; we don't trust it for ingestion
         const source = runtime.buildBetterTaskSource;
-        if (!source?.triggerSync) return sendJson(res, 503, { error: "buildbetter source not configured" });
+        // The source is always registered (so a mid-session MCP login works
+        // without restart), so also check it's actually configured — otherwise
+        // a sync would no-op. Returning 503 (not a false 202) lets BuildBetter
+        // retry the delivery once credentials land.
+        if (!source?.triggerSync || !source.isConfigured?.()) {
+          return sendJson(res, 503, { error: "buildbetter source not configured" });
+        }
         // Don't block the webhook response on the full sync — ack fast,
         // sync in the background (BuildBetter expects a quick 200).
         source.triggerSync().then(
@@ -1631,6 +1637,8 @@ function renderApp() {
     .badge.ok { color: var(--accent); }
     .badge.warn { color: var(--warn); }
     .badge.err { color: var(--err); }
+    .badge.mcp { background: rgba(96,165,250,.16); color: #7fb3ff; border-color: rgba(96,165,250,.35); }
+    .badge.muted { opacity: .65; }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
     input, select, textarea {
       background: var(--bg); color: var(--text); border: 1px solid var(--line);
@@ -3643,7 +3651,7 @@ async function renderIntegrations() {
       <div class="ui-card" style="display: flex; flex-direction: column; gap: var(--space-2);">
         <div style="display: flex; align-items: flex-start; gap: var(--space-2);">
           <div class="ui-grow">
-            <div style="font-weight: 600; font-size: 13px; display:flex; align-items:center; gap:6px;"><span>\${escapeHtml(e.name)}</span><span class="badge" style="background:rgba(96,165,250,.16); color:#7fb3ff; border-color:rgba(96,165,250,.35); font-size:9px;">MCP</span></div>
+            <div style="font-weight: 600; font-size: 13px; display:flex; align-items:center; gap:6px;"><span>\${escapeHtml(e.name)}</span><span class="badge mcp" style="font-size:9px;">MCP</span></div>
             <div class="ui-meta" style="margin-top: 2px;">\${escapeHtml(e.description ?? "")}</div>
             \${e.featured ? '<div class="ui-meta" style="margin-top:3px; opacity:.85;">↑ Also available as a non-MCP (direct API) integration above</div>' : ""}
           </div>
@@ -3668,8 +3676,8 @@ async function renderIntegrations() {
     // Make the integration TYPE unmistakable: an MCP path vs a non-MCP
     // (direct API / file-drop) path. Two integrations can offer both.
     const kindBadge = p.kind === "mcp"
-      ? '<span class="badge" style="background:rgba(96,165,250,.16); color:#7fb3ff; border-color:rgba(96,165,250,.35);">MCP</span>'
-      : '<span class="badge" style="opacity:.65;">non-MCP</span>';
+      ? '<span class="badge mcp">MCP</span>'
+      : '<span class="badge muted">non-MCP</span>';
     let actions = "";
     let editForm = "";
     if (p.kind === "api" && p.envKeys?.length > 0) {

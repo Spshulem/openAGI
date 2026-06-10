@@ -235,14 +235,69 @@ export class McpRegistry {
   }
 
   async connect(name, { silent = false } = {}) {
-    if (this.connecting.has(name)) return this.connecting.get(name);
+    const inflight = this.connecting.get(name);
+    if (inflight) {
+      // An interactive (non-silent) in-flight connect serves any caller. A
+      // silent in-flight connect serves silent callers. But an interactive
+      // caller must NOT be handed a silent attempt (which fails fast without
+      // opening a browser) — wait for it, then connect interactively if the
+      // silent attempt didn't already get us connected.
+      if (!inflight.silent || silent) return inflight.promise;
+      return inflight.promise.then(
+        (status) => status,
+        () => this.connect(name, { silent: false })
+      );
+    }
     const promise = this.doConnect(name, { silent });
-    this.connecting.set(name, promise);
+    const entry = { promise, silent };
+    this.connecting.set(name, entry);
     // The caller awaits `promise` and handles its rejection; this cleanup chain
     // is separate, so swallow its copy of the rejection to avoid an
     // unhandledRejection when a connect fails (e.g. silent boot reconnect).
-    promise.finally(() => this.connecting.delete(name)).catch(() => {});
+    promise.finally(() => {
+      if (this.connecting.get(name) === entry) this.connecting.delete(name);
+    }).catch(() => {});
     return promise;
+  }
+
+  /**
+   * Silently obtain a Bearer token for a connected OAuth MCP server, reusing
+   * the registry's own OAuth client (or the cached token on disk) — never opens
+   * a browser. Returns null when there's no usable token. This is the shared
+   * primitive integrations use to call a vendor's REST/GraphQL API with the
+   * same login the user already granted to that vendor's MCP server.
+   */
+  async silentTokenFor(name) {
+    let oauth = this.clients.get(name)?.oauth ?? null;
+    if (!oauth) {
+      const server = this.servers.get(name);
+      if (server?.auth !== "oauth" || !server.url) return null;
+      oauth = new McpOAuthClient({
+        name: server.name,
+        resourceUrl: server.resourceUrl ?? deriveResourceUrl(server.url),
+        scope: server.scope,
+        dataDir: this.dataDir
+      });
+    }
+    try {
+      return await oauth.ensureToken({ interactive: false });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Sync probe: is there a usable OAuth token cached on disk for this server
+   * (so an integration can report itself "configured" without a network call)?
+   * Reads the same <dataDir>/mcp/auth/<name>.json the OAuth client writes.
+   */
+  hasOAuthToken(name) {
+    try {
+      const cache = readJsonFile(path.join(this.dataDir, "mcp", "auth", `${name}.json`), null);
+      return Boolean(cache?.access_token || cache?.refresh_token);
+    } catch {
+      return false;
+    }
   }
 
   async doConnect(name, { silent = false } = {}) {
