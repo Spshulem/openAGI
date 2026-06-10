@@ -423,27 +423,41 @@ export class AbiRuntime {
       this.agentHost.ensureSpecialistAgent(propagated.specialist, "main");
     }
 
-    const memoryItem = this.memory.remember(
-      {
+    // An 'ignore' verdict has a consequence: the signal is NOT committed to
+    // memory (forgetting low-signal noise is the point), just audit-logged.
+    // Every other verdict remembers the signal + decision as before.
+    let memoryItem = null;
+    if (scrutiny.action === "ignore") {
+      this.events?.emit?.("signal-ignored", {
+        at: nowIso(),
+        signalId: signal.id,
         source: signal.source,
-        content: `${signal.summary}\nDecision: ${scrutiny.action}\nReasons: ${scrutiny.reasons.join(" ")}`,
-        tags: ["signal", signal.domain, signal.taskType, ...(signal.tags ?? [])],
-        novelty: signal.novelty,
-        risk: signal.risk,
-        repetition: signal.repetition,
-        specificity: signal.specificity,
-        metadata: {
-          signalId: signal.id,
-          workflowId: workflow?.id,
-          scrutiny: scrutiny.dimensions
+        summary: signal.summary,
+        score: scrutiny.score
+      });
+    } else {
+      memoryItem = this.memory.remember(
+        {
+          source: signal.source,
+          content: `${signal.summary}\nDecision: ${scrutiny.action}\nReasons: ${scrutiny.reasons.join(" ")}`,
+          tags: ["signal", signal.domain, signal.taskType, ...(signal.tags ?? [])],
+          novelty: signal.novelty,
+          risk: signal.risk,
+          repetition: signal.repetition,
+          specificity: signal.specificity,
+          metadata: {
+            signalId: signal.id,
+            workflowId: workflow?.id,
+            scrutiny: scrutiny.dimensions
+          }
+        },
+        {
+          source: "abi-runtime",
+          strength: scrutiny.score,
+          critical: signal.risk >= 0.85
         }
-      },
-      {
-        source: "abi-runtime",
-        strength: scrutiny.score,
-        critical: signal.risk >= 0.85
-      }
-    );
+      );
+    }
 
     const output = {
       id: createId("out"),
@@ -468,7 +482,9 @@ export class AbiRuntime {
       outputId: output.id,
       createdAt: nowIso(),
       loop: "outputs-to-integrations",
-      summary: `Output ${output.id} fed back into memory tier ${memoryItem.tier}.`
+      summary: memoryItem
+        ? `Output ${output.id} fed back into memory tier ${memoryItem.tier}.`
+        : `Output ${output.id} ignored — signal not committed to memory.`
     });
 
     return output;

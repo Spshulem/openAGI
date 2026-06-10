@@ -69,8 +69,20 @@ export class AgentHost {
       this.ensureSpecialistAgent(output.propagation.specialist, agentId);
     }
 
+    // The scrutiny verdict has consequences, not just prompt flavor:
+    //   act       → full tool access
+    //   ask       → side-effecting tool calls divert to the approval queue
+    //               this turn (the agent is told to clarify first)
+    //   watch     → read-only tools only (filtered list + invoke-time gate)
+    //   ignore    → no tools; the user still gets a (brief) reply — a direct
+    //               human message is never silently dropped
+    //   propagate → full access (the specialist spawn already happened above)
+    const verdict = output.scrutiny.action;
+    const toolPolicy = verdict === "watch" ? "read-only" : verdict === "ask" ? "confirm" : verdict === "ignore" ? "none" : "full";
     const toolRegistry = this.runtime.tools;
-    const tools = toolRegistry?.toOpenAITools?.() ?? [];
+    const tools = toolPolicy === "none"
+      ? []
+      : (toolRegistry?.toOpenAITools?.({ readOnly: toolPolicy === "read-only" }) ?? []);
 
     // Lava intuition (C2): top principles from the vector store inserted into
     // the prompt as soft hints — distinct from explicit memoryHits.
@@ -114,7 +126,11 @@ export class AgentHost {
         target: from,
         agentId,
         sessionId,
-        runtime: this.runtime
+        runtime: this.runtime,
+        // Enforced in ToolRegistry.invoke — the filtered tool list above is
+        // advisory to the model; this gate is not.
+        __scrutinyPolicy: toolPolicy === "read-only" ? "read-only" : toolPolicy === "confirm" ? "confirm" : null,
+        __reason: toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null
       }
     });
 
@@ -274,7 +290,7 @@ Your job is to help through the ABI loop:
 3. Propagate bounded specialists only when repeated or novel high-risk work justifies it.
 
 Current decision: ${output.scrutiny.action}
-Reasons:
+${verdictGuidance(output.scrutiny.action)}Reasons:
 ${output.scrutiny.reasons.map((reason) => `- ${reason}`).join("\n")}
 ${intuitionBlock}${ambientBlock}${screenBlock}
 Answer the user plainly. If a specialist was created, mention its name and scope.`;
@@ -309,6 +325,22 @@ Stay inside the bounded scope. If the user's request falls outside it, say so an
       sessions: this.store.listSessions()
     };
   }
+}
+
+// What each scrutiny verdict means for THIS turn — matches the enforcement
+// in agent-host.handleMessage / ToolRegistry.invoke, so the model's
+// expectations line up with what will actually happen to its tool calls.
+function verdictGuidance(action) {
+  if (action === "ask") {
+    return "This turn: clarify before acting. Ask ONE focused clarifying question. Any side-effecting tool you call now will be queued for the user's approval instead of executing immediately — prefer to ask first, act next turn.\n";
+  }
+  if (action === "watch") {
+    return "This turn: observation mode. Only read-only tools are available; side-effecting calls will be rejected. Answer from what you can read and note what you'd do once confidence is higher.\n";
+  }
+  if (action === "ignore") {
+    return "This turn: low-signal. No tools are available. Reply briefly and move on.\n";
+  }
+  return "";
 }
 
 // Format the fresh focused-window context the floating widget attaches to a

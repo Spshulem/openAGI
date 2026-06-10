@@ -22,6 +22,13 @@ export class ToolRegistry {
       // Short human-readable summary used in the approval UI when the args
       // alone don't describe the action well. Optional fn(args) -> string.
       summarize: typeof tool.summarize === "function" ? tool.summarize : null,
+      // Whether invoking this tool changes state anywhere (memory, tasks,
+      // cron, outbound messages, external services). Defaults to TRUE — a
+      // tool must explicitly declare sideEffects: false to count as
+      // read-only. Scrutiny verdicts gate on this: 'watch' turns allow only
+      // read-only tools; 'ask' turns divert side-effecting calls to the
+      // approval queue.
+      sideEffects: tool.sideEffects !== false,
       metadata: tool.metadata ?? {}
     };
     this.tools.set(normalized.name, normalized);
@@ -44,12 +51,13 @@ export class ToolRegistry {
     return this.tools.get(name);
   }
 
-  list() {
-    return [...this.tools.values()].map(({ handler, ...rest }) => rest);
+  list({ readOnly = false } = {}) {
+    const all = [...this.tools.values()].map(({ handler, ...rest }) => rest);
+    return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
   }
 
-  toOpenAITools() {
-    return this.list().map((tool) => ({
+  toOpenAITools(options = {}) {
+    return this.list(options).map((tool) => ({
       type: "function",
       name: tool.name,
       description: tool.description,
@@ -57,8 +65,8 @@ export class ToolRegistry {
     }));
   }
 
-  toAnthropicTools() {
-    return this.list().map((tool) => ({
+  toAnthropicTools(options = {}) {
+    return this.list(options).map((tool) => ({
       name: tool.name,
       description: tool.description,
       input_schema: tool.parameters
@@ -70,10 +78,21 @@ export class ToolRegistry {
     if (!tool) {
       return { ok: false, error: `Unknown tool: ${name}` };
     }
+    // Scrutiny 'watch' policy: read-only turns hard-block side-effecting
+    // tools (defense in depth — the filtered tool list is advisory to the
+    // model, this gate is not).
+    if (context?.__scrutinyPolicy === "read-only" && tool.sideEffects) {
+      return {
+        ok: false,
+        error: `Tool ${name} is blocked this turn: scrutiny verdict 'watch' permits read-only tools only.`
+      };
+    }
     // Confirmation gate. When set, divert the call into the pending-action
     // queue UNLESS context.__confirmed is true (which the approve endpoint
-    // sets after a human OKs the action).
-    if (tool.needsConfirmation && !context?.__confirmed && this.pendingActions) {
+    // sets after a human OKs the action). Scrutiny 'ask' turns extend this
+    // to EVERY side-effecting tool, not just the always-gated ones.
+    const scrutinyConfirm = context?.__scrutinyPolicy === "confirm" && tool.sideEffects;
+    if ((tool.needsConfirmation || scrutinyConfirm) && !context?.__confirmed && this.pendingActions) {
       const summary = tool.summarize ? safeSummarize(tool.summarize, args) : `Run ${name}`;
       const action = this.pendingActions.enqueue({
         toolName: name,
@@ -150,6 +169,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "recall",
+    sideEffects: false,
     description: "Search memory for items related to a query. Returns the most relevant items across short, medium, and long-term memory.",
     parameters: {
       type: "object",
@@ -247,6 +267,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "recall_activity",
+    sideEffects: false,
     description: "Search the user's ambient capture log (window titles + app focus events + OCR text from screen frames). Use this when the user asks about what they were doing at a specific time, or to ground 'where did I leave off' questions. Returns rows with timestamp, app, window, and matching snippet.",
     parameters: {
       type: "object",
@@ -274,6 +295,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "recall_spend",
+    sideEffects: false,
     description: "Summarize LLM credit (USD) usage: how much has been spent, on what activity/model, and the costliest recent calls. Use to answer questions about cost/credits/budget — e.g. 'why did I spend $4 today?'.",
     parameters: {
       type: "object",
@@ -299,6 +321,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_sessions",
+    sideEffects: false,
     description: "List recent conversations across channels.",
     parameters: {
       type: "object",
@@ -315,6 +338,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_skills",
+    sideEffects: false,
     description: "List the skills (named prompts) available to this agent.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
@@ -362,6 +386,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_mcp_tools",
+    sideEffects: false,
     description: "List tools exposed by connected MCP servers.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
@@ -474,6 +499,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_cron_jobs",
+    sideEffects: false,
     description: "List all scheduled jobs (prompt schedules, autopilot pulses, system tasks).",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => runtime.cron.listJobs()
@@ -493,6 +519,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "get_audit",
+    sideEffects: false,
     description: "Get a structural health snapshot of the runtime: specialist counts, memory tier saturation, outcome quality (7d/30d), upcoming cron jobs, MCP servers, and any actionable findings (warn/err severity). Use this when the user asks 'how are you doing' or 'what's wrong'.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => runtime.introspector?.audit() ?? { error: "no introspector" }
@@ -500,6 +527,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "get_budget",
+    sideEffects: false,
     description: "Get today's LLM spend, daily limit, calls, and token counts. Returns 14 days of history.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => runtime.budget?.status?.() ?? { error: "no budget" }
@@ -569,6 +597,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_tasks",
+    sideEffects: false,
     description: "List tasks. Filter by queue (user/agent), bucket (today / this_week / this_month / this_quarter / this_year / someday / done), or status (pending/in_progress/blocked/completed/cancelled).",
     parameters: {
       type: "object",
@@ -649,6 +678,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_goals",
+    sideEffects: false,
     description: "List goals with optional status filter. Use to see what longer-term threads exist before adding more tasks — a task linked to an existing goal is more useful than a free-floating one.",
     parameters: {
       type: "object",
@@ -694,6 +724,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "daily_recap",
+    sideEffects: false,
     description: "Answer 'what did I get done today?' Returns a structured summary of completed tasks, skills run, agent actions approved, time tracked, and themes. Pass a date (YYYY-MM-DD) to recap a specific day; defaults to today in the user's local timezone. format='markdown' returns a human-readable chat reply; format='json' returns the raw structure for further processing.",
     parameters: {
       type: "object",
@@ -714,6 +745,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "daily_plan",
+    sideEffects: false,
     description: "Answer 'what should I do today?' Returns a forward-looking plan synthesized from the user's calendar, pending + carried-over tasks, recent call commitments, and active goals: a focus list, what the agent can take off their plate, and time-sensitive items. Pass a date (YYYY-MM-DD) to plan a specific day; defaults to today. format='markdown' for a chat reply, 'json' for the raw structure.",
     parameters: {
       type: "object",
@@ -758,6 +790,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "list_mcp_catalog",
+    sideEffects: false,
     description: "List the MCP servers in OpenAGI's curated catalog — names, descriptions, auth mode (api-key vs oauth), availability (available vs coming-soon), and required env-var name for bearer-auth entries. Use BEFORE connect_catalog_mcp to confirm an entry exists and learn what credentials it needs.",
     parameters: {
       type: "object",
