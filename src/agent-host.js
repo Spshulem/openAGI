@@ -3,6 +3,14 @@ import { createModelProvider } from "./model-provider.js";
 import { createId, nowIso } from "./utils.js";
 import { detectTaskInChat } from "./task-store.js";
 
+// Internal tools every specialist gets regardless of scope: its own memory
+// and the task queue it drains. Everything else comes from the specialist's
+// scoped allowlist (selected at propagation from the bounded scope).
+const SPECIALIST_CORE_TOOLS = [
+  "recall", "remember",
+  "list_tasks", "agent_pick_next", "complete_task", "move_task", "save_draft"
+];
+
 export class AgentHost {
   constructor(options = {}) {
     this.runtime = options.runtime;
@@ -80,9 +88,20 @@ export class AgentHost {
     const verdict = output.scrutiny.action;
     const toolPolicy = verdict === "watch" ? "read-only" : verdict === "ask" ? "confirm" : verdict === "ignore" ? "none" : "full";
     const toolRegistry = this.runtime.tools;
-    const tools = toolPolicy === "none"
+    let tools = toolPolicy === "none"
       ? []
       : (toolRegistry?.toOpenAITools?.({ readOnly: toolPolicy === "read-only" }) ?? []);
+
+    // Specialist bounds: a bounded specialist sees (and may invoke) only its
+    // scoped allowlist + the core set every specialist needs. Without this,
+    // "bounded" was advisory prompt text and any specialist could call any
+    // tool in the system.
+    let allowedToolNames = null;
+    if (isSpecialist) {
+      const scoped = agent.metadata?.specialist?.allowedTools ?? [];
+      allowedToolNames = [...new Set([...SPECIALIST_CORE_TOOLS, ...scoped])];
+      tools = tools.filter((tool) => allowedToolNames.includes(tool.name));
+    }
 
     // Lava intuition (C2): top principles from the vector store inserted into
     // the prompt as soft hints — distinct from explicit memoryHits.
@@ -130,7 +149,8 @@ export class AgentHost {
         // Enforced in ToolRegistry.invoke — the filtered tool list above is
         // advisory to the model; this gate is not.
         __scrutinyPolicy: toolPolicy === "read-only" ? "read-only" : toolPolicy === "confirm" ? "confirm" : null,
-        __reason: toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null
+        __reason: toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null,
+        __allowedTools: allowedToolNames
       }
     });
 
@@ -297,7 +317,8 @@ Answer the user plainly. If a specialist was created, mention its name and scope
   }
 
   ensureSpecialistAgent(specialist, parentId) {
-    const allowedToolList = (specialist.allowedTools ?? []).join(", ") || "all available tools";
+    // Matches the enforced allowlist in handleMessage: core set + scoped tools.
+    const allowedToolList = [...new Set([...SPECIALIST_CORE_TOOLS, ...(specialist.allowedTools ?? [])])].join(", ");
     return this.store.ensureAgent({
       id: specialist.id,
       name: specialist.name,
