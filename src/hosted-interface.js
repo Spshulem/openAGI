@@ -1020,6 +1020,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const { resolveSuggestion } = await import("./suggestion-feed.js");
         const candidate = resolveSuggestion(runtime, id, status);
         if (!candidate) return sendJson(res, 404, { error: "unknown suggestion" });
+        // Let any open dashboard refresh its Suggestions tab live.
+        events.emit("suggestion-resolved", { id, status, category: candidate.category ?? null });
 
         // For MCP suggestions, accepting auto-registers + connects the server.
         if (status === "accepted" && candidate.category === "mcp" && candidate.mcpRegister && runtime.mcp?.registerServer) {
@@ -1034,22 +1036,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
         }
         // For task suggestions, accepting creates the task in the right
-        // queue + bucket. The proposal title becomes the task title.
+        // queue + bucket — through the same materializer the observer's
+        // OPENAGI_AUTO_TASKS=1 path uses, so dedup (by suggestionId) and the
+        // draft-only guardrails for agent-queue tasks apply identically.
         if (status === "accepted" && candidate.category === "task" && runtime.tasks?.add) {
-          try {
-            const task = runtime.tasks.add(
-              {
-                title: candidate.title,
-                description: candidate.rationale,
-                bucket: candidate.taskBucket ?? "today",
-                sourceMeta: { suggestionId: id, observedApps: candidate.context?.apps }
-              },
-              { source: "proactive-observer", queue: candidate.taskQueue ?? "user" }
-            );
-            return sendJson(res, 200, { ...candidate, taskId: task.id });
-          } catch (error) {
-            return sendJson(res, 200, { ...candidate, taskCreateError: error.message });
-          }
+          const { materializeTaskFromSuggestion } = await import("./proactive-observer.js");
+          const task = materializeTaskFromSuggestion(runtime, candidate);
+          if (!task) return sendJson(res, 200, { ...candidate, taskCreateError: "could not create task" });
+          return sendJson(res, 200, { ...candidate, taskId: task.id });
         }
         // Story 1 + 6: accepting a skill suggestion materializes it into
         // a real SKILL.md file under the user skills dir. Dispatches by

@@ -2360,7 +2360,9 @@ test("McpRegistry persist surfaces filesystem errors instead of swallowing", asy
   fs.rmSync(dir, { recursive: true });
 });
 
-test("proactive-observer: task proposals materialize into real tasks", async () => {
+test("proactive-observer: task proposals materialize into real tasks with OPENAGI_AUTO_TASKS=1", async (t) => {
+  process.env.OPENAGI_AUTO_TASKS = "1";
+  t.after(() => { delete process.env.OPENAGI_AUTO_TASKS; });
   const { ProactiveObserver } = await import("../src/proactive-observer.js");
   const { TaskStore } = await import("../src/task-store.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-observer-task-"));

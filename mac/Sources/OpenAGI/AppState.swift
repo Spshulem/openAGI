@@ -289,6 +289,13 @@ final class AppState: ObservableObject {
       let pathPart = date.isEmpty ? "/?tab=today" : "/?tab=today&date=\(urlEncode(date))"
       notify(title: title, body: body, path: pathPart)
     }
+    if event == "daily-plan" {
+      // Morning "here's your day" notification (calendar + focus + what the
+      // agent will draft). Tap routes to the Tasks tab.
+      let title = parseField(data, "title") ?? "Your day"
+      let body = parseField(data, "body") ?? "Tap to see today's plan."
+      notify(title: title, body: body, path: "/?tab=tasks")
+    }
     if event == "pending-action" {
       // Agent queued something that needs approval (gated tool). Land in
       // chat with the action id so the inline approval card renders.
