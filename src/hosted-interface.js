@@ -295,7 +295,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!bb.ok) return sendJson(res, 401, { error: "unauthorized", reason: bb.reason });
         await readJson(req).catch(() => ({})); // drain body; we don't trust it for ingestion
         const source = runtime.buildBetterTaskSource;
-        if (!source?.triggerSync) return sendJson(res, 503, { error: "buildbetter source not configured" });
+        // The source is always registered (so a mid-session MCP login works
+        // without restart), so also check it's actually configured — otherwise
+        // a sync would no-op. Returning 503 (not a false 202) lets BuildBetter
+        // retry the delivery once credentials land.
+        if (!source?.triggerSync || !source.isConfigured?.()) {
+          return sendJson(res, 503, { error: "buildbetter source not configured" });
+        }
         // Don't block the webhook response on the full sync — ack fast,
         // sync in the background (BuildBetter expects a quick 200).
         source.triggerSync().then(
@@ -846,11 +852,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             ]
           },
         ];
-        // featured ids already shown as full multi-path cards above —
-        // skip them in the browse-catalog section to avoid duplication.
+        // Featured integrations (BuildBetter, Linear, Rize, …) are ALSO listed
+        // in the browse catalog below — intentionally a duplicate, flagged so
+        // the UI can say "this is the MCP version of an integration you also
+        // have a non-MCP (API) path for above".
         const featuredIds = new Set(integrations.map((i) => i.id));
         const catalog = MCP_CATALOG
-          .filter((entry) => !featuredIds.has(entry.id))
           .map((entry) => ({
             id: entry.id,
             name: entry.name,
@@ -862,7 +869,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             apiKeyHelp: entry.apiKeyHelp ?? null,
             apiKeyConfigured: entry.apiKeyEnvVar ? Boolean(process.env[entry.apiKeyEnvVar]) : true,
             connectable: entry.status === "available" && Boolean(entry.register),
-            configured: mcpInCatalog(entry.id)
+            configured: mcpInCatalog(entry.id),
+            featured: featuredIds.has(entry.id)
           }));
         return sendJson(res, 200, { integrations, catalog, categories: CATEGORIES });
       }
@@ -1205,17 +1213,21 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Fire-and-forget so the OAuth dance doesn't block the HTTP response.
         // Dashboard polls /mcp and listens for SSE 'mcp' events to learn when
         // it's done (or if an OAuth URL needs to be opened).
-        if (!runtime.mcp.isConnecting?.(name)) {
-          runtime.mcp.connect(name)
-            .then((status) => {
-              pendingOauth.delete(name);
-              events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
-            })
-            .catch((error) => {
-              events.emit("mcp", { op: "connect-error", name, error: error.message });
-            });
-          events.emit("mcp", { op: "connecting", name });
-        }
+        //
+        // Always call connect(): the registry dedups in-flight attempts itself,
+        // and a manual (interactive) connect made while a silent boot reconnect
+        // is in flight must chain an interactive attempt after it — the silent
+        // attempt can't open a browser and fails OAUTH_INTERACTIVE_REQUIRED,
+        // which used to leave the Connect click doing nothing.
+        runtime.mcp.connect(name)
+          .then((status) => {
+            pendingOauth.delete(name);
+            events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
+          })
+          .catch((error) => {
+            events.emit("mcp", { op: "connect-error", name, error: error.message });
+          });
+        events.emit("mcp", { op: "connecting", name });
         return sendJson(res, 202, { name, status: "connecting" });
       }
       if (method === "POST" && pathname.match(/^\/mcp\/clear-auth\/[^/]+$/)) {
@@ -1639,6 +1651,8 @@ function renderApp() {
     .badge.ok { color: var(--accent); }
     .badge.warn { color: var(--warn); }
     .badge.err { color: var(--err); }
+    .badge.mcp { background: rgba(96,165,250,.16); color: #7fb3ff; border-color: rgba(96,165,250,.35); }
+    .badge.muted { opacity: .65; }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
     input, select, textarea {
       background: var(--bg); color: var(--text); border: 1px solid var(--line);
@@ -2702,6 +2716,10 @@ function renderSkillDetail(skill) {
 
 async function refreshMcp() {
   const servers = await fetchJson("/mcp");
+  // Preserve scroll position across the full rebuild below — otherwise every
+  // SSE "mcp" event (e.g. a connect finishing) snaps the list back to the top.
+  const mcpScroller = sidebarList.scrollHeight > sidebarList.clientHeight ? sidebarList : sidebarList.parentElement;
+  const mcpSavedScroll = mcpScroller ? mcpScroller.scrollTop : 0;
   sidebarList.innerHTML = "";
   // Always-visible Register button at the top of the MCP sidebar so the
   // user has an unambiguous entry point — separate from the magical
@@ -2737,6 +2755,8 @@ async function refreshMcp() {
     li.addEventListener("click", () => renderMcpDetail(s));
     sidebarList.appendChild(li);
   }
+  // Restore the pre-rebuild scroll position now that the list is repopulated.
+  if (mcpScroller) mcpScroller.scrollTop = mcpSavedScroll;
   // Show a hero "Register your first MCP" CTA in the main pane when empty.
   if (servers.length === 0) {
     main.innerHTML = \`
@@ -3690,8 +3710,9 @@ async function renderIntegrations() {
       <div class="ui-card" style="display: flex; flex-direction: column; gap: var(--space-2);">
         <div style="display: flex; align-items: flex-start; gap: var(--space-2);">
           <div class="ui-grow">
-            <div style="font-weight: 600; font-size: 13px;">\${escapeHtml(e.name)}</div>
+            <div style="font-weight: 600; font-size: 13px; display:flex; align-items:center; gap:6px;"><span>\${escapeHtml(e.name)}</span><span class="badge mcp" style="font-size:9px;">MCP</span></div>
             <div class="ui-meta" style="margin-top: 2px;">\${escapeHtml(e.description ?? "")}</div>
+            \${e.featured ? '<div class="ui-meta" style="margin-top:3px; opacity:.85;">↑ Also available as a non-MCP (direct API) integration above</div>' : ""}
           </div>
           \${badge}
         </div>
@@ -3711,6 +3732,11 @@ async function renderIntegrations() {
     const envBlock = p.envKeys?.length > 0
       ? \`<div class="muted" style="font-size:11px; margin-top:4px;">env: <code>\${p.envKeys.map(escapeHtml).join("</code> · <code>")}</code></div>\`
       : "";
+    // Make the integration TYPE unmistakable: an MCP path vs a non-MCP
+    // (direct API / file-drop) path. Two integrations can offer both.
+    const kindBadge = p.kind === "mcp"
+      ? '<span class="badge mcp">MCP</span>'
+      : '<span class="badge muted">non-MCP</span>';
     let actions = "";
     let editForm = "";
     if (p.kind === "api" && p.envKeys?.length > 0) {
@@ -3743,7 +3769,7 @@ async function renderIntegrations() {
       <div style="border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-top:6px;">
         <div class="row between" style="align-items:center; gap:8px;">
           <div style="flex:1; min-width:0;">
-            <div style="font-weight:500; font-size:13px;">\${escapeHtml(p.label)}</div>
+            <div style="font-weight:500; font-size:13px; display:flex; align-items:center; gap:6px;">\${kindBadge}<span>\${escapeHtml(p.label)}</span></div>
             \${p.detail ? \`<div class="muted" style="font-size:11px; margin-top:2px;">\${escapeHtml(p.detail)}</div>\` : ""}
             \${envBlock}
             \${lastSync}

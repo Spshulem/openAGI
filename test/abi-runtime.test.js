@@ -3215,7 +3215,7 @@ test("webhooks: /webhooks/buildbetter requires secret, then triggers a sync (202
   const { createHostedInterface } = await import("../src/hosted-interface.js");
   let synced = 0;
   const runtime = {
-    buildBetterTaskSource: { triggerSync: async () => { synced += 1; return { created: 1 }; } },
+    buildBetterTaskSource: { isConfigured: () => true, triggerSync: async () => { synced += 1; return { created: 1 }; } },
     events: { on: () => {}, emit: () => {} }
   };
   const app = createHostedInterface(runtime, { port: 0, buildBetterWebhookSecret: "hook-secret" });
@@ -3241,5 +3241,22 @@ test("webhooks: /webhooks/buildbetter requires secret, then triggers a sync (202
   await new Promise((r) => setTimeout(r, 30));
   assert.ok(synced >= 1, "sync triggered by webhook");
 
+  await app.close();
+});
+
+test("webhooks: /webhooks/buildbetter 503s (not a false 202) when the source is unconfigured", async () => {
+  const { createHostedInterface } = await import("../src/hosted-interface.js");
+  let synced = 0;
+  const runtime = {
+    // Source is registered (so a mid-session MCP login works) but has no creds yet.
+    buildBetterTaskSource: { isConfigured: () => false, triggerSync: async () => { synced += 1; } },
+    events: { on: () => {}, emit: () => {} }
+  };
+  const app = createHostedInterface(runtime, { port: 0, buildBetterWebhookSecret: "hook-secret" });
+  const address = await app.listen();
+  const resp = await fetch(`${address.url}/webhooks/buildbetter?secret=hook-secret`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(resp.status, 503, "unconfigured → 503 so BuildBetter retries, not a swallowed 202");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(synced, 0, "no sync attempted while unconfigured");
   await app.close();
 });

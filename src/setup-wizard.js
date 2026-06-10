@@ -272,9 +272,10 @@ export function renderWizard({ proposedToken } = {}) {
         <summary>BuildBetter — call action items become tasks</summary>
         <div style="padding-top:10px;" class="grid">
           <p class="sub">Pulls action_item / commitment / follow_up extractions from your recent calls. Polls every 15 min, and (optionally) syncs instantly via webhook.</p>
-          <div><label>BUILDBETTER_API_KEY</label><input type="password" name="BUILDBETTER_API_KEY" autocomplete="off"></div>
-          <div><label>BUILDBETTER_USER_EMAIL <span class="sub">(or use BUILDBETTER_USER_NAME below)</span></label><input type="email" name="BUILDBETTER_USER_EMAIL" placeholder="you@example.com"></div>
-          <div><label>BUILDBETTER_USER_NAME <span class="sub">(alternative to email)</span></label><input type="text" name="BUILDBETTER_USER_NAME" placeholder="Your Name"></div>
+          <p class="sub">Already connected BuildBetter on the <code>MCP</code> tab? You can leave everything below blank — OpenAGI reuses that login.</p>
+          <div><label>BUILDBETTER_API_KEY <span class="sub">(optional if connected via MCP)</span></label><input type="password" name="BUILDBETTER_API_KEY" autocomplete="off"></div>
+          <div><label>BUILDBETTER_USER_EMAIL <span class="sub">(optional — auto-detected from your login)</span></label><input type="email" name="BUILDBETTER_USER_EMAIL" placeholder="you@example.com"></div>
+          <div><label>BUILDBETTER_USER_NAME <span class="sub">(optional — only needed if auto-detect can't pinpoint you)</span></label><input type="text" name="BUILDBETTER_USER_NAME" placeholder="Your Name"></div>
           <div><label>BUILDBETTER_WEBHOOK_SECRET <span class="sub">(optional — enables instant push)</span></label><input type="password" name="BUILDBETTER_WEBHOOK_SECRET" autocomplete="off" placeholder="a long random string"><p class="sub">Set this, then point a BuildBetter webhook at <code>&lt;your public URL&gt;/webhooks/buildbetter?secret=…</code> (shown on the Channels tab once a public URL is set) to sync the moment a call is processed instead of waiting for the poll.</p></div>
         </div>
       </details>
