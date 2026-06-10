@@ -1,4 +1,5 @@
 import path from "node:path";
+import { resolveDataDir } from "./data-dir.js";
 import { AgentHost } from "./agent-host.js";
 import { FileBackedAgentStore } from "./agent-store.js";
 import { CronScheduler, createDailyAdaptationReviewJob } from "./cron-scheduler.js";
@@ -15,6 +16,7 @@ import { registerInboxWatcher } from "./integrations/inbox-watcher.js";
 import { registerIMessagePoller } from "./integrations/imessage-poller.js";
 import { registerBuildBetterTaskSource } from "./integrations/buildbetter-tasks.js";
 import { registerCalendarIntegration } from "./integrations/calendar.js";
+import { registerWebSearchTools } from "./integrations/web-search.js";
 import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemoryCondenser } from "./memory-condenser.js";
@@ -380,6 +382,9 @@ export class AbiRuntime {
       // The source attaches to runtime even when disabled so the dashboard
       // can render the toggle + permission status.
       registerIMessagePoller(this);
+      // Web search tools (web_search / fetch_url). Always registered; web_search
+      // returns a clear "no provider configured" error until a key is set.
+      registerWebSearchTools(this);
     }
   }
 
@@ -890,7 +895,7 @@ export function createDefaultRuntime(options = {}) {
 }
 
 export function createDurableRuntime(options = {}) {
-  const dataDir = options.dataDir ?? path.join(process.cwd(), ".openagi");
+  const dataDir = options.dataDir ?? resolveDataDir();
   const mcpLogDir = path.join(dataDir, "mcp", "logs");
   const runtime = createDefaultRuntime({
     ...options,
@@ -924,5 +929,13 @@ export function createDurableRuntime(options = {}) {
   });
   const mcpConfigPath = options.mcpConfigPath ?? path.join(dataDir, "mcp.json");
   runtime.mcp.loadConfigFile(mcpConfigPath);
+  // Reconnect previously-authorized MCP servers on boot, silently — servers
+  // with a cached OAuth token / bearer key / stdio command come back "live"
+  // instead of showing "idle" until someone clicks Connect. Never opens a
+  // browser: OAuth servers without a usable token just stay idle. Non-blocking
+  // and best-effort so a slow/dead server can't hold up startup.
+  if (options.autoConnectMcp !== false && runtime.mcp?.connectAll) {
+    Promise.resolve().then(() => runtime.mcp.connectAll({ silent: true })).catch(() => {});
+  }
   return runtime;
 }

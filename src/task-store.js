@@ -15,6 +15,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir, writeJsonAtomic, readJsonFile } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Story 8: order matters — sort + filter UI traverses this top-to-bottom.
 // today / this_week stay at the top, done at the bottom; month/quarter/
@@ -35,7 +36,7 @@ export const GOAL_STATUSES = ["active", "completed", "cancelled", "deferred"];
 export class TaskStore {
   constructor(options = {}) {
     this.runtime = options.runtime ?? null;
-    this.dataDir = options.dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi";
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.taskDir = path.join(this.dataDir, TASK_DIR);
     ensureDir(this.taskDir);
     this.tasks = new Map(); // id → task

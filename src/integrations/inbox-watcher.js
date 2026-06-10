@@ -20,13 +20,14 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir } from "../file-utils.js";
 import { nowIso } from "../utils.js";
+import { resolveDataDir } from "../data-dir.js";
 
 const POLL_INTERVAL_MS = 30 * 1000;
 
 export class InboxWatcher {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.dataDir = options.dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi";
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.inboxDir = path.join(this.dataDir, "inbox");
     this.processedDir = path.join(this.inboxDir, "processed");
     ensureDir(this.inboxDir);

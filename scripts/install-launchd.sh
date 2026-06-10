@@ -69,6 +69,8 @@ cat > "${PLIST}" <<EOF
   <dict>
     <key>PATH</key>
     <string>$(dirname "${NODE_BIN}"):/usr/local/bin:/usr/bin:/bin</string>
+    <key>OPENAGI_DATA_DIR</key>
+    <string>${HOME}/.openagi</string>
   </dict>
 </dict>
 </plist>

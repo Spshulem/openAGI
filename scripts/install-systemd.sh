@@ -36,7 +36,8 @@ Wants=network-online.target
 Type=simple
 ExecStart=${NODE_BIN} ${PROJECT_DIR}/examples/hosted-server.js
 WorkingDirectory=${PROJECT_DIR}
-EnvironmentFile=-${PROJECT_DIR}/.openagi/.env
+EnvironmentFile=-${2}/.env
+Environment=OPENAGI_DATA_DIR=${2}
 Restart=on-failure
 RestartSec=10s
 StandardOutput=journal
@@ -47,7 +48,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=${PROJECT_DIR}/.openagi
+ReadWritePaths=${2}
 
 [Install]
 WantedBy=${1:-multi-user.target}
@@ -77,7 +78,11 @@ fi
 
 if [[ "${MODE}" == "user" ]]; then
   mkdir -p "$HOME/.config/systemd/user"
-  build_unit default.target > "$HOME/.config/systemd/user/${UNIT_NAME}"
+  # User service runs as the invoking user → data dir is their own ~/.openagi.
+  # Create it up front: it's in ReadWritePaths and ProtectHome=read-only would
+  # otherwise stop the daemon from creating it on first run.
+  mkdir -p "$HOME/.openagi"
+  build_unit default.target "${HOME}/.openagi" > "$HOME/.config/systemd/user/${UNIT_NAME}"
   systemctl --user daemon-reload
   systemctl --user enable --now "${UNIT_NAME}"
   echo "Installed user service. Tail: journalctl --user -u openagi -f"
@@ -95,9 +100,13 @@ if ! id -u openagi &>/dev/null; then
   useradd --system --shell /usr/sbin/nologin --home-dir "${PROJECT_DIR}" openagi
   echo "Created system user 'openagi'."
 fi
+mkdir -p "${PROJECT_DIR}/.openagi"
 chown -R openagi:openagi "${PROJECT_DIR}/.openagi" 2>/dev/null || true
 
-build_unit multi-user.target > "/etc/systemd/system/${UNIT_NAME}"
+# System service runs as User=openagi, whose home is PROJECT_DIR, so its
+# data dir is the already-chowned ${PROJECT_DIR}/.openagi (NOT the root/sudo
+# invoker's ${HOME}, which the openagi user can't write).
+build_unit multi-user.target "${PROJECT_DIR}/.openagi" > "/etc/systemd/system/${UNIT_NAME}"
 # Pin User=openagi for system mode by appending — done inline so build_unit stays portable
 sed -i '/^\[Service\]/a User=openagi\nGroup=openagi' "/etc/systemd/system/${UNIT_NAME}"
 

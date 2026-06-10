@@ -18,6 +18,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 const DEFAULT_LOOKBACK_DAYS = 21;
 const MIN_OCCURRENCES = 2;
@@ -48,7 +49,7 @@ const PROPOSAL_SYSTEM_PROMPT = [
 export class SessionMiner {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.dataDir = options.dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi";
+    this.dataDir = options.dataDir ?? resolveDataDir();
     this.lookbackDays = options.lookbackDays ?? DEFAULT_LOOKBACK_DAYS;
     this.minOccurrences = options.minOccurrences ?? MIN_OCCURRENCES;
     this.suggestedDir = path.join(this.dataDir, SUGGESTED_DIR);

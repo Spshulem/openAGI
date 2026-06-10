@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Story 4: unified read/write surface for proposals coming from three
 // independent sources:
@@ -157,8 +158,5 @@ function findSourceFile(runtime, id) {
 // Used when runtime doesn't expose dataDir directly — falls back to the
 // proactive observer's known dataDir (set at construction).
 function defaultDataDir(runtime) {
-  return runtime?.proactiveObserver?.dataDir
-    ?? runtime?.patternMiner?.dataDir
-    ?? process.env.OPENAGI_DATA_DIR
-    ?? ".openagi";
+  return runtime?.proactiveObserver?.dataDir ?? runtime?.patternMiner?.dataDir ?? resolveDataDir();
 }

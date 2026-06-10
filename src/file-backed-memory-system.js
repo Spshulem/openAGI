@@ -2,11 +2,12 @@ import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
 import { MemorySystem } from "./memory-system.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 export class FileBackedMemorySystem extends MemorySystem {
   constructor(options = {}) {
     super(options);
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "memory");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "memory");
     this.snapshotPath = options.snapshotPath ?? path.join(this.dir, "memory-state.json");
     this.eventsPath = options.eventsPath ?? path.join(this.dir, "memory-events.jsonl");
     ensureDir(this.dir);

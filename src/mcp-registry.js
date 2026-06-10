@@ -4,6 +4,8 @@ import { McpStdioClient } from "./mcp-client.js";
 import { McpHttpClient } from "./mcp-http-client.js";
 import { McpOAuthClient } from "./mcp-oauth.js";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
+import { resolveDataDir } from "./data-dir.js";
+import { assertSafePublicUrl } from "./url-guard.js";
 
 // Whitelist of executables permitted as the `command` for stdio MCP servers.
 // Anything not in this set is rejected at registerServer() — closes the
@@ -19,7 +21,7 @@ export class McpRegistry {
     this.servers = new Map();
     this.clients = new Map();
     this.logDir = options.logDir;
-    this.dataDir = options.dataDir ?? (options.logDir ? path.dirname(path.dirname(options.logDir)) : ".openagi");
+    this.dataDir = options.dataDir ?? (options.logDir ? path.dirname(path.dirname(options.logDir)) : resolveDataDir());
     this.toolRegistry = options.toolRegistry ?? null;
     // Set by hosted-interface so OAuth-required surfaces in the dashboard SSE.
     this.onOauthRequired = options.onOauthRequired ?? null;
@@ -232,15 +234,81 @@ export class McpRegistry {
     return this.connecting.has(name);
   }
 
-  async connect(name) {
-    if (this.connecting.has(name)) return this.connecting.get(name);
-    const promise = this.doConnect(name);
-    this.connecting.set(name, promise);
-    promise.finally(() => this.connecting.delete(name));
+  async connect(name, { silent = false } = {}) {
+    const inflight = this.connecting.get(name);
+    if (inflight) {
+      // An interactive (non-silent) in-flight connect serves any caller. A
+      // silent in-flight connect serves silent callers. But an interactive
+      // caller must NOT be handed a silent attempt (which fails fast without
+      // opening a browser) — wait for it, then connect interactively if the
+      // silent attempt didn't already get us connected.
+      if (!inflight.silent || silent) return inflight.promise;
+      return inflight.promise.then(
+        (status) => status,
+        () => this.connect(name, { silent: false })
+      );
+    }
+    const promise = this.doConnect(name, { silent });
+    const entry = { promise, silent };
+    this.connecting.set(name, entry);
+    // The caller awaits `promise` and handles its rejection; this cleanup chain
+    // is separate, so swallow its copy of the rejection to avoid an
+    // unhandledRejection when a connect fails (e.g. silent boot reconnect).
+    promise.finally(() => {
+      if (this.connecting.get(name) === entry) this.connecting.delete(name);
+    }).catch(() => {});
     return promise;
   }
 
-  async doConnect(name) {
+  /**
+   * Silently obtain a Bearer token for a connected OAuth MCP server, reusing
+   * the registry's own OAuth client (or the cached token on disk) — never opens
+   * a browser. Returns null when there's no usable token. This is the shared
+   * primitive integrations use to call a vendor's REST/GraphQL API with the
+   * same login the user already granted to that vendor's MCP server.
+   */
+  async silentTokenFor(name) {
+    let oauth = this.clients.get(name)?.oauth ?? null;
+    if (!oauth) {
+      const server = this.servers.get(name);
+      if (server?.auth !== "oauth" || !server.url) return null;
+      oauth = new McpOAuthClient({
+        name: server.name,
+        resourceUrl: server.resourceUrl ?? deriveResourceUrl(server.url),
+        scope: server.scope,
+        dataDir: this.dataDir
+      });
+    }
+    try {
+      return await oauth.ensureToken({ interactive: false });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Sync probe: is there a usable OAuth token cached on disk for this server
+   * (so an integration can report itself "configured" without a network call)?
+   * Reads the same <dataDir>/mcp/auth/<name>.json the OAuth client writes.
+   */
+  hasOAuthToken(name) {
+    try {
+      const cache = readJsonFile(path.join(this.dataDir, "mcp", "auth", `${name}.json`), null);
+      if (!cache) return false;
+      // Mirror what ensureToken({interactive:false}) can actually do: a
+      // refresh_token can always mint a fresh access token silently, but a
+      // bare access_token only counts while unexpired (same 30s safety margin
+      // as McpOAuthClient.isExpired) — otherwise integrations report
+      // "configured", ack webhooks, and then silently fail to authenticate.
+      if (cache.refresh_token) return true;
+      if (!cache.access_token || !cache.expires_at) return false;
+      return Date.now() < cache.expires_at - 30_000;
+    } catch {
+      return false;
+    }
+  }
+
+  async doConnect(name, { silent = false } = {}) {
     const server = this.servers.get(name);
     if (!server) throw new Error(`Unknown MCP server: ${name}`);
     if (!server.enabled) throw new Error(`MCP server ${name} is disabled.`);
@@ -300,25 +368,29 @@ export class McpRegistry {
       }
       this.clients.set(name, client);
     }
-    await client.connect();
+    // silent → never open a browser for OAuth; fail fast if a token isn't cached.
+    await client.connect({ interactive: !silent });
     this.exposeAsTools(server.name);
     return client.status();
   }
 
-  async connectAll() {
+  async connectAll({ silent = false } = {}) {
+    const targets = [...this.servers].filter(([, server]) => {
+      if (!server.enabled) return false;
+      if (server.transport === "stdio" && !server.command) return false;
+      if (server.transport === "http" && !server.url) return false;
+      return server.transport === "stdio" || server.transport === "http";
+    });
+    const attempt = (name) => this.connect(name, { silent }).then(
+      (status) => ({ name, ok: true, status }),
+      (error) => ({ name, ok: false, error: error.message, code: error.code ?? null })
+    );
+    // Silent boot reconnect runs concurrently (no browser, so no popup storm)
+    // to pay max-latency, not sum. Interactive connect-all stays sequential so
+    // we never open several OAuth browser tabs at once.
+    if (silent) return Promise.all(targets.map(([name]) => attempt(name)));
     const results = [];
-    for (const [name, server] of this.servers) {
-      if (!server.enabled) continue;
-      if (server.transport === "stdio" && !server.command) continue;
-      if (server.transport === "http" && !server.url) continue;
-      if (server.transport !== "stdio" && server.transport !== "http") continue;
-      try {
-        const status = await this.connect(name);
-        results.push({ name, ok: true, status });
-      } catch (error) {
-        results.push({ name, ok: false, error: error.message });
-      }
-    }
+    for (const [name] of targets) results.push(await attempt(name));
     return results;
   }
 
@@ -408,7 +480,7 @@ function expandEnv(obj, allowedKeys) {
 // We deliberately don't read process.env directly — only what the user has
 // explicitly placed in this file is eligible for ${VAR} substitution.
 function loadDotenvKeys(dataDir) {
-  const file = path.join(dataDir ?? ".openagi", ".env");
+  const file = path.join(dataDir ?? resolveDataDir(), ".env");
   let text;
   try { text = fs.readFileSync(file, "utf8"); } catch { return []; }
   const keys = [];
@@ -421,32 +493,10 @@ function loadDotenvKeys(dataDir) {
 
 // Reject MCP URLs that point at loopback / link-local / RFC1918 / cloud
 // metadata endpoints. Combined with the env-var allowlist this closes the
-// SSRF + secret-exfil chain through `/mcp/register`.
+// SSRF + secret-exfil chain through `/mcp/register`. Delegates to the shared
+// url-guard (same guard the fetch_url tool uses).
 function assertSafeMcpUrl(value) {
-  let u;
-  try { u = new URL(value); } catch { throw new Error(`Invalid MCP url: ${value}`); }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
-    throw new Error(`MCP url protocol must be http or https, got "${u.protocol}".`);
-  }
-  const host = u.hostname.toLowerCase();
-  if (
-    host === "localhost" || host === "0.0.0.0" || host === "::" ||
-    host.endsWith(".localhost") ||
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    host === "169.254.169.254" || // AWS / GCP IMDS
-    /^fd[0-9a-f]{2}:/.test(host) || // ULA
-    /^fe80:/.test(host) || // link-local
-    host === "::1"
-  ) {
-    throw new Error(
-      `MCP url host "${host}" is not allowed (loopback, private, or link-local). ` +
-      `Use a public hostname.`
-    );
-  }
+  assertSafePublicUrl(value, "MCP url");
 }
 
 // For OAuth discovery, use the MCP endpoint's origin as the resource URL

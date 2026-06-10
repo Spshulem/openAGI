@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { ensureDir, writeJsonAtomic, readJsonFile, appendJsonLine } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Persistent record of every computer-use action the agent intends to take,
 // alongside the reasoning the model supplied for it. Each action belongs
@@ -20,7 +21,7 @@ import { createId, nowIso } from "./utils.js";
 
 export class ComputerUseLog {
   constructor({ dir } = {}) {
-    this.dir = dir ?? path.join(process.cwd(), ".openagi", "computer-use");
+    this.dir = dir ?? path.join(resolveDataDir(), "computer-use");
     ensureDir(this.dir);
     this.sessions = new Map();
     this.actions = new Map();

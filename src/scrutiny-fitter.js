@@ -1,6 +1,7 @@
 import path from "node:path";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Outcome → scrutiny weight fitter (B2). For each panel judge, compute the
 // correlation between each scrutiny dimension and the outcome qualityScore,
@@ -23,7 +24,7 @@ const DIMENSIONS = ["environment", "company", "evidence", "memory", "uncertainty
 export class ScrutinyFitter {
   constructor(options = {}) {
     this.runtime = options.runtime;
-    this.dir = options.dir ?? path.join(process.cwd(), ".openagi", "scrutiny");
+    this.dir = options.dir ?? path.join(resolveDataDir(), "scrutiny");
     this.statePath = path.join(this.dir, "fitter-state.json");
     this.pendingPath = path.join(this.dir, "pending-changes.json");
     this.minSamples = options.minSamples ?? DEFAULT_MIN_SAMPLES;

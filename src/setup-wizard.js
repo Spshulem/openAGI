@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { ensureDir, writeTextAtomic } from "./file-utils.js";
 import { generateToken } from "./auth.js";
 import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
+import { resolveDataDir } from "./data-dir.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
 // configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
@@ -24,6 +25,10 @@ const WIZARD_FIELDS = [
   "OPENAGI_COMPUTER_USE",
   "OPENAGI_PUBLIC_URL",
   "OPENAGI_DAILY_USD_LIMIT",
+  "EXA_API_KEY", "TAVILY_API_KEY", "FIRECRAWL_API_KEY", "BRAVE_API_KEY",
+  "PERPLEXITY_API_KEY", "SERPAPI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CSE_ID",
+  "WEB_SEARCH_PROVIDER",
+  "BUILDBETTER_INGEST_MODE",
   // Per-MCP bearer keys, declared by catalog entries via apiKeyEnvVar.
   // Kept in this allowlist so the wizard's /setup/save can write them.
   ...MCP_CATALOG.filter((e) => e.apiKeyEnvVar).map((e) => e.apiKeyEnvVar)
@@ -41,7 +46,7 @@ export function isFirstRun() {
 }
 
 export function envFilePath(dataDir) {
-  return path.join(dataDir ?? process.env.OPENAGI_DATA_DIR ?? ".openagi", ".env");
+  return path.join(dataDir ?? resolveDataDir(), ".env");
 }
 
 export function readExistingEnv(dataDir) {
@@ -267,9 +272,10 @@ export function renderWizard({ proposedToken } = {}) {
         <summary>BuildBetter — call action items become tasks</summary>
         <div style="padding-top:10px;" class="grid">
           <p class="sub">Pulls action_item / commitment / follow_up extractions from your recent calls. Polls every 15 min, and (optionally) syncs instantly via webhook.</p>
-          <div><label>BUILDBETTER_API_KEY</label><input type="password" name="BUILDBETTER_API_KEY" autocomplete="off"></div>
-          <div><label>BUILDBETTER_USER_EMAIL <span class="sub">(or use BUILDBETTER_USER_NAME below)</span></label><input type="email" name="BUILDBETTER_USER_EMAIL" placeholder="you@example.com"></div>
-          <div><label>BUILDBETTER_USER_NAME <span class="sub">(alternative to email)</span></label><input type="text" name="BUILDBETTER_USER_NAME" placeholder="Your Name"></div>
+          <p class="sub">Already connected BuildBetter on the <code>MCP</code> tab? You can leave everything below blank — OpenAGI reuses that login.</p>
+          <div><label>BUILDBETTER_API_KEY <span class="sub">(optional if connected via MCP)</span></label><input type="password" name="BUILDBETTER_API_KEY" autocomplete="off"></div>
+          <div><label>BUILDBETTER_USER_EMAIL <span class="sub">(optional — auto-detected from your login)</span></label><input type="email" name="BUILDBETTER_USER_EMAIL" placeholder="you@example.com"></div>
+          <div><label>BUILDBETTER_USER_NAME <span class="sub">(optional — only needed if auto-detect can't pinpoint you)</span></label><input type="text" name="BUILDBETTER_USER_NAME" placeholder="Your Name"></div>
           <div><label>BUILDBETTER_WEBHOOK_SECRET <span class="sub">(optional — enables instant push)</span></label><input type="password" name="BUILDBETTER_WEBHOOK_SECRET" autocomplete="off" placeholder="a long random string"><p class="sub">Set this, then point a BuildBetter webhook at <code>&lt;your public URL&gt;/webhooks/buildbetter?secret=…</code> (shown on the Channels tab once a public URL is set) to sync the moment a call is processed instead of waiting for the poll.</p></div>
         </div>
       </details>
