@@ -171,8 +171,49 @@ export function registerCoreTools(registry, runtime) {
           score: Number(score.toFixed(3)),
           tags: item.tags,
           content: item.content,
-          kind: item.kind ?? "raw"
+          kind: item.kind ?? "raw",
+          // Confidence signals: fidelity ("specific" = precise, trust details),
+          // strength (decays unless reinforced), locked (a user correction).
+          fidelity: item.fidelity ?? "normal",
+          strength: Number((item.strength ?? 0).toFixed(2)),
+          locked: Boolean(item.locked)
         }))
+      };
+    }
+  });
+
+  registry.register({
+    name: "correct_memory",
+    description: "Replace a stored memory that turned out to be WRONG. Hides the stale version from all future recall and locks in the corrected fact so the mistake never repeats. Use when the user corrects something previously stored or stated (a time, name, decision, preference) — do NOT just call remember with a second conflicting fact.",
+    parameters: {
+      type: "object",
+      properties: {
+        correction: { type: "string", description: "The corrected fact, stated fully and standalone (e.g. 'The Acme review meeting is at 4pm, not 3pm')." },
+        query: { type: "string", description: "What the stale memory was about — used to find it (e.g. 'Acme review meeting time')." },
+        id: { type: "string", description: "Exact memory id to supersede, when known (from a recall result). Takes precedence over query." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional extra tags for the correction." }
+      },
+      required: ["correction"],
+      additionalProperties: false
+    },
+    handler: async (args, context) => {
+      if (!runtime.memory?.correct) return { error: "memory system does not support corrections" };
+      const scope = context?.agentId && context.agentId !== "main" ? `specialist:${context.agentId}` : "main";
+      const result = runtime.memory.correct({
+        id: args.id ?? null,
+        query: args.query ?? null,
+        content: String(args.correction ?? "").trim(),
+        tags: args.tags ?? [],
+        scope,
+        source: "correct-memory-tool",
+        metadata: { agentId: context.agentId, sessionId: context.sessionId }
+      });
+      return {
+        id: result.item.id,
+        tier: result.item.tier,
+        content: result.item.content,
+        supersededCount: result.superseded.length,
+        superseded: result.superseded.map((item) => ({ id: item.id, content: item.content.slice(0, 120) }))
       };
     }
   });
