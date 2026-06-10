@@ -294,7 +294,15 @@ export class McpRegistry {
   hasOAuthToken(name) {
     try {
       const cache = readJsonFile(path.join(this.dataDir, "mcp", "auth", `${name}.json`), null);
-      return Boolean(cache?.access_token || cache?.refresh_token);
+      if (!cache) return false;
+      // Mirror what ensureToken({interactive:false}) can actually do: a
+      // refresh_token can always mint a fresh access token silently, but a
+      // bare access_token only counts while unexpired (same 30s safety margin
+      // as McpOAuthClient.isExpired) — otherwise integrations report
+      // "configured", ack webhooks, and then silently fail to authenticate.
+      if (cache.refresh_token) return true;
+      if (!cache.access_token || !cache.expires_at) return false;
+      return Date.now() < cache.expires_at - 30_000;
     } catch {
       return false;
     }

@@ -1203,17 +1203,21 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Fire-and-forget so the OAuth dance doesn't block the HTTP response.
         // Dashboard polls /mcp and listens for SSE 'mcp' events to learn when
         // it's done (or if an OAuth URL needs to be opened).
-        if (!runtime.mcp.isConnecting?.(name)) {
-          runtime.mcp.connect(name)
-            .then((status) => {
-              pendingOauth.delete(name);
-              events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
-            })
-            .catch((error) => {
-              events.emit("mcp", { op: "connect-error", name, error: error.message });
-            });
-          events.emit("mcp", { op: "connecting", name });
-        }
+        //
+        // Always call connect(): the registry dedups in-flight attempts itself,
+        // and a manual (interactive) connect made while a silent boot reconnect
+        // is in flight must chain an interactive attempt after it — the silent
+        // attempt can't open a browser and fails OAUTH_INTERACTIVE_REQUIRED,
+        // which used to leave the Connect click doing nothing.
+        runtime.mcp.connect(name)
+          .then((status) => {
+            pendingOauth.delete(name);
+            events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
+          })
+          .catch((error) => {
+            events.emit("mcp", { op: "connect-error", name, error: error.message });
+          });
+        events.emit("mcp", { op: "connecting", name });
         return sendJson(res, 202, { name, status: "connecting" });
       }
       if (method === "POST" && pathname.match(/^\/mcp\/clear-auth\/[^/]+$/)) {

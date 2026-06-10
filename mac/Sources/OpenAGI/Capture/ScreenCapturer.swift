@@ -132,20 +132,33 @@ final class ScreenCapturer {
         content.displays.first { $0.frame.contains(CGPoint(x: w.frame.midX, y: w.frame.midY)) }
       } ?? content.displays.first
       guard let display else { return nil }
-      var excluded: [SCWindow] = []
-      if let wn = excludingWindowNumber {
-        excluded += content.windows.filter { $0.windowID == CGWindowID(wn) }
-      }
-      // Also cut out any window belonging to an excluded app/title, so OCR never
-      // reads e.g. 1Password sitting beside the focused app on the same display
-      // (the frontmost-only privacy check above doesn't cover other visible windows).
-      excluded += content.windows.filter { w in
-        CaptureSettings.shared.isExcluded(bundleId: w.owningApplication?.bundleIdentifier, windowTitle: w.title)
-      }
-      let filter = SCContentFilter(display: display, excludingWindows: excluded)
+      let filter: SCContentFilter
       let cfg = SCStreamConfiguration()
-      cfg.width = display.width
-      cfg.height = display.height
+      if let frontWindow {
+        // We matched the focused window: capture JUST that window. A
+        // display-level grab would OCR every other (non-excluded) window
+        // sharing the monitor — side-by-side Mail/Slack/docs text — and
+        // attribute it to the focused app, misgrounding the answer.
+        filter = SCContentFilter(desktopIndependentWindow: frontWindow)
+        let scale = CGFloat(filter.pointPixelScale)
+        cfg.width = max(1, Int(frontWindow.frame.width * scale))
+        cfg.height = max(1, Int(frontWindow.frame.height * scale))
+      } else {
+        // No window match — fall back to the whole display, minus the overlay
+        // and any window belonging to an excluded app/title, so OCR never
+        // reads e.g. 1Password sitting beside the focused app on the display
+        // (the frontmost-only privacy check above doesn't cover other windows).
+        var excluded: [SCWindow] = []
+        if let wn = excludingWindowNumber {
+          excluded += content.windows.filter { $0.windowID == CGWindowID(wn) }
+        }
+        excluded += content.windows.filter { w in
+          CaptureSettings.shared.isExcluded(bundleId: w.owningApplication?.bundleIdentifier, windowTitle: w.title)
+        }
+        filter = SCContentFilter(display: display, excludingWindows: excluded)
+        cfg.width = display.width
+        cfg.height = display.height
+      }
       cfg.minimumFrameInterval = CMTime(value: 1, timescale: 1)
       cfg.queueDepth = 1
       cfg.scalesToFit = true

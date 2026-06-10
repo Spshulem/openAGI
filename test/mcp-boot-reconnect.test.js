@@ -42,13 +42,22 @@ test("connectAll({silent:true}) leaves an un-authorized OAuth server idle withou
   assert.equal(server.connected, false);
 });
 
-test("hasOAuthToken reflects the cached token on disk", () => {
+test("hasOAuthToken reflects a SILENTLY USABLE cached token on disk", () => {
   const reg = new McpRegistry({ dataDir: tmp, configPath: null });
   assert.equal(reg.hasOAuthToken("nope-no-cache"), false);
-  writeTokenCache("hbtcache", { access_token: "a" });
-  assert.equal(reg.hasOAuthToken("hbtcache"), true);
+  // A refresh token can always mint a new access token silently.
   writeTokenCache("hbtrefresh", { refresh_token: "r" });
   assert.equal(reg.hasOAuthToken("hbtrefresh"), true);
+  // A live access token (unexpired) counts.
+  writeTokenCache("hbtlive", { access_token: "a", expires_at: Date.now() + 600_000 });
+  assert.equal(reg.hasOAuthToken("hbtlive"), true);
+  // An expired (or unknown-expiry) access token with no refresh token does NOT:
+  // silentTokenFor() can't use it, so reporting "configured" would ack webhooks
+  // and then silently drop them.
+  writeTokenCache("hbtexpired", { access_token: "a", expires_at: Date.now() - 1000 });
+  assert.equal(reg.hasOAuthToken("hbtexpired"), false);
+  writeTokenCache("hbtcache", { access_token: "a" });
+  assert.equal(reg.hasOAuthToken("hbtcache"), false);
 });
 
 test("silentTokenFor returns a cached, unexpired token without a browser", async () => {
