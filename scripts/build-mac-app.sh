@@ -52,6 +52,25 @@ echo "▶ OpenAGI.app build · version ${VERSION} · ${NODE_ARCH}"
 
 mkdir -p "${BUILD_DIR}/cache"
 
+# Toolchain sanity: a bare CommandLineTools install can't provide the macOS
+# platform SDK swift-build needs ("unable to lookup item 'PlatformPath'").
+# When the active toolchain is broken and a full Xcode exists, use it via
+# DEVELOPER_DIR instead of failing — no sudo/xcode-select required.
+if [[ -z "${DEVELOPER_DIR:-}" ]] && ! xcrun --sdk macosx --show-sdk-platform-path >/dev/null 2>&1; then
+  for XC in /Applications/Xcode.app /Applications/Xcode-beta.app; do
+    if [[ -d "${XC}/Contents/Developer" ]]; then
+      export DEVELOPER_DIR="${XC}/Contents/Developer"
+      echo "▶ Active toolchain can't build for macOS — using ${XC} (DEVELOPER_DIR)"
+      break
+    fi
+  done
+  if [[ -z "${DEVELOPER_DIR:-}" ]]; then
+    echo "ERROR: the active developer toolchain ($(xcode-select -p)) can't provide the macOS SDK and no Xcode.app was found." >&2
+    echo "Fix with: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer (after installing Xcode)" >&2
+    exit 1
+  fi
+fi
+
 # 1. Compile the Swift menubar binary
 echo "▶ Compiling Swift binary"
 (cd "${MAC_DIR}" && swift build -c release --product OpenAGI)
