@@ -205,7 +205,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const body = await readJson(req);
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
         try {
-          const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup" });
+          // ephemeral: the connectivity test must not seed a session, task,
+          // memory item, or outcome — it's plumbing, not conversation.
+          const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup", ephemeral: true });
           return sendJson(res, 200, { reply: turn.reply, model: turn.model });
         } catch (error) {
           return sendJson(res, 500, { error: error.message });

@@ -423,7 +423,9 @@ export class AbiRuntime {
       this.agentHost.ensureSpecialistAgent(propagated.specialist, "main");
     }
 
-    const memoryItem = this.memory.remember(
+    // Ephemeral signals (setup-wizard connectivity test) are not committed
+    // to memory — they're a round-trip check, not lived experience.
+    const memoryItem = options.ephemeral ? null : this.memory.remember(
       {
         source: signal.source,
         content: `${signal.summary}\nDecision: ${scrutiny.action}\nReasons: ${scrutiny.reasons.join(" ")}`,
@@ -468,7 +470,9 @@ export class AbiRuntime {
       outputId: output.id,
       createdAt: nowIso(),
       loop: "outputs-to-integrations",
-      summary: `Output ${output.id} fed back into memory tier ${memoryItem.tier}.`
+      summary: memoryItem
+        ? `Output ${output.id} fed back into memory tier ${memoryItem.tier}.`
+        : `Output ${output.id} was ephemeral — not committed to memory.`
     });
 
     return output;

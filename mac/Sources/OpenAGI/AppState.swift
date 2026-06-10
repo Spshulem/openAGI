@@ -148,6 +148,13 @@ final class AppState: ObservableObject {
         offeredSetupThisLaunch = true
         notify(title: "Welcome to OpenAGI", body: "Two minutes of setup and your agent is live.", path: "/setup")
         openDashboard(path: "/setup")
+      } else if h.firstRun != true && !providerConfigured && !offeredSetupThisLaunch {
+        // Partially-configured install (auth token saved, model key missing —
+        // isFirstRun() is false but the agent can't think). Nudge once per
+        // launch with a notification only; don't grab a window from someone
+        // who may be running deterministic-only on purpose.
+        offeredSetupThisLaunch = true
+        notify(title: "OpenAGI needs a model key", body: "The agent is running without an LLM. Tap to finish setup.", path: "/setup")
       }
     } catch {
       status = .down

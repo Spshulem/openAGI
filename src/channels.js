@@ -32,7 +32,10 @@ export class ChannelManager {
       agentId: body.agentId ?? "main",
       sessionId: body.sessionId,
       text: body.text ?? body.message,
-      metadata: body.metadata ?? {}
+      metadata: body.metadata ?? {},
+      // Ephemeral turns (setup-wizard test message) leave no trace: no
+      // session, no memory write, no outcome — just a model round-trip.
+      ephemeral: body.ephemeral === true
     });
   }
 
