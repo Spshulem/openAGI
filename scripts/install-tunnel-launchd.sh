@@ -10,8 +10,9 @@ set -euo pipefail
 
 LABEL="app.openagi.tunnel"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="${PROJECT_DIR}/.openagi"
+# Write tunnel.log where the tunnel-watcher looks for it: the OpenAGI data dir
+# (OPENAGI_DATA_DIR, default ~/.openagi) — NOT the project dir.
+LOG_DIR="${OPENAGI_DATA_DIR:-$HOME/.openagi}"
 CFD_BIN="${OPENAGI_CLOUDFLARED:-$(command -v cloudflared || true)}"
 
 if [[ "${1:-install}" == "uninstall" ]]; then
@@ -61,4 +62,4 @@ echo
 echo "Installed ${LABEL}."
 echo "  log:  ${LOG_DIR}/tunnel.log"
 echo "  Once cloudflared connects, the OpenAGI tunnel-watcher will pick up the URL"
-echo "  and auto-write it to OPENAGI_PUBLIC_URL in .openagi/.env."
+echo "  and auto-write it to OPENAGI_PUBLIC_URL in ${LOG_DIR}/.env."
