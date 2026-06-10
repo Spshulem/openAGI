@@ -273,6 +273,31 @@ export function registerCoreTools(registry, runtime) {
   });
 
   registry.register({
+    name: "recall_spend",
+    description: "Summarize LLM credit (USD) usage: how much has been spent, on what activity/model, and the costliest recent calls. Use to answer questions about cost/credits/budget — e.g. 'why did I spend $4 today?'.",
+    parameters: {
+      type: "object",
+      properties: {
+        days: { type: "integer", minimum: 1, maximum: 30, description: "Look-back window in days (default 1 = today; the local ledger retains 30 days)." }
+      },
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      const ledger = runtime.budget?.ledger;
+      if (!ledger) return { error: "no credit ledger available" };
+      // Clamp to the retained window so the reported `days` matches the data.
+      const days = Math.min(args.days ?? 1, ledger.retentionDays ?? 30);
+      const analytics = ledger.analytics({ days });
+      const top = ledger.query({ days })
+        .slice()
+        .sort((a, b) => (b.usd ?? 0) - (a.usd ?? 0))
+        .slice(0, 10)
+        .map((r) => ({ at: r.at, model: r.model, activity: r.channel, agentId: r.agentId, usd: Number((r.usd ?? 0).toFixed(4)), tools: r.tools ?? [] }));
+      return { days, totalUsd: analytics.totalUsd, calls: analytics.totalCalls, byActivity: analytics.byActivity, byModel: analytics.byModel, top };
+    }
+  });
+
+  registry.register({
     name: "list_sessions",
     description: "List recent conversations across channels.",
     parameters: {
