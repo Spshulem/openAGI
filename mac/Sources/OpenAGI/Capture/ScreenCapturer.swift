@@ -179,7 +179,9 @@ final class ScreenCapturer {
     }
   }
 
-  private static func runOcr(image: CGImage, completion: @escaping (String, Double) -> Void) {
+  // nonisolated: OCR deliberately runs on ocrQueue, off the main actor —
+  // it touches no actor state (Vision request + completion callback only).
+  nonisolated private static func runOcr(image: CGImage, completion: @escaping (String, Double) -> Void) {
     let req = VNRecognizeTextRequest { request, error in
       let observations = request.results as? [VNRecognizedTextObservation] ?? []
       var pieces: [String] = []

@@ -20,10 +20,10 @@ final class ActivityTracker {
     observer = center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] note in
       guard let self else { return }
       let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-      self.handleAppFocus(bundleId: app?.bundleIdentifier, name: app?.localizedName)
+      Task { @MainActor in self.handleAppFocus(bundleId: app?.bundleIdentifier, name: app?.localizedName) }
     }
     pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-      self?.pollFrontmostWindow()
+      Task { @MainActor in self?.pollFrontmostWindow() }
     }
     pollFrontmostWindow()
   }

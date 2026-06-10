@@ -12,7 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       NSApp.setActivationPolicy(.accessory) // No Dock icon, only menubar.
 
       UNUserNotificationCenter.current().delegate = self
-      UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+      _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
 
       LoginItem.registerOnFirstLaunchIfNeeded()
 

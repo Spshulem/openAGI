@@ -45,7 +45,7 @@ struct PrivacyPanel: View {
         section(title: "Status") {
           HStack {
             Toggle("Capture enabled", isOn: $settings.enabled)
-              .onChange(of: settings.enabled) { _ in CaptureController.shared.apply() }
+              .onChange(of: settings.enabled) { _, _ in CaptureController.shared.apply() }
             Spacer()
             if let until = settings.pausedUntil, Date() < until {
               Text("Paused until \(until.formatted(date: .omitted, time: .shortened))")
