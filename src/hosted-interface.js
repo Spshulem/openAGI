@@ -3306,7 +3306,7 @@ async function renderScrutiny() {
     .join("");
   main.innerHTML = \`
     <div class="pane">
-      <h2>Scrutiny <span class="muted" style="font-size:14px;font-weight:400;">· cycle \${fitter.cycles ?? 0} · \${fitter.autoApply ? "auto-apply" : "warmup"}</span></h2>
+      <h2>Scrutiny <span class="muted" style="font-size:14px;font-weight:400;">· cycle \${fitter.cycles ?? 0} · \${fitter.autoApply ? "auto-apply" : "warmup"}\${fitter.restoredWeightsAt ? \` · calibrated \${escapeHtml(new Date(fitter.restoredWeightsAt).toLocaleDateString())}\` : ""}</span></h2>
       <div class="row" style="gap:8px;margin-bottom:14px;">
         <button id="fitBtn">Run fit now</button>
         <button class="secondary" id="judgeBtn">Run LLM judge</button>
