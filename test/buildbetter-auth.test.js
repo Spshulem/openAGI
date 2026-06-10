@@ -73,48 +73,30 @@ test("authHeaders uses the API key when set", async () => {
   assert.deepEqual(await src.authHeaders(), { "X-BuildBetter-Api-Key": "secret" });
 });
 
-test("authHeaders falls back to a reused OAuth bearer token", async () => {
-  // _oauthToken delegates to the canonical ensureToken({interactive:false}).
-  const fakeOauth = {
-    ensureToken: async ({ interactive }) => {
-      assert.equal(interactive, false, "poller must never open a browser");
-      return "tok";
-    }
-  };
-  const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
+test("authHeaders falls back to the BuildBetter MCP OAuth token via the registry", async () => {
+  let askedFor;
+  const mcp = { silentTokenFor: async (name) => { askedFor = name; return "tok"; } };
+  const src = new BuildBetterTaskSource({ apiKey: null, runtime: { mcp } });
   assert.deepEqual(await src.authHeaders(), { authorization: "Bearer tok" });
+  assert.equal(askedFor, "buildbetter", "reuses the buildbetter MCP server's token");
 });
 
-test("authHeaders returns null when ensureToken can't get a token without a browser", async () => {
-  const fakeOauth = {
-    ensureToken: async () => { const e = new Error("no token"); e.code = "OAUTH_INTERACTIVE_REQUIRED"; throw e; }
-  };
-  const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
-  assert.equal(await src.authHeaders(), null);
+test("authHeaders returns null when the registry has no silent token", async () => {
+  const src1 = new BuildBetterTaskSource({ apiKey: null, runtime: { mcp: { silentTokenFor: async () => null } } });
+  assert.equal(await src1.authHeaders(), null);
+  // ...and when there's no registry at all.
+  const src2 = new BuildBetterTaskSource({ apiKey: null, runtime: {} });
+  assert.equal(await src2.authHeaders(), null);
 });
 
-test("_oauthToken delegates to ensureToken({interactive:false}) and returns its token", async () => {
-  let calledWith;
-  const fakeOauth = { ensureToken: async (opts) => { calledWith = opts; return "fresh-token"; } };
-  const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
-  assert.equal(await src._oauthToken(), "fresh-token");
-  assert.deepEqual(calledWith, { interactive: false }, "must request a silent token, never interactive");
-});
-
-test("_oauthToken returns null when ensureToken throws (no usable cache / refresh failed)", async () => {
-  const fakeOauth = { ensureToken: async () => { throw new Error("refresh failed"); } };
-  const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
-  assert.equal(await src._oauthToken(), null);
-});
-
-test("isConfigured is true with only a reused OAuth connection", () => {
-  const fakeOauth = { loadCache: () => ({ refresh_token: "r" }), isExpired: () => true };
-  const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
+test("isConfigured is true with only a reused OAuth connection (registry reports a cached token)", () => {
+  const src = new BuildBetterTaskSource({ apiKey: null, runtime: { mcp: { hasOAuthToken: () => true } } });
   assert.equal(src.isConfigured(), true);
 });
 
-test("isConfigured is false with neither api key nor OAuth cache", () => {
-  const fakeOauth = { loadCache: () => null, isExpired: () => true };
-  const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
+test("isConfigured is false with neither api key nor a cached OAuth token", () => {
+  const src = new BuildBetterTaskSource({ apiKey: null, runtime: { mcp: { hasOAuthToken: () => false } } });
   assert.equal(src.isConfigured(), false);
+  // No registry at all → also false.
+  assert.equal(new BuildBetterTaskSource({ apiKey: null, runtime: {} }).isConfigured(), false);
 });
