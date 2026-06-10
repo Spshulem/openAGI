@@ -367,7 +367,10 @@ export const MCP_CATALOG = [
     authType: "oauth",
     status: "available",
     matches: { hostnames: ["buildbetter.app", "app.buildbetter.app"], keywords: ["buildbetter", "action item", "interview"] },
-    register: { url: "https://mcp.buildbetter.app/sse", transport: "http", auth: "oauth" }
+    // url is a getter so BUILDBETTER_MCP_URL (e.g. a staging MCP server) is
+    // read when the server is REGISTERED, not at module import — .env loads
+    // after imports in the hosted-server boot order.
+    register: { get url() { return process.env.BUILDBETTER_MCP_URL ?? "https://mcp.buildbetter.app/sse"; }, transport: "http", auth: "oauth" }
   },
   {
     id: "rize",

@@ -17,7 +17,14 @@
 // Adapted from autolist's apps/api/src/lib/integrations/buildbetter.ts
 // to OpenAGI's task store + integration registry pattern.
 
-const BUILDBETTER_ENDPOINT = "https://api.buildbetter.app/v1/graphql";
+// Endpoints are env-overridable so the integration can point at a staging
+// BuildBetter environment (read live — a .env edit + daemon restart is
+// enough, no rebuild):
+//   BUILDBETTER_API_URL → GraphQL endpoint (default prod)
+//   BUILDBETTER_APP_URL → web app origin for deep links (default prod)
+//   BUILDBETTER_MCP_URL → MCP server URL (consumed by mcp-catalog.js)
+const apiEndpoint = () => process.env.BUILDBETTER_API_URL ?? "https://api.buildbetter.app/v1/graphql";
+const appOrigin = () => (process.env.BUILDBETTER_APP_URL ?? "https://app.buildbetter.app").replace(/\/$/, "");
 // The MCP server id this integration reuses for OAuth (option 2): when no API
 // key is set, the poller borrows the token the user already granted to the
 // BuildBetter MCP server, via the shared registry primitives
@@ -102,7 +109,7 @@ export class BuildBetterTaskSource {
     if (!auth) {
       throw new Error("BuildBetter: no auth (set BUILDBETTER_API_KEY or connect BuildBetter from the MCP tab)");
     }
-    const res = await fetch(BUILDBETTER_ENDPOINT, {
+    const res = await fetch(apiEndpoint(), {
       method: "POST",
       headers: { "content-type": "application/json", ...auth },
       body: JSON.stringify({ query: graphql, variables })
@@ -227,7 +234,7 @@ export class BuildBetterTaskSource {
           bucket: "this_week",
           tags: types,
           sourceId,
-          sourceUrl: call ? `https://app.buildbetter.app/interviews/${call.id}` : null,
+          sourceUrl: call ? `${appOrigin()}/interviews/${call.id}` : null,
           sourceMeta: {
             extractionId: ex.id,
             callId: call?.id,
