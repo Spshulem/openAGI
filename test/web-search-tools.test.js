@@ -107,7 +107,9 @@ test("fetch_url allows a public host and returns stripped text", async () => {
   registerWebSearchTools({ tools });
   await withFetchUrlEnv(async () => {
     globalThis.fetch = async () => ({ ok: true, status: 200, headers: { get: () => null }, text: async () => "<p>hello <b>world</b></p>" });
-    const { result } = await tools.invoke("fetch_url", { url: "https://example.com/page" });
+    // Literal public IP: skips safeFetch's DNS-resolution layer so this test
+    // stays deterministic in network-restricted CI (no real lookup needed).
+    const { result } = await tools.invoke("fetch_url", { url: "https://93.184.216.34/page" });
     assert.equal(result.error, undefined);
     assert.match(result.content, /hello\s+world/);
   });
@@ -118,13 +120,14 @@ test("fetch_url does not follow a redirect into an internal host", async () => {
   registerWebSearchTools({ tools });
   await withFetchUrlEnv(async () => {
     globalThis.fetch = async (u) => {
-      if (String(u).includes("example.com")) {
+      if (String(u).includes("93.184.216.34")) {
         return { ok: false, status: 302, headers: { get: (h) => (h.toLowerCase() === "location" ? "http://169.254.169.254/" : null) }, text: async () => "" };
       }
       // would only be reached if the guard failed to block the redirect target
       return { ok: true, status: 200, headers: { get: () => null }, text: async () => "INTERNAL-SECRET" };
     };
-    const { result } = await tools.invoke("fetch_url", { url: "https://example.com/redir" });
+    // Literal public IP start URL: no DNS lookup, deterministic offline.
+    const { result } = await tools.invoke("fetch_url", { url: "https://93.184.216.34/redir" });
     assert.ok(result.error, "redirect into an internal host must surface an error");
     assert.ok(!JSON.stringify(result).includes("INTERNAL-SECRET"), "internal body must never be returned");
   });
