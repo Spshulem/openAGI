@@ -317,12 +317,22 @@ final class AppState: ObservableObject {
     return (json["name"] as? String, json["description"] as? String)
   }
 
+  // Tracks whether we've already fired the budget notification for the current
+  // over-cap episode. pollOnce() calls fetchAuditAndNotify() every ~5s while
+  // degraded, so without this latch the budget warning notifies on every poll
+  // (spam once spend crosses 70%). Re-armed when spend drops back under the cap
+  // (or resets at day rollover).
+  private var budgetNotified = false
+
   private func fetchAuditAndNotify() async {
-    if findings.contains(where: { $0.severity == "warn" && $0.area == "budget" }) {
-      notify(title: "OpenAGI budget", body: "Today's spend > 70% of daily cap.", path: "/")
-    }
-    if findings.contains(where: { $0.area == "specialists" }) {
-      // Avoid spamming — only notify on transitions; for now, no-op.
+    let budgetWarn = findings.contains { $0.severity == "warn" && $0.area == "budget" }
+    if budgetWarn {
+      if !budgetNotified {
+        notify(title: "OpenAGI budget", body: "Today's spend > 70% of daily cap.", path: "/")
+        budgetNotified = true
+      }
+    } else {
+      budgetNotified = false
     }
   }
 

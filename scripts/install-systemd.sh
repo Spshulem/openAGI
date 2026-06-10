@@ -79,6 +79,9 @@ fi
 if [[ "${MODE}" == "user" ]]; then
   mkdir -p "$HOME/.config/systemd/user"
   # User service runs as the invoking user → data dir is their own ~/.openagi.
+  # Create it up front: it's in ReadWritePaths and ProtectHome=read-only would
+  # otherwise stop the daemon from creating it on first run.
+  mkdir -p "$HOME/.openagi"
   build_unit default.target "${HOME}/.openagi" > "$HOME/.config/systemd/user/${UNIT_NAME}"
   systemctl --user daemon-reload
   systemctl --user enable --now "${UNIT_NAME}"

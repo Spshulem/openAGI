@@ -148,9 +148,11 @@ export const serpapi = {
         publishedDate: r.date ?? undefined
       }));
     }
-    // Google Programmable Search fallback.
+    // Google Programmable Search fallback. cse.list caps `num` at 10 (1–10);
+    // a higher value (the tool schema allows up to 20) returns a 400.
+    const cseNum = Math.min(10, Math.max(1, num));
     const data = await getJson(
-      `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(process.env.GOOGLE_API_KEY)}&cx=${encodeURIComponent(process.env.GOOGLE_CSE_ID)}&q=${encodeURIComponent(query)}&num=${num}`
+      `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(process.env.GOOGLE_API_KEY)}&cx=${encodeURIComponent(process.env.GOOGLE_CSE_ID)}&q=${encodeURIComponent(query)}&num=${cseNum}`
     );
     return (data.items ?? []).map((r) => ({
       title: str(r.title), url: str(r.link), snippet: str(r.snippet).slice(0, 400)

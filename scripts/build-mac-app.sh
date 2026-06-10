@@ -31,7 +31,12 @@ if [[ -z "${VERSION:-}" ]]; then
     VERSION="$(node -p "require('${ROOT}/package.json').version")"
   fi
 fi
-BUILD_NUM="${BUILD_NUM:-$(date +%s)}"
+# Build number must use the SAME scheme as CI (release-mac.yml stamps
+# `date -u +%y%m%d%H%M`). A local epoch-seconds value (~1.78e9) is numerically
+# smaller than any YYMMDDHHMM value (~2.6e9 in 2026), so Sparkle would treat a
+# locally-built app as forever older than every CI release of the same version
+# and nag to "update" to it endlessly. Keep both schemes identical.
+BUILD_NUM="${BUILD_NUM:-$(date -u +%y%m%d%H%M)}"
 NODE_VERSION="${NODE_VERSION:-22.21.1}"
 
 ARCH="$(uname -m)"
