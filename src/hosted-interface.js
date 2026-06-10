@@ -183,7 +183,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // Setup wizard handlers — work both during first-run (auth-bypassed)
       // and after-auth (so users can re-edit env from the dashboard's Settings).
       if (method === "GET" && pathname === "/setup") {
-        return sendHtml(res, 200, renderWizard(), extraCookies);
+        // Re-runs prefill from the live env: the existing auth token is
+        // KEPT (a re-run used to silently rotate it on save), provider/
+        // model/budget show their current values, and already-set secrets
+        // get a "saved" marker instead of looking unconfigured.
+        return sendHtml(res, 200, renderWizard({ existingEnv: process.env }), extraCookies);
       }
       if (method === "POST" && pathname === "/setup/save") {
         const body = await readJson(req);
@@ -216,7 +220,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/") return sendHtml(res, 200, renderApp(), extraCookies);
-      if (method === "GET" && pathname === "/health") return sendJson(res, 200, { ok: true, status: runtime.status() });
+      // firstRun lets clients (Mac app) know setup has never completed, so
+      // they can take the user to the wizard instead of sitting silent.
+      if (method === "GET" && pathname === "/health") return sendJson(res, 200, { ok: true, firstRun: isFirstRun(), status: runtime.status() });
       if (method === "GET" && pathname === "/memory") return sendJson(res, 200, runtime.memory.snapshot());
       if (method === "GET" && pathname === "/agents") return sendJson(res, 200, runtime.agentHost?.store.listAgents() ?? runtime.propagation.list());
       if (method === "GET" && pathname === "/specialists") {

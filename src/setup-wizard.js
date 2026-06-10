@@ -110,8 +110,18 @@ function parseEnvText(text) {
   return out;
 }
 
-export function renderWizard({ proposedToken } = {}) {
-  const token = proposedToken ?? generateToken(32);
+export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
+  // Re-running /setup must NOT rotate the auth token: every save used to
+  // overwrite OPENAGI_AUTH_TOKEN with a fresh value because the hidden field
+  // always submitted. Keep the existing token when there is one.
+  const token = proposedToken ?? existingEnv.OPENAGI_AUTH_TOKEN ?? generateToken(32);
+  const hasExistingToken = Boolean(existingEnv.OPENAGI_AUTH_TOKEN);
+  const val = (key, fallback = "") => escapeHtml(existingEnv[key] ?? fallback);
+  // "✓ saved" marker for secret fields that already have a value — blank
+  // means "keep what's saved", so the user can see what's configured
+  // without us echoing the secret back into the page.
+  const saved = (key) => (existingEnv[key] ? ' <span class="pill">✓ saved — blank keeps it</span>' : "");
+  const providerChecked = (p) => ((existingEnv.OPENAGI_PROVIDER ?? "auto") === p ? "checked" : "");
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -198,35 +208,41 @@ export function renderWizard({ proposedToken } = {}) {
       <h3>Pick a primary provider</h3>
       <p>You can supply both — but pick which one drives chat and tool calls. Switch later from the dashboard.</p>
       <div class="grid">
-        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="auto" checked> Auto · use whichever has a key (Anthropic preferred)</label>
-        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="anthropic"> Anthropic · Claude Sonnet 4.6</label>
-        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai"> OpenAI · ChatGPT (GPT-5)</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="auto" ${providerChecked("auto")}> Auto · use whichever has a key (Anthropic preferred)</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="anthropic" ${providerChecked("anthropic")}> Anthropic · Claude Sonnet 4.6</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai" ${providerChecked("openai")}> OpenAI · ChatGPT (GPT-5)</label>
       </div>
 
       <h3 style="margin-top:14px;">Anthropic key</h3>
       <p>Get one at <a href="https://console.anthropic.com/" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
-      <label>ANTHROPIC_API_KEY</label>
+      <label>ANTHROPIC_API_KEY${saved("ANTHROPIC_API_KEY")}</label>
       <input type="password" name="ANTHROPIC_API_KEY" placeholder="sk-ant-…" autocomplete="off">
       <label style="margin-top:8px;">Model</label>
-      <input type="text" name="ANTHROPIC_MODEL" value="claude-sonnet-4-6">
+      <input type="text" name="ANTHROPIC_MODEL" value="${val("ANTHROPIC_MODEL", "claude-sonnet-4-6")}">
 
       <h3 style="margin-top:14px;">OpenAI / ChatGPT key</h3>
       <p>Get one at <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">platform.openai.com</a>. Works with Zero Data Retention orgs.</p>
-      <label>OPENAI_API_KEY</label>
+      <label>OPENAI_API_KEY${saved("OPENAI_API_KEY")}</label>
       <input type="password" name="OPENAI_API_KEY" placeholder="sk-proj-…" autocomplete="off">
       <label style="margin-top:8px;">Model</label>
-      <input type="text" name="OPENAI_MODEL" value="gpt-5">
+      <input type="text" name="OPENAI_MODEL" value="${val("OPENAI_MODEL", "gpt-5")}">
     </div>
 
     <div class="step">
       <h2>3 / 8 · auth</h2>
       <h3>Bearer token</h3>
-      <p>This is the password for your dashboard. Save it now — you'll need it to log in. We auto-generated a strong one for you, or paste your own.</p>
+      <p>${hasExistingToken
+        ? "This is your <strong>existing</strong> dashboard token — saving keeps it unchanged. Regenerate only if you want to rotate it (other signed-in browsers will need the new one)."
+        : "This is the password for your dashboard. Save it now — you'll need it to log in. We auto-generated a strong one for you, or paste your own."}</p>
       <div class="token" id="tokenView">${escapeHtml(token)}</div>
       <input type="hidden" name="OPENAGI_AUTH_TOKEN" id="tokenInput" value="${escapeHtml(token)}">
       <div class="actions">
         <button type="button" class="secondary" id="copyToken">Copy</button>
         <button type="button" class="secondary" id="regenToken">Regenerate</button>
+      </div>
+      <div style="margin-top:14px; padding-top:12px; border-top:1px solid #2a352f;">
+        <p class="sub" style="margin-bottom:8px;">That's the minimum viable setup — a model key + this token. Everything below (channels, sources, MCPs, tunnel, budget) can wait.</p>
+        <button type="submit" class="secondary">Save now — set up the rest later</button>
       </div>
     </div>
 
@@ -238,16 +254,16 @@ export function renderWizard({ proposedToken } = {}) {
       <details>
         <summary>Twilio SMS — text the agent and get texts back</summary>
         <div style="padding-top:10px;" class="grid">
-          <div><label>TWILIO_ACCOUNT_SID</label><input type="text" name="TWILIO_ACCOUNT_SID" placeholder="AC..."></div>
-          <div><label>TWILIO_AUTH_TOKEN</label><input type="password" name="TWILIO_AUTH_TOKEN" autocomplete="off"></div>
-          <div><label>TWILIO_FROM_NUMBER</label><input type="text" name="TWILIO_FROM_NUMBER" placeholder="+15551234567"></div>
+          <div><label>TWILIO_ACCOUNT_SID${saved("TWILIO_ACCOUNT_SID")}</label><input type="text" name="TWILIO_ACCOUNT_SID" placeholder="AC..."></div>
+          <div><label>TWILIO_AUTH_TOKEN${saved("TWILIO_AUTH_TOKEN")}</label><input type="password" name="TWILIO_AUTH_TOKEN" autocomplete="off"></div>
+          <div><label>TWILIO_FROM_NUMBER${saved("TWILIO_FROM_NUMBER")}</label><input type="text" name="TWILIO_FROM_NUMBER" placeholder="+15551234567"></div>
         </div>
       </details>
 
       <details style="margin-top:8px;">
         <summary>Telegram — bot from @BotFather</summary>
         <div style="padding-top:10px;" class="grid">
-          <div><label>TELEGRAM_BOT_TOKEN</label><input type="password" name="TELEGRAM_BOT_TOKEN" autocomplete="off"></div>
+          <div><label>TELEGRAM_BOT_TOKEN${saved("TELEGRAM_BOT_TOKEN")}</label><input type="password" name="TELEGRAM_BOT_TOKEN" autocomplete="off"></div>
           <div><label>TELEGRAM_WEBHOOK_SECRET (any random string)</label><input type="text" name="TELEGRAM_WEBHOOK_SECRET"></div>
           <div class="opt"><input type="checkbox" id="tgPoll" name="TELEGRAM_POLLING" value="1"><label for="tgPoll" style="margin:0;">Long-poll instead of webhook (works without a tunnel)</label></div>
         </div>
@@ -263,7 +279,7 @@ export function renderWizard({ proposedToken } = {}) {
         <summary>Linear — assigned issues become tasks</summary>
         <div style="padding-top:10px;">
           <p class="sub">Get a personal API key at <a href="https://linear.app/settings/api" target="_blank" rel="noopener">linear.app/settings/api</a>. Polls every 5 min.</p>
-          <label>LINEAR_API_KEY</label>
+          <label>LINEAR_API_KEY${saved("LINEAR_API_KEY")}</label>
           <input type="password" name="LINEAR_API_KEY" placeholder="lin_api_…" autocomplete="off">
         </div>
       </details>
@@ -273,10 +289,10 @@ export function renderWizard({ proposedToken } = {}) {
         <div style="padding-top:10px;" class="grid">
           <p class="sub">Pulls action_item / commitment / follow_up extractions from your recent calls. Polls every 15 min, and (optionally) syncs instantly via webhook.</p>
           <p class="sub">Already connected BuildBetter on the <code>MCP</code> tab? You can leave everything below blank — OpenAGI reuses that login.</p>
-          <div><label>BUILDBETTER_API_KEY <span class="sub">(optional if connected via MCP)</span></label><input type="password" name="BUILDBETTER_API_KEY" autocomplete="off"></div>
-          <div><label>BUILDBETTER_USER_EMAIL <span class="sub">(optional — auto-detected from your login)</span></label><input type="email" name="BUILDBETTER_USER_EMAIL" placeholder="you@example.com"></div>
-          <div><label>BUILDBETTER_USER_NAME <span class="sub">(optional — only needed if auto-detect can't pinpoint you)</span></label><input type="text" name="BUILDBETTER_USER_NAME" placeholder="Your Name"></div>
-          <div><label>BUILDBETTER_WEBHOOK_SECRET <span class="sub">(optional — enables instant push)</span></label><input type="password" name="BUILDBETTER_WEBHOOK_SECRET" autocomplete="off" placeholder="a long random string"><p class="sub">Set this, then point a BuildBetter webhook at <code>&lt;your public URL&gt;/webhooks/buildbetter?secret=…</code> (shown on the Channels tab once a public URL is set) to sync the moment a call is processed instead of waiting for the poll.</p></div>
+          <div><label>BUILDBETTER_API_KEY <span class="sub">(optional if connected via MCP)</span>${saved("BUILDBETTER_API_KEY")}</label><input type="password" name="BUILDBETTER_API_KEY" autocomplete="off"></div>
+          <div><label>BUILDBETTER_USER_EMAIL <span class="sub">(optional — auto-detected from your login)</span></label><input type="email" name="BUILDBETTER_USER_EMAIL" placeholder="you@example.com" value="${val("BUILDBETTER_USER_EMAIL")}"></div>
+          <div><label>BUILDBETTER_USER_NAME <span class="sub">(optional — only needed if auto-detect can't pinpoint you)</span></label><input type="text" name="BUILDBETTER_USER_NAME" placeholder="Your Name" value="${val("BUILDBETTER_USER_NAME")}"></div>
+          <div><label>BUILDBETTER_WEBHOOK_SECRET <span class="sub">(optional — enables instant push)</span>${saved("BUILDBETTER_WEBHOOK_SECRET")}</label><input type="password" name="BUILDBETTER_WEBHOOK_SECRET" autocomplete="off" placeholder="a long random string"><p class="sub">Set this, then point a BuildBetter webhook at <code>&lt;your public URL&gt;/webhooks/buildbetter?secret=…</code> (shown on the Channels tab once a public URL is set) to sync the moment a call is processed instead of waiting for the poll.</p></div>
         </div>
       </details>
 
@@ -284,7 +300,7 @@ export function renderWizard({ proposedToken } = {}) {
         <summary>Rize.io — what you worked on today</summary>
         <div style="padding-top:10px;">
           <p class="sub">Activity tracking surfaces "what did I work on today?" via the <code>rize_*</code> agent tools. Get a key at <a href="https://my.rize.io/settings/api" target="_blank" rel="noopener">my.rize.io/settings/api</a>.</p>
-          <label>RIZE_API_KEY</label>
+          <label>RIZE_API_KEY${saved("RIZE_API_KEY")}</label>
           <input type="password" name="RIZE_API_KEY" autocomplete="off">
         </div>
       </details>
@@ -293,7 +309,7 @@ export function renderWizard({ proposedToken } = {}) {
         <summary>Calendar — did the meeting happen?</summary>
         <div style="padding-top:10px;">
           <p class="sub">Paste your calendar's <strong>secret iCal/ICS URL</strong> (Google: Settings → your calendar → "Secret address in iCal format"; Outlook/Apple have an equivalent). Used to reconcile whether scheduled meetings occurred and to plan your day. Comma-separate multiple calendars. No OAuth required.</p>
-          <label>CALENDAR_ICS_URL</label>
+          <label>CALENDAR_ICS_URL${saved("CALENDAR_ICS_URL")}</label>
           <input type="password" name="CALENDAR_ICS_URL" autocomplete="off" placeholder="https://calendar.google.com/calendar/ical/.../basic.ics">
         </div>
       </details>
@@ -337,7 +353,7 @@ export function renderWizard({ proposedToken } = {}) {
       <p>If you want Twilio or Telegram webhooks to reach this machine, expose it via a tunnel. <code>cloudflared</code> on macOS: <code>brew install cloudflared</code>; on Linux: <a href="https://pkg.cloudflare.com/index.html" target="_blank" rel="noopener">pkg.cloudflare.com</a>.</p>
       <p>Then run <code>npm run tunnel</code> in another terminal and paste the URL it prints below.</p>
       <label>OPENAGI_PUBLIC_URL <span class="sub">leave blank to skip</span></label>
-      <input type="text" name="OPENAGI_PUBLIC_URL" placeholder="https://abcd.trycloudflare.com">
+      <input type="text" name="OPENAGI_PUBLIC_URL" placeholder="https://abcd.trycloudflare.com" value="${val("OPENAGI_PUBLIC_URL")}">
     </div>
 
     <div class="step">
@@ -345,7 +361,7 @@ export function renderWizard({ proposedToken } = {}) {
       <h3>Daily budget</h3>
       <p>Hard ceiling on LLM spend per day. Provider calls throw <code>BUDGET_EXCEEDED</code> past this. Default $10/day.</p>
       <label>OPENAGI_DAILY_USD_LIMIT</label>
-      <input type="number" name="OPENAGI_DAILY_USD_LIMIT" value="10" min="0.5" step="0.5">
+      <input type="number" name="OPENAGI_DAILY_USD_LIMIT" value="${val("OPENAGI_DAILY_USD_LIMIT", "10")}" min="0.5" step="0.5">
     </div>
 
     <div class="step">
@@ -435,6 +451,7 @@ export function renderWizard({ proposedToken } = {}) {
     const out = document.getElementById("output");
     out.style.display = "block";
     out.textContent = "Saving…";
+    out.scrollIntoView({ behavior: "smooth", block: "center" });
     const btn = document.getElementById("saveBtn");
     btn.disabled = true;
 

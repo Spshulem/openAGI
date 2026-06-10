@@ -125,6 +125,12 @@ final class AppState: ObservableObject {
     pollTimer = nil
   }
 
+  // Latched per launch: a fresh install gets walked to the setup wizard
+  // exactly once instead of sitting silent behind a menubar icon. (The
+  // single biggest onboarding failure was the app launching, starting an
+  // unconfigured daemon, and never showing the user ANYTHING.)
+  private var offeredSetupThisLaunch = false
+
   private func pollOnce() async {
     // Always probe /health on its own so we can distinguish "daemon is dead"
     // from "daemon is up but /audit is throwing".
@@ -138,6 +144,11 @@ final class AppState: ObservableObject {
       memoryLong = h.status?.memory?.long ?? 0
       lastError = nil
       consecutiveFailures = 0
+      if h.firstRun == true && !offeredSetupThisLaunch {
+        offeredSetupThisLaunch = true
+        notify(title: "Welcome to OpenAGI", body: "Two minutes of setup and your agent is live.", path: "/setup")
+        openDashboard(path: "/setup")
+      }
     } catch {
       status = .down
       lastError = "/health: \(error.localizedDescription)"
@@ -416,6 +427,7 @@ final class AppState: ObservableObject {
 
 struct HealthResponse: Decodable {
   let ok: Bool?
+  let firstRun: Bool?
   let status: HealthInner?
   struct HealthInner: Decodable {
     let agentHost: AgentHost?
