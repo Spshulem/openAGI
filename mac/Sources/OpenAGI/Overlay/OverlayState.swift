@@ -12,6 +12,14 @@ final class OverlayState: ObservableObject {
   @Published var error: String? = nil
   @Published var contextNote: String? = nil
 
+  /// Reset the answer area so the panel shrinks back to just the ask field.
+  func clearAnswer() {
+    answer = ""
+    error = nil
+    contextNote = nil
+    question = ""
+  }
+
   func ask() async {
     let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !q.isEmpty else { return }
