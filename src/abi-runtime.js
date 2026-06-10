@@ -423,9 +423,11 @@ export class AbiRuntime {
       this.agentHost.ensureSpecialistAgent(propagated.specialist, "main");
     }
 
-    // An 'ignore' verdict has a consequence: the signal is NOT committed to
-    // memory (forgetting low-signal noise is the point), just audit-logged.
-    // Every other verdict remembers the signal + decision as before.
+    // Two reasons a signal is NOT committed to memory:
+    //   - an 'ignore' verdict (forgetting low-signal noise is the point) —
+    //     audit-logged via the signal-ignored event;
+    //   - an ephemeral turn (setup-wizard connectivity test) — a round-trip
+    //     check, not lived experience.
     let memoryItem = null;
     if (scrutiny.action === "ignore") {
       this.events?.emit?.("signal-ignored", {
@@ -435,7 +437,7 @@ export class AbiRuntime {
         summary: signal.summary,
         score: scrutiny.score
       });
-    } else {
+    } else if (!options.ephemeral) {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
@@ -484,7 +486,7 @@ export class AbiRuntime {
       loop: "outputs-to-integrations",
       summary: memoryItem
         ? `Output ${output.id} fed back into memory tier ${memoryItem.tier}.`
-        : `Output ${output.id} ignored — signal not committed to memory.`
+        : `Output ${output.id} not committed to memory (${scrutiny.action === "ignore" ? "ignored" : "ephemeral"}).`
     });
 
     return output;

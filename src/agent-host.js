@@ -25,6 +25,10 @@ export class AgentHost {
     let agentId = input.agentId ?? "main";
     const text = String(input.text ?? input.message ?? "").trim();
     if (!text) throw new Error("Message text is required.");
+    // Ephemeral turns (setup-wizard "say hi" test) must leave no trace:
+    // no session in the dashboard list, no auto-task, no memory write,
+    // no outcome — they're a connectivity check, not a conversation.
+    const ephemeral = input.ephemeral === true;
 
     // Specialist routing: see if any active specialist's bounded scope matches.
     // The caller can opt out by passing input.routeTo === false (used by sub-agents to avoid loops).
@@ -45,7 +49,7 @@ export class AgentHost {
     // Auto-task detection — if the user said "remind me to X" / "todo: X" /
     // "I need to X", create a task in the user queue without requiring them
     // to invoke add_task. Best-effort; failures don't block the chat reply.
-    if (this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot") {
+    if (!ephemeral && this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot") {
       const detected = detectTaskInChat(text);
       if (detected) {
         try {
@@ -57,20 +61,23 @@ export class AgentHost {
       }
     }
 
-    const sessionBefore = this.store.appendMessage(sessionId, {
-      role: "user",
-      content: text,
-      agentId,
-      channel,
-      from,
-      metadata: input.metadata ?? {}
-    });
+    const sessionBefore = ephemeral
+      ? { id: sessionId, messages: [{ role: "user", content: text }] }
+      : this.store.appendMessage(sessionId, {
+          role: "user",
+          content: text,
+          agentId,
+          channel,
+          from,
+          metadata: input.metadata ?? {}
+        });
 
     const signal = this.messageToSignal({ text, channel, from, agent, sessionId, metadata: input.metadata ?? {} });
     const isSpecialist = agent.role === "specialist";
     const output = this.runtime.processSignal(signal, {
       scope: isSpecialist ? `specialist:${agent.id}` : "main",
-      parentSpecialistId: isSpecialist ? agent.id : null
+      parentSpecialistId: isSpecialist ? agent.id : null,
+      ephemeral
     });
 
     if (output.propagation?.specialist) {
@@ -154,7 +161,7 @@ export class AgentHost {
       }
     });
 
-    const outcomeRecord = this.runtime.outcomes?.record({
+    const outcomeRecord = ephemeral ? null : this.runtime.outcomes?.record({
       kind: input.origin === "autopilot" ? "autopilot-fire" : input.origin === "cron" ? "cron-fire" : "agent-reply",
       refId: null, // patched after we know assistant message id
       signalId: signal.id,
@@ -177,49 +184,53 @@ export class AgentHost {
       }
     }) ?? null;
 
-    const sessionAfter = this.store.appendMessage(sessionId, {
-      role: "assistant",
-      content: modelResult.text,
-      agentId,
-      channel,
-      from: "openagi",
-      metadata: {
-        provider: modelResult.provider,
-        model: modelResult.model,
-        responseId: modelResult.id,
-        outputId: output.id,
-        outcomeId: outcomeRecord?.id ?? null,
-        toolCalls: (modelResult.toolCalls ?? []).map((call) => ({
-          name: call.name,
-          arguments: call.arguments,
-          ok: call.result?.ok ?? false
-        }))
-      }
-    });
+    const sessionAfter = ephemeral
+      ? { id: sessionId, messages: [{ role: "user", content: text }, { role: "assistant", content: modelResult.text }] }
+      : this.store.appendMessage(sessionId, {
+          role: "assistant",
+          content: modelResult.text,
+          agentId,
+          channel,
+          from: "openagi",
+          metadata: {
+            provider: modelResult.provider,
+            model: modelResult.model,
+            responseId: modelResult.id,
+            outputId: output.id,
+            outcomeId: outcomeRecord?.id ?? null,
+            toolCalls: (modelResult.toolCalls ?? []).map((call) => ({
+              name: call.name,
+              arguments: call.arguments,
+              ok: call.result?.ok ?? false
+            }))
+          }
+        });
 
     if (outcomeRecord) outcomeRecord.refId = sessionAfter.messages.at(-1)?.id ?? null;
 
-    this.runtime.memory.remember(
-      {
-        source: "agent-host",
-        scope: agent.role === "specialist" ? `specialist:${agent.id}` : "main",
-        content: `Session ${sessionId} user asked: ${text}\nAgent replied: ${modelResult.text}`,
-        tags: ["agent-turn", channel, agentId],
-        novelty: output.scrutiny.dimensions.novelty,
-        risk: output.scrutiny.dimensions.risk,
-        repetition: output.scrutiny.dimensions.repetition,
-        specificity: 0.6,
-        metadata: {
-          sessionId,
-          agentId,
-          outputId: output.id
+    if (!ephemeral) {
+      this.runtime.memory.remember(
+        {
+          source: "agent-host",
+          scope: agent.role === "specialist" ? `specialist:${agent.id}` : "main",
+          content: `Session ${sessionId} user asked: ${text}\nAgent replied: ${modelResult.text}`,
+          tags: ["agent-turn", channel, agentId],
+          novelty: output.scrutiny.dimensions.novelty,
+          risk: output.scrutiny.dimensions.risk,
+          repetition: output.scrutiny.dimensions.repetition,
+          specificity: 0.6,
+          metadata: {
+            sessionId,
+            agentId,
+            outputId: output.id
+          }
+        },
+        {
+          source: "agent-host",
+          strength: output.scrutiny.score
         }
-      },
-      {
-        source: "agent-host",
-        strength: output.scrutiny.score
-      }
-    );
+      );
+    }
 
     return {
       id: createId("turn"),

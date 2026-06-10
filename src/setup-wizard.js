@@ -288,7 +288,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
         <summary>BuildBetter — call action items become tasks</summary>
         <div style="padding-top:10px;" class="grid">
           <p class="sub">Pulls action_item / commitment / follow_up extractions from your recent calls. Polls every 15 min, and (optionally) syncs instantly via webhook.</p>
-          <p class="sub">Already connected BuildBetter on the <code>MCP</code> tab? You can leave everything below blank — OpenAGI reuses that login.</p>
+          <p class="sub"><strong>Easiest path:</strong> check <strong>BuildBetter</strong> in step 6 below (one-click OAuth) and leave this card blank — task sync reuses that login automatically, identity included. The fields here are only for API-key setups or webhook push.</p>
           <div><label>BUILDBETTER_API_KEY <span class="sub">(optional if connected via MCP)</span>${saved("BUILDBETTER_API_KEY")}</label><input type="password" name="BUILDBETTER_API_KEY" autocomplete="off"></div>
           <div><label>BUILDBETTER_USER_EMAIL <span class="sub">(optional — auto-detected from your login)</span></label><input type="email" name="BUILDBETTER_USER_EMAIL" placeholder="you@example.com" value="${val("BUILDBETTER_USER_EMAIL")}"></div>
           <div><label>BUILDBETTER_USER_NAME <span class="sub">(optional — only needed if auto-detect can't pinpoint you)</span></label><input type="text" name="BUILDBETTER_USER_NAME" placeholder="Your Name" value="${val("BUILDBETTER_USER_NAME")}"></div>
