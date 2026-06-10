@@ -216,6 +216,14 @@ For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the O
 | **Telegram** | Webhook (`/channels/telegram/webhook`) or long polling (`TELEGRAM_POLLING=1`). |
 | **Persistent state** | All under `.openagi/`: memory (JSONL audit + atomic snapshot), cron jobs, agent/session store, specialist workspaces, MCP logs. |
 
+### Credits
+
+The **Credits** dashboard tab shows today's LLM spend vs the daily cap (`OPENAGI_DAILY_USD_LIMIT`), totals broken down **by activity** (chat / autopilot / cron / overlay / sms) and **by model**, a **30-day spend chart**, and a per-call **audit log** — each row records time, model, activity type, agent, cost, and tools called, so you can see exactly what cost credits and why.
+
+Ask the agent in chat via the **`recall_spend`** tool ("why did I spend $4 today?") — it reads the same ledger.
+
+Data is a local rolling 30-day ledger at `~/.openagi/budget/ledger.jsonl`. It stores cost + attribution only — **no message content**.
+
 ---
 
 ## Remote access (SMS, Telegram, tunneling)
