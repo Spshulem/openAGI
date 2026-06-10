@@ -36,6 +36,18 @@ export class FileBackedMemorySystem extends MemorySystem {
     return item;
   }
 
+  correct(input) {
+    // super.correct() routes the new locked item through this.remember()
+    // (already persisted); this extra event captures the supersede mutations
+    // on the stale items and snapshots them.
+    const result = super.correct(input);
+    this.persist("correct", {
+      correctedId: result.item.id,
+      superseded: result.superseded.map((item) => item.id)
+    });
+    return result;
+  }
+
   decay(now = new Date()) {
     const result = super.decay(now);
     if (result.removed.length > 0 || result.promoted.length > 0) {

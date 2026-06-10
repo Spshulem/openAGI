@@ -270,7 +270,7 @@ export class AgentHost {
 
 Your job is to help through the ABI loop:
 1. Apply directional adaptive scrutiny.
-2. Use memory deliberately.
+2. Use memory deliberately. When the user CORRECTS something you previously stored or said (a time, a name, a decision, a preference), call correct_memory with the corrected fact — never just remember a second conflicting version.
 3. Propagate bounded specialists only when repeated or novel high-risk work justifies it.
 
 Current decision: ${output.scrutiny.action}

@@ -49,6 +49,10 @@ export class MemorySystem {
       dangerLevel,
       repetition: clamp(observation.repetition ?? context.repetition ?? 0),
       kind: observation.kind ?? context.kind ?? "raw",
+      // Locked items (user corrections) neither strength-decay nor get
+      // evicted/TTL-deleted; past their tier TTL they promote upward instead,
+      // so a locked-in correction eventually becomes long-term intuition.
+      locked: Boolean(observation.locked ?? context.locked ?? false),
       metadata: {
         ...(observation.metadata ?? {}),
         ...(context.metadata ?? {})
@@ -71,6 +75,9 @@ export class MemorySystem {
     for (const item of this.items.values()) {
       if (!tiers.has(item.tier)) continue;
       if (scope && item.scope && item.scope !== scope && item.scope !== "main") continue;
+      // Superseded items were corrected by the user — never recall the stale
+      // version (the correction itself carries the fact forward).
+      if (item.metadata?.supersededBy) continue;
       const textScore = tokenOverlapScore(queryText, `${item.content} ${item.tags.join(" ")}`);
       const tierWeight = item.tier === "short" ? 1.15 : item.tier === "medium" ? 1 : 0.85;
       const strengthWeight = 0.4 + item.strength * 0.6;
@@ -82,7 +89,13 @@ export class MemorySystem {
       }
       // Principle boost: distilled principles get a small edge in long-tier recall.
       const principleBoost = item.kind === "principle" ? 0.1 : 0;
-      const score = textScore * tierWeight * strengthWeight + dangerBoost + principleBoost;
+      // Corrections outrank whatever they replaced; fidelity finally feeds the
+      // ranking ("the hourglass on the spider"): specific-fidelity items edge
+      // out generic ones when both match. Gated on a real text match so
+      // unrelated corrections/specific items don't surface on every query.
+      const correctionBoost = textScore > 0 && item.kind === "correction" ? 0.3 : 0;
+      const fidelityBoost = textScore > 0 && item.fidelity === "specific" ? 0.05 : 0;
+      const score = textScore * tierWeight * strengthWeight + dangerBoost + principleBoost + correctionBoost + fidelityBoost;
       if (score > 0) scored.push({ item, score });
     }
 
@@ -103,6 +116,64 @@ export class MemorySystem {
     return item;
   }
 
+  /**
+   * Lock in a correction: hide the stale memory from all future retrieval
+   * and store the corrected fact as a locked item ("learn it once, never
+   * make that mistake again"). The stale item(s) are matched by explicit
+   * `id`, or by retrieval on `query` — only the top hit and its near-ties
+   * are superseded, so a fuzzy query can't bury unrelated memories.
+   * Returns { item, superseded } where `item` is the new locked correction.
+   */
+  correct({ id = null, query = null, content, tags = [], scope = "main", source = "correction", metadata = {} } = {}) {
+    const text = String(content ?? "").trim();
+    if (!text) throw new Error("correct() requires the corrected content.");
+
+    const targets = [];
+    if (id) {
+      const item = this.items.get(id);
+      if (item && !item.locked) targets.push(item);
+    } else if (query) {
+      const hits = this.retrieve(query, { limit: 5, scope });
+      const top = hits[0]?.score ?? 0;
+      for (const { item, score } of hits) {
+        if (item.locked || item.kind === "correction") continue;
+        if (score >= 0.15 && score >= top * 0.8) targets.push(item);
+        if (targets.length >= 3) break;
+      }
+    }
+
+    // The correction inherits the staleness-resistant traits of what it
+    // replaces: at least medium tier (corrections must outlive RAM), the
+    // highest tier among its targets, and high specificity.
+    const tierRank = { short: 0, medium: 1, long: 2 };
+    const targetTier = targets.reduce((best, t) => (tierRank[t.tier] > tierRank[best] ? t.tier : best), "medium");
+    const inheritedTags = [...new Set(targets.flatMap((t) => t.tags ?? []))];
+
+    const corrected = this.remember(
+      {
+        source,
+        scope,
+        content: text,
+        tags: [...new Set(["correction", ...inheritedTags, ...tags])],
+        risk: Math.max(0.3, ...targets.map((t) => t.risk ?? 0)),
+        specificity: 0.85,
+        novelty: 0.4,
+        repetition: 0.3,
+        kind: "correction",
+        locked: true,
+        metadata: { ...metadata, corrects: targets.map((t) => t.id) }
+      },
+      { strength: 1.0, tier: targetTier }
+    );
+
+    const at = nowIso();
+    for (const target of targets) {
+      target.metadata = { ...target.metadata, supersededBy: corrected.id, supersededAt: at };
+    }
+
+    return { item: corrected, superseded: targets };
+  }
+
   decay(now = new Date()) {
     const current = now instanceof Date ? now : new Date(now);
     const removed = [];
@@ -113,17 +184,22 @@ export class MemorySystem {
       const ttl = this.ttlMs[item.tier];
 
       if (ageMs <= ttl) {
-        item.strength = clamp(item.strength - this.decayRate(item.tier));
+        // Locked corrections don't fade.
+        if (!item.locked) item.strength = clamp(item.strength - this.decayRate(item.tier));
         continue;
       }
 
-      if (item.tier === "short" && (item.repetition >= 0.55 || item.risk >= 0.7 || item.novelty >= 0.7)) {
+      // Superseded items never promote — a corrected fact must not ride the
+      // promotion path into long-term memory. They expire on tier TTL.
+      const superseded = Boolean(item.metadata?.supersededBy);
+
+      if (!superseded && item.tier === "short" && (item.locked || item.repetition >= 0.55 || item.risk >= 0.7 || item.novelty >= 0.7)) {
         const medium = this.promote(item, "medium", current.toISOString());
         promoted.push(medium);
         continue;
       }
 
-      if (item.tier === "medium" && (item.risk >= 0.8 || item.repetition >= 0.75)) {
+      if (!superseded && item.tier === "medium" && (item.locked || item.risk >= 0.8 || item.repetition >= 0.75)) {
         const long = this.promote(item, "long", current.toISOString());
         promoted.push(long);
         continue;
@@ -219,9 +295,12 @@ export class MemorySystem {
     const tierItems = this.byTier(tier);
     if (tierItems.length <= limit) return;
 
+    // Locked corrections are exempt from cap eviction (low volume by nature;
+    // a tier may briefly exceed its cap rather than forget a correction).
     tierItems
+      .filter((item) => !item.locked)
       .sort((a, b) => a.strength - b.strength || a.lastAccessedAt.localeCompare(b.lastAccessedAt))
-      .slice(0, tierItems.length - limit)
+      .slice(0, Math.max(0, tierItems.length - limit))
       .forEach((item) => this.items.delete(item.id));
   }
 }
