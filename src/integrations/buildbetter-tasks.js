@@ -93,25 +93,20 @@ export class BuildBetterTaskSource {
     }
   }
 
-  // Silently obtain a Bearer token from the cached OAuth connection. Never
-  // triggers the interactive browser flow — if there's no cache, returns null
-  // so a headless poller degrades gracefully instead of hanging on consent.
+  // Silently obtain a Bearer token from the cached OAuth connection. Delegates
+  // to the canonical token lifecycle in McpOAuthClient (cached-or-refresh, no
+  // browser): ensureToken({interactive:false}) returns a valid token or throws
+  // OAUTH_INTERACTIVE_REQUIRED / a refresh error, both of which mean "no token"
+  // for a headless poller. Sharing this keeps us from drifting from how the
+  // live MCP client refreshes the same cache.
   async _oauthToken() {
     const client = this._oauth();
     if (!client) return null;
-    let cache;
-    try { cache = client.loadCache(); } catch { return null; }
-    if (!cache) return null;
     try {
-      if (cache.access_token && !client.isExpired(cache)) return cache.access_token;
-      if (cache.refresh_token && cache.discovery && cache.client) {
-        await client.refresh(cache);
-        return client.loadCache()?.access_token ?? null;
-      }
+      return await client.ensureToken({ interactive: false });
     } catch {
-      // refresh failed (revoked / network) — treat OAuth as unavailable.
+      return null;
     }
-    return null;
   }
 
   // Resolve auth headers: API key wins (preserves existing setups), else the
@@ -323,6 +318,11 @@ export class BuildBetterTaskSource {
   async syncTranscripts({ now = new Date() } = {}) {
     if (!(await this.authHeaders())) return { skipped: true, reason: "no BuildBetter auth (set BUILDBETTER_API_KEY or connect BuildBetter via MCP)" };
     if (!this.runtime?.observations?.record) return { skipped: true, reason: "no observation store" };
+    // Transcripts are filtered to calls YOU attended, so without an identity
+    // getRecentCalls matches nothing — skip with a clear reason instead of
+    // silently recording zero transcripts (mirrors syncSignals).
+    await this.ensureIdentity();
+    if (!this.userEmail && !this.userName) return { skipped: true, reason: "could not determine your BuildBetter identity (set BUILDBETTER_USER_EMAIL or BUILDBETTER_USER_NAME)" };
 
     const sinceIso = new Date(now.getTime() - LOOKBACK_DAYS * 86400 * 1000).toISOString();
     let calls;

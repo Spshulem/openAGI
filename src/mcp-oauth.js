@@ -105,9 +105,15 @@ export class McpOAuthClient {
   // entirely and let the server apply its own default. Returns null = "omit".
   resolveScope(discovery) {
     if (this.scopeExplicit) return this.preferredScope; // caller forced it
-    const supported = discovery?.resourceMeta?.scopes_supported
-      ?? discovery?.serverMeta?.scopes_supported;
-    if (!Array.isArray(supported)) return null;
+    // Prefer the resource's advertised scopes, but fall through to the auth
+    // server's when the resource advertises an EMPTY list (an empty array is
+    // not nullish, so a plain `??` would wrongly stop at it).
+    const resourceScopes = discovery?.resourceMeta?.scopes_supported;
+    const serverScopes = discovery?.serverMeta?.scopes_supported;
+    const supported = (Array.isArray(resourceScopes) && resourceScopes.length) ? resourceScopes
+      : (Array.isArray(serverScopes) && serverScopes.length) ? serverScopes
+      : null;
+    if (!supported) return null;
     const want = this.preferredScope.split(/\s+/).filter(Boolean);
     const inter = want.filter((s) => supported.includes(s));
     return inter.length ? inter.join(" ") : null;

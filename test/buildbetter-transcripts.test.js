@@ -41,6 +41,20 @@ test("ingestMode defaults to signals", () => {
   if (prev !== undefined) process.env.BUILDBETTER_INGEST_MODE = prev;
 });
 
+test("syncTranscripts skips with a reason when identity can't be determined (no silent empty)", async () => {
+  const observations = fakeObservations();
+  // Auth present (api key) but no email/name, and `me` returns no user.
+  const src = new BuildBetterTaskSource({ apiKey: "k", runtime: { observations } });
+  src.query = async () => ({ me: { person: null } });
+  let fetched = 0;
+  src.getTranscript = async () => { fetched += 1; return "x"; };
+  const res = await src.syncTranscripts({ now: new Date("2026-06-02T00:00:00Z") });
+  assert.equal(res.skipped, true);
+  assert.match(res.reason, /identity/i);
+  assert.equal(observations._rows.length, 0, "records nothing");
+  assert.equal(fetched, 0, "never even fetches transcripts");
+});
+
 test("getTranscript assembles speaker-labeled lines, falling back to Speaker N", async () => {
   const src = new BuildBetterTaskSource({ apiKey: "k", userEmail: "me@x.com" });
   src.query = async () => ({

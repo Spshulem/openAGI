@@ -74,42 +74,35 @@ test("authHeaders uses the API key when set", async () => {
 });
 
 test("authHeaders falls back to a reused OAuth bearer token", async () => {
+  // _oauthToken delegates to the canonical ensureToken({interactive:false}).
   const fakeOauth = {
-    loadCache: () => ({ access_token: "tok", expires_at: Date.now() + 600_000 }),
-    isExpired: () => false,
-    refresh: async () => { throw new Error("should not refresh a fresh token"); }
+    ensureToken: async ({ interactive }) => {
+      assert.equal(interactive, false, "poller must never open a browser");
+      return "tok";
+    }
   };
   const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
   assert.deepEqual(await src.authHeaders(), { authorization: "Bearer tok" });
 });
 
-test("authHeaders returns null with no api key and no OAuth cache", async () => {
-  const fakeOauth = { loadCache: () => null, isExpired: () => true, refresh: async () => {} };
+test("authHeaders returns null when ensureToken can't get a token without a browser", async () => {
+  const fakeOauth = {
+    ensureToken: async () => { const e = new Error("no token"); e.code = "OAUTH_INTERACTIVE_REQUIRED"; throw e; }
+  };
   const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
   assert.equal(await src.authHeaders(), null);
 });
 
-test("_oauthToken silently refreshes an expired token (no browser flow)", async () => {
-  let refreshed = false;
-  const fakeOauth = {
-    loadCache() {
-      return refreshed
-        ? { access_token: "new", expires_at: Date.now() + 600_000 }
-        : { access_token: "old", expires_at: 0, refresh_token: "r", discovery: {}, client: {} };
-    },
-    isExpired(c) { return (c.expires_at ?? 0) <= Date.now(); },
-    refresh: async () => { refreshed = true; }
-  };
+test("_oauthToken delegates to ensureToken({interactive:false}) and returns its token", async () => {
+  let calledWith;
+  const fakeOauth = { ensureToken: async (opts) => { calledWith = opts; return "fresh-token"; } };
   const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
-  assert.equal(await src._oauthToken(), "new");
+  assert.equal(await src._oauthToken(), "fresh-token");
+  assert.deepEqual(calledWith, { interactive: false }, "must request a silent token, never interactive");
 });
 
-test("_oauthToken never triggers interactive auth when nothing is cached", async () => {
-  const fakeOauth = {
-    loadCache: () => null,
-    isExpired: () => true,
-    refresh: async () => { throw new Error("must not refresh"); }
-  };
+test("_oauthToken returns null when ensureToken throws (no usable cache / refresh failed)", async () => {
+  const fakeOauth = { ensureToken: async () => { throw new Error("refresh failed"); } };
   const src = new BuildBetterTaskSource({ apiKey: null, oauthClient: fakeOauth });
   assert.equal(await src._oauthToken(), null);
 });

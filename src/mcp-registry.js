@@ -312,19 +312,22 @@ export class McpRegistry {
   }
 
   async connectAll({ silent = false } = {}) {
+    const targets = [...this.servers].filter(([, server]) => {
+      if (!server.enabled) return false;
+      if (server.transport === "stdio" && !server.command) return false;
+      if (server.transport === "http" && !server.url) return false;
+      return server.transport === "stdio" || server.transport === "http";
+    });
+    const attempt = (name) => this.connect(name, { silent }).then(
+      (status) => ({ name, ok: true, status }),
+      (error) => ({ name, ok: false, error: error.message, code: error.code ?? null })
+    );
+    // Silent boot reconnect runs concurrently (no browser, so no popup storm)
+    // to pay max-latency, not sum. Interactive connect-all stays sequential so
+    // we never open several OAuth browser tabs at once.
+    if (silent) return Promise.all(targets.map(([name]) => attempt(name)));
     const results = [];
-    for (const [name, server] of this.servers) {
-      if (!server.enabled) continue;
-      if (server.transport === "stdio" && !server.command) continue;
-      if (server.transport === "http" && !server.url) continue;
-      if (server.transport !== "stdio" && server.transport !== "http") continue;
-      try {
-        const status = await this.connect(name, { silent });
-        results.push({ name, ok: true, status });
-      } catch (error) {
-        results.push({ name, ok: false, error: error.message, code: error.code ?? null });
-      }
-    }
+    for (const [name] of targets) results.push(await attempt(name));
     return results;
   }
 

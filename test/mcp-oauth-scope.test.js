@@ -60,3 +60,14 @@ test("empty resource scopes_supported array → omit scope", () => {
   const discovery = { resourceMeta: { scopes_supported: [] }, serverMeta: {} };
   assert.equal(client.resolveScope(discovery), null);
 });
+
+test("empty resource scopes_supported falls through to the auth server's scopes (not the empty array)", () => {
+  const client = make();
+  // resourceMeta advertises an EMPTY list but the auth server advertises real
+  // scopes — a naive `??` would keep [] and wrongly omit the scope.
+  const discovery = {
+    resourceMeta: { scopes_supported: [] },
+    serverMeta: { scopes_supported: ["openid", "email"] }
+  };
+  assert.equal(client.resolveScope(discovery), "openid email");
+});

@@ -55,11 +55,10 @@ export class McpHttpClient {
 
   async connect({ interactive = true } = {}) {
     if (this.connected) return { tools: this.tools, serverInfo: this.serverInfo };
-    // Applies for the duration of this connect's requests; controls whether an
-    // OAuth token miss may open a browser (true) or must fail fast (false).
-    this._interactiveAuth = interactive;
     if (this.logDir) ensureDir(this.logDir);
     try {
+      // `interactive` is threaded per-request (not latched on the instance) so
+      // a silent boot connect can't leave later tool calls unable to re-auth.
       this.serverInfo = await this.request(
         "initialize",
         {
@@ -67,11 +66,11 @@ export class McpHttpClient {
           capabilities: { tools: {} },
           clientInfo: { name: "openagi", version: "0.2.0" }
         },
-        { timeoutMs: this.initializeTimeoutMs }
+        { timeoutMs: this.initializeTimeoutMs, interactive }
       );
       // notifications/initialized has no response.
-      await this.notify("notifications/initialized", {});
-      const list = await this.request("tools/list", {});
+      await this.notify("notifications/initialized", {}, { interactive });
+      const list = await this.request("tools/list", {}, { interactive });
       this.tools = list?.tools ?? [];
       this.connected = true;
       this.lastError = null;
@@ -94,21 +93,21 @@ export class McpHttpClient {
     return this.request("tools/call", { name: toolName, arguments: args });
   }
 
-  notify(method, params) {
-    return this.send({ jsonrpc: "2.0", method, params }, { isNotification: true });
+  notify(method, params, options = {}) {
+    return this.send({ jsonrpc: "2.0", method, params }, { isNotification: true, interactive: options.interactive });
   }
 
   async request(method, params, options = {}) {
     const id = this.nextId++;
     const message = { jsonrpc: "2.0", id, method, params };
-    return this.send(message, { timeoutMs: options.timeoutMs });
+    return this.send(message, { timeoutMs: options.timeoutMs, interactive: options.interactive });
   }
 
   /**
    * Send a JSON-RPC message. Awaits response unless `isNotification` is set.
    * On 401 with an oauth client: refresh once, retry once.
    */
-  async send(message, { isNotification = false, timeoutMs = this.timeoutMs, retried = false } = {}) {
+  async send(message, { isNotification = false, timeoutMs = this.timeoutMs, retried = false, interactive = true } = {}) {
     const headers = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
@@ -116,7 +115,7 @@ export class McpHttpClient {
     };
     if (this.bearerToken) headers.authorization = `Bearer ${this.bearerToken}`;
     if (this.oauth) {
-      const token = await this.oauth.ensureToken({ interactive: this._interactiveAuth ?? true });
+      const token = await this.oauth.ensureToken({ interactive });
       headers.authorization = `Bearer ${token}`;
     }
     if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
@@ -146,7 +145,7 @@ export class McpHttpClient {
       // Force a re-auth on next call.
       const cache = this.oauth.loadCache();
       if (cache) this.oauth.saveCache({ ...cache, access_token: null, expires_at: 0 });
-      return this.send(message, { isNotification, timeoutMs, retried: true });
+      return this.send(message, { isNotification, timeoutMs, retried: true, interactive });
     }
 
     if (response.status === 202) {
