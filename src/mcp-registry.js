@@ -217,10 +217,14 @@ export class McpRegistry {
       const client = this.clients.get(name);
       const tools = client?.tools ?? server.tools ?? [];
       for (const tool of tools) {
+        const rawName = tool.name ?? tool;
         out.push({
           server: name,
           trustLevel: server.trustLevel,
-          name: tool.name ?? tool,
+          name: rawName,
+          // The name the tool is actually registered + callable under (matches
+          // exposeAsTools). Consumers that build allowlists must use this.
+          registeredName: `mcp_${name}_${String(rawName).replace(/[^a-zA-Z0-9_]/g, "_")}`,
           description: tool.description ?? "",
           inputSchema: tool.inputSchema ?? null,
           connected: Boolean(client?.connected)

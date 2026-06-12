@@ -57,6 +57,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("miner-result", (data) => broadcast("miner-result", data));
   events.on("cron-catchup", (data) => broadcast("cron-catchup", data));
   events.on("proactive-suggestion", (data) => broadcast("proactive-suggestion", data));
+  events.on("suggestion-resolved", (data) => broadcast("suggestion-resolved", data));
   events.on("task-updated", (data) => broadcast("task-updated", data));
   events.on("clarification-created", (data) => broadcast("clarification-created", data));
   events.on("clarification-resolved", (data) => broadcast("clarification-resolved", data));
@@ -272,6 +273,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
         const body = await readJson(req);
+        // `ephemeral` (no session/memory/task) is an INTERNAL flag for the
+        // setup-test path only — never let a public /message caller set it to
+        // evade persistence.
+        if (body && typeof body === "object") delete body.ephemeral;
         // Chat must return a structured error, not a generic 500: the
         // dashboard needs to distinguish "budget cap hit" / "provider auth
         // failed" / "network blip" to show something actionable.
@@ -4515,7 +4520,14 @@ async function fetchJson(path) {
 }
 async function postJson(path, body) {
   const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}) });
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error ?? \`\${path} -> \${r.status}\`);
+  if (!r.ok) {
+    const b = await r.json().catch(() => ({}));
+    // Surface the structured error code (e.g. "budget") + status so callers
+    // can tell "you hit your daily cap" apart from a network/agent failure.
+    const err = new Error(b.code === "budget" ? (b.error ?? "Daily budget exceeded") + " — raise OPENAGI_DAILY_USD_LIMIT in setup." : (b.error ?? \`\${path} -> \${r.status}\`));
+    err.code = b.code; err.status = r.status;
+    throw err;
+  }
   return r.json();
 }
 function escapeHtml(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]); }

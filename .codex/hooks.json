@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -fSsL 'https://api.buildbetter.app/bb.sh' | bash -s -- hook stop --provider codex"
+          }
+        ]
+      }
+    ]
+  }
+}

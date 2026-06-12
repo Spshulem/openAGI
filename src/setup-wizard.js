@@ -116,8 +116,12 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
   // Re-running /setup must NOT rotate the auth token: every save used to
   // overwrite OPENAGI_AUTH_TOKEN with a fresh value because the hidden field
   // always submitted. Keep the existing token when there is one.
-  const token = proposedToken ?? existingEnv.OPENAGI_AUTH_TOKEN ?? generateToken(32);
-  const hasExistingToken = Boolean(existingEnv.OPENAGI_AUTH_TOKEN);
+  // Treat a blank OPENAGI_AUTH_TOKEN (common in a copied .env.example) as
+  // MISSING — `??` would keep the empty string and ship an auth-disabled
+  // dashboard. Generate a real token instead.
+  const existingToken = (existingEnv.OPENAGI_AUTH_TOKEN ?? "").trim() || null;
+  const token = proposedToken ?? existingToken ?? generateToken(32);
+  const hasExistingToken = Boolean(existingToken);
   const val = (key, fallback = "") => escapeHtml(existingEnv[key] ?? fallback);
   // "✓ saved" marker for secret fields that already have a value — blank
   // means "keep what's saved", so the user can see what's configured

@@ -13,8 +13,14 @@ export function selectScopedTools(tools, scopeText) {
     const name = typeof tool === "string" ? tool : tool?.name;
     if (!name) continue;
     const description = typeof tool === "object" ? (tool.description ?? "") : "";
+    // The allowlist must store the CALLABLE name. MCP tools are registered as
+    // `mcp_<server>_<tool>` (McpRegistry.exposeAsTools), but listTools()
+    // surfaces the raw `<tool>` name — so match scope on the readable name but
+    // store registeredName when present, or the specialist's allowlist would
+    // filter out the very mcp_… tool the agent must call.
+    const callable = (typeof tool === "object" && tool.registeredName) ? tool.registeredName : name;
     const score = tokenOverlapScore(scopeText, `${name.replace(/[_-]/g, " ")} ${description}`);
-    if (score > 0.05) scored.push({ name, score });
+    if (score > 0.05) scored.push({ name: callable, score });
   }
   scored.sort((a, b) => b.score - a.score);
   return [...new Set(scored.slice(0, MAX_SCOPE_TOOLS).map((entry) => entry.name))];

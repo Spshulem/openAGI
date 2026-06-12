@@ -153,7 +153,14 @@ export class AbiRuntime {
     if (typeof this.propagation.bindVectorStore === "function") this.propagation.bindVectorStore(this.vectorStore);
     this.specialistRouter = options.specialistRouter ?? new SpecialistRouter({ vectorStore: this.vectorStore, ...(options.routerOptions ?? {}) });
     this.condenser = options.condenser ?? new MemoryCondenser({ runtime: this, ...(options.condenserOptions ?? {}) });
-    this.scrutinyFitter = options.scrutinyFitter ?? new ScrutinyFitter({ runtime: this, ...(options.scrutinyFitterOptions ?? {}) });
+    this.scrutinyFitter = options.scrutinyFitter ?? new ScrutinyFitter({
+      runtime: this,
+      // Root persisted weights under the runtime's data dir (not the global
+      // resolveDataDir default), so a custom createDurableRuntime({dataDir})
+      // keeps its calibration with the rest of its state.
+      dir: options.dataDir ? path.join(options.dataDir, "scrutiny") : undefined,
+      ...(options.scrutinyFitterOptions ?? {})
+    });
     this.scrutinyJudge = options.scrutinyJudge ?? new ScrutinyJudge({ runtime: this, ...(options.scrutinyJudgeOptions ?? {}) });
     this.vocabulary = options.vocabulary ?? new VocabularyCurator({ runtime: this, ...(options.vocabularyOptions ?? {}) });
     this.introspector = options.introspector ?? new Introspector({ runtime: this });
@@ -478,16 +485,21 @@ export class AbiRuntime {
       }))
     };
 
-    this.outputs.push(output);
-    this.feedback.push({
-      id: createId("fb"),
-      outputId: output.id,
-      createdAt: nowIso(),
-      loop: "outputs-to-integrations",
-      summary: memoryItem
-        ? `Output ${output.id} fed back into memory tier ${memoryItem.tier}.`
-        : `Output ${output.id} not committed to memory (${scrutiny.action === "ignore" ? "ignored" : "ephemeral"}).`
-    });
+    // Ephemeral turns (setup-wizard connectivity test) leave NO trace — that
+    // includes the in-memory outputs/feedback logs the dashboard reads, not
+    // just durable memory. Skip recording them.
+    if (!options.ephemeral) {
+      this.outputs.push(output);
+      this.feedback.push({
+        id: createId("fb"),
+        outputId: output.id,
+        createdAt: nowIso(),
+        loop: "outputs-to-integrations",
+        summary: memoryItem
+          ? `Output ${output.id} fed back into memory tier ${memoryItem.tier}.`
+          : `Output ${output.id} not committed to memory (ignored).`
+      });
+    }
 
     return output;
   }

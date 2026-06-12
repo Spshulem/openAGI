@@ -131,12 +131,15 @@ export class MemorySystem {
     const targets = [];
     if (id) {
       const item = this.items.get(id);
-      if (item && !item.locked) targets.push(item);
+      // A prior correction CAN be re-corrected (9:00 → 9:30 → 10:00): supersede
+      // even locked items, just not one already superseded.
+      if (item && !item.metadata?.supersededBy) targets.push(item);
     } else if (query) {
       const hits = this.retrieve(query, { limit: 5, scope });
       const top = hits[0]?.score ?? 0;
       for (const { item, score } of hits) {
-        if (item.locked || item.kind === "correction") continue;
+        // retrieve() already hides superseded items; corrections themselves are
+        // fair game so a re-correction supersedes the prior one (no stacking).
         if (score >= 0.15 && score >= top * 0.8) targets.push(item);
         if (targets.length >= 3) break;
       }

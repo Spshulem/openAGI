@@ -117,7 +117,7 @@ test("agent turn under each verdict gets the right tools + enforcement context",
     { verdict: "act", toolNames: ["lookup_thing", "send_thing"], policy: null },
     { verdict: "ask", toolNames: ["lookup_thing", "send_thing"], policy: "confirm" },
     { verdict: "watch", toolNames: ["lookup_thing"], policy: "read-only" },
-    { verdict: "ignore", toolNames: [], policy: null }
+    { verdict: "ignore", toolNames: [], policy: "none" }
   ];
   for (const { verdict, toolNames, policy } of expectations) {
     const { host, captured } = makeHost(verdict);
@@ -155,4 +155,19 @@ test("processSignal: 'ignore' skips the memory write and emits an audit event", 
   assert.equal(output.memory, null, "ignored signals are not committed to memory");
   assert.equal(runtime.memory.items.size, before, "memory count unchanged");
   assert.ok(emitted.some((e) => e.name === "signal-ignored" && e.payload.signalId === "sig_noise"));
+});
+
+test("'none' policy (ignore verdict) hard-blocks EVERY tool at invoke, even read-only", async () => {
+  const { ToolRegistry } = await import("../src/index.js");
+  const reg = new ToolRegistry();
+  const ran = [];
+  reg.register({ name: "lookup", sideEffects: false, handler: async () => { ran.push("lookup"); return {}; } });
+  reg.register({ name: "send", handler: async () => { ran.push("send"); return {}; } });
+  const ctx = { __scrutinyPolicy: "none" };
+  for (const name of ["lookup", "send"]) {
+    const r = await reg.invoke(name, {}, ctx);
+    assert.equal(r.ok, false, `${name} must be blocked under 'none'`);
+    assert.match(r.error, /ignore.*permits no tools/i);
+  }
+  assert.equal(ran.length, 0, "no handler runs under an ignore verdict — even read-only");
 });

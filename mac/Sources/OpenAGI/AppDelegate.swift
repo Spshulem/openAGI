@@ -12,7 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       NSApp.setActivationPolicy(.accessory) // No Dock icon, only menubar.
 
       UNUserNotificationCenter.current().delegate = self
-      _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+      // Fire-and-forget: requesting notification auth shows a system prompt the
+      // user may sit on — don't block daemon/UI startup waiting for their answer.
+      Task { _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) }
 
       LoginItem.registerOnFirstLaunchIfNeeded()
 

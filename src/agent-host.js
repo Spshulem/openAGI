@@ -155,7 +155,11 @@ export class AgentHost {
         runtime: this.runtime,
         // Enforced in ToolRegistry.invoke — the filtered tool list above is
         // advisory to the model; this gate is not.
-        __scrutinyPolicy: toolPolicy === "read-only" ? "read-only" : toolPolicy === "confirm" ? "confirm" : null,
+        // 'none' (ignore) and 'read-only' (watch) are ENFORCED in
+        // ToolRegistry.invoke — the advertised tool list is advisory only
+        // (providers treat an empty list as "use everything"), so the gate is
+        // what actually holds.
+        __scrutinyPolicy: toolPolicy === "none" ? "none" : toolPolicy === "read-only" ? "read-only" : toolPolicy === "confirm" ? "confirm" : null,
         __reason: toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null,
         __allowedTools: allowedToolNames
       }

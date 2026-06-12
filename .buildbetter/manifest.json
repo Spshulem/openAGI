@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "manifestId": "manifest-7a64897fef0c2227205f4811e088ee5b",
+  "createdAt": "2026-06-12T02:48:42Z",
+  "updatedAt": "2026-06-12T02:48:43Z",
+  "hookVersion": "0.4.1",
+  "installId": "install-422fa08a955782cb87bbaef1755e01ba",
+  "repository": {
+    "rootFingerprint": "sha256:257111f9ce7ce005b24b624964f60b6c634159ec46f9832a603cc74da63df3ef",
+    "gitRemotes": [
+      {
+        "name": "origin",
+        "urlHash": "9b66777d8e90d692cf49d677b772040457130d3d843f83684ab9a6a5b87d5c1e",
+        "host": "github.com",
+        "owner": "Spshulem",
+        "repo": "openAGI"
+      }
+    ],
+    "worktreeRootBasename": "openAGI"
+  },
+  "providers": [
+    {
+      "provider": "claude",
+      "configPath": ".claude/settings.json",
+      "callbackCommand": "curl -fSsL 'https://api.buildbetter.app/bb.sh' | bash -s -- hook stop --provider claude",
+      "installedAt": "2026-06-12T02:48:42Z"
+    },
+    {
+      "provider": "codex",
+      "configPath": ".codex/hooks.json",
+      "callbackCommand": "curl -fSsL 'https://api.buildbetter.app/bb.sh' | bash -s -- hook stop --provider codex",
+      "installedAt": "2026-06-12T02:48:43Z"
+    }
+  ],
+  "capabilities": [
+    "agent_session_stop_hook",
+    "session_blob_merkle_upload",
+    "spool_retry"
+  ]
+}

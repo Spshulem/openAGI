@@ -61,20 +61,26 @@ export class ScrutinyFitter {
    * timestamp when something was restored, else null.
    */
   restoreWeights() {
-    const judges = this.runtime?.scrutiny?.judges;
-    if (!judges) return null;
-    const saved = readJsonFile(this.weightsPath, null);
-    if (!saved?.judges) return null;
-    let restored = false;
-    for (const [name, weights] of Object.entries(saved.judges)) {
-      const judge = judges[name];
-      if (!judge || typeof weights !== "object") continue;
-      const sane = DIMENSIONS.every((dim) => typeof weights[dim] === "number" && Number.isFinite(weights[dim]));
-      if (!sane) continue;
-      judge.weights = { ...weights };
-      restored = true;
+    // Never let a corrupt/truncated weights.json (manual edit, partial write,
+    // disk error) abort daemon startup — fall back to the in-code defaults.
+    try {
+      const judges = this.runtime?.scrutiny?.judges;
+      if (!judges) return null;
+      const saved = readJsonFile(this.weightsPath, null);
+      if (!saved || typeof saved !== "object" || !saved.judges || typeof saved.judges !== "object") return null;
+      let restored = false;
+      for (const [name, weights] of Object.entries(saved.judges)) {
+        const judge = judges[name];
+        if (!judge || typeof weights !== "object" || weights === null) continue;
+        const sane = DIMENSIONS.every((dim) => typeof weights[dim] === "number" && Number.isFinite(weights[dim]));
+        if (!sane) continue;
+        judge.weights = { ...weights };
+        restored = true;
+      }
+      return restored ? (saved.appliedAt ?? null) : null;
+    } catch {
+      return null; // malformed → keep default weights, don't crash boot
     }
-    return restored ? (saved.appliedAt ?? null) : null;
   }
 
   /**

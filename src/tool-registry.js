@@ -87,6 +87,17 @@ export class ToolRegistry {
         error: `Tool ${name} is outside this specialist's bounded scope. Recommend the user take this to the main agent.`
       };
     }
+    // Scrutiny 'none' policy (ignore verdict): hard-block EVERY tool. An empty
+    // advertised tool list is NOT enough — OpenAI/Anthropic providers treat an
+    // empty `tools` array as "fall back to the full registry", and the
+    // deterministic provider calls invoke() directly. This gate is the actual
+    // guarantee that an ignored turn runs no tools.
+    if (context?.__scrutinyPolicy === "none") {
+      return {
+        ok: false,
+        error: `Tool ${name} is blocked this turn: scrutiny verdict 'ignore' permits no tools.`
+      };
+    }
     // Scrutiny 'watch' policy: read-only turns hard-block side-effecting
     // tools (defense in depth — the filtered tool list is advisory to the
     // model, this gate is not).

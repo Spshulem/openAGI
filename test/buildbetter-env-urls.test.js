@@ -10,7 +10,7 @@ import { MCP_CATALOG } from "../src/mcp-catalog.js";
 // body, not just until the first suspension point.
 async function withEnv(vars, fn) {
   const saved = {};
-  for (const [k, v] of Object.entries(vars)) { saved[k] = process.env[k]; process.env[k] = v; }
+  for (const [k, v] of Object.entries(vars)) { saved[k] = process.env[k]; if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   try { return await fn(); } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
@@ -33,7 +33,11 @@ test("BUILDBETTER_API_URL routes GraphQL queries to staging", async () => {
 
 test("BUILDBETTER_MCP_URL overrides the catalog register URL, read lazily", async () => {
   const entry = MCP_CATALOG.find((e) => e.id === "buildbetter");
-  assert.equal(entry.register.url, "https://mcp.buildbetter.app/sse", "prod default");
+  // Assert the prod default with the var explicitly UNSET — the test process
+  // itself may run with BUILDBETTER_MCP_URL set (e.g. on a staging device).
+  await withEnv({ BUILDBETTER_MCP_URL: undefined }, () => {
+    assert.equal(entry.register.url, "https://mcp.buildbetter.app/sse", "prod default");
+  });
   await withEnv({ BUILDBETTER_MCP_URL: "https://mcp.staging.buildbetter.app/sse" }, () => {
     assert.equal(entry.register.url, "https://mcp.staging.buildbetter.app/sse", "env read at access time, not import time");
   });

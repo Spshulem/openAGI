@@ -63,13 +63,28 @@ export function resolveTarget({ remote, token, dataDir = resolveDataDir() } = {}
   if (cfg?.remote) {
     return { url: normalizeBase(cfg.remote), token: token ?? cfg.token ?? null, source: "node.json", remote: true };
   }
-  // 4. local default
+  // 4. local default. The token is usually only in <dataDir>/.env (the wizard
+  // wrote it there, not into the CLI's environment) — peek it so `openagi
+  // status/chat/doctor` work locally right after setup without exporting it.
   return {
     url: normalizeBase(`127.0.0.1:${DEFAULT_LOCAL_PORT()}`),
-    token: token ?? process.env.OPENAGI_AUTH_TOKEN ?? null,
+    token: token ?? process.env.OPENAGI_AUTH_TOKEN ?? peekEnvToken(dataDir),
     source: "local",
     remote: false
   };
+}
+
+function peekEnvToken(dataDir) {
+  try {
+    for (const raw of fs.readFileSync(path.join(dataDir, ".env"), "utf8").split(/\r?\n/)) {
+      const line = raw.trim();
+      if (line.startsWith("OPENAGI_AUTH_TOKEN=")) {
+        const v = line.slice("OPENAGI_AUTH_TOKEN=".length).trim().replace(/^['"]|['"]$/g, "");
+        return v || null;
+      }
+    }
+  } catch { /* no env file */ }
+  return null;
 }
 
 export class CliClient {
