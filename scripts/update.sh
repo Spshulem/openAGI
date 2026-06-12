@@ -12,7 +12,20 @@
 #   curl -fsSL https://raw.githubusercontent.com/Spshulem/openAGI/main/scripts/update.sh | sh
 set -eu
 
-PROJECT_DIR="${OPENAGI_INSTALL_DIR:-/opt/openagi}"
+# Resolve the install dir: explicit override wins; else, when run as
+# ./scripts/update.sh from a real checkout, use THIS script's own repo
+# (so non-/opt installs like ~/openAGI on a Pi/Distiller auto-update too);
+# else fall back to /opt/openagi for the `curl | sh` case.
+if [ -n "${OPENAGI_INSTALL_DIR:-}" ]; then
+  PROJECT_DIR="${OPENAGI_INSTALL_DIR}"
+else
+  SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)
+  if [ -n "${SELF_DIR}" ] && [ -d "${SELF_DIR}/../.git" ]; then
+    PROJECT_DIR=$(CDPATH= cd -- "${SELF_DIR}/.." && pwd)
+  else
+    PROJECT_DIR="/opt/openagi"
+  fi
+fi
 COMPOSE_FILE="${PROJECT_DIR}/docker-compose.yml"
 LAUNCHD_LABEL="app.openagi.daemon"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
