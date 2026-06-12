@@ -46,6 +46,7 @@ import { PropagationController } from "./propagation-controller.js";
 import { SkillRegistry } from "./skills.js";
 import { registerCoreTools, ToolRegistry } from "./tool-registry.js";
 import { registerDefaultWorkflows, WorkflowRegistry } from "./workflow-registry.js";
+import { applyPersona } from "./persona.js";
 import { createId, nowIso } from "./utils.js";
 
 const AUTOPILOT_DEFAULT_PROMPT = `Autopilot pulse. Look at what's recent — sessions, memory, scheduled jobs, MCP tools you have access to.
@@ -982,6 +983,9 @@ export function createDurableRuntime(options = {}) {
   });
   const mcpConfigPath = options.mcpConfigPath ?? path.join(dataDir, "mcp.json");
   runtime.mcp.loadConfigFile(mcpConfigPath);
+  // Apply persona.md (if present) to the main agent — name + system prompt.
+  // Re-applied every boot so editing the file + restarting updates the agent.
+  applyPersona(runtime, dataDir);
   // Reconnect previously-authorized MCP servers on boot, silently — servers
   // with a cached OAuth token / bearer key / stdio command come back "live"
   // instead of showing "idle" until someone clicks Connect. Never opens a

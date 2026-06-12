@@ -19,6 +19,14 @@ export class InMemoryAgentStore {
     return created;
   }
 
+  // Overwrite fields on an agent (unlike ensureAgent, which no-ops if it
+  // exists). Used to apply persona.md to the main agent on every boot.
+  setAgent(id, fields) {
+    const merged = normalizeAgent({ ...(this.agents.get(id) ?? { id }), ...fields, id });
+    this.agents.set(id, merged);
+    return merged;
+  }
+
   createAgent(agent = {}) {
     const id = agent.id ?? createId("agent");
     return this.ensureAgent({ ...agent, id });
@@ -108,6 +116,18 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
     this.agents.set(created.id, created);
     this.saveAgents();
     return created;
+  }
+
+  // Overwrite fields on an agent (unlike ensureAgent). Used to apply
+  // persona.md to the main agent on every boot. Skips the disk write when
+  // nothing actually changed (avoids needless churn on every restart).
+  setAgent(id, fields) {
+    const before = this.agents.get(id);
+    const merged = normalizeAgent({ ...(before ?? { id }), ...fields, id });
+    if (before && before.name === merged.name && before.systemPrompt === merged.systemPrompt) return before;
+    this.agents.set(id, merged);
+    this.saveAgents();
+    return merged;
   }
 
   createAgent(agent = {}) {
