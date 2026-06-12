@@ -149,6 +149,7 @@ export class ProactiveObserver {
     try {
       const result = await provider.generate({
         input: prompt,
+        task: "observer",
         agent: { id: "proactive-observer", name: "proactive-observer" },
         memoryHits: [],
         messages: [],
@@ -536,6 +537,7 @@ ProactiveObserver.prototype.scanTasksAgainstActivity = async function ({ now = n
   try {
     const result = await provider.generate({
       input: prompt,
+      task: "observer",
       agent: { id: "task-scanner", name: "task-scanner" },
       memoryHits: [],
       messages: [],

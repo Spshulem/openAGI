@@ -456,6 +456,21 @@ Additional defenses:
 
 See `.env.example`. All keys read from `.env` and `~/.openagi/.env` (override the location with `OPENAGI_DATA_DIR`).
 
+### Model tiering
+
+You set **one base model** for everything (`OPENAI_MODEL` / `ANTHROPIC_MODEL`). You do **not** need a top model for every internal job — the small, frequent background work (proactive observation, scrutiny judging, memory condensing, session mining, daily recaps) runs fine on a cheaper `mini`/`nano` model, which is where most of the spend hides. Tiering is **opt-in**: until you set a tier, every task stays on the base model.
+
+Run `openagi models` to see the plan — which job runs on which model, why each is safe to shrink, and exactly what to set to start saving.
+
+| Variable | What it does |
+|---|---|
+| `OPENAI_MODEL` / `ANTHROPIC_MODEL` | Base model — handles chat + autopilot (real reasoning). Default `gpt-5` / `claude-sonnet-4-6`. |
+| `OPENAI_MODEL_MINI` / `ANTHROPIC_MODEL_MINI` | Mini tier — memory condensing, session mining, daily recap. e.g. `gpt-5-mini`. |
+| `OPENAI_MODEL_NANO` / `ANTHROPIC_MODEL_NANO` | Nano tier — proactive observer, scrutiny judges (short, very frequent). e.g. `gpt-5-nano`. |
+| `OPENAI_MODEL_TASK_<JOB>` | Pin one job to an exact model (wins over its tier). Jobs: `OBSERVER`, `SCRUTINY`, `CONDENSE`, `MINE`, `PLAN`, `CHAT`, `AUTOPILOT`. |
+
+Recommended starting point for OpenAI: `OPENAI_MODEL=gpt-5`, `OPENAI_MODEL_MINI=gpt-5-mini`, `OPENAI_MODEL_NANO=gpt-5-nano`. The ledger records the **actual** model each call used, so `openagi status` / `/budget` show where the money really goes.
+
 ### Web search
 
 The agent gains two tools — `web_search` and `fetch_url` — once at least one provider key is set. With no key configured, `web_search` returns a clear "no provider configured" error and `fetch_url` still works via a plain HTTP fetch.
