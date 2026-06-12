@@ -156,6 +156,24 @@ test("respond=trigger matches the keyword as a whole word, not a substring", asy
   assert.equal(r.captured, 4, "but every message is still captured to memory");
 });
 
+test("note-to-self: replies to your own self-texts but never loops on its own replies", async () => {
+  // respond=trigger, you (the self handle) are on the allowlist, capture all.
+  const b = policyBridge({ respondMode: "trigger", trigger: "peri", allowFrom: ["me@example.com"], captureMode: "all" });
+  // Two rows, both fromMe (self-thread): your command, then the bridge's own
+  // reply echoed back by chat.db on the next read. client.chat returns "ok-reply".
+  b.bridge.readMessages = async () => [
+    { rowid: 1, handle: "me@example.com", fromMe: true, text: "Peri what's up?" },
+    { rowid: 2, handle: "me@example.com", fromMe: true, text: "ok-reply" }
+  ];
+  const r = await b.bridge.poll();
+  assert.equal(r.replied, 1, "only the real self-command replies");
+  assert.equal(b.forwarded.length, 1);
+  assert.equal(b.forwarded[0].text, "what's up?", "mention stripped");
+  // The echoed reply must be skipped entirely — not captured, not answered.
+  assert.equal(b.remembered.filter((m) => /ok-reply/.test(m.content)).length, 0, "own reply not captured");
+  assert.equal(b.sent.length, 1, "no second send (no loop)");
+});
+
 test("capture=all saves every incoming message to memory, even unreplied", async () => {
   const b = policyBridge({ respondMode: "none", captureMode: "all" });
   b.bridge.readMessages = async () => [

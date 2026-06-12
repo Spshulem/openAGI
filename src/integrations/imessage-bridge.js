@@ -26,9 +26,17 @@ export class IMessageBridge {
     this.client = options.client; // CliClient pointed at the main
     this.dbPath = options.dbPath ?? DEFAULT_DB;
     this.statePath = options.statePath ?? path.join(options.dataDir ?? path.join(os.homedir(), ".openagi"), "imessage-bridge.json");
-    this.readMessages = options.readMessages ?? ((sinceRowid) => readNewMessages(this.dbPath, sinceRowid));
+    // "Note to self": also read your OWN texts in your self-thread so you can
+    // command the agent by texting yourself. On by default; your handles come
+    // from the allowlist. (Resolved lazily at poll time — allowFrom is set below.)
+    this.selfChat = options.selfChat ?? true;
+    this.readMessages = options.readMessages ?? ((sinceRowid) =>
+      readNewMessages(this.dbPath, sinceRowid, { selfHandles: this.selfChat ? [...this.allowFrom] : [] }));
     this.sendMessage = options.sendMessage ?? sendViaIMessage;
     this.onEvent = options.onEvent ?? (() => {});
+    // Texts the bridge itself just sent — so reading the self-thread doesn't
+    // echo our own replies back into capture/reply (would otherwise loop).
+    this._recentSends = [];
 
     // Sender allowlist (phone/email handles), lower-cased.
     this.allowFrom = new Set((options.allowFrom ?? []).map((h) => String(h).toLowerCase()));
@@ -111,6 +119,10 @@ export class IMessageBridge {
       const text = (row.text ?? "").trim();
       if (!text || !row.handle) { skipped++; continue; }
 
+      // Skip the bridge's OWN replies echoed back via the self-thread, so we
+      // never capture or reply to ourselves (would otherwise loop).
+      if (row.fromMe && this._recentSends.includes(text)) { skipped++; continue; }
+
       // 1. Ambient memory capture (independent of replying).
       if (this.shouldCapture(row.handle)) {
         try {
@@ -130,6 +142,9 @@ export class IMessageBridge {
         const reply = res?.json?.reply;
         if (res?.ok && reply) {
           await this.sendMessage(row.handle, reply);
+          // Remember it so the self-thread echo of this reply is ignored next poll.
+          this._recentSends.push(reply.trim());
+          if (this._recentSends.length > 50) this._recentSends.shift();
           replied++;
           this.onEvent({ kind: "relayed", handle: row.handle, in: text.slice(0, 80), out: reply.slice(0, 80) });
         } else {
@@ -163,29 +178,48 @@ export class IMessageBridge {
   stop() { this._stopped = true; if (this._timer) clearTimeout(this._timer); }
 }
 
-// Read new INCOMING messages (is_from_me = 0) newer than sinceRowid, across all
-// conversations. Returns [{ rowid, handle, text, appleDate }]. Pulls text from
-// the `text` column, falling back to a best-effort decode of attributedBody
-// (modern macOS often stores the body there, leaving `text` NULL).
-export async function readNewMessages(dbPath, sinceRowid) {
+// Read new messages newer than sinceRowid. By default only INCOMING
+// (is_from_me = 0), across all conversations. `selfHandles` (your own
+// handles — the allowlist) additionally pulls your OWN sent messages in your
+// self-thread, so you can text yourself to command the agent ("note to self").
+// We never pull your outgoing messages to OTHER people. Returns
+// [{ rowid, handle, fromMe, text, appleDate }].
+export async function readNewMessages(dbPath, sinceRowid, { selfHandles = [] } = {}) {
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(dbPath);
   try {
+    const self = [...new Set(selfHandles.map((h) => String(h).toLowerCase()))].filter(Boolean);
+    // Outgoing messages carry handle_id=0 (no handle row); the recipient lives
+    // in the `chat` table. So self-texts ("note to self") are matched by the
+    // conversation's chat_identifier, NOT message.handle. We only pull
+    // is_from_me=1 when that chat is one of YOUR OWN handles — never your
+    // outgoing messages to other people.
+    const selfClause = self.length
+      ? ` OR (m.is_from_me = 1 AND lower(c.chat_identifier) IN (${self.map(() => "?").join(",")}))`
+      : "";
     // CAST date to TEXT: chat.db `date` is nanoseconds since 2001 (~8e17),
     // which overflows a JS number and makes node:sqlite throw. We only need it
-    // as a string timestamp anyway.
+    // as a string timestamp anyway. handle = the sender for incoming, or the
+    // self chat_identifier for your own self-texts.
     const rows = db.prepare(`
       SELECT m.ROWID AS rowid, m.text AS text, m.attributedBody AS body,
-             CAST(m.date AS TEXT) AS appleDate, h.id AS handle
+             m.is_from_me AS fromMe, CAST(m.date AS TEXT) AS appleDate,
+             COALESCE(h.id, c.chat_identifier) AS handle
       FROM message m
       LEFT JOIN handle h ON h.ROWID = m.handle_id
-      WHERE m.ROWID > ? AND m.is_from_me = 0 AND h.id IS NOT NULL
+      LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+      LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+      WHERE m.ROWID > ? AND (
+        (m.is_from_me = 0 AND h.id IS NOT NULL)${selfClause}
+      )
+      GROUP BY m.ROWID
       ORDER BY m.ROWID ASC
       LIMIT 200
-    `).all(sinceRowid);
+    `).all(sinceRowid, ...self);
     return rows.map((r) => ({
       rowid: r.rowid,
       handle: r.handle,
+      fromMe: r.fromMe === 1,
       appleDate: r.appleDate,
       text: r.text && r.text.trim() ? r.text : extractAttributedText(r.body)
     }));
