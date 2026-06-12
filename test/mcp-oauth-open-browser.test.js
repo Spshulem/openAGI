@@ -43,3 +43,24 @@ test("macOS opens via `open`", () => {
   assert.equal(calls[0].cmd, "open");
   assert.deepEqual(calls[0].args, ["https://x"]);
 });
+
+// Headless OAuth completion: the callback port must be pinnable so it can be
+// SSH-tunneled from the browser machine to a headless main.
+test("OPENAGI_OAUTH_CALLBACK_PORT pins the callback port (else random)", async () => {
+  const { startCallbackServer } = await import("../src/mcp-oauth.js");
+  const saved = process.env.OPENAGI_OAUTH_CALLBACK_PORT;
+  try {
+    process.env.OPENAGI_OAUTH_CALLBACK_PORT = "8765";
+    const fixed = await startCallbackServer();
+    assert.equal(fixed.port, 8765, "fixed port honored");
+    fixed.server.close();
+
+    delete process.env.OPENAGI_OAUTH_CALLBACK_PORT;
+    const rand = await startCallbackServer();
+    assert.ok(rand.port > 0 && rand.port !== 8765, "random port when unset");
+    rand.server.close();
+  } finally {
+    if (saved === undefined) delete process.env.OPENAGI_OAUTH_CALLBACK_PORT;
+    else process.env.OPENAGI_OAUTH_CALLBACK_PORT = saved;
+  }
+});
