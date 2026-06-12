@@ -36,9 +36,11 @@ export class IMessageBridge {
     // Response policy — WHO/WHAT gets an agent reply:
     //   all     → reply to every incoming message
     //   allow   → reply only to allowlisted senders (default when --allow given)
-    //   trigger → reply only when the message contains `trigger` (and, if an
-    //             allowlist is set, the sender is on it) — the trigger word is
-    //             stripped before forwarding ("Peri what's up" → "what's up")
+    //   trigger → reply only when the message contains `trigger` as a whole
+    //             word (and, if an allowlist is set, the sender is on it) — a
+    //             leading mention is stripped ("Peri what's up" → "what's up").
+    //             Everything else is still captured per captureMode, so the
+    //             agent silently listens + saves until you invoke it by name.
     //   none    → never reply (capture-only mode)
     this.respondMode = options.respondMode ?? (this.allowFrom.size ? "allow" : "all");
     this.trigger = (options.trigger ?? "").toLowerCase();
@@ -72,11 +74,13 @@ export class IMessageBridge {
     if (this.respondMode === "allow") return { respond: allowed, forward: text };
     if (this.respondMode === "trigger") {
       if (!allowed || !this.trigger) return { respond: false };
-      const lower = text.toLowerCase();
-      const at = lower.indexOf(this.trigger);
-      if (at === -1) return { respond: false };
-      // Strip a leading "<trigger>[,:]" prefix; otherwise forward as-is.
-      const stripped = text.replace(new RegExp(`^\\s*${escapeRe(this.trigger)}[\\s,:]+`, "i"), "").trim();
+      // Match the trigger as a whole word so "Peri, what's up?" fires but
+      // "perimeter" / "period" don't.
+      const wordRe = new RegExp(`\\b${escapeRe(this.trigger)}\\b`, "i");
+      if (!wordRe.test(text)) return { respond: false };
+      // Strip a leading "<trigger>" mention so it isn't echoed back into the
+      // prompt ("Peri what's up" → "what's up"); a bare "Peri" forwards as-is.
+      const stripped = text.replace(new RegExp(`^\\s*${escapeRe(this.trigger)}\\b[\\s,:!.?]*`, "i"), "").trim();
       return { respond: true, forward: stripped || text };
     }
     return { respond: false };

@@ -141,6 +141,21 @@ test("respond=trigger only replies on the trigger word, stripped before forwardi
   assert.equal(b.forwarded[0].text, "what's the weather?", "trigger prefix stripped");
 });
 
+test("respond=trigger matches the keyword as a whole word, not a substring", async () => {
+  const b = policyBridge({ respondMode: "trigger", trigger: "peri", allowFrom: ["+15551112222"], captureMode: "all" });
+  b.bridge.readMessages = async () => [
+    { rowid: 1, handle: "+15551112222", text: "the perimeter is huge" },   // contains 'peri' but not as a word
+    { rowid: 2, handle: "+15551112222", text: "by the end of the period" }, // 'peri' inside 'period'
+    { rowid: 3, handle: "+15551112222", text: "Peri what's the weather?" }, // real invocation
+    { rowid: 4, handle: "+15551112222", text: "hey peri!" }                 // mid-sentence + punctuation
+  ];
+  const r = await b.bridge.poll();
+  assert.equal(r.replied, 2, "only the two real invocations reply");
+  assert.equal(b.forwarded[0].text, "what's the weather?", "leading mention stripped");
+  assert.equal(b.forwarded[1].text, "hey peri!", "non-leading mention forwarded as-is");
+  assert.equal(r.captured, 4, "but every message is still captured to memory");
+});
+
 test("capture=all saves every incoming message to memory, even unreplied", async () => {
   const b = policyBridge({ respondMode: "none", captureMode: "all" });
   b.bridge.readMessages = async () => [
