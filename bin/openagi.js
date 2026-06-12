@@ -40,6 +40,8 @@ function parseArgs(argv) {
     else if (a === "--respond") flags.respond = argv[++i];
     else if (a === "--capture") flags.capture = argv[++i];
     else if (a === "--trigger") flags.trigger = argv[++i];
+    else if (a === "--days") flags.days = argv[++i];
+    else if (a === "--limit") flags.limit = argv[++i];
     else if (a === "-h" || a === "--help") flags.help = true;
     else positional.push(a);
   }
@@ -195,6 +197,26 @@ async function cmdMigrate(positional, flags) {
   return 0;
 }
 
+async function cmdImessageSearch(positional, flags) {
+  const { searchMessages } = await import("../src/integrations/imessage-bridge.js");
+  const query = positional.join(" ").trim();
+  let rows;
+  try {
+    rows = await searchMessages(undefined, { query, handle: flags.from, days: flags.days ? Number(flags.days) : null, limit: flags.limit ? Number(flags.limit) : 30 });
+  } catch (error) {
+    console.error(c(RED, `✗ ${/too large|cantopen|unable to open/i.test(error.message) ? "can't read chat.db — grant Full Disk Access to this process" : error.message}`));
+    return 1;
+  }
+  if (flags.json) { console.log(JSON.stringify(rows, null, 2)); return 0; }
+  if (!rows.length) { console.log(c(DIM, "no matching messages")); return 0; }
+  for (const m of rows) {
+    const who = m.fromMe ? c(GREEN, "me →") : c(BOLD, `${m.handle} →`);
+    const when = m.date ? c(DIM, m.date.slice(0, 16).replace("T", " ")) : "";
+    console.log(`${when} ${who} ${m.text.replace(/\s+/g, " ").slice(0, 200)}`);
+  }
+  return 0;
+}
+
 async function cmdImessageBridge(flags) {
   const { client, target } = makeClient(flags);
   if (!target.remote && !flags.remote) {
@@ -302,6 +324,7 @@ async function main() {
       case "update": return await cmdUpdate(positional, flags);
       case "migrate": return await cmdMigrate(positional, flags);
       case "imessage-bridge": return await cmdImessageBridge(flags);
+      case "imessage-search": return await cmdImessageSearch(positional, flags);
       case "tick": return await cmdTick(flags);
       default:
         console.error(c(RED, `unknown command: ${cmd}`));

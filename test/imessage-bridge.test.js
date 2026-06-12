@@ -164,3 +164,41 @@ test("capture=allow only saves allowlisted senders", async () => {
   assert.equal(r.captured, 1);
   assert.match(b.remembered[0].content, /trusted/);
 });
+
+// ── search ──────────────────────────────────────────────────────────────────
+
+import { searchMessages } from "../src/integrations/imessage-bridge.js";
+
+async function makeChatDb() {
+  const { DatabaseSync } = await import("node:sqlite");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chatdb-"));
+  const file = path.join(dir, "chat.db");
+  const db = new DatabaseSync(file);
+  db.exec(`CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+           CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT, attributedBody BLOB, is_from_me INTEGER, date INTEGER, handle_id INTEGER);`);
+  db.prepare("INSERT INTO handle (ROWID,id) VALUES (1,?),(2,?)").run("+15551112222", "sarah@example.com");
+  const nowNs = String(BigInt(Date.now() - 978307200000) * 1000000n);
+  const oldNs = String(BigInt(Date.now() - 978307200000 - 40 * 86400000) * 1000000n);
+  db.prepare("INSERT INTO message (text,is_from_me,date,handle_id) VALUES (?,?,?,?)").run("dinner at 7 tonight", 0, nowNs, 1);
+  db.prepare("INSERT INTO message (text,is_from_me,date,handle_id) VALUES (?,?,?,?)").run("sounds good, see you then", 1, nowNs, 1);
+  db.prepare("INSERT INTO message (text,is_from_me,date,handle_id) VALUES (?,?,?,?)").run("old message about taxes", 0, oldNs, 2);
+  db.close();
+  return file;
+}
+
+test("searchMessages finds by text, both directions", async () => {
+  const file = await makeChatDb();
+  const hits = await searchMessages(file, { query: "dinner" });
+  assert.equal(hits.length, 1);
+  assert.match(hits[0].text, /dinner at 7/);
+  assert.equal(hits[0].fromMe, false);
+  assert.ok(hits[0].date, "has an ISO date");
+});
+
+test("searchMessages filters by handle and by days", async () => {
+  const file = await makeChatDb();
+  assert.equal((await searchMessages(file, { handle: "sarah" })).length, 1, "by handle (email)");
+  const recent = await searchMessages(file, { days: 7 });
+  assert.ok(recent.every((m) => !/taxes/.test(m.text)), "40-day-old message excluded by days=7");
+  assert.ok(recent.length >= 2);
+});
