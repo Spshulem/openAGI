@@ -40,6 +40,7 @@ export { SpecialistRouter } from "./specialist-router.js";
 export { VocabularyCurator } from "./vocabulary-curator.js";
 export { MemorySystem } from "./memory-system.js";
 export { AnthropicProvider, createModelProvider, DeterministicModelProvider, OpenAIResponsesProvider } from "./model-provider.js";
+export { ModelRouter, TASK_PROFILES, TIERS, renderModelPlan } from "./model-router.js";
 export { PropagationController } from "./propagation-controller.js";
 export { SkillRegistry } from "./skills.js";
 export { registerCoreTools, ToolRegistry } from "./tool-registry.js";

@@ -242,6 +242,7 @@ async function synthesizeWithLLM(runtime, inputs) {
   try {
     const result = await provider.generate({
       input: prompt,
+      task: "plan",
       agent: { id: "daily-planner", name: "daily-planner" },
       memoryHits: [], messages: [], tools: [], toolRegistry: null,
       instructions: PLAN_SYSTEM_PROMPT,

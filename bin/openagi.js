@@ -290,6 +290,26 @@ async function cmdTick(flags) {
   return res.ok ? 0 : 1;
 }
 
+// Show the model tiering plan: base model + which jobs run on cheaper tiers,
+// with recommendations for what to set. Reads the same env the daemon uses.
+async function cmdModels(flags) {
+  const { loadBootEnv } = await import("../src/boot.js");
+  loadBootEnv();
+  const { createModelProvider, renderModelPlan } = await import("../src/index.js");
+  const provider = createModelProvider();
+  if (!provider.router) {
+    console.log(c(DIM, "No LLM provider configured (deterministic mode). Set OPENAI_API_KEY or ANTHROPIC_API_KEY to enable tiering."));
+    return 0;
+  }
+  const providerName = provider.constructor.name === "AnthropicProvider" ? "anthropic" : "openai";
+  if (flags.json) {
+    console.log(JSON.stringify({ provider: providerName, models: provider.router.tierModels(), tasks: provider.router.describe() }, null, 2));
+    return 0;
+  }
+  console.log(renderModelPlan(provider.router, { provider: providerName }));
+  return 0;
+}
+
 function printHelp() {
   console.log(`${c(BOLD, "openagi")} — proactive local agent · CLI
 
@@ -306,6 +326,7 @@ ${c(BOLD, "Use it (local, or a remote main):")}
   openagi migrate <openclaw|hermes> [--from D] [--dry-run]
                               import another agent's persona, memory + telegram
   openagi tick                fire a scheduler tick
+  openagi models              show the model tiering plan + savings tips
 
 ${c(BOLD, "Turn this device into a node of a remote main:")}
   openagi pair <main-url> [--token T]    save the main as this device's target
@@ -345,6 +366,7 @@ async function main() {
       case "imessage-search": return await cmdImessageSearch(positional, flags);
       case "imessage-server": return await cmdImessageServer(flags);
       case "tick": return await cmdTick(flags);
+      case "models": return await cmdModels(flags);
       default:
         console.error(c(RED, `unknown command: ${cmd}`));
         printHelp();
