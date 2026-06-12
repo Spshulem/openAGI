@@ -52,7 +52,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=${2}
+# Writable: the data dir, AND the install dir itself — self-update
+# (openagi update / OPENAGI_AUTO_UPDATE) git-pulls the checkout, which
+# ProtectHome=read-only would otherwise block ("Read-only file system").
+ReadWritePaths=${2} ${PROJECT_DIR}
 
 [Install]
 WantedBy=${1:-multi-user.target}
