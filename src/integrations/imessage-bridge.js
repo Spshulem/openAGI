@@ -167,9 +167,12 @@ export async function readNewMessages(dbPath, sinceRowid) {
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(dbPath);
   try {
+    // CAST date to TEXT: chat.db `date` is nanoseconds since 2001 (~8e17),
+    // which overflows a JS number and makes node:sqlite throw. We only need it
+    // as a string timestamp anyway.
     const rows = db.prepare(`
       SELECT m.ROWID AS rowid, m.text AS text, m.attributedBody AS body,
-             m.date AS appleDate, h.id AS handle
+             CAST(m.date AS TEXT) AS appleDate, h.id AS handle
       FROM message m
       LEFT JOIN handle h ON h.ROWID = m.handle_id
       WHERE m.ROWID > ? AND m.is_from_me = 0 AND h.id IS NOT NULL
@@ -205,6 +208,49 @@ export function extractAttributedText(body) {
   let end = i;
   while (end > start && buf[end - 1] < 0x20) end--;
   return buf.slice(start, end).toString("utf8").trim();
+}
+
+// Search the iMessage history (both directions). Filters: text `query`
+// (substring, case-insensitive), `handle` (sender/recipient), `days` (lookback).
+// Returns newest-first [{ rowid, handle, fromMe, text, date }]. This is what an
+// "ask questions about my iMessages" capability calls. chat.db `date` is
+// nanoseconds since the 2001-01-01 Apple epoch.
+const APPLE_EPOCH_MS = 978307200000; // 2001-01-01 UTC in unix ms
+export async function searchMessages(dbPath, { query = "", handle = null, days = null, limit = 50 } = {}) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    const where = ["(m.text IS NOT NULL OR m.attributedBody IS NOT NULL)"];
+    const params = [];
+    if (handle) { where.push("h.id LIKE ?"); params.push(`%${handle}%`); }
+    if (days) {
+      const cutoffNs = String(BigInt(Math.floor((Date.now() - days * 86400000 - APPLE_EPOCH_MS))) * 1000000n);
+      where.push("CAST(m.date AS TEXT) > ?"); params.push(cutoffNs);
+    }
+    // Pull a window newest-first, then filter text in JS (covers attributedBody).
+    const rows = db.prepare(`
+      SELECT m.ROWID AS rowid, m.text AS text, m.attributedBody AS body,
+             m.is_from_me AS fromMe, CAST(m.date AS TEXT) AS dateNs, h.id AS handle
+      FROM message m
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY m.ROWID DESC
+      LIMIT 2000
+    `).all(...params);
+    const q = query.trim().toLowerCase();
+    const out = [];
+    for (const r of rows) {
+      const text = r.text && r.text.trim() ? r.text : extractAttributedText(r.body);
+      if (!text) continue;
+      if (q && !text.toLowerCase().includes(q)) continue;
+      const ns = r.dateNs ? Number(BigInt(r.dateNs) / 1000000n) + APPLE_EPOCH_MS : null;
+      out.push({ rowid: r.rowid, handle: r.handle, fromMe: r.fromMe === 1, text, date: ns ? new Date(ns).toISOString() : null });
+      if (out.length >= limit) break;
+    }
+    return out;
+  } finally {
+    db.close();
+  }
 }
 
 // Send a message back over iMessage via AppleScript. Requires Automation
