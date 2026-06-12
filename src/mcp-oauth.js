@@ -316,16 +316,30 @@ function defaultPrintAuthUrl({ name, url }) {
   process.stderr.write(banner);
 }
 
-function openInBrowser(url) {
-  // Best-effort, never throws.
+export function openInBrowser(url, { platform = process.platform, env = process.env, spawnFn = spawn } = {}) {
+  // Best-effort. On a HEADLESS box (no display) there's no browser to open —
+  // and on Linux a missing `xdg-open` previously CRASHED the daemon, because
+  // spawn() reports a missing binary via an async 'error' event, not a sync
+  // throw, so the try/catch never caught it. Now: skip the spawn when there's
+  // no display, and always attach an 'error' handler so a missing/again-failing
+  // opener degrades to the printed URL instead of taking down the process.
+  // (The auth URL is also surfaced to the dashboard via onAuthUrl → pendingAuthUrl.)
+  if (platform === "linux" && !env.DISPLAY && !env.WAYLAND_DISPLAY) {
+    return { opened: false, reason: "headless" }; // rely on the printed URL + dashboard
+  }
   try {
-    const cmd = process.platform === "darwin" ? "open"
-      : process.platform === "win32" ? "cmd"
+    const cmd = platform === "darwin" ? "open"
+      : platform === "win32" ? "cmd"
       : "xdg-open";
-    const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
-    spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+    const args = platform === "win32" ? ["/c", "start", "", url] : [url];
+    const child = spawnFn(cmd, args, { detached: true, stdio: "ignore" });
+    // CRITICAL: handle the async 'error' event (missing binary etc) so it
+    // never bubbles up as an unhandled 'error' and kills the daemon.
+    child.on?.("error", () => { /* opener missing/failed — printed URL is the fallback */ });
+    child.unref?.();
+    return { opened: true };
   } catch {
-    /* fall back to printed URL */
+    return { opened: false, reason: "spawn-threw" };
   }
 }
 
