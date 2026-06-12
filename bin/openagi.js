@@ -35,6 +35,8 @@ function parseArgs(argv) {
     else if (a === "--port") flags.port = argv[++i];
     else if (a === "--allow") flags.allow = argv[++i];
     else if (a === "--check") flags.check = true;
+    else if (a === "--from") flags.from = argv[++i];
+    else if (a === "--dry-run") flags.dryRun = true;
     else if (a === "-h" || a === "--help") flags.help = true;
     else positional.push(a);
   }
@@ -154,6 +156,42 @@ function cmdUnpair() {
   return 0;
 }
 
+async function cmdMigrate(positional, flags) {
+  const { detectSource, defaultSourceDir, extract, applyMigration } = await import("../src/migrate.js");
+  const { resolveDataDir } = await import("../src/data-dir.js");
+  let source = positional[0];
+  if (!source) {
+    source = detectSource();
+    if (!source) { console.error(c(RED, "couldn't detect an OpenClaw or Hermes install — pass `openagi migrate <openclaw|hermes> --from <dir>`")); return 1; }
+    console.log(c(DIM, `detected: ${source}`));
+  }
+  const dir = flags.from ?? defaultSourceDir(source);
+  let extracted;
+  try { extracted = extract(source, dir); }
+  catch (error) { console.error(c(RED, `✗ ${error.message}`)); return 1; }
+
+  console.log(`${c(BOLD, `Migrate ${source}`)} from ${c(DIM, dir)}`);
+  console.log(`  agent name:  ${extracted.agentName ? c(GREEN, extracted.agentName) : c(YELLOW, "(none found)")}`);
+  console.log(`  persona:     ${extracted.persona ? c(GREEN, "yes") : c(YELLOW, "none")}`);
+  console.log(`  memories:    ${extracted.memories.length}`);
+  console.log(`  telegram:    ${extracted.telegram.length ? c(GREEN, extracted.telegram.map((t) => t.label).join(", ")) : "none"}`);
+  for (const n of extracted.notes) console.log(c(DIM, `  note: ${n}`));
+
+  if (flags.dryRun || flags.check) { console.log(c(YELLOW, "\n(dry run — nothing applied. Re-run without --dry-run to migrate.)")); return 0; }
+
+  const { client, target } = makeClient(flags);
+  const health = await client.health();
+  if (!health.ok) { console.error(c(RED, `✗ OpenAGI main unreachable at ${target.url} — start it (\`openagi serve\`) or pass --remote`)); return 1; }
+
+  const result = await applyMigration({ extracted, dataDir: resolveDataDir(), client });
+  console.log(c(GREEN, `\n✓ migrated: ${result.importedMemories}/${extracted.memories.length} memories imported`)
+    + (result.persona ? c(GREEN, ", persona written") : "")
+    + (extracted.telegram.length ? c(GREEN, ", telegram configured") : ""));
+  console.log(c(DIM, "Restart the main to apply the persona + telegram (`openagi update`, or restart the service)."));
+  if (extracted.telegram.length) console.log(c(YELLOW, "If OpenClaw/Hermes is still running, stop it first — Telegram allows only one poller per bot token."));
+  return 0;
+}
+
 async function cmdImessageBridge(flags) {
   const { client, target } = makeClient(flags);
   if (!target.remote && !flags.remote) {
@@ -223,6 +261,8 @@ ${c(BOLD, "Use it (local, or a remote main):")}
   openagi setup               print the dashboard/setup URL + token
   openagi update [--check]    fast-forward + restart (or just check); set
                               OPENAGI_AUTO_UPDATE=1 for a daily auto-update
+  openagi migrate <openclaw|hermes> [--from D] [--dry-run]
+                              import another agent's persona, memory + telegram
   openagi tick                fire a scheduler tick
 
 ${c(BOLD, "Turn this device into a node of a remote main:")}
@@ -250,6 +290,7 @@ async function main() {
       case "pair": return cmdPair(positional, flags);
       case "unpair": return cmdUnpair();
       case "update": return await cmdUpdate(positional, flags);
+      case "migrate": return await cmdMigrate(positional, flags);
       case "imessage-bridge": return await cmdImessageBridge(flags);
       case "tick": return await cmdTick(flags);
       default:
