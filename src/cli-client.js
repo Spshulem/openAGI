@@ -30,6 +30,7 @@ export function readNodeConfig(dataDir = resolveDataDir()) {
 
 export function writeNodeConfig({ remote, token }, dataDir = resolveDataDir()) {
   const file = nodeConfigPath(dataDir);
+  fs.mkdirSync(dataDir, { recursive: true }); // a fresh node has no ~/.openagi yet
   fs.writeFileSync(file, JSON.stringify({ remote, token: token ?? null }, null, 2) + "\n", { mode: 0o600 });
   return file;
 }

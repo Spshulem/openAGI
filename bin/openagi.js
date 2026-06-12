@@ -33,6 +33,8 @@ function parseArgs(argv) {
     else if (a === "--token") flags.token = argv[++i];
     else if (a === "--host") flags.host = argv[++i];
     else if (a === "--port") flags.port = argv[++i];
+    else if (a === "--allow") flags.allow = argv[++i];
+    else if (a === "--check") flags.check = true;
     else if (a === "-h" || a === "--help") flags.help = true;
     else positional.push(a);
   }
@@ -152,6 +154,32 @@ function cmdUnpair() {
   return 0;
 }
 
+async function cmdImessageBridge(flags) {
+  const { client, target } = makeClient(flags);
+  if (!target.remote && !flags.remote) {
+    console.log(c(DIM, "Bridging to the LOCAL daemon. For the main+nodes setup, `openagi pair <main>` first or pass --remote."));
+  }
+  // Verify the main is reachable before we start polling chat.db.
+  const health = await client.health();
+  if (!health.ok) { console.error(c(RED, `✗ main unreachable at ${target.url} — ${health.error ?? "HTTP " + health.status}`)); return 1; }
+
+  const { IMessageBridge } = await import("../src/integrations/imessage-bridge.js");
+  const allowFrom = flags.allow ? String(flags.allow).split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const bridge = new IMessageBridge({
+    client,
+    allowFrom,
+    onEvent: (e) => {
+      if (e.kind === "relayed") console.log(c(GREEN, `↔ ${e.handle}: `) + c(DIM, `"${e.in}" → "${e.out}"`));
+      else if (e.kind && e.error) console.error(c(YELLOW, `! ${e.kind} ${e.handle ?? ""}: ${e.error}`));
+    }
+  });
+  console.log(c(GREEN, `iMessage bridge → main at ${target.url}`));
+  console.log(c(DIM, `Incoming iMessages${allowFrom.length ? ` from ${allowFrom.join(", ")}` : ""} are answered by the main. Ctrl-C to stop.`));
+  console.log(c(DIM, "Requires: Full Disk Access (read chat.db) + Automation→Messages (send) for this process."));
+  bridge.start({ intervalMs: 2000 });
+  await new Promise(() => {}); // run until killed
+}
+
 async function cmdUpdate(positional, flags) {
   const { client, target } = makeClient(flags);
   const checkOnly = positional.includes("--check") || flags.check;
@@ -200,6 +228,8 @@ ${c(BOLD, "Use it (local, or a remote main):")}
 ${c(BOLD, "Turn this device into a node of a remote main:")}
   openagi pair <main-url> [--token T]    save the main as this device's target
   openagi unpair                         forget it
+  openagi imessage-bridge [--allow h,…]  (macOS) relay incoming iMessages to the
+                                         main and text its replies back
 
 ${c(BOLD, "Global flags:")} --remote <url>  --token <token>  --json
 
@@ -220,6 +250,7 @@ async function main() {
       case "pair": return cmdPair(positional, flags);
       case "unpair": return cmdUnpair();
       case "update": return await cmdUpdate(positional, flags);
+      case "imessage-bridge": return await cmdImessageBridge(flags);
       case "tick": return await cmdTick(flags);
       default:
         console.error(c(RED, `unknown command: ${cmd}`));
