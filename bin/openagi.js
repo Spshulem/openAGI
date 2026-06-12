@@ -197,6 +197,20 @@ async function cmdMigrate(positional, flags) {
   return 0;
 }
 
+async function cmdImessageServer(flags) {
+  const { createImessageServer } = await import("../src/integrations/imessage-server.js");
+  const token = flags.token ?? process.env.OPENAGI_IMESSAGE_NODE_TOKEN ?? null;
+  if (!token) { console.error(c(RED, "a token is required — pass --token <secret> (the main uses the same as OPENAGI_IMESSAGE_NODE_TOKEN)")); return 1; }
+  const port = Number(flags.port ?? process.env.OPENAGI_IMESSAGE_PORT ?? 43298);
+  const host = flags.host ?? "0.0.0.0";
+  const server = createImessageServer({ token });
+  await new Promise((resolve) => server.listen(port, host, resolve));
+  console.log(c(GREEN, `iMessage node service on http://${host}:${port}`));
+  console.log(c(DIM, `On the main, set OPENAGI_IMESSAGE_NODE=http://<this-host>:${port} and OPENAGI_IMESSAGE_NODE_TOKEN=<the token>, then restart — the agent gets a search_imessages tool.`));
+  console.log(c(DIM, "Requires Full Disk Access (read chat.db) for this process. Ctrl-C to stop."));
+  await new Promise(() => {}); // run until killed
+}
+
 async function cmdImessageSearch(positional, flags) {
   const { searchMessages } = await import("../src/integrations/imessage-bridge.js");
   const query = positional.join(" ").trim();
@@ -302,6 +316,10 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
                                          --allow h1,h2   (sender allowlist)
                                          --trigger word  (reply only on a word)
                                          --capture none|allow|all  (→ memory)
+  openagi imessage-search <query>        (macOS) search iMessage history
+                                         [--from h] [--days N] [--limit N]
+  openagi imessage-server --token T      (macOS) serve iMessage search to a
+                                         remote main (gives it search_imessages)
 
 ${c(BOLD, "Global flags:")} --remote <url>  --token <token>  --json
 
@@ -325,6 +343,7 @@ async function main() {
       case "migrate": return await cmdMigrate(positional, flags);
       case "imessage-bridge": return await cmdImessageBridge(flags);
       case "imessage-search": return await cmdImessageSearch(positional, flags);
+      case "imessage-server": return await cmdImessageServer(flags);
       case "tick": return await cmdTick(flags);
       default:
         console.error(c(RED, `unknown command: ${cmd}`));

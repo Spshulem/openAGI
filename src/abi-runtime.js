@@ -17,6 +17,7 @@ import { registerIMessagePoller } from "./integrations/imessage-poller.js";
 import { registerBuildBetterTaskSource } from "./integrations/buildbetter-tasks.js";
 import { registerCalendarIntegration } from "./integrations/calendar.js";
 import { registerWebSearchTools } from "./integrations/web-search.js";
+import { registerImessageSearchTool } from "./integrations/imessage-search-tool.js";
 import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
 import { MemoryCondenser } from "./memory-condenser.js";
@@ -404,6 +405,9 @@ export class AbiRuntime {
       // Web search tools (web_search / fetch_url). Always registered; web_search
       // returns a clear "no provider configured" error until a key is set.
       registerWebSearchTools(this);
+      // search_imessages — only when an iMessage node (a Mac running
+      // `openagi imessage-server`) is configured via OPENAGI_IMESSAGE_NODE.
+      registerImessageSearchTool(this);
     }
   }
 
