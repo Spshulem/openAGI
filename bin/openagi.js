@@ -37,6 +37,9 @@ function parseArgs(argv) {
     else if (a === "--check") flags.check = true;
     else if (a === "--from") flags.from = argv[++i];
     else if (a === "--dry-run") flags.dryRun = true;
+    else if (a === "--respond") flags.respond = argv[++i];
+    else if (a === "--capture") flags.capture = argv[++i];
+    else if (a === "--trigger") flags.trigger = argv[++i];
     else if (a === "-h" || a === "--help") flags.help = true;
     else positional.push(a);
   }
@@ -203,16 +206,19 @@ async function cmdImessageBridge(flags) {
 
   const { IMessageBridge } = await import("../src/integrations/imessage-bridge.js");
   const allowFrom = flags.allow ? String(flags.allow).split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const respondMode = flags.respond ?? (allowFrom.length ? "allow" : "all");
+  const captureMode = flags.capture ?? "none";
   const bridge = new IMessageBridge({
-    client,
-    allowFrom,
+    client, allowFrom, respondMode, captureMode, trigger: flags.trigger,
     onEvent: (e) => {
       if (e.kind === "relayed") console.log(c(GREEN, `↔ ${e.handle}: `) + c(DIM, `"${e.in}" → "${e.out}"`));
+      else if (e.kind === "captured") console.log(c(DIM, `· saved to memory — ${e.handle}: "${e.in}"`));
       else if (e.kind && e.error) console.error(c(YELLOW, `! ${e.kind} ${e.handle ?? ""}: ${e.error}`));
     }
   });
   console.log(c(GREEN, `iMessage bridge → main at ${target.url}`));
-  console.log(c(DIM, `Incoming iMessages${allowFrom.length ? ` from ${allowFrom.join(", ")}` : ""} are answered by the main. Ctrl-C to stop.`));
+  const respondDesc = respondMode === "all" ? "everyone" : respondMode === "allow" ? `allowlist (${allowFrom.join(", ")})` : respondMode === "trigger" ? `messages containing "${flags.trigger}"` : "no one (capture-only)";
+  console.log(c(DIM, `Reply to: ${respondDesc}.${captureMode !== "none" ? ` Save to memory: ${captureMode}.` : ""} Ctrl-C to stop.`));
   console.log(c(DIM, "Requires: Full Disk Access (read chat.db) + Automation→Messages (send) for this process."));
   bridge.start({ intervalMs: 2000 });
   await new Promise(() => {}); // run until killed
@@ -268,8 +274,12 @@ ${c(BOLD, "Use it (local, or a remote main):")}
 ${c(BOLD, "Turn this device into a node of a remote main:")}
   openagi pair <main-url> [--token T]    save the main as this device's target
   openagi unpair                         forget it
-  openagi imessage-bridge [--allow h,…]  (macOS) relay incoming iMessages to the
-                                         main and text its replies back
+  openagi imessage-bridge [opts]         (macOS) relay incoming iMessages to the
+                                         main and text its replies back. Opts:
+                                         --respond all|allow|trigger|none
+                                         --allow h1,h2   (sender allowlist)
+                                         --trigger word  (reply only on a word)
+                                         --capture none|allow|all  (→ memory)
 
 ${c(BOLD, "Global flags:")} --remote <url>  --token <token>  --json
 

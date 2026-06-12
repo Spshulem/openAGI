@@ -97,3 +97,70 @@ test("extractAttributedText returns empty for a body with no NSString marker", (
   assert.equal(extractAttributedText(Buffer.from("garbage")), "");
   assert.equal(extractAttributedText(null), "");
 });
+
+// ── response policies + memory capture ──────────────────────────────────────
+
+function policyBridge(opts) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-imsg-pol-"));
+  const sent = [], forwarded = [], remembered = [];
+  const client = {
+    chat: async (text, o) => { forwarded.push({ text, from: o.from }); return { ok: true, json: { reply: "ok-reply" } }; },
+    request: async (m, route, body) => { if (route === "/memory/remember") remembered.push(body); return { ok: true }; }
+  };
+  const bridge = new IMessageBridge({
+    client, dataDir: dir,
+    readMessages: async () => [],
+    sendMessage: async (h, t) => sent.push({ h, t }),
+    ...opts
+  });
+  bridge._saveState({ lastRowid: 0, initialized: true });
+  return { bridge, sent, forwarded, remembered };
+}
+
+test("respond=all replies to everyone; respond=none never replies", async () => {
+  let b = policyBridge({ respondMode: "all" });
+  b.bridge.readMessages = async () => [{ rowid: 1, handle: "+1999", text: "hi" }];
+  assert.equal((await b.bridge.poll()).replied, 1);
+
+  b = policyBridge({ respondMode: "none" });
+  b.bridge.readMessages = async () => [{ rowid: 1, handle: "+1999", text: "hi" }];
+  const r = await b.bridge.poll();
+  assert.equal(r.replied, 0);
+  assert.equal(b.sent.length, 0);
+});
+
+test("respond=trigger only replies on the trigger word, stripped before forwarding", async () => {
+  const b = policyBridge({ respondMode: "trigger", trigger: "peri", allowFrom: ["+15551112222"] });
+  b.bridge.readMessages = async () => [
+    { rowid: 1, handle: "+15551112222", text: "just chatting, no trigger" },
+    { rowid: 2, handle: "+15551112222", text: "Peri, what's the weather?" }
+  ];
+  const r = await b.bridge.poll();
+  assert.equal(r.replied, 1, "only the triggered message");
+  assert.equal(b.forwarded.length, 1);
+  assert.equal(b.forwarded[0].text, "what's the weather?", "trigger prefix stripped");
+});
+
+test("capture=all saves every incoming message to memory, even unreplied", async () => {
+  const b = policyBridge({ respondMode: "none", captureMode: "all" });
+  b.bridge.readMessages = async () => [
+    { rowid: 1, handle: "+1888", text: "remember the milk" },
+    { rowid: 2, handle: "+1777", text: "and eggs" }
+  ];
+  const r = await b.bridge.poll();
+  assert.equal(r.captured, 2);
+  assert.equal(r.replied, 0, "capture-only: no replies");
+  assert.match(b.remembered[0].content, /iMessage from \+1888: remember the milk/);
+  assert.ok(b.remembered[0].tags.includes("imessage"));
+});
+
+test("capture=allow only saves allowlisted senders", async () => {
+  const b = policyBridge({ respondMode: "all", captureMode: "allow", allowFrom: ["+15551112222"] });
+  b.bridge.readMessages = async () => [
+    { rowid: 1, handle: "+1999", text: "stranger" },
+    { rowid: 2, handle: "+15551112222", text: "trusted" }
+  ];
+  const r = await b.bridge.poll();
+  assert.equal(r.captured, 1);
+  assert.match(b.remembered[0].content, /trusted/);
+});

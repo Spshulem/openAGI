@@ -19,6 +19,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_DB = path.join(os.homedir(), "Library", "Messages", "chat.db");
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 export class IMessageBridge {
   constructor(options = {}) {
@@ -27,9 +28,27 @@ export class IMessageBridge {
     this.statePath = options.statePath ?? path.join(options.dataDir ?? path.join(os.homedir(), ".openagi"), "imessage-bridge.json");
     this.readMessages = options.readMessages ?? ((sinceRowid) => readNewMessages(this.dbPath, sinceRowid));
     this.sendMessage = options.sendMessage ?? sendViaIMessage;
-    // Optional allowlist of sender handles (phone/email). Empty = anyone.
-    this.allowFrom = new Set((options.allowFrom ?? []).map((h) => String(h).toLowerCase()));
     this.onEvent = options.onEvent ?? (() => {});
+
+    // Sender allowlist (phone/email handles), lower-cased.
+    this.allowFrom = new Set((options.allowFrom ?? []).map((h) => String(h).toLowerCase()));
+
+    // Response policy — WHO/WHAT gets an agent reply:
+    //   all     → reply to every incoming message
+    //   allow   → reply only to allowlisted senders (default when --allow given)
+    //   trigger → reply only when the message contains `trigger` (and, if an
+    //             allowlist is set, the sender is on it) — the trigger word is
+    //             stripped before forwarding ("Peri what's up" → "what's up")
+    //   none    → never reply (capture-only mode)
+    this.respondMode = options.respondMode ?? (this.allowFrom.size ? "allow" : "all");
+    this.trigger = (options.trigger ?? "").toLowerCase();
+
+    // Capture policy — WHICH incoming messages are saved to the main's memory
+    // (ambient awareness, even when not replied to):
+    //   none  → save nothing extra (replies still create their own memory)
+    //   allow → save messages from allowlisted senders
+    //   all   → save every incoming message
+    this.captureMode = options.captureMode ?? "none";
   }
 
   _loadState() {
@@ -40,31 +59,70 @@ export class IMessageBridge {
     fs.writeFileSync(this.statePath, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
   }
 
-  allowed(handle) {
+  onAllowlist(handle) {
     return this.allowFrom.size === 0 || this.allowFrom.has(String(handle).toLowerCase());
   }
 
-  // One pass: forward each new allowed incoming message, reply with the main's
-  // answer. Returns a summary { processed, replied, skipped, errors }.
+  // Decide whether to reply, and return the text to forward (trigger stripped).
+  // { respond: bool, forward: string }
+  responseFor(handle, text) {
+    const allowed = this.allowFrom.size === 0 || this.allowFrom.has(String(handle).toLowerCase());
+    if (this.respondMode === "none") return { respond: false };
+    if (this.respondMode === "all") return { respond: true, forward: text };
+    if (this.respondMode === "allow") return { respond: allowed, forward: text };
+    if (this.respondMode === "trigger") {
+      if (!allowed || !this.trigger) return { respond: false };
+      const lower = text.toLowerCase();
+      const at = lower.indexOf(this.trigger);
+      if (at === -1) return { respond: false };
+      // Strip a leading "<trigger>[,:]" prefix; otherwise forward as-is.
+      const stripped = text.replace(new RegExp(`^\\s*${escapeRe(this.trigger)}[\\s,:]+`, "i"), "").trim();
+      return { respond: true, forward: stripped || text };
+    }
+    return { respond: false };
+  }
+
+  shouldCapture(handle) {
+    if (this.captureMode === "all") return true;
+    if (this.captureMode === "allow") return this.allowFrom.has(String(handle).toLowerCase());
+    return false;
+  }
+
+  // One pass: for each new incoming message, optionally capture it to the
+  // main's memory and optionally reply via the agent. Returns a summary.
   async poll() {
     let state = this._loadState();
     // First run: don't replay history — start from the current high-water mark.
     if (state.lastRowid == null) {
       state = { lastRowid: await this.readMaxRowid(), initialized: true };
       this._saveState(state);
-      return { processed: 0, replied: 0, skipped: 0, errors: 0, bootstrapped: true };
+      return { processed: 0, replied: 0, captured: 0, skipped: 0, errors: 0, bootstrapped: true };
     }
 
     const rows = await this.readMessages(state.lastRowid);
-    let processed = 0, replied = 0, skipped = 0, errors = 0, highest = state.lastRowid;
+    let processed = 0, replied = 0, captured = 0, skipped = 0, errors = 0, highest = state.lastRowid;
     for (const row of rows) {
       if (row.rowid > highest) highest = row.rowid;
       processed++;
       const text = (row.text ?? "").trim();
       if (!text || !row.handle) { skipped++; continue; }
-      if (!this.allowed(row.handle)) { skipped++; continue; }
+
+      // 1. Ambient memory capture (independent of replying).
+      if (this.shouldCapture(row.handle)) {
+        try {
+          const cap = await this.client.request("POST", "/memory/remember", {
+            content: `iMessage from ${row.handle}: ${text}`,
+            tags: ["imessage", row.handle], importance: "normal"
+          });
+          if (cap.ok) { captured++; this.onEvent({ kind: "captured", handle: row.handle, in: text.slice(0, 80) }); }
+        } catch { /* capture is best-effort */ }
+      }
+
+      // 2. Reply per the response policy.
+      const decision = this.responseFor(row.handle, text);
+      if (!decision.respond) { skipped++; continue; }
       try {
-        const res = await this.client.chat(text, { from: `imessage:${row.handle}` });
+        const res = await this.client.chat(decision.forward, { from: `imessage:${row.handle}` });
         const reply = res?.json?.reply;
         if (res?.ok && reply) {
           await this.sendMessage(row.handle, reply);
@@ -80,7 +138,7 @@ export class IMessageBridge {
       }
     }
     this._saveState({ ...state, lastRowid: highest });
-    return { processed, replied, skipped, errors };
+    return { processed, replied, captured, skipped, errors };
   }
 
   async readMaxRowid() {
