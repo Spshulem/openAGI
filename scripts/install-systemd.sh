@@ -38,7 +38,11 @@ ExecStart=${NODE_BIN} ${PROJECT_DIR}/examples/hosted-server.js
 WorkingDirectory=${PROJECT_DIR}
 EnvironmentFile=-${2}/.env
 Environment=OPENAGI_DATA_DIR=${2}
-Restart=on-failure
+# Restart=always (not on-failure): the setup wizard applies new settings by
+# asking the daemon to restart itself — a CLEAN exit(0) via /control/restart.
+# on-failure would NOT bring it back after that, leaving the daemon dead the
+# moment a user saves the wizard. always also covers OOM/clean shutdowns.
+Restart=always
 RestartSec=10s
 StandardOutput=journal
 StandardError=journal
