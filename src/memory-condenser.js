@@ -93,6 +93,7 @@ export class MemoryCondenser {
       try {
         const result = await provider.generate({
           input: prompt,
+          task: "condense",
           agent: { id: "condenser", name: "memory-condenser" },
           memoryHits: [],
           messages: [],
