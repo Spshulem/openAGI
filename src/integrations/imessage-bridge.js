@@ -216,7 +216,7 @@ export function extractAttributedText(body) {
 // "ask questions about my iMessages" capability calls. chat.db `date` is
 // nanoseconds since the 2001-01-01 Apple epoch.
 const APPLE_EPOCH_MS = 978307200000; // 2001-01-01 UTC in unix ms
-export async function searchMessages(dbPath, { query = "", handle = null, days = null, limit = 50 } = {}) {
+export async function searchMessages(dbPath = DEFAULT_DB, { query = "", handle = null, days = null, limit = 50 } = {}) {
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(dbPath);
   try {
