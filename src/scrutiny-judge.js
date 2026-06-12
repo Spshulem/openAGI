@@ -39,6 +39,7 @@ export class ScrutinyJudge {
     const prompt = buildJudgePrompt(sample);
     const result = await provider.generate({
       input: prompt,
+      task: "scrutiny",
       agent: { id: "scrutiny-judge", name: "scrutiny-judge" },
       memoryHits: [],
       messages: [],

@@ -1,3 +1,5 @@
+import { ModelRouter } from "./model-router.js";
+
 export class DeterministicModelProvider {
   constructor(options = {}) {
     this.name = options.name ?? "deterministic";
@@ -56,13 +58,26 @@ export class OpenAIResponsesProvider {
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? 6;
     this.budgetGuard = options.budgetGuard ?? null;
+    // Per-task model tiering. Defaults to base for everything until tier env
+    // vars are set, so this is a no-op until the user opts in.
+    this.router = options.router ?? new ModelRouter({ envPrefix: "OPENAI", baseModel: this.model });
   }
 
   isConfigured() {
     return Boolean(this.apiKey);
   }
 
-  async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {} }) {
+  // Resolve which model a call should use: explicit `model` wins, then a named
+  // `task` (routed via the configured tiers), then a raw `tier`, else the base.
+  resolveModel({ model, tier, task } = {}) {
+    if (model) return model;
+    if (task) return this.router.resolve(task);
+    if (tier) return this.router.tierModel(tier);
+    return this.model;
+  }
+
+  async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task }) {
+    const model = this.resolveModel({ model: modelOverride, tier, task });
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
     this.budgetGuard?.check();
 
@@ -84,7 +99,7 @@ export class OpenAIResponsesProvider {
     let response;
     for (let hop = 0; hop < this.maxToolHops; hop += 1) {
       const body = {
-        model: this.model,
+        model,
         instructions: baseInstructions,
         input: conversationInput
       };
@@ -121,7 +136,7 @@ export class OpenAIResponsesProvider {
 
     return {
       provider: "openai",
-      model: this.model,
+      model,
       id: response?.id,
       text: extractResponseText(response) || "(no text)",
       toolCalls
@@ -144,7 +159,7 @@ export class OpenAIResponsesProvider {
       const json = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(json?.error?.message ?? `OpenAI request failed with ${response.status}`);
       const callTools = (json.output ?? []).filter((item) => item.type === "function_call").map((item) => item.name);
-      this.budgetGuard?.record(json.usage, this.model, {
+      this.budgetGuard?.record(json.usage, body.model, {
         channel: context.channel,
         agentId: context.agentId,
         sessionId: context.sessionId,
@@ -168,14 +183,23 @@ export class AnthropicProvider {
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? 6;
     this.budgetGuard = options.budgetGuard ?? null;
+    this.router = options.router ?? new ModelRouter({ envPrefix: "ANTHROPIC", baseModel: this.model });
   }
 
   isConfigured() {
     return Boolean(this.apiKey);
   }
 
-  async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {} }) {
+  resolveModel({ model, tier, task } = {}) {
+    if (model) return model;
+    if (task) return this.router.resolve(task);
+    if (tier) return this.router.tierModel(tier);
+    return this.model;
+  }
+
+  async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task }) {
     if (!this.apiKey) throw new Error("ANTHROPIC_API_KEY is not configured.");
+    const model = this.resolveModel({ model: modelOverride, tier, task });
     this.budgetGuard?.check();
 
     const tools = toolRegistry?.toAnthropicTools?.() ?? [];
@@ -200,7 +224,7 @@ export class AnthropicProvider {
 
     for (let hop = 0; hop < this.maxToolHops; hop += 1) {
       response = await this.postMessages({
-        model: this.model,
+        model,
         max_tokens: this.maxTokens,
         system,
         messages: convo,
@@ -234,7 +258,7 @@ export class AnthropicProvider {
 
     return {
       provider: "anthropic",
-      model: this.model,
+      model,
       id: response?.id,
       text: text || "(no text)",
       toolCalls
@@ -258,7 +282,7 @@ export class AnthropicProvider {
       const json = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(json?.error?.message ?? `Anthropic request failed with ${response.status}`);
       const callTools = (json.content ?? []).filter((b) => b.type === "tool_use").map((b) => b.name);
-      this.budgetGuard?.record(json.usage, this.model, {
+      this.budgetGuard?.record(json.usage, body.model, {
         channel: context.channel,
         agentId: context.agentId,
         sessionId: context.sessionId,

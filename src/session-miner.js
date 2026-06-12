@@ -132,6 +132,7 @@ export class SessionMiner {
     try {
       const result = await provider.generate({
         input: prompt,
+        task: "mine",
         agent: { id: "session-miner", name: "session-miner" },
         memoryHits: [],
         messages: [],
