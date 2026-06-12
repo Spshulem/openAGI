@@ -343,7 +343,7 @@ export function openInBrowser(url, { platform = process.platform, env = process.
   }
 }
 
-function startCallbackServer() {
+export function startCallbackServer() {
   return new Promise((resolve, reject) => {
     let resolveCb, rejectCb;
     const callback = new Promise((res, rej) => { resolveCb = res; rejectCb = rej; });
@@ -377,7 +377,16 @@ function startCallbackServer() {
       }
     });
     server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    // Default: an OS-assigned random loopback port (fine when the browser and
+    // daemon are on the same machine). On a HEADLESS main reached from another
+    // device's browser, set OPENAGI_OAUTH_CALLBACK_PORT to a FIXED port and
+    // SSH-tunnel it from the browser machine:
+    //   ssh -L 8765:127.0.0.1:8765 distiller    # on the laptop
+    //   OPENAGI_OAUTH_CALLBACK_PORT=8765         # on the main
+    // Then the loopback redirect the browser hits tunnels back to the daemon.
+    const fixed = Number.parseInt(process.env.OPENAGI_OAUTH_CALLBACK_PORT ?? "", 10);
+    const listenPort = Number.isInteger(fixed) && fixed > 0 ? fixed : 0;
+    server.listen(listenPort, "127.0.0.1", () => {
       const port = server.address().port;
       resolve({ server, port, callback });
     });
