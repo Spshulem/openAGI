@@ -227,6 +227,29 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // they can take the user to the wizard instead of sitting silent.
       if (method === "GET" && pathname === "/health") return sendJson(res, 200, { ok: true, firstRun: isFirstRun(), status: runtime.status() });
       if (method === "GET" && pathname === "/memory") return sendJson(res, 200, runtime.memory.snapshot());
+      if (method === "POST" && pathname === "/memory/remember") {
+        // Direct memory import (auth-gated) — for migrations from another
+        // agent, bulk seeding, or integrations. Body: { content, tags?,
+        // importance?, scope?, source? }. Mirrors the `remember` tool.
+        const body = await readJson(req);
+        const content = String(body?.content ?? "").trim();
+        if (!content) return sendJson(res, 400, { error: "content required" });
+        const importance = body.importance ?? "normal";
+        const item = runtime.memory.remember(
+          {
+            source: body.source ?? "import",
+            scope: body.scope ?? "main",
+            content,
+            tags: ["import", ...(Array.isArray(body.tags) ? body.tags : [])],
+            risk: importance === "high" ? 0.8 : importance === "low" ? 0.2 : 0.45,
+            specificity: 0.7,
+            repetition: 0.4,
+            novelty: 0.5
+          },
+          { source: "memory-import", strength: importance === "high" ? 0.85 : 0.6 }
+        );
+        return sendJson(res, 200, { id: item.id, tier: item.tier });
+      }
       if (method === "GET" && pathname === "/agents") return sendJson(res, 200, runtime.agentHost?.store.listAgents() ?? runtime.propagation.list());
       if (method === "GET" && pathname === "/specialists") {
         const includeRetired = url.searchParams.get("retired") === "1";
