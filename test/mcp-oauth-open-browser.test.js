@@ -44,20 +44,33 @@ test("macOS opens via `open`", () => {
   assert.deepEqual(calls[0].args, ["https://x"]);
 });
 
+// Pick a port the OS says is currently free, so the test doesn't collide with
+// whatever else is running on the dev machine (a hardcoded port can — and did —
+// clash with a real app).
+async function freePort() {
+  const { createServer } = await import("node:net");
+  return new Promise((resolve, reject) => {
+    const s = createServer();
+    s.on("error", reject);
+    s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resolve(p)); });
+  });
+}
+
 // Headless OAuth completion: the callback port must be pinnable so it can be
 // SSH-tunneled from the browser machine to a headless main.
 test("OPENAGI_OAUTH_CALLBACK_PORT pins the callback port (else random)", async () => {
   const { startCallbackServer } = await import("../src/mcp-oauth.js");
   const saved = process.env.OPENAGI_OAUTH_CALLBACK_PORT;
+  const pinned = await freePort();
   try {
-    process.env.OPENAGI_OAUTH_CALLBACK_PORT = "8765";
+    process.env.OPENAGI_OAUTH_CALLBACK_PORT = String(pinned);
     const fixed = await startCallbackServer();
-    assert.equal(fixed.port, 8765, "fixed port honored");
+    assert.equal(fixed.port, pinned, "fixed port honored");
     fixed.server.close();
 
     delete process.env.OPENAGI_OAUTH_CALLBACK_PORT;
     const rand = await startCallbackServer();
-    assert.ok(rand.port > 0 && rand.port !== 8765, "random port when unset");
+    assert.ok(rand.port > 0 && rand.port !== pinned, "random port when unset");
     rand.server.close();
   } finally {
     if (saved === undefined) delete process.env.OPENAGI_OAUTH_CALLBACK_PORT;

@@ -228,6 +228,17 @@ export class AbiRuntime {
         task: "retirement-sweep",
         dailyAt: "04:00"
       });
+      // Opt-in self-update: when OPENAGI_AUTO_UPDATE is truthy, the daemon
+      // checks its git checkout daily and fast-forwards + restarts if a newer
+      // version is available. Off by default — registered disabled so it's
+      // visible in the dashboard and can be toggled without an env change.
+      this.cron.addJob({
+        id: "self-update",
+        name: "Self-update (fast-forward + restart when a new version ships)",
+        enabled: /^(1|true|yes|on)$/i.test(process.env.OPENAGI_AUTO_UPDATE ?? ""),
+        task: "self-update",
+        dailyAt: process.env.OPENAGI_AUTO_UPDATE_AT ?? "04:30"
+      });
       this.cron.addJob({
         id: "weekly-scrutiny-fit",
         name: "Weekly scrutiny weight fit",
@@ -541,6 +552,18 @@ export class AbiRuntime {
       }
       if (job.task === "condense") {
         return this.condenser.condense({ now });
+      }
+      if (job.task === "self-update") {
+        const { applyUpdate } = await import("./self-update.js");
+        const result = await applyUpdate();
+        if (result.updated) {
+          this.events?.emit?.("self-update", { at: nowIso(), from: result.from, to: result.to });
+          // Respawn with the new code (systemd Restart=always / launchd
+          // KeepAlive / Mac DaemonController bring it back). Defer so the
+          // tick result can flush first.
+          setTimeout(() => process.exit(0), 500);
+        }
+        return result;
       }
       if (job.task === "retirement-sweep") {
         const retired = this.propagation.retirementSweep?.() ?? [];

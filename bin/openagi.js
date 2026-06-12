@@ -152,6 +152,28 @@ function cmdUnpair() {
   return 0;
 }
 
+async function cmdUpdate(positional, flags) {
+  const { client, target } = makeClient(flags);
+  const checkOnly = positional.includes("--check") || flags.check;
+  // GET = dry check, POST = apply + restart. The daemon owns the git checkout.
+  const res = checkOnly ? await client.request("GET", "/control/update") : await client.request("POST", "/control/update");
+  if (flags.json) { console.log(JSON.stringify(res.json ?? { error: res.error ?? res.status }, null, 2)); return res.ok ? 0 : 1; }
+  if (!res.ok) { console.error(c(RED, `✗ ${res.error ?? "HTTP " + res.status}`)); return 1; }
+  const r = res.json ?? {};
+  if (checkOnly) {
+    if (r.updateAvailable) console.log(c(YELLOW, `↑ update available: ${r.current} → ${r.latest} (${r.behind} commit${r.behind === 1 ? "" : "s"} behind on ${r.branch})`));
+    else console.log(c(GREEN, `✓ up to date (${r.current} on ${r.branch ?? "?"})`) + (r.reason ? c(DIM, ` — ${r.reason}`) : ""));
+    return 0;
+  }
+  if (r.updated) {
+    console.log(c(GREEN, `✓ updated ${r.from} → ${r.to}`) + (r.depsChanged ? c(DIM, " (deps reinstalled)") : ""));
+    console.log(c(DIM, `${target.remote ? "main" : "daemon"} is restarting with the new code…`));
+  } else {
+    console.log(c(GREEN, `✓ ${r.reason ?? "nothing to do"}`));
+  }
+  return 0;
+}
+
 async function cmdTick(flags) {
   const { client } = makeClient(flags);
   const res = await client.tick();
@@ -171,6 +193,8 @@ ${c(BOLD, "Use it (local, or a remote main):")}
   openagi status              health, provider, memory, task counts
   openagi doctor              diagnose setup/connection and print fixes
   openagi setup               print the dashboard/setup URL + token
+  openagi update [--check]    fast-forward + restart (or just check); set
+                              OPENAGI_AUTO_UPDATE=1 for a daily auto-update
   openagi tick                fire a scheduler tick
 
 ${c(BOLD, "Turn this device into a node of a remote main:")}
@@ -195,6 +219,7 @@ async function main() {
       case "setup": return await cmdSetup(flags);
       case "pair": return cmdPair(positional, flags);
       case "unpair": return cmdUnpair();
+      case "update": return await cmdUpdate(positional, flags);
       case "tick": return await cmdTick(flags);
       default:
         console.error(c(RED, `unknown command: ${cmd}`));

@@ -91,7 +91,17 @@ local daemon.
 | `openagi status` | health, provider, memory, task counts |
 | `openagi doctor` | diagnose setup/connection, print fixes |
 | `openagi setup` | print the dashboard/setup URL + token |
+| `openagi update [--check]` | fast-forward the checkout + restart (or just check) |
 | `openagi pair <url> [--token T]` / `unpair` | save / forget a remote main |
 | `openagi tick` | fire a scheduler tick |
 
 Global flags: `--remote <url>`, `--token <token>`, `--json`.
+
+## Keeping it current
+
+The daemon updates itself — no manual `git pull` on the device.
+
+- **Manual:** `openagi update` (locally or `--remote` against the main) fast-forwards the git checkout, reinstalls deps if `package.json` changed, and restarts with the new code. `openagi update --check` just reports whether a newer version is available. Fast-forward only — it never clobbers local commits.
+- **Automatic (opt-in):** set `OPENAGI_AUTO_UPDATE=1` (and optionally `OPENAGI_AUTO_UPDATE_AT=HH:MM`, default `04:30`) in the main's `.env`. A daily cron job checks for updates and applies + restarts when one ships. Off by default; visible/toggleable in the dashboard's Cron tab.
+
+Both rely on the supervisor (systemd `Restart=always`, launchd, or the Mac app) to respawn after the update — which the install scripts already configure.

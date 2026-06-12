@@ -722,6 +722,25 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         setTimeout(() => process.exit(0), 200);
         return;
       }
+      if (method === "GET" && pathname === "/control/update") {
+        // Dry check — is a newer version available? (no changes applied)
+        const { checkForUpdate } = await import("./self-update.js");
+        return sendJson(res, 200, await checkForUpdate());
+      }
+      if (method === "POST" && pathname === "/control/update") {
+        // Self-update: fast-forward the checkout, reinstall deps if needed,
+        // then exit(0) so the supervisor (systemd Restart=always / launchd
+        // KeepAlive / Mac DaemonController) respawns with the new code. No-op
+        // with a reason when already current or not fast-forwardable.
+        const { applyUpdate } = await import("./self-update.js");
+        const result = await applyUpdate();
+        sendJson(res, result.updated ? 202 : 200, result);
+        if (result.updated) {
+          runtime.events?.emit?.("self-update", { at: new Date().toISOString(), from: result.from, to: result.to });
+          setTimeout(() => process.exit(0), 300); // respawn with new code
+        }
+        return;
+      }
       if (method === "GET" && pathname === "/integrations/status") {
         // Unified integrations view. Every source/channel/MCP catalog
         // entry shows up here, with whichever paths apply (API key vs.
