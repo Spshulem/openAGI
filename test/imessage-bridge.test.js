@@ -20,10 +20,14 @@ function makeBridge({ messages = [], replies = {}, allowFrom = [] } = {}) {
       return reply ? { ok: true, json: { reply } } : { ok: false, status: 500, error: "no reply" };
     }
   };
+  // The bridge tracks a DATE cursor now. Tests still describe rows by rowid for
+  // brevity; normalize appleDate from rowid so a row's rowid doubles as its date.
+  const norm = (m) => ({ ...m, appleDate: String(m.appleDate ?? m.rowid ?? 0) });
   const bridge = new IMessageBridge({
     client, allowFrom,
     dataDir: dir,
-    readMessages: async (since) => messages.filter((m) => m.rowid > since),
+    readMessages: async (since) => messages.map(norm).filter((m) => BigInt(m.appleDate) > BigInt(since || 0)),
+    readMaxCursor: async () => messages.reduce((mx, m) => (BigInt(norm(m).appleDate) > BigInt(mx || 0) ? norm(m).appleDate : mx), "0"),
     sendMessage: async (handle, text) => { sent.push({ handle, text }); }
   });
   return { bridge, sent, forwarded, dir };
@@ -44,9 +48,9 @@ test("relays a new incoming message to the main and texts the reply back", async
     messages: [{ rowid: 5, handle: "+15551112222", text: "what's on my calendar?" }],
     replies: { "what's on my calendar?": "You have a 3pm with Acme." }
   });
-  await bridge.poll(); // bootstrap (maxRowid=5)
+  await bridge.poll(); // bootstrap (max date=5)
   // a NEW message arrives after the bootstrap mark
-  bridge.readMessages = async (since) => [{ rowid: 6, handle: "+15551112222", text: "remind me to call Sam" }].filter((m) => m.rowid > since);
+  bridge.readMessages = async (since) => [{ rowid: 6, appleDate: "6", handle: "+15551112222", text: "remind me to call Sam" }].filter((m) => BigInt(m.appleDate) > BigInt(since || 0));
   bridge.client.chat = async (text, opts) => { forwarded.push({ text, from: opts.from }); return { ok: true, json: { reply: "Got it — I'll remind you." } }; };
   const r = await bridge.poll();
   assert.equal(r.replied, 1);
@@ -59,9 +63,9 @@ test("allowlist drops messages from non-allowed senders", async () => {
     messages: [{ rowid: 1, handle: "+1999", text: "hi" }],
     allowFrom: ["+15551112222"]
   });
-  // force past bootstrap with lastRowid already set
-  bridge._saveState({ lastRowid: 0, initialized: true });
-  bridge.readMessages = async () => [{ rowid: 2, handle: "+1999", text: "spam" }, { rowid: 3, handle: "+15551112222", text: "real" }];
+  // force past bootstrap with the date cursor already set
+  bridge._saveState({ lastDate: "0", initialized: true });
+  bridge.readMessages = async () => [{ rowid: 2, appleDate: "2", handle: "+1999", text: "spam" }, { rowid: 3, appleDate: "3", handle: "+15551112222", text: "real" }];
   bridge.client.chat = async () => ({ ok: true, json: { reply: "ok" } });
   const r = await bridge.poll();
   assert.equal(r.skipped, 1, "non-allowed sender skipped");
@@ -70,15 +74,15 @@ test("allowlist drops messages from non-allowed senders", async () => {
   assert.equal(sent[0].handle, "+15551112222");
 });
 
-test("advances the rowid high-water mark even when a send errors", async () => {
+test("advances the date high-water mark even when a send errors", async () => {
   const { bridge, dir } = makeBridge({});
-  bridge._saveState({ lastRowid: 100, initialized: true });
-  bridge.readMessages = async (since) => [{ rowid: 101, handle: "+1", text: "x" }].filter((m) => m.rowid > since);
+  bridge._saveState({ lastDate: "100", initialized: true });
+  bridge.readMessages = async (since) => [{ rowid: 101, appleDate: "101", handle: "+1", text: "x" }].filter((m) => BigInt(m.appleDate) > BigInt(since || 0));
   bridge.client.chat = async () => ({ ok: false, status: 500, error: "boom" });
   const r = await bridge.poll();
   assert.equal(r.errors, 1);
   const state = JSON.parse(fs.readFileSync(path.join(dir, "imessage-bridge.json"), "utf8"));
-  assert.equal(state.lastRowid, 101, "won't reprocess the same failed message forever");
+  assert.equal(state.lastDate, "101", "won't reprocess the same failed message forever");
 });
 
 test("extractAttributedText pulls text from an attributedBody blob", () => {
@@ -113,7 +117,7 @@ function policyBridge(opts) {
     sendMessage: async (h, t) => sent.push({ h, t }),
     ...opts
   });
-  bridge._saveState({ lastRowid: 0, initialized: true });
+  bridge._saveState({ lastDate: "0", initialized: true });
   return { bridge, sent, forwarded, remembered };
 }
 
@@ -166,7 +170,6 @@ test("hardening: reads chat.db via ONE reused read-only connection (no per-poll 
            CREATE TABLE chat_message_join (message_id INTEGER, chat_id INTEGER);
            CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT, attributedBody BLOB, is_from_me INTEGER, date INTEGER, handle_id INTEGER);`);
   db.prepare("INSERT INTO handle (ROWID,id) VALUES (1,?)").run("+15551234567");
-  const ins = db.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (?,?,0,0,1)");
   db.close();
 
   const forwarded = [];
@@ -178,17 +181,20 @@ test("hardening: reads chat.db via ONE reused read-only connection (no per-poll 
               request: async () => ({ ok: true }) },
     sendMessage: async () => {}
   });
-  bridge._saveState({ lastRowid: 0, initialized: true });
+  // Date cursor at 1000ns; new messages have higher (later) dates. Note rowid
+  // is INTENTIONALLY non-monotonic with date here (rowid 9 is newer than 10) —
+  // proving we track by date, not rowid, which is what survives a db rebuild.
+  bridge._saveState({ lastDate: "1000", initialized: true });
 
-  // First poll: insert a row, expect it read through the read-only reused conn.
-  const w1 = new DatabaseSync(file); w1.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (10,?,0,0,1)").run("hello one"); w1.close();
+  // First poll: a newer message (higher date, LOWER rowid) read via reused conn.
+  const w1 = new DatabaseSync(file); w1.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (10,?,0,2000,1)").run("hello one"); w1.close();
   const r1 = await bridge.poll();
   assert.equal(r1.replied, 1, "read + replied to the incoming message");
   assert.ok(bridge._db, "connection is kept open (reused), not closed after the poll");
   const conn = bridge._db;
 
-  // Second poll: another row, SAME connection object reused (not reopened).
-  const w2 = new DatabaseSync(file); w2.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (11,?,0,0,1)").run("hello two"); w2.close();
+  // Second poll: another message with an even later date but a LOWER rowid (9).
+  const w2 = new DatabaseSync(file); w2.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (9,?,0,3000,1)").run("hello two"); w2.close();
   const r2 = await bridge.poll();
   assert.equal(r2.replied, 1);
   assert.equal(bridge._db, conn, "same connection reused across polls");

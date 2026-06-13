@@ -49,16 +49,28 @@ export class IMessageBridge {
     // we don't reopen the 1.5GB chat.db every tick. readNewMessages gets it via
     // `db`; on any read error we drop it so the next poll reopens cleanly.
     this._db = null;
-    this.readMessages = options.readMessages ?? (async (sinceRowid) => {
+    this.readMessages = options.readMessages ?? (async (sinceDate) => {
       if (!this._db) this._db = await openChatDbReadOnly(this.dbPath);
       try {
-        return await readNewMessages(this.dbPath, sinceRowid, {
+        return await readNewMessages(this.dbPath, sinceDate, {
           selfHandles: this.selfChat ? [...this.allowFrom] : [],
           db: this._db
         });
       } catch (error) {
         try { this._db?.close(); } catch { /* ignore */ }
         this._db = null; // reopen next tick (e.g. db was vacuumed/replaced)
+        throw error;
+      }
+    });
+    // Bootstrap cursor = the current newest message date, so first run skips
+    // history. Injectable for tests; real default queries MAX(date).
+    this.readMaxCursor = options.readMaxCursor ?? (async () => {
+      if (!this._db) this._db = await openChatDbReadOnly(this.dbPath);
+      try {
+        return await readMaxAppleDate(this.dbPath, this._db);
+      } catch (error) {
+        try { this._db?.close(); } catch { /* ignore */ }
+        this._db = null;
         throw error;
       }
     });
@@ -134,17 +146,21 @@ export class IMessageBridge {
   // main's memory and optionally reply via the agent. Returns a summary.
   async poll() {
     let state = this._loadState();
-    // First run: don't replay history — start from the current high-water mark.
-    if (state.lastRowid == null) {
-      state = { lastRowid: await this.readMaxRowid(), initialized: true };
+    // First run (or migrating off the old rowid cursor): don't replay history —
+    // start from the current newest message date. lastDate is the cursor now;
+    // legacy state with only lastRowid re-bootstraps here (correct, since after
+    // a chat.db rebuild the old rowid no longer maps to anything meaningful).
+    if (state.lastDate == null) {
+      state = { lastDate: await this.readMaxCursor(), initialized: true };
       this._saveState(state);
       return { processed: 0, replied: 0, captured: 0, skipped: 0, errors: 0, bootstrapped: true };
     }
 
-    const rows = await this.readMessages(state.lastRowid);
-    let processed = 0, replied = 0, captured = 0, skipped = 0, errors = 0, highest = state.lastRowid;
+    const rows = await this.readMessages(state.lastDate);
+    let processed = 0, replied = 0, captured = 0, skipped = 0, errors = 0;
+    let highest = state.lastDate;
     for (const row of rows) {
-      if (row.rowid > highest) highest = row.rowid;
+      if (row.appleDate && BigInt(row.appleDate) > BigInt(highest || 0)) highest = row.appleDate;
       processed++;
       const text = (row.text ?? "").trim();
       if (!text || !row.handle) { skipped++; continue; }
@@ -186,13 +202,8 @@ export class IMessageBridge {
         this.onEvent({ kind: "send-error", handle: row.handle, error: error.message });
       }
     }
-    this._saveState({ ...state, lastRowid: highest });
+    this._saveState({ ...state, lastDate: highest });
     return { processed, replied, captured, skipped, errors };
-  }
-
-  async readMaxRowid() {
-    const rows = await this.readMessages(0);
-    return rows.reduce((mx, r) => Math.max(mx, r.rowid), 0);
   }
 
   // Run the poll loop until stop() is called. Default 10s: a read-only reader is
@@ -215,13 +226,19 @@ export class IMessageBridge {
   }
 }
 
-// Read new messages newer than sinceRowid. By default only INCOMING
+// Read new messages newer than `sinceDate`. By default only INCOMING
 // (is_from_me = 0), across all conversations. `selfHandles` (your own
 // handles — the allowlist) additionally pulls your OWN sent messages in your
 // self-thread, so you can text yourself to command the agent ("note to self").
 // We never pull your outgoing messages to OTHER people. Returns
 // [{ rowid, handle, fromMe, text, appleDate }].
-export async function readNewMessages(dbPath, sinceRowid, { selfHandles = [], db: reuseDb = null } = {}) {
+// `sinceDate` is an Apple-epoch nanosecond timestamp as a STRING (m.date is too
+// big for a JS number). We track by DATE, not ROWID: a chat.db rebuild
+// renumbers ROWIDs non-chronologically (a brand-new message can land at a LOWER
+// rowid than old ones), but m.date is the true send time and only ever
+// increases — so a date cursor survives rebuilds. Bound via BigInt so the
+// comparison stays exact.
+export async function readNewMessages(dbPath, sinceDate, { selfHandles = [], db: reuseDb = null } = {}) {
   // Reuse a caller-owned read-only connection (the polling bridge does this to
   // avoid reopening chat.db every tick); otherwise open one read-only + close.
   const db = reuseDb ?? await openChatDbReadOnly(dbPath);
@@ -247,13 +264,13 @@ export async function readNewMessages(dbPath, sinceRowid, { selfHandles = [], db
       LEFT JOIN handle h ON h.ROWID = m.handle_id
       LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
       LEFT JOIN chat c ON c.ROWID = cmj.chat_id
-      WHERE m.ROWID > ? AND (
+      WHERE m.date > ? AND (
         (m.is_from_me = 0 AND h.id IS NOT NULL)${selfClause}
       )
       GROUP BY m.ROWID
-      ORDER BY m.ROWID ASC
+      ORDER BY m.date ASC
       LIMIT 200
-    `).all(sinceRowid, ...self);
+    `).all(BigInt(sinceDate || 0), ...self);
     return rows.map((r) => ({
       rowid: r.rowid,
       handle: r.handle,
@@ -263,6 +280,18 @@ export async function readNewMessages(dbPath, sinceRowid, { selfHandles = [], db
     }));
   } finally {
     if (!reuseDb) db.close(); // never close a connection the caller owns
+  }
+}
+
+// Current newest message timestamp (Apple ns, as a string). Used to bootstrap
+// the date cursor so first-run / post-rebuild skips history and starts "now".
+export async function readMaxAppleDate(dbPath, reuseDb = null) {
+  const db = reuseDb ?? await openChatDbReadOnly(dbPath);
+  try {
+    const r = db.prepare("SELECT CAST(MAX(date) AS TEXT) AS d FROM message").get();
+    return r?.d ?? "0";
+  } finally {
+    if (!reuseDb) db.close();
   }
 }
 
