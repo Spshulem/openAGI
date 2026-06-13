@@ -112,12 +112,54 @@ test("applyUpdate refuses to update a diverged checkout (won't clobber local com
     "fetch": "",
     "rev-list --count HEAD..origin/main": "2",
     "rev-list --count origin/main..HEAD": "1",   // local is ahead → diverged
+    "merge-base HEAD origin/main": "c0mm0n",      // shared ancestor → real local commits
     "rev-parse --short origin/main": "bbbbbbb"
   });
   const r = await applyUpdate({ run, installDeps: async () => {} });
   assert.equal(r.updated, false);
   assert.match(r.reason, /diverg|fast-forward/i);
   assert.ok(!calls.includes("merge --ff-only origin/main"), "must not merge a diverged checkout");
+  assert.ok(!calls.some((c) => c.startsWith("reset --hard")), "must not hard-reset a checkout with real local commits");
+});
+
+test("applyUpdate recovers from an upstream history rewrite (unrelated + clean tree → hard reset)", async () => {
+  let resetTo = null, installed = false;
+  const { run, calls } = fakeGit({
+    "rev-parse --abbrev-ref HEAD": "main",
+    "rev-parse --short HEAD": "0ldhash",
+    "rev-parse --abbrev-ref --symbolic-full-name @{u}": "origin/main",
+    "fetch": "",
+    "rev-list --count HEAD..origin/main": "300",  // looks fully behind...
+    "rev-list --count origin/main..HEAD": "295",  // ...AND ahead (unrelated histories)
+    "merge-base HEAD origin/main": new Error("no merge base"), // ← no shared ancestor
+    "rev-parse --short origin/main": "newhash",
+    "status --porcelain": "",                      // clean working tree
+    "reset --hard origin/main": () => { resetTo = "origin/main"; return ""; }
+  });
+  const r = await applyUpdate({ run, installDeps: async () => { installed = true; } });
+  assert.equal(r.updated, true);
+  assert.equal(r.recovered, true, "flagged as a rewrite recovery");
+  assert.equal(resetTo, "origin/main", "hard-reset onto upstream");
+  assert.ok(installed, "deps reinstalled after recovery");
+  assert.ok(!calls.includes("merge --ff-only origin/main"), "recovers via reset, not merge");
+});
+
+test("applyUpdate will NOT hard-reset a rewrite if the tree is dirty (protects local edits)", async () => {
+  const { run, calls } = fakeGit({
+    "rev-parse --abbrev-ref HEAD": "main",
+    "rev-parse --short HEAD": "0ldhash",
+    "rev-parse --abbrev-ref --symbolic-full-name @{u}": "origin/main",
+    "fetch": "",
+    "rev-list --count HEAD..origin/main": "300",
+    "rev-list --count origin/main..HEAD": "295",
+    "merge-base HEAD origin/main": new Error("no merge base"),
+    "rev-parse --short origin/main": "newhash",
+    "status --porcelain": " M src/foo.js"           // uncommitted local change
+  });
+  const r = await applyUpdate({ run, installDeps: async () => {} });
+  assert.equal(r.updated, false);
+  assert.match(r.reason, /dirty|resolve manually/i);
+  assert.ok(!calls.some((c) => c.startsWith("reset --hard")), "never hard-reset a dirty tree");
 });
 
 test("applyUpdate: already up to date is a clean no-op", async () => {

@@ -44,8 +44,17 @@ export async function checkForUpdate({ run = gitRun } = {}) {
   const behind = Number.parseInt(await run(["rev-list", "--count", `HEAD..${upstream}`]), 10) || 0;
   const ahead = Number.parseInt(await run(["rev-list", "--count", `${upstream}..HEAD`]), 10) || 0;
   const latest = await run(["rev-parse", "--short", upstream]);
+  // "unrelated": HEAD and upstream share NO common ancestor — the upstream
+  // history was rewritten (e.g. a filter-repo purge / force-push). Distinct from
+  // ordinary divergence (local commits), which always shares a merge-base. We
+  // use this to safely auto-recover without ever discarding real local commits.
+  let unrelated = false;
+  if (behind > 0 && ahead > 0) {
+    try { await run(["merge-base", "HEAD", upstream]); }
+    catch { unrelated = true; }
+  }
   return {
-    ok: true, branch, current, upstream, latest, behind, ahead,
+    ok: true, branch, current, upstream, latest, behind, ahead, unrelated,
     updateAvailable: behind > 0,
     canFastForward: behind > 0 && ahead === 0
   };
@@ -59,6 +68,23 @@ export async function applyUpdate({ run = gitRun, installDeps = defaultInstallDe
   if (!status.ok) return { updated: false, ...status };
   if (!status.updateAvailable) return { updated: false, reason: "already up to date", ...status };
   if (!status.canFastForward) {
+    // Recover from an upstream history rewrite: when the histories are unrelated
+    // (no shared ancestor) AND the working tree is clean, hard-reset onto
+    // upstream. Gated on `unrelated` so real local commits (which share a
+    // merge-base) are never discarded, and on a clean tree so no uncommitted
+    // edits are lost. This auto-heals installs whose ff-update broke after a
+    // history purge — without it they'd silently stop updating.
+    if (status.unrelated) {
+      const dirty = (await run(["status", "--porcelain"]).catch(() => "dirty")).length > 0;
+      if (dirty) {
+        return { updated: false, reason: "upstream history was rewritten but the working tree is dirty — resolve manually with `git reset --hard <upstream>`", ...status };
+      }
+      await run(["reset", "--hard", status.upstream]);
+      try { await installDeps(); }
+      catch (error) { return { updated: true, recovered: true, from: status.current, to: status.latest, depsInstalled: false, depsError: error.message, branch: status.branch }; }
+      const to = await run(["rev-parse", "--short", "HEAD"]);
+      return { updated: true, recovered: true, reason: "recovered from upstream history rewrite (hard reset onto a clean checkout)", from: status.current, to, branch: status.branch };
+    }
     return { updated: false, reason: `local commits / divergence (ahead ${status.ahead}) — not fast-forwardable; resolve manually`, ...status };
   }
 
