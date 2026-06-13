@@ -156,6 +156,48 @@ test("respond=trigger matches the keyword as a whole word, not a substring", asy
   assert.equal(r.captured, 4, "but every message is still captured to memory");
 });
 
+test("hardening: reads chat.db via ONE reused read-only connection (no per-poll reopen)", async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-imsg-ro-"));
+  const file = path.join(dir, "chat.db");
+  const db = new DatabaseSync(file);
+  db.exec(`CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+           CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, chat_identifier TEXT);
+           CREATE TABLE chat_message_join (message_id INTEGER, chat_id INTEGER);
+           CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT, attributedBody BLOB, is_from_me INTEGER, date INTEGER, handle_id INTEGER);`);
+  db.prepare("INSERT INTO handle (ROWID,id) VALUES (1,?)").run("+15551234567");
+  const ins = db.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (?,?,0,0,1)");
+  db.close();
+
+  const forwarded = [];
+  const bridge = new IMessageBridge({
+    dbPath: file,
+    dataDir: dir,
+    // real default readMessages → exercises openChatDbReadOnly + connection reuse
+    client: { chat: async (text, o) => { forwarded.push(text); return { ok: true, json: { reply: "ok" } }; },
+              request: async () => ({ ok: true }) },
+    sendMessage: async () => {}
+  });
+  bridge._saveState({ lastRowid: 0, initialized: true });
+
+  // First poll: insert a row, expect it read through the read-only reused conn.
+  const w1 = new DatabaseSync(file); w1.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (10,?,0,0,1)").run("hello one"); w1.close();
+  const r1 = await bridge.poll();
+  assert.equal(r1.replied, 1, "read + replied to the incoming message");
+  assert.ok(bridge._db, "connection is kept open (reused), not closed after the poll");
+  const conn = bridge._db;
+
+  // Second poll: another row, SAME connection object reused (not reopened).
+  const w2 = new DatabaseSync(file); w2.prepare("INSERT INTO message (ROWID,text,is_from_me,date,handle_id) VALUES (11,?,0,0,1)").run("hello two"); w2.close();
+  const r2 = await bridge.poll();
+  assert.equal(r2.replied, 1);
+  assert.equal(bridge._db, conn, "same connection reused across polls");
+  assert.deepEqual(forwarded, ["hello one", "hello two"]);
+
+  bridge.stop();
+  assert.equal(bridge._db, null, "stop() releases chat.db");
+});
+
 test("note-to-self: replies to your own self-texts but never loops on its own replies", async () => {
   // respond=trigger, you (the self handle) are on the allowlist, capture all.
   const b = policyBridge({ respondMode: "trigger", trigger: "peri", allowFrom: ["zargle@me.com"], captureMode: "all" });
