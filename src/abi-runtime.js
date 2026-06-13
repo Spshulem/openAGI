@@ -200,12 +200,16 @@ export class AbiRuntime {
         task: "condense",
         dailyAt: "03:30"
       });
+      // Cadence is env-tunable: autopilot pulses carry a large prompt, so on a
+      // metered model the interval is the single biggest cost lever. Default
+      // 30 min; set OPENAGI_AUTOPILOT_INTERVAL_MIN to slow it (e.g. 120 = 2h).
+      const autopilotMin = Number(process.env.OPENAGI_AUTOPILOT_INTERVAL_MIN) || 30;
       this.cron.addJob({
         id: "agent-pulse",
-        name: "Agent autopilot — drain agent queue every 30 min",
+        name: `Agent autopilot — drain agent queue every ${autopilotMin} min`,
         enabled: true,
         task: "autopilot",
-        intervalMs: 30 * 60 * 1000,
+        intervalMs: autopilotMin * 60 * 1000,
         input: {
           agentId: "main",
           prompt: AGENT_PULSE_PROMPT
