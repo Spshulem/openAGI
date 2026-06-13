@@ -133,6 +133,10 @@ export class AgentHost {
     const modelResult = await this.modelProvider.generate({
       input: text,
       agent,
+      // Route by what the call IS, so model tiering applies: autonomous pulses
+      // (autopilot/cron) are cheap "anything to do?" work; everything else is
+      // user-facing chat. Both default to the base model until tiers/pins are set.
+      task: (channel === "autopilot" || channel === "cron") ? "autopilot" : "chat",
       scrutiny: output.scrutiny,
       memoryHits: output.customContext.map((entry) => ({
         score: entry.score,
