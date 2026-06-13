@@ -11,6 +11,8 @@
 # Config (env vars):
 #   IMESSAGE_RESPOND   all|allow|trigger|none   reply policy (default: all)
 #   IMESSAGE_ALLOW     h1,h2                     sender allowlist (for respond=allow)
+#   IMESSAGE_ALLOW_CHATS c1,c2                   group chat ids where ANY member
+#                                                can invoke the trigger (chat787…)
 #   IMESSAGE_TRIGGER   word                      trigger word (for respond=trigger)
 #   IMESSAGE_CAPTURE   none|allow|all            save incoming → memory (default: none)
 #   IMESSAGE_NODE_TOKEN  secret                  if set, ALSO install the search
@@ -51,6 +53,7 @@ mkdir -p "$(dirname "${BRIDGE_PLIST}")" "${LOG_DIR}"
 # Build the bridge argument array.
 bridge_args=("imessage-bridge" "--respond" "${IMESSAGE_RESPOND:-all}")
 [[ -n "${IMESSAGE_ALLOW:-}" ]]   && bridge_args+=("--allow" "${IMESSAGE_ALLOW}")
+[[ -n "${IMESSAGE_ALLOW_CHATS:-}" ]] && bridge_args+=("--allow-chat" "${IMESSAGE_ALLOW_CHATS}")
 [[ -n "${IMESSAGE_TRIGGER:-}" ]] && bridge_args+=("--trigger" "${IMESSAGE_TRIGGER}")
 [[ -n "${IMESSAGE_CAPTURE:-}" ]] && bridge_args+=("--capture" "${IMESSAGE_CAPTURE}")
 

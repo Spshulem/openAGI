@@ -82,6 +82,10 @@ export class IMessageBridge {
 
     // Sender allowlist (phone/email handles), lower-cased.
     this.allowFrom = new Set((options.allowFrom ?? []).map((h) => String(h).toLowerCase()));
+    // Group-chat allowlist (chat identifiers, e.g. "chat787…"). In an allowed
+    // group, ANY member's message can invoke the trigger, and the reply is
+    // posted back to the group. Members' messages are still captured regardless.
+    this.allowChats = new Set((options.allowChats ?? []).map((c) => String(c).toLowerCase()));
 
     // Response policy — WHO/WHAT gets an agent reply:
     //   all     → reply to every incoming message
@@ -116,9 +120,15 @@ export class IMessageBridge {
   }
 
   // Decide whether to reply, and return the text to forward (trigger stripped).
-  // { respond: bool, forward: string }
-  responseFor(handle, text) {
-    const allowed = this.allowFrom.size === 0 || this.allowFrom.has(String(handle).toLowerCase());
+  // { respond: bool, forward: string }. `chatId` lets an allowlisted GROUP
+  // authorize any member's message (not just allowlisted senders).
+  responseFor(handle, text, chatId = null) {
+    // No allowlist of any kind → open to all. Otherwise a sender qualifies via
+    // the handle allowlist OR by being in an allowlisted group chat.
+    const noAllowlist = this.allowFrom.size === 0 && this.allowChats.size === 0;
+    const allowed = noAllowlist
+      || this.allowFrom.has(String(handle).toLowerCase())
+      || (chatId != null && this.allowChats.has(String(chatId).toLowerCase()));
     if (this.respondMode === "none") return { respond: false };
     if (this.respondMode === "all") return { respond: true, forward: text };
     if (this.respondMode === "allow") return { respond: allowed, forward: text };
@@ -181,13 +191,17 @@ export class IMessageBridge {
       }
 
       // 2. Reply per the response policy.
-      const decision = this.responseFor(row.handle, text);
+      const decision = this.responseFor(row.handle, text, row.chatId);
       if (!decision.respond) { skipped++; continue; }
       try {
-        const res = await this.client.chat(decision.forward, { from: `imessage:${row.handle}` });
+        // Session keys off the conversation so a group has one shared thread.
+        const sessionKey = row.isGroup ? row.chatId : row.handle;
+        const res = await this.client.chat(decision.forward, { from: `imessage:${sessionKey}` });
         const reply = res?.json?.reply;
         if (res?.ok && reply) {
-          await this.sendMessage(row.handle, reply);
+          // Reply to the GROUP chat if it's a group; otherwise DM the sender.
+          if (row.isGroup) await this.sendMessage(row.chatId, reply, { group: true });
+          else await this.sendMessage(row.handle, reply);
           // Remember it so the self-thread echo of this reply is ignored next poll.
           this._recentSends.push(reply.trim());
           if (this._recentSends.length > 50) this._recentSends.shift();
@@ -259,7 +273,8 @@ export async function readNewMessages(dbPath, sinceDate, { selfHandles = [], db:
     const rows = db.prepare(`
       SELECT m.ROWID AS rowid, m.text AS text, m.attributedBody AS body,
              m.is_from_me AS fromMe, CAST(m.date AS TEXT) AS appleDate,
-             COALESCE(h.id, c.chat_identifier) AS handle
+             COALESCE(h.id, c.chat_identifier) AS handle,
+             c.chat_identifier AS chatId
       FROM message m
       LEFT JOIN handle h ON h.ROWID = m.handle_id
       LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
@@ -274,6 +289,9 @@ export async function readNewMessages(dbPath, sinceDate, { selfHandles = [], db:
     return rows.map((r) => ({
       rowid: r.rowid,
       handle: r.handle,
+      chatId: r.chatId,
+      // Group chats use a "chat<digits>" identifier; 1:1s use the person's handle.
+      isGroup: typeof r.chatId === "string" && /^chat\d/.test(r.chatId),
       fromMe: r.fromMe === 1,
       appleDate: r.appleDate,
       text: r.text && r.text.trim() ? r.text : extractAttributedText(r.body)
@@ -358,9 +376,19 @@ export async function searchMessages(dbPath = DEFAULT_DB, { query = "", handle =
 }
 
 // Send a message back over iMessage via AppleScript. Requires Automation
-// permission for Messages granted to the controlling process.
-export async function sendViaIMessage(handle, text, { run = execFileAsync } = {}) {
-  const script = `
+// permission for Messages granted to the controlling process. For a group
+// (`group: true`), `target` is the chat identifier (e.g. "chat787…") and the
+// reply is posted to the GROUP; otherwise `target` is a person's handle (DM).
+export async function sendViaIMessage(target, text, { run = execFileAsync, group = false } = {}) {
+  const script = group
+    ? `
+    on run {chatId, msgText}
+      tell application "Messages"
+        set theChat to first chat whose id contains chatId
+        send msgText to theChat
+      end tell
+    end run`
+    : `
     on run {targetHandle, msgText}
       tell application "Messages"
         set svc to 1st account whose service type = iMessage
@@ -368,5 +396,5 @@ export async function sendViaIMessage(handle, text, { run = execFileAsync } = {}
         send msgText to theBuddy
       end tell
     end run`;
-  await run("osascript", ["-e", script, handle, text], { timeout: 15000 });
+  await run("osascript", ["-e", script, target, text], { timeout: 15000 });
 }
