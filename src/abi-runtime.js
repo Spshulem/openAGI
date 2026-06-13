@@ -26,6 +26,7 @@ import { OutcomeStore } from "./outcome-store.js";
 import { Introspector } from "./introspector.js";
 import { PatternMiner } from "./pattern-miner.js";
 import { SessionMiner } from "./session-miner.js";
+import { IMessageExtractor } from "./imessage-extractor.js";
 import { ProactiveObserver } from "./proactive-observer.js";
 import { TaskStore } from "./task-store.js";
 import { PendingActionStore } from "./pending-actions.js";
@@ -169,6 +170,7 @@ export class AbiRuntime {
     this.tunnelWatcher = options.tunnelWatcher ?? new TunnelWatcher(options.tunnelWatcherOptions ?? {});
     this.patternMiner = options.patternMiner ?? new PatternMiner({ runtime: this, dataDir: options.dataDir, ...(options.patternMinerOptions ?? {}) });
     this.sessionMiner = options.sessionMiner ?? new SessionMiner({ runtime: this, dataDir: options.dataDir, ...(options.sessionMinerOptions ?? {}) });
+    this.imessageExtractor = options.imessageExtractor ?? new IMessageExtractor({ runtime: this, dataDir: options.dataDir });
     this.proactiveObserver = options.proactiveObserver ?? new ProactiveObserver({ runtime: this, dataDir: options.dataDir, ...(options.proactiveObserverOptions ?? {}) });
     // Story 3: closes the suggestion → outcome → next-suggestion loop.
     // Reads resolved suggestion history + user mute preferences, feeds
@@ -283,6 +285,17 @@ export class AbiRuntime {
         enabled: true,
         task: "session-mine",
         intervalMs: 60 * 60 * 1000
+      });
+      // Proactive iMessage extraction: scan newly-captured texts for follow-ups,
+      // events, and links. Cheap (early-returns when no new messages; nano tier
+      // otherwise). Tunable via OPENAGI_IMESSAGE_EXTRACT_MIN (default 15 min).
+      const extractMin = Number(process.env.OPENAGI_IMESSAGE_EXTRACT_MIN) || 15;
+      this.cron.addJob({
+        id: "imessage-extract",
+        name: `iMessage extraction — surface follow-ups/events/links every ${extractMin} min`,
+        enabled: true,
+        task: "imessage-extract",
+        intervalMs: extractMin * 60 * 1000
       });
       // Proactive observer — fast cadence so the agent reacts within
       // minutes when it sees something worth saying.
@@ -605,6 +618,11 @@ export class AbiRuntime {
       if (job.task === "session-mine") {
         const result = await this.sessionMiner.mine({ now });
         this.events?.emit?.("miner-result", { source: "session-miner", at: nowIso(), ...result });
+        return result;
+      }
+      if (job.task === "imessage-extract") {
+        const result = await this.imessageExtractor.extract();
+        this.events?.emit?.("miner-result", { source: "imessage-extractor", at: nowIso(), ...result });
         return result;
       }
       if (job.task === "proactive-observe") {

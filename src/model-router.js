@@ -24,7 +24,8 @@ export const TASK_PROFILES = {
   scrutiny:  { tier: "nano", label: "Scrutiny judges",     why: "Short act/ask/watch/ignore classification, very frequent — nano is plenty." },
   condense:  { tier: "mini", label: "Memory condensing",   why: "Summarize a cluster of notes into one — a mini model handles it." },
   mine:      { tier: "mini", label: "Session mining",      why: "Cluster intents out of a transcript — mini is enough." },
-  plan:      { tier: "mini", label: "Daily plan / recap",  why: "Summarize the day — mini is enough." }
+  plan:      { tier: "mini", label: "Daily plan / recap",  why: "Summarize the day — mini is enough." },
+  extract:   { tier: "nano", label: "iMessage extraction", why: "Pull follow-ups/events from a batch of texts, runs often — nano is plenty." }
 };
 
 // Order matters for display (strongest → cheapest).
