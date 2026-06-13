@@ -19,10 +19,10 @@ test("ensureIdentity auto-derives email from the me query", async () => {
   const src = new BuildBetterTaskSource({ apiKey: "k" }); // no email/name given
   src.query = async (q) => {
     assert.match(q, /\bme\b/);
-    return { me: { person: { first_name: "Spencer", last_name: "Shulem", email: "you@example.com" } } };
+    return { me: { person: { first_name: "Test", last_name: "User", email: "test@example.com" } } };
   };
   await src.ensureIdentity();
-  assert.equal(src.userEmail, "you@example.com");
+  assert.equal(src.userEmail, "test@example.com");
 });
 
 test("ensureIdentity falls back to full name when me has no email", async () => {
