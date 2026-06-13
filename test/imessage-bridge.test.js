@@ -226,12 +226,12 @@ test("group chat: any member can invoke the trigger; reply goes to the GROUP, no
 
 test("note-to-self: replies to your own self-texts but never loops on its own replies", async () => {
   // respond=trigger, you (the self handle) are on the allowlist, capture all.
-  const b = policyBridge({ respondMode: "trigger", trigger: "peri", allowFrom: ["zargle@me.com"], captureMode: "all" });
+  const b = policyBridge({ respondMode: "trigger", trigger: "peri", allowFrom: ["me@example.com"], captureMode: "all" });
   // Two rows, both fromMe (self-thread): your command, then the bridge's own
   // reply echoed back by chat.db on the next read. client.chat returns "ok-reply".
   b.bridge.readMessages = async () => [
-    { rowid: 1, handle: "zargle@me.com", fromMe: true, text: "Peri what's up?" },
-    { rowid: 2, handle: "zargle@me.com", fromMe: true, text: "ok-reply" }
+    { rowid: 1, handle: "me@example.com", fromMe: true, text: "Peri what's up?" },
+    { rowid: 2, handle: "me@example.com", fromMe: true, text: "ok-reply" }
   ];
   const r = await b.bridge.poll();
   assert.equal(r.replied, 1, "only the real self-command replies");
