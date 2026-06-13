@@ -114,7 +114,7 @@ function policyBridge(opts) {
   const bridge = new IMessageBridge({
     client, dataDir: dir,
     readMessages: async () => [],
-    sendMessage: async (h, t) => sent.push({ h, t }),
+    sendMessage: async (h, t, sendOpts) => sent.push({ h, t, group: sendOpts?.group ?? false }),
     ...opts
   });
   bridge._saveState({ lastDate: "0", initialized: true });
@@ -202,6 +202,26 @@ test("hardening: reads chat.db via ONE reused read-only connection (no per-poll 
 
   bridge.stop();
   assert.equal(bridge._db, null, "stop() releases chat.db");
+});
+
+test("group chat: any member can invoke the trigger; reply goes to the GROUP, not the sender", async () => {
+  const b = policyBridge({ respondMode: "trigger", trigger: "peri", allowChats: ["chat787"], captureMode: "all" });
+  b.bridge.readMessages = async () => [
+    // a non-allowlisted member of the allowed group invokes Peri
+    { rowid: 1, appleDate: "1", handle: "+1999", chatId: "chat787", isGroup: true, text: "Peri what's the plan?" },
+    // same member, no trigger → captured, no reply
+    { rowid: 2, appleDate: "2", handle: "+1999", chatId: "chat787", isGroup: true, text: "just chatting" },
+    // a DIFFERENT group not on the allowlist → no reply even with the trigger
+    { rowid: 3, appleDate: "3", handle: "+1888", chatId: "chat999", isGroup: true, text: "Peri hello" }
+  ];
+  const r = await b.bridge.poll();
+  assert.equal(r.replied, 1, "only the allowed group's triggered message replies");
+  assert.equal(b.sent.length, 1);
+  assert.equal(b.sent[0].h, "chat787", "reply sent to the GROUP chat id, not +1999");
+  assert.equal(b.sent[0].group, true, "sent with the group flag");
+  assert.equal(b.forwarded[0].text, "what's the plan?", "trigger mention stripped");
+  assert.equal(b.forwarded[0].from, "imessage:chat787", "session keyed to the group");
+  assert.equal(r.captured, 3, "all group messages still captured");
 });
 
 test("note-to-self: replies to your own self-texts but never loops on its own replies", async () => {

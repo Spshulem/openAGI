@@ -34,6 +34,7 @@ function parseArgs(argv) {
     else if (a === "--host") flags.host = argv[++i];
     else if (a === "--port") flags.port = argv[++i];
     else if (a === "--allow") flags.allow = argv[++i];
+    else if (a === "--allow-chat") flags.allowChat = argv[++i];
     else if (a === "--check") flags.check = true;
     else if (a === "--from") flags.from = argv[++i];
     else if (a === "--dry-run") flags.dryRun = true;
@@ -242,10 +243,11 @@ async function cmdImessageBridge(flags) {
 
   const { IMessageBridge } = await import("../src/integrations/imessage-bridge.js");
   const allowFrom = flags.allow ? String(flags.allow).split(",").map((s) => s.trim()).filter(Boolean) : [];
-  const respondMode = flags.respond ?? (allowFrom.length ? "allow" : "all");
+  const allowChats = flags.allowChat ? String(flags.allowChat).split(",").map((s) => s.trim()).filter(Boolean) : [];
+  const respondMode = flags.respond ?? (allowFrom.length || allowChats.length ? "allow" : "all");
   const captureMode = flags.capture ?? "none";
   const bridge = new IMessageBridge({
-    client, allowFrom, respondMode, captureMode, trigger: flags.trigger,
+    client, allowFrom, allowChats, respondMode, captureMode, trigger: flags.trigger,
     onEvent: (e) => {
       if (e.kind === "relayed") console.log(c(GREEN, `↔ ${e.handle}: `) + c(DIM, `"${e.in}" → "${e.out}"`));
       else if (e.kind === "captured") console.log(c(DIM, `· saved to memory — ${e.handle}: "${e.in}"`));
@@ -255,8 +257,9 @@ async function cmdImessageBridge(flags) {
   console.log(c(GREEN, `iMessage bridge → main at ${target.url}`));
   const respondDesc = respondMode === "all" ? "everyone" : respondMode === "allow" ? `allowlist (${allowFrom.join(", ")})` : respondMode === "trigger" ? `messages containing "${flags.trigger}"` : "no one (capture-only)";
   console.log(c(DIM, `Reply to: ${respondDesc}.${captureMode !== "none" ? ` Save to memory: ${captureMode}.` : ""} Ctrl-C to stop.`));
+  if (allowChats.length) console.log(c(DIM, `Group chats where anyone can invoke: ${allowChats.join(", ")}`));
   console.log(c(DIM, "Requires: Full Disk Access (read chat.db) + Automation→Messages (send) for this process."));
-  bridge.start({ intervalMs: 2000 });
+  bridge.start(); // default 10s, read-only-safe
   await new Promise(() => {}); // run until killed
 }
 
@@ -335,6 +338,8 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
                                          main and text its replies back. Opts:
                                          --respond all|allow|trigger|none
                                          --allow h1,h2   (sender allowlist)
+                                         --allow-chat c1,c2  (group chats where
+                                                          anyone can invoke)
                                          --trigger word  (reply only on a word)
                                          --capture none|allow|all  (→ memory)
   openagi imessage-search <query>        (macOS) search iMessage history
