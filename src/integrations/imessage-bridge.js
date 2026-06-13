@@ -21,6 +21,21 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_DB = path.join(os.homedir(), "Library", "Messages", "chat.db");
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Open chat.db as a strictly READ-ONLY, non-locking reader. This is critical:
+// node:sqlite opens read-WRITE by default, and a read-write connection on a
+// live WAL database (which Messages.app is constantly writing) attempts WAL
+// checkpoints and grabs exclusive locks — which can stall or crash Messages.
+// Read-only + query_only guarantees we never write/checkpoint; a short
+// busy_timeout means we back off instead of blocking if the writer holds a lock.
+async function openChatDbReadOnly(dbPath) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    db.exec("PRAGMA query_only = 1; PRAGMA busy_timeout = 2000;");
+  } catch { /* pragmas are best-effort hardening */ }
+  return db;
+}
+
 export class IMessageBridge {
   constructor(options = {}) {
     this.client = options.client; // CliClient pointed at the main
@@ -30,8 +45,23 @@ export class IMessageBridge {
     // command the agent by texting yourself. On by default; your handles come
     // from the allowlist. (Resolved lazily at poll time — allowFrom is set below.)
     this.selfChat = options.selfChat ?? true;
-    this.readMessages = options.readMessages ?? ((sinceRowid) =>
-      readNewMessages(this.dbPath, sinceRowid, { selfHandles: this.selfChat ? [...this.allowFrom] : [] }));
+    // One reused READ-ONLY connection (opened lazily, kept open across polls) so
+    // we don't reopen the 1.5GB chat.db every tick. readNewMessages gets it via
+    // `db`; on any read error we drop it so the next poll reopens cleanly.
+    this._db = null;
+    this.readMessages = options.readMessages ?? (async (sinceRowid) => {
+      if (!this._db) this._db = await openChatDbReadOnly(this.dbPath);
+      try {
+        return await readNewMessages(this.dbPath, sinceRowid, {
+          selfHandles: this.selfChat ? [...this.allowFrom] : [],
+          db: this._db
+        });
+      } catch (error) {
+        try { this._db?.close(); } catch { /* ignore */ }
+        this._db = null; // reopen next tick (e.g. db was vacuumed/replaced)
+        throw error;
+      }
+    });
     this.sendMessage = options.sendMessage ?? sendViaIMessage;
     this.onEvent = options.onEvent ?? (() => {});
     // Texts the bridge itself just sent — so reading the self-thread doesn't
@@ -165,8 +195,10 @@ export class IMessageBridge {
     return rows.reduce((mx, r) => Math.max(mx, r.rowid), 0);
   }
 
-  // Run the poll loop until stop() is called.
-  start({ intervalMs = 2000 } = {}) {
+  // Run the poll loop until stop() is called. Default 10s: a read-only reader is
+  // gentle, but a longer interval further reduces any chance of contending with
+  // Messages, and iMessage commands don't need sub-10s latency.
+  start({ intervalMs = 10000 } = {}) {
     this._stopped = false;
     const tick = async () => {
       if (this._stopped) return;
@@ -175,7 +207,12 @@ export class IMessageBridge {
     };
     tick();
   }
-  stop() { this._stopped = true; if (this._timer) clearTimeout(this._timer); }
+  stop() {
+    this._stopped = true;
+    if (this._timer) clearTimeout(this._timer);
+    try { this._db?.close(); } catch { /* ignore */ } // release chat.db
+    this._db = null;
+  }
 }
 
 // Read new messages newer than sinceRowid. By default only INCOMING
@@ -184,9 +221,10 @@ export class IMessageBridge {
 // self-thread, so you can text yourself to command the agent ("note to self").
 // We never pull your outgoing messages to OTHER people. Returns
 // [{ rowid, handle, fromMe, text, appleDate }].
-export async function readNewMessages(dbPath, sinceRowid, { selfHandles = [] } = {}) {
-  const { DatabaseSync } = await import("node:sqlite");
-  const db = new DatabaseSync(dbPath);
+export async function readNewMessages(dbPath, sinceRowid, { selfHandles = [], db: reuseDb = null } = {}) {
+  // Reuse a caller-owned read-only connection (the polling bridge does this to
+  // avoid reopening chat.db every tick); otherwise open one read-only + close.
+  const db = reuseDb ?? await openChatDbReadOnly(dbPath);
   try {
     const self = [...new Set(selfHandles.map((h) => String(h).toLowerCase()))].filter(Boolean);
     // Outgoing messages carry handle_id=0 (no handle row); the recipient lives
@@ -224,7 +262,7 @@ export async function readNewMessages(dbPath, sinceRowid, { selfHandles = [] } =
       text: r.text && r.text.trim() ? r.text : extractAttributedText(r.body)
     }));
   } finally {
-    db.close();
+    if (!reuseDb) db.close(); // never close a connection the caller owns
   }
 }
 
@@ -255,8 +293,7 @@ export function extractAttributedText(body) {
 // nanoseconds since the 2001-01-01 Apple epoch.
 const APPLE_EPOCH_MS = 978307200000; // 2001-01-01 UTC in unix ms
 export async function searchMessages(dbPath = DEFAULT_DB, { query = "", handle = null, days = null, limit = 50 } = {}) {
-  const { DatabaseSync } = await import("node:sqlite");
-  const db = new DatabaseSync(dbPath);
+  const db = await openChatDbReadOnly(dbPath);
   try {
     const where = ["(m.text IS NOT NULL OR m.attributedBody IS NOT NULL)"];
     const params = [];
