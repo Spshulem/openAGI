@@ -2773,6 +2773,7 @@ function renderSkillDetail(skill) {
   });
 }
 
+let selectedMcpName = null;
 async function refreshMcp() {
   const servers = await fetchJson("/mcp");
   // Preserve scroll position across the full rebuild below — otherwise every
@@ -2810,8 +2811,14 @@ async function refreshMcp() {
   }
   for (const s of servers) {
     const li = document.createElement("li");
+    if (s.name === selectedMcpName) li.className = "active";
     li.innerHTML = \`<div class="title">\${escapeHtml(s.name)} \${s.connected ? '<span class="badge ok">live</span>' : '<span class="badge">idle</span>'}</div><div class="preview">\${(s.tools ?? []).join(", ") || "—"}</div>\`;
-    li.addEventListener("click", () => renderMcpDetail(s));
+    li.addEventListener("click", () => {
+      selectedMcpName = s.name;
+      for (const el of sidebarList.querySelectorAll("li")) el.classList.remove("active");
+      li.classList.add("active");
+      renderMcpDetail(s);
+    });
     sidebarList.appendChild(li);
   }
   // Restore the pre-rebuild scroll position now that the list is repopulated.
@@ -2828,11 +2835,17 @@ async function refreshMcp() {
     \`;
     document.getElementById("emptyRegBtn")?.addEventListener("click", () => openMcpComposer());
   } else {
-    renderMcpDetail(servers[0]);
+    // Keep the user on the server they're working with — otherwise every SSE
+    // refresh (e.g. a connect finishing) snaps the pane back to servers[0],
+    // hiding the OAuth banner of the server they actually clicked Connect on.
+    const sel = servers.find((s) => s.name === selectedMcpName) || servers[0];
+    selectedMcpName = sel.name;
+    renderMcpDetail(sel);
   }
 }
 
 function renderMcpDetail(server) {
+  selectedMcpName = server.name;
   const transportLabel = server.transport === "http" ? \`http · \${escapeHtml(server.auth || "none")}\` : escapeHtml(server.transport);
   const endpoint = server.transport === "http"
     ? \`<pre>\${escapeHtml(server.url || "(no url)")}</pre>\`
