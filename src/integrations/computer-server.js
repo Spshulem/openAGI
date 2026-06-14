@@ -86,18 +86,27 @@ export function createComputerServer({ token, run = execFileAsync, screenshot = 
 
 // Logical (point) size of the main display + the downscale factor we apply.
 // factor maps a coordinate in the returned screenshot's space up to display
-// points (what cliclick consumes).
+// points (what cliclick consumes). Source: `system_profiler` "UI Looks like"
+// (the effective/point resolution) — needs NO TCC permission, unlike asking
+// Finder via osascript (which requires Automation/AppleEvents approval).
+// Cached briefly since the resolution rarely changes and system_profiler is slow.
+let _geoCache = null;
+let _geoCacheAt = 0;
 async function defaultGeometry(run) {
+  if (_geoCache && Date.now() - _geoCacheAt < 30_000) return _geoCache;
   let logicalW = null;
   let logicalH = null;
   try {
-    const { stdout } = await run("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
-    const nums = String(stdout).split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
-    if (nums.length === 4) { logicalW = nums[2]; logicalH = nums[3]; }
-  } catch { /* osascript unavailable — fall back to no scaling */ }
+    const { stdout } = await run("system_profiler", ["SPDisplaysDataType"]);
+    const m = String(stdout).match(/UI Looks like:\s*(\d+)\s*x\s*(\d+)/i)
+      || String(stdout).match(/Resolution:\s*(\d+)\s*x\s*(\d+)/i);
+    if (m) { logicalW = parseInt(m[1], 10); logicalH = parseInt(m[2], 10); }
+  } catch { /* fall back to no scaling */ }
   const targetW = SCALE_WIDTH && logicalW ? Math.min(SCALE_WIDTH, logicalW) : (logicalW ?? 0);
   const factor = logicalW && targetW ? logicalW / targetW : 1;
-  return { logicalW, logicalH, targetW, factor };
+  const geo = { logicalW, logicalH, targetW, factor };
+  if (logicalW) { _geoCache = geo; _geoCacheAt = Date.now(); } // only cache successful reads
+  return geo;
 }
 
 async function defaultScreenshot(run, geo) {
