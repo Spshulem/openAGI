@@ -56,7 +56,7 @@ export class OpenAIResponsesProvider {
     this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-5";
     this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
     this.timeoutMs = options.timeoutMs ?? 120000;
-    this.maxToolHops = options.maxToolHops ?? 6;
+    this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;
     // Per-task model tiering. Defaults to base for everything until tier env
     // vars are set, so this is a no-op until the user opts in.
@@ -126,11 +126,33 @@ export class OpenAIResponsesProvider {
         const parsedArgs = safeParseJson(call.arguments) ?? {};
         const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: call.name, arguments: parsedArgs, result: invocation });
-        conversationInput.push({
-          type: "function_call_output",
-          call_id: call.call_id,
-          output: JSON.stringify(invocation.ok ? invocation.result : { error: invocation.error })
-        });
+        const result = invocation.ok ? invocation.result : { error: invocation.error };
+        // A tool that returns a screenshot (computer_screenshot) carries the PNG
+        // as base64. function_call_output is text-only, so the model can't see
+        // it there — strip the bytes from the JSON output and re-attach them as
+        // a real input_image in a following user turn so the model can ground on it.
+        const image = invocation.ok && result && typeof result === "object" && result.image && result.format ? result : null;
+        if (image) {
+          const { image: bytes, ...meta } = result;
+          conversationInput.push({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: JSON.stringify({ ...meta, image: "[attached as image below]" })
+          });
+          conversationInput.push({
+            role: "user",
+            content: [
+              { type: "input_text", text: `Screenshot (${meta.width}×${meta.height}, click coordinates are in this image's space):` },
+              { type: "input_image", image_url: `data:image/${image.format};base64,${bytes}` }
+            ]
+          });
+        } else {
+          conversationInput.push({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: JSON.stringify(result)
+          });
+        }
       }
     }
 
@@ -181,7 +203,7 @@ export class AnthropicProvider {
     this.version = options.version ?? "2023-06-01";
     this.maxTokens = options.maxTokens ?? 4096;
     this.timeoutMs = options.timeoutMs ?? 120000;
-    this.maxToolHops = options.maxToolHops ?? 6;
+    this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;
     this.router = options.router ?? new ModelRouter({ envPrefix: "ANTHROPIC", baseModel: this.model });
   }
