@@ -56,8 +56,50 @@ export class ToolRegistry {
     return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
   }
 
+  // Tools advertised to the model, bounded so the array doesn't blow past the
+  // provider's limit. A handful of large MCP servers (e.g. PostHog ~118 tools)
+  // can push the total past ~250, which makes the OpenAI Responses API reject
+  // EVERY call with a server_error. Core/internal tools are always advertised;
+  // MCP tools fill the remaining budget, whole servers at a time (smallest
+  // first, so many small integrations beat one giant one). Anything not
+  // advertised is STILL invokable via run_mcp_tool + discoverable via
+  // list_mcp_tools — no capability is lost, just the direct function affordance.
+  _modelToolList(options = {}) {
+    const all = this.list(options);
+    const max = Number(process.env.OPENAGI_MAX_MODEL_TOOLS) || 128;
+    if (all.length <= max) return all;
+    const core = all.filter((t) => t.source !== "mcp");
+    const mcp = all.filter((t) => t.source === "mcp");
+    const budget = Math.max(0, max - core.length);
+    const byServer = new Map();
+    for (const t of mcp) {
+      const s = t.metadata?.server ?? "?";
+      if (!byServer.has(s)) byServer.set(s, []);
+      byServer.get(s).push(t);
+    }
+    const servers = [...byServer.entries()].sort((a, b) => a[1].length - b[1].length);
+    const picked = [];
+    const advertised = [];
+    const overflow = [];
+    for (const [name, tools] of servers) {
+      if (picked.length + tools.length <= budget) { picked.push(...tools); advertised.push(name); }
+      else overflow.push(`${name}(${tools.length})`);
+    }
+    this._logToolCap(all.length, max, advertised, overflow);
+    return [...core, ...picked];
+  }
+
+  // Surface what got capped (once per distinct overflow set) — never silently
+  // drop tools, per the "no silent caps" rule.
+  _logToolCap(total, max, advertised, overflow) {
+    const key = overflow.join(",");
+    if (key === this._lastToolCapKey || !overflow.length) { this._lastToolCapKey = key; return; }
+    this._lastToolCapKey = key;
+    console.warn(`[tools] ${total} tools exceed model cap ${max}; advertising core + [${advertised.join(", ")}] directly. Reachable only via run_mcp_tool: [${overflow.join(", ")}]. Raise OPENAGI_MAX_MODEL_TOOLS to advertise more.`);
+  }
+
   toOpenAITools(options = {}) {
-    return this.list(options).map((tool) => ({
+    return this._modelToolList(options).map((tool) => ({
       type: "function",
       name: tool.name,
       description: tool.description,
@@ -66,7 +108,7 @@ export class ToolRegistry {
   }
 
   toAnthropicTools(options = {}) {
-    return this.list(options).map((tool) => ({
+    return this._modelToolList(options).map((tool) => ({
       name: tool.name,
       description: tool.description,
       input_schema: tool.parameters
@@ -448,7 +490,7 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "list_mcp_tools",
     sideEffects: false,
-    description: "List tools exposed by connected MCP servers.",
+    description: "List tools exposed by connected MCP servers — INCLUDING ones not advertised directly as functions (large servers are capped to keep the tool list within provider limits). Use this to discover a tool, then call it with run_mcp_tool.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
       const tools = runtime.mcp?.listTools?.() ?? [];
@@ -458,7 +500,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "run_mcp_tool",
-    description: "Invoke a tool on a connected MCP server.",
+    description: "Invoke a tool on a connected MCP server. Use this for any MCP tool that isn't available as a direct function (large servers like PostHog are reached this way). Call list_mcp_tools first if unsure of the exact server/tool name.",
     parameters: {
       type: "object",
       properties: {
