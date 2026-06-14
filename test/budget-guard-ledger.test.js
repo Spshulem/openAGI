@@ -36,3 +36,16 @@ test("record without meta still aggregates and does not throw (back-compat)", ()
   assert.equal(rows.length, 1);
   assert.equal(rows[0].channel, null);
 });
+
+test("priceFor bills nano/mini variants at their own rate, not flagship (longest-prefix)", () => {
+  const g = new BudgetGuard({ storePath: path.join(os.tmpdir(), `bg-${Date.now()}.json`) });
+  // gpt-5.4-nano must NOT resolve to gpt-5 ($5/$15) — it's $0.20/$1.25.
+  assert.equal(g.priceFor("gpt-5.4-nano").in, 0.2, "nano input price, not flagship");
+  assert.equal(g.priceFor("gpt-5.4-nano").out, 1.25);
+  assert.equal(g.priceFor("gpt-5-nano").in, 0.05);
+  assert.equal(g.priceFor("gpt-5.4-mini").in, 0.75);
+  assert.equal(g.priceFor("gpt-5.5").out, 30, "gpt-5.5 output is $30, not gpt-5's $15");
+  assert.equal(g.priceFor("gpt-5").in, 5, "flagship still flagship");
+  // an unknown future variant matches the longest sensible prefix, not bare gpt-5
+  assert.equal(g.priceFor("gpt-5.4-nano-2027").in, 0.2);
+});

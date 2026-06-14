@@ -4,12 +4,18 @@ import { resolveDataDir } from "./data-dir.js";
 import { nowIso } from "./utils.js";
 import { CreditLedger } from "./credit-ledger.js";
 
+// USD per 1M tokens. Keep specific variants (…-nano, …-mini, …-5.5) listed so
+// priceFor's longest-prefix match doesn't bill a nano call at flagship rates.
 const DEFAULT_PRICES = {
   "claude-sonnet-4-6": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   "claude-opus-4-7": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
   "claude-haiku-4-5": { in: 1, out: 5, cacheRead: 0.1, cacheWrite: 1.25 },
-  "gpt-5": { in: 5, out: 15, cacheRead: 0.5, cacheWrite: 0 },
+  "gpt-5.5": { in: 5, out: 30, cacheRead: 0.5, cacheWrite: 0 },
+  "gpt-5.4-mini": { in: 0.75, out: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+  "gpt-5.4-nano": { in: 0.2, out: 1.25, cacheRead: 0.02, cacheWrite: 0 },
   "gpt-5-mini": { in: 0.25, out: 2, cacheRead: 0.025, cacheWrite: 0 },
+  "gpt-5-nano": { in: 0.05, out: 0.4, cacheRead: 0.005, cacheWrite: 0 },
+  "gpt-5": { in: 5, out: 15, cacheRead: 0.5, cacheWrite: 0 },
   default: { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 }
 };
 
@@ -100,7 +106,12 @@ export class BudgetGuard {
     if (!model) return this.prices.default;
     const exact = this.prices[model];
     if (exact) return exact;
-    const prefix = Object.keys(this.prices).find((key) => model.startsWith(key));
+    // Longest matching prefix wins, so "gpt-5.4-nano" resolves to the nano
+    // price, not "gpt-5" (flagship). A short prefix like "gpt-5" must never
+    // shadow a more specific variant.
+    const prefix = Object.keys(this.prices)
+      .filter((key) => key !== "default" && model.startsWith(key))
+      .sort((a, b) => b.length - a.length)[0];
     return prefix ? this.prices[prefix] : this.prices.default;
   }
 
