@@ -21,6 +21,29 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_DB = path.join(os.homedir(), "Library", "Messages", "chat.db");
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// iMessage has no markdown — agent replies full of **bold**, ## headers, and
+// [links](url) render literally and look broken. Convert to clean plain text:
+// strip emphasis/headers/code fences, turn list bullets into •, flatten links
+// to "text (url)", and collapse excess blank lines.
+export function toPlainText(md) {
+  if (!md) return "";
+  let t = String(md);
+  t = t.replace(/```[^\n]*\n?([\s\S]*?)```/g, "$1");        // code fences → inner text
+  t = t.replace(/`([^`]+)`/g, "$1");                          // inline code
+  t = t.replace(/!\[[^\]]*\]\([^)]*\)/g, "");                // images → drop
+  t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");      // [text](url) → text (url)
+  t = t.replace(/^\s{0,3}#{1,6}\s+/gm, "");                  // # headers → text
+  t = t.replace(/^\s{0,3}>\s?/gm, "");                       // blockquotes
+  t = t.replace(/^(\s*)[-*+]\s+/gm, "$1• ");                 // bullets → •
+  t = t.replace(/\*\*([^*]+)\*\*/g, "$1").replace(/__([^_]+)__/g, "$1"); // bold
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1$2");           // *italic*
+  t = t.replace(/(^|[^_])_([^_\n]+)_/g, "$1$2");             // _italic_
+  t = t.replace(/~~([^~]+)~~/g, "$1");                       // strikethrough
+  t = t.replace(/^\s{0,3}([-*_]){3,}\s*$/gm, "");            // --- rules
+  t = t.replace(/\n{3,}/g, "\n\n").trim();                   // collapse blank lines
+  return t;
+}
+
 // Open chat.db as a strictly READ-ONLY, non-locking reader. This is critical:
 // node:sqlite opens read-WRITE by default, and a read-write connection on a
 // live WAL database (which Messages.app is constantly writing) attempts WAL
@@ -197,7 +220,7 @@ export class IMessageBridge {
         // Session keys off the conversation so a group has one shared thread.
         const sessionKey = row.isGroup ? row.chatId : row.handle;
         const res = await this.client.chat(decision.forward, { from: `imessage:${sessionKey}` });
-        const reply = res?.json?.reply;
+        const reply = toPlainText(res?.json?.reply);
         if (res?.ok && reply) {
           // Reply to the GROUP chat if it's a group; otherwise DM the sender.
           if (row.isGroup) await this.sendMessage(row.chatId, reply, { group: true });

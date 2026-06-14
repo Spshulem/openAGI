@@ -6,7 +6,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { IMessageBridge, extractAttributedText } from "../src/integrations/imessage-bridge.js";
+import { IMessageBridge, extractAttributedText, toPlainText } from "../src/integrations/imessage-bridge.js";
+
+test("toPlainText strips markdown so iMessage replies aren't wack", () => {
+  const md = "## Plan\n\nHere's the **budget**:\n- venue: $12k\n- food: *catered*\n\nSee [the doc](https://x.com/d) and `run this`.\n\n~~old~~ done";
+  const out = toPlainText(md);
+  assert.ok(!/\*\*|##|~~|`/.test(out), "no markdown markers remain");
+  assert.match(out, /Plan/);
+  assert.match(out, /budget:/);
+  assert.match(out, /• venue: \$12k/, "bullets become •");
+  assert.match(out, /the doc \(https:\/\/x\.com\/d\)/, "links flattened to text (url)");
+  assert.match(out, /run this/);
+  assert.match(out, /old done|done/);
+});
 
 function makeBridge({ messages = [], replies = {}, allowFrom = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-imsg-"));
