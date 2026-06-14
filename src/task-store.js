@@ -251,6 +251,26 @@ export class TaskStore {
     return true;
   }
 
+  // Move a task between the user and agent queues, preserving its id and
+  // history. The snapshot is the authoritative load source, so flipping the
+  // field + re-snapshotting is enough; we log a "move" event on the target
+  // queue for the audit trail. Used by the task-sweep to re-home tasks that
+  // were filed in the wrong queue (e.g. an agent-actionable reply that the
+  // extractor defaulted into the user queue).
+  setQueue(id, queue) {
+    if (!QUEUES.includes(queue)) throw new Error(`unknown queue: ${queue}`);
+    const task = this.tasks.get(id);
+    if (!task || task.queue === queue) return task ?? null;
+    const fromQueue = task.queue;
+    const next = { ...task, queue, updatedAt: nowIso() };
+    this.tasks.set(id, next);
+    this.appendEvent(fromQueue, { op: "delete", id });
+    this.appendEvent(queue, { op: "create", task: next });
+    this.snapshot();
+    this.runtime?.events?.emit?.("task-updated", { op: "update", task: next });
+    return next;
+  }
+
   list({ queue, bucket, status, limit = 50 } = {}) {
     let out = [...this.tasks.values()];
     if (queue) out = out.filter((t) => t.queue === queue);

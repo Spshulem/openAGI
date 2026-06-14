@@ -25,7 +25,8 @@ export const TASK_PROFILES = {
   condense:  { tier: "mini", label: "Memory condensing",   why: "Summarize a cluster of notes into one — a mini model handles it." },
   mine:      { tier: "mini", label: "Session mining",      why: "Cluster intents out of a transcript — mini is enough." },
   plan:      { tier: "mini", label: "Daily plan / recap",  why: "Summarize the day — mini is enough." },
-  extract:   { tier: "nano", label: "iMessage extraction", why: "Pull follow-ups/events from a batch of texts, runs often — nano is plenty." }
+  extract:   { tier: "nano", label: "iMessage extraction", why: "Pull follow-ups/events from a batch of texts, runs often — nano is plenty." },
+  sweep:     { tier: "mini", label: "Task list hygiene",    why: "Classify queue + dedupe/stale-judge the task list — mini has the judgment for it." }
 };
 
 // Order matters for display (strongest → cheapest).

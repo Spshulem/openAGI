@@ -24,14 +24,18 @@ const URL_RE = /https?:\/\/[^\s<>"')]+/gi;
 
 const SYSTEM_PROMPT = [
   "You extract actionable items from a batch of the user's recent text messages.",
+  '"Peri" is the AI assistant; "Spencer" is the human owner.',
   "Return STRICT JSON only, no prose:",
-  '{"followups":[{"text":"<what the user needs to do>","who":"<sender if known>"}],',
+  '{"followups":[{"text":"<the action>","who":"<sender if known>","queue":"agent|user","action":"act|draft"}],',
   ' "events":[{"title":"<plan>","when":"<date/time as written>"}]}',
   "Rules:",
-  "- followups: only things the USER must do or reply to — commitments, direct asks",
-  '  ("can you…", "don\'t forget", "let me know", "send me…"). Not their own outgoing chatter.',
+  "- followups: only real, specific commitments or direct asks. Not idle chatter.",
+  '- queue: "agent" if Peri can handle it itself (reply to a text, look something up, remember a fact,',
+  '  draft/introduce); "user" if only Spencer can (in-person, personal decisions, his own accounts).',
+  '- action (queue "agent" only): "draft" if completing it SENDS something externally (a text/email/DM) —',
+  '  prepare but do not send; "act" if safe to just do (lookup, remember, internal note). Use "act" otherwise.',
   "- events: plans tied to a date/time (dinner Fri 7pm, flight Tuesday, meeting the 15th).",
-  "- Be conservative. Only real, specific items. Use empty arrays if nothing qualifies."
+  "- Be conservative. Use empty arrays if nothing qualifies."
 ].join("\n");
 
 export class IMessageExtractor {
@@ -112,9 +116,13 @@ export class IMessageExtractor {
     for (const f of followups) {
       if (!f?.text) continue;
       try {
+        // Route to the right queue, and tag agent tasks that send externally
+        // as `plan-action` (draft-only) so autopilot prepares but never sends.
+        const queue = f.queue === "agent" ? "agent" : "user";
+        const tags = queue === "agent" && f.action === "draft" ? ["plan-action"] : [];
         this.runtime?.tasks?.add?.(
-          { title: f.text, sourceMeta: { from: f.who ?? null, origin: "imessage" } },
-          { source: "imessage", queue: "user" }
+          { title: f.text, tags, sourceMeta: { from: f.who ?? null, origin: "imessage" } },
+          { source: "imessage", queue }
         );
         createdTasks++;
       } catch { /* best effort */ }

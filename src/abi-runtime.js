@@ -27,6 +27,7 @@ import { Introspector } from "./introspector.js";
 import { PatternMiner } from "./pattern-miner.js";
 import { SessionMiner } from "./session-miner.js";
 import { IMessageExtractor } from "./imessage-extractor.js";
+import { TaskSweep } from "./task-sweep.js";
 import { ProactiveObserver } from "./proactive-observer.js";
 import { TaskStore } from "./task-store.js";
 import { PendingActionStore } from "./pending-actions.js";
@@ -177,6 +178,9 @@ export class AbiRuntime {
     // a compact summary into the observer's system prompt each pass.
     this.suggestionFeedback = options.suggestionFeedback ?? new SuggestionFeedback({ runtime: this, dataDir: options.dataDir });
     this.tasks = options.tasks ?? new TaskStore({ runtime: this, dataDir: options.dataDir, ...(options.taskStoreOptions ?? {}) });
+    // Periodic task-list hygiene: dedupe, re-home to the right queue, cancel
+    // stale auto-extracted items, archive old terminal tasks.
+    this.taskSweep = options.taskSweep ?? new TaskSweep({ runtime: this });
     // The "ask me" queue: ambiguous task-reconciliation outcomes become
     // questions instead of bad guesses. dataDir-scoped like other stores.
     this.clarifications = options.clarifications ?? new ClarificationStore({
@@ -379,6 +383,17 @@ export class AbiRuntime {
         enabled: true,
         task: "task-activity-scan",
         intervalMs: 15 * 60 * 1000
+      });
+      // Task-list hygiene — dedupe, re-home to the right queue (agent vs
+      // user), cancel stale auto-extracted items, archive old terminal
+      // tasks. Tunable via OPENAGI_TASK_SWEEP_MIN (default 60 min).
+      const sweepMin = Number(process.env.OPENAGI_TASK_SWEEP_MIN) || 60;
+      this.cron.addJob({
+        id: "task-sweep",
+        name: `Task-list hygiene — dedupe / re-home / archive every ${sweepMin} min`,
+        enabled: true,
+        task: "task-sweep",
+        intervalMs: sweepMin * 60 * 1000
       });
       registerCoreTools(this.tools, this);
       // Computer-use tools register only when explicitly opted-in via env
@@ -671,6 +686,11 @@ export class AbiRuntime {
         if (!this.proactiveObserver?.scanTasksAgainstActivity) return { skipped: true, reason: "no observer" };
         const result = await this.proactiveObserver.scanTasksAgainstActivity({ now });
         this.events?.emit?.("miner-result", { source: "task-activity-scan", at: nowIso(), ...result });
+        return result;
+      }
+      if (job.task === "task-sweep") {
+        const result = await this.taskSweep.sweep({ now });
+        this.events?.emit?.("miner-result", { source: "task-sweep", at: nowIso(), ...result });
         return result;
       }
       return { skipped: true, reason: `No handler for task ${job.task}` };
