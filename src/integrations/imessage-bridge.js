@@ -337,23 +337,30 @@ export async function readMaxAppleDate(dbPath, reuseDb = null) {
 }
 
 // Best-effort text out of the NSAttributedString typedstream blob Messages
-// stores in `attributedBody`. Byte-walk (no fragile control-char regex): find
-// the "NSString" class marker, skip the short length-prefix of control bytes
-// (and a leading '+'), then collect UTF-8 until the 0x86/0x84 end marker.
-// Not a full typedstream parser — pragmatic, handles the common case.
+// stores in `attributedBody` (used when the `text` column is NULL, which is the
+// default on recent macOS). The layout after the class name is:
+//   NSString 01 9x 84 01 2b <len> <utf8 bytes…> 86 …
+// The 0x2b ('+') marker introduces a length-prefixed string; <len> is a
+// typedstream integer — a single byte when < 0x80, else 0x81 + uint16LE or
+// 0x82 + uint32LE for longer strings. Read exactly <len> UTF-8 bytes.
+// (The old version byte-walked from a fixed offset and stopped on the first
+// high byte (0x94), so it emitted a lone replacement char for every message —
+// breaking the "Peri" trigger on the bridge host. See PR that added this note.)
 export function extractAttributedText(body) {
   if (!body) return "";
   const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
   const marker = buf.indexOf(Buffer.from("NSString", "ascii"));
   if (marker === -1) return "";
-  let i = marker + "NSString".length;
-  while (i < buf.length && (buf[i] < 0x20 || buf[i] === 0x2b)) i++; // skip ctrl bytes + leading '+'
-  const start = i;
-  while (i < buf.length && buf[i] !== 0x86 && buf[i] !== 0x84) i++;
-  // Trim any trailing control bytes that slipped in.
-  let end = i;
-  while (end > start && buf[end - 1] < 0x20) end--;
-  return buf.slice(start, end).toString("utf8").trim();
+  let i = buf.indexOf(0x2b, marker + "NSString".length); // the '+' string marker
+  if (i === -1) return "";
+  i += 1;
+  if (i >= buf.length) return "";
+  let len = buf[i++];
+  if (len === 0x81) { len = buf.readUInt16LE(i); i += 2; }
+  else if (len === 0x82) { len = buf.readUInt32LE(i); i += 4; }
+  if (!Number.isFinite(len) || len <= 0) return "";
+  // Strip U+FFFC (object-replacement) placeholders that mark inline attachments.
+  return buf.slice(i, Math.min(i + len, buf.length)).toString("utf8").replace(/￼/g, "").trim();
 }
 
 // Search the iMessage history (both directions). Filters: text `query`

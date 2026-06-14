@@ -98,11 +98,27 @@ test("advances the date high-water mark even when a send errors", async () => {
 });
 
 test("extractAttributedText pulls text from an attributedBody blob", () => {
-  // Minimal synthetic typedstream: ...NSString <ctrl> + <text> 0x86...
+  // Real chat.db typedstream layout: NSString 01 94 84 01 2b <len> <utf8> 86…
+  // where <len> is the UTF-8 byte length (single byte when < 0x80).
   const text = "hello from imessage";
   const blob = Buffer.concat([
     Buffer.from("streamtyped...NSString", "binary"),
-    Buffer.from([0x01, 0x2b]),
+    Buffer.from([0x01, 0x94, 0x84, 0x01, 0x2b, text.length]),
+    Buffer.from(text, "utf8"),
+    Buffer.from([0x86, 0x84])
+  ]);
+  assert.equal(extractAttributedText(blob), text);
+});
+
+test("extractAttributedText handles long strings (0x81 + uint16 length)", () => {
+  // Strings >= 0x80 bytes encode the length as 0x81 followed by a uint16 LE.
+  const text = "x".repeat(200);
+  const len = Buffer.alloc(2);
+  len.writeUInt16LE(text.length, 0);
+  const blob = Buffer.concat([
+    Buffer.from("streamtyped...NSString", "binary"),
+    Buffer.from([0x01, 0x94, 0x84, 0x01, 0x2b, 0x81]),
+    len,
     Buffer.from(text, "utf8"),
     Buffer.from([0x86, 0x84])
   ]);
