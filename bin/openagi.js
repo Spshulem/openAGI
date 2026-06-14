@@ -212,6 +212,20 @@ async function cmdImessageServer(flags) {
   await new Promise(() => {}); // run until killed
 }
 
+async function cmdComputerServer(flags) {
+  const { createComputerServer } = await import("../src/integrations/computer-server.js");
+  const token = flags.token ?? process.env.OPENAGI_COMPUTER_NODE_TOKEN ?? null;
+  if (!token) { console.error(c(RED, "a token is required — pass --token <secret> (the main uses the same as OPENAGI_COMPUTER_NODE_TOKEN)")); return 1; }
+  const port = Number(flags.port ?? process.env.OPENAGI_COMPUTER_NODE_PORT ?? 43299);
+  const host = flags.host ?? "0.0.0.0";
+  const server = createComputerServer({ token });
+  await new Promise((resolve) => server.listen(port, host, resolve));
+  console.log(c(GREEN, `computer-use node service on http://${host}:${port}`));
+  console.log(c(DIM, `On the main, set OPENAGI_COMPUTER_NODE=http://<this-host>:${port} and OPENAGI_COMPUTER_NODE_TOKEN=<the token>, then restart — the computer_* tools execute here.`));
+  console.log(c(DIM, "Requires: a display (or virtual display), Screen Recording (capture) + Accessibility (input) for this process, and `cliclick` installed. Ctrl-C to stop."));
+  await new Promise(() => {}); // run until killed
+}
+
 async function cmdImessageSearch(positional, flags) {
   const { searchMessages } = await import("../src/integrations/imessage-bridge.js");
   const query = positional.join(" ").trim();
@@ -346,6 +360,8 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
                                          [--from h] [--days N] [--limit N]
   openagi imessage-server --token T      (macOS) serve iMessage search to a
                                          remote main (gives it search_imessages)
+  openagi computer-server --token T      (macOS) serve screen capture + input to
+                                         a remote main (powers the computer_* tools)
 
 ${c(BOLD, "Global flags:")} --remote <url>  --token <token>  --json
 
@@ -370,6 +386,7 @@ async function main() {
       case "imessage-bridge": return await cmdImessageBridge(flags);
       case "imessage-search": return await cmdImessageSearch(positional, flags);
       case "imessage-server": return await cmdImessageServer(flags);
+      case "computer-server": return await cmdComputerServer(flags);
       case "tick": return await cmdTick(flags);
       case "models": return await cmdModels(flags);
       default:
