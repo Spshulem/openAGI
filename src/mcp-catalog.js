@@ -249,6 +249,25 @@ export const MCP_CATALOG = [
     }
   },
   {
+    id: "airtable",
+    name: "Airtable",
+    description: "Read and write Airtable bases, tables, fields, and records — create/update structured data.",
+    category: "developer-tools",
+    authType: "api-key",
+    status: "available",
+    apiKeyEnvVar: "AIRTABLE_API_KEY",
+    apiKeyHelp: "Personal access token from Airtable → Builder hub → Personal access tokens (scopes: schema.bases:read, data.records:read, data.records:write).",
+    matches: { hostnames: ["airtable.com"], keywords: ["airtable", "base", "no-code database"] },
+    // Airtable ships an stdio MCP via npm; the token is read from the env, which
+    // the registry expands from the user's .env at register time.
+    register: {
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "airtable-mcp-server"],
+      env: { AIRTABLE_API_KEY: "\${AIRTABLE_API_KEY}" }
+    }
+  },
+  {
     id: "neon",
     name: "Neon",
     description: "Manage Neon serverless Postgres databases and branches.",
