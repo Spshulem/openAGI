@@ -56,6 +56,26 @@ export function isComputerUseEnabled() {
   return v === "1" || v === "true" || v === "yes";
 }
 
+/// A configured computer-use node (a Mac running `openagi computer-server`)
+/// turns the stub into real execution: screenshots + input synthesis run on
+/// that node. Without it, input is logged and refused (no fake success).
+function computerNode() {
+  const url = (process.env.OPENAGI_COMPUTER_NODE ?? "").replace(/\/$/, "");
+  if (!url) return null;
+  return { url, token: process.env.OPENAGI_COMPUTER_NODE_TOKEN ?? null };
+}
+
+async function callNode(node, path, body, fetchImpl) {
+  const res = await fetchImpl(`${node.url}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(node.token ? { authorization: `Bearer ${node.token}` } : {}) },
+    body: JSON.stringify(body ?? {})
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || `computer node HTTP ${res.status}`);
+  return json;
+}
+
 /// Remove all computer-use tools from the registry. Caller is expected
 /// to also close any active session so the agent doesn't leave a dangling
 /// reference. Returns the number of tools actually unregistered.
@@ -70,7 +90,7 @@ export function unregisterComputerUseTools(registry) {
   return count;
 }
 
-export function registerComputerUseTools(registry, runtime) {
+export function registerComputerUseTools(registry, runtime, { fetchImpl = globalThis.fetch } = {}) {
   if (!runtime.computerUseLog) return { registered: false, reason: "no computer-use log bound" };
 
   const requireActiveSession = () => {
@@ -139,7 +159,28 @@ export function registerComputerUseTools(registry, runtime) {
         args: {},
         reasoning: args.reasoning ?? null
       });
-      // Stub: pull recent OCR + active app from existing observation store.
+      const node = computerNode();
+      if (node) {
+        try {
+          const shot = await callNode(node, "/screenshot", {}, fetchImpl);
+          runtime.computerUseLog.markActionResult(action.id, {
+            status: "executed",
+            result: { width: shot.width, height: shot.height, bytes: shot.bytes }
+          });
+          return {
+            actionId: action.id,
+            image: shot.base64,
+            format: shot.format ?? "png",
+            width: shot.width,
+            height: shot.height,
+            note: "Live screenshot from the computer-use node."
+          };
+        } catch (error) {
+          runtime.computerUseLog.markActionResult(action.id, { status: "error", result: { error: error.message } });
+          throw new Error(`computer-use node screenshot failed: ${error.message}`);
+        }
+      }
+      // No node: fall back to OCR readback from the observation store.
       const snippets = await (runtime.observations?.search?.({ limit: 3 }) ?? Promise.resolve([]));
       const text = snippets.map((s) => s.text ?? "").filter(Boolean).join("\n").slice(0, 1200);
       const app = snippets[0]?.app ?? "(unknown)";
@@ -151,19 +192,19 @@ export function registerComputerUseTools(registry, runtime) {
         actionId: action.id,
         app,
         ocrSample: text || "(no recent OCR — capture may not be running)",
-        note: "Real OCR readback. Raw screenshot image bytes are not available in this build (ships with the Mac app)."
+        note: "OCR readback only — no computer-use node configured, so no raw screenshot. Set OPENAGI_COMPUTER_NODE for live capture."
       };
     }
   });
 
-  // Helper to register an input-synthesis action tool. Production honesty:
-  // the intent + reasoning are recorded to the audit log, the action is
-  // marked "unavailable", and then the handler THROWS so the agent receives
-  // an explicit failure instead of a fabricated success. No silent stub.
-  function registerUnavailableAction(name, description, paramShape) {
+  // Helper to register an input-synthesis action tool. When a computer-use
+  // node is configured the action executes ON that node (real input); without
+  // one, the intent + reasoning are logged and the handler THROWS so the agent
+  // gets an explicit failure instead of a fabricated success. No silent stub.
+  function registerAction(name, nodePath, description, paramShape, payloadOf) {
     registry.register({
       name,
-      description: description + " NOTE: not executable in this build — the call is logged and then refused.",
+      description: description + " Executes on the connected computer-use node; without one (OPENAGI_COMPUTER_NODE unset) the call is logged and refused.",
       parameters: {
         type: "object",
         properties: {
@@ -181,36 +222,47 @@ export function registerComputerUseTools(registry, runtime) {
           args: actionArgs,
           reasoning: reasoning ?? null
         });
-        runtime.computerUseLog.markActionResult(action.id, {
-          status: "unavailable",
-          result: { reason: "input synthesis not available in this build" }
-        });
-        throw new Error(EXECUTION_UNAVAILABLE);
+        const node = computerNode();
+        if (!node) {
+          runtime.computerUseLog.markActionResult(action.id, {
+            status: "unavailable",
+            result: { reason: "no computer-use node configured" }
+          });
+          throw new Error(EXECUTION_UNAVAILABLE);
+        }
+        try {
+          await callNode(node, nodePath, payloadOf(actionArgs), fetchImpl);
+          runtime.computerUseLog.markActionResult(action.id, { status: "executed", result: { via: "node" } });
+          return { actionId: action.id, ok: true };
+        } catch (error) {
+          runtime.computerUseLog.markActionResult(action.id, { status: "error", result: { error: error.message } });
+          throw new Error(`computer-use node ${name} failed: ${error.message}`);
+        }
       }
     });
   }
 
-  registerUnavailableAction("computer_click", "Click at (x, y) coordinates on the user's screen. Coordinates are screen-space pixels with (0,0) at top-left.", {
+  registerAction("computer_click", "/click", "Click at (x, y) coordinates on the screen. Coordinates are screen-space pixels with (0,0) at top-left.", {
     x: { type: "integer", description: "Screen x (pixels)." },
     y: { type: "integer", description: "Screen y (pixels)." },
     button: { type: "string", enum: ["left", "right", "middle"], description: "Default left." }
-  });
-  registerUnavailableAction("computer_type", "Type a string into the focused app.", {
+  }, (a) => ({ x: a.x, y: a.y, button: a.button ?? "left" }));
+  registerAction("computer_type", "/type", "Type a string into the focused app.", {
     text: { type: "string", description: "Text to type. Use computer_key for non-printable keys." }
-  });
-  registerUnavailableAction("computer_key", "Press a key chord. Examples: 'cmd+a', 'enter', 'esc', 'cmd+shift+t'.", {
+  }, (a) => ({ text: a.text ?? "" }));
+  registerAction("computer_key", "/key", "Press a key chord. Examples: 'cmd+a', 'enter', 'esc', 'cmd+shift+t'.", {
     chord: { type: "string", description: "Key chord, plus-separated. Modifiers: cmd, shift, alt, ctrl. Then the key name." }
-  });
-  registerUnavailableAction("computer_scroll", "Scroll at (x, y).", {
+  }, (a) => ({ chord: a.chord }));
+  registerAction("computer_scroll", "/scroll", "Scroll at (x, y).", {
     x: { type: "integer" },
     y: { type: "integer" },
     deltaX: { type: "integer", description: "Horizontal scroll delta in lines." },
     deltaY: { type: "integer", description: "Vertical scroll delta in lines. Negative = down." }
-  });
-  registerUnavailableAction("computer_move", "Move the mouse to (x, y) without clicking.", {
+  }, (a) => ({ x: a.x, y: a.y, deltaX: a.deltaX, deltaY: a.deltaY }));
+  registerAction("computer_move", "/move", "Move the mouse to (x, y) without clicking.", {
     x: { type: "integer" },
     y: { type: "integer" }
-  });
+  }, (a) => ({ x: a.x, y: a.y }));
 
-  return { registered: true };
+  return { registered: true, node: Boolean(computerNode()) };
 }
