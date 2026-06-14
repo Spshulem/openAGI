@@ -13,18 +13,32 @@ const execFileAsync = promisify(execFile);
 // reaches it through the computer_* tools when OPENAGI_COMPUTER_NODE is set.
 //
 //   GET  /health                         -> { ok, service: "computer" }
-//   POST /screenshot {}                  -> { format, base64, width, height, bytes }
+//   POST /screenshot {}                  -> { format, base64, width, height, scale, ... }
 //   POST /click  { x, y, button? }       -> { ok: true }
 //   POST /move   { x, y }                -> { ok: true }
 //   POST /type   { text }                -> { ok: true }
 //   POST /key    { chord }               -> { ok: true }   ("cmd+a", "enter", …)
 //   POST /scroll { x, y, deltaX, deltaY }-> 501 (not supported via cliclick)
 //
-// Real execution: `screencapture` for the image, `cliclick` for input. The
-// node process needs macOS Screen Recording (capture) + Accessibility (input)
+// Coordinate model (matches the Anthropic/OpenAI reference loops):
+//   * `screencapture` returns PIXELS (a Retina/HiDPI display is 2× the logical
+//     point size). `cliclick` clicks in POINTS. So raw screenshot coords would
+//     be off by the backing-scale factor.
+//   * Vision models are also more accurate on smaller images (~1280px wide).
+//   So we downscale the screenshot to OPENAGI_COMPUTER_SCALE_WIDTH (default
+//   1280, capped at the display's logical width) and report that as the image
+//   the model reasons about. Click/move coords come back in THAT space and we
+//   scale them up to logical points before handing them to cliclick. One factor
+//   handles both Retina and the downscale.
+//
+// Real execution: `screencapture` for the image, `sips` to resize, `cliclick`
+// for input, `osascript` (Finder desktop bounds) for the logical point size.
+// The node process needs Screen Recording (capture) + Accessibility (input)
 // permissions — failures surface as explicit errors, never fake success.
 
-export function createComputerServer({ token, run = execFileAsync, screenshot = defaultScreenshot } = {}) {
+const SCALE_WIDTH = Number(process.env.OPENAGI_COMPUTER_SCALE_WIDTH ?? "1280") || 0; // 0 = no scaling
+
+export function createComputerServer({ token, run = execFileAsync, screenshot = defaultScreenshot, geometry = defaultGeometry } = {}) {
   return http.createServer((req, res) => {
     const send = (code, body) => {
       res.writeHead(code, { "content-type": "application/json" });
@@ -46,13 +60,18 @@ export function createComputerServer({ token, run = execFileAsync, screenshot = 
       try { body = raw ? JSON.parse(raw) : {}; } catch { return send(400, { error: "bad json" }); }
       try {
         switch (url.pathname) {
-          case "/screenshot": return send(200, await screenshot(run));
+          case "/screenshot": return send(200, await screenshot(run, await geometry(run)));
           case "/click": {
+            const g = await geometry(run);
             const prefix = body.button === "right" ? "rc" : body.button === "middle" ? "tc" : "c";
-            await run("cliclick", [`${prefix}:${int(body.x)},${int(body.y)}`]);
+            await run("cliclick", [`${prefix}:${scale(body.x, g.factor)},${scale(body.y, g.factor)}`]);
             return send(200, { ok: true });
           }
-          case "/move": await run("cliclick", [`m:${int(body.x)},${int(body.y)}`]); return send(200, { ok: true });
+          case "/move": {
+            const g = await geometry(run);
+            await run("cliclick", [`m:${scale(body.x, g.factor)},${scale(body.y, g.factor)}`]);
+            return send(200, { ok: true });
+          }
           case "/type": await run("cliclick", ["-w", "20", `t:${String(body.text ?? "")}`]); return send(200, { ok: true });
           case "/key": await run("cliclick", keyArgsForChord(body.chord)); return send(200, { ok: true });
           case "/scroll": return send(501, { error: "scroll is not supported on this node (cliclick has no scroll primitive)" });
@@ -65,13 +84,39 @@ export function createComputerServer({ token, run = execFileAsync, screenshot = 
   });
 }
 
-async function defaultScreenshot(run) {
+// Logical (point) size of the main display + the downscale factor we apply.
+// factor maps a coordinate in the returned screenshot's space up to display
+// points (what cliclick consumes).
+async function defaultGeometry(run) {
+  let logicalW = null;
+  let logicalH = null;
+  try {
+    const { stdout } = await run("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop']);
+    const nums = String(stdout).split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite);
+    if (nums.length === 4) { logicalW = nums[2]; logicalH = nums[3]; }
+  } catch { /* osascript unavailable — fall back to no scaling */ }
+  const targetW = SCALE_WIDTH && logicalW ? Math.min(SCALE_WIDTH, logicalW) : (logicalW ?? 0);
+  const factor = logicalW && targetW ? logicalW / targetW : 1;
+  return { logicalW, logicalH, targetW, factor };
+}
+
+async function defaultScreenshot(run, geo) {
   const file = path.join(os.tmpdir(), `openagi-cu-${process.pid}-${Math.floor(process.hrtime()[1])}.png`);
   try {
     await run("screencapture", ["-x", "-t", "png", file]);
+    if (geo?.targetW) await run("sips", ["--resampleWidth", String(geo.targetW), file]); // resize in place, keeps aspect
     const buf = fs.readFileSync(file);
     const dims = pngDims(buf);
-    return { format: "png", base64: buf.toString("base64"), width: dims.w, height: dims.h, bytes: buf.length };
+    return {
+      format: "png",
+      base64: buf.toString("base64"),
+      width: dims.w,
+      height: dims.h,
+      bytes: buf.length,
+      scale: geo?.factor ?? 1,
+      logicalWidth: geo?.logicalW ?? null,
+      logicalHeight: geo?.logicalH ?? null
+    };
   } finally {
     try { fs.unlinkSync(file); } catch { /* ignore */ }
   }
@@ -108,7 +153,7 @@ export function keyArgsForChord(chord) {
   return args;
 }
 
-function int(v) { return Math.round(Number(v)) || 0; }
+function scale(v, factor) { return Math.round(Number(v || 0) * (factor || 1)); }
 
 function mapError(error) {
   const msg = error?.stderr || error?.message || String(error);

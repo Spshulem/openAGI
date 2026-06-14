@@ -27,14 +27,34 @@ test("rejects requests without the bearer token", async () => {
   } finally { server.close(); }
 });
 
-test("/click maps button to the right cliclick verb", async () => {
+test("/click maps button to the right cliclick verb (factor 1 = no scaling)", async () => {
   const calls = [];
-  const { server, base } = await start({ token: "secret", run: async (cmd, args) => { calls.push([cmd, args]); } });
+  const { server, base } = await start({
+    token: "secret",
+    run: async (cmd, args) => { calls.push([cmd, args]); },
+    geometry: async () => ({ factor: 1, targetW: 1280, logicalW: 1280 })
+  });
   try {
     await post(base, "/click", { x: 10, y: 20 });
     await post(base, "/click", { x: 30, y: 40, button: "right" });
     assert.deepEqual(calls[0], ["cliclick", ["c:10,20"]]);
     assert.deepEqual(calls[1], ["cliclick", ["rc:30,40"]]);
+  } finally { server.close(); }
+});
+
+test("/click scales screenshot-space coords up to logical points", async () => {
+  const calls = [];
+  const { server, base } = await start({
+    token: "secret",
+    run: async (cmd, args) => { calls.push([cmd, args]); },
+    // logical 2560 wide, screenshot downscaled to 1280 → factor 2
+    geometry: async () => ({ factor: 2, targetW: 1280, logicalW: 2560 })
+  });
+  try {
+    await post(base, "/click", { x: 100, y: 50 });
+    await post(base, "/move", { x: 640, y: 400 });
+    assert.deepEqual(calls[0], ["cliclick", ["c:200,100"]]);
+    assert.deepEqual(calls[1], ["cliclick", ["m:1280,800"]]);
   } finally { server.close(); }
 });
 
