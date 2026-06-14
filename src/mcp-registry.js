@@ -16,6 +16,16 @@ const ALLOWED_STDIO_COMMANDS = new Set([
   "docker"
 ]);
 
+// MCP tools are exposed to the model as `mcp_<server>_<tool>`, and that name
+// must match OpenAI's tool-name rule ^[a-zA-Z0-9_-]+$. BOTH segments can carry
+// spaces/punctuation (e.g. a server literally named "BB Staging"), so sanitize
+// each — otherwise the whole tools[] array is rejected and every tool-bearing
+// call (autopilot, chat, sweeps) fails. The handler dispatches via stored
+// server/tool refs, not by parsing this name, so sanitizing is lossless.
+const mcpSeg = (s) => String(s).replace(/[^a-zA-Z0-9_]/g, "_");
+const mcpToolName = (server, tool) => `mcp_${mcpSeg(server)}_${mcpSeg(tool)}`;
+const mcpToolPrefix = (server) => `mcp_${mcpSeg(server)}_`;
+
 export class McpRegistry {
   constructor(options = {}) {
     this.servers = new Map();
@@ -224,7 +234,7 @@ export class McpRegistry {
           name: rawName,
           // The name the tool is actually registered + callable under (matches
           // exposeAsTools). Consumers that build allowlists must use this.
-          registeredName: `mcp_${name}_${String(rawName).replace(/[^a-zA-Z0-9_]/g, "_")}`,
+          registeredName: mcpToolName(name, rawName),
           description: tool.description ?? "",
           inputSchema: tool.inputSchema ?? null,
           connected: Boolean(client?.connected)
@@ -405,7 +415,7 @@ export class McpRegistry {
     this.clients.delete(name);
     if (this.toolRegistry) {
       for (const toolName of [...this.toolRegistry.tools.keys()]) {
-        if (toolName.startsWith(`mcp_${name}_`)) this.toolRegistry.unregister(toolName);
+        if (toolName.startsWith(mcpToolPrefix(name))) this.toolRegistry.unregister(toolName);
       }
     }
     return true;
@@ -428,10 +438,10 @@ export class McpRegistry {
     const client = this.clients.get(serverName);
     if (!client) return;
     for (const toolName of [...this.toolRegistry.tools.keys()]) {
-      if (toolName.startsWith(`mcp_${serverName}_`)) this.toolRegistry.unregister(toolName);
+      if (toolName.startsWith(mcpToolPrefix(serverName))) this.toolRegistry.unregister(toolName);
     }
     for (const tool of client.tools ?? []) {
-      const safeName = `mcp_${serverName}_${String(tool.name).replace(/[^a-zA-Z0-9_]/g, "_")}`;
+      const safeName = mcpToolName(serverName, tool.name);
       this.toolRegistry.register({
         name: safeName,
         description: `[MCP:${serverName}] ${tool.description ?? tool.name}`,
