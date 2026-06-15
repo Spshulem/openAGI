@@ -218,7 +218,9 @@ export class AbiRuntime {
         intervalMs: autopilotMin * 60 * 1000,
         input: {
           agentId: "main",
-          prompt: AGENT_PULSE_PROMPT
+          prompt: AGENT_PULSE_PROMPT,
+          // Only fire (spend a base-model call) when there's queued agent work.
+          requireQueuedWork: true
         }
       });
       this.cron.addJob({
@@ -887,6 +889,14 @@ export class AbiRuntime {
 
   async runAutopilot(job) {
     if (!this.agentHost) return { skipped: true, reason: "agent-host-disabled" };
+    // Cheap gate (no tokens): a queue-draining pulse must NOT spend a base-model
+    // call when there's nothing committed to do. Jobs opt in via
+    // input.requireQueuedWork; scheduled review prompts (weekly-harsh-review)
+    // leave it off and run unconditionally. This is the "react only to new work"
+    // rule — the agent wakes only when agentPickNext has a real task.
+    if (job.input?.requireQueuedWork && !this.tasks?.agentPickNext?.()) {
+      return { skipped: true, reason: "no queued agent work" };
+    }
     try {
       this.budget.check();
     } catch (error) {
