@@ -23,7 +23,8 @@ final class ActivityTracker {
       Task { @MainActor in self.handleAppFocus(bundleId: app?.bundleIdentifier, name: app?.localizedName) }
     }
     pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-      Task { @MainActor in self?.pollFrontmostWindow() }
+      guard let self else { return }
+      Task { @MainActor in self.pollFrontmostWindow() }
     }
     pollFrontmostWindow()
   }
