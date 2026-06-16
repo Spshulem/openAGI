@@ -15,7 +15,8 @@ final class CaptureController {
   func start() {
     apply()
     retentionTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
-      Task { @MainActor in self?.runRetention() }
+      guard let self else { return }
+      Task { @MainActor in self.runRetention() }
     }
     runRetention()
   }
