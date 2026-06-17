@@ -668,6 +668,25 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           : null;
         return sendJson(res, 200, { digest });
       }
+      if (method === "POST" && pathname.startsWith("/outreach/") && pathname.endsWith("/act")) {
+        const id = decodeURIComponent(pathname.slice("/outreach/".length, -"/act".length));
+        const item = runtime.outreach?.get(id);
+        if (!item) return sendJson(res, 404, { error: "unknown outreach item" });
+        if (item.status === "acted" || item.status === "dismissed") {
+          return sendJson(res, 200, { item });
+        }
+        const body = await readJson(req).catch(() => ({}));
+        const action = String(body.action ?? "");
+        try {
+          await applyOutreachAction(runtime, item, action, body.note);
+          const status = action === "dismiss" ? "dismissed" : "acted";
+          const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });
+          return sendJson(res, 200, { item: updated });
+        } catch (error) {
+          const updated = runtime.outreach.resolve(id, { action, by: "user" }, { status: "error", error: error.message });
+          return sendJson(res, 400, { item: updated, error: error.message });
+        }
+      }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/approve")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/approve".length));
         const action = runtime.pendingActions?.get(id);
@@ -1451,6 +1470,42 @@ function sendJson(res, status, value) {
   const body = JSON.stringify(value, null, 2);
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body) });
   res.end(body);
+}
+
+// Map an outreach action to the real action on the underlying source. Throws
+// on a failed delegation so the route can mark the item status:"error".
+async function applyOutreachAction(runtime, item, action, note) {
+  if (action === "dismiss") return;
+  const ref = item.sourceRef ?? {};
+  switch (ref.kind) {
+    case "draft":
+      if (action === "approve") { if (!runtime.drafts?.approve(ref.id)) throw new Error("draft not approvable"); return; }
+      if (action === "edit") return;
+      throw new Error(`unsupported draft action: ${action}`);
+    case "task":
+      // TaskStore has no dedicated cancel(); update(id,{status:"cancelled"})
+      // is the canonical cancel path (returns the task, or null if unknown).
+      if (action === "close") { if (!runtime.tasks?.update(ref.id, { status: "cancelled" })) throw new Error("task not cancellable"); return; }
+      if (action === "keep" || action === "snooze") return;
+      throw new Error(`unsupported task action: ${action}`);
+    case "pending-action":
+      if (action === "do") {
+        const a = runtime.pendingActions?.get(ref.id);
+        if (!a) throw new Error("pending action gone");
+        const r = await runtime.tools.invoke(a.toolName, a.args, { ...a.context, __confirmed: true });
+        runtime.pendingActions.decide(ref.id, { decision: "approve", decidedBy: "user", result: r.ok ? r.result : null, error: r.ok ? null : r.error });
+        if (!r.ok) throw new Error(r.error ?? "tool failed");
+        return;
+      }
+      throw new Error(`unsupported pending-action action: ${action}`);
+    case "suggestion":
+      if (action === "accept") return;
+      throw new Error(`unsupported suggestion action: ${action}`);
+    case "clarification":
+      return;
+    default:
+      return;
+  }
 }
 
 function sendXml(res, status, value) {

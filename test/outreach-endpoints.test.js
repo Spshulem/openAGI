@@ -38,3 +38,37 @@ test("GET /outreach/digest returns the current rollup or null", async () => {
   assert.ok("digest" in json);
   await app.close?.();
 });
+
+test("POST /outreach/:id/act approves a draft via delegation and is idempotent", async () => {
+  const { runtime, app, base } = await bootApp();
+  const draft = runtime.drafts.add({ kind: "reply", title: "Reply", body: "hello" });
+  const item = runtime.outreach.append({
+    type: "draft", sourceRef: { kind: "draft", id: draft.id },
+    title: "Reply", needsDecision: false, actions: ["approve", "dismiss"]
+  });
+  const res = await fetch(`${base}/outreach/${item.id}/act`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "approve" })
+  });
+  assert.equal(res.status, 200);
+  assert.equal(runtime.drafts.get(draft.id).status, "approved");
+  assert.equal(runtime.outreach.get(item.id).status, "acted");
+
+  const res2 = await fetch(`${base}/outreach/${item.id}/act`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "dismiss" })
+  });
+  assert.equal(res2.status, 200);
+  assert.equal(runtime.outreach.get(item.id).decision.action, "approve");
+  await app.close?.();
+});
+
+test("POST /outreach/:id/act on unknown id returns 404", async () => {
+  const { app, base } = await bootApp();
+  const res = await fetch(`${base}/outreach/nope/act`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "approve" })
+  });
+  assert.equal(res.status, 404);
+  await app.close?.();
+});
