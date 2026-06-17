@@ -43,13 +43,6 @@ final class AppState: ObservableObject {
     OutreachConsumer.shared.reconfigure(url: url, token: token)
   }
 
-  // Mirrors the server's quiet-hours config (default 22:00–08:00). Live outreach
-  // decisions don't banner during this window; they roll into the next digest.
-  func inQuietHours(_ date: Date = Date()) -> Bool {
-    let h = Calendar.current.component(.hour, from: date)
-    return h >= 22 || h < 8
-  }
-
   struct Nudge: Identifiable, Equatable {
     let id: String
     let title: String

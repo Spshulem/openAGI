@@ -18,6 +18,9 @@ final class OutreachConsumer: ObservableObject {
 
   @Published private(set) var items: [OutreachItem] = []
   @Published private(set) var configured: Bool = false
+  // Server's configurable quiet-hours window (HH:mm). nil until /outreach/config
+  // is fetched; inQuietHours() falls back to a 22:00–08:00 default meanwhile.
+  @Published private(set) var quietHours: (start: String, end: String)? = nil
 
   private var baseURL: URL?
   private var token: String = ""
@@ -35,7 +38,43 @@ final class OutreachConsumer: ObservableObject {
     self.configured = (self.baseURL != nil)
     guard configured else { return }
     Task { await backfill() }
+    Task { await fetchConfig() }
     startSSE()
+  }
+
+  // Pull the server's outreach config so the client quiet-hours window tracks
+  // the server's configurable one rather than a hardcoded 22:00–08:00.
+  func fetchConfig() async {
+    guard let base = baseURL else { return }
+    var req = URLRequest(url: base.appendingPathComponent("outreach/config"))
+    authed(&req)
+    do {
+      let (data, _) = try await URLSession.shared.data(for: req)
+      let cfg = try JSONDecoder().decode(OutreachConfigResponse.self, from: data)
+      if let q = cfg.quietHours {
+        quietHours = (start: q.start, end: q.end)
+      }
+    } catch {
+      // Keep whatever we had; inQuietHours() falls back to the default window.
+    }
+  }
+
+  // Minute-granular, overnight-aware quiet-hours check using the server's window
+  // (falls back to 22:00–08:00 until config is fetched).
+  func inQuietHours(_ date: Date = Date()) -> Bool {
+    guard let q = quietHours else { return defaultQuiet(date) }
+    func mins(_ s: String) -> Int {
+      let p = s.split(separator: ":")
+      return (Int(p.first ?? "0") ?? 0) * 60 + (p.count > 1 ? Int(p[1]) ?? 0 : 0)
+    }
+    let now = Calendar.current.component(.hour, from: date) * 60 + Calendar.current.component(.minute, from: date)
+    let s = mins(q.start), e = mins(q.end)
+    return s <= e ? (now >= s && now < e) : (now >= s || now < e)
+  }
+
+  private func defaultQuiet(_ date: Date) -> Bool {
+    let h = Calendar.current.component(.hour, from: date)
+    return h >= 22 || h < 8
   }
 
   private func authed(_ req: inout URLRequest) {
@@ -75,26 +114,40 @@ final class OutreachConsumer: ObservableObject {
     }
   }
 
+  // Server resolved an item out-of-band (cross-device act, cron, auto-resolve).
+  // The SSE "outreach-resolved" event carries the item; drop it from the overlay.
+  func removeResolved(_ id: String) { items.removeAll { $0.id == id } }
+
   func act(_ id: String, action: String, note: String? = nil) async {
     var body: [String: Any] = ["action": action]
     if let note { body["note"] = note }
-    await post("outreach/\(id)/act", body: body)
-    items.removeAll { $0.id == id }
+    if await post("outreach/\(id)/act", body: body) {
+      items.removeAll { $0.id == id }
+    } else {
+      await backfill() // failed: don't lose it — reconcile (it may already be resolved, else it stays visible)
+    }
   }
 
   func reply(_ id: String, text: String) async {
-    await post("outreach/\(id)/reply", body: ["text": text])
-    items.removeAll { $0.id == id }
+    if await post("outreach/\(id)/reply", body: ["text": text]) {
+      items.removeAll { $0.id == id }
+    } else {
+      await backfill()
+    }
   }
 
-  private func post(_ pathPart: String, body: [String: Any]) async {
-    guard let base = baseURL else { return }
+  @discardableResult
+  private func post(_ pathPart: String, body: [String: Any]) async -> Bool {
+    guard let base = baseURL else { return false }
     var req = URLRequest(url: base.appendingPathComponent(pathPart))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     authed(&req)
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-    _ = try? await URLSession.shared.data(for: req)
+    do {
+      let (_, resp) = try await URLSession.shared.data(for: req)
+      return ((resp as? HTTPURLResponse)?.statusCode).map { (200..<300).contains($0) } ?? false
+    } catch { return false }
   }
 
   private func startSSE() {
@@ -119,6 +172,13 @@ final class OutreachConsumer: ObservableObject {
     Task { await backfill() }
     startSSE()
   }
+}
+
+// Decoding shape for GET /outreach/config. We only need the quiet-hours window;
+// other fields (enabled, cadenceHours, stalledDays) are ignored here.
+private struct OutreachConfigResponse: Decodable {
+  struct QH: Decodable { let start: String; let end: String }
+  let quietHours: QH?
 }
 
 // Dedicated SSE listener for the remote main's /events stream. On any
@@ -149,14 +209,28 @@ final class OutreachSSEDelegate: NSObject, URLSessionDataDelegate {
       let block = String(buffer[..<nl.lowerBound])
       buffer.removeSubrange(buffer.startIndex..<nl.upperBound)
       var event = "message"
+      var dataLine = ""
       for raw in block.split(separator: "\n") {
         let line = String(raw)
         if line.hasPrefix("event:") {
           event = line.dropFirst("event:".count).trimmingCharacters(in: .whitespaces)
+        } else if line.hasPrefix("data:") {
+          dataLine += line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
         }
       }
-      if event == "outreach" || event == "outreach-resolved" {
+      if event == "outreach" {
         Task { @MainActor in await OutreachConsumer.shared.backfill() }
+      } else if event == "outreach-resolved" {
+        // resolve() server-side does NOT bump seq, so since=cursor backfill won't
+        // surface this resolution. The event's data payload IS the resolved item;
+        // pull its id and remove it directly. Fall back to backfill on decode fail.
+        if let d = dataLine.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let rid = obj["id"] as? String {
+          Task { @MainActor in OutreachConsumer.shared.removeResolved(rid) }
+        } else {
+          Task { @MainActor in await OutreachConsumer.shared.backfill() }
+        }
       }
     }
   }

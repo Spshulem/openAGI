@@ -44,7 +44,7 @@ final class NotificationPresenter {
   func present(_ item: OutreachItem) {
     // Hold live decisions during quiet hours — they'll show in the next digest
     // and remain in the overlay list regardless.
-    if AppState.shared.inQuietHours() && item.needsDecision { return }
+    if OutreachConsumer.shared.inQuietHours() && item.needsDecision { return }
     guard item.needsDecision || item.type == "digest" else { return }
 
     let content = UNMutableNotificationContent()

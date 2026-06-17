@@ -173,7 +173,10 @@ struct OverlayView: View {
       }
       if !item.actions.isEmpty {
         HStack(spacing: 6) {
-          ForEach(item.actions, id: \.self) { a in
+          // "review" only opens the overlay list — pointless here since the user
+          // is already looking at it (and the server no-ops it into 'acted'). Only
+          // digests carry "review", so filtering it is safe.
+          ForEach(item.actions.filter { $0 != "review" }, id: \.self) { a in
             Button(actionLabel(a)) {
               Task { await outreach.act(item.id, action: a) }
             }
