@@ -51,3 +51,14 @@ test("unknown events are ignored (no item created)", () => {
   events.emit("miner-result", { source: "task-sweep" });
   assert.equal(store.list().length, 0);
 });
+
+test("attach is idempotent — calling attach twice yields one item per event", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "outreach-idem-"));
+  const events = new EventEmitter();
+  const store = new OutreachStore({ dir, runtime: { events } });
+  const mapper = new OutreachMapper({ store, events });
+  mapper.attach();
+  mapper.attach(); // second attach must NOT double-subscribe
+  events.emit("draft-created", { id: "draft_idem", title: "Once" });
+  assert.equal(store.list().filter((i) => i.sourceRef?.id === "draft_idem").length, 1);
+});

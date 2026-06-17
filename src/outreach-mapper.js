@@ -46,6 +46,7 @@ export class OutreachMapper {
   }
 
   attach() {
+    if (this._handlers.length) this.detach();
     for (const [event, build] of Object.entries(MAP)) {
       const handler = (data) => {
         try {
