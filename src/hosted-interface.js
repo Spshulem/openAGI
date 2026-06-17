@@ -25,7 +25,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   const getPublicUrl = () => options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null;
   const getTwilioAuthToken = () => options.twilioAuthToken ?? process.env.TWILIO_AUTH_TOKEN ?? null;
   const getTelegramSecret = () => options.telegramSecret ?? process.env.TELEGRAM_WEBHOOK_SECRET ?? null;
-  const channels =
+  let channels =
     options.channels ??
     (runtime.agentHost
       ? new ChannelManager({
@@ -686,6 +686,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const updated = runtime.outreach.resolve(id, { action, by: "user" }, { status: "error", error: error.message });
           return sendJson(res, 400, { item: updated, error: error.message });
         }
+      }
+      if (method === "POST" && pathname.startsWith("/outreach/") && pathname.endsWith("/reply")) {
+        const id = decodeURIComponent(pathname.slice("/outreach/".length, -"/reply".length));
+        const item = runtime.outreach?.get(id);
+        if (!item) return sendJson(res, 404, { error: "unknown outreach item" });
+        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        const body = await readJson(req);
+        const forward = `Re: "${item.title}" (${item.type}, actions: ${item.actions.join("/")}).\nUser says: ${body.text ?? ""}\nInterpret intent and take the appropriate action.`;
+        const turn = await channels.handleLocalMessage({ text: forward, from: `outreach:${id}` });
+        return sendJson(res, 200, { reply: turn.reply ?? null });
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/approve")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/approve".length));
@@ -1376,11 +1386,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }
   });
 
-  return {
+  const app = {
     runtime,
     channels,
     events,
     server,
+    // Test seam: inject a fake agent host so /outreach/:id/reply and the
+    // /channels/* routes can be exercised without a real model. The route
+    // handlers close over the `channels` variable, so reassigning it here
+    // takes effect immediately.
+    __setChannels(c) { channels = c; },
     listen() {
       return new Promise((resolve) => {
         server.listen(port, host, () => {
@@ -1404,13 +1419,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (tickerHandle) clearInterval(tickerHandle);
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
         sseClients.clear();
-        channels?.stop();
+        channels?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
         server.close((error) => (error ? reject(error) : resolve()));
       });
     }
   };
+
+  return app;
 }
 
 function handleSse(req, res, clients) {

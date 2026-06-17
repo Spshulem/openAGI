@@ -72,3 +72,19 @@ test("POST /outreach/:id/act on unknown id returns 404", async () => {
   assert.equal(res.status, 404);
   await app.close?.();
 });
+
+test("POST /outreach/:id/reply forwards the text to the agent with item context", async () => {
+  const { runtime, app, base } = await bootApp();
+  const item = runtime.outreach.append({ type: "stalled-task", sourceRef: { kind: "task", id: "task_9" }, title: "Stalled: X", needsDecision: true, actions: ["close", "keep"] });
+  let lastForward = null;
+  const fakeChannels = { handleLocalMessage: async (m) => { lastForward = m; return { reply: "ok" }; } };
+  app.__setChannels(fakeChannels);
+  const res = await fetch(`${base}/outreach/${item.id}/reply`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "close it and remind me Friday" })
+  });
+  assert.equal(res.status, 200);
+  assert.match(lastForward.text, /close it and remind me Friday/);
+  assert.match(lastForward.text, /Stalled: X/);
+  await app.close?.();
+});
