@@ -43,6 +43,11 @@ import { ScrutinyPanel } from "./scrutiny-panel.js";
 import { SpecialistRouter } from "./specialist-router.js";
 import { TunnelWatcher } from "./tunnel-watcher.js";
 import { VectorStore } from "./vector-store.js";
+import { OutreachStore } from "./outreach-store.js";
+import { OutreachMapper } from "./outreach-mapper.js";
+import { loadOutreachConfig } from "./outreach-config.js";
+import { surfaceStalledTasks } from "./outreach-stalled.js";
+import { composeDigest } from "./outreach-digest.js";
 import { VocabularyCurator } from "./vocabulary-curator.js";
 import { MemorySystem } from "./memory-system.js";
 import { PropagationController } from "./propagation-controller.js";
@@ -192,6 +197,21 @@ export class AbiRuntime {
       runtime: this,
       dir: options.dataDir ? `${options.dataDir}/drafts` : undefined
     });
+    // Proactive outreach: store + mapper that turn existing runtime events
+    // (drafts, suggestions, pending actions, clarifications) into a single
+    // outreach feed. The event bus is late-bound by hosted-interface.js (this
+    // runtime never assigns this.events in the constructor — it's defined non-
+    // enumerably later), so the mapper is created here but only attaches once
+    // events exist: guarded below, and re-attached via bindOutreachEvents().
+    this.outreachConfig = loadOutreachConfig(options.dataDir);
+    this.outreach = options.outreach ?? new OutreachStore({
+      dir: options.dataDir ? path.join(options.dataDir, "outreach") : undefined,
+      runtime: this
+    });
+    if (this.outreachConfig.enabled) {
+      this.outreachMapper = new OutreachMapper({ store: this.outreach, events: this.events });
+      if (this.events) this.outreachMapper.attach();
+    }
     this.skillReplay = options.skillReplay ?? new SkillReplay({ runtime: this, dataDir: options.dataDir, ...(options.skillReplayOptions ?? {}) });
     this.outputs = [];
     this.feedback = [];
@@ -396,6 +416,13 @@ export class AbiRuntime {
         enabled: true,
         task: "task-sweep",
         intervalMs: sweepMin * 60 * 1000
+      });
+      this.cron.addJob({
+        id: "outreach-digest",
+        name: `Outreach digest every ${this.outreachConfig.cadenceHours}h`,
+        enabled: this.outreachConfig.enabled,
+        task: "outreach-digest",
+        intervalMs: this.outreachConfig.cadenceHours * 60 * 60 * 1000
       });
       registerCoreTools(this.tools, this);
       // Computer-use tools register only when explicitly opted-in via env
@@ -692,11 +719,36 @@ export class AbiRuntime {
       }
       if (job.task === "task-sweep") {
         const result = await this.taskSweep.sweep({ now });
+        if (this.outreachConfig?.enabled && Array.isArray(result.flaggedTasks)) {
+          surfaceStalledTasks(this.outreach, result.flaggedTasks);
+        }
         this.events?.emit?.("miner-result", { source: "task-sweep", at: nowIso(), ...result });
         return result;
       }
+      if (job.task === "outreach-digest") {
+        return this.runOutreachDigest({ now });
+      }
       return { skipped: true, reason: `No handler for task ${job.task}` };
     }, now);
+  }
+
+  // Late-bind the event bus to the outreach mapper. hosted-interface.js owns
+  // the bus and calls this (like pendingActions.bindEvents) once it exists, so
+  // the mapper can subscribe even though it was constructed before the bus.
+  bindOutreachEvents(events) {
+    if (!this.outreachConfig?.enabled || !events) return;
+    if (!this.outreachMapper) {
+      this.outreachMapper = new OutreachMapper({ store: this.outreach, events });
+    } else {
+      this.outreachMapper.events = events;
+    }
+    this.outreachMapper.attach();
+  }
+
+  runOutreachDigest({ now = new Date() } = {}) {
+    if (!this.outreachConfig?.enabled) return { skipped: true, reason: "outreach disabled" };
+    const item = composeDigest(this.outreach, this.outreachConfig, { now });
+    return item ? { ok: true, digestId: item.id, title: item.title } : { ok: true, empty: true };
   }
 
   // Morning digest: roll up pending today-bucket user tasks into one

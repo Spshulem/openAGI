@@ -58,6 +58,9 @@ export class TaskSweep {
     if (!tasks?.list) return { skipped: true, reason: "no task store" };
 
     const summary = { deduped: 0, requeued: 0, cancelledStale: 0, retagged: 0, flagged: 0, archived: 0, considered: 0 };
+    // Tasks flagged for human review (NOT the auto-cancelled stale ones).
+    // Surfaced to the outreach feed so stalled work gets nudged.
+    const flaggedTasks = [];
 
     // 1) Rule-based dedup within each queue.
     const active = tasks.list({ limit: 1000 }).filter((t) => ACTIVE.has(t.status));
@@ -100,7 +103,7 @@ export class TaskSweep {
           // Stale → cancel auto-sourced; flag everything else for review.
           if (v.stale === true) {
             if (AUTO_SOURCES.has(t.source)) { tasks.update(t.id, { status: "cancelled" }); summary.cancelledStale++; continue; }
-            if (addTag(tasks, t, "review")) summary.flagged++;
+            if (addTag(tasks, t, "review")) { summary.flagged++; flaggedTasks.push({ id: t.id, title: t.title }); }
           }
           const targetQueue = v.queue === "agent" || v.queue === "user" ? v.queue : t.queue;
           if (targetQueue !== t.queue && tasks.setQueue) { tasks.setQueue(t.id, targetQueue); summary.requeued++; }
@@ -122,6 +125,7 @@ export class TaskSweep {
     }
 
     summary.at = nowIso();
+    summary.flaggedTasks = flaggedTasks;
     return summary;
   }
 }

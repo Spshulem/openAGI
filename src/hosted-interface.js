@@ -80,6 +80,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   if (!runtime.events) {
     Object.defineProperty(runtime, "events", { value: events, enumerable: false });
   }
+  // Proactive outreach mapper subscribes here: it was constructed before the
+  // bus existed, so we late-bind the same bus now (mirrors bindEvents above).
+  if (runtime.bindOutreachEvents) runtime.bindOutreachEvents(runtime.events);
 
   if (runtime.tunnelWatcher) {
     runtime.tunnelWatcher.on("tunnel-url", (data) => events.emit("tunnel", { op: "url", ...data }));
