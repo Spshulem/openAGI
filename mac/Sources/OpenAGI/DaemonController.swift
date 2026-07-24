@@ -49,6 +49,24 @@ final class DaemonController {
       return
     }
 
+    // The health check just failed, but something may still be holding the
+    // port (e.g. a previously-adopted daemon whose event loop hung, or one
+    // pegged at 100% CPU no longer servicing requests). We have no Process
+    // handle for it if we didn't spawn it ourselves, so `process` can't tell
+    // us what to kill. Without this, every restart attempt spawns a new
+    // child that immediately dies with EADDRINUSE and gets kept alive as a
+    // zombie — auto-recovery loops forever without ever actually replacing
+    // the stuck daemon.
+    if let stalePid = pidListeningOnPort(43210) {
+      NSLog("OpenAGI: port 43210 held by unresponsive pid \(stalePid); killing it before respawn")
+      kill(stalePid, SIGTERM)
+      Thread.sleep(forTimeInterval: 1.0)
+      if pidListeningOnPort(43210) == stalePid {
+        kill(stalePid, SIGKILL)
+        Thread.sleep(forTimeInterval: 0.5)
+      }
+    }
+
     if !FileManager.default.fileExists(atPath: logFile.path) {
       FileManager.default.createFile(atPath: logFile.path, contents: nil)
     }
@@ -167,5 +185,28 @@ final class DaemonController {
     task.resume()
     _ = semaphore.wait(timeout: .now() + 1.5)
     return found
+  }
+
+  /// PID of whatever process is currently LISTENING on the given TCP port,
+  /// or nil if nothing is. Used to recover from a daemon that's still
+  /// holding the port but no longer answering /health — see start().
+  private func pidListeningOnPort(_ port: UInt16) -> Int32? {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    proc.arguments = ["-ti", "tcp:\(port)", "-sTCP:LISTEN"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = Pipe()
+    do {
+      try proc.run()
+      proc.waitUntilExit()
+    } catch {
+      return nil
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let text = String(data: data, encoding: .utf8)?
+      .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+    let firstLine = text.split(separator: "\n").first.map(String.init) ?? text
+    return Int32(firstLine)
   }
 }
