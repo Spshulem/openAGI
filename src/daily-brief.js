@@ -1,0 +1,330 @@
+// src/daily-brief.js
+// Composes the Quick Ask popover's daily brief: a short, ranked, inline-
+// actionable list drawn from the plan cache, tasks, suggestions, drafts and
+// clarifications.
+//
+// Two rules drive the whole design:
+//
+// 1. NO LLM, NO HTTP on this path. GET /plan/daily re-runs the model on every
+//    request and BudgetGuard throws at the daily cap, so the brief reads the
+//    plan CACHE written by the 08:00 cron and otherwise touches only stores.
+//    That also keeps this a pure function of (stores, clock) — directly
+//    testable without a server.
+//
+// 2. SCORES ARE ONLY COMPARABLE WITHIN A KIND. Suggestions carry no dueDate
+//    and no priority (measured: 0 of 1092 pending on a real install), so a
+//    single due-date-weighted formula scores them all identically and tasks
+//    take every slot — the brief silently becomes a task list. Instead we
+//    allocate slots per kind and rank inside each kind on evidence that kind
+//    actually has.
+import path from "node:path";
+import { readJsonFile } from "./file-utils.js";
+import { resolveDataDir } from "./data-dir.js";
+import { listAllSuggestions } from "./suggestion-feed.js";
+
+// Bucket order, mirrored from task-store.js. "done" never enters the brief.
+const BUCKETS = ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"];
+const VALID_CLARIFICATION_ANSWERS = ["yes", "in_progress", "no", "dropped"];
+const CLARIFICATION_LABELS = { yes: "Yes", in_progress: "In progress", no: "Not yet", dropped: "Dropped" };
+// "automation" suggestions have no accept branch server-side (hosted-interface.js
+// falls through to a bare 200), so accepting one does nothing. Hide until handled.
+const EXCLUDED_SUGGESTION_CATEGORIES = new Set(["automation"]);
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+
+/// Slot budget per kind for a given limit. focus is pinned above the rest;
+/// the suggestion floor is what guarantees the agent's own findings always
+/// get a seat, which is the entire point of the feature.
+function slotPlan(limit) {
+  return { focus: 1, clarification: 1, draft: 1, task: 2, suggestionFloor: 1, limit };
+}
+
+export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } = {}) {
+  const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  const degraded = [];
+  // AbiRuntime does NOT carry a dataDir property, and resolveDataDir() memoizes
+  // its first result process-wide — so a caller that knows the right directory
+  // (the route does) MUST pass it, or a second differently-configured instance
+  // in one process silently reads the first one's files.
+  const resolvedDataDir = dataDir ?? runtime?.dataDir ?? resolveDataDir();
+  const plan = safely(degraded, "plan", () => readPlanCache(resolvedDataDir, now), null);
+
+  const tasks = safely(degraded, "tasks", () => runtime.tasks?.list?.({ queue: "user", status: "pending", limit: 200 }) ?? [], []);
+  const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
+  const clarifications = safely(degraded, "clarifications", () => runtime.clarifications?.list?.({ status: "pending" }) ?? [], []);
+  const suggestions = safely(degraded, "suggestions", () => listAllSuggestions(runtime, { status: "pending" }) ?? [], []);
+
+  const slots = slotPlan(limit);
+  const items = [];
+
+  // ── focus (pinned, never scored against anything) ──────────────────────
+  const focusItems = buildFocus(plan, tasks, slots.focus);
+  items.push(...focusItems);
+  const pinnedTaskIds = new Set(focusItems.map((f) => f.sourceTaskId).filter(Boolean));
+
+  // ── the ranked kinds ───────────────────────────────────────────────────
+  const rankedTasks = tasks
+    .filter((t) => t.bucket !== "done" && !pinnedTaskIds.has(t.id))
+    .map((t) => buildTask(t, nowMs))
+    .sort(byScoreDesc);
+
+  const rankedClarifications = clarifications.map((c) => buildClarification(c, nowMs)).sort(byScoreDesc);
+  const rankedDrafts = drafts.map((d) => buildDraft(d, nowMs)).sort(byScoreDesc);
+
+  const multipliers = safely(degraded, "preferences", () => runtime.suggestionFeedback?.categoryMultipliers?.() ?? {}, {});
+  const isMuted = (c) => {
+    try { return runtime.suggestionFeedback?.isMuted?.(c) === true; } catch { return false; }
+  };
+  const eligibleSuggestions = suggestions.filter(
+    (s) => !EXCLUDED_SUGGESTION_CATEGORIES.has(s.category) && !isMuted(s.category)
+  );
+  const rankedSuggestions = eligibleSuggestions
+    .map((s) => buildSuggestion(s, nowMs, multipliers))
+    .sort(byScoreDesc);
+
+  // ── slot allocation: fixed budgets, then cascade the remainder ─────────
+  const take = (list, n) => list.splice(0, Math.max(0, n));
+  const remainingAfter = () => slots.limit - items.length;
+
+  items.push(...take(rankedClarifications, Math.min(slots.clarification, remainingAfter())));
+  items.push(...take(rankedDrafts, Math.min(slots.draft, remainingAfter())));
+
+  // Reserve the suggestion floor BEFORE tasks claim what's left, otherwise a
+  // pile of overdue tasks squeezes suggestions out entirely.
+  const reserve = rankedSuggestions.length > 0 ? Math.min(slots.suggestionFloor, remainingAfter()) : 0;
+  items.push(...take(rankedTasks, Math.max(0, Math.min(slots.task, remainingAfter() - reserve))));
+  items.push(...take(rankedSuggestions, Math.min(reserve, remainingAfter())));
+
+  // Cascade any still-unused slots. Suggestions go first: they are the
+  // designated filler kind, and letting tasks spill past their slot budget is
+  // exactly the "brief silently becomes a task list" regression rule 2 exists
+  // to prevent. Tasks only claim what suggestions cannot fill, so a
+  // suggestion-free install still gets a full brief instead of two rows.
+  items.push(...take(rankedSuggestions, remainingAfter()));
+  items.push(...take(rankedTasks, remainingAfter()));
+
+  const shownSuggestionIds = new Set(items.filter((i) => i.kind === "suggestion").map((i) => i.id));
+  const olderCount = suggestions.filter((s) => !shownSuggestionIds.has(`suggestion:${s.id}`)).length;
+  const oldestAt = suggestions.length
+    ? suggestions.reduce((min, s) => (s.proposedAt && (!min || s.proposedAt < min) ? s.proposedAt : min), null)
+    : null;
+
+  return {
+    items: items.map(stripInternal),
+    older: { count: olderCount, oldestAt },
+    generatedAt: new Date(nowMs).toISOString(),
+    planCachedAt: plan?.cachedAt ?? null,
+    degraded
+  };
+}
+
+// ─── per-kind builders ───────────────────────────────────────────────────
+
+function buildFocus(plan, tasks, max) {
+  const focus = Array.isArray(plan?.focus) ? plan.focus.slice(0, max) : [];
+  return focus.map((f) => {
+    // The model can emit a taskId that does not exist. Resolve defensively;
+    // an unresolvable id yields a readable row with no task actions rather
+    // than a broken button.
+    const task = f.taskId ? tasks.find((t) => t.id === f.taskId) : null;
+    return {
+      id: `focus:${f.taskId ?? slug(f.title)}`,
+      kind: "focus",
+      title: f.title,
+      why: f.why || "in today's plan",
+      score: 1,
+      scoreBreakdown: { pinned: true },
+      dueAt: task?.dueDate ?? null,
+      source: "daily-plan",
+      actions: task ? taskActions(task.id) : [],
+      deepLink: "/?tab=today",
+      sourceTaskId: task?.id ?? null
+    };
+  });
+}
+
+function buildTask(t, nowMs) {
+  const due = dueUrgency(t, nowMs);
+  const priority = clamp01((Number(t.priority) || 0) / 100);
+  const carried = carriedOver(t, nowMs) ? 1 : 0;
+  const score = clamp01(0.55 * due.value + 0.30 * priority + 0.15 * carried);
+  return {
+    id: `task:${t.id}`,
+    kind: "task",
+    title: t.title,
+    why: [due.label, carried ? "carried over" : null, t.source && t.source !== "manual" ? `from ${t.source}` : null]
+      .filter(Boolean).join(" · ") || "on your list",
+    score,
+    scoreBreakdown: { dueUrgency: due.value, priority, carriedOver: carried },
+    dueAt: t.dueDate ?? null,
+    source: t.source ?? "manual",
+    actions: taskActions(t.id),
+    deepLink: "/?tab=tasks"
+  };
+}
+
+function buildSuggestion(s, nowMs, multipliers) {
+  const seq = s.sequence;
+  let score;
+  let breakdown;
+  if (seq && typeof seq.confidence === "number") {
+    const confidence = clamp01(seq.confidence);
+    const countRamp = clamp01((Number(seq.count) || 0) / 10);
+    const daysRamp = clamp01((Number(seq.distinctDays) || 0) / 5);
+    const regular = seq.cadence?.type && seq.cadence.type !== "irregular" ? 1 : 0;
+    score = clamp01(0.40 * confidence + 0.30 * countRamp + 0.20 * daysRamp + 0.10 * regular);
+    breakdown = { confidence, countRamp, daysRamp, cadenceRegularity: regular };
+  } else {
+    // Observer candidates carry no frequency evidence — recency is the only
+    // honest discriminator, so claim nothing more than that.
+    const ageDays = s.proposedAt ? (nowMs - new Date(s.proposedAt).getTime()) / DAY_MS : 14;
+    score = clamp01(1 - ageDays / 14);
+    breakdown = { recency: score };
+  }
+  // MUST default to 1.0: categoryMultipliers() only emits keys for categories
+  // with >=3 resolutions inside a 30-day window, which on a real install is
+  // none of them — it returns {}. Without this, score * undefined === NaN and
+  // the sort order becomes implementation-defined.
+  const multiplier = Number.isFinite(multipliers?.[s.category]) ? multipliers[s.category] : 1.0;
+  breakdown.categoryMultiplier = multiplier;
+  return {
+    id: `suggestion:${s.id}`,
+    kind: "suggestion",
+    title: s.title || "OpenAGI noticed something",
+    why: suggestionWhy(s, breakdown),
+    score: clamp01(score * multiplier),
+    scoreBreakdown: breakdown,
+    dueAt: null,
+    source: s.source ?? "observer",
+    actions: [
+      { id: "accept", label: "Yes", style: "primary", method: "POST", path: `/proactive/suggestions/${encodeURIComponent(s.id)}/accept`, body: null },
+      { id: "reject", label: "No", style: "secondary", method: "POST", path: `/proactive/suggestions/${encodeURIComponent(s.id)}/reject`, body: null }
+    ],
+    deepLink: "/?tab=suggestions"
+  };
+}
+
+function buildDraft(d, nowMs) {
+  const score = ageScore(d.createdAt, nowMs);
+  return {
+    id: `draft:${d.id}`,
+    kind: "draft",
+    title: d.title || "(untitled draft)",
+    why: `draft waiting${d.kind && d.kind !== "other" ? ` · ${d.kind}` : ""}`,
+    score,
+    scoreBreakdown: { age: score },
+    dueAt: null,
+    source: "agent",
+    actions: [
+      { id: "approve", label: "Approve", style: "primary", method: "POST", path: `/drafts/${encodeURIComponent(d.id)}/approve`, body: null },
+      { id: "discard", label: "Discard", style: "destructive", method: "POST", path: `/drafts/${encodeURIComponent(d.id)}/discard`, body: null }
+    ],
+    deepLink: "/?tab=today"
+  };
+}
+
+function buildClarification(c, nowMs) {
+  const score = ageScore(c.createdAt, nowMs);
+  return {
+    id: `clarification:${c.id}`,
+    kind: "clarification",
+    title: c.question || "Did you finish this?",
+    why: "needs your call",
+    score,
+    scoreBreakdown: { age: score },
+    dueAt: null,
+    source: "agent",
+    actions: VALID_CLARIFICATION_ANSWERS.map((a) => ({
+      id: `answer:${a}`,
+      label: CLARIFICATION_LABELS[a],
+      style: a === "yes" ? "primary" : a === "dropped" ? "destructive" : "secondary",
+      method: "POST",
+      path: `/tasks/clarifications/${encodeURIComponent(c.id)}/answer`,
+      body: { answer: a }
+    })),
+    deepLink: "/?tab=today"
+  };
+}
+
+// ─── scoring helpers ─────────────────────────────────────────────────────
+
+function dueUrgency(t, nowMs) {
+  if (t.dueDate) {
+    const dueMs = new Date(t.dueDate).getTime();
+    const deltaDays = (dueMs - nowMs) / DAY_MS;
+    if (deltaDays < 0) {
+      const late = Math.max(1, Math.round(-deltaDays));
+      return { value: 1.0, label: `overdue ${late}d` };
+    }
+    if (deltaDays < 1) return { value: 0.85, label: "due today" };
+    if (deltaDays <= 3) return { value: 0.6, label: `due in ${Math.ceil(deltaDays)}d` };
+  }
+  const idx = BUCKETS.indexOf(t.bucket);
+  if (idx >= 0) return { value: Math.max(0, 0.5 - 0.1 * idx), label: t.bucket.replace(/_/g, " ") };
+  return { value: 0, label: "" };
+}
+
+function carriedOver(t, nowMs) {
+  if (t.bucket !== "today" || !t.createdAt) return false;
+  const startOfToday = new Date(nowMs);
+  startOfToday.setUTCHours(0, 0, 0, 0);
+  return new Date(t.createdAt).getTime() < startOfToday.getTime();
+}
+
+/// Drafts and clarifications are decision-blocked by definition, so how long
+/// they have been waiting is the honest discriminator. Saturates at 48h, the
+/// same "still waiting" threshold outreach-digest uses.
+function ageScore(createdAt, nowMs) {
+  if (!createdAt) return 0.5;
+  return clamp01((nowMs - new Date(createdAt).getTime()) / (48 * HOUR_MS));
+}
+
+function suggestionWhy(s, breakdown) {
+  const seq = s.sequence;
+  if (seq) {
+    const parts = [];
+    if (seq.count) parts.push(`seen ${seq.count}x`);
+    if (seq.distinctDays > 1) parts.push(`across ${seq.distinctDays} days`);
+    if (seq.cadence?.type && seq.cadence.type !== "irregular") parts.push(`${seq.cadence.type} cadence`);
+    if (parts.length) return parts.join(" · ");
+  }
+  return s.rationale ? String(s.rationale).slice(0, 120) : "noticed on screen";
+}
+
+function taskActions(id) {
+  return [
+    { id: "complete", label: "Done", style: "primary", method: "POST", path: `/tasks/${encodeURIComponent(id)}/complete`, body: null },
+    { id: "snooze", label: "Snooze", style: "secondary", method: "PATCH", path: `/tasks/${encodeURIComponent(id)}`, body: { bucket: "this_week" } }
+  ];
+}
+
+// ─── plumbing ────────────────────────────────────────────────────────────
+
+/// Read the plan artifact the 08:00 cron writes. A missing file is the normal
+/// first-run state, NOT a degraded source — the brief simply has nothing to
+/// pin and fills every slot from the live stores instead.
+function readPlanCache(dataDir, now) {
+  const iso = new Date(now).toISOString().slice(0, 10);
+  return readJsonFile(path.join(dataDir, "plan", `${iso}.json`), null);
+}
+
+/// Run a source loader with its own failure boundary so one broken store
+/// never blanks the whole brief.
+function safely(degraded, name, fn, fallback) {
+  try {
+    return fn();
+  } catch {
+    if (name !== "plan") degraded.push(name);
+    return fallback;
+  }
+}
+
+function stripInternal(item) {
+  const { sourceTaskId, ...rest } = item;
+  return rest;
+}
+
+function byScoreDesc(a, b) { return b.score - a.score; }
+function clamp01(n) { return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0; }
+function slug(s) { return String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40) || "item"; }
