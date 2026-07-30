@@ -1,4 +1,5 @@
 import path from "node:path";
+import fsSync from "node:fs";
 import { resolveDataDir } from "./data-dir.js";
 import { AgentHost } from "./agent-host.js";
 import { FileBackedAgentStore } from "./agent-store.js";
@@ -298,13 +299,48 @@ export class AbiRuntime {
         intervalMs: 7 * 24 * 60 * 60 * 1000,
         nextRunAt: nextSundayMorning().toISOString()
       });
+      const existingNightlyPatternJob = this.cron.listJobs().find((job) => job.id === "nightly-pattern-mine") ?? null;
+      const existingHourlyPatternJob = this.cron.listJobs().find((job) => job.id === "hourly-pattern-mine") ?? null;
       this.cron.addJob({
         id: "nightly-pattern-mine",
-        name: "Nightly activity pattern miner",
+        name: "Nightly deep activity workflow miner",
         enabled: true,
         task: "pattern-mine",
-        dailyAt: "02:30"
+        dailyAt: "02:30",
+        input: { maxCandidates: 5, mode: "deep" }
       });
+      // Fast workflow-learning pass. The ambient digest above is deliberately
+      // only a cheap app-count heartbeat; it does not preserve action order.
+      // Run the semantic/action sequence miner separately every hour so a
+      // newly repeated workflow can surface while it is still useful, while
+      // retaining the nightly pass for day/week recalculation. A new job id
+      // is intentional: FileBackedCronScheduler preserves existing jobs, so
+      // deployed installs pick this cadence up without rewriting the user's
+      // enabled/disabled choice for the nightly job.
+      const configuredPatternMineMin = Number(process.env.OPENAGI_PATTERN_MINE_INTERVAL_MIN);
+      const patternMineMin = Number.isFinite(configuredPatternMineMin) && configuredPatternMineMin >= 15
+        ? configuredPatternMineMin
+        : 60;
+      this.cron.addJob({
+        id: "hourly-pattern-mine",
+        name: `Continuous activity workflow miner every ${patternMineMin} min`,
+        // A deployed user who disabled the old miner likely did so for
+        // privacy/cost reasons. Carry that preference into the new faster job
+        // instead of silently re-enabling observation mining.
+        enabled: existingNightlyPatternJob ? existingNightlyPatternJob.enabled !== false : true,
+        task: "pattern-mine",
+        intervalMs: patternMineMin * 60 * 1000,
+        input: { maxCandidates: 2, mode: "continuous" }
+      });
+      // Once the new job exists, an explicit env setting is authoritative on
+      // later boots. Preserve dashboard/manual edits when the env is absent.
+      if (existingHourlyPatternJob && process.env.OPENAGI_PATTERN_MINE_INTERVAL_MIN && existingHourlyPatternJob.intervalMs !== patternMineMin * 60 * 1000) {
+        this.cron.updateJob("hourly-pattern-mine", {
+          name: `Continuous activity workflow miner every ${patternMineMin} min`,
+          intervalMs: patternMineMin * 60 * 1000,
+          input: { maxCandidates: 2, mode: "continuous" }
+        });
+      }
       this.cron.addJob({
         id: "nightly-session-mine",
         name: "Nightly chat-session skill miner",
@@ -694,7 +730,7 @@ export class AbiRuntime {
         return this.scrutinyFitter.fit({ now });
       }
       if (job.task === "pattern-mine") {
-        const result = await this.patternMiner.mine({ now });
+        const result = await this.patternMiner.mine({ now, ...(job.input ?? {}) });
         this.events?.emit?.("miner-result", { source: "pattern-miner", at: nowIso(), ...result });
         return result;
       }
@@ -944,6 +980,23 @@ export class AbiRuntime {
   async runDailyPlan({ now = new Date() } = {}) {
     const { computeDailyPlan, renderDailyPlanMarkdown, queuePlanActions } = await import("./daily-planner.js");
     const plan = await computeDailyPlan(this, { date: now });
+    // Persist BEFORE the skip guard. GET /plan/daily re-runs the LLM on every
+    // request, so the Quick Ask brief can never call it — it reads this cache
+    // instead. A thin day must still leave an artifact, otherwise the brief
+    // has no plan to pin all day. The guard below suppresses only the
+    // notification, never the cache write.
+    try {
+      const { writeJsonAtomic } = await import("./file-utils.js");
+      const pathMod = await import("node:path");
+      const dir = pathMod.default.join(this.dataDir ?? resolveDataDir(), "plan");
+      fsSync.mkdirSync(dir, { recursive: true });
+      writeJsonAtomic(pathMod.default.join(dir, `${plan.dateISO}.json`), {
+        ...plan,
+        cachedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      console.warn(`[openagi] daily plan cache write failed: ${error.message}`);
+    }
     // Skip a truly empty day rather than firing a hollow notification.
     if (plan.counts.events === 0 && plan.counts.focus === 0) {
       return { skipped: true, reason: "nothing scheduled and no pending tasks" };
