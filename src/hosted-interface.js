@@ -21,6 +21,7 @@ import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
 import { NodeRegistry, readOrCreateIdentity } from "./node-registry.js";
 import { readNodeConfig } from "./cli-client.js";
+import { composeBrief } from "./daily-brief.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -374,6 +375,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             cachedAt: cached?.cachedAt ?? null
           });
         }
+      }
+      if (method === "GET" && pathname === "/brief/today") {
+        const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "5", 10);
+        const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(10, rawLimit)) : 5;
+        // Pass the already-resolved dataDir (const at hosted-interface.js:50)
+        // rather than letting the composer call the memoizing resolveDataDir().
+        return sendJson(res, 200, composeBrief(runtime, { now: new Date(), limit, dataDir }));
       }
       if (method === "GET" && pathname === "/channels") {
         const status = channels?.status() ?? { enabled: false };
