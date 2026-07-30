@@ -1,5 +1,4 @@
 import path from "node:path";
-import fsSync from "node:fs";
 import { resolveDataDir } from "./data-dir.js";
 import { AgentHost } from "./agent-host.js";
 import { FileBackedAgentStore } from "./agent-store.js";
@@ -987,10 +986,15 @@ export class AbiRuntime {
     // notification, never the cache write.
     try {
       const { writeJsonAtomic } = await import("./file-utils.js");
-      const pathMod = await import("node:path");
-      const dir = pathMod.default.join(this.dataDir ?? resolveDataDir(), "plan");
-      fsSync.mkdirSync(dir, { recursive: true });
-      writeJsonAtomic(pathMod.default.join(dir, `${plan.dateISO}.json`), {
+      // AbiRuntime carries no dataDir property of its own — resolveDataDir()
+      // is the single source of truth for where state lives, and it is what
+      // the reader resolves to as well (hosted-interface.js resolves it once
+      // and threads it into composeBrief). Resolving it here rather than
+      // reading some per-instance field is what keeps writer and reader
+      // pointed at the same directory. writeJsonAtomic creates the parent
+      // directory itself, so there is no mkdir to do first.
+      const dir = path.join(resolveDataDir(), "plan");
+      writeJsonAtomic(path.join(dir, `${plan.dateISO}.json`), {
         ...plan,
         cachedAt: new Date().toISOString()
       });
