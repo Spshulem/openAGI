@@ -22,6 +22,7 @@ import path from "node:path";
 import { readJsonFile } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { listAllSuggestions } from "./suggestion-feed.js";
+import { planDateKey } from "./daily-planner.js";
 
 // Bucket order, mirrored from task-store.js. "done" never enters the brief.
 const BUCKETS = ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"];
@@ -341,7 +342,11 @@ function taskActions(id) {
 /// first-run state, NOT a degraded source — the brief simply has nothing to
 /// pin and fills every slot from the live stores instead.
 function readPlanCache(dataDir, now) {
-  const iso = new Date(now).toISOString().slice(0, 10);
+  // planDateKey, not toISOString().slice(0,10) — the artifact is named for the
+  // user's LOCAL day, and west of UTC the UTC date rolls over while it is still
+  // today locally (17:00 in America/Los_Angeles). Keying this off UTC made the
+  // evening brief silently drop its focus row every day. See planDateKey.
+  const iso = planDateKey(now);
   return readJsonFile(path.join(dataDir, "plan", `${iso}.json`), null);
 }
 

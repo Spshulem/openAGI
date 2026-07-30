@@ -30,7 +30,7 @@ export async function computeDailyPlan(runtime, { date = new Date(), timezone, u
   const commitments = pullCommitments(runtime);
   const goals = pullActiveGoals(runtime);
 
-  const inputs = { date: label, dateISO: startISO.slice(0, 10), timezone: tz, calendar, tasks, carriedOver, commitments, goals };
+  const inputs = { date: label, dateISO: planDateKey(date, tz), timezone: tz, calendar, tasks, carriedOver, commitments, goals };
 
   const synth = useLLM
     ? await synthesizeWithLLM(runtime, inputs)
@@ -295,6 +295,25 @@ function deterministicPlan(inputs) {
 }
 
 // ─── shared day-bounds (kept identical to daily-recap) ────────────────────
+
+/// The calendar day a plan belongs to, in the user's timezone, as YYYY-MM-DD.
+///
+/// This is the filename of the plan-cache artifact, so the cron that WRITES it
+/// and the brief that READS it must derive it the same way or the brief spends
+/// part of every day looking for a file that does not exist. That is not
+/// hypothetical: the reader used to key off the UTC date, which in America/
+/// Los_Angeles rolls over at 17:00 local — so from 5pm until midnight the
+/// evening brief silently dropped its focus row while the artifact sat on disk
+/// under yesterday's (correct) name. Both sides now call this one function.
+///
+/// en-CA formats as YYYY-MM-DD, and asking Intl for the date directly avoids
+/// the UTC round-trip that caused the mismatch in the first place.
+export function planDateKey(date = new Date(), timezone) {
+  const tz = timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
+  }).format(new Date(date));
+}
 
 function localDayBounds(date, tz) {
   const parts = new Intl.DateTimeFormat("en-CA", {
