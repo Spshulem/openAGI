@@ -17,6 +17,7 @@
 //    take every slot — the brief silently becomes a task list. Instead we
 //    allocate slots per kind and rank inside each kind on evidence that kind
 //    actually has.
+import fs from "node:fs";
 import path from "node:path";
 import { readJsonFile } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
@@ -54,6 +55,17 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
   const clarifications = safely(degraded, "clarifications", () => runtime.clarifications?.list?.({ status: "pending" }) ?? [], []);
   const suggestions = safely(degraded, "suggestions", () => listAllSuggestions(runtime, { status: "pending" }) ?? [], []);
+  // listAllSuggestions() catches its own readdir errors and returns [], so the
+  // safely() boundary above can NEVER see a broken store — an unreadable
+  // suggestion queue would otherwise be reported as a healthy empty one. Ask
+  // the filesystem directly instead, and only when the list came back empty
+  // (a non-empty list has already proven the store readable).
+  // The dirs it walks hang off runtime.dataDir, not the caller's dataDir
+  // override, so check the directory the feed actually read.
+  if (suggestions.length === 0 && !degraded.includes("suggestions")
+      && suggestionStoreUnreadable(runtime?.dataDir ?? resolvedDataDir)) {
+    degraded.push("suggestions");
+  }
 
   const slots = slotPlan(limit);
   const items = [];
@@ -91,24 +103,41 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   items.push(...take(rankedDrafts, Math.min(slots.draft, remainingAfter())));
 
   // Reserve the suggestion floor BEFORE tasks claim what's left, otherwise a
-  // pile of overdue tasks squeezes suggestions out entirely.
+  // pile of overdue tasks squeezes suggestions out entirely. It is held aside
+  // rather than pushed here so the rendered array still follows slot rank
+  // (focus, clarification, draft, task, suggestion) once tasks cascade below.
   const reserve = rankedSuggestions.length > 0 ? Math.min(slots.suggestionFloor, remainingAfter()) : 0;
-  items.push(...take(rankedTasks, Math.max(0, Math.min(slots.task, remainingAfter() - reserve))));
-  items.push(...take(rankedSuggestions, Math.min(reserve, remainingAfter())));
+  const floorSuggestions = take(rankedSuggestions, reserve);
+  const held = floorSuggestions.length;
 
-  // Cascade any still-unused slots. Suggestions go first: they are the
-  // designated filler kind, and letting tasks spill past their slot budget is
-  // exactly the "brief silently becomes a task list" regression rule 2 exists
-  // to prevent. Tasks only claim what suggestions cannot fill, so a
-  // suggestion-free install still gets a full brief instead of two rows.
+  // Tasks take their own slot budget first, then the cascade: the spec routes
+  // unused slots to task and only then to suggestion, because an overdue task
+  // matters more than a pattern-miner candidate. This cannot re-create the
+  // "brief silently becomes a task list" regression rule 2 exists to prevent —
+  // the floor above is already removed from the pool, so tasks spilling past
+  // their budget can shrink the suggestion rows but can never erase them.
+  items.push(...take(rankedTasks, Math.max(0, Math.min(slots.task, remainingAfter() - held))));
+  items.push(...take(rankedTasks, Math.max(0, remainingAfter() - held)));
+
+  // Suggestions last, in slot order: the guaranteed floor, then whatever slots
+  // the other kinds could not fill (a task-free install still gets a full brief
+  // instead of one row).
+  items.push(...floorSuggestions);
   items.push(...take(rankedSuggestions, remainingAfter()));
-  items.push(...take(rankedTasks, remainingAfter()));
 
+  // "N older" is a claim about rows the popover COULD have shown. Counting the
+  // whole pending queue advertises depth that does not exist: excluded
+  // ("automation", no server-side accept branch) and muted suggestions are
+  // filtered out above and can never be rendered, so they are not "older" —
+  // they are invisible. Count against the eligible set only, and derive
+  // oldestAt from that same set so the two never disagree.
   const shownSuggestionIds = new Set(items.filter((i) => i.kind === "suggestion").map((i) => i.id));
-  const olderCount = suggestions.filter((s) => !shownSuggestionIds.has(`suggestion:${s.id}`)).length;
-  const oldestAt = suggestions.length
-    ? suggestions.reduce((min, s) => (s.proposedAt && (!min || s.proposedAt < min) ? s.proposedAt : min), null)
-    : null;
+  const olderSuggestions = eligibleSuggestions.filter((s) => !shownSuggestionIds.has(`suggestion:${s.id}`));
+  const olderCount = olderSuggestions.length;
+  const oldestAt = olderSuggestions.reduce(
+    (min, s) => (s.proposedAt && (!min || s.proposedAt < min) ? s.proposedAt : min),
+    null
+  );
 
   return {
     items: items.map(stripInternal),
@@ -307,6 +336,32 @@ function taskActions(id) {
 function readPlanCache(dataDir, now) {
   const iso = new Date(now).toISOString().slice(0, 10);
   return readJsonFile(path.join(dataDir, "plan", `${iso}.json`), null);
+}
+
+/// Can the suggestion store be read at all? Distinguishes "nothing pending"
+/// (healthy) from "cannot look" (degraded), which listAllSuggestions() itself
+/// collapses into one empty array.
+///
+/// A dataDir we cannot list means the install's storage is gone or locked —
+/// every source is suspect, so the suggestion queue is certainly not honestly
+/// empty. Missing SUBdirectories are different: proactive/suggestions/ and
+/// skills-suggested/ are created lazily on first write, so their absence on a
+/// readable dataDir is a first-run install with a genuinely empty queue and
+/// must not be flagged. A subdir that exists but will not list (permissions,
+/// bad mount) is the real broken case.
+function suggestionStoreUnreadable(dataDir) {
+  if (!dataDir || !canList(dataDir)) return true;
+  const dirs = [path.join(dataDir, "proactive", "suggestions"), path.join(dataDir, "skills-suggested")];
+  return dirs.some((dir) => fs.existsSync(dir) && !canList(dir));
+}
+
+function canList(dir) {
+  try {
+    fs.readdirSync(dir);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /// Run a source loader with its own failure boundary so one broken store

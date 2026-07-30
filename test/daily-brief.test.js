@@ -67,8 +67,30 @@ test("a huge suggestion backlog still yields at least one suggestion alongside o
   ];
   const brief = composeBrief(makeRuntime({ tasks, suggestions }), { now: NOW, limit: 5 });
   assert.ok(brief.items.some((i) => i.kind === "suggestion"), "at least one suggestion must survive slot allocation");
-  assert.ok(brief.items.filter((i) => i.kind === "task").length <= 2, "tasks are capped at their slot count");
+  // NOT "tasks are capped at 2": the spec cascades unused slots to task FIRST
+  // and suggestion second, so tasks legitimately spill past their slot budget.
+  // What matters is that they cannot spill over the reserved suggestion floor.
+  assert.ok(
+    brief.items.filter((i) => i.kind === "task").length < brief.items.length,
+    "tasks must not crowd suggestions out of the brief entirely"
+  );
   assert.equal(brief.older.count, 1000 - brief.items.filter((i) => i.kind === "suggestion").length);
+});
+
+test("unused slots cascade to task before suggestion (spec order)", () => {
+  // The measured case: 8 overdue tasks + 50 suggestions at the default limit.
+  // Cascading suggestions first gave 2 tasks + 3 suggestions; the spec's order
+  // gives 4 tasks + 1 suggestion — overdue work outranks miner candidates, and
+  // the floor still guarantees the agent's own finding a seat.
+  const tasks = Array.from({ length: 8 }, (_, i) =>
+    task({ id: `t${i}`, title: `Overdue ${i}`, dueDate: `2026-07-${String(10 + i).padStart(2, "0")}T00:00:00.000Z` })
+  );
+  const suggestions = Array.from({ length: 50 }, (_, i) => minedSuggestion({ id: `sug_${i}` }));
+  const brief = composeBrief(makeRuntime({ tasks, suggestions }), { now: NOW, limit: 5 });
+  assert.equal(brief.items.filter((i) => i.kind === "task").length, 4, "tasks claim the cascade");
+  assert.equal(brief.items.filter((i) => i.kind === "suggestion").length, 1, "the floor is exactly one, not the remainder");
+  // Slot rank is also the render order: every task sits above the suggestion.
+  assert.equal(brief.items.at(-1).kind, "suggestion");
 });
 
 test("empty category multipliers never produce NaN scores", () => {
@@ -95,6 +117,46 @@ test("automation suggestions never appear (no server-side accept branch exists)"
   const rt = makeRuntime({ suggestions: [minedSuggestion({ id: "prop_a", category: "automation" })] });
   const brief = composeBrief(rt, { now: NOW, limit: 5 });
   assert.equal(brief.items.length, 0);
+});
+
+test("older.count excludes suggestions that could never be rendered", () => {
+  // "N older" is a promise about rows the popover COULD show. An automation
+  // candidate (no server-side accept branch) and a muted-category one are both
+  // filtered before slot allocation, so counting them advertises depth that
+  // does not exist.
+  const rt = makeRuntime({
+    suggestions: [minedSuggestion({ id: "prop_a", category: "automation" }), minedSuggestion({ id: "sug_m" })],
+    muted: ["skill"]
+  });
+  const brief = composeBrief(rt, { now: NOW, limit: 5 });
+  assert.equal(brief.items.length, 0, "neither suggestion is renderable");
+  assert.equal(brief.older.count, 0, "so neither may be advertised as older");
+  assert.equal(brief.older.oldestAt, null, "and there is no oldest older item");
+});
+
+test("older.count still counts eligible suggestions that merely did not fit", () => {
+  const suggestions = Array.from({ length: 4 }, (_, i) => minedSuggestion({ id: `sug_${i}` }));
+  const rt = makeRuntime({ suggestions: [...suggestions, minedSuggestion({ id: "prop_x", category: "automation" })] });
+  const brief = composeBrief(rt, { now: NOW, limit: 2 });
+  const shown = brief.items.filter((i) => i.kind === "suggestion").length;
+  assert.equal(brief.older.count, 4 - shown);
+  assert.ok(brief.older.oldestAt, "an eligible-but-unshown suggestion has an age");
+});
+
+test("a genuinely empty suggestion store is not degraded", () => {
+  const brief = composeBrief(makeRuntime({ tasks: [task()] }), { now: NOW, limit: 5 });
+  assert.deepEqual(brief.degraded, [], "an empty queue is a healthy queue");
+});
+
+test("an unreadable suggestion store is reported in degraded", () => {
+  // listAllSuggestions() catches its own readdir errors and returns [], so the
+  // safely() boundary never sees a throw — without an explicit check the brief
+  // claims a healthy empty queue while the store is actually gone.
+  const rt = makeRuntime({ tasks: [task()] });
+  rt.dataDir = path.join(os.tmpdir(), `openagi-brief-missing-${process.pid}-${Date.now()}`);
+  const brief = composeBrief(rt, { now: NOW, limit: 5 });
+  assert.deepEqual(brief.degraded, ["suggestions"]);
+  assert.ok(brief.items.length > 0, "the surviving sources still render");
 });
 
 test("a plan focus item is pinned first even though it has no due date", () => {
