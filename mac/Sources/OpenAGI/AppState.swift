@@ -26,7 +26,6 @@ final class AppState: ObservableObject {
   @Published var recentSessions: [SessionSummary] = []
   @Published var topTasks: [TaskSummary] = []
   @Published var paused: Bool = false
-  @Published var nudges: [Nudge] = []
 
   // Remote "main" pointer for proactive outreach. When set, OutreachConsumer
   // points at this URL/token (a separate host from the local daemon above) and
@@ -63,13 +62,6 @@ final class AppState: ObservableObject {
     let fresh = UUID().uuidString
     UserDefaults.standard.set(fresh, forKey: key)
     return fresh
-  }
-
-  struct Nudge: Identifiable, Equatable {
-    let id: String
-    let title: String
-    let body: String
-    let category: String
   }
 
   private var pollTimer: Timer?
@@ -329,15 +321,9 @@ final class AppState: ObservableObject {
       let suggestionId = parseField(data, "id") ?? ""
       let pathPart = suggestionId.isEmpty ? "/?tab=chat" : "/?tab=chat&suggestion=\(urlEncode(suggestionId))"
       notify(title: title, body: body, path: pathPart)
-      let nudge = Nudge(
-        id: suggestionId.isEmpty ? UUID().uuidString : suggestionId,
-        title: parsed.name ?? "OpenAGI noticed something",
-        body: body,
-        category: category
-      )
-      nudges.removeAll { $0.id == nudge.id }
-      nudges.insert(nudge, at: 0)
-      if nudges.count > 20 { nudges = Array(nudges.prefix(20)) }
+      // The popover's brief is server-composed, so a new suggestion means the
+      // ranking may have changed — refetch rather than mutating local state.
+      Task { await BriefConsumer.shared.refresh() }
     }
     if event == "daily-recap" {
       // Story 7: evening "what did you get done today" notification.

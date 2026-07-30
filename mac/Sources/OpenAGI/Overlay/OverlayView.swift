@@ -4,6 +4,7 @@ struct OverlayView: View {
   @ObservedObject var state = OverlayState.shared
   @ObservedObject var app = AppState.shared
   @ObservedObject var outreach = OutreachConsumer.shared
+  @ObservedObject var brief = BriefConsumer.shared
   @FocusState private var fieldFocused: Bool
   @State private var pillHovered = false
   // Per-item reply text for the targeted chat field, keyed by outreach id.
@@ -36,13 +37,13 @@ struct OverlayView: View {
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
     .onChange(of: state.error) { _, _ in onContentChange() }
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
-    .onChange(of: app.nudges.count) { _, _ in onContentChange() }
+    .onChange(of: brief.items.count) { _, _ in onContentChange() }
     .onChange(of: outreach.items.count) { _, _ in onContentChange() }
     .onChange(of: app.status) { _, _ in onContentChange() }
   }
 
   // Combined attention count shown on the collapsed pill badge.
-  private var pillBadgeCount: Int { app.nudges.count + outreach.items.count }
+  private var pillBadgeCount: Int { brief.items.count + outreach.items.count }
 
   private var pill: some View {
     Button(action: {
@@ -133,33 +134,16 @@ struct OverlayView: View {
         }
         .frame(maxHeight: 240)
       }
-      if !app.nudges.isEmpty {
+      if !brief.items.isEmpty || brief.isLoading {
         Divider()
-        Text("Nudges").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-        ForEach(app.nudges.prefix(4)) { n in
-          HStack(alignment: .top, spacing: 6) {
-            VStack(alignment: .leading, spacing: 1) {
-              Text(n.title).font(.system(size: 11, weight: .medium)).lineLimit(2)
-              if !n.body.isEmpty { Text(n.body).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2) }
-            }
-            Spacer()
-            Button(action: { app.openDashboard(path: "/?tab=chat&suggestion=\(n.id)") }) {
-              Image(systemName: "arrow.up.right.square")
-            }.buttonStyle(.plain).help("Review in chat")
-            Button(action: {
-              withAnimation(.easeOut(duration: 0.15)) { app.nudges.removeAll { $0.id == n.id } }
-            }) {
-              Image(systemName: "xmark")
-            }.buttonStyle(.plain).help("Dismiss")
-          }
-        }
+        BriefSection()
       }
     }
     .padding(12)
     .frame(width: 320)
     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.1), lineWidth: 1))
-    .onAppear { fieldFocused = true }
+    .onAppear { fieldFocused = true; Task { await brief.refresh() } }
     .onChange(of: state.expanded) { _, expanded in if expanded { fieldFocused = true } }
   }
 
