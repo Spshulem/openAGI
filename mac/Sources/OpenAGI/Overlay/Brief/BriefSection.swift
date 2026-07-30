@@ -25,9 +25,16 @@ struct BriefSection: View {
         row(item)
       }
 
+      // Two distinct channels. A transport/HTTP failure is always an error (red).
+      // An outcome is informational (secondary) — EXCEPT that the accept endpoint
+      // reports failures as 200s with a *Error field, so outcomeMessage prefixes
+      // those with "Failed:" and they must still read as failures.
       if let err = brief.lastError {
-        Text(err).font(.system(size: 10))
-          .foregroundStyle(err.hasPrefix("Failed") ? .red : .secondary)
+        Text(err).font(.system(size: 10)).foregroundStyle(.red).lineLimit(2)
+      }
+      if let outcome = brief.lastOutcome {
+        Text(outcome).font(.system(size: 10))
+          .foregroundStyle(outcome.hasPrefix("Failed") ? .red : .secondary)
           .lineLimit(2)
       }
 

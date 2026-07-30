@@ -37,7 +37,13 @@ struct OverlayView: View {
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
     .onChange(of: state.error) { _, _ in onContentChange() }
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
+    // Every BriefConsumer field below adds or removes a row in BriefSection, and
+    // the panel is sized manually — anything missing from this list renders clipped.
     .onChange(of: brief.items.count) { _, _ in onContentChange() }
+    .onChange(of: brief.isLoading) { _, _ in onContentChange() }
+    .onChange(of: brief.lastError) { _, _ in onContentChange() }
+    .onChange(of: brief.lastOutcome) { _, _ in onContentChange() }
+    .onChange(of: brief.olderCount) { _, _ in onContentChange() }
     .onChange(of: outreach.items.count) { _, _ in onContentChange() }
     .onChange(of: app.status) { _, _ in onContentChange() }
   }

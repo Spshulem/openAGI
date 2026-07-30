@@ -16,6 +16,11 @@ final class BriefConsumer: ObservableObject {
   @Published private(set) var olderCount: Int = 0
   @Published private(set) var isLoading = false
   @Published private(set) var lastError: String? = nil
+  /// The last action's server-reported outcome ("Task added", "Skill created: …").
+  /// Kept SEPARATE from `lastError` on purpose: `act()` refetches immediately and
+  /// `refresh()` nils `lastError` on success, so an outcome parked there would be
+  /// wiped before it ever rendered. Nothing clears this but the next action.
+  @Published private(set) var lastOutcome: String? = nil
   /// Action ids currently in flight, keyed by item id. `accept` is NOT
   /// idempotent server-side (skill materialization dedupes into slug-2,
   /// slug-3), so a double tap must be impossible.
@@ -48,6 +53,7 @@ final class BriefConsumer: ObservableObject {
     defer { inFlight.remove(item.id) }
 
     let snapshot = items
+    lastOutcome = nil                      // the previous action's result is stale now
     items.removeAll { $0.id == item.id }   // optimistic
 
     do {
@@ -63,7 +69,7 @@ final class BriefConsumer: ObservableObject {
       }
       let (data, resp) = try await URLSession.shared.data(for: req)
       try AppState.ensureOK(resp, data)
-      lastError = outcomeMessage(data)
+      lastOutcome = outcomeMessage(data)
       await refresh()
     } catch {
       items = snapshot            // restore — the decision was not recorded

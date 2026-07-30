@@ -444,12 +444,55 @@ final class AppState: ObservableObject {
   /// becomes "/tasks%3Fqueue=user" and 404s), which silently emptied every
   /// query-string fetch in this file. Split the query off and let
   /// URLComponents own it.
+  /// Assigning the raw split verbatim to `percentEncodedQuery` is a loaded gun:
+  /// that setter is a precondition, not a throwing API, so one unencoded byte
+  /// (a space in "?q=hello world") aborts the whole app. Sanitise first.
   nonisolated static func buildURL(base: URL, path: String) -> URL {
     let parts = path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
     let rawPath = String(parts.first ?? "")
     var comps = URLComponents(url: base.appendingPathComponent(rawPath), resolvingAgainstBaseURL: false)
-    if parts.count > 1, !parts[1].isEmpty { comps?.percentEncodedQuery = String(parts[1]) }
+    if parts.count > 1, !parts[1].isEmpty {
+      comps?.percentEncodedQuery = sanitizedPercentEncodedQuery(String(parts[1]))
+    }
     return comps?.url ?? base.appendingPathComponent(rawPath)
+  }
+
+  /// Make any caller-supplied query string safe to hand to `percentEncodedQuery`.
+  /// Escapes already present are preserved byte-for-byte (re-encoding them would
+  /// turn "%20" into "%2520" and "%26" into a literal "&", changing the request),
+  /// anything outside the RFC 3986 query set is percent-encoded, and a stray "%"
+  /// that does not introduce a valid escape becomes "%25". The result therefore
+  /// contains only characters the setter accepts, so it can never abort.
+  nonisolated static func sanitizedPercentEncodedQuery(_ raw: String) -> String {
+    func isASCIIHex(_ s: Unicode.Scalar) -> Bool {
+      (s >= "0" && s <= "9") || (s >= "a" && s <= "f") || (s >= "A" && s <= "F")
+    }
+    let scalars = Array(raw.unicodeScalars)
+    var out = ""
+    out.reserveCapacity(scalars.count)
+    var i = 0
+    while i < scalars.count {
+      let s = scalars[i]
+      if s == "%" {
+        if i + 2 < scalars.count, isASCIIHex(scalars[i + 1]), isASCIIHex(scalars[i + 2]) {
+          out.unicodeScalars.append(contentsOf: scalars[i...(i + 2)])
+          i += 3
+        } else {
+          out += "%25"
+          i += 1
+        }
+        continue
+      }
+      // `.urlQueryAllowed` is exactly the query set minus "%", which is handled
+      // above — so every branch here emits setter-legal characters.
+      if CharacterSet.urlQueryAllowed.contains(s) {
+        out.unicodeScalars.append(s)
+      } else {
+        out += String(s).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+      }
+      i += 1
+    }
+    return out
   }
 
   /// Throw on any non-2xx so callers see a real error instead of decoding
