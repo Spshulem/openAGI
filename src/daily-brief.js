@@ -28,9 +28,25 @@ import { planDateKey } from "./daily-planner.js";
 const BUCKETS = ["today", "this_week", "this_month", "this_quarter", "this_year", "someday", "done"];
 const VALID_CLARIFICATION_ANSWERS = ["yes", "in_progress", "no", "dropped"];
 const CLARIFICATION_LABELS = { yes: "Yes", in_progress: "In progress", no: "Not yet", dropped: "Dropped" };
-// "automation" suggestions have no accept branch server-side (hosted-interface.js
-// falls through to a bare 200), so accepting one does nothing. Hide until handled.
-const EXCLUDED_SUGGESTION_CATEGORIES = new Set(["automation"]);
+// Suggestion categories the accept route can genuinely act on. Read off the
+// POST /proactive/suggestions/:id/(accept|reject|dismiss) handler in
+// hosted-interface.js, which branches on candidate.category: "mcp" registers +
+// connects the server, "task" materializes a task, "skill" writes a SKILL.md,
+// "knowledge" remembers it into the memory store. Everything else falls through
+// to a bare commit({}) — status flipped to accepted, nothing created.
+//
+// This is an ALLOWLIST, and it has to be, because the blocklist it replaces
+// (just "automation") FAILED OPEN. Verified live: a suggestion with category
+// "reminder" rendered a "Yes" button, was marked accepted on disk, had zero
+// side effect, and reported "Suggestion accepted" to the user. Failing open on
+// this path means telling someone an action happened when it did not — the one
+// thing this brief must never do — and every category added server-side in
+// future silently inherits that lie. Failing CLOSED costs a hidden row until
+// somebody adds the branch, which is a row we could not have honoured anyway.
+//
+// So: a category off this list is invisible, exactly like "automation" was.
+// Adding an accept branch means adding the category here, in the same commit.
+const ACTIONABLE_SUGGESTION_CATEGORIES = new Set(["mcp", "task", "skill", "knowledge"]);
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -97,7 +113,7 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
     try { return runtime.suggestionFeedback?.isMuted?.(c) === true; } catch { return false; }
   };
   const eligibleSuggestions = suggestions.filter(
-    (s) => !EXCLUDED_SUGGESTION_CATEGORIES.has(s.category) && !isMuted(s.category)
+    (s) => ACTIONABLE_SUGGESTION_CATEGORIES.has(s.category) && !isMuted(s.category)
   );
   const rankedSuggestions = eligibleSuggestions
     .map((s) => buildSuggestion(s, nowMs, multipliers))
@@ -134,11 +150,13 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   items.push(...take(rankedSuggestions, remainingAfter()));
 
   // "N older" is a claim about rows the popover COULD have shown. Counting the
-  // whole pending queue advertises depth that does not exist: excluded
-  // ("automation", no server-side accept branch) and muted suggestions are
-  // filtered out above and can never be rendered, so they are not "older" —
-  // they are invisible. Count against the eligible set only, and derive
-  // oldestAt from that same set so the two never disagree.
+  // whole pending queue advertises depth that does not exist: suggestions
+  // outside ACTIONABLE_SUGGESTION_CATEGORIES (no server-side accept branch) and
+  // muted ones are filtered out above and can never be rendered, so they are
+  // not "older" — they are invisible. Count against the eligible set only, and
+  // derive oldestAt from that same set so the two never disagree. Unchanged by
+  // the blocklist→allowlist inversion: a newly-hidden category is hidden the
+  // same way "automation" already was, and stays out of this count.
   const shownSuggestionIds = new Set(items.filter((i) => i.kind === "suggestion").map((i) => i.id));
   const olderSuggestions = eligibleSuggestions.filter((s) => !shownSuggestionIds.has(`suggestion:${s.id}`));
   const olderCount = olderSuggestions.length;

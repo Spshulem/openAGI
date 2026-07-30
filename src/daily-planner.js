@@ -294,7 +294,7 @@ function deterministicPlan(inputs) {
   return { focus, agentWillDo: [], timeSensitive, note: null };
 }
 
-// ─── shared day-bounds (kept identical to daily-recap) ────────────────────
+// ─── shared day-bounds (imported by daily-recap) ──────────────────────────
 
 /// The calendar day a plan belongs to, in the user's timezone, as YYYY-MM-DD.
 ///
@@ -315,19 +315,62 @@ export function planDateKey(date = new Date(), timezone) {
   }).format(new Date(date));
 }
 
-function localDayBounds(date, tz) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
-  }).formatToParts(date);
-  const year = parts.find((p) => p.type === "year").value;
-  const month = parts.find((p) => p.type === "month").value;
-  const day = parts.find((p) => p.type === "day").value;
-  const startLocal = new Date(`${year}-${month}-${day}T00:00:00`);
-  const offsetMin = startLocal.getTimezoneOffset();
-  const startUtc = new Date(startLocal.getTime() - offsetMin * 60_000);
-  const endUtc = new Date(startUtc.getTime() + 86_400_000);
+/// The UTC instants bounding the local day that contains `date` in `tz`, plus
+/// a human label for it. `startISO` is the instant of local midnight and
+/// `endISO` the instant of the NEXT local midnight, so the window is 23, 24 or
+/// 25 hours long across a DST transition — the day the user actually lived.
+///
+/// This is the only window computeDailyPlan and computeDailyRecap ever look at:
+/// it is handed to calendar_events_between and every pull* filter compares
+/// timestamps against it. It used to return local midnight RELABELLED as UTC —
+/// it parsed "YYYY-MM-DD" in the PROCESS zone and then subtracted that same
+/// zone's offset back off, which cancels out to exactly YYYY-MM-DDT00:00:00Z
+/// for the user's local date whatever their zone. So in America/Los_Angeles
+/// "today" ran from 17:00 yesterday to 17:00 today: it pulled in last night's
+/// calendar, dropped tonight's, and the brief pinned a focus row from it. The
+/// label was a whole day out for the same reason. UTC is the one zone where
+/// the relabelling is a no-op, which is why it survived so long.
+///
+/// Note for anyone tempted to reach for startISO.slice(0, 10): that used to
+/// yield the correct local date, but only as a side effect of the bug. Use
+/// planDateKey — which is what the plan-cache writer and the brief already do.
+export function localDayBounds(date, tz) {
+  const [year, month, day] = planDateKey(date, tz).split("-").map(Number);
+  const startMs = zonedMidnightMs(year, month, day, tz);
+  // Add the day in UTC-calendar space (never +86_400_000, which is wrong twice
+  // a year) and re-resolve, so the closing bound is the next local midnight
+  // under whatever offset is in effect by then.
+  const next = new Date(Date.UTC(year, month - 1, day + 1));
+  const endMs = zonedMidnightMs(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), tz);
   const label = new Intl.DateTimeFormat("en-US", {
     timeZone: tz, weekday: "long", month: "long", day: "numeric"
-  }).format(startUtc);
-  return { startISO: startUtc.toISOString(), endISO: endUtc.toISOString(), label };
+  }).format(new Date(startMs));
+  return { startISO: new Date(startMs).toISOString(), endISO: new Date(endMs).toISOString(), label };
+}
+
+/// The instant at which the wall clock in `tz` reads midnight on the given
+/// calendar date. There is no direct API for this, so: pretend the wall time is
+/// UTC, ask what offset the zone was on around then, and subtract it. The first
+/// guess can land on the wrong side of a DST transition (the offset that
+/// applies at noon UTC is not always the one that applied at local midnight),
+/// so it is re-measured at the guessed instant; one correction is enough for
+/// every real zone. On a spring-forward day where local midnight does not
+/// exist this settles on 01:00 local, the standard resolution.
+function zonedMidnightMs(year, month, day, tz) {
+  const wallAsUtc = Date.UTC(year, month - 1, day);
+  const guess = wallAsUtc - zoneOffsetMs(wallAsUtc, tz);
+  return wallAsUtc - zoneOffsetMs(guess, tz);
+}
+
+/// How far ahead of UTC `tz` was at instant `ms`, in milliseconds (negative
+/// west of UTC). Measured by rendering the instant in the zone and reading the
+/// wall clock back as if it were UTC.
+function zoneOffsetMs(ms, tz) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"
+  }).formatToParts(new Date(ms));
+  const at = (type) => Number(parts.find((p) => p.type === type).value);
+  const wallAsUtc = Date.UTC(at("year"), at("month") - 1, at("day"), at("hour"), at("minute"), at("second"));
+  return wallAsUtc - ms;
 }

@@ -16,6 +16,11 @@ final class BriefEditorState: ObservableObject {
   @Published private(set) var openItemID: String? = nil
   /// The text being edited. Seeded ONLY from the item's full `editValue`.
   @Published var text: String = ""
+  /// The seed `text` was opened with, so "the user has typed" can be told from
+  /// "this is still exactly what the server sent". Not @Published: it is
+  /// bookkeeping, it changes nothing on screen, and publishing it would fire
+  /// OverlayView's resize allowlist for a value no pixel depends on.
+  private var openSeed: String? = nil
 
   /// Open `item`'s editor, seeded with its complete current text.
   ///
@@ -27,6 +32,7 @@ final class BriefEditorState: ObservableObject {
   func open(_ item: BriefItem) -> Bool {
     guard let seed = item.editValue else { return false }
     text = seed
+    openSeed = seed
     openItemID = item.id
     return true
   }
@@ -34,9 +40,50 @@ final class BriefEditorState: ObservableObject {
   func close() {
     openItemID = nil
     text = ""
+    openSeed = nil
   }
 
   func isOpen(_ item: BriefItem) -> Bool { openItemID == item.id }
+
+  /// Keep the editor anchored to a row that still exists.
+  ///
+  /// `close()` used to be the ONLY thing that cleared `openItemID`, and nothing
+  /// calls it when the row leaves by any other route — Approve, Discard, or a
+  /// refresh that simply no longer lists the item. The id then stayed pinned to
+  /// a draft that was gone while `text` still held the user's typed body.
+  ///
+  /// That is not merely untidy, because a removed row can come BACK: act()
+  /// restores it when the request throws, and a refresh can list it again. On
+  /// that revival `isOpen` matches once more, the field re-mounts on a seed
+  /// captured before the item left, and `.onAppear` yanks keyboard focus out of
+  /// the Quick Ask field with no user action — one Return away from PATCHing a
+  /// stale body over whatever the draft says now. (It cannot reach a DIFFERENT
+  /// draft: both the id and the PATCH path come from the same live BriefItem,
+  /// and draft ids are `draft_<uuid>`, never reused. Stale, not misdirected.)
+  ///
+  /// Called from BriefConsumer whenever `items` or `inFlight` moves, so this
+  /// holds even while the panel is collapsed and no brief view is mounted.
+  func reconcile(items: [BriefItem], inFlight: Set<String>) {
+    guard let open = openItemID else { return }
+    // A row with an action in flight is NOT gone — act() removes it
+    // optimistically and puts it back if the request throws. Deciding here
+    // would discard the user's revision on every failed Approve. act()'s defer
+    // clears `inFlight` and calls back, which is when the answer is known.
+    if inFlight.contains(open) { return }
+    guard let live = items.first(where: { $0.id == open }) else { close(); return }
+    // Still listed, but the daemon no longer sends a body for it. Same rule as
+    // open(): no trustworthy seed, no editor — never a PATCH built on a guess.
+    guard let seed = live.editValue else { close(); return }
+    // The row's text moved server-side and the user had not touched theirs:
+    // follow the live item instead of holding a snapshot of a version that no
+    // longer exists. A body the user HAS typed is never overwritten — their
+    // edit is the newer one, and losing it is the failure this whole type is
+    // built to avoid.
+    if seed != openSeed && text == openSeed {
+      text = seed
+      openSeed = seed
+    }
+  }
 }
 
 // Renders the ranked brief. Every button comes from the server's declarative

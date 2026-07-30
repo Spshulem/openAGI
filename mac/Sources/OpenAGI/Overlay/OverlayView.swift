@@ -18,7 +18,16 @@ struct OverlayView: View {
   var onExpand: () -> Void = {}
   var onContentChange: () -> Void = {}
 
+  // The resize watchers are applied in two chunks rather than one chain because
+  // the whole thing — the Group's ViewBuilder plus fifteen generic .onChange
+  // overloads — stopped type-checking in reasonable time as a single expression.
+  // Splitting it is purely a compile-time concern; the modifier order, and so
+  // the behaviour, is identical to writing them end to end.
   var body: some View {
+    briefWatchers(panelWatchers(panelBody))
+  }
+
+  private var panelBody: some View {
     Group {
       if state.expanded {
         expandedPanel
@@ -32,12 +41,36 @@ struct OverlayView: View {
       }
     }
     .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.expanded)
+  }
+
+  private func panelWatchers<V: View>(_ content: V) -> some View {
+    content
+    // `expanded` swaps a 44pt pill for a 320pt panel, which is the single
+    // largest height change this view has. The two buttons below pair their
+    // own mutation with onExpand/onCollapse, but they are not the only writers:
+    // TrayController's "N needs you…" item and NotificationPresenter's
+    // body/Review tap both do `OverlayController.show()` then set
+    // `OverlayState.shared.expanded = true` directly. show() sizes the panel
+    // FIRST — while `expanded` is still false, so to the pill's 44×44 — and
+    // then the flag flips with nothing left to re-measure, leaving the whole
+    // expanded panel rendering inside a pill-sized frame. Watching the state
+    // itself covers every writer, including ones outside this file.
+    .onChange(of: state.expanded) { _, _ in onContentChange() }
     // The panel resizes around this content — tell the controller whenever
     // something that changes our height lands (answer, error, nudges, …).
     .onChange(of: state.answer) { _, _ in onContentChange() }
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
     .onChange(of: state.error) { _, _ in onContentChange() }
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
+    .onChange(of: app.status) { _, _ in onContentChange() }
+    // Same identity-not-count reasoning as `brief.items` below: OutreachConsumer
+    // .ingest can drop an acted item and add a pending one in the same batch, so
+    // the count holds while the rows — and the panel's height — change. Equatable.
+    .onChange(of: outreach.items) { _, _ in onContentChange() }
+  }
+
+  private func briefWatchers<V: View>(_ content: V) -> some View {
+    content
     // Every BriefConsumer field below adds or removes a row in BriefSection, and
     // the panel is sized manually — anything missing from this list renders clipped.
     // Watch `items`, not `items.count`: row height varies with content (title
@@ -58,11 +91,6 @@ struct OverlayView: View {
     // mode is losing the Save button off the bottom edge, mid-edit.
     .onChange(of: briefEditor.openItemID) { _, _ in onContentChange() }
     .onChange(of: briefEditor.text) { _, _ in onContentChange() }
-    // Same identity-not-count reasoning as `brief.items`: OutreachConsumer.ingest
-    // can drop an acted item and add a pending one in the same batch, so the
-    // count holds while the rows — and the panel's height — change. Equatable.
-    .onChange(of: outreach.items) { _, _ in onContentChange() }
-    .onChange(of: app.status) { _, _ in onContentChange() }
   }
 
   // Combined attention count shown on the collapsed pill badge.

@@ -132,6 +132,84 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     };
   }
 
+  // How long accepting an MCP suggestion waits for the handshake before it
+  // answers "registered, not connected yet". The popover blocks on that
+  // request, so the wait has to stay inside a click's patience budget: a
+  // local stdio handshake lands in well under a second and an http
+  // initialize is one round-trip, while the slow paths (npx cold-download,
+  // OAuth browser consent) run for minutes — mcp-client allows 300s for
+  // initialize and mcp-http-client 5min — and must never hold the response
+  // open. 3s clears the fast paths without making the button feel broken.
+  const MCP_ACCEPT_CONNECT_MS = Number.parseInt(process.env.OPENAGI_MCP_ACCEPT_CONNECT_MS ?? "3000", 10);
+
+  /// Connect an MCP server and report what ACTUALLY happened, so a caller can
+  /// print the truth instead of assuming success. Never throws. Returns
+  ///   { connected: true,  connectError: null }   handshake done, tools live
+  ///   { connected: false, connectError: null }   registered, not connected —
+  ///       either still handshaking past our wait, or waiting on the user to
+  ///       finish an interactive authorization. NOT a failure.
+  ///   { connected: false, connectError: "<reason>" }  it really failed.
+  ///
+  /// The OAuth carve-out is deliberate. mcp-oauth signals "needs the human"
+  /// two ways: a typed error (code OAUTH_INTERACTIVE_REQUIRED) when the
+  /// caller asked not to open a browser, and — on the interactive path this
+  /// one uses — printAuthUrlFn → registry.onOauthRequired → pendingOauth,
+  /// while the connect promise stays parked on the browser callback. Neither
+  /// is an error; both mean "registered, needs authorization".
+  ///
+  /// `connected` is read back off the registry (the same source GET /mcp
+  /// reports from) rather than inferred from the promise, so this response
+  /// can never contradict what the MCP tab shows a second later.
+  async function connectAndReport(name) {
+    const isConnected = () =>
+      Boolean(runtime.mcp?.listServers?.().find((s) => s.name === name)?.connected);
+    if (typeof runtime.mcp?.connect !== "function") return { connected: isConnected(), connectError: null };
+    // An OAuth prompt raised DURING this attempt proves we are parked on the
+    // user, not broken. A pre-existing entry proves nothing (it can be stale),
+    // so remember the mark we started from.
+    const oauthMarkBefore = pendingOauth.get(name)?.at ?? null;
+    const newOauthPrompt = () => {
+      const at = pendingOauth.get(name)?.at ?? null;
+      return at != null && at !== oauthMarkBefore;
+    };
+
+    let attempt;
+    try {
+      attempt = Promise.resolve(runtime.mcp.connect(name));
+    } catch (error) {
+      return { connected: isConnected(), connectError: error?.message ?? String(error) };
+    }
+    events.emit("mcp", { op: "connecting", name });
+    // The attempt outlives our wait on purpose: the registry dedups it, the
+    // dashboard learns the ending over SSE, and /mcp shows the real state.
+    // These handlers also keep a late rejection from going unhandled.
+    attempt.then(
+      (status) => {
+        pendingOauth.delete(name);
+        events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
+      },
+      (error) => { events.emit("mcp", { op: "connect-error", name, error: error?.message ?? String(error) }); }
+    );
+
+    let timer = null;
+    // `rejected` is tracked as its own flag, not inferred from a truthy error:
+    // a promise can reject with undefined, and that must still be classified
+    // as a settled attempt rather than silently reading as "no error".
+    const outcome = await Promise.race([
+      attempt.then(() => ({ settled: true, rejected: false }), (error) => ({ settled: true, rejected: true, error })),
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ settled: false }), MCP_ACCEPT_CONNECT_MS); })
+    ]);
+    if (timer) clearTimeout(timer);
+
+    // Timed out, or it resolved — either way the registry has the last word.
+    if (!outcome.settled || !outcome.rejected) return { connected: isConnected(), connectError: null };
+    if (outcome.error?.code === "OAUTH_INTERACTIVE_REQUIRED" || newOauthPrompt()) {
+      return { connected: isConnected(), connectError: null };
+    }
+    const reason = outcome.error?.message ?? (outcome.error == null ? "connect failed" : String(outcome.error));
+    return { connected: isConnected(), connectError: reason };
+  }
+
   if (runtime.agentHost) {
     const original = runtime.agentHost.handleMessage.bind(runtime.agentHost);
     runtime.agentHost.handleMessage = async (input) => {
@@ -1256,9 +1334,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return fail({ registerError: error.message });
           }
           // The server IS registered now, so a connect failure must not undo
-          // the accept — OAuth/handshake problems surface via SSE instead.
-          try { runtime.mcp.connect?.(name).catch(() => { /* OAuth path surfaces via SSE */ }); } catch { /* ignore */ }
-          return commit({ registered: name });
+          // the accept. But it must not be reported as a connection either:
+          // this used to fire-and-forget connect() with a swallowed rejection
+          // and answer { registered }, which every client rendered as
+          // "Connected <name>" — including for a server that could never be
+          // reached. Wait (briefly) for the real outcome and say which of the
+          // three it was: connected / registered-but-not-connected /
+          // registered-but-connect-failed.
+          const outcome = await connectAndReport(name);
+          return commit({ registered: name, ...outcome });
         }
         // For task suggestions, accepting creates the task in the right
         // queue + bucket — through the same materializer the observer's
@@ -2437,6 +2521,17 @@ function showToast(msg, ok = true) {
   setTimeout(() => t.remove(), 4500);
 }
 
+// Accepting an MCP suggestion has three real endings, and the accept
+// response now reports which one happened (connected + connectError).
+// Say the true one — claiming "connected" for a server that never answered
+// sent people to the MCP tab to find it sitting there disconnected.
+function mcpAcceptMessage(res) {
+  const name = res.registered;
+  if (res.connectError) return "Registered " + name + " — connect failed: " + res.connectError;
+  if (res.connected) return "✓ MCP " + name + " connected — opening MCP tab";
+  return "Registered " + name + " — not connected yet (may need authorization)";
+}
+
 newBtn.addEventListener("click", async () => {
   if (state.tab === "chat") {
     state.sessionId = null;
@@ -2739,7 +2834,7 @@ async function renderChatDeepLink() {
             showToast("✓ Task added — opening Tasks", true);
             setTimeout(() => switchTab("tasks"), 600);
           } else if (action === "accept" && res.registered) {
-            showToast(\`✓ MCP \${res.registered} connected — opening MCP tab\`, true);
+            showToast(mcpAcceptMessage(res), !res.connectError);
             setTimeout(() => switchTab("mcp"), 600);
           } else {
             showToast(\`Suggestion \${action}d\`, true);
@@ -3978,7 +4073,7 @@ async function renderSuggestions() {
             showToast("✓ Task added — opening Tasks", true);
             setTimeout(() => switchTab("tasks"), 600);
           } else if (action === "accept" && res.registered) {
-            showToast(\`✓ MCP \${res.registered} connected — opening MCP tab\`, true);
+            showToast(mcpAcceptMessage(res), !res.connectError);
             setTimeout(() => switchTab("mcp"), 600);
           } else if (action === "accept") {
             showToast("✓ Accepted", true);

@@ -84,6 +84,11 @@ final class BriefConsumer: ObservableObject {
       degraded = decoded.degraded
       planCachedAt = decoded.planCachedAt
       lastError = nil
+      // The list just changed under the inline editor. Deliberately NOT in the
+      // catch branch: a transport failure says nothing about which rows exist,
+      // `items` is left stale, and closing an editor on that would discard a
+      // revision over a dropped packet.
+      BriefEditorState.shared.reconcile(items: items, inFlight: inFlight)
     } catch {
       guard generation == refreshGeneration else { return }
       lastError = error.localizedDescription
@@ -97,7 +102,13 @@ final class BriefConsumer: ObservableObject {
   func act(_ item: BriefItem, _ action: BriefAction) async {
     guard !inFlight.contains(item.id) else { return }
     inFlight.insert(item.id)
-    defer { inFlight.remove(item.id) }
+    // Clearing `inFlight` is what makes the acted row's fate knowable, so it is
+    // also the moment the editor's anchor can finally be decided. Both happen
+    // here, together, on every exit path — including the throwing one.
+    defer {
+      inFlight.remove(item.id)
+      BriefEditorState.shared.reconcile(items: items, inFlight: inFlight)
+    }
 
     // RULE: never snapshot the whole array across an await. `inFlight` is keyed
     // per item, so two rows can be acted on concurrently; restoring a
@@ -109,6 +120,13 @@ final class BriefConsumer: ObservableObject {
     let actedIndex = items.firstIndex { $0.id == item.id } ?? items.count
 
     lastOutcome = nil                      // the previous action's result is stale now
+    // An expand- or SSE-triggered refresh already in flight was BUILT before
+    // this decision and still carries the row being removed, so letting it land
+    // re-adds a row the user just acted on (and, with the editor open on it,
+    // re-mounts the field and steals focus). Bumping the generation retires it
+    // exactly the way a newer refresh would; act() then does its own refetch on
+    // success, so nothing is left unreconciled.
+    refreshGeneration &+= 1
     items.removeAll { $0.id == item.id }   // optimistic
 
     do {
@@ -118,7 +136,12 @@ final class BriefConsumer: ObservableObject {
       req.timeoutInterval = 10
       if let t = token() { req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization") }
       if let body = action.body {
-        req.httpBody = try JSONSerialization.data(withJSONObject: body.mapValues { $0.value })
+        // Encode THROUGH AnyCodable, not around it. Reaching past it with
+        // JSONSerialization over `.value` left two encoders for one wire
+        // format: AnyCodable.encode already had to be fixed once for nested
+        // containers, and this path would not have inherited that fix. One
+        // encoder means a body can only ever be wrong in one place.
+        req.httpBody = try JSONEncoder().encode(body)
       } else if action.method != "DELETE" {
         req.httpBody = "{}".data(using: .utf8)
       }
@@ -164,7 +187,7 @@ final class BriefConsumer: ObservableObject {
     case "accept" where isSuggestionPath(action.path):
       // ONLY this route returns these keys as a success report. Elsewhere a
       // taskId is just the row's provenance, not something that was created.
-      if let mcp = obj["registered"] as? String { return "Connected \(mcp)" }
+      if let mcp = obj["registered"] as? String { return mcpOutcome(mcp, obj) }
       if let slug = obj["skillSlug"] as? String { return "Skill created: \(slug)" }
       if obj["taskId"] is String { return "Task added" }
       // A "knowledge" suggestion is written into the memory store
@@ -210,6 +233,37 @@ final class BriefConsumer: ObservableObject {
     default:
       return genericOutcome(action)
     }
+  }
+
+  /// Accepting an MCP suggestion does two separable things: it WRITES the
+  /// server into the registry, and it then tries to CONNECT to it. `registered`
+  /// only ever proved the first, yet this reported "Connected <name>" — so a
+  /// server that was written down and never reached still read as working, and
+  /// the user learned otherwise the next time a tool call went missing.
+  ///
+  /// The accept response now carries the second half explicitly
+  /// (`connected` + `connectError`), and these four cases are exactly what it
+  /// can say. Note `connected` is read as `Bool?`, not `?? false`: ABSENT is a
+  /// third state, not a no. An older daemon sends neither field, and it did
+  /// attempt the connection — so the honest report is the half we can prove
+  /// ("Registered X") with no claim either way about the connection.
+  private func mcpOutcome(_ name: String, _ obj: [String: Any]) -> String {
+    let connected = obj["connected"] as? Bool
+    // `connected` is checked BEFORE `connectError`, which is the opposite of
+    // the web toast in hosted-interface.js. The server builds both from one
+    // return (`{ connected: isConnected(), connectError: … }`), so a retry that
+    // threw against an ALREADY-connected server yields true alongside an error
+    // string. The tools are live in that case; "connect failed" would be the
+    // wrong half to report.
+    if connected == true { return "Connected \(name)" }
+    // Prefixed "Failed" so BriefSection renders it red: the registry entry
+    // landed, but the thing the user actually asked for did not happen.
+    if let why = (obj["connectError"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines), !why.isEmpty {
+      return "Failed: registered \(name), couldn't connect — \(why)"
+    }
+    if connected == false { return "Registered \(name) — not connected" }
+    return "Registered \(name)"
   }
 
   /// Nothing may be silent. An action this build does not recognize — a newer

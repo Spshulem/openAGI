@@ -119,6 +119,47 @@ test("automation suggestions never appear (no server-side accept branch exists)"
   assert.equal(brief.items.length, 0);
 });
 
+// THE fail-open case the allowlist exists for. The filter used to be a
+// blocklist of one ("automation"), so a category nobody had thought about
+// rendered a "Yes" that flipped the record to accepted, did nothing, and told
+// the user "Suggestion accepted". Verified live with category "reminder"
+// before the inversion: it rendered accept + reject.
+test("an unknown suggestion category never renders an accept action", () => {
+  // prop_* so the observer envelope keeps the category verbatim — anything
+  // under skills-suggested/ is normalized to "skill" and would prove nothing.
+  const rt = makeRuntime({
+    suggestions: [
+      minedSuggestion({ id: "prop_reminder", category: "reminder" }),
+      minedSuggestion({ id: "prop_digest", category: "digest" }),
+      minedSuggestion({ id: "prop_none", category: undefined })
+    ]
+  });
+  const brief = composeBrief(rt, { now: NOW, limit: 5 });
+  assert.deepEqual(
+    brief.items.flatMap((i) => i.actions.filter((a) => a.id === "accept")),
+    [],
+    "no row may offer an accept the server has no branch for"
+  );
+  assert.equal(brief.items.length, 0, "a category with no accept path is hidden, not shown button-less");
+  assert.equal(brief.older.count, 0, "and an invisible row is not 'older' either");
+});
+
+// The other half of the invariant: closing the filter must not close it on the
+// categories hosted-interface.js really does materialize (mcp → registerServer,
+// task → materializeTaskFromSuggestion, skill → createSkillFrom*, knowledge →
+// memory.remember). Hiding those would be its own quiet lie.
+test("every category with a real server-side accept branch still renders one", () => {
+  for (const category of ["mcp", "task", "skill", "knowledge"]) {
+    const rt = makeRuntime({ suggestions: [minedSuggestion({ id: `prop_${category}`, category })] });
+    const brief = composeBrief(rt, { now: NOW, limit: 5 });
+    const row = brief.items.find((i) => i.id === `suggestion:prop_${category}`);
+    assert.ok(row, `${category} suggestions must still reach the brief`);
+    const accept = row.actions.find((a) => a.id === "accept");
+    assert.ok(accept, `${category} must keep its accept action`);
+    assert.equal(accept.path, `/proactive/suggestions/prop_${category}/accept`);
+  }
+});
+
 test("older.count excludes suggestions that could never be rendered", () => {
   // "N older" is a promise about rows the popover COULD show. An automation
   // candidate (no server-side accept branch) and a muted-category one are both

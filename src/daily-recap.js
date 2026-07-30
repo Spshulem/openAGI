@@ -8,6 +8,13 @@
 // of the output — goals, dependencies, retros — but this module ships
 // useful on its own with what we already have.
 
+// The day window and the day key both come from daily-planner rather than
+// being reimplemented here. They used to be byte-identical copies annotated
+// "kept identical", which is exactly how the timezone bug in localDayBounds
+// came to exist in two places at once. daily-planner imports nothing, so this
+// direction cannot cycle.
+import { localDayBounds, planDateKey } from "./daily-planner.js";
+
 const HOURS_DECIMAL_PLACES = 1;
 
 /// Build the recap. `date` is a Date object identifying which day to
@@ -32,7 +39,9 @@ export function computeDailyRecap(runtime, { date = new Date(), timezone } = {})
   const tasksByGoal = groupCompletedByGoal(runtime, completedTasks);
   return {
     date: label,
-    dateISO: startISO.slice(0, 10),
+    // planDateKey, not startISO.slice(0, 10): startISO is now a real instant,
+    // so its UTC date is the previous day for most of the evening west of UTC.
+    dateISO: planDateKey(date, tz),
     timezone: tz,
     range: { from: startISO, to: endISO },
     completedTasks,
@@ -284,25 +293,13 @@ function pullUnblocked(runtime, startISO, endISO) {
     .map((e) => ({ id: e.task?.id, title: e.task?.title ?? "(unknown)", completedDepId: e.completedDepId, at: e.at }));
 }
 
-// ─── day boundaries (timezone-aware) ───────────────────────────────────
-
-function localDayBounds(date, tz) {
-  // Build start-of-day in the user's timezone, return ISO bounds + a
-  // human label like "Tuesday, May 13".
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit"
-  }).formatToParts(date);
-  const year = parts.find((p) => p.type === "year").value;
-  const month = parts.find((p) => p.type === "month").value;
-  const day = parts.find((p) => p.type === "day").value;
-  // Start = local midnight; we approximate by parsing the "YYYY-MM-DD"
-  // as UTC then adjusting by the zone offset for that moment.
-  const startLocal = new Date(`${year}-${month}-${day}T00:00:00`);
-  const offsetMin = startLocal.getTimezoneOffset();
-  const startUtc = new Date(startLocal.getTime() - offsetMin * 60_000);
-  const endUtc = new Date(startUtc.getTime() + 86_400_000);
-  const label = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz, weekday: "long", month: "long", day: "numeric"
-  }).format(startUtc);
-  return { startISO: startUtc.toISOString(), endISO: endUtc.toISOString(), label };
-}
+// ─── day boundaries ────────────────────────────────────────────────────
+//
+// localDayBounds lives in daily-planner.js and is imported at the top of this
+// file. The pull* filters above compare ISO strings lexicographically rather
+// than parsing them, which is only an instant ordering because every timestamp
+// involved is Date#toISOString output (nowIso(), utils.js) — fixed-width UTC
+// with a trailing Z — and the bounds still are too. A writer that starts
+// emitting local-offset timestamps ("...+09:00") would break those filters
+// silently; test/day-bounds-timezone.test.js pins the bound format so the
+// breakage lands there instead.
