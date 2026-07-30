@@ -449,20 +449,47 @@ final class AppState: ObservableObject {
 
   // MARK: — HTTP helpers
 
+  /// Build a request URL from a daemon path that MAY carry a query string.
+  /// `URL.appendingPathComponent` percent-encodes "?" (so "/tasks?queue=user"
+  /// becomes "/tasks%3Fqueue=user" and 404s), which silently emptied every
+  /// query-string fetch in this file. Split the query off and let
+  /// URLComponents own it.
+  nonisolated static func buildURL(base: URL, path: String) -> URL {
+    let parts = path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+    let rawPath = String(parts.first ?? "")
+    var comps = URLComponents(url: base.appendingPathComponent(rawPath), resolvingAgainstBaseURL: false)
+    if parts.count > 1, !parts[1].isEmpty { comps?.percentEncodedQuery = String(parts[1]) }
+    return comps?.url ?? base.appendingPathComponent(rawPath)
+  }
+
+  /// Throw on any non-2xx so callers see a real error instead of decoding
+  /// an error body into nil and rendering it as "(no reply)".
+  nonisolated static func ensureOK(_ resp: URLResponse, _ data: Data) throws {
+    guard let http = resp as? HTTPURLResponse else { return }
+    guard (200..<300).contains(http.statusCode) else {
+      let snippet = String(data: data.prefix(300), encoding: .utf8) ?? ""
+      throw NSError(domain: "OpenAGI", code: http.statusCode, userInfo: [
+        NSLocalizedDescriptionKey: "HTTP \(http.statusCode)\(snippet.isEmpty ? "" : ": \(snippet)")"
+      ])
+    }
+  }
+
   private func get<T: Decodable>(_ path: String) async throws -> T {
-    var req = URLRequest(url: baseURL.appendingPathComponent(path))
+    var req = URLRequest(url: Self.buildURL(base: baseURL, path: path))
     if let token = authToken() { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-    let (data, _) = try await URLSession.shared.data(for: req)
+    let (data, resp) = try await URLSession.shared.data(for: req)
+    try Self.ensureOK(resp, data)
     return try JSONDecoder().decode(T.self, from: data)
   }
 
   private func post(_ path: String, body: Data? = nil) async throws -> Data {
-    var req = URLRequest(url: baseURL.appendingPathComponent(path))
+    var req = URLRequest(url: Self.buildURL(base: baseURL, path: path))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     if let token = authToken() { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
     if let body = body { req.httpBody = body }
-    let (data, _) = try await URLSession.shared.data(for: req)
+    let (data, resp) = try await URLSession.shared.data(for: req)
+    try Self.ensureOK(resp, data)
     return data
   }
 }
