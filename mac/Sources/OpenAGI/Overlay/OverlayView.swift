@@ -39,7 +39,10 @@ struct OverlayView: View {
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
     // Every BriefConsumer field below adds or removes a row in BriefSection, and
     // the panel is sized manually — anything missing from this list renders clipped.
-    .onChange(of: brief.items.count) { _, _ in onContentChange() }
+    // Watch `items`, not `items.count`: row height varies with content (title
+    // wrap, whether `why` is present, whether the actions row renders), so a
+    // same-count swap changes the panel's height too. BriefItem is Equatable.
+    .onChange(of: brief.items) { _, _ in onContentChange() }
     .onChange(of: brief.isLoading) { _, _ in onContentChange() }
     .onChange(of: brief.lastError) { _, _ in onContentChange() }
     .onChange(of: brief.lastOutcome) { _, _ in onContentChange() }
@@ -140,7 +143,12 @@ struct OverlayView: View {
         }
         .frame(maxHeight: 240)
       }
-      if !brief.items.isEmpty || brief.isLoading {
+      // Gate on everything BriefSection can render, not just the rows. Gating on
+      // items alone hid the section the instant the last item was acted on —
+      // which is exactly when "Task added" / "Skill created" lands, so the
+      // confirmation for the final decision was never visible. It also hid a
+      // failed refresh's error and the "N older" count on an empty brief.
+      if brief.hasContent {
         Divider()
         BriefSection()
       }

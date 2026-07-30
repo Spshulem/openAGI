@@ -26,6 +26,13 @@ final class BriefConsumer: ObservableObject {
   /// slug-3), so a double tap must be impossible.
   @Published private(set) var inFlight: Set<String> = []
 
+  /// True when BriefSection would render anything at all. The overlay gates the
+  /// whole section on this rather than on `items`, so an outcome, an error, or
+  /// the "N older" count still shows once the last row has been acted on.
+  var hasContent: Bool {
+    !items.isEmpty || isLoading || olderCount > 0 || lastError != nil || lastOutcome != nil
+  }
+
   private var baseURL: URL { AppState.shared.baseURL }
   private func token() -> String? { AppState.shared.authToken() }
 

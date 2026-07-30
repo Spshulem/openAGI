@@ -58,12 +58,19 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   // listAllSuggestions() catches its own readdir errors and returns [], so the
   // safely() boundary above can NEVER see a broken store — an unreadable
   // suggestion queue would otherwise be reported as a healthy empty one. Ask
-  // the filesystem directly instead, and only when the list came back empty
-  // (a non-empty list has already proven the store readable).
-  // The dirs it walks hang off runtime.dataDir, not the caller's dataDir
-  // override, so check the directory the feed actually read.
-  if (suggestions.length === 0 && !degraded.includes("suggestions")
-      && suggestionStoreUnreadable(runtime?.dataDir ?? resolvedDataDir)) {
+  // the filesystem directly instead.
+  //
+  // Probe UNCONDITIONALLY, not just when the list came back empty: the feed
+  // walks TWO directories (proactive/suggestions and skills-suggested), so one
+  // can be unreadable while the other still returns rows. Gating on an empty
+  // list let a half-broken store report as healthy with most of the queue
+  // silently missing.
+  //
+  // Resolve the dirs the way the feed itself does (suggestion-feed.js), not via
+  // the caller's dataDir override — AbiRuntime carries no dataDir, so the feed
+  // falls back to its sub-stores' own paths and can be reading somewhere else
+  // entirely.
+  if (!degraded.includes("suggestions") && suggestionStoreUnreadable(suggestionDataDir(runtime, resolvedDataDir))) {
     degraded.push("suggestions");
   }
 
@@ -349,6 +356,18 @@ function readPlanCache(dataDir, now) {
 /// readable dataDir is a first-run install with a genuinely empty queue and
 /// must not be flagged. A subdir that exists but will not list (permissions,
 /// bad mount) is the real broken case.
+/// Resolve the directory the suggestion feed ACTUALLY reads, mirroring
+/// suggestion-feed.js's own fallback chain. AbiRuntime carries no `dataDir`, so
+/// in the daemon the feed resolves through its sub-stores — probing the
+/// caller's dataDir instead would happily report a healthy store while the feed
+/// was reading a broken one somewhere else.
+function suggestionDataDir(runtime, fallback) {
+  return runtime?.dataDir
+    ?? runtime?.proactiveObserver?.dataDir
+    ?? runtime?.patternMiner?.dataDir
+    ?? fallback;
+}
+
 function suggestionStoreUnreadable(dataDir) {
   if (!dataDir || !canList(dataDir)) return true;
   const dirs = [path.join(dataDir, "proactive", "suggestions"), path.join(dataDir, "skills-suggested")];
