@@ -320,7 +320,11 @@ final class AppState: ObservableObject {
         default: return "🔔"
         }
       }()
-      let title = "\(prefix): \(parsed.name ?? "OpenAGI noticed something")"
+      // The payload sends title/rationale (src/proactive-observer.js:300-306);
+      // parseSkillCandidate reads name/description, which are absent here, so
+      // this fell through to the placeholder for every suggestion ever sent.
+      let suggestionTitle = parseField(data, "title") ?? parsed.name ?? "OpenAGI noticed something"
+      let title = "\(prefix): \(suggestionTitle)"
       let body = parseField(data, "rationale") ?? parsed.description ?? "Tap to review in chat."
       let suggestionId = parseField(data, "id") ?? ""
       let pathPart = suggestionId.isEmpty ? "/?tab=chat" : "/?tab=chat&suggestion=\(urlEncode(suggestionId))"
