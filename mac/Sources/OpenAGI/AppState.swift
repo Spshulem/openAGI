@@ -173,6 +173,15 @@ final class AppState: ObservableObject {
       memoryLong = h.status?.memory?.long ?? 0
       lastError = nil
       consecutiveFailures = 0
+      // First successful /health of the launch — now, and not before, the
+      // daemon is definitely up and serving. The collapsed pill's badge counts
+      // brief items, so without this it reads 0 until the user opens the
+      // popover: the one always-visible "something needs you" signal was blank
+      // exactly when there was something to see.
+      if !didInitialBriefRefresh {
+        didInitialBriefRefresh = true
+        scheduleBriefRefresh()
+      }
       if h.firstRun == true && !offeredSetupThisLaunch {
         offeredSetupThisLaunch = true
         notify(title: "Welcome to OpenAGI", body: "Two minutes of setup and your agent is live.", path: "/setup")
@@ -271,7 +280,63 @@ final class AppState: ObservableObject {
     sseSession?.invalidateAndCancel()
   }
 
+  // MARK: — Brief refresh
+
+  /// SSE events that can change what `GET /brief/today` ranks. The brief is
+  /// composed from the plan cache, the task store, the draft store, the
+  /// clarification store and the suggestion feed (src/daily-brief.js), so any
+  /// event that mutates one of those invalidates both the popover's list and
+  /// the collapsed pill's badge. Names taken verbatim from the broadcast list
+  /// in src/hosted-interface.js — nothing here is invented.
+  ///
+  /// Deliberately excluded: "task-reminder" and "daily-recap" are pure
+  /// notifications over unchanged state, and refetching on them would just
+  /// burn a request.
+  private static let briefRelevantEvents: Set<String> = [
+    "proactive-suggestion",
+    "suggestion-resolved",
+    "task-updated",
+    "task-auto-changed",
+    "task-unblocked",
+    "clarification-created",
+    "clarification-resolved",
+    "draft-created",
+    "draft-resolved",
+    "daily-plan"
+  ]
+
+  private var briefRefreshTask: Task<Void, Never>?
+  private var briefRefreshPending = false
+  private var didInitialBriefRefresh = false
+
+  /// Coalesce brief refetches. These events arrive in bursts — one planner run
+  /// emits a daily-plan plus a task-updated per task it touched — and they all
+  /// want the same single GET. Trailing-edge debounce (~1s), with a 3s ceiling
+  /// so a steady drip of events can't defer the refresh forever.
+  func scheduleBriefRefresh() {
+    briefRefreshPending = true
+    guard briefRefreshTask == nil else { return }   // the open window will pick it up
+    briefRefreshTask = Task { [self] in
+      let start = Date()
+      while true {
+        briefRefreshPending = false
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        if Task.isCancelled { briefRefreshTask = nil; return }
+        // Nothing new landed during the window, or we've deferred long enough.
+        if !briefRefreshPending || Date().timeIntervalSince(start) >= 3 { break }
+      }
+      // Clear BEFORE the fetch: an event arriving mid-request must be able to
+      // open a fresh window rather than being swallowed by this one.
+      briefRefreshTask = nil
+      briefRefreshPending = false
+      await BriefConsumer.shared.refresh()
+    }
+  }
+
   func handleSSEEvent(_ event: String, _ data: String) {
+    // The brief is server-composed, so a change to any of its sources means the
+    // ranking may have moved — refetch rather than mutating local state.
+    if Self.briefRelevantEvents.contains(event) { scheduleBriefRefresh() }
     if event == "cron", data.contains("\"op\":\"run\"") {
       notify(title: "OpenAGI", body: "Scheduled job fired.", path: "/")
     }
@@ -321,9 +386,7 @@ final class AppState: ObservableObject {
       let suggestionId = parseField(data, "id") ?? ""
       let pathPart = suggestionId.isEmpty ? "/?tab=chat" : "/?tab=chat&suggestion=\(urlEncode(suggestionId))"
       notify(title: title, body: body, path: pathPart)
-      // The popover's brief is server-composed, so a new suggestion means the
-      // ranking may have changed — refetch rather than mutating local state.
-      Task { await BriefConsumer.shared.refresh() }
+      // (the brief refetch is handled by briefRelevantEvents at the top)
     }
     if event == "daily-recap" {
       // Story 7: evening "what did you get done today" notification.
@@ -447,10 +510,22 @@ final class AppState: ObservableObject {
   /// Assigning the raw split verbatim to `percentEncodedQuery` is a loaded gun:
   /// that setter is a precondition, not a throwing API, so one unencoded byte
   /// (a space in "?q=hello world") aborts the whole app. Sanitise first.
+  /// The path half needs the same care for the opposite reason:
+  /// `appendingPathComponent` treats its argument as a LITERAL segment and
+  /// re-encodes "%", so a server-emitted "/drafts/a%2Fb/approve" would go out as
+  /// "/drafts/a%252Fb/approve" and 404 — src/daily-brief.js wraps every id in
+  /// encodeURIComponent, so its escapes must survive verbatim. `percentEncodedPath`
+  /// preserves them, and is likewise a precondition setter, so it gets sanitised too.
   nonisolated static func buildURL(base: URL, path: String) -> URL {
     let parts = path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
     let rawPath = String(parts.first ?? "")
-    var comps = URLComponents(url: base.appendingPathComponent(rawPath), resolvingAgainstBaseURL: false)
+    var comps = URLComponents(url: base, resolvingAgainstBaseURL: false)
+    var basePath = comps?.percentEncodedPath ?? ""
+    while basePath.hasSuffix("/") { basePath.removeLast() }
+    let joined = rawPath.isEmpty ? basePath : basePath + (rawPath.hasPrefix("/") ? rawPath : "/" + rawPath)
+    // `joined` is empty only for the degenerate path "" / "?q=1"; "/" keeps those
+    // byte-identical to what appendingPathComponent used to produce.
+    comps?.percentEncodedPath = sanitizedPercentEncodedPath(joined.isEmpty ? "/" : joined)
     if parts.count > 1, !parts[1].isEmpty {
       comps?.percentEncodedQuery = sanitizedPercentEncodedQuery(String(parts[1]))
     }
@@ -464,6 +539,23 @@ final class AppState: ObservableObject {
   /// that does not introduce a valid escape becomes "%25". The result therefore
   /// contains only characters the setter accepts, so it can never abort.
   nonisolated static func sanitizedPercentEncodedQuery(_ raw: String) -> String {
+    sanitizedPercentEncoded(raw, allowed: .urlQueryAllowed)
+  }
+
+  /// The `percentEncodedPath` counterpart. Same contract, path character set —
+  /// and one extra rule the setter enforces: with an authority component present
+  /// (we always have host:port) the path must be empty or start with "/", so a
+  /// caller path missing its leading slash gets one rather than aborting.
+  nonisolated static func sanitizedPercentEncodedPath(_ raw: String) -> String {
+    let cleaned = sanitizedPercentEncoded(raw, allowed: .urlPathAllowed)
+    if cleaned.isEmpty || cleaned.hasPrefix("/") { return cleaned }
+    return "/" + cleaned
+  }
+
+  /// Shared engine for both sanitizers above. `allowed` must be one of the URL
+  /// component sets, all of which exclude "%" — which is handled explicitly here
+  /// — so every branch emits a character the matching setter accepts.
+  private nonisolated static func sanitizedPercentEncoded(_ raw: String, allowed: CharacterSet) -> String {
     func isASCIIHex(_ s: Unicode.Scalar) -> Bool {
       (s >= "0" && s <= "9") || (s >= "a" && s <= "f") || (s >= "A" && s <= "F")
     }
@@ -483,12 +575,12 @@ final class AppState: ObservableObject {
         }
         continue
       }
-      // `.urlQueryAllowed` is exactly the query set minus "%", which is handled
-      // above — so every branch here emits setter-legal characters.
-      if CharacterSet.urlQueryAllowed.contains(s) {
+      // `allowed` is exactly the component's legal set minus "%", which is
+      // handled above — so every branch here emits setter-legal characters.
+      if allowed.contains(s) {
         out.unicodeScalars.append(s)
       } else {
-        out += String(s).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        out += String(s).addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
       }
       i += 1
     }

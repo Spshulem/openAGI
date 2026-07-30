@@ -1212,33 +1212,63 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Story 4: status writes go through the unified feed so they
         // land in the right source file (observer OR miner). Same id
         // namespace; resolveSuggestion locates the file by id.
-        const { resolveSuggestion } = await import("./suggestion-feed.js");
-        const candidate = resolveSuggestion(runtime, id, status);
+        const { findSuggestion, resolveSuggestion } = await import("./suggestion-feed.js");
+
+        // reject / dismiss have no materialization step — the status write IS
+        // the whole action, so they resolve straight away.
+        if (status !== "accepted") {
+          const resolved = resolveSuggestion(runtime, id, status);
+          if (!resolved) return sendJson(res, 404, { error: "unknown suggestion" });
+          // Let any open dashboard refresh its Suggestions tab live.
+          events.emit("suggestion-resolved", { id, status, category: resolved.category ?? null });
+          return sendJson(res, 200, resolved);
+        }
+
+        // Accept is transactional from the user's point of view: materialize
+        // FIRST, record "accepted" only once the side effect actually landed.
+        // Writing accepted up front and failing afterwards stranded the
+        // suggestion — gone from the pending queue, nothing created, and no
+        // way for the user to retry the thing they just said yes to.
+        const candidate = findSuggestion(runtime, id);
         if (!candidate) return sendJson(res, 404, { error: "unknown suggestion" });
-        // Let any open dashboard refresh its Suggestions tab live.
-        events.emit("suggestion-resolved", { id, status, category: candidate.category ?? null });
+
+        // commit(): record the accept, then answer with the RESOLVED envelope
+        // so status/resolvedAt in the body match what's on disk.
+        const commit = (extra) => {
+          // Null only if the record vanished between read and write; the side
+          // effect still landed, so report it rather than 404 the user.
+          const accepted = resolveSuggestion(runtime, id, "accepted") ?? { ...candidate, status: "accepted" };
+          events.emit("suggestion-resolved", { id, status: "accepted", category: accepted.category ?? null });
+          return sendJson(res, 200, { ...accepted, ...extra });
+        };
+        // fail(): nothing was written, so the suggestion is still pending and
+        // the user can retry it from the same queue. The body keeps the exact
+        // *Error field the Mac client and the dashboard key their message off.
+        const fail = (extra) => sendJson(res, 200, { ...candidate, ...extra });
 
         // For MCP suggestions, accepting auto-registers + connects the server.
-        if (status === "accepted" && candidate.category === "mcp" && candidate.mcpRegister && runtime.mcp?.registerServer) {
+        if (candidate.category === "mcp" && candidate.mcpRegister && runtime.mcp?.registerServer) {
+          const reg = candidate.mcpRegister;
+          const name = candidate.mcpId ?? candidate.title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
           try {
-            const reg = candidate.mcpRegister;
-            const name = candidate.mcpId ?? candidate.title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
             runtime.mcp.registerServer({ name, ...reg });
-            runtime.mcp.connect?.(name).catch(() => { /* OAuth path surfaces via SSE */ });
-            return sendJson(res, 200, { ...candidate, registered: name });
           } catch (error) {
-            return sendJson(res, 200, { ...candidate, registerError: error.message });
+            return fail({ registerError: error.message });
           }
+          // The server IS registered now, so a connect failure must not undo
+          // the accept — OAuth/handshake problems surface via SSE instead.
+          try { runtime.mcp.connect?.(name).catch(() => { /* OAuth path surfaces via SSE */ }); } catch { /* ignore */ }
+          return commit({ registered: name });
         }
         // For task suggestions, accepting creates the task in the right
         // queue + bucket — through the same materializer the observer's
         // OPENAGI_AUTO_TASKS=1 path uses, so dedup (by suggestionId) and the
         // draft-only guardrails for agent-queue tasks apply identically.
-        if (status === "accepted" && candidate.category === "task" && runtime.tasks?.add) {
+        if (candidate.category === "task" && runtime.tasks?.add) {
           const { materializeTaskFromSuggestion } = await import("./proactive-observer.js");
           const task = materializeTaskFromSuggestion(runtime, candidate);
-          if (!task) return sendJson(res, 200, { ...candidate, taskCreateError: "could not create task" });
-          return sendJson(res, 200, { ...candidate, taskId: task.id });
+          if (!task) return fail({ taskCreateError: "could not create task" });
+          return commit({ taskId: task.id });
         }
         // Story 1 + 6: accepting a skill suggestion materializes it into
         // a real SKILL.md file under the user skills dir. Dispatches by
@@ -1246,29 +1276,61 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // (Story 1 shape — flat title + draftBody), miner candidates use
         // createSkillFromCandidate (Story 6 shape — proposal.body +
         // sequence stats + scheduleHint). Both write to the same dir.
-        if (status === "accepted" && candidate.category === "skill" && runtime.skills?.reload) {
+        if (candidate.category === "skill" && runtime.skills?.reload) {
+          let result;
           try {
             const { createSkillFromSuggestion, createSkillFromCandidate } = await import("./skill-materialize.js");
             const isMined = candidate.source === "pattern-miner" || candidate.source === "session-miner";
-            const result = isMined
+            result = isMined
               ? createSkillFromCandidate({ runtime, candidate })
               : createSkillFromSuggestion({ runtime, suggestion: candidate });
             runtime.skills.reload();
-            return sendJson(res, 200, {
-              ...candidate,
-              skillSlug: result.slug,
-              skillPath: result.path,
-              scheduleHint: result.scheduleHint ?? null,
-              triggerHint: result.triggerHint ?? null,
-              // When the candidate had a scheduleHint, the dashboard
-              // asks the user whether to also create a cron job.
-              requiresScheduleConfirm: Boolean(result.scheduleHint)
-            });
           } catch (error) {
-            return sendJson(res, 200, { ...candidate, skillCreateError: error.message });
+            return fail({ skillCreateError: error.message });
           }
+          return commit({
+            skillSlug: result.slug,
+            skillPath: result.path,
+            scheduleHint: result.scheduleHint ?? null,
+            triggerHint: result.triggerHint ?? null,
+            // When the candidate had a scheduleHint, the dashboard
+            // asks the user whether to also create a cron job.
+            requiresScheduleConfirm: Boolean(result.scheduleHint)
+          });
         }
-        return sendJson(res, 200, candidate);
+        // "knowledge" suggestions are things the observer learned about the
+        // user. Accepting one used to be a no-op that still marked it
+        // accepted — a Yes button that did nothing. Persist it into the same
+        // memory store the `remember` tool writes to and hand back memoryId
+        // so the client can say what actually happened.
+        if (candidate.category === "knowledge") {
+          if (!runtime.memory?.remember) return fail({ memoryCreateError: "no memory system", error: "no memory system" });
+          const content = [candidate.title, candidate.rationale].filter(Boolean).join(" — ").trim();
+          if (!content) return fail({ memoryCreateError: "suggestion has no title or rationale to remember", error: "suggestion has no title or rationale to remember" });
+          let item;
+          try {
+            item = runtime.memory.remember(
+              {
+                source: candidate.source ?? "proactive-observer",
+                scope: "main",
+                content,
+                tags: ["knowledge", "proactive-suggestion"],
+                risk: 0.45,
+                specificity: 0.7,
+                repetition: 0.4,
+                novelty: 0.6,
+                metadata: { suggestionId: candidate.id, suggestionSource: candidate.source ?? null }
+              },
+              { source: "proactive-suggestion", strength: 0.7 }
+            );
+          } catch (error) {
+            // `error` duplicates the message because the Mac client's outcome
+            // reader keys off a fixed list that predates memoryCreateError.
+            return fail({ memoryCreateError: error.message, error: error.message });
+          }
+          return commit({ memoryId: item.id, memoryTier: item.tier });
+        }
+        return commit({});
       }
       if (method === "POST" && pathname.match(/^\/skills\/[^/]+\/schedule$/)) {
         // Story 6: follow-up after accepting a miner candidate with

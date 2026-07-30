@@ -79,7 +79,7 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   const items = [];
 
   // ── focus (pinned, never scored against anything) ──────────────────────
-  const focusItems = buildFocus(plan, tasks, slots.focus);
+  const focusItems = buildFocus(plan, tasks, slots.focus, nowMs, runtime);
   items.push(...focusItems);
   const pinnedTaskIds = new Set(focusItems.map((f) => f.sourceTaskId).filter(Boolean));
 
@@ -158,28 +158,74 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
 
 // ─── per-kind builders ───────────────────────────────────────────────────
 
-function buildFocus(plan, tasks, max) {
+function buildFocus(plan, tasks, max, nowMs, runtime) {
   const focus = Array.isArray(plan?.focus) ? plan.focus.slice(0, max) : [];
-  return focus.map((f) => {
-    // The model can emit a taskId that does not exist. Resolve defensively;
-    // an unresolvable id yields a readable row with no task actions rather
-    // than a broken button.
-    const task = f.taskId ? tasks.find((t) => t.id === f.taskId) : null;
-    return {
-      id: `focus:${f.taskId ?? slug(f.title)}`,
+  const rows = [];
+  for (const f of focus) {
+    const title = String(f.title ?? "").trim();
+    if (!title) continue; // nothing to render and nothing to act on
+    const { task, alreadyDone } = resolveFocusTask(f, title, tasks, runtime);
+    // The focus row is pinned above everything else, so it must never be a
+    // dead slot. A focus whose task is already completed needs nothing from
+    // the user — drop it rather than squat the top row until tomorrow's plan.
+    if (alreadyDone) continue;
+    rows.push({
+      id: `focus:${f.taskId ?? slug(title)}`,
       kind: "focus",
-      title: f.title,
+      title,
       why: f.why || "in today's plan",
       score: 1,
       scoreBreakdown: { pinned: true },
       dueAt: task?.dueDate ?? null,
       source: "daily-plan",
-      actions: task ? taskActions(task.id) : [],
+      // Never zero actions. With a task behind it the row acts on that task;
+      // without one the only honest offer is to put it on the list, which also
+      // makes the row resolvable (by title) on the next brief.
+      actions: task ? taskActions(task, nowMs) : [addTaskAction(title)],
       deepLink: "/?tab=today",
       sourceTaskId: task?.id ?? null
-    };
-  });
+    });
+  }
+  return rows;
 }
+
+/// Resolve a plan focus row to something the user can act on. Three cases, all
+/// real:
+///   - the id names a pending task            → act on that task
+///   - the id names an already-completed task → the focus is done (caller drops
+///     it); the pending list alone cannot tell this apart from a bad id, which
+///     is why the store is consulted directly
+///   - the id names nothing, or was never set → fall back to an exact title
+///     match against the pending list, so a focus the user has since added as a
+///     task binds to it instead of rendering a second, action-less copy
+function resolveFocusTask(f, title, tasks, runtime) {
+  const pending = f.taskId ? tasks.find((t) => t.id === f.taskId) : null;
+  if (pending) return { task: pending, alreadyDone: false };
+  if (f.taskId) {
+    let stored = null;
+    try { stored = runtime?.tasks?.get?.(f.taskId) ?? null; } catch { stored = null; }
+    if (stored) {
+      if (stored.status === "completed" || stored.bucket === "done") return { task: null, alreadyDone: true };
+      return { task: stored, alreadyDone: false };
+    }
+  }
+  const key = titleKey(title);
+  const byTitle = key ? tasks.find((t) => titleKey(t.title) === key) : null;
+  return { task: byTitle ?? null, alreadyDone: false };
+}
+
+function addTaskAction(title) {
+  return {
+    id: "add",
+    label: "Add to tasks",
+    style: "primary",
+    method: "POST",
+    path: "/tasks",
+    body: { title, bucket: "today", queue: "user", source: "daily-plan" }
+  };
+}
+
+function titleKey(s) { return String(s ?? "").trim().toLowerCase(); }
 
 function buildTask(t, nowMs) {
   const due = dueUrgency(t, nowMs);
@@ -196,7 +242,7 @@ function buildTask(t, nowMs) {
     scoreBreakdown: { dueUrgency: due.value, priority, carriedOver: carried },
     dueAt: t.dueDate ?? null,
     source: t.source ?? "manual",
-    actions: taskActions(t.id),
+    actions: taskActions(t, nowMs),
     deepLink: "/?tab=tasks"
   };
 }
@@ -244,6 +290,11 @@ function buildSuggestion(s, nowMs, multipliers) {
 
 function buildDraft(d, nowMs) {
   const score = ageScore(d.createdAt, nowMs);
+  const ref = encodeURIComponent(d.id);
+  // A revise action is only honest when we can hand the client the draft's
+  // WHOLE current text (see editValue below). Without it there is nothing safe
+  // to seed an editor with, so the row falls back to approve/discard.
+  const editable = typeof d.body === "string";
   return {
     id: `draft:${d.id}`,
     kind: "draft",
@@ -253,9 +304,35 @@ function buildDraft(d, nowMs) {
     scoreBreakdown: { age: score },
     dueAt: null,
     source: "agent",
+    // The draft body, VERBATIM and never truncated — the seed for the inline
+    // editor behind the "revise" action.
+    //
+    // It has to be shipped, and it has to be whole. `title` is a subject line
+    // and `why` is a summary ("draft waiting · email"); neither is the text
+    // being edited, and PATCHing either one back would overwrite the draft with
+    // a fragment of itself. There is deliberately no length cap here: a capped
+    // body is indistinguishable on the wire from a genuinely short one, so the
+    // client would submit the cap and destroy everything past it.
+    //
+    // Why the composer sends it instead of the client fetching it: there is no
+    // GET /drafts/:id route (hosted-interface.js exposes the /drafts LIST plus
+    // PATCH/approve/discard on an id), so a client would have to pull every
+    // pending draft and match by id — an extra request that can fail, on a path
+    // where failing open means seeding an editor with the wrong text. The
+    // composer already holds the full record from drafts.list(), so this costs
+    // nothing and cannot disagree with the row it is attached to.
+    ...(editable ? { editValue: d.body } : {}),
     actions: [
-      { id: "approve", label: "Approve", style: "primary", method: "POST", path: `/drafts/${encodeURIComponent(d.id)}/approve`, body: null },
-      { id: "discard", label: "Discard", style: "destructive", method: "POST", path: `/drafts/${encodeURIComponent(d.id)}/discard`, body: null }
+      // Revise comes FIRST, ahead of Approve: "change this" is the decision the
+      // user makes before "yes", and it is the one this brief never offered.
+      // style "revise" is the client's signal NOT to dispatch on tap — it opens
+      // an inline field and dispatches on submit, with the typed text merged in
+      // under `bodyField`.
+      ...(editable
+        ? [{ id: "revise", label: "Edit", style: "revise", method: "PATCH", path: `/drafts/${ref}`, body: null, bodyField: "body" }]
+        : []),
+      { id: "approve", label: "Approve", style: "primary", method: "POST", path: `/drafts/${ref}/approve`, body: null },
+      { id: "discard", label: "Discard", style: "destructive", method: "POST", path: `/drafts/${ref}/discard`, body: null }
     ],
     deepLink: "/?tab=today"
   };
@@ -291,8 +368,11 @@ function dueUrgency(t, nowMs) {
     const dueMs = new Date(t.dueDate).getTime();
     const deltaDays = (dueMs - nowMs) / DAY_MS;
     if (deltaDays < 0) {
-      const late = Math.max(1, Math.round(-deltaDays));
-      return { value: 1.0, label: `overdue ${late}d` };
+      // Score saturates at 1.0 for anything overdue — but the LABEL is a
+      // factual claim, and rounding sub-day lateness up to a whole day said
+      // "overdue 1d" about a task that missed its 4pm deadline two hours ago.
+      // Say the true unit instead; the score is untouched.
+      return { value: 1.0, label: `overdue ${lateLabel(nowMs - dueMs)}` };
     }
     if (deltaDays < 1) return { value: 0.85, label: "due today" };
     if (deltaDays <= 3) return { value: 0.6, label: `due in ${Math.ceil(deltaDays)}d` };
@@ -302,11 +382,35 @@ function dueUrgency(t, nowMs) {
   return { value: 0, label: "" };
 }
 
+/// How late is late, in the largest unit that is still true.
+function lateLabel(lateMs) {
+  const ms = Math.max(0, lateMs);
+  if (ms < HOUR_MS) return `${Math.max(1, Math.round(ms / 60_000))}m`;
+  if (ms < DAY_MS) return `${Math.max(1, Math.round(ms / HOUR_MS))}h`;
+  return `${Math.max(1, Math.round(ms / DAY_MS))}d`;
+}
+
+/// "carried over" is rendered verbatim in the item's `why` string, so it has to
+/// be true. It used to compare against setUTCHours(0,0,0,0) — the UTC day, not
+/// the user's — which is the same class of bug readPlanCache had: west of UTC
+/// the two disagree for the tail of every local day, so a task created at 5pm
+/// PT was reported as carried over from yesterday the moment it was typed.
+/// Comparing local day KEYS (the same ones the plan artifact is named for)
+/// keeps this honest and keeps it consistent with the rest of the file.
 function carriedOver(t, nowMs) {
   if (t.bucket !== "today" || !t.createdAt) return false;
-  const startOfToday = new Date(nowMs);
-  startOfToday.setUTCHours(0, 0, 0, 0);
-  return new Date(t.createdAt).getTime() < startOfToday.getTime();
+  const createdKey = localDayKey(new Date(t.createdAt).getTime());
+  const todayKey = localDayKey(nowMs);
+  if (!createdKey || !todayKey) return false;
+  return createdKey < todayKey;
+}
+
+/// Local calendar day (YYYY-MM-DD) for an instant, or null when the instant is
+/// not a real one — planDateKey throws on an Invalid Date and the clock here is
+/// caller-supplied, so this stays a total function.
+function localDayKey(ms) {
+  if (!Number.isFinite(ms)) return null;
+  try { return planDateKey(new Date(ms)); } catch { return null; }
 }
 
 /// Drafts and clarifications are decision-blocked by definition, so how long
@@ -329,11 +433,63 @@ function suggestionWhy(s, breakdown) {
   return s.rationale ? String(s.rationale).slice(0, 120) : "noticed on screen";
 }
 
-function taskActions(id) {
+function taskActions(t, nowMs) {
+  const id = t.id;
+  const until = snoozeUntil(t, nowMs);
+  // dueDate is OMITTED rather than sent as null when it cannot be computed:
+  // task-store.update treats an explicit null as "clear the due date", which
+  // would destroy a real commitment on a broken clock.
+  const snoozeBody = until ? { bucket: "this_week", dueDate: until } : { bucket: "this_week" };
   return [
     { id: "complete", label: "Done", style: "primary", method: "POST", path: `/tasks/${encodeURIComponent(id)}/complete`, body: null },
-    { id: "snooze", label: "Snooze", style: "secondary", method: "PATCH", path: `/tasks/${encodeURIComponent(id)}`, body: { bucket: "this_week" } }
+    {
+      id: "snooze",
+      label: "Snooze",
+      style: "secondary",
+      method: "PATCH",
+      path: `/tasks/${encodeURIComponent(id)}`,
+      body: snoozeBody
+    }
   ];
+}
+
+/// Snooze has to actually move the row. dueUrgency short-circuits on dueDate
+/// and never reaches the bucket, so the old bucket-only PATCH left an overdue
+/// task at the identical score, the identical "overdue Nd" label and the
+/// identical position — the user tapped Snooze and the brief came back
+/// unchanged. So push the DEADLINE, not just the bucket.
+///
+/// Pushed, never cleared: a due date is a real commitment the user made and
+/// dropping it to silence a row would throw that away. The new deadline is the
+/// end of the next local day ("get it done tomorrow"), measured from whichever
+/// is later — now or the existing due date — so snoozing can only ever move a
+/// deadline outward, never pull a future one in.
+function snoozeUntil(t, nowMs) {
+  if (!Number.isFinite(nowMs)) return null;
+  const dueMs = t.dueDate ? new Date(t.dueDate).getTime() : NaN;
+  const from = Number.isFinite(dueMs) ? Math.max(dueMs, nowMs) : nowMs;
+  const until = endOfNextLocalDay(from);
+  return Number.isFinite(until) ? new Date(until).toISOString() : null;
+}
+
+/// Local midnight opening the day that contains `ms`. planDateKey renders the
+/// user's calendar day; a date-time string with no offset is defined to be
+/// LOCAL, so this round-trips to that day's midnight without hand-rolled
+/// offset arithmetic (and without the UTC-day bug this file has been bitten by
+/// twice — see readPlanCache and carriedOver).
+function startOfLocalDay(ms) {
+  const key = localDayKey(ms);
+  if (!key) return ms;
+  const parsed = new Date(`${key}T00:00:00`).getTime();
+  return Number.isFinite(parsed) ? parsed : ms;
+}
+
+/// The instant that closes the NEXT local day. Hopping 36h and re-keying rather
+/// than adding 24h keeps this on the right calendar day across DST boundaries,
+/// where a local day is 23 or 25 hours long.
+function endOfNextLocalDay(ms) {
+  const tomorrow = startOfLocalDay(startOfLocalDay(ms) + 36 * HOUR_MS);
+  return startOfLocalDay(tomorrow + 36 * HOUR_MS);
 }
 
 // ─── plumbing ────────────────────────────────────────────────────────────

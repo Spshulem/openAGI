@@ -171,14 +171,67 @@ test("a plan focus item is pinned first even though it has no due date", () => {
   assert.equal(brief.planCachedAt, "2026-07-29T15:00:00.000Z");
 });
 
-test("a focus item with an unresolvable taskId still renders, with no task actions", () => {
+test("a focus item with an unresolvable taskId renders with a working action, never zero", () => {
+  // It used to render with actions: [] — a pinned top row with no tap target
+  // and no way to clear it. The focus row is the one row the user cannot
+  // dismiss, so a dead one squats the slot until tomorrow's plan.
   const plan = {
     dateISO: "2026-07-29", cachedAt: "2026-07-29T15:00:00.000Z",
     focus: [{ title: "Hallucinated", taskId: "t_does_not_exist", why: "x" }], tasks: []
   };
   const brief = composeBrief(makeRuntime({ plan }), { now: NOW, limit: 5 });
   assert.equal(brief.items[0].kind, "focus");
-  assert.deepEqual(brief.items[0].actions, []);
+  assert.ok(brief.items[0].actions.length > 0, "a focus row must never render with zero actions");
+  const add = brief.items[0].actions[0];
+  // The action must not point at the id that does not exist (a 404 button).
+  assert.equal(add.method, "POST");
+  assert.equal(add.path, "/tasks", "the only honest offer for an unbacked focus is to put it on the list");
+  assert.equal(add.body.title, "Hallucinated");
+});
+
+test("a focus row whose task is already completed is dropped, not left action-less", () => {
+  // The measured case: the user completes their focus task, it leaves the
+  // pending list, and the row loses its buttons for the rest of the day.
+  const plan = {
+    dateISO: "2026-07-29", cachedAt: "2026-07-29T15:00:00.000Z",
+    focus: [{ title: "The one thing", taskId: "t1", why: "biggest lever" }], tasks: []
+  };
+  const rt = makeRuntime({ tasks: [task({ id: "t2", title: "Something else" })], plan });
+  // tasks.list() is the PENDING list, which a completed task has left; the
+  // store still knows about it.
+  rt.tasks.get = (id) => (id === "t1" ? task({ id: "t1", status: "completed", bucket: "done" }) : null);
+  const brief = composeBrief(rt, { now: NOW, limit: 5 });
+  assert.equal(brief.items.filter((i) => i.kind === "focus").length, 0, "a finished focus needs nothing from the user");
+  assert.ok(brief.items.length > 0, "and the rest of the brief still renders");
+});
+
+test("a focus item with no taskId binds to a matching pending task and gets its actions", () => {
+  const plan = {
+    dateISO: "2026-07-29", cachedAt: "2026-07-29T15:00:00.000Z",
+    focus: [{ title: "Ship the brief", taskId: null, why: "biggest lever" }], tasks: []
+  };
+  const rt = makeRuntime({ tasks: [task({ id: "t9", title: "Ship the brief" })], plan });
+  const brief = composeBrief(rt, { now: NOW, limit: 5 });
+  const focus = brief.items[0];
+  assert.equal(focus.kind, "focus");
+  assert.deepEqual(focus.actions.map((a) => a.id), ["complete", "snooze"]);
+  assert.ok(focus.actions[0].path.includes("t9"), "the buttons act on the task the focus is really about");
+  assert.equal(brief.items.filter((i) => i.id === "task:t9").length, 0, "and it does not also take a task slot");
+});
+
+test("every focus row carries at least one action", () => {
+  const plan = {
+    dateISO: "2026-07-29", cachedAt: "2026-07-29T15:00:00.000Z",
+    focus: [
+      { title: "Narrative focus", taskId: null, why: "no task behind it" },
+      { title: "Bad id", taskId: "nope", why: "x" }
+    ],
+    tasks: []
+  };
+  const brief = composeBrief(makeRuntime({ plan }), { now: NOW, limit: 5 });
+  for (const item of brief.items.filter((i) => i.kind === "focus")) {
+    assert.ok(item.actions.length > 0, `focus row ${item.id} rendered with no actions`);
+  }
 });
 
 test("a task that is already the pinned focus does not also occupy a task slot", () => {
@@ -208,6 +261,45 @@ test("overdue tasks outrank not-yet-due ones", () => {
   const brief = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 });
   const t = brief.items.filter((i) => i.kind === "task");
   assert.equal(t[0].id, "task:t_late");
+});
+
+test("sub-day lateness is labelled in real units, and the score is untouched", () => {
+  // Math.max(1, Math.round(-deltaDays)) called a task that missed a 3pm
+  // deadline two hours ago "overdue 1d" — a factual claim about the user's own
+  // calendar, and a wrong one. The score saturates at 1.0 either way, so only
+  // the sentence was ever at stake.
+  const tasks = [
+    task({ id: "t_hours", title: "Two hours late", dueDate: "2026-07-29T15:00:00.000Z" }),
+    task({ id: "t_days", title: "Weeks late", dueDate: "2026-07-01T17:00:00.000Z" })
+  ];
+  const brief = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 });
+  const hours = brief.items.find((i) => i.id === "task:t_hours");
+  const days = brief.items.find((i) => i.id === "task:t_days");
+  assert.equal(hours.why.split(" · ")[0], "overdue 2h", `got: ${hours.why}`);
+  assert.equal(days.why.split(" · ")[0], "overdue 28d", `got: ${days.why}`);
+  assert.equal(hours.scoreBreakdown.dueUrgency, 1.0, "the score still saturates for anything overdue");
+  assert.equal(days.scoreBreakdown.dueUrgency, 1.0);
+});
+
+test("snooze pushes the deadline forward and never pulls a future one in", () => {
+  // Snooze used to PATCH the bucket only, which dueUrgency never reads. It now
+  // moves the due date — but a snooze must not turn "due next month" into "due
+  // tomorrow", so the push is measured from whichever is later, now or the
+  // existing deadline.
+  const tasks = [
+    task({ id: "t_late", title: "Overdue", dueDate: "2026-07-01T00:00:00.000Z" }),
+    task({ id: "t_far", title: "Due next month", bucket: "this_month", dueDate: "2026-09-01T00:00:00.000Z" })
+  ];
+  const brief = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 });
+  for (const id of ["task:t_late", "task:t_far"]) {
+    const item = brief.items.find((i) => i.id === id);
+    const snooze = item.actions.find((a) => a.id === "snooze");
+    assert.ok(snooze.body.dueDate, "snooze must carry a new deadline, not just a bucket");
+    const next = new Date(snooze.body.dueDate).getTime();
+    assert.ok(next > NOW.getTime(), `${id}: the new deadline must be in the future`);
+    const current = new Date(item.dueAt).getTime();
+    assert.ok(next > current, `${id}: snooze must move the deadline outward, never inward`);
+  }
 });
 
 test("a failing source is isolated and named in degraded", () => {
@@ -247,4 +339,61 @@ test("clarifications and drafts get slots and age-based scores", () => {
   assert.ok(brief.items.some((i) => i.kind === "draft"));
   const clar = brief.items.find((i) => i.kind === "clarification");
   assert.equal(clar.actions.length, 4, "one button per valid answer");
+});
+
+// The brief's whole premise is "yes / no / change this". Yes and no shipped;
+// this is the third. A draft is the one kind where "change this" is a real
+// edit, so the row has to carry an action the client can turn into a text
+// field — and the text to put in it.
+test("a draft carries a well-formed revise action, ahead of Approve", () => {
+  const rt = makeRuntime({
+    drafts: [{ id: "d/1 x", title: "Reply to Adam", status: "pending", createdAt: "2026-07-27T17:00:00.000Z", kind: "email", body: "Hi Adam,\n\nHere it is.\n" }]
+  });
+  const draft = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "draft");
+  const revise = draft.actions.find((a) => a.id === "revise");
+  assert.ok(revise, "a draft must offer a way to change it, not only approve/discard");
+  assert.equal(revise.style, "revise", "the client keys 'do not dispatch on tap' off this style");
+  assert.equal(revise.method, "PATCH");
+  // The id goes through encodeURIComponent, so an id with a slash or a space
+  // still addresses one draft instead of a route that does not exist.
+  assert.equal(revise.path, "/drafts/d%2F1%20x");
+  assert.equal(revise.bodyField, "body", "names the key the typed text is merged in under");
+  assert.equal(revise.body, null, "carries no body of its own — the client supplies it");
+  assert.ok(
+    draft.actions.findIndex((a) => a.id === "revise") < draft.actions.findIndex((a) => a.id === "approve"),
+    "'change this' is the decision that comes before 'yes'"
+  );
+});
+
+// THE dangerous case. `why` is a summary and `title` is a subject line; if the
+// client seeds its editor from either and PATCHes that back, the rest of the
+// draft is gone. So the seed ships on the item, whole.
+test("the revise seed is the draft body verbatim, never a truncated preview", () => {
+  const body = [
+    "Hi Adam,",
+    "",
+    Array.from({ length: 40 }, (_, i) => `Paragraph ${i}: something the user would be furious to lose.`).join("\n"),
+    "",
+    "Best,",
+    "Spencer"
+  ].join("\n");
+  const rt = makeRuntime({
+    drafts: [{ id: "d1", title: "Follow-up", status: "pending", createdAt: "2026-07-27T17:00:00.000Z", kind: "email", body }]
+  });
+  const draft = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "draft");
+  assert.equal(draft.editValue, body, "the seed must be byte-identical to the stored body");
+  assert.equal(draft.editValue.length, body.length, "and must not be capped at any length");
+  assert.ok(draft.why.length < body.length, "the row's summary is NOT the seed — that is the whole point");
+});
+
+// No seed, no editor. A record we cannot read the body of has nothing safe to
+// put in a text field, and an editor that opens empty submits empty.
+test("a draft with no readable body offers no revise action at all", () => {
+  const rt = makeRuntime({
+    drafts: [{ id: "d1", title: "Reply to Adam", status: "pending", createdAt: "2026-07-27T17:00:00.000Z", kind: "email" }]
+  });
+  const draft = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "draft");
+  assert.equal(draft.editValue, undefined, "no seed is sent when there is none to send");
+  assert.ok(!draft.actions.some((a) => a.id === "revise"), "and no edit is offered without one");
+  assert.ok(draft.actions.some((a) => a.id === "approve"), "approve/discard still work");
 });

@@ -5,6 +5,7 @@ struct OverlayView: View {
   @ObservedObject var app = AppState.shared
   @ObservedObject var outreach = OutreachConsumer.shared
   @ObservedObject var brief = BriefConsumer.shared
+  @ObservedObject var briefEditor = BriefEditorState.shared
   @FocusState private var fieldFocused: Bool
   @State private var pillHovered = false
   // Per-item reply text for the targeted chat field, keyed by outreach id.
@@ -47,7 +48,20 @@ struct OverlayView: View {
     .onChange(of: brief.lastError) { _, _ in onContentChange() }
     .onChange(of: brief.lastOutcome) { _, _ in onContentChange() }
     .onChange(of: brief.olderCount) { _, _ in onContentChange() }
-    .onChange(of: outreach.items.count) { _, _ in onContentChange() }
+    .onChange(of: brief.degraded) { _, _ in onContentChange() }
+    .onChange(of: brief.inFlight) { _, _ in onContentChange() }
+    // The inline draft editor is the one piece of brief state that is NOT on
+    // BriefConsumer, and it changes the panel's height twice: once when it opens
+    // (a multi-line field plus a button row appear inside a row) and again on
+    // every line the body grows or shrinks by, since the field is 3–8 lines
+    // tall. Both have to be here or the editor renders clipped — the failure
+    // mode is losing the Save button off the bottom edge, mid-edit.
+    .onChange(of: briefEditor.openItemID) { _, _ in onContentChange() }
+    .onChange(of: briefEditor.text) { _, _ in onContentChange() }
+    // Same identity-not-count reasoning as `brief.items`: OutreachConsumer.ingest
+    // can drop an acted item and add a pending one in the same batch, so the
+    // count holds while the rows — and the panel's height — change. Equatable.
+    .onChange(of: outreach.items) { _, _ in onContentChange() }
     .onChange(of: app.status) { _, _ in onContentChange() }
   }
 
