@@ -30,6 +30,7 @@ import { PatternMiner } from "./pattern-miner.js";
 import { SessionMiner } from "./session-miner.js";
 import { IMessageExtractor } from "./imessage-extractor.js";
 import { TaskSweep } from "./task-sweep.js";
+import { BacklogTriage, summarizeTriagePass } from "./backlog-triage.js";
 import { ProactiveObserver } from "./proactive-observer.js";
 import { TaskStore } from "./task-store.js";
 import { PendingActionStore } from "./pending-actions.js";
@@ -197,6 +198,14 @@ export class AbiRuntime {
     // Periodic task-list hygiene: dedupe, re-home to the right queue, cancel
     // stale auto-extracted items, archive old terminal tasks.
     this.taskSweep = options.taskSweep ?? new TaskSweep({ runtime: this });
+    // Weekly backlog cleanup: retires suggestions/drafts that rules or a cheap
+    // model pass can show are dead, and reports what still matters. See
+    // backlog-triage.js — every resolution is evidenced and reversible.
+    this.backlogTriage = options.backlogTriage ?? new BacklogTriage({
+      runtime: this,
+      dataDir: options.dataDir,
+      ...(options.backlogTriageOptions ?? {})
+    });
     // The "ask me" queue: ambiguous task-reconciliation outcomes become
     // questions instead of bad guesses. dataDir-scoped like other stores.
     this.clarifications = options.clarifications ?? new ClarificationStore({
@@ -460,6 +469,30 @@ export class AbiRuntime {
         enabled: true,
         task: "task-sweep",
         intervalMs: sweepMin * 60 * 1000
+      });
+      // Weekly backlog triage. A CLEANUP CADENCE, not a pulse — the whole
+      // complaint it answers is "there are 1,901 and 1,096 older ones", so a
+      // job that runs every 30 minutes would be answering a noise problem with
+      // more noise, and would re-judge the same items over and over for real
+      // money. Weekly is also the shortest useful period: an item has to sit
+      // unanswered for at least a week before this module will even look at it
+      // (freshDays = 7), so a daily run would spend most of its passes finding
+      // nothing new to judge.
+      //
+      // Sunday 05:15 local. The nightly chain (pattern-mine 02:30, memory
+      // condense + session-mine 03:30, retirement sweep 04:00, self-update
+      // 04:30, weekly scrutiny fit 05:00) is finished by then, so triage reads
+      // a settled queue rather than racing the miners that fill it, and it
+      // lands hours before the 08:00 daily plan + task digest — so Monday's
+      // first brief is the first thing that reads the cleaned backlog.
+      this.cron.addJob({
+        id: "backlog-triage",
+        name: "Weekly backlog triage — retire dead suggestions, surface what still matters",
+        enabled: true,
+        task: "backlog-triage",
+        intervalMs: 7 * 24 * 60 * 60 * 1000,
+        // +15 min so it does not share a tick with weekly-scrutiny-fit (05:00).
+        nextRunAt: new Date(nextSundayMorning(5).getTime() + 15 * 60 * 1000).toISOString()
       });
       this.cron.addJob({
         id: "outreach-digest",
@@ -798,6 +831,18 @@ export class AbiRuntime {
         }
         this.events?.emit?.("miner-result", { source: "task-sweep", at: nowIso(), ...result });
         return result;
+      }
+      if (job.task === "backlog-triage") {
+        // run() is written never to throw — everything that can fail lands in
+        // result.degraded — so this handler needs no try/catch of its own and a
+        // bad pass can never turn the scheduler into a crash loop.
+        // Input spreads FIRST so the dashboard can set { dryRun: true } or
+        // { useLLM: false } on the job — but never `now`, which is the
+        // scheduler's to supply.
+        const result = await this.backlogTriage.run({ ...(job.input ?? {}), now });
+        const summary = summarizeTriagePass(result);
+        this.events?.emit?.("miner-result", { source: "backlog-triage", at: nowIso(), ...summary });
+        return summary;
       }
       if (job.task === "outreach-digest") {
         return this.runOutreachDigest({ now });

@@ -856,10 +856,18 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "agent_pick_next",
-    description: "Pop the next task from the agent's own queue. Returns the highest-priority pending task in the agent queue, or null if the queue is empty.",
+    description: "Claim the next task from the agent's own queue. Returns the highest-priority available task, or null if there is nothing to work. Claiming is a time-boxed lease: the task is marked in_progress and held for you, but if you don't call complete_task or move_task the lease expires and the task returns to the queue. Tasks whose draft is already waiting for the user's review are NOT returned — that work is done.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
-      const task = runtime.tasks.agentPickNext?.() ?? null;
+      // Claim, don't peek. Peeking is what produced the re-draft treadmill:
+      // the pulse drafted a task, never completed it, and the next pulse got
+      // the identical task back. agentClaimNext leases it. Runtimes without
+      // leasing (older stores, test stubs) fall back to the plain pick — but
+      // only when the method is genuinely absent, never because the queue
+      // legitimately came back empty.
+      const task = typeof runtime.tasks?.agentClaimNext === "function"
+        ? runtime.tasks.agentClaimNext()
+        : (runtime.tasks?.agentPickNext?.() ?? null);
       return task ? { task } : { task: null, reason: "agent queue empty" };
     }
   });
@@ -923,7 +931,34 @@ export function registerCoreTools(registry, runtime) {
     },
     handler: async (args) => {
       if (!runtime.drafts?.add) throw new Error("no draft store available");
+      // One open draft per task, ever. Without this, a task that never got
+      // completed collected a fresh draft every 30-minute pulse — 69 of the
+      // 97 pending drafts on the real install were duplicates of a task that
+      // already had one, and one task had been drafted seven times. The
+      // queue-level guard in agentPickNext catches the cross-pulse case;
+      // this catches a model that calls save_draft twice in a single turn.
+      // "Open" means pending / approved / sent — only a discarded draft
+      // means the user wants another attempt.
+      if (args.taskId && typeof runtime.drafts.list === "function") {
+        const existing = (runtime.drafts.list({ status: null }) ?? []).find(
+          (d) => d.taskId === args.taskId && (d.status === "pending" || d.status === "approved" || d.status === "sent")
+        );
+        if (existing) {
+          return {
+            draftId: existing.id,
+            status: existing.status,
+            duplicate: true,
+            note: `This task already has a ${existing.status} draft ("${existing.title}"). Nothing new was saved. Use edit if it needs changing, or call complete_task if the work is done.`
+          };
+        }
+      }
       const draft = runtime.drafts.add(args);
+      // The draft is the deliverable: release the agent's lease and reset the
+      // attempt counter, and mark the task as awaiting review so the queue
+      // stops serving it and the user can see what's waiting on them.
+      if (draft.taskId && typeof runtime.tasks?.noteDraftSaved === "function") {
+        runtime.tasks.noteDraftSaved(draft.taskId, draft.id);
+      }
       return { draftId: draft.id, status: draft.status, note: "Draft saved for review. It has NOT been sent — the user will review and approve it." };
     }
   });

@@ -206,6 +206,28 @@ final class BriefConsumer: ObservableObject {
     case "discard" where isDraftPath(action.path):
       return "Draft discarded"
 
+    // The two discards must not report the same thing, because they DID not do
+    // the same thing: plain Discard resolves the artifact and leaves the task
+    // free to draft again (which is why the user's discards kept coming back),
+    // "Stop asking" also retires the generating task.
+    //
+    // Which branch we are in is decided by the ACTION, as everywhere else here.
+    // The body is then read only to answer a question the action cannot: the
+    // route reports the draft half and the task half separately, because the
+    // task can be gone, already completed, or unwritable while the draft was
+    // still discarded fine. "Won't ask again" is a claim about the task, so it
+    // is made only when the server says a task was actually retired.
+    case "stop_asking" where isDraftPath(action.path):
+      if obj["retired"] is [String: Any] { return "Discarded — won't ask again" }
+      if let why = (obj["retireError"] as? String)?
+        .trimmingCharacters(in: .whitespacesAndNewlines), !why.isEmpty {
+        // Prefixed "Failed" so BriefSection renders it red: the draft is gone,
+        // but the thing the user actually asked for — make it stop — did not
+        // happen, and they need to know it will be back.
+        return "Failed: discarded, but couldn't stop the task — \(why)"
+      }
+      return "Discarded — no task left to stop"
+
     case "complete" where isTaskPath(action.path):
       return "Marked done"
 

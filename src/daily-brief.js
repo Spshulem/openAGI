@@ -48,6 +48,45 @@ const CLARIFICATION_LABELS = { yes: "Yes", in_progress: "In progress", no: "Not 
 // Adding an accept branch means adding the category here, in the same commit.
 const ACTIONABLE_SUGGESTION_CATEGORIES = new Set(["mcp", "task", "skill", "knowledge"]);
 
+// What accepting a suggestion actually DOES, per category — read straight off
+// the accept branches in hosted-interface.js (see ACTIONABLE_SUGGESTION_CATEGORIES
+// above for the mapping). A bare "Yes" named the answer, not the consequence:
+// for a mined skill candidate "Yes" writes a SKILL.md into the user's skills
+// dir, and the row never said so. The user's words on the shipped version were
+// "Is that an idea of what actions it wants me to take? It's not very clear
+// what it's trying to do." These labels are the answer to that question, and
+// they must stay in lockstep with the branch they name — a label that promises
+// something the server does not do is the same lie the allowlist exists to
+// prevent, just told in the button instead of the row.
+const ACCEPT_LABELS = {
+  mcp: "Connect it",
+  task: "Add as task",
+  skill: "Save as skill",
+  knowledge: "Remember it"
+};
+
+// Statuses the brief treats as open work. MEASURED on the user's install: of 32
+// tasks, 16 user tasks are "in_progress" and exactly ONE is "pending" — so
+// filtering on status "pending" (which this composer did) hid every single
+// thing the user was actually working on and rendered a task-free brief on an
+// install with sixteen live commitments.
+//
+// "blocked" is deliberately absent: task-store sets it for tasks with unmet
+// dependencies precisely so the UI does not surface them, and nothing the user
+// can tap from a one-row popover would unblock one. "completed"/"cancelled"
+// are done.
+const ACTIVE_TASK_STATUSES = ["pending", "in_progress"];
+
+// Statuses a draft's GENERATING task can be retired from, i.e. the states in
+// which "stop asking" is a thing that can still happen. Deliberately excludes
+// both terminal states, for opposite reasons: a "cancelled" task is already
+// retired, and a "completed" one must NEVER be flipped to cancelled — that
+// would destroy a real outcome the user earned in order to silence a row.
+// "blocked" is in, because a blocked agent task is exactly the one the sweep
+// parks after three failed attempts and the one most likely to be re-served if
+// its blocker ever clears.
+const RETIRABLE_TASK_STATUSES = new Set(["pending", "in_progress", "blocked"]);
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -68,7 +107,7 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   const resolvedDataDir = dataDir ?? runtime?.dataDir ?? resolveDataDir();
   const plan = safely(degraded, "plan", () => readPlanCache(resolvedDataDir, now), null);
 
-  const tasks = safely(degraded, "tasks", () => runtime.tasks?.list?.({ queue: "user", status: "pending", limit: 200 }) ?? [], []);
+  const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime), []);
   const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
   const clarifications = safely(degraded, "clarifications", () => runtime.clarifications?.list?.({ status: "pending" }) ?? [], []);
   const suggestions = safely(degraded, "suggestions", () => listAllSuggestions(runtime, { status: "pending" }) ?? [], []);
@@ -106,7 +145,14 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
     .sort(byScoreDesc);
 
   const rankedClarifications = clarifications.map((c) => buildClarification(c, nowMs)).sort(byScoreDesc);
-  const rankedDrafts = drafts.map((d) => buildDraft(d, nowMs)).sort(byScoreDesc);
+  // The two facts a draft row needs beyond its own record, both about the task
+  // that PRODUCED it: is that task still able to produce another (so "stop
+  // asking" is offered only when it can do something), and how many drafts it
+  // has produced already (so the row can say why this keeps happening).
+  const draftTotals = draftCountsByTask(runtime);
+  const rankedDrafts = drafts
+    .map((d) => buildDraft(d, nowMs, generatorTask(runtime, d), draftTotals.get(d.taskId) ?? 0))
+    .sort(byScoreDesc);
 
   const multipliers = safely(degraded, "preferences", () => runtime.suggestionFeedback?.categoryMultipliers?.() ?? {}, {});
   const isMuted = (c) => {
@@ -153,17 +199,20 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   // whole pending queue advertises depth that does not exist: suggestions
   // outside ACTIONABLE_SUGGESTION_CATEGORIES (no server-side accept branch) and
   // muted ones are filtered out above and can never be rendered, so they are
-  // not "older" — they are invisible. Count against the eligible set only, and
-  // derive oldestAt from that same set so the two never disagree. Unchanged by
-  // the blocklist→allowlist inversion: a newly-hidden category is hidden the
-  // same way "automation" already was, and stays out of this count.
-  const shownSuggestionIds = new Set(items.filter((i) => i.kind === "suggestion").map((i) => i.id));
-  const olderSuggestions = eligibleSuggestions.filter((s) => !shownSuggestionIds.has(`suggestion:${s.id}`));
-  const olderCount = olderSuggestions.length;
-  const oldestAt = olderSuggestions.reduce(
-    (min, s) => (s.proposedAt && (!min || s.proposedAt < min) ? s.proposedAt : min),
-    null
-  );
+  // not "older" — they are invisible. Unchanged by the blocklist→allowlist
+  // inversion: a newly-hidden category is hidden the same way "automation"
+  // already was, and stays out of this count.
+  //
+  // The leftovers of the four ranked arrays ARE that set, exactly: take()
+  // splices what it hands to `items` out of them, and every ineligible row
+  // (wrong category, muted, bucket "done", already pinned as focus) was
+  // filtered before the arrays were built. Deriving the count from the
+  // leftovers rather than re-filtering one kind is what keeps it truthful now
+  // that the task pool is no longer empty — the old suggestion-only count said
+  // "3 older" on an install with sixteen in-progress tasks it was also hiding.
+  const unshown = [...rankedClarifications, ...rankedDrafts, ...rankedTasks, ...rankedSuggestions];
+  const olderCount = unshown.length;
+  const oldestAt = oldestOf(unshown);
 
   return {
     items: items.map(stripInternal),
@@ -245,24 +294,123 @@ function addTaskAction(title) {
 
 function titleKey(s) { return String(s ?? "").trim().toLowerCase(); }
 
+/// Load the task pool. Two calls rather than one unfiltered one: task-store's
+/// list() filters on an exact status and applies `limit` AFTER sorting, so a
+/// single statusless call would spend the same budget on completed/cancelled/
+/// blocked rows. Deduped by id because the store is not the only implementation
+/// that answers this call — a stub (or a future store) that ignores the filter
+/// must not double every row — and re-filtered for the same reason, so a store
+/// that hands back terminal tasks cannot slip a completed one into the brief.
+function listActiveTasks(runtime) {
+  const byId = new Map();
+  for (const status of ACTIVE_TASK_STATUSES) {
+    const rows = runtime?.tasks?.list?.({ queue: "user", status, limit: 200 }) ?? [];
+    for (const t of rows) if (t?.id && !byId.has(t.id)) byId.set(t.id, t);
+  }
+  return [...byId.values()].filter((t) => ACTIVE_TASK_STATUSES.includes(t.status ?? "pending"));
+}
+
 function buildTask(t, nowMs) {
   const due = dueUrgency(t, nowMs);
   const priority = clamp01((Number(t.priority) || 0) / 100);
-  const carried = carriedOver(t, nowMs) ? 1 : 0;
-  const score = clamp01(0.55 * due.value + 0.30 * priority + 0.15 * carried);
+  const started = t.status === "in_progress" ? 1 : 0;
+  // carriedOver is the PENDING task's age signal, and a started task must not
+  // collect it on top of `openAge` — that is the same fact counted twice, and
+  // it is what let a task started in June outrank a task due today (both are
+  // bucket "today", so the started one banked 0.12 + 0.08 against a due-date
+  // gap of 0.55 * (0.85 - 0.5) = 0.1925 and won by a nose). Dropping it here
+  // keeps the score built out of exactly the facts taskWhy renders, which is
+  // why that string drops "carried over" for started rows too.
+  const carried = !started && carriedOver(t, nowMs) ? 1 : 0;
+  const openMs = taskOpenMs(t, nowMs);
+  // How long an already-started task has been open, ramped over two weeks and
+  // then SATURATED. What it buys is separation between something picked up this
+  // morning and something that has been open since June. What it deliberately
+  // does not do is rank the second group against itself: on the real install
+  // all sixteen in-progress tasks were created 6-8 weeks ago and every one of
+  // them pins this term at 1.0, so the tie falls back to priority and creation
+  // order — the task store's own ranking, which is a better answer than
+  // "whichever is most abandoned wins". Only meaningful for started work; a
+  // pending task's age is already carried by carriedOver.
+  const openAge = started ? clamp01(openMs / (14 * DAY_MS)) : 0;
+  // The started boost is deliberately small and bounded by 0.12 (half of it at
+  // minimum, all of it once fully aged). The ceiling is the whole point:
+  // 0.55 * (0.85 - 0.5) = 0.1925 is the gap between "due today" and a bare
+  // bucket-"today" task, so 0.12 < 0.1925 means a pending task with a real
+  // deadline still outranks the oldest possible in-progress one. That is what
+  // stops sixteen in-progress rows from swamping a brief that also has dated
+  // work in it. Raising this past 0.1925 (or re-adding `carried` on top of it)
+  // silently inverts that, so both are asserted in daily-brief.test.js.
+  const startedTerm = started ? 0.5 + 0.5 * openAge : 0;
+  const score = clamp01(0.55 * due.value + 0.25 * priority + 0.12 * startedTerm + 0.08 * carried);
   return {
     id: `task:${t.id}`,
     kind: "task",
     title: t.title,
-    why: [due.label, carried ? "carried over" : null, t.source && t.source !== "manual" ? `from ${t.source}` : null]
-      .filter(Boolean).join(" · ") || "on your list",
+    why: taskWhy(t, due, carried, openMs),
     score,
-    scoreBreakdown: { dueUrgency: due.value, priority, carriedOver: carried },
+    scoreBreakdown: { dueUrgency: due.value, priority, carriedOver: carried, started, openAge },
     dueAt: t.dueDate ?? null,
     source: t.source ?? "manual",
     actions: taskActions(t, nowMs),
-    deepLink: "/?tab=tasks"
+    deepLink: "/?tab=tasks",
+    sourceCreatedAt: t.createdAt ?? null
   };
+}
+
+/// The row's one-line justification. "in progress · added 8w ago" and "due
+/// today" are different claims about different facts, and the brief used to
+/// render the second for both — an in-progress task filed under bucket "today"
+/// read as "today", which the user could only take as a deadline.
+///
+/// For started work the bucket name is dropped: it is where the task was FILED,
+/// not a fact about it, and next to an age it reads as a contradiction. A real
+/// dueDate still shows, because that is a commitment the user made. "carried
+/// over" is dropped too — "added 8w ago" says the same thing with a number.
+function taskWhy(t, due, carried, openMs) {
+  const parts = [];
+  if (t.status === "in_progress") {
+    parts.push("in progress");
+    if (t.dueDate && due.label) parts.push(due.label);
+    const age = ageLabel(openMs);
+    if (age) parts.push(`added ${age} ago`);
+  } else {
+    if (due.label) parts.push(due.label);
+    if (carried) parts.push("carried over");
+  }
+  if (t.source && t.source !== "manual") parts.push(`from ${t.source}`);
+  return parts.join(" · ") || "on your list";
+}
+
+/// How long the task has existed. createdAt, and ONLY createdAt.
+///
+/// updatedAt is the obvious choice and it is the wrong one: this install's
+/// proactive-observer rewrites `sourceMeta` on every in-progress task each
+/// reconciliation pass (measured — 149 of 281 task updates in the live event
+/// log patch sourceMeta alone, and all 16 in-progress tasks were stamped within
+/// the same second today). So updatedAt tracks the DAEMON, not the user, and a
+/// row saying "no update in 6w" would be reporting how long the observer had
+/// been quiet while the user read it as how long they had been ignoring it —
+/// a sentence that is false in exactly the way this file exists to prevent.
+///
+/// There is no startedAt on a task record either, so "started 8 weeks ago" is
+/// unavailable. createdAt is never rewritten (task-store.update() copies it
+/// through untouched), which makes "added 8w ago" the strongest claim actually
+/// backed by the data.
+function taskOpenMs(t, nowMs) {
+  if (!t.createdAt || !Number.isFinite(nowMs)) return 0;
+  const ms = new Date(t.createdAt).getTime();
+  if (!Number.isFinite(ms)) return 0;
+  return Math.max(0, nowMs - ms);
+}
+
+/// An age in the largest unit that is still true, or null when it is not worth
+/// saying. Under a day is noise on something added this morning; weeks beat
+/// "55d" for something that has been open since June.
+function ageLabel(ms) {
+  if (!Number.isFinite(ms) || ms < DAY_MS) return null;
+  const days = ms / DAY_MS;
+  return days >= 14 ? `${Math.round(days / 7)}w` : `${Math.floor(days)}d`;
 }
 
 function buildSuggestion(s, nowMs, multipliers) {
@@ -292,32 +440,101 @@ function buildSuggestion(s, nowMs, multipliers) {
   return {
     id: `suggestion:${s.id}`,
     kind: "suggestion",
-    title: s.title || "OpenAGI noticed something",
+    title: suggestionTitle(s),
     why: suggestionWhy(s, breakdown),
     score: clamp01(score * multiplier),
     scoreBreakdown: breakdown,
     dueAt: null,
     source: s.source ?? "observer",
     actions: [
-      { id: "accept", label: "Yes", style: "primary", method: "POST", path: `/proactive/suggestions/${encodeURIComponent(s.id)}/accept`, body: null },
-      { id: "reject", label: "No", style: "secondary", method: "POST", path: `/proactive/suggestions/${encodeURIComponent(s.id)}/reject`, body: null }
+      {
+        id: "accept",
+        // Names the consequence, not the answer. The id stays "accept" — the
+        // Mac client keys its outcome message off action.id, never the label.
+        label: ACCEPT_LABELS[s.category] ?? "Yes",
+        style: "primary",
+        method: "POST",
+        path: `/proactive/suggestions/${encodeURIComponent(s.id)}/accept`,
+        body: null
+      },
+      // "Dismiss", not "No": the pair now reads as verb/verb, and it is what
+      // the route does (status → rejected, the row leaves the queue) and what
+      // the client already reports back ("Suggestion dismissed").
+      { id: "reject", label: "Dismiss", style: "secondary", method: "POST", path: `/proactive/suggestions/${encodeURIComponent(s.id)}/reject`, body: null }
     ],
-    deepLink: "/?tab=suggestions"
+    deepLink: "/?tab=suggestions",
+    sourceCreatedAt: s.proposedAt ?? null
   };
 }
 
-function buildDraft(d, nowMs) {
+/// A sentence the user can read, never a machine slug.
+///
+/// The bug: mined candidates title themselves with the SLUG of the skill they
+/// would create. suggestion-feed.js normalize() lifts `proposal.name` into
+/// `title`, and proposal.name is kebab-case by construction — measured on the
+/// user's install, 567 of 567 pending mined candidates have a name with no
+/// spaces in it. So the popover rendered rows called "return-to-zoom-after-auth"
+/// and "post-meeting-buildbetter-staging", which is a filename, not an offer.
+///
+/// The prose is already on the record and was simply never read: all 567 carry
+/// a `proposal.description` — one sentence, 64-186 chars, e.g. "After checking
+/// Slack, open Codex briefly to prepare or review work before joining a Zoom
+/// call." Observer candidates (prop_*) are the other shape: they already title
+/// themselves in prose ("Triage PR #4437 for ob-website SEO changes") and have
+/// no proposal at all, so their title is kept verbatim.
+function suggestionTitle(s) {
+  const described = firstSentence(s.proposal?.description);
+  if (described) return described;
+  const title = String(s.title ?? "").trim();
+  if (title && !looksLikeSlug(title)) return title;
+  // No third source. `rationale` looks like one and is not: for a mined
+  // candidate suggestion-feed.js composes it FROM the description plus stats,
+  // so when the description is missing what is left is
+  // "Observed 12× · across 6 days · hourly cadence · confidence 0.99" — a
+  // measurement, not a sentence, and worse to read than the id.
+  //
+  // So: render the slug AS IT IS STORED rather than de-kebabbing it into a
+  // sentence we made up. A machine id the user can match against the
+  // Suggestions tab is honest; invented prose about what a pattern "means" is
+  // exactly the kind of claim this brief must not make.
+  return title || "OpenAGI noticed something";
+}
+
+/// Kebab/snake machine identifier: lowercase alphanumeric runs joined by - or _,
+/// and no whitespace anywhere. Deliberately strict — a real sentence never
+/// matches, and a one-word title (no separator) is not treated as a slug because
+/// there is nothing to un-mangle and nothing better to show.
+function looksLikeSlug(s) {
+  return /^[a-z0-9]+(?:[-_][a-z0-9]+)+$/.test(String(s ?? "").trim());
+}
+
+/// First sentence of a prose field, so a two-sentence description does not turn
+/// a popover row into a paragraph. Falls back to the whole string when there is
+/// no terminator (which is every mined description on the real install).
+function firstSentence(text) {
+  const s = String(text ?? "").trim();
+  if (!s) return "";
+  const m = s.match(/^[\s\S]*?[.!?](?=\s|$)/);
+  return (m ? m[0] : s).trim();
+}
+
+function buildDraft(d, nowMs, generator, draftsFromTask) {
   const score = ageScore(d.createdAt, nowMs);
   const ref = encodeURIComponent(d.id);
   // A revise action is only honest when we can hand the client the draft's
   // WHOLE current text (see editValue below). Without it there is nothing safe
   // to seed an editor with, so the row falls back to approve/discard.
   const editable = typeof d.body === "string";
+  // "Stop asking" is only offered when there is something for it to stop. A
+  // draft with no taskId has no generator, and a generator in a terminal state
+  // cannot re-draft — in both cases the button would be a promise the server
+  // has to refuse, and the honest version of that is no button.
+  const stoppable = Boolean(generator) && RETIRABLE_TASK_STATUSES.has(generator.status ?? "pending");
   return {
     id: `draft:${d.id}`,
     kind: "draft",
     title: d.title || "(untitled draft)",
-    why: `draft waiting${d.kind && d.kind !== "other" ? ` · ${d.kind}` : ""}`,
+    why: draftWhy(d, draftsFromTask),
     score,
     scoreBreakdown: { age: score },
     dueAt: null,
@@ -350,10 +567,68 @@ function buildDraft(d, nowMs) {
         ? [{ id: "revise", label: "Edit", style: "revise", method: "PATCH", path: `/drafts/${ref}`, body: null, bodyField: "body" }]
         : []),
       { id: "approve", label: "Approve", style: "primary", method: "POST", path: `/drafts/${ref}/approve`, body: null },
-      { id: "discard", label: "Discard", style: "destructive", method: "POST", path: `/drafts/${ref}/discard`, body: null }
+      // Two different decisions, and conflating them is the bug this pair
+      // exists to fix. Discard resolves THIS ARTIFACT and deliberately leaves
+      // the task alone — task-store treats a discarded draft as "not this one,
+      // try again" (OPEN_DRAFT_STATUSES), which is a real and often correct
+      // outcome. It is also why the user's discards kept coming back: measured
+      // on their install, 69 of 97 pending drafts belong to a task that already
+      // had one and a single task had produced four.
+      { id: "discard", label: "Discard", style: "destructive", method: "POST", path: `/drafts/${ref}/discard`, body: null },
+      // …and the other half, said out loud. style "retire" is a NEW style: it
+      // asks the client to render this apart from the tap-happy row, and an
+      // older client that has never heard of it falls back to its default
+      // (secondary) — a plainer button that still works, never a missing one.
+      ...(stoppable
+        ? [{ id: "stop_asking", label: "Stop asking", style: "retire", method: "POST", path: `/drafts/${ref}/stop-asking`, body: null }]
+        : [])
     ],
-    deepLink: "/?tab=today"
+    deepLink: "/?tab=today",
+    sourceCreatedAt: d.createdAt ?? null
   };
+}
+
+/// The draft row's one-line justification.
+///
+/// The count is the answer to the user's own question — "I hit discard and it
+/// keeps coming back. I don't know why." — so it is stated in the row rather
+/// than left for them to infer from a button. It counts EVERY draft the task
+/// has produced, resolved ones included, because the discarded ones are the
+/// whole story; a count of just the pending ones would say "1" on the task that
+/// has been drafted four times.
+function draftWhy(d, draftsFromTask) {
+  const parts = ["draft waiting"];
+  if (d.kind && d.kind !== "other") parts.push(d.kind);
+  if (Number.isFinite(draftsFromTask) && draftsFromTask > 1) parts.push(`${draftsFromTask} drafts from this task`);
+  return parts.join(" · ");
+}
+
+/// The task that produced this draft, or null. Never throws: a draft row is
+/// still worth showing when the task store cannot answer, it just loses the
+/// "stop asking" offer — which is the correct degradation, since without the
+/// task we cannot know whether there is anything to retire.
+function generatorTask(runtime, draft) {
+  if (!draft?.taskId) return null;
+  try { return runtime?.tasks?.get?.(draft.taskId) ?? null; } catch { return null; }
+}
+
+/// taskId → how many drafts that task has produced, in any status.
+///
+/// Enrichment ONLY, which is why it swallows its own failure instead of going
+/// through safely(): `degraded` is a claim that a source could not be read, and
+/// the pending-draft list this brief is actually built from was already read
+/// successfully by the time this runs. Losing the count costs a clause in one
+/// row; reporting "couldn't read drafts" next to four drafts we are rendering
+/// would be the louder lie.
+function draftCountsByTask(runtime) {
+  const counts = new Map();
+  try {
+    for (const d of runtime?.drafts?.list?.({ status: null }) ?? []) {
+      if (!d?.taskId) continue;
+      counts.set(d.taskId, (counts.get(d.taskId) ?? 0) + 1);
+    }
+  } catch { /* enrichment only — see above */ }
+  return counts;
 }
 
 function buildClarification(c, nowMs) {
@@ -375,8 +650,27 @@ function buildClarification(c, nowMs) {
       path: `/tasks/clarifications/${encodeURIComponent(c.id)}/answer`,
       body: { answer: a }
     })),
-    deepLink: "/?tab=today"
+    deepLink: "/?tab=today",
+    sourceCreatedAt: c.createdAt ?? null
   };
+}
+
+/// The earliest timestamp among a set of rows, or null. Parses rather than
+/// comparing ISO strings lexicographically: task createdAt, draft createdAt and
+/// suggestion proposedAt are written by different stores and a single one of
+/// them carrying an offset (+00:00 rather than Z) would silently sort wrong.
+function oldestOf(items) {
+  let bestAt = null;
+  let bestMs = Infinity;
+  for (const item of items) {
+    const at = item?.sourceCreatedAt;
+    if (!at) continue;
+    const ms = new Date(at).getTime();
+    if (!Number.isFinite(ms) || ms >= bestMs) continue;
+    bestMs = ms;
+    bestAt = at;
+  }
+  return bestAt;
 }
 
 // ─── scoring helpers ─────────────────────────────────────────────────────
@@ -573,8 +867,10 @@ function safely(degraded, name, fn, fallback) {
   }
 }
 
+/// Composer bookkeeping never reaches the wire. sourceTaskId resolves the focus
+/// row to a task; sourceCreatedAt feeds older.oldestAt across kinds.
 function stripInternal(item) {
-  const { sourceTaskId, ...rest } = item;
+  const { sourceTaskId, sourceCreatedAt, ...rest } = item;
   return rest;
 }
 

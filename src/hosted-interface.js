@@ -1184,6 +1184,35 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const ok = runtime.tasks.remove(id);
         return sendJson(res, ok ? 200 : 404, { ok, id });
       }
+      // The undo for "stop asking" (POST /drafts/:id/stop-asking). Retiring a
+      // task is allowed to be one tap precisely BECAUSE this exists: nothing was
+      // deleted, so putting it back is a status change plus a note.
+      //
+      // It returns to "pending", not to sourceMeta.retired.fromStatus, and that
+      // is deliberate. "Un-retire" means "you may work this again", and pending
+      // is the only status the agent queue serves (agentPickNext filters on it);
+      // restoring an in_progress task to in_progress would produce a task that
+      // is un-retired and still invisible to the queue — the wedged state
+      // task-store's whole lease design exists to prevent. The status it was
+      // stopped from is preserved in the history entry, so nothing is lost.
+      if (method === "POST" && pathname.match(/^\/tasks\/[^/]+\/unretire$/)) {
+        if (!runtime.tasks?.get || !runtime.tasks?.update) return sendJson(res, 503, { error: "no task store" });
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const task = runtime.tasks.get(id);
+        if (!task) return sendJson(res, 404, { error: "unknown task" });
+        const retired = task.sourceMeta?.retired ?? null;
+        if (!retired) return sendJson(res, 409, { error: "task was not retired" });
+        const meta = { ...(task.sourceMeta ?? {}) };
+        // Move the record into history rather than dropping it: `retired` has
+        // to mean "is retired right now" for this route and the UI to be able to
+        // tell, and the audit trail has to survive the undo. Both, not either.
+        const history = Array.isArray(meta.retiredHistory) ? [...meta.retiredHistory] : [];
+        history.push({ ...retired, revertedAt: new Date().toISOString(), revertedBy: "user" });
+        delete meta.retired;
+        meta.retiredHistory = history;
+        const next = runtime.tasks.update(id, { status: "pending", sourceMeta: meta });
+        return next ? sendJson(res, 200, next) : sendJson(res, 404, { error: "unknown task" });
+      }
       // Clarification queue — the "ask me" loop. ids are looked up in an
       // in-memory Map (never a filesystem path), so the strict-id concern
       // from suggestion routes doesn't apply here.
@@ -1229,6 +1258,39 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const action = parts[3];
         const draft = action === "approve" ? runtime.drafts.approve(id) : runtime.drafts.discard(id);
         return draft ? sendJson(res, 200, draft) : sendJson(res, 404, { error: "unknown or already-resolved draft" });
+      }
+      // "Stop asking" — discard this draft AND retire the task that generates
+      // it. The /discard route above is deliberately the OTHER choice: it
+      // resolves the artifact and leaves the task alone, which task-store reads
+      // as "not this one, try again" (OPEN_DRAFT_STATUSES in task-store.js), so
+      // the next autopilot pulse drafts it again. That is a real and often
+      // correct behaviour, and it is also why the user's discards kept coming
+      // back — measured on their install: 69 of 97 pending drafts belonged to a
+      // task that already had one, and task_7d758c61ed194ddb had produced four.
+      // Rather than guess which one a discard meant, both are offered.
+      //
+      // Returns BOTH halves of what happened, because they can differ: the
+      // draft is always resolvable, the retirement can be skipped (no task, an
+      // already-completed task) or fail, and the client must not report "won't
+      // ask again" unless a task was actually retired.
+      if (method === "POST" && pathname.match(/^\/drafts\/[^/]+\/stop-asking$/)) {
+        if (!runtime.drafts?.get || !runtime.drafts?.discard) return sendJson(res, 503, { error: "no draft store" });
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        // Read BEFORE discarding: discard() returns null for an already-resolved
+        // draft, and the taskId on the stored record is the only way to know
+        // what to retire in that case. A second client discarding the same row
+        // must not cost the user their "stop asking".
+        const existing = runtime.drafts.get(id);
+        if (!existing) return sendJson(res, 404, { error: "unknown draft" });
+        const resolved = runtime.drafts.discard(id);
+        const retirement = retireGeneratingTask(runtime, existing.taskId ?? null, { draftId: id });
+        return sendJson(res, 200, {
+          draft: resolved ?? existing,
+          // Whether THIS call resolved the draft. false means it was already
+          // resolved (approved/sent/discarded) before we got here.
+          discarded: Boolean(resolved),
+          ...retirement
+        });
       }
       if (method === "POST" && pathname.match(/^\/drafts\/[^/]+\/send$/)) {
         // Explicit user-initiated send: route the draft body through a REAL
@@ -1758,6 +1820,105 @@ function sendJson(res, status, value) {
   const body = JSON.stringify(value, null, 2);
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body) });
   res.end(body);
+}
+
+// Task statuses a "stop asking" may retire FROM. Mirrors the allowlist in
+// daily-brief.js, and the reason both exist is the "completed" case: flipping a
+// completed task to cancelled would erase a real outcome the user earned in
+// order to silence a row, so the composer never offers the button and the route
+// refuses it even if something else asks.
+const RETIRABLE_TASK_STATUSES = new Set(["pending", "in_progress", "blocked"]);
+
+/// Retire the task that generates a draft, so it can never draft again.
+///
+/// HOW, and why this shape. task-store has no cancel()/retire() of its own —
+/// verified by reading it — so this composes the primitives it does have:
+/// status "cancelled" (a STATUSES member, and the one state agentPickNext's
+/// `status === "pending"` filter and sweepStuckTasks' terminal check both
+/// exclude, so a cancelled task is unreachable by every path that could
+/// re-draft it) plus a sourceMeta stamp, which is where that store already
+/// keeps agentLease / agentStall / agentReconcile / awaitingReview.
+///
+/// That choice is what buys the two properties this has to have:
+///   - AUDIT TRAIL. update() appends the whole patch to tasks/<queue>.jsonl and
+///     re-snapshots, so who/why/when/from-what lands in the same append-only
+///     log as every other status change on that task — nothing bespoke to go
+///     looking for later. An outcome is recorded alongside it (kind
+///     "task-retired", low quality score) because "the agent made work I did
+///     not want" is exactly the signal the outcome store exists to hold, and
+///     complete() records the positive half the same way.
+///   - REVERSIBLE. Nothing is deleted: the task keeps its id, title, body,
+///     history and queue, and POST /tasks/:id/unretire puts it straight back
+///     into the queue. `retired` is what makes the state legible to that route.
+///
+/// Never throws: the draft half of "stop asking" has already happened by the
+/// time this runs, so a failure here is reported, not raised.
+function retireGeneratingTask(runtime, taskId, { draftId = null, by = "user", reason = "stop-asking" } = {}) {
+  if (!taskId) return { retired: null, retireSkipped: "no-generating-task" };
+  if (typeof runtime.tasks?.get !== "function" || typeof runtime.tasks?.update !== "function") {
+    return { retired: null, retireSkipped: "no-task-store" };
+  }
+  let task;
+  try { task = runtime.tasks.get(taskId); } catch (error) { return { retired: null, retireError: error.message }; }
+  if (!task) return { retired: null, retireSkipped: "task-not-found" };
+  // Already cancelled counts as retired: the user's goal is the END STATE, and
+  // reporting "couldn't stop it" about a task that is already stopped would be
+  // false in the direction that matters.
+  if (task.status === "cancelled") return { retired: task, retireSkipped: "already-retired" };
+  if (!RETIRABLE_TASK_STATUSES.has(task.status ?? "pending")) {
+    return { retired: null, retireSkipped: `not-retirable:${task.status}` };
+  }
+  const meta = { ...(task.sourceMeta ?? {}) };
+  // The claim and the review are both over. Leaving these behind would keep the
+  // task advertising a lease nobody holds and a review nobody owes.
+  delete meta.agentLease;
+  delete meta.awaitingReview;
+  meta.retired = {
+    at: new Date().toISOString(),
+    by,
+    reason,
+    draftId,
+    // What to put it back to, and what it looked like when it was stopped.
+    fromStatus: task.status ?? null,
+    fromBucket: task.bucket ?? null
+  };
+  let retired;
+  try {
+    retired = runtime.tasks.update(taskId, { status: "cancelled", sourceMeta: meta });
+  } catch (error) {
+    return { retired: null, retireError: error.message };
+  }
+  if (!retired) return { retired: null, retireSkipped: "task-not-found" };
+  recordRetirementOutcome(runtime, retired, { draftId, by, reason });
+  return { retired };
+}
+
+/// The learning half of the audit trail. Best-effort by construction: the
+/// retirement is already committed to the task log when this runs, and a broken
+/// outcome store must not turn a decision the user made into an error they see.
+function recordRetirementOutcome(runtime, task, { draftId, by, reason }) {
+  if (!runtime.outcomes?.record) return;
+  try {
+    const outcome = runtime.outcomes.record({
+      kind: "task-retired",
+      refId: task.id,
+      metadata: {
+        task: task.id,
+        title: task.title,
+        draftId,
+        by,
+        reason,
+        // Lineage back to the proactive suggestion that materialized this task,
+        // the same field complete() reports on — so "this proposal led to N
+        // completed tasks" can finally be read against "…and N the user shut off".
+        sourceSuggestionId: task.sourceMeta?.suggestionId ?? null
+      }
+    });
+    // The lowest score any completed path assigns is 0.7 (auto-completed from
+    // observed activity). "The user told this task to stop" is the opposite
+    // signal and has to score below everything the positive path can produce.
+    runtime.outcomes.resolve?.(outcome.id, 0.05, "task-retired");
+  } catch { /* audit is a side effect; it never undoes the user's decision */ }
 }
 
 // Map an outreach action to the real action on the underlying source. Throws
@@ -4554,6 +4715,7 @@ async function renderToday() {
               <button class="ui-btn ui-btn-accent" data-draft-action="approve" data-id="\${escapeHtml(d.id)}">Approve</button>
               <button class="ui-btn" data-draft-action="save" data-id="\${escapeHtml(d.id)}">Save edits</button>
               <button class="ui-btn ui-btn-ghost" data-draft-action="discard" data-id="\${escapeHtml(d.id)}">Discard</button>
+              \${!d.taskId ? "" : \`<button class="ui-btn ui-btn-ghost" data-draft-action="stop-asking" data-id="\${escapeHtml(d.id)}" title="Discard this draft AND retire the task that keeps producing it, so it never drafts again. Reversible from the Tasks tab.">Stop asking</button>\`}
               \${sendChannels.length === 0 ? "" : \`
                 <span class="ui-meta" style="margin-left:auto;">Send via</span>
                 <input class="ui-input" data-draft-target="\${escapeHtml(d.id)}" placeholder="\${d.recipient ? escapeHtml(d.recipient) : "recipient"}" style="width:auto; min-width:120px;">
@@ -4670,8 +4832,19 @@ async function renderToday() {
             body: JSON.stringify({ body: bodyEl.value })
           });
         }
-        await fetch("/drafts/" + encodeURIComponent(id) + "/" + action, { method: "POST", credentials: "include" });
-        showToast(action === "approve" ? "Approved — ready to use." : "Discarded.", true);
+        const resolveRes = await fetch("/drafts/" + encodeURIComponent(id) + "/" + action, { method: "POST", credentials: "include" });
+        if (action === "stop-asking") {
+          // Report the half that actually happened. The draft is always
+          // resolvable; the retirement can be skipped (no generating task, an
+          // already-completed one), and claiming "won't ask again" when nothing
+          // was retired is the exact lie this pair of buttons exists to end.
+          const out = await resolveRes.json().catch(() => ({}));
+          if (out && out.retired) showToast("Discarded — won't ask again.", true);
+          else if (out && out.retireError) showToast("Discarded, but couldn't stop the task: " + out.retireError, false);
+          else showToast("Discarded. Nothing to stop — this draft has no live task behind it.", true);
+        } else {
+          showToast(action === "approve" ? "Approved — ready to use." : "Discarded.", true);
+        }
       } catch { showToast("Couldn't update the draft.", false); }
       renderToday();
     });

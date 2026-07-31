@@ -150,8 +150,26 @@ struct BriefSection: View {
     }
   }
 
-  @ViewBuilder private func row(_ item: BriefItem) -> some View {
-    VStack(alignment: .leading, spacing: 3) {
+  /// One brief row. The action list is split in two, deliberately.
+  ///
+  /// A draft now offers Edit / Approve / Discard AND "Stop asking", and those
+  /// last two are one tap apart while meaning very different things — Discard
+  /// resolves this draft (the task may legitimately produce a better one later),
+  /// "Stop asking" retires the task so it never drafts again. Discard is the
+  /// common case and keeps its place in the tap row at full weight; anything the
+  /// server marks `style: "retire"` drops to its own line underneath, smaller
+  /// and unaccented, so the deliberate choice cannot be collected by a thumb
+  /// aimed at the common one.
+  ///
+  /// Not a modal and not a second tap: the panel is 320pt of manually-sized
+  /// popover, a confirm sheet has nowhere to live in it, and a two-step Discard
+  /// would tax the action the user takes most to protect the one they take
+  /// rarely. Separation plus a truthful outcome line plus a reversible server
+  /// action is the trade this makes instead.
+  private func row(_ item: BriefItem) -> some View {
+    let inline = item.actions.filter { !isDeliberate($0) }
+    let deliberate = item.actions.filter { isDeliberate($0) }
+    return VStack(alignment: .leading, spacing: 3) {
       HStack(alignment: .top, spacing: 5) {
         Text(icon(item.kind)).font(.system(size: 11))
         Text(item.title).font(.system(size: 12, weight: .semibold)).lineLimit(2)
@@ -159,10 +177,17 @@ struct BriefSection: View {
       if !item.why.isEmpty {
         Text(item.why).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
       }
-      if !item.actions.isEmpty {
+      if !inline.isEmpty {
         HStack(spacing: 6) {
-          ForEach(item.actions) { action in
+          ForEach(inline) { action in
             actionButton(item, action)
+          }
+        }
+      }
+      if !deliberate.isEmpty {
+        HStack(spacing: 6) {
+          ForEach(deliberate) { action in
+            deliberateButton(item, action)
           }
         }
       }
@@ -171,6 +196,12 @@ struct BriefSection: View {
       }
     }
   }
+
+  /// A "retire"-styled action: consequential, rare, and never adjacent to the
+  /// button it must not be confused with. Recognised by STYLE, not id, so a
+  /// newer daemon can mark any action this way without a client change — and an
+  /// id-based list here would have gone stale the first time it did.
+  private func isDeliberate(_ action: BriefAction) -> Bool { action.style == "retire" }
 
   /// Most actions dispatch on tap. A "revise" action does NOT: it has no body
   /// of its own to send (the server sends `body: null` and names the key it
@@ -201,6 +232,24 @@ struct BriefSection: View {
         .foregroundStyle(tint(action.style))
         .disabled(brief.inFlight.contains(item.id))
     }
+  }
+
+  /// The de-emphasised second line. Same single tap as everything else — the
+  /// weight is carried by position, size and colour rather than by an extra
+  /// step. The ⊘ is there so the line reads as "off switch" at a glance in a
+  /// 10pt font, and `.help` spells out the part a two-word label cannot: that
+  /// this reaches past the draft to the task, and that it can be undone.
+  @ViewBuilder private func deliberateButton(_ item: BriefItem, _ action: BriefAction) -> some View {
+    Button {
+      Task { await brief.act(item, action) }
+    } label: {
+      Text("⊘ \(action.label)")
+        .font(.system(size: 10))
+        .foregroundStyle(.secondary)
+    }
+    .buttonStyle(.plain)
+    .disabled(brief.inFlight.contains(item.id))
+    .help("Also retires the task that keeps producing this, so it can't come back. Undo it from the Tasks tab.")
   }
 
   /// The inline editor: the draft's real body, editable in place.
@@ -312,6 +361,12 @@ struct BriefSection: View {
     switch style {
     case "primary": return .blue
     case "destructive": return .red
+    // Deliberately NOT red. It shares a row with Discard, and two red buttons
+    // one tap apart is the exact confusion this split exists to remove — the
+    // weight lives in position and size (see deliberateButton), not in colour.
+    // Present for the case where a retire-styled action is rendered by the
+    // ordinary path (an older layout, a preview) rather than the quiet one.
+    case "retire": return .secondary
     default: return .secondary
     }
   }

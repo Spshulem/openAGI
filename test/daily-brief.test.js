@@ -29,7 +29,10 @@ function makeRuntime({ tasks = [], drafts = [], clarifications = [], suggestions
   }
   return {
     dataDir,
-    tasks: { list: () => tasks },
+    // Honours the status filter the way task-store.list() does. The composer
+    // asks once per active status, so a stub that ignored the filter (the
+    // previous one did) would hand every row back twice and hide the dedupe.
+    tasks: { list: ({ status } = {}) => (status ? tasks.filter((t) => (t.status ?? "pending") === status) : tasks) },
     drafts: { list: () => drafts },
     clarifications: { list: () => clarifications },
     suggestionFeedback: {
@@ -437,4 +440,338 @@ test("a draft with no readable body offers no revise action at all", () => {
   assert.equal(draft.editValue, undefined, "no seed is sent when there is none to send");
   assert.ok(!draft.actions.some((a) => a.id === "revise"), "and no edit is offered without one");
   assert.ok(draft.actions.some((a) => a.id === "approve"), "approve/discard still work");
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// The brief used to filter tasks on status "pending". MEASURED on the user's
+// real install: 16 of their 17 open user tasks are "in_progress" and exactly
+// one is "pending" — so the popover rendered a task-free brief for someone
+// with sixteen live commitments, including "Resolve the AI PM Course Vimeo
+// checkout error" and "Finish QA on BuildBetter follow-ups flow for PR 4180".
+// ─────────────────────────────────────────────────────────────────────────
+
+test("in-progress tasks reach the brief — the install where every open task is one", () => {
+  const tasks = [
+    task({ id: "t_vimeo", title: "Resolve the AI PM Course Vimeo checkout error", status: "in_progress", createdAt: "2026-06-06T05:39:21.743Z" }),
+    task({ id: "t_qa", title: "Finish QA on BuildBetter follow-ups flow for PR 4180", status: "in_progress", createdAt: "2026-06-09T00:00:00.000Z" })
+  ];
+  const brief = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 });
+  assert.deepEqual(
+    brief.items.filter((i) => i.kind === "task").map((i) => i.id).sort(),
+    ["task:t_qa", "task:t_vimeo"],
+    "work the user has already started is the most current work there is"
+  );
+});
+
+test("a blocked or completed task never reaches the brief", () => {
+  // "blocked" is set by task-store precisely so the UI does not surface it,
+  // and no button on a one-row popover can unblock one. The status filter
+  // going away must not turn the pool into 'every task that exists'.
+  const tasks = [
+    task({ id: "t_ok", title: "Open", status: "in_progress" }),
+    task({ id: "t_blocked", title: "Blocked", status: "blocked" }),
+    task({ id: "t_done", title: "Done", status: "completed", bucket: "done" }),
+    task({ id: "t_cancelled", title: "Cancelled", status: "cancelled" })
+  ];
+  const brief = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 });
+  assert.deepEqual(brief.items.filter((i) => i.kind === "task").map((i) => i.id), ["task:t_ok"]);
+});
+
+test("a store that ignores the status filter does not get every task twice", () => {
+  // The composer asks once per active status. A store (or a future one) that
+  // returns the same rows for both would otherwise render duplicate rows and
+  // double the 'N older' count.
+  const rows = [task({ id: "t1", status: "in_progress" }), task({ id: "t2", status: "pending" })];
+  const rt = makeRuntime({});
+  rt.tasks = { list: () => rows };
+  const brief = composeBrief(rt, { now: NOW, limit: 5 });
+  assert.deepEqual(brief.items.filter((i) => i.kind === "task").map((i) => i.id), ["task:t1", "task:t2"]);
+});
+
+test("an in-progress row says so, and says how long it has been open", () => {
+  // "today" (the BUCKET) is what the old why string said about a task the user
+  // picked up in June — which they can only read as a deadline. What is
+  // actually true is that it is in progress and eight weeks old.
+  const tasks = [task({ id: "t1", status: "in_progress", createdAt: "2026-06-06T05:39:21.743Z", source: "proactive-observer" })];
+  const brief = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 });
+  const row = brief.items.find((i) => i.kind === "task");
+  assert.equal(row.why, "in progress · added 8w ago · from proactive-observer", `got: ${row.why}`);
+  assert.equal(row.scoreBreakdown.started, 1);
+  assert.ok(!row.why.includes("today"), "a bucket name is where the task was filed, not a deadline");
+});
+
+// THE trap. updatedAt is the obvious staleness signal and it is the wrong one:
+// this install's proactive-observer re-stamps sourceMeta on every in-progress
+// task each reconciliation pass (149 of 281 task updates in the live event log
+// patch sourceMeta alone; all 16 in-progress tasks were stamped inside the same
+// second). A row keyed off it would have said "no update in 6w" yesterday and
+// nothing at all today, having learned nothing about the user either time.
+test("age comes from createdAt, so a daemon touching the record cannot change it", () => {
+  const stamped = task({ id: "t1", status: "in_progress", createdAt: "2026-06-06T05:39:21.743Z", updatedAt: NOW.toISOString(), source: "proactive-observer" });
+  const untouched = { ...stamped, id: "t2", updatedAt: "2026-06-06T05:39:21.743Z" };
+  const rows = composeBrief(makeRuntime({ tasks: [stamped, untouched] }), { now: NOW, limit: 5 })
+    .items.filter((i) => i.kind === "task");
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].why, rows[1].why, "a sourceMeta re-stamp is not news about the user");
+  assert.ok(rows[0].why.includes("added 8w ago"), `got: ${rows[0].why}`);
+  assert.equal(rows[0].score, rows[1].score, "and it must not move the ranking either");
+});
+
+test("a just-added in-progress task claims no age at all", () => {
+  const tasks = [task({ id: "t1", status: "in_progress", createdAt: "2026-07-29T09:00:00.000Z", source: "manual" })];
+  const brief = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 });
+  const row = brief.items.find((i) => i.kind === "task");
+  assert.equal(row.why, "in progress", "eight hours is not a fact worth reporting");
+  assert.ok(row.scoreBreakdown.openAge < 0.03, `and it barely moves the score, got ${row.scoreBreakdown.openAge}`);
+});
+
+test("a started task does not bank 'carried over' on top of its age", () => {
+  // The same fact counted twice. Both terms are age signals; a started row
+  // reports its age as `openAge`, so carriedOver must read 0 or the ceiling
+  // that keeps deadlines on top stops holding.
+  const tasks = [task({ id: "t1", status: "in_progress", createdAt: "2026-06-01T00:00:00.000Z" })];
+  const row = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 }).items.find((i) => i.kind === "task");
+  assert.equal(row.scoreBreakdown.carriedOver, 0);
+  assert.equal(row.scoreBreakdown.openAge, 1, "premise: it is maximally old, so this is the strongest case");
+  assert.ok(!row.why.includes("carried over"), "and the sentence does not claim it either");
+});
+
+test("an in-progress task with a real deadline still reports the deadline", () => {
+  const tasks = [task({ id: "t1", status: "in_progress", dueDate: "2026-07-27T17:00:00.000Z" })];
+  const row = composeBrief(makeRuntime({ tasks }), { now: NOW, limit: 5 }).items.find((i) => i.kind === "task");
+  assert.equal(row.why.split(" · ")[0], "in progress");
+  assert.ok(row.why.includes("overdue 2d"), `a dueDate is a commitment and must survive, got: ${row.why}`);
+});
+
+test("started outranks untouched, but never outranks a real deadline", () => {
+  // Both halves matter. The first is why in_progress is scored at all; the
+  // second is the cap that stops sixteen in-progress rows from swamping a
+  // brief that also contains dated work.
+  const started = task({ id: "t_started", title: "Started weeks ago", status: "in_progress", createdAt: "2026-06-01T00:00:00.000Z" });
+  const untouched = task({ id: "t_untouched", title: "Never started", status: "pending", createdAt: "2026-06-01T00:00:00.000Z" });
+  const dueToday = task({ id: "t_due", title: "Due today", status: "pending", dueDate: "2026-07-29T23:00:00.000Z", createdAt: "2026-07-29T09:00:00.000Z" });
+
+  const ranked = composeBrief(makeRuntime({ tasks: [untouched, started] }), { now: NOW, limit: 5 })
+    .items.filter((i) => i.kind === "task").map((i) => i.id);
+  assert.deepEqual(ranked, ["task:t_started", "task:t_untouched"], "something you have started beats something you have not");
+
+  const withDeadline = composeBrief(makeRuntime({ tasks: [started, dueToday] }), { now: NOW, limit: 5 })
+    .items.filter((i) => i.kind === "task").map((i) => i.id);
+  assert.deepEqual(withDeadline, ["task:t_due", "task:t_started"], "a maximally old in-progress task must not outrank a task due today");
+});
+
+test("'N older' counts every eligible row that did not fit, not just suggestions", () => {
+  // Before in_progress entered the pool there were never unshown tasks on the
+  // real install, so a suggestion-only count was accidentally right. With 16
+  // in-progress tasks and 2 task slots it became a lie: "1 older" on a brief
+  // hiding fourteen tasks and a suggestion.
+  const tasks = Array.from({ length: 6 }, (_, i) =>
+    task({ id: `t${i}`, title: `In flight ${i}`, status: "in_progress", createdAt: "2026-06-01T00:00:00.000Z" })
+  );
+  const drafts = [
+    { id: "d1", title: "Draft one", status: "pending", createdAt: "2026-07-27T17:00:00.000Z", kind: "email" },
+    { id: "d2", title: "Draft two", status: "pending", createdAt: "2026-05-01T17:00:00.000Z", kind: "email" }
+  ];
+  const suggestions = [minedSuggestion({ id: "sug_a" }), minedSuggestion({ id: "sug_b" })];
+  const brief = composeBrief(makeRuntime({ tasks, drafts, suggestions }), { now: NOW, limit: 5 });
+  const shown = brief.items.length;
+  assert.equal(shown, 5, "premise: the brief is full");
+  assert.equal(brief.older.count, 6 + 2 + 2 - shown, "every eligible row the popover could not show is 'older'");
+  assert.equal(brief.older.oldestAt, "2026-05-01T17:00:00.000Z", "and oldestAt spans kinds too — the unshown draft is the oldest thing hidden");
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Rows titled "return-to-zoom-after-auth" / "post-meeting-buildbetter-staging".
+// The user: "Is that an idea of what actions it wants me to take? It's not
+// very clear what it's trying to do." Two defects: the title was the slug of
+// the skill that WOULD be created, and the button said "Yes" without ever
+// saying what yes does.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Verbatim shape of ~/.openagi/skills-suggested/sug_*.json, which is what
+// suggestion-feed.js normalize() reads: title comes from proposal.name (kebab,
+// 567/567 measured) and the readable sentence is proposal.description.
+function minedCandidateFile(over = {}) {
+  return {
+    id: "sug_z", source: "pattern-miner", status: "pending", proposedAt: "2026-07-29T10:00:00.000Z",
+    fingerprint: "actions:auth→attend-call",
+    sequence: { confidence: 0.99, count: 12, distinctDays: 6, cadence: { type: "hourly" } },
+    proposal: {
+      name: "return-to-zoom-after-auth",
+      description: "After completing a macOS SecurityAgent authentication prompt, return to the active Zoom call.",
+      body: "When a SecurityAgent prompt appears, finish it and switch straight back to Zoom.",
+      scheduleHint: null
+    },
+    ...over
+  };
+}
+
+test("a mined candidate renders the sentence on the record, not the skill slug", () => {
+  const brief = composeBrief(makeRuntime({ suggestions: [minedCandidateFile()] }), { now: NOW, limit: 5 });
+  const row = brief.items.find((i) => i.kind === "suggestion");
+  assert.equal(
+    row.title,
+    "After completing a macOS SecurityAgent authentication prompt, return to the active Zoom call.",
+    "proposal.description is prose the miner already wrote; the slug is a filename"
+  );
+  assert.ok(!/^[a-z0-9]+(?:-[a-z0-9]+)+$/.test(row.title), "no row may be titled with a machine id");
+});
+
+test("the accept button says what accepting does, per category", () => {
+  // Read off the accept branches in hosted-interface.js: skill → SKILL.md,
+  // task → materializes a task, mcp → registers + connects, knowledge →
+  // memory.remember. A bare "Yes" named the answer, not the consequence.
+  const expected = { skill: "Save as skill", task: "Add as task", mcp: "Connect it", knowledge: "Remember it" };
+  for (const [category, label] of Object.entries(expected)) {
+    const rt = makeRuntime({ suggestions: [minedSuggestion({ id: `prop_${category}`, category, title: "Something the observer noticed" })] });
+    const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.id === `suggestion:prop_${category}`);
+    const accept = row.actions.find((a) => a.id === "accept");
+    assert.equal(accept.label, label, `${category} must say what Yes does`);
+    // The id is the contract with the client's outcome reader; only the label moved.
+    assert.equal(accept.path, `/proactive/suggestions/prop_${category}/accept`);
+    const reject = row.actions.find((a) => a.id === "reject");
+    assert.equal(reject.label, "Dismiss");
+  }
+});
+
+test("an observer suggestion keeps its own prose title untouched", () => {
+  // prop_* records already title themselves in a sentence ("Triage PR #4437
+  // for ob-website SEO changes") and carry no proposal at all.
+  const rt = makeRuntime({
+    suggestions: [minedSuggestion({ id: "prop_1", category: "task", title: "Triage PR #4437 for ob-website SEO changes", sequence: undefined })]
+  });
+  const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "suggestion");
+  assert.equal(row.title, "Triage PR #4437 for ob-website SEO changes");
+});
+
+test("a record with nothing human on it shows the slug rather than invented prose", () => {
+  // The honest floor. If the miner wrote no description we have no sentence,
+  // and de-kebabbing "return-to-zoom-after-auth" into a claim about what the
+  // user does would be the composer making something up.
+  const raw = minedCandidateFile();
+  delete raw.proposal.description;
+  const rt = makeRuntime({ suggestions: [raw] });
+  const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "suggestion");
+  assert.equal(row.title, "return-to-zoom-after-auth", "the stored id, verbatim — not a sentence we made up");
+});
+
+test("a two-sentence description is trimmed to one, and never mid-word", () => {
+  const raw = minedCandidateFile();
+  raw.proposal.description = "Open Codex after checking Slack. Then join the Zoom call and take notes.";
+  const rt = makeRuntime({ suggestions: [raw] });
+  const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "suggestion");
+  assert.equal(row.title, "Open Codex after checking Slack.");
+});
+
+// ── "Discard" vs "Stop asking" ─────────────────────────────────────────────
+//
+// The user's report, verbatim: "I hit discard and it keeps coming back. I don't
+// know why." The why is that discarding resolves the ARTIFACT and leaves the
+// task that produced it in the agent queue — task-store reads a discarded draft
+// as "not this one, try again" — so the next pulse drafts it again. Measured on
+// the real install: 69 of 97 pending drafts belong to a task that already had
+// one, and task_7d758c61ed194ddb had produced four.
+
+/// makeRuntime's task stub is list()-only, matching what the composer needed
+/// before. Both of these actions turn on what the GENERATING task is, so the
+/// tests that exercise them need get() — added here rather than in the shared
+/// stub so no existing test's focus-resolution changes underneath it.
+function withTaskGet(rt) {
+  rt.tasks.get = (id) => rt.tasks.list().find((t) => t.id === id) ?? null;
+  return rt;
+}
+
+test("a draft whose task is still live offers BOTH discards, and they differ", () => {
+  const rt = withTaskGet(makeRuntime({
+    tasks: [task({ id: "t9", queue: "agent", title: "Compare ISPs", status: "pending" })],
+    drafts: [{ id: "d1", taskId: "t9", title: "ISP comparison", status: "pending", kind: "doc", body: "…", createdAt: "2026-07-27T17:00:00.000Z" }]
+  }));
+  const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "draft");
+  const discard = row.actions.find((a) => a.id === "discard");
+  const stop = row.actions.find((a) => a.id === "stop_asking");
+  assert.ok(discard, "the common case keeps its button");
+  assert.ok(stop, "and the deliberate one is offered when there is a task to retire");
+  assert.notEqual(discard.path, stop.path, "two decisions, two routes — the server must be able to tell them apart");
+  assert.equal(stop.path, "/drafts/d1/stop-asking");
+  assert.equal(stop.method, "POST");
+  // The style is the client's whole basis for weighting them: BriefSection
+  // splits on style == "retire" to move this off the tap row onto its own line.
+  assert.equal(stop.style, "retire");
+  assert.equal(discard.style, "destructive");
+  assert.ok(
+    row.actions.findIndex((a) => a.id === "discard") < row.actions.findIndex((a) => a.id === "stop_asking"),
+    "Discard is the common case and comes first"
+  );
+});
+
+test("no live task behind a draft means no 'Stop asking' — there is nothing to stop", () => {
+  // MEASURED on the real install: of 52 tasks referenced by a pending draft, 51
+  // no longer exist in the task store. Offering to retire a task that is gone
+  // would be a button the server has to refuse.
+  const rt = withTaskGet(makeRuntime({
+    tasks: [],
+    drafts: [{ id: "d1", taskId: "gone", title: "Orphan", status: "pending", kind: "doc", body: "…", createdAt: "2026-07-27T17:00:00.000Z" }]
+  }));
+  const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "draft");
+  assert.ok(!row.actions.some((a) => a.id === "stop_asking"));
+  assert.ok(row.actions.some((a) => a.id === "discard"), "the draft is still discardable");
+});
+
+test("a COMPLETED generating task is never offered for retirement", () => {
+  // Retiring writes status "cancelled". Doing that to a completed task would
+  // erase a real outcome the user earned in order to silence a row — the one
+  // failure mode this allowlist exists to prevent.
+  const rt = withTaskGet(makeRuntime({
+    tasks: [task({ id: "t9", queue: "agent", status: "completed" })],
+    drafts: [{ id: "d1", taskId: "t9", title: "Done work", status: "pending", kind: "doc", body: "…", createdAt: "2026-07-27T17:00:00.000Z" }]
+  }));
+  const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "draft");
+  assert.ok(!row.actions.some((a) => a.id === "stop_asking"));
+});
+
+test("the row says how many drafts the task has produced — the answer to 'why does it keep coming back'", () => {
+  const rt = withTaskGet(makeRuntime({
+    tasks: [task({ id: "t9", queue: "agent", status: "pending" })],
+    drafts: [
+      { id: "d1", taskId: "t9", title: "Attempt 4", status: "pending", kind: "doc", body: "…", createdAt: "2026-07-27T17:00:00.000Z" },
+      { id: "d2", taskId: "t9", title: "Attempt 3", status: "discarded", kind: "doc", body: "…", createdAt: "2026-07-20T17:00:00.000Z" },
+      { id: "d3", taskId: "t9", title: "Attempt 2", status: "discarded", kind: "doc", body: "…", createdAt: "2026-07-13T17:00:00.000Z" },
+      { id: "d4", taskId: "t9", title: "Attempt 1", status: "discarded", kind: "doc", body: "…", createdAt: "2026-07-06T17:00:00.000Z" }
+    ]
+  }));
+  const rows = composeBrief(rt, { now: NOW, limit: 5 }).items.filter((i) => i.kind === "draft");
+  assert.equal(rows.length, 1, "only the pending one is a row — the resolved three are history");
+  assert.match(rows[0].why, /4 drafts from this task/,
+    "the discarded ones ARE the story; counting only pending ones would say nothing");
+});
+
+test("one draft from a task says nothing about a count", () => {
+  const rt = withTaskGet(makeRuntime({
+    tasks: [task({ id: "t9", queue: "agent", status: "pending" })],
+    drafts: [{ id: "d1", taskId: "t9", title: "First", status: "pending", kind: "email", body: "…", createdAt: "2026-07-27T17:00:00.000Z" }]
+  }));
+  const row = composeBrief(rt, { now: NOW, limit: 5 }).items.find((i) => i.kind === "draft");
+  assert.equal(row.why, "draft waiting · email");
+});
+
+test("a broken draft-history read costs the count, never a degraded claim", () => {
+  // The pending list was already read successfully by the time the enrichment
+  // runs, so reporting "couldn't read drafts" next to a draft we are rendering
+  // would be the louder lie.
+  const rt = withTaskGet(makeRuntime({
+    tasks: [task({ id: "t9", queue: "agent", status: "pending" })],
+    drafts: [{ id: "d1", taskId: "t9", title: "First", status: "pending", kind: "doc", body: "…", createdAt: "2026-07-27T17:00:00.000Z" }]
+  }));
+  const pending = rt.drafts.list();
+  rt.drafts.list = ({ status } = {}) => {
+    if (status === null) throw new Error("history unreadable");
+    return pending;
+  };
+  const brief = composeBrief(rt, { now: NOW, limit: 5 });
+  assert.ok(!brief.degraded.includes("drafts"));
+  const row = brief.items.find((i) => i.kind === "draft");
+  assert.ok(row, "and the row still renders");
+  assert.equal(row.why, "draft waiting · doc", "just without the count");
+  assert.ok(row.actions.some((a) => a.id === "stop_asking"),
+    "and the offer stands — it turns on the task store, which is fine");
 });

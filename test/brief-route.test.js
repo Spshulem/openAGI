@@ -160,3 +160,187 @@ test("the revise action round-trips a long draft without losing a byte", async (
     assert.equal(runtime.drafts.get(created.id).body, typed, "approving keeps the revision");
   } finally { await app.close(); }
 });
+
+// ── the two discards, dispatched verbatim, checked at the queue ────────────
+//
+// The user's report: "I hit discard and it keeps coming back. I don't know
+// why." Discarding a draft resolves the ARTIFACT and deliberately leaves the
+// generating task alone, which task-store reads as "not this one, try again" —
+// so the next autopilot pulse drafts it again. Both meanings are now offered,
+// and the test that matters is not what the routes return but what the AGENT
+// QUEUE does afterwards.
+
+/// Is this task something the autopilot pulse can still pick up? Asserted
+/// through the queue's own gate AND through the plain list, so neither a
+/// renamed helper nor a changed filter can let this pass silently.
+function willRedraft(runtime, taskId) {
+  const picked = runtime.tasks.agentPickNext({ sweep: false });
+  const listed = runtime.tasks
+    .list({ queue: "agent", status: "pending", limit: 200 })
+    .some((t) => t.id === taskId);
+  return { picked: picked?.id === taskId, listed };
+}
+
+function seedDraftedTask(runtime) {
+  const task = runtime.tasks.add(
+    { title: "Compare Frontier vs SAIL Internet options", bucket: "today", priority: 60 },
+    { queue: "agent", source: "proactive-observer" }
+  );
+  const draft = runtime.drafts.add({
+    taskId: task.id, kind: "doc", title: "ISP comparison draft", body: "# Frontier vs Sail\n\nBottom line…"
+  });
+  return { task, draft };
+}
+
+test("plain Discard resolves the draft and leaves the task free to draft again", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-briefdiscard-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    const { task } = seedDraftedTask(runtime);
+    const item = (await (await fetch(`${base}/brief/today`)).json()).items.find((i) => i.kind === "draft");
+    assert.ok(item, "the pending draft must appear in the brief");
+    const discard = item.actions.find((a) => a.id === "discard");
+    assert.ok(discard, "Discard stays the common case");
+
+    const res = await fetch(`${base}${discard.path}`, { method: discard.method, headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(res.status, 200);
+    assert.equal(runtime.drafts.get((await res.json()).id).status, "discarded");
+
+    // This is the behaviour, not the bug: a discarded draft means "not this
+    // one", and the task may legitimately produce a better one later.
+    assert.equal(runtime.tasks.get(task.id).status, "pending");
+    const after = willRedraft(runtime, task.id);
+    assert.ok(after.picked, "the very next pulse would draft it again");
+    assert.ok(after.listed);
+  } finally { await app.close(); }
+});
+
+test("Stop asking discards the draft AND retires the task, so it can never re-draft", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-briefstop-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    const { task, draft } = seedDraftedTask(runtime);
+    const item = (await (await fetch(`${base}/brief/today`)).json()).items.find((i) => i.kind === "draft");
+    const stop = item.actions.find((a) => a.id === "stop_asking");
+    assert.ok(stop, "a draft with a live generating task must offer the second meaning");
+    // Same wire contract as every other action: dispatched verbatim.
+    const res = await fetch(`${base}${stop.path}`, { method: stop.method, headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+
+    // Both halves reported, separately — the client says "won't ask again" only
+    // when the task half actually happened.
+    assert.equal(body.discarded, true);
+    assert.equal(body.draft.id, draft.id);
+    assert.equal(body.draft.status, "discarded");
+    assert.ok(body.retired && body.retired.id === task.id, "the response must prove the TASK moved, not just the draft");
+    assert.equal(body.retired.status, "cancelled");
+
+    // Audit trail: who, why, when, and what it was before.
+    const stored = runtime.tasks.get(task.id);
+    assert.equal(stored.status, "cancelled");
+    assert.equal(stored.sourceMeta.retired.by, "user");
+    assert.equal(stored.sourceMeta.retired.reason, "stop-asking");
+    assert.equal(stored.sourceMeta.retired.draftId, draft.id);
+    assert.equal(stored.sourceMeta.retired.fromStatus, "pending");
+    assert.ok(Date.parse(stored.sourceMeta.retired.at) > 0);
+    // …and it is durable, in the same append-only log as every other status
+    // change on that task rather than somewhere bespoke.
+    const log = fs.readFileSync(path.join(dataDir, "tasks", "agent.jsonl"), "utf8");
+    assert.match(log, /"reason":"stop-asking"/);
+    // …and recorded as an outcome, the way completing one is.
+    const outcome = runtime.outcomes.recent(20, "task-retired").find((o) => o.refId === task.id);
+    assert.ok(outcome, "a retirement is a signal about the agent's work, not just a status flip");
+    assert.ok(outcome.qualityScore < 0.7, "and it scores below anything the completed path can produce");
+
+    // The point of the whole feature.
+    const after = willRedraft(runtime, task.id);
+    assert.equal(after.picked, false, "the queue can never hand this task out again");
+    assert.equal(after.listed, false);
+    // And the row is gone from the brief rather than lingering.
+    const items = (await (await fetch(`${base}/brief/today`)).json()).items;
+    assert.ok(!items.some((i) => i.id === `draft:${draft.id}`));
+  } finally { await app.close(); }
+});
+
+test("retiring is reversible, and the undo keeps the audit trail", async () => {
+  // Retirement is allowed to be one tap precisely because nothing is destroyed.
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-briefunretire-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    const { task, draft } = seedDraftedTask(runtime);
+    await fetch(`${base}/drafts/${draft.id}/stop-asking`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(runtime.tasks.get(task.id).status, "cancelled");
+
+    const res = await fetch(`${base}/tasks/${task.id}/unretire`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(res.status, 200);
+    const back = await res.json();
+    // "pending", not the status it was stopped from: un-retiring means "you may
+    // work this again", and pending is the only status the agent queue serves.
+    assert.equal(back.status, "pending");
+    assert.equal(back.sourceMeta.retired, undefined, "`retired` must mean 'is retired right now'");
+    assert.equal(back.sourceMeta.retiredHistory.length, 1, "…and the record survives the undo");
+    assert.equal(back.sourceMeta.retiredHistory[0].reason, "stop-asking");
+    assert.ok(Date.parse(back.sourceMeta.retiredHistory[0].revertedAt) > 0);
+    assert.ok(willRedraft(runtime, task.id).picked, "genuinely back in the queue, not just un-flagged");
+
+    // Nothing to undo twice.
+    const again = await fetch(`${base}/tasks/${task.id}/unretire`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(again.status, 409);
+  } finally { await app.close(); }
+});
+
+test("Stop asking on a draft with no generating task discards it and says so", async () => {
+  // The composer does not offer the button in this case, so this is the race:
+  // the task went away between the fetch and the tap. The draft half must still
+  // happen, and the response must not let the client claim a task was retired.
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-briefstoporphan-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    const draft = runtime.drafts.add({ kind: "doc", title: "Orphan draft", body: "no task behind me" });
+    const res = await fetch(`${base}/drafts/${draft.id}/stop-asking`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.discarded, true);
+    assert.equal(runtime.drafts.get(draft.id).status, "discarded");
+    assert.equal(body.retired, null, "nothing was retired, and the wire must say so");
+    assert.equal(body.retireSkipped, "no-generating-task");
+  } finally { await app.close(); }
+});
+
+test("Stop asking twice is safe: the second call still reports the task as retired", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-briefstoptwice-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    const { task, draft } = seedDraftedTask(runtime);
+    await fetch(`${base}/drafts/${draft.id}/stop-asking`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const res = await fetch(`${base}/drafts/${draft.id}/stop-asking`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    // The draft was already resolved by the first call…
+    assert.equal(body.discarded, false);
+    // …but the END STATE is what the user asked for, so "won't ask again" is
+    // still the true thing to report.
+    assert.equal(body.retireSkipped, "already-retired");
+    assert.ok(body.retired && body.retired.id === task.id);
+    assert.equal(runtime.tasks.get(task.id).status, "cancelled");
+  } finally { await app.close(); }
+});
+
+test("a completed task is never retired by a stop-asking on its draft", async () => {
+  // Flipping completed -> cancelled would erase a real outcome to silence a row.
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-briefstopdone-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    const { task, draft } = seedDraftedTask(runtime);
+    runtime.tasks.complete(task.id, "manual");
+    const res = await fetch(`${base}/drafts/${draft.id}/stop-asking`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const body = await res.json();
+    assert.equal(body.discarded, true);
+    assert.equal(body.retired, null);
+    assert.equal(body.retireSkipped, "not-retirable:completed");
+    const stored = runtime.tasks.get(task.id);
+    assert.equal(stored.status, "completed", "the completion stands");
+    assert.equal(stored.completedAt !== null, true);
+  } finally { await app.close(); }
+});
