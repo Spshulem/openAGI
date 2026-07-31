@@ -43,6 +43,11 @@ struct TrayMenu: View {
   // `enabled` or `pausedUntil` flips — otherwise after Disable the label
   // stays "Disable capture" until the menu is reopened.
   @ObservedObject var captureSettings: CaptureSettings = CaptureSettings.shared
+  // Observe permission state so the Capture submenu can say why capture is off.
+  // The app is an accessory (no Dock icon, no main window) — the tray is the
+  // only always-reachable surface, so a missing permission has to show here or
+  // the user just sees capture silently doing nothing.
+  @ObservedObject var capturePermissions: CapturePermissions = CapturePermissions.shared
   // Observe the outreach consumer so the pending-count line stays live.
   @ObservedObject var outreach: OutreachConsumer = OutreachConsumer.shared
 
@@ -186,6 +191,15 @@ struct TrayMenu: View {
 
       Divider()
       Menu("Capture") {
+        // macOS won't re-prompt once the user has answered, so the only real
+        // recovery is System Settings. Say capture is off and point there.
+        if captureSettings.enabled && !capturePermissions.screenRecordingGranted {
+          Text("⚠ Screen Recording not granted — capture off").disabled(true).font(.caption)
+          Button("Open Screen Recording settings…") {
+            CapturePermissions.shared.openScreenRecordingSettings()
+          }
+          Divider()
+        }
         Button(captureLabel()) { CaptureController.shared.toggleEnabled() }
         Button("Pause for 1 hour") { CaptureController.shared.togglePause(durationHours: 1) }
         Button("Pause until tomorrow") { CaptureController.shared.togglePause(durationHours: 12) }

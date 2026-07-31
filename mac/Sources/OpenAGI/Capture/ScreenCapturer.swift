@@ -25,6 +25,12 @@ final class ScreenCapturer {
 
   private var timer: Timer?
   private var capturing = false
+  /// Consecutive SCK failures while the preflight still claims we're granted.
+  /// Bounds the damage if TCC state and the capture daemon ever disagree —
+  /// we shut the timer down instead of retrying (and possibly re-prompting)
+  /// forever. Reset on every success.
+  private var consecutiveFailures = 0
+  private static let maxConsecutiveFailures = 3
   private let ocrQueue = DispatchQueue(label: "openagi.capture.ocr")
   private var thumbnailsDir: URL {
     let dir = CaptureSettings.captureDir.appendingPathComponent("thumbnails", isDirectory: true)
@@ -34,6 +40,31 @@ final class ScreenCapturer {
 
   func start() {
     stop()
+    // PERMISSION GATE — see CapturePermissions for the full why. Short version:
+    // SCShareableContent / SCScreenshotManager PROMPT when Screen Recording is
+    // missing, so we must never reach them to discover that it's missing.
+    // CGPreflightScreenCaptureAccess() (via refreshScreenRecording) is the
+    // non-prompting question; it is the only correct way to ask.
+    guard CapturePermissions.shared.refreshScreenRecording() else {
+      // No permission: schedule NOTHING. A timer that ticks into an early
+      // return is the same bug with the dialog hidden — it burns a wakeup every
+      // N seconds and buries the reason capture is dead. Instead: spend this
+      // launch's single deliberate prompt (a no-op if already asked or already
+      // answered), then wait for the user to come back from System Settings.
+      CapturePermissions.shared.noteCaptureFailure(
+        "Screen Recording permission is not granted — screen capture is off.")
+      CapturePermissions.shared.requestScreenRecordingOnceThisLaunch()
+      CapturePermissions.shared.beginWatchingForGrant()
+      NSLog("OpenAGI capture: Screen Recording not granted — capture timer not scheduled")
+      return
+    }
+    // The gate above is also where an absent -> granted transition is noticed,
+    // and that fires the resume hook, which re-enters start() through
+    // CaptureController.apply(). Drop whatever that nested call scheduled so
+    // exactly one capture timer survives (two would double the capture rate).
+    stop()
+    CapturePermissions.shared.noteCaptureFailure(nil)
+    consecutiveFailures = 0
     let interval = max(2.0, CaptureSettings.shared.captureIntervalSeconds)
     timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
       guard let self else { return }
@@ -48,6 +79,19 @@ final class ScreenCapturer {
 
   func captureOnce() async {
     if !CaptureSettings.shared.isActiveNow() { return }
+    // Re-gate on every tick with the non-prompting preflight: the user can
+    // revoke Screen Recording in System Settings while we're running, and a
+    // re-signed build silently invalidates an existing grant. If it's gone,
+    // tear the timer down rather than calling SCShareableContent — that call
+    // would re-raise the system dialog on this tick and every tick after it.
+    guard CapturePermissions.shared.refreshScreenRecording() else {
+      stop()
+      CapturePermissions.shared.noteCaptureFailure(
+        "Screen Recording permission is not granted — screen capture is off.")
+      CapturePermissions.shared.beginWatchingForGrant()
+      NSLog("OpenAGI capture: Screen Recording revoked — capture timer stopped")
+      return
+    }
     if capturing { return }
     capturing = true
     defer { capturing = false }
@@ -76,6 +120,8 @@ final class ScreenCapturer {
       cfg.showsCursor = false
 
       let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+      consecutiveFailures = 0
+      CapturePermissions.shared.noteCaptureFailure(nil)
       let uid = UUID().uuidString
       let nsImage = NSImage(cgImage: cgImage, size: .zero)
 
@@ -99,6 +145,18 @@ final class ScreenCapturer {
       }
     } catch {
       NSLog("OpenAGI capture: \(error.localizedDescription)")
+      // The preflight said we were granted, yet ScreenCaptureKit refused. That
+      // can mean TCC and the capture daemon disagree (classic after a re-sign,
+      // where the grant is invalidated under a running process). Don't retry
+      // forever — every attempt is a chance for the system dialog to reappear.
+      consecutiveFailures += 1
+      if consecutiveFailures >= Self.maxConsecutiveFailures {
+        stop()
+        CapturePermissions.shared.noteCaptureFailure(
+          "Screen capture failed \(consecutiveFailures)× in a row (\(error.localizedDescription)). Capture stopped. Check Screen Recording in System Settings, then relaunch OpenAGI if it stays off.")
+        CapturePermissions.shared.beginWatchingForGrant()
+        NSLog("OpenAGI capture: stopping timer after \(consecutiveFailures) consecutive failures")
+      }
     }
   }
 
@@ -108,6 +166,17 @@ final class ScreenCapturer {
   // unavailable — callers then proceed without screen context.
   func captureFocusedText(excludingWindowNumber: Int? = nil) async -> ScreenContext? {
     if !CaptureSettings.shared.isActiveNow() { return nil }
+    // Same non-prompting gate as the ambient path. This IS a deliberate,
+    // user-initiated moment (they just pressed Quick Ask), so it may spend the
+    // launch's one system prompt — but it must not call into ScreenCaptureKit
+    // to find that out, and it returns nil rather than blocking on an answer.
+    guard CapturePermissions.shared.refreshScreenRecording() else {
+      CapturePermissions.shared.noteCaptureFailure(
+        "Screen Recording permission is not granted — screen capture is off.")
+      CapturePermissions.shared.requestScreenRecordingOnceThisLaunch()
+      CapturePermissions.shared.beginWatchingForGrant()
+      return nil
+    }
     let app = NSWorkspace.shared.frontmostApplication
     let bundleId = app?.bundleIdentifier
     let appName = app?.localizedName ?? bundleId ?? "(unknown)"

@@ -32,6 +32,7 @@ final class PrivacyWindowController {
 
 struct PrivacyPanel: View {
   @ObservedObject private var settings = CaptureSettings.shared
+  @ObservedObject private var permissions = CapturePermissions.shared
   @State private var stats: (frames: Int, activity: Int, diskBytes: Int) = (0, 0, 0)
   @State private var newBundleId: String = ""
   @State private var newPattern: String = ""
@@ -41,6 +42,8 @@ struct PrivacyPanel: View {
     ScrollView {
       VStack(alignment: .leading, spacing: 18) {
         header
+
+        permissionsSection
 
         section(title: "Status") {
           HStack {
@@ -154,6 +157,64 @@ struct PrivacyPanel: View {
     .onDisappear { statsTimer?.invalidate() }
   }
 
+  // macOS permission state. Screen capture is dead without Screen Recording,
+  // and macOS will NOT ask again once the user has answered — every later
+  // request is a silent no-op — so the only honest UI is: say it's off, say
+  // why, and hand the user a link straight to the right Settings pane.
+  // Granting there resumes capture on its own (no relaunch): CapturePermissions
+  // re-checks with the non-prompting preflight when the app is next activated.
+  private var permissionsSection: some View {
+    section(title: "macOS permissions") {
+      permissionRow(
+        name: "Screen Recording",
+        granted: permissions.screenRecordingGranted,
+        // Do NOT promise automatic resume. The grant is observed by re-running
+        // the non-prompting preflight when the app is activated, and macOS does
+        // not reliably report a fresh grant to an already-running process — the
+        // preflight can keep reading "denied" until relaunch. Telling the user
+        // it "resumes automatically" and then leaving capture off is exactly the
+        // kind of confident-but-wrong claim this panel exists to eliminate.
+        detail: permissions.screenRecordingGranted
+          ? "Screen frames + OCR are running."
+          : "Screen capture is OFF. macOS won't ask again — turn it on in System Settings, then switch back here. If it still says OFF, quit and reopen OpenAGI.",
+        action: { permissions.openScreenRecordingSettings() })
+
+      permissionRow(
+        name: "Accessibility",
+        granted: permissions.accessibilityGranted,
+        detail: permissions.accessibilityGranted
+          ? "Window titles are recorded alongside app names."
+          : "Optional. Without it, activity is recorded with app names but no window titles.",
+        action: { permissions.openAccessibilitySettings() })
+
+      if let failure = permissions.lastCaptureFailure {
+        Text("⚠ \(failure)")
+          .font(.caption)
+          .foregroundColor(.orange)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }
+  }
+
+  private func permissionRow(name: String, granted: Bool, detail: String, action: @escaping () -> Void) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack {
+        Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+          .foregroundColor(granted ? .green : .orange)
+        Text(name).bold()
+        Text(granted ? "Granted" : "Not granted")
+          .font(.caption)
+          .foregroundColor(granted ? .secondary : .orange)
+        Spacer()
+        Button("Open System Settings…", action: action)
+      }
+      Text(detail)
+        .font(.caption)
+        .foregroundColor(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+
   private var header: some View {
     VStack(alignment: .leading, spacing: 4) {
       Text("Capture privacy").font(.title2).bold()
@@ -189,6 +250,10 @@ struct PrivacyPanel: View {
 
   private func refreshStats() {
     stats = CaptureStorage.shared.stats()
+    // Non-prompting re-read (CGPreflightScreenCaptureAccess / AXIsProcessTrusted)
+    // so the rows update live while the panel is open and the user is toggling
+    // switches in System Settings. Never touches a capture API.
+    permissions.refresh()
   }
 
   private func startTimer() {
