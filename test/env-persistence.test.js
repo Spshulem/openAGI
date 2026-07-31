@@ -28,8 +28,18 @@ test("saveEnv writes under OPENAGI_DATA_DIR and survives a reload", () => {
 test("envFilePath() returns absolute ~/.openagi/.env when OPENAGI_DATA_DIR is unset", () => {
   const prev = process.env.OPENAGI_DATA_DIR;
   delete process.env.OPENAGI_DATA_DIR;
-  _resetDataDirCache();
-  assert.equal(envFilePath(), path.join(os.homedir(), ".openagi", ".env"));
+  // This asserts PRODUCTION behaviour, and under `node --test` the default data
+  // dir is deliberately redirected to a temp dir so a test cannot touch the
+  // user's live install (src/data-dir.js). Drop the runner's marker to see the
+  // real default.
+  const marker = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  try {
+    _resetDataDirCache();
+    assert.equal(envFilePath(), path.join(os.homedir(), ".openagi", ".env"));
+  } finally {
+    if (marker !== undefined) process.env.NODE_TEST_CONTEXT = marker;
+  }
   if (prev !== undefined) process.env.OPENAGI_DATA_DIR = prev;
   _resetDataDirCache();
 });
