@@ -4,6 +4,11 @@ const COOKIE_NAME = "openagi_token";
 const COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
 
 export function checkAuth(req, url, token) {
+  // No token configured => no auth. That is deliberate for the single-user
+  // loopback install, and ONLY safe there. What makes it safe is not this
+  // function: it is checkBindSafety() below, which refuses to boot at all on a
+  // non-loopback bind with no token. Do not weaken that guard on the
+  // assumption that this line fails closed — it does not.
   if (!token) return { ok: true, reason: "auth disabled (OPENAGI_AUTH_TOKEN unset)" };
 
   const header = req.headers.authorization;
@@ -88,6 +93,68 @@ export function verifyBuildBetterWebhook({ headerValue, queryValue, expected }) 
 
 export function generateToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString("base64url");
+}
+
+// Is this bind address reachable only from this machine? Everything else —
+// 0.0.0.0, ::, a specific LAN address, a hostname we can't classify — is
+// treated as exposed. Unknown means exposed on purpose: this feeds a
+// fail-closed check, so guessing "probably local" is the wrong direction.
+export function isLoopbackHost(host) {
+  if (typeof host !== "string") return false;
+  let h = host.trim().toLowerCase();
+  if (!h) return false;
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1); // [::1]
+  if (h.startsWith("::ffff:")) h = h.slice(7);                  // IPv4-mapped
+  if (h === "localhost" || h === "::1") return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const octets = m.slice(1).map(Number);
+  if (octets.some((o) => o > 255)) return false;
+  return octets[0] === 127; // the whole 127.0.0.0/8 loopback block
+}
+
+// The bind-time authorization policy, kept next to checkAuth so the two are
+// read together.
+//
+// Serving a non-loopback address with no token publishes the dashboard and the
+// entire API — memory, screen-OCR recall, message-derived data, MCP server
+// registration — to every device that can route to this host. That is not a
+// warning-level mistake, so callers must treat { ok: false } as fatal rather
+// than logging it and continuing. Loopback with no token stays allowed: it is
+// the single-user local install, and it is reachable only from this machine.
+export function checkBindSafety({ host, token } = {}) {
+  const hasToken = typeof token === "string" && token.trim().length > 0;
+  if (hasToken) return { ok: true, reason: "auth token configured" };
+  if (isLoopbackHost(host)) return { ok: true, reason: "loopback bind — reachable only from this machine" };
+
+  const shown = typeof host === "string" && host.trim() ? host.trim() : "(unset)";
+  return {
+    ok: false,
+    reason: `non-loopback bind (${shown}) with no OPENAGI_AUTH_TOKEN`,
+    message: [
+      `✗ OpenAGI refused to start.`,
+      ``,
+      `  bind host:          ${shown}   (not loopback)`,
+      `  OPENAGI_AUTH_TOKEN: not set`,
+      ``,
+      `  In this configuration the dashboard and the whole API — memory, screen`,
+      `  recall, message history, MCP server registration — would be served to`,
+      `  every device that can reach this host, with no credential at all.`,
+      ``,
+      `  Fix one of these, then start again:`,
+      ``,
+      `  1. Set a token (recommended). Generate one:`,
+      `       openssl rand -hex 32`,
+      `     then put it in the environment as OPENAGI_AUTH_TOKEN — export it, add`,
+      `     it to <data-dir>/.env, or add it to the "environment:" block of your`,
+      `     docker-compose.yml. Clients pass it as "Authorization: Bearer <token>".`,
+      ``,
+      `  2. Or run \`openagi setup\`, which generates and stores one for you.`,
+      ``,
+      `  3. Or bind to loopback only, if nothing else needs to reach it:`,
+      `       HOST=127.0.0.1        (or: openagi serve --host 127.0.0.1)`,
+    ].join("\n"),
+  };
 }
 
 function parseCookie(header) {

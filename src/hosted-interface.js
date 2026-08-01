@@ -6,6 +6,7 @@ import { createDefaultRuntime } from "./abi-runtime.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
+import { randomBytes } from "node:crypto";
 
 const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
 import {
@@ -22,6 +23,9 @@ import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
 import { NodeRegistry, readOrCreateIdentity } from "./node-registry.js";
 import { readNodeConfig } from "./cli-client.js";
 import { composeBrief } from "./daily-brief.js";
+import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
+import { assertSafeStdioSpec } from "./mcp-registry.js";
+import { summarizeRegisterMcpServer } from "./tool-registry.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -1630,10 +1634,22 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname.match(/^\/mcp\/clear-auth\/[^/]+$/)) {
         const name = decodeURIComponent(pathname.split("/")[3]);
+        // SEC-3: the [^/]+ in the route above does NOT mean "one path segment".
+        // url.pathname keeps percent-encoding, so "..%2F..%2F..%2Fvictim"
+        // matches it, and decodeURIComponent then hands path.join a traversal —
+        // which this handler used to unlinkSync. Validate the decoded name as a
+        // single file stem (LABEL_SEGMENT, because real server names contain
+        // spaces: the live install has "buildbetter staging.json") and assert
+        // the resolved path is inside <dataDir>/mcp/auth before deleting.
+        const authPath = safeJoinOrNull(
+          path.join(resolveDataDir(), "mcp", "auth"),
+          `${name}.json`,
+          { pattern: LABEL_SEGMENT, label: "MCP server name" }
+        );
+        if (!authPath) return sendJson(res, 400, { error: "invalid MCP server name" });
         pendingOauth.delete(name);
         // Wipe cached OAuth tokens so the next connect starts a fresh flow.
         try {
-          const authPath = path.join(resolveDataDir(), "mcp", "auth", `${name}.json`);
           if (fsSync.existsSync(authPath)) fsSync.unlinkSync(authPath);
         } catch { /* ignore */ }
         return sendJson(res, 200, { ok: true });
@@ -1660,8 +1676,49 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname === "/mcp/register") {
         const body = await readJson(req);
-        const server = runtime.mcp.registerServer(body);
-        return sendJson(res, 200, server);
+        // SEC-5: registering an MCP server spawns a process or hands a remote
+        // host a live channel into this agent, which is why the agent-facing
+        // register_mcp_server tool is `needsConfirmation: true`. This route
+        // used to register straight away, so the one path a prompt-injected
+        // page or an unauthenticated caller could reach was also the one path
+        // with no human in the loop. Same queue, same approval card, same
+        // executor as the tool.
+        if (!runtime.pendingActions || !runtime.tools?.invoke) {
+          return sendJson(res, 503, {
+            error: "approval queue unavailable — refusing to register an MCP server unattended"
+          });
+        }
+        // Fail closed BEFORE queueing: never ask a human to approve a spec the
+        // registry would reject anyway (an approval prompt is a bad place to
+        // learn your argv is malformed, and it trains people to click through).
+        const inferredTransport = body?.transport ?? (body?.url ? "http" : body?.command ? "stdio" : null);
+        if (inferredTransport === "stdio") {
+          try {
+            assertSafeStdioSpec(body);
+          } catch (error) {
+            return sendJson(res, 400, { error: error.message });
+          }
+        }
+        const action = runtime.pendingActions.enqueue({
+          toolName: "register_mcp_server",
+          args: body,
+          context: { source: "http", route: "/mcp/register" },
+          summary: summarizeRegisterMcpServer(body ?? {}),
+          reason: "MCP registration requested over HTTP"
+        });
+        // register_mcp_server's handler forwards a fixed subset of the spec, so
+        // say plainly which keys will not survive approval rather than dropping
+        // them silently (clientSecret/env/headers/cwd today — they have to be
+        // set in mcp.json/.env until the tool's schema carries them).
+        const CARRIED = new Set(["name", "transport", "command", "args", "url", "auth", "apiKey", "clientId", "scope", "trustLevel"]);
+        const dropped = Object.keys(body ?? {}).filter((k) => !CARRIED.has(k));
+        return sendJson(res, 202, {
+          status: "awaiting_confirmation",
+          actionId: action.id,
+          summary: action.summary,
+          droppedFields: dropped,
+          message: "Queued for approval — approve it in the dashboard's Approvals card, or POST /pending-actions/<id>/approve."
+        });
       }
 
       if (method === "POST" && pathname === "/tick") {
@@ -1780,11 +1837,54 @@ function handleSse(req, res, clients) {
   });
 }
 
+// SEC-4: every HTML response this daemon serves gets a per-response nonce and
+// a CSP built around it.
+//
+// Why nonce and not 'unsafe-inline': the payloads that reach this page arrive
+// through prompt injection (OCR'd screen text, iMessage bodies, fetched pages)
+// and land in the DOM via innerHTML. innerHTML never runs a <script> tag, so
+// the vector is an event-handler ATTRIBUTE — onmouseover=, onerror=. A
+// nonce-based script-src blocks inline handlers; 'unsafe-inline' explicitly
+// permits them, which would make the header decorative.
+//
+// style-src deliberately keeps 'unsafe-inline'. The dashboard is built out of
+// hundreds of style="" attributes plus one inline <style> block, and a nonce
+// cannot cover an attribute — a nonce in style-src would silently disable
+// 'unsafe-inline' and render the whole UI unstyled. Inline CSS cannot execute
+// script in any browser this ships to; the escaping fixes are what stop the
+// style="position:fixed;inset:0" overlay trick.
+//
+// The nonce is stamped onto the templates' own <script> tags here rather than
+// in each template, so renderApp, renderLoginPage and the setup wizard are all
+// covered without three copies of the same knowledge. Only our own HTML ever
+// reaches this function.
+const CSP_DIRECTIVES = [
+  "default-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "font-src 'self' data:",
+  "connect-src 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+  "frame-src 'none'",
+  "base-uri 'none'",
+  "object-src 'none'"
+];
+
 function sendHtml(res, status, value, cookies = []) {
-  const headers = { "content-type": "text/html; charset=utf-8", "content-length": Buffer.byteLength(value) };
+  const nonce = randomBytes(18).toString("base64");
+  const html = String(value).replace(/<script(?=[\s>])/gi, `<script nonce="${nonce}"`);
+  const headers = {
+    "content-type": "text/html; charset=utf-8",
+    "content-length": Buffer.byteLength(html),
+    "content-security-policy": [`script-src 'nonce-${nonce}'`, ...CSP_DIRECTIVES].join("; "),
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer"
+  };
   if (cookies.length) headers["Set-Cookie"] = cookies;
   res.writeHead(status, headers);
-  res.end(value);
+  res.end(html);
 }
 
 function renderLoginPage(reason, next = "/") {
@@ -1812,8 +1912,10 @@ ${reason ? `<div class="err">${escapeHtmlForLogin(reason)}</div>` : ""}
 </body></html>`;
 }
 
+// SEC-4: single quotes too — this value lands in an attribute, and an
+// attribute is just as happy to be delimited by ' as by ".
 function escapeHtmlForLogin(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]);
+  return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 }
 
 function sendJson(res, status, value) {
@@ -2536,12 +2638,36 @@ const FENCE = BT + BT + BT;
 const FENCE_RE = new RegExp(FENCE + "(\\\\w+)?\\\\n([\\\\s\\\\S]*?)" + FENCE, "g");
 const INLINE_RE = new RegExp(BT + "([^" + BT + "\\\\n]+)" + BT, "g");
 
+// Decide whether a markdown link target may become an href, and return the
+// attribute-safe value if so. Parse with the URL parser rather than a regex:
+// "java\\tscript:alert(1)" and "  javascript:alert(1)" both defeat naive
+// prefix checks, and the parser normalizes them before we look at .protocol.
+// The input arrives already HTML-escaped (renderMarkdown escapes first), so
+// the entities we introduced are decoded before parsing and the parsed href is
+// re-escaped on the way out.
+function safeLinkHref(rawUrl) {
+  const decoded = String(rawUrl)
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+  let parsed;
+  try { parsed = new URL(decoded); } catch (e) { return null; }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  return escapeHtml(parsed.href);
+}
+
 function renderMarkdown(input) {
   if (!input) return "";
   let s = String(input);
 
   // Escape HTML first — guarantees XSS safety even if the renderer is buggy.
-  s = s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+  // Quotes included: the rules below build attributes (href=, class=) out of
+  // captured text, and a bare " or ' in that text closes the attribute and
+  // opens a new one. Reproduced with
+  // [Open](https://x.co"style="position:fixed;inset:0"onmouseover="...).
+  s = s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
   // Fenced code blocks
   s = s.replace(FENCE_RE, (_, lang, code) => {
@@ -2565,9 +2691,16 @@ function renderMarkdown(input) {
   s = s.replace(/(?<!\\w)\\*([^*\\n]+?)\\*(?!\\w)/g, "<em>$1</em>");
   s = s.replace(/(?<!\\w)_([^_\\n]+?)_(?!\\w)/g, "<em>$1</em>");
 
-  // Links [text](url)
-  s = s.replace(/\\[([^\\]]+)\\]\\((https?:[^\\s)]+)\\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  // Links [text](url). The URL is parsed, not pattern-matched: only http(s)
+  // becomes an anchor, everything else (javascript:, data:, vbscript:, or
+  // anything URL parsing rejects) is left as literal text. Splicing the raw
+  // capture into href="..." is what let an injected page put three real
+  // attributes on the anchor.
+  s = s.replace(/\\[([^\\]]+)\\]\\(([^\\s)]+)\\)/g, (whole, text, rawUrl) => {
+    const href = safeLinkHref(rawUrl);
+    if (!href) return whole;
+    return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
+  });
 
   // Lists
   const lines = s.split(/\\n/);
@@ -3383,7 +3516,10 @@ async function refreshMcp() {
   for (const s of servers) {
     const li = document.createElement("li");
     if (s.name === selectedMcpName) li.className = "active";
-    li.innerHTML = \`<div class="title">\${escapeHtml(s.name)} \${s.connected ? '<span class="badge ok">live</span>' : '<span class="badge">idle</span>'}</div><div class="preview">\${(s.tools ?? []).join(", ") || "—"}</div>\`;
+    // Tool names come off the wire from whatever MCP server was registered —
+    // escape them here exactly as renderMcpDetail already does for the same
+    // array. This row was the one place the array reached innerHTML raw.
+    li.innerHTML = \`<div class="title">\${escapeHtml(s.name)} \${s.connected ? '<span class="badge ok">live</span>' : '<span class="badge">idle</span>'}</div><div class="preview">\${escapeHtml((s.tools ?? []).join(", ")) || "—"}</div>\`;
     li.addEventListener("click", () => {
       selectedMcpName = s.name;
       for (const el of sidebarList.querySelectorAll("li")) el.classList.remove("active");
@@ -3608,7 +3744,16 @@ function openMcpComposer() {
     btn.textContent = "Registering…";
     try {
       const result = await postJson("/mcp/register", body);
-      showOut("Registered ✓ — " + JSON.stringify(result, null, 2));
+      // Registration is approval-gated now (SEC-5) — say so, rather than
+      // claiming "Registered ✓" for something that has not run yet.
+      if (result && result.status === "awaiting_confirmation") {
+        const dropped = (result.droppedFields ?? []).length
+          ? "\\nNot carried through approval: " + result.droppedFields.join(", ") + " — set these in mcp.json / .env."
+          : "";
+        showOut("Queued for approval — open the Approvals card and confirm it." + dropped);
+      } else {
+        showOut("Registered ✓ — " + JSON.stringify(result, null, 2));
+      }
       composerOpen = false;
       setTimeout(() => refreshMcp(), 600);
     } catch (err) {
@@ -5133,7 +5278,11 @@ async function postJson(path, body) {
   }
   return r.json();
 }
-function escapeHtml(s) { return String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c]); }
+// Both quote characters are escaped: nearly every caller drops the result into
+// an attribute inside a template literal, and an unescaped ' or " ends that
+// attribute and starts a new one (that is exactly how the markdown link
+// injection worked).
+function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]); }
 
 // Inline help marker — renders a (?) chip with a hover tooltip. Use it for
 // obscure terms in dense panes so users don't have to leave the page to

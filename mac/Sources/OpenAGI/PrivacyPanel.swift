@@ -74,7 +74,12 @@ struct PrivacyPanel: View {
         }
 
         section(title: "Excluded apps") {
-          Text("Frames from these app bundles are skipped before OCR runs.").font(.caption).foregroundColor(.secondary)
+          // decideCapture() runs bundleIdIsExcluded over EVERY window on the
+          // display, so this is per-window, not just the front app. What it
+          // still cannot do is see a URL: users assume "1Password is excluded"
+          // generalizes to "my bank is excluded", and it does not.
+          Text("Windows belonging to these apps are cut out of the picture before the screenshot is taken — including when they are only sitting beside what you're working on. Matching ignores case and covers an app's helpers (com.1password also covers com.1password.browser-helper). It is a bundle-ID list, so a website can't be listed here: a banking site in a browser tab is not recognised as one.").font(.caption).foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
           ForEach(settings.excludedBundleIds, id: \.self) { id in
             HStack {
               Text(id).monospaced().font(.system(size: 12))
@@ -97,6 +102,8 @@ struct PrivacyPanel: View {
         }
 
         section(title: "Excluded window-title patterns (regex)") {
+          Text("Matched against every on-screen window's title, always case-insensitively, and a matching window is cut out of the picture. If no window title can be read at all, capture skips that moment and says so rather than capturing something it couldn't check.").font(.caption).foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
           ForEach(settings.excludedWindowPatterns, id: \.self) { pat in
             HStack {
               Text(pat).monospaced().font(.system(size: 12))
@@ -182,9 +189,14 @@ struct PrivacyPanel: View {
       permissionRow(
         name: "Accessibility",
         granted: permissions.accessibilityGranted,
+        // frontmostWindowTitle() is gated on AXIsProcessTrusted(), so without
+        // Accessibility the ACTIVITY LOG loses window titles. Capture-time
+        // exclusions are unaffected: decideCapture() reads titles from the
+        // ScreenCaptureKit window list, and skips the capture outright when no
+        // title anywhere is readable. Say which of the two this permission is.
         detail: permissions.accessibilityGranted
           ? "Window titles are recorded alongside app names."
-          : "Optional. Without it, activity is recorded with app names but no window titles.",
+          : "Optional. Without it, activity is recorded with app names but no window titles. Window-title exclusions still apply during capture — those titles come from the window list, not Accessibility.",
         action: { permissions.openAccessibilitySettings() })
 
       if let failure = permissions.lastCaptureFailure {
@@ -218,7 +230,18 @@ struct PrivacyPanel: View {
   private var header: some View {
     VStack(alignment: .leading, spacing: 4) {
       Text("Capture privacy").font(.title2).bold()
-      Text("Everything stays on this Mac. OCR runs locally via Vision. Excluded apps are never captured. The agent can summarize OCR text but never sends raw frames to any LLM.").font(.caption).foregroundColor(.secondary)
+      // Consent copy. Every sentence here has to survive a reading of the code,
+      // because this is what the user weighs before granting Screen Recording.
+      // The images/text split is the part people get wrong: CaptureBridge pushes
+      // app + window + OCR text and no image bytes, while agent-host.js splices
+      // OCR snippets (with window titles) into prompts for the configured model
+      // provider — on chat turns AND unattended, from the proactive observer.
+      Text("Screenshots are OCR'd on this Mac by Apple's Vision framework. The frames and thumbnails stay here — they are never uploaded and never sent to a model.")
+        .font(.caption).foregroundColor(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      Text("The text is different. OCR text and window titles are stored by the daemon, and short excerpts are sent to your model provider — when you ask the agent something, and when its background observers run on their own every few minutes. The exclusion lists below are what keep text out of it.")
+        .font(.caption).foregroundColor(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
     }
   }
 

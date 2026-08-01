@@ -42,8 +42,25 @@ need_sudo() {
   fi
 }
 
+# This script is designed to run unattended (systemd timer, cron, `openagi
+# update`). That makes every `docker pull` here a supply-chain edge: whatever
+# the referenced tag points at right now becomes the code running on this box.
+# A pinned vX.Y.Z tag is immutable, so the pull is a no-op until someone bumps
+# the pin on purpose; a floating tag is not, so say so out loud.
+warn_if_floating_tag() {
+  case "$1" in
+    *:v[0-9]*|*@sha256:*) return 0 ;;
+    *)
+      color_yellow "⚠ ${1} is a floating tag — this pull can change the running code without you choosing a version."
+      color_yellow "  Pin a release tag (e.g. ghcr.io/spshulem/openagi:v0.0.10) to make updates deliberate."
+      ;;
+  esac
+}
+
 update_docker_compose() {
   color_green "▶ Updating via docker compose"
+  IMAGE=$(grep -oE '^[[:space:]]*image:[[:space:]]*\S*openagi\S*' "${COMPOSE_FILE}" 2>/dev/null | head -1 | sed -E 's/.*image:[[:space:]]*//')
+  [ -n "${IMAGE:-}" ] && warn_if_floating_tag "${IMAGE}"
   (cd "${PROJECT_DIR}" && need_sudo docker compose pull && need_sudo docker compose up -d)
   color_green "✓ Container recreated."
 }
@@ -51,13 +68,30 @@ update_docker_compose() {
 update_docker_container() {
   color_green "▶ Updating standalone Docker container 'openagi'"
   IMAGE=$(docker inspect -f '{{.Config.Image}}' openagi)
+  warn_if_floating_tag "${IMAGE}"
+
+  # Carry the container's own configuration across the recreate. This used to
+  # replay a bare `docker run`, which silently dropped every -e the user had
+  # set — including OPENAGI_AUTH_TOKEN and their API keys. That is no longer
+  # merely lossy: the daemon refuses to start on a non-loopback bind with no
+  # token, so an unattended update would have left the agent down. Allowlisted
+  # by prefix so we don't replay PATH/NODE_VERSION out of the image.
+  set --
+  while IFS= read -r kv; do
+    case "${kv}" in
+      OPENAGI_*=*|ANTHROPIC_*=*|OPENAI_*=*|TWILIO_*=*|TELEGRAM_*=*|RIZE_*=*|HOST=*|PORT=*)
+        set -- "$@" -e "${kv}" ;;
+    esac
+  done <<CONTAINER_ENV
+$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' openagi)
+CONTAINER_ENV
+
   need_sudo docker pull "${IMAGE}"
   need_sudo docker stop openagi
   need_sudo docker rm openagi
-  # Replay the run with the same image; user is responsible for any extra flags.
   need_sudo docker run -d --name openagi --restart unless-stopped \
-    -p 43210:43210 -v openagi-data:/data "${IMAGE}"
-  color_green "✓ Container replaced. If you used custom flags, re-run with them manually."
+    -p 43210:43210 -v openagi-data:/data "$@" "${IMAGE}"
+  color_green "✓ Container replaced. Env carried over; if you used custom ports or mounts, re-run with them manually."
 }
 
 update_systemd() {

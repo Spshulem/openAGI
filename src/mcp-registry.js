@@ -6,15 +6,188 @@ import { McpOAuthClient } from "./mcp-oauth.js";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { assertSafePublicUrl } from "./url-guard.js";
+import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 
 // Whitelist of executables permitted as the `command` for stdio MCP servers.
-// Anything not in this set is rejected at registerServer() — closes the
-// "register /bin/sh -c <payload>" RCE path.
+// Anything not in this set is rejected at registerServer().
+//
+// SEC-5 — what this DOES NOT do. This list constrains the executable and
+// nothing else. Every runner on it can be told to execute a string, so an
+// executable allowlist alone never closed the "register a shell payload" path:
+//
+//   {"command":"node",  "args":["-e","<any JS>"]}
+//   {"command":"python","args":["-c","<any Python>"]}
+//   {"command":"npx",   "args":["-c","<any shell>"]}
+//   {"command":"docker","args":["run","-v","/:/host","alpine","sh","-c","…"]}
+//
+// assertSafeStdioSpec() below removes those argv shapes. Be clear about what
+// that buys: it is a DENYLIST over a Turing-complete CLI surface, so it
+// reduces the reachable RCE, it does not eliminate it —
+//   • `npx <pkg>` and `uvx <pkg>` exist to download and run third-party code;
+//   • `node ./whatever.js` runs whatever that file contains;
+//   • a runner can grow a new eval-shaped flag we don't model.
+// The control that actually bounds MCP registration is the human approval
+// gate, which BOTH register paths now go through (the register_mcp_server tool
+// and POST /mcp/register). Treat the checks here as defense in depth behind
+// that gate, never as the gate itself.
 const ALLOWED_STDIO_COMMANDS = new Set([
   "npx", "node", "bun", "bunx", "deno",
   "python", "python3", "uv", "uvx",
   "docker"
 ]);
+
+// Per-runner flags that mean "the next thing is source code, run it".
+// Per-runner rather than one flat set because the same letter means different
+// things: `-p` is --print for node but --package for npx, and `-c` is
+// "run this code" for python but a config path for plenty of MCP servers.
+const EVAL_FLAGS_BY_RUNNER = {
+  node: ["-e", "--eval", "-p", "--print"],
+  bun: ["-e", "--eval", "-p", "--print"],
+  deno: ["-e", "--eval"],
+  python: ["-c"],
+  python3: ["-c"],
+  npx: ["-c", "--call"],
+  bunx: ["-c", "--call"],
+  uv: ["-c", "--command"],
+  uvx: ["-c", "--command"],
+  // Not registrable as `command`, but reachable as a NESTED command —
+  // `docker run … alpine sh -c '…'`, `uv run … bash -c '…'`.
+  sh: ["-c"], bash: ["-c"], zsh: ["-c"], dash: ["-c"], ksh: ["-c"],
+  perl: ["-e", "-E"], ruby: ["-e"], php: ["-r"],
+  docker: []
+};
+const DEFAULT_EVAL_FLAGS = ["-e", "--eval", "-c", "--command", "-p", "--print"];
+
+// Flags that consume the NEXT token as their value. Without these the option
+// scan stops at that value (it isn't a flag) and everything after it is
+// invisible — `npx -p evil-pkg -c '<shell>'` walked straight through the first
+// version of this guard.
+const VALUE_FLAGS_BY_RUNNER = {
+  node: ["-r", "--require", "--import", "--loader", "--experimental-loader", "--env-file", "--conditions", "-C"],
+  bun: ["-r", "--require", "--preload", "--config", "--env-file"],
+  deno: ["--config", "--import-map", "--lock", "--cert", "--v8-flags"],
+  python: ["-W", "-X"],
+  python3: ["-W", "-X"],
+  npx: ["-p", "--package", "--registry", "--cache", "--userconfig", "--shell", "--node-options"],
+  bunx: ["-p", "--package", "--registry"],
+  uv: ["--with", "--python", "--from", "--index", "--project", "--directory"],
+  uvx: ["--with", "--python", "--from", "--index"],
+  sh: ["-o"], bash: ["-o"], zsh: ["-o"], dash: ["-o"], ksh: ["-o"],
+  perl: ["-I"], ruby: ["-I", "-r"], php: ["-d"],
+  docker: []
+};
+
+// Flags after which the rest of argv belongs to the spawned program, not the
+// interpreter — `python -m pkg -c cfg.yaml` passes -c to pkg, not to python.
+const TERMINATOR_FLAGS_BY_RUNNER = {
+  python: ["-m"],
+  python3: ["-m"],
+  node: [],
+  bun: []
+};
+
+// Tokens that name an interpreter. When one shows up mid-argv it starts a new
+// option region — that is how `uv run --with x python -c '…'` and
+// `docker run --rm img sh -c '…'` get caught.
+const INTERPRETER_LEAVES = new Set(Object.keys(EVAL_FLAGS_BY_RUNNER));
+
+// docker flags that hand the container the host. Volumes/devices/capabilities
+// are dangerous with any value; the namespace flags only when set to `host`.
+const DOCKER_ALWAYS_DENY = new Set([
+  "-v", "--volume", "--mount", "--privileged", "--device", "--cap-add", "--security-opt"
+]);
+const DOCKER_HOST_NS_FLAGS = new Set([
+  "--network", "--net", "--pid", "--ipc", "--uts", "--userns", "--cgroupns"
+]);
+
+function commandLeaf(value) {
+  return String(value ?? "").trim().split("/").pop();
+}
+
+/// Reject argv shapes that turn an allowed runner into "execute this string",
+/// and docker shapes that escape the container. Throws on the first problem.
+/// Exported so the HTTP register path can fail fast BEFORE asking a human to
+/// approve a spec the registry would refuse anyway.
+export function assertSafeStdioSpec({ command, args } = {}) {
+  const argv = args ?? [];
+  if (!Array.isArray(argv)) throw new Error("stdio MCP `args` must be an array of strings.");
+  for (const a of argv) {
+    if (typeof a !== "string") throw new Error("stdio MCP `args` must all be strings.");
+    if (a.includes("\0")) throw new Error("stdio MCP `args` must not contain a NUL byte.");
+  }
+  const leaf = commandLeaf(command);
+  if (leaf === "docker") assertSafeDockerArgs(argv);
+  scanOptionRegion(leaf, argv, 0);
+  for (let i = 0; i < argv.length; i += 1) {
+    const nested = commandLeaf(argv[i]);
+    if (INTERPRETER_LEAVES.has(nested)) scanOptionRegion(nested, argv, i + 1);
+  }
+}
+
+/// Walk one interpreter's own option region: the flags before the first
+/// non-flag token (its script / module / package / subcommand). Anything after
+/// that belongs to the spawned program, not the interpreter, which is why
+/// `node server.js -c config.json` is fine and `node -c …` would not be.
+function scanOptionRegion(leaf, argv, start) {
+  const denied = EVAL_FLAGS_BY_RUNNER[leaf] ?? DEFAULT_EVAL_FLAGS;
+  const valueFlags = VALUE_FLAGS_BY_RUNNER[leaf] ?? [];
+  const terminators = TERMINATOR_FLAGS_BY_RUNNER[leaf] ?? [];
+  const shortLetters = new Set(denied.filter((f) => /^-[A-Za-z]$/.test(f)).map((f) => f[1]));
+  for (let i = start; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === "--") return;
+    if (!token.startsWith("-")) {
+      // deno's eval/repl are subcommands, not flags.
+      if (leaf === "deno" && (token === "eval" || token === "repl")) {
+        throw new Error(`stdio MCP argument "${token}" is not permitted: 'deno ${token}' executes arbitrary code.`);
+      }
+      return;
+    }
+    const name = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+    const reject = (why) => { throw new Error(`stdio MCP argument "${token}" is not permitted: ${why}`); };
+    if (denied.includes(name)) reject(`it makes '${leaf}' evaluate code passed on the command line.`);
+    if (isShortFlagFor(token, name, shortLetters)) reject(`it carries an eval flag for '${leaf}'.`);
+    if (terminators.includes(name)) return;               // rest belongs to the child
+    if (valueFlags.includes(name) && !token.includes("=")) i += 1;  // skip its value
+  }
+}
+
+/// Does this token carry one of `letters` as a short flag? Covers the three
+/// spellings a short flag actually takes: exact (`-c`), clustered (`-uc`), and
+/// value-attached (`-cprint(1)`, `-e1+1`). Exact and clustered are checked
+/// against the whole letter run so `-uc <code>` is caught; attached values are
+/// only checked at the first position, because a later character inside an
+/// attached value (`-r./lib/preload.js`) is data, not a flag.
+function isShortFlagFor(token, name, letters) {
+  if (letters.size === 0 || !/^-[A-Za-z]/.test(token)) return false;
+  if (/^-[A-Za-z]+$/.test(name)) return [...name.slice(1)].some((ch) => letters.has(ch));
+  return letters.has(token[1]);
+}
+
+/// docker's own options can appear anywhere before the image and many take a
+/// separate value token, so there is no reliable "option region" to stop at —
+/// scan the whole argv. Cost: a server invoked as `docker run img app -v`
+/// (its own verbose flag) is refused. That is the trade we take.
+function assertSafeDockerArgs(argv) {
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    const name = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+    // docker's pflag parser also accepts a short flag with its value attached:
+    // `-v/:/host` is `-v /:/host`.
+    if (/^-[A-Za-z]/.test(token) && !token.startsWith("--") && DOCKER_ALWAYS_DENY.has(token.slice(0, 2))) {
+      throw new Error(`docker argument "${token}" is not permitted: it exposes the host filesystem, devices, or capabilities to the container.`);
+    }
+    if (DOCKER_ALWAYS_DENY.has(name)) {
+      throw new Error(`docker argument "${token}" is not permitted: it exposes the host filesystem, devices, or capabilities to the container.`);
+    }
+    if (DOCKER_HOST_NS_FLAGS.has(name)) {
+      const value = token.includes("=") ? token.slice(token.indexOf("=") + 1) : argv[i + 1];
+      if (String(value ?? "").toLowerCase() === "host") {
+        throw new Error(`docker argument "${token} ${value}" is not permitted: it shares a host namespace with the container.`);
+      }
+    }
+  }
+}
 
 // MCP tools are exposed to the model as `mcp_<server>_<tool>`, and that name
 // must match OpenAI's tool-name rule ^[a-zA-Z0-9_-]+$. BOTH segments can carry
@@ -74,13 +247,15 @@ export class McpRegistry {
     if (transport === "stdio") {
       const cmd = server.command;
       if (!cmd) throw new Error("stdio MCP server requires a `command`.");
-      const cmdLeaf = String(cmd).trim().split("/").pop();
+      const cmdLeaf = commandLeaf(cmd);
       if (!ALLOWED_STDIO_COMMANDS.has(cmdLeaf)) {
         throw new Error(
           `stdio command "${cmd}" is not in the allowlist. ` +
           `Permitted: ${[...ALLOWED_STDIO_COMMANDS].join(", ")}.`
         );
       }
+      // …and the argv, which the allowlist above says nothing about.
+      assertSafeStdioSpec({ command: cmd, args: server.args });
     }
 
     // http URL must be http(s) and not a loopback / link-local / RFC1918 host.
@@ -166,11 +341,17 @@ export class McpRegistry {
     const registered = [];
     const servers = config.servers ?? config.mcpServers ?? {};
     this._suppressPersist = true;
+    this.rejectedFromConfig = [];
     try {
     for (const [name, spec] of Object.entries(servers)) {
       // Skip comment-only entries (keys like "_comment", "//", "//2").
       if (name.startsWith("_") || name === "//" || /^\/\/\d*$/.test(name)) continue;
       if (typeof spec !== "object" || spec === null) continue;
+      // SEC-5 widened what registerServer refuses (argv, not just the
+      // executable). This loop runs at boot, so one bad entry must disable
+      // that ONE server — not stop the daemon from starting. Recorded and
+      // logged so it isn't a silent disappearance.
+      try {
       registered.push(
         this.registerServer({
           name,
@@ -195,6 +376,12 @@ export class McpRegistry {
           transport: spec.transport
         })
       );
+      } catch (error) {
+        this.rejectedFromConfig.push({ name, error: error.message });
+        try {
+          process.stderr.write(`[openagi] MCP server '${name}' in mcp.json was NOT registered: ${error.message}\n`);
+        } catch { /* ignore */ }
+      }
     }
     } finally {
       this._suppressPersist = false;
@@ -307,7 +494,11 @@ export class McpRegistry {
    */
   hasOAuthToken(name) {
     try {
-      const cache = readJsonFile(path.join(this.dataDir, "mcp", "auth", `${name}.json`), null);
+      // SEC-3 audit: same <dataDir>/mcp/auth/<name>.json shape as the
+      // clear-auth route. Today every caller passes a constant id, but the
+      // join is the sink, not the caller — guard it here too.
+      const cachePath = safeJoinOrNull(path.join(this.dataDir, "mcp", "auth"), `${name}.json`, { pattern: LABEL_SEGMENT });
+      const cache = cachePath ? readJsonFile(cachePath, null) : null;
       if (!cache) return false;
       // Mirror what ensureToken({interactive:false}) can actually do: a
       // refresh_token can always mint a fresh access token silently, but a

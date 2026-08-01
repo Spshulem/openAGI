@@ -12,6 +12,14 @@ import Vision
 // Capture is gated by CaptureSettings.isActiveNow() and the per-frame
 // exclusion check (so private windows / banking sites are skipped before
 // OCR runs).
+//
+// EXCLUSIONS ARE PER-WINDOW, NOT PER-FRONTMOST-APP. Checking only the frontmost
+// app and then grabbing the display with `excludingWindows: []` is the bug this
+// file used to have: 1Password, Messages or a banking tab merely VISIBLE beside
+// the focused window was captured and OCR'd every 5 seconds. Every capture path
+// here now runs the same CaptureSettings.decideCapture() over the full window
+// list — see exclusionDecision(for:) — and honours its .skip verdict, which is
+// what fires when the screen cannot be evaluated at all.
 
 struct ScreenContext {
   let app: String
@@ -31,6 +39,9 @@ final class ScreenCapturer {
   /// forever. Reset on every success.
   private var consecutiveFailures = 0
   private static let maxConsecutiveFailures = 3
+  /// Last fail-closed skip reason, so the log records a change of state rather
+  /// than the same line every 5 seconds.
+  private var lastSkipReason: String?
   private let ocrQueue = DispatchQueue(label: "openagi.capture.ocr")
   private var thumbnailsDir: URL {
     let dir = CaptureSettings.captureDir.appendingPathComponent("thumbnails", isDirectory: true)
@@ -110,7 +121,21 @@ final class ScreenCapturer {
       // over availableContent.displays.
       let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
       guard let display = content.displays.first else { return }
-      let filter = SCContentFilter(display: display, excludingWindows: [])
+      // Per-window exclusions for the WHOLE display — not just the frontmost
+      // app. Anything the user excluded that happens to be visible beside the
+      // focused window is kept out of the pixels before OCR ever sees them,
+      // and an unevaluable screen skips the tick entirely.
+      let excludedWindows: [SCWindow]
+      switch Self.exclusionDecision(for: content) {
+      case .skip(let reason):
+        noteExclusionSkip(reason)
+        return
+      case .capture(let ids):
+        let idSet = Set(ids)
+        excludedWindows = content.windows.filter { idSet.contains(UInt32($0.windowID)) }
+      }
+      lastSkipReason = nil
+      let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
       let cfg = SCStreamConfiguration()
       cfg.width = display.width
       cfg.height = display.height
@@ -208,6 +233,17 @@ final class ScreenCapturer {
         // display-level grab would OCR every other (non-excluded) window
         // sharing the monitor — side-by-side Mail/Slack/docs text — and
         // attribute it to the focused app, misgrounding the answer.
+        //
+        // Still run the shared policy over that one window: the frontmost
+        // pre-check above uses the Accessibility title, which is nil when
+        // Accessibility is off, and ScreenCaptureKit may know a title (or an
+        // owning app) that AX did not. Excluded or unevaluable -> no context.
+        switch Self.exclusionDecision(for: [frontWindow]) {
+        case .skip:
+          return nil
+        case .capture(let ids):
+          if ids.contains(UInt32(frontWindow.windowID)) { return nil }
+        }
         filter = SCContentFilter(desktopIndependentWindow: frontWindow)
         let scale = CGFloat(filter.pointPixelScale)
         cfg.width = max(1, Int(frontWindow.frame.width * scale))
@@ -217,12 +253,15 @@ final class ScreenCapturer {
         // and any window belonging to an excluded app/title, so OCR never
         // reads e.g. 1Password sitting beside the focused app on the display
         // (the frontmost-only privacy check above doesn't cover other windows).
-        var excluded: [SCWindow] = []
-        if let wn = excludingWindowNumber {
-          excluded += content.windows.filter { $0.windowID == CGWindowID(wn) }
-        }
-        excluded += content.windows.filter { w in
-          CaptureSettings.shared.isExcluded(bundleId: w.owningApplication?.bundleIdentifier, windowTitle: w.title)
+        // Same decision procedure as the ambient path, by construction.
+        let overlayIDs = excludingWindowNumber.map { [UInt32(CGWindowID($0))] } ?? []
+        let excluded: [SCWindow]
+        switch Self.exclusionDecision(for: content, alwaysExclude: overlayIDs) {
+        case .skip:
+          return nil
+        case .capture(let ids):
+          let idSet = Set(ids)
+          excluded = content.windows.filter { idSet.contains(UInt32($0.windowID)) }
         }
         filter = SCContentFilter(display: display, excludingWindows: excluded)
         cfg.width = display.width
@@ -246,6 +285,42 @@ final class ScreenCapturer {
       NSLog("OpenAGI overlay capture: \(error.localizedDescription)")
       return nil
     }
+  }
+
+  // MARK: — the one place a window list becomes an exclusion decision
+
+  /// Adapter: ScreenCaptureKit's window list -> CaptureSettings.decideCapture().
+  /// Every capture path in this file goes through here, so the ambient timer and
+  /// Quick Ask cannot disagree about what is private. Them each carrying their
+  /// own copy of the check is precisely how the ambient path ended up grabbing
+  /// the display with `excludingWindows: []`.
+  private static func exclusionDecision(for content: SCShareableContent,
+                                        alwaysExclude: [UInt32] = []) -> CaptureDecision {
+    exclusionDecision(for: content.windows, alwaysExclude: alwaysExclude)
+  }
+
+  private static func exclusionDecision(for windows: [SCWindow],
+                                        alwaysExclude: [UInt32] = []) -> CaptureDecision {
+    let infos = windows.map { w in
+      CaptureWindowInfo(windowID: UInt32(w.windowID),
+                        bundleId: w.owningApplication?.bundleIdentifier,
+                        title: w.title,
+                        isOnScreen: w.isOnScreen)
+    }
+    return CaptureSettings.shared.captureDecision(windows: infos, alwaysExcludeWindowIDs: alwaysExclude)
+  }
+
+  /// A fail-closed skip is not an error — the timer keeps running so capture
+  /// resumes by itself once the screen is evaluable again — but it must not be
+  /// silent, or capture looks broken for a reason nobody can see. Surfaced in
+  /// the privacy panel / tray via lastCaptureFailure; logged once per change.
+  private func noteExclusionSkip(_ reason: String) {
+    let message = "Screen capture skipped: \(reason)."
+    if lastSkipReason != reason {
+      lastSkipReason = reason
+      NSLog("OpenAGI capture: \(message)")
+    }
+    CapturePermissions.shared.noteCaptureFailure(message)
   }
 
   // nonisolated: OCR deliberately runs on ocrQueue, off the main actor —

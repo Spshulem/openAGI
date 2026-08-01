@@ -64,6 +64,7 @@ import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { createId, nowIso } from "./utils.js";
 import { listAllSuggestions } from "./suggestion-feed.js";
+import { safeJoinOrNull } from "./path-guard.js";
 
 /// Status written to a suggestion this module retires. Deliberately NOT
 /// "dismissed" — that is what a human pressing Dismiss produces, and the two
@@ -864,7 +865,11 @@ export function undoTriagePass(runtime, passId = "latest", { dataDir } = {}) {
     ?? runtime?.proactiveObserver?.dataDir
     ?? runtime?.patternMiner?.dataDir
     ?? resolveDataDir();
-  const file = path.join(dir, "backlog-triage", `${passId === "latest" ? "latest" : passId}.json`);
+  // SEC-3 audit: `passId` is the other path.join(dir, userInput) in this file.
+  // It has no HTTP route today, but it is a caller-supplied file stem, so it
+  // gets the same segment allowlist + containment assertion.
+  const file = safeJoinOrNull(path.join(dir, "backlog-triage"), `${passId === "latest" ? "latest" : passId}.json`);
+  if (!file) return { ok: false, error: `invalid pass id: ${String(passId).slice(0, 64)}` };
   const report = readJsonFile(file, null);
   if (!report) return { ok: false, error: `no triage report at ${file}` };
 
@@ -1046,10 +1051,14 @@ function suggestionFile(dataDir, id) {
   // Mirrors suggestion-feed.js findSourceFile. Not imported because that helper
   // is private to that module and this one needs the PATH (to write the audit
   // block atomically in one pass), not just a status flip.
+  // SEC-3: ids reaching here come from model verdicts and from the same
+  // percent-encoded routes suggestion-feed serves, so the segment is validated
+  // and the resolved path is asserted to stay inside the intended directory
+  // before any read/write. Same guard, same reasons — see path-guard.js.
   const candidates = [
-    path.join(dataDir, "proactive", "suggestions", `${id}.json`),
-    path.join(dataDir, "skills-suggested", `${id}.json`)
-  ];
+    safeJoinOrNull(path.join(dataDir, "proactive", "suggestions"), `${id}.json`),
+    safeJoinOrNull(path.join(dataDir, "skills-suggested"), `${id}.json`)
+  ].filter(Boolean);
   return candidates.find((f) => fs.existsSync(f)) ?? null;
 }
 

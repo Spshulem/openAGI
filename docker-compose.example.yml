@@ -1,24 +1,36 @@
 # OpenAGI Docker Compose example.
 #
 #   1. Copy .env.example to .env (next to this file) and fill in keys.
-#   2. docker compose -f docker-compose.example.yml up -d
-#   3. Visit http://localhost:43210/setup on first run.
+#   2. Set OPENAGI_AUTH_TOKEN in that .env — it is REQUIRED, not optional:
+#        echo "OPENAGI_AUTH_TOKEN=$(openssl rand -hex 32)" >> .env
+#      The container binds 0.0.0.0 (it has to, for the published port below to
+#      reach it) and the daemon refuses to start on a non-loopback bind with no
+#      token, rather than serving the dashboard and API to your whole LAN.
+#   3. docker compose -f docker-compose.example.yml up -d
+#   4. Visit http://localhost:43210/setup?token=<your token> on first run.
 #
-# To run on a Linux SBC (Raspberry Pi, pamir.ai, Jetson):
-#   - Pull the arm64 image: docker pull openagi/openagi:latest (multi-arch, auto-selected).
-#   - Same compose file, no changes.
+# The image is published to GHCR by .github/workflows/docker.yml — there is no
+# official Docker Hub image. The tag is pinned on purpose: `docker compose pull`
+# (and Watchtower) re-pull unattended, so a floating :latest means new code can
+# land on your box without you deciding to. Bump it when you want to update.
+#
+# To run on a Linux SBC (Raspberry Pi, pamir.ai, Jetson): same file, no changes
+# — the image is multi-arch (amd64 + arm64) and Docker picks the right one.
 
 services:
   openagi:
-    image: openagi/openagi:latest
+    image: ghcr.io/spshulem/openagi:v0.0.10
     container_name: openagi
     ports:
+      # Publishes to every interface. Change to "127.0.0.1:43210:43210" if only
+      # this machine should reach it.
       - "43210:43210"
     volumes:
       - openagi-data:/data
     environment:
       OPENAGI_DATA_DIR: /data
-      OPENAGI_AUTH_TOKEN: ${OPENAGI_AUTH_TOKEN:-}
+      # Required — the daemon will not boot without it. See the header.
+      OPENAGI_AUTH_TOKEN: "${OPENAGI_AUTH_TOKEN:?set OPENAGI_AUTH_TOKEN in .env first — generate one with `openssl rand -hex 32`}"
       OPENAGI_PUBLIC_URL: ${OPENAGI_PUBLIC_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
@@ -41,6 +53,14 @@ services:
 
   # Optional: cloudflared quick-tunnel as a sidecar so SMS/Telegram webhooks reach the daemon.
   # Comment out if you don't need a public URL.
+  #
+  # This one stays on :latest on purpose, unlike the image above: the namespace
+  # is Cloudflare's own, and Cloudflare retires old cloudflared builds — a pin
+  # here goes stale and the tunnel stops connecting.
+  #
+  # NOTE: a quick-tunnel puts this daemon on a public *.trycloudflare.com URL.
+  # OPENAGI_AUTH_TOKEN is the only thing gating it. Do not enable this sidecar
+  # without one.
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: openagi-tunnel

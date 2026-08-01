@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createDurableRuntime, createHostedInterface } from "./index.js";
+import { checkBindSafety } from "./auth.js";
 import { loadEnvFile } from "./file-utils.js";
 import { resolveDataDir, _resetDataDirCache } from "./data-dir.js";
 
@@ -56,36 +57,86 @@ export function installCrashGuards() {
   crashGuardsInstalled = true;
   process.on("unhandledRejection", (reason) => {
     const err = reason instanceof Error ? reason : new Error(String(reason));
-    console.error(`[openagi] unhandled rejection (kept alive): ${err.stack || err.message}`);
+    console.error(`[openagi] unhandled rejection ${livenessNote()}: ${err.stack || err.message}`);
   });
   // An uncaught synchronous exception can leave state undefined, but for a
   // supervised, always-on daemon staying up beats crash-looping; the error is
   // logged loudly so it's still diagnosable in daemon.log / journald.
   process.on("uncaughtException", (err) => {
-    console.error(`[openagi] uncaught exception (kept alive): ${err?.stack || err}`);
+    console.error(`[openagi] uncaught exception ${livenessNote()}: ${err?.stack || err}`);
+  });
+}
+
+// ─── Startup failures must be non-zero ────────────────────────────────────
+//
+// "Kept alive" is only true once there is something alive to keep. Before the
+// interface is listening these guards were a trap: a corrupt snapshot threw out
+// of the runtime constructor, the guard logged it, nothing was left on the event
+// loop, and the process exited 0. launchd's KeepAlive{SuccessfulExit=false}
+// reads exit 0 as "it meant to stop" and never restarts — a silently, and
+// permanently, dead assistant. `openagi serve` reached the same place by a
+// different road: main() catches, returns 1, and then skips process.exit for
+// the serve command.
+//
+// So instead of trying to intercept every route out, we assert the invariant at
+// the only place they all converge: if the process is exiting and the server
+// never came up, the exit code is wrong and we correct it. The supervisor then
+// restarts, which is the right answer for a transient fault and a visible,
+// throttled crash-loop for a permanent one — either beats dying quietly.
+let bootPhase = "idle"; // idle → starting → running
+let startupExitGuardInstalled = false;
+
+function livenessNote() {
+  return bootPhase === "starting" ? "(during startup — fatal)" : "(kept alive)";
+}
+
+function armStartupExitGuard() {
+  bootPhase = "starting";
+  if (startupExitGuardInstalled) return;
+  startupExitGuardInstalled = true;
+  process.on("exit", (code) => {
+    if (bootPhase === "running" || code !== 0) return;
+    console.error(
+      "[openagi] FATAL: the server never finished starting — exiting 1 so launchd/systemd " +
+      "restarts it. (Exit 0 here would be read as a clean, intentional stop and the daemon " +
+      "would stay dead until the next login.)"
+    );
+    process.exitCode = 1;
   });
 }
 
 // Boot env + start the hosted interface. Returns the listen address.
 // host/port fall back to HOST/PORT env then sane defaults; callers (the CLI)
-// can override. Binding to 0.0.0.0 is safe because the HTTP interface enforces
-// the bearer token — but we warn so it's a deliberate choice.
+// can override.
+//
+// Binding to a non-loopback address is safe ONLY when OPENAGI_AUTH_TOKEN is
+// set. It is not otherwise: checkAuth() treats an unset token as "auth
+// disabled" and serves everything. The Docker image sets HOST=0.0.0.0 and the
+// Linux installer used to set no token, which is precisely that hole — so this
+// is enforced here, fatally, rather than warned about.
 export async function startServer({ host, port } = {}) {
   installCrashGuards();
+  armStartupExitGuard();
   const dataDir = loadBootEnv();
   const resolvedHost = host ?? process.env.HOST ?? "127.0.0.1";
   const resolvedPort = Number.parseInt(String(port ?? process.env.PORT ?? "43210"), 10);
 
-  if ((resolvedHost === "0.0.0.0" || resolvedHost === "::") && !process.env.OPENAGI_AUTH_TOKEN) {
-    console.warn(
-      "⚠ Binding to " + resolvedHost + " with NO OPENAGI_AUTH_TOKEN set — the dashboard and API would be\n" +
-      "  reachable UNAUTHENTICATED on your network. Run `openagi setup` (or set OPENAGI_AUTH_TOKEN)\n" +
-      "  before exposing OpenAGI to other devices."
-    );
+  // FAIL CLOSED. process.exit rather than throw, deliberately. A throw here
+  // takes a long way round: installCrashGuards() swallows it as an unhandled
+  // rejection, `openagi serve` catches it and then skips process.exit for the
+  // serve command, and it is only the startup exit guard above that finally
+  // corrects the code — printing a "restarts it" message that is wrong for
+  // this fault, since restarting a misconfigured bind just repeats it. This is
+  // a configuration refusal, not a crash: say so once and stop.
+  const safety = checkBindSafety({ host: resolvedHost, token: process.env.OPENAGI_AUTH_TOKEN });
+  if (!safety.ok) {
+    console.error(safety.message);
+    process.exit(1);
   }
 
   const runtime = createDurableRuntime({ dataDir });
   const app = createHostedInterface(runtime, { host: resolvedHost, port: resolvedPort });
   const address = await app.listen();
+  bootPhase = "running"; // boot survived; from here on an exit 0 is a real one
   return { app, runtime, address, dataDir, host: resolvedHost, port: resolvedPort };
 }
