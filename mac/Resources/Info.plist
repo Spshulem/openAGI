@@ -31,7 +31,7 @@
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSHumanReadableCopyright</key>
-  <string>Released under MIT license.</string>
+  <string>Licensed under the PolyForm Noncommercial License 1.0.0. Commercial use requires a separate license.</string>
 
   <!-- Capture permission usage strings. macOS shows these when prompting. -->
   <key>NSAppleEventsUsageDescription</key>

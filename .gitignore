@@ -1,4 +1,17 @@
+# Secrets. Bare ".env" matches only that exact name, so the variants a
+# contributor actually creates (.env.local, .env.production) were NOT ignored —
+# in a PUBLIC repo that is one slip away from a leaked key. docs/RELEASE.md also
+# walks the user through exporting a developer-id.p12, so the signing and
+# notarization material is enumerated here explicitly rather than trusted to
+# land outside the tree.
 .env
+.env.*
+!.env.example
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
 .openagi/*
 !.openagi/mcp.json.example
 node_modules/
