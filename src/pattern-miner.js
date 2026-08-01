@@ -16,12 +16,15 @@ import fs from "node:fs";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { analyzeActivityPatterns } from "./activity-patterns.js";
+import { safeJoinOrNull } from "./path-guard.js";
 
-const DEFAULT_LOOKBACK_DAYS = 14;
+const DEFAULT_LOOKBACK_DAYS = 28;
 const MIN_OCCURRENCES = 3;
-const MIN_SEQUENCE_LEN = 3;
+const MIN_SEQUENCE_LEN = 2;
 const MAX_SEQUENCE_LEN = 6;
 const MIN_CONFIDENCE = 0.55;
+const MAX_ACTIVITY_ROWS = 50_000;
 const SUGGESTED_DIR = "skills-suggested";
 
 export class PatternMiner {
@@ -215,12 +218,20 @@ export class PatternMiner {
    * suggestion. Returns the skill's path.
    */
   accept(id) {
-    const file = path.join(this.suggestedDir, `${id}.json`);
-    const candidate = readJsonFile(file, null);
+    // SEC-3: `id` comes off POST /suggested/<id>/accept ([^/]+ still matches a
+    // percent-encoded "../"), so validate the segment and assert containment
+    // before reading — this call materializes a skill from whatever it reads.
+    const file = safeJoinOrNull(this.suggestedDir, `${id}.json`);
+    const candidate = file ? readJsonFile(file, null) : null;
     if (!candidate) throw new Error(`Unknown candidate: ${id}`);
     const skillName = sanitizeSkillName(candidate.proposal.name);
     const skillsRoot = path.join(this.dataDir, "skills");
-    const skillDir = path.join(skillsRoot, skillName);
+    // sanitizeSkillName already strips everything outside [a-z0-9-], so it
+    // cannot emit a separator or "..". The guard is belt-and-braces: the name
+    // originates in an LLM proposal, and that sanitizer is one edit away from
+    // being loosened by someone who doesn't know it is load-bearing.
+    const skillDir = safeJoinOrNull(skillsRoot, skillName);
+    if (!skillDir) throw new Error(`Unsafe skill name from candidate ${id}`);
     ensureDir(skillDir);
     const md = renderSkillMarkdown(candidate, skillName);
     fs.writeFileSync(path.join(skillDir, "SKILL.md"), md, { mode: 0o600 });
@@ -232,8 +243,9 @@ export class PatternMiner {
   }
 
   reject(id, reason = null) {
-    const file = path.join(this.suggestedDir, `${id}.json`);
-    const candidate = readJsonFile(file, null);
+    // SEC-3: same untrusted `id` as accept() — same guard.
+    const file = safeJoinOrNull(this.suggestedDir, `${id}.json`);
+    const candidate = file ? readJsonFile(file, null) : null;
     if (!candidate) return null;
     candidate.status = "rejected";
     candidate.rejectedAt = nowIso();

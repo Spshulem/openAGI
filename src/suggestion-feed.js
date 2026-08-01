@@ -3,6 +3,7 @@ import path from "node:path";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { safeJoinOrNull } from "./path-guard.js";
 
 // Story 4: unified read/write surface for proposals coming from three
 // independent sources:
@@ -148,10 +149,16 @@ function pickEnvelope(raw) {
 
 function findSourceFile(runtime, id) {
   const dataDir = runtime?.dataDir ?? defaultDataDir(runtime);
+  // SEC-3: `id` arrives from POST /proactive/suggestions/<id>/{accept,reject,
+  // dismiss}, whose route regex is [^/]+ — which still matches "..%2F..%2Fx"
+  // because url.pathname keeps the percent-encoding. Joining the decoded value
+  // walked out of these directories and let the caller read, rewrite (injecting
+  // status/resolvedAt/note), chmod, and echo back any .json on disk. Validate
+  // the segment and assert containment before touching the filesystem.
   const candidates = [
-    path.join(dataDir, "proactive", "suggestions", `${id}.json`),
-    path.join(dataDir, "skills-suggested", `${id}.json`)
-  ];
+    safeJoinOrNull(path.join(dataDir, "proactive", "suggestions"), `${id}.json`),
+    safeJoinOrNull(path.join(dataDir, "skills-suggested"), `${id}.json`)
+  ].filter(Boolean);
   return candidates.find((f) => fs.existsSync(f)) ?? null;
 }
 
