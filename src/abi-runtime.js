@@ -299,6 +299,19 @@ export class AbiRuntime {
         task: "self-update",
         dailyAt: process.env.OPENAGI_AUTO_UPDATE_AT ?? "04:30"
       });
+      // Ambient capture is the only store in the system with unbounded growth:
+      // observation-store.js documented "caller (autopilot job) prunes old rows
+      // by date" and no such caller was ever registered, so a live install
+      // reached 1.26 GiB of screen OCR. 05:15 is deliberately AFTER the 02:30
+      // nightly miner (which reads a 28-day window) and off every other slot, so
+      // retention never shares a tick with another job.
+      this.cron.addJob({
+        id: "observation-retention",
+        name: "Daily observation retention — prune expired capture, reclaim disk",
+        enabled: true,
+        task: "observation-retention",
+        dailyAt: "05:15"
+      });
       this.cron.addJob({
         id: "weekly-scrutiny-fit",
         name: "Weekly scrutiny weight fit",
@@ -712,146 +725,7 @@ export class AbiRuntime {
       });
     }
 
-    return this.cron.runDue(async (job) => {
-      if (job.task === "daily-adaptation-review") {
-        return this.processSignal({
-          id: createId("sig"),
-          ...job.input,
-          receivedAt: nowIso()
-        });
-      }
-      if (job.task === "prompt") {
-        return this.runScheduledPrompt(job);
-      }
-      if (job.task === "autopilot") {
-        return this.runAutopilot(job);
-      }
-      if (job.task === "condense") {
-        return this.condenser.condense({ now });
-      }
-      if (job.task === "self-update") {
-        const { applyUpdate } = await import("./self-update.js");
-        const result = await applyUpdate();
-        if (result.updated) {
-          this.events?.emit?.("self-update", { at: nowIso(), from: result.from, to: result.to });
-          // Respawn with the new code (systemd Restart=always / launchd
-          // KeepAlive / Mac DaemonController bring it back). Defer so the
-          // tick result can flush first.
-          setTimeout(() => process.exit(0), 500);
-        }
-        return result;
-      }
-      if (job.task === "retirement-sweep") {
-        const retired = this.propagation.retirementSweep?.() ?? [];
-        // C3: cross-generation inheritance — distill each retired specialist's
-        // scoped memory into a legacy principle that lives in main long-tier.
-        const legacies = [];
-        for (const sp of retired) {
-          try {
-            const result = await this.condenser.condense({
-              scope: `specialist:${sp.id}`,
-              writeScope: "main",
-              originSpecialistId: sp.id
-            });
-            legacies.push({ specialistId: sp.id, principles: result.principles ?? 0 });
-          } catch { /* skip */ }
-        }
-        return { retired: retired.map((s) => ({ id: s.id, name: s.name, reason: s.retirementReason })), legacies };
-      }
-      if (job.task === "scrutiny-fit") {
-        return this.scrutinyFitter.fit({ now });
-      }
-      if (job.task === "pattern-mine") {
-        const result = await this.patternMiner.mine({ now, ...(job.input ?? {}) });
-        this.events?.emit?.("miner-result", { source: "pattern-miner", at: nowIso(), ...result });
-        return result;
-      }
-      if (job.task === "session-mine") {
-        const result = await this.sessionMiner.mine({ now });
-        this.events?.emit?.("miner-result", { source: "session-miner", at: nowIso(), ...result });
-        return result;
-      }
-      if (job.task === "imessage-extract") {
-        const result = await this.imessageExtractor.extract();
-        this.events?.emit?.("miner-result", { source: "imessage-extractor", at: nowIso(), ...result });
-        return result;
-      }
-      if (job.task === "proactive-observe") {
-        const result = await this.proactiveObserver.observe({ now });
-        this.events?.emit?.("miner-result", { source: "proactive-observer", at: nowIso(), ...result });
-        return result;
-      }
-      if (job.task === "linear-task-sync") {
-        if (!this.linearTaskSource?.sync) return { skipped: true, reason: "no linear source" };
-        return this.linearTaskSource.sync({ now });
-      }
-      if (job.task === "buildbetter-task-sync") {
-        if (!this.buildBetterTaskSource?.sync) return { skipped: true, reason: "no buildbetter source" };
-        return this.buildBetterTaskSource.sync({ now });
-      }
-      if (job.task === "inbox-sweep") {
-        if (!this.inboxWatcher?.sweep) return { skipped: true, reason: "no inbox watcher" };
-        return this.inboxWatcher.sweep();
-      }
-      if (job.task === "imessage-sync") {
-        if (!this.imessagePoller?.sync) return { skipped: true, reason: "no imessage poller" };
-        return this.imessagePoller.sync({ now });
-      }
-      if (job.task === "task-digest") {
-        return this.runTaskDigest({ now });
-      }
-      if (job.task === "daily-recap") {
-        return this.runDailyRecap({ now });
-      }
-      if (job.task === "daily-plan") {
-        return this.runDailyPlan({ now });
-      }
-      if (job.task === "weekly-retrospective") {
-        return this.runWeeklyRetrospective({ now });
-      }
-      if (job.task === "weekly-project-scan") {
-        if (!this.proactiveObserver?.observe) return { skipped: true, reason: "no observer" };
-        const result = await this.proactiveObserver.observe({ now, mode: "long-horizon", force: true });
-        this.events?.emit?.("miner-result", { source: "weekly-observer", at: nowIso(), ...result });
-        return result;
-      }
-      if (job.task === "task-reminders") {
-        return this.runTaskReminders({ now });
-      }
-      if (job.task === "task-activity-scan") {
-        if (!this.proactiveObserver?.scanTasksAgainstActivity) return { skipped: true, reason: "no observer" };
-        const result = await this.proactiveObserver.scanTasksAgainstActivity({ now });
-        this.events?.emit?.("miner-result", { source: "task-activity-scan", at: nowIso(), ...result });
-        return result;
-      }
-      if (job.task === "task-sweep") {
-        const result = await this.taskSweep.sweep({ now });
-        if (this.outreachConfig?.enabled && Array.isArray(result.flaggedTasks)) {
-          surfaceStalledTasks(this.outreach, result.flaggedTasks);
-        }
-        this.events?.emit?.("miner-result", { source: "task-sweep", at: nowIso(), ...result });
-        return result;
-      }
-      if (job.task === "backlog-triage") {
-        // run() is written never to throw — everything that can fail lands in
-        // result.degraded — so this handler needs no try/catch of its own and a
-        // bad pass can never turn the scheduler into a crash loop.
-        // Input spreads FIRST so the dashboard can set { dryRun: true } or
-        // { useLLM: false } on the job — but never `now`, which is the
-        // scheduler's to supply.
-        const result = await this.backlogTriage.run({ ...(job.input ?? {}), now });
-        const summary = summarizeTriagePass(result);
-        this.events?.emit?.("miner-result", { source: "backlog-triage", at: nowIso(), ...summary });
-        return summary;
-      }
-      if (job.task === "outreach-digest") {
-        return this.runOutreachDigest({ now });
-      }
-      if (job.task === "ambient-digest") {
-        return this.runAmbientDigest({ now });
-      }
-      return { skipped: true, reason: `No handler for task ${job.task}` };
-    }, now, {
+    return this.cron.runDue((job) => this.runJobTask(job, now), now, {
       onTimeout: (job, timeoutMs) => {
         this.events?.emit?.("cron-job-timeout", {
           at: nowIso(),
@@ -859,8 +733,187 @@ export class AbiRuntime {
           jobName: job.name,
           timeoutMs
         });
+      },
+      onBudgetExceeded: (job, budgetMs) => {
+        // The fire ran out of wall clock before reaching this job. It stays
+        // due and runs on the next tick — say so rather than let the schedule
+        // quietly slip.
+        this.events?.emit?.("cron-tick-budget", {
+          at: nowIso(),
+          deferredJobId: job.id,
+          deferredJobName: job.name,
+          budgetMs
+        });
       }
     });
+  }
+
+  // The single dispatch table for a cron job's task. Shared by the tick
+  // (_tickOnce) and by a user-initiated run (POST /cron/:id/run). It used to
+  // live inline in the runDue callback, which meant the manual route had no
+  // access to it: that route special-cased task==="autopilot" and sent
+  // EVERYTHING else to runScheduledPrompt(), so "Run now" on backlog-triage
+  // fired an agent chat turn with the text "(empty scheduled prompt)" and
+  // never called backlogTriage.run(). One table, both callers.
+  async runJobTask(job, now = new Date()) {
+    if (job.task === "daily-adaptation-review") {
+      return this.processSignal({
+        id: createId("sig"),
+        ...job.input,
+        receivedAt: nowIso()
+      });
+    }
+    if (job.task === "prompt") {
+      return this.runScheduledPrompt(job);
+    }
+    if (job.task === "autopilot") {
+      return this.runAutopilot(job);
+    }
+    if (job.task === "condense") {
+      return this.condenser.condense({ now });
+    }
+    if (job.task === "self-update") {
+      const { applyUpdate } = await import("./self-update.js");
+      const result = await applyUpdate();
+      if (result.updated) {
+        this.events?.emit?.("self-update", { at: nowIso(), from: result.from, to: result.to });
+        // Respawn with the new code (systemd Restart=always / launchd
+        // KeepAlive / Mac DaemonController bring it back). Defer so the
+        // tick result can flush first.
+        setTimeout(() => process.exit(0), 500);
+      }
+      return result;
+    }
+    if (job.task === "observation-retention") {
+      const { pruneObservations } = await import("./observation-retention.js");
+      // job.input is the override surface: { dryRun }, { policy }, { reclaim }.
+      // Spread after `now` so a job row can pin a clock in a test but the
+      // scheduled row (input {}) uses the tick's clock.
+      const result = await pruneObservations(this.observations, {
+        now,
+        logger: (line) => console.log(`[openagi] ${line}`),
+        ...(job.input ?? {})
+      });
+      this.events?.emit?.("observation-retention", {
+        at: nowIso(),
+        applied: result.applied,
+        deleted: result.deleted,
+        cutoffs: result.cutoffs,
+        bytesAfter: result.footprint?.bytes ?? null,
+        reclaimedBytes: result.reclaim?.reclaimedBytes ?? 0
+      });
+      return result;
+    }
+    if (job.task === "retirement-sweep") {
+      const retired = this.propagation.retirementSweep?.() ?? [];
+      // C3: cross-generation inheritance — distill each retired specialist's
+      // scoped memory into a legacy principle that lives in main long-tier.
+      const legacies = [];
+      for (const sp of retired) {
+        try {
+          const result = await this.condenser.condense({
+            scope: `specialist:${sp.id}`,
+            writeScope: "main",
+            originSpecialistId: sp.id
+          });
+          legacies.push({ specialistId: sp.id, principles: result.principles ?? 0 });
+        } catch { /* skip */ }
+      }
+      return { retired: retired.map((s) => ({ id: s.id, name: s.name, reason: s.retirementReason })), legacies };
+    }
+    if (job.task === "scrutiny-fit") {
+      return this.scrutinyFitter.fit({ now });
+    }
+    if (job.task === "pattern-mine") {
+      const result = await this.patternMiner.mine({ now, ...(job.input ?? {}) });
+      this.events?.emit?.("miner-result", { source: "pattern-miner", at: nowIso(), ...result });
+      return result;
+    }
+    if (job.task === "session-mine") {
+      const result = await this.sessionMiner.mine({ now });
+      this.events?.emit?.("miner-result", { source: "session-miner", at: nowIso(), ...result });
+      return result;
+    }
+    if (job.task === "imessage-extract") {
+      const result = await this.imessageExtractor.extract();
+      this.events?.emit?.("miner-result", { source: "imessage-extractor", at: nowIso(), ...result });
+      return result;
+    }
+    if (job.task === "proactive-observe") {
+      const result = await this.proactiveObserver.observe({ now });
+      this.events?.emit?.("miner-result", { source: "proactive-observer", at: nowIso(), ...result });
+      return result;
+    }
+    if (job.task === "linear-task-sync") {
+      if (!this.linearTaskSource?.sync) return { skipped: true, reason: "no linear source" };
+      return this.linearTaskSource.sync({ now });
+    }
+    if (job.task === "buildbetter-task-sync") {
+      if (!this.buildBetterTaskSource?.sync) return { skipped: true, reason: "no buildbetter source" };
+      return this.buildBetterTaskSource.sync({ now });
+    }
+    if (job.task === "inbox-sweep") {
+      if (!this.inboxWatcher?.sweep) return { skipped: true, reason: "no inbox watcher" };
+      return this.inboxWatcher.sweep();
+    }
+    if (job.task === "imessage-sync") {
+      if (!this.imessagePoller?.sync) return { skipped: true, reason: "no imessage poller" };
+      return this.imessagePoller.sync({ now });
+    }
+    if (job.task === "task-digest") {
+      return this.runTaskDigest({ now });
+    }
+    if (job.task === "daily-recap") {
+      return this.runDailyRecap({ now });
+    }
+    if (job.task === "daily-plan") {
+      return this.runDailyPlan({ now });
+    }
+    if (job.task === "weekly-retrospective") {
+      return this.runWeeklyRetrospective({ now });
+    }
+    if (job.task === "weekly-project-scan") {
+      if (!this.proactiveObserver?.observe) return { skipped: true, reason: "no observer" };
+      const result = await this.proactiveObserver.observe({ now, mode: "long-horizon", force: true });
+      this.events?.emit?.("miner-result", { source: "weekly-observer", at: nowIso(), ...result });
+      return result;
+    }
+    if (job.task === "task-reminders") {
+      return this.runTaskReminders({ now });
+    }
+    if (job.task === "task-activity-scan") {
+      if (!this.proactiveObserver?.scanTasksAgainstActivity) return { skipped: true, reason: "no observer" };
+      const result = await this.proactiveObserver.scanTasksAgainstActivity({ now });
+      this.events?.emit?.("miner-result", { source: "task-activity-scan", at: nowIso(), ...result });
+      return result;
+    }
+    if (job.task === "task-sweep") {
+      const result = await this.taskSweep.sweep({ now });
+      if (this.outreachConfig?.enabled && Array.isArray(result.flaggedTasks)) {
+        surfaceStalledTasks(this.outreach, result.flaggedTasks);
+      }
+      this.events?.emit?.("miner-result", { source: "task-sweep", at: nowIso(), ...result });
+      return result;
+    }
+    if (job.task === "backlog-triage") {
+      // run() is written never to throw — everything that can fail lands in
+      // result.degraded — so this handler needs no try/catch of its own and a
+      // bad pass can never turn the scheduler into a crash loop.
+      // Input spreads FIRST so the dashboard can set { dryRun: true } or
+      // { useLLM: false } on the job — but never `now`, which is the
+      // scheduler's to supply.
+      const result = await this.backlogTriage.run({ ...(job.input ?? {}), now });
+      const summary = summarizeTriagePass(result);
+      this.events?.emit?.("miner-result", { source: "backlog-triage", at: nowIso(), ...summary });
+      return summary;
+    }
+    if (job.task === "outreach-digest") {
+      return this.runOutreachDigest({ now });
+    }
+    if (job.task === "ambient-digest") {
+      return this.runAmbientDigest({ now });
+    }
+    return { skipped: true, reason: `No handler for task ${job.task}` };
   }
 
   // Late-bind the event bus to the outreach mapper. hosted-interface.js owns

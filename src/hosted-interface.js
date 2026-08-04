@@ -83,6 +83,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("cron-catchup", (data) => broadcast("cron-catchup", data));
   events.on("cron-job-timeout", (data) => broadcast("cron-job-timeout", data));
   events.on("cron-interrupted", (data) => broadcast("cron-interrupted", data));
+  events.on("cron-tick-budget", (data) => broadcast("cron-tick-budget", data));
   events.on("proactive-suggestion", (data) => broadcast("proactive-suggestion", data));
   events.on("suggestion-resolved", (data) => broadcast("suggestion-resolved", data));
   events.on("task-updated", (data) => broadcast("task-updated", data));
@@ -361,9 +362,33 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/") return sendHtml(res, 200, renderApp(), extraCookies);
-      // firstRun lets clients (Mac app) know setup has never completed, so
-      // they can take the user to the wizard instead of sitting silent.
-      if (method === "GET" && pathname === "/health") return sendJson(res, 200, { ok: true, firstRun: isFirstRun(), status: runtime.status() });
+      // /health is a PUBLIC route (isPublicRoute in auth.js) and must stay one:
+      // launchd, the Docker HEALTHCHECK and the setup wizard's post-restart
+      // poll all need an answer before any credential exists. But it used to
+      // hand every caller the whole of runtime.status(), which embeds
+      // cron.listJobs() — and a job carries its `input` verbatim: the scheduled
+      // prompt text, the SMS/Telegram recipient, the agent id — plus the
+      // integration list, provider config and memory counts. Loopback-only that
+      // is untidy; behind a tunnel (OPENAGI_PUBLIC_URL is supported, and
+      // docker-compose.example.yml ships a cloudflared sidecar) it is an
+      // uncredentialed dump of the user's private automation.
+      //
+      // So the route is split, not closed: liveness for everyone, full status
+      // for a caller that passes the ordinary auth check. When no token is
+      // configured checkAuth returns ok — that is the single-user loopback
+      // install, which checkBindSafety() guarantees is reachable only from this
+      // machine, and where the same caller can already open the dashboard.
+      //
+      // firstRun stays public deliberately: clients route the user to the setup
+      // wizard on it, and isFirstRun() is only ever true when no token is set —
+      // i.e. it is the constant false on exactly the exposed installs this is
+      // protecting. The Mac tray reads provider/memory out of `status` and DOES
+      // send its bearer token (AppState.get), so it keeps the full body.
+      if (method === "GET" && pathname === "/health") {
+        const probe = { ok: true, firstRun: isFirstRun() };
+        if (checkAuth(req, url, getAuthToken()).ok) probe.status = runtime.status();
+        return sendJson(res, 200, probe);
+      }
       if (method === "GET" && pathname === "/memory") return sendJson(res, 200, runtime.memory.snapshot());
       if (method === "POST" && pathname === "/memory/remember") {
         // Direct memory import (auth-gated) — for migrations from another
@@ -770,9 +795,24 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/observations/stats") {
         return sendJson(res, 200, await runtime.observations.stats());
       }
+      // Retention, routed through observation-retention.js so the HTTP surface
+      // gets the same cutoffs, counts and refusals as the scheduled job.
+      //
+      // This used to call runtime.observations.prune(body) directly, whose
+      // defaults are { olderThanDays: 90, framesOlderThanDays: 7 } — so an
+      // empty POST silently deleted three weeks of frame OCR that the 28-day
+      // pattern miner still reads, with no preview, no counts and no undo.
+      // Now: DRY RUN unless the caller explicitly says { "apply": true }.
       if (method === "POST" && pathname === "/observations/prune") {
-        const body = await readJson(req).catch(() => ({}));
-        return sendJson(res, 200, await runtime.observations.prune(body));
+        const body = (await readJson(req).catch(() => ({}))) ?? {};
+        const { pruneObservations } = await import("./observation-retention.js");
+        const result = await pruneObservations(runtime.observations, {
+          dryRun: body.apply !== true,
+          ...(body.policy ? { policy: body.policy } : {}),
+          ...(body.reclaim ? { reclaim: body.reclaim } : {}),
+          logger: (line) => console.log(`[openagi] ${line}`)
+        });
+        return sendJson(res, 200, result);
       }
 
       if (method === "GET" && pathname === "/admin/provider") {
@@ -872,6 +912,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           },
           intervalMs: body.intervalSeconds ? body.intervalSeconds * 1000 : body.intervalMs,
           dailyAt: body.dailyAt,
+          // Per-job override of the 10-minute default (see TIMEOUT_MS). For the
+          // rare job that legitimately runs longer than every other job should
+          // be allowed to.
+          timeoutMs: body.timeoutSeconds ? body.timeoutSeconds * 1000 : body.timeoutMs,
           nextRunAt: body.delaySeconds ? new Date(Date.now() + body.delaySeconds * 1000).toISOString() : body.nextRunAt
         });
         events.emit("cron", { op: "add", job });
@@ -883,16 +927,96 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         events.emit("cron", { op: "remove", id });
         return sendJson(res, 200, { removed });
       }
+      // Recent runs, so a client that got a 202 can poll for the outcome.
+      // Declared before the /cron/:id routes: "runs" is a reserved job id here.
+      if (method === "GET" && pathname === "/cron/runs") {
+        const limit = Math.min(Number.parseInt(url.searchParams.get("limit") ?? "20", 10) || 20, 100);
+        return sendJson(res, 200, { running: runtime.cron.listRunning(), runs: runtime.cron.listRuns(limit) });
+      }
+      if (method === "GET" && pathname.match(/^\/cron\/runs\/[^/]+$/)) {
+        const runId = decodeURIComponent(pathname.split("/")[3]);
+        const run = runtime.cron.getRun(runId);
+        if (!run) return sendJson(res, 404, { error: "unknown-run", runId });
+        return sendJson(res, 200, run);
+      }
+
+      // Manual "Run now". This route MUST answer promptly with a real
+      // outcome — it ran, it was accepted (poll for the result), or it was
+      // refused. It previously awaited the handler with no timeout and only
+      // answered when it settled, so a wedged handler left the user staring
+      // at a button that did nothing, forever, with no feedback.
       if (method === "POST" && pathname.match(/^\/cron\/[^/]+\/run$/)) {
         const id = decodeURIComponent(pathname.split("/")[2]);
         const job = runtime.cron.listJobs().find((j) => j.id === id);
         if (!job) return sendJson(res, 404, { error: "unknown-job" });
-        const result =
-          job.task === "autopilot"
-            ? await runtime.runAutopilot(job)
-            : await runtime.runScheduledPrompt(job);
-        events.emit("cron", { op: "run", id, result });
-        return sendJson(res, 200, { result });
+
+        // Grace window: a job that finishes fast returns its result inline
+        // (what the dashboard wants); anything slower gets a 202 + runId. The
+        // connection is never held longer than this, whatever the handler does.
+        const requested = Number.parseInt(url.searchParams.get("wait") ?? "", 10);
+        const graceMs = Math.min(Number.isFinite(requested) && requested >= 0 ? requested : 1500, 10_000);
+
+        const started = runtime.cron.runJobNow((j) => runtime.runJobTask(j), id, {
+          source: "manual",
+          onTimeout: (timedOutJob, timeoutMs) => {
+            events.emit("cron-job-timeout", {
+              at: new Date().toISOString(),
+              jobId: timedOutJob.id,
+              jobName: timedOutJob.name,
+              source: "manual",
+              timeoutMs
+            });
+          }
+        });
+
+        if (!started.started) {
+          // Refused, with the reason and since when — never a silent stall.
+          if (started.reason === "already-running") {
+            return sendJson(res, 409, {
+              status: "already-running",
+              jobId: id,
+              runId: started.running?.runId ?? null,
+              startedAt: started.running?.startedAt ?? null,
+              source: started.running?.source ?? null,
+              poll: started.running?.runId ? `/cron/runs/${encodeURIComponent(started.running.runId)}` : null,
+              message: "This job is already running. Wait for it to finish — running it twice concurrently is not safe."
+            });
+          }
+          return sendJson(res, 404, { error: started.reason ?? "unknown-job", jobId: id });
+        }
+
+        let graceTimer = null;
+        const settled = await Promise.race([
+          started.promise,
+          new Promise((resolve) => { graceTimer = setTimeout(() => resolve(null), graceMs); })
+        ]);
+        if (graceTimer) clearTimeout(graceTimer);
+
+        if (!settled) {
+          const pending = runtime.cron.getRun(started.runId);
+          events.emit("cron", { op: "run-accepted", id, runId: started.runId });
+          return sendJson(res, 202, {
+            status: "accepted",
+            jobId: id,
+            runId: started.runId,
+            startedAt: pending?.startedAt ?? null,
+            timeoutMs: pending?.timeoutMs ?? null,
+            poll: `/cron/runs/${encodeURIComponent(started.runId)}`,
+            message: `Still running after ${graceMs}ms — poll the run for the outcome.`
+          });
+        }
+        // Compact payload deliberately: the full handler result is fetched by
+        // the caller from /cron/runs/:runId, not broadcast to every SSE client.
+        events.emit("cron", { op: "run", id, runId: settled.runId, status: settled.status, durationMs: settled.durationMs });
+        const status = settled.status === "ok" ? "ran" : settled.status;
+        return sendJson(res, 200, {
+          status,
+          jobId: id,
+          runId: settled.runId,
+          durationMs: settled.durationMs,
+          error: settled.error,
+          result: settled.result
+        });
       }
 
       if (method === "GET" && pathname === "/skills") return sendJson(res, 200, runtime.skills?.list() ?? []);
@@ -3508,6 +3632,7 @@ function renderCronDetail(job) {
         <span class="badge \${job.enabled ? 'ok' : 'warn'}">\${job.enabled ? "enabled" : "disabled"}</span>
         <span class="badge">task: \${escapeHtml(job.task)}</span>
         <span class="badge">next: \${escapeHtml(new Date(job.nextRunAt).toLocaleString())}</span>
+        \${job.lastRunStatus ? \`<span class="badge \${job.lastRunStatus === "ok" ? "ok" : "warn"}">last run: \${escapeHtml(job.lastRunStatus)}\${job.lastRunSource ? " (" + escapeHtml(job.lastRunSource) + ")" : ""}</span>\` : ""}
       </div>
       <h3>Input</h3>
       <pre>\${escapeHtml(JSON.stringify(job.input ?? {}, null, 2))}</pre>
@@ -3518,9 +3643,57 @@ function renderCronDetail(job) {
       <pre id="jobResult" class="ok" style="margin-top: 12px;"></pre>
     </div>
   \`;
+  // "Run now" never leaves the user waiting on an open socket: the route
+  // answers within its grace window with ran / accepted / already-running, and
+  // an accepted run is polled here until it reaches a terminal status.
   $("runJob").addEventListener("click", async () => {
-    const res = await postJson(\`/cron/\${encodeURIComponent(job.id)}/run\`, {});
-    $("jobResult").textContent = JSON.stringify(res, null, 2);
+    const btn = $("runJob");
+    const out = $("jobResult");
+    btn.disabled = true;
+    out.className = "";
+    out.textContent = "Starting…";
+    try {
+      const r = await fetch(\`/cron/\${encodeURIComponent(job.id)}/run\`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        credentials: "include",
+        body: "{}"
+      });
+      const body = await r.json().catch(() => ({}));
+      if (r.status === 409) {
+        out.className = "warn";
+        out.textContent = "Already running since " + new Date(body.startedAt).toLocaleTimeString() + " — " + (body.message || "");
+        return;
+      }
+      if (!r.ok) {
+        out.className = "warn";
+        out.textContent = "Failed: " + (body.error || r.status);
+        return;
+      }
+      if (r.status !== 202) {
+        out.className = body.status === "ran" ? "ok" : "warn";
+        out.textContent = body.status + " in " + body.durationMs + "ms\\n" + JSON.stringify(body.result ?? body.error, null, 2);
+        return;
+      }
+      out.textContent = "Running… (started " + new Date(body.startedAt).toLocaleTimeString() + ")";
+      const deadline = Date.now() + Math.min((body.timeoutMs || 600000) + 30000, 3600000);
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const run = await fetchJson(body.poll).catch(() => null);
+        if (!run) continue;
+        if (run.status === "running") { out.textContent = "Running… " + Math.round((Date.now() - new Date(run.startedAt).getTime()) / 1000) + "s"; continue; }
+        out.className = run.status === "ok" ? "ok" : "warn";
+        out.textContent = run.status + " in " + run.durationMs + "ms\\n" + JSON.stringify(run.result ?? run.error, null, 2);
+        return;
+      }
+      out.className = "warn";
+      out.textContent = "Still running — check " + body.poll;
+    } finally {
+      // Deliberately no refreshCron() here: it re-renders the pane from the
+      // first job and would wipe the outcome the user just asked for. The
+      // last-run badge picks the status up on the next render.
+      btn.disabled = false;
+    }
   });
   $("deleteJob").addEventListener("click", async () => {
     await fetch(\`/cron/\${encodeURIComponent(job.id)}\`, { method: "DELETE" });
@@ -5729,7 +5902,15 @@ evt.addEventListener("message", (e) => {
     }
   } catch {}
 });
-evt.addEventListener("cron", () => { if (state.tab === "cron") refreshCron(); });
+evt.addEventListener("cron", (e) => {
+  // Schedule changes (add/remove) redraw the tab. A run starting or finishing
+  // must NOT — refreshCron() re-renders the detail pane from the first job and
+  // would wipe the outcome of the run the user is watching.
+  let op = null;
+  try { op = JSON.parse(e.data ?? "{}").op ?? null; } catch { op = null; }
+  if (op === "run" || op === "run-accepted") return;
+  if (state.tab === "cron") refreshCron();
+});
 evt.addEventListener("mcp", (e) => {
   if (state.tab === "mcp" && !composerOpen) refreshMcp();
   // Surface OAuth-required as a system notification if the page is unfocused

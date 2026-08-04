@@ -43,6 +43,14 @@ export function clearCookie() {
 export function isPublicRoute(pathname) {
   // Webhooks self-authenticate; /health stays open as a liveness check.
   // /sign-in is the path you use to GET auth — must be reachable unauthenticated.
+  //
+  // "Public" here waives BOTH the auth gate and the CSRF gate, so a route on
+  // this list has to be safe for an anonymous caller by construction — the
+  // listing is not the place to relax that. /health earns its slot by serving
+  // two different bodies: liveness to anyone, and the full runtime status only
+  // to a caller that passes checkAuth. It used to serve the full status to
+  // everyone, which published every scheduled job's input (prompt text,
+  // message recipients, agent ids) to anything that could reach the port.
   return (
     pathname === "/health" ||
     pathname === "/sign-in" ||
