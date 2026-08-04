@@ -143,6 +143,15 @@ function countRows(db, sql, ...params) {
 // the frame cutoff; activity titles and transcripts die on the text cutoff.
 const TEXT_CUTOFF_PREDICATE = "((kind = 'frame' AND at < ?) OR (kind <> 'frame' AND at < ?))";
 
+// `keepFrameText`: drop the screenshots but keep the words that were read off
+// them. The default above ties frame OCR to the FRAME cutoff on the reasoning
+// that OCR of an image you no longer hold is orphaned — but the image is the
+// expensive part (frames are ~all of the bytes) and the text is the part recall
+// and search actually read. Keeping the text is what lets someone reclaim disk
+// without going blind to their own history, so it is offered as a policy rather
+// than forcing an all-or-nothing choice.
+const TEXT_CUTOFF_PREDICATE_KEEP_FRAME_TEXT = "(kind <> 'frame' AND at < ?)";
+
 /**
  * Delete observation rows past their retention cutoff.
  *
@@ -183,10 +192,16 @@ export async function pruneObservations(store, options = {}) {
   }
 
   const db = store.db;
+  // keepFrameText swaps the predicate AND the bound parameters together — the
+  // two are a pair, and passing the frame cutoff to a one-placeholder statement
+  // would bind it to the wrong column and silently delete the wrong rows.
+  const keepFrameText = options.keepFrameText === true;
+  const textPredicate = keepFrameText ? TEXT_CUTOFF_PREDICATE_KEEP_FRAME_TEXT : TEXT_CUTOFF_PREDICATE;
+  const textParams = keepFrameText ? [cutoffs.text] : [cutoffs.frames, cutoffs.text];
   const counted = {
     frames: countRows(db, "SELECT COUNT(*) AS n FROM frames WHERE captured_at < ?", cutoffs.frames),
     activity: countRows(db, "SELECT COUNT(*) AS n FROM activity WHERE at < ?", cutoffs.text),
-    texts: countRows(db, `SELECT COUNT(*) AS n FROM texts WHERE ${TEXT_CUTOFF_PREDICATE}`, cutoffs.frames, cutoffs.text)
+    texts: countRows(db, `SELECT COUNT(*) AS n FROM texts WHERE ${textPredicate}`, ...textParams)
   };
 
   if (dryRun) {
@@ -214,7 +229,7 @@ export async function pruneObservations(store, options = {}) {
   try {
     deleted.frames = db.prepare("DELETE FROM frames WHERE captured_at < ?").run(cutoffs.frames).changes;
     deleted.activity = db.prepare("DELETE FROM activity WHERE at < ?").run(cutoffs.text).changes;
-    deleted.texts = db.prepare(`DELETE FROM texts WHERE ${TEXT_CUTOFF_PREDICATE}`).run(cutoffs.frames, cutoffs.text).changes;
+    deleted.texts = db.prepare(`DELETE FROM texts WHERE ${textPredicate}`).run(...textParams).changes;
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");

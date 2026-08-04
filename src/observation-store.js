@@ -14,7 +14,7 @@
 
 import path from "node:path";
 import fs from "node:fs";
-import { ensureDir } from "./file-utils.js";
+import { chmodOwnerOnly, ensureDir } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 
@@ -22,12 +22,20 @@ import { resolveDataDir } from "./data-dir.js";
 // single hit can't dump an entire call transcript into a tool result. The
 // FTS `snippet` already carries the match context; full text stays in the DB.
 const TRANSCRIPT_SEARCH_TEXT_CAP = 1000;
+const WINDOW_SEARCH_TEXT_CAP = 2000;
+const WINDOW_SEARCH_LIMIT = 100;
+const WINDOW_TEXT_KINDS = new Set(["activity", "frame"]);
 
 function capTranscriptText(row) {
   if (row && row.kind === "transcript" && typeof row.text === "string" && row.text.length > TRANSCRIPT_SEARCH_TEXT_CAP) {
     return { ...row, text: row.text.slice(0, TRANSCRIPT_SEARCH_TEXT_CAP) + "…" };
   }
   return row;
+}
+
+function capWindowText(row) {
+  if (!row || typeof row.text !== "string" || row.text.length <= WINDOW_SEARCH_TEXT_CAP) return row;
+  return { ...row, text: row.text.slice(0, WINDOW_SEARCH_TEXT_CAP) + "…" };
 }
 
 let sqlite3Module = null;
@@ -42,8 +50,25 @@ async function loadSqlite() {
   }
 }
 
+// The only options this store accepts. An unknown key is a typo, and a typo
+// here is dangerous rather than merely wrong: the option that selects the
+// directory is `dir`, so `new ObservationStore({ dataDir })` silently ignored
+// the caller's isolation and fell through to resolveDataDir() — the LIVE
+// install. That is not hypothetical; a script written to operate on a scratch
+// copy deleted 132,334 rows from the real database because of exactly this.
+// Fail loudly instead of quietly targeting the user's data.
+const OBSERVATION_STORE_OPTIONS = new Set(["dir"]);
+
 export class ObservationStore {
   constructor(options = {}) {
+    const unknown = Object.keys(options).filter((k) => !OBSERVATION_STORE_OPTIONS.has(k));
+    if (unknown.length > 0) {
+      throw new TypeError(
+        `ObservationStore: unknown option(s) ${unknown.join(", ")}. ` +
+        `Did you mean "dir"? (accepted: ${[...OBSERVATION_STORE_OPTIONS].join(", ")}). ` +
+        "An ignored directory option silently targets the live data dir."
+      );
+    }
     this.dir = options.dir ?? path.join(resolveDataDir(), "observations");
     this.dbPath = path.join(this.dir, "index.db");
     ensureDir(this.dir);
@@ -63,6 +88,10 @@ export class ObservationStore {
       return;
     }
     this.db = new sqlite.DatabaseSync(this.dbPath);
+    // node:sqlite creates the file with the process umask (0644). This is the
+    // screen-OCR corpus — tighten it now rather than waiting for the next
+    // boot's hardenDataDir() pass.
+    chmodOwnerOnly(this.dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS activity (
         id INTEGER PRIMARY KEY,
@@ -217,6 +246,106 @@ export class ObservationStore {
     if (machine) { where += " AND source_machine_id = ?"; params.push(machine); }
     params.push(limit);
     return this.db.prepare(`SELECT 'activity' AS kind, app, window, at, event, source_machine_id AS sourceMachineId FROM activity WHERE ${where} ORDER BY at DESC LIMIT ?`).all(...params);
+  }
+
+  // Return text-bearing observation rows inside a time window without changing
+  // search()'s long-standing no-query behavior (recent activity only). This is
+  // intentionally bounded by both row count and per-row text size because it is
+  // used to ground miner prompts with nearby OCR, not to export whole captures.
+  //
+  // SQLite stores normalized text kinds ("frame" / "activity") in FTS5. The
+  // JSONL fallback stores the original observation shape, so normalize
+  // frame-summary -> frame and ocrText/window -> text for parity.
+  async searchTextWindow({ since, until, kinds = ["frame", "activity"], machine, limit = 25 } = {}) {
+    await this.ready;
+    const requestedKinds = Array.isArray(kinds) ? kinds : [kinds];
+    const normalizedKinds = [...new Set(requestedKinds
+      .map((kind) => kind === "frame-summary" ? "frame" : String(kind ?? ""))
+      .filter((kind) => WINDOW_TEXT_KINDS.has(kind)))];
+    if (normalizedKinds.length === 0) return [];
+
+    const parsedLimit = Number.parseInt(String(limit), 10);
+    const boundedLimit = Math.max(1, Math.min(WINDOW_SEARCH_LIMIT, Number.isFinite(parsedLimit) ? parsedLimit : 25));
+
+    if (this.fallback) {
+      let observations = [];
+      try {
+        observations = fs.readFileSync(this.fallbackPath, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map(JSON.parse);
+      } catch {
+        return [];
+      }
+      return observations
+        .filter((o) => !machine || o.sourceMachineId === machine)
+        .map((o) => {
+          const kind = o.kind === "frame-summary" ? "frame" : o.kind;
+          const at = o.at ?? o.ingestedAt ?? null;
+          const text = kind === "frame" ? o.ocrText : kind === "activity" ? o.window : null;
+          if (!normalizedKinds.includes(kind) || !at || !text) return null;
+          return capWindowText({
+            kind,
+            ref: kind === "frame" && o.frameId != null ? String(o.frameId) : null,
+            at,
+            app: o.app ?? null,
+            window: o.window ?? null,
+            text: String(text)
+          });
+        })
+        .filter(Boolean)
+        .filter((row) => !since || row.at >= since)
+        .filter((row) => !until || row.at <= until)
+        .sort((a, b) => a.at.localeCompare(b.at))
+        .slice(0, boundedLimit);
+    }
+
+    // The miner asks for frame OCR only. Route that hot path through the
+    // indexed frames.captured_at/source_machine_id columns, then join to FTS
+    // by frame uid; filtering texts.at directly would scan the UNINDEXED FTS
+    // metadata column once per representative action.
+    if (normalizedKinds.length === 1 && normalizedKinds[0] === "frame") {
+      const frameClauses = ["1=1"];
+      const frameParams = [];
+      if (since) { frameClauses.push("f.captured_at >= ?"); frameParams.push(since); }
+      if (until) { frameClauses.push("f.captured_at <= ?"); frameParams.push(until); }
+      if (machine) { frameClauses.push("f.source_machine_id = ?"); frameParams.push(machine); }
+      frameParams.push(boundedLimit);
+      return this.db.prepare(
+        `SELECT 'frame' AS kind, f.frame_uid AS ref, f.captured_at AS at,
+                f.app, f.window, t.text
+         FROM frames f
+         JOIN texts t ON t.kind = 'frame' AND t.ref = f.frame_uid
+         WHERE ${frameClauses.join(" AND ")}
+         ORDER BY f.captured_at ASC
+         LIMIT ?`
+      ).all(...frameParams).map(capWindowText);
+    }
+
+    const clauses = [`kind IN (${normalizedKinds.map(() => "?").join(", ")})`];
+    const params = [...normalizedKinds];
+    if (since) { clauses.push("at >= ?"); params.push(since); }
+    if (until) { clauses.push("at <= ?"); params.push(until); }
+    if (machine) {
+      clauses.push(`(
+        (kind = 'frame' AND ref IN (SELECT frame_uid FROM frames WHERE source_machine_id = ?))
+        OR
+        (kind = 'activity' AND ref IN (
+          SELECT CAST(id AS TEXT) FROM activity WHERE source_machine_id = ?
+          UNION
+          SELECT app || ':' || window FROM activity WHERE source_machine_id = ?
+        ))
+      )`);
+      params.push(machine, machine, machine);
+    }
+    params.push(boundedLimit);
+    return this.db.prepare(
+      `SELECT kind, ref, at, app, window, text
+       FROM texts
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY at ASC
+       LIMIT ?`
+    ).all(...params).map(capWindowText);
   }
 
   async existsRef(ref) {
