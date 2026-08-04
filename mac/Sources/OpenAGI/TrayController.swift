@@ -119,9 +119,9 @@ struct TrayMenu: View {
       // When daemon is down or degraded, the restart action moves up
       // here next to the error so it's discoverable without scrolling.
       if state.status == .down || state.status == .degraded {
-        Button(state.status == .down ? "↻ Restart daemon" : "↻ Restart daemon (recover)") {
-          DaemonController.shared.restart()
-        }
+        // force: the button promises a restart, so it has to happen even when
+        // the app adopted this daemon rather than spawning it.
+        Button(restartLabel) { DaemonController.shared.restart(force: true) }
       }
       if state.providerConfigured {
         Text("Model: \(state.providerName)").disabled(true)
@@ -145,6 +145,34 @@ struct TrayMenu: View {
     }
   }
 
+  /// Say what pressing the button will actually do, in the plain imperative the
+  /// rest of this menu uses ("Pause agent", "Show daemon log…").
+  ///
+  /// What shipped was `state.status == .down ? "↻ Restart daemon" : "↻ Restart
+  /// daemon (recover)"`, and "(recover)" was wrong twice over. It named an
+  /// implementation detail — that bouncing a daemon which still answers is how
+  /// you clear a wedged one — so the user read it as a warning. And it was on
+  /// screen nearly permanently, because the .degraded branch it lived in is
+  /// mostly not about the daemon at all: computeStatus() returns .degraded once
+  /// spend passes 70% of the daily cap (AppState.computeStatus), which for a
+  /// daily user is most of every afternoon with a completely healthy daemon.
+  /// A budget number was being rendered as a permanent "recover" button.
+  private var restartLabel: String {
+    switch state.reachability {
+    case .notRunning:
+      // Nothing holds the port. This starts a daemon; it doesn't restart one.
+      return "↻ Start daemon"
+    case .notResponding:
+      // Alive, still owns 43210, no longer answering. DaemonController.start()
+      // SIGTERMs then SIGKILLs the port holder before respawning, so "force-quit"
+      // is literally what happens — and a stopped process only dies to SIGKILL.
+      return "↻ Force-quit and restart daemon"
+    case .serving:
+      // It is answering. Restarting is ordinary maintenance, not a rescue.
+      return "↻ Restart daemon"
+    }
+  }
+
   private var statusLine: String {
     // An unconfigured agent isn't "online" in any sense the user cares
     // about — say so before anything else.
@@ -152,7 +180,10 @@ struct TrayMenu: View {
     switch state.status {
     case .healthy: return "● online"
     case .degraded: return "● needs attention"
-    case .down: return "● daemon offline"
+    // "offline" is false for a process that is running and holding the port —
+    // which is exactly the case where the user most needs the truth, because
+    // the fix is different. Only say offline when nothing is listening.
+    case .down: return state.reachability == .notResponding ? "● daemon not responding" : "● daemon offline"
     case .unknown: return "● connecting…"
     }
   }

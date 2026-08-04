@@ -19,7 +19,7 @@
 //    actually has.
 import fs from "node:fs";
 import path from "node:path";
-import { readJsonFile } from "./file-utils.js";
+import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { listAllSuggestions } from "./suggestion-feed.js";
 import { planDateKey } from "./daily-planner.js";
@@ -106,6 +106,11 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   // in one process silently reads the first one's files.
   const resolvedDataDir = dataDir ?? runtime?.dataDir ?? resolveDataDir();
   const plan = safely(degraded, "plan", () => readPlanCache(resolvedDataDir, now), null);
+  // Focus rows the user cleared TODAY. Deliberately outside safely(): a
+  // suppression that cannot be read costs the suppression, not the brief, and
+  // reporting "couldn't read today's plan" would be false — the plan itself
+  // read fine. Worst case the pinned row comes back and can be dismissed again.
+  const dismissedFocus = readFocusDismissals(resolvedDataDir, now);
 
   const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime), []);
   const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
@@ -134,7 +139,7 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   const items = [];
 
   // ── focus (pinned, never scored against anything) ──────────────────────
-  const focusItems = buildFocus(plan, tasks, slots.focus, nowMs, runtime);
+  const focusItems = buildFocus(plan, tasks, slots.focus, nowMs, runtime, dismissedFocus);
   items.push(...focusItems);
   const pinnedTaskIds = new Set(focusItems.map((f) => f.sourceTaskId).filter(Boolean));
 
@@ -225,8 +230,13 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
 
 // ─── per-kind builders ───────────────────────────────────────────────────
 
-function buildFocus(plan, tasks, max, nowMs, runtime) {
-  const focus = Array.isArray(plan?.focus) ? plan.focus.slice(0, max) : [];
+function buildFocus(plan, tasks, max, nowMs, runtime, dismissed = EMPTY_SET) {
+  // Dismissals are applied BEFORE the slice, not after. Slicing first and then
+  // dropping would spend the single focus slot on a row the user has already
+  // cleared and leave the slot empty for the rest of the day — the plan's next
+  // focus should take it. (Measured: the real install's plan carries two.)
+  const all = Array.isArray(plan?.focus) ? plan.focus : [];
+  const focus = all.filter((f) => !dismissed.has(focusKey(f?.title))).slice(0, max);
   const rows = [];
   for (const f of focus) {
     const title = String(f.title ?? "").trim();
@@ -245,10 +255,12 @@ function buildFocus(plan, tasks, max, nowMs, runtime) {
       scoreBreakdown: { pinned: true },
       dueAt: task?.dueDate ?? null,
       source: "daily-plan",
-      // Never zero actions. With a task behind it the row acts on that task;
-      // without one the only honest offer is to put it on the list, which also
-      // makes the row resolvable (by title) on the next brief.
-      actions: task ? taskActions(task, nowMs) : [addTaskAction(title)],
+      // Never zero actions. With a task behind it the row acts on that task —
+      // Done and Snooze both resolve it, so it needs nothing more.
+      //
+      // Without one, the row gets BOTH offers and neither is recommended. See
+      // unbackedFocusActions for why there is no advice-vs-work classifier.
+      actions: task ? taskActions(task, nowMs) : unbackedFocusActions(title),
       deepLink: "/?tab=today",
       sourceTaskId: task?.id ?? null
     });
@@ -281,18 +293,81 @@ function resolveFocusTask(f, title, tasks, runtime) {
   return { task: byTitle ?? null, alreadyDone: false };
 }
 
+/// What to offer on a focus row the plan could not tie to a task.
+///
+/// There are exactly two things such a row can be, and both are real:
+///
+///   • WORK the planner named that is not on the list yet — "Ship the brief".
+///     "Add to tasks" is the right offer, and it also makes the row resolvable
+///     by title on the next brief.
+///   • ADVICE about posture — "Keep the day intentionally open — no scheduled
+///     meetings, deadlines, or carried-over commitments". Measured on the real
+///     install: BOTH of 2026-08-03's focus rows are this shape, taskId null
+///     ("Set priorities for the week", "Protect open time for one meaningful
+///     work block"). Filing advice as a to-do is nonsense, and the user said so.
+///
+/// This composer deliberately does NOT try to tell them apart. Every available
+/// signal is planner prose, so any classifier here is a regex guessing at
+/// intent, and being wrong costs either a lost real task (advice-shaped work
+/// filed under "you can't add this") or the exact bug being fixed. Inventing a
+/// claim the data does not support is the one thing this file must not do.
+///
+/// So: offer both, recommend neither. `style: "primary"` is what made "Add to
+/// tasks" read as the thing to do; two secondaries say "you decide which of
+/// these this is", which is the honest state of the composer's knowledge. The
+/// user is the authority on whether "protect open time" belongs on their list.
+///
+/// The row is PINNED above everything else, so "make it go away" has to exist
+/// or it squats the top slot until tomorrow's plan overwrites it. That is the
+/// dismiss. It is never the ONLY action, so the "a focus row must never render
+/// with zero actions" rule holds.
+function unbackedFocusActions(title) {
+  return [addTaskAction(title), dismissFocusAction(title)];
+}
+
 function addTaskAction(title) {
   return {
     id: "add",
     label: "Add to tasks",
-    style: "primary",
+    style: "secondary",
     method: "POST",
     path: "/tasks",
     body: { title, bucket: "today", queue: "user", source: "daily-plan" }
   };
 }
 
-function titleKey(s) { return String(s ?? "").trim().toLowerCase(); }
+/// "Not today", not "Dismiss": the suppression lasts exactly one local day and
+/// the label has to say so. Tomorrow's plan is a NEW claim about a new day, and
+/// silencing it with yesterday's tap would be its own quiet lie.
+///
+/// The key travels in the BODY. It is the normalized focus title, whole and
+/// untruncated — never `slug()`, which caps at 40 chars and would collide two
+/// long pieces of advice into one dismissal — and it is only ever compared as a
+/// string INSIDE a per-day file whose name is derived from the clock. No
+/// filename is ever built out of planner prose, so there is no traversal sink
+/// here to guard.
+function dismissFocusAction(title) {
+  return {
+    id: "dismiss",
+    label: "Not today",
+    style: "secondary",
+    method: "POST",
+    path: FOCUS_DISMISS_PATH,
+    body: { key: focusKey(title) }
+  };
+}
+
+const FOCUS_DISMISS_PATH = "/brief/focus/dismiss";
+const EMPTY_SET = new Set();
+
+/// The identity of a focus row for suppression purposes. Title-based on
+/// purpose: an unbacked focus has no id of its own (taskId is null, which is
+/// what makes it unbacked), and the planner re-emits the same sentence across
+/// re-runs of the same day's cron. Normalized so a whitespace or case change
+/// between the cached plan and a re-plan does not resurrect a dismissed row.
+export function focusKey(title) { return titleKey(title); }
+
+function titleKey(s) { return String(s ?? "").trim().replace(/\s+/g, " ").toLowerCase(); }
 
 /// Load the task pool. Two calls rather than one unfiltered one: task-store's
 /// list() filters on an exact status and applies `limit` AFTER sorting, so a
@@ -816,6 +891,87 @@ function readPlanCache(dataDir, now) {
   // evening brief silently drop its focus row every day. See planDateKey.
   const iso = planDateKey(now);
   return readJsonFile(path.join(dataDir, "plan", `${iso}.json`), null);
+}
+
+/// Where a day's focus dismissals live: plan/dismissed/YYYY-MM-DD.json.
+///
+/// A SUBDIRECTORY of the plan cache, not a sibling of the artifacts. Nothing in
+/// the tree scans plan/*.json today, but "the plan cache dir contains plan
+/// artifacts" is a property worth keeping true — a sidecar named
+/// 2026-08-03.dismissed.json sitting next to 2026-08-03.json is one careless
+/// glob away from being read as a plan.
+///
+/// Named for the LOCAL day, the same key the artifact it suppresses rows from
+/// is named for (planDateKey). That is what makes the suppression expire on its
+/// own: tomorrow reads a different file, which does not exist, so tomorrow's
+/// plan is judged on its own terms with no cleanup job and no TTL to get wrong.
+///
+/// Returns null when the clock is not a real instant — planDateKey throws on an
+/// Invalid Date, and every caller here is on a caller-supplied clock.
+function focusDismissalPath(dataDir, now) {
+  let iso;
+  try { iso = planDateKey(now); } catch { return null; }
+  return path.join(dataDir, "plan", "dismissed", `${iso}.json`);
+}
+
+/// Today's dismissed focus keys. Total function: a missing file is the normal
+/// state (nothing dismissed yet) and a corrupt one is not worth failing a whole
+/// brief over — both yield "nothing suppressed", which errs toward SHOWING the
+/// row. That is the safe direction: a row that comes back can be dismissed
+/// again, whereas a read error that hid rows would silently shrink the brief.
+function readFocusDismissals(dataDir, now) {
+  const file = focusDismissalPath(dataDir, now);
+  return file ? new Set(readDismissedKeys(file)) : EMPTY_SET;
+}
+
+/// The keys in one day-record, or [] if it cannot be read for ANY reason.
+///
+/// Deliberately swallows rather than quarantining: readJsonFile's default would
+/// RENAME an unparseable file aside, and this one is a suppression list the
+/// user built by tapping — moving it is a bigger intervention than the problem.
+/// Left in place, the next dismissal simply overwrites it with a good record,
+/// so the file self-heals and the only cost is that already-dismissed rows come
+/// back once.
+function readDismissedKeys(file) {
+  let record = null;
+  try { record = readJsonFile(file, null, { quarantine: false }); } catch { return []; }
+  const keys = Array.isArray(record?.focus) ? record.focus : [];
+  return keys.filter((k) => typeof k === "string" && k.length > 0);
+}
+
+/// Record "not today" for one focus row. Called by POST /brief/focus/dismiss.
+///
+/// Append-only within the day and idempotent: re-dismissing an already-listed
+/// key rewrites the same list rather than duplicating it, so a double tap (or a
+/// retry after a dropped response) cannot corrupt the record.
+///
+/// The write is READ-MODIFY-WRITE on one small file rather than an append log,
+/// because the reader has to answer "is this key suppressed" on every brief and
+/// a set is the shape that question wants. writeJsonAtomic renames into place,
+/// so a crash mid-write leaves the previous day-record intact rather than a
+/// half-file that would read as "nothing dismissed".
+export function dismissFocus(runtime, { key, now = new Date(), dataDir } = {}) {
+  const focus = focusKey(key);
+  // A blank key would match no row and suppress nothing, so recording it is
+  // pure noise in a file the user cannot see. Say no instead of writing a
+  // no-op and reporting success.
+  if (!focus) return { ok: false, error: "missing key" };
+
+  const resolvedDataDir = dataDir ?? runtime?.dataDir ?? resolveDataDir();
+  const file = focusDismissalPath(resolvedDataDir, now);
+  if (!file) return { ok: false, error: "bad clock" };
+
+  const prior = readDismissedKeys(file);
+  const next = prior.includes(focus) ? prior : [...prior, focus];
+  const record = { date: path.basename(file, ".json"), focus: next, updatedAt: new Date().toISOString() };
+  try {
+    writeJsonAtomic(file, record);
+  } catch (error) {
+    // The caller reports this to the user. A dismissal that silently failed to
+    // persist is the "I hit discard and it keeps coming back" bug again.
+    return { ok: false, error: error.message };
+  }
+  return { ok: true, date: record.date, key: focus, dismissed: next };
 }
 
 /// Can the suggestion store be read at all? Distinguishes "nothing pending"

@@ -70,12 +70,20 @@ final class AppState: ObservableObject {
 
   enum HealthStatus { case unknown, healthy, degraded, down }
 
+  /// Why the daemon is unreachable. `.serving` while /health answers.
+  ///
+  /// `status == .down` is set by any failed /health fetch, so on its own it
+  /// cannot tell "the process is gone" from "the process is alive, still owns
+  /// port 43210, and stopped answering". The user hit the second case for 25
+  /// hours — daemon in process state T, socket LISTENing, /health timing out —
+  /// and the tray could only say "daemon offline", which is false for a running
+  /// process and points at the wrong fix. A wedged daemon needs its port holder
+  /// force-quit before a respawn can bind; a missing one just needs starting.
+  enum DaemonReachability { case serving, notRunning, notResponding }
+  @Published var reachability: DaemonReachability = .serving
+
   @Published var lastError: String? = nil
   @Published var consecutiveFailures: Int = 0
-  // Throttle for the auto-restart-on-3-consecutive-fails recovery path.
-  // Without this we'd respawn in a tight loop if the daemon is broken
-  // for a real reason (port conflict, missing entitlement, etc).
-  private var lastAutoRestartAt: Date = .distantPast
 
   struct Finding: Identifiable, Codable {
     var id: String { "\(severity):\(area):\(note)" }
@@ -164,8 +172,18 @@ final class AppState: ObservableObject {
     // Always probe /health on its own so we can distinguish "daemon is dead"
     // from "daemon is up but /audit is throwing".
     do {
-      let h: HealthResponse = try await get("/health")
+      // 4s, not URLSession's 60s default. A wedged-but-listening daemon still
+      // completes the TCP handshake out of the kernel's accept queue and then
+      // never answers, so the default leaves this request hanging for a full
+      // minute — during which the tray keeps showing the last good status
+      // ("● online") for a daemon serving nothing, while the 5s timer stacks a
+      // dozen more doomed requests behind it. A wedged daemon reported as
+      // healthy is the worst state this surface can be in. Under the poll
+      // interval, so a wedge shows up on the next tick; local /health answers
+      // in ~0.3s, so the headroom is ~13x.
+      let h: HealthResponse = try await get("/health", timeout: 4)
       status = computeStatus(h)
+      reachability = .serving
       providerName = h.status?.agentHost?.provider ?? "—"
       providerConfigured = h.status?.agentHost?.providerConfigured ?? false
       memoryShort = h.status?.memory?.short ?? 0
@@ -198,18 +216,35 @@ final class AppState: ObservableObject {
       status = .down
       lastError = "/health: \(error.localizedDescription)"
       consecutiveFailures += 1
+      // Alive and holding the port, or actually gone? See DaemonReachability —
+      // the tray says different things and offers different actions for each.
+      reachability = await DaemonController.shared.isPortHeld() ? .notResponding : .notRunning
       if consecutiveFailures == 3 {
         notify(title: "OpenAGI offline", body: lastError ?? "Daemon stopped responding.", path: "/")
       }
-      // Auto-recover: if /health has been failing for 3+ consecutive
-      // polls (~15s with default 5s polling), the daemon is genuinely
-      // dead. Restart it. Capped at one auto-restart per minute so we
-      // don't spin if the daemon is fundamentally broken — the user
-      // sees the offline state and can take action.
-      if consecutiveFailures == 3, Date().timeIntervalSince(lastAutoRestartAt) > 60 {
-        lastAutoRestartAt = Date()
+      // Auto-recover: once /health has failed 3+ consecutive polls (~15s at the
+      // 5s poll interval) the daemon is not coming back on its own. Restart it,
+      // at most once a minute so a fundamentally broken daemon (port conflict,
+      // missing entitlement) doesn't get respawned in a tight loop.
+      //
+      // `>=`, not `==`. consecutiveFailures only resets on a SUCCESSFUL /health,
+      // so during an outage it climbs 1,2,3,4,… monotonically and an equality
+      // test matches at most once. If that single instant fell inside the 60s
+      // throttle window, the recovery path never ran again for the rest of the
+      // outage however long it lasted — and if the one restart it did get failed
+      // to take, likewise. The cap advertised here was one per minute; what
+      // shipped was at most one per outage, sometimes zero.
+      //
+      // The throttle reads DaemonController's own stamp rather than a clock
+      // private to AppState, so a restart the USER just triggered from the tray
+      // also holds this off — otherwise the poller would kill their booting
+      // daemon 15s in, every time.
+      if consecutiveFailures >= 3,
+         Date().timeIntervalSince(DaemonController.shared.lastRestartAt) > 60 {
         NSLog("OpenAGI: daemon /health failing — auto-restarting")
-        DaemonController.shared.restart()
+        // force: 3 failed health polls is enough evidence to replace whatever
+        // holds the port, including a daemon this app only adopted.
+        DaemonController.shared.restart(force: true)
       }
       return
     }
@@ -476,7 +511,22 @@ final class AppState: ObservableObject {
     UNUserNotificationCenter.current().add(req)
   }
 
-  struct MessageReply: Decodable { let reply: String? }
+  struct MessageReply: Decodable {
+    let reply: String?
+    let session: SessionRef?
+    struct SessionRef: Decodable { let id: String? }
+  }
+
+  /// Server-side session id of the most recent successful overlay ask.
+  ///
+  /// POST /message is a normal, fully persisted turn: agent-store's
+  /// sessionKey({channel:"overlay", from:"user", agentId:"main"}) resolves to
+  /// "overlay:user:main" and both the question and the answer are written to
+  /// the file-backed session store before the reply comes back. So the popover
+  /// already HAS a real conversation — it just never told anyone which one.
+  /// The overlay's "Continue in chat" reads this to deep-link to that exact
+  /// session instead of opening an empty composer.
+  @Published var lastAskSessionId: String? = nil
 
   // Send a question to the agent from the floating widget, attaching fresh
   // focused-window context. Returns the agent's reply text.
@@ -489,9 +539,47 @@ final class AppState: ObservableObject {
     }
     let payload: [String: Any] = ["text": text, "channel": "overlay", "metadata": meta]
     let body = try JSONSerialization.data(withJSONObject: payload)
+    // Cleared up front: a failed ask must not leave the previous ask's session
+    // id behind for a "Continue in chat" that would then hand over the wrong
+    // conversation. A throw below leaves this nil, which is the honest state.
+    lastAskSessionId = nil
     let data = try await post("/message", body: body)
     let decoded = try JSONDecoder().decode(MessageReply.self, from: data)
+    if let id = decoded.session?.id, !id.isEmpty { lastAskSessionId = id }
     return decoded.reply ?? "(no reply)"
+  }
+
+  /// Open the dashboard's chat tab ON a specific server-side session.
+  ///
+  /// Deep-linking the session id (rather than replaying the question and answer
+  /// through the URL) is what makes the handoff lossless: the dashboard refetches
+  /// GET /sessions/:id, so the full history comes across, an answer of any length
+  /// survives (a URL would not hold a 6KB reply), and the screenContext attached
+  /// to the turn is still on the message for the chat tab to show.
+  ///
+  /// Without an id we do NOT pretend: the plain chat tab opens, same as before.
+  /// That path is only reachable if the daemon answered 200 without naming a
+  /// session, which today it never does.
+  func openChatSession(_ sessionId: String?) {
+    guard let id = sessionId, !id.isEmpty else {
+      openDashboard(path: "/?tab=chat")
+      return
+    }
+    openDashboard(path: "/?tab=chat&session=" + Self.queryValueEncoded(id))
+  }
+
+  /// Percent-encode a string being spliced in as a query-parameter VALUE.
+  /// `.urlQueryAllowed` (what `urlEncode` above uses) permits "&", "=", "+"
+  /// and "#" because they are legal *somewhere* in a query — but inside a
+  /// single value they mean "next parameter", "key/value split", "space"
+  /// (URLSearchParams decodes "+" as a space) and "start of fragment". A
+  /// session id is "channel:from:agentId" with a caller-supplied `from`, so
+  /// those bytes are reachable. ":" is deliberately left alone: it is legal in
+  /// a query, URLSearchParams returns it verbatim, and it keeps the link
+  /// readable as "session=overlay:user:main".
+  nonisolated static func queryValueEncoded(_ s: String) -> String {
+    let allowed = CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&=+?#;"))
+    return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
   }
 
   func togglePause() async {
@@ -599,8 +687,12 @@ final class AppState: ObservableObject {
     }
   }
 
-  private func get<T: Decodable>(_ path: String) async throws -> T {
+  /// `timeout` is opt-in: only /health passes one. The other polls are allowed
+  /// URLSession's default, because a slow /audit on a big store is still a
+  /// working daemon and capping it would turn slowness into a false error.
+  private func get<T: Decodable>(_ path: String, timeout: TimeInterval? = nil) async throws -> T {
     var req = URLRequest(url: Self.buildURL(base: baseURL, path: path))
+    if let timeout { req.timeoutInterval = timeout }
     if let token = authToken() { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
     let (data, resp) = try await URLSession.shared.data(for: req)
     try Self.ensureOK(resp, data)

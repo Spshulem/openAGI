@@ -63,6 +63,12 @@ struct OverlayView: View {
     .onChange(of: state.error) { _, _ in onContentChange() }
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
     .onChange(of: app.status) { _, _ in onContentChange() }
+    // Swaps the answer footer's button between "Continue in chat" and the
+    // shorter "Open chat". Same single row at the default text size, but that
+    // row is Button + Spacer + "Clear" inside a fixed 320pt panel, so at large
+    // accessibility text sizes the longer label is what decides whether it
+    // wraps to two lines. Height-relevant, therefore here.
+    .onChange(of: app.lastAskSessionId) { _, _ in onContentChange() }
     // Same identity-not-count reasoning as `brief.items` below: OutreachConsumer
     // .ingest can drop an acted item and add a pending one in the same batch, so
     // the count holds while the rows — and the panel's height — change. Equatable.
@@ -91,6 +97,12 @@ struct OverlayView: View {
     // mode is losing the Save button off the bottom edge, mid-edit.
     .onChange(of: briefEditor.openItemID) { _, _ in onContentChange() }
     .onChange(of: briefEditor.text) { _, _ in onContentChange() }
+    // The read-only body preview. Expanding a draft adds a 150pt scroll box, a
+    // link row, AND lifts the row title's 2-line cap — three height changes on
+    // one flag. Missing from this list it renders clipped, which is the exact
+    // bug being fixed here ("I can't even scroll on that edit view"), so it has
+    // to be watched from the moment the flag exists.
+    .onChange(of: briefEditor.expandedItemID) { _, _ in onContentChange() }
   }
 
   // Combined attention count shown on the collapsed pill badge.
@@ -156,15 +168,20 @@ struct OverlayView: View {
         Text(err).font(.caption).foregroundStyle(.red).lineLimit(4)
       } else if !state.answer.isEmpty {
         ScrollView {
-          Text(state.answer)
-            .font(.callout)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+          answerBody
         }
         .frame(maxHeight: 220)
         HStack {
-          Button("Continue in chat") { app.openDashboard(path: "/?tab=chat") }
-            .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
+          // Hands over the SESSION, not the text — see AppState.openChatSession.
+          // Without an id (daemon answered 200 but named no session) the label
+          // stops promising continuity it cannot deliver.
+          Button(app.lastAskSessionId == nil ? "Open chat" : "Continue in chat") {
+            app.openChatSession(app.lastAskSessionId)
+          }
+          .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
+          .help(app.lastAskSessionId == nil
+                ? "Open the dashboard's chat tab"
+                : "Open this conversation in the dashboard, with the question, the answer and the screen context it used")
           Spacer()
           Button(action: { state.clearAnswer() }) {
             Text("Clear").font(.caption).foregroundStyle(.secondary)
@@ -201,6 +218,55 @@ struct OverlayView: View {
     .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.1), lineWidth: 1))
     .onAppear { fieldFocused = true; Task { await brief.refresh() } }
     .onChange(of: state.expanded) { _, expanded in if expanded { fieldFocused = true } }
+  }
+
+  // The agent answers in markdown ("## Open old tasks to triage", "**19 old
+  // open/stale tasks**") and a plain Text renders that verbatim, so the popover
+  // was showing the user the syntax instead of the answer. Blocks become real
+  // layout; everything inline goes through AttributedString(markdown:).
+  private var answerBody: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      ForEach(QuickMarkdown.parse(state.answer)) { block in
+        blockView(block)
+      }
+    }
+    .textSelection(.enabled)
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  @ViewBuilder private func blockView(_ block: QuickMarkdown.Block) -> some View {
+    switch block.kind {
+    case .heading(let level):
+      Text(QuickMarkdown.inline(block.text))
+        .font(.system(size: level <= 1 ? 14 : level == 2 ? 13 : 12, weight: .semibold))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 2)
+    case .paragraph:
+      Text(QuickMarkdown.inline(block.text))
+        .font(.callout)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    case .quote:
+      Text(QuickMarkdown.inline(block.text))
+        .font(.callout).italic().foregroundStyle(.secondary)
+        .padding(.leading, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    case .bullet(let marker):
+      HStack(alignment: .firstTextBaseline, spacing: 6) {
+        Text(marker)
+          .font(.callout).foregroundStyle(.secondary)
+        Text(QuickMarkdown.inline(block.text))
+          .font(.callout)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    case .code:
+      Text(block.text)
+        .font(.system(size: 11, design: .monospaced))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.12)))
+    case .rule:
+      Divider()
+    }
   }
 
   // One proactive-outreach item: title, summary, its inline action buttons, and
@@ -248,5 +314,142 @@ struct OverlayView: View {
   // "in_progress" → "In Progress"; default capitalizes the action verb.
   private func actionLabel(_ a: String) -> String {
     a.split(separator: "_").map { $0.capitalized }.joined(separator: " ")
+  }
+}
+
+/// Just enough markdown for a 320pt popover — not a document viewer.
+///
+/// SwiftUI's `AttributedString(markdown:)` alone is not enough: it parses the
+/// whole document but SwiftUI's `Text` ignores the block-level presentation
+/// intents it produces, so "## Heading" and "- item" come out looking exactly
+/// like the raw source the user was complaining about. So block syntax is
+/// turned into layout here and only the inline span of each block is handed to
+/// the system parser, which is genuinely good at **bold**, *italic*, `code`
+/// and [links](https://example.com).
+///
+/// Consciously out of scope: nested/indented lists (flattened to one level),
+/// tables (left as literal text), images, and footnotes. If the answer needs
+/// those, "Continue in chat" is one click away and the dashboard renders full
+/// markdown.
+enum QuickMarkdown {
+  struct Block: Identifiable {
+    enum Kind {
+      case heading(Int)
+      case paragraph
+      case quote
+      case bullet(String)
+      case code
+      case rule
+    }
+    let id: Int
+    let kind: Kind
+    let text: String
+  }
+
+  static func parse(_ markdown: String) -> [Block] {
+    var blocks: [Block] = []
+    var paragraph: [String] = []
+    var code: [String] = []
+    var inCode = false
+
+    func flushParagraph() {
+      guard !paragraph.isEmpty else { return }
+      blocks.append(Block(id: blocks.count, kind: .paragraph, text: paragraph.joined(separator: " ")))
+      paragraph.removeAll()
+    }
+    func append(_ kind: Block.Kind, _ text: String) {
+      flushParagraph()
+      blocks.append(Block(id: blocks.count, kind: kind, text: text))
+    }
+
+    for raw in markdown.components(separatedBy: .newlines) {
+      let line = raw.trimmingCharacters(in: .whitespaces)
+
+      if line.hasPrefix("```") || line.hasPrefix("~~~") {
+        if inCode {
+          append(.code, code.joined(separator: "\n"))
+          code.removeAll()
+        } else {
+          flushParagraph()
+        }
+        inCode.toggle()
+        continue
+      }
+      if inCode { code.append(raw); continue }
+
+      if line.isEmpty { flushParagraph(); continue }
+
+      // A run of 3+ of -, * or _ and nothing else. Checked before the bullet
+      // rule, which would otherwise eat "---" as a bullet with empty text.
+      if line.count >= 3, line.allSatisfy({ $0 == "-" }) || line.allSatisfy({ $0 == "*" }) || line.allSatisfy({ $0 == "_" }) {
+        append(.rule, "")
+        continue
+      }
+      if let heading = headingSplit(line) {
+        append(.heading(heading.level), heading.text)
+        continue
+      }
+      if line.hasPrefix("> ") || line == ">" {
+        append(.quote, String(line.dropFirst(1)).trimmingCharacters(in: .whitespaces))
+        continue
+      }
+      if let bullet = bulletSplit(line) {
+        append(.bullet(bullet.marker), bullet.text)
+        continue
+      }
+      paragraph.append(line)
+    }
+    // An unterminated fence still has to render — truncated model output is
+    // common enough that dropping the tail would lose the answer.
+    if inCode, !code.isEmpty { append(.code, code.joined(separator: "\n")) }
+    flushParagraph()
+    return blocks
+  }
+
+  /// "### Foo" → (3, "Foo"). Requires the space, so a "#hashtag" stays text.
+  private static func headingSplit(_ line: String) -> (level: Int, text: String)? {
+    var level = 0
+    var rest = Substring(line)
+    while rest.first == "#", level < 6 {
+      level += 1
+      rest = rest.dropFirst()
+    }
+    guard level > 0, rest.first == " " else { return nil }
+    // Trailing "##" (closed ATX headings) is decoration, not content.
+    let text = rest.trimmingCharacters(in: .whitespaces)
+      .replacingOccurrences(of: "#+$", with: "", options: .regularExpression)
+      .trimmingCharacters(in: .whitespaces)
+    return (level, text)
+  }
+
+  /// "- foo" / "* foo" / "3. foo" → the marker to draw plus the item text.
+  /// Ordered items keep their own number so a numbered list stays numbered.
+  private static func bulletSplit(_ line: String) -> (marker: String, text: String)? {
+    for lead in ["- ", "* ", "+ "] where line.hasPrefix(lead) {
+      return ("•", String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces))
+    }
+    let digits = line.prefix { $0.isNumber }
+    if !digits.isEmpty, digits.count <= 3 {
+      let after = line.dropFirst(digits.count)
+      if after.hasPrefix(". ") || after.hasPrefix(") ") {
+        return (digits + ".", String(after.dropFirst(2)).trimmingCharacters(in: .whitespaces))
+      }
+    }
+    return nil
+  }
+
+  /// Inline emphasis, code spans and links for one block's text.
+  /// `.inlineOnlyPreservingWhitespace` is deliberate: block syntax has already
+  /// been consumed above, and the full parser would re-flow whitespace and
+  /// re-introduce presentation intents that `Text` cannot draw. On a parse
+  /// failure the raw string is shown — never nothing.
+  static func inline(_ s: String) -> AttributedString {
+    guard !s.isEmpty else { return AttributedString("") }
+    let options = AttributedString.MarkdownParsingOptions(
+      allowsExtendedAttributes: false,
+      interpretedSyntax: .inlineOnlyPreservingWhitespace,
+      failurePolicy: .returnPartiallyParsedIfPossible
+    )
+    return (try? AttributedString(markdown: s, options: options)) ?? AttributedString(s)
   }
 }

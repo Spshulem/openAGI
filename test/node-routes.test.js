@@ -23,7 +23,11 @@ async function bootApp(dataDir, opts = {}) {
   return { runtime, app, base };
 }
 
-test("GET /nodes on a standalone/main instance returns a self-entry and an empty roster", async () => {
+// `nodes` is the whole topology, so a main with nothing paired to it has a
+// topology of exactly one machine: itself. (It used to be [] — the roster
+// listed only *other* machines, which is why a paired node could never see
+// the main it was paired to.)
+test("GET /nodes on a standalone/main instance returns a self-entry and a roster of just itself", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-main-"));
   const { app, base } = await bootApp(dataDir);
   try {
@@ -33,7 +37,9 @@ test("GET /nodes on a standalone/main instance returns a self-entry and an empty
     assert.equal(json.self.role, "main");
     assert.ok(json.self.nodeId);
     assert.equal(json.self.pairedTo, null);
-    assert.deepEqual(json.nodes, []);
+    assert.equal(json.nodes.length, 1);
+    assert.equal(json.nodes[0].self, true);
+    assert.equal(json.nodes[0].nodeId, json.self.nodeId);
     assert.equal(json.stale, false);
   } finally { await app.close(); }
 });
@@ -49,9 +55,10 @@ test("POST /nodes/heartbeat upserts the sender, then GET /nodes includes it", as
     assert.equal(hb.status, 200);
     const res = await fetch(`${base}/nodes`);
     const json = await res.json();
-    assert.equal(json.nodes.length, 1);
-    assert.equal(json.nodes[0].name, "Mac mini");
-    assert.equal(json.nodes[0].status, "online");
+    const mini = json.nodes.find((n) => n.name === "Mac mini");
+    assert.ok(mini, "the heartbeating node joins the topology");
+    assert.equal(mini.status, "online");
+    assert.equal(mini.self, false);
   } finally { await app.close(); }
 });
 
@@ -84,7 +91,7 @@ test("POST /nodes/heartbeat rejects non-string fields instead of persisting a po
     const getRes = await fetch(`${base}/nodes`);
     assert.equal(getRes.status, 200);
     const json = await getRes.json();
-    assert.deepEqual(json.nodes, []);
+    assert.deepEqual(json.nodes.filter((n) => !n.self), [], "nothing was persisted — only this machine is listed");
   } finally { await app.close(); }
 });
 
@@ -125,8 +132,8 @@ test("GET /nodes on a paired instance proxies to its main and caches the result"
     assert.equal(json.self.role, "node");
     assert.equal(json.self.pairedTo, mainBase);
     assert.equal(json.stale, false);
-    assert.equal(json.nodes.length, 1);
-    assert.equal(json.nodes[0].name, "Mac mini");
+    assert.ok(json.nodes.some((n) => n.name === "Mac mini"));
+    assert.ok(json.nodes.some((n) => n.role === "main"), "the main it proxied is part of the topology");
 
     const cached = JSON.parse(fs.readFileSync(path.join(nodeDir, "nodes", "cache.json"), "utf8"));
     assert.ok(cached.cachedAt, "proxy result was cached to disk");
@@ -161,8 +168,7 @@ test("GET /nodes on a paired instance still returns the fresh roster even if wri
     const json = await res.json();
     assert.equal(res.status, 200, "a cache-write failure must not turn a successful fetch into an error response");
     assert.equal(json.stale, false, "the roster is fresh, not a fallback — the cache write failing doesn't make it stale");
-    assert.equal(json.nodes.length, 1);
-    assert.equal(json.nodes[0].name, "Mac mini");
+    assert.ok(json.nodes.some((n) => n.name === "Mac mini"));
   } finally {
     await nodeApp.close();
     await mainApp.close();
@@ -175,7 +181,7 @@ test("GET /nodes on a paired instance falls back to the cache, marked stale, whe
   fs.mkdirSync(path.join(nodeDir, "nodes"), { recursive: true });
   fs.writeFileSync(
     path.join(nodeDir, "nodes", "cache.json"),
-    JSON.stringify({ self: { nodeId: "x", name: "y", role: "node", version: "0.0.9", pairedTo: "http://127.0.0.1:1" }, nodes: [{ nodeId: "other", name: "Distiller", role: "main", status: "online" }], cachedAt: new Date(Date.now() - 300000).toISOString() })
+    JSON.stringify({ self: { nodeId: "other", name: "Distiller", role: "main", version: "0.0.9", pairedTo: null }, nodes: [{ nodeId: "sib", name: "Mac mini", role: "node", version: "0.0.9", lastSeenAt: new Date(Date.now() - 300000).toISOString(), status: "online" }], cachedAt: new Date(Date.now() - 300000).toISOString() })
   );
   const { app, base } = await bootApp(nodeDir);
   try {
@@ -185,6 +191,7 @@ test("GET /nodes on a paired instance falls back to the cache, marked stale, whe
     assert.equal(json.stale, true);
     assert.ok(json.cachedAt);
     assert.equal(json.nodes[0].name, "Distiller", "served from the stale cache, not empty");
+    assert.ok(json.nodes.some((n) => n.name === "Mac mini"), "cached siblings are kept too");
   } finally { await app.close(); }
 });
 
@@ -198,6 +205,11 @@ test("GET /nodes on a paired instance with no cache yet returns an empty-but-val
     assert.equal(res.status, 200);
     assert.equal(json.stale, true);
     assert.equal(json.cachedAt, null);
-    assert.deepEqual(json.nodes, []);
+    // Never reached, nothing cached — but pairing still tells us a main
+    // exists and that this machine is here, so the view is never blank.
+    assert.deepEqual(
+      json.nodes.map((n) => [n.role, n.status]),
+      [["main", "unreachable"], ["node", "online"]]
+    );
   } finally { await app.close(); }
 });

@@ -10,6 +10,14 @@ final class DaemonController {
   private var process: Process?
   private var logHandle: FileHandle?
 
+  /// When restart() last ran — manual (tray) or automatic (AppState's
+  /// /health-failure recovery). One shared clock, deliberately: the auto path
+  /// throttles off this, so a restart the user just triggered holds it off for
+  /// the same minute. With separate clocks the poller would SIGKILL the daemon
+  /// the user started ~15s into its boot, then the user would press the button
+  /// again, and the two would take turns killing each other.
+  private(set) var lastRestartAt: Date = .distantPast
+
   private var bundleResources: URL {
     Bundle.main.resourceURL ?? URL(fileURLWithPath: ".")
   }
@@ -30,7 +38,12 @@ final class DaemonController {
     dataDir.appendingPathComponent("daemon.log")
   }
 
-  func start() {
+  func start() { start(adoptExisting: true) }
+
+  /// `adoptExisting: false` is the "restart really means restart" path — see
+  /// restart(force:). It skips the adopt branch below so the stale-port cleanup
+  /// runs and we spawn a daemon we actually own a handle to.
+  private func start(adoptExisting: Bool) {
     guard process == nil else { return }
     if !FileManager.default.fileExists(atPath: nodeBinary.path) {
       NSLog("OpenAGI: missing bundled Node binary at \(nodeBinary.path)")
@@ -44,7 +57,7 @@ final class DaemonController {
     // OpenAGI, just adopt it instead of spawning a duplicate that will fail
     // with EADDRINUSE in a tight restart loop. Common when the user runs
     // `npm run serve` in a terminal alongside the .app.
-    if isExistingDaemonHealthy() {
+    if adoptExisting, isExistingDaemonHealthy() {
       NSLog("OpenAGI: existing daemon detected on 127.0.0.1:43210; adopting it")
       return
     }
@@ -57,11 +70,11 @@ final class DaemonController {
     // child that immediately dies with EADDRINUSE and gets kept alive as a
     // zombie — auto-recovery loops forever without ever actually replacing
     // the stuck daemon.
-    if let stalePid = pidListeningOnPort(43210) {
+    if let stalePid = Self.pidListeningOnPort(43210) {
       NSLog("OpenAGI: port 43210 held by unresponsive pid \(stalePid); killing it before respawn")
       kill(stalePid, SIGTERM)
       Thread.sleep(forTimeInterval: 1.0)
-      if pidListeningOnPort(43210) == stalePid {
+      if Self.pidListeningOnPort(43210) == stalePid {
         kill(stalePid, SIGKILL)
         Thread.sleep(forTimeInterval: 0.5)
       }
@@ -124,9 +137,45 @@ final class DaemonController {
     }
   }
 
-  func restart() {
+  /// Bounce the daemon.
+  ///
+  /// `force: true` means "replace whatever is on 43210", and it is what the tray
+  /// button and the health-poll recovery both want. Without it, restart is
+  /// frequently a silent no-op: start() adopts an already-healthy daemon and
+  /// returns without setting `process` (which happens on every relaunch while an
+  /// older daemon is still alive — the user's is orphaned to PPID 1 right now),
+  /// and with `process` nil, stop() short-circuits on its `guard let proc`. So
+  /// restart degraded into a no-op stop plus a start() that re-adopted the very
+  /// daemon it was asked to replace. That same nil handle is why Quit leaves the
+  /// orphan behind, which is how the state perpetuates itself.
+  ///
+  /// Opt-in rather than the default because AppDelegate restarts on
+  /// wake-from-sleep off a single 2s probe; a daemon merely slow to answer as
+  /// the machine wakes should be adopted once it responds, not killed.
+  func restart(force: Bool = false) {
+    lastRestartAt = Date()
     stop()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start(adoptExisting: !force) }
+  }
+
+  /// Is anything LISTENING on the daemon port right now?
+  ///
+  /// Paired with a failing /health this is what separates the two failures that
+  /// look identical from the outside: false means the process is gone, true
+  /// means it is alive, still owns 43210, and has stopped answering — the state
+  /// the user's daemon sat in for 25 hours (process state T, socket LISTENing).
+  /// They need different words in the tray and different actions behind it.
+  ///
+  /// Hops off the main thread because pidListeningOnPort spawns lsof and blocks
+  /// on it, and the only caller (AppState.pollOnce) is @MainActor.
+  func isPortHeld() async -> Bool {
+    await withCheckedContinuation { cont in
+      // Static, so this @Sendable closure captures nothing but a port number —
+      // DaemonController itself is not Sendable.
+      DispatchQueue.global(qos: .utility).async {
+        cont.resume(returning: Self.pidListeningOnPort(43210) != nil)
+      }
+    }
   }
 
   /// Async probe: is the daemon actually responding on /health right now?
@@ -190,7 +239,7 @@ final class DaemonController {
   /// PID of whatever process is currently LISTENING on the given TCP port,
   /// or nil if nothing is. Used to recover from a daemon that's still
   /// holding the port but no longer answering /health — see start().
-  private func pidListeningOnPort(_ port: UInt16) -> Int32? {
+  private static func pidListeningOnPort(_ port: UInt16) -> Int32? {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
     proc.arguments = ["-ti", "tcp:\(port)", "-sTCP:LISTEN"]

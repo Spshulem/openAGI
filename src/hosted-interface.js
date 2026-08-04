@@ -20,9 +20,16 @@ import {
 import { ChannelManager } from "./channels.js";
 import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
-import { NodeRegistry, readOrCreateIdentity } from "./node-registry.js";
+import {
+  NodeRegistry,
+  readOrCreateIdentity,
+  resolveBuildInfo,
+  statusFor,
+  compareVersions,
+  newestOf
+} from "./node-registry.js";
 import { readNodeConfig } from "./cli-client.js";
-import { composeBrief } from "./daily-brief.js";
+import { composeBrief, dismissFocus } from "./daily-brief.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
@@ -335,8 +342,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
 
       if (method === "GET" && pathname === "/" && extraCookies.length) {
-        // Strip ?token from URL after we set the cookie.
-        const clean = url.pathname;
+        // Strip ?token from the URL after we set the cookie — and ONLY ?token.
+        // This used to redirect to `url.pathname`, throwing the entire query
+        // away. checkAuth answers a query token with setCookie:true BEFORE it
+        // consults the cookie, and AppState.openDashboard appends "&token=" to
+        // every dashboard open, so this branch runs on every click of every
+        // deep link the Mac app has ever produced — and every one of them
+        // (?tab=, ?session=, ?suggestion=, ?pending=, ?compose=, ?date=)
+        // arrived at a bare "/" with its routing deleted. "Continue in chat"
+        // landing on an empty default chat was this, as much as the missing
+        // payload on the button.
+        const params = new URLSearchParams(url.search);
+        params.delete("token");
+        const rest = params.toString();
+        const clean = url.pathname + (rest ? "?" + rest : "");
         res.writeHead(302, { Location: clean, "Set-Cookie": extraCookies });
         return res.end();
       }
@@ -403,24 +422,141 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (body.url !== undefined && body.url !== null && typeof body.url !== "string") {
           return sendJson(res, 400, { error: "url must be a string or null" });
         }
-        if (body.version !== undefined && body.version !== null && typeof body.version !== "string") {
-          return sendJson(res, 400, { error: "version must be a string or null" });
+        for (const field of ["version", "build", "buildSource"]) {
+          if (body[field] !== undefined && body[field] !== null && typeof body[field] !== "string") {
+            return sendJson(res, 400, { error: `${field} must be a string or null` });
+          }
         }
         nodeRegistry.upsert({
           nodeId: body.nodeId, name: body.name, role: body.role,
-          url: body.url ?? null, version: body.version ?? null
+          url: body.url ?? null, version: body.version ?? null,
+          // A node reports its own build identity (git SHA or bundle build
+          // number). Without it a roster can only show package.json versions,
+          // which have drifted behind the release tags and so cannot answer
+          // "is this node up to date" — the whole point of the column.
+          build: body.build ?? null, buildSource: body.buildSource ?? null
         });
         return sendJson(res, 200, { ok: true });
       }
       if (method === "GET" && pathname === "/nodes") {
         const identity = readOrCreateIdentity(dataDir);
         const pairing = readNodeConfig(dataDir);
-        if (!pairing?.remote) {
+        const build = resolveBuildInfo({ packageVersion: PACKAGE_VERSION });
+        const now = Date.now();
+        const nowIso = new Date(now).toISOString();
+
+        // Every roster row is rebuilt from primitive facts — a name, a
+        // timestamp, a version. A `status` that arrived over the wire or came
+        // back out of nodes/cache.json is deliberately DROPPED: a liveness
+        // verdict is only true at the instant it was computed, and replaying a
+        // cached one is how a machine last seen on Jul 19 was still being
+        // reported "online" two weeks later. Callers pass status explicitly.
+        // statusBasis separates what we just measured (this machine is
+        // answering; the main accepted or refused a connection a moment ago)
+        // from what we are only recalling (a sibling's heartbeat as recorded
+        // in a cache we can no longer refresh). The UI must not present the
+        // second kind as a current fact.
+        const row = (entry, { self = false, status, statusAsOf, statusBasis = "measured" }) => ({
+          nodeId: typeof entry.nodeId === "string" ? entry.nodeId : null,
+          name: typeof entry.name === "string" && entry.name ? entry.name : null,
+          role: entry.role === "main" ? "main" : "node",
+          url: typeof entry.url === "string" ? entry.url : null,
+          version: typeof entry.version === "string" ? entry.version : null,
+          build: typeof entry.build === "string" ? entry.build : null,
+          buildSource: typeof entry.buildSource === "string" ? entry.buildSource : null,
+          lastSeenAt: typeof entry.lastSeenAt === "string" ? entry.lastSeenAt : null,
+          status,
+          statusAsOf: statusAsOf ?? null,
+          statusBasis,
+          self
+        });
+        // This machine is always part of its own topology, and it is the one
+        // row we never have to guess at: it is answering this request, and we
+        // read its build identity locally rather than from anyone's roster.
+        const selfRow = (role) => row(
+          {
+            ...identity, role, url: getPublicUrl(),
+            version: build.version, build: build.build, buildSource: build.buildSource,
+            lastSeenAt: nowIso
+          },
+          { self: true, status: "online", statusAsOf: nowIso }
+        );
+        const hostLabel = (u) => { try { return new URL(u).host; } catch { return u; } };
+        const reasonOf = (error) => String(
+          error?.name === "AbortError" || error?.name === "TimeoutError"
+            ? "no response within 5s"
+            : (error?.message || error || "unknown error")
+        ).slice(0, 200);
+
+        const respond = (rows, rest) => {
+          // Keep the first row for a given identity: mainRow and selfRow are
+          // built from what we know locally, so they win over the copies of
+          // themselves that a roster may also contain.
+          const seen = new Set();
+          const nodes = [];
+          for (const r of rows) {
+            const key = r.nodeId ?? `name:${r.name}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            nodes.push(r);
+          }
+          nodes.sort((a, b) => (
+            a.role === b.role ? (a.name ?? "").localeCompare(b.name ?? "") : (a.role === "main" ? -1 : 1)
+          ));
+          const newestVersion = newestOf(nodes.map((n) => n.version));
+          // A machine that was re-registered (identity.json regenerated after
+          // a reinstall or a moved data dir) leaves an old row behind under
+          // the same hostname. Dedupe can't merge them — the ids genuinely
+          // differ — so label it rather than showing what looks like a second
+          // machine that mysteriously went offline.
+          const selfName = nodes.find((n) => n.self)?.name ?? null;
+          for (const n of nodes) {
+            n.staleRegistration = Boolean(!n.self && n.role !== "main" && selfName && n.name === selfName);
+          }
+          for (const n of nodes) {
+            // Only claim "behind" when both versions actually parsed —
+            // compareVersions returns null rather than pretending.
+            n.behind = compareVersions(n.version, newestVersion) === -1;
+            // Surfacing the EXISTING authenticated updater (bin/openagi.js ->
+            // POST /control/update), not a new remote-execution channel: the
+            // command runs from the operator's shell with their own token.
+            //
+            // A --remote target is only ever built from an address WE hold
+            // locally (this machine, or the main in node.json). A sibling's
+            // `url` arrives in its heartbeat, so a compromised node could set
+            // it to a host it controls; printing "openagi update --remote
+            // <that host> --token <your token>" would be a ready-made way to
+            // get an operator to hand over their token. Those rows get no
+            // command, and the UI tells the user to run it on the machine.
+            if (n.self) n.updateCommand = "openagi update";
+            else if (n.role === "main" && rest.pairedTo) n.updateCommand = `openagi update --remote ${rest.pairedTo}`;
+            else n.updateCommand = null;
+          }
           return sendJson(res, 200, {
-            self: { nodeId: identity.nodeId, name: identity.name, role: "main", version: PACKAGE_VERSION, pairedTo: null },
-            nodes: nodeRegistry.list(),
-            stale: false,
-            cachedAt: null
+            self: {
+              nodeId: identity.nodeId,
+              name: identity.name,
+              role: rest.pairedTo ? "node" : "main",
+              version: build.version,
+              // package.json has drifted behind the git tags, so it is
+              // reported separately instead of masquerading as the version.
+              packageVersion: PACKAGE_VERSION,
+              build: build.build,
+              buildSource: build.buildSource,
+              pairedTo: rest.pairedTo
+            },
+            nodes,
+            newestVersion,
+            updateCommand: "openagi update",
+            ...rest
+          });
+        };
+
+        if (!pairing?.remote) {
+          const others = nodeRegistry.list({ now })
+            .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: nowIso }));
+          return respond([selfRow("main"), ...others], {
+            pairedTo: null, stale: false, cachedAt: null, unreachableReason: null
           });
         }
         try {
@@ -433,28 +569,49 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               signal: ctrl.signal
             });
           } finally { clearTimeout(timer); }
-          if (!upstream.ok) throw new Error(`upstream ${upstream.status}`);
+          if (!upstream.ok) throw new Error(`main answered ${upstream.status}`);
           const upstreamJson = await upstream.json();
-          const cached = { ...upstreamJson, cachedAt: new Date().toISOString() };
+          const cached = { ...upstreamJson, cachedAt: nowIso };
           // Best-effort only: a fresh roster we already have in hand must
           // still be returned even if persisting it to disk fails (e.g. a
           // full disk, or a stale nodes/cache.json path that isn't a
           // directory) — caching is an optimization for the next request,
           // not a precondition for answering this one.
           try { writeJsonAtomic(nodesCachePath, cached); } catch { /* best-effort */ }
-          return sendJson(res, 200, {
-            self: { nodeId: identity.nodeId, name: identity.name, role: "node", version: PACKAGE_VERSION, pairedTo: pairing.remote },
-            nodes: cached.nodes ?? [],
-            stale: false,
-            cachedAt: cached.cachedAt
+          // The main's own identity is upstream.self. Dropping it is why the
+          // roster only ever contained this machine and the user could never
+          // see the Distiller it is paired to.
+          const mainRow = row(
+            { ...(upstreamJson?.self ?? {}), role: "main", url: pairing.remote, lastSeenAt: nowIso },
+            { status: "online", statusAsOf: nowIso }
+          );
+          mainRow.name ??= hostLabel(pairing.remote);
+          const siblings = (Array.isArray(upstreamJson?.nodes) ? upstreamJson.nodes : [])
+            // Exactly one main exists and we synthesize it above from our own
+            // pairing config; nothing arriving over the wire gets to claim it.
+            .filter((e) => e && typeof e === "object" && e.role !== "main")
+            .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: nowIso }));
+          return respond([mainRow, selfRow("node"), ...siblings], {
+            pairedTo: pairing.remote, stale: false, cachedAt: nowIso, unreachableReason: null
           });
-        } catch {
+        } catch (error) {
           const cached = readJsonFile(nodesCachePath, null);
-          return sendJson(res, 200, {
-            self: { nodeId: identity.nodeId, name: identity.name, role: "node", version: PACKAGE_VERSION, pairedTo: pairing.remote },
-            nodes: cached?.nodes ?? [],
-            stale: true,
-            cachedAt: cached?.cachedAt ?? null
+          const cachedAt = typeof cached?.cachedAt === "string" ? cached.cachedAt : null;
+          // "unreachable" rather than "offline": we did not infer this from a
+          // timestamp, we just tried to open a connection and it failed. The
+          // main may be fine and the network may not be — say what we know.
+          const mainRow = row(
+            { ...(cached?.self ?? {}), role: "main", url: pairing.remote, lastSeenAt: cachedAt },
+            { status: "unreachable", statusAsOf: nowIso }
+          );
+          mainRow.name ??= hostLabel(pairing.remote);
+          const siblings = (Array.isArray(cached?.nodes) ? cached.nodes : [])
+            .filter((e) => e && typeof e === "object" && e.role !== "main")
+            // statusAsOf is the cache timestamp, not now: these rows are the
+            // last thing we were told, and the UI says so.
+            .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: cachedAt, statusBasis: "cached" }));
+          return respond([mainRow, selfRow("node"), ...siblings], {
+            pairedTo: pairing.remote, stale: true, cachedAt, unreachableReason: reasonOf(error)
           });
         }
       }
@@ -464,6 +621,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Pass the already-resolved dataDir (const at hosted-interface.js:50)
         // rather than letting the composer call the memoizing resolveDataDir().
         return sendJson(res, 200, composeBrief(runtime, { now: new Date(), limit, dataDir }));
+      }
+      // "Not today" on a daily-plan focus row that maps to no task. The whole
+      // decision — where the record lives, how it expires, what a key is — is
+      // in daily-brief.js next to the composer that has to honour it; this is
+      // only the transport. `key` is DATA (it is compared inside a per-day file
+      // named for the clock), so there is no path built from it to guard here.
+      if (method === "POST" && pathname === "/brief/focus/dismiss") {
+        const body = await readJson(req);
+        const result = dismissFocus(runtime, { key: body?.key, now: new Date(), dataDir });
+        return sendJson(res, result.ok ? 200 : 400, result);
       }
       if (method === "GET" && pathname === "/channels") {
         const status = channels?.status() ?? { enabled: false };
@@ -1762,6 +1929,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const pairing = readNodeConfig(dataDir);
           if (pairing?.remote) {
             const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30_000;
+            const heartbeatBuild = resolveBuildInfo({ packageVersion: PACKAGE_VERSION });
             let heartbeatFailStreak = 0;
             const sendHeartbeat = async () => {
               try {
@@ -1778,7 +1946,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                     body: JSON.stringify({
                       nodeId: identity.nodeId, name: identity.name, role: "node",
                       url: options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null,
-                      version: PACKAGE_VERSION
+                      // Report the resolved build identity, not just
+                      // package.json — the main's roster can only tell the
+                      // user which machines are behind if the nodes say what
+                      // they are actually running.
+                      version: heartbeatBuild.version ?? PACKAGE_VERSION,
+                      build: heartbeatBuild.build,
+                      buildSource: heartbeatBuild.buildSource
                     }),
                     signal: ctrl.signal
                   });
@@ -2969,6 +3143,58 @@ async function loadSession(id) {
   renderChat();
 }
 
+// Read the session id out of a chat deep link. The Quick Ask popover's
+// "Continue in chat" button opens /?tab=chat&session=<id>&token=... where <id>
+// is the server-side session the ask already created ("overlay:user:main"), so
+// the handoff carries the real conversation instead of replaying text: full
+// history, the screen context that was attached, and answers far longer than
+// any URL could hold. Returns null for anything that is not a usable id so the
+// caller falls through to a normal fresh chat.
+function deepLinkSessionId(search) {
+  try {
+    const raw = new URLSearchParams(search).get("session");
+    const id = (raw ?? "").trim();
+    return id === "" ? null : id;
+  } catch {
+    return null;
+  }
+}
+
+// Land the user on the conversation named by the deep link. Returns true when
+// the thread was actually loaded, false when we said so and left them on a
+// fresh chat instead.
+async function openSessionDeepLink(id) {
+  let session = null;
+  try {
+    session = await fetchJson("/sessions/" + encodeURIComponent(id));
+  } catch (err) {
+    showToast("Could not open that conversation: " + err.message, false);
+    return false;
+  }
+  const messages = Array.isArray(session && session.messages) ? session.messages : [];
+  // GET /sessions/:id answers with an empty shell for an id it has never seen
+  // (agent-store getSession returns a default rather than 404ing), so "no
+  // messages" is exactly how a purged or mistyped deep link looks. Say that,
+  // rather than rendering an empty thread that looks identical to the bug this
+  // whole deep link exists to fix.
+  if (messages.length === 0) {
+    state.sessionId = null;
+    state.messages = [];
+    showToast("That conversation is no longer available — starting a new one.", false);
+    return false;
+  }
+  state.sessionId = (session && session.id) || id;
+  state.messages = messages;
+  // Keep replying on the channel the conversation started on. An overlay ask
+  // is channel "overlay" / from "user"; sending the follow-up as local/browser
+  // would compute a different session key and fork the thread in two.
+  state.channel = (messages[0] && messages[0].channel) || "local";
+  state.from = (messages[0] && messages[0].from) || "browser";
+  await refreshSessions();
+  renderChat();
+  return true;
+}
+
 function renderChat() {
   main.innerHTML = \`
     <div id="chat-deeplink" style="margin-bottom:8px;"></div>
@@ -3226,6 +3452,27 @@ function renderFirstRunWelcome() {
   \`;
 }
 
+// A Quick Ask turn can carry the text of the window the user was looking at
+// (AppState.askOverlay attaches it as metadata.screenContext, and agent-host
+// splices it into the prompt). That is a real input to the answer, so it has to
+// be visible here — otherwise the handoff into chat silently drops the single
+// piece of context that explains why the reply says what it says. The screen
+// text itself is deliberately NOT dumped into the thread: it is whatever
+// happened to be on screen, it can be thousands of characters, and it is
+// already summarized by the answer. App + window + size is the honest receipt.
+function screenContextChip(metadata) {
+  const sc = metadata && metadata.screenContext;
+  if (!sc || typeof sc !== "object") return "";
+  const app = String(sc.app ?? "").trim();
+  const window = String(sc.window ?? "").trim();
+  const chars = typeof sc.text === "string" ? sc.text.trim().length : 0;
+  if (!app && !window && chars === 0) return "";
+  const where = [app || "active window", window].filter(Boolean).join(" — ");
+  const size = chars > 0 ? " (" + chars + " chars)" : "";
+  return '<div class="meta" title="Sent to the model with this message">📎 read from screen: ' +
+    escapeHtml(where + size) + "</div>";
+}
+
 function appendMessage(msg, autoscroll = true) {
   const thread = $("thread");
   if (!thread) return;
@@ -3234,7 +3481,8 @@ function appendMessage(msg, autoscroll = true) {
   const meta = msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
   // Assistant replies render markdown; user messages stay literal.
   const body = msg.role === "assistant" ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
-  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div><div class="body">\${body}</div>\`;
+  const context = msg.role === "user" ? screenContextChip(msg.metadata) : "";
+  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\`;
   thread.appendChild(div);
   if (autoscroll) thread.scrollTop = thread.scrollHeight;
 }
@@ -3901,40 +4149,133 @@ function timeAgo(iso) {
   return Math.floor(ms / 86400000) + "d ago";
 }
 
+// Status is a claim about right now, so every one of these is either measured
+// (this machine is answering; the main just accepted or refused a connection)
+// or derived from a timestamp we are showing next to it. "unreachable" is
+// deliberately distinct from "offline": offline is an inference from an old
+// heartbeat, unreachable is a connection we just tried and failed to make.
+const NODE_STATUS = {
+  online:      { badge: "ok",    label: "online" },
+  offline:     { badge: "warn",  label: "offline" },
+  unreachable: { badge: "err",   label: "unreachable" },
+  unknown:     { badge: "muted", label: "unknown" }
+};
+
+function nodeBuildLabel(n) {
+  if (!n.build) return "unknown";
+  const origin = { git: "commit", "app-bundle": "build", env: "build" }[n.buildSource];
+  return origin ? origin + " " + n.build : n.build;
+}
+
 async function renderNodes() {
   const data = await fetchJson("/nodes");
-  const roleLabel = data.self.role === "main" ? "Main" : "Node";
-  const pairedLine = data.self.role === "node"
-    ? \`<div class="desc">Paired to: <code>\${escapeHtml(data.self.pairedTo)}</code></div>\`
-    : \`<div class="desc">This machine is a main — other nodes heartbeat to it.</div>\`;
-  const staleBanner = data.stale
-    ? \`<div class="card" style="border-color:var(--warn,#c8963e);"><div class="name warn">Showing cached topology\${data.cachedAt ? \` as of \${escapeHtml(new Date(data.cachedAt).toLocaleTimeString())}\` : ""}</div><div class="desc">Could not reach the main just now — this is the last known roster.</div></div>\`
+  const self = data.self ?? {};
+  const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+  const isNode = self.role === "node";
+
+  // The default experience when a main is down is this banner, not the table,
+  // so it has to say three things plainly: we could not reach it, why, and
+  // how old the rows below actually are.
+  const banner = data.stale
+    ? \`<div class="card warn-banner">
+         <div class="name warn">Can't reach the main — showing what I last knew</div>
+         <div class="desc">
+           <code>\${escapeHtml(self.pairedTo ?? "")}</code> did not answer\${data.unreachableReason ? " (" + escapeHtml(data.unreachableReason) + ")" : ""}.
+           \${data.cachedAt
+             ? "Everything below except this machine is from " + escapeHtml(new Date(data.cachedAt).toLocaleString()) + " (" + escapeHtml(timeAgo(data.cachedAt)) + ") and may have changed since."
+             : "This machine has never reached that main, so all it knows is that the pairing exists."}
+         </div>
+       </div>\`
     : "";
-  const rows = data.nodes.length > 0
-    ? data.nodes.map((n) => \`
-        <tr>
-          <td>\${escapeHtml(n.name)}</td>
-          <td>\${escapeHtml(n.role)}</td>
-          <td><span class="\${n.status === "online" ? "name" : "name warn"}">\${n.status}</span></td>
-          <td>\${escapeHtml(new Date(n.lastSeenAt).toLocaleString())}</td>
-          <td>\${escapeHtml(n.version ?? "")}</td>
-        </tr>\`).join("")
-    : \`<tr><td colspan="5" class="desc">No other nodes have checked in yet.</td></tr>\`;
+
+  const rows = nodes.map((n) => {
+    const s = NODE_STATUS[n.status] ?? NODE_STATUS.unknown;
+    // Only rows we are recalling get an "as of" — a measured status (this
+    // machine, or a main we just failed to open a connection to) is true now,
+    // and dating it would imply doubt we don't have.
+    const recalled = n.statusBasis === "cached";
+    const asOf = recalled && n.statusAsOf
+      ? \`<div class="sub">as of \${escapeHtml(timeAgo(n.statusAsOf))}</div>\`
+      : "";
+    const seen = n.lastSeenAt
+      ? escapeHtml(timeAgo(n.lastSeenAt)) + \`<div class="sub">\${escapeHtml(new Date(n.lastSeenAt).toLocaleString())}</div>\`
+      : \`<span class="sub">never\${n.role === "main" ? " reached" : " heard from"}</span>\`;
+    // A version read out of a cache we can no longer refresh does not support
+    // the claim "up to date" — that machine may have been updated, or fallen
+    // further behind, in the meantime. Only this machine's own version is
+    // known to be current while the main is unreachable.
+    const versionIsCurrent = !data.stale || n.self;
+    const howToUpdate = n.updateCommand
+      ? \`<div class="sub"><code>\${escapeHtml(n.updateCommand)}</code></div>\`
+      : \`<div class="sub">run <code>openagi update</code> on that machine</div>\`;
+    let update;
+    if (n.behind) {
+      update = \`<span class="badge warn">behind\${data.newestVersion ? " " + escapeHtml(data.newestVersion) : ""}</span>\`
+        + (versionIsCurrent ? "" : \`<div class="sub">as of \${escapeHtml(timeAgo(data.cachedAt))}</div>\`)
+        + howToUpdate;
+    } else if (!n.version) {
+      update = \`<span class="sub">version unknown</span>\`;
+    } else if (versionIsCurrent) {
+      update = \`<span class="sub">up to date</span>\`;
+    } else {
+      update = \`<span class="sub">last known \${escapeHtml(n.version)}\${data.cachedAt ? " (" + escapeHtml(timeAgo(data.cachedAt)) + ")" : ""} — can't verify now</span>\`;
+    }
+    return \`
+      <tr>
+        <td>\${escapeHtml(n.name ?? "unknown")}\${n.self ? \` <span class="badge">this machine</span>\` : ""}\${n.staleRegistration ? \` <span class="badge muted" title="Same hostname as this machine but a different node id — an earlier install that never checked in again.">old registration</span>\` : ""}\${n.url ? \`<div class="sub">\${escapeHtml(n.url)}</div>\` : ""}</td>
+        <td>\${escapeHtml(n.role)}</td>
+        <td><span class="badge \${s.badge}">\${escapeHtml(s.label)}</span>\${asOf}</td>
+        <td>\${seen}</td>
+        <td>\${escapeHtml(n.version ?? "unknown")}<div class="sub">\${escapeHtml(nodeBuildLabel(n))}</div></td>
+        <td>\${update}</td>
+      </tr>\`;
+  }).join("");
+
+  // A version alone can't answer "is this up to date" — package.json has
+  // drifted behind the release tags — so the build identity is always shown
+  // next to it, and is the literal word "unknown" when it can't be determined.
+  const selfBuild = self.build
+    ? escapeHtml(nodeBuildLabel(self)) + " · " + escapeHtml(self.buildSource ?? "")
+    : "build unknown — this install can't identify which commit it is running";
+
   main.innerHTML = \`
     <div class="pane">
       <h2>Nodes</h2>
       <div class="card">
-        <div class="name">\${escapeHtml(data.self.name)} (this machine) — \${roleLabel}</div>
-        \${pairedLine}
-        <div class="desc">Version: \${escapeHtml(data.self.version ?? "unknown")}</div>
+        <div class="name">\${escapeHtml(self.name ?? "this machine")} <span class="badge">this machine</span> <span class="badge">\${isNode ? "node" : "main"}</span></div>
+        <div class="desc">\${isNode
+          ? "Paired to <code>" + escapeHtml(self.pairedTo ?? "") + "</code> — this machine heartbeats to that main."
+          : "This machine is a main — other nodes heartbeat to it."}</div>
+        <div class="desc">Version \${escapeHtml(self.version ?? "unknown")} · \${selfBuild}</div>
+        \${self.packageVersion && self.packageVersion !== self.version
+          ? \`<div class="sub">package.json says \${escapeHtml(self.packageVersion)}; the running build reports \${escapeHtml(self.version)}.</div>\`
+          : ""}
+        <div class="row" style="margin-top:8px;"><button id="nodesRefresh">Re-check now</button></div>
       </div>
-      \${staleBanner}
-      <table class="grid" style="margin-top:12px; width:100%;">
-        <thead><tr><th>Name</th><th>Role</th><th>Status</th><th>Last seen</th><th>Version</th></tr></thead>
-        <tbody>\${rows}</tbody>
-      </table>
+      \${banner}
+      <div style="overflow-x:auto; margin-top:12px;">
+        <table style="width:100%; border-collapse:collapse; text-align:left;">
+          <thead><tr>
+            <th>Machine</th><th>Role</th><th>Status</th><th>Last seen</th><th>Version</th><th>Update</th>
+          </tr></thead>
+          <tbody>\${rows}</tbody>
+        </table>
+      </div>
+      <div class="desc" style="margin-top:12px;">
+        OpenAGI does not push code to your machines. To update one, run
+        <code>\${escapeHtml(data.updateCommand ?? "openagi update")}</code> on that machine
+        (or <code>scripts/update.sh</code>); on macOS the app updates itself via Sparkle.
+        Addresses reported by other nodes are shown for identification only — this page
+        will not build a command that sends your token to one.
+      </div>
     </div>
   \`;
+  main.querySelectorAll("table th, table td").forEach((c) => {
+    c.style.padding = "6px 10px";
+    c.style.borderBottom = "1px solid var(--line)";
+    c.style.verticalAlign = "top";
+  });
+  document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes());
 }
 
 async function renderChannels() {
@@ -5535,7 +5876,17 @@ const initialTab = (() => {
     return t && VALID_TABS.has(t) ? t : "chat";
   } catch { return "chat"; }
 })();
-switchTab(initialTab);
+// ?session=<id> rides along with ?tab=chat when the Quick Ask popover hands a
+// conversation over. Resolved AFTER switchTab so the chat tab, its sidebar and
+// its composer already exist; landing on a different tab ignores it entirely.
+// This runs off the URL rather than any in-page state, so it works the same
+// whether the dashboard was closed, already open on Tasks, or already open on
+// a different chat session — every click is a fresh navigation.
+const initialSession = deepLinkSessionId(window.location.search);
+(async () => {
+  await switchTab(initialTab);
+  if (initialTab === "chat" && initialSession) await openSessionDeepLink(initialSession);
+})();
 </script>
 </body>
 </html>`;

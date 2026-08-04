@@ -14,6 +14,20 @@ final class BriefEditorState: ObservableObject {
 
   /// item.id whose editor is open, or nil when none is.
   @Published private(set) var openItemID: String? = nil
+  /// item.id whose body is expanded READ-ONLY, or nil when none is.
+  ///
+  /// Separate from `openItemID` because reading and rewriting are different
+  /// jobs and the common one is reading. The user's words: "I wish I could just
+  /// hit View or click on it and be able to see it instead of just approve and
+  /// discard." Approving something you cannot read is the actual defect; the
+  /// editor was the only way to see a body, it did not scroll, and draft bodies
+  /// on the real install run to 14,279 characters.
+  ///
+  /// @Published for the same reason as `openItemID`: the panel is sized from an
+  /// .onChange allowlist in OverlayView, and expanding a body changes the
+  /// rendered height. Private @State here would be invisible to that list and
+  /// the body would render clipped.
+  @Published private(set) var expandedItemID: String? = nil
   /// The text being edited. Seeded ONLY from the item's full `editValue`.
   @Published var text: String = ""
   /// The seed `text` was opened with, so "the user has typed" can be told from
@@ -34,6 +48,10 @@ final class BriefEditorState: ObservableObject {
     text = seed
     openSeed = seed
     openItemID = item.id
+    // The editor shows the same text the read-only view does, scrollably. Two
+    // copies of one body stacked in a 320pt popover is noise, so opening the
+    // editor takes over from the preview.
+    expandedItemID = nil
     return true
   }
 
@@ -44,6 +62,23 @@ final class BriefEditorState: ObservableObject {
   }
 
   func isOpen(_ item: BriefItem) -> Bool { openItemID == item.id }
+
+  /// Show/hide `item`'s body read-only. Never touches the editor's `text`: an
+  /// expansion carries no user input, so toggling it can't lose anything —
+  /// which is exactly why it, and not the editor, is what a tap on the title
+  /// opens.
+  func toggleExpanded(_ item: BriefItem) {
+    guard item.editValue != nil else { return }  // nothing to reveal
+    expandedItemID = (expandedItemID == item.id) ? nil : item.id
+  }
+
+  /// Unconditional close, for the paths that mean "put this away" rather than
+  /// "flip it" — Escape, most of all. A toggle bound to Escape would OPEN the
+  /// preview if it ever fired while closed, which is the opposite of what the
+  /// key means.
+  func collapse() { expandedItemID = nil }
+
+  func isExpanded(_ item: BriefItem) -> Bool { expandedItemID == item.id }
 
   /// Keep the editor anchored to a row that still exists.
   ///
@@ -64,6 +99,15 @@ final class BriefEditorState: ObservableObject {
   /// Called from BriefConsumer whenever `items` or `inFlight` moves, so this
   /// holds even while the panel is collapsed and no brief view is mounted.
   func reconcile(items: [BriefItem], inFlight: Set<String>) {
+    // The read-only preview needs the same anchoring, for the milder version of
+    // the same reason: a body left expanded under a row that has been approved
+    // or discarded is a panel-sized block of text describing something that no
+    // longer exists. No typed input is at stake here, so the rule is simply
+    // "gone and not in flight -> collapse".
+    if let shown = expandedItemID, !inFlight.contains(shown),
+       !items.contains(where: { $0.id == shown && $0.editValue != nil }) {
+      expandedItemID = nil
+    }
     guard let open = openItemID else { return }
     // A row with an action in flight is NOT gone — act() removes it
     // optimistically and puts it back if the request throws. Deciding here
@@ -92,6 +136,10 @@ final class BriefEditorState: ObservableObject {
 struct BriefSection: View {
   @ObservedObject var brief = BriefConsumer.shared
   @ObservedObject var editor = BriefEditorState.shared
+  /// Only for `openDashboard` — the escape hatch out of the popover to the full
+  /// artifact. Observed rather than reached for statically so this view follows
+  /// the same convention as OverlayView.
+  @ObservedObject var app = AppState.shared
   @FocusState private var editorFocused: Bool
 
   var body: some View {
@@ -169,16 +217,20 @@ struct BriefSection: View {
   private func row(_ item: BriefItem) -> some View {
     let inline = item.actions.filter { !isDeliberate($0) }
     let deliberate = item.actions.filter { isDeliberate($0) }
+    let readable = item.editValue != nil && !editor.isOpen(item)
     return VStack(alignment: .leading, spacing: 3) {
-      HStack(alignment: .top, spacing: 5) {
-        Text(icon(item.kind)).font(.system(size: 11))
-        Text(item.title).font(.system(size: 12, weight: .semibold)).lineLimit(2)
-      }
+      titleLine(item, readable: readable)
       if !item.why.isEmpty {
         Text(item.why).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
       }
-      if !inline.isEmpty {
+      if !inline.isEmpty || readable {
         HStack(spacing: 6) {
+          // "View" leads. It is the question the user actually has in front of
+          // a draft — "what IS this?" — and it was the one thing the row could
+          // not answer. Client-side and keyed off `editValue`, not `kind`: the
+          // body is already on the wire, so this needs no new server action, no
+          // new route, and cannot disagree with a daemon of another version.
+          if readable { viewButton(item) }
           ForEach(inline) { action in
             actionButton(item, action)
           }
@@ -191,10 +243,110 @@ struct BriefSection: View {
           }
         }
       }
+      if editor.isExpanded(item), let body = item.editValue {
+        bodyPreview(item, body)
+      }
       if editor.isOpen(item) {
         editorField(item)
       }
     }
+  }
+
+  /// The row's headline. Tapping it expands the body when there is one —
+  /// the gesture the user reached for ("click on it and be able to see it").
+  ///
+  /// A tap target with no visual affordance is a secret, so a chevron marks the
+  /// rows that have one and the plain rows keep the plain title they had.
+  /// TRUNCATION: `lineLimit(2)` is right for a list and wrong for reading — the
+  /// longest pending draft title on the real install is 86 characters, which
+  /// does not fit two lines of 12pt in a 320pt panel. Expanding lifts the cap,
+  /// so the full title and the full body arrive by the same tap.
+  @ViewBuilder private func titleLine(_ item: BriefItem, readable: Bool) -> some View {
+    let expanded = editor.isExpanded(item)
+    HStack(alignment: .top, spacing: 5) {
+      Text(icon(item.kind)).font(.system(size: 11))
+      if readable || expanded {
+        Button {
+          editor.toggleExpanded(item)
+        } label: {
+          HStack(alignment: .top, spacing: 4) {
+            Text(item.title)
+              .font(.system(size: 12, weight: .semibold))
+              .lineLimit(expanded ? nil : 2)
+              .multilineTextAlignment(.leading)
+              .fixedSize(horizontal: false, vertical: true)
+            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+              .font(.system(size: 8, weight: .semibold))
+              .foregroundStyle(.tertiary)
+              .padding(.top, 3)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(expanded ? "Hide the full text" : "Show the full text")
+      } else {
+        Text(item.title).font(.system(size: 12, weight: .semibold)).lineLimit(2)
+      }
+    }
+  }
+
+  /// The explicit twin of the tappable title. Both are here on purpose: the
+  /// title is the gesture people try first, and a labelled button is the one
+  /// they can find. It sits in the action row so "what is this?" is offered
+  /// beside "approve it", which is the pairing that was missing.
+  @ViewBuilder private func viewButton(_ item: BriefItem) -> some View {
+    Button(editor.isExpanded(item) ? "Hide" : "View") {
+      editor.toggleExpanded(item)
+    }
+    .buttonStyle(.borderless)
+    .font(.system(size: 11))
+    .foregroundStyle(.secondary)
+    .help("Read the full text before deciding on it")
+  }
+
+  /// The draft's real body, read-only and SCROLLABLE.
+  ///
+  /// Scrolling is the entire point. Bodies here reach 14,279 characters, so
+  /// "just render it all" is not an option and truncating would answer "what IS
+  /// this?" with a fragment. `maxHeight` bounds the box and the ScrollView keeps
+  /// every character inside it reachable.
+  ///
+  /// It renders BELOW the action row, and that ordering is load-bearing: the
+  /// buttons the user came to press stay pinned above a block of text that can
+  /// be a hundred lines long, so reading can never push Approve/Discard off the
+  /// bottom of a manually-sized panel.
+  ///
+  /// Read-only, and `textSelection(.enabled)` rather than editable: this view
+  /// exists so a decision can be made from the whole text, and it must not be
+  /// possible to nudge a character into a draft while reading it.
+  @ViewBuilder private func bodyPreview(_ item: BriefItem, _ body: String) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      ScrollView {
+        Text(body)
+          .font(.system(size: 11))
+          .textSelection(.enabled)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(6)
+      }
+      .frame(maxHeight: 150)
+      .background(RoundedRectangle(cornerRadius: 5).fill(Color.primary.opacity(0.05)))
+      .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
+      HStack(spacing: 8) {
+        // The escape hatch out of a 320pt popover. `deepLink` has been on the
+        // wire since the first version of this section and nothing in the app
+        // had ever used it, so until now there was NO route from a brief row to
+        // the full artifact — the dashboard's Today tab renders every pending
+        // draft in a resizable textarea. It does now.
+        Button("Open in dashboard") { app.openDashboard(path: item.deepLink) }
+          .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.blue)
+        Spacer()
+        Text("scroll to read · select to copy").font(.system(size: 9)).foregroundStyle(.tertiary)
+      }
+    }
+    // Escape closes the preview rather than collapsing the whole overlay, the
+    // same bargain the editor strikes with KeyableOverlayPanel's cancelOperation.
+    .onExitCommand { editor.collapse() }
   }
 
   /// A "retire"-styled action: consequential, rare, and never adjacent to the
@@ -253,21 +405,36 @@ struct BriefSection: View {
   }
 
   /// The inline editor: the draft's real body, editable in place.
+  ///
+  /// TextEditor, not TextField(axis: .vertical). The vertical TextField GREW to
+  /// its `lineLimit` ceiling and then simply stopped: past eight lines the rest
+  /// of the body was neither visible nor reachable, which is the user's report
+  /// — "I can't even scroll on that edit view so I don't even know what it is."
+  /// Draft bodies here run to 14,279 characters, i.e. hundreds of lines. A
+  /// TextEditor in a fixed frame scrolls, so every line is reachable.
+  ///
+  /// The fixed height is also what keeps the panel honest: the field no longer
+  /// changes size as the body grows, so a long draft cannot push Save off the
+  /// bottom of a manually-sized 320pt popover.
   @ViewBuilder private func editorField(_ item: BriefItem) -> some View {
     VStack(alignment: .leading, spacing: 4) {
-      // axis: .vertical is load-bearing, not cosmetic. A draft body is
-      // multi-line; a single-line TextField would flatten the newlines it was
-      // seeded with, and submitting that would silently reformat the user's
-      // draft into one paragraph.
-      TextField("Draft body", text: $editor.text, axis: .vertical)
-        .textFieldStyle(.roundedBorder)
+      TextEditor(text: $editor.text)
         .font(.system(size: 11))
-        .lineLimit(3...8)
+        .scrollContentBackground(.hidden)
+        .padding(4)
+        .frame(height: 120)
+        .background(RoundedRectangle(cornerRadius: 5).fill(Color.primary.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
         .focused($editorFocused)
-        .onSubmit { submitEdit(item) }
       HStack(spacing: 6) {
         Button("Save") { submitEdit(item) }
           .buttonStyle(.borderless).font(.system(size: 11)).foregroundStyle(.blue)
+          // ⌘↩ saves. TextEditor has no .onSubmit — Return types a newline, as
+          // it must in a multi-line body — so the shortcut moved to the modifier
+          // that means "commit this" everywhere else on the platform. This
+          // replaces the old ↩-saves/⌥↩-newline pairing, which taxed the common
+          // keystroke in a multi-line field to serve the rare one.
+          .keyboardShortcut(.return, modifiers: .command)
           // An all-whitespace body is a deletion wearing an edit's clothes:
           // draft-store.edit() writes whatever it is given, so refuse it here.
           .disabled(brief.inFlight.contains(item.id) || isBlank(editor.text))
@@ -275,9 +442,7 @@ struct BriefSection: View {
           .buttonStyle(.borderless).font(.system(size: 11)).foregroundStyle(.secondary)
           .disabled(brief.inFlight.contains(item.id))
         Spacer()
-        // ⌥↩ is spelled out because Return is bound to save here: a draft body
-        // is multi-line and the user needs to know how to add a line to it.
-        Text("↩ save · ⌥↩ newline · esc cancel").font(.system(size: 9)).foregroundStyle(.tertiary)
+        Text("⌘↩ save · esc cancel").font(.system(size: 9)).foregroundStyle(.tertiary)
       }
     }
     // Escape while the field has focus closes the EDITOR. Without this the

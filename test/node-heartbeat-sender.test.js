@@ -28,11 +28,20 @@ test("a paired instance sends a heartbeat shortly after boot, and the main's reg
   await nodeApp.listen();
 
   try {
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    const res = await fetch(`${mainBase}/nodes`);
-    const json = await res.json();
-    assert.equal(json.nodes.length, 1, "the node's heartbeat reached the main");
-    assert.equal(json.nodes[0].status, "online");
+    // The main's roster now includes the main itself, so a bare count can't
+    // tell "the node checked in" apart from "only the main is listed" — poll
+    // for the row that is not this main, and identify it by nodeId.
+    let arrival = null;
+    for (let attempt = 0; attempt < 40 && !arrival; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const json = await (await fetch(`${mainBase}/nodes`)).json();
+      arrival = json.nodes.find((n) => !n.self) ?? null;
+    }
+    assert.ok(arrival, "the node's heartbeat reached the main");
+    assert.equal(arrival.role, "node");
+    assert.equal(arrival.status, "online");
+    // The heartbeat carries the sender's build identity, not just a version.
+    assert.equal(typeof arrival.buildSource, "string");
   } finally {
     await nodeApp.close();
     await mainApp.close();
