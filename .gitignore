@@ -31,3 +31,6 @@ build/
 # Temporary files
 *.tmp
 *.swp
+
+# Local tooling install metadata (install id + repo fingerprint, per-machine)
+.buildbetter/
