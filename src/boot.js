@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createDurableRuntime, createHostedInterface } from "./index.js";
 import { checkBindSafety } from "./auth.js";
-import { loadEnvFile } from "./file-utils.js";
+import { hardenDataDir, loadEnvFile } from "./file-utils.js";
 import { resolveDataDir, _resetDataDirCache } from "./data-dir.js";
 
 // Read a single var from an env file WITHOUT importing the rest of its keys.
@@ -118,6 +118,11 @@ export async function startServer({ host, port } = {}) {
   installCrashGuards();
   armStartupExitGuard();
   const dataDir = loadBootEnv();
+  // Screen OCR, message-derived content, transcripts, memory and scheduled
+  // prompts all live here, and every install created before this shipped has
+  // 0755 directories and 0644 SQLite databases on disk. Tighten in place on
+  // each boot — best-effort, mode bits only, idempotent. See hardenDataDir().
+  hardenDataDir(dataDir);
   const resolvedHost = host ?? process.env.HOST ?? "127.0.0.1";
   const resolvedPort = Number.parseInt(String(port ?? process.env.PORT ?? "43210"), 10);
 

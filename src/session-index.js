@@ -14,7 +14,7 @@
 
 import path from "node:path";
 import fs from "node:fs";
-import { ensureDir } from "./file-utils.js";
+import { chmodOwnerOnly, ensureDir } from "./file-utils.js";
 import { nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 
@@ -67,6 +67,10 @@ export class SessionIndex {
     }
     try {
       this.db = new sqlite.DatabaseSync(this.dbPath);
+      // node:sqlite creates the file with the process umask (0644), and this
+      // index holds every message of every session. Tighten it now rather than
+      // waiting for the next boot's hardenDataDir() pass.
+      chmodOwnerOnly(this.dbPath);
       // Transient lock contention (another process/test holding the same
       // file) must retry internally instead of throwing immediately.
       this.db.exec("PRAGMA busy_timeout = 5000;");
