@@ -131,6 +131,18 @@ function composeRationale(raw) {
     const hourPart = raw.sequence.startHour != null ? ` around ${pad(raw.sequence.startHour)}:00` : "";
     parts.push(`Observed ${raw.sequence.count}× ${hourPart}`.trim());
   }
+  if (raw.sequence?.distinctDays > 1 || raw.sequence?.distinctWeeks > 1) {
+    const spans = [];
+    if (raw.sequence.distinctDays > 1) spans.push(`${raw.sequence.distinctDays} days`);
+    if (raw.sequence.distinctWeeks > 1) spans.push(`${raw.sequence.distinctWeeks} weeks`);
+    parts.push(`across ${spans.join(" / ")}`);
+  }
+  if (raw.sequence?.cadence?.type && raw.sequence.cadence.type !== "irregular") {
+    parts.push(`${raw.sequence.cadence.type} cadence`);
+  }
+  if (Array.isArray(raw.sequence?.horizons) && raw.sequence.horizons.length > 0) {
+    parts.push(`views: ${raw.sequence.horizons.join(" / ")}`);
+  }
   if (typeof raw.sequence?.confidence === "number") {
     parts.push(`confidence ${raw.sequence.confidence.toFixed(2)}`);
   }

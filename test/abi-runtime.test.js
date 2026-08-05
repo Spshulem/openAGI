@@ -1167,7 +1167,8 @@ test("pattern miner detects repeating sequences and writes a candidate", async (
   assert.ok(result.candidates >= 1, `expected at least one candidate, got ${result.candidates ?? 0} (mined: ${result.mined})`);
   const list = miner.list();
   assert.ok(list.length >= 1);
-  assert.ok(list[0].sequence.apps.length >= 3);
+  assert.ok(list.some((candidate) => candidate.sequence.actionKeys.length >= 2));
+  assert.ok(list.some((candidate) => candidate.sequence.horizons.includes("day")));
 });
 
 test("skill replay parses frontmatter steps and validates the action vocabulary", async () => {

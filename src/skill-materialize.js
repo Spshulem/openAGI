@@ -48,10 +48,17 @@ export function createSkillFromCandidate({ runtime, candidate }) {
       createdBy: candidate.source === "session-miner" ? "session-miner" : "pattern-miner",
       observedCount: seq.count ?? null,
       observedConfidence: typeof seq.confidence === "number" ? seq.confidence : null,
+      observedHorizons: Array.isArray(seq.horizons) ? seq.horizons : null,
+      observedCadence: seq.cadence ?? null,
+      observedTrigger: proposal?.triggerHint ?? seq.trigger ?? null,
       sequenceFingerprint: candidate.fingerprint ?? null
     }
   });
-  return { ...result, scheduleHint: proposal?.scheduleHint ?? null };
+  return {
+    ...result,
+    scheduleHint: proposal?.scheduleHint ?? null,
+    triggerHint: proposal?.triggerHint ?? seq.trigger ?? null
+  };
 }
 
 // Compose a description string that includes the observed stats so the
@@ -66,6 +73,15 @@ function composeMinedDescription(candidate) {
     const hour = typeof seq.startHour === "number" ? ` around ${String(seq.startHour).padStart(2, "0")}:00` : "";
     parts.push(`Detected from ${seq.count} occurrences${hour}.`);
   }
+  if (seq.distinctDays > 1 || seq.distinctWeeks > 1) {
+    const spans = [];
+    if (seq.distinctDays > 1) spans.push(`${seq.distinctDays} days`);
+    if (seq.distinctWeeks > 1) spans.push(`${seq.distinctWeeks} weeks`);
+    parts.push(`Repeated across ${spans.join(" and ")}.`);
+  }
+  if (seq.cadence?.type && seq.cadence.type !== "irregular") {
+    parts.push(`Typical cadence: ${seq.cadence.type}.`);
+  }
   return parts.join(" ").trim().slice(0, 1024);
 }
 
@@ -74,6 +90,21 @@ function composeMinedDescription(candidate) {
 // concrete steps to follow if the prose is vague.
 function buildMinedBody(proposal, seq) {
   const body = String(proposal?.body ?? "").trim();
+  const actions = Array.isArray(seq?.actions) ? seq.actions : [];
+  if (actions.length > 0) {
+    const actionLines = actions.map((action, i) => {
+      const label = typeof action === "string"
+        ? action
+        : (action?.label ?? action?.action ?? action?.key ?? `Step ${i + 1}`);
+      const apps = Array.isArray(action?.apps) && action.apps.length > 0
+        ? ` (${action.apps.join(" / ")})`
+        : "";
+      return `${i + 1}. ${label}${apps}`;
+    }).join("\n");
+    // Avoid duplicating if the model already wrote a numbered workflow.
+    if (/^\d+\.\s/m.test(body)) return body;
+    return body + "\n\n**Observed action workflow:**\n" + actionLines + "\n";
+  }
   const apps = Array.isArray(seq?.apps) ? seq.apps : [];
   if (apps.length === 0) return body;
   const appLines = apps.map((a, i) => `${i + 1}. ${a}`).join("\n");

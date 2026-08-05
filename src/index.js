@@ -30,6 +30,7 @@ export { OutcomeStore, scoreFromToolCalls } from "./outcome-store.js";
 export { ObservationStore } from "./observation-store.js";
 export { SessionIndex } from "./session-index.js";
 export { buildAmbientDigest } from "./ambient-digest.js";
+export { analyzeActivityPatterns, classifyActivityAction } from "./activity-patterns.js";
 export { PatternMiner } from "./pattern-miner.js";
 export { SkillReplay, parseReplayBlock } from "./skill-replay.js";
 export { TunnelWatcher } from "./tunnel-watcher.js";

@@ -143,6 +143,13 @@ function parseSkill(filePath, dir) {
     sourceSuggestionId: meta.sourceSuggestionId ?? null,
     createdBy: meta.createdBy ?? null,
     createdAt: meta.createdAt ?? null,
+    // Learned workflow metadata remains available after acceptance. Runtime
+    // execution is still user-invoked/approval-gated; these fields describe
+    // the observed interaction and let UI/future trigger adapters use it
+    // without reparsing the source candidate.
+    observedTrigger: meta.observedTrigger ?? null,
+    observedCadence: meta.observedCadence ?? null,
+    observedHorizons: meta.observedHorizons ?? [],
     body,
     dir,
     path: filePath
