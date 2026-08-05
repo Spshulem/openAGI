@@ -12,6 +12,12 @@ export class FileBackedCronScheduler extends CronScheduler {
     // { runningJobId, startedAt } while a job handler is executing; persisted
     // into the store so a mid-run daemon death leaves a visible marker.
     this.running = null;
+    // jobId -> marker. A manual "Run now" can overlap a tick job (different
+    // jobs are allowed to run concurrently), so the marker cannot be a single
+    // slot that whichever job finishes first clears. The persisted `running`
+    // field keeps its original single-object shape — the OLDEST live job — so
+    // consumeInterruption() and the on-disk format are unchanged.
+    this._runningById = new Map();
     // Marker found on disk at load time (previous process died mid-job).
     // Consumed once at boot via consumeInterruption().
     this._interrupted = null;
@@ -66,16 +72,27 @@ export class FileBackedCronScheduler extends CronScheduler {
   // runDue() hooks (see CronScheduler.runDue): persist the mid-run marker
   // while a handler executes so a daemon death mid-job is visible next boot.
   noteJobStart(job) {
-    this.running = { runningJobId: job.id, startedAt: nowIso() };
+    this._runningById.set(job.id, { runningJobId: job.id, startedAt: nowIso() });
+    this.running = this._oldestRunning();
     this.save();
   }
 
   // No disk write here (was a full-file rewrite on every job, tripling I/O
   // per tick): the in-memory clear is always flushed by whichever comes
-  // next — the following job's noteJobStart(), or runDue's own tick-closing
-  // save() if this was the last job — before a crash could observe the gap.
-  noteJobEnd() {
-    this.running = null;
+  // next — the following job's noteJobStart(), runDue's own tick-closing
+  // save(), or runJobNow's save() — before a crash could observe the gap.
+  noteJobEnd(job) {
+    if (job?.id) this._runningById.delete(job.id);
+    else this._runningById.clear();
+    this.running = this._oldestRunning();
+  }
+
+  _oldestRunning() {
+    let oldest = null;
+    for (const marker of this._runningById.values()) {
+      if (!oldest || marker.startedAt < oldest.startedAt) oldest = marker;
+    }
+    return oldest;
   }
 
   // Boot note: return the marker left by a process that died mid-job (or

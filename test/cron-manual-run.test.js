@@ -154,22 +154,51 @@ test("a manual run of a non-prompt task runs THAT task, not an agent chat turn",
 // a slow tick cannot starve the schedule forever
 // ---------------------------------------------------------------------------
 
-test("runDue stops starting new jobs past the tick budget and leaves the rest due", { timeout: 10_000 }, async () => {
-  const cron = schedulerWith([
-    { id: "a", name: "A", task: "t", nextRunAt: "2026-01-01T00:00:00.000Z" },
-    { id: "b", name: "B", task: "t", nextRunAt: "2026-01-01T00:00:00.100Z" },
-    { id: "c", name: "C", task: "t", nextRunAt: "2026-01-01T00:00:00.200Z" }
-  ]);
+// These two pin the budget from both sides. They deliberately avoid asking
+// "how many jobs fit inside 100ms of wall clock" — that phrasing made the
+// assertion a stopwatch race against the machine, and it failed intermittently
+// under full-suite load (three 60ms handlers against a 100ms budget: if the
+// first handler's timer is late, the tick stops at one job instead of two and
+// the test fails even though the production behaviour is exactly right). Each
+// scenario below is separated from its threshold by orders of magnitude, so
+// scheduling jitter cannot flip the outcome.
+const budgetJobs = () => schedulerWith([
+  { id: "a", name: "A", task: "t", nextRunAt: "2026-01-01T00:00:00.000Z" },
+  { id: "b", name: "B", task: "t", nextRunAt: "2026-01-01T00:00:00.100Z" },
+  { id: "c", name: "C", task: "t", nextRunAt: "2026-01-01T00:00:00.200Z" }
+]);
+const TICK_NOW = new Date("2026-01-01T00:00:01.000Z");
+
+test("a generous tick budget does not truncate the fire — every due job runs", { timeout: 10_000 }, async () => {
+  const cron = budgetJobs();
   const ran = [];
   const results = await cron.runDue(
-    async (job) => { ran.push(job.id); await new Promise((r) => setTimeout(r, 60)); return { ok: true }; },
-    new Date("2026-01-01T00:00:01.000Z"),
-    { tickBudgetMs: 100 }
+    async (job) => { ran.push(job.id); return { ok: true }; },
+    TICK_NOW,
+    { tickBudgetMs: 60_000 }
   );
-  assert.deepEqual(ran, ["a", "b"], "the in-flight job finishes; the tick then stops starting new ones");
-  assert.equal(results.length, 2);
-  const c = cron.listJobs().find((j) => j.id === "c");
-  assert.equal(c.nextRunAt, "2026-01-01T00:00:00.200Z", "the deferred job stays due for the next tick");
+  assert.deepEqual(ran, ["a", "b", "c"], "the budget must not cut a fire short when there is time left");
+  assert.equal(results.length, 3);
+});
+
+test("an exhausted tick budget stops starting new jobs and leaves the rest due", { timeout: 10_000 }, async () => {
+  const cron = budgetJobs();
+  const ran = [];
+  // Budget 1ms, handler 50ms: after the first job the budget is spent by a
+  // factor of ~50, whatever the machine is doing.
+  const results = await cron.runDue(
+    async (job) => { ran.push(job.id); await new Promise((r) => setTimeout(r, 50)); return { ok: true }; },
+    TICK_NOW,
+    { tickBudgetMs: 1 }
+  );
+  assert.deepEqual(ran, ["a"], "the FIRST job always runs — a lone slow job must still get its turn");
+  assert.equal(results.length, 1);
+  // Nothing is dropped: the unstarted jobs keep their nextRunAt and are still
+  // due on the next tick 10s later.
+  const jobs = cron.listJobs();
+  assert.equal(jobs.find((j) => j.id === "b").nextRunAt, "2026-01-01T00:00:00.100Z");
+  assert.equal(jobs.find((j) => j.id === "c").nextRunAt, "2026-01-01T00:00:00.200Z");
+  assert.deepEqual(cron.dueJobs(TICK_NOW).map((j) => j.id), ["b", "c"], "the deferred jobs stay due");
 });
 
 // ---------------------------------------------------------------------------
