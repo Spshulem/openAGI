@@ -4,9 +4,20 @@ Tracking near-term items not yet shipped. Each item lists what's already wired, 
 
 ---
 
+## Recently shipped (v0.0.11)
+
+- **Nodes view.** Every machine in the installation, with liveness derived at read time rather than replayed from a cached verdict. Machines that do work without being full installs — an iMessage pass-through with no daemon and no heartbeat — appear as service nodes, probed live against a budget that can never hold the page.
+- **Daily brief.** A single surface for what changed, with dismissible advice and readable drafts, degrading honestly when a source is unavailable instead of rendering an empty confident page.
+- **Multi-horizon workflow mining.** Candidates carry action keys, day/week horizons and a cadence classification, so a weekly routine is no longer indistinguishable from noise. Mining runs hourly with a nightly deep pass; materialized skills retain the observation that produced them.
+- **Security.** Path traversal, dashboard XSS and MCP argv injection closed; `/health` no longer over-discloses; the data directory and SQLite files are tightened to owner-only on every boot.
+- **Privacy.** Ambient capture honours exclusions for non-frontmost windows, and the README no longer claims data never leaves — prompts go to your LLM, and the docs now say so before asking for Screen Recording.
+- **Bounded growth.** Observation retention is scheduled rather than unbounded, after a capture directory reached 1.2GB unattended.
+
+---
+
 ## Remote capture streaming (multi-machine setup)
 
-**Status:** Coming soon · plumbing partially in place
+**Status:** Mostly shipped as of v0.0.11 · one real gap left
 
 **Idea:** Run the daemon (the agent itself) on one machine — typically a home Mac mini that's always on — and stream screen captures + activity events from any number of laptops/desktops to that central daemon. Use OpenAGI from your work laptop, your couch laptop, your gaming desktop; the agent on the Mac mini sees them all and answers "what was I doing on the work laptop yesterday at 3pm" alongside "what was I doing on the home Mac last weekend".
 
@@ -17,17 +28,21 @@ Tracking near-term items not yet shipped. Each item lists what's already wired, 
 - Bearer auth (`OPENAGI_AUTH_TOKEN`) plus the CSRF gate (`auth.js#checkOrigin`) already secures the endpoint against random network traffic.
 - `cloudflared` / `ngrok` tunneling is already supported via `npm run tunnel`, exposing `127.0.0.1:43210` on a public URL.
 
+Shipped since this item was written:
+
+- **Configurable capture destination.** `AppState.captureRemoteURL` + `captureRemoteToken` replace the old hardcoded `127.0.0.1:43210` in the capture path. The token rule is deliberate: when a remote destination is set, only the remote-scoped token is ever sent — the local daemon's own token authenticates to `127.0.0.1` and is never forwarded to another host, so a missing remote token yields an unauthenticated request rather than a leaked one.
+- **Per-source attribution.** `sourceMachineId` is carried on every observation (per-observation, falling back to a per-batch value) through `observation-store.js`, so recall can distinguish machines.
+- **Node identity, pairing and heartbeats.** Each install generates a stable identity; whichever install receives heartbeats acts as the main and keeps a file-backed registry of the rest.
+- **Connection health UX.** The Nodes view reports liveness derived from `lastSeenAt` at read time — never a stored or replayed verdict — and says `unknown` when there is no usable timestamp rather than guessing. Service machines that never heartbeat (like an iMessage pass-through) are probed live against a budget and shown as their own kind.
+
 ### What's still missing
 
-- **Capture-only client mode** for the Mac app: a launch flag (or settings panel toggle) that says "I'm a capture client, not a daemon host." In this mode, the bundled Node daemon doesn't start; only the capture pipeline runs, pointed at a remote daemon URL.
-- **Configurable daemon URL.** Today both `CaptureBridge.swift:33` and `AppState.swift:14` hardcode `http://127.0.0.1:43210`. Need a settings field for the remote daemon URL + the auth token, persisted in UserDefaults.
-- **Per-source attribution.** Each observation needs a `sourceMachineId` so recall queries can filter by machine ("what was I doing on the laptop") or aggregate across all machines. Schema migration in `observations/index.db`.
-- **Connection health UX.** Capture client needs to show "connected to homemini.local:43210" or "offline, queueing 47 observations" in the menu bar. The existing `tunnelWatcher` plumbing is a model.
-- **Robustness for flaky networks.** Right now `CaptureBridge` retries inline on flush. A more durable queue with exponential backoff + offline persistence would handle a laptop suspending mid-flush.
+- **Capture-only client mode** for the Mac app: a launch flag (or settings panel toggle) that says "I'm a capture client, not a daemon host." In this mode, the bundled Node daemon doesn't start; only the capture pipeline runs, pointed at a remote daemon URL. This is the remaining gap — today every Mac app instance still starts its own bundled daemon, so a laptop pointed at a home Mac mini runs a second daemon it doesn't need.
+- **Exponential backoff on a flaky link.** Captures are persisted locally and marked pushed only on success, so a laptop suspending mid-flush doesn't lose data. What's missing is backoff: retries are still paced by the flush interval rather than backing off when a remote is down.
 
 ### Effort
 
-Rough estimate: **3–5 days** for v0 if we keep it simple (settings panel + URL field + source attribution column). Could be done in a long weekend.
+Most of the original estimate is spent. What's left is **~1 day**: a settings toggle that suppresses the bundled daemon, plus backoff on the flush retry.
 
 ### Why it's worth doing
 
