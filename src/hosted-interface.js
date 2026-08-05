@@ -28,6 +28,7 @@ import {
   compareVersions,
   newestOf
 } from "./node-registry.js";
+import { ServiceProbe, adoptRemoteServices, mergeServices } from "./service-nodes.js";
 import { readNodeConfig } from "./cli-client.js";
 import { composeBrief, dismissFocus } from "./daily-brief.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
@@ -62,6 +63,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   const dataDir = options.dataDir ?? resolveDataDir();
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodesCachePath = path.join(dataDir, "nodes", "cache.json");
+  // Service nodes (see service-nodes.js) are configured in the environment,
+  // not registered by heartbeat. One probe instance per interface so its
+  // result cache survives between requests; serviceEnv is a seam for tests
+  // that need a main and a node with different configuration in one process.
+  const serviceProbe = options.serviceProbe ?? new ServiceProbe(options.serviceProbeOptions);
+  const getServiceEnv = () => options.serviceEnv ?? process.env;
 
   const events = new EventEmitter();
   events.setMaxListeners(50);
@@ -470,6 +477,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const now = Date.now();
         const nowIso = new Date(now).toISOString();
 
+        // Kick the service probes off BEFORE the first await below, so a
+        // sleeping Mac mini and a slow main are waited on concurrently rather
+        // than one after the other. describe() is budget-bounded and never
+        // rejects; the .catch is only there so a programming error in the
+        // probe can never turn the whole topology view into a 500.
+        const localServicesPromise = Promise.resolve()
+          .then(() => serviceProbe.describe({ env: getServiceEnv(), now }))
+          .catch(() => []);
+
         // Every roster row is rebuilt from primitive facts — a name, a
         // timestamp, a version. A `status` that arrived over the wire or came
         // back out of nodes/cache.json is deliberately DROPPED: a liveness
@@ -573,7 +589,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             nodes,
             newestVersion,
             updateCommand: "openagi update",
-            ...rest
+            ...rest,
+            // Configured SERVICE endpoints — machines that do work for this
+            // installation without being installs themselves. A separate key,
+            // never mixed into `nodes`: an older client decodes `nodes` as
+            // peers and would render a service as a permanently-unknown ghost
+            // machine, whereas an unknown top-level key it simply ignores.
+            // Always an array, so the shape never depends on configuration.
+            services: Array.isArray(rest.services) ? rest.services : []
           });
         };
 
@@ -581,7 +604,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const others = nodeRegistry.list({ now })
             .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: nowIso }));
           return respond([selfRow("main"), ...others], {
-            pairedTo: null, stale: false, cachedAt: null, unreachableReason: null
+            pairedTo: null, stale: false, cachedAt: null, unreachableReason: null,
+            services: await localServicesPromise
           });
         }
         try {
@@ -617,7 +641,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             .filter((e) => e && typeof e === "object" && e.role !== "main")
             .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: nowIso }));
           return respond([mainRow, selfRow("node"), ...siblings], {
-            pairedTo: pairing.remote, stale: false, cachedAt: nowIso, unreachableReason: null
+            pairedTo: pairing.remote, stale: false, cachedAt: nowIso, unreachableReason: null,
+            // The main carries its configured services onward. The user's
+            // service node is wired up on the main and they are looking at
+            // their laptop, so without this the machine stays invisible
+            // exactly where they look for it. "reported" is the honest basis:
+            // the main measured it a moment ago, we did not.
+            services: mergeServices(
+              await localServicesPromise,
+              adoptRemoteServices(upstreamJson?.services, { originName: mainRow.name, basis: "reported" })
+            )
           });
         } catch (error) {
           const cached = readJsonFile(nodesCachePath, null);
@@ -636,7 +669,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             // last thing we were told, and the UI says so.
             .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: cachedAt, statusBasis: "cached" }));
           return respond([mainRow, selfRow("node"), ...siblings], {
-            pairedTo: pairing.remote, stale: true, cachedAt, unreachableReason: reasonOf(error)
+            pairedTo: pairing.remote, stale: true, cachedAt, unreachableReason: reasonOf(error),
+            // Same rows, but we could not refresh them: "cached", so the age
+            // the UI prints is the age of the main's probe, not of ours.
+            services: mergeServices(
+              await localServicesPromise,
+              adoptRemoteServices(cached?.services, { originName: mainRow.name, basis: "cached" })
+            )
           });
         }
       }
@@ -4334,6 +4373,16 @@ const NODE_STATUS = {
   unknown:     { badge: "muted", label: "unknown" }
 };
 
+// A service's liveness is a PROBE, not a heartbeat, so it gets its own
+// vocabulary rather than borrowing "online/offline" — those words mean "a
+// machine did or did not check in", and nothing here ever checks in.
+const SERVICE_REACHABILITY = {
+  reachable:         { badge: "ok",    label: "reachable" },
+  unreachable:       { badge: "err",   label: "unreachable" },
+  unknown:           { badge: "muted", label: "unknown" },
+  "not-configured":  { badge: "muted", label: "not configured" }
+};
+
 function nodeBuildLabel(n) {
   if (!n.build) return "unknown";
   const origin = { git: "commit", "app-bundle": "build", env: "build" }[n.buildSource];
@@ -4404,6 +4453,54 @@ async function renderNodes() {
       </tr>\`;
   }).join("");
 
+  // Service nodes: machines that do work for this installation without being
+  // installs themselves (the Mac mini that serves iMessage search). They sit in
+  // the SAME table so the whole topology reads as one thing, but every column
+  // that only means something for a peer says so instead of being left blank —
+  // a service has no heartbeat, no version and nothing to update.
+  const services = Array.isArray(data.services) ? data.services : [];
+  const connected = services.filter((s) => s.configured);
+  const notConnected = services.filter((s) => !s.configured);
+
+  const serviceRows = connected.map((s) => {
+    // Own-property lookup, not a bare index: "constructor"/"__proto__" reach
+    // Object.prototype and would sail past a nullish-coalescing fallback,
+    // putting the word undefined into a class attribute. reachability arrives
+    // over the wire from the main, so it is not ours to trust.
+    const r = (Object.prototype.hasOwnProperty.call(SERVICE_REACHABILITY, s.reachability)
+      && SERVICE_REACHABILITY[s.reachability]) || SERVICE_REACHABILITY.unknown;
+    // How we know, in the user's terms. "live" is the only phrasing that gets
+    // to imply "right now"; everything else is dated, including a result this
+    // machine merely heard about from the main. A verdict with no usable
+    // timestamp cannot be dated at all — say that, rather than letting
+    // timeAgo(null) turn the unix epoch into "20000d ago".
+    const when = s.checkedAt ? escapeHtml(timeAgo(s.checkedAt)) : "at an unknown time";
+    let how;
+    if (s.checkBasis === "live") how = "checked just now";
+    else if (s.checkBasis === "cached") how = "checked " + when + " (cached)";
+    else if (s.checkBasis === "reported") {
+      how = "checked by " + escapeHtml(s.originName ?? "the main") + " " + when;
+    } else how = "not checked yet";
+    const where = s.origin === "main"
+      ? \`<div class="sub">configured on \${escapeHtml(s.originName ?? "the main")}</div>\`
+      : \`<div class="sub">configured on this machine</div>\`;
+    return \`
+      <tr>
+        <td>\${escapeHtml(s.name ?? s.id ?? "service")}\${s.host ? \`<div class="sub">\${escapeHtml(s.host)}</div>\` : ""}\${s.purpose ? \`<div class="sub">\${escapeHtml(s.purpose)}</div>\` : ""}</td>
+        <td>service\${where}</td>
+        <td><span class="badge \${r.badge}">\${escapeHtml(r.label)}</span><div class="sub">\${how}</div>\${s.detail ? \`<div class="sub">\${escapeHtml(s.detail)}</div>\` : ""}</td>
+        <td><span class="sub">n/a<div class="sub">probed, never heartbeats</div></span></td>
+        <td><span class="sub">n/a<div class="sub">not an OpenAGI install</div></span></td>
+        <td><span class="sub">managed on that machine</span></td>
+      </tr>\`;
+  }).join("");
+
+  const notConnectedNote = notConnected.length
+    ? \`<div class="sub" style="margin-top:8px;">Not connected: \${notConnected
+        .map((s) => escapeHtml(s.name ?? s.id) + (s.detail ? " — " + escapeHtml(s.detail) : ""))
+        .join(" · ")}</div>\`
+    : "";
+
   // A version alone can't answer "is this up to date" — package.json has
   // drifted behind the release tags — so the build identity is always shown
   // next to it, and is the literal word "unknown" when it can't be determined.
@@ -4426,20 +4523,28 @@ async function renderNodes() {
         <div class="row" style="margin-top:8px;"><button id="nodesRefresh">Re-check now</button></div>
       </div>
       \${banner}
-      <div style="overflow-x:auto; margin-top:12px;">
+      <div class="desc" style="margin-top:12px;">
+        Everything this installation talks to. <b>main</b> is the machine that holds the
+        brain; <b>node</b>s are OpenAGI installs paired to it that check in every 30s;
+        <b>service</b>s are machines that do one job for it (and never check in, so their
+        row is a live probe, not a memory).
+      </div>
+      <div style="overflow-x:auto; margin-top:8px;">
         <table style="width:100%; border-collapse:collapse; text-align:left;">
           <thead><tr>
-            <th>Machine</th><th>Role</th><th>Status</th><th>Last seen</th><th>Version</th><th>Update</th>
+            <th>Machine or service</th><th>Role</th><th>Status</th><th>Last seen</th><th>Version</th><th>Update</th>
           </tr></thead>
-          <tbody>\${rows}</tbody>
+          <tbody>\${rows}\${serviceRows}</tbody>
         </table>
       </div>
+      \${notConnectedNote}
       <div class="desc" style="margin-top:12px;">
         OpenAGI does not push code to your machines. To update one, run
         <code>\${escapeHtml(data.updateCommand ?? "openagi update")}</code> on that machine
         (or <code>scripts/update.sh</code>); on macOS the app updates itself via Sparkle.
         Addresses reported by other nodes are shown for identification only — this page
-        will not build a command that sends your token to one.
+        will not build a command that sends your token to one, and never renders the
+        credential a service is configured with.
       </div>
     </div>
   \`;
