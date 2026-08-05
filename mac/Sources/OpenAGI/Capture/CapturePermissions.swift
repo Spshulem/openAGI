@@ -132,11 +132,13 @@ final class CapturePermissions: ObservableObject {
     let ws = NSWorkspace.shared.notificationCenter
     workspaceObservers.append(
       ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
-        Task { @MainActor in self?.handleActivation() }
+        guard let self else { return }
+        Task { @MainActor in self.handleActivation() }
       })
     appObservers.append(
       NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-        Task { @MainActor in self?.handleActivation() }
+        guard let self else { return }
+        Task { @MainActor in self.handleActivation() }
       })
   }
 
