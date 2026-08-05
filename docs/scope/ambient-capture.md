@@ -2,6 +2,8 @@
 
 What it would take to add Rewind.ai-style screen + activity capture to the Mac app, feed it into OpenAGI's tiered memory, mine it for repeated patterns, and turn those into runnable skills.
 
+> **This is the original scope document, kept for the reasoning.** It is not the description of what shipped. In particular the privacy notes below were written as intentions and one of them did not survive contact with the runtime: **OCR text and window titles are sent to your configured model provider** — on every chat turn, and unattended on a cron. Frames and thumbnails are not. The accurate, current description is in the README under [What capture does with your screen](../../README.md#what-capture-does-with-your-screen), and the privacy-posture section at the end of this doc has been corrected to match the code.
+
 References that inform this scope:
 
 - [alikia2x/openrewind](https://github.com/alikia2x/openrewind) — Swift-native, ScreenCaptureKit + Vision OCR, SQLite FTS5, the cleanest open reference for the capture half.
@@ -24,7 +26,7 @@ A user can:
 What this scope deliberately **does not** include:
 
 - **Keystroke logging.** Captures passwords, 2FA codes, private DMs. Not worth the risk; activity tracking + OCR gets us most of the way.
-- **Cloud sync.** All capture stays local on disk, encrypted by the OS user-dir protections. Optional encryption-at-rest can come later.
+- **Cloud sync.** There is no OpenAGI cloud: frames, thumbnails, OCR text and activity live on disk under the user's own directory, encrypted by the OS user-dir protections. Optional encryption-at-rest can come later. (This is not the same as "nothing leaves" — the shipped runtime sends OCR text and window titles to the user's model provider; see Privacy posture below.)
 - **Audio/microphone capture.** Out of scope. If you want meeting transcription, that's a separate scope.
 
 ---
@@ -46,8 +48,8 @@ What this scope deliberately **does not** include:
 - `mac/Sources/OpenAGI/Capture/ScreenCapturer.swift`:
   - `ScreenCaptureKit` for periodic full-screen snapshots (configurable interval, default 5s, throttled when idle).
   - Active display only; if the user has multiple monitors, optionally each.
-  - Skip frames where the foreground app is in the exclusion list (1Password, Apple Wallet, banking sites, etc.).
-  - Skip frames where the window title matches an exclusion regex (Incognito / Private / 2FA, etc.).
+  - Exclude any window whose app is in the exclusion list (1Password, other password managers, secure messengers, Apple Wallet, etc.) — as shipped this is per window, so an excluded app beside the focused one is cut out of the frame too. Matching is on the app's **bundle ID**, so there is no way to name a website here: a banking site in a browser tab is not something this list can recognise.
+  - Exclude any window whose title matches an exclusion regex (Incognito / Private / 2FA, etc.). As shipped this fails closed: when the window list or every window title is unreadable, the capture is skipped rather than taken unchecked.
 - `mac/Sources/OpenAGI/Capture/Ocr.swift`:
   - Apple `Vision` framework — `VNRecognizeTextRequest` on each captured frame.
   - On-device, free, fast (~50ms per frame on M1).
@@ -89,7 +91,7 @@ What this scope deliberately **does not** include:
 - First-launch banner in dashboard if Screen Recording permission isn't granted.
 - Tray icon shows a 🔴 dot when capture is paused or permission missing.
 
-**Phase 0 total: 4–5 days.** End state: Mac app captures + indexes; nothing leaves the machine; dashboard has no idea this is happening yet.
+**Phase 0 total: 4–5 days.** End state: Mac app captures + indexes; at this phase there is no bridge and no agent, so nothing leaves the machine yet; dashboard has no idea this is happening yet. (Phase 1 adds the daemon push, and Phase 2/3 put OCR excerpts in front of the model — see Privacy posture.)
 
 ---
 
@@ -159,10 +161,11 @@ What this scope deliberately **does not** include:
 
 ### 3.1 Sequence detector (~1 day)
 
-- New autopilot job `mine-patterns`, runs nightly.
-- Walks the activity table; bins by hour-of-day and weekday.
-- Identifies sequences of length ≥ 3 that recur ≥ 3 times within the last 14 days.
-- Confidence scoring weighs: count, time-of-day stability, sequence rigidity.
+- Fast `pattern-mine` pass runs hourly, with a deeper recalculation nightly.
+- Walks the activity table as semantic actions (app + window intent), preserving same-app window transitions; bins support across action, hour, day, and week horizons.
+- Identifies sequences of length ≥ 2 that recur ≥ 3 times within the last 28 days, so workflows such as “sales call → contract” are eligible without an artificial third app.
+- Confidence scoring weighs occurrence count, distinct-day/week support, time/cadence stability, action specificity, lag consistency, and shared context between steps.
+- Sequential routines prefer an interaction trigger (for example, after a sales call) over an arbitrary clock schedule.
 
 ### 3.2 LLM proposal (~1 day)
 
@@ -238,11 +241,11 @@ Backed by:
 - **OCR quality.** Vision is good but not perfect; small text, code, dark themes can degrade. Worth shipping; not a blocker.
 - **Pattern false positives.** A noisy proposal queue erodes user trust. Threshold confidence high; let users tune.
 - **Skill replay reliability.** macOS UI changes break recorded sequences. The Action Vocabulary above is an attempt to abstract this — using app-level actions instead of pixel coordinates.
-- **Privacy posture.** Hard rules:
-  - Capture data NEVER leaves the machine without explicit user opt-in (e.g., "send this OCR text to GPT-5 to summarize").
-  - Daemon → LLM calls should be allowed to *summarize* OCR text but never stream raw frames.
-  - Excluded-app list defaults to a sensible starter set (1Password, password managers, banking, private browsing).
-  - One-click "delete all captures" with a confirmation in the privacy panel.
+- **Privacy posture.** What actually shipped, stated the way a user has to be able to consent to it:
+  - **Frames and thumbnails never leave the Mac.** They are OCR'd on-device by Vision and stored under `~/Library/Application Support/OpenAGI/capture/`; the daemon push carries timestamp, app, window title and OCR text with no image bytes (`CaptureBridge.unpushedBatch`).
+  - **OCR text and window titles do leave, in excerpts, to the user's model provider** — and not only when the user asks something. `agent-host.js` puts up to 6 snippets (with window titles) into every non-cron chat turn; `proactive-observer.js` sends up to 8 every 10 minutes unattended, up to 20 across a 7-day lookback in the daily mid-horizon pass, and up to 10 in the 15-minute task scan; `pattern-miner.js` includes up to 6 excerpts when drafting a skill. The README table under "What capture does with your screen" is the canonical list.
+  - The exclusion list is an **app bundle ID list plus window-title regexes**, editable in the privacy panel, evaluated per window (`CaptureSettings.decideCapture`) so matching windows are cut out of the frame before the screenshot is taken, and fail-closed when the screen can't be evaluated. It has no URL or domain awareness, so it cannot recognise a banking site in a browser tab except through a window title. Defaults cover password managers and vaults, secure messengers, Keychain Access, Apple Passwords/Wallet and system password prompts, plus title rules for private/incognito, passwords and passkeys, 2FA / OTP / authenticator, recovery phrases, API keys, card numbers and online banking.
+  - Capture is off until the user turns it on, pauses are one click, and one-click "delete all captures" (with a confirmation) wipes the Mac-side copy; the daemon's copy is cleared separately.
 - **Disk cost.** Frames at 5s intervals ≈ 1–3 GB/day uncompacted. Retention defaults must be tight.
 
 ## Recommended sequence

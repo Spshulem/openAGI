@@ -81,7 +81,7 @@ The highlighted rows are the bet — Scrutiny, tiered Memory, Propagation, the c
 | **Watches your work, learns patterns**         | **✅**  |       —       |      —      |        —        |    —     |     —     |
 | **Auto-drafts skills from observed routines**  | **✅**  |       —       |      —      |        —        |    —     |     —     |
 | Runs on your machine                           |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
-| Your data never leaves                         |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
+| Your data stays local (bar prompts to your LLM) |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
 | Bring your own LLM                             | ✅ any  |   ✅ 200+    |     ✅      |     ✅ 23+      |    —     |     —     |
 | Persistent memory across sessions              | ✅ tiered | ✅ FTS5     | ✅ markdown |    ✅ durable   | limited  | limited   |
 | Multi-channel (SMS / Telegram / HTTP)          |   ✅    |      ✅       |     ✅      |  dashboard only |    —     |     —     |
@@ -125,7 +125,8 @@ Open `http://127.0.0.1:43210/`. Drop in an OpenAI or Anthropic key in the wizard
 | Right away | Chat UI, MCP tab, Skills tab, Memory tab, Activity tab. Tools like `remember`, `recall`, `schedule_message` already work. |
 | After 1 chat | The agent remembers. Ask it later "what did we decide about X" — it knows. |
 | First night _(03:30 UTC)_ | **Session miner** runs across your chat history, clusters recurring intents, drafts skills you might want, drops them in the Suggested tab. |
-| First night _(02:30 UTC)_ | If you've enabled Mac screen capture, the **pattern miner** runs across your activity, finds repeating app sequences (e.g. "Slack → GitHub → Notion every 9am"), drafts a skill, surfaces it. |
+| First hour | If you've enabled Mac screen capture, the **workflow miner** checks action sequences and can surface an already-repeated routine without waiting overnight. |
+| First night _(02:30 local)_ | The deep pass rechecks day/week cadence and longer-running workflows, then drafts any newly supported skills. |
 | Each Mac notification | "OpenAGI learned a new skill" — click to review, accept with one click, and it's saved as a real `SKILL.md` the agent can run. |
 | Ongoing | Schedule a prompt with `schedule_message` and OpenAGI texts/Telegrams you when it fires. |
 
@@ -208,7 +209,7 @@ For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the O
 | **Tool-use loop** | When `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is set, the agent uses tool calling with structured args. Default model: `gpt-5`. |
 | **Internal tools** | `remember`, `recall`, `schedule_message`, `list_sessions`, `list_skills`, `run_skill`, `list_mcp_tools`, `run_mcp_tool`, `register_mcp_server`, `connect_mcp_server`, `disconnect_mcp_server`, `list_cron_jobs`, `cancel_cron_job`, `get_audit`, `get_budget`, `set_provider`, `retire_specialist`, `replay_skill`. |
 | **Skills** | Drop a `SKILL.md` (frontmatter + body) under `.openagi/skills/<name>/` — it shows up as a first-class tool the agent can invoke. |
-| **Auto-skill mining** | Pattern-miner runs nightly, detects repeating activity sequences, LLM proposes a skill, lands in `.openagi/skills-suggested/` for one-click accept. Session-miner does the same on chat history. |
+| **Auto-skill mining** | Pattern-miner checks hourly, detects repeatable action workflows across action/hour/day/week horizons, and proposes a skill in `.openagi/skills-suggested/` for one-click accept. A nightly deep pass revalidates longer trends. Session-miner does the same on chat history. |
 | **Skill replay** | Action vocabulary (`open_app`, `keyboard_shortcut`, `applescript`, `shortcut`, `type`, `wait`, `say`, `browser`, ...) — Mac executor confirms first run with a modal, persists trust. |
 | **MCP execution** | Register stdio or HTTP+OAuth MCP servers in `.openagi/mcp.json` (or via the UI). On connect, every tool the server advertises becomes a callable agent tool (`mcp_<server>_<tool>`). |
 | **Cron prompts** | The agent can call `schedule_message({prompt, delaySeconds | intervalSeconds | dailyAt, channel, target})`. When the job fires, the daemon runs the prompt and routes the reply to the originating channel (Telegram, local). |
@@ -259,16 +260,41 @@ Off by default. To enable on the macOS native app:
 4. Click **Capture → Privacy settings…** to tune frequency, retention, app/regex exclusions, and disk budget.
 
 Once running:
-- Every ~30 seconds the Mac batches activity (window titles + frame OCR) and pushes to the daemon's `/observations` endpoint.
-- Nightly at 02:30 UTC, the **pattern miner** clusters repeating sequences and asks the LLM to propose a skill name + description + body.
+- Every ~30 seconds the Mac batches activity (window titles + frame OCR) and pushes to the daemon's `/observations` endpoint — `127.0.0.1:43210`, unless you deliberately point capture at another machine's daemon.
+- Hourly, the **workflow miner** looks for repeated semantic action sequences—including two-step and same-app/window flows—and compares support across hours, days, and weeks. A deeper pass still runs nightly at 02:30 local time.
+- Nearby window/OCR evidence grounds proposals so a sequence can become “sales call → contract → follow-up,” rather than merely “Zoom → Chrome → Mail.”
 - Suggested skills land in `.openagi/skills-suggested/` and surface in the dashboard's **Skills → Suggested** section.
 - Accept → writes a real `SKILL.md`. If the skill includes a `replay:` block, `replay_skill` invokes it (Mac shows a confirmation modal first run).
 
-Privacy posture (non-negotiable):
-- No keystroke logging
-- No cloud sync — capture stays local
-- Default-deny exclusion list: 1Password, Wallet, banking sites, private/incognito windows, 2FA / OTP screens
-- One-click wipe in the privacy panel
+### What capture does with your screen
+
+Worth reading before you grant Screen Recording. The pictures and the text pulled out of them are handled differently, and that difference is the whole story.
+
+**The images stay here.** Frames are OCR'd on-device by Apple's Vision framework. Frames and thumbnails are written to `~/Library/Application Support/OpenAGI/capture/` and never leave the Mac — they are never uploaded and never sent to a model. The 30-second push to the daemon carries timestamp, app name, window title and OCR text only, with no image bytes ([`CaptureBridge.swift`](mac/Sources/OpenAGI/Capture/CaptureBridge.swift)). **Delete all captured data** in the privacy panel wipes the local copy; the daemon's copy is cleared separately.
+
+**The text goes to your model provider.** OCR text and window titles are what the agent reasons over, so excerpts of them are placed in prompts sent to whichever provider you configured (OpenAI, Anthropic, a local model — your choice, and a local one keeps this on your machine too):
+
+| When | What is sent |
+|---|---|
+| Every chat turn you send | Up to 6 OCR snippets (≤280 chars each) from the last 10 minutes, each labelled with its app **and window title** (`src/agent-host.js`) |
+| Quick Ask (⌥Space) | The OCR text of the window you're looking at, plus its title |
+| Proactive observer — every 10 min, unattended | Up to 8 OCR snippets from the last 15 minutes (`src/proactive-observer.js`) |
+| Mid-horizon observer — daily 17:30, unattended | Up to 20 OCR snippets across a 7-day lookback |
+| Task activity scan — every 15 min, unattended | Up to 10 OCR snippets from the last 30 minutes |
+| Workflow miner — hourly + nightly | Up to 6 OCR excerpts (200 chars each) around a detected routine, when it drafts a skill |
+| Whenever the agent calls `recall_activity` | The matching rows from your capture log — window titles + OCR snippets |
+
+The unattended rows run on a cron whether or not you're in a conversation. If that's more than you want: capture is off until you turn it on, **Pause** stops it, and pointing OpenAGI at a local model keeps the text on your machine.
+
+**What the exclusion list can and can't do.** It is two lists you can read and edit in **Capture → Privacy settings…**: app bundle IDs, and regexes matched against window titles. Every window on the display is checked against both, case-insensitively, and a matching window is cut out of the picture before the screenshot is taken — so a password manager open beside the document you're working on isn't captured either. A listed bundle ID also covers that app's helpers (`com.1password` covers `com.1password.browser-helper`). Defaults cover password managers and vaults, secure messengers (Messages, Signal, WhatsApp, Telegram), Keychain Access, Apple Passwords and Wallet, and system password prompts; the title rules cover private/incognito windows, passwords and passkeys, 2FA / OTP / authenticator screens, recovery phrases, API keys, card numbers and online banking. Add your own for anything else you care about.
+
+What it can't do is see a **URL** — nothing in OpenAGI reads a browser's address bar, so exclusion is by app and window title only. Your bank's site is recognised only if its window title happens to say so (the default rules do match "online banking"); a tab titled "Chase — Accounts" matches nothing, and a rule of your own is the only thing that would catch it. Two things worth knowing about how this fails: it fails **closed** — if the window list can't be read, or title rules are configured and not one on-screen window has a readable title, that capture is skipped entirely and the panel tells you why, rather than capturing something it couldn't check. And **Accessibility** permission is what supplies window titles for the activity log; the capture decision reads titles from the window list, so exclusions keep working without it.
+
+Privacy posture:
+- No keystroke logging, no audio, no camera — screenshots, app focus, and window titles only
+- Off by default; one-click pause and one-click wipe in the privacy panel
+- Frames and thumbnails never leave the Mac; OCR text and window titles go to the daemon and, in excerpts, to your model provider (table above)
+- The exclusion list is yours to inspect and edit, applies per window before the screenshot is taken, and fails closed when the screen can't be evaluated
 
 ---
 
@@ -276,7 +302,7 @@ Privacy posture (non-negotiable):
 
 Press **⌥Space** (or click the tray icon → **Quick Ask**) to summon a small always-on-top pill that expands into an ask box over any app.
 
-**Screen context.** On each ask, the widget does an on-device OCR grab of the focused window using the same ScreenCaptureKit pipeline as the pattern miner. The capture exclusion list applies — 1Password, banking sites, 2FA screens, and private windows are never read. Requires **Screen Recording** permission; without it, the ask still works but the panel shows "no screen context."
+**Screen context.** On each ask, the widget does an on-device OCR grab of the focused window using the same ScreenCaptureKit pipeline as the pattern miner. Your [capture exclusion list](#what-capture-does-with-your-screen) applies first: if the front app's bundle ID or its window title matches, the widget grabs nothing and the panel shows "no screen context". Matching is by bundle ID and window title only — there's no URL awareness, so a banking page in a browser tab isn't recognised as one. The OCR'd **text** is sent to your model provider along with your question and the window's title; the screenshot itself is not. Requires **Screen Recording** permission; without it, the ask still works but the panel shows "no screen context."
 
 **Proactive nudges.** Suggestions from the agent's scrutiny layer surface as a badge on the pill. Open the nudge list to send it to chat or dismiss it.
 
@@ -448,6 +474,10 @@ Run `openagi models` to see the plan — which job runs on which model, why each
 
 Recommended starting point for OpenAI: `OPENAI_MODEL=gpt-5`, `OPENAI_MODEL_MINI=gpt-5-mini`, `OPENAI_MODEL_NANO=gpt-5-nano`. The ledger records the **actual** model each call used, so `openagi status` / `/budget` show where the money really goes.
 
+### Workflow-learning cadence
+
+`OPENAGI_PATTERN_MINE_INTERVAL_MIN` controls the fast activity-workflow pass (default `60`, minimum `15`). Statistical detection is local and deterministic; the model is called only for a new workflow that clears the confidence threshold. The nightly pass remains enabled for longer day/week recalculation.
+
 ### Web search
 
 The agent gains two tools — `web_search` and `fetch_url` — once at least one provider key is set. With no key configured, `web_search` returns a clear "no provider configured" error and `fetch_url` still works via a plain HTTP fetch.
@@ -501,7 +531,8 @@ src/
   memory-system.js            short/medium/long tiers with decay
   model-provider.js           DeterministicModelProvider + OpenAI / Anthropic tool loops
   observation-store.js        SQLite FTS5 store for capture observations
-  pattern-miner.js            cluster repeating activity → propose skills
+  activity-patterns.js        semantic action sequences + multi-horizon cadence
+  pattern-miner.js            ground repeating workflows → propose skills
   session-miner.js            cluster repeating chat intents → propose skills
   propagation-controller.js   bounded specialist creation
   skills.js                   SKILL.md loader, exposes each skill as a tool
