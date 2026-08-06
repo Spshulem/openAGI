@@ -10,6 +10,14 @@ const DEFAULT_PRICES = {
   "claude-sonnet-4-6": { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   "claude-opus-4-7": { in: 15, out: 75, cacheRead: 1.5, cacheWrite: 18.75 },
   "claude-haiku-4-5": { in: 1, out: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+  // gpt-5.6 ships as three named variants rather than a size ladder. All three
+  // are listed because priceFor falls back to the longest matching PREFIX, and
+  // "gpt-5.6-luna" would otherwise silently bill at the "gpt-5" flagship rate —
+  // 25x luna's real input price, against a daily cap that silences the agent
+  // when it trips.
+  "gpt-5.6-luna": { in: 0.2, out: 1.2, cacheRead: 0.02, cacheWrite: 0 },
+  "gpt-5.6-terra": { in: 2, out: 12, cacheRead: 0.2, cacheWrite: 0 },
+  "gpt-5.6-sol": { in: 5, out: 30, cacheRead: 0.5, cacheWrite: 0 },
   "gpt-5.5": { in: 5, out: 30, cacheRead: 0.5, cacheWrite: 0 },
   "gpt-5.4-mini": { in: 0.75, out: 4.5, cacheRead: 0.075, cacheWrite: 0 },
   "gpt-5.4-nano": { in: 0.2, out: 1.25, cacheRead: 0.02, cacheWrite: 0 },

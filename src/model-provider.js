@@ -54,6 +54,10 @@ export class OpenAIResponsesProvider {
   constructor(options = {}) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
     this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-5";
+    // Reasoning depth for models that support it. Left null unless configured,
+    // because sending `reasoning` to a non-reasoning model is a 400 — an opt-in
+    // key must never become a floor that breaks every other model in the table.
+    this.reasoningEffort = options.reasoningEffort ?? process.env.OPENAI_REASONING_EFFORT ?? null;
     this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
@@ -107,6 +111,7 @@ export class OpenAIResponsesProvider {
         instructions: baseInstructions,
         input: conversationInput
       };
+      if (this.reasoningEffort) body.reasoning = { effort: this.reasoningEffort };
       if (toolList.length > 0) body.tools = toolList;
       response = await this.postResponses(body, context);
 
