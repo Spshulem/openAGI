@@ -229,14 +229,19 @@ test("GET /nodes marks which nodes are behind the newest version it can see", as
   try {
     await fetch(`${base}/nodes/heartbeat`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ nodeId: "old", name: "Old box", role: "node", version: "0.0.6", build: "abc1234", buildSource: "git" })
+      body: JSON.stringify({ nodeId: "old", name: "Old box", role: "node", version: "9.0.6", build: "abc1234", buildSource: "git" })
     });
     await fetch(`${base}/nodes/heartbeat`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ nodeId: "new", name: "New box", role: "node", version: "0.0.10", build: "def5678", buildSource: "git" })
+      body: JSON.stringify({ nodeId: "new", name: "New box", role: "node", version: "9.0.10", build: "def5678", buildSource: "git" })
     });
     const json = await (await fetch(`${base}/nodes`)).json();
-    assert.equal(json.newestVersion, "0.0.10", "0.0.10 > 0.0.6 numerically, not lexicographically");
+    // 9.x deliberately: newestVersion considers this install's OWN version too,
+    // so versions near the real package version made this test fail on every
+    // release (it was pinned to 0.0.10 and broke the moment 0.0.11 shipped).
+    // The property under test is numeric vs lexicographic ordering, which these
+    // still exercise — lexicographically "9.0.6" sorts ABOVE "9.0.10".
+    assert.equal(json.newestVersion, "9.0.10", "9.0.10 > 9.0.6 numerically, not lexicographically");
     assert.equal(json.nodes.find((n) => n.name === "Old box").behind, true);
     assert.equal(json.nodes.find((n) => n.name === "New box").behind, false);
     assert.equal(json.nodes.find((n) => n.name === "Old box").build, "abc1234", "the build a node reports is stored and shown");
