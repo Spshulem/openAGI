@@ -24,6 +24,13 @@ const DEFAULT_PRICES = {
   "gpt-5-mini": { in: 0.25, out: 2, cacheRead: 0.025, cacheWrite: 0 },
   "gpt-5-nano": { in: 0.05, out: 0.4, cacheRead: 0.005, cacheWrite: 0 },
   "gpt-5": { in: 5, out: 15, cacheRead: 0.5, cacheWrite: 0 },
+  // Embeddings are the highest-CALL-VOLUME model in a live install (vector
+  // store writes), and they match none of the chat prefixes above — so without
+  // these they fell through to `default` and billed at $3/1M instead of $0.02,
+  // a 150x over-count on the meter that silences the agent when it trips.
+  // Output/cache columns are zero because embeddings have neither.
+  "text-embedding-3-small": { in: 0.02, out: 0, cacheRead: 0, cacheWrite: 0 },
+  "text-embedding-3-large": { in: 0.13, out: 0, cacheRead: 0, cacheWrite: 0 },
   default: { in: 3, out: 15, cacheRead: 0.3, cacheWrite: 3.75 }
 };
 
