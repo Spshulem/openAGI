@@ -7,13 +7,14 @@ import { fileURLToPath } from "node:url";
 // The menubar app is a SwiftPM executable target with no test target, so the
 // only mechanism available for pinning its behaviour from CI is the same one
 // test/privacy-copy.test.js uses: assert against the Swift source. Each
-// assertion below encodes a defect that actually shipped and bit the user, so
-// a future edit that reintroduces it fails here instead of on their machine.
+// assertion below encodes a defect that shipped, so a future edit that
+// reintroduces it fails here instead of in a user's installation.
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TRAY = "mac/Sources/OpenAGI/TrayController.swift";
 const APPSTATE = "mac/Sources/OpenAGI/AppState.swift";
 const DAEMON = "mac/Sources/OpenAGI/DaemonController.swift";
+const APPDELEGATE = "mac/Sources/OpenAGI/AppDelegate.swift";
 
 function read(rel) {
   return fs.readFileSync(path.join(root, rel), "utf8");
@@ -34,8 +35,8 @@ test("tray restart action never labels itself with recovery jargon", () => {
   // still answers is how you clear a wedged one — and reads to a user as a
   // warning that something is broken. It was on screen nearly permanently:
   // computeStatus() returns .degraded once spend passes 70% of the daily cap,
-  // which for this user is most of every afternoon with a totally healthy
-  // daemon. A budget number rendered as a permanent "recover" button.
+  // which under sustained use can be most of the day with a healthy daemon. A
+  // budget number rendered as a permanent "recover" button.
   const body = code(TRAY);
   for (const m of body.matchAll(/"[^"\n]*[Rr]estart[^"\n]*"/g)) {
     assert.doesNotMatch(
@@ -48,9 +49,9 @@ test("tray restart action never labels itself with recovery jargon", () => {
 });
 
 test("tray tells a wedged daemon apart from a missing one, in both label and status", () => {
-  // The user's daemon sat in process state T (stopped by a job-control signal)
-  // holding its LISTEN socket on 43210 for 25 hours: process alive, port bound,
-  // /health never answering. status == .down covered both that and "the process
+  // A daemon can sit in process state T (stopped by a job-control signal) while
+  // holding its LISTEN socket indefinitely: process alive, port bound, /health
+  // never answering. status == .down covered both that and "the process
   // is gone", but they need different words and different actions — one is a
   // plain start, the other needs the port holder force-quit first.
   const tray = code(TRAY);
@@ -143,7 +144,7 @@ test("auto-restart cannot stomp a restart the user just asked for", () => {
   );
   assert.match(
     daemon,
-    /func restart\(force: Bool = false\) \{\s*\n\s*lastRestartAt = Date\(\)/,
+    /func restart\(force: Bool = false\) -> Bool \{\s*\n\s*lastRestartAt = Date\(\)/,
     `${DAEMON}.restart() must record the stamp itself, so a tray-initiated restart counts.`
   );
   assert.match(
@@ -160,12 +161,33 @@ test("auto-restart cannot stomp a restart the user just asked for", () => {
   );
 });
 
+test("a stale crash callback cannot clear a newer daemon process", () => {
+  const daemon = code(DAEMON);
+  const handler = daemon.indexOf("proc.terminationHandler");
+  const launch = daemon.indexOf("try proc.run()", handler);
+  assert.ok(handler >= 0 && launch > handler, `${DAEMON} termination handler not found`);
+  const body = daemon.slice(handler, launch);
+  assert.match(
+    body,
+    /guard let self, self\.process === p else \{ return \}/,
+    "the exit callback must prove its Process is still the controller's current child"
+  );
+  assert.ok(
+    body.indexOf("self.process === p") < body.indexOf("self.process = nil"),
+    "process identity must be checked before the shared handle is cleared"
+  );
+  assert.match(
+    body,
+    /guard let self, self\.process == nil else \{ return \}[\s\S]*self\.start\(\)/,
+    "the delayed crash restart must yield to a manual restart that already started a child"
+  );
+});
+
 test("Restart daemon replaces an adopted daemon instead of silently doing nothing", () => {
   // start() adopts an already-healthy daemon on 43210 and returns WITHOUT ever
   // setting `process`. That is not an edge case — it is what happens every time
-  // the app is relaunched while a previous daemon is still alive, and the user's
-  // daemon is in exactly that state right now (reparented to PPID 1, no app
-  // running). With `process` nil, stop() short-circuits on its `guard let proc`,
+  // the app is relaunched while a previous daemon is still alive and reparented
+  // to launchd. With `process` nil, stop() short-circuits on its `guard let proc`,
   // so restart() is a no-op stop followed by a start() that adopts the very same
   // daemon again — the menu item does nothing whatsoever. Relabelling a button
   // that does nothing only makes the lie easier to read.
@@ -202,6 +224,115 @@ test("Restart daemon replaces an adopted daemon instead of silently doing nothin
       `${rel} must force the restart — ${why}.`
     );
   }
+});
+
+test("Restart daemon is always available as ordinary maintenance", () => {
+  // A healthy daemon can still be stale after an app update or configuration
+  // change. Hiding restart behind .down/.degraded made the only immediate
+  // recovery action disappear in exactly that healthy-but-old state.
+  const tray = code(TRAY);
+  const start = tray.indexOf("private var actionsSection");
+  const end = tray.indexOf("private func captureLabel", start);
+  assert.ok(start >= 0 && end > start, `${TRAY} actions section not found`);
+  const actions = tray.slice(start, end);
+  assert.match(
+    actions,
+    /Button\(restartLabel\) \{ restartDaemon\(\) \}/,
+    `${TRAY} must expose restart even while health is green; stale runtime state ` +
+      `does not necessarily make /health fail.`
+  );
+  assert.equal(
+    (tray.match(/Button\(restartLabel\)/g) ?? []).length,
+    1,
+    `${TRAY} should render one restart action, not duplicate it in status-dependent sections.`
+  );
+});
+
+test("Restart daemon never terminates a listener managed outside the app", () => {
+  const daemon = code(DAEMON);
+  const restart = daemon.indexOf("func restart(force: Bool = false) -> Bool");
+  const owns = daemon.indexOf("private func ownsDaemon", restart);
+  assert.ok(restart >= 0 && owns > restart, `${DAEMON} safe restart region not found`);
+  const body = daemon.slice(restart, owns);
+  assert.match(body, /if force[\s\S]*pidListeningOnPort\(43210\)[\s\S]*!ownsDaemon/);
+  assert.ok(
+    body.indexOf("!ownsDaemon") < body.indexOf("stop()"),
+    "ownership must be verified before restart signals any listener"
+  );
+  assert.match(
+    daemon,
+    /if let stalePid = Self\.pidListeningOnPort\(43210\) \{\s*guard ownsDaemon\(listenerPid: stalePid\) else/,
+    "start() must repeat ownership verification after the restart delay to close bind races"
+  );
+  assert.match(code(TRAY), /guard !DaemonController\.shared\.restart\(force: true\)/);
+  assert.match(code(TRAY), /managed outside OpenAGI/);
+  assert.match(code(TRAY), /canManageCurrentListener\(\)[\s\S]*Daemon managed externally/);
+  assert.match(daemon, /func canManageCurrentListener\(\) -> Bool/);
+});
+
+test("app launch replaces only a daemon running this bundle's Node binary", () => {
+  // A Sparkle update relaunches the native process at the same bundle path but
+  // does not automatically terminate an orphaned Node child. Merely checking
+  // /health adopted that old runtime, so the new app continued reporting the
+  // old version. We must identify ownership from the kernel-reported executable
+  // path; command-line text is forgeable, while killing every healthy listener
+  // would break the supported `npm run serve` development workflow.
+  const daemon = code(DAEMON);
+  assert.match(
+    daemon,
+    /if adoptExisting, isExistingDaemonHealthy\(\) \{[\s\S]*Self\.isBundledDaemon\(listenerPid, currentNodeBinary: nodeBinary\)[\s\S]*healthy external daemon[\s\S]*return/,
+    `${DAEMON} must replace a healthy listener only after its executable path ` +
+      `matches this app bundle's Node binary, and adopt a healthy external daemon.`
+  );
+  assert.match(
+    daemon,
+    /proc_pidpath\(pid,/,
+    `${DAEMON} must resolve listener ownership through proc_pidpath rather than ` +
+      `trusting process arguments or a self-reported health field.`
+  );
+  assert.match(
+    daemon,
+    /textExecutablePath\(for: pid\)[\s\S]*app\.openagi\.daemon\/org\.sparkle-project\.Sparkle\/Installation[\s\S]*OpenAGI\.app\/Contents\/Resources\/node\/bin\/node/,
+    `${DAEMON} must recognize the old executable after Sparkle moves its bundle ` +
+      `into the installation cache; proc_pidpath returns ENOENT for that live vnode.`
+  );
+});
+
+test("application termination signals the daemon without racing a quit-time flush", () => {
+  // applicationWillTerminate does not extend process lifetime for an un-awaited
+  // Task. When stop() lived after CaptureBridge.flushNow(), macOS could tear the
+  // app down first and reparent the daemon to launchd, creating the stale runtime
+  // that the next app launch adopted.
+  const app = code(APPDELEGATE);
+  const start = app.indexOf("nonisolated func applicationWillTerminate");
+  const end = app.indexOf("nonisolated func userNotificationCenter", start);
+  assert.ok(start >= 0 && end > start, `${APPDELEGATE} termination delegate not found`);
+  const termination = app.slice(start, end);
+  const stop = termination.indexOf("DaemonController.shared.stopForApplicationTermination()");
+  const task = termination.indexOf("Task { @MainActor in");
+  assert.ok(stop >= 0, `${APPDELEGATE} must stop the daemon during termination`);
+  assert.ok(
+    stop < task,
+    `${APPDELEGATE} must call stop() synchronously before starting cleanup that ` +
+      `crosses an await; a stop inside that Task can be abandoned at process exit.`
+  );
+  assert.doesNotMatch(
+    termination,
+    /CaptureBridge\.flushNow\(\)/,
+    `${APPDELEGATE} must not start an un-awaited local flush after stopping its daemon; ` +
+      `unpushed rows are durable and retry on the next launch.`
+  );
+  const daemon = code(DAEMON);
+  const syncStop = daemon.slice(
+    daemon.indexOf("func stopForApplicationTermination()"),
+    daemon.indexOf("func restart(force:")
+  );
+  assert.match(syncStop, /proc\.terminate\(\)[\s\S]*while proc\.isRunning[\s\S]*SIGKILL/);
+  assert.doesNotMatch(
+    code(TRAY),
+    /Button\("Quit OpenAGI"\)[\s\S]{0,160}DaemonController\.shared\.stop\(\)/,
+    "the tray must let applicationWillTerminate retain the Process handle for synchronous cleanup"
+  );
 });
 
 test("the /health poll times out well inside the poll interval", () => {

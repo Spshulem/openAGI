@@ -36,12 +36,12 @@ test("BUILDBETTER_MCP_URL overrides the catalog register URL, read lazily", asyn
   // Assert the prod default with the var explicitly UNSET — the test process
   // itself may run with BUILDBETTER_MCP_URL set (e.g. on a staging device).
   await withEnv({ BUILDBETTER_MCP_URL: undefined }, () => {
-    assert.equal(entry.register.url, "https://mcp.buildbetter.app/sse", "prod default");
+    assert.equal(entry.register.url, "https://mcp.buildbetter.app", "prod default");
   });
   await withEnv({ BUILDBETTER_MCP_URL: "https://mcp.staging.buildbetter.app/sse" }, () => {
     assert.equal(entry.register.url, "https://mcp.staging.buildbetter.app/sse", "env read at access time, not import time");
   });
-  assert.equal(entry.register.url, "https://mcp.buildbetter.app/sse", "back to default after env cleared");
+  assert.equal(entry.register.url, "https://mcp.buildbetter.app", "back to default after env cleared");
 });
 
 test("catalog register spread captures the overridden URL", async () => {

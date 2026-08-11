@@ -23,7 +23,6 @@ logs/
 # Mac SwiftPM build artifacts
 mac/.build/
 mac/.swiftpm/
-mac/Package.resolved
 
 # Mac app bundle output
 build/

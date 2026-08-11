@@ -31,9 +31,11 @@ import {
 import { ServiceProbe, adoptRemoteServices, mergeServices } from "./service-nodes.js";
 import { readNodeConfig } from "./cli-client.js";
 import { composeBrief, dismissFocus } from "./daily-brief.js";
+import { queryReviewQueue, ReviewQueueQueryError } from "./review-queue.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
+import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -207,7 +209,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         pendingOauth.delete(name);
         events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
       },
-      (error) => { events.emit("mcp", { op: "connect-error", name, error: error?.message ?? String(error) }); }
+      (error) => {
+        // Once a usable token exists, the browser part succeeded. A later MCP
+        // handshake failure must not keep the stale "OAuth required" banner.
+        if (runtime.mcp?.hasOAuthToken?.(name)) pendingOauth.delete(name);
+        events.emit("mcp", { op: "connect-error", name, error: error?.message ?? String(error) });
+      }
     );
 
     let timer = null;
@@ -231,15 +238,35 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   if (runtime.agentHost) {
     const original = runtime.agentHost.handleMessage.bind(runtime.agentHost);
-    runtime.agentHost.handleMessage = async (input) => {
-      const result = await original(input);
-      events.emit("message", {
-        sessionId: result.session.id,
-        agent: result.agent,
-        reply: result.reply,
-        toolCalls: result.output?.scrutiny?.action ? [] : []
-      });
-      return result;
+    runtime.agentHost.handleMessage = async (input, handleOptions) => {
+      try {
+        const result = await original(input, handleOptions);
+        events.emit("message", {
+          sessionId: result.session.id,
+          requestId: boundedProgressText(input?.metadata?.requestId, 200) || null,
+          status: "complete",
+          agent: result.agent,
+          reply: result.reply,
+          toolCalls: result.output?.scrutiny?.action ? [] : []
+        });
+        return result;
+      } catch (error) {
+        logAgentFailure(error, {
+          sessionId: error?.openagiSessionId ?? null,
+          requestId: error?.openagiRequestId ?? input?.metadata?.requestId ?? null
+        });
+        if (error?.openagiSessionId) {
+          const failure = messageFailure(error, error.openagiSessionId);
+          events.emit("message", {
+            sessionId: error.openagiSessionId,
+            requestId: error.openagiRequestId ?? null,
+            status: "failed",
+            code: failure.code,
+            error: failure.error
+          });
+        }
+        throw error;
+      }
     };
   }
 
@@ -345,7 +372,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup", ephemeral: true });
           return sendJson(res, 200, { reply: turn.reply, model: turn.model });
         } catch (error) {
-          return sendJson(res, 500, { error: error.message });
+          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
         }
       }
 
@@ -478,8 +505,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const nowIso = new Date(now).toISOString();
 
         // Kick the service probes off BEFORE the first await below, so a
-        // sleeping Mac mini and a slow main are waited on concurrently rather
-        // than one after the other. describe() is budget-bounded and never
+        // sleeping service host and a slow main are waited on concurrently
+        // rather than one after the other. describe() is budget-bounded and never
         // rejects; the .catch is only there so a programming error in the
         // probe can never turn the whole topology view into a 500.
         const localServicesPromise = Promise.resolve()
@@ -629,7 +656,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           try { writeJsonAtomic(nodesCachePath, cached); } catch { /* best-effort */ }
           // The main's own identity is upstream.self. Dropping it is why the
           // roster only ever contained this machine and the user could never
-          // see the Distiller it is paired to.
+          // see the remote main it is paired to.
           const mainRow = row(
             { ...(upstreamJson?.self ?? {}), role: "main", url: pairing.remote, lastSeenAt: nowIso },
             { status: "online", statusAsOf: nowIso }
@@ -686,6 +713,27 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // rather than letting the composer call the memoizing resolveDataDir().
         return sendJson(res, 200, composeBrief(runtime, { now: new Date(), limit, dataDir }));
       }
+      // Searchable, cursor-paginated view of everything eligible for the
+      // Quick Ask review queue. It deliberately shares daily-brief's
+      // eligibility rules, so the footer count and this destination cannot
+      // describe different sets of records.
+      if (method === "GET" && pathname === "/review-queue") {
+        try {
+          return sendJson(res, 200, queryReviewQueue(runtime, {
+            dataDir,
+            q: url.searchParams.get("q"),
+            kind: url.searchParams.get("kind"),
+            cursor: url.searchParams.get("cursor"),
+            limit: url.searchParams.get("limit"),
+            sort: url.searchParams.get("sort")
+          }));
+        } catch (error) {
+          if (error instanceof ReviewQueueQueryError) {
+            return sendJson(res, error.statusCode, { error: error.message });
+          }
+          throw error;
+        }
+      }
       // "Not today" on a daily-plan focus row that maps to no task. The whole
       // decision — where the record lives, how it expires, what a key is — is
       // in daily-brief.js next to the composer that has to honour it; this is
@@ -738,6 +786,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // setup-test path only — never let a public /message caller set it to
         // evade persistence.
         if (body && typeof body === "object") delete body.ephemeral;
+        // Opt-in streaming keeps the existing JSON contract untouched. The
+        // same auth and Origin gates above protect both forms; this is a direct
+        // response stream, not a broadcast that another signed-in client can
+        // accidentally observe.
+        if (acceptsEventStream(req)) {
+          return streamLocalMessage(res, channels, body);
+        }
         // Chat must return a structured error, not a generic 500: the
         // dashboard needs to distinguish "budget cap hit" / "provider auth
         // failed" / "network blip" to show something actionable.
@@ -745,8 +800,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const result = await channels.handleLocalMessage(body);
           return sendJson(res, 200, result);
         } catch (error) {
-          const code = error?.code === "BUDGET_EXCEEDED" || /budget/i.test(error?.message ?? "") ? "budget" : "agent-error";
-          return sendJson(res, 500, { error: error.message ?? String(error), code });
+          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
         }
       }
 
@@ -1241,11 +1295,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "GET" && pathname === "/computer-use/log") {
         if (!runtime.computerUseLog) return sendJson(res, 503, { error: "no computer-use log" });
+        const { computerUseReadiness } = await import("./integrations/computer-use.js");
         const limit = Number(url.searchParams.get("limit") ?? 100);
         const sessions = runtime.computerUseLog.listSessions();
         const actions = runtime.computerUseLog.listActions({ limit });
+        const readiness = await computerUseReadiness({
+          toolsRegistered: runtime.tools?.has?.("start_computer_use_session") ?? false
+        });
         return sendJson(res, 200, {
-          enabled: process.env.OPENAGI_COMPUTER_USE === "1" || process.env.OPENAGI_COMPUTER_USE === "true",
+          enabled: readiness.enabled,
+          readiness,
           stats: runtime.computerUseLog.stats(),
           sessions,
           actions
@@ -1325,10 +1384,26 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // entry shows up here, with whichever paths apply (API key vs.
         // MCP) so the user has ONE place to configure everything.
         const { MCP_CATALOG, CATEGORIES } = await import("./mcp-catalog.js");
-        const registeredMcps = new Set(
-          (runtime.mcp?.listServers?.() ?? []).map((s) => (s.name ?? "").toLowerCase())
-        );
-        const mcpInCatalog = (id) => registeredMcps.has(id) || registeredMcps.has(id.replace(/-/g, ""));
+        const registeredMcps = runtime.mcp?.listServers?.() ?? [];
+        const mcpStatus = (id) => {
+          const wanted = String(id).toLowerCase();
+          const compact = wanted.replace(/-/g, "");
+          const server = registeredMcps.find((candidate) => {
+            const name = String(candidate.name ?? "").toLowerCase();
+            return name === wanted || name === compact;
+          });
+          const registered = Boolean(server);
+          const authenticated = server?.auth === "oauth"
+            ? Boolean(runtime.mcp.hasOAuthToken?.(server.name))
+            : registered;
+          return {
+            registered,
+            connected: Boolean(server?.connected),
+            authenticated,
+            configured: Boolean(server?.connected),
+            mcpName: server?.name ?? null
+          };
+        };
         const integrations = [
           {
             id: "linear",
@@ -1349,7 +1424,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "MCP (on-demand)",
                 catalogId: "linear",
-                configured: mcpInCatalog("linear")
+                ...mcpStatus("linear")
               }
             ]
           },
@@ -1372,7 +1447,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "MCP (on-demand)",
                 catalogId: "buildbetter",
-                configured: mcpInCatalog("buildbetter")
+                ...mcpStatus("buildbetter")
               }
             ]
           },
@@ -1393,7 +1468,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "MCP (on-demand)",
                 catalogId: "rize",
-                configured: mcpInCatalog("rize")
+                ...mcpStatus("rize")
               }
             ]
           },
@@ -1413,7 +1488,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "reMarkable MCP",
                 catalogId: "remarkable",
-                configured: mcpInCatalog("remarkable")
+                ...mcpStatus("remarkable")
               }
             ]
           },
@@ -1476,7 +1551,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             apiKeyHelp: entry.apiKeyHelp ?? null,
             apiKeyConfigured: entry.apiKeyEnvVar ? Boolean(process.env[entry.apiKeyEnvVar]) : true,
             connectable: entry.status === "available" && Boolean(entry.register),
-            configured: mcpInCatalog(entry.id),
+            ...mcpStatus(entry.id),
             featured: featuredIds.has(entry.id)
           }));
         return sendJson(res, 200, { integrations, catalog, categories: CATEGORIES });
@@ -1499,6 +1574,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const task = runtime.tasks.add(body, { source: body.source ?? "manual", queue: body.queue ?? "user" });
           return sendJson(res, 200, task);
         } catch (error) { return sendJson(res, 400, { error: error.message }); }
+      }
+      if (method === "GET" && pathname.match(/^\/tasks\/[^/]+$/)) {
+        if (!runtime.tasks?.get) return sendJson(res, 503, { error: "no task store" });
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const task = runtime.tasks.get(id);
+        return task ? sendJson(res, 200, task) : sendJson(res, 404, { error: "unknown task" });
       }
       if (method === "PATCH" && pathname.match(/^\/tasks\/[^/]+$/)) {
         if (!runtime.tasks?.update) return sendJson(res, 503, { error: "no task store" });
@@ -1667,9 +1748,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // the same card shape; source badge tells them apart.
         const { listAllSuggestions } = await import("./suggestion-feed.js");
         const status = url.searchParams.get("status");
-        return sendJson(res, 200, listAllSuggestions(runtime, {
+        const id = url.searchParams.get("id");
+        const suggestions = listAllSuggestions(runtime, {
           status: status === "null" ? null : (status ?? "pending")
-        }));
+        });
+        return sendJson(res, 200, id ? suggestions.filter((item) => item.id === id) : suggestions);
       }
       if (method === "POST" && pathname === "/proactive/observe") {
         if (!runtime.proactiveObserver?.observe) return sendJson(res, 503, { error: "no observer" });
@@ -1935,7 +2018,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const servers = runtime.mcp.listServers().map((s) => ({
           ...s,
           connecting: runtime.mcp.isConnecting?.(s.name) ?? false,
-          pendingAuthUrl: pendingOauth.get(s.name)?.url ?? null
+          authenticated: s.auth === "oauth" ? Boolean(runtime.mcp.hasOAuthToken?.(s.name)) : null,
+          // The authorization page may already have returned while the MCP
+          // initialize request is still settling. Token presence is the
+          // authoritative signal that login finished; don't render an old URL
+          // as if the user still needs to authorize.
+          pendingAuthUrl: runtime.mcp.hasOAuthToken?.(s.name)
+            ? null
+            : (pendingOauth.get(s.name)?.url ?? null)
         }));
         return sendJson(res, 200, servers);
       }
@@ -1957,6 +2047,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
           })
           .catch((error) => {
+            if (runtime.mcp.hasOAuthToken?.(name)) pendingOauth.delete(name);
             events.emit("mcp", { op: "connect-error", name, error: error.message });
           });
         events.emit("mcp", { op: "connecting", name });
@@ -1972,17 +2063,24 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // spaces: the live install has "buildbetter staging.json") and assert
         // the resolved path is inside <dataDir>/mcp/auth before deleting.
         const authPath = safeJoinOrNull(
-          path.join(resolveDataDir(), "mcp", "auth"),
+          path.join(dataDir, "mcp", "auth"),
           `${name}.json`,
           { pattern: LABEL_SEGMENT, label: "MCP server name" }
         );
         if (!authPath) return sendJson(res, 400, { error: "invalid MCP server name" });
         pendingOauth.delete(name);
-        // Wipe cached OAuth tokens so the next connect starts a fresh flow.
+        // "Forget login" is stronger than a transport disconnect: close the
+        // active client and unregister its tools before deleting the cache, so
+        // the dashboard and model cannot keep using a supposedly-forgotten
+        // credential until restart.
         try {
+          await runtime.mcp.disconnect?.(name);
           if (fsSync.existsSync(authPath)) fsSync.unlinkSync(authPath);
-        } catch { /* ignore */ }
-        return sendJson(res, 200, { ok: true });
+        } catch (error) {
+          return sendJson(res, 500, { error: `could not forget OAuth login: ${error.message}` });
+        }
+        events.emit("mcp", { op: "oauth-forgotten", name });
+        return sendJson(res, 200, { ok: true, disconnected: true, authenticated: false });
       }
       if (method === "POST" && pathname.match(/^\/mcp\/disconnect\/[^/]+$/)) {
         const name = decodeURIComponent(pathname.split("/")[3]);
@@ -2059,6 +2157,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       return sendJson(res, 404, { error: "not-found" });
     } catch (error) {
+      if (error?.openagiSessionId) {
+        logAgentFailure(error, {
+          sessionId: error.openagiSessionId,
+          requestId: error.openagiRequestId ?? null
+        });
+        return sendJson(res, 500, messageFailure(error, error.openagiSessionId));
+      }
       // Log so we can diagnose 500s instead of swallowing them.
       const logLine = `[${new Date().toISOString()}] 500 ${req.method} ${req.url} — ${error.message}\n${error.stack ?? ""}\n`;
       try { process.stderr.write(logLine); } catch { /* ignore */ }
@@ -2132,6 +2237,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 }
               }
             };
+            // Check in as soon as the listener is ready. Waiting one full
+            // interval made a freshly-started node invisible for 30 seconds
+            // (or longer when a custom interval was configured).
+            sendHeartbeat().catch(() => {});
             heartbeatHandle = setInterval(() => { sendHeartbeat().catch(() => {}); }, heartbeatIntervalMs);
           }
           const address = server.address();
@@ -2172,6 +2281,159 @@ function handleSse(req, res, clients) {
     clearInterval(heartbeat);
     clients.delete(res);
   });
+}
+
+function acceptsEventStream(req) {
+  return String(req.headers.accept ?? "")
+    .split(",")
+    .some((part) => part.trim().toLowerCase().split(";")[0] === "text/event-stream");
+}
+
+// Stream lifecycle for POST /message + Accept: text/event-stream:
+//   status    { stage, at, ...safe progress fields }
+//   session   { id, messageCount, agent } once the user turn is persisted
+//   heartbeat { at, stage, sessionId } every 15s while work is outstanding
+//   delta     { text, reset, at, provider, model, hop, sessionId, requestId }
+//             visible assistant text only; reset replaces an earlier tool hop
+//   final     the exact object returned by the legacy JSON endpoint
+//   failure   { code, error, sessionId } for a terminal provider/agent error
+//
+// Delta frames are private to this direct authenticated response. They are not
+// broadcast on /events or persisted as partial messages; the final durable
+// assistant record remains authoritative and a disconnected client recovers it
+// from the named session. Provider adapters expose text only, never reasoning,
+// tool arguments or tool results.
+async function streamLocalMessage(res, channels, body) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no"
+  });
+  res.flushHeaders?.();
+
+  let connected = true;
+  let stage = "queued";
+  let sessionId = boundedProgressText(body?.sessionId, 500) || null;
+  const requestId = boundedProgressText(body?.metadata?.requestId, 200) || null;
+  const write = (event, data) => {
+    if (!connected || res.destroyed || res.writableEnded) return false;
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      return true;
+    } catch {
+      connected = false;
+      return false;
+    }
+  };
+
+  write("status", { stage, at: new Date().toISOString(), ...(sessionId ? { sessionId } : {}), ...(requestId ? { requestId } : {}) });
+  const heartbeat = setInterval(() => {
+    write("heartbeat", { at: new Date().toISOString(), stage, sessionId, ...(requestId ? { requestId } : {}) });
+  }, 15_000);
+  res.on("close", () => {
+    connected = false;
+    clearInterval(heartbeat);
+  });
+
+  const onProgress = (raw) => {
+    const progress = normalizeMessageProgress(raw);
+    stage = progress.stage;
+    if (progress.session?.id) {
+      sessionId = progress.session.id;
+      write("session", {
+        id: progress.session.id,
+        messageCount: progress.session.messageCount,
+        agent: progress.agent ?? null,
+        ...(requestId ? { requestId } : {})
+      });
+    } else if (progress.sessionId) {
+      sessionId = progress.sessionId;
+    }
+    write("status", { ...progress, ...(requestId ? { requestId } : {}) });
+  };
+
+  const onTextDelta = (raw) => {
+    const delta = normalizeMessageTextDelta(raw);
+    if (!delta) return;
+    if (delta.sessionId) sessionId = delta.sessionId;
+    write("delta", {
+      ...delta,
+      ...(sessionId && !delta.sessionId ? { sessionId } : {}),
+      ...(requestId ? { requestId } : {})
+    });
+  };
+
+  try {
+    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta });
+    sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
+    write("final", result);
+  } catch (error) {
+    write("failure", { ...messageFailure(error, error?.openagiSessionId ?? sessionId), ...(requestId ? { requestId } : {}) });
+  } finally {
+    clearInterval(heartbeat);
+    if (connected && !res.writableEnded) res.end();
+  }
+}
+
+function normalizeMessageTextDelta(raw) {
+  if (typeof raw?.text !== "string" || raw.text.length === 0) return null;
+  const delta = {
+    // Do not trim: leading/trailing spaces are real model output tokens.
+    text: raw.text.slice(0, 64_000),
+    reset: raw.reset === true,
+    at: boundedProgressText(raw?.at, 50) || new Date().toISOString()
+  };
+  for (const key of ["provider", "model"]) {
+    const value = boundedProgressText(raw?.[key], 300);
+    if (value) delta[key] = value;
+  }
+  const deltaSessionId = boundedProgressText(raw?.sessionId, 500);
+  if (deltaSessionId) delta.sessionId = deltaSessionId;
+  if (Number.isFinite(raw?.hop)) delta.hop = raw.hop;
+  return delta;
+}
+
+function normalizeMessageProgress(raw) {
+  const stage = boundedProgressText(raw?.stage, 40) || "thinking";
+  const progress = {
+    stage,
+    at: boundedProgressText(raw?.at, 50) || new Date().toISOString()
+  };
+  const sessionId = boundedProgressText(raw?.sessionId, 500);
+  if (sessionId) progress.sessionId = sessionId;
+  const sessionRecordId = boundedProgressText(raw?.session?.id, 500);
+  if (sessionRecordId) {
+    progress.session = {
+      id: sessionRecordId,
+      messageCount: Number.isFinite(raw?.session?.messageCount) ? raw.session.messageCount : null
+    };
+  }
+  const agentId = boundedProgressText(raw?.agent?.id, 300);
+  if (agentId) {
+    progress.agent = {
+      id: agentId,
+      name: boundedProgressText(raw?.agent?.name, 300) || agentId,
+      role: boundedProgressText(raw?.agent?.role, 100) || null
+    };
+  }
+  for (const key of ["provider", "model", "tool"]) {
+    const value = boundedProgressText(raw?.[key], 300);
+    if (value) progress[key] = value;
+  }
+  if (Number.isFinite(raw?.hop)) progress.hop = raw.hop;
+  if (Number.isFinite(raw?.maxToolHops)) progress.maxToolHops = raw.maxToolHops;
+  const code = boundedProgressText(raw?.code, 100);
+  if (code) progress.code = code;
+  return progress;
+}
+
+function boundedProgressText(value, max) {
+  return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+function messageFailure(error, sessionId = null) {
+  return publicAgentFailure(error, sessionId);
 }
 
 // SEC-4: every HTML response this daemon serves gets a per-response nonce and
@@ -2870,10 +3132,11 @@ function renderApp() {
     <h1>OpenAGI</h1>
     <span id="status" class="status">connecting…</span>
     <nav id="nav">
-      <!-- Primary tabs — the 5 everyday surfaces. Keeps the nav readable
+      <!-- Primary tabs — the everyday surfaces. Keeps the nav readable
            on narrow windows; the other 11 tabs live behind "More ▾". -->
       <button data-tab="chat" class="active" title="Talk to your agent in natural language.">Chat</button>
       <button data-tab="tasks" title="My tasks + agent tasks. The agent's own queue gets drained every 30 min by the autopilot pulse.">Tasks</button>
+      <button data-tab="review" title="Search and work through every open task, draft, clarification, and suggestion behind Quick Ask.">Review</button>
       <button data-tab="suggestions" title="Things the proactive observer noticed + agent actions awaiting your approval.">Suggestions</button>
       <button data-tab="memory" title="Short, medium, and long-term memory. Promotion happens automatically.">Memory</button>
       <button data-tab="integrations" title="Connect MCPs (Linear, GitHub, Stripe, …), sources (BuildBetter, Rize, inbox folder), and channels (Telegram).">Integrations</button>
@@ -2919,12 +3182,29 @@ function renderApp() {
 const state = {
   tab: "chat",
   sessionId: null,
+  activeRequestId: null,
+  activeRequestStage: null,
+  activeRequestError: null,
+  activeRequestMissingSince: null,
+  activeRequestText: "",
+  activeRequestModel: "",
+  freshChatRequested: false,
   sessions: [],
   agentId: "main",
   channel: "local",
   from: "browser",
   messages: [],
-  health: null
+  health: null,
+  review: {
+    q: "",
+    kind: "all",
+    sort: "oldest",
+    items: [],
+    nextCursor: null,
+    total: 0,
+    byKind: {},
+    summary: null
+  }
 };
 
 const $ = (id) => document.getElementById(id);
@@ -3104,20 +3384,42 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
     sendBtn.disabled = true;
     reply.style.display = "block";
     reply.innerHTML = '<div class="muted" style="padding:10px 12px;">Thinking…</div>';
+    const requestId = newChatRequestId();
+    let streamedText = "";
+    const showStreamedReply = (model = "") => {
+      reply.innerHTML = \`
+        <div class="card" style="padding:12px; margin-bottom:14px;">
+          <div class="muted" style="font-size:11px; margin-bottom:6px;">openagi\${model ? " → " + escapeHtml(model) : " is replying…"}</div>
+          <div>\${renderMarkdown(streamedText)}</div>
+          <div class="muted" style="margin-top:8px; font-size:11px;">Response is still streaming…</div>
+        </div>
+      \`;
+    };
     try {
-      const result = await postJson("/message", {
+      const result = await postMessageStream({
         text,
         channel: state.channel ?? "local",
         from: state.from ?? "browser",
         agentId: state.agentId,
-        sessionId: state.sessionId
+        sessionId: state.sessionId,
+        metadata: { requestId, requestSource: "page-chat" }
+      }, (event, data) => {
+        if (event === "session" && data?.id) state.sessionId = data.id;
+        if (event === "delta" && typeof data?.text === "string") {
+          streamedText = data.reset === true ? data.text : streamedText + data.text;
+          showStreamedReply(data.model ?? "");
+        } else if ((event === "status" || event === "heartbeat") && !streamedText) {
+          const label = data?.stage === "tool" ? "Using tools…" : data?.stage === "saving" ? "Saving the answer…" : "Thinking…";
+          reply.innerHTML = '<div class="muted" style="padding:10px 12px;">' + label + '</div>';
+        }
       });
       if (result.session?.id) state.sessionId = result.session.id;
+      const continueHref = "/?tab=chat" + (state.sessionId ? "&session=" + encodeURIComponent(state.sessionId) : "");
       reply.innerHTML = \`
         <div class="card" style="padding:12px; margin-bottom:14px;">
           <div class="muted" style="font-size:11px; margin-bottom:6px;">openagi → \${escapeHtml(result.model?.model ?? "")}</div>
           <div>\${renderMarkdown(result.reply ?? "")}</div>
-          <div style="margin-top:8px; font-size:11px;"><a href="/?tab=chat">continue in chat →</a></div>
+          <div style="margin-top:8px; font-size:11px;"><a href="\${escapeHtml(continueHref)}">continue in chat →</a></div>
         </div>
       \`;
       input.value = "";
@@ -3167,6 +3469,11 @@ newBtn.addEventListener("click", async () => {
   if (state.tab === "chat") {
     state.sessionId = null;
     state.messages = [];
+    state.activeRequestId = null;
+    state.activeRequestStage = null;
+    state.activeRequestError = null;
+    state.activeRequestMissingSince = null;
+    state.freshChatRequested = true;
     state.from = "browser-" + Date.now();
     renderTab();
   } else if (state.tab === "cron") {
@@ -3201,6 +3508,7 @@ newBtn.addEventListener("click", async () => {
 
 async function switchTab(tab) {
   state.tab = tab;
+  syncNodesAutoRefresh();
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   const body = document.querySelector(".body");
   const showSidebar = (yes) => {
@@ -3213,6 +3521,15 @@ async function switchTab(tab) {
     sidebarTitle.textContent = "Sessions";
     newBtn.textContent = "+ New";
     await refreshSessions();
+    // A bare Chat open should look like chat history, not an unexplained blank
+    // composer. Select the newest human-facing session unless the user
+    // explicitly pressed + New or a specific ?session= handoff is about to be
+    // resolved. Background cron/autopilot transcripts stay out of this choice.
+    const requestedSession = deepLinkSessionId(window.location.search);
+    if (!state.sessionId && !state.freshChatRequested && !requestedSession) {
+      const latest = latestInteractiveSession(state.sessions);
+      if (latest) await loadSession(latest.id);
+    }
   } else if (tab === "cron") {
     showSidebar(true);
     sidebarTitle.textContent = "Schedules";
@@ -3262,6 +3579,9 @@ async function switchTab(tab) {
   } else if (tab === "today") {
     showSidebar(false);
     await renderToday();
+  } else if (tab === "review") {
+    showSidebar(false);
+    await renderReview();
   } else if (tab === "tasks") {
     showSidebar(false);
     await renderTasks();
@@ -3283,6 +3603,9 @@ function renderTab() {
 async function refreshSessions() {
   const sessions = await fetchJson("/sessions");
   state.sessions = sessions;
+  // A session refresh can finish after the user has switched to another tab.
+  // Keep the cached list current, but never replace another tab's sidebar.
+  if (state.tab !== "chat") return sessions;
   sidebarList.innerHTML = "";
   if (sessions.length === 0) {
     sidebarList.innerHTML = '<li class="empty">No sessions yet</li>';
@@ -3294,16 +3617,39 @@ async function refreshSessions() {
     li.addEventListener("click", () => loadSession(s.id));
     sidebarList.appendChild(li);
   }
+  return sessions;
 }
 
 async function loadSession(id) {
   state.sessionId = id;
+  state.freshChatRequested = false;
   const session = await fetchJson("/sessions/" + encodeURIComponent(id));
+  // Sidebar clicks can race. If B (or + New) was selected while A's history
+  // was in flight, A's late response must not overwrite B's conversation.
+  if (state.tab !== "chat" || state.sessionId !== id) return false;
+  const resolvedId = session?.id || id;
+  state.sessionId = resolvedId;
   state.messages = session.messages ?? [];
+  state.activeRequestId = latestChatRequestId(state.messages);
+  state.activeRequestStage = null;
+  state.activeRequestError = null;
+  state.activeRequestMissingSince = null;
+  state.activeRequestText = "";
+  state.activeRequestModel = "";
   state.channel = state.messages[0]?.channel ?? "local";
   state.from = state.messages[0]?.from ?? "browser";
   await refreshSessions();
+  if (state.tab !== "chat" || state.sessionId !== resolvedId) return false;
   renderChat();
+  return true;
+}
+
+function latestInteractiveSession(sessions) {
+  if (!Array.isArray(sessions)) return null;
+  return sessions.find((session) => {
+    const id = String(session?.id ?? "").toLowerCase();
+    return id && !id.startsWith("autopilot:") && !id.startsWith("cron:");
+  }) ?? null;
 }
 
 // Read the session id out of a chat deep link. The Quick Ask popover's
@@ -3323,16 +3669,46 @@ function deepLinkSessionId(search) {
   }
 }
 
+function deepLinkRequestId(search) {
+  try {
+    const raw = new URLSearchParams(search).get("request");
+    const id = (raw ?? "").trim();
+    return id === "" ? null : id;
+  } catch {
+    return null;
+  }
+}
+
 // Land the user on the conversation named by the deep link. Returns true when
 // the thread was actually loaded, false when we said so and left them on a
 // fresh chat instead.
-async function openSessionDeepLink(id) {
+async function openSessionDeepLink(id, requestId = null) {
   let session = null;
-  try {
-    session = await fetchJson("/sessions/" + encodeURIComponent(id));
-  } catch (err) {
-    showToast("Could not open that conversation: " + err.message, false);
-    return false;
+  // The popup knows the session id before it opens POST /message, specifically
+  // so its handoff is available while work is running. If the user clicks in
+  // the tiny interval before the daemon persists the user turn, retry this
+  // named request rather than declaring its brand-new session "gone".
+  const attempts = requestId ? 4 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      session = await fetchJson("/sessions/" + encodeURIComponent(id));
+    } catch (err) {
+      if (attempt === attempts - 1) {
+        showToast("Could not open that conversation: " + err.message, false);
+        return false;
+      }
+    }
+    const candidateMessages = Array.isArray(session?.messages) ? session.messages : [];
+    const requestedTurnIsPresent = !requestId || candidateMessages.some((message) => {
+      const metadata = message?.metadata;
+      const value = metadata?.requestId ?? metadata?.request?.id;
+      return typeof value === "string" && value.trim() === requestId;
+    });
+    // A reused overlay session already has old messages. Do not mistake that
+    // history for the new handoff: wait briefly for this exact request to be
+    // persisted, then adopt it as a durable queued request below.
+    if (candidateMessages.length > 0 && requestedTurnIsPresent) break;
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
   const messages = Array.isArray(session && session.messages) ? session.messages : [];
   // GET /sessions/:id answers with an empty shell for an id it has never seen
@@ -3340,14 +3716,39 @@ async function openSessionDeepLink(id) {
   // messages" is exactly how a purged or mistyped deep link looks. Say that,
   // rather than rendering an empty thread that looks identical to the bug this
   // whole deep link exists to fix.
-  if (messages.length === 0) {
+  if (messages.length === 0 && !requestId) {
     state.sessionId = null;
     state.messages = [];
     showToast("That conversation is no longer available — starting a new one.", false);
     return false;
   }
   state.sessionId = (session && session.id) || id;
+  state.freshChatRequested = false;
   state.messages = messages;
+  state.activeRequestId = requestId;
+  if (!state.activeRequestId) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const value = messages[i]?.metadata?.requestId ?? messages[i]?.metadata?.request?.id;
+      if (typeof value === "string" && value.trim()) {
+        state.activeRequestId = value.trim();
+        break;
+      }
+    }
+  }
+  state.activeRequestStage = null;
+  state.activeRequestError = null;
+  state.activeRequestText = "";
+  state.activeRequestModel = "";
+  const requestedTurnIsPresent = Boolean(requestId && messages.some((message) => {
+    const metadata = message?.metadata;
+    const value = metadata?.requestId ?? metadata?.request?.id;
+    return typeof value === "string" && value.trim() === requestId;
+  }));
+  // The popup can hand off before routing or a same-session queue reaches the
+  // store. Keep that named request visibly queued, block duplicate sends, and
+  // let the recovery poll reconcile it once its user/assistant records appear.
+  state.activeRequestMissingSince = requestId && !requestedTurnIsPresent ? Date.now() : null;
+  if (state.activeRequestMissingSince) state.activeRequestStage = "queued";
   // Keep replying on the channel the conversation started on. An overlay ask
   // is channel "overlay" / from "user"; sending the follow-up as local/browser
   // would compute a different session key and fork the thread in two.
@@ -3358,9 +3759,212 @@ async function openSessionDeepLink(id) {
   return true;
 }
 
+function newChatRequestId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return "req_" + globalThis.crypto.randomUUID().replaceAll("-", "");
+  } catch { /* deterministic fallback below */ }
+  return "req_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+// Direct response streams outlive the DOM that started them. Only the request
+// still selected in Chat may mutate visible conversation state; a completion
+// for a session the user left remains durable on the server and is picked up
+// from the session list/history instead.
+function chatRequestOwnsVisibleState(current, sessionIds, requestId) {
+  return current?.tab === "chat"
+    && current?.activeRequestId === requestId
+    && sessionIds.some((id) => Boolean(id) && current?.sessionId === id);
+}
+
+function messageRequestId(message) {
+  const metadata = message?.metadata;
+  const value = metadata?.requestId ?? metadata?.request?.id;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function messageRequestStatus(message) {
+  const metadata = message?.metadata;
+  const value = metadata?.requestStatus ?? metadata?.request?.status ?? metadata?.status;
+  return typeof value === "string" ? value.toLowerCase() : null;
+}
+
+// Six provider hops can each consume the 120-second provider timeout. Thirty
+// minutes leaves ample room for that plus tools while preventing a user turn
+// stranded by a daemon crash from saying “working” and polling forever.
+const CHAT_REQUEST_STALE_MS = 30 * 60 * 1000;
+// A disconnected request is recoverable too: the daemon deliberately keeps a queued
+// turn running after the direct HTTP stream drops. Keep reconciling its durable
+// history until the same 30-minute stale cutoff used by every pending request.
+const CHAT_REQUEST_LIVE_STAGES = ["queued", "routing", "accepted", "thinking", "model", "tool", "saving", "disconnected"];
+
+function latestChatRequestId(messages) {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i -= 1) {
+    const id = messageRequestId(messages[i]);
+    if (id) return id;
+  }
+  return null;
+}
+
+function requestState(messages, requestId) {
+  if (!requestId) return null;
+  const userIndex = messages.findIndex((message) => message.role === "user" && messageRequestId(message) === requestId);
+  if (userIndex < 0) return null;
+  let laterIdentifiedRequest = false;
+  for (let i = userIndex + 1; i < messages.length; i += 1) {
+    const message = messages[i];
+    const messageId = messageRequestId(message);
+    if (message.role === "user" && messageId) {
+      laterIdentifiedRequest = true;
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    // New records carry requestId on both sides. Legacy assistant records do
+    // not, so adjacency remains the fallback only when no overlapping request
+    // makes that inference ambiguous.
+    if (messageId && messageId !== requestId) continue;
+    if (!messageId && laterIdentifiedRequest) continue;
+    const status = messageRequestStatus(message);
+    if (status === "failed") return { status: "failed", message };
+    return { status: "complete", message };
+  }
+  const userMessage = messages[userIndex];
+  const createdAt = Date.parse(userMessage?.createdAt ?? "");
+  if (Number.isFinite(createdAt) && Date.now() - createdAt > CHAT_REQUEST_STALE_MS) {
+    return { status: "interrupted", message: userMessage };
+  }
+  return { status: "pending", message: userMessage };
+}
+
+function isPendingUserMessage(messages, index) {
+  const message = messages[index];
+  if (message?.role !== "user") return false;
+  const id = messageRequestId(message);
+  return Boolean(id && requestState(messages, id)?.status === "pending");
+}
+
+function activeChatRequestIsPending() {
+  const id = state.activeRequestId || latestChatRequestId(state.messages);
+  const persisted = requestState(state.messages, id);
+  return persisted?.status === "pending"
+    || (!persisted && Boolean(id) && CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage));
+}
+
+function chatStageLabel(stage) {
+  return ({
+    queued: "Queued",
+    routing: "Choosing the right agent",
+    accepted: "Request saved",
+    thinking: "Thinking",
+    model: "Waiting for the model",
+    tool: "Using tools",
+    saving: "Saving the answer",
+    disconnected: "Connection lost — checking the saved request"
+  })[stage] ?? "Working";
+}
+
+function renderChatRequestStatus() {
+  const host = document.getElementById("chat-request-status");
+  if (!host) return;
+  const id = state.activeRequestId || latestChatRequestId(state.messages);
+  const persisted = requestState(state.messages, id);
+  const hasLiveProgress = CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage);
+  const failed = state.activeRequestStage === "failed" || persisted?.status === "failed";
+  const interrupted = state.activeRequestStage === "interrupted" || (!hasLiveProgress && persisted?.status === "interrupted");
+  const pending = !failed && !interrupted && (persisted?.status === "pending" || hasLiveProgress);
+  if (!failed && !interrupted && !pending) {
+    host.innerHTML = "";
+    return;
+  }
+  if (failed) {
+    const persistedText = persisted?.message?.content;
+    const detail = state.activeRequestError || persistedText || "The agent could not complete this request.";
+    host.innerHTML = \`
+      <div class="card err" style="padding:10px 12px; margin-bottom:10px;" role="status">
+        <strong>Request failed.</strong> \${escapeHtml(detail)}
+      </div>
+    \`;
+    return;
+  }
+  if (interrupted) {
+    host.innerHTML = \`
+      <div class="card warn-banner" style="padding:10px 12px; margin-bottom:10px;" role="status">
+        <strong>Request interrupted.</strong> No completion was recorded. Review any task changes before retrying.
+      </div>
+    \`;
+    return;
+  }
+  host.innerHTML = \`
+    <div class="card" style="padding:10px 12px; margin-bottom:10px;" role="status" aria-live="polite">
+      <span class="muted">◌ \${escapeHtml(chatStageLabel(state.activeRequestStage))}… This conversation updates automatically; you can keep this window open or come back later.</span>
+    </div>
+  \`;
+}
+
+let activeChatRefresh = null;
+async function refreshActiveChatSession(id = state.sessionId, { force = false } = {}) {
+  if (!id || state.tab !== "chat") return false;
+  if (activeChatRefresh && !force) return activeChatRefresh;
+  const request = (async () => {
+    const session = await fetchJson("/sessions/" + encodeURIComponent(id));
+    // The fetch may finish after a sidebar click or + New. Applying that stale
+    // response would reopen the old conversation even though its stream handler
+    // correctly detached, so verify the selection again at the async boundary.
+    if (state.tab !== "chat" || state.sessionId !== id) return false;
+    const messages = Array.isArray(session?.messages) ? session.messages : [];
+    const before = state.messages.map((message) => message.id ?? [message.role, message.createdAt, message.content].join(":"))
+      .join("|");
+    const after = messages.map((message) => message.id ?? [message.role, message.createdAt, message.content].join(":"))
+      .join("|");
+    if (!force && before === after) return false;
+
+    const draft = document.getElementById("input")?.value ?? "";
+    const wasFocused = document.activeElement?.id === "input";
+    state.sessionId = session?.id || id;
+    state.messages = messages;
+    state.channel = messages[0]?.channel ?? state.channel ?? "local";
+    state.from = messages[0]?.from ?? state.from ?? "browser";
+    const outcome = requestState(messages, state.activeRequestId);
+    if (outcome) state.activeRequestMissingSince = null;
+    else if (state.activeRequestId && CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage)) {
+      // A disconnect can happen while this turn is still queued behind another
+      // same-session turn, before AgentHost persists its user record. Remember
+      // when it first went missing so polling recovers a late write but still
+      // terminates at CHAT_REQUEST_STALE_MS after a daemon crash.
+      state.activeRequestMissingSince ??= Date.now();
+    }
+    if (outcome?.status === "complete") {
+      state.activeRequestStage = "complete";
+      state.activeRequestError = null;
+      state.activeRequestText = "";
+      state.activeRequestModel = "";
+    } else if (outcome?.status === "failed") {
+      state.activeRequestStage = "failed";
+      state.activeRequestText = "";
+      state.activeRequestModel = "";
+    } else if (outcome?.status === "interrupted") {
+      state.activeRequestStage = "interrupted";
+      state.activeRequestText = "";
+      state.activeRequestModel = "";
+    }
+    renderChat();
+    const input = document.getElementById("input");
+    if (input && draft) {
+      input.value = draft;
+      input.dispatchEvent(new Event("input"));
+      if (wasFocused) input.focus();
+    }
+    await refreshSessions();
+    return true;
+  })();
+  activeChatRefresh = request;
+  try { return await request; }
+  finally { if (activeChatRefresh === request) activeChatRefresh = null; }
+}
+
 function renderChat() {
   main.innerHTML = \`
     <div id="chat-deeplink" style="margin-bottom:8px;"></div>
+    <div id="chat-request-status"></div>
     <div class="thread" id="thread"></div>
     <form class="composer" id="composer">
       <textarea id="input" placeholder="Message your OpenAGI agent…" rows="1"></textarea>
@@ -3379,7 +3983,11 @@ function renderChat() {
     try { dismissed = localStorage.getItem("openagi.welcomeDismissed") === "1"; } catch { /* ignore */ }
     thread.innerHTML = (noSessions && !dismissed) ? renderFirstRunWelcome() : renderChatPlaceholder();
   }
-  for (const m of state.messages) appendMessage(m, false);
+  for (let i = 0; i < state.messages.length; i += 1) {
+    appendMessage(state.messages[i], false, { pending: isPendingUserMessage(state.messages, i) });
+  }
+  renderStreamingAssistant();
+  renderChatRequestStatus();
   thread.scrollTop = thread.scrollHeight;
   // Render a deep-link panel above the thread when the user arrived
   // here via a notification with ?suggestion=<id> or ?pending=<id>.
@@ -3409,6 +4017,10 @@ function renderChat() {
     if (thread) thread.innerHTML = renderChatPlaceholder();
   });
   const input = $("input");
+  const composerBlocked = activeChatRequestIsPending();
+  input.disabled = composerBlocked;
+  $("send").disabled = composerBlocked;
+  if (composerBlocked) input.placeholder = "Wait for the current request to finish…";
   // ?compose=<intent> seeds the input with a starter sentence so the user
   // can finish typing and Enter — agent picks up via add_task /
   // connect_catalog_mcp / etc tools. Used by the menu-bar "+ Add task"
@@ -3435,7 +4047,7 @@ function renderChat() {
       history.replaceState(null, "", url.toString());
     }
   }
-  input.focus();
+  if (!composerBlocked) input.focus();
   input.addEventListener("input", () => {
     input.style.height = "auto";
     input.style.height = Math.min(200, input.scrollHeight) + "px";
@@ -3450,26 +4062,97 @@ function renderChat() {
     e.preventDefault();
     const text = input.value.trim();
     if (!text) return;
+    const sendBtn = $("send");
+    if (sendBtn.disabled) return;
+    const requestId = newChatRequestId();
+    if (!state.sessionId) {
+      if (!state.from || state.from === "browser") state.from = "browser-" + newChatRequestId();
+      state.sessionId = state.channel + ":" + state.from + ":" + state.agentId;
+    }
+    const submittedSessionId = state.sessionId;
+    let requestSessionId = submittedSessionId;
+    const ownsVisibleRequest = () => chatRequestOwnsVisibleState(
+      state,
+      [submittedSessionId, requestSessionId],
+      requestId
+    );
+    const refreshDetachedSessionList = async () => {
+      if (state.tab === "chat") await refreshSessions().catch(() => {});
+    };
+    state.freshChatRequested = false;
+    state.activeRequestId = requestId;
+    state.activeRequestStage = "queued";
+    state.activeRequestError = null;
+    state.activeRequestMissingSince = null;
+    state.activeRequestText = "";
+    state.activeRequestModel = "";
     input.value = "";
     input.style.height = "auto";
-    appendMessage({ role: "user", content: text, from: state.from, channel: state.channel, createdAt: new Date().toISOString() });
-    const sendBtn = $("send");
+    const optimistic = {
+      role: "user",
+      content: text,
+      from: state.from,
+      channel: state.channel,
+      createdAt: new Date().toISOString(),
+      metadata: { requestId, requestSource: "dashboard" }
+    };
+    state.messages.push(optimistic);
+    appendMessage(optimistic, true, { pending: true });
+    renderChatRequestStatus();
     sendBtn.disabled = true;
     try {
-      const result = await postJson("/message", {
+      const result = await postMessageStream({
         text,
         channel: state.channel,
         from: state.from,
         agentId: state.agentId,
-        sessionId: state.sessionId
+        sessionId: submittedSessionId,
+        metadata: { requestId, requestSource: "dashboard" }
+      }, (event, data) => {
+        if (event === "session" && data?.id) {
+          const wasVisible = ownsVisibleRequest();
+          requestSessionId = data.id;
+          if (wasVisible) state.sessionId = data.id;
+          return;
+        }
+        if (!ownsVisibleRequest()) return;
+        if (event === "status" || event === "heartbeat") {
+          state.activeRequestStage = data?.stage ?? state.activeRequestStage;
+          renderChatRequestStatus();
+        } else if (event === "delta") {
+          updateStreamingAssistant(requestId, data);
+        }
       });
-      state.sessionId = result.session.id;
-      appendMessage({ role: "assistant", content: result.reply, from: "openagi", channel: state.channel, createdAt: result.createdAt, metadata: result.model });
-      refreshSessions();
+      const finalSessionId = result.session?.id || requestSessionId;
+      if (ownsVisibleRequest()) {
+        requestSessionId = finalSessionId;
+        state.sessionId = finalSessionId;
+        state.activeRequestStage = "complete";
+        await refreshActiveChatSession(finalSessionId, { force: true });
+      } else {
+        await refreshDetachedSessionList();
+      }
     } catch (err) {
-      appendMessage({ role: "assistant", content: "[error] " + err.message });
+      // An explicit daemon failure is terminal. A broken HTTP/SSE transport is
+      // not: the daemon intentionally continues the already-persisted turn.
+      // Keep it pending and let the session poll/global SSE reconcile it.
+      if (ownsVisibleRequest()) {
+        state.activeRequestStage = err.terminal === true ? "failed" : "disconnected";
+        state.activeRequestError = err.message;
+        // Prefer the daemon's persisted failure record when available. If the
+        // connection itself died first, the local status remains visible and the
+        // pending-session poll can still pick up a later completion.
+        await refreshActiveChatSession(requestSessionId, { force: true }).catch(() => {});
+        renderChatRequestStatus();
+      } else {
+        await refreshDetachedSessionList();
+      }
     } finally {
-      sendBtn.disabled = false;
+      if (ownsVisibleRequest()) {
+        const currentSend = $("send");
+        const outcome = requestState(state.messages, state.activeRequestId);
+        if (currentSend) currentSend.disabled = outcome?.status === "pending" || activeChatRequestIsPending();
+      }
     }
   });
 }
@@ -3636,7 +4319,7 @@ function screenContextChip(metadata) {
     escapeHtml(where + size) + "</div>";
 }
 
-function appendMessage(msg, autoscroll = true) {
+function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   const thread = $("thread");
   if (!thread) return;
   const div = document.createElement("div");
@@ -3645,9 +4328,45 @@ function appendMessage(msg, autoscroll = true) {
   // Assistant replies render markdown; user messages stay literal.
   const body = msg.role === "assistant" ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
   const context = msg.role === "user" ? screenContextChip(msg.metadata) : "";
-  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\`;
+  const pendingNote = pending
+    ? '<div class="meta" style="margin-top:5px;">◌ Agent is still working — this request is saved.</div>'
+    : "";
+  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${pendingNote}\`;
   thread.appendChild(div);
   if (autoscroll) thread.scrollTop = thread.scrollHeight;
+}
+
+// Keep transient model text outside state.messages: only the exact provider
+// result that AgentHost persisted belongs in conversation history. The small
+// buffer survives a tab re-render or a transport disconnect, then disappears
+// as soon as the durable completed/failed record is fetched.
+function updateStreamingAssistant(requestId, delta) {
+  if (!requestId || requestId !== state.activeRequestId) return;
+  if (typeof delta?.text !== "string" || delta.text.length === 0) return;
+  state.activeRequestText = delta.reset === true
+    ? delta.text
+    : (state.activeRequestText ?? "") + delta.text;
+  if (typeof delta.model === "string" && delta.model) state.activeRequestModel = delta.model;
+  renderStreamingAssistant();
+}
+
+function renderStreamingAssistant() {
+  const thread = $("thread");
+  if (!thread || !state.activeRequestText || !activeChatRequestIsPending()) return;
+  let div = Array.from(thread.querySelectorAll(".msg.assistant.streaming"))
+    .find((candidate) => candidate.dataset.requestId === state.activeRequestId);
+  if (!div) {
+    div = document.createElement("div");
+    div.className = "msg assistant streaming";
+    div.dataset.requestId = state.activeRequestId ?? "";
+    div.innerHTML = '<div class="meta"></div><div class="body" aria-live="polite"></div>';
+    thread.appendChild(div);
+  }
+  const meta = div.querySelector(".meta");
+  const body = div.querySelector(".body");
+  if (meta) meta.textContent = state.activeRequestModel ? state.activeRequestModel + " · replying…" : "openagi · replying…";
+  if (body) body.innerHTML = renderMarkdown(state.activeRequestText);
+  thread.scrollTop = thread.scrollHeight;
 }
 
 async function refreshCron() {
@@ -4026,6 +4745,9 @@ function renderMcpDetail(server) {
   const connectingBanner = server.connecting && !server.connected
     ? \`<div class="card"><div class="row" style="align-items:center; gap:10px; flex-wrap:wrap;"><span class="name">⏳ Connecting…</span><span class="muted" style="flex:1; min-width:0;">waiting for handshake</span></div></div>\`
     : "";
+  const errorBanner = server.lastError && !server.connecting && !server.connected
+    ? \`<div class="card err"><div class="name">Connection failed</div><div class="desc">\${escapeHtml(server.lastError)}</div></div>\`
+    : "";
   main.innerHTML = \`
     <div class="pane">
       <h2>\${escapeHtml(server.name)}</h2>
@@ -4033,17 +4755,19 @@ function renderMcpDetail(server) {
         <span class="badge \${server.connected ? 'ok' : ''}">\${server.connected ? "connected" : "disconnected"}</span>
         <span class="badge">trust: \${escapeHtml(server.trustLevel)}</span>
         <span class="badge">transport: \${transportLabel}</span>
+        \${server.auth === "oauth" ? \`<span class="badge \${server.authenticated ? 'ok' : ''}">\${server.authenticated ? "authorized" : "not authorized"}</span>\` : ""}
         \${server.pendingAuthUrl ? '<span class="badge warn">awaiting auth</span>' : ""}
       </div>
       \${oauthBanner}
       \${connectingBanner}
+      \${errorBanner}
       <h3>Endpoint</h3>
       \${endpoint}
       <h3>Tools</h3>
       <pre>\${escapeHtml((server.tools ?? []).join("\\n") || "(none — connect to discover)")}</pre>
       <div class="row" style="gap: 8px; margin-top: 12px;flex-wrap:wrap;">
         <button id="connBtn" \${server.connecting ? "disabled" : ""}>\${server.connected ? "Disconnect" : "Connect"}</button>
-        \${server.transport === "http" && server.auth === "oauth" ? \`<button class="secondary" id="clearAuthBtn">Re-auth (clear cached token)</button>\` : ""}
+        \${server.transport === "http" && server.auth === "oauth" ? \`<button class="secondary" id="clearAuthBtn">Forget login</button>\` : ""}
         <button class="secondary" id="callBtn">Call tool…</button>
       </div>
       <pre id="mcpOut" class="ok" style="margin-top: 12px;"></pre>
@@ -4061,9 +4785,14 @@ function renderMcpDetail(server) {
   });
   const clearBtn = $("clearAuthBtn");
   if (clearBtn) clearBtn.addEventListener("click", async () => {
-    if (!confirm("Clear cached OAuth token for " + server.name + "? Next Connect will run the auth flow again.")) return;
-    await postJson(\`/mcp/clear-auth/\${encodeURIComponent(server.name)}\`, {});
-    refreshMcp();
+    if (!confirm("Disconnect " + server.name + " and forget its saved OAuth login? You can connect and authorize it again later.")) return;
+    try {
+      await postJson(\`/mcp/clear-auth/\${encodeURIComponent(server.name)}\`, {});
+      showToast("Login forgotten. The integration is disconnected.", true);
+      refreshMcp();
+    } catch (error) {
+      showToast("Could not forget login: " + error.message, false);
+    }
   });
   $("callBtn").addEventListener("click", () => {
     const tool = prompt("Tool name?");
@@ -4389,8 +5118,80 @@ function nodeBuildLabel(n) {
   return origin ? origin + " " + n.build : n.build;
 }
 
-async function renderNodes() {
-  const data = await fetchJson("/nodes");
+let nodesRenderPromise = null;
+let nodesRefreshTimer = null;
+
+// Keep topology reasonably fresh without polling a panel the user cannot see.
+// Re-entering the browser tab gets an immediate refresh; the 30-second timer
+// exists only while both the Nodes app tab and this document are visible.
+function syncNodesAutoRefresh() {
+  if (nodesRefreshTimer) {
+    clearInterval(nodesRefreshTimer);
+    nodesRefreshTimer = null;
+  }
+  if (state.tab === "nodes" && !document.hidden) {
+    nodesRefreshTimer = setInterval(() => {
+      renderNodes({ showLoading: false });
+    }, 30_000);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  syncNodesAutoRefresh();
+  if (state.tab === "nodes" && !document.hidden) {
+    renderNodes({ showLoading: false });
+  }
+});
+
+// A slow main can make several refresh triggers coincide (tab entry, timer,
+// visibility, and the button). Share one promise so those triggers produce one
+// request and a late response cannot overwrite a different app tab.
+function renderNodes(options = {}) {
+  if (nodesRenderPromise) return nodesRenderPromise;
+  let request;
+  request = renderNodesOnce(options).finally(() => {
+    if (nodesRenderPromise === request) nodesRenderPromise = null;
+  });
+  nodesRenderPromise = request;
+  return request;
+}
+
+async function renderNodesOnce({ showLoading = true } = {}) {
+  if (state.tab !== "nodes") return;
+  if (showLoading) {
+    main.innerHTML = \`
+      <div class="pane" aria-busy="true">
+        <h2>Nodes</h2>
+        <div class="card"><div class="name">Loading nodes…</div><div class="desc">Checking this machine, paired installs, and connected services.</div></div>
+      </div>
+    \`;
+  } else {
+    const refresh = document.getElementById("nodesRefresh");
+    if (refresh) {
+      refresh.disabled = true;
+      refresh.textContent = "Checking…";
+    }
+  }
+
+  let data;
+  try {
+    data = await fetchJson("/nodes");
+  } catch (error) {
+    if (state.tab !== "nodes") return;
+    main.innerHTML = \`
+      <div class="pane">
+        <h2>Nodes</h2>
+        <div class="card">
+          <div class="name err">Couldn't load nodes</div>
+          <div class="desc">\${escapeHtml(error?.message ?? String(error))}</div>
+          <div class="row" style="margin-top:8px;"><button id="nodesRetry">Try again</button></div>
+        </div>
+      </div>
+    \`;
+    document.getElementById("nodesRetry")?.addEventListener("click", () => renderNodes());
+    return;
+  }
+  if (state.tab !== "nodes") return;
   const self = data.self ?? {};
   const nodes = Array.isArray(data.nodes) ? data.nodes : [];
   const isNode = self.role === "node";
@@ -4454,8 +5255,8 @@ async function renderNodes() {
   }).join("");
 
   // Service nodes: machines that do work for this installation without being
-  // installs themselves (the Mac mini that serves iMessage search). They sit in
-  // the SAME table so the whole topology reads as one thing, but every column
+  // installs themselves (for example, a host that serves iMessage search).
+  // They sit in the SAME table so the whole topology reads as one thing, but every column
   // that only means something for a peer says so instead of being left blank —
   // a service has no heartbeat, no version and nothing to update.
   const services = Array.isArray(data.services) ? data.services : [];
@@ -4553,7 +5354,7 @@ async function renderNodes() {
     c.style.borderBottom = "1px solid var(--line)";
     c.style.verticalAlign = "top";
   });
-  document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes());
+  document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes({ showLoading: false }));
 }
 
 async function renderChannels() {
@@ -4853,8 +5654,11 @@ async function renderSuggestions() {
   // auto-register, automations → notes, knowledge → just FYI.
   // Plus: pending agent-initiated actions (catalog connects, daemon
   // restarts) that need explicit human approval before they run.
+  const targetSuggestionId = new URLSearchParams(window.location.search).get("suggestion");
+  const suggestionPath = "/proactive/suggestions?status=pending"
+    + (targetSuggestionId ? "&id=" + encodeURIComponent(targetSuggestionId) : "");
   const [list, pendingActions] = await Promise.all([
-    fetchJson("/proactive/suggestions?status=pending").catch(() => []),
+    fetchJson(suggestionPath).catch(() => []),
     fetchJson("/pending-actions?status=pending").catch(() => ({ actions: [] }))
   ]);
   const actions = pendingActions?.actions ?? [];
@@ -4947,7 +5751,7 @@ async function renderSuggestions() {
       sequenceMeta = "observed " + s.sequence.count + "× · confidence " + conf + hourPart;
     }
     return \`
-      <div class="card" style="padding:14px; margin-bottom:10px;" data-suggestion-id="\${s.id}">
+      <div class="card" style="padding:14px; margin-bottom:10px;" data-suggestion-id="\${escapeHtml(s.id)}">
         <div class="row between" style="align-items:flex-start; gap:8px;">
           <div style="flex:1; min-width:0;">
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
@@ -4974,9 +5778,12 @@ async function renderSuggestions() {
 
   main.innerHTML = \`
     <div class="pane">
-      <h2>Suggestions <span class="badge">\${list.length}</span></h2>
+      <div class="ui-row" style="justify-content:space-between; align-items:flex-start;">
+        <h2>Suggestions <span class="badge">\${list.length}</span></h2>
+        \${targetSuggestionId ? '<button class="ui-btn ui-btn-ghost ui-btn-sm" id="showAllSuggestions">Show all suggestions</button>' : ""}
+      </div>
       <div id="suggestionsPageChat"></div>
-      <p class="muted">Proactive observer proposed these from your recent on-screen activity. Accept routes to the right place — tasks land in the Tasks tab, MCPs auto-register, skills become drafts.</p>
+      <p class="muted">\${targetSuggestionId ? "Selected from Review. " : ""}Proactive observer proposed these from your recent on-screen activity. Accept routes to the right place — tasks land in the Tasks tab, MCPs auto-register, skills become drafts.</p>
       \${list.map(card).join("")}
       \${pendingActionsHtml}
     </div>
@@ -4986,6 +5793,12 @@ async function renderSuggestions() {
     onAfterSend: async () => { await renderSuggestions(); }
   });
   bindPendingActionButtons();
+  $("showAllSuggestions")?.addEventListener("click", () => {
+    const next = new URL(window.location.href);
+    next.searchParams.delete("suggestion");
+    history.replaceState(null, "", next.toString());
+    renderSuggestions();
+  });
 
   document.querySelectorAll("[data-suggestion-id]").forEach((el) => {
     const id = el.dataset.suggestionId;
@@ -5012,6 +5825,7 @@ async function renderSuggestions() {
       });
     });
   });
+  revealDeepLinkedRecord("suggestion", "[data-suggestion-id]", "suggestionId");
 }
 
 function bindPendingActionButtons() {
@@ -5050,8 +5864,12 @@ async function renderIntegrations() {
 
   const catalogCard = (e) => {
     let badge;
-    if (e.configured) {
+    if (e.connected) {
       badge = '<span class="ui-badge ui-badge-accent">on</span>';
+    } else if (e.authenticated) {
+      badge = '<span class="ui-badge">authorized</span>';
+    } else if (e.registered) {
+      badge = '<span class="ui-badge">sign in required</span>';
     } else if (e.status === "coming-soon") {
       badge = '<span class="ui-badge">soon</span>';
     } else {
@@ -5060,11 +5878,11 @@ async function renderIntegrations() {
     // Bearer-auth entries need an API key. Reveal an inline input here
     // when the env var isn't set yet — the click handler reads the value
     // from this field and POSTs it alongside the catalogId.
-    const needsKey = e.connectable && !e.configured && e.apiKeyEnvVar && !e.apiKeyConfigured;
+    const needsKey = e.connectable && !e.registered && e.apiKeyEnvVar && !e.apiKeyConfigured;
     const keyFieldId = \`cat-key-\${e.id}\`;
     let action;
-    if (e.configured) {
-      action = \`<a class="ui-btn ui-btn-ghost ui-btn-sm" href="/?tab=mcp">Manage →</a>\`;
+    if (e.registered) {
+      action = \`<a class="ui-btn ui-btn-ghost ui-btn-sm" href="/?tab=mcp">Manage →</a>\${e.authType === "oauth" ? \` <button class="ui-btn ui-btn-ghost ui-btn-sm" data-forget-mcp="\${escapeHtml(e.mcpName)}">Forget login</button>\` : ""}\`;
     } else if (e.connectable) {
       action = \`<button class="ui-btn ui-btn-sm add-mcp-btn" data-catalog-id="\${escapeHtml(e.id)}" data-int-id="\${escapeHtml(e.id)}" \${needsKey ? \`data-key-field-id="\${keyFieldId}"\` : ""}>+ Connect</button>\`;
     } else {
@@ -5096,9 +5914,15 @@ async function renderIntegrations() {
   };
 
   const pathBlock = (it, p) => {
-    const status = p.configured
-      ? '<span class="badge ok">on</span>'
-      : '<span class="badge">off</span>';
+    const status = p.kind === "mcp"
+      ? (p.connected
+          ? '<span class="badge ok">on</span>'
+          : p.authenticated
+            ? '<span class="badge">authorized</span>'
+            : p.registered
+              ? '<span class="badge warn">sign in required</span>'
+              : '<span class="badge">off</span>')
+      : (p.configured ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>');
     const lastSync = p.lastSyncedAt
       ? \`<div class="muted" style="font-size:11px; margin-top:4px;">last sync: \${escapeHtml(new Date(p.lastSyncedAt).toLocaleString())}</div>\`
       : "";
@@ -5131,10 +5955,10 @@ async function renderIntegrations() {
           </div>
         </form>
       \`;
-    } else if (p.kind === "mcp" && !p.configured) {
+    } else if (p.kind === "mcp" && !p.registered) {
       actions = \`<button class="add-mcp-btn" data-catalog-id="\${escapeHtml(p.catalogId)}" data-int-id="\${escapeHtml(it.id)}" style="font-size:11px; padding:3px 8px;">+ Connect this MCP</button>\`;
-    } else if (p.kind === "mcp" && p.configured) {
-      actions = \`<a href="/?tab=mcp" style="font-size:11px;">Manage in MCP tab →</a>\`;
+    } else if (p.kind === "mcp" && p.registered) {
+      actions = \`<a href="/?tab=mcp" style="font-size:11px;">Manage →</a> <button class="secondary" data-forget-mcp="\${escapeHtml(p.mcpName)}" style="font-size:11px; padding:3px 8px;">Forget login</button>\`;
     } else if (p.kind === "folder" && p.configured) {
       actions = \`<a href="/?tab=tasks" style="font-size:11px;">View tasks →</a>\`;
     }
@@ -5225,6 +6049,22 @@ async function renderIntegrations() {
     });
   });
 
+  document.querySelectorAll("[data-forget-mcp]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const name = btn.dataset.forgetMcp;
+      if (!name || !confirm("Disconnect " + name + " and forget its saved OAuth login? You can authorize it again later.")) return;
+      btn.disabled = true;
+      try {
+        await postJson(\`/mcp/clear-auth/\${encodeURIComponent(name)}\`, {});
+        showToast("Login forgotten. The integration is disconnected.", true);
+        await renderIntegrations();
+      } catch (error) {
+        showToast("Could not forget login: " + error.message, false);
+        btn.disabled = false;
+      }
+    });
+  });
+
   // Inline credential edit forms — show/hide and submit to /setup/save.
   document.querySelectorAll(".edit-creds-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -5265,17 +6105,24 @@ async function renderIntegrations() {
 
 async function renderTasks() {
   state.taskFilter = state.taskFilter || { bucket: "all" };
+  const targetTaskId = new URLSearchParams(window.location.search).get("task");
+  if (targetTaskId) state.taskFilter.bucket = "all";
   const data = await fetchJson("/tasks?limit=200").catch(() => ({ tasks: [], stats: {} }));
-  const tasks = data.tasks ?? [];
+  let tasks = data.tasks ?? [];
+  if (targetTaskId && !tasks.some((task) => task.id === targetTaskId)) {
+    const target = await fetchJson("/tasks/" + encodeURIComponent(targetTaskId)).catch(() => null);
+    if (target) tasks = [target, ...tasks];
+  }
   const stats = data.stats ?? {};
   const filterB = state.taskFilter.bucket;
 
   const taskRow = (t) => {
     const isOverdue = t.dueDate && Date.parse(t.dueDate) < Date.now() && t.status !== "completed";
     const dueDateStr = t.dueDate ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+    const sourceHref = t.sourceUrl ? safeLinkHref(t.sourceUrl) : null;
     const sourceBadge = t.source && t.source !== "manual"
-      ? (t.sourceUrl
-          ? \`<a class="ui-badge" href="\${escapeHtml(t.sourceUrl)}" target="_blank" rel="noopener" style="text-decoration:none;">\${escapeHtml(t.source)} ↗</a>\`
+      ? (sourceHref
+          ? \`<a class="ui-badge" href="\${sourceHref}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">\${escapeHtml(t.source)} ↗</a>\`
           : \`<span class="ui-badge">\${escapeHtml(t.source)}</span>\`)
       : "";
     const titleStyle = t.status === "completed" ? "text-decoration:line-through; color:var(--muted-foreground);" : "";
@@ -5388,6 +6235,183 @@ async function renderTasks() {
       await renderTasks();
     });
   });
+  revealDeepLinkedRecord("task", ".task", "taskId");
+}
+
+async function renderReview({ append = false } = {}) {
+  const review = state.review;
+  const previousScroll = append ? (main.querySelector(".pane")?.scrollTop ?? 0) : 0;
+  const params = new URLSearchParams({ limit: "50", sort: review.sort });
+  if (review.q) params.set("q", review.q);
+  if (review.kind !== "all") params.set("kind", review.kind);
+  if (append && review.nextCursor) params.set("cursor", review.nextCursor);
+
+  if (!append) {
+    main.innerHTML = '<div class="pane"><h2>Review</h2><div class="ui-empty">Loading open items…</div></div>';
+  }
+
+  let page;
+  try {
+    page = await fetchJson("/review-queue?" + params.toString());
+  } catch (error) {
+    main.innerHTML = \`
+      <div class="pane">
+        <h2>Review</h2>
+        <div class="ui-empty">Couldn\\'t load the review queue. <button class="ui-btn ui-btn-sm" id="reviewRetry">Try again</button></div>
+      </div>
+    \`;
+    $("reviewRetry")?.addEventListener("click", () => renderReview());
+    return;
+  }
+
+  review.items = append ? [...review.items, ...(page.items ?? [])] : (page.items ?? []);
+  review.nextCursor = page.nextCursor ?? null;
+  review.total = page.total ?? 0;
+  review.byKind = page.byKind ?? {};
+  review.summary = page.summary ?? { total: review.total, byKind: review.byKind };
+
+  const allCounts = review.summary.byKind ?? {};
+  const kinds = [
+    { key: "all", label: "All", count: review.summary.total ?? 0 },
+    { key: "task", label: "Tasks", count: allCounts.tasks ?? 0 },
+    { key: "draft", label: "Drafts", count: allCounts.drafts ?? 0 },
+    { key: "clarification", label: "Clarifications", count: allCounts.clarifications ?? 0 },
+    { key: "suggestion", label: "Suggestions", count: allCounts.suggestions ?? 0 }
+  ];
+  const icon = { task: "✓", draft: "📝", clarification: "?", suggestion: "💡" };
+  const kindName = { task: "task", draft: "draft", clarification: "clarification", suggestion: "suggestion" };
+  const cards = review.items.map((item) => {
+    const created = item.createdAt && Number.isFinite(Date.parse(item.createdAt))
+      ? new Date(item.createdAt).toLocaleString()
+      : null;
+    const meta = [
+      kindName[item.kind] ?? item.kind,
+      item.source,
+      created,
+      item.shownInQuickAsk ? "shown in Quick Ask" : null
+    ].filter(Boolean);
+    return \`
+      <article class="ui-card" data-review-id="\${escapeHtml(item.id)}" style="margin-bottom:var(--space-2);">
+        <div class="ui-row" style="align-items:flex-start; gap:var(--space-3);">
+          <span aria-hidden="true" style="font-size:18px; line-height:1.4;">\${icon[item.kind] ?? "•"}</span>
+          <div class="ui-grow">
+            <div style="font-weight:600; line-height:1.4;">\${escapeHtml(item.title)}</div>
+            \${item.summary ? \`<div class="ui-meta" style="margin-top:3px;">\${escapeHtml(item.summary)}</div>\` : ""}
+            \${item.preview ? \`<div style="margin-top:7px; font-size:13px; line-height:1.5;">\${escapeHtml(item.preview)}</div>\` : ""}
+            <div class="ui-meta" style="margin-top:7px;">\${meta.map(escapeHtml).join(" · ")}</div>
+          </div>
+          <a class="ui-btn ui-btn-ghost ui-btn-sm" href="\${escapeHtml(item.deepLink)}">Open</a>
+        </div>
+      </article>
+    \`;
+  }).join("");
+  const quickReviewable = review.summary.quickAskReviewable ?? review.summary.quickAskShown ?? 0;
+  const more = review.summary.moreThanQuickAsk ?? Math.max(0, (review.summary.total ?? 0) - quickReviewable);
+  const filtered = Boolean(review.q || review.kind !== "all");
+
+  main.innerHTML = \`
+    <div class="pane">
+      <div class="ui-row" style="justify-content:space-between; align-items:flex-start; gap:var(--space-4);">
+        <div>
+          <h2 style="margin:0;">Review <span class="ui-badge">\${review.summary.total ?? 0} open items</span></h2>
+          <p class="ui-meta" style="margin:6px 0 0;">
+            These are not all Tasks: the queue contains tasks, drafts, clarifications, and suggestions.
+            Quick Ask currently shows \${quickReviewable} reviewable item\${quickReviewable === 1 ? "" : "s"}; \${more} more are searchable here.
+          </p>
+        </div>
+        <button class="ui-btn ui-btn-ghost ui-btn-sm" id="reviewCleanup">Run cleanup now</button>
+      </div>
+
+      <form id="reviewSearchForm" class="ui-row" style="margin:var(--space-4) 0 var(--space-3); gap:var(--space-2); align-items:center;">
+        <input class="ui-input ui-grow" id="reviewSearch" type="search" maxlength="300" value="\${escapeHtml(review.q)}" placeholder="Search titles, descriptions, sources, and draft text…">
+        <select class="ui-input" id="reviewSort" aria-label="Sort review items">
+          <option value="oldest" \${review.sort === "oldest" ? "selected" : ""}>Oldest first</option>
+          <option value="newest" \${review.sort === "newest" ? "selected" : ""}>Newest first</option>
+        </select>
+        <button class="ui-btn ui-btn-sm" type="submit">Search</button>
+      </form>
+
+      <div class="ui-row" style="flex-wrap:wrap; gap:var(--space-2); margin-bottom:var(--space-3);">
+        \${kinds.map((entry) => \`
+          <button type="button" class="ui-btn ui-btn-sm \${review.kind === entry.key ? "" : "ui-btn-ghost"}" data-review-kind="\${entry.key}">
+            \${entry.label} <span style="opacity:.75;">\${entry.count}</span>
+          </button>
+        \`).join("")}
+      </div>
+
+      <div class="ui-meta" style="margin-bottom:var(--space-2);">
+        \${filtered ? \`\${review.total} matching · \` : ""}showing \${review.items.length}\${review.nextCursor ? " so far" : ""}
+      </div>
+      <div id="reviewCleanupStatus" class="ui-meta" style="margin-bottom:var(--space-2);" aria-live="polite"></div>
+      \${cards || '<div class="ui-empty">No open items match this search.</div>'}
+      \${review.nextCursor ? '<div style="text-align:center; margin-top:var(--space-4);"><button class="ui-btn ui-btn-ghost" id="reviewMore">Load 50 more</button></div>' : ""}
+    </div>
+  \`;
+
+  $("reviewSearchForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    review.q = $("reviewSearch")?.value.trim() ?? "";
+    review.nextCursor = null;
+    renderReview();
+  });
+  document.querySelectorAll("[data-review-kind]").forEach((button) => {
+    button.addEventListener("click", () => {
+      review.kind = button.dataset.reviewKind;
+      review.nextCursor = null;
+      renderReview();
+    });
+  });
+  $("reviewSort")?.addEventListener("change", (event) => {
+    review.sort = event.target.value === "newest" ? "newest" : "oldest";
+    review.nextCursor = null;
+    renderReview();
+  });
+  $("reviewMore")?.addEventListener("click", () => renderReview({ append: true }));
+  $("reviewCleanup")?.addEventListener("click", async () => {
+    if (!confirm("Run conservative backlog cleanup now? It may retire stale duplicates and dead suggestions or drafts. Every automatic resolution records its evidence and can be reversed.")) return;
+    const button = $("reviewCleanup");
+    const status = $("reviewCleanupStatus");
+    button.disabled = true;
+    status.textContent = "Starting cleanup…";
+    try {
+      const run = await postJson("/cron/backlog-triage/run", {});
+      if (run.status === "ran") {
+        showToast("Cleanup finished.", true);
+        await renderReview();
+        return;
+      }
+      if (run.status !== "accepted" || !run.poll) {
+        throw new Error(run.error || run.message || "Cleanup did not start (" + (run.status || "unknown status") + ").");
+      }
+      status.textContent = "Cleanup is running in the background. This page will refresh when it finishes.";
+      // The scheduler's hard timeout is ten minutes. Poll through that
+      // boundary with a grace minute, then make one authoritative final read;
+      // an exact 300×2s loop could stop a fraction before the timeout status
+      // landed and leave this button disabled forever.
+      const pollDeadline = Date.now() + 11 * 60 * 1000;
+      while (Date.now() < pollDeadline && state.tab === "review") {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const result = await fetchJson(run.poll).catch(() => null);
+        if (!result || result.status === "running") continue;
+        showToast(result.status === "ok" ? "Cleanup finished." : "Cleanup stopped: " + (result.error || result.status), result.status === "ok");
+        await renderReview();
+        return;
+      }
+      if (state.tab !== "review") return;
+      const finalResult = await fetchJson(run.poll).catch(() => null);
+      if (finalResult && finalResult.status !== "running") {
+        showToast(finalResult.status === "ok" ? "Cleanup finished." : "Cleanup stopped: " + (finalResult.error || finalResult.status), finalResult.status === "ok");
+        await renderReview();
+        return;
+      }
+      throw new Error("Cleanup is still running or its final status could not be confirmed. Refresh this page to check again.");
+    } catch (error) {
+      status.textContent = "Cleanup status: " + (error.message || String(error));
+      button.disabled = false;
+    }
+  });
+
+  if (append) main.querySelector(".pane")?.scrollTo({ top: previousScroll });
 }
 
 async function renderToday() {
@@ -5642,16 +6666,25 @@ async function renderToday() {
       renderToday();
     });
   });
+  revealDeepLinkedRecord("draft", "[data-draft]", "draft");
+  revealDeepLinkedRecord("clarification", "[data-clar]", "clar");
 }
 
 async function renderComputerUse() {
   // Computer-use beta — the agent's intent + reasoning log. Shows every
-  // action the agent decided to take in a session, with the reasoning
-  // it gave. Phase 1a: actions are stubbed (logged but not executed);
-  // phase 1b will execute real input via the Mac app.
+  // action the agent decided to take in a session, with the reasoning it gave.
+  // A connected node executes; observation-only mode reads recent OCR and
+  // refuses input honestly.
   const data = await fetchJson("/computer-use/log?limit=200").catch(() => ({ sessions: [], actions: [], stats: {} }));
-  const { sessions = [], actions = [], stats = {}, enabled = false } = data;
+  const { sessions = [], actions = [], stats = {}, enabled = false, readiness = {} } = data;
   const active = sessions.find((s) => s.status === "active");
+  const modeCopy = readiness.mode === "control-ready"
+    ? "Ready — live screenshots plus click, type, key, and move actions execute through the connected computer-use node. Scroll is not supported by the current node backend."
+    : readiness.mode === "node-unreachable"
+      ? "Enabled, but the configured computer-use node is unreachable. Screen reads fall back to recent OCR; input is refused."
+      : readiness.mode === "observe-only"
+        ? "Observation-only — the agent can inspect recent local OCR. Click, type, key, and move require a connected computer-use node; scroll is not yet supported."
+        : "Off — enable it here before asking the agent to inspect or control the computer.";
 
   const sessionCard = (s) => {
     const sActions = actions.filter((a) => a.sessionId === s.id);
@@ -5695,7 +6728,7 @@ async function renderComputerUse() {
       <div class="ui-row" style="justify-content: space-between; align-items: flex-start; margin-bottom: var(--space-3);">
         <div>
           <h2 style="margin: 0;">Computer Use <span class="ui-badge">beta</span></h2>
-          <div class="ui-meta" style="margin-top: 2px;">Phase 1a — actions are logged with reasoning but NOT executed yet (Mac CGEvent integration ships in phase 1b).</div>
+          <div class="ui-meta" style="margin-top: 2px;">\${escapeHtml(modeCopy)}</div>
         </div>
         <button
           id="computerUseToggle"
@@ -5706,6 +6739,18 @@ async function renderComputerUse() {
       </div>
 
       <p class="ui-muted">Every action the agent intends to take is recorded here with its stated reasoning. Sessions are user-approved (via the standard approval gate). You can abort an active session at any time.</p>
+
+      <div class="ui-card" style="margin: var(--space-3) 0;">
+        <div class="ui-row" style="gap:var(--space-2); flex-wrap:wrap;">
+          <span class="ui-badge \${readiness.screenshot && readiness.screenshot !== "disabled" ? "ui-badge-accent" : ""}">screen: \${escapeHtml(readiness.screenshot ?? "disabled")}</span>
+          <span class="ui-badge \${readiness.inputAvailable ? "ui-badge-accent" : ""}">input: \${readiness.inputAvailable ? "ready" : "not ready"}</span>
+          <span class="ui-badge">tools: \${readiness.toolsRegistered ? "registered" : "hidden"}</span>
+        </div>
+        <div style="margin-top:var(--space-3);">
+          <button id="computerUseTry" class="ui-btn ui-btn-sm" \${enabled ? "" : "disabled"}>Try in Chat</button>
+          <span class="ui-meta" style="margin-left:8px;">Starts with an explicit screen-inspection request; the session approval still appears before use.</span>
+        </div>
+      </div>
 
       <div class="ui-row" style="gap: var(--space-2); margin: var(--space-3) 0;">
         <span class="ui-badge">\${stats.sessions ?? 0} sessions</span>
@@ -5730,6 +6775,17 @@ async function renderComputerUse() {
       } catch (err) {
         showToast("Abort failed: " + err.message, false);
       }
+    });
+  });
+
+  document.getElementById("computerUseTry")?.addEventListener("click", () => {
+    switchTab("chat");
+    requestAnimationFrame(() => {
+      const input = document.getElementById("input");
+      if (!input) return;
+      input.value = "Use computer use to inspect what is on my screen right now. Tell me what you can see before taking any action.";
+      input.dispatchEvent(new Event("input"));
+      input.focus();
     });
   });
 
@@ -5875,6 +6931,16 @@ function renderTimeline(rows) {
   \`;
 }
 
+function revealDeepLinkedRecord(paramName, selector, datasetKey) {
+  const id = new URLSearchParams(window.location.search).get(paramName);
+  if (!id) return;
+  const row = [...main.querySelectorAll(selector)].find((candidate) => candidate.dataset?.[datasetKey] === id);
+  if (!row) return;
+  row.scrollIntoView({ block: "center" });
+  row.style.outline = "2px solid var(--accent)";
+  row.style.outlineOffset = "2px";
+}
+
 function debounce(fn, ms) {
   let t;
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
@@ -5896,6 +6962,84 @@ async function postJson(path, body) {
     throw err;
   }
   return r.json();
+}
+
+// Opt in to the daemon's direct lifecycle stream for a single chat request.
+// Visible model text arrives incrementally as delta frames while provider
+// adapters still reconstruct complete structured responses for tool loops. The
+// final frame remains the exact JSON object legacy callers receive.
+async function postMessageStream(body, onEvent = () => {}) {
+  const r = await fetch("/message", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify(body ?? {})
+  });
+  const contentType = (r.headers.get("content-type") ?? "").toLowerCase();
+  if (!contentType.includes("text/event-stream")) {
+    const payload = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const err = new Error(payload.code === "budget"
+        ? (payload.error ?? "Daily budget exceeded") + " — raise OPENAGI_DAILY_USD_LIMIT in setup."
+        : (payload.error ?? "/message -> " + r.status));
+      err.code = payload.code; err.status = r.status;
+      err.terminal = true;
+      throw err;
+    }
+    return payload;
+  }
+  if (!r.ok) {
+    const err = new Error("/message -> " + r.status);
+    err.status = r.status; err.terminal = true;
+    throw err;
+  }
+  if (!r.body) throw new Error("The agent response stream was unavailable.");
+
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let final = null;
+  let failure = null;
+
+  const consume = (frame) => {
+    let event = "message";
+    const data = [];
+    for (const rawLine of frame.split(/\\r?\\n/)) {
+      if (!rawLine || rawLine.startsWith(":")) continue;
+      const colon = rawLine.indexOf(":");
+      const field = colon < 0 ? rawLine : rawLine.slice(0, colon);
+      let value = colon < 0 ? "" : rawLine.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") event = value || "message";
+      if (field === "data") data.push(value);
+    }
+    if (data.length === 0) return;
+    let payload;
+    try { payload = JSON.parse(data.join("\\n")); }
+    catch { return; }
+    onEvent(event, payload);
+    if (event === "final") final = payload;
+    if (event === "failure") failure = payload;
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const frames = buffer.split(/\\r?\\n\\r?\\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) consume(frame);
+    if (done) break;
+  }
+  if (buffer.trim()) consume(buffer);
+  if (failure) {
+    const err = new Error(failure.code === "budget"
+      ? (failure.error ?? "Daily budget exceeded") + " — raise OPENAGI_DAILY_USD_LIMIT in setup."
+      : (failure.error ?? "The agent could not complete that request."));
+    err.code = failure.code;
+    err.terminal = true;
+    throw err;
+  }
+  if (!final) throw new Error("The response stream ended before the agent finished.");
+  return final;
 }
 // Both quote characters are escaped: nearly every caller drops the result into
 // an attribute inside a template literal, and an unescaped ' or " ends that
@@ -6000,8 +7144,13 @@ const evt = new EventSource("/events");
 evt.addEventListener("message", (e) => {
   try {
     const data = JSON.parse(e.data);
-    if (state.tab === "chat" && data.sessionId === state.sessionId && data.reply) {
-      // already shown via direct response, skip
+    if (state.tab === "chat" && data.sessionId === state.sessionId) {
+      // A dashboard opened while Quick Ask is still working did not make the
+      // direct POST and therefore has no response callback of its own. Reload
+      // the named session when the daemon announces completion. The old skip
+      // left that dashboard showing "pending" forever even though the answer
+      // had already been persisted.
+      refreshActiveChatSession(data.sessionId, { force: true }).catch(() => {});
     } else {
       refreshSessions();
     }
@@ -6152,10 +7301,32 @@ setInterval(refreshHealth, 5000);
 refreshHealth();
 setInterval(refreshAmbientBadge, 15000);
 refreshAmbientBadge();
+// Recovery path for a missed SSE event (dashboard opened after completion,
+// laptop wake, EventSource reconnect). Poll only while the selected durable
+// request genuinely has no terminal assistant message, so ordinary chat costs
+// no background requests.
+setInterval(() => {
+  if (state.tab !== "chat" || !state.sessionId) return;
+  const id = state.activeRequestId || latestChatRequestId(state.messages);
+  const outcome = requestState(state.messages, id);
+  const waitingForPersistence = !outcome && Boolean(id)
+    && CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage);
+  if (waitingForPersistence && state.activeRequestMissingSince
+      && Date.now() - state.activeRequestMissingSince > CHAT_REQUEST_STALE_MS) {
+    state.activeRequestStage = "interrupted";
+    state.activeRequestMissingSince = null;
+    renderChat();
+  } else if (outcome?.status === "pending" || waitingForPersistence) {
+    refreshActiveChatSession(state.sessionId).catch(() => {});
+  } else if (outcome?.status === "interrupted" && state.activeRequestStage !== "interrupted") {
+    state.activeRequestStage = "interrupted";
+    renderChat();
+  }
+}, 2000);
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","tasks","review","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");
@@ -6169,9 +7340,10 @@ const initialTab = (() => {
 // whether the dashboard was closed, already open on Tasks, or already open on
 // a different chat session — every click is a fresh navigation.
 const initialSession = deepLinkSessionId(window.location.search);
+const initialRequest = deepLinkRequestId(window.location.search);
 (async () => {
   await switchTab(initialTab);
-  if (initialTab === "chat" && initialSession) await openSessionDeepLink(initialSession);
+  if (initialTab === "chat" && initialSession) await openSessionDeepLink(initialSession, initialRequest);
 })();
 </script>
 </body>

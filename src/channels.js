@@ -19,7 +19,7 @@ export class ChannelManager {
     if (this.runtime) this.runtime.channels = this;
   }
 
-  async handleLocalMessage(body) {
+  async handleLocalMessage(body, options = {}) {
     return this.agentHost.handleMessage({
       channel: body.channel ?? "local",
       from: body.from ?? "user",
@@ -30,6 +30,13 @@ export class ChannelManager {
       // Ephemeral turns (setup-wizard test message) leave no trace: no
       // session, no memory write, no outcome — just a model round-trip.
       ephemeral: body.ephemeral === true
+    }, {
+      // Transport-owned callback. It is deliberately not read from `body`:
+      // callers of the public HTTP API must not be able to inject executable
+      // values into the host. The streamed /message transport uses this to
+      // keep a slow tool-using turn visibly alive.
+      onProgress: options.onProgress,
+      onTextDelta: options.onTextDelta
     });
   }
 

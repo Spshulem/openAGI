@@ -184,6 +184,12 @@ test("older.count still counts eligible suggestions that merely did not fit", ()
   const brief = composeBrief(rt, { now: NOW, limit: 2 });
   const shown = brief.items.filter((i) => i.kind === "suggestion").length;
   assert.equal(brief.older.count, 4 - shown);
+  assert.deepEqual(brief.older.byKind, {
+    clarifications: 0,
+    drafts: 0,
+    tasks: 0,
+    suggestions: 4 - shown
+  });
   assert.ok(brief.older.oldestAt, "an eligible-but-unshown suggestion has an age");
 });
 
@@ -259,6 +265,8 @@ test("a focus item with no taskId binds to a matching pending task and gets its 
   const focus = brief.items[0];
   assert.equal(focus.kind, "focus");
   assert.deepEqual(focus.actions.map((a) => a.id), ["complete", "snooze"]);
+  assert.deepEqual(focus.entityRef, { kind: "task", id: "t9" });
+  assert.ok(focus.menuActions.some((a) => a.id.startsWith("move:")), "a task-backed focus can be moved too");
   assert.ok(focus.actions[0].path.includes("t9"), "the buttons act on the task the focus is really about");
   assert.equal(brief.items.filter((i) => i.id === "task:t9").length, 0, "and it does not also take a task slot");
 });
@@ -370,6 +378,22 @@ test("every item carries declarative actions with an absolute daemon path", () =
       assert.ok(["POST", "PATCH", "DELETE"].includes(a.method));
       assert.ok(a.label.length > 0);
     }
+  }
+});
+
+test("task rows expose store identity and backwards-compatible menu-only move actions", () => {
+  const brief = composeBrief(makeRuntime({ tasks: [task({ id: "task 1/x", bucket: "this_week" })] }), { now: NOW, limit: 5 });
+  const row = brief.items.find((item) => item.kind === "task");
+  assert.deepEqual(row.entityRef, { kind: "task", id: "task 1/x" });
+  assert.ok(Array.isArray(row.menuActions));
+  assert.ok(row.menuActions.length > 0);
+  assert.ok(!row.menuActions.some((action) => action.body?.bucket === "this_week"), "the current bucket is not offered");
+  assert.ok(!row.menuActions.some((action) => action.body?.bucket === "done"), "Done remains the explicit inline action");
+  assert.ok(!row.actions.some((action) => action.id.startsWith("move:")), "old clients never render menu choices inline");
+  for (const action of row.menuActions) {
+    assert.equal(action.method, "PATCH");
+    assert.equal(action.path, "/tasks/task%201%2Fx");
+    assert.ok(action.id.startsWith("move:"));
   }
 });
 
@@ -578,6 +602,43 @@ test("'N older' counts every eligible row that did not fit, not just suggestions
   assert.equal(shown, 5, "premise: the brief is full");
   assert.equal(brief.older.count, 6 + 2 + 2 - shown, "every eligible row the popover could not show is 'older'");
   assert.equal(brief.older.oldestAt, "2026-05-01T17:00:00.000Z", "and oldestAt spans kinds too — the unshown draft is the oldest thing hidden");
+});
+
+test("older.byKind truthfully names each kind left behind by slot allocation", () => {
+  const clarifications = Array.from({ length: 2 }, (_, i) => ({
+    id: `c${i}`,
+    question: `Question ${i}?`,
+    status: "pending",
+    createdAt: "2026-07-28T17:00:00.000Z",
+    options: ["Yes", "No"]
+  }));
+  const drafts = Array.from({ length: 2 }, (_, i) => ({
+    id: `d${i}`,
+    title: `Draft ${i}`,
+    status: "pending",
+    createdAt: "2026-07-27T17:00:00.000Z",
+    kind: "email"
+  }));
+  const tasks = Array.from({ length: 6 }, (_, i) => task({ id: `t${i}`, title: `Task ${i}` }));
+  const suggestions = Array.from({ length: 2 }, (_, i) => minedSuggestion({ id: `sug_${i}` }));
+  const brief = composeBrief(makeRuntime({ clarifications, drafts, tasks, suggestions }), { now: NOW, limit: 5 });
+  const totals = { clarification: 2, draft: 2, task: 6, suggestion: 2 };
+  const shown = brief.items.reduce((counts, item) => {
+    counts[item.kind] = (counts[item.kind] ?? 0) + 1;
+    return counts;
+  }, {});
+
+  assert.deepEqual(brief.older.byKind, {
+    clarifications: totals.clarification - (shown.clarification ?? 0),
+    drafts: totals.draft - (shown.draft ?? 0),
+    tasks: totals.task - (shown.task ?? 0),
+    suggestions: totals.suggestion - (shown.suggestion ?? 0)
+  });
+  assert.equal(
+    Object.values(brief.older.byKind).reduce((sum, count) => sum + count, 0),
+    brief.older.count,
+    "the additive breakdown and backwards-compatible aggregate cannot drift"
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -133,6 +133,16 @@ test("SEC-4: renderMarkdown refuses non-http(s) link schemes", async () => {
   assert.match(ok, /<a href="https:\/\/example\.com\/a\?b=1"/);
 });
 
+test("SEC-4: task source links use the same http(s)-only URL gate", async () => {
+  const { script } = await dashboard();
+  assert.match(script, /const sourceHref = t\.sourceUrl \? safeLinkHref\(t\.sourceUrl\) : null/);
+  assert.doesNotMatch(
+    script,
+    /href="\\\$\{escapeHtml\(t\.sourceUrl\)\}/,
+    "escaping an attribute does not make a javascript: URL safe to navigate"
+  );
+});
+
 // ── 3. the MCP sidebar tool list ───────────────────────────────────────────
 
 test("SEC-4: MCP tool names are escaped in the sidebar, not just the detail pane", async () => {

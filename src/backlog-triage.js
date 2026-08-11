@@ -1,15 +1,9 @@
 // Backlog triage — the cleanup cadence for the suggestion + draft queues.
 //
-// The problem, measured on the user's install (2026-07-30): 1,134 PENDING
-// suggestions (567 observer proposals + 567 mined candidates) and 97 pending
-// drafts. 767 of the suggestions are older than a week; 242 are older than a
-// month. Nothing in the system ever retires any of them, so the queue only
-// grows and the Quick Ask brief — which shows five rows and scores observer
-// suggestions at `1 - ageDays/14` — can literally never surface anything older
-// than a fortnight. The user's words: "it should kind of go through and say,
-// hey it's been a while, it hasn't responded, let's clean up the ones that
-// probably are automatically done, and then what are the still most critical
-// most important ones for me to do?"
+// Pending suggestions and drafts can otherwise accumulate indefinitely: the
+// producer queues keep discovering work, while the compact Quick Ask surface
+// can show only a handful of rows. Without a retirement cadence, older useful
+// items become effectively unreachable behind a growing recent backlog.
 //
 // Two halves, in that order:
 //
@@ -19,13 +13,12 @@
 //      as a report the dashboard/CLI can read.
 //
 // ── why a pre-filter at all ──────────────────────────────────────────────
-// Sending 1,134 items to a model every week is both expensive and stupid: most
-// of them are decidable from evidence already on the record. The rules below
-// resolve ~52% of the queue for zero tokens (measured: see the numbers on each
-// rule), and only the genuinely ambiguous remainder — "has this quietly been
-// done?", "does this still matter?" — costs anything. Even then the pass is
-// capped (default 200 items) so one run has a bounded, predictable cost and
-// the tail drains over a few weeks instead of in one giant bill.
+// Sending an unbounded queue to a model every week is both expensive and
+// unnecessary: many rows are decidable from evidence already on the record.
+// The rules below resolve those for zero tokens, and only the genuinely
+// ambiguous remainder — "has this quietly been done?", "does this still
+// matter?" — costs anything. Even then the pass is capped (default 200 items)
+// so one run has a bounded, predictable cost and the tail drains gradually.
 //
 // ── why nothing here is destructive ──────────────────────────────────────
 // Auto-dismissing something the user still wanted is the worst outcome
@@ -268,6 +261,7 @@ export class BacklogTriage {
     // ── phase 2: the part rules cannot do ────────────────────────────────
     let llmResolutions = [];
     let llmKeeps = [];
+    let llmDeferrals = [];
     if (!useLLM) {
       report.llm.skipped = "disabled";
     } else if (plan.ambiguous.length === 0) {
@@ -277,6 +271,7 @@ export class BacklogTriage {
       Object.assign(report.llm, outcome.stats);
       llmResolutions = outcome.resolutions;
       llmKeeps = outcome.keeps;
+      llmDeferrals = outcome.deferrals;
     }
 
     // ── phase 3: apply, under a hard ceiling ─────────────────────────────
@@ -284,7 +279,7 @@ export class BacklogTriage {
     const capped = allResolutions.length > this.options.maxResolutions;
     const toApply = capped ? allResolutions.slice(0, this.options.maxResolutions) : allResolutions;
 
-    const applied = { suggestions: 0, drafts: 0, keepsAnnotated: 0, failed: 0 };
+    const applied = { suggestions: 0, drafts: 0, keepsAnnotated: 0, deferralsAnnotated: 0, failed: 0 };
     if (!dryRun) {
       for (const r of toApply) {
         const ok = r.kind === "draft"
@@ -307,6 +302,13 @@ export class BacklogTriage {
       for (const k of llmKeeps) {
         if (this.annotateKeep(dir, k, passId, degraded)) applied.keepsAnnotated += 1;
       }
+      // An "unsure" or low-confidence dismissal is still a completed model
+      // judgement. Record that fact without changing status so the next
+      // bounded pass advances to untouched rows rather than spending its cap
+      // on the same oldest uncertainty forever.
+      for (const d of llmDeferrals) {
+        if (this.annotateDeferral(dir, d, passId, degraded)) applied.deferralsAnnotated += 1;
+      }
     }
     report.applied = { ...applied, cappedAt: capped ? this.options.maxResolutions : null, wouldApply: allResolutions.length };
 
@@ -325,7 +327,8 @@ export class BacklogTriage {
 
   // ── the LLM half ───────────────────────────────────────────────────────
 
-  /// Judge the ambiguous set in batches. Returns { resolutions, keeps, stats }.
+  /// Judge the ambiguous set in batches. Returns resolutions, ranked keeps,
+  /// non-resolving deferrals, and stats.
   /// Any failure degrades to "we judged fewer than we wanted" — never a throw.
   async judge(candidates, { passId, degraded }) {
     // Wall clock, deliberately NOT the caller's `now`. `now` is a LOGICAL clock
@@ -334,13 +337,14 @@ export class BacklogTriage {
     // times out before it makes a single call.
     const phaseStartedMs = Date.now();
     const stats = {
-      attempted: true, skipped: null, model: null, batches: 0, itemsSent: 0,
-      deferred: 0, verdicts: { dismiss: 0, keep: 0, unsure: 0, invalid: 0, lowConfidence: 0 },
+      attempted: true, skipped: null, model: null, batches: 0, itemsSent: 0, itemsJudged: 0,
+      deferred: 0, verdicts: { dismiss: 0, keep: 0, unsure: 0, invalid: 0, duplicate: 0, missing: 0, lowConfidence: 0 },
       estimated: { inputTokens: 0, outputTokens: 0, usd: 0 },
       actual: null, stoppedEarly: null
     };
     const resolutions = [];
     const keeps = [];
+    const deferrals = [];
 
     const provider = this.runtime?.agentHost?.modelProvider;
     // Same gate every other LLM path in this repo uses (daily-planner,
@@ -350,7 +354,7 @@ export class BacklogTriage {
       stats.attempted = false;
       stats.skipped = "no-provider";
       stats.deferred = candidates.length;
-      return { resolutions, keeps, stats };
+      return { resolutions, keeps, deferrals, stats };
     }
 
     // BudgetGuard, up front: if today's cap is already spent there is no point
@@ -363,16 +367,30 @@ export class BacklogTriage {
       stats.attempted = false;
       stats.skipped = error?.code === "BUDGET_EXCEEDED" ? "budget-exhausted" : "budget-unavailable";
       stats.deferred = candidates.length;
-      return { resolutions, keeps, stats };
+      return { resolutions, keeps, deferrals, stats };
     }
 
     stats.model = safely(degraded, "resolveModel",
       () => provider.resolveModel?.({ task: "sweep" }) ?? provider.model ?? null, null);
 
-    // Oldest first: the tail is both the most likely to be dead and the part
-    // the brief can never show, so draining from that end is where a capped
-    // pass buys the most.
-    const ordered = [...candidates].sort((a, b) => b.ageDays - a.ageDays);
+    // Untouched first, then oldest within each group. Keeps stay pending by
+    // design, so a simple oldest-first sort selected them again on every run
+    // and could permanently starve the untouched tail behind a 200-item cap.
+    // Previously judged rows remain eligible for later reconsideration, but
+    // only after every never-judged row has had a turn. Among reviewed rows,
+    // least-recently reviewed goes first so reconsideration rotates too.
+    const ordered = [...candidates].sort((a, b) => {
+      const reviewed = Number(Boolean(a.priorModelReviewAt)) - Number(Boolean(b.priorModelReviewAt));
+      if (reviewed) return reviewed;
+      if (a.priorModelReviewAt && b.priorModelReviewAt) {
+        const aReviewedAt = Date.parse(a.priorModelReviewAt);
+        const bReviewedAt = Date.parse(b.priorModelReviewAt);
+        const reviewOrder = (Number.isFinite(aReviewedAt) ? aReviewedAt : 0)
+          - (Number.isFinite(bReviewedAt) ? bReviewedAt : 0);
+        if (reviewOrder) return reviewOrder;
+      }
+      return b.ageDays - a.ageDays;
+    });
     const sendable = ordered.slice(0, this.options.maxLlmItems);
     stats.deferred = ordered.length - sendable.length;
 
@@ -423,10 +441,17 @@ export class BacklogTriage {
       stats.estimated.outputTokens += estimates[b].outputTokens;
       stats.estimated.usd += estimates[b].usd;
 
+      const seenIndexes = new Set();
       for (const raw of parseJsonArray(text)) {
         const checked = validateVerdict(raw, batch.length);
         if (!checked.ok) { stats.verdicts.invalid += 1; continue; }
         const v = checked.value;
+        if (seenIndexes.has(v.i)) {
+          stats.verdicts.duplicate += 1;
+          continue;
+        }
+        seenIndexes.add(v.i);
+        stats.itemsJudged += 1;
         const item = batch[v.i];
         if (v.verdict === "dismiss") {
           // The one place a model gets to retire something. Three gates: an
@@ -434,7 +459,18 @@ export class BacklogTriage {
           // an actual explanation (enforced by validateVerdict). Anything less
           // leaves the item pending — counted separately so a pass where the
           // model is hedging everything is visible rather than looking quiet.
-          if (v.confidence < this.options.minDismissConfidence) { stats.verdicts.lowConfidence += 1; continue; }
+          if (v.confidence < this.options.minDismissConfidence) {
+            stats.verdicts.lowConfidence += 1;
+            deferrals.push({
+              ...item,
+              verdict: "defer",
+              modelVerdict: "dismiss",
+              decidedBy: `llm:${stats.model ?? "unknown"}`,
+              confidence: v.confidence,
+              reason: v.reason
+            });
+            continue;
+          }
           stats.verdicts.dismiss += 1;
           resolutions.push({
             ...item,
@@ -455,7 +491,34 @@ export class BacklogTriage {
           });
         } else {
           stats.verdicts.unsure += 1;
+          deferrals.push({
+            ...item,
+            verdict: "unsure",
+            modelVerdict: "unsure",
+            decidedBy: `llm:${stats.model ?? "unknown"}`,
+            confidence: v.confidence,
+            reason: v.reason
+          });
         }
+      }
+
+      // A model can return valid JSON that omits rows, repeats one index, or
+      // contains no usable verdicts at all. Do not call those rows judged, and
+      // do not let the same oldest malformed batch starve the untouched tail
+      // forever. Record a non-resolving scheduling attempt so the next bounded
+      // pass rotates onward; the item remains pending and fully actionable.
+      for (let i = 0; i < batch.length; i += 1) {
+        if (seenIndexes.has(i)) continue;
+        stats.verdicts.missing += 1;
+        const item = batch[i];
+        deferrals.push({
+          ...item,
+          verdict: "unsure",
+          modelVerdict: "missing",
+          decidedBy: `llm:${stats.model ?? "unknown"}`,
+          confidence: 0,
+          reason: "The model returned no valid verdict for this item; it remains pending and will rotate behind untouched work."
+        });
       }
     }
 
@@ -465,9 +528,11 @@ export class BacklogTriage {
     }
     stats.estimated.usd = Number(stats.estimated.usd.toFixed(6));
     // Everything the pass did not actually judge is deferred, whether it was
-    // over the cap or in a batch that never ran. One number, honest either way.
-    stats.deferred = ordered.length - stats.itemsSent;
-    return { resolutions, keeps, stats };
+    // over the cap, in a batch that never ran, or omitted from a malformed
+    // response. `itemsSent` remains a cost/accounting fact; it is not proof the
+    // model returned one unique valid verdict per row.
+    stats.deferred = ordered.length - stats.itemsJudged;
+    return { resolutions, keeps, deferrals, stats };
   }
 
   // ── writes (all reversible, all evidenced) ─────────────────────────────
@@ -499,21 +564,34 @@ export class BacklogTriage {
   /// remains in every surface that reads the queue. This is what makes the
   /// ranking durable between passes and what a future brief change would read.
   annotateKeep(dir, keep, passId, degraded) {
-    const file = suggestionFile(dir, keep.id);
+    return this.annotatePending(dir, { ...keep, verdict: "keep", modelVerdict: "keep" }, passId, degraded, "annotate");
+  }
+
+  /// Record a completed judgement that deliberately left the row pending.
+  /// This is scheduling metadata, not a resolution: the status and every
+  /// user-facing action remain unchanged.
+  annotateDeferral(dir, deferral, passId, degraded) {
+    return this.annotatePending(dir, deferral, passId, degraded, "annotate-defer");
+  }
+
+  annotatePending(dir, judgement, passId, degraded, errorPrefix) {
+    const file = suggestionFile(dir, judgement.id);
     if (!file) return false;
     try {
       const raw = readJsonFile(file, null);
       if (!raw || raw.status !== "pending") return false;
       raw.autoTriage = {
-        passId, at: nowIso(), verdict: "keep",
-        decidedBy: keep.decidedBy, reason: keep.reason,
-        confidence: keep.confidence, stillMattersScore: keep.stillMattersScore,
-        evidence: keep.evidence ?? null
+        passId, at: nowIso(), verdict: judgement.verdict,
+        modelVerdict: judgement.modelVerdict,
+        decidedBy: judgement.decidedBy, reason: judgement.reason,
+        confidence: judgement.confidence,
+        stillMattersScore: judgement.stillMattersScore ?? null,
+        evidence: judgement.evidence ?? null
       };
       writeJsonAtomic(file, raw);
       return true;
     } catch (error) {
-      degraded.push(`annotate:${keep.id}: ${String(error?.message ?? error).slice(0, 80)}`);
+      degraded.push(`${errorPrefix}:${judgement.id}: ${String(error?.message ?? error).slice(0, 80)}`);
       return false;
     }
   }
@@ -750,6 +828,9 @@ function makeResolution(s, nowMs, rule, reason, evidence) {
 /// bill for judgement the model does not need to make this call.
 function toCandidate(s, ageDays) {
   const seq = s.sequence;
+  const priorModelReviewAt = String(s.autoTriage?.decidedBy ?? "").startsWith("llm:")
+    ? s.autoTriage?.at ?? null
+    : null;
   return {
     kind: "suggestion",
     id: s.id,
@@ -758,6 +839,7 @@ function toCandidate(s, ageDays) {
     source: s.source ?? "unknown",
     proposedAt: s.proposedAt ?? null,
     ageDays: round1(ageDays),
+    priorModelReviewAt,
     summary: firstSentence(s.rationale ?? s.proposal?.description ?? "").slice(0, 220),
     evidence: seq
       ? { count: seq.count ?? null, distinctDays: seq.distinctDays ?? null, confidence: seq.confidence ?? null, cadence: seq.cadence?.type ?? null }
@@ -769,9 +851,9 @@ function toCandidate(s, ageDays) {
 /// itself. Note what this rule is NOT: an age rule. Age only decides whether it
 /// is even eligible — the retirement is justified by the evidence being thin.
 ///
-/// Worth knowing before tuning this: on the real install every mined candidate
-/// reports confidence between 0.886 and 1.0, so confidence alone discriminates
-/// nothing. The count and distinct-day floors are what actually fire (13 items).
+/// Confidence alone is not sufficient because miners often report uniformly
+/// high confidence. Count and distinct-day floors supply independent evidence
+/// that a pattern never established itself.
 function weakEvidence(seq) {
   const confidence = Number(seq.confidence);
   const count = Number(seq.count);
@@ -783,8 +865,7 @@ function weakEvidence(seq) {
 
 // ─── ranking the survivors ───────────────────────────────────────────────
 
-/// The second half of the user's question: "what are the still most critical
-/// most important ones for me to do?"
+/// Rank the still-relevant survivors for the compact review surface.
 ///
 /// Only model-judged keeps can be ranked, and that is the honest boundary: a
 /// deterministic keep means "too new to judge", not "important". Items the pass
@@ -930,7 +1011,7 @@ export function renderTriageMarkdown(report) {
   for (const [rule, n] of Object.entries(p.byRule ?? {})) lines.push(`  - ${rule}: ${n}`);
   lines.push(`- ${p.keptFresh} left alone (newer than the triage window)`);
   if (report.llm.skipped) lines.push(`- Model pass skipped: ${report.llm.skipped} — ${report.llm.deferred} items still waiting`);
-  else lines.push(`- Model judged ${report.llm.itemsSent} in ${report.llm.batches} batch(es); ${report.llm.deferred} deferred to the next pass`);
+  else lines.push(`- Model judged ${report.llm.itemsJudged ?? report.llm.itemsSent} of ${report.llm.itemsSent} sent in ${report.llm.batches} batch(es); ${report.llm.deferred} deferred to the next pass`);
 
   if (report.critical.length > 0) {
     lines.push("", "### Still matters most");
@@ -1003,11 +1084,11 @@ function emptyReport(passId, startedAt, dryRun) {
     scanned: { suggestions: 0, drafts: 0 },
     prefilter: { resolved: 0, keptFresh: 0, ambiguous: 0, byRule: {} },
     llm: {
-      attempted: false, skipped: null, model: null, batches: 0, itemsSent: 0,
-      deferred: 0, verdicts: { dismiss: 0, keep: 0, unsure: 0, invalid: 0 },
+      attempted: false, skipped: null, model: null, batches: 0, itemsSent: 0, itemsJudged: 0,
+      deferred: 0, verdicts: { dismiss: 0, keep: 0, unsure: 0, invalid: 0, duplicate: 0, missing: 0, lowConfidence: 0 },
       estimated: { inputTokens: 0, outputTokens: 0, usd: 0 }, actual: null, stoppedEarly: null
     },
-    applied: { suggestions: 0, drafts: 0, keepsAnnotated: 0, failed: 0, cappedAt: null, wouldApply: 0 },
+    applied: { suggestions: 0, drafts: 0, keepsAnnotated: 0, deferralsAnnotated: 0, failed: 0, cappedAt: null, wouldApply: 0 },
     critical: [],
     samples: [],
     _resolvedIds: [],
@@ -1026,7 +1107,7 @@ export function summarizeTriagePass(report) {
     scanned: report.scanned,
     retired: report.applied.suggestions + report.applied.drafts,
     byRule: report.prefilter.byRule,
-    modelJudged: report.llm.itemsSent,
+    modelJudged: report.llm.itemsJudged ?? report.llm.itemsSent,
     deferred: report.llm.deferred,
     critical: report.critical.length,
     degraded: report.degraded

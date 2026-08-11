@@ -311,8 +311,8 @@ test("a weak mined pattern younger than the stale window is never retired by rul
 
 test("only superseded re-drafts are retired — a completed parent task never justifies it", () => {
   // The trap this guards: for a draft-only task, "completed" means the AGENT
-  // finished the draft, not that the user acted on it. 96 of the 97 pending
-  // drafts on the real install sit under a completed+archived task.
+  // finished the draft, not that the user acted on it. Pending drafts can
+  // legitimately remain under completed or archived agent tasks.
   const drafts = [
     { id: "draft_a", taskId: "task_1", title: "First attempt", createdAt: new Date(NOW.getTime() - 40 * DAY).toISOString() },
     { id: "draft_b", taskId: "task_1", title: "Second attempt", createdAt: new Date(NOW.getTime() - 30 * DAY).toISOString() },
@@ -474,6 +474,81 @@ test("the cap bounds one pass and defers the rest instead of spending more", asy
   assert.equal(sent[0], 39);
 });
 
+test("bounded passes advance through untouched rows before rejudging pending keeps", async () => {
+  const dir = tempDataDir();
+  for (let i = 0; i < 4; i += 1) {
+    writeSuggestion(dir, observer(`prop_${i}`, {
+      title: distinctTitle(i),
+      proposedAt: new Date(NOW.getTime() - (13 - i) * DAY).toISOString()
+    }));
+  }
+  const provider = stubProvider((items) => items.map((it, i) => ({
+    i: it.i,
+    verdict: i === 0 ? "keep" : "unsure",
+    confidence: 0.9,
+    stillMattersScore: i === 0 ? 0.7 : undefined,
+    reason: i === 0 ? "This still names open work." : "There is not enough evidence yet."
+  })));
+  const runtime = makeRuntime({ dir, provider });
+  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2 });
+
+  const first = await triage.run({ now: NOW });
+  assert.equal(first.llm.itemsSent, 2);
+  assert.equal(first.applied.keepsAnnotated, 1);
+  assert.equal(first.applied.deferralsAnnotated, 1);
+  const firstTitles = provider.calls.flatMap((call) => call.items.map((item) => item.title));
+  assert.deepEqual(firstTitles, [distinctTitle(0), distinctTitle(1)], "the first pass starts with the oldest untouched rows");
+
+  provider.calls.length = 0;
+  const second = await triage.run({ now: NOW });
+  assert.equal(second.llm.itemsSent, 2);
+  const secondTitles = provider.calls.flatMap((call) => call.items.map((item) => item.title));
+  assert.deepEqual(secondTitles, [distinctTitle(2), distinctTitle(3)], "the next pass advances to untouched rows even though reviewed rows are older");
+
+  const reviewed = listAllSuggestions(runtime, { status: "pending" })
+    .filter((suggestion) => suggestion.autoTriage?.decidedBy?.startsWith("llm:"));
+  assert.equal(reviewed.length, 4, "both keep and unsure judgements become visible to the next scheduler pass");
+});
+
+test("reconsideration rotates by oldest review time instead of item age", async () => {
+  const dir = tempDataDir();
+  writeSuggestion(dir, observer("prop_oldest_item", {
+    title: distinctTitle(0),
+    proposedAt: new Date(NOW.getTime() - 40 * DAY).toISOString(),
+    autoTriage: { at: "2026-07-29T12:00:00.000Z", verdict: "keep", decidedBy: "llm:test" }
+  }));
+  writeSuggestion(dir, observer("prop_oldest_review", {
+    title: distinctTitle(1),
+    proposedAt: new Date(NOW.getTime() - 20 * DAY).toISOString(),
+    autoTriage: { at: "2026-07-20T12:00:00.000Z", verdict: "unsure", decidedBy: "llm:test" }
+  }));
+  const provider = stubProvider((items) => items.map((item) => ({
+    i: item.i, verdict: "unsure", confidence: 0.5, reason: "There is not enough evidence yet."
+  })));
+  const runtime = makeRuntime({ dir, provider });
+
+  await new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 1, batchSize: 1 }).run({ now: NOW });
+  assert.equal(provider.calls[0].items[0].title, distinctTitle(1), "the least-recently reviewed row gets the next turn");
+});
+
+test("mined suggestion normalization preserves prior triage scheduling metadata", () => {
+  const dir = tempDataDir();
+  writeSuggestion(dir, mined("sug_reviewed", {
+    fingerprint: "app.a→app.b",
+    autoTriage: {
+      passId: "triage_previous",
+      at: "2026-07-20T12:00:00.000Z",
+      verdict: "keep",
+      decidedBy: "llm:test",
+      reason: "This still names open work.",
+      confidence: 0.9
+    }
+  }));
+  const [suggestion] = listAllSuggestions(makeRuntime({ dir }), { status: "pending" });
+  assert.equal(suggestion.autoTriage.passId, "triage_previous");
+  assert.equal(suggestion.autoTriage.verdict, "keep");
+});
+
 test("the LLM deadline is measured on the wall clock, not the injected `now`", async () => {
   // Regression: deriving the deadline from `now` meant any pass dated in the
   // past (a test, a catch-up run after a sleep) blew its whole budget of time
@@ -558,8 +633,69 @@ test("malformed verdicts are counted and resolve nothing", async () => {
 
   const report = await new BacklogTriage({ runtime, dataDir: dir }).run({ now: NOW });
   assert.equal(report.llm.verdicts.invalid, 3);
+  assert.equal(report.llm.verdicts.missing, 2);
+  assert.equal(report.llm.itemsJudged, 0);
+  assert.equal(report.llm.deferred, 2);
   assert.equal(report.applied.suggestions, 0);
+  assert.equal(report.applied.deferralsAnnotated, 2, "unjudged rows rotate without being resolved");
   assert.equal(listAllSuggestions(runtime, { status: "pending" }).length, 2);
+});
+
+test("duplicate model indexes are ignored and cannot decide one row twice", async () => {
+  const dir = tempDataDir();
+  for (let i = 0; i < 3; i += 1) writeSuggestion(dir, observer(`prop_${i}`, { title: distinctTitle(i) }));
+  const provider = stubProvider(() => [
+    { i: 0, verdict: "keep", confidence: 0.9, stillMattersScore: 0.7, reason: "This still describes unfinished work." },
+    { i: 0, verdict: "dismiss", confidence: 0.99, reason: "A conflicting duplicate verdict must be ignored." },
+    { i: 1, verdict: "unsure", confidence: 0.5, reason: "There is not enough evidence yet." }
+  ]);
+  const runtime = makeRuntime({ dir, provider });
+
+  const report = await new BacklogTriage({ runtime, dataDir: dir }).run({ now: NOW });
+  assert.equal(report.llm.verdicts.duplicate, 1);
+  assert.equal(report.llm.verdicts.missing, 1);
+  assert.equal(report.llm.itemsJudged, 2);
+  assert.equal(report.llm.deferred, 1);
+  assert.equal(report.applied.suggestions, 0, "the duplicate dismiss cannot override the first verdict");
+  const rows = listAllSuggestions(runtime, { status: "pending" });
+  assert.equal(rows.find((row) => row.id === "prop_0").autoTriage.modelVerdict, "keep");
+  assert.equal(rows.find((row) => row.id === "prop_2").autoTriage.modelVerdict, "missing");
+});
+
+test("a wholly malformed batch rotates behind untouched rows on the next pass", async () => {
+  const dir = tempDataDir();
+  for (let i = 0; i < 4; i += 1) {
+    writeSuggestion(dir, observer(`prop_${i}`, {
+      title: distinctTitle(i),
+      proposedAt: new Date(NOW.getTime() - (13 - i) * DAY).toISOString()
+    }));
+  }
+  const provider = stubProvider((items) => items.map((item) => ({
+    i: item.i, verdict: "unsure", confidence: 0.5, reason: "There is not enough evidence yet."
+  })));
+  const originalGenerate = provider.generate.bind(provider);
+  let malformedOnce = true;
+  provider.generate = async function generate(args) {
+    if (malformedOnce) {
+      malformedOnce = false;
+      const items = args.input.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+      this.calls.push({ task: args.task, instructions: args.instructions, items });
+      return { provider: "stub", model: this.model, text: "not a JSON array" };
+    }
+    return originalGenerate(args);
+  };
+  const runtime = makeRuntime({ dir, provider });
+  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2 });
+
+  const first = await triage.run({ now: NOW });
+  assert.equal(first.llm.itemsJudged, 0);
+  assert.equal(first.llm.verdicts.missing, 2);
+  assert.deepEqual(provider.calls[0].items.map((item) => item.title), [distinctTitle(0), distinctTitle(1)]);
+
+  provider.calls.length = 0;
+  const second = await triage.run({ now: NOW });
+  assert.equal(second.llm.itemsJudged, 2);
+  assert.deepEqual(provider.calls[0].items.map((item) => item.title), [distinctTitle(2), distinctTitle(3)]);
 });
 
 test("a rule-side keep is never overturned by the model — rules run first and win", async () => {

@@ -50,6 +50,9 @@ struct TrayMenu: View {
   @ObservedObject var capturePermissions: CapturePermissions = CapturePermissions.shared
   // Observe the outreach consumer so the pending-count line stays live.
   @ObservedObject var outreach: OutreachConsumer = OutreachConsumer.shared
+  // Sparkle owns the persisted preferences; observing the wrapper keeps these
+  // toggles in sync after the user changes one from the tray.
+  @ObservedObject var updates: UpdateController = UpdateController.shared
 
   var body: some View {
     Group {
@@ -116,13 +119,6 @@ struct TrayMenu: View {
         Text("⚠ \(err)").disabled(true).foregroundStyle(.red).lineLimit(3)
         Button("Show daemon log…") { revealDaemonLog() }
       }
-      // When daemon is down or degraded, the restart action moves up
-      // here next to the error so it's discoverable without scrolling.
-      if state.status == .down || state.status == .degraded {
-        // force: the button promises a restart, so it has to happen even when
-        // the app adopted this daemon rather than spawning it.
-        Button(restartLabel) { DaemonController.shared.restart(force: true) }
-      }
       if state.providerConfigured {
         Text("Model: \(state.providerName)").disabled(true)
       } else {
@@ -158,14 +154,17 @@ struct TrayMenu: View {
   /// daily user is most of every afternoon with a completely healthy daemon.
   /// A budget number was being rendered as a permanent "recover" button.
   private var restartLabel: String {
+    if !DaemonController.shared.canManageCurrentListener() {
+      return "Daemon managed externally…"
+    }
     switch state.reachability {
     case .notRunning:
       // Nothing holds the port. This starts a daemon; it doesn't restart one.
       return "↻ Start daemon"
     case .notResponding:
-      // Alive, still owns 43210, no longer answering. DaemonController.start()
-      // SIGTERMs then SIGKILLs the port holder before respawning, so "force-quit"
-      // is literally what happens — and a stopped process only dies to SIGKILL.
+      // Alive, still owns 43210, no longer answering. An app-owned listener is
+      // terminated before respawning; an external listener is preserved and
+      // explained when the user presses the action.
       return "↻ Force-quit and restart daemon"
     case .serving:
       // It is answering. Restarting is ordinary maintenance, not a rescue.
@@ -214,6 +213,11 @@ struct TrayMenu: View {
       Button(state.paused ? "Resume agent" : "Pause agent") {
         Task { await state.togglePause() }
       }
+      // Always available—not only after a health failure. Updating, changing
+      // settings, or clearing stale runtime state are ordinary maintenance.
+      // force: the button replaces an adopted bundle-owned listener. A
+      // terminal-managed listener is preserved and explained instead.
+      Button(restartLabel) { restartDaemon() }
       Button("Open dashboard…") { state.openDashboard() }
       Button("Open health audit…") { state.openDashboard(path: "/?tab=health") }
       Button("Open activity log…") { state.openDashboard(path: "/?tab=activity") }
@@ -222,10 +226,14 @@ struct TrayMenu: View {
 
       Divider()
       Menu("Capture") {
-        // macOS won't re-prompt once the user has answered, so the only real
-        // recovery is System Settings. Say capture is off and point there.
+        // Keep both recovery paths visible: a deliberate request retry and the
+        // System Settings pane. Neither runs from a timer or status refresh.
         if captureSettings.enabled && !capturePermissions.screenRecordingGranted {
           Text("⚠ Screen Recording not granted — capture off").disabled(true).font(.caption)
+          Button("Request Screen Recording permission…") {
+            CapturePermissions.shared.requestScreenRecordingFromPermissionButton()
+            CapturePermissions.shared.beginWatchingForGrant()
+          }
           Button("Open Screen Recording settings…") {
             CapturePermissions.shared.openScreenRecordingSettings()
           }
@@ -253,6 +261,16 @@ struct TrayMenu: View {
     return "Resume capture"
   }
 
+  private func restartDaemon() {
+    guard !DaemonController.shared.restart(force: true) else { return }
+    let alert = NSAlert()
+    alert.messageText = "This daemon is managed outside OpenAGI"
+    alert.informativeText = "Another process owns port 43210. Restart it from the terminal or service manager that launched it; OpenAGI will not terminate an external process."
+    alert.alertStyle = .informational
+    alert.addButton(withTitle: "OK")
+    alert.runModal()
+  }
+
   private func copyAuthToken() {
     guard let token = state.authToken(), !token.isEmpty else { return }
     let pb = NSPasteboard.general
@@ -267,8 +285,26 @@ struct TrayMenu: View {
         Text("⚠ \(state.findings.count) finding(s)").disabled(true).font(.caption)
       }
       Text("OpenAGI \(Self.versionString)").disabled(true).font(.caption)
-      Button(UpdateController.shared.isEnabled ? "Check for updates…" : "About auto-updates…") {
-        UpdateController.shared.checkForUpdates()
+      Menu("Updates") {
+        if updates.isEnabled {
+          if let warning = updates.installLocationWarning {
+            Text(warning).disabled(true).font(.caption)
+            Divider()
+          }
+          Toggle("Check automatically", isOn: Binding(
+            get: { updates.automaticallyChecksForUpdates },
+            set: { updates.setAutomaticallyChecksForUpdates($0) }
+          ))
+          Toggle("Install and restart automatically", isOn: Binding(
+            get: { updates.automaticallyInstallsAndRestarts },
+            set: { updates.setAutomaticallyInstallsAndRestarts($0) }
+          ))
+          .disabled(!updates.allowsAutomaticInstall)
+          Divider()
+          Button("Check now…") { updates.checkForUpdates() }
+        } else {
+          Button("About auto-updates…") { updates.checkForUpdates() }
+        }
       }
       Button("Quick Ask  ⌥Space") { OverlayController.shared.toggle() }
       Toggle("Enable Quick Ask", isOn: Binding(
@@ -281,7 +317,6 @@ struct TrayMenu: View {
       ))
       Divider()
       Button("Quit OpenAGI") {
-        DaemonController.shared.stop()
         NSApp.terminate(nil)
       }
     }

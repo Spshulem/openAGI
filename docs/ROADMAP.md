@@ -80,6 +80,74 @@ detection from annotated pages, ~500 lines + 3 native deps) is on the
 list if there's demand, but the inbox approach delivers most of the
 value with 130 lines and zero deps.
 
+## BuildBetter task synchronization
+
+**Status:** Discovery complete · API support needed for reliable two-way sync
+
+OpenAGI already imports BuildBetter call action items into its local task
+store, and can reuse an existing BuildBetter MCP OAuth connection. BuildBetter's
+Tasks screen, however, is backed by the separate Success follow-up queue. The
+current integration does not read or update that queue.
+
+BuildBetter's existing REST surface is enough for an experimental snapshot
+import and basic create/update/complete actions. Production-grade two-way sync
+still needs a general task contract with:
+
+- paginated list, search, single-item lookup, and an incremental sync cursor;
+- stable external references and idempotent creates so retries cannot duplicate
+  work;
+- versioned updates for conflict detection;
+- archive, restore, and deletion tombstones;
+- timestamps, provenance, and source references in public responses; and
+- transactional webhook events for task lifecycle changes.
+
+REST should be the background synchronization plane. Equivalent MCP tools can
+then provide interactive list/get/create/update/complete/archive/restore
+operations using the same authorization and task semantics. Reconciliation must
+also recognize when a Success task and an imported call action item share the
+same source, or the two existing BuildBetter task paths will create duplicates.
+
+Open question: Success follow-ups currently belong to a company or person,
+whereas OpenAGI tasks may be workspace-wide. The public contract must either
+support workspace-scoped tasks or explicitly preserve that account-only
+constraint.
+
+## Computer Use
+
+**Status:** Safe first increment shipped locally · native Mac execution remains
+
+OpenAGI now has a provider-neutral Computer Use tool set rather than a
+provider-specific prompt convention. It includes an explicit, human-approved
+session boundary; live action and reasoning logs; a kill switch; screen reads;
+and click/type/key/move actions through a bearer-gated computer-use node. When
+no node is reachable, screen inspection falls back to recent local OCR and
+input calls fail explicitly instead of reporting fake success.
+
+The dashboard reports four distinct readiness states (`disabled`,
+`observe-only`, `node-unreachable`, and `control-ready`) and provides a safe
+Try in Chat prompt. The main agent is told to start Computer Use only after an
+explicit user request, to inspect before acting, and to end the session when
+done. Passive screen capture never authorizes control.
+
+The next build-out is a native local Mac executor so a self-contained desktop
+install does not need the separate `openagi computer-server` + `cliclick`
+helper. That work should preserve the existing contract:
+
+- Screen Recording gates screenshots; Accessibility gates input.
+- A visible session-level approval is required before the first action.
+- Password fields, secure-input state, excluded apps/windows, and permission
+  uncertainty fail closed.
+- Every requested action records intent, coordinates/keys, result, and the
+  model's stated reason; the user can abort at any point.
+- Image dimensions and display scale are part of the observation/action loop,
+  and each action is followed by a fresh observation before another action.
+- Local execution stays local; remote nodes use a scoped credential and never
+  receive provider or integration secrets.
+
+Scrolling is not yet implemented by the current `cliclick` node backend and is
+reported as unsupported. Native macOS `CGEvent` execution is the intended
+general replacement, not a machine-specific automation script.
+
 ## Other items currently in the README's roadmap
 
 | Item | Effort | Notes |

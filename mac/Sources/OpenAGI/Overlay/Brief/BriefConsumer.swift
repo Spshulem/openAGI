@@ -14,6 +14,10 @@ final class BriefConsumer: ObservableObject {
 
   @Published private(set) var items: [BriefItem] = []
   @Published private(set) var olderCount: Int = 0
+  /// Optional because an older daemon only sends `older.count`. In that case
+  /// the footer still says "items" and never implies the whole backlog is
+  /// unfinished tasks.
+  @Published private(set) var olderBreakdown: BriefOlderBreakdown? = nil
   @Published private(set) var isLoading = false
   @Published private(set) var lastError: String? = nil
   /// The last action's server-reported outcome ("Task added", "Skill created: …").
@@ -46,6 +50,10 @@ final class BriefConsumer: ObservableObject {
   var hasContent: Bool {
     !items.isEmpty || isLoading || olderCount > 0 || lastError != nil
       || lastOutcome != nil || !degraded.isEmpty || !inFlight.isEmpty
+  }
+
+  var olderDisclosureLabel: String {
+    BriefOlder(count: olderCount, oldestAt: nil, byKind: olderBreakdown).disclosureLabel
   }
 
   private var baseURL: URL { AppState.shared.baseURL }
@@ -81,6 +89,7 @@ final class BriefConsumer: ObservableObject {
       guard generation == refreshGeneration else { return }  // a newer fetch already won
       items = decoded.items
       olderCount = decoded.older.count
+      olderBreakdown = decoded.older.byKind
       degraded = decoded.degraded
       planCachedAt = decoded.planCachedAt
       lastError = nil

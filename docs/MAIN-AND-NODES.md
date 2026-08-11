@@ -8,8 +8,27 @@ machines at it as thin **nodes**.
 
 You configure integrations **once**, on the main. Nodes don't need any keys.
 
+### Configure once does not mean copying `.env`
+
+Provider and integration credentials belong on the main. A thin node sends its
+work to the main and never receives the OpenAI, Anthropic, search, messaging, or
+MCP secrets stored there. Host-specific values (data directories, listen
+addresses, capture permissions, iMessage paths, and update preferences) stay on
+the machine they configure.
+
+The CLI already follows that model. The Mac app does not yet: as documented
+below, it still starts a complete local runtime, so its local provider status is
+independent from the main. Do not work around that by copying the main's `.env`
+to the Mac. The durable Mac-node design is a thin remote mode with a scoped
+per-node credential; raw provider-key replication would create another agent,
+another scheduler, and another independent spend ledger.
+
+Until scoped node credentials land, the saved pairing token has the same power
+as the main's bearer token. Pair only devices you trust and protect
+`<dataDir>/node.json` like any other credential file.
+
 ```
-   ┌─────────── main (Distiller / Pi) ───────────┐
+   ┌──────────── main (always-on host) ───────────┐
    │  openagi serve --host 0.0.0.0               │
    │  • all API keys / MCP / task sources        │
    │  • memory, scrutiny, propagation, cron      │
@@ -37,7 +56,7 @@ to the network with no token set.
 Finish setup from any device with a browser:
 
 ```sh
-openagi setup     # prints the wizard URL, e.g. http://distiller.local:43210/setup
+openagi setup     # prints the wizard URL, e.g. http://main-host.local:43210/setup
 ```
 
 Open that URL, add a model key, and (the point of this topology) connect your
@@ -61,7 +80,7 @@ the remote below.
 On your laptop (or any device with the CLI):
 
 ```sh
-openagi pair http://distiller.local:43210 --token <the-main's-auth-token>
+openagi pair http://main-host.local:43210 --token <the-main's-auth-token>
 openagi doctor      # verifies it can reach + auth the main
 openagi chat        # interactive — talks to the main, uses ITS integrations
 openagi status
@@ -78,7 +97,7 @@ local daemon.
 
 > Status: the Mac menubar app currently always runs its own local daemon. Pointing
 > it at a remote main (so screen-capture observations and Quick Ask feed the
-> Distiller, and the dashboard shows the main's state) is the next piece — see
+> main, and the dashboard shows the main's state) is the next piece — see
 > the "remote main" setting work in progress. Until then, the **CLI** is the way
 > to use a node; the Mac app stays a self-contained local install.
 

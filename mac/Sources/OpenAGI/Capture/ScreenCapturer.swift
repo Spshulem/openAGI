@@ -59,12 +59,12 @@ final class ScreenCapturer {
     guard CapturePermissions.shared.refreshScreenRecording() else {
       // No permission: schedule NOTHING. A timer that ticks into an early
       // return is the same bug with the dialog hidden — it burns a wakeup every
-      // N seconds and buries the reason capture is dead. Instead: spend this
-      // launch's single deliberate prompt (a no-op if already asked or already
-      // answered), then wait for the user to come back from System Settings.
+      // N seconds and buries the reason capture is dead. Give startup a bounded
+      // series of non-prompting preflight retries, then request only for a code
+      // identity that has never been granted or automatically asked before.
       CapturePermissions.shared.noteCaptureFailure(
         "Screen Recording permission is not granted — screen capture is off.")
-      CapturePermissions.shared.requestScreenRecordingOnceThisLaunch()
+      CapturePermissions.shared.scheduleAutomaticScreenRecordingRequestIfNeeded()
       CapturePermissions.shared.beginWatchingForGrant()
       NSLog("OpenAGI capture: Screen Recording not granted — capture timer not scheduled")
       return
@@ -198,7 +198,7 @@ final class ScreenCapturer {
     guard CapturePermissions.shared.refreshScreenRecording() else {
       CapturePermissions.shared.noteCaptureFailure(
         "Screen Recording permission is not granted — screen capture is off.")
-      CapturePermissions.shared.requestScreenRecordingOnceThisLaunch()
+      CapturePermissions.shared.requestScreenRecordingForFeatureUseIfNeeded()
       CapturePermissions.shared.beginWatchingForGrant()
       return nil
     }

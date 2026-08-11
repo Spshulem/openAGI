@@ -7,7 +7,7 @@ import fs from "node:fs";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { writeNodeConfig } from "../src/cli-client.js";
 
-test("a paired instance sends a heartbeat shortly after boot, and the main's registry reflects it", async () => {
+test("a paired instance heartbeats immediately on listen instead of waiting for its interval", async () => {
   // dataDir is passed explicitly to both createDurableRuntime and
   // createHostedInterface's options (not via process.env.OPENAGI_DATA_DIR) —
   // resolveDataDir() memoizes its first result for the whole test process,
@@ -23,7 +23,9 @@ test("a paired instance sends a heartbeat shortly after boot, and the main's reg
   writeNodeConfig({ remote: mainBase, token: null }, nodeDir);
   const nodeRuntime = createDurableRuntime({ dataDir: nodeDir });
   const nodeApp = createHostedInterface(nodeRuntime, {
-    host: "127.0.0.1", port: 0, tickerMs: 0, dataDir: nodeDir, heartbeatIntervalMs: 20
+    // Deliberately much longer than this test's deadline. A setInterval-only
+    // sender can never pass; the registration must come from the eager send.
+    host: "127.0.0.1", port: 0, tickerMs: 0, dataDir: nodeDir, heartbeatIntervalMs: 60_000
   });
   await nodeApp.listen();
 
@@ -32,8 +34,8 @@ test("a paired instance sends a heartbeat shortly after boot, and the main's reg
     // tell "the node checked in" apart from "only the main is listed" — poll
     // for the row that is not this main, and identify it by nodeId.
     let arrival = null;
-    for (let attempt = 0; attempt < 40 && !arrival; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    for (let attempt = 0; attempt < 20 && !arrival; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
       const json = await (await fetch(`${mainBase}/nodes`)).json();
       arrival = json.nodes.find((n) => !n.self) ?? null;
     }

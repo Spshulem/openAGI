@@ -60,8 +60,14 @@ struct OverlayView: View {
     // something that changes our height lands (answer, error, nudges, …).
     .onChange(of: state.answer) { _, _ in onContentChange() }
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
+    .onChange(of: state.progressStage) { _, _ in onContentChange() }
     .onChange(of: state.error) { _, _ in onContentChange() }
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
+    .onChange(of: state.briefContext) { _, _ in onContentChange() }
+    .onChange(of: state.composerFocusRequest) { _, _ in
+      fieldFocused = true
+      onContentChange()
+    }
     .onChange(of: app.status) { _, _ in onContentChange() }
     // Swaps the answer footer's button between "Continue in chat" and the
     // shorter "Open chat". Same single row at the default text size, but that
@@ -149,23 +155,79 @@ struct OverlayView: View {
       if app.status == .down {
         Text("OpenAGI is offline").font(.caption).foregroundStyle(.red)
       }
-      TextField("Ask about what you're looking at…", text: $state.question)
+      TextField(state.briefContext == nil ? "Ask about what you're looking at…" : "Ask about this item…", text: $state.question)
         .textFieldStyle(.roundedBorder)
         .focused($fieldFocused)
-        .disabled(app.status == .down)
+        .disabled(app.status == .down || state.isLoading || state.isDetached)
         .onSubmit { Task { await state.ask() } }
+      if let selected = state.briefContext {
+        HStack(spacing: 5) {
+          Text("About: \(selected.title)")
+            .font(.system(size: 10, weight: .medium))
+            .lineLimit(1)
+          Spacer(minLength: 4)
+          Button { state.clearBriefContext() } label: {
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+          }
+          .buttonStyle(.plain)
+          .help("Stop chatting about this item")
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.10)))
+      }
       if let note = state.contextNote {
         Text(note).font(.system(size: 10)).foregroundStyle(.tertiary)
       }
       if state.isLoading {
         HStack(spacing: 6) {
           ProgressView().controlSize(.small)
-          Text("Thinking…").font(.system(size: 11)).foregroundStyle(.secondary)
+          Text(state.progressLabel).font(.system(size: 11)).foregroundStyle(.secondary)
+          Spacer()
+          Button("Continue in main app") {
+            app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
+          }
+          .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 2)
+        if !state.answer.isEmpty {
+          ScrollView {
+            answerBody
+          }
+          .frame(maxHeight: 220)
+        }
+      } else if state.isDetached {
+        VStack(alignment: .leading, spacing: 5) {
+          Text("Connection lost before completion was confirmed. Open the main app to see whether the request is still running.")
+            .font(.caption).foregroundStyle(.secondary).lineLimit(4)
+          HStack {
+            Button("Open in main app") {
+              app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
+            }
+            .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
+            Spacer()
+            Button(action: { state.clearAnswer() }) {
+              Text("Clear").font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+          }
+        }
       } else if let err = state.error {
-        Text(err).font(.caption).foregroundStyle(.red).lineLimit(4)
+        VStack(alignment: .leading, spacing: 5) {
+          Text(err).font(.caption).foregroundStyle(.red).lineLimit(4)
+          HStack {
+            Button("Open in main app") {
+              app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
+            }
+            .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
+            Spacer()
+            Button(action: { state.clearAnswer() }) {
+              Text("Clear").font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+          }
+        }
       } else if !state.answer.isEmpty {
         ScrollView {
           answerBody
@@ -176,7 +238,7 @@ struct OverlayView: View {
           // Without an id (daemon answered 200 but named no session) the label
           // stops promising continuity it cannot deliver.
           Button(app.lastAskSessionId == nil ? "Open chat" : "Continue in chat") {
-            app.openChatSession(app.lastAskSessionId)
+            app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
           }
           .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
           .help(app.lastAskSessionId == nil

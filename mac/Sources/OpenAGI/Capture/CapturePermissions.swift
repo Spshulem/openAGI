@@ -1,6 +1,41 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import Security
+
+enum ScreenRecordingPermissionDecision: Equatable {
+  case inactive
+  case alreadyGranted
+  case previouslyGranted
+  case previouslyRequested
+  case request
+}
+
+/// Pure decision core for identity-aware permission paths. Keeping this free
+/// of TCC and UserDefaults makes the cross-launch cases executable in tests.
+struct ScreenRecordingPermissionPolicy {
+  static func identityAwareDecision(
+    captureActive: Bool,
+    preflightGranted: Bool,
+    identity: String,
+    grantedIdentities: Set<String>,
+    automaticOnboardingConsumedIdentities: Set<String>
+  ) -> ScreenRecordingPermissionDecision {
+    if !captureActive { return .inactive }
+    if preflightGranted { return .alreadyGranted }
+    if grantedIdentities.contains(identity) { return .previouslyGranted }
+    if automaticOnboardingConsumedIdentities.contains(identity) { return .previouslyRequested }
+    return .request
+  }
+
+  static func needsHistoryMigration(
+    identity: String,
+    storedVersions: [String: Int],
+    currentVersion: Int
+  ) -> Bool {
+    (storedVersions[identity] ?? 0) < currentVersion
+  }
+}
 
 // Single source of truth for the two TCC permissions ambient capture depends on:
 // Screen Recording (ScreenCaptureKit) and Accessibility (window titles).
@@ -23,23 +58,33 @@ import Foundation
 // currently never calls it (ActivityTracker.swift:63 and ScreenCapturer's
 // frontmostWindowTitle use the safe form) — keep it that way.
 //
-// The other half of the story: once the user has answered, macOS will not ask
-// again. TCC records the decision and every later CGRequestScreenCaptureAccess()
-// is a silent no-op. There is therefore no such thing as a "retry the dialog"
-// recovery path — the only way back is System Settings, which is why this type
-// exposes the state plus a deep link instead of re-asking.
+// CGRequestScreenCaptureAccess() is a request, not a status probe. TCC can show
+// it whenever macOS considers the current code identity unapproved, including
+// briefly during an update relaunch. This type therefore remembers grants by
+// the app's stable designated requirement and gives startup a short preflight-
+// only grace period before deciding whether a first-use request is appropriate.
 
 @MainActor
 final class CapturePermissions: ObservableObject {
   static let shared = CapturePermissions()
+
+  private static let grantedIdentitiesKey = "openagi.screenRecording.grantedIdentities"
+  private static let automaticOnboardingConsumedIdentitiesKey = "openagi.screenRecording.automaticOnboardingConsumedIdentities"
+  private static let permissionHistoryVersionKey = "openagi.screenRecording.permissionHistoryVersion"
+  private static let currentPermissionHistoryVersion = 1
+  private static let startupPreflightRetryNanoseconds: [UInt64] = [
+    250_000_000,
+    500_000_000,
+    750_000_000
+  ]
 
   /// Screen Recording (TCC). Read via CGPreflightScreenCaptureAccess() only.
   @Published private(set) var screenRecordingGranted: Bool
   /// Accessibility (TCC). Read via AXIsProcessTrusted() only — never the
   /// prompting AXIsProcessTrustedWithOptions form.
   @Published private(set) var accessibilityGranted: Bool
-  /// True once this launch has spent its single, deliberate system prompt.
-  @Published private(set) var didAskScreenRecordingThisLaunch = false
+  /// True once this launch has spent its single deliberate system request.
+  @Published private(set) var didRequestScreenRecordingThisLaunch = false
   /// Set when capture stopped itself for a reason the user has to see (so the
   /// privacy panel / tray can say why capture is off instead of dying quietly).
   @Published private(set) var lastCaptureFailure: String?
@@ -50,14 +95,18 @@ final class CapturePermissions: ObservableObject {
 
   private var watching = false
   private var notifyingGrant = false
+  private var automaticRequestTask: Task<Void, Never>?
   private var workspaceObservers: [NSObjectProtocol] = []
   private var appObservers: [NSObjectProtocol] = []
   private var lastActivationRefresh = Date.distantPast
+  private let permissionIdentity: String
 
   private init() {
+    permissionIdentity = Self.currentPermissionIdentity()
     // Both of these are non-prompting reads. Safe at init.
     screenRecordingGranted = CGPreflightScreenCaptureAccess()
     accessibilityGranted = AXIsProcessTrusted()
+    if screenRecordingGranted { rememberCurrentIdentityGrant() }
   }
 
   // MARK: — non-prompting state reads
@@ -69,6 +118,7 @@ final class CapturePermissions: ObservableObject {
     let granted = CGPreflightScreenCaptureAccess()
     let was = screenRecordingGranted
     if granted != was { screenRecordingGranted = granted }
+    if granted { rememberCurrentIdentityGrant() }
     // The absent -> granted transition fires the resume hook from HERE, not
     // from the caller, so it cannot be missed depending on which observer
     // happened to notice first (activation vs. the privacy panel's refresh).
@@ -90,24 +140,112 @@ final class CapturePermissions: ObservableObject {
     refreshAccessibility()
   }
 
-  // MARK: — the one deliberate ask
+  // MARK: — deliberate requests
 
-  /// Show the macOS Screen Recording prompt at most once per app launch.
+  /// Schedule the one automatic first-use request allowed for this code
+  /// identity. The capture lifecycle calls this only when capture is enabled
+  /// and the initial non-prompting preflight returned false.
   ///
-  /// Callers must be user-visible, deliberate moments (app launch with capture
-  /// enabled, the user turning capture on, the user invoking Quick Ask) — NEVER
-  /// the repeating capture timer. The launch-scoped flag is belt-and-braces:
-  /// macOS itself only ever shows this dialog once per TCC decision.
-  func requestScreenRecordingOnceThisLaunch() {
-    if didAskScreenRecordingThisLaunch { return }
-    if screenRecordingGranted { return }
-    didAskScreenRecordingThisLaunch = true
+  /// The delayed checks cover the launch/update window where TCC can briefly
+  /// return false for an unchanged signed app. If this identity was ever
+  /// observed as granted, or has already received its automatic request, we
+  /// surface recovery controls instead of asking again.
+  func scheduleAutomaticScreenRecordingRequestIfNeeded() {
+    guard automaticRequestTask == nil, !didRequestScreenRecordingThisLaunch else { return }
+    // Releases before this policy did not persist permission history. If an
+    // existing capture-enabled install upgrades while TCC is temporarily
+    // returning false, there is no honest way to distinguish a prior grant
+    // from a prior denial. Migrate it without automatically prompting; the
+    // labelled Request Permission control remains available. Fresh installs
+    // start with capture disabled, and their explicit enable action marks the
+    // policy current before requesting first-use access.
+    let isPermissionHistoryMigration = ScreenRecordingPermissionPolicy.needsHistoryMigration(
+      identity: permissionIdentity,
+      storedVersions: permissionHistoryVersions(),
+      currentVersion: Self.currentPermissionHistoryVersion)
+    markPermissionHistoryCurrent()
+    automaticRequestTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      for delay in Self.startupPreflightRetryNanoseconds {
+        try? await Task.sleep(nanoseconds: delay)
+        if Task.isCancelled { return }
+        if self.refreshScreenRecording() { return }
+      }
+
+      if isPermissionHistoryMigration {
+        self.rememberCurrentIdentity(forKey: Self.automaticOnboardingConsumedIdentitiesKey)
+        self.noteCaptureFailure(
+          "Screen Recording was configured before this update but macOS is not reporting access — capture is off. Use Request Permission or open System Settings if it does not recover.")
+        self.automaticRequestTask = nil
+        return
+      }
+      self.requestScreenRecordingRespectingHistory()
+    }
+  }
+
+  /// Cancel onboarding while it is still in the non-prompting grace period.
+  /// Once CoreGraphics is already presenting its system UI it cannot be
+  /// recalled, so every inactive capture path calls this before that boundary.
+  func cancelAutomaticScreenRecordingRequest() {
+    automaticRequestTask?.cancel()
+    automaticRequestTask = nil
+  }
+
+  /// Feature use (enabling capture or Quick Ask) may request first-use access,
+  /// but it must not bypass a remembered grant during a transient false
+  /// preflight. Only the literal Request Permission button does that.
+  func requestScreenRecordingForFeatureUseIfNeeded() {
+    cancelAutomaticScreenRecordingRequest()
+    markPermissionHistoryCurrent()
+    requestScreenRecordingRespectingHistory()
+  }
+
+  /// The explicitly labelled permission button is the user's deliberate retry
+  /// after the status UI explains that macOS is not reporting access.
+  func requestScreenRecordingFromPermissionButton() {
+    cancelAutomaticScreenRecordingRequest()
+    markPermissionHistoryCurrent()
+    requestScreenRecordingOnceThisLaunch()
+  }
+
+  private func requestScreenRecordingRespectingHistory() {
+    let decision = ScreenRecordingPermissionPolicy.identityAwareDecision(
+      captureActive: CaptureSettings.shared.isActiveNow(),
+      preflightGranted: refreshScreenRecording(),
+      identity: permissionIdentity,
+      grantedIdentities: rememberedIdentities(forKey: Self.grantedIdentitiesKey),
+      automaticOnboardingConsumedIdentities: rememberedIdentities(
+        forKey: Self.automaticOnboardingConsumedIdentitiesKey))
+    switch decision {
+    case .inactive, .alreadyGranted, .previouslyRequested:
+      return
+    case .previouslyGranted:
+      noteCaptureFailure(
+        "Screen Recording was previously granted but macOS is not reporting it — capture is off. Use Request Permission or open System Settings if it does not recover.")
+    case .request:
+      requestScreenRecordingOnceThisLaunch()
+    }
+  }
+
+  /// The only implementation site allowed to call CoreGraphics' prompting
+  /// API. Both automatic onboarding and explicit actions converge here.
+  private func requestScreenRecordingOnceThisLaunch() {
+    if didRequestScreenRecordingThisLaunch { return }
+    if refreshScreenRecording() { return }
+    didRequestScreenRecordingThisLaunch = true
     // Off the main actor: the call can block while the system dialog is up, and
     // its return value reflects the state at call time, not the user's answer —
     // the real signal is the activation-driven preflight in handleActivation().
     Task.detached(priority: .userInitiated) {
       let granted = CGRequestScreenCaptureAccess()
-      await MainActor.run { CapturePermissions.shared.applyRequestResult(granted) }
+      await MainActor.run {
+        let permissions = CapturePermissions.shared
+        // Persist only after the request API really ran. Marking it before the
+        // detached task starts could suppress onboarding forever if the app
+        // quits in that small scheduling window.
+        permissions.rememberCurrentIdentity(forKey: Self.automaticOnboardingConsumedIdentitiesKey)
+        permissions.applyRequestResult(granted)
+      }
     }
   }
 
@@ -115,6 +253,62 @@ final class CapturePermissions: ObservableObject {
     // Trust the preflight over the request's return value; refreshScreenRecording
     // owns the transition -> resume hook.
     if granted { refreshScreenRecording() }
+  }
+
+  private func rememberCurrentIdentityGrant() {
+    markPermissionHistoryCurrent()
+    rememberCurrentIdentity(forKey: Self.grantedIdentitiesKey)
+  }
+
+  private func markPermissionHistoryCurrent() {
+    var versions = permissionHistoryVersions()
+    versions[permissionIdentity] = Self.currentPermissionHistoryVersion
+    UserDefaults.standard.set(versions, forKey: Self.permissionHistoryVersionKey)
+  }
+
+  private func permissionHistoryVersions() -> [String: Int] {
+    let raw = UserDefaults.standard.dictionary(forKey: Self.permissionHistoryVersionKey) ?? [:]
+    return raw.reduce(into: [:]) { result, pair in
+      if let number = pair.value as? NSNumber { result[pair.key] = number.intValue }
+    }
+  }
+
+  private func rememberedIdentities(forKey key: String) -> Set<String> {
+    Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+  }
+
+  private func rememberCurrentIdentity(forKey key: String) {
+    var identities = rememberedIdentities(forKey: key)
+    guard identities.insert(permissionIdentity).inserted else { return }
+    UserDefaults.standard.set(identities.sorted(), forKey: key)
+  }
+
+  /// TCC continuity follows a code signature's designated requirement, not an
+  /// app version, path, display name, or machine name. Its binary form is a
+  /// stable opaque identifier across correctly signed updates.
+  private static func currentPermissionIdentity() -> String {
+    var dynamicCode: SecCode?
+    var staticCode: SecStaticCode?
+    var requirement: SecRequirement?
+    var requirementData: CFData?
+    if SecCodeCopySelf([], &dynamicCode) == errSecSuccess,
+       let dynamicCode,
+       SecCodeCopyStaticCode(dynamicCode, [], &staticCode) == errSecSuccess,
+       let staticCode,
+       SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess,
+       let requirement,
+       SecRequirementCopyData(requirement, [], &requirementData) == errSecSuccess,
+       let requirementData {
+      return (requirementData as Data).base64EncodedString()
+    }
+
+    // Unsigned local builds have no designated requirement. Keep their
+    // automatic-request bookkeeping scoped to this bundle and install path;
+    // release builds always take the signed branch above.
+    let bundle = Bundle.main
+    let bundleId = bundle.bundleIdentifier ?? "unknown-bundle"
+    let path = bundle.bundleURL.resolvingSymlinksInPath().standardizedFileURL.path
+    return "unsigned:\(bundleId):\(path)"
   }
 
   // MARK: — resume without a restart
@@ -165,6 +359,7 @@ final class CapturePermissions: ObservableObject {
     if notifyingGrant { return }  // no re-entry via apply() -> start() -> refresh()
     notifyingGrant = true
     defer { notifyingGrant = false }
+    cancelAutomaticScreenRecordingRequest()
     stopWatchingForGrant()
     lastCaptureFailure = nil
     onScreenRecordingGranted?()

@@ -389,7 +389,12 @@ export const MCP_CATALOG = [
     // url is a getter so BUILDBETTER_MCP_URL (e.g. a staging MCP server) is
     // read when the server is REGISTERED, not at module import — .env loads
     // after imports in the hosted-server boot order.
-    register: { get url() { return process.env.BUILDBETTER_MCP_URL ?? "https://mcp.buildbetter.app/sse"; }, transport: "http", auth: "oauth" }
+    // The hosted server uses Streamable HTTP at its origin. `/sse` was the
+    // pre-2025 transport and now answers 404 after an otherwise-successful
+    // OAuth flow. `legacyUrls` lets existing exact catalog registrations move
+    // forward without touching custom/user-named servers.
+    legacyUrls: ["https://mcp.buildbetter.app/sse"],
+    register: { get url() { return process.env.BUILDBETTER_MCP_URL ?? "https://mcp.buildbetter.app"; }, transport: "http", auth: "oauth" }
   },
   {
     id: "rize",
@@ -399,7 +404,10 @@ export const MCP_CATALOG = [
     authType: "oauth",
     status: "available",
     matches: { bundleIds: ["io.rize"], hostnames: ["rize.io", "my.rize.io"], keywords: ["rize", "rize.io"] },
-    register: { url: "https://mcp.rize.io/sse", transport: "http", auth: "oauth" }
+    // Protected-resource discovery advertises /mcp. Keeping /sse here made
+    // the browser login succeed, then the MCP initialize POST fail with 404.
+    legacyUrls: ["https://mcp.rize.io/sse"],
+    register: { url: "https://mcp.rize.io/mcp", transport: "http", auth: "oauth" }
   },
 
   // ─── Filesystem ─────────────────────────────────────────────────────
@@ -414,6 +422,19 @@ export const MCP_CATALOG = [
     register: { transport: "stdio", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] }
   }
 ];
+
+/// Upgrade only exact, known catalog endpoints. Custom server names and URLs
+/// are user-owned and never rewritten. The returned object is a copy only
+/// when a migration applies, which makes it safe for config-load callers to
+/// detect whether the on-disk file needs an atomic update.
+export function migrateCatalogRegistration(name, spec) {
+  if (!spec || typeof spec !== "object" || typeof spec.url !== "string") return spec;
+  const entry = MCP_CATALOG.find((candidate) => candidate.id === name);
+  if (!entry?.register || !(entry.legacyUrls ?? []).includes(spec.url)) return spec;
+  const currentUrl = entry.register.url;
+  if (typeof currentUrl !== "string" || !currentUrl || currentUrl === spec.url) return spec;
+  return { ...spec, url: currentUrl };
+}
 
 // Given recent activity rows (apps + OCR snippets), return the MCP catalog
 // entries whose match-criteria fire. Each result includes the trigger

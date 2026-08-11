@@ -143,7 +143,10 @@ export class McpOAuthClient {
     // Only send `scope` when we have one the server supports — sending an
     // unsupported scope (or a hardcoded default) is what triggers invalid_scope.
     if (scope) authUrl.searchParams.set("scope", scope);
-    authUrl.searchParams.set("resource", this.resourceUrl);
+    // Discovery may canonicalize the protected resource (Rize discovers from
+    // its origin but advertises `/mcp`). Ask for the token audience the server
+    // declared instead of blindly echoing the discovery seed URL.
+    authUrl.searchParams.set("resource", discovery.resourceMeta?.resource ?? this.resourceUrl);
 
     this.printAuthUrlFn({ name: this.name, url: authUrl.toString() });
     openInBrowser(authUrl.toString());
@@ -368,8 +371,13 @@ export function startCallbackServer() {
           return;
         }
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-        res.end(`<!doctype html><meta charset=utf-8><title>OpenAGI</title><body style=font-family:system-ui;padding:40px;background:#0e1411;color:#e8efea>` +
-          `<h2 style=color:#6fe1b1>✓ Authorized</h2><p>You can close this tab and return to OpenAGI.</p></body>`);
+        const dashboardUrl = oauthReturnUrl();
+        res.end(`<!doctype html><meta charset=utf-8><title>OpenAGI</title>` +
+          `<meta http-equiv="refresh" content="3;url=${escapeHtml(dashboardUrl)}">` +
+          `<body style=font-family:system-ui;padding:40px;background:#0e1411;color:#e8efea>` +
+          `<h2 style=color:#6fe1b1>✓ Authorized</h2>` +
+          `<p>OpenAGI is finishing the connection. Returning to Integrations…</p>` +
+          `<p><a style=color:#6fe1b1 href="${escapeHtml(dashboardUrl)}">Return now</a></p></body>`);
         resolveCb({ code, state });
       } catch (err) {
         try { res.writeHead(500); res.end(); } catch { /* ignore */ }
@@ -391,6 +399,19 @@ export function startCallbackServer() {
       resolve({ server, port, callback });
     });
   });
+}
+
+function oauthReturnUrl() {
+  const configured = process.env.OPENAGI_OAUTH_RETURN_URL;
+  if (configured) {
+    try {
+      const url = new URL(configured);
+      if (url.protocol === "http:" || url.protocol === "https:") return url.toString();
+    } catch { /* use the local dashboard fallback */ }
+  }
+  const port = Number.parseInt(process.env.PORT ?? process.env.OPENAGI_PORT ?? "43210", 10);
+  const safePort = Number.isInteger(port) && port > 0 && port <= 65535 ? port : 43210;
+  return `http://127.0.0.1:${safePort}/?tab=integrations`;
 }
 
 function redirectUriCandidates() {

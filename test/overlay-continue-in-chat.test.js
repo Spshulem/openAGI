@@ -156,6 +156,33 @@ test("no ?session= means no deep link (plain /?tab=chat still opens a fresh chat
   assert.equal(deepLinkSessionId("?tab=chat&session=%20%20"), null);
 });
 
+test("the popup request id survives the handoff query", async () => {
+  const { script } = await boot();
+  const deepLinkRequestId = new Function(
+    `${extractFunction(script, "deepLinkRequestId")}; return deepLinkRequestId;`
+  )();
+  assert.equal(deepLinkRequestId("?tab=chat&request=ask_123"), "ask_123");
+  assert.equal(deepLinkRequestId("?tab=chat&request=ask%3Aencoded"), "ask:encoded");
+  assert.equal(deepLinkRequestId("?tab=chat"), null);
+});
+
+test("a bare Chat open chooses newest interactive history, not background sessions", async () => {
+  const { script } = await boot();
+  const latestInteractiveSession = new Function(
+    `${extractFunction(script, "latestInteractiveSession")}; return latestInteractiveSession;`
+  )();
+  const sessions = [
+    { id: "cron:hourly:main" },
+    { id: "autopilot:agent-pulse" },
+    { id: "overlay:user:main" },
+    { id: "local:browser:main" }
+  ];
+  assert.equal(latestInteractiveSession(sessions).id, "overlay:user:main");
+  assert.equal(latestInteractiveSession(sessions.slice(0, 2)), null);
+  assert.match(script, /!state\.freshChatRequested && !requestedSession[\s\S]{0,180}latestInteractiveSession\(state\.sessions\)/);
+  assert.match(script, /freshChatRequested = true[\s\S]{0,180}renderTab\(\)/, "+ New must remain an intentionally empty composer");
+});
+
 test("opening the deep link loads the overlay conversation into the chat thread", async () => {
   const { script, base } = await boot();
   // Real payload from the real daemon — this is what the browser would fetch.
@@ -183,6 +210,37 @@ test("opening the deep link loads the overlay conversation into the chat thread"
   assert.equal(state.from, "user");
   assert.equal(calls.rendered, 1, "the thread is re-rendered with the loaded history");
   assert.deepEqual(calls.toasts, [], "a healthy handoff is silent");
+});
+
+test("a reused session stays queued until the newly handed-off request is persisted", async () => {
+  const { script } = await boot();
+  const oldMessages = [
+    { role: "user", content: "old question", channel: "overlay", from: "user", metadata: { requestId: "req_old" } },
+    { role: "assistant", content: "old answer", channel: "overlay", from: "user", metadata: { requestId: "req_old" } }
+  ];
+  const state = { sessionId: null, messages: [], channel: "local", from: "browser" };
+  let fetches = 0;
+  const openSessionDeepLink = new Function(
+    "fetchJson", "state", "refreshSessions", "renderChat", "showToast", "setTimeout",
+    `${extractFunction(script, "openSessionDeepLink")}; return openSessionDeepLink;`
+  )(
+    async () => {
+      fetches += 1;
+      return { id: "overlay:user:main", messages: oldMessages };
+    },
+    state,
+    async () => {},
+    () => {},
+    () => {},
+    (fn) => fn()
+  );
+
+  assert.equal(await openSessionDeepLink("overlay:user:main", "req_new"), true);
+  assert.equal(fetches, 4, "old history must not make a brand-new request look loaded");
+  assert.equal(state.activeRequestId, "req_new");
+  assert.equal(state.activeRequestStage, "queued");
+  assert.equal(typeof state.activeRequestMissingSince, "number");
+  assert.equal(state.messages.length, 2, "existing history remains visible while the new turn arrives");
 });
 
 test("a stale deep link says so instead of silently showing a blank chat", async () => {
@@ -233,9 +291,89 @@ test("the bootstrap actually consumes the deep link on load", async () => {
   const { script } = await boot();
   assert.match(
     script,
-    /openSessionDeepLink\(initialSession\)/,
+    /openSessionDeepLink\(initialSession, initialRequest\)/,
     "deepLinkSessionId/openSessionDeepLink exist but nothing calls them on page load"
   );
+});
+
+test("dashboard distinguishes a persisted pending request from completed and failed turns", async () => {
+  const { script } = await boot();
+  const requestState = new Function(
+    `const CHAT_REQUEST_STALE_MS = 30 * 60 * 1000;
+     ${extractFunction(script, "messageRequestId")}
+     ${extractFunction(script, "messageRequestStatus")}
+     ${extractFunction(script, "requestState")}
+     return requestState;`
+  )();
+  const user = { role: "user", content: "clean this up", metadata: { requestId: "req_1" } };
+  assert.equal(requestState([user], "req_1").status, "pending");
+  assert.equal(requestState([user, { role: "assistant", content: "done" }], "req_1").status, "complete");
+  const failed = { role: "assistant", content: "Could not finish", metadata: { requestId: "req_1", status: "failed" } };
+  assert.equal(requestState([user, failed], "req_1").status, "failed");
+
+  const secondUser = { role: "user", content: "and this", metadata: { requestId: "req_2" } };
+  const secondReply = { role: "assistant", content: "second done", metadata: { requestId: "req_2" } };
+  const firstReply = { role: "assistant", content: "first done", metadata: { requestId: "req_1" } };
+  const interleaved = [user, secondUser, secondReply, firstReply];
+  assert.equal(requestState(interleaved, "req_1").message, firstReply);
+  assert.equal(requestState(interleaved, "req_2").message, secondReply);
+
+  const orphan = { role: "user", content: "old", createdAt: "2020-01-01T00:00:00.000Z", metadata: { requestId: "req_old" } };
+  assert.equal(requestState([orphan], "req_old").status, "interrupted");
+});
+
+test("dashboard composer consumes lifecycle frames instead of appearing disconnected", async () => {
+  const { script } = await boot();
+  assert.doesNotThrow(() => new Function(script), "the complete generated dashboard script must parse");
+  const postMessageStream = new Function(
+    "fetch", "TextDecoder", "Uint8Array",
+    `${extractFunction(script, "postMessageStream")}; return postMessageStream;`
+  )(
+    async () => new Response([
+      'event: status\ndata: {"stage":"thinking"}\n\n',
+      'event: heartbeat\ndata: {"stage":"tool"}\n\n',
+      'event: delta\ndata: {"text":"Live answer","reset":true,"model":"gpt-test"}\n\n',
+      'event: final\ndata: {"reply":"finished","session":{"id":"overlay:user:main"}}\n\n'
+    ].join(""), { headers: { "content-type": "text/event-stream" } }),
+    TextDecoder,
+    Uint8Array
+  );
+  const seen = [];
+  const result = await postMessageStream({ text: "work" }, (event, data) => seen.push([event, data]));
+  assert.equal(result.reply, "finished");
+  assert.deepEqual(seen.slice(0, 2).map(([event, data]) => [event, data.stage]), [["status", "thinking"], ["heartbeat", "tool"]]);
+  assert.deepEqual(seen[2], ["delta", { text: "Live answer", reset: true, model: "gpt-test" }]);
+  assert.match(script, /event === "delta"[\s\S]{0,100}updateStreamingAssistant\(requestId, data\)/);
+  assert.match(script, /function renderStreamingAssistant\([\s\S]{0,1200}renderMarkdown\(state\.activeRequestText\)/);
+  assert.match(script, /function renderPageChatComposer\([\s\S]{0,2600}postMessageStream\([\s\S]{0,800}event === "delta"/);
+});
+
+test("same-session completion reloads the durable thread", async () => {
+  const { script } = await boot();
+  assert.match(script, /data\.sessionId === state\.sessionId[\s\S]{0,700}refreshActiveChatSession\(data\.sessionId/);
+  assert.match(script, /const waitingForPersistence = !outcome && Boolean\(id\)/);
+  assert.match(script, /outcome\?\.status === "pending" \|\| waitingForPersistence\)[\s\S]{0,120}refreshActiveChatSession/);
+});
+
+test("transport loss stays pending while explicit daemon failure is terminal", async () => {
+  const { script } = await boot();
+  assert.match(script, /err\.terminal === true \? "failed" : "disconnected"/);
+  assert.match(script, /currentSend\.disabled = outcome\?\.status === "pending"/);
+  assert.match(script, /waitingForPersistence[\s\S]{0,500}CHAT_REQUEST_STALE_MS/);
+  assert.match(script, /Request interrupted[\s\S]{0,300}Review any task changes before retrying/);
+});
+
+test("Mac Quick Ask names the session before waiting and offers the handoff in every state", () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const appState = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/AppState.swift"), "utf8");
+  const overlay = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/Overlay/OverlayView.swift"), "utf8");
+  assert.match(appState, /let sessionId = lastAskSessionId \?\? "overlay:user:main"/);
+  assert.match(appState, /lastAskSessionId = sessionId[\s\S]{0,900}"sessionId": sessionId/);
+  assert.match(appState, /setValue\("text\/event-stream", forHTTPHeaderField: "Accept"\)/);
+  assert.match(appState, /case "delta"[\s\S]{0,350}onTextDelta\?\(delta\.text, delta\.reset == true\)/);
+  assert.match(overlay, /if state\.isLoading[\s\S]{0,1200}if !state\.answer\.isEmpty[\s\S]{0,250}answerBody/);
+  assert.match(overlay, /if state\.isLoading[\s\S]{0,900}Continue in main app/);
+  assert.match(overlay, /else if let err = state\.error[\s\S]{0,900}Open in main app/);
 });
 
 // ─── Screen context must not vanish in the hop ──────────────────────────────

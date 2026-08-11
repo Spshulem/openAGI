@@ -5,12 +5,11 @@
 //
 // node-registry.js knows about PEERS: full OpenAGI installs that generate an
 // identity.json, heartbeat every 30s, and report a version and a build. That
-// is the only kind of machine the Nodes view could see, which is why the user's
-// Mac mini — a real, load-bearing, healthy machine running
-// `openagi imessage-server` behind a tailnet address — did not appear anywhere.
-// It has no daemon, no identity, and never heartbeats. It is known to the main
-// only because the main's environment names it (OPENAGI_IMESSAGE_NODE), and its
-// liveness is not a remembered timestamp but a question you have to go and ask.
+// is the only kind of machine the Nodes view could see, so a service-only host
+// running `openagi imessage-server` did not appear anywhere. It has no daemon,
+// no identity, and never heartbeats. It is known to the main only because the
+// main's environment names it (OPENAGI_IMESSAGE_NODE), and its liveness is not
+// a remembered timestamp but a question you have to go and ask.
 //
 // So a service is modelled as its own kind, deliberately NOT as a peer:
 //
@@ -25,9 +24,8 @@
 //
 //  1. A probe result is "live" ONLY if it completed during the request that is
 //     reporting it. Anything else is "cached" and carries its age. The Nodes
-//     view spent two weeks telling the user a dead machine was "online" because
-//     a cached verdict was replayed as a current one; the fix must not be
-//     undone one field over by a probe cache that does the same thing.
+//     A cached verdict must never be replayed as current; a probe cache that
+//     does so merely moves the same stale-status bug one field over.
 //  2. A probe must never hold the response. It runs in parallel with everything
 //     else /nodes does and is raced against a budget; whatever has not answered
 //     by then keeps running in the background to populate the cache for the
@@ -76,17 +74,19 @@ export function scrubSecrets(text, secrets = []) {
   return out.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1");
 }
 
-// Split a configured endpoint into (a) the address it is safe to show a user
-// and (b) the credential material that must never be shown. Query and fragment
-// are dropped entirely rather than inspected — a token in `?token=` is a real
-// pattern, and no service here needs a query string to be reachable.
-export function scrubEndpoint(raw) {
+// Parse a configured endpoint once, keeping the path-bearing probe base private
+// while reducing the display address to its origin. Paths can be credentials
+// just as readily as query strings (for example, an unguessable webhook-style
+// route), so they must never be serialized into /nodes or its on-disk cache.
+// Query and fragment are dropped entirely rather than inspected — no service
+// here needs either one to be reachable.
+function parseEndpoint(raw) {
   const value = str(raw);
   if (!value) return null;
   let u;
-  try { u = new URL(value); } catch { return { endpoint: null, host: null, username: null, password: null, invalid: true }; }
+  try { u = new URL(value); } catch { return { endpoint: null, host: null, username: null, password: null, probeBase: null, invalid: true }; }
   if (u.protocol !== "http:" && u.protocol !== "https:") {
-    return { endpoint: null, host: null, username: null, password: null, invalid: true };
+    return { endpoint: null, host: null, username: null, password: null, probeBase: null, invalid: true };
   }
   // Percent-decode so the credential we compare/scrub against is the literal
   // one — but never let a malformed escape throw, because that would take the
@@ -94,13 +94,22 @@ export function scrubEndpoint(raw) {
   const decode = (v) => { if (!v) return null; try { return decodeURIComponent(v); } catch { return v; } };
   const username = decode(u.username);
   const password = decode(u.password);
-  const display = new URL(u.href);
-  display.username = "";
-  display.password = "";
-  display.search = "";
-  display.hash = "";
-  const endpoint = display.href.replace(/\/+$/, "");
-  return { endpoint, host: u.host, username, password, invalid: false };
+  const probe = new URL(u.href);
+  probe.username = "";
+  probe.password = "";
+  probe.search = "";
+  probe.hash = "";
+  const probeBase = probe.href.replace(/\/+$/, "");
+  return { endpoint: u.origin, host: u.host, username, password, probeBase, invalid: false };
+}
+
+// Return only the address that is safe to show or propagate. The private probe
+// base deliberately does not cross this exported sanitization boundary.
+export function scrubEndpoint(raw) {
+  const parsed = parseEndpoint(raw);
+  if (!parsed) return null;
+  const { endpoint, host, invalid } = parsed;
+  return { endpoint, host, invalid };
 }
 
 // Turn the environment into a description of every service kind: what it is,
@@ -118,12 +127,13 @@ export function readServiceConfig({ env = process.env, kinds = SERVICE_KINDS } =
         probeUrl: null, probeHeaders: {}, secrets: []
       };
     }
-    const parsed = scrubEndpoint(raw);
+    const parsed = parseEndpoint(raw);
     // The raw configured string is treated as a secret even when it has no
     // userinfo: a token can also hide in a path, and over-redacting one error
     // message costs nothing next to leaking a credential. The >= 4 floor keeps
     // a trivially short value from redacting half the sentence.
-    const secrets = [token, parsed?.password, parsed?.username, raw].filter((s) => typeof s === "string" && s.length >= 4);
+    const secrets = [token, parsed?.password, parsed?.username, raw, parsed?.probeBase, parsed?.probeBase && `${parsed.probeBase}${kind.healthPath}`]
+      .filter((s) => typeof s === "string" && s.length >= 4);
     if (!parsed || parsed.invalid) {
       return {
         kind, configured: true, invalid: true, endpoint: null, host: null,
@@ -144,7 +154,7 @@ export function readServiceConfig({ env = process.env, kinds = SERVICE_KINDS } =
       invalid: false,
       endpoint: parsed.endpoint,
       host: parsed.host,
-      probeUrl: `${parsed.endpoint}${kind.healthPath}`,
+      probeUrl: `${parsed.probeBase}${kind.healthPath}`,
       probeHeaders: headers,
       secrets
     };
@@ -199,7 +209,7 @@ export class ServiceProbe {
     const started = [];
     for (const cfg of configs) {
       if (!cfg.configured || cfg.invalid) continue;
-      const key = `${cfg.kind.id}|${cfg.endpoint}`;
+      const key = `${cfg.kind.id}|${cfg.probeUrl}`;
       before.set(key, this._results.get(key) ?? null);
       started.push(this._ensureProbe(key, cfg, now));
     }
@@ -214,7 +224,7 @@ export class ServiceProbe {
     const prev = this._results.get(key);
     // Rate-limit: a fresh-enough result is served as an explicitly CACHED
     // answer rather than re-probing. This keeps a dashboard refresh loop (or
-    // two tabs) from hammering someone's Mac mini, and the honesty cost is
+    // two tabs) from hammering a service host, and the honesty cost is
     // paid in the response, which says the age out loud.
     if (prev && (now - prev.at) < this._minIntervalMs) return Promise.resolve();
     const promise = this._runProbe(key, cfg).finally(() => {
@@ -237,8 +247,10 @@ export class ServiceProbe {
         redirect: "manual",
         signal: AbortSignal.timeout(this._timeoutMs)
       });
-      // Drain so the socket is released rather than left half-read.
-      try { await res.arrayBuffer(); } catch { /* body is not the point */ }
+      // The body is not part of the health contract. Cancel it rather than
+      // materializing it: a misconfigured or compromised service can otherwise
+      // stream an arbitrarily large response into this daemon's memory.
+      try { await res.body?.cancel(); } catch { /* status is still authoritative */ }
       verdict = res.ok
         ? { reachability: "reachable", detail: null }
         : {
@@ -294,7 +306,7 @@ export class ServiceProbe {
         checkAgeMs: null
       };
     }
-    const key = `${cfg.kind.id}|${cfg.endpoint}`;
+    const key = `${cfg.kind.id}|${cfg.probeUrl}`;
     const current = this._results.get(key) ?? null;
     if (!current) {
       // The probe is still running past the budget. Saying "unknown" is the

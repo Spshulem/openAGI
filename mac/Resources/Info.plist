@@ -50,6 +50,10 @@
   <string>unOtVkyA3akAScIoYYZ8UkqoBx56Ze1mDcEni8K1964=</string>
   <key>SUEnableAutomaticChecks</key>
   <true/>
+  <!-- Users can opt into immediate background install + relaunch from the
+       tray. Keep that disruptive choice off for a fresh installation. -->
+  <key>SUAutomaticallyUpdate</key>
+  <false/>
   <key>SUScheduledCheckInterval</key>
   <integer>86400</integer>
 </dict>

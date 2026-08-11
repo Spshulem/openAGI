@@ -1,14 +1,12 @@
-// Computer-use beta integration. Wires Anthropic's `computer_*` tool
-// vocabulary into OpenAGI's ToolRegistry. This build does NOT synthesize
-// mouse / keyboard events — real input synthesis lives in the Mac app
-// behind macOS Accessibility permission and ships in a later phase.
+// Computer-use beta integration. Wires a provider-neutral `computer_*` tool
+// vocabulary into OpenAGI's ToolRegistry. A connected computer-use node can
+// capture the live screen and synthesize input; without one, the safe local
+// fallback is read-only OCR from the observation store.
 //
-// IMPORTANT (production honesty): the input-synthesis tools (click, type,
-// key, scroll, move) record the agent's intent to the audit log and then
-// THROW. They never report fake success — an agent calling computer_click
-// gets an explicit "execution not available in this build" error so it
-// knows the action did not happen. Only session management and the
-// (real-data) screenshot/OCR readback actually function.
+// IMPORTANT (production honesty): without a reachable node, input-synthesis
+// tools record the agent's intent and then THROW. They never report fake
+// success. Session management and the real-data screenshot/OCR readback still
+// function in observation-only mode.
 //
 // The tools are registered behind a feature flag (OPENAGI_COMPUTER_USE=1)
 // so the default install is unaffected. Tool list:
@@ -30,9 +28,9 @@
 // produced in its assistant text turn alongside the tool call — captured
 // via a separate `reasoning` param that the agent is instructed to fill.
 
-const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis (click/type/key/scroll/move) is NOT available in this build — those calls are logged and then refused, so do not assume they succeed.";
+const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
-const EXECUTION_UNAVAILABLE = "computer-use input synthesis is not available in this build. The intent was recorded to the audit log but NOT performed. Do not assume the action succeeded.";
+const EXECUTION_UNAVAILABLE = "no reachable computer-use node is configured. The intent was recorded to the audit log but NOT performed. Do not assume the action succeeded.";
 
 // Tool names that this module registers. Kept here in one place so the
 // dynamic unregister path (used by the dashboard toggle) can remove
@@ -54,6 +52,51 @@ export const COMPUTER_USE_TOOL_NAMES = [
 export function isComputerUseEnabled() {
   const v = process.env.OPENAGI_COMPUTER_USE;
   return v === "1" || v === "true" || v === "yes";
+}
+
+/// Public, secret-free capability status for the dashboard. This never returns
+/// the configured node URL or token. A health failure is a readiness state, not
+/// an exception that breaks the rest of the Computer Use page.
+export async function computerUseReadiness({
+  env = process.env,
+  fetchImpl = globalThis.fetch,
+  toolsRegistered = null,
+  timeoutMs = 1_200
+} = {}) {
+  const value = String(env.OPENAGI_COMPUTER_USE ?? "").toLowerCase();
+  const enabled = value === "1" || value === "true" || value === "yes";
+  const nodeUrl = String(env.OPENAGI_COMPUTER_NODE ?? "").replace(/\/$/, "");
+  const nodeConfigured = Boolean(nodeUrl);
+  let nodeReachable = false;
+  if (nodeConfigured && typeof fetchImpl === "function") {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchImpl(`${nodeUrl}/health`, {
+        method: "GET",
+        headers: { accept: "application/json" },
+        signal: controller.signal
+      });
+      nodeReachable = Boolean(response?.ok);
+    } catch { /* unreachable is reported below */ }
+    finally { clearTimeout(timer); }
+  }
+  const mode = !enabled
+    ? "disabled"
+    : nodeReachable
+      ? "control-ready"
+      : nodeConfigured
+        ? "node-unreachable"
+        : "observe-only";
+  return {
+    enabled,
+    toolsRegistered: toolsRegistered == null ? enabled : Boolean(toolsRegistered),
+    mode,
+    nodeConfigured,
+    nodeReachable,
+    screenshot: enabled ? (nodeReachable ? "live-image" : "recent-ocr") : "disabled",
+    inputAvailable: enabled && nodeReachable
+  };
 }
 
 /// A configured computer-use node (a Mac running `openagi computer-server`)
@@ -143,7 +186,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   registry.register({
     name: "computer_screenshot",
     sideEffects: false,
-    description: "Read the current screen state. Returns the most recent OCR text + active app from the observation store (real data). This build does not return raw image bytes — image transport ships with the Mac app in a later phase.",
+    description: "Read the current screen state. A connected computer-use node returns a live image; observation-only mode returns the most recent OCR text + active app from the local observation store.",
     parameters: {
       type: "object",
       properties: {

@@ -20,6 +20,11 @@ const ENVELOPE_FIELDS = [
   "id", "proposedAt", "category", "title", "rationale", "status",
   "draftBody", "taskQueue", "taskBucket", "mcpId", "mcpRegister",
   "context", "resolvedAt", "note", "source",
+  // Backlog triage keeps pending rows in the feed but records that they were
+  // already reviewed. Carry the audit block through normalization so a later
+  // bounded pass can prefer untouched rows instead of judging the same oldest
+  // keeps every week.
+  "autoTriage",
   // Miner-only fields surface as-is so the UI can show count + confidence
   "sequence", "fingerprint", "proposal", "judgeBypass"
 ];
@@ -117,6 +122,7 @@ function normalize(raw, filePath, forceSource = null) {
     fingerprint: raw.fingerprint ?? null,
     proposal: raw.proposal ?? null,
     judgeBypass: raw.judgeBypass ?? false,
+    autoTriage: raw.autoTriage ?? null,
     resolvedAt: raw.resolvedAt ?? null,
     source
   });

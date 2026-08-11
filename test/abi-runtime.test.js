@@ -2995,7 +2995,7 @@ test("computer-use: input-synthesis tools refuse honestly (record intent, then t
   // computer_click must THROW — never report success.
   await assert.rejects(
     () => registry.get("computer_click").handler({ x: 10, y: 20, reasoning: "click the button" }),
-    /not available in this build/
+    /no reachable computer-use node/
   );
 
   // But the intent must still be recorded to the audit log, marked unavailable.
@@ -3006,8 +3006,8 @@ test("computer-use: input-synthesis tools refuse honestly (record intent, then t
   assert.equal(click.args.x, 10);
 
   // computer_type + computer_key likewise refuse.
-  await assert.rejects(() => registry.get("computer_type").handler({ text: "hi", reasoning: "type" }), /not available/);
-  await assert.rejects(() => registry.get("computer_key").handler({ chord: "cmd+a", reasoning: "select" }), /not available/);
+  await assert.rejects(() => registry.get("computer_type").handler({ text: "hi", reasoning: "type" }), /no reachable computer-use node/);
+  await assert.rejects(() => registry.get("computer_key").handler({ chord: "cmd+a", reasoning: "select" }), /no reachable computer-use node/);
 
   // computer_screenshot returns REAL data (no fake-success flag).
   const shot = await registry.get("computer_screenshot").handler({ reasoning: "look" });

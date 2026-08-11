@@ -242,8 +242,9 @@ final class AppState: ObservableObject {
       if consecutiveFailures >= 3,
          Date().timeIntervalSince(DaemonController.shared.lastRestartAt) > 60 {
         NSLog("OpenAGI: daemon /health failing — auto-restarting")
-        // force: 3 failed health polls is enough evidence to replace whatever
-        // holds the port, including a daemon this app only adopted.
+        // force: 3 failed health polls is enough evidence to replace a bundled
+        // daemon this app no longer has a Process handle for. DaemonController
+        // still refuses to terminate externally managed listeners.
         DaemonController.shared.restart(force: true)
       }
       return
@@ -517,6 +518,30 @@ final class AppState: ObservableObject {
     struct SessionRef: Decodable { let id: String? }
   }
 
+  private struct OverlayStreamStatus: Decodable {
+    let stage: String?
+  }
+
+  private struct OverlayStreamSession: Decodable {
+    let id: String?
+  }
+
+  private struct OverlayStreamDelta: Decodable {
+    let text: String
+    let reset: Bool?
+  }
+
+  private struct OverlayStreamFailure: Decodable {
+    let error: String?
+    let code: String?
+    let sessionId: String?
+  }
+
+  nonisolated static func requestMayStillBeRunning(after error: Error) -> Bool {
+    let ns = error as NSError
+    return ns.domain == NSURLErrorDomain || ns.domain == "OpenAGI.Transport"
+  }
+
   /// Server-side session id of the most recent successful overlay ask.
   ///
   /// POST /message is a normal, fully persisted turn: agent-store's
@@ -527,26 +552,147 @@ final class AppState: ObservableObject {
   /// The overlay's "Continue in chat" reads this to deep-link to that exact
   /// session instead of opening an empty composer.
   @Published var lastAskSessionId: String? = nil
+  /// Correlates the currently visible Quick Ask turn with daemon progress.
+  /// It is persisted on the user message, so the dashboard can distinguish a
+  /// genuinely pending turn from an old conversation that simply ended with a
+  /// user message.
+  @Published var lastAskRequestId: String? = nil
+
+  /// Reserve the durable ids synchronously, before focused-window capture.
+  /// OverlayState flips `isLoading` before capture starts, so without this tiny
+  /// preflight the working-state handoff button has a brief window where it can
+  /// only open an unrelated blank chat.
+  @discardableResult
+  func beginOverlayAsk() -> String {
+    if lastAskSessionId == nil { lastAskSessionId = "overlay:user:main" }
+    let requestId = "ask_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    lastAskRequestId = requestId
+    return requestId
+  }
 
   // Send a question to the agent from the floating widget, attaching fresh
   // focused-window context. Returns the agent's reply text.
-  func askOverlay(text: String, screenContext: ScreenContext?) async throws -> String {
+  func askOverlay(
+    text: String,
+    screenContext: ScreenContext?,
+    briefContext: BriefChatContext? = nil,
+    requestId preparedRequestId: String? = nil,
+    onProgress: ((String) -> Void)? = nil,
+    onTextDelta: ((String, Bool) -> Void)? = nil
+  ) async throws -> String {
+    // Name the durable conversation BEFORE opening the request. The model may
+    // use several tool hops and outlive a compact-window HTTP timeout; knowing
+    // the id up front keeps "Continue in main app" honest during work and after
+    // any client-side disconnect. Explicit sessionId also prevents specialist
+    // routing from silently moving this turn to an id the popup cannot predict.
+    let sessionId = lastAskSessionId ?? "overlay:user:main"
+    let requestId = preparedRequestId ?? beginOverlayAsk()
+    lastAskSessionId = sessionId
+    lastAskRequestId = requestId
+
     var meta: [String: Any] = [:]
     if let s = screenContext, !s.text.isEmpty {
       var sc: [String: Any] = ["app": s.app, "text": s.text]
       if let w = s.window { sc["window"] = w }
       meta["screenContext"] = sc
     }
-    let payload: [String: Any] = ["text": text, "channel": "overlay", "metadata": meta]
+    if let briefContext { meta["briefContext"] = briefContext.jsonObject }
+    meta["requestId"] = requestId
+    meta["requestSource"] = "overlay"
+    let payload: [String: Any] = [
+      "text": text,
+      "channel": "overlay",
+      "from": "user",
+      "agentId": "main",
+      "sessionId": sessionId,
+      "metadata": meta
+    ]
     let body = try JSONSerialization.data(withJSONObject: payload)
-    // Cleared up front: a failed ask must not leave the previous ask's session
-    // id behind for a "Continue in chat" that would then hand over the wrong
-    // conversation. A throw below leaves this nil, which is the honest state.
-    lastAskSessionId = nil
-    let data = try await post("/message", body: body)
-    let decoded = try JSONDecoder().decode(MessageReply.self, from: data)
-    if let id = decoded.session?.id, !id.isEmpty { lastAskSessionId = id }
-    return decoded.reply ?? "(no reply)"
+    return try await streamOverlayMessage(body: body, onProgress: onProgress, onTextDelta: onTextDelta)
+  }
+
+  /// Consume POST /message's opt-in SSE response. Status and heartbeat frames
+  /// keep the small popup alive while long tool runs proceed; `final` is the
+  /// exact legacy JSON response. If an older daemon ignores the Accept header,
+  /// its ordinary JSON body is decoded as a compatibility fallback.
+  private func streamOverlayMessage(
+    body: Data,
+    onProgress: ((String) -> Void)?,
+    onTextDelta: ((String, Bool) -> Void)?
+  ) async throws -> String {
+    var req = URLRequest(url: Self.buildURL(base: baseURL, path: "/message"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+    if let token = authToken() { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    req.httpBody = body
+
+    let (bytes, response) = try await URLSession.shared.bytes(for: req)
+    guard let http = response as? HTTPURLResponse else {
+      throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [NSLocalizedDescriptionKey: "The daemon returned an invalid response."])
+    }
+
+    let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+    if !contentType.contains("text/event-stream") {
+      var data = Data()
+      for try await byte in bytes { data.append(byte) }
+      try Self.ensureOK(response, data)
+      let decoded = try JSONDecoder().decode(MessageReply.self, from: data)
+      if let id = decoded.session?.id, !id.isEmpty { lastAskSessionId = id }
+      return decoded.reply ?? "(no reply)"
+    }
+
+    guard (200..<300).contains(http.statusCode) else {
+      throw NSError(domain: "OpenAGI", code: http.statusCode, userInfo: [
+        NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"
+      ])
+    }
+
+    var parser = ServerSentEventParser()
+    for try await line in bytes.lines {
+      guard let event = parser.consume(line: line) else { continue }
+      let data = Data(event.data.utf8)
+      switch event.name {
+      case "status":
+        if let status = try? JSONDecoder().decode(OverlayStreamStatus.self, from: data),
+           let stage = status.stage, !stage.isEmpty {
+          onProgress?(stage)
+        }
+      case "heartbeat":
+        // A heartbeat proves the daemon is still working even when no new
+        // token/tool stage has landed. Preserve the named stage if supplied.
+        if let status = try? JSONDecoder().decode(OverlayStreamStatus.self, from: data),
+           let stage = status.stage, !stage.isEmpty {
+          onProgress?(stage)
+        }
+      case "session":
+        if let session = try? JSONDecoder().decode(OverlayStreamSession.self, from: data),
+           let id = session.id, !id.isEmpty {
+          lastAskSessionId = id
+        }
+      case "delta":
+        // The daemon allowlists visible assistant text before emitting this
+        // frame. Tool inputs/results and provider reasoning never cross it.
+        if let delta = try? JSONDecoder().decode(OverlayStreamDelta.self, from: data),
+           !delta.text.isEmpty {
+          onTextDelta?(delta.text, delta.reset == true)
+        }
+      case "final":
+        let decoded = try JSONDecoder().decode(MessageReply.self, from: data)
+        if let id = decoded.session?.id, !id.isEmpty { lastAskSessionId = id }
+        return decoded.reply ?? "(no reply)"
+      case "failure":
+        let failure = try? JSONDecoder().decode(OverlayStreamFailure.self, from: data)
+        if let id = failure?.sessionId, !id.isEmpty { lastAskSessionId = id }
+        let message = failure?.error ?? "The agent could not complete that request."
+        throw NSError(domain: "OpenAGI.Agent", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+      default:
+        continue
+      }
+    }
+    throw NSError(domain: "OpenAGI.Transport", code: -1, userInfo: [
+      NSLocalizedDescriptionKey: "The connection ended before completion was confirmed."
+    ])
   }
 
   /// Open the dashboard's chat tab ON a specific server-side session.
@@ -560,12 +706,16 @@ final class AppState: ObservableObject {
   /// Without an id we do NOT pretend: the plain chat tab opens, same as before.
   /// That path is only reachable if the daemon answered 200 without naming a
   /// session, which today it never does.
-  func openChatSession(_ sessionId: String?) {
+  func openChatSession(_ sessionId: String?, requestId: String? = nil) {
     guard let id = sessionId, !id.isEmpty else {
       openDashboard(path: "/?tab=chat")
       return
     }
-    openDashboard(path: "/?tab=chat&session=" + Self.queryValueEncoded(id))
+    var path = "/?tab=chat&session=" + Self.queryValueEncoded(id)
+    if let requestId, !requestId.isEmpty {
+      path += "&request=" + Self.queryValueEncoded(requestId)
+    }
+    openDashboard(path: path)
   }
 
   /// Percent-encode a string being spliced in as a query-parameter VALUE.

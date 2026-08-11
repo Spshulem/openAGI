@@ -17,6 +17,11 @@ let package = Package(
         .product(name: "Sparkle", package: "Sparkle")
       ],
       path: "Sources/OpenAGI"
+    ),
+    .testTarget(
+      name: "OpenAGITests",
+      dependencies: ["OpenAGI"],
+      path: "Tests/OpenAGITests"
     )
   ]
 )
