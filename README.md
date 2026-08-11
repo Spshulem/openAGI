@@ -346,7 +346,7 @@ On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read
 
 ## Skills
 
-Skills are markdown templates the agent can run as sub-prompts. Four are bundled (`recap`, `morning-brief`, `remarkable-morning-brief`, `remind`). Add your own at `.openagi/skills/<name>/SKILL.md`:
+Skills are markdown templates the agent can run as sub-prompts. Three are bundled (`recap`, `morning-brief`, `remind`). Add your own at `.openagi/skills/<name>/SKILL.md`:
 
 ```markdown
 ---
@@ -369,18 +369,15 @@ User asked: {{input}}
 
 The skill becomes the `skill_weekly_review` tool and is also runnable from the UI's **Skills** tab. The `replay:` block (optional) makes it executable on the Mac via `replay_skill` with a confirmation modal.
 
-### reMarkable morning brief
+### Agent-authored report workflows
 
-`remarkable-morning-brief` composes a fixed-size PDF from the user's connected Calendar, BuildBetter, GitHub, and optional PostHog sources, then uploads it through the reMarkable MCP. It is orchestration only: every source remains an existing OpenAGI integration or MCP server.
+OpenAGI can create a reusable skill from a normal conversation. Ask it to design the workflow, name it, and save it; the approval-gated `create_skill` tool writes the resulting instructions under `.openagi/skills/` and reloads the registry immediately. The saved skill can use any connected MCP tools and can be scheduled later with `schedule_message`.
 
-Before the first run:
+For example, a user can ask:
 
-1. Configure the existing calendar integration with `CALENDAR_ICS_URL`, or connect a calendar MCP.
-2. Connect BuildBetter and GitHub from **Integrations**. Connect PostHog if you want its product pulse.
-3. Connect Playwright and reMarkable from the catalog. Playwright uses Microsoft's official MCP PDF capability; reMarkable uses the maintained `remarkable-mcp` cloud uploader and asks for `REMARKABLE_TOKEN`.
-4. Run `remarkable-morning-brief` once interactively and inspect the receipt. Then ask OpenAGI to schedule that exact skill daily with `schedule_message`.
+> Create a reusable weekly product report. Gather evidence from my connected analytics and project tools, compose a printable HTML report, save it as PDF with Playwright, and upload it to my connected document destination. Mark missing sources instead of failing the whole run. Show me the skill before saving it.
 
-The skill never writes source systems, does not overwrite an existing daily document, and continues with a clearly marked degraded section when an optional source is unavailable.
+This is intentionally not a bundled report template. The user's prompt defines the sources, layout, failure policy, delivery target, and cadence. Connect Playwright from the catalog for generic HTML-to-PDF output and reMarkable when that is the desired destination; another skill can use different source and delivery MCPs without changing OpenAGI.
 
 ---
 

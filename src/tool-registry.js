@@ -482,6 +482,40 @@ export function registerCoreTools(registry, runtime) {
   });
 
   registry.register({
+    name: "create_skill",
+    description: "Save a reusable, agent-authored workflow as a SKILL.md in the user's OpenAGI skills directory and reload it immediately. Use when the user explicitly asks to create, program, or save a reusable capability. The instructions may compose any existing core/MCP tools and may use {{input}} plus {{args.field}} templates. Never include credentials or literal secret values. THIS REQUIRES USER APPROVAL so the user can inspect the complete instructions before they become durable.",
+    needsConfirmation: true,
+    sideEffects: true,
+    summarize: (args) => `Create reusable skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short skill name. It is normalized to a lowercase filesystem-safe slug." },
+        description: { type: "string", description: "One-sentence description shown in the skills list." },
+        instructions: { type: "string", description: "Complete reusable workflow instructions. Reference capabilities/tools, inputs, output contract, safety constraints, and degradation behavior. Do not include frontmatter or secrets." }
+      },
+      required: ["name", "description", "instructions"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.skills?.reload) throw new Error("Skills are not configured with a writable user directory.");
+      const { createSkillFromPrompt } = await import("./skill-materialize.js");
+      const result = createSkillFromPrompt({
+        runtime,
+        name: args.name,
+        description: args.description,
+        instructions: args.instructions
+      });
+      runtime.skills.reload();
+      return {
+        name: result.slug,
+        path: result.path,
+        note: "Skill created and loaded. It can now be run with run_skill or scheduled with schedule_message."
+      };
+    }
+  });
+
+  registry.register({
     name: "replay_skill",
     // Drives the user's Mac (AppleScript / keyboard / app control) — always
     // route through the pending-actions approval queue, same as

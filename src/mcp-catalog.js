@@ -373,7 +373,7 @@ export const MCP_CATALOG = [
     authType: "api-key",
     status: "available",
     apiKeyEnvVar: "REMARKABLE_TOKEN",
-    apiKeyHelp: "Cloud device token created with `uvx remarkable-mcp --register YOUR_ONE_TIME_CODE`.",
+    apiKeyHelp: "Requires uv/uvx. Create a cloud device token with `uvx remarkable-mcp --register YOUR_ONE_TIME_CODE`.",
     matches: { hostnames: ["my.remarkable.com", "remarkable.com"], keywords: ["remarkable", "rmapi"] },
     // remarkable-mcp 1.x currently imports FastMCP APIs removed in mcp 2.x.
     // Pinning the transitive runtime keeps the maintained Python server usable

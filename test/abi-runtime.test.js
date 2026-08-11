@@ -271,7 +271,6 @@ test("skills loader exposes bundled skills as tools", () => {
   assert.ok(runtime.skills, "runtime.skills should exist");
   const names = runtime.skills.list().map((s) => s.name);
   assert.ok(names.includes("recap"), "expected 'recap' skill bundled");
-  assert.ok(names.includes("remarkable-morning-brief"), "expected 'remarkable-morning-brief' skill bundled");
   const toolNames = runtime.tools.list().map((t) => t.name);
   assert.ok(toolNames.some((n) => n.startsWith("skill_")), "expected at least one skill_* tool");
 });
