@@ -1,6 +1,11 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 
+// Stable, locale-independent order. Copies rather than sorting in place so a
+// caller's array (and the registry's own values) are never reordered underneath
+// them. See _modelToolList for why byte-stable ordering is load-bearing.
+const sortByName = (tools) => [...tools].sort((a, b) => String(a.name).localeCompare(String(b.name), "en"));
+
 export class ToolRegistry {
   constructor() {
     this.tools = new Map();
@@ -64,10 +69,18 @@ export class ToolRegistry {
   // first, so many small integrations beat one giant one). Anything not
   // advertised is STILL invokable via run_mcp_tool + discoverable via
   // list_mcp_tools — no capability is lost, just the direct function affordance.
+  // The advertised tool array is the largest STATIC block in every request —
+  // ~67k tokens on a live install — which makes it the bulk of what a provider
+  // can serve from prompt cache. Caching needs an exact prefix match, and
+  // list() returns Map insertion order, i.e. the order MCP servers happened to
+  // finish connecting. That reordered the block between restarts and produced a
+  // 0% cache hit rate on tens of millions of input tokens a day. Ordering is
+  // otherwise meaningless to the model, so it is pinned by name. Core stays
+  // ahead of MCP, matching the comment above.
   _modelToolList(options = {}) {
     const all = this.list(options);
     const max = Number(process.env.OPENAGI_MAX_MODEL_TOOLS) || 128;
-    if (all.length <= max) return all;
+    if (all.length <= max) return sortByName(all);
     const core = all.filter((t) => t.source !== "mcp");
     const mcp = all.filter((t) => t.source === "mcp");
     const budget = Math.max(0, max - core.length);
@@ -77,7 +90,10 @@ export class ToolRegistry {
       if (!byServer.has(s)) byServer.set(s, []);
       byServer.get(s).push(t);
     }
-    const servers = [...byServer.entries()].sort((a, b) => a[1].length - b[1].length);
+    // Tie-break by server name. Without it, equal-sized servers were ordered by
+    // Map insertion — i.e. by whichever MCP server finished connecting first —
+    // so the advertised set could differ between restarts for no real reason.
+    const servers = [...byServer.entries()].sort((a, b) => a[1].length - b[1].length || a[0].localeCompare(b[0]));
     const picked = [];
     const advertised = [];
     const overflow = [];
@@ -86,7 +102,7 @@ export class ToolRegistry {
       else overflow.push(`${name}(${tools.length})`);
     }
     this._logToolCap(all.length, max, advertised, overflow);
-    return [...core, ...picked];
+    return [...sortByName(core), ...sortByName(picked)];
   }
 
   // Surface what got capped (once per distinct overflow set) — never silently
