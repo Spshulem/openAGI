@@ -187,6 +187,20 @@ export const MCP_CATALOG = [
     register: { url: "https://api.githubcopilot.com/mcp/", transport: "http", auth: "oauth" }
   },
   {
+    id: "playwright",
+    name: "Playwright",
+    description: "Render agent-authored pages and save them as PDFs with Microsoft's official Playwright MCP.",
+    category: "developer-tools",
+    authType: "api-key",
+    status: "available",
+    matches: { keywords: ["playwright", "render pdf", "save as pdf", "printable report"] },
+    register: {
+      transport: "stdio",
+      command: "npx",
+      args: ["-y", "@playwright/mcp@latest", "--headless", "--isolated", "--caps=pdf", "--output-dir", "/tmp/openagi-playwright"]
+    }
+  },
+  {
     id: "stripe",
     name: "Stripe",
     description: "Access Stripe payments, customers, and subscriptions.",
@@ -354,12 +368,23 @@ export const MCP_CATALOG = [
   {
     id: "remarkable",
     name: "reMarkable",
-    description: "Read your reMarkable tablet's documents + handwritten notes (via SamMorrowDrums/remarkable-mcp).",
+    description: "Browse, read, upload, and organize documents on a reMarkable tablet (via SamMorrowDrums/remarkable-mcp).",
     category: "design-docs",
     authType: "api-key",
     status: "available",
+    apiKeyEnvVar: "REMARKABLE_TOKEN",
+    apiKeyHelp: "Requires uv/uvx. Create a cloud device token with `uvx remarkable-mcp --register YOUR_ONE_TIME_CODE`.",
     matches: { hostnames: ["my.remarkable.com", "remarkable.com"], keywords: ["remarkable", "rmapi"] },
-    register: { transport: "stdio", command: "npx", args: ["-y", "@sammorrowdrums/remarkable-mcp"] }
+    // remarkable-mcp 1.x currently imports FastMCP APIs removed in mcp 2.x.
+    // Pinning the transitive runtime keeps the maintained Python server usable
+    // until it publishes a compatible release; the MCP package itself remains
+    // unpinned so users receive its fixes.
+    register: {
+      transport: "stdio",
+      command: "uvx",
+      args: ["--with", "mcp<2", "--from", "remarkable-mcp", "remarkable-mcp"],
+      env: { REMARKABLE_TOKEN: "\${REMARKABLE_TOKEN}" }
+    }
   },
 
   // ─── Communication ──────────────────────────────────────────────────

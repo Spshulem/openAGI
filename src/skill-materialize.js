@@ -23,6 +23,22 @@ export function createSkillFromSuggestion({ runtime, suggestion }) {
   });
 }
 
+// Materialize a skill the user explicitly asked the agent to author. This is
+// the conversational counterpart to the observer/miner acceptance paths: the
+// same slugging, frontmatter, atomic write, and user-directory boundary apply,
+// but no repeated-behavior candidate is required first.
+export function createSkillFromPrompt({ runtime, name, description, instructions }) {
+  if (!String(name ?? "").trim()) throw new Error("skill name is required");
+  if (!String(instructions ?? "").trim()) throw new Error("skill instructions are required");
+  return writeSkillFile({
+    runtime,
+    title: name,
+    description: description ?? name,
+    body: instructions,
+    lineage: { createdBy: "user-prompt" }
+  });
+}
+
 /// Story 6: miner candidates have a different shape than observer
 /// suggestions — proposal.{name, body, scheduleHint} + sequence stats
 /// — but produce the same end artifact: a runnable SKILL.md. Wraps

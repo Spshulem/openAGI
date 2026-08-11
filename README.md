@@ -369,6 +369,16 @@ User asked: {{input}}
 
 The skill becomes the `skill_weekly_review` tool and is also runnable from the UI's **Skills** tab. The `replay:` block (optional) makes it executable on the Mac via `replay_skill` with a confirmation modal.
 
+### Agent-authored report workflows
+
+OpenAGI can create a reusable skill from a normal conversation. Ask it to design the workflow, name it, and save it; the approval-gated `create_skill` tool writes the resulting instructions under `.openagi/skills/` and reloads the registry immediately. The saved skill can use any connected MCP tools and can be scheduled later with `schedule_message`.
+
+For example, a user can ask:
+
+> Create a reusable weekly product report. Gather evidence from my connected analytics and project tools, compose a printable HTML report, save it as PDF with Playwright, and upload it to my connected document destination. Mark missing sources instead of failing the whole run. Show me the skill before saving it.
+
+This is intentionally not a bundled report template. The user's prompt defines the sources, layout, failure policy, delivery target, and cadence. Connect Playwright from the catalog for generic HTML-to-PDF output and reMarkable when that is the desired destination; another skill can use different source and delivery MCPs without changing OpenAGI.
+
 ---
 
 ## Integrations

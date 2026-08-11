@@ -482,6 +482,40 @@ export function registerCoreTools(registry, runtime) {
   });
 
   registry.register({
+    name: "create_skill",
+    description: "Save a reusable, agent-authored workflow as a SKILL.md in the user's OpenAGI skills directory and reload it immediately. Use when the user explicitly asks to create, program, or save a reusable capability. The instructions may compose any existing core/MCP tools and may use {{input}} plus {{args.field}} templates. Never include credentials or literal secret values. THIS REQUIRES USER APPROVAL so the user can inspect the complete instructions before they become durable.",
+    needsConfirmation: true,
+    sideEffects: true,
+    summarize: (args) => `Create reusable skill '${String(args.name ?? "(unnamed)").slice(0, 80)}'`,
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Short skill name. It is normalized to a lowercase filesystem-safe slug." },
+        description: { type: "string", description: "One-sentence description shown in the skills list." },
+        instructions: { type: "string", description: "Complete reusable workflow instructions. Reference capabilities/tools, inputs, output contract, safety constraints, and degradation behavior. Do not include frontmatter or secrets." }
+      },
+      required: ["name", "description", "instructions"],
+      additionalProperties: false
+    },
+    handler: async (args) => {
+      if (!runtime.skills?.reload) throw new Error("Skills are not configured with a writable user directory.");
+      const { createSkillFromPrompt } = await import("./skill-materialize.js");
+      const result = createSkillFromPrompt({
+        runtime,
+        name: args.name,
+        description: args.description,
+        instructions: args.instructions
+      });
+      runtime.skills.reload();
+      return {
+        name: result.slug,
+        path: result.path,
+        note: "Skill created and loaded. It can now be run with run_skill or scheduled with schedule_message."
+      };
+    }
+  });
+
+  registry.register({
     name: "replay_skill",
     // Drives the user's Mac (AppleScript / keyboard / app control) — always
     // route through the pending-actions approval queue, same as
@@ -1003,7 +1037,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "connect_catalog_mcp",
-    description: "One-click register an MCP server from the curated catalog by id. For bearer-auth entries (Stripe, PostHog, etc.), pass the user's API key via apiKey — it'll be persisted to .env under the entry's declared env var, then the MCP is registered with `${VAR}` indirection. For OAuth entries (Linear, Notion, GitHub), no key is needed; the OAuth handshake will surface in the dashboard's MCP tab. THIS REQUIRES USER APPROVAL — you'll get back {status:'awaiting_confirmation'} and the user must approve via the dashboard before the registration actually runs.",
+    description: "One-click register an MCP server from the curated catalog by id. When an entry declares an API-key env var (hosted or stdio), pass the user's key via apiKey — it'll be persisted to .env under that declared name and the registration keeps only `${VAR}` indirection. For OAuth entries (Linear, Notion, GitHub), no key is needed; the OAuth handshake will surface in the dashboard's MCP tab. THIS REQUIRES USER APPROVAL — you'll get back {status:'awaiting_confirmation'} and the user must approve via the dashboard before the registration actually runs.",
     parameters: {
       type: "object",
       properties: {
@@ -1031,7 +1065,11 @@ export function registerCoreTools(registry, runtime) {
       const entry = MCP_CATALOG.find((e) => e.id === args.catalogId);
       if (!entry) throw new Error(`Catalog entry '${args.catalogId}' not found. Use list_mcp_catalog to see what's available.`);
       if (!entry.register) throw new Error(`Catalog entry '${entry.id}' has no register info (likely status=coming-soon).`);
-      if (entry.register.auth === "bearer" && entry.apiKeyEnvVar) {
+      // Stdio MCPs can need secrets just like hosted bearer servers. Handle
+      // any catalog-declared env var here, matching the dashboard connect
+      // route, so entries such as reMarkable/Supabase/Airtable can be
+      // connected by the agent without ever persisting a literal in mcp.json.
+      if (entry.apiKeyEnvVar) {
         const incoming = typeof args.apiKey === "string" ? args.apiKey.trim() : "";
         const existing = process.env[entry.apiKeyEnvVar] ?? "";
         if (incoming) {
