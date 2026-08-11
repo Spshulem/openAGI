@@ -1003,7 +1003,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "connect_catalog_mcp",
-    description: "One-click register an MCP server from the curated catalog by id. For bearer-auth entries (Stripe, PostHog, etc.), pass the user's API key via apiKey — it'll be persisted to .env under the entry's declared env var, then the MCP is registered with `${VAR}` indirection. For OAuth entries (Linear, Notion, GitHub), no key is needed; the OAuth handshake will surface in the dashboard's MCP tab. THIS REQUIRES USER APPROVAL — you'll get back {status:'awaiting_confirmation'} and the user must approve via the dashboard before the registration actually runs.",
+    description: "One-click register an MCP server from the curated catalog by id. When an entry declares an API-key env var (hosted or stdio), pass the user's key via apiKey — it'll be persisted to .env under that declared name and the registration keeps only `${VAR}` indirection. For OAuth entries (Linear, Notion, GitHub), no key is needed; the OAuth handshake will surface in the dashboard's MCP tab. THIS REQUIRES USER APPROVAL — you'll get back {status:'awaiting_confirmation'} and the user must approve via the dashboard before the registration actually runs.",
     parameters: {
       type: "object",
       properties: {
@@ -1031,7 +1031,11 @@ export function registerCoreTools(registry, runtime) {
       const entry = MCP_CATALOG.find((e) => e.id === args.catalogId);
       if (!entry) throw new Error(`Catalog entry '${args.catalogId}' not found. Use list_mcp_catalog to see what's available.`);
       if (!entry.register) throw new Error(`Catalog entry '${entry.id}' has no register info (likely status=coming-soon).`);
-      if (entry.register.auth === "bearer" && entry.apiKeyEnvVar) {
+      // Stdio MCPs can need secrets just like hosted bearer servers. Handle
+      // any catalog-declared env var here, matching the dashboard connect
+      // route, so entries such as reMarkable/Supabase/Airtable can be
+      // connected by the agent without ever persisting a literal in mcp.json.
+      if (entry.apiKeyEnvVar) {
         const incoming = typeof args.apiKey === "string" ? args.apiKey.trim() : "";
         const existing = process.env[entry.apiKeyEnvVar] ?? "";
         if (incoming) {
