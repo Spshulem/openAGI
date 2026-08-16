@@ -8,6 +8,7 @@
 #   ./scripts/build-mac-app.sh                      # release build, no signing
 #   SIGN_IDENTITY="Developer ID Application: ..." ./scripts/build-mac-app.sh
 #   SIGN_IDENTITY="..." NOTARIZE=1 ./scripts/build-mac-app.sh
+#   SIGN_IDENTITY="..." NOTARIZE=1 AC_KEYCHAIN_PROFILE=openagi ./scripts/build-mac-app.sh
 #
 # Output:
 #   build/OpenAGI.app
@@ -259,19 +260,40 @@ fi
 
 # 6. Optional: notarize
 if [[ "${NOTARIZE:-0}" == "1" ]]; then
-  if [[ -z "${AC_USERNAME:-}" || -z "${AC_TEAM_ID:-}" ]]; then
-    echo "Set AC_USERNAME, AC_PASSWORD, AC_TEAM_ID env vars to notarize." >&2
+  NOTARY_AUTH=()
+  if [[ -n "${AC_KEYCHAIN_PROFILE:-}" ]]; then
+    NOTARY_AUTH=(--keychain-profile "${AC_KEYCHAIN_PROFILE}")
+  elif [[ -n "${AC_USERNAME:-}" && -n "${AC_PASSWORD:-}" && -n "${AC_TEAM_ID:-}" ]]; then
+    NOTARY_AUTH=(
+      --apple-id "${AC_USERNAME}"
+      --password "${AC_PASSWORD}"
+      --team-id "${AC_TEAM_ID}"
+    )
+  else
+    echo "Set AC_KEYCHAIN_PROFILE or all of AC_USERNAME, AC_PASSWORD, AC_TEAM_ID to notarize." >&2
     exit 1
   fi
-  TARGET="${DMG_PATH:-${APP}}"
-  echo "▶ Submitting ${TARGET} for notarization"
+
+  # notarytool accepts ZIP, PKG, and DMG containers—not a raw .app bundle.
+  # A branch/test build skips the DMG, so submit a ditto ZIP and staple the
+  # resulting ticket back onto the original app after Apple accepts it.
+  if [[ -n "${DMG_PATH:-}" ]]; then
+    SUBMIT_TARGET="${DMG_PATH}"
+    STAPLE_TARGET="${DMG_PATH}"
+    ASSESS_TYPE="install"
+  else
+    SUBMIT_TARGET="${BUILD_DIR}/OpenAGI-${VERSION}-notarization.zip"
+    STAPLE_TARGET="${APP}"
+    ASSESS_TYPE="execute"
+    rm -f "${SUBMIT_TARGET}"
+    ditto -c -k --sequesterRsrc --keepParent "${APP}" "${SUBMIT_TARGET}"
+  fi
+  echo "▶ Submitting ${SUBMIT_TARGET} for notarization"
 
   # Capture submit output so we can parse status + submission id.
   NOTARY_LOG="${BUILD_DIR}/notarize-submit.log"
-  xcrun notarytool submit "${TARGET}" \
-    --apple-id "${AC_USERNAME}" \
-    --password "${AC_PASSWORD}" \
-    --team-id "${AC_TEAM_ID}" \
+  xcrun notarytool submit "${SUBMIT_TARGET}" \
+    "${NOTARY_AUTH[@]}" \
     --wait 2>&1 | tee "${NOTARY_LOG}"
 
   STATUS="$(grep -E '^[[:space:]]*status:' "${NOTARY_LOG}" | tail -1 | awk -F': ' '{print $2}' | tr -d '[:space:]')"
@@ -285,16 +307,15 @@ if [[ "${NOTARIZE:-0}" == "1" ]]; then
       echo "" >&2
       echo "▶ Fetching Apple's notarization log:" >&2
       xcrun notarytool log "${SUBMISSION_ID}" \
-        --apple-id "${AC_USERNAME}" \
-        --password "${AC_PASSWORD}" \
-        --team-id "${AC_TEAM_ID}" >&2 || true
+        "${NOTARY_AUTH[@]}" >&2 || true
     fi
     exit 1
   fi
 
-  echo "▶ Stapling notarization ticket"
-  # stapler accepts both .app directories and .dmg files.
-  xcrun stapler staple "${TARGET}"
+  echo "▶ Stapling and validating notarization ticket"
+  xcrun stapler staple "${STAPLE_TARGET}"
+  xcrun stapler validate "${STAPLE_TARGET}"
+  spctl --assess --type "${ASSESS_TYPE}" --verbose=4 "${STAPLE_TARGET}"
 fi
 
 echo "▶ Done. ${APP}"
