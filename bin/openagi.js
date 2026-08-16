@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// OpenAGI CLI. Run the daemon headless (e.g. on a Distiller / Pi over SSH) and
+// OpenAGI CLI. Run the daemon headless on a remote main over SSH and
 // make it the MAIN that holds every integration; point other devices at it as
 // thin "nodes" with `--remote` / `openagi pair`.
 //
@@ -17,7 +17,10 @@
 
 import readline from "node:readline";
 import { resolveDataDir } from "../src/data-dir.js";
-import { resolveTarget, CliClient, runDoctor, writeNodeConfig, clearNodeConfig, normalizeBase, readNodeConfig } from "../src/cli-client.js";
+import {
+  resolveTarget, resolveUpdateTarget, CliClient, runDoctor, writeNodeConfig, normalizeBase,
+  readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider
+} from "../src/cli-client.js";
 import { pinnedRemoteOrigin } from "../src/node-control.js";
 
 const RESET = "\x1b[0m", DIM = "\x1b[2m", BOLD = "\x1b[1m", GREEN = "\x1b[32m", RED = "\x1b[31m", YELLOW = "\x1b[33m";
@@ -39,6 +42,7 @@ function parseArgs(argv) {
     else if (a === "--check") flags.check = true;
     else if (a === "--from") flags.from = argv[++i];
     else if (a === "--dry-run") flags.dryRun = true;
+    else if (a === "--force") flags.force = true;
     else if (a === "--respond") flags.respond = argv[++i];
     else if (a === "--capture") flags.capture = argv[++i];
     else if (a === "--trigger") flags.trigger = argv[++i];
@@ -105,9 +109,14 @@ async function cmdStatus(flags) {
   const ah = h.status?.agentHost ?? {};
   const mem = h.status?.memory ?? {};
   console.log(`${c(GREEN, "●")} ${target.remote ? "main" : "local"} ${c(DIM, target.url)}`);
-  console.log(`  provider:   ${ah.providerConfigured ? c(GREEN, ah.provider) : c(YELLOW, "not configured")}`);
-  console.log(`  setup:      ${h.firstRun ? c(YELLOW, "incomplete (run `openagi setup`)") : c(GREEN, "complete")}`);
-  console.log(`  memory:     short ${mem.short ?? 0} · medium ${mem.medium ?? 0} · long ${mem.long ?? 0}`);
+  if (h.access === "node-scoped") {
+    console.log(`  credential: ${c(GREEN, "paired node accepted")}`);
+    console.log(`  main detail: ${c(DIM, "hidden from node-scoped credentials")}`);
+  } else {
+    console.log(`  provider:   ${ah.providerConfigured ? c(GREEN, ah.provider) : c(YELLOW, "not configured")}`);
+    console.log(`  setup:      ${h.firstRun ? c(YELLOW, "incomplete (run `openagi setup`)") : c(GREEN, "complete")}`);
+    console.log(`  memory:     short ${mem.short ?? 0} · medium ${mem.medium ?? 0} · long ${mem.long ?? 0}`);
+  }
   const tasks = await client.tasks();
   if (tasks.ok) {
     const s = tasks.json?.stats?.user ?? {};
@@ -141,49 +150,104 @@ async function cmdSetup(flags) {
     return 1;
   }
   console.log(`Open the setup wizard: ${c(BOLD, setupUrl)}`);
-  if (target.token) console.log(c(DIM, `Auth token (for the login prompt / nodes): ${target.token}`));
+  if (target.nodeId) console.log(c(DIM, "This paired node retains only a scoped credential; open the setup URL with the main's admin login."));
+  else if (target.token) console.log(c(DIM, `Auth token (for the login prompt / nodes): ${target.token}`));
   else console.log(c(DIM, "No auth token known here — the wizard will generate one on first run."));
   return 0;
 }
 
-function cmdPair(positional, flags) {
+async function cmdPair(positional, flags) {
   const url = positional[0];
   if (!url) { console.error(c(RED, "usage: OPENAGI_REMOTE_TOKEN=… openagi pair <main-url>")); return 1; }
   if (flags.token) {
     console.error(c(RED, "refusing a pairing credential on the command line; set OPENAGI_REMOTE_TOKEN in the environment instead"));
     return 1;
   }
+  const dataDir = resolveDataDir();
   const remote = normalizeBase(url);
+  const allowInsecureRemote = process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
+    || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true";
   try {
-    pinnedRemoteOrigin(remote, {
-      allowInsecureRemote: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
-        || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true"
-    });
+    pinnedRemoteOrigin(remote, { allowInsecureRemote });
   } catch (error) {
     console.error(c(RED, `✗ ${error.message}`));
     return 1;
   }
-  const file = writeNodeConfig({ remote, token: process.env.OPENAGI_REMOTE_TOKEN ?? null }, resolveDataDir());
-  console.log(c(GREEN, `✓ paired with ${remote}`));
-  console.log(c(DIM, `saved to ${file}. This device is now a node; \`openagi chat/status/doctor\` target the main.`));
-  if (!process.env.OPENAGI_REMOTE_TOKEN) console.log(c(YELLOW, "No OPENAGI_REMOTE_TOKEN was set. An authenticated main cannot enroll this node until it is provided for the first handshake."));
+  const existing = readNodeConfig(dataDir);
+  let existingRemote = null;
+  if (existing?.remote) {
+    try { existingRemote = pinnedRemoteOrigin(normalizeBase(existing.remote), { allowInsecureRemote }); }
+    catch {
+      console.error(c(RED, "✗ the saved pairing is invalid; run `openagi unpair --force` before pairing again."));
+      return 1;
+    }
+    if (existingRemote !== remote) {
+      console.error(c(RED, "✗ this device is already paired with a different main; run `openagi unpair` first."));
+      return 1;
+    }
+  }
+  const alreadyConfirmed = existingRemote === remote && existing?.nodeEnrollmentConfirmed === true;
+  const pairingToken = alreadyConfirmed
+    ? null
+    : (process.env.OPENAGI_REMOTE_TOKEN ?? (existingRemote === remote ? existing?.token : null) ?? null);
+  const file = writeNodeConfig({ remote, token: pairingToken }, dataDir);
+  console.log(c(GREEN, alreadyConfirmed ? `✓ pairing with ${remote} is already confirmed` : `✓ pairing saved for ${remote}`));
+
+  const local = await restartLocalDaemon({ dataDir });
+  if (local.restarted) {
+    console.log(c(DIM, `saved to ${file}; the local daemon accepted a restart request to activate the pairing.`));
+    console.log(c(DIM, "A supervised installation starts again automatically; otherwise start OpenAGI again."));
+  } else if (local.running === false) {
+    console.log(c(DIM, `saved to ${file}; the local daemon is not running and will load the pairing on its next start.`));
+  } else {
+    console.error(c(RED, "✗ pairing was saved, but the running local daemon could not be restarted."));
+    console.error(c(DIM, "Restart OpenAGI before relying on the new pairing."));
+    return 1;
+  }
+  if (!alreadyConfirmed && !pairingToken) console.log(c(YELLOW, "No OPENAGI_REMOTE_TOKEN was set. An authenticated main cannot enroll this node until it is provided for the first handshake."));
   return 0;
 }
 
-async function cmdUnpair() {
-  const dataDir = resolveDataDir();
-  const pairing = readNodeConfig(dataDir);
-  let revokeFailed = false;
-  if (pairing?.remote && pairing.nodeToken) {
-    const target = resolveTarget({ dataDir });
-    const client = new CliClient(target, { timeoutMs: 5_000 });
-    const revoked = await client.request("POST", "/nodes/revoke", { nodeId: target.nodeId });
-    revokeFailed = !revoked.ok;
+async function cmdUnpair(flags) {
+  const allowInsecureRemote = process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
+    || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true";
+  const result = await revokeAndClearNodeConfig({
+    dataDir: resolveDataDir(),
+    force: flags.force === true,
+    allowInsecureRemote,
+    restartLocal: true
+  });
+  if (result.removed) {
+    console.log(c(GREEN, result.revoked
+      ? "✓ node credential revoked and local pairing removed."
+      : "✓ local pairing removed; commands target the local daemon again."));
+    if (result.forced) {
+      console.log(c(YELLOW, "Remote revocation was not confirmed. Remove the node from the main when it is reachable."));
+    }
+    if (result.local?.restarted) {
+      console.log(c(DIM, "The local daemon accepted a restart request to apply the change."));
+      console.log(c(DIM, "A supervised installation starts again automatically; otherwise start OpenAGI again."));
+    } else if (result.local?.running === false) {
+      console.log(c(DIM, "The local daemon is not running and will load the unpaired state on its next start."));
+    } else if (result.local && !result.local.applied) {
+      console.error(c(RED, "✗ the old remote credential was revoked, but the running local daemon could not be restarted."));
+      console.error(c(DIM, "Restart OpenAGI before relying on local-only routing."));
+      return 1;
+    }
+    return 0;
   }
-  const removed = clearNodeConfig(dataDir);
-  console.log(removed ? c(GREEN, "✓ unpaired — commands target the local daemon again.") : c(DIM, "no pairing was set."));
-  if (revokeFailed) console.log(c(YELLOW, "The main was unreachable, so its scoped node credential could not be revoked yet; remove the node from the main when it is reachable."));
-  return revokeFailed ? 1 : 0;
+  if (result.reason === "not-paired") {
+    console.log(c(DIM, "no pairing was set."));
+    return 0;
+  }
+  if (result.reason === "local-daemon-restart-required") {
+    console.error(c(RED, "✗ the running local daemon could not be restarted safely, so the local pairing was kept."));
+    console.error(c(DIM, "Fix or restart the local daemon, then run `openagi unpair` again."));
+    return 1;
+  }
+  console.error(c(RED, "✗ remote credential revocation was not confirmed; the local pairing was kept so this can be retried."));
+  console.error(c(DIM, "Retry when the main is reachable, or use `openagi unpair --force` to forget only the local pairing."));
+  return 1;
 }
 
 async function cmdMigrate(positional, flags) {
@@ -286,13 +350,35 @@ async function cmdImessageSearch(positional, flags) {
 }
 
 async function cmdImessageBridge(flags) {
-  const { client, target } = makeClient(flags);
-  if (!target.remote && !flags.remote) {
+  const clientProvider = createRefreshingNodeClientProvider({
+    remote: flags.remote,
+    token: flags.token,
+    dataDir: resolveDataDir(),
+    allowInsecureRemote: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
+      || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true",
+    // Once enrollment is confirmed, remove broader credential references
+    // owned by this long-running CLI process. The saved node token is resolved
+    // afresh for every request and is never printed.
+    onScopedCredential: () => {
+      flags.token = undefined;
+      delete process.env.OPENAGI_REMOTE_TOKEN;
+    }
+  });
+  // Probe in a short-lived frame so the initial client (which may still carry
+  // the one-time pairing credential) is eligible for collection immediately.
+  const probe = await (async () => {
+    const client = clientProvider();
+    return {
+      health: await client.health(),
+      url: client.target.url,
+      remote: client.target.remote
+    };
+  })();
+  if (!probe.remote && !flags.remote) {
     console.log(c(DIM, "Bridging to the LOCAL daemon. For the main+nodes setup, `openagi pair <main>` first or pass --remote."));
   }
   // Verify the main is reachable before we start polling chat.db.
-  const health = await client.health();
-  if (!health.ok) { console.error(c(RED, `✗ main unreachable at ${target.url} — ${health.error ?? "HTTP " + health.status}`)); return 1; }
+  if (!probe.health.ok) { console.error(c(RED, `✗ main unreachable at ${probe.url} — ${probe.health.error ?? "HTTP " + probe.health.status}`)); return 1; }
 
   const { IMessageBridge } = await import("../src/integrations/imessage-bridge.js");
   const allowFrom = flags.allow ? String(flags.allow).split(",").map((s) => s.trim()).filter(Boolean) : [];
@@ -300,14 +386,14 @@ async function cmdImessageBridge(flags) {
   const respondMode = flags.respond ?? (allowFrom.length || allowChats.length ? "allow" : "all");
   const captureMode = flags.capture ?? "none";
   const bridge = new IMessageBridge({
-    client, allowFrom, allowChats, respondMode, captureMode, trigger: flags.trigger,
+    clientProvider, allowFrom, allowChats, respondMode, captureMode, trigger: flags.trigger,
     onEvent: (e) => {
       if (e.kind === "relayed") console.log(c(GREEN, `↔ ${e.handle}: `) + c(DIM, `"${e.in}" → "${e.out}"`));
       else if (e.kind === "captured") console.log(c(DIM, `· saved to memory — ${e.handle}: "${e.in}"`));
       else if (e.kind && e.error) console.error(c(YELLOW, `! ${e.kind} ${e.handle ?? ""}: ${e.error}`));
     }
   });
-  console.log(c(GREEN, `iMessage bridge → main at ${target.url}`));
+  console.log(c(GREEN, `iMessage bridge → main at ${probe.url}`));
   const respondDesc = respondMode === "all" ? "everyone" : respondMode === "allow" ? `allowlist (${allowFrom.join(", ")})` : respondMode === "trigger" ? `messages containing "${flags.trigger}"` : "no one (capture-only)";
   console.log(c(DIM, `Reply to: ${respondDesc}.${captureMode !== "none" ? ` Save to memory: ${captureMode}.` : ""} Ctrl-C to stop.`));
   if (allowChats.length) console.log(c(DIM, `Group chats where anyone can invoke: ${allowChats.join(", ")}`));
@@ -317,7 +403,8 @@ async function cmdImessageBridge(flags) {
 }
 
 async function cmdUpdate(positional, flags) {
-  const { client, target } = makeClient(flags);
+  const target = resolveUpdateTarget({ remote: flags.remote, token: flags.token });
+  const client = new CliClient(target);
   const checkOnly = positional.includes("--check") || flags.check;
   // GET = dry check, POST = apply + restart. The daemon owns the git checkout.
   const res = checkOnly ? await client.request("GET", "/control/update") : await client.request("POST", "/control/update");
@@ -378,7 +465,8 @@ ${c(BOLD, "Use it (local, or a remote main):")}
   openagi doctor              diagnose setup/connection and print fixes
   openagi setup               print the dashboard/setup URL + token
   openagi update [--check]    fast-forward + restart (or just check); set
-                              OPENAGI_AUTO_UPDATE=1 for a daily auto-update
+                              OPENAGI_AUTO_UPDATE=1 for a daily auto-update;
+                              defaults to this device even when it is paired
   openagi migrate <openclaw|hermes> [--from D] [--dry-run]
                               import another agent's persona, memory + telegram
   openagi purge-outcomes [--dry-run]
@@ -391,7 +479,7 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
   OPENAGI_REMOTE_TOKEN=… openagi pair <https-main-url>
                                          enroll once, then retain only a
                                          revocable node-scoped credential
-  openagi unpair                         forget it
+  openagi unpair [--force]               revoke its scoped credential, then forget it
   openagi imessage-bridge [opts]         (macOS) relay incoming iMessages to the
                                          main and text its replies back. Opts:
                                          --respond all|allow|trigger|none
@@ -410,7 +498,8 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
 
 ${c(BOLD, "Global flags:")} --remote <url>  --token <token>  --json
 
-${c(DIM, "Target precedence: --remote > OPENAGI_REMOTE env > saved pairing > local daemon.")}`);
+${c(DIM, "Target precedence: --remote > OPENAGI_REMOTE env > saved pairing > local daemon.")}
+${c(DIM, "Update exception: `openagi update` targets this device; pass --remote explicitly to update another main.")}`);
 }
 
 async function main() {
@@ -424,8 +513,8 @@ async function main() {
       case "status": return await cmdStatus(flags);
       case "doctor": return await cmdDoctor(flags);
       case "setup": return await cmdSetup(flags);
-      case "pair": return cmdPair(positional, flags);
-      case "unpair": return await cmdUnpair();
+      case "pair": return await cmdPair(positional, flags);
+      case "unpair": return await cmdUnpair(flags);
       case "update": return await cmdUpdate(positional, flags);
       case "migrate": return await cmdMigrate(positional, flags);
       case "purge-outcomes": return await cmdPurgeOutcomes(flags);

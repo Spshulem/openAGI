@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ToolRegistry } from "../src/index.js";
+import { createHostedInterface, ToolRegistry } from "../src/index.js";
 import { registerImessageSearchTool } from "../src/integrations/imessage-search-tool.js";
 import { createImessageServer } from "../src/integrations/imessage-server.js";
 
@@ -22,6 +22,26 @@ test("tool is not registered before either transport exists", () => {
     assert.equal(r.registered, false);
     assert.equal(runtime.tools.has("search_imessages"), false);
   });
+});
+
+test("hosted startup registers paired search after installing the capability facade", () => {
+  withEnv("OPENAGI_IMESSAGE_NODE", undefined, () => {
+    const runtime = { tools: new ToolRegistry() };
+    createHostedInterface(runtime, {
+      dataDir: fs.mkdtempSync(path.join(os.tmpdir(), "imessage-hosted-")),
+      tickerMs: 0
+    });
+    assert.equal(runtime.tools.has("search_imessages"), true);
+  });
+});
+
+test("hosted startup preserves an integrations-disabled runtime", () => {
+  const runtime = { integrations: false, tools: new ToolRegistry() };
+  createHostedInterface(runtime, {
+    dataDir: fs.mkdtempSync(path.join(os.tmpdir(), "imessage-hosted-off-")),
+    tickerMs: 0
+  });
+  assert.equal(runtime.tools.has("search_imessages"), false);
 });
 
 function pairedRuntime(nodes, dispatch) {
@@ -65,6 +85,21 @@ test("tool dispatches through the authenticated paired-node capability", async (
     "search",
     { query: "dinner", person: "sarah", days: 7, limit: 20 }
   ]);
+});
+
+test("first invocation refreshes a newly available local capability", async () => {
+  const node = readyNode("local", "This Mac");
+  let refreshed = false;
+  const runtime = pairedRuntime([], async () => ({ results: [] }));
+  runtime.nodeCapabilities.list = () => refreshed ? [node] : [];
+  runtime.nodeCapabilities.resolve = () => refreshed ? node : null;
+  runtime.nodeCapabilities.refresh = async () => { refreshed = true; };
+  registerImessageSearchTool(runtime);
+
+  const out = await runtime.tools.invoke("search_imessages", { query: "hello" });
+  assert.equal(refreshed, true);
+  assert.equal(out.ok, true);
+  assert.equal(out.result.count, 0);
 });
 
 test("multiple paired nodes require an explicit immutable selector", async () => {

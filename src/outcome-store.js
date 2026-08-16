@@ -141,7 +141,7 @@ export class OutcomeStore {
    * Heuristic resolution sweep — inspects pending outcomes and tries to score them.
    * - agent-reply with a follow-up user message → score from follow-up tone
    * - sent-message with no reply within 6h → 0.4 (delivered, no engagement)
-   * - cron-fire / autopilot-fire with tool calls -> graded by per-call ok flags
+   * - cron-fire / autopilot-fire / approved tool-call with tool calls -> graded by per-call ok flags
    *   only once older than followupWindowMinutes, so feedback can land first;
    *   'standing by' -> 0.5 quiet
    * - anything pending > 24h with no signal → resolve null with source 'timeout'
@@ -166,7 +166,7 @@ export class OutcomeStore {
         }
       }
 
-      if (score === null && (o.kind === "cron-fire" || o.kind === "autopilot-fire")) {
+      if (score === null && (o.kind === "cron-fire" || o.kind === "autopilot-fire" || o.kind === "tool-call")) {
         if (Array.isArray(o.toolCalls) && o.toolCalls.length > 0 && age > followupWindowMinutes * 60 * 1000) {
           const failedCalls = o.toolCalls.filter((c) => !(c?.ok)).length;
           score = scoreFromToolCalls(o.toolCalls);
@@ -175,7 +175,7 @@ export class OutcomeStore {
         } else if (age > 60 * 60 * 1000) {
           score = 0.5;
           source = "system-inferred";
-          note = "cron fired, no tool actions";
+          note = o.kind === "tool-call" ? "approved tool call recorded no executable action" : "cron fired, no tool actions";
         }
       }
 

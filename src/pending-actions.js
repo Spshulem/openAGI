@@ -29,6 +29,7 @@ export class PendingActionStore {
     this._loadSnapshot();
     this._replayJournal();
     this._recoverInterruptedExecutions();
+    this._recoverInterruptedContinuations();
     this._expirePending();
   }
 
@@ -133,6 +134,65 @@ export class PendingActionStore {
     return action;
   }
 
+  prepareContinuation(id, { requestId, sessionId, resetFailed = false } = {}) {
+    const action = this.actions.get(id);
+    if (!action || action.status !== "approved" || action.error != null) return null;
+    if (action.continuation?.status === "delivered") return action.continuation;
+    if (action.continuation && !(resetFailed && action.continuation.status === "failed")) {
+      return action.continuation;
+    }
+    const at = new Date(this.now()).toISOString();
+    action.continuation = {
+      status: "pending",
+      requestId: String(requestId ?? `approval_${id}`).slice(0, 240),
+      sessionId: String(sessionId ?? action.context?.sessionId ?? "").slice(0, 500),
+      attempts: resetFailed ? 0 : Number(action.continuation?.attempts ?? 0),
+      updatedAt: at,
+      error: null
+    };
+    this._appendJournal({ op: "continuation", id, continuation: action.continuation });
+    return action.continuation;
+  }
+
+  claimContinuation(id, { maxAttempts = 5 } = {}) {
+    const action = this.actions.get(id);
+    const continuation = action?.continuation;
+    if (!action || action.status !== "approved" || action.error != null || !continuation) return null;
+    if (!new Set(["pending", "failed"]).has(continuation.status)) return null;
+    if (continuation.attempts >= maxAttempts) return null;
+    const deliveryId = createId("delivery");
+    continuation.status = "delivering";
+    continuation.deliveryId = deliveryId;
+    continuation.attempts += 1;
+    continuation.updatedAt = new Date(this.now()).toISOString();
+    continuation.error = null;
+    this._appendJournal({ op: "continuation", id, continuation });
+    return { action, continuation, deliveryId };
+  }
+
+  finishContinuation(id, { deliveryId, delivered, terminal = false, error = null } = {}) {
+    const action = this.actions.get(id);
+    const continuation = action?.continuation;
+    if (!continuation || continuation.status !== "delivering"
+        || continuation.deliveryId !== deliveryId) return null;
+    continuation.status = delivered ? "delivered" : terminal ? "blocked" : "failed";
+    continuation.updatedAt = new Date(this.now()).toISOString();
+    continuation.error = delivered ? null : String(error ?? "continuation failed").slice(0, 200);
+    delete continuation.deliveryId;
+    this._appendJournal({ op: "continuation", id, continuation });
+    return continuation;
+  }
+
+  recoverableContinuations({ toolName } = {}) {
+    return [...this.actions.values()].filter((action) =>
+      action.status === "approved"
+      && action.error == null
+      && (!toolName || action.toolName === toolName)
+      && action.context?.sessionId
+      && (!action.continuation || ["pending", "failed", "delivering"].includes(action.continuation.status))
+    );
+  }
+
   // Persist a snapshot once the journal grows past N entries — keeps
   // replay cost bounded across long uptime.
   snapshot() {
@@ -190,6 +250,9 @@ export class PendingActionStore {
           a.claimedBy = event.claimedBy;
           a.executionId = event.executionId;
         }
+      } else if (event.op === "continuation" && event.id && event.continuation) {
+        const a = this.actions.get(event.id);
+        if (a) a.continuation = event.continuation;
       }
     }
   }
@@ -238,6 +301,17 @@ export class PendingActionStore {
         error: action.error
       });
       this._emitResolution(action);
+    }
+  }
+
+  _recoverInterruptedContinuations() {
+    for (const action of this.actions.values()) {
+      if (action.continuation?.status !== "delivering") continue;
+      action.continuation.status = "pending";
+      action.continuation.updatedAt = new Date(this.now()).toISOString();
+      action.continuation.error = "delivery interrupted by daemon restart";
+      delete action.continuation.deliveryId;
+      this._appendJournal({ op: "continuation", id: action.id, continuation: action.continuation });
     }
   }
 

@@ -104,7 +104,7 @@ export async function computerUseReadiness({
       });
       nodeReachable = Boolean(response?.ok);
       if (response?.ok) {
-        const body = await response.json().catch(() => null);
+        const body = await readNodeJsonLimited(response, 256 * 1024).catch(() => null);
         const capability = body?.capability?.id === "computer-use" ? body.capability : null;
         operations = Array.isArray(capability?.operations) ? capability.operations : [];
         liveScreenshot = capability?.screenshotReady === true && operations.includes("screenshot");
@@ -146,7 +146,13 @@ function explicitComputerNode(env = process.env) {
       allowInsecureRemote: env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
         || String(env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true"
     });
-    return { kind: "http", id: "explicit", url: safeUrl, token: env.OPENAGI_COMPUTER_NODE_TOKEN ?? null };
+    const token = typeof env.OPENAGI_COMPUTER_NODE_TOKEN === "string" && env.OPENAGI_COMPUTER_NODE_TOKEN
+      ? env.OPENAGI_COMPUTER_NODE_TOKEN
+      : null;
+    if (!token) {
+      return { kind: "invalid", id: "explicit", detail: "the explicit computer node requires a scoped authentication token" };
+    }
+    return { kind: "http", id: "explicit", url: safeUrl, token };
   } catch (error) {
     return { kind: "invalid", id: "explicit", detail: error.message };
   }
@@ -171,6 +177,16 @@ function computerNode(runtime, session = null) {
     nodeId: session?.targetNodeId ?? null
   });
   return record ? relayComputerNode(runtime, record) : null;
+}
+
+function computerNodeForRevocation(runtime, session, lease) {
+  const explicit = explicitComputerNode();
+  if (explicit?.kind === "http" && lease?.nodeId === explicit.id) return explicit;
+  const nodeId = lease?.nodeId ?? session?.targetNodeId;
+  if (nodeId && runtime?.nodeCapabilities?.dispatch) {
+    return relayComputerNode(runtime, { nodeId });
+  }
+  return null;
 }
 
 const NODE_PATHS = {
@@ -201,10 +217,20 @@ async function callNode(node, operation, body, fetchImpl, timeoutMs = 30_000, op
       signal: controller.signal
     });
   } finally { clearTimeout(timer); }
-  const json = await res.json().catch(() => ({}));
+  const json = await readNodeJsonLimited(
+    res,
+    operation === "screenshot" ? 12 * 1024 * 1024 : 256 * 1024
+  ).catch(() => ({}));
   if (!res.ok) {
-    const error = new Error(json.error || `computer node HTTP ${res.status}`);
+    const publicError = typeof json?.error === "string" ? json.error.slice(0, 300) : `computer node HTTP ${res.status}`;
+    const error = new Error(publicError);
     error.nodeAcknowledged = true;
+    // Current nodes state this explicitly. Older compatible node services used
+    // 5xx for executor failures after entering a lease, so retain that legacy
+    // default only for 5xx. Redirects/auth/route failures never prove that the
+    // action reached the lease and must not advance its sequence.
+    error.nodeSequenceConsumed = json?.sequenceConsumed === true
+      || (json?.sequenceConsumed !== false && res.status >= 500);
     throw error;
   }
   return json;
@@ -238,6 +264,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   };
 
   runtime.__computerNodeLeases ??= new Map();
+  runtime.__computerNodeLeaseOpenings ??= new Map();
 
   const ensureNodeLease = async (node, session) => {
     const existing = runtime.__computerNodeLeases.get(session.id);
@@ -245,38 +272,72 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       if (existing.nodeId !== node.id) throw new Error("approved computer-use session is bound to a different node");
       return existing;
     }
-    const goalHash = crypto.createHash("sha256")
-      .update(`${session.sourceSessionId}\0${session.targetNodeId}\0${session.goal}`, "utf8")
-      .digest("hex");
-    const opened = await callNode(node, "session.start", {
-      sessionId: session.id,
-      goalHash,
-      expiresAt: session.expiresAt,
-      maxActions: 200,
-      allowedOperations: ["session.end", "screenshot", "click", "move", "type", "key", "scroll"]
-    }, fetchImpl);
-    const lease = {
-      nodeId: node.id,
-      leaseId: opened.leaseId,
-      nextSequence: Number.isSafeInteger(opened.nextSequence) ? opened.nextSequence : 1
-    };
-    runtime.__computerNodeLeases.set(session.id, lease);
-    return lease;
+    const opening = runtime.__computerNodeLeaseOpenings.get(session.id);
+    if (opening) return await opening;
+    const promise = (async () => {
+      const goalHash = crypto.createHash("sha256")
+        .update(`${session.sourceSessionId}\0${session.targetNodeId}\0${session.goal}`, "utf8")
+        .digest("hex");
+      const opened = await callNode(node, "session.start", {
+        sessionId: session.id,
+        goalHash,
+        expiresAt: session.expiresAt,
+        maxActions: 200,
+        allowedOperations: ["session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+      }, fetchImpl);
+      const lease = {
+        nodeId: node.id,
+        leaseId: opened.leaseId,
+        nextSequence: Number.isSafeInteger(opened.nextSequence) ? opened.nextSequence : 1,
+        inFlightSequence: null
+      };
+      const current = runtime.computerUseLog.getSession(session.id);
+      if (!current || current.status !== "active") {
+        // Stop may race the first node handshake. The newly-created lease was
+        // never exposed to another action, so sequence 1 can revoke it safely.
+        await callNode(node, "session.end", {
+          leaseId: lease.leaseId,
+          actionId: `abort_${crypto.randomUUID().replaceAll("-", "")}`,
+          sequence: lease.nextSequence
+        }, fetchImpl, 5_000, { sessionId: session.id }).catch(() => {});
+        throw new Error("computer-use session ended while the node lease was opening");
+      }
+      runtime.__computerNodeLeases.set(session.id, lease);
+      return lease;
+    })();
+    runtime.__computerNodeLeaseOpenings.set(session.id, promise);
+    try {
+      return await promise;
+    } finally {
+      if (runtime.__computerNodeLeaseOpenings.get(session.id) === promise) {
+        runtime.__computerNodeLeaseOpenings.delete(session.id);
+      }
+    }
   };
 
   const invokeNodeAction = async (node, session, action, operation, payload = {}) => {
     const lease = await ensureNodeLease(node, session);
+    if (lease.inFlightSequence != null) {
+      throw new Error("another computer-use action is already in progress");
+    }
+    const sequence = lease.nextSequence;
+    lease.inFlightSequence = sequence;
     try {
       const result = await callNode(node, operation, {
         ...payload,
         leaseId: lease.leaseId,
         actionId: action.id,
-        sequence: lease.nextSequence
+        sequence
       }, fetchImpl, 30_000, { sessionId: session.id });
-      lease.nextSequence += 1;
+      if (lease.nextSequence === sequence) lease.nextSequence += 1;
       return result;
     } catch (error) {
+      if (error?.nodeSequenceConsumed === true && lease.nextSequence === sequence) {
+        lease.nextSequence += 1;
+      }
       throw error;
+    } finally {
+      if (lease.inFlightSequence === sequence) lease.inFlightSequence = null;
     }
   };
 
@@ -287,16 +348,16 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     runtime.computerUseLog.endSession(session.id, { reason, status });
     runtime.nodeCapabilities?.cancelSession?.(session.id, reason);
     const lease = runtime.__computerNodeLeases.get(session.id);
-    const node = computerNode(runtime, session);
+    const node = computerNodeForRevocation(runtime, session, lease);
     runtime.__computerNodeLeases.delete(session.id);
     if (lease && node) {
-      try {
-        await callNode(node, "session.end", {
-          leaseId: lease.leaseId,
-          actionId: `abort_${crypto.randomUUID().replaceAll("-", "")}`,
-          sequence: lease.nextSequence
-        }, fetchImpl, 5_000);
-      } catch { /* best-effort node-side lease revocation */ }
+      // session.end is an authenticated, idempotent lease revocation at the
+      // node. It deliberately ignores the physical-action sequence so Stop
+      // always wins a race with an action that is entering or settling.
+      await callNode(node, "session.end", {
+        leaseId: lease.leaseId,
+        actionId: `abort_${crypto.randomUUID().replaceAll("-", "")}`
+      }, fetchImpl, 5_000, { sessionId: session.id }).catch(() => {});
     }
     return true;
   };
@@ -452,6 +513,9 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       },
       additionalProperties: false
     },
+    // Ending an already-approved capability is a safety action and must never
+    // be held behind a second scrutiny approval.
+    scrutinyConfirmationRequired: () => false,
     handler: async (args, context = {}) => {
       const active = runtime.computerUseLog.activeSessionFor(context.sessionId);
       if (!active) return { ended: false, reason: "no active session" };
@@ -539,6 +603,11 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         additionalProperties: false
       },
       metadata,
+      // The human approves the bounded goal, chat, and immutable target when
+      // the session starts. Each action then revalidates that active session
+      // and its node lease below. Re-queuing actions here would both duplicate
+      // the approval and, for computer_type, persist the text being typed.
+      scrutinyConfirmationRequired: () => false,
       handler: async (args, context = {}) => {
         const session = requireActiveSession(context);
         const reasoning = includeReasoning ? args.reasoning : null;
@@ -606,4 +675,47 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y }), ["frameId", "x", "y"]);
 
   return { registered: true, node: Boolean(explicitComputerNode() ?? runtime.nodeCapabilities?.resolve?.("computer-use")) };
+}
+
+async function readNodeJsonLimited(response, maxBytes) {
+  const declared = Number(response?.headers?.get?.("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error("computer node response exceeded the transport limit");
+  }
+  if (response?.body?.getReader) {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) throw new Error("computer node response exceeded the transport limit");
+        chunks.push(value);
+      }
+    } catch (error) {
+      try { await reader.cancel(); } catch { /* best effort */ }
+      throw error;
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+  if (typeof response?.text === "function") {
+    const raw = await response.text();
+    if (Buffer.byteLength(raw, "utf8") > maxBytes) {
+      throw new Error("computer node response exceeded the transport limit");
+    }
+    return raw ? JSON.parse(raw) : {};
+  }
+  const value = await response.json();
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") > maxBytes) {
+    throw new Error("computer node response exceeded the transport limit");
+  }
+  return value;
 }

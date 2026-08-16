@@ -89,6 +89,24 @@ test("NodeRegistry.prune removes entries not seen in over PRUNE_AFTER_MS, and up
   assert.deepEqual(remaining, ["fresh"], "the stale entry was pruned by the second upsert, not just the fresh one added");
 });
 
+test("liveness pruning preserves the scoped credential a sleeping node needs to return", () => {
+  const dir = tmpDir("openagi-nodereg-sleep-");
+  const registry = new NodeRegistry({ dir });
+  const token = "a".repeat(43);
+  const t0 = Date.now();
+  registry.enroll("sleeping", token, { now: t0 });
+  registry.upsert({ nodeId: "sleeping", name: "Sleeping node", role: "node", version: "1" }, { now: t0 });
+
+  const returnedAt = t0 + PRUNE_AFTER_MS + 1;
+  assert.equal(registry.prune({ now: returnedAt }), 1);
+  assert.equal(registry.list({ now: returnedAt }).length, 0);
+  assert.equal(registry.authenticate("sleeping", token), true, "staleness is not credential revocation");
+
+  registry.upsert({ nodeId: "sleeping", name: "Sleeping node", role: "node", version: "1" }, { now: returnedAt });
+  assert.equal(registry.authenticate("sleeping", token), true);
+  assert.equal(registry.list({ now: returnedAt }).length, 1);
+});
+
 test("NodeRegistry persists across instances (file-backed)", () => {
   const dir = tmpDir("openagi-nodereg-");
   const now = Date.now();

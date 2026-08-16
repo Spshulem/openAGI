@@ -56,6 +56,24 @@ export function createComputerExecutor({
 } = {}) {
   const leases = new Map();
   const leasesBySession = new Map();
+  const helperControllers = new Set();
+
+  const abortLeaseHelpers = (lease) => {
+    for (const controller of lease?.helperControllers ?? []) controller.abort();
+    lease?.helperControllers?.clear?.();
+  };
+
+  const runForLease = async (lease, fn) => {
+    const controller = new AbortController();
+    lease.helperControllers.add(controller);
+    helperControllers.add(controller);
+    try {
+      return await fn(controller.signal);
+    } finally {
+      lease.helperControllers.delete(controller);
+      helperControllers.delete(controller);
+    }
+  };
 
   const inspect = async () => {
     if (typeof capabilityStatus === "function") return normalizeCapabilityStatus(await capabilityStatus());
@@ -79,6 +97,7 @@ export function createComputerExecutor({
     const at = now();
     for (const [id, lease] of leases) {
       if (at > lease.expiresAt || at - lease.lastUsedAt > idleLeaseMs) {
+        abortLeaseHelpers(lease);
         leases.delete(id);
         if (leasesBySession.get(lease.sessionId) === id) leasesBySession.delete(lease.sessionId);
       }
@@ -125,7 +144,9 @@ export function createComputerExecutor({
       maxActions,
       allowedOperations,
       frames: new Map(),
-      results: new Map()
+      results: new Map(),
+      helperControllers: new Set(),
+      executing: 0
     };
     leases.set(lease.id, lease);
     leasesBySession.set(sessionId, lease.id);
@@ -139,56 +160,91 @@ export function createComputerExecutor({
     const sequence = Number(payload?.sequence);
     const lease = leases.get(leaseId);
     if (!lease) throw new Error("computer-use node lease is missing or expired");
+    const signature = actionSignature(operation, payload);
     const cached = lease.results.get(actionId);
     if (cached) {
-      if (cached.sequence !== sequence || cached.operation !== operation) {
+      if (cached.sequence !== sequence || cached.operation !== operation || cached.signature !== signature) {
         throw new Error("computer-use action id was reused with different input");
       }
-      if (cached.error) throw new Error(cached.error);
+      if (cached.error) {
+        const failure = new Error(cached.error);
+        failure.nodeSequenceConsumed = true;
+        throw failure;
+      }
       return cached.result;
     }
     if (!Number.isSafeInteger(sequence) || sequence !== lease.lastSequence + 1) {
       throw new Error(`computer-use action sequence must be ${lease.lastSequence + 1}`);
     }
-    if (lease.lastSequence >= lease.maxActions) throw new Error("computer-use node lease action limit reached");
+    if (operation !== "session.end" && lease.lastSequence >= lease.maxActions) {
+      throw new Error("computer-use node lease action limit reached");
+    }
     if (!lease.allowedOperations.includes(operation)) throw new Error(`operation ${operation} is outside this approved lease`);
+    if (operation !== "session.end" && lease.executing > 0) {
+      throw new Error("another computer-use action is still executing");
+    }
     lease.lastSequence = sequence;
     lease.lastUsedAt = now();
+    lease.executing += 1;
     try {
       const result = await perform(lease);
-      lease.results.set(actionId, { sequence, operation, result });
+      if (operation !== "session.end" && leases.get(lease.id) !== lease) {
+        throw new Error("computer-use node lease was revoked during the action");
+      }
+      lease.results.set(actionId, { sequence, operation, signature, result });
       trimResults(lease.results);
       return result;
     } catch (error) {
-      const message = mapError(error);
-      lease.results.set(actionId, { sequence, operation, error: message });
+      // A helper must never turn typed content into an HTTP/node-control error.
+      const message = operation === "type" ? "computer type action failed" : mapError(error);
+      lease.results.set(actionId, { sequence, operation, signature, error: message });
       trimResults(lease.results);
-      throw new Error(message);
+      const failure = new Error(message);
+      failure.nodeSequenceConsumed = true;
+      throw failure;
+    } finally {
+      lease.executing = Math.max(0, lease.executing - 1);
     }
+  };
+
+  const endLease = (payload) => {
+    purgeExpired();
+    const leaseId = validId(payload?.leaseId, "leaseId");
+    const lease = leases.get(leaseId);
+    // Revocation is authenticated by the surrounding node transport and is
+    // intentionally idempotent. It must not depend on action sequencing:
+    // Stop can race an in-flight event whose sequence has not settled yet.
+    if (!lease) return { ok: true, alreadyEnded: true };
+    leases.delete(lease.id);
+    if (leasesBySession.get(lease.sessionId) === lease.id) leasesBySession.delete(lease.sessionId);
+    abortLeaseHelpers(lease);
+    lease.frames.clear();
+    return { ok: true };
   };
 
   const invoke = async (operation, payload = {}) => {
     if (operation === "session.start") return await startLease(payload);
+    if (operation === "session.end") return endLease(payload);
     return withLease(operation, payload, async (lease) => {
-      if (operation === "session.end") {
-        leases.delete(lease.id);
-        leasesBySession.delete(lease.sessionId);
-        return { ok: true };
-      }
       if (operation === "screenshot") {
         const status = await inspect();
         if (!status.screenshotReady) throw new Error(status.detail || "live screenshot is not currently available");
-        const shot = screenshot
-          ? await screenshot(run, await geometry(run))
-          : await screenshotFromHelper(helperRun, helperPath);
+        const shot = await runForLease(lease, async (signal) => (
+          screenshot
+            ? await screenshot(run, await geometry(run), { signal })
+            : await screenshotFromHelper(helperRun, helperPath, { signal })
+        ));
         const frameId = `cuframe_${crypto.randomUUID().replaceAll("-", "")}`;
+        const focus = normalizePrivateFocus(shot.focus);
+        const { focus: _privateFocus, ...publicShot } = shot;
         lease.frames.clear();
         lease.frames.set(frameId, {
           width: Number(shot.width), height: Number(shot.height), scale: Number(shot.scale) || 1,
           offsetX: Number(shot.offsetX) || 0, offsetY: Number(shot.offsetY) || 0,
+          focus,
           createdAt: now()
         });
-        return { ...shot, frameId };
+        return { ...publicShot, frameId };
       }
       if (!INPUT_OPERATIONS.includes(operation)) throw new Error("unsupported computer-use operation");
       const status = await inspect();
@@ -200,7 +256,11 @@ export function createComputerExecutor({
         // Typed text goes through stdin, never argv: command arguments are
         // visible to other local processes via ps even when the audit log is
         // properly redacted.
-        await helperRun(helperPath, operation, action, { timeoutMs: 10_000, maxStdoutBytes: 128 * 1024 });
+        await runForLease(lease, (signal) => helperRun(helperPath, operation, action, {
+          timeoutMs: 10_000,
+          maxStdoutBytes: 128 * 1024,
+          signal
+        }));
         lease.frames.clear();
         return { ok: true };
       }
@@ -230,14 +290,19 @@ export function createComputerExecutor({
     invoke,
     cancelSession(sessionId) {
       const leaseId = leasesBySession.get(sessionId);
-      if (leaseId) leases.delete(leaseId);
+      const lease = leaseId ? leases.get(leaseId) : null;
+      if (lease) {
+        leases.delete(leaseId);
+        abortLeaseHelpers(lease);
+      }
       leasesBySession.delete(sessionId);
-      cancelComputerHelperProcesses();
+      return Boolean(lease);
     },
     async close() {
+      for (const controller of helperControllers) controller.abort();
       leases.clear();
       leasesBySession.clear();
-      cancelComputerHelperProcesses();
+      helperControllers.clear();
     }
   };
 }
@@ -266,7 +331,10 @@ export function createComputerServer({ token, executor = null, ...executorOption
         if (!operation) return send(404, { error: "not found" });
         return send(200, await computer.invoke(operation, body));
       } catch (error) {
-        return send(500, { error: mapError(error) });
+        return send(500, {
+          error: mapError(error),
+          sequenceConsumed: error?.nodeSequenceConsumed === true
+        });
       }
     });
   });
@@ -330,9 +398,28 @@ function trimResults(results) {
   while (results.size > 20) results.delete(results.keys().next().value);
 }
 
+function actionSignature(operation, payload) {
+  const canonical = canonicalJson({ operation, payload });
+  return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function finite(value, label) {
   const number = Number(value);
   if (!Number.isFinite(number)) throw new Error(`${label} must be a finite number`);
+  return number;
+}
+
+function finiteInteger(value, label) {
+  const number = finite(value, label);
+  if (!Number.isSafeInteger(number)) throw new Error(`${label} must be an integer`);
   return number;
 }
 
@@ -341,21 +428,21 @@ function normalizeInputPayload(operation, payload, lease, at, frameTtlMs) {
     const button = payload.button;
     if (!["left", "right", "middle"].includes(button)) throw new Error("button must be left, right, or middle");
     const point = pointInFrame(payload, lease, at, frameTtlMs);
-    return { x: scale(point.x, point.frame.scale), y: scale(point.y, point.frame.scale), button };
+    return { x: scale(point.x, point.frame.scale), y: scale(point.y, point.frame.scale), button, focus: point.frame.focus };
   }
   if (operation === "move") {
     const point = pointInFrame(payload, lease, at, frameTtlMs);
-    return { x: scale(point.x, point.frame.scale), y: scale(point.y, point.frame.scale) };
+    return { x: scale(point.x, point.frame.scale), y: scale(point.y, point.frame.scale), focus: point.frame.focus };
   }
   if (operation === "type") {
-    requireFreshFrame(payload, lease, at, frameTtlMs);
+    const frame = requireFreshFrame(payload, lease, at, frameTtlMs);
     if (typeof payload.text !== "string") throw new Error("text is required");
     const value = payload.text;
     if (Buffer.byteLength(value, "utf8") > 16 * 1024 || value.includes("\0")) throw new Error("typed text exceeds 16 KiB or contains NUL");
-    return { text: value };
+    return { text: value, focus: frame.focus };
   }
   if (operation === "key") {
-    requireFreshFrame(payload, lease, at, frameTtlMs);
+    const frame = requireFreshFrame(payload, lease, at, frameTtlMs);
     const chord = String(payload.chord ?? "").toLowerCase().trim();
     const parts = chord.split("+").map((part) => part.trim()).filter(Boolean);
     const modifiers = new Set(["cmd", "command", "ctrl", "control", "alt", "opt", "option", "shift"]);
@@ -363,27 +450,28 @@ function normalizeInputPayload(operation, payload, lease, at, frameTtlMs) {
     if (!chord || chord.length > 80 || keys.length !== 1 || !/^(?:[a-z0-9`=\-\[\]\\;',./]|enter|return|esc|escape|tab|space|delete|backspace|up|down|left|right|home|end|pageup|pagedown)$/.test(keys[0])) {
       throw new Error("chord must contain supported modifiers and exactly one supported key");
     }
-    return { chord };
+    return { chord, focus: frame.focus };
   }
   const point = pointInFrame(payload, lease, at, frameTtlMs);
   return {
     x: scale(point.x, point.frame.scale),
     y: scale(point.y, point.frame.scale),
     deltaX: boundedScrollDelta(payload.deltaX ?? 0, "deltaX"),
-    deltaY: boundedScrollDelta(payload.deltaY ?? 0, "deltaY")
+    deltaY: boundedScrollDelta(payload.deltaY ?? 0, "deltaY"),
+    focus: point.frame.focus
   };
 }
 
 function boundedScrollDelta(value, label) {
-  const number = finite(value, label);
+  const number = finiteInteger(value, label);
   if (Math.abs(number) > 1_000) throw new Error(`${label} must be between -1000 and 1000`);
   return number;
 }
 
 function pointInFrame(payload, lease, at, frameTtlMs) {
   const frame = requireFreshFrame(payload, lease, at, frameTtlMs);
-  const x = finite(payload.x, "x");
-  const y = finite(payload.y, "y");
+  const x = finiteInteger(payload.x, "x");
+  const y = finiteInteger(payload.y, "y");
   if (x < 0 || y < 0 || x >= frame.width || y >= frame.height) {
     throw new Error("coordinates are outside the referenced screenshot frame");
   }
@@ -401,6 +489,27 @@ function requireFreshFrame(payload, lease, at, frameTtlMs) {
   return frame;
 }
 
+function normalizePrivateFocus(raw) {
+  const focus = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  const windowID = Number(focus?.windowID);
+  const processIdentifier = Number(focus?.processIdentifier);
+  const bundleIdentifier = typeof focus?.bundleIdentifier === "string" ? focus.bundleIdentifier : "";
+  const title = typeof focus?.title === "string" ? focus.title : "";
+  const x = Number(focus?.x);
+  const y = Number(focus?.y);
+  const width = Number(focus?.width);
+  const height = Number(focus?.height);
+  if (!Number.isSafeInteger(windowID) || windowID <= 0
+      || !Number.isSafeInteger(processIdentifier) || processIdentifier <= 0
+      || !bundleIdentifier || Buffer.byteLength(bundleIdentifier, "utf8") > 512
+      || !title || Buffer.byteLength(title, "utf8") > 1_024
+      || ![x, y, width, height].every(Number.isFinite)
+      || width < 32 || height < 32) {
+    throw new Error("computer helper did not bind the screenshot to an exact focused window");
+  }
+  return { windowID, processIdentifier, bundleIdentifier, title, x, y, width, height };
+}
+
 export function runComputerHelper(helperPath, operation, payload = null, {
   timeoutMs = 10_000,
   maxStdoutBytes = 128 * 1024,
@@ -415,22 +524,30 @@ export function runComputerHelper(helperPath, operation, payload = null, {
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let finished = false;
+    let terminationError = null;
+    let hardKillTimer = null;
     const finish = (error, result) => {
       if (finished) return;
       finished = true;
       activeHelperChildren.delete(child);
       clearTimeout(timer);
+      if (hardKillTimer) clearTimeout(hardKillTimer);
       signal?.removeEventListener?.("abort", onAbort);
       if (error) reject(error);
       else resolve(result);
     };
-    const onAbort = () => {
-      child.kill("SIGKILL");
-      finish(new Error("computer helper was cancelled"));
+    const terminateCooperatively = (error) => {
+      if (finished || terminationError) return;
+      terminationError = error;
+      child.kill("SIGTERM");
+      hardKillTimer = setTimeout(() => {
+        if (!finished) child.kill("SIGKILL");
+      }, 500);
+      hardKillTimer.unref?.();
     };
+    const onAbort = () => terminateCooperatively(new Error("computer helper was cancelled"));
     const overflow = (stream) => {
-      child.kill("SIGKILL");
-      finish(new Error(`computer helper ${stream} exceeded its limit`));
+      terminateCooperatively(new Error(`computer helper ${stream} exceeded its limit`));
     };
     child.stdout.on("data", (chunk) => {
       stdoutBytes += chunk.length;
@@ -442,22 +559,32 @@ export function runComputerHelper(helperPath, operation, payload = null, {
       if (stderrBytes > maxStderrBytes) return overflow("stderr");
       stderr.push(chunk);
     });
+    child.stdin.on("error", (error) => {
+      // A helper may exit or be cancelled before the bounded stdin payload is
+      // flushed. Consume EPIPE here so it cannot become an uncaught process
+      // error; preserve the cancellation reason when one already exists.
+      if (finished || terminationError) return;
+      finish(error);
+    });
     child.on("error", (error) => finish(error));
     child.on("close", (code, signal) => {
       const out = Buffer.concat(stdout);
       const err = Buffer.concat(stderr);
+      if (terminationError) return finish(terminationError);
       if (code === 0) return finish(null, { stdout: out, stderr: err });
       const failure = new Error(`computer helper failed (${signal || code || "unknown"})`);
       failure.stderr = err.toString("utf8").slice(0, maxStderrBytes);
       finish(failure);
     });
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(new Error("computer helper timed out"));
+      terminateCooperatively(new Error("computer helper timed out"));
     }, Math.max(1, timeoutMs));
     timer.unref?.();
     signal?.addEventListener?.("abort", onAbort, { once: true });
-    if (signal?.aborted) onAbort();
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
     try {
       child.stdin.end(payload == null ? undefined : JSON.stringify(payload));
     } catch (error) {
@@ -471,12 +598,13 @@ export function cancelComputerHelperProcesses() {
   for (const child of activeHelperChildren) child.kill("SIGKILL");
 }
 
-async function screenshotFromHelper(helperRun, helperPath) {
+async function screenshotFromHelper(helperRun, helperPath, { signal = null } = {}) {
   if (!helperPath) throw new Error("the signed OpenAGI computer helper is unavailable");
   const { stdout } = await helperRun(helperPath, "screenshot", null, {
     timeoutMs: 10_000,
     maxStdoutBytes: 12 * 1024 * 1024,
-    maxStderrBytes: 32 * 1024
+    maxStderrBytes: 32 * 1024,
+    signal
   });
   const shot = JSON.parse(String(stdout));
   if (shot?.format !== "png" || typeof shot?.base64 !== "string"
@@ -493,7 +621,8 @@ async function screenshotFromHelper(helperRun, helperPath) {
     bytes: Number.isSafeInteger(shot.bytes) ? shot.bytes : Math.floor(shot.base64.length * 0.75),
     scale: Number.isFinite(shot.scale) && shot.scale > 0 ? shot.scale : 1,
     offsetX: Number.isFinite(shot.offsetX) ? shot.offsetX : 0,
-    offsetY: Number.isFinite(shot.offsetY) ? shot.offsetY : 0
+    offsetY: Number.isFinite(shot.offsetY) ? shot.offsetY : 0,
+    focus: normalizePrivateFocus(shot.focus)
   };
 }
 

@@ -486,15 +486,16 @@ export class AbiRuntime {
       // Daily deterministic cleanup drains legacy duplicate/dead suggestions
       // in bounded reversible passes. BacklogTriage itself rate-limits the LLM
       // judgement phase to weekly, so this faster housekeeping cadence does
-      // not multiply model cost. 05:15 stays clear of the nightly miners and
-      // lands before the morning plan reads the review queue.
+      // not multiply model cost. 05:45 stays clear of observation retention
+      // and the nightly miners, then lands before the morning plan reads the
+      // review queue.
       const existingBacklogTriageJob = this.cron.listJobs().find((job) => job.id === "backlog-triage") ?? null;
       this.cron.addJob({
         id: "backlog-triage",
         name: "Daily backlog hygiene — retire duplicates; review relevance weekly",
         enabled: true,
         task: "backlog-triage",
-        dailyAt: "05:15"
+        dailyAt: "05:45"
       });
       // FileBackedCronScheduler preserves existing rows. Upgrade the old
       // weekly default without changing a user's enabled/disabled choice.
@@ -502,7 +503,7 @@ export class AbiRuntime {
         this.cron.updateJob("backlog-triage", {
           name: "Daily backlog hygiene — retire duplicates; review relevance weekly",
           intervalMs: null,
-          dailyAt: "05:15",
+          dailyAt: "05:45",
           ...(existingBacklogTriageJob.enabled ? {} : { nextRunAt: null })
         });
       }

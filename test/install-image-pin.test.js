@@ -96,3 +96,26 @@ test("the generated compose file sets an auth token — HOST 0.0.0.0 without one
   // And it must be generated, not left blank for the user to forget.
   assert.match(install, /openssl rand|\/dev\/urandom|randomBytes/, "install.sh must GENERATE a strong token");
 });
+
+test("shipped pairing guidance uses HTTPS and never puts the pairing secret in argv", () => {
+  const guides = [
+    "scripts/install.sh",
+    "docs/MAIN-AND-NODES.md",
+    "docs/runbooks/declare-this-mac-main.md"
+  ];
+  for (const rel of guides) {
+    const body = read(rel);
+    assert.doesNotMatch(
+      body,
+      /openagi pair[^\n]*--token\b/,
+      `${rel} must not teach users to put a pairing credential in process arguments or shell history`
+    );
+    assert.doesNotMatch(
+      body,
+      /openagi pair\s+http:\/\//,
+      `${rel} must not advertise plaintext HTTP for cross-device pairing`
+    );
+    assert.match(body, /OPENAGI_REMOTE_TOKEN/, `${rel} must document the supported secret-input channel`);
+    assert.match(body, /openagi pair\s+https:\/\//, `${rel} must show a protected remote origin`);
+  }
+});

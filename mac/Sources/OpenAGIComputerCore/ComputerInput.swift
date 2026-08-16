@@ -2,12 +2,15 @@ import AppKit
 import ApplicationServices
 import Carbon
 import CoreGraphics
+import Foundation
 
 public enum ComputerInputError: LocalizedError {
   case accessibilityRequired
   case consoleSessionRequired
   case screenLocked
   case secureInputEnabled
+  case focusChanged
+  case cancelled
   case invalidButton(String)
   case invalidPoint
   case invalidText
@@ -23,6 +26,10 @@ public enum ComputerInputError: LocalizedError {
       return "computer input is unavailable while the screen is locked"
     case .secureInputEnabled:
       return "computer input is unavailable while Secure Event Input is enabled"
+    case .focusChanged:
+      return "the focused window changed after the approved screenshot; take a new screenshot"
+    case .cancelled:
+      return "computer input was cancelled"
     case .invalidButton(let button):
       return "unknown mouse button '\(button)'"
     case .invalidPoint:
@@ -32,6 +39,26 @@ public enum ComputerInputError: LocalizedError {
     case .unknownKey(let name):
       return "unknown key '\(name)'"
     }
+  }
+}
+
+public final class ComputerInputCancellation: @unchecked Sendable {
+  private let lock = NSLock()
+  private var cancelled = false
+
+  public init() {}
+
+  public func cancel() {
+    lock.lock()
+    cancelled = true
+    lock.unlock()
+  }
+
+  public func check() throws {
+    lock.lock()
+    let value = cancelled
+    lock.unlock()
+    if value { throw ComputerInputError.cancelled }
   }
 }
 
@@ -52,7 +79,9 @@ public enum ComputerInput {
     return session["CGSSessionScreenIsLocked"] as? Bool ?? false
   }
 
-  public static func click(x: Double, y: Double, button: String) throws {
+  public static func click(x: Double, y: Double, button: String,
+                           focus: ComputerFocusIdentity? = nil,
+                           cancellation: ComputerInputCancellation? = nil) throws {
     try requirePoint(x: x, y: y)
     let point = CGPoint(x: x, y: y)
     let source = CGEventSource(stateID: .hidSystemState)
@@ -69,15 +98,13 @@ public enum ComputerInput {
     default:
       throw ComputerInputError.invalidButton(button)
     }
-    if let down = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton) {
-      try postPhysicalEvent(down)
-    }
-    if let up = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton) {
-      try postPhysicalEvent(up)
-    }
+    let down = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton)
+    let up = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton)
+    try postPhysicalPair(down, up, focus: focus, cancellation: cancellation)
   }
 
-  public static func move(x: Double, y: Double) throws {
+  public static func move(x: Double, y: Double, focus: ComputerFocusIdentity? = nil,
+                          cancellation: ComputerInputCancellation? = nil) throws {
     try requirePoint(x: x, y: y)
     if let event = CGEvent(
       mouseEventSource: CGEventSource(stateID: .hidSystemState),
@@ -85,11 +112,13 @@ public enum ComputerInput {
       mouseCursorPosition: CGPoint(x: x, y: y),
       mouseButton: .left
     ) {
-      try postPhysicalEvent(event)
+      try postPhysicalEvent(event, focus: focus, cancellation: cancellation)
     }
   }
 
-  public static func scroll(x: Double, y: Double, deltaX: Int32, deltaY: Int32) throws {
+  public static func scroll(x: Double, y: Double, deltaX: Int32, deltaY: Int32,
+                            focus: ComputerFocusIdentity? = nil,
+                            cancellation: ComputerInputCancellation? = nil) throws {
     try requirePoint(x: x, y: y)
     guard let event = CGEvent(
       scrollWheelEvent2Source: CGEventSource(stateID: .hidSystemState),
@@ -100,10 +129,11 @@ public enum ComputerInput {
       wheel3: 0
     ) else { return }
     event.location = CGPoint(x: x, y: y)
-    try postPhysicalEvent(event)
+    try postPhysicalEvent(event, focus: focus, cancellation: cancellation)
   }
 
-  public static func sendShortcut(_ spec: String) throws {
+  public static func sendShortcut(_ spec: String, focus: ComputerFocusIdentity? = nil,
+                                  cancellation: ComputerInputCancellation? = nil) throws {
     guard !spec.isEmpty, spec.utf8.count <= 80, !spec.contains("\0") else {
       throw ComputerInputError.unknownKey(spec)
     }
@@ -127,23 +157,23 @@ public enum ComputerInput {
       }
     }
     guard let key else { throw ComputerInputError.unknownKey(spec) }
-    try sendKey(named: key, modifiers: modifiers)
+    try sendKey(named: key, modifiers: modifiers, focus: focus, cancellation: cancellation)
   }
 
-  public static func sendKey(named name: String, modifiers: CGEventFlags = []) throws {
+  public static func sendKey(named name: String, modifiers: CGEventFlags = [],
+                             focus: ComputerFocusIdentity? = nil,
+                             cancellation: ComputerInputCancellation? = nil) throws {
     guard let code = keyCode(for: name) else { throw ComputerInputError.unknownKey(name) }
     let source = CGEventSource(stateID: .hidSystemState)
-    if let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true) {
-      down.flags = modifiers
-      try postPhysicalEvent(down)
-    }
-    if let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) {
-      up.flags = modifiers
-      try postPhysicalEvent(up)
-    }
+    let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true)
+    let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
+    down?.flags = modifiers
+    up?.flags = modifiers
+    try postPhysicalPair(down, up, focus: focus, cancellation: cancellation)
   }
 
-  public static func sendType(_ text: String) throws {
+  public static func sendType(_ text: String, focus: ComputerFocusIdentity? = nil,
+                              cancellation: ComputerInputCancellation? = nil) throws {
     guard text.utf8.count <= 16 * 1024, !text.contains("\0") else {
       throw ComputerInputError.invalidText
     }
@@ -154,11 +184,10 @@ public enum ComputerInput {
       let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
       down?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
       up?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-      // Secure Event Input and lock state can change during a long type. Check
-      // the live state immediately before every event rather than only once at
-      // the beginning of the operation.
-      if let down { try postPhysicalEvent(down) }
-      if let up { try postPhysicalEvent(up) }
+      // Check before every character pair. Once key-down is posted, key-up is
+      // an uninterruptible cleanup boundary so cancellation or a focus change
+      // cannot strand a pressed key in the system event stream.
+      try postPhysicalPair(down, up, focus: focus, cancellation: cancellation)
     }
   }
 
@@ -174,18 +203,36 @@ public enum ComputerInput {
     guard !secureInputEnabled else { throw ComputerInputError.secureInputEnabled }
   }
 
-  private static func requirePhysicalInputReady() throws {
+  private static func requirePhysicalInputReady(focus: ComputerFocusIdentity?) throws {
     try validateInputReadiness(
       accessibilityGranted: accessibilityGranted,
       consoleSessionActive: consoleSessionActive,
       screenLocked: screenLocked,
       secureInputEnabled: secureInputEnabled
     )
+    if let focus {
+      guard ComputerScreenshot.focusStillMatches(focus) else {
+        throw ComputerInputError.focusChanged
+      }
+    }
   }
 
-  private static func postPhysicalEvent(_ event: CGEvent) throws {
-    try requirePhysicalInputReady()
+  private static func postPhysicalEvent(_ event: CGEvent, focus: ComputerFocusIdentity?,
+                                        cancellation: ComputerInputCancellation?) throws {
+    try cancellation?.check()
+    try requirePhysicalInputReady(focus: focus)
     event.post(tap: .cghidEventTap)
+  }
+
+  private static func postPhysicalPair(_ down: CGEvent?, _ up: CGEvent?,
+                                       focus: ComputerFocusIdentity?,
+                                       cancellation: ComputerInputCancellation?) throws {
+    try cancellation?.check()
+    try requirePhysicalInputReady(focus: focus)
+    // Never insert a cancellation/readiness check between these posts. A Stop
+    // request is observed before the next pair, after the release is complete.
+    down?.post(tap: .cghidEventTap)
+    up?.post(tap: .cghidEventTap)
   }
 
   private static func requirePoint(x: Double, y: Double) throws {

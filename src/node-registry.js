@@ -266,23 +266,16 @@ export class NodeRegistry {
     return removed;
   }
 
-  // Mutates `store.entries` in place, deleting anything stale; returns the
-  // count removed. Shared by prune() (which persists unconditionally when
-  // something changed) and upsert() (which persists anyway right after).
+  // Mutates only the ephemeral roster entries, deleting anything stale;
+  // returns the count removed. Scoped credentials survive liveness pruning:
+  // a sleeping node must be able to authenticate its first returning
+  // heartbeat. Credentials are removed only by explicit revoke/unpair.
+  // Shared by prune() and upsert().
   _pruneStore(store, now) {
     let removed = 0;
     for (const [nodeId, entry] of Object.entries(store.entries)) {
       if ((now - new Date(entry.lastSeenAt).getTime()) > PRUNE_AFTER_MS) {
         delete store.entries[nodeId];
-        delete store.credentials[nodeId];
-        removed += 1;
-      }
-    }
-    for (const [nodeId, credential] of Object.entries(store.credentials ?? {})) {
-      if (store.entries[nodeId]) continue;
-      const createdAt = new Date(credential.createdAt).getTime();
-      if (Number.isFinite(createdAt) && (now - createdAt) > PRUNE_AFTER_MS) {
-        delete store.credentials[nodeId];
         removed += 1;
       }
     }

@@ -28,6 +28,15 @@ export class ToolRegistry {
       // already-approved state is still active, so invoking the handler is a
       // no-op/readback and must not create a fresh approval request.
       confirmationRequired: typeof tool.confirmationRequired === "function" ? tool.confirmationRequired : null,
+      // Scrutiny normally routes every side-effecting call through the pending
+      // action store. A tool may return false here only when a narrower,
+      // already-approved capability boundary authorizes the call itself (for
+      // example an active, chat-bound computer-use session). Keeping this
+      // separate from confirmationRequired prevents that exemption from
+      // weakening the tool's own initial approval gate.
+      scrutinyConfirmationRequired: typeof tool.scrutinyConfirmationRequired === "function"
+        ? tool.scrutinyConfirmationRequired
+        : null,
       // Resolve approval-critical facts (for example the immutable target
       // node) before the card is created. The prepared args are what the user
       // sees, approves, and the confirmed handler later receives.
@@ -73,7 +82,14 @@ export class ToolRegistry {
   }
 
   list({ readOnly = false } = {}) {
-    const all = [...this.tools.values()].map(({ handler, confirmationRequired, prepareApprovalArgs, approvalDedupeKey, ...rest }) => rest);
+    const all = [...this.tools.values()].map(({
+      handler,
+      confirmationRequired,
+      scrutinyConfirmationRequired,
+      prepareApprovalArgs,
+      approvalDedupeKey,
+      ...rest
+    }) => rest);
     return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
   }
 
@@ -197,7 +213,9 @@ export class ToolRegistry {
       }
     }
     const toolConfirm = tool.needsConfirmation && safeConfirmationRequired(tool.confirmationRequired, invocationArgs, context);
-    const scrutinyConfirm = context?.__scrutinyPolicy === "confirm" && tool.sideEffects;
+    const scrutinyConfirm = context?.__scrutinyPolicy === "confirm"
+      && tool.sideEffects
+      && safeConfirmationRequired(tool.scrutinyConfirmationRequired, invocationArgs, context);
     if ((toolConfirm || scrutinyConfirm) && !context?.__confirmed && this.pendingActions) {
       const summary = tool.summarize ? safeSummarize(tool.summarize, invocationArgs) : `Run ${name}`;
       const dedupeKey = safeApprovalDedupeKey(tool.approvalDedupeKey, invocationArgs, context);

@@ -142,7 +142,7 @@ test("duplicate consolidation compares stale and fresh copies at one decay time"
   assert.equal(result.retained[0].lastDecayedAt, freshAt);
 });
 
-test("file-backed consolidation archives exact automated duplicates before removing them", () => {
+test("file-backed consolidation records a content-free audit receipt before removal", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-memory-maintenance-"));
   const memory = new FileBackedMemorySystem({ dir, autoLoad: false });
   // Seed pre-upgrade duplicates directly: current remember() prevents these.
@@ -158,8 +158,11 @@ test("file-backed consolidation archives exact automated duplicates before remov
 
   const archive = fs.readFileSync(memory.duplicateArchivePath, "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(archive.length, 1);
-  assert.equal(archive[0].item.id, "auto_2");
+  assert.equal(archive[0].removedId, "auto_2");
   assert.equal(archive[0].canonicalId, "auto_1");
+  assert.equal(archive[0].rawContentHash, two.rawContentHash);
+  assert.equal("item" in archive[0], false);
+  assert.doesNotMatch(JSON.stringify(archive[0]), /duplicate automated output/);
 
   const reloaded = new FileBackedMemorySystem({ dir });
   assert.equal(reloaded.items.size, 1, "consolidated active snapshot survives restart");
@@ -177,6 +180,36 @@ test("duplicate maintenance never consolidates explicit user memories or correct
   assert.equal(result.removed.length, 0);
   assert.ok(memory.items.has("explicit_1") && memory.items.has("explicit_2"));
   assert.ok(memory.items.has(correction.id) && memory.items.has("correction_2"));
+});
+
+test("partial archive failure never merges evidence from the duplicate left active", () => {
+  const memory = new MemorySystem();
+  const canonical = memory.remember(
+    { source: "agent-host", content: "same automated evidence", tags: ["runtime"] },
+    { id: "canonical", tier: "medium", strength: 0.8, now: "2026-08-10T00:00:00.000Z" }
+  );
+  const removable = {
+    ...canonical, id: "removable", strength: 0.5, repetition: 0.4,
+    lastObservedAt: "2026-08-11T00:00:00.000Z", lastAccessedAt: "2026-08-11T00:00:00.000Z", metadata: {}
+  };
+  const archiveFailed = {
+    ...canonical, id: "archive-failed", strength: 0.2, repetition: 0.95,
+    lastObservedAt: "2026-08-12T00:00:00.000Z", lastAccessedAt: "2026-08-12T00:00:00.000Z", metadata: {}
+  };
+  memory.items.set(removable.id, removable);
+  memory.items.set(archiveFailed.id, archiveFailed);
+
+  const result = memory.consolidateAutomatedDuplicates({
+    now: new Date("2026-08-12T00:01:00.000Z"),
+    archive: ({ item }) => {
+      if (item.id === archiveFailed.id) throw new Error("archive unavailable");
+    }
+  });
+
+  assert.deepEqual(result.removed.map((item) => item.id), [removable.id]);
+  assert.equal(memory.items.has(archiveFailed.id), true);
+  assert.equal(canonical.repetition, 0.4, "failed archive evidence is not double-counted into the canonical row");
+  assert.equal(canonical.lastObservedAt, removable.lastObservedAt);
 });
 
 test("daily condenser runs bounded duplicate maintenance before principle clustering", async () => {

@@ -182,6 +182,10 @@ export function registerImessageSearchTool(runtime, {
       catch (error) { return { error: error.message }; }
 
       if (hasCapabilityFacade) {
+        // Local providers are measured asynchronously after the hosted facade
+        // is installed. Refresh at invocation so the first real search does not
+        // depend on an unrelated visit to the Nodes page.
+        try { await runtime.nodeCapabilities.refresh?.(); } catch { /* remote candidates may still be usable */ }
         const candidates = readyCandidates(runtime);
         if (!args.node && candidates.length > 1) {
           return { error: "Multiple iMessage-capable nodes are online; specify the node name or ID." };

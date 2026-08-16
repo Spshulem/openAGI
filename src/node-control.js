@@ -7,7 +7,16 @@ const MAX_RESULT_BYTES = 12 * 1024 * 1024;
 const MAX_COMMAND_BYTES = 256 * 1024;
 const MAX_POLL_RESPONSE_BYTES = 256 * 1024;
 const MAX_QUEUED_COMMANDS = 20;
-const SETTLED_TTL_MS = 15 * 60 * 1000;
+const MAX_IN_FLIGHT_COMMANDS = 16;
+const MAX_IN_FLIGHT_REVOCATIONS = 1;
+// Node-side computer-use leases are capped at 15 minutes. Keep an undelivered
+// revocation addressable for at least that whole window even when the caller's
+// short acknowledgement deadline has elapsed.
+const REVOCATION_DELIVERY_TTL_MS = 20 * 60 * 1000;
+// A timed-out revocation remains queued until its delivery TTL. Retain its
+// settled ownership for at least as long so a late authenticated ACK can remove
+// that queued copy instead of allowing another delivery after execution.
+const SETTLED_TTL_MS = REVOCATION_DELIVERY_TTL_MS;
 const MAX_SETTLED_COMMANDS = 2_000;
 
 const text = (value, max = 120) => (
@@ -101,15 +110,34 @@ export class NodeControlBroker {
     return named.length === 1 ? named[0] : null;
   }
 
-  async poll(nodeId, capabilities, { timeoutMs = DEFAULT_POLL_MS, signal } = {}) {
+  async poll(nodeId, capabilities, {
+    timeoutMs = DEFAULT_POLL_MS,
+    signal,
+    revocationsOnly = false
+  } = {}) {
     const record = this.advertise(nodeId, capabilities);
     this._pruneSettled();
     const queue = this.queues.get(record.nodeId) ?? [];
-    while (queue.length) {
-      const queued = queue.shift();
-      if (Date.parse(queued.expiresAt) > this.now()) return queued;
-      this._rejectCommand(queued.id, "node control command expired before delivery");
+    for (let index = 0; index < queue.length;) {
+      const queued = queue[index];
+      if (Date.parse(queued.expiresAt) <= this.now()) {
+        queue.splice(index, 1);
+        this._rejectCommand(queued.id, "node control command expired before delivery", {
+          keepQueued: true
+        });
+        continue;
+      }
+      if (revocationsOnly && queued.operation !== "session.end") {
+        index += 1;
+        continue;
+      }
+      queue.splice(index, 1);
+      if (!queue.length) this.queues.delete(record.nodeId);
+      const pending = this.pending.get(queued.id);
+      if (pending) pending.delivered = true;
+      return queued;
     }
+    if (!queue.length) this.queues.delete(record.nodeId);
 
     // Only one outstanding poll per node. Replacing an older request is safe:
     // it carried no command, and prevents a reconnect loop from accumulating
@@ -118,24 +146,33 @@ export class NodeControlBroker {
     return await new Promise((resolve) => {
       let done = false;
       const finish = (command) => {
-        if (done) return;
+        if (done) return false;
         done = true;
         clearTimeout(timer);
         signal?.removeEventListener?.("abort", onAbort);
         if (this.polls.get(record.nodeId)?.finish === finish) this.polls.delete(record.nodeId);
         resolve(command);
+        return true;
       };
       const onAbort = () => finish(null);
       const timer = setTimeout(() => finish(null), Math.max(1, timeoutMs));
       signal?.addEventListener?.("abort", onAbort, { once: true });
-      this.polls.set(record.nodeId, { finish });
+    this.polls.set(record.nodeId, {
+      finish,
+      accepts: (command) => !revocationsOnly || command.operation === "session.end"
+    });
     });
   }
 
   dispatch(nodeId, capability, operation, payload, { timeoutMs = this.commandTimeoutMs, sessionId = null } = {}) {
     const record = this.list(capability).find((entry) => entry.nodeId === nodeId);
-    const advertised = record?.capabilities.find((entry) => entry.id === capability && entry.ready);
-    if (!advertised) return Promise.reject(new Error("selected node capability is not ready"));
+    const advertised = record?.capabilities.find((entry) => entry.id === capability);
+    // Revocation remains available when capture/input readiness drops (locked
+    // screen, Secure Input, permission change, or a newly excluded window).
+    // Those states must disable actions, never disable Stop.
+    if (!advertised || (operation !== "session.end" && !advertised.ready)) {
+      return Promise.reject(new Error("selected node capability is not ready"));
+    }
     if (!advertised.operations.includes(operation)) {
       return Promise.reject(new Error(`selected node does not support ${operation}`));
     }
@@ -147,7 +184,9 @@ export class NodeControlBroker {
       operation,
       payload: payload ?? {},
       createdAt: new Date(this.now()).toISOString(),
-      expiresAt: new Date(this.now() + timeout).toISOString(),
+      expiresAt: new Date(this.now() + (
+        operation === "session.end" ? Math.max(timeout, REVOCATION_DELIVERY_TTL_MS) : timeout
+      )).toISOString(),
       ...(typeof sessionId === "string" && sessionId ? { sessionId: sessionId.slice(0, 240) } : {})
     };
     try {
@@ -160,19 +199,38 @@ export class NodeControlBroker {
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this._removeQueued(command.id);
-        this.pending.delete(command.id);
-        this._rememberSettled(command.id, nodeId);
-        reject(new Error("node control command timed out"));
+        const pending = this.pending.get(command.id);
+        if (operation === "session.end") this._retainRevocation(command);
+        this._rejectCommand(command.id, "node control command timed out", {
+          nodeAcknowledged: pending?.delivered === true,
+          nodeSequenceConsumed: pending?.delivered === true,
+          // The dashboard should not wait indefinitely for an offline/busy
+          // node, but revocation itself remains queued as a detached,
+          // authenticated command. A later poll can still tear down the lease.
+          keepQueued: operation === "session.end"
+        });
       }, timeout);
-      this.pending.set(command.id, { nodeId, sessionId: command.sessionId ?? null, resolve, reject, timer });
+      const pending = {
+        nodeId,
+        sessionId: command.sessionId ?? null,
+        resolve,
+        reject,
+        timer,
+        delivered: false
+      };
+      this.pending.set(command.id, pending);
       const poll = this.polls.get(nodeId);
-      if (poll) poll.finish(command);
+      if (poll?.accepts?.(command) && poll.finish(command)) pending.delivered = true;
       else {
         const queue = this.queues.get(nodeId) ?? [];
-        queue.push(command);
+        if (operation === "session.end") queue.unshift(command);
+        else queue.push(command);
         while (queue.length > MAX_QUEUED_COMMANDS) {
-          const dropped = queue.shift();
+          // Ordinary work may be shed under pressure; it must never displace a
+          // revocation that is waiting to stop physical input.
+          let dropIndex = queue.findIndex((queued) => queued.operation !== "session.end");
+          if (dropIndex < 0) dropIndex = queue.length - 1;
+          const [dropped] = queue.splice(dropIndex, 1);
           const stranded = this.pending.get(dropped?.id);
           if (!stranded) continue;
           this._rejectCommand(dropped.id, "node control queue is full");
@@ -188,15 +246,22 @@ export class NodeControlBroker {
       // Auth already binds this result to nodeId. ACK an unknown/previously
       // settled id so a node whose first 200 response was lost does not retry
       // forever or re-execute the command after a reconnect.
-      return true;
+      const settled = this.settled.get(commandId);
+      if (settled?.nodeId === nodeId) this._removeQueued(commandId);
+      return !settled || settled.nodeId === nodeId;
     }
     if (pending.nodeId !== nodeId) return false;
     this.pending.delete(commandId);
     clearTimeout(pending.timer);
+    this._removeQueued(commandId);
     this._rememberSettled(commandId, nodeId);
     if (error) {
       const failure = new Error(text(error, 120) ?? "node command failed");
       failure.nodeAcknowledged = true;
+      failure.nodeSequenceConsumed = ![
+        "node-command-expired-or-mismatched",
+        "node-capability-command-rejected"
+      ].includes(error);
       pending.reject(failure);
     }
     else pending.resolve(result ?? {});
@@ -205,12 +270,17 @@ export class NodeControlBroker {
 
   cancelSession(sessionId, reason = "computer-use session was stopped") {
     let cancelled = 0;
+    let delivered = 0;
     for (const [commandId, pending] of this.pending) {
       if (pending.sessionId !== sessionId) continue;
-      this._rejectCommand(commandId, reason);
+      if (pending.delivered) delivered += 1;
+      this._rejectCommand(commandId, reason, {
+        nodeAcknowledged: pending.delivered,
+        nodeSequenceConsumed: pending.delivered
+      });
       cancelled += 1;
     }
-    return cancelled;
+    return { cancelled, delivered };
   }
 
   removeNode(nodeId, reason = "node credential was revoked") {
@@ -231,14 +301,36 @@ export class NodeControlBroker {
     }
   }
 
-  _rejectCommand(commandId, reason) {
-    this._removeQueued(commandId);
+  _retainRevocation(command) {
+    const queue = this.queues.get(command.nodeId) ?? [];
+    if (!queue.some((queued) => queued.id === command.id)) queue.unshift(command);
+    while (queue.length > MAX_QUEUED_COMMANDS) {
+      const ordinary = queue.findIndex((queued) => queued.operation !== "session.end");
+      const dropIndex = ordinary >= 0 ? ordinary : queue.length - 1;
+      const [dropped] = queue.splice(dropIndex, 1);
+      if (dropped?.id === command.id) break;
+      if (this.pending.has(dropped?.id)) {
+        this._rejectCommand(dropped.id, "node control queue is full");
+      }
+    }
+    if (queue.some((queued) => queued.id === command.id)) this.queues.set(command.nodeId, queue);
+  }
+
+  _rejectCommand(commandId, reason, {
+    nodeAcknowledged = false,
+    nodeSequenceConsumed = false,
+    keepQueued = false
+  } = {}) {
+    if (!keepQueued) this._removeQueued(commandId);
     const pending = this.pending.get(commandId);
     if (!pending) return false;
     this.pending.delete(commandId);
     clearTimeout(pending.timer);
     this._rememberSettled(commandId, pending.nodeId);
-    pending.reject(new Error(reason));
+    const failure = new Error(reason);
+    if (nodeAcknowledged) failure.nodeAcknowledged = true;
+    if (nodeSequenceConsumed) failure.nodeSequenceConsumed = true;
+    pending.reject(failure);
     return true;
   }
 
@@ -282,10 +374,18 @@ export function createNodeControlWorker({
     throw new Error("remote, token, nodeId and execute are required");
   }
   let stopped = true;
-  let controller = null;
+  const controllers = new Set();
+  const executionControllers = new Set();
   let loopPromise = null;
-  let unsentEnvelope = null;
   const completed = new Map();
+  const inFlight = new Map();
+  const revocationsInFlight = new Set();
+  const sessionTails = new Map();
+  const resultQueue = [];
+  const queuedResultIds = new Set();
+  let wakeResultSender = null;
+  let wakeRevocationWaiter = null;
+  const retryWakeups = new Set();
   const base = pinnedRemoteOrigin(remote, { allowInsecureRemote });
   const headers = {
     "content-type": "application/json",
@@ -294,12 +394,19 @@ export function createNodeControlWorker({
   };
 
   const sleep = (ms) => new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      retryWakeups.delete(finish);
+      resolve();
+    };
+    timer = setTimeout(finish, ms);
+    retryWakeups.add(finish);
   });
   const post = async (path, body, timeout) => {
-    controller = new AbortController();
-    const timer = setTimeout(() => controller?.abort(), timeout);
+    const controller = new AbortController();
+    controllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), timeout);
     timer.unref?.();
     try {
       return await fetchImpl(`${base}${path}`, {
@@ -311,60 +418,163 @@ export function createNodeControlWorker({
       });
     } finally {
       clearTimeout(timer);
-      controller = null;
+      controllers.delete(controller);
     }
   };
-  const loop = async () => {
+
+  const enqueueResult = (envelope) => {
+    if (queuedResultIds.has(envelope.commandId)) return;
+    resultQueue.push(envelope);
+    queuedResultIds.add(envelope.commandId);
+    const wake = wakeResultSender;
+    wakeResultSender = null;
+    wake?.();
+  };
+
+  const rememberCompleted = (commandId, envelope) => {
+    completed.set(commandId, envelope);
+    while (completed.size > 100) completed.delete(completed.keys().next().value);
+  };
+
+  const executeCommand = async (command) => {
+    let envelope;
+    const commandExpiry = Date.parse(command.expiresAt);
+    if (command.nodeId !== nodeId || !Number.isFinite(commandExpiry) || commandExpiry <= Date.now()) {
+      envelope = { nodeId, commandId: command.id, error: "node-command-expired-or-mismatched" };
+    } else {
+      let result = null;
+      let error = null;
+      const executionController = new AbortController();
+      executionControllers.add(executionController);
+      try {
+        result = await execute(command, { signal: executionController.signal });
+        if (commandExpiry <= Date.now()) {
+          throw Object.assign(new Error("node command expired during execution"), { code: "node-command-expired" });
+        }
+        if (Buffer.byteLength(JSON.stringify(result ?? {})) > MAX_RESULT_BYTES) {
+          throw Object.assign(new Error("node command result exceeded the transport limit"), {
+            nodeSequenceConsumed: true
+          });
+        }
+      } catch (caught) {
+        error = publicNodeError(caught);
+      } finally {
+        executionControllers.delete(executionController);
+      }
+      envelope = {
+        nodeId,
+        commandId: command.id,
+        ...(error ? { error } : { result })
+      };
+    }
+    rememberCompleted(command.id, envelope);
+    enqueueResult(envelope);
+  };
+
+  const scheduleCommand = (command) => {
+    const cached = completed.get(command.id);
+    if (cached) {
+      enqueueResult(cached);
+      return;
+    }
+    if (inFlight.has(command.id)) return;
+    if (command.operation === "session.end"
+        && revocationsInFlight.size >= MAX_IN_FLIGHT_REVOCATIONS) {
+      throw new Error("revocation execution lane is full");
+    }
+
+    const run = () => executeCommand(command);
+    let task;
+    // A stop command must be able to revoke its lease and abort a helper while
+    // the preceding physical action is still running. Other commands from one
+    // approved session remain ordered even though the worker keeps polling so
+    // it can receive that stop.
+    if (command.operation === "session.end" || !command.sessionId) {
+      task = run();
+    } else {
+      const previous = sessionTails.get(command.sessionId) ?? Promise.resolve();
+      task = previous.catch(() => {}).then(run);
+      sessionTails.set(command.sessionId, task);
+    }
+    inFlight.set(command.id, task);
+    if (command.operation === "session.end") revocationsInFlight.add(command.id);
+    task.catch(() => {}).finally(() => {
+      inFlight.delete(command.id);
+      revocationsInFlight.delete(command.id);
+      if (command.sessionId && sessionTails.get(command.sessionId) === task) {
+        sessionTails.delete(command.sessionId);
+      }
+    });
+  };
+
+  const pollLoop = async () => {
     while (!stopped) {
       try {
-        if (unsentEnvelope) {
-          const delivered = await post("/nodes/control/result", unsentEnvelope, 10_000);
-          if (!delivered.ok) throw new Error(`control result rejected: ${delivered.status}`);
-          unsentEnvelope = null;
+        // Do not accept a second Stop while the reserved revocation lane is
+        // occupied. A slow provider health check must not turn the priority
+        // exemption into unbounded concurrent work.
+        if (revocationsInFlight.size >= MAX_IN_FLIGHT_REVOCATIONS) {
+          const active = [...revocationsInFlight]
+            .map((commandId) => inFlight.get(commandId))
+            .filter(Boolean);
+          if (active.length) {
+            await Promise.race([
+              Promise.race(active.map((task) => task.catch(() => {}))),
+              new Promise((resolve) => { wakeRevocationWaiter = resolve; })
+            ]);
+            wakeRevocationWaiter = null;
+          }
+          else revocationsInFlight.clear();
           continue;
         }
+        // Keep a small revocation-only long poll alive even when all ordinary
+        // execution slots are occupied. `session.end` is deliberately exempt
+        // from that cap so Stop can cancel one of those operations; accepting
+        // any other command here would defeat the resource bound.
+        const ordinaryInFlight = inFlight.size - revocationsInFlight.size;
+        const revocationsOnly = ordinaryInFlight >= MAX_IN_FLIGHT_COMMANDS;
+        const effectivePollMs = revocationsOnly ? Math.min(pollMs, 1_000) : pollMs;
         const advertised = sanitizeNodeCapabilities(await capabilities());
+        // `capabilities()` may itself wait on a helper health probe. Stop can
+        // run while that probe is pending, after its controller-abort sweep;
+        // never create a fresh long-poll once shutdown has begun.
+        if (stopped) break;
         const response = await post("/nodes/control/poll", {
           nodeId,
           capabilities: advertised,
-          timeoutMs: pollMs
-        }, pollMs + 5_000);
+          timeoutMs: effectivePollMs,
+          ...(revocationsOnly ? { revocationsOnly: true } : {})
+        }, effectivePollMs + 5_000);
         if (!response.ok) throw new Error(`control poll rejected: ${response.status}`);
         const body = await readJsonResponseLimited(response, MAX_POLL_RESPONSE_BYTES);
         const command = body?.command;
         if (!command || typeof command.id !== "string") continue;
-        const cached = completed.get(command.id);
-        if (cached) {
-          unsentEnvelope = cached;
-          continue;
+        if (revocationsOnly && command.operation !== "session.end") {
+          throw new Error("revocation-only poll returned ordinary work");
         }
-        let envelope;
-        const commandExpiry = Date.parse(command.expiresAt);
-        if (command.nodeId !== nodeId || !Number.isFinite(commandExpiry) || commandExpiry <= Date.now()) {
-          envelope = { nodeId, commandId: command.id, error: "node-command-expired-or-mismatched" };
-        } else {
-          let result = null;
-          let error = null;
-          try {
-            result = await execute(command);
-            if (commandExpiry <= Date.now()) {
-              throw Object.assign(new Error("node command expired during execution"), { code: "node-command-expired" });
-            }
-            if (Buffer.byteLength(JSON.stringify(result ?? {})) > MAX_RESULT_BYTES) {
-              throw new Error("node command result exceeded the transport limit");
-            }
-          } catch (caught) {
-            error = publicNodeError(caught);
-          }
-          envelope = {
-            nodeId,
-            commandId: command.id,
-            ...(error ? { error } : { result })
-          };
-        }
-        completed.set(command.id, envelope);
-        while (completed.size > 100) completed.delete(completed.keys().next().value);
-        unsentEnvelope = envelope;
+        scheduleCommand(command);
+      } catch (error) {
+        if (stopped) break;
+        await sleep(retryMs);
+      }
+    }
+  };
+
+  const resultLoop = async () => {
+    while (!stopped) {
+      if (!resultQueue.length) {
+        await new Promise((resolve) => { wakeResultSender = resolve; });
+        continue;
+      }
+      const envelope = resultQueue[0];
+      try {
+        const delivered = await post("/nodes/control/result", envelope, 10_000);
+        const accepted = delivered.ok;
+        const status = delivered.status;
+        try { await delivered.body?.cancel?.(); } catch { /* the ACK body is intentionally ignored */ }
+        if (!accepted) throw new Error(`control result rejected: ${status}`);
+        resultQueue.shift();
+        queuedResultIds.delete(envelope.commandId);
       } catch (error) {
         if (stopped) break;
         await sleep(retryMs);
@@ -376,12 +586,29 @@ export function createNodeControlWorker({
     start() {
       if (!stopped) return;
       stopped = false;
-      loopPromise = loop();
+      loopPromise = Promise.all([pollLoop(), resultLoop()]);
     },
     async stop() {
       stopped = true;
-      controller?.abort();
+      const executions = [...inFlight.values()];
+      for (const controller of controllers) controller.abort();
+      for (const controller of executionControllers) controller.abort();
+      const wake = wakeResultSender;
+      wakeResultSender = null;
+      wake?.();
+      const wakeRevocation = wakeRevocationWaiter;
+      wakeRevocationWaiter = null;
+      wakeRevocation?.();
+      for (const finish of retryWakeups) finish();
       await loopPromise?.catch?.(() => {});
+      if (executions.length) {
+        let settleTimer;
+        await Promise.race([
+          Promise.allSettled(executions),
+          new Promise((resolve) => { settleTimer = setTimeout(resolve, 1_000); })
+        ]);
+        clearTimeout(settleTimer);
+      }
       loopPromise = null;
     }
   };
@@ -446,5 +673,8 @@ async function readJsonResponseLimited(response, maxBytes) {
 
 function publicNodeError(error) {
   const code = typeof error?.code === "string" ? error.code.slice(0, 64) : "";
-  return /^[a-z0-9_-]+$/i.test(code) ? code : "node-capability-command-failed";
+  if (/^[a-z0-9_-]+$/i.test(code)) return code;
+  return error?.nodeSequenceConsumed === true
+    ? "node-capability-command-failed"
+    : "node-capability-command-rejected";
 }

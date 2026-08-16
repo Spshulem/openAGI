@@ -3061,10 +3061,18 @@ test("computer-use: input-synthesis tools refuse honestly (record intent, then t
   const log = new ComputerUseLog({ dir });
   registerComputerUseTools(registry, { tools: registry, computerUseLog: log, observations: { search: async () => [] } });
 
-  // Open a session (this genuinely works).
+  // Seed the already-approved observation-only session directly. The public
+  // start tool now (correctly) requires an immutable, online target before it
+  // can consume an approval; this regression is specifically about the
+  // no-node input handlers remaining honest once a legacy/local session exists.
   const context = { sessionId: "test:honest" };
-  const start = await registry.get("start_computer_use_session").handler({ goal: "do a thing" }, context);
-  assert.ok(start.sessionId);
+  const start = log.startSession({
+    goal: "do a thing",
+    approvedBy: "user",
+    sourceSessionId: context.sessionId,
+    targetNodeId: null
+  });
+  assert.ok(start.id);
 
   // computer_click must THROW — never report success.
   await assert.rejects(
@@ -3073,7 +3081,7 @@ test("computer-use: input-synthesis tools refuse honestly (record intent, then t
   );
 
   // But the intent must still be recorded to the audit log, marked unavailable.
-  const actions = log.listActions({ sessionId: start.sessionId });
+  const actions = log.listActions({ sessionId: start.id });
   const click = actions.find((a) => a.kind === "click");
   assert.ok(click, "click intent recorded for audit");
   assert.equal(click.status, "unavailable");

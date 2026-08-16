@@ -171,3 +171,21 @@ test("resolveSweep holds fresh cron/autopilot fires open for the followup window
   assert.equal(late[0].source, "system-inferred");
   assert.equal(store.outcomes.get(o.id).qualityScore, 0.7);
 });
+
+test("resolveSweep scores an approved local tool call after the feedback window", () => {
+  const store = new OutcomeStore({ dir: tmpDir("sweep-approved-tool-") });
+  const outcome = store.record({
+    kind: "tool-call",
+    refId: "act-approved",
+    sessionId: "session-local",
+    toolCalls: [{ name: "add_task", ok: true }],
+    metadata: { approvedExecution: true }
+  });
+
+  const early = store.resolveSweep();
+  assert.equal(early.length, 0);
+  const late = store.resolveSweep({ now: new Date(Date.now() + 31 * 60 * 1000) });
+  assert.equal(late.length, 1);
+  assert.equal(store.outcomes.get(outcome.id).qualityScore, 0.7);
+  assert.equal(store.outcomes.get(outcome.id).source, "system-inferred");
+});

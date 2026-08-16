@@ -942,24 +942,24 @@ test("the runtime registers daily deterministic triage while model review stays 
   assert.equal(job.task, "backlog-triage");
   assert.equal(job.enabled, true);
   assert.equal(job.intervalMs, null);
-  assert.equal(job.dailyAt, "05:15");
+  assert.equal(job.dailyAt, "05:45");
   const next = new Date(job.nextRunAt);
   assert.equal(next.getHours(), 5);
-  assert.equal(next.getMinutes(), 15);
+  assert.equal(next.getMinutes(), 45);
   assert.ok(runtime.backlogTriage instanceof BacklogTriage);
 });
 
-test("backlog hygiene stays at 05:15 after a late catch-up and disabled migration stays unscheduled", async () => {
+test("backlog hygiene stays at 05:45 after a late catch-up and disabled migration stays unscheduled", async () => {
   const { CronScheduler } = await import("../src/cron-scheduler.js");
   const cron = new CronScheduler();
   const late = new Date(2026, 7, 14, 12, 0, 0, 0);
-  const job = cron.addJob({ id: "backlog-triage", task: "backlog-triage", dailyAt: "05:15" });
+  const job = cron.addJob({ id: "backlog-triage", task: "backlog-triage", dailyAt: "05:45" });
   const next = cron.computeNextRun(job, late);
   assert.equal(next.getHours(), 5);
-  assert.equal(next.getMinutes(), 15);
+  assert.equal(next.getMinutes(), 45);
   assert.equal(next.getDate(), late.getDate() + 1);
 
-  cron.updateJob(job.id, { enabled: false, intervalMs: null, dailyAt: "05:15", nextRunAt: null });
+  cron.updateJob(job.id, { enabled: false, intervalMs: null, dailyAt: "05:45", nextRunAt: null });
   assert.equal(cron.listJobs().find((entry) => entry.id === job.id).nextRunAt, null);
 });
 

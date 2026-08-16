@@ -391,8 +391,8 @@ export class MemorySystem {
   /**
    * Collapse exact duplicate automated memories already present in a store.
    * `archive` is called before each removal; if it throws, that row stays
-   * active. FileBackedMemorySystem supplies an append-only archive callback,
-   * which makes every consolidation recoverable.
+   * active. FileBackedMemorySystem stores a content-free audit receipt so the
+   * maintenance decision remains traceable without duplicating private text.
    */
   consolidateAutomatedDuplicates({ maxRemovals = 250, archive = null, now = new Date() } = {}) {
     const cap = Number.isFinite(Number(maxRemovals)) ? Math.max(0, Math.trunc(Number(maxRemovals))) : 250;
@@ -433,6 +433,7 @@ export class MemorySystem {
       );
       const canonical = ordered[0];
       let merged = 0;
+      const mergedItems = [canonical];
       for (const duplicate of ordered.slice(1)) {
         if (removed.length >= cap) break;
         try {
@@ -443,15 +444,16 @@ export class MemorySystem {
         this.items.delete(duplicate.id);
         this.dropPrincipleVector(duplicate.id);
         removed.push(duplicate);
+        mergedItems.push(duplicate);
         merged += 1;
       }
       if (merged > 0) {
-        canonical.strength = Math.max(canonical.strength ?? 0, ...ordered.map((item) => item.strength ?? 0));
-        canonical.repetition = clamp(Math.max(canonical.repetition ?? 0, ...ordered.map((item) => item.repetition ?? 0)));
-        canonical.lastObservedAt = latestIso(ordered.map((item) => item.lastObservedAt ?? item.createdAt));
-        canonical.lastAccessedAt = latestIso(ordered.map((item) => item.lastAccessedAt ?? item.createdAt));
+        canonical.strength = Math.max(canonical.strength ?? 0, ...mergedItems.map((item) => item.strength ?? 0));
+        canonical.repetition = clamp(Math.max(canonical.repetition ?? 0, ...mergedItems.map((item) => item.repetition ?? 0)));
+        canonical.lastObservedAt = latestIso(mergedItems.map((item) => item.lastObservedAt ?? item.createdAt));
+        canonical.lastAccessedAt = latestIso(mergedItems.map((item) => item.lastAccessedAt ?? item.createdAt));
         canonical.lastDecayedAt = latestIso([
-          ...ordered.map((item) => item.lastDecayedAt),
+          ...mergedItems.map((item) => item.lastDecayedAt),
           canonical.lastObservedAt
         ]) ?? canonical.lastDecayedAt;
         canonical.metadata = {

@@ -6,7 +6,7 @@ import { createDefaultRuntime } from "./abi-runtime.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
 import {
@@ -42,6 +42,7 @@ import {
   createImessageNodeCapability,
   isImessageSearchEnabled
 } from "./integrations/imessage-node-capability.js";
+import { registerImessageSearchTool } from "./integrations/imessage-search-tool.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -128,6 +129,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }
   };
   runtime.nodeCapabilities = capabilityFacade;
+  // AbiRuntime is constructed before the hosted node-capability facade exists,
+  // so its first registration attempt cannot see paired iMessage providers.
+  // Register again after the facade is installed; the helper is idempotent and
+  // preserves an already-configured legacy transport.
+  if (runtime.integrations !== false && runtime.tools?.register) registerImessageSearchTool(runtime);
   const nodesCachePath = path.join(dataDir, "nodes", "cache.json");
   // Service nodes (see service-nodes.js) are configured in the environment,
   // not registered by heartbeat. One probe instance per interface so its
@@ -363,22 +369,43 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     };
   }
 
-  const queuedApprovalContinuations = new Set();
-  function queueApprovalContinuation(action, invokeResult) {
-    if (
-      action?.toolName !== "start_computer_use_session"
-      || !invokeResult?.ok
-      || !channels?.handleLocalMessage
-      || !action.context?.sessionId
-      || queuedApprovalContinuations.has(action.id)
-    ) {
-      return null;
+  const approvalContinuationTimers = new Set();
+  let approvalContinuationsClosing = false;
+
+  function successfulContinuationAlreadyPersisted(action, requestId) {
+    const session = runtime.agentHost?.store?.getSession?.(action.context?.sessionId);
+    return Boolean(session?.messages?.some((message) =>
+      message.role === "assistant"
+      && message.metadata?.requestId === requestId
+      && message.metadata?.status !== "failed"
+    ));
+  }
+
+  function scheduleApprovalContinuation(actionId, delayMs = 0) {
+    if (approvalContinuationsClosing) return;
+    const timer = setTimeout(() => {
+      approvalContinuationTimers.delete(timer);
+      deliverApprovalContinuation(actionId).catch(() => {});
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    approvalContinuationTimers.add(timer);
+  }
+
+  async function deliverApprovalContinuation(actionId) {
+    if (approvalContinuationsClosing) return;
+    const claim = runtime.pendingActions?.claimContinuation?.(actionId, { maxAttempts: 5 });
+    if (!claim) return;
+    const { action, continuation, deliveryId } = claim;
+    const requestId = continuation.requestId;
+    const sessionId = continuation.sessionId;
+    if (successfulContinuationAlreadyPersisted(action, requestId)) {
+      runtime.pendingActions.finishContinuation(actionId, { deliveryId, delivered: true });
+      return;
     }
-    queuedApprovalContinuations.add(action.id);
     const goal = String(action.args?.goal ?? action.summary ?? "the approved computer-use goal").slice(0, 500);
-    const sessionId = action.context.sessionId;
-    setImmediate(() => {
-      channels.handleLocalMessage({
+    let toolAttempted = false;
+    try {
+      await channels.handleLocalMessage({
         channel: action.context.channel ?? "local",
         from: action.context.from ?? "user",
         agentId: action.context.agentId ?? "main",
@@ -387,16 +414,97 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           + goal
           + "\nContinue the original request now. First call computer_use_status and use the active session. Do not call start_computer_use_session again.",
         metadata: {
-          requestId: "approval_" + action.id,
+          requestId,
           runtimeEvent: "approval",
-          approvalActionId: action.id
+          approvalActionId: action.id,
+          continuationAttempt: continuation.attempts
         }
-      }).catch((error) => {
-        logAgentFailure(error, { sessionId, requestId: "approval_" + action.id });
+      }, {
+        // Once a model has reached any tool, replaying a failed turn is not
+        // provably safe: a physical action may have completed before the
+        // provider failed. Only pre-tool transport/provider failures retry.
+        onProgress(progress) {
+          if (progress?.stage === "tool") toolAttempted = true;
+        }
       });
-    });
-    return { status: "queued", sessionId };
+      runtime.pendingActions.finishContinuation(actionId, { deliveryId, delivered: true });
+    } catch (error) {
+      logAgentFailure(error, { sessionId, requestId });
+      if (toolAttempted) {
+        const active = runtime.computerUseLog?.activeSessionFor?.(sessionId) ?? null;
+        if (active) {
+          try {
+            await runtime.abortComputerUseSession?.(
+              active,
+              "continuation failed after a tool attempt; renew approval before resuming"
+            );
+          } catch { /* main-side authority is already revoked synchronously */ }
+        }
+        runtime.pendingActions.finishContinuation(actionId, {
+          deliveryId,
+          delivered: false,
+          terminal: true,
+          error: "manual reapproval required after a tool attempt"
+        });
+        return;
+      }
+      const failed = runtime.pendingActions.finishContinuation(actionId, {
+        deliveryId,
+        delivered: false,
+        // Durable state is deliberately categorical; provider diagnostics stay
+        // in protected logs and cannot leak into searchable approval history.
+        error: "transient continuation failure"
+      });
+      if (failed && failed.attempts < 5 && !approvalContinuationsClosing) {
+        const delays = [1_000, 5_000, 30_000, 120_000];
+        scheduleApprovalContinuation(actionId, delays[Math.min(failed.attempts - 1, delays.length - 1)]);
+      }
+    }
   }
+
+  function queueApprovalContinuation(action, invokeResult, { resetFailed = false } = {}) {
+    if (
+      action?.toolName !== "start_computer_use_session"
+      || !invokeResult?.ok
+      || !channels?.handleLocalMessage
+      || !action.context?.sessionId
+    ) {
+      return null;
+    }
+    const sessionId = action.context.sessionId;
+    const continuation = runtime.pendingActions?.prepareContinuation?.(action.id, {
+      requestId: "approval_" + action.id,
+      sessionId,
+      resetFailed
+    });
+    if (!continuation) return null;
+    if (["pending", "failed"].includes(continuation.status)) scheduleApprovalContinuation(action.id);
+    return {
+      status: continuation.status === "delivered"
+        ? "delivered"
+        : continuation.status === "blocked"
+          ? "manual-reapproval-required"
+          : "queued",
+      sessionId
+    };
+  }
+
+  // Recover approvals committed before a daemon exit or transient provider
+  // failure. A deterministic request id lets us recognize a response that was
+  // persisted before the delivery receipt and avoid re-running it on restart.
+  setImmediate(() => {
+    for (const action of runtime.pendingActions?.recoverableContinuations?.({
+      toolName: "start_computer_use_session"
+    }) ?? []) {
+      queueApprovalContinuation(action, { ok: true });
+    }
+    for (const action of runtime.pendingActions?.list?.() ?? []) {
+      if (action.toolName === "start_computer_use_session"
+          && action.status === "approved" && action.error == null && !action.continuation) {
+        queueApprovalContinuation(action, { ok: true });
+      }
+    }
+  });
 
   let tickerHandle = null;
   let heartbeatHandle = null;
@@ -446,6 +554,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         const provider = activeNodeCapabilityProviders().get(command.capability);
         if (!provider) throw new Error("node capability is disabled or unavailable");
+        const revocation = command.capability === "computer-use" && command.operation === "session.end";
+        // Stop is an authenticated, idempotent lease revocation. Do not put a
+        // potentially slow helper health probe in front of it: that would let
+        // input continue while the user is explicitly trying to stop it.
+        if (revocation) return await provider.invoke(command.operation, command.payload ?? {});
         const capability = (await provider.health()).capability;
         if (capability?.ready !== true || !capability.operations?.includes?.(command.operation)) {
           throw new Error(capability?.detail || "node capability operation is not ready");
@@ -473,7 +586,6 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     // safely retry with the same token after a restart instead of becoming
     // permanently locked out of its stable node id.
     if (pairing.nodeToken && pairing.nodeEnrollmentConfirmed === true) return pairing.nodeToken;
-    if (!pairing.token) throw new Error("node enrollment requires a one-time main pairing credential");
     const nodeToken = pairing.nodeToken ?? randomBytes(32).toString("base64url");
     pairing.nodeToken = nodeToken;
     pairing.nodeEnrollmentConfirmed = false;
@@ -491,7 +603,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${pairing.token}`
+          ...(pairing.token ? { authorization: `Bearer ${pairing.token}` } : {})
         },
         body: JSON.stringify({ nodeId: identity.nodeId, nodeToken }),
         redirect: "manual",
@@ -519,7 +631,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const pathname = url.pathname;
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
-        "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke"
+        "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
+        "/nodes/capture-memory"
       ].includes(pathname);
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message");
@@ -562,9 +675,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const extraCookies = [];
       const setupBypass = setupActive && setupRoutes;
       if (!isPublicRoute(pathname) && !setupBypass) {
-        const auth = (nodeScopedRoute || nodeClientRoute) && requestNodeId
-          ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
-          : checkAuth(req, url, getAuthToken());
+        const auth = nodeScopedRoute
+          ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
+          : nodeClientRoute && requestNodeId
+            ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
+            : checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
           // Browsers (Accept: text/html) get the login form on ANY failed GET,
           // not just GET /. After sign-in, redirect back to the original path.
@@ -786,6 +901,43 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         });
         return sendJson(res, 200, { ok: true });
       }
+      if (method === "POST" && pathname === "/nodes/capture-memory") {
+        const body = await readJsonLimited(req, 12 * 1024);
+        const keys = Object.keys(body ?? {});
+        if (keys.some((key) => !["content", "tags", "importance"].includes(key))) {
+          return sendJson(res, 400, { error: "capture contains unsupported fields" });
+        }
+        const content = typeof body?.content === "string" ? body.content.trim() : "";
+        if (!content || content.includes("\0") || Buffer.byteLength(content, "utf8") > 8 * 1024) {
+          return sendJson(res, 400, { error: "content must be non-empty text of at most 8 KiB without NUL" });
+        }
+        const rawTags = body.tags ?? [];
+        if (!Array.isArray(rawTags) || rawTags.length > 16
+            || rawTags.some((tag) => typeof tag !== "string" || !tag.trim()
+              || tag.includes("\0") || Buffer.byteLength(tag, "utf8") > 128)) {
+          return sendJson(res, 400, { error: "tags must be at most 16 bounded non-empty strings" });
+        }
+        const importance = body.importance ?? "normal";
+        if (!new Set(["low", "normal", "high"]).has(importance)) {
+          return sendJson(res, 400, { error: "importance must be low, normal, or high" });
+        }
+        const tags = [...new Set(["imessage", "node-capture", ...rawTags.map((tag) => tag.trim())])];
+        const item = runtime.memory.remember(
+          {
+            source: "imessage-bridge",
+            scope: "main",
+            content,
+            tags,
+            risk: importance === "high" ? 0.8 : importance === "low" ? 0.2 : 0.45,
+            specificity: 0.7,
+            repetition: 0.4,
+            novelty: 0.5,
+            metadata: { nodeId: requestNodeId }
+          },
+          { source: "imessage-bridge", strength: importance === "high" ? 0.85 : 0.6 }
+        );
+        return sendJson(res, 200, { id: item.id, tier: item.tier });
+      }
       if (method === "POST" && pathname === "/nodes/revoke") {
         const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
         if (body.nodeId !== requestNodeId) {
@@ -808,7 +960,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 409, { error: "node must heartbeat before polling for control work" });
         }
         const timeoutMs = Math.max(1, Math.min(25_000, Number(body.timeoutMs) || 20_000));
-        const command = await nodeControlBroker.poll(body.nodeId, body.capabilities, { timeoutMs });
+        const command = await nodeControlBroker.poll(body.nodeId, body.capabilities, {
+          timeoutMs,
+          revocationsOnly: body.revocationsOnly === true
+        });
         return sendJson(res, 200, { command });
       }
       if (method === "POST" && pathname === "/nodes/control/result") {
@@ -1118,7 +1273,36 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
-        const body = await readJson(req);
+        let body = await readJsonLimited(req, requestNodeId ? 128 * 1024 : 2 * 1024 * 1024);
+        if (requestNodeId) {
+          const allowed = new Set(["text", "from", "sessionId"]);
+          if (!body || typeof body !== "object" || Array.isArray(body)
+              || Object.keys(body).some((key) => !allowed.has(key))) {
+            return sendJson(res, 400, { error: "node message contains unsupported fields" });
+          }
+          if (typeof body.text !== "string" || !body.text.trim()
+              || body.text.includes("\0") || Buffer.byteLength(body.text, "utf8") > 64 * 1024) {
+            return sendJson(res, 400, { error: "node message text must be non-empty and at most 64 KiB" });
+          }
+          for (const field of ["from", "sessionId"]) {
+            if (body[field] !== undefined && (typeof body[field] !== "string"
+                || !body[field] || body[field].includes("\0")
+                || Buffer.byteLength(body[field], "utf8") > 500)) {
+              return sendJson(res, 400, { error: `${field} must be bounded non-empty text` });
+            }
+          }
+          // A node credential proves only which installation sent the
+          // message. It does not grant authority to impersonate an owner chat
+          // or select an existing session. Keep the caller's bounded `from`
+          // value solely as a conversation discriminator (the iMessage bridge
+          // uses one per sender/group), then bind both provenance and the
+          // durable session to the authenticated node id. Hashing the two
+          // components separately makes the namespace unambiguous even when a
+          // custom node id or conversation contains `:`. A supplied sessionId
+          // is deliberately ignored, so a leaked owner session id can never
+          // inherit that chat's approved computer-use lease.
+          body = bindScopedNodeMessage(body, requestNodeId);
+        }
         // `ephemeral` (no session/memory/task) is an INTERNAL flag for the
         // setup-test path only — never let a public /message caller set it to
         // evade persistence.
@@ -1214,8 +1398,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const until = url.searchParams.get("until") ?? null;
         const app = url.searchParams.get("app") ?? null;
         const machine = url.searchParams.get("machine") ?? null;
+        const kinds = url.searchParams.get("kinds")?.split(",").map((kind) => kind.trim()).filter(Boolean) ?? null;
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
-        const results = await runtime.observations.search({ query, since, until, app, machine, limit });
+        const results = await runtime.observations.search({ query, since, until, app, machine, kinds, limit });
         return sendJson(res, 200, results);
       }
       if (method === "GET" && pathname === "/observations/timeline") {
@@ -1611,6 +1796,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (action.status === "expired") {
           return sendJson(res, 410, { error: "approval expired; request it again" });
         }
+        if (action.status === "approved" && action.error == null
+            && action.toolName === "start_computer_use_session") {
+          const continuation = queueApprovalContinuation(action, { ok: true }, { resetFailed: true });
+          return sendJson(res, 200, {
+            ok: true,
+            alreadyApproved: true,
+            ...(continuation ? { continuation } : {})
+          });
+        }
         if (action.status !== "pending") return sendJson(res, 409, { error: `action already ${action.status}` });
         const claim = runtime.pendingActions?.claimForExecution?.(id, { claimedBy: "user" });
         if (!claim) {
@@ -1646,11 +1840,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!action) return sendJson(res, 404, { error: "unknown pending action" });
         if (action.status !== "pending") return sendJson(res, 409, { error: `action already ${action.status}` });
         const body = await readJson(req).catch(() => ({}));
-        runtime.pendingActions.decide(id, {
+        const decided = runtime.pendingActions.decide(id, {
           decision: "deny",
           decidedBy: "user",
           error: body.reason ?? "denied by user"
         });
+        if (decided?.status !== "denied") {
+          return sendJson(res, 409, { error: `action already ${decided?.status ?? "claimed"}` });
+        }
         return sendJson(res, 200, { id, status: "denied" });
       }
       if (method === "GET" && pathname === "/computer-use/log") {
@@ -2627,6 +2824,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     },
     close() {
       return new Promise((resolve, reject) => {
+        approvalContinuationsClosing = true;
+        for (const timer of approvalContinuationTimers) clearTimeout(timer);
+        approvalContinuationTimers.clear();
         if (tickerHandle) clearInterval(tickerHandle);
         if (heartbeatHandle) clearInterval(heartbeatHandle);
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
@@ -2670,6 +2870,20 @@ function acceptsEventStream(req) {
   return String(req.headers.accept ?? "")
     .split(",")
     .some((part) => part.trim().toLowerCase().split(";")[0] === "text/event-stream");
+}
+
+function bindScopedNodeMessage(body, requestNodeId) {
+  const conversation = body.from ?? "cli";
+  const nodeNamespace = createHash("sha256").update(requestNodeId, "utf8").digest("base64url");
+  const conversationNamespace = createHash("sha256").update(conversation, "utf8").digest("base64url");
+  return {
+    text: body.text,
+    channel: "node",
+    from: `node:${requestNodeId}:${conversationNamespace}`,
+    agentId: "main",
+    sessionId: `node:${nodeNamespace}:${conversationNamespace}:main`,
+    metadata: { sourceNodeId: requestNodeId }
+  };
 }
 
 // Stream lifecycle for POST /message + Accept: text/event-stream:
@@ -3466,6 +3680,147 @@ function renderApp() {
     .err { color: var(--err); }
     .empty { color: var(--muted); padding: 16px; text-align: center; }
 
+    /* Computer history — a quiet, scan-first timeline based on the native
+       desktop history pattern. Capture controls stay honest: this web surface
+       can verify received observations, while pause/privacy remain owned by
+       the Mac app that performs capture. */
+    .history-page { padding-top: var(--space-6); }
+    .history-page-header { margin-bottom: var(--space-5); }
+    .history-page-header h2 {
+      margin: 0; font-size: 28px; line-height: 1.2; font-weight: 650;
+      letter-spacing: -0.025em;
+    }
+    .history-page-subtitle {
+      margin: var(--space-2) 0 0; max-width: 680px;
+      color: var(--muted-foreground); font-size: var(--font-size-sm);
+    }
+    .history-status-card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); overflow: hidden;
+    }
+    .history-status-row {
+      display: flex; align-items: center; gap: var(--space-4);
+      padding: var(--space-4) var(--space-5);
+    }
+    .history-status-row + .history-status-row { border-top: 1px solid var(--border); }
+    .history-status-copy { flex: 1; min-width: 0; }
+    .history-status-title {
+      display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+      font-weight: 650; font-size: var(--font-size-base);
+    }
+    .history-status-description {
+      margin: var(--space-1) 0 0; color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.5;
+    }
+    .history-status-pill {
+      display: inline-flex; align-items: center; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--muted-bg);
+      color: var(--muted-foreground); padding: 3px 9px;
+      font-size: var(--font-size-xs); font-weight: 600; white-space: nowrap;
+    }
+    .history-status-pill.receiving {
+      color: var(--accent-foreground); background: var(--accent-bg);
+      border-color: rgba(111,225,177,.28);
+    }
+    .history-status-pill.problem {
+      color: var(--warn); background: rgba(240,180,84,.08);
+      border-color: rgba(240,180,84,.3);
+    }
+    .history-control-help {
+      margin: 0 var(--space-5) var(--space-4); padding: 10px 12px;
+      border-radius: var(--radius); border: 1px solid var(--border);
+      background: var(--muted-bg); color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.5;
+    }
+    .history-control-help[hidden] { display: none; }
+    .history-section { margin-top: 36px; }
+    .history-section-header {
+      display: flex; align-items: flex-end; justify-content: space-between;
+      gap: var(--space-4); margin-bottom: var(--space-4);
+    }
+    .history-section-heading { min-width: 0; }
+    .history-section-heading h3 {
+      margin: 0; color: var(--foreground); font-size: 20px; line-height: 1.25;
+      text-transform: none; letter-spacing: -0.015em; font-weight: 650;
+    }
+    .history-section-meta {
+      margin-top: 3px; color: var(--muted-foreground);
+      font-size: var(--font-size-xs);
+    }
+    .history-filters {
+      display: grid; grid-template-columns: minmax(220px, 1fr) 170px;
+      gap: var(--space-2); margin-bottom: var(--space-4);
+    }
+    .history-filter-label {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+    .history-days {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); overflow: hidden;
+    }
+    .history-day { padding: var(--space-4) var(--space-5) 0; }
+    .history-day + .history-day { border-top: 1px solid var(--border); }
+    .history-day-title {
+      margin: 0; padding-bottom: var(--space-3); color: var(--foreground);
+      font-size: var(--font-size-base); font-weight: 650;
+    }
+    .history-entry {
+      display: grid; grid-template-columns: 88px minmax(0, 1fr);
+      gap: var(--space-4);
+    }
+    .history-entry-time {
+      padding-top: 2px; color: var(--muted-foreground);
+      font-size: var(--font-size-xs); text-align: right; white-space: nowrap;
+    }
+    .history-entry-body {
+      min-width: 0; border-left: 1px solid var(--border);
+      padding: 0 0 var(--space-5) var(--space-4);
+    }
+    .history-entry-title {
+      margin: 0; color: var(--foreground); font-size: var(--font-size-base);
+      font-weight: 600; line-height: 1.4; overflow-wrap: anywhere;
+    }
+    .history-entry-summary {
+      margin: var(--space-1) 0 0; color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.55; overflow-wrap: anywhere;
+    }
+    .history-apps {
+      display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--space-2);
+    }
+    .history-app-label {
+      display: inline-flex; align-items: center; min-width: 0;
+      padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--background);
+      color: var(--muted-foreground); font-size: var(--font-size-xs);
+      white-space: nowrap; max-width: 260px; overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .history-state {
+      padding: 56px var(--space-5); text-align: center;
+      color: var(--muted-foreground); font-size: var(--font-size-sm);
+    }
+    .history-state strong {
+      display: block; margin-bottom: var(--space-1);
+      color: var(--foreground); font-size: var(--font-size-base);
+    }
+    .history-state .ui-btn { margin-top: var(--space-3); }
+    .history-load-more { display: flex; justify-content: center; margin-top: var(--space-4); }
+    .history-load-more[hidden] { display: none; }
+    @media (max-width: 720px) {
+      .history-page { padding: var(--space-5) var(--space-4) 48px; }
+      .history-page-header h2 { font-size: 24px; }
+      .history-status-row { align-items: flex-start; flex-wrap: wrap; padding: var(--space-4); }
+      .history-status-row .ui-btn { width: 100%; }
+      .history-control-help { margin-left: var(--space-4); margin-right: var(--space-4); }
+      .history-section-header { align-items: stretch; flex-direction: column; }
+      .history-section-header .ui-btn { width: 100%; }
+      .history-filters { grid-template-columns: 1fr; }
+      .history-day { padding-left: var(--space-4); padding-right: var(--space-4); }
+      .history-entry { grid-template-columns: 66px minmax(0, 1fr); gap: var(--space-2); }
+      .history-entry-body { padding-left: var(--space-3); }
+    }
+
     /* ─── Primitive components (shadcn-style, vanilla CSS) ───────────────
        Every new feature should compose these instead of inline styles. */
 
@@ -3651,7 +4006,7 @@ function renderApp() {
           <div class="nav-more-section">
             <div class="nav-more-label">Diagnostics</div>
             <button data-tab="today" title="What you got done today — completed tasks, skills run, actions approved, time tracked, themes.">Today</button>
-            <button data-tab="activity" title="Ambient capture log — what you were doing on screen (if capture is enabled).">Activity</button>
+            <button data-tab="activity" title="A day-by-day timeline of activity received from screen capture.">Computer History</button>
             <button data-tab="computer-use" title="Computer use (beta) — every action the agent intended to take, with the reasoning it gave.">Computer Use</button>
             <button data-tab="budget" title="Today's LLM spend + 14-day history.">Credits</button>
             <button data-tab="outcomes" title="Quality scores for completed agent work, 7d + 30d rolling.">Outcomes</button>
@@ -4638,16 +4993,16 @@ function renderChat() {
   if (composerBlocked) input.placeholder = "Wait for the current request to finish…";
   // ?compose=<intent> seeds the input with a starter sentence so the user
   // can finish typing and Enter — agent picks up via add_task /
-  // connect_catalog_mcp / etc tools. Used by the menu-bar "+ Add task"
-  // button so its click drops you straight into a conversation rather
-  // than a structured form.
+  // connect_catalog_mcp / etc tools. Menu-bar shortcuts and Computer
+  // History use this to land in a ready-to-edit prompt.
   const composeIntent = new URLSearchParams(window.location.search).get("compose");
-  if (composeIntent && state.messages.length === 0) {
+  if (composeIntent && (state.messages.length === 0 || composeIntent === "ask-history")) {
     const seed = ({
       "add-task": "Add a task: ",
       "add-mcp": "Connect this MCP: ",
       "schedule": "Remind me to ",
-      "remember": "Remember that "
+      "remember": "Remember that ",
+      "ask-history": "Summarize what I was working on recently from my computer history, group it by workstream, and tell me where I left off."
     })[composeIntent];
     if (seed) {
       input.value = seed;
@@ -7594,52 +7949,130 @@ async function renderComputerUse() {
 }
 
 async function renderActivity() {
-  const stats = await fetchJson("/observations/stats").catch(() => ({}));
-  state.activityFilter = state.activityFilter || { query: "" };
+  // The store records individual focus changes. Pull a bounded window large
+  // enough to distill into useful ten-minute work periods instead of showing
+  // a noisy wall of repeated bundle identifiers.
+  const HISTORY_PAGE_SIZE = 400;
+  state.activityFilter = state.activityFilter || { query: "", since: "7d", limit: HISTORY_PAGE_SIZE };
+  if (typeof state.activityFilter.since !== "string") state.activityFilter.since = "7d";
+  if (!Number.isFinite(state.activityFilter.limit)) state.activityFilter.limit = HISTORY_PAGE_SIZE;
   main.innerHTML = \`
-    <div class="pane">
-      <h2>Activity <span class="muted" style="font-weight:400;font-size:14px;">· \${stats.mode === "sqlite" ? \`\${stats.activity ?? 0} events · \${stats.frames ?? 0} frames\` : \`mode: \${escapeHtml(stats.mode ?? "—")}\`}</span></h2>
-
-      \${stats.mode !== "sqlite" && stats.mode !== "fallback-jsonl"
-        ? '<div class="card warn-banner"><div class="name">Capture not running</div><div class="desc">Install the Mac app and grant Screen Recording + Accessibility permissions, or this view will be empty. Activity events appear as soon as the Mac app starts pushing.</div></div>'
-        : ""}
-
-      <div class="row" style="gap:10px;margin:14px 0;">
-        <input type="search" id="actSearch" placeholder="Search OCR text or window titles…" value="\${escapeHtml(state.activityFilter.query)}" style="flex:1;">
-        <select id="actSince" style="width:160px;">
-          <option value="">All time</option>
-          <option value="1h">Last hour</option>
-          <option value="6h">Last 6 hours</option>
-          <option value="24h" selected>Last 24 hours</option>
-          <option value="7d">Last 7 days</option>
-        </select>
+    <div class="pane history-page">
+      <div class="history-page-header">
+        <h2>Computer history</h2>
+        <p class="history-page-subtitle">A timeline of activity OpenAGI has received from your capture Mac. Search it when you need to remember where you left off.</p>
       </div>
 
-      <h3>Timeline (last 24h)</h3>
-      <div id="timeline" class="card" style="padding:14px;"></div>
+      <section id="historyStatusCard" class="history-status-card" aria-label="Computer history capture status" aria-live="polite" aria-busy="true">
+        <div class="history-status-row">
+          <div class="history-status-copy">
+            <div class="history-status-title">Checking capture status</div>
+            <p class="history-status-description">Looking for the most recently received activity.</p>
+          </div>
+          <span class="history-status-pill">Checking…</span>
+        </div>
+      </section>
 
-      <h3>Results</h3>
-      <div id="actResults" class="grid"></div>
+      <section class="history-section" aria-labelledby="historyHeading">
+        <div class="history-section-header">
+          <div class="history-section-heading">
+            <h3 id="historyHeading">History</h3>
+            <div id="historyResultMeta" class="history-section-meta">Loading activity…</div>
+          </div>
+          <button id="askHistory" class="ui-btn ui-btn-secondary" type="button">Ask about your history</button>
+        </div>
+
+        <div class="history-filters">
+          <label class="history-filter-label" for="actSearch">Search computer history</label>
+          <input class="ui-input" type="search" id="actSearch" placeholder="Search window titles or captured text…" value="\${escapeHtml(state.activityFilter.query)}" autocomplete="off">
+          <label class="history-filter-label" for="actSince">History time range</label>
+          <select class="ui-select" id="actSince">
+            <option value="1h" \${state.activityFilter.since === "1h" ? "selected" : ""}>Last hour</option>
+            <option value="6h" \${state.activityFilter.since === "6h" ? "selected" : ""}>Last 6 hours</option>
+            <option value="24h" \${state.activityFilter.since === "24h" ? "selected" : ""}>Last 24 hours</option>
+            <option value="7d" \${state.activityFilter.since === "7d" ? "selected" : ""}>Last 7 days</option>
+            <option value="" \${state.activityFilter.since === "" ? "selected" : ""}>All time</option>
+          </select>
+        </div>
+
+        <div id="actResults" class="history-days" aria-live="polite" aria-busy="true">
+          <div class="history-state"><strong>Loading computer history</strong>Gathering the latest activity into a timeline.</div>
+        </div>
+        <div id="historyLoadMoreWrap" class="history-load-more" hidden>
+          <button id="historyLoadMore" class="ui-btn ui-btn-secondary" type="button">Load more</button>
+        </div>
+      </section>
     </div>
   \`;
-  const reload = async () => {
-    const since = sinceFromOption($("actSince").value);
-    const q = $("actSearch").value.trim();
+
+  let listRequest = 0;
+  const loadStatus = async () => {
+    const card = $("historyStatusCard");
+    if (card) card.setAttribute("aria-busy", "true");
+    try {
+      const [stats, latest] = await Promise.all([
+        fetchJson("/observations/stats"),
+        fetchJson("/observations/search?limit=1")
+      ]);
+      if (state.tab !== "activity") return;
+      renderHistoryStatus(stats, Array.isArray(latest) ? latest[0] : null, null, loadStatus);
+    } catch (error) {
+      if (state.tab !== "activity") return;
+      renderHistoryStatus(null, null, error, loadStatus);
+    }
+  };
+  const reload = async ({ resetLimit = false } = {}) => {
+    const search = $("actSearch");
+    const range = $("actSince");
+    const list = $("actResults");
+    const loadWrap = $("historyLoadMoreWrap");
+    if (!search || !range || !list || !loadWrap) return;
+    if (resetLimit) state.activityFilter.limit = HISTORY_PAGE_SIZE;
+    const since = sinceFromOption(range.value);
+    const q = search.value.trim();
     state.activityFilter.query = q;
-    const results = await fetchJson("/observations/search?" + new URLSearchParams({
-      ...(q ? { q } : {}),
-      ...(since ? { since } : {}),
-      limit: "60"
-    }).toString());
-    renderActivityResults(results);
+    state.activityFilter.since = range.value;
+    const requestedLimit = state.activityFilter.limit;
+    const requestId = ++listRequest;
+    list.setAttribute("aria-busy", "true");
+    if (resetLimit) {
+      list.innerHTML = '<div class="history-state"><strong>Loading computer history</strong>Gathering matching activity.</div>';
+    }
+    loadWrap.hidden = true;
+    try {
+      const results = await fetchJson("/observations/search?" + new URLSearchParams({
+        ...(q ? { q } : {}),
+        ...(since ? { since } : {}),
+        kinds: "activity,frame",
+        limit: String(requestedLimit + 1)
+      }).toString());
+      if (requestId !== listRequest || state.tab !== "activity") return;
+      const rows = (Array.isArray(results) ? results : [])
+        .slice(0, requestedLimit)
+        .filter((row) => row?.kind !== "transcript");
+      const hasMore = Array.isArray(results) && results.length > requestedLimit;
+      renderActivityResults(rows, { query: q, hasMore });
+    } catch (error) {
+      if (requestId !== listRequest || state.tab !== "activity") return;
+      renderActivityError(error, () => reload({ resetLimit: true }));
+    }
   };
-  const reloadTimeline = async () => {
-    const tl = await fetchJson("/observations/timeline?since=" + encodeURIComponent(new Date(Date.now() - 24*3600*1000).toISOString()));
-    renderTimeline(tl);
-  };
-  $("actSearch").addEventListener("input", debounce(reload, 250));
-  $("actSince").addEventListener("change", reload);
-  await Promise.all([reload(), reloadTimeline()]);
+
+  $("actSearch").addEventListener("input", debounce(() => reload({ resetLimit: true }), 250));
+  $("actSince").addEventListener("change", () => reload({ resetLimit: true }));
+  $("historyLoadMore").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Loading…";
+    state.activityFilter.limit += HISTORY_PAGE_SIZE;
+    await reload();
+    if (state.tab === "activity" && document.body.contains(button)) {
+      button.disabled = false;
+      button.textContent = "Load more";
+    }
+  });
+  $("askHistory").addEventListener("click", openHistoryChat);
+  await Promise.all([reload({ resetLimit: true }), loadStatus()]);
 }
 
 function sinceFromOption(value) {
@@ -7650,64 +8083,270 @@ function sinceFromOption(value) {
   return new Date(Date.now() - hours * 3600 * 1000).toISOString();
 }
 
-function renderActivityResults(results) {
-  const list = $("actResults");
-  if (!list) return;
-  if (!results || results.length === 0) {
-    list.innerHTML = '<div class="empty">No matching activity yet.</div>';
-    return;
-  }
-  list.innerHTML = results.map((r) => {
-    const meta = [r.app, r.window].filter(Boolean).map(escapeHtml).join(" · ");
-    const when = r.at ? new Date(r.at).toLocaleString() : "";
-    const rawSnippet = r.snippet || r.text || r.window || r.event || "";
-    // Stored observation text (BuildBetter transcripts, OCR of viewed pages)
-    // is untrusted — escape it before innerHTML, but keep the FTS <mark>
-    // highlight tags the search injects.
-    const snippet = escapeHtml(rawSnippet).replaceAll("&lt;mark&gt;", "<mark>").replaceAll("&lt;/mark&gt;", "</mark>");
-    return \`<div class="card">
-      <div class="row between"><span class="name">\${escapeHtml(meta) || "(no app)"}</span><span class="muted" style="font-size:11px;">\${escapeHtml(when)}</span></div>
-      <div class="desc" style="margin-top:6px;line-height:1.5;">\${snippet}</div>
-    </div>\`;
-  }).join("");
+function historyCleanText(value) {
+  return String(value ?? "").replace(/<\\/?mark>/gi, "").replace(/\\s+/g, " ").trim();
 }
 
-function renderTimeline(rows) {
-  const host = $("timeline");
-  if (!host) return;
-  if (!rows || rows.length === 0) { host.innerHTML = '<div class="muted">No data in this window.</div>'; return; }
-  // Group by hour, then show per-app stacked bars
-  const byHour = new Map();
-  const apps = new Set();
-  for (const r of rows) {
-    if (!byHour.has(r.hour)) byHour.set(r.hour, {});
-    byHour.get(r.hour)[r.app || "—"] = r.n;
-    apps.add(r.app || "—");
+function historyTruncate(value, length = 180) {
+  const text = historyCleanText(value);
+  return text.length > length ? text.slice(0, length - 1).trimEnd() + "…" : text;
+}
+
+function historyDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function historyDayKey(value) {
+  const date = historyDate(value);
+  if (!date) return "unknown";
+  return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
+}
+
+function historyDayLabel(value) {
+  const date = historyDate(value);
+  if (!date) return "Earlier";
+  const today = new Date();
+  const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const startDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const daysAgo = Math.round((startToday.getTime() - startDate.getTime()) / 86_400_000);
+  if (daysAgo === 0) return "Today";
+  if (daysAgo === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+}
+
+function historyTimeLabel(value) {
+  const date = historyDate(value);
+  return date ? date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "Time unavailable";
+}
+
+function historyAppLabel(value) {
+  const raw = historyCleanText(value);
+  if (!raw) return "";
+  const known = {
+    "com.apple.finder": "Finder",
+    "com.apple.safari": "Safari",
+    "com.google.chrome": "Chrome",
+    "com.microsoft.edgemac": "Microsoft Edge",
+    "com.openai.chat": "ChatGPT",
+    "com.openai.codex": "Codex",
+    "com.blizzard.worldofwarcraft": "World of Warcraft",
+    "worldofwarcraft": "World of Warcraft",
+    "com.wispr.wispr-flow": "Wispr Flow",
+    "wispr flow": "Wispr Flow",
+    "wine preloader": "Wine"
+  };
+  const exact = known[raw.toLocaleLowerCase()];
+  if (exact) return exact;
+  const parts = raw.split(".").filter(Boolean);
+  let candidate = parts.at(-1) ?? raw;
+  if (/^(app|desktop|mac|client)$/i.test(candidate) && parts.length > 1) candidate = parts.at(-2);
+  return candidate
+    .replace(/[-_]+/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\b\w/g, (letter) => letter.toLocaleUpperCase())
+    .trim() || raw;
+}
+
+function historyBucketKey(row) {
+  const date = historyDate(row?.at);
+  if (!date) return "unknown:" + historyCleanText(row?.at);
+  return historyDayKey(row.at) + ":" + Math.floor(date.getTime() / (10 * 60_000));
+}
+
+function historyPeriodCopy(rows) {
+  const apps = [...new Set(rows.map((row) => historyAppLabel(row?.app)).filter(Boolean))];
+  const details = [];
+  for (const row of rows) {
+    const windowTitle = historyCleanText(row?.window);
+    const snippet = historyCleanText(row?.snippet || row?.text);
+    for (const candidate of [windowTitle, snippet]) {
+      if (candidate && !details.some((value) => value.toLocaleLowerCase() === candidate.toLocaleLowerCase())) {
+        details.push(candidate);
+      }
+      if (details.length >= 2) break;
+    }
+    if (details.length >= 2) break;
   }
-  const sortedHours = [...byHour.keys()].sort();
-  const max = Math.max(...rows.map((r) => r.n));
-  const palette = ["#6fe1b1", "#f0b454", "#a98ef5", "#7ab8ff", "#f08080", "#94a9b1"];
-  const appColor = {};
-  [...apps].forEach((a, i) => appColor[a] = palette[i % palette.length]);
-  host.innerHTML = \`
-    <div style="display:grid;grid-template-columns:repeat(\${sortedHours.length},1fr);gap:2px;align-items:end;height:80px;">
-      \${sortedHours.map((h) => {
-        const cell = byHour.get(h);
-        const total = Object.values(cell).reduce((a, b) => a + b, 0);
-        const stack = Object.entries(cell).map(([app, n]) =>
-          \`<div style="height:\${(n / max) * 100}%;background:\${appColor[app]};" title="\${escapeHtml(app)}: \${n}"></div>\`
-        ).join("");
-        return \`<div title="\${escapeHtml(h)}: \${total}" style="display:flex;flex-direction:column-reverse;height:100%;">\${stack}</div>\`;
+  const appSummary = apps.length === 0
+    ? "Captured computer"
+    : apps.length === 1
+      ? apps[0]
+      : apps.length === 2
+        ? apps.join(" and ")
+        : apps.slice(0, 2).join(", ") + ", and " + (apps.length - 2) + " more app" + (apps.length === 3 ? "" : "s");
+  const title = details[0]
+    ? historyTruncate(details[0], 180)
+    : apps.length > 2
+      ? "Activity across " + appSummary
+      : appSummary + " activity";
+  const summary = details.length > 0
+    ? details.map((value) => historyTruncate(value, 220)).join(" · ")
+    : apps.length === 1
+      ? "You were active in " + apps[0] + " during this period."
+      : apps.length > 1
+        ? "You moved between " + appSummary + " during this period."
+        : "OpenAGI received activity during this period, but no app or window detail was available.";
+  return { apps, title, summary };
+}
+
+function historyPeriods(results) {
+  const periods = [];
+  const byBucket = new Map();
+  for (const row of results) {
+    const key = historyBucketKey(row);
+    let period = byBucket.get(key);
+    if (!period) {
+      period = { at: row?.at, rows: [] };
+      byBucket.set(key, period);
+      periods.push(period);
+    }
+    period.rows.push(row);
+  }
+  return periods.map((period) => ({ ...period, ...historyPeriodCopy(period.rows) }));
+}
+
+function historyRelativeTime(value) {
+  const date = historyDate(value);
+  if (!date) return null;
+  const elapsed = Math.max(0, Date.now() - date.getTime());
+  if (elapsed < 60_000) return "just now";
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 60) return minutes + " min ago";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + " hr" + (hours === 1 ? "" : "s") + " ago";
+  const days = Math.floor(hours / 24);
+  return days + " day" + (days === 1 ? "" : "s") + " ago";
+}
+
+function historySnippetHtml(value) {
+  // Observation text is private, untrusted content. Strip the only markup the
+  // FTS endpoint emits, then escape everything before inserting into HTML.
+  return escapeHtml(historyTruncate(value, 360));
+}
+
+function renderActivityResults(results, { query = "", hasMore = false } = {}) {
+  const list = $("actResults");
+  if (!list) return;
+  list.setAttribute("aria-busy", "false");
+  const meta = $("historyResultMeta");
+  const loadWrap = $("historyLoadMoreWrap");
+  if (!results || results.length === 0) {
+    list.innerHTML = query
+      ? '<div class="history-state"><strong>No matching activity</strong>Try a different phrase or a wider time range.</div>'
+      : '<div class="history-state"><strong>No computer history yet</strong>Activity will appear here after the Mac app sends its first observation.</div>';
+    if (meta) meta.textContent = query ? "No matches" : "No activity received";
+    if (loadWrap) loadWrap.hidden = true;
+    return;
+  }
+  const periods = historyPeriods(results);
+  const days = new Map();
+  for (const period of periods) {
+    const key = historyDayKey(period?.at);
+    if (!days.has(key)) days.set(key, { at: period?.at, periods: [] });
+    days.get(key).periods.push(period);
+  }
+  list.innerHTML = [...days.values()].map((day) => \`
+    <section class="history-day">
+      <h4 class="history-day-title">\${escapeHtml(historyDayLabel(day.at))}</h4>
+      \${day.periods.map((period) => {
+        const timestamp = historyDate(period?.at)?.toISOString() ?? "";
+        return \`<article class="history-entry">
+          <time class="history-entry-time"\${timestamp ? \` datetime="\${escapeHtml(timestamp)}"\` : ""}>\${escapeHtml(historyTimeLabel(period?.at))}</time>
+          <div class="history-entry-body">
+            <h5 class="history-entry-title">\${escapeHtml(period.title)}</h5>
+            <p class="history-entry-summary">\${historySnippetHtml(period.summary)}</p>
+            \${period.apps.length ? \`<div class="history-apps">\${period.apps.slice(0, 6).map((app) => \`<span class="history-app-label" aria-label="Application: \${escapeHtml(app)}">\${escapeHtml(app)}</span>\`).join("")}\${period.apps.length > 6 ? \`<span class="history-app-label" aria-label="\${period.apps.length - 6} additional applications">+\${period.apps.length - 6} more</span>\` : ""}</div>\` : ""}
+          </div>
+        </article>\`;
       }).join("")}
+    </section>
+  \`).join("");
+  if (meta) meta.textContent = "Showing " + periods.length + " work period" + (periods.length === 1 ? "" : "s")
+    + " from " + results.length + " observation" + (results.length === 1 ? "" : "s")
+    + (hasMore ? " · more available" : "");
+  if (loadWrap) loadWrap.hidden = !hasMore;
+}
+
+function renderActivityError(error, retry) {
+  const list = $("actResults");
+  if (!list) return;
+  list.setAttribute("aria-busy", "false");
+  list.innerHTML = '<div class="history-state"><strong>Couldn’t load computer history</strong>The local history service did not answer.<br><button id="historyRetry" class="ui-btn ui-btn-secondary" type="button">Try again</button></div>';
+  const meta = $("historyResultMeta");
+  if (meta) meta.textContent = "History unavailable";
+  const loadWrap = $("historyLoadMoreWrap");
+  if (loadWrap) loadWrap.hidden = true;
+  $("historyRetry")?.addEventListener("click", retry);
+}
+
+function renderHistoryStatus(stats, latest, error, retry) {
+  const host = $("historyStatusCard");
+  if (!host) return;
+  const available = stats?.mode === "sqlite" || stats?.mode === "fallback-jsonl";
+  const relative = historyRelativeTime(latest?.at);
+  const latestDate = historyDate(latest?.at);
+  const receiving = Boolean(available && latestDate && Date.now() - latestDate.getTime() <= 10 * 60_000);
+  const count = stats?.mode === "sqlite"
+    ? (Number(stats.activity ?? 0).toLocaleString() + " events · " + Number(stats.frames ?? 0).toLocaleString() + " frames")
+    : stats?.mode === "fallback-jsonl"
+      ? Number(stats.observations ?? 0).toLocaleString() + " observations"
+      : "Status could not be measured";
+  const title = error ? "Capture status unavailable"
+    : receiving ? "Activity received recently"
+      : latestDate ? "History is available" : "No activity received yet";
+  const description = error
+    ? "The dashboard could not reach the local observation service. Existing history may still be on disk."
+    : receiving
+      ? "Last activity arrived " + relative + ". This confirms history is reaching OpenAGI; the capture switch remains controlled by the Mac app."
+      : latestDate
+        ? "Last activity arrived " + relative + ". This dashboard cannot tell whether capture is paused, disabled, or the capture Mac is offline."
+        : "The history store is ready, but it has not received activity. Enable capture from the OpenAGI menu bar app on the Mac you want to observe.";
+  const pillClass = receiving ? " receiving" : (error || !latestDate ? " problem" : "");
+  const pill = error ? "Unavailable" : receiving ? "Receiving" : latestDate ? "Last received " + relative : "No history";
+  host.setAttribute("aria-busy", "false");
+  host.innerHTML = \`
+    <div class="history-status-row">
+      <div class="history-status-copy">
+        <div class="history-status-title">\${escapeHtml(title)} <span class="history-status-pill\${pillClass}">\${escapeHtml(pill)}</span></div>
+        <p class="history-status-description">\${escapeHtml(description)} \${escapeHtml(count)}.</p>
+      </div>
+      \${error ? '<button id="historyStatusRetry" class="ui-btn ui-btn-secondary" type="button">Retry status</button>' : '<button id="historyPauseHelp" class="ui-btn ui-btn-secondary" type="button" aria-controls="historyControlHelp" aria-expanded="false">How to pause</button>'}
     </div>
-    <div style="display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-top:6px;">
-      <span>\${escapeHtml(sortedHours[0] ?? "")}</span>
-      <span>\${escapeHtml(sortedHours.at(-1) ?? "")}</span>
+    <div class="history-status-row">
+      <div class="history-status-copy">
+        <div class="history-status-title">Privacy exclusions</div>
+        <p class="history-status-description">Choose apps and window-title patterns that must never enter computer history.</p>
+      </div>
+      <button id="historyPrivacyHelp" class="ui-btn ui-btn-secondary" type="button" aria-controls="historyControlHelp" aria-expanded="false">Manage exclusions</button>
     </div>
-    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;">
-      \${[...apps].map((a) => \`<span class="chip" style="border-color:\${appColor[a]};color:\${appColor[a]};">\${escapeHtml(a)}</span>\`).join("")}
-    </div>
+    <div id="historyControlHelp" class="history-control-help" role="status" tabindex="-1" hidden></div>
   \`;
+  $("historyPauseHelp")?.addEventListener("click", () => showHistoryControlHelp("pause"));
+  $("historyPrivacyHelp")?.addEventListener("click", () => showHistoryControlHelp("privacy"));
+  $("historyStatusRetry")?.addEventListener("click", retry);
+}
+
+function showHistoryControlHelp(kind) {
+  const host = $("historyControlHelp");
+  if (!host) return;
+  const pause = kind === "pause";
+  host.textContent = pause
+    ? "On the Mac running capture, open the OpenAGI menu bar icon, choose Capture, then Pause for 1 hour or Pause until tomorrow. That Mac remains the source of truth for capture state."
+    : "On the Mac running capture, open the OpenAGI menu bar icon, choose Capture, then Privacy settings. Matching apps or window-title patterns are skipped on that Mac before observations are sent.";
+  host.hidden = false;
+  $("historyPauseHelp")?.setAttribute("aria-expanded", String(pause));
+  $("historyPrivacyHelp")?.setAttribute("aria-expanded", String(!pause));
+  host.focus();
+}
+
+async function openHistoryChat() {
+  const url = new URL(window.location.href);
+  url.searchParams.set("tab", "chat");
+  url.searchParams.set("compose", "ask-history");
+  history.replaceState(null, "", url.toString());
+  await switchTab("chat");
 }
 
 function revealDeepLinkedRecord(paramName, selector, datasetKey) {

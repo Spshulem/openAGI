@@ -12,6 +12,21 @@ const ready = async () => ({
   detail: "ready"
 });
 
+const privateFocus = Object.freeze({
+  windowID: 7,
+  processIdentifier: 42,
+  bundleIdentifier: "com.example.Editor",
+  title: "Project Notes",
+  x: 0,
+  y: 0,
+  width: 1280,
+  height: 800
+});
+
+function screenshotResult(overrides = {}) {
+  return { format: "png", base64: "x", width: 100, height: 100, bytes: 1, scale: 1, focus: privateFocus, ...overrides };
+}
+
 function executor(opts = {}) {
   return createComputerExecutor({
     capabilityStatus: ready,
@@ -20,12 +35,12 @@ function executor(opts = {}) {
   });
 }
 
-async function lease(computer, sessionId = "chat:one") {
+async function lease(computer, sessionId = "chat:one", maxActions = 20) {
   return await computer.invoke("session.start", {
     sessionId,
     goalHash: "a".repeat(64),
     allowedOperations: ["session.end", "screenshot", "click", "move", "type", "key", "scroll"],
-    maxActions: 20
+    maxActions
   });
 }
 
@@ -58,16 +73,17 @@ test("executor binds coordinates to a screenshot frame and scales them", async (
   const computer = executor({
     helperPath: "/signed/helper",
     helperRun: async (command, operation, payload) => { calls.push([command, operation, payload]); return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) }; },
-    screenshot: async () => ({ format: "png", base64: "AAAA", width: 1280, height: 800, bytes: 3, scale: 2 })
+    screenshot: async () => screenshotResult({ base64: "AAAA", width: 1280, height: 800, bytes: 3, scale: 2 })
   });
   const active = await lease(computer);
   const shot = await action(computer, active, 1, "screenshot");
+  assert.equal("focus" in shot, false, "private focus identity never leaves the node executor");
   await action(computer, active, 2, "click", { frameId: shot.frameId, x: 100, y: 50, button: "right" });
   const nextShot = await action(computer, active, 3, "screenshot");
   await action(computer, active, 4, "move", { frameId: nextShot.frameId, x: 640, y: 400 });
   const inputCalls = calls.filter(([command]) => command === "/signed/helper");
-  assert.deepEqual(inputCalls.at(-2), ["/signed/helper", "click", { x: 200, y: 100, button: "right" }]);
-  assert.deepEqual(inputCalls.at(-1), ["/signed/helper", "move", { x: 1280, y: 800 }]);
+  assert.deepEqual(inputCalls.at(-2), ["/signed/helper", "click", { x: 200, y: 100, button: "right", focus: privateFocus }]);
+  assert.deepEqual(inputCalls.at(-1), ["/signed/helper", "move", { x: 1280, y: 800, focus: privateFocus }]);
   await assert.rejects(
     () => action(computer, active, 5, "click", { frameId: nextShot.frameId, x: 1280, y: 5, button: "left" }),
     /unknown, stale, or expired|outside the referenced screenshot/
@@ -81,7 +97,7 @@ test("node lease enforces goal binding, monotonic sequence, expiry and idempoten
     now: () => now,
     idleLeaseMs: 50,
     absoluteLeaseMs: 500,
-    screenshot: async () => { executions += 1; return { format: "png", base64: "x", width: 10, height: 10, bytes: 1, scale: 1 }; }
+    screenshot: async () => { executions += 1; return screenshotResult({ width: 40, height: 40 }); }
   });
   const active = await lease(computer, "chat:bound");
   const first = await action(computer, active, 1, "screenshot", {}, "same_action");
@@ -89,6 +105,15 @@ test("node lease enforces goal binding, monotonic sequence, expiry and idempoten
   assert.equal(retry.frameId, first.frameId);
   assert.equal(executions, 1, "idempotent retry does not execute twice");
   await assert.rejects(() => action(computer, active, 3, "screenshot"), /sequence must be 2/);
+  await assert.rejects(
+    () => computer.invoke("screenshot", {
+      leaseId: active.leaseId,
+      actionId: "same_action",
+      sequence: 1,
+      changed: true
+    }),
+    /reused with different input/
+  );
   await assert.rejects(
     () => computer.invoke("session.start", { sessionId: "chat:bound", goalHash: "b".repeat(64) }),
     /different approved goal/
@@ -102,13 +127,13 @@ test("helper receives typed text on stdin, while strict inputs reject unsafe fal
   const computer = executor({
     helperPath: "/signed/helper",
     helperRun: async (command, operation, payload) => { calls.push({ command, operation, payload }); return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) }; },
-    screenshot: async () => ({ format: "png", base64: "x", width: 100, height: 100, bytes: 1, scale: 1 })
+    screenshot: async () => screenshotResult()
   });
   const active = await lease(computer);
   const shot = await action(computer, active, 1, "screenshot");
   await action(computer, active, 2, "type", { frameId: shot.frameId, text: "private words" });
   assert.equal(calls.at(-1).operation, "type");
-  assert.deepEqual(calls.at(-1).payload, { text: "private words" });
+  assert.deepEqual(calls.at(-1).payload, { text: "private words", focus: privateFocus });
   assert.equal(JSON.stringify([calls.at(-1).command, calls.at(-1).operation]).includes("private words"), false);
   const nextShot = await action(computer, active, 3, "screenshot");
   await assert.rejects(() => action(computer, active, 4, "key", { frameId: nextShot.frameId, chord: "cmd+not-a-key" }), /supported key/);
@@ -122,15 +147,64 @@ test("all input, including type and key, requires a fresh screenshot frame", asy
     frameTtlMs: 1_000,
     helperPath: "/signed/helper",
     helperRun: async () => ({ stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) }),
-    screenshot: async () => ({ format: "png", base64: "x", width: 100, height: 100, bytes: 1, scale: 1 })
+    screenshot: async () => screenshotResult()
   });
   const active = await lease(computer);
   const shot = await action(computer, active, 1, "screenshot");
   now += 1_001;
+  const staleActions = [
+    ["click", { frameId: shot.frameId, x: 1, y: 1, button: "left" }],
+    ["move", { frameId: shot.frameId, x: 1, y: 1 }],
+    ["type", { frameId: shot.frameId, text: "never sent" }],
+    ["key", { frameId: shot.frameId, chord: "enter" }],
+    ["scroll", { frameId: shot.frameId, x: 1, y: 1, deltaX: 0, deltaY: -1 }]
+  ];
+  for (let index = 0; index < staleActions.length; index += 1) {
+    const [operation, payload] = staleActions[index];
+    await assert.rejects(
+      () => action(computer, active, index + 2, operation, payload),
+      operation === "type" ? /computer type action failed/ : /unknown, stale, or expired/
+    );
+  }
+});
+
+test("session stop revokes the lease and aborts its in-flight signed helper", async () => {
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const computer = executor({
+    helperPath: "/signed/helper",
+    helperRun: async (_command, operation, _payload, options) => {
+      if (operation !== "click") return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) };
+      markStarted();
+      return await new Promise((resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new Error("helper cancelled")), { once: true });
+      });
+    },
+    screenshot: async () => screenshotResult()
+  });
+  const active = await lease(computer, "chat:stop-race");
+  const shot = await action(computer, active, 1, "screenshot");
+  const pendingClick = action(computer, active, 2, "click", {
+    frameId: shot.frameId, x: 10, y: 10, button: "left"
+  }).then(() => null, (error) => error);
+  await started;
+  assert.deepEqual(await action(computer, active, 999, "session.end"), { ok: true });
+  assert.match((await pendingClick)?.message || "", /helper cancelled|revoked during the action/);
+  assert.deepEqual(await action(computer, active, 1, "session.end"), { ok: true, alreadyEnded: true });
   await assert.rejects(
-    () => action(computer, active, 2, "type", { frameId: shot.frameId, text: "never sent" }),
-    /unknown, stale, or expired/
+    () => action(computer, active, 4, "screenshot"),
+    /lease is missing or expired/
   );
+});
+
+test("session end remains available after the physical-action limit is reached", async () => {
+  const computer = executor({
+    screenshot: async () => screenshotResult({ width: 40, height: 40 })
+  });
+  const active = await lease(computer, "chat:action-limit", 1);
+  await action(computer, active, 1, "screenshot");
+  assert.deepEqual(await action(computer, active, 2, "session.end"), { ok: true });
+  await assert.rejects(() => action(computer, active, 3, "screenshot"), /lease is missing or expired/);
 });
 
 test("helper runner writes payload to stdin, bounds output, and never places it in argv", async () => {
@@ -147,12 +221,60 @@ test("helper runner writes payload to stdin, bounds output, and never places it 
   }
 });
 
+test("helper cancellation requests cooperative cleanup before any hard kill", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-helper-cancel-"));
+  const helper = path.join(dir, "helper.js");
+  const marker = path.join(dir, "cleanup-complete");
+  const ready = path.join(dir, "ready");
+  fs.writeFileSync(helper, `#!/usr/bin/env node\nconst fs=require('node:fs');process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(marker)},'yes');setTimeout(()=>process.exit(2),20)});fs.writeFileSync(${JSON.stringify(ready)},'yes');process.stdin.resume();setInterval(()=>{},1000);\n`, { mode: 0o700 });
+  const controller = new AbortController();
+  try {
+    const pending = runComputerHelper(helper, "type", { text: "bounded" }, {
+      timeoutMs: 2_000,
+      signal: controller.signal
+    });
+    const deadline = Date.now() + 2_000;
+    while (!fs.existsSync(ready) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(ready), true, "test helper installed its cleanup handler");
+    controller.abort();
+    await assert.rejects(pending, /cancelled/);
+    assert.equal(fs.readFileSync(marker, "utf8"), "yes");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an already-aborted helper request never writes into a killed child's stdin", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    runComputerHelper("/bin/sleep", "1", { text: "x".repeat(16 * 1024) }, {
+      timeoutMs: 2_000,
+      signal: controller.signal
+    }),
+    /cancelled/
+  );
+});
+
 test("an install without the signed helper refuses input instead of putting it in argv", async () => {
-  const computer = executor({ screenshot: async () => ({ format: "png", base64: "x", width: 10, height: 10, bytes: 1, scale: 1 }) });
+  const computer = executor({ screenshot: async () => screenshotResult({ width: 40, height: 40 }) });
   const active = await lease(computer);
   const shot = await action(computer, active, 1, "screenshot");
   await assert.rejects(
     () => action(computer, active, 2, "scroll", { frameId: shot.frameId, x: 1, y: 1, deltaX: 0, deltaY: -3 }),
     /signed OpenAGI computer helper/
+  );
+});
+
+test("a screenshot without an exact private focus identity fails closed", async () => {
+  const computer = executor({
+    screenshot: async () => ({ format: "png", base64: "x", width: 100, height: 100, bytes: 1, scale: 1 })
+  });
+  const active = await lease(computer, "chat:no-focus");
+  await assert.rejects(
+    () => action(computer, active, 1, "screenshot"),
+    /did not bind the screenshot to an exact focused window/
   );
 });

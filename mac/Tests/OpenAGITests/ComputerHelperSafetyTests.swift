@@ -69,6 +69,127 @@ final class ComputerHelperSafetyTests: XCTestCase {
     XCTAssertEqual((imageX + globalOriginX / scale) * scale, 920.0, accuracy: 0.000_001)
   }
 
+  func testFocusedWindowResolutionRequiresOneExactFrameMatch() {
+    let focused = ComputerWindowIdentity(
+      processIdentifier: 42,
+      title: "Project Notes",
+      frame: CGRect(x: 100, y: 200, width: 800, height: 600)
+    )
+    let candidates = [
+      ComputerWindowIdentity(
+        windowID: 7,
+        processIdentifier: 42,
+        title: "Project Notes",
+        frame: CGRect(x: 100.5, y: 199.5, width: 800, height: 600)
+      ),
+      ComputerWindowIdentity(
+        windowID: 8,
+        processIdentifier: 42,
+        title: "Project Notes",
+        frame: CGRect(x: 900, y: 200, width: 800, height: 600)
+      )
+    ]
+
+    XCTAssertEqual(
+      ComputerScreenshot.exactFocusedWindowID(focused: focused, candidates: candidates),
+      7
+    )
+  }
+
+  func testFocusedWindowResolutionFailsClosedWhenIdentityIsAmbiguous() {
+    let focused = ComputerWindowIdentity(
+      processIdentifier: 42,
+      title: "Untitled",
+      frame: CGRect(x: 10, y: 20, width: 500, height: 400)
+    )
+    let duplicate = ComputerWindowIdentity(
+      windowID: 9,
+      processIdentifier: 42,
+      title: "Untitled",
+      frame: focused.frame
+    )
+    let otherProcess = ComputerWindowIdentity(
+      windowID: 10,
+      processIdentifier: 77,
+      title: "Untitled",
+      frame: focused.frame
+    )
+
+    XCTAssertNil(ComputerScreenshot.exactFocusedWindowID(
+      focused: focused,
+      candidates: [duplicate, ComputerWindowIdentity(
+        windowID: 11,
+        processIdentifier: 42,
+        title: "Untitled",
+        frame: focused.frame
+      )]
+    ))
+    XCTAssertEqual(ComputerScreenshot.exactFocusedWindowID(
+      focused: focused,
+      candidates: [duplicate, otherProcess]
+    ), 9)
+  }
+
+  func testInputFocusBindingRejectsChangedWindowAndPrivacy() {
+    let frame = CGRect(x: 100, y: 200, width: 800, height: 600)
+    let expected = ComputerFocusIdentity(
+      windowID: 7,
+      processIdentifier: 42,
+      bundleIdentifier: "com.example.Editor",
+      title: "Project Notes",
+      frame: frame
+    )
+    let focused = ComputerWindowIdentity(
+      processIdentifier: 42,
+      title: "Project Notes",
+      frame: frame
+    )
+    let candidate = ComputerWindowIdentity(
+      windowID: 7,
+      processIdentifier: 42,
+      title: "Project Notes",
+      frame: frame
+    )
+    let privacy = ComputerCapturePrivacy()
+
+    XCTAssertTrue(ComputerScreenshot.focusIdentityMatches(
+      expected: expected,
+      frontmostProcessIdentifier: 42,
+      frontmostBundleIdentifier: "com.example.Editor",
+      focused: focused,
+      candidates: [candidate],
+      privacy: privacy
+    ))
+    XCTAssertFalse(ComputerScreenshot.focusIdentityMatches(
+      expected: expected,
+      frontmostProcessIdentifier: 77,
+      frontmostBundleIdentifier: "com.example.Other",
+      focused: focused,
+      candidates: [candidate],
+      privacy: privacy
+    ))
+    XCTAssertFalse(ComputerScreenshot.focusIdentityMatches(
+      expected: expected,
+      frontmostProcessIdentifier: 42,
+      frontmostBundleIdentifier: "com.example.Editor",
+      focused: ComputerWindowIdentity(
+        processIdentifier: 42,
+        title: "Different Window",
+        frame: frame
+      ),
+      candidates: [candidate],
+      privacy: privacy
+    ))
+    XCTAssertFalse(ComputerScreenshot.focusIdentityMatches(
+      expected: expected,
+      frontmostProcessIdentifier: 42,
+      frontmostBundleIdentifier: "com.example.Editor",
+      focused: focused,
+      candidates: [candidate],
+      privacy: ComputerCapturePrivacy(excludedBundleIds: ["com.example.Editor"])
+    ))
+  }
+
   func testInputReadinessRejectsEveryUnsafeLiveState() {
     XCTAssertThrowsError(try ComputerInput.validateInputReadiness(
       accessibilityGranted: false, consoleSessionActive: true,

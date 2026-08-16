@@ -1,7 +1,6 @@
 # OpenAGI: 3-Minute Demo
 
-Updated from `origin/main` at `bb0aebb` and a live local daemon inspection on
-2026-08-13.
+This script uses fictional examples so it is safe to reuse in any installation.
 
 ## The One-Line Position
 
@@ -46,21 +45,18 @@ iMessage or Quick Ask
   and later schedule it. This is only demoable after the latest `main` changes
   are integrated and the daemon is rebuilt/restarted.
 
-The inspected daemon already has populated Tasks, Skills, Suggestions, Today,
-and Review surfaces. Do not quote volatile totals in the presentation; show one
-good item from each surface.
+Do not quote volatile totals in the presentation; preselect one fictional or
+non-sensitive item from each surface.
 
 ## Required Preflight
 
 Do this before the audience is present.
 
-1. **Integrate and restart the intended build.** The latest remote changes have
-   been fetched, but the current feature branch has uncommitted edits in files
-   that also changed on `main`. Resolve those edits before updating; do not run
-   a blind update on the dirty checkout.
+1. **Build and restart the intended version.** Confirm the checkout is clean and
+   the packaged runtime matches the code you intend to demonstrate.
 2. Run `openagi doctor` and confirm the daemon and Mac node are healthy.
-3. In **Integrations**, confirm iMessage is enabled with the self-chat handle.
-   The currently inspected daemon reports iMessage ingestion as disabled.
+3. In **Integrations**, confirm iMessage is enabled with the intended self-chat
+   handle.
 4. Verify macOS grants the OpenAGI process **Full Disk Access** and
    **Automation -> Messages**.
 5. Verify local iMessage access without changing anything:
@@ -84,8 +80,8 @@ Do this before the audience is present.
 7. In **Skills**, preselect one safe suggested workflow with a clear action
    sequence and more than one observation. Do not depend on a miner producing a
    new candidate during the demo.
-8. In **Tasks**, keep the existing Vimeo migration task as the fallback item.
-   In **Review**, pre-apply the search term `Vimeo`.
+8. In **Tasks**, seed a fictional recording-migration task as the fallback item.
+   In **Review**, pre-apply the search term `recording migration`.
 9. Open these surfaces in order: Messages, Tasks, Skills, Review.
 
 ## The Three-Minute Script
@@ -103,11 +99,11 @@ Say:
 
 Send this to the configured self-chat:
 
-> OpenAGI, add "Cancel Vimeo and move the recordings" to my tasks today. Prepare
-> the migration checklist as an agent task. Draft only; do not contact anyone.
+> OpenAGI, add "Review the recording migration plan" to my tasks today. Prepare
+> a migration checklist as an agent task. Draft only; do not contact anyone.
 
 Show the plain-text iMessage response. Move on after 12 seconds even if the
-response is still in flight; the pre-existing Vimeo task is the fallback.
+response is still in flight; the fictional migration task is the fallback.
 
 Say:
 
@@ -120,7 +116,7 @@ Open **Tasks** and filter to **today**.
 
 Show:
 
-- The Vimeo item under **My tasks**.
+- The recording-migration item under **My tasks**.
 - The checklist or draft under **Agent tasks**.
 - Its source, bucket, status, and draft-only constraint.
 
@@ -159,7 +155,7 @@ Say:
 
 ### 2:05-2:35 - Review and Safety
 
-Open **Review** with the prepared `Vimeo` search.
+Open **Review** with the prepared `recording migration` search.
 
 Show that tasks, drafts, and suggestions can be searched and handled from one
 place. Approve nothing irreversible.
@@ -190,8 +186,8 @@ the running daemon.
 
 Ask in chat:
 
-> Create a reusable skill named `vimeo-migration-review`. It should inspect open
-> Vimeo migration tasks, draft a concise checklist, flag missing context, and
+> Create a reusable skill named `recording-migration-review`. It should inspect
+> open recording-migration tasks, draft a concise checklist, flag missing context, and
 > never send or delete anything. Show me the full skill before saving it.
 
 Then show the approval card and say:
@@ -220,8 +216,8 @@ The defensible claim is not "OpenAGI has features they lack." It is:
 
 ## Failure Plan
 
-- **No iMessage reply:** move to Tasks after 12 seconds and use the pre-existing
-  Vimeo item. Say the bridge is asynchronous; do not troubleshoot on stage.
+- **No iMessage reply:** move to Tasks after 12 seconds and use the prepared
+  fictional migration item. Say the bridge is asynchronous; do not troubleshoot on stage.
 - **New task is delayed:** show the existing task and agent draft. Do not refresh
   repeatedly.
 - **Suggested skill is weak:** use the preselected candidate; never force a new
@@ -230,7 +226,7 @@ The defensible claim is not "OpenAGI has features they lack." It is:
   materialization is approval-gated. Do not open a terminal to debug.
 - **Latest `create_skill` is absent:** skip the optional ending. The learned-skill
   acceptance path is the primary self-improvement proof.
-- **Review is noisy:** keep the prepared `Vimeo` search active.
+- **Review is noisy:** keep the prepared `recording migration` search active.
 
 ## Claims to Avoid
 
@@ -255,6 +251,6 @@ The defensible claim is not "OpenAGI has features they lack." It is:
 - [ ] One human task and one draft-only agent task are visible.
 - [ ] One safe learned-skill candidate is preselected.
 - [ ] The candidate shows repeated observations and provenance.
-- [ ] `Vimeo` is prepared in Review search.
+- [ ] `recording migration` is prepared in Review search.
 - [ ] The optional `create_skill` ending is used only if verified live.
 - [ ] A timer is visible to the presenter, not the audience.

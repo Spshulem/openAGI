@@ -42,9 +42,13 @@ public struct ComputerScreenshotResult: Encodable, Equatable {
   public let offsetX: Double
   public let offsetY: Double
   public let base64: String
+  /// This identity is consumed only by the local signed input helper. The
+  /// daemon strips it before returning the screenshot to a model or main.
+  public let focus: ComputerFocusIdentity
 
   public init(width: Int, height: Int, bytes: Int, scale: Double,
-              offsetX: Double, offsetY: Double, base64: String) {
+              offsetX: Double, offsetY: Double, base64: String,
+              focus: ComputerFocusIdentity) {
     self.format = "png"
     self.width = width
     self.height = height
@@ -53,6 +57,55 @@ public struct ComputerScreenshotResult: Encodable, Equatable {
     self.offsetX = offsetX
     self.offsetY = offsetY
     self.base64 = base64
+    self.focus = focus
+  }
+}
+
+/// A local-only proof of the exact focused window that produced a screenshot.
+/// It is passed back to the signed helper for every subsequent input event so
+/// focus changes fail closed instead of directing input into another window.
+public struct ComputerFocusIdentity: Codable, Equatable {
+  public let windowID: UInt32
+  public let processIdentifier: Int32
+  public let bundleIdentifier: String
+  public let title: String
+  public let x: Double
+  public let y: Double
+  public let width: Double
+  public let height: Double
+
+  public init(windowID: UInt32, processIdentifier: Int32,
+              bundleIdentifier: String, title: String, frame: CGRect) {
+    self.windowID = windowID
+    self.processIdentifier = processIdentifier
+    self.bundleIdentifier = bundleIdentifier
+    self.title = title
+    self.x = Double(frame.origin.x)
+    self.y = Double(frame.origin.y)
+    self.width = Double(frame.width)
+    self.height = Double(frame.height)
+  }
+
+  public var frame: CGRect {
+    CGRect(x: x, y: y, width: width, height: height)
+  }
+}
+
+/// The public, non-pixel identity needed to prove that a ScreenCaptureKit
+/// window is the exact Accessibility-focused window. PID + title alone is not
+/// enough: many apps can have multiple documents with the same title.
+public struct ComputerWindowIdentity: Equatable {
+  public let windowID: CGWindowID?
+  public let processIdentifier: pid_t
+  public let title: String
+  public let frame: CGRect
+
+  public init(windowID: CGWindowID? = nil, processIdentifier: pid_t,
+              title: String, frame: CGRect) {
+    self.windowID = windowID
+    self.processIdentifier = processIdentifier
+    self.title = title
+    self.frame = frame
   }
 }
 
@@ -177,8 +230,8 @@ public enum ComputerScreenshot {
   public static let maximumPNGBytes = 8 * 1024 * 1024
 
   /// Non-prompting readiness probe used by the helper status response. It does
-  /// not enumerate or capture pixels; it only proves the focused window has a
-  /// readable owner/title and passes the persisted privacy policy.
+  /// not capture pixels; it proves the focused AX window maps uniquely to one
+  /// on-screen CoreGraphics window and passes the persisted privacy policy.
   public static func focusedWindowPrivacyReady(
     privacy: ComputerCapturePrivacy = .load()
   ) -> Bool {
@@ -186,8 +239,12 @@ public enum ComputerScreenshot {
           AXIsProcessTrusted(),
           let app = NSWorkspace.shared.frontmostApplication,
           let bundleId = app.bundleIdentifier,
-          let title = focusedWindowTitle(processIdentifier: app.processIdentifier) else { return false }
-    return privacy.permits(bundleId: bundleId, title: title)
+          let focused = focusedWindowIdentity(processIdentifier: app.processIdentifier),
+          privacy.permits(bundleId: bundleId, title: focused.title) else { return false }
+    return exactFocusedWindowID(
+      focused: focused,
+      candidates: windowListIdentities(processIdentifier: app.processIdentifier)
+    ) != nil
   }
 
   /// Capture only the Accessibility-focused window of the frontmost app. This
@@ -212,8 +269,10 @@ public enum ComputerScreenshot {
     guard privacy.settingsReadable,
           let app = NSWorkspace.shared.frontmostApplication,
           let bundleId = app.bundleIdentifier,
-          let focusedTitle = focusedWindowTitle(processIdentifier: app.processIdentifier),
-          privacy.permits(bundleId: bundleId, title: focusedTitle) else {
+          let focused = focusedWindowIdentity(processIdentifier: app.processIdentifier) else {
+      throw ComputerScreenshotError.focusedWindowUnavailable
+    }
+    guard privacy.permits(bundleId: bundleId, title: focused.title) else {
       throw ComputerScreenshotError.focusedWindowExcluded
     }
 
@@ -221,18 +280,30 @@ public enum ComputerScreenshot {
     guard let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) else {
       throw ComputerScreenshotError.focusedWindowUnavailable
     }
-    guard let focusedWindowID = focusedWindowID(
-      processIdentifier: app.processIdentifier,
-      title: focusedTitle
+    guard let focusedWindowID = exactFocusedWindowID(
+      focused: focused,
+      candidates: windowListIdentities(processIdentifier: app.processIdentifier)
     ), let window = content.windows.first(where: {
       $0.windowID == focusedWindowID
         && $0.isOnScreen
         && $0.owningApplication?.processID == app.processIdentifier
-        && $0.title == focusedTitle
+        && $0.title == focused.title
+        && framesReferToSameWindow($0.frame, focused.frame)
         && $0.frame.width >= 32
         && $0.frame.height >= 32
         && mainDisplay.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
     }), privacy.permits(bundleId: window.owningApplication?.bundleIdentifier, title: window.title) else {
+      throw ComputerScreenshotError.focusedWindowUnavailable
+    }
+
+    // Focus can move while ScreenCaptureKit enumerates. Re-read the AX-focused
+    // element immediately before pixel capture and fail closed on any change.
+    guard focusStillMatches(
+      processIdentifier: app.processIdentifier,
+      title: focused.title,
+      frame: focused.frame,
+      windowID: focusedWindowID
+    ) else {
       throw ComputerScreenshotError.focusedWindowUnavailable
     }
 
@@ -253,6 +324,16 @@ public enum ComputerScreenshot {
     configuration.ignoreShadowsSingleWindow = true
     let image = try await SCScreenshotManager.captureImage(contentFilter: filter,
                                                             configuration: configuration)
+    // Capture is asynchronous. Re-check after pixels arrive too, and discard
+    // them if focus changed while ScreenCaptureKit was working.
+    guard focusStillMatches(
+      processIdentifier: app.processIdentifier,
+      title: focused.title,
+      frame: focused.frame,
+      windowID: focusedWindowID
+    ) else {
+      throw ComputerScreenshotError.focusedWindowUnavailable
+    }
     let representation = NSBitmapImageRep(cgImage: image)
     guard let png = representation.representation(using: .png, properties: [:]) else {
       throw ComputerScreenshotError.encodingFailed
@@ -260,6 +341,13 @@ public enum ComputerScreenshot {
     guard png.count <= maxPNGBytes else { throw ComputerScreenshotError.imageTooLarge }
     let actualScale = imageToPointScale(imagePixelWidth: image.width,
                                         windowPointWidth: Double(window.frame.width))
+    let focus = ComputerFocusIdentity(
+      windowID: focusedWindowID,
+      processIdentifier: app.processIdentifier,
+      bundleIdentifier: bundleId,
+      title: focused.title,
+      frame: focused.frame
+    )
     return ComputerScreenshotResult(
       width: image.width,
       height: image.height,
@@ -267,7 +355,8 @@ public enum ComputerScreenshot {
       scale: actualScale,
       offsetX: Double(window.frame.origin.x),
       offsetY: Double(window.frame.origin.y),
-      base64: png.base64EncodedString()
+      base64: png.base64EncodedString(),
+      focus: focus
     )
   }
 
@@ -279,22 +368,111 @@ public enum ComputerScreenshot {
     return windowPointWidth / Double(imagePixelWidth)
   }
 
-  private static func focusedWindowID(processIdentifier: pid_t,
-                                      title: String) -> CGWindowID? {
-    guard let rawWindows = CGWindowListCopyWindowInfo(
-      [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
-    ) as? [[String: Any]] else { return nil }
-    for raw in rawWindows {
-      guard (raw[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processIdentifier,
-            (raw[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
-            raw[kCGWindowName as String] as? String == title,
-            let number = raw[kCGWindowNumber as String] as? NSNumber else { continue }
-      return CGWindowID(number.uint32Value)
+  /// Resolve one—and only one—window number from the AX focused identity. This
+  /// is public for deterministic safety tests; production candidates still
+  /// come only from the local CoreGraphics window list.
+  public static func exactFocusedWindowID(
+    focused: ComputerWindowIdentity,
+    candidates: [ComputerWindowIdentity]
+  ) -> CGWindowID? {
+    let matches = candidates.filter {
+      $0.windowID != nil
+        && $0.processIdentifier == focused.processIdentifier
+        && $0.title == focused.title
+        && framesReferToSameWindow($0.frame, focused.frame)
     }
-    return nil
+    return matches.count == 1 ? matches[0].windowID : nil
   }
 
-  private static func focusedWindowTitle(processIdentifier: pid_t) -> String? {
+  public static func framesReferToSameWindow(
+    _ lhs: CGRect,
+    _ rhs: CGRect,
+    tolerance: CGFloat = 2
+  ) -> Bool {
+    guard tolerance >= 0,
+          [lhs.origin.x, lhs.origin.y, lhs.width, lhs.height,
+           rhs.origin.x, rhs.origin.y, rhs.width, rhs.height].allSatisfy({ $0.isFinite }) else {
+      return false
+    }
+    return abs(lhs.origin.x - rhs.origin.x) <= tolerance
+      && abs(lhs.origin.y - rhs.origin.y) <= tolerance
+      && abs(lhs.width - rhs.width) <= tolerance
+      && abs(lhs.height - rhs.height) <= tolerance
+  }
+
+  /// Pure focus comparison used by both the live helper and deterministic
+  /// safety tests. The current window must still be the exact captured window
+  /// and must still pass the latest privacy exclusions.
+  public static func focusIdentityMatches(
+    expected: ComputerFocusIdentity,
+    frontmostProcessIdentifier: pid_t?,
+    frontmostBundleIdentifier: String?,
+    focused: ComputerWindowIdentity?,
+    candidates: [ComputerWindowIdentity],
+    privacy: ComputerCapturePrivacy
+  ) -> Bool {
+    guard expected.windowID > 0,
+          expected.processIdentifier > 0,
+          expected.title.utf8.count <= 1_024,
+          expected.bundleIdentifier.utf8.count <= 512,
+          expected.width >= 32, expected.height >= 32,
+          [expected.x, expected.y, expected.width, expected.height].allSatisfy({ $0.isFinite }),
+          frontmostProcessIdentifier == expected.processIdentifier,
+          frontmostBundleIdentifier == expected.bundleIdentifier,
+          let focused,
+          focused.processIdentifier == expected.processIdentifier,
+          focused.title == expected.title,
+          framesReferToSameWindow(focused.frame, expected.frame),
+          privacy.permits(bundleId: frontmostBundleIdentifier, title: focused.title) else {
+      return false
+    }
+    return exactFocusedWindowID(focused: focused, candidates: candidates) == expected.windowID
+  }
+
+  /// Re-read the frontmost app, AX focus, window list, and privacy policy
+  /// immediately before a physical event.
+  public static func focusStillMatches(
+    _ expected: ComputerFocusIdentity,
+    privacy: ComputerCapturePrivacy = .load()
+  ) -> Bool {
+    let app = NSWorkspace.shared.frontmostApplication
+    let pid = app?.processIdentifier
+    return focusIdentityMatches(
+      expected: expected,
+      frontmostProcessIdentifier: pid,
+      frontmostBundleIdentifier: app?.bundleIdentifier,
+      focused: pid.map({ focusedWindowIdentity(processIdentifier: $0) }) ?? nil,
+      candidates: pid.map({ windowListIdentities(processIdentifier: $0) }) ?? [],
+      privacy: privacy
+    )
+  }
+
+  private static func windowListIdentities(
+    processIdentifier: pid_t
+  ) -> [ComputerWindowIdentity] {
+    guard let rawWindows = CGWindowListCopyWindowInfo(
+      [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+    ) as? [[String: Any]] else { return [] }
+    return rawWindows.compactMap { raw in
+      guard (raw[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == processIdentifier,
+            (raw[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+            let title = (raw[kCGWindowName as String] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !title.isEmpty,
+            let number = raw[kCGWindowNumber as String] as? NSNumber,
+            let bounds = raw[kCGWindowBounds as String] as? [String: Any],
+            let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return nil }
+      return ComputerWindowIdentity(
+        windowID: CGWindowID(number.uint32Value),
+        processIdentifier: processIdentifier,
+        title: title,
+        frame: frame
+      )
+    }
+  }
+
+  private static func focusedWindowIdentity(
+    processIdentifier: pid_t
+  ) -> ComputerWindowIdentity? {
     guard AXIsProcessTrusted() else { return nil }
     let application = AXUIElementCreateApplication(processIdentifier)
     var focusedWindow: AnyObject?
@@ -307,6 +485,56 @@ public enum ComputerScreenshot {
                                         kAXTitleAttribute as CFString,
                                         &title) == .success else { return nil }
     let value = (title as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    return value?.isEmpty == false ? value : nil
+    guard let value, !value.isEmpty,
+          let position = pointAttribute(focusedWindow as! AXUIElement,
+                                        attribute: kAXPositionAttribute as CFString),
+          let size = sizeAttribute(focusedWindow as! AXUIElement,
+                                   attribute: kAXSizeAttribute as CFString),
+          size.width > 0, size.height > 0 else { return nil }
+    return ComputerWindowIdentity(
+      processIdentifier: processIdentifier,
+      title: value,
+      frame: CGRect(origin: position, size: size)
+    )
+  }
+
+  private static func focusStillMatches(
+    processIdentifier: pid_t,
+    title: String,
+    frame: CGRect,
+    windowID: CGWindowID
+  ) -> Bool {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
+          let focused = focusedWindowIdentity(processIdentifier: processIdentifier),
+          focused.title == title,
+          framesReferToSameWindow(focused.frame, frame) else { return false }
+    return exactFocusedWindowID(
+      focused: focused,
+      candidates: windowListIdentities(processIdentifier: processIdentifier)
+    ) == windowID
+  }
+
+  private static func pointAttribute(
+    _ element: AXUIElement,
+    attribute: CFString
+  ) -> CGPoint? {
+    var raw: AnyObject?
+    guard AXUIElementCopyAttributeValue(element, attribute, &raw) == .success,
+          let raw,
+          CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    var point = CGPoint.zero
+    return AXValueGetValue(raw as! AXValue, .cgPoint, &point) ? point : nil
+  }
+
+  private static func sizeAttribute(
+    _ element: AXUIElement,
+    attribute: CFString
+  ) -> CGSize? {
+    var raw: AnyObject?
+    guard AXUIElementCopyAttributeValue(element, attribute, &raw) == .success,
+          let raw,
+          CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    var size = CGSize.zero
+    return AXValueGetValue(raw as! AXValue, .cgSize, &size) ? size : nil
   }
 }

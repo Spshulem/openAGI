@@ -66,12 +66,21 @@ export class FileBackedMemorySystem extends MemorySystem {
   consolidateAutomatedDuplicates(options = {}) {
     const result = super.consolidateAutomatedDuplicates({
       ...options,
-      // Archive the complete duplicate row before removing it from active
-      // recall. If this append fails, MemorySystem leaves the row untouched.
-      archive: (entry) => appendJsonLine(this.duplicateArchivePath, {
+      // Keep an auditable removal receipt without creating a second,
+      // indefinite copy of private memory content or metadata. If this append
+      // fails, MemorySystem leaves the active row untouched.
+      archive: ({ at, canonicalId, item }) => appendJsonLine(this.duplicateArchivePath, {
         version: 1,
         op: "consolidate-exact-duplicate",
-        ...entry
+        at,
+        canonicalId,
+        removedId: item.id,
+        rawContentHash: item.rawContentHash ?? null,
+        tier: item.tier ?? null,
+        source: item.source ?? null,
+        scope: item.scope ?? null,
+        createdAt: item.createdAt ?? null,
+        lastObservedAt: item.lastObservedAt ?? null
       })
     });
     if (result.removed.length > 0) {
