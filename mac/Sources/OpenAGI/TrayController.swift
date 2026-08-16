@@ -154,7 +154,7 @@ struct TrayMenu: View {
   /// daily user is most of every afternoon with a completely healthy daemon.
   /// A budget number was being rendered as a permanent "recover" button.
   private var restartLabel: String {
-    if !DaemonController.shared.canManageCurrentListener() {
+    if state.daemonManagedExternally {
       return "Daemon managed externally…"
     }
     switch state.reachability {

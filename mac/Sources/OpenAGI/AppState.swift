@@ -81,6 +81,10 @@ final class AppState: ObservableObject {
   /// force-quit before a respawn can bind; a missing one just needs starting.
   enum DaemonReachability { case serving, notRunning, notResponding }
   @Published var reachability: DaemonReachability = .serving
+  /// Cached by pollOnce so SwiftUI never launches `lsof` while rendering the
+  /// tray menu. restart(force:) still revalidates ownership synchronously at
+  /// the moment the user clicks, before it signals any listener.
+  @Published var daemonManagedExternally: Bool = false
 
   @Published var lastError: String? = nil
   @Published var consecutiveFailures: Int = 0
@@ -184,6 +188,7 @@ final class AppState: ObservableObject {
       let h: HealthResponse = try await get("/health", timeout: 4)
       status = computeStatus(h)
       reachability = .serving
+      daemonManagedExternally = await DaemonController.shared.listenerOwnership() == .external
       providerName = h.status?.agentHost?.provider ?? "—"
       providerConfigured = h.status?.agentHost?.providerConfigured ?? false
       memoryShort = h.status?.memory?.short ?? 0
@@ -218,7 +223,17 @@ final class AppState: ObservableObject {
       consecutiveFailures += 1
       // Alive and holding the port, or actually gone? See DaemonReachability —
       // the tray says different things and offers different actions for each.
-      reachability = await DaemonController.shared.isPortHeld() ? .notResponding : .notRunning
+      switch await DaemonController.shared.listenerOwnership() {
+      case .none:
+        reachability = .notRunning
+        daemonManagedExternally = false
+      case .managed:
+        reachability = .notResponding
+        daemonManagedExternally = false
+      case .external:
+        reachability = .notResponding
+        daemonManagedExternally = true
+      }
       if consecutiveFailures == 3 {
         notify(title: "OpenAGI offline", body: lastError ?? "Daemon stopped responding.", path: "/")
       }
@@ -441,12 +456,19 @@ final class AppState: ObservableObject {
       notify(title: title, body: body, path: "/?tab=tasks")
     }
     if event == "pending-action" {
-      // Agent queued something that needs approval (gated tool). Land in
-      // chat with the action id so the inline approval card renders.
+      // Agent queued something that needs approval (gated tool). Reconcile the
+      // durable queue and expand Quick Ask so the user can decide right in the
+      // floating surface; the native notification remains a second route.
       let summary = parseField(data, "summary") ?? "Agent action awaiting approval"
       let actionId = parseField(data, "id") ?? ""
       let pathPart = actionId.isEmpty ? "/?tab=chat" : "/?tab=chat&pending=\(urlEncode(actionId))"
+      Task { await PendingApprovalConsumer.shared.refresh() }
+      OverlayController.shared.show()
+      OverlayState.shared.expanded = true
       notify(title: "🤖 Agent wants to: \(summary)", body: "Tap to approve or deny.", path: pathPart)
+    }
+    if event == "pending-action-resolved" {
+      Task { await PendingApprovalConsumer.shared.refresh() }
     }
   }
 

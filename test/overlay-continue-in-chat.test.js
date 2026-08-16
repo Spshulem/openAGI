@@ -376,6 +376,23 @@ test("Mac Quick Ask names the session before waiting and offers the handoff in e
   assert.match(overlay, /else if let err = state\.error[\s\S]{0,900}Open in main app/);
 });
 
+test("Mac Quick Ask owns a durable inline approval surface", () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const appState = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/AppState.swift"), "utf8");
+  const overlay = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/Overlay/OverlayView.swift"), "utf8");
+  const approvals = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/Overlay/PendingApprovalConsumer.swift"), "utf8");
+
+  assert.match(approvals, /path: "\/pending-actions\?status=pending"/);
+  assert.match(approvals, /path: "\/pending-actions\/\\\(id\)\/\\\(decision\)"/);
+  assert.match(overlay, /"Approval needed" : "Approvals needed"/);
+  assert.match(overlay, /Button\("Approve & run"\)/);
+  assert.match(overlay, /ForEach\(approvals\.items\)[\s\S]{0,500}\.frame\(maxHeight: 230\)/);
+  assert.match(overlay, /Open all approvals in main app/);
+  assert.match(overlay, /await approvals\.refresh\(\)/);
+  assert.match(appState, /if event == "pending-action"[\s\S]{0,700}PendingApprovalConsumer\.shared\.refresh\(\)[\s\S]{0,300}OverlayState\.shared\.expanded = true/);
+  assert.match(appState, /if event == "pending-action-resolved"[\s\S]{0,160}PendingApprovalConsumer\.shared\.refresh\(\)/);
+});
+
 // ─── Screen context must not vanish in the hop ──────────────────────────────
 
 test("a turn that used screen context says so in the thread", async () => {

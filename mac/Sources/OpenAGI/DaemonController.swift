@@ -8,6 +8,12 @@ import Darwin
 final class DaemonController {
   static let shared = DaemonController()
 
+  enum ListenerOwnership: Sendable {
+    case none
+    case managed
+    case external
+  }
+
   private var process: Process?
   private var logHandle: FileHandle?
 
@@ -106,6 +112,7 @@ final class DaemonController {
     env["OPENAGI_DATA_DIR"] = dataDir.path
     env["HOST"] = "127.0.0.1"
     env["PORT"] = "43210"
+    env["OPENAGI_COMPUTER_HELPER"] = bundleResources.appendingPathComponent("OpenAGIComputerHelper").path
     proc.environment = env
 
     let stdoutPipe = Pipe()
@@ -219,30 +226,23 @@ final class DaemonController {
     return Self.isBundledDaemon(listenerPid, currentNodeBinary: nodeBinary)
   }
 
-  /// True when the tray can safely start/restart the listener. A healthy
-  /// terminal-managed server is supported, but its lifecycle stays with the
-  /// terminal or service manager that launched it.
-  func canManageCurrentListener() -> Bool {
-    guard let listenerPid = Self.pidListeningOnPort(43210) else { return true }
-    return ownsDaemon(listenerPid: listenerPid)
-  }
-
-  /// Is anything LISTENING on the daemon port right now?
-  ///
-  /// Paired with a failing /health this is what separates the two failures that
-  /// look identical from the outside: false means the process is gone, true
-  /// means it is alive, still owns 43210, and has stopped answering. A stopped
-  /// process can hold that socket indefinitely, so the states need different
-  /// recovery actions.
-  ///
-  /// Hops off the main thread because pidListeningOnPort spawns lsof and blocks
-  /// on it, and the only caller (AppState.pollOnce) is @MainActor.
-  func isPortHeld() async -> Bool {
-    await withCheckedContinuation { cont in
-      // Static, so this @Sendable closure captures nothing but a port number —
-      // DaemonController itself is not Sendable.
+  /// Classify the current listener for the tray and health poll without ever
+  /// launching `lsof` on the main actor. The result is display state only:
+  /// restart(force:) repeats the ownership check immediately before signaling
+  /// a process, so a listener change between poll and click remains safe.
+  func listenerOwnership() async -> ListenerOwnership {
+    let currentNodeBinary = nodeBinary
+    return await withCheckedContinuation { cont in
       DispatchQueue.global(qos: .utility).async {
-        cont.resume(returning: Self.pidListeningOnPort(43210) != nil)
+        guard let listenerPid = Self.pidListeningOnPort(43210) else {
+          cont.resume(returning: .none)
+          return
+        }
+        let ownership: ListenerOwnership = Self.isBundledDaemon(
+          listenerPid,
+          currentNodeBinary: currentNodeBinary
+        ) ? .managed : .external
+        cont.resume(returning: ownership)
       }
     }
   }

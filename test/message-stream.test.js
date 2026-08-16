@@ -261,7 +261,7 @@ test("legacy JSON /message remains synchronous and auth still gates stream negot
 });
 
 test("agent/provider progress exposes model and tool hops without arguments or results", async () => {
-  const provider = new OpenAIResponsesProvider({ apiKey: "test", model: "gpt-test", maxToolHops: 2 });
+  const provider = new OpenAIResponsesProvider({ apiKey: "test", model: "gpt-test", maxToolHops: 1 });
   let responseCount = 0;
   provider.postResponses = async () => {
     responseCount += 1;
@@ -276,6 +276,7 @@ test("agent/provider progress exposes model and tool hops without arguments or r
   const result = await provider.generate({
     input: "do it",
     agent: { name: "Agent" },
+    maxToolHops: 2,
     tools: [{ type: "function", name: "safe_tool", description: "", parameters: { type: "object" } }],
     toolRegistry: { invoke: async () => ({ ok: true, result: { private: "also-not-streamed" } }) },
     onProgress: (event) => progress.push(event)
@@ -289,6 +290,183 @@ test("agent/provider progress exposes model and tool hops without arguments or r
   ]);
   assert.equal(JSON.stringify(progress).includes("must-not-stream"), false);
   assert.equal(JSON.stringify(progress).includes("also-not-streamed"), false);
+});
+
+test("OpenAI reserves a no-tools final answer after exhausting tool hops", async () => {
+  const provider = new OpenAIResponsesProvider({ apiKey: "test", model: "gpt-test", maxToolHops: 2 });
+  const bodies = [];
+  const responses = [
+    { output: [{ type: "function_call", call_id: "call_1", name: "safe_tool", arguments: "{}" }] },
+    { output: [{ type: "function_call", call_id: "call_2", name: "safe_tool", arguments: "{}" }] },
+    { id: "resp_final", output_text: "Finished after two tools.", output: [] }
+  ];
+  provider.postResponses = async (body) => {
+    bodies.push(body);
+    return responses.shift();
+  };
+  const invoked = [];
+  const result = await provider.generate({
+    input: "use all the tools",
+    agent: { name: "Agent" },
+    tools: [{ type: "function", name: "safe_tool", description: "", parameters: { type: "object" } }],
+    toolRegistry: {
+      invoke: async (_name, _args) => {
+        invoked.push("called");
+        return { ok: true, result: { done: true } };
+      }
+    }
+  });
+
+  assert.equal(result.text, "Finished after two tools.");
+  assert.equal(invoked.length, 2, "the final answer retry must not repeat a tool");
+  assert.equal(bodies.length, 3);
+  assert.ok(Array.isArray(bodies[0].tools));
+  assert.ok(Array.isArray(bodies[1].tools));
+  assert.equal("tools" in bodies[2], false, "the synthesis request must not advertise tools");
+  assert.match(bodies[2].instructions, /Return a user-visible final answer now/);
+});
+
+test("OpenAI retries an empty terminal response once without tools, then fails explicitly", async () => {
+  const provider = new OpenAIResponsesProvider({ apiKey: "test", model: "gpt-test", maxToolHops: 1 });
+  const bodies = [];
+  provider.postResponses = async (body) => {
+    bodies.push(body);
+    return { id: `empty_${bodies.length}`, output: [] };
+  };
+
+  await assert.rejects(
+    provider.generate({ input: "answer me", agent: { name: "Agent" }, tools: [{ name: "unused" }] }),
+    (error) => error?.code === "EMPTY_MODEL_RESPONSE"
+  );
+  assert.equal(bodies.length, 2);
+  assert.equal("tools" in bodies[1], false);
+});
+
+test("OpenAI attaches computer screenshots as native image inputs", async () => {
+  const provider = new OpenAIResponsesProvider({ apiKey: "test", model: "gpt-test", maxToolHops: 1 });
+  const bodies = [];
+  const responses = [
+    {
+      id: "resp_tool",
+      output: [{ type: "function_call", call_id: "call_screen", name: "computer_screenshot", arguments: "{}" }]
+    },
+    { id: "resp_final", output_text: "I can see the screen.", output: [] }
+  ];
+  provider.postResponses = async (body) => {
+    bodies.push(body);
+    return responses.shift();
+  };
+
+  const result = await provider.generate({
+    input: "inspect the screen",
+    agent: { name: "Agent" },
+    tools: [{ type: "function", name: "computer_screenshot", description: "", parameters: { type: "object" } }],
+    toolRegistry: {
+      invoke: async () => ({
+        ok: true,
+        result: { image: "cG5nLWJ5dGVz", format: "png", width: 1280, height: 800, frameId: "frame_1" }
+      })
+    }
+  });
+
+  assert.equal(result.text, "I can see the screen.");
+  const imageTurn = bodies[1].input.find((item) => item?.role === "user" && Array.isArray(item.content));
+  assert.ok(imageTurn);
+  assert.deepEqual(imageTurn.content[1], {
+    type: "input_image",
+    image_url: "data:image/png;base64,cG5nLWJ5dGVz"
+  });
+  const toolOutput = bodies[1].input.find((item) => item?.type === "function_call_output");
+  assert.match(toolOutput.output, /attached as image below/);
+  assert.equal(toolOutput.output.includes("cG5nLWJ5dGVz"), false,
+    "base64 is not duplicated into the textual result");
+});
+
+test("Anthropic honors a per-turn tool-hop override and still reserves a no-tools final answer", async () => {
+  const provider = new AnthropicProvider({ apiKey: "test", model: "claude-test", maxToolHops: 1 });
+  const bodies = [];
+  const responses = [
+    { id: "msg_tool", content: [{ type: "tool_use", id: "tool_1", name: "safe_tool", input: {} }] },
+    { id: "msg_tool_2", content: [{ type: "tool_use", id: "tool_2", name: "safe_tool", input: {} }] },
+    { id: "msg_final", content: [{ type: "text", text: "Finished safely." }] }
+  ];
+  provider.postMessages = async (body) => {
+    bodies.push(body);
+    return responses.shift();
+  };
+  let invoked = 0;
+  const result = await provider.generate({
+    input: "use the tool",
+    agent: { name: "Agent" },
+    maxToolHops: 2,
+    toolRegistry: {
+      toAnthropicTools: () => [{ name: "safe_tool", description: "", input_schema: { type: "object" } }],
+      invoke: async () => {
+        invoked += 1;
+        return { ok: true, result: { done: true } };
+      }
+    }
+  });
+
+  assert.equal(result.text, "Finished safely.");
+  assert.equal(invoked, 2);
+  assert.equal(bodies.length, 3);
+  assert.ok(Array.isArray(bodies[0].tools));
+  assert.ok(Array.isArray(bodies[1].tools));
+  assert.equal("tools" in bodies[2], false);
+});
+
+test("Anthropic retries an empty terminal response once without tools, then fails explicitly", async () => {
+  const provider = new AnthropicProvider({ apiKey: "test", model: "claude-test", maxToolHops: 1 });
+  const bodies = [];
+  provider.postMessages = async (body) => {
+    bodies.push(body);
+    return { id: `empty_${bodies.length}`, content: [] };
+  };
+
+  await assert.rejects(
+    provider.generate({ input: "answer me", agent: { name: "Agent" } }),
+    (error) => error?.code === "EMPTY_MODEL_RESPONSE"
+  );
+  assert.equal(bodies.length, 2);
+  assert.equal("tools" in bodies[1], false);
+  assert.deepEqual(bodies[1].messages, [{ role: "user", content: "answer me" }]);
+});
+
+test("Anthropic attaches computer screenshots as native image tool results", async () => {
+  const provider = new AnthropicProvider({ apiKey: "test", model: "claude-test", maxToolHops: 1 });
+  const bodies = [];
+  const responses = [
+    { id: "msg_tool", content: [{ type: "tool_use", id: "tool_screen", name: "computer_screenshot", input: {} }] },
+    { id: "msg_final", content: [{ type: "text", text: "I can see the screen." }] }
+  ];
+  provider.postMessages = async (body) => {
+    bodies.push(body);
+    return responses.shift();
+  };
+
+  const result = await provider.generate({
+    input: "inspect the screen",
+    agent: { name: "Agent" },
+    toolRegistry: {
+      toAnthropicTools: () => [{ name: "computer_screenshot", description: "", input_schema: { type: "object" } }],
+      invoke: async () => ({
+        ok: true,
+        result: { image: "cG5nLWJ5dGVz", format: "png", width: 1280, height: 800, frameId: "frame_1" }
+      })
+    }
+  });
+
+  assert.equal(result.text, "I can see the screen.");
+  const toolResult = bodies[1].messages.at(-1).content[0];
+  assert.equal(toolResult.type, "tool_result");
+  assert.deepEqual(toolResult.content[1], {
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: "cG5nLWJ5dGVz" }
+  });
+  assert.match(toolResult.content[0].text, /attached as image below/);
+  assert.equal(toolResult.content[0].text.includes("cG5nLWJ5dGVz"), false,
+    "base64 is not duplicated into the textual result");
 });
 
 test("OpenAI streams visible text across tool hops without exposing tool data", async () => {
@@ -644,6 +822,38 @@ test("a failed agent turn is durable and broadcasts terminal state to other chat
     await eventsReader?.cancel().catch(() => {});
     await app.close();
   }
+});
+
+test("agent host rejects provider placeholders instead of persisting them as successful answers", async () => {
+  const runtime = createDefaultRuntime();
+  runtime.agentHost.modelProvider = {
+    name: "empty-test-provider",
+    model: "test-model",
+    isConfigured: () => true,
+    async generate() {
+      return { id: "empty_response", text: "(no text)", provider: "test", model: "test-model", toolCalls: [] };
+    }
+  };
+
+  await assert.rejects(
+    runtime.agentHost.handleMessage({
+      channel: "overlay",
+      from: "user",
+      text: "please answer",
+      metadata: { requestId: "req-empty-1" }
+    }),
+    (error) => error?.code === "EMPTY_MODEL_RESPONSE"
+  );
+
+  const session = runtime.agentHost.store.getSession("overlay:user:main");
+  assert.equal(session.messages.length, 2);
+  assert.equal(session.messages.some((message) => message.content === "(no text)"), false);
+  assert.match(session.messages[1].content, /model returned no answer after retrying/i);
+  assert.deepEqual(session.messages[1].metadata, {
+    status: "failed",
+    code: "provider-empty-response",
+    requestId: "req-empty-1"
+  });
 });
 
 test("provider diagnostics redact credentials, private URLs, and local paths", () => {

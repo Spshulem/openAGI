@@ -110,7 +110,10 @@ const DEFAULTS = {
   // entirely. Stop early, write what we have.
   deadlineMs: 7 * 60 * 1000,
   // Share of the remaining daily budget one pass is allowed to plan to spend.
-  budgetFraction: 0.25
+  budgetFraction: 0.25,
+  // Deterministic cleanup is cheap and safe enough to run daily. The model
+  // judgement remains weekly so faster queue draining does not multiply cost.
+  llmIntervalDays: 7
 };
 
 function envNumber(name, fallback) {
@@ -194,6 +197,7 @@ export class BacklogTriage {
       maxResolutions: envNumber("OPENAGI_BACKLOG_TRIAGE_MAX_RESOLUTIONS", DEFAULTS.maxResolutions),
       deadlineMs: DEFAULTS.deadlineMs,
       budgetFraction: DEFAULTS.budgetFraction,
+      llmIntervalDays: envNumber("OPENAGI_BACKLOG_TRIAGE_LLM_INTERVAL_DAYS", DEFAULTS.llmIntervalDays),
       ...options
     };
   }
@@ -262,13 +266,21 @@ export class BacklogTriage {
     let llmResolutions = [];
     let llmKeeps = [];
     let llmDeferrals = [];
+    const latest = safely(degraded, "read-latest", () => readJsonFile(path.join(dir, "backlog-triage", "latest.json"), null), null);
+    const previousLlmAt = latest?.llm?.lastAttemptAt
+      ?? (latest?.llm?.itemsSent > 0 ? latest.startedAt : null);
+    report.llm.lastAttemptAt = previousLlmAt;
     if (!useLLM) {
       report.llm.skipped = "disabled";
     } else if (plan.ambiguous.length === 0) {
       report.llm.skipped = "no-candidates";
+    } else if (!llmReviewDue(previousLlmAt, startedAt, this.options.llmIntervalDays)) {
+      report.llm.skipped = "cadence";
+      report.llm.deferred = plan.ambiguous.length;
     } else {
-      const outcome = await this.judge(plan.ambiguous, { passId, degraded });
+      const outcome = await this.judge(plan.ambiguous, { passId, degraded, attemptedAt: startedAt });
       Object.assign(report.llm, outcome.stats);
+      report.llm.lastAttemptAt = outcome.stats.lastAttemptAt ?? previousLlmAt;
       llmResolutions = outcome.resolutions;
       llmKeeps = outcome.keeps;
       llmDeferrals = outcome.deferrals;
@@ -330,7 +342,7 @@ export class BacklogTriage {
   /// Judge the ambiguous set in batches. Returns resolutions, ranked keeps,
   /// non-resolving deferrals, and stats.
   /// Any failure degrades to "we judged fewer than we wanted" — never a throw.
-  async judge(candidates, { passId, degraded }) {
+  async judge(candidates, { passId, degraded, attemptedAt = new Date() }) {
     // Wall clock, deliberately NOT the caller's `now`. `now` is a LOGICAL clock
     // — it is what ages are measured against and tests inject it freely — and
     // deriving a real-time deadline from it means a pass dated in the past
@@ -340,7 +352,7 @@ export class BacklogTriage {
       attempted: true, skipped: null, model: null, batches: 0, itemsSent: 0, itemsJudged: 0,
       deferred: 0, verdicts: { dismiss: 0, keep: 0, unsure: 0, invalid: 0, duplicate: 0, missing: 0, lowConfidence: 0 },
       estimated: { inputTokens: 0, outputTokens: 0, usd: 0 },
-      actual: null, stoppedEarly: null
+      actual: null, stoppedEarly: null, lastAttemptAt: null
     };
     const resolutions = [];
     const keeps = [];
@@ -417,6 +429,10 @@ export class BacklogTriage {
       const batch = batches[b];
       let text;
       try {
+        // Advance the weekly cadence at the moment a real provider request is
+        // made, even when it times out or returns 503. Daily deterministic
+        // cleanup must not become a daily hammer against a failing provider.
+        stats.lastAttemptAt ??= new Date(attemptedAt).toISOString();
         const result = await provider.generate({
           input: prompts[b],
           // No model id here by design — `task` routes through ModelRouter so
@@ -1086,7 +1102,7 @@ function emptyReport(passId, startedAt, dryRun) {
     llm: {
       attempted: false, skipped: null, model: null, batches: 0, itemsSent: 0, itemsJudged: 0,
       deferred: 0, verdicts: { dismiss: 0, keep: 0, unsure: 0, invalid: 0, duplicate: 0, missing: 0, lowConfidence: 0 },
-      estimated: { inputTokens: 0, outputTokens: 0, usd: 0 }, actual: null, stoppedEarly: null
+      estimated: { inputTokens: 0, outputTokens: 0, usd: 0 }, actual: null, stoppedEarly: null, lastAttemptAt: null
     },
     applied: { suggestions: 0, drafts: 0, keepsAnnotated: 0, deferralsAnnotated: 0, failed: 0, cappedAt: null, wouldApply: 0 },
     critical: [],
@@ -1094,6 +1110,14 @@ function emptyReport(passId, startedAt, dryRun) {
     _resolvedIds: [],
     degraded: []
   };
+}
+
+export function llmReviewDue(previousAt, now = new Date(), intervalDays = DEFAULTS.llmIntervalDays) {
+  if (!previousAt || !Number.isFinite(Date.parse(previousAt))) return true;
+  const nowMs = (now instanceof Date ? now : new Date(now)).getTime();
+  const elapsed = nowMs - Date.parse(previousAt);
+  // A corrected system clock must not freeze relevance review for weeks.
+  return elapsed < 0 || elapsed >= intervalDays * DAY_MS;
 }
 
 /// Small, loggable shape of a pass. The full report carries every sample and

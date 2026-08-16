@@ -24,6 +24,22 @@ export class ToolRegistry {
       // {status:"awaiting_confirmation"} instead of running. The action is
       // surfaced in the dashboard for the user to approve/deny.
       needsConfirmation: Boolean(tool.needsConfirmation),
+      // Optional dynamic guard for idempotent tools. Returning false means the
+      // already-approved state is still active, so invoking the handler is a
+      // no-op/readback and must not create a fresh approval request.
+      confirmationRequired: typeof tool.confirmationRequired === "function" ? tool.confirmationRequired : null,
+      // Resolve approval-critical facts (for example the immutable target
+      // node) before the card is created. The prepared args are what the user
+      // sees, approves, and the confirmed handler later receives.
+      prepareApprovalArgs: typeof tool.prepareApprovalArgs === "function" ? tool.prepareApprovalArgs : null,
+      // Optional stable identity used to collapse repeated requests for the
+      // same approval while the first card is still pending.
+      approvalDedupeKey: typeof tool.approvalDedupeKey === "function" ? tool.approvalDedupeKey : null,
+      // Particularly sensitive approvals (for example physical computer
+      // control) expire even if the dashboard card is left untouched.
+      approvalTtlMs: Number.isFinite(Number(tool.approvalTtlMs)) && Number(tool.approvalTtlMs) > 0
+        ? Math.trunc(Number(tool.approvalTtlMs))
+        : null,
       // Short human-readable summary used in the approval UI when the args
       // alone don't describe the action well. Optional fn(args) -> string.
       summarize: typeof tool.summarize === "function" ? tool.summarize : null,
@@ -57,7 +73,7 @@ export class ToolRegistry {
   }
 
   list({ readOnly = false } = {}) {
-    const all = [...this.tools.values()].map(({ handler, ...rest }) => rest);
+    const all = [...this.tools.values()].map(({ handler, confirmationRequired, prepareApprovalArgs, approvalDedupeKey, ...rest }) => rest);
     return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
   }
 
@@ -169,15 +185,30 @@ export class ToolRegistry {
     // queue UNLESS context.__confirmed is true (which the approve endpoint
     // sets after a human OKs the action). Scrutiny 'ask' turns extend this
     // to EVERY side-effecting tool, not just the always-gated ones.
+    let invocationArgs = args ?? {};
+    if (tool.needsConfirmation && !context?.__confirmed && tool.prepareApprovalArgs) {
+      try {
+        invocationArgs = await tool.prepareApprovalArgs(invocationArgs, context ?? {});
+        if (!invocationArgs || typeof invocationArgs !== "object" || Array.isArray(invocationArgs)) {
+          throw new Error("approval preparation returned invalid arguments");
+        }
+      } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+      }
+    }
+    const toolConfirm = tool.needsConfirmation && safeConfirmationRequired(tool.confirmationRequired, invocationArgs, context);
     const scrutinyConfirm = context?.__scrutinyPolicy === "confirm" && tool.sideEffects;
-    if ((tool.needsConfirmation || scrutinyConfirm) && !context?.__confirmed && this.pendingActions) {
-      const summary = tool.summarize ? safeSummarize(tool.summarize, args) : `Run ${name}`;
+    if ((toolConfirm || scrutinyConfirm) && !context?.__confirmed && this.pendingActions) {
+      const summary = tool.summarize ? safeSummarize(tool.summarize, invocationArgs) : `Run ${name}`;
+      const dedupeKey = safeApprovalDedupeKey(tool.approvalDedupeKey, invocationArgs, context);
       const action = this.pendingActions.enqueue({
         toolName: name,
-        args,
+        args: invocationArgs,
         context,
         summary,
-        reason: context.__reason ?? null
+        reason: context.__reason ?? null,
+        dedupeKey,
+        ttlMs: toolConfirm ? tool.approvalTtlMs : null
       });
       return {
         ok: true,
@@ -185,12 +216,12 @@ export class ToolRegistry {
           status: "awaiting_confirmation",
           actionId: action.id,
           summary: action.summary,
-          message: `Queued for human approval. Visit the dashboard's Approvals tab (or run /pending-actions) to approve or deny.`
+          message: `Queued for human approval. Open the dashboard's Approvals tab, or the Computer Use page for a computer-use request.`
         }
       };
     }
     try {
-      const result = await tool.handler(args ?? {}, context);
+      const result = await tool.handler(invocationArgs, context);
       return { ok: true, result };
     } catch (error) {
       return { ok: false, error: error.message ?? String(error) };
@@ -200,6 +231,21 @@ export class ToolRegistry {
 
 function safeSummarize(fn, args) {
   try { return String(fn(args ?? {})).slice(0, 240); } catch { return null; }
+}
+
+function safeConfirmationRequired(fn, args, context) {
+  if (typeof fn !== "function") return true;
+  try { return fn(args ?? {}, context ?? {}) !== false; } catch { return true; }
+}
+
+function safeApprovalDedupeKey(fn, args, context) {
+  if (typeof fn !== "function") return null;
+  try {
+    const value = fn(args ?? {}, context ?? {});
+    return typeof value === "string" && value ? value.slice(0, 500) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function registerCoreTools(registry, runtime) {

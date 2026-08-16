@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import OpenAGIComputerCore
 
 // Action vocabulary executor. Each step is a single-key dictionary; the key
 // names the action and the value is its argument. Unknown keys are logged
@@ -126,63 +127,15 @@ final class ActionExecutor {
   }
 
   private func sendShortcut(_ spec: String) throws {
-    // Parse like "cmd+shift+k"
-    let parts = spec.lowercased().split(separator: "+").map { $0.trimmingCharacters(in: .whitespaces) }
-    var modifiers: CGEventFlags = []
-    var key: String? = nil
-    for p in parts {
-      switch p {
-      case "cmd", "command", "⌘": modifiers.insert(.maskCommand)
-      case "shift", "⇧": modifiers.insert(.maskShift)
-      case "alt", "option", "opt", "⌥": modifiers.insert(.maskAlternate)
-      case "ctrl", "control", "⌃": modifiers.insert(.maskControl)
-      default: key = p
-      }
-    }
-    guard let key else { throw NSError(domain: "OpenAGI.replay", code: 5, userInfo: [NSLocalizedDescriptionKey: "no key in shortcut '\(spec)'"]) }
-    try sendKey(named: key, modifiers: modifiers)
+    try ComputerInput.sendShortcut(spec)
   }
 
   private func sendKey(named name: String, modifiers: CGEventFlags) throws {
-    guard let code = keyCode(for: name) else {
-      throw NSError(domain: "OpenAGI.replay", code: 6, userInfo: [NSLocalizedDescriptionKey: "unknown key '\(name)'"])
-    }
-    let src = CGEventSource(stateID: .hidSystemState)
-    if let down = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: true) {
-      down.flags = modifiers
-      down.post(tap: .cghidEventTap)
-    }
-    if let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false) {
-      up.flags = modifiers
-      up.post(tap: .cghidEventTap)
-    }
+    try ComputerInput.sendKey(named: name, modifiers: modifiers)
   }
 
   private func sendType(_ text: String) throws {
-    let src = CGEventSource(stateID: .hidSystemState)
-    for char in text.unicodeScalars {
-      let utf16 = String(char).utf16
-      let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)
-      let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false)
-      down?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: Array(utf16))
-      up?.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: Array(utf16))
-      down?.post(tap: .cghidEventTap)
-      up?.post(tap: .cghidEventTap)
-    }
-  }
-
-  private func keyCode(for name: String) -> CGKeyCode? {
-    let n = name.lowercased()
-    let map: [String: CGKeyCode] = [
-      "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51,
-      "escape": 53, "esc": 53, "left": 123, "right": 124, "down": 125, "up": 126,
-      "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
-      "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
-      "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "9": 25, "7": 26, "8": 28, "0": 29,
-      "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45, "m": 46,
-      ",": 43, ".": 47, "/": 44, ";": 41, "'": 39, "[": 33, "]": 30, "-": 27, "=": 24, "`": 50
-    ]
-    return map[n]
+    try ComputerInput.sendType(text)
   }
 
   private func stringValue(_ v: Any) -> String {

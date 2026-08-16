@@ -28,10 +28,20 @@ export function readNodeConfig(dataDir = resolveDataDir()) {
   }
 }
 
-export function writeNodeConfig({ remote, token }, dataDir = resolveDataDir()) {
+export function writeNodeConfig({ remote, token, nodeToken = undefined, nodeEnrollmentConfirmed = undefined }, dataDir = resolveDataDir()) {
   const file = nodeConfigPath(dataDir);
   fs.mkdirSync(dataDir, { recursive: true }); // a fresh node has no ~/.openagi yet
-  fs.writeFileSync(file, JSON.stringify({ remote, token: token ?? null }, null, 2) + "\n", { mode: 0o600 });
+  const existing = readNodeConfig(dataDir);
+  fs.writeFileSync(file, JSON.stringify({
+    remote,
+    token: token ?? null,
+    nodeToken: nodeToken === undefined
+      ? (existing?.remote === remote ? (existing?.nodeToken ?? null) : null)
+      : nodeToken,
+    nodeEnrollmentConfirmed: nodeEnrollmentConfirmed === undefined
+      ? (existing?.remote === remote ? (existing?.nodeEnrollmentConfirmed ?? null) : null)
+      : Boolean(nodeEnrollmentConfirmed)
+  }, null, 2) + "\n", { mode: 0o600 });
   return file;
 }
 
@@ -62,7 +72,14 @@ export function resolveTarget({ remote, token, dataDir = resolveDataDir() } = {}
   // 3. saved node pairing
   const cfg = readNodeConfig(dataDir);
   if (cfg?.remote) {
-    return { url: normalizeBase(cfg.remote), token: token ?? cfg.token ?? null, source: "node.json", remote: true };
+    const nodeId = readStoredNodeId(dataDir);
+    return {
+      url: normalizeBase(cfg.remote),
+      token: token ?? cfg.nodeToken ?? cfg.token ?? null,
+      nodeId: token ? null : (cfg.nodeToken ? nodeId : null),
+      source: "node.json",
+      remote: true
+    };
   }
   // 4. local default. The token is usually only in <dataDir>/.env (the wizard
   // wrote it there, not into the CLI's environment) — peek it so `openagi
@@ -88,6 +105,13 @@ function peekEnvToken(dataDir) {
   return null;
 }
 
+function readStoredNodeId(dataDir) {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(dataDir, "identity.json"), "utf8"));
+    return typeof value?.nodeId === "string" ? value.nodeId : null;
+  } catch { return null; }
+}
+
 export class CliClient {
   constructor(target, { fetchImpl = globalThis.fetch, timeoutMs = 60000 } = {}) {
     this.target = target;
@@ -98,6 +122,7 @@ export class CliClient {
   headers(extra = {}) {
     const h = { ...extra };
     if (this.target.token) h.authorization = `Bearer ${this.target.token}`;
+    if (this.target.nodeId) h["x-openagi-node-id"] = this.target.nodeId;
     return h;
   }
 

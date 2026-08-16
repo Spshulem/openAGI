@@ -46,6 +46,14 @@ export const SERVICE_KINDS = [
     urlEnv: "OPENAGI_IMESSAGE_NODE",
     tokenEnv: "OPENAGI_IMESSAGE_NODE_TOKEN",
     healthPath: "/health"
+  },
+  {
+    id: "computer-use",
+    name: "Computer use",
+    purpose: "Captures a live screen and performs user-approved click, type, key, move, and scroll actions on a connected Mac.",
+    urlEnv: "OPENAGI_COMPUTER_NODE",
+    tokenEnv: "OPENAGI_COMPUTER_NODE_TOKEN",
+    healthPath: "/health"
   }
 ];
 

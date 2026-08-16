@@ -142,6 +142,25 @@ export async function startServer({ host, port } = {}) {
   const runtime = createDurableRuntime({ dataDir });
   const app = createHostedInterface(runtime, { host: resolvedHost, port: resolvedPort });
   const address = await app.listen();
+  let shuttingDown = false;
+  const originalClose = app.close.bind(app);
+  const onSignal = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const force = setTimeout(() => process.exit(1), 5_000);
+    originalClose()
+      .then(() => { clearTimeout(force); process.exit(0); })
+      .catch(() => { clearTimeout(force); process.exit(1); });
+  };
+  const onTerm = () => onSignal("SIGTERM");
+  const onInt = () => onSignal("SIGINT");
+  process.once("SIGTERM", onTerm);
+  process.once("SIGINT", onInt);
+  app.close = async () => {
+    process.removeListener("SIGTERM", onTerm);
+    process.removeListener("SIGINT", onInt);
+    return await originalClose();
+  };
   bootPhase = "running"; // boot survived; from here on an exit 0 is a real one
   return { app, runtime, address, dataDir, host: resolvedHost, port: resolvedPort };
 }

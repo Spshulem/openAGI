@@ -15,32 +15,58 @@ import { resolveDataDir } from "./data-dir.js";
 // mid-action-queue doesn't lose anything.
 
 export class PendingActionStore {
-  constructor({ dir } = {}) {
+  constructor({ dir, now = () => Date.now() } = {}) {
     this.dir = dir ?? path.join(resolveDataDir(), "pending-actions");
+    this.now = now;
     ensureDir(this.dir);
     this.actions = new Map();
     this.events = null;
+    // Recovery and expiry happen while the durable runtime is constructed,
+    // before createHostedInterface owns/binds the live event bus. Hold those
+    // resolutions until bindEvents() so the durable outreach copy is not left
+    // actionable after its underlying approval became terminal at startup.
+    this.deferredResolutionEvents = [];
     this._loadSnapshot();
     this._replayJournal();
+    this._recoverInterruptedExecutions();
+    this._expirePending();
   }
 
   /// Late-bound: hosted-interface creates the event bus, then calls this
   /// so subsequent enqueue/decide calls broadcast over SSE → Mac app.
   bindEvents(events) {
     this.events = events;
+    const deferred = this.deferredResolutionEvents.splice(0);
+    for (const payload of deferred) {
+      this.events?.emit?.("pending-action-resolved", payload);
+    }
   }
 
   list({ status } = {}) {
+    this._expirePending();
     const all = [...this.actions.values()];
     const filtered = status ? all.filter((a) => a.status === status) : all;
     return filtered.sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
   }
 
   get(id) {
+    this._expirePending();
     return this.actions.get(id) ?? null;
   }
 
-  enqueue({ toolName, args, context, summary, reason }) {
+  enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null }) {
+    const boundedDedupeKey = typeof dedupeKey === "string" ? dedupeKey.slice(0, 500) : null;
+    if (boundedDedupeKey) {
+      const existing = this.list({ status: "pending" }).find((candidate) =>
+        candidate.toolName === toolName && candidate.dedupeKey === boundedDedupeKey
+      );
+      if (existing) return existing;
+    }
+    const createdMs = this.now();
+    const createdAt = new Date(createdMs).toISOString();
+    const boundedTtlMs = Number.isFinite(Number(ttlMs)) && Number(ttlMs) > 0
+      ? Math.min(Math.trunc(Number(ttlMs)), 24 * 60 * 60 * 1000)
+      : null;
     const action = {
       id: createId("act"),
       toolName,
@@ -48,8 +74,10 @@ export class PendingActionStore {
       context: serializableContext(context),
       summary: summary ?? `Run ${toolName}`,
       reason: reason ?? null,
+      dedupeKey: boundedDedupeKey,
       status: "pending",
-      createdAt: nowIso(),
+      createdAt,
+      expiresAt: boundedTtlMs ? new Date(createdMs + boundedTtlMs).toISOString() : null,
       decidedAt: null,
       decidedBy: null,
       result: null,
@@ -67,17 +95,41 @@ export class PendingActionStore {
     return action;
   }
 
-  decide(id, { decision, decidedBy, result, error }) {
+  // Synchronously claim a pending action before its side effect is awaited.
+  // Dashboard, overlay, and notification approval surfaces can race; checking
+  // `status === pending` in each route is not enough because both requests can
+  // pass that check before either handler returns. The persisted executing
+  // state makes the claim one-shot and fail-closed across a daemon crash.
+  claimForExecution(id, { claimedBy = "user" } = {}) {
+    this._expirePending();
+    const action = this.actions.get(id);
+    if (!action || action.status !== "pending") return null;
+    const claimedAt = new Date(this.now()).toISOString();
+    const executionId = createId("exec");
+    action.status = "executing";
+    action.claimedAt = claimedAt;
+    action.claimedBy = claimedBy;
+    action.executionId = executionId;
+    this._appendJournal({ op: "claim", id, status: action.status, claimedAt, claimedBy, executionId });
+    return { action, executionId };
+  }
+
+  decide(id, { decision, decidedBy, result, error, executionId = null }) {
+    this._expirePending();
     const action = this.actions.get(id);
     if (!action) return null;
-    if (action.status !== "pending") return action;
+    const finishingClaim = action.status === "executing"
+      && typeof executionId === "string"
+      && executionId === action.executionId;
+    if (action.status !== "pending" && !finishingClaim) return action;
     action.status = decision === "approve" ? "approved" : "denied";
-    action.decidedAt = nowIso();
+    action.decidedAt = new Date(this.now()).toISOString();
     action.decidedBy = decidedBy ?? "user";
     if (result !== undefined) action.result = result;
     if (error !== undefined) action.error = error;
     this.actions.set(id, action);
     this._appendJournal({ op: "decide", id, status: action.status, decidedAt: action.decidedAt, decidedBy: action.decidedBy, result, error });
+    this._emitResolution(action);
     return action;
   }
 
@@ -130,12 +182,83 @@ export class PendingActionStore {
           if (event.result !== undefined) a.result = event.result;
           if (event.error !== undefined) a.error = event.error;
         }
+      } else if (event.op === "claim" && event.id) {
+        const a = this.actions.get(event.id);
+        if (a && a.status === "pending") {
+          a.status = "executing";
+          a.claimedAt = event.claimedAt;
+          a.claimedBy = event.claimedBy;
+          a.executionId = event.executionId;
+        }
       }
     }
   }
 
   _appendJournal(event) {
     appendJsonLine(this._journalPath(), event);
+  }
+
+  _expirePending() {
+    const atMs = this.now();
+    const decidedAt = new Date(atMs).toISOString();
+    for (const action of this.actions.values()) {
+      if (action.status !== "pending" || !action.expiresAt) continue;
+      const expiresAt = Date.parse(action.expiresAt);
+      if (!Number.isFinite(expiresAt) || atMs < expiresAt) continue;
+      action.status = "expired";
+      action.decidedAt = decidedAt;
+      action.decidedBy = "system";
+      action.error = "Approval expired before it was used.";
+      this._appendJournal({
+        op: "decide",
+        id: action.id,
+        status: action.status,
+        decidedAt,
+        decidedBy: action.decidedBy,
+        error: action.error
+      });
+      this._emitResolution(action);
+    }
+  }
+
+  _recoverInterruptedExecutions() {
+    const decidedAt = new Date(this.now()).toISOString();
+    for (const action of this.actions.values()) {
+      if (action.status !== "executing") continue;
+      action.status = "interrupted";
+      action.decidedAt = decidedAt;
+      action.decidedBy = "system";
+      action.error = "Approval execution was interrupted by a daemon restart; request it again before retrying.";
+      this._appendJournal({
+        op: "decide",
+        id: action.id,
+        status: action.status,
+        decidedAt,
+        decidedBy: action.decidedBy,
+        error: action.error
+      });
+      this._emitResolution(action);
+    }
+  }
+
+  _emitResolution(action) {
+    const payload = {
+      id: action.id,
+      toolName: action.toolName,
+      status: action.status,
+      decidedAt: action.decidedAt,
+      decidedBy: action.decidedBy,
+      error: action.error ?? null,
+      // "approved" records the user's decision. It does not, by itself,
+      // prove the confirmed handler succeeded. Consumers must use this field
+      // before presenting the linked outreach item as acted.
+      executionSucceeded: action.status === "approved" && action.error == null
+    };
+    if (this.events) {
+      this.events.emit?.("pending-action-resolved", payload);
+    } else {
+      this.deferredResolutionEvents.push(payload);
+    }
   }
 }
 
@@ -148,6 +271,7 @@ function serializableContext(ctx) {
     agentId: ctx.agentId ?? null,
     channel: ctx.channel ?? null,
     from: ctx.from ?? null,
-    target: ctx.target ?? null
+    target: ctx.target ?? null,
+    origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null
   };
 }

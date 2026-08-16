@@ -76,6 +76,9 @@ echo "▶ Compiling Swift binary"
 (cd "${MAC_DIR}" && swift build -c release --product OpenAGI)
 BIN="$(cd "${MAC_DIR}" && swift build -c release --product OpenAGI --show-bin-path)/OpenAGI"
 [[ -x "${BIN}" ]] || { echo "Build failed: ${BIN} not found" >&2; exit 1; }
+(cd "${MAC_DIR}" && swift build -c release --product OpenAGIComputerHelper)
+HELPER="$(cd "${MAC_DIR}" && swift build -c release --product OpenAGIComputerHelper --show-bin-path)/OpenAGIComputerHelper"
+[[ -x "${HELPER}" ]] || { echo "Build failed: ${HELPER} not found" >&2; exit 1; }
 
 # 2. Fetch Node 22 runtime if not cached
 if [[ ! -f "${NODE_TGZ}" ]]; then
@@ -90,6 +93,8 @@ mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 
 cp "${BIN}" "${APP}/Contents/MacOS/OpenAGI"
 chmod +x "${APP}/Contents/MacOS/OpenAGI"
+cp "${HELPER}" "${APP}/Contents/Resources/OpenAGIComputerHelper"
+chmod +x "${APP}/Contents/Resources/OpenAGIComputerHelper"
 
 # Add @executable_path/../Frameworks to rpath so dyld finds Sparkle.framework
 # inside the bundle. Idempotent: ignore the "already present" error on re-runs.
@@ -197,6 +202,12 @@ if [[ -n "${SIGN_USED}" ]]; then
     codesign --force --options runtime --timestamp \
       --entitlements "${MAC_DIR}/Resources/node-entitlements.plist" \
       --sign "${SIGN_IDENTITY}" "${NODE_BINARY}"
+  fi
+  # Computer Use input runs in its own nested executable. Sign it explicitly
+  # before sealing the outer app so Developer ID/notarization covers the code
+  # that synthesizes CGEvents; --deep is intentionally not used below.
+  if [[ -f "${APP}/Contents/Resources/OpenAGIComputerHelper" ]]; then
+    codesign "${CS_FLAGS[@]}" "${APP}/Contents/Resources/OpenAGIComputerHelper"
   fi
   # Sign other nested executables (npm/npx are scripts; just sign anything binary).
   find "${APP}/Contents/Resources/node" -type f -perm +111 ! -path "*/node" -exec \

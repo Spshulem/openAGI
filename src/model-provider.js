@@ -9,6 +9,11 @@ const DEFAULT_SSE_LIMITS = Object.freeze({
   maxTotalBytes: 64 * 1024 * 1024
 });
 const MAX_ANTHROPIC_CONTENT_BLOCK_INDEX = 1_023;
+const FINAL_ANSWER_INSTRUCTION = [
+  "The runtime has finished the available tool phase.",
+  "Return a user-visible final answer now and do not call any tools.",
+  "Summarize what was completed; if anything could not be completed, say so explicitly."
+].join(" ");
 
 export class DeterministicModelProvider {
   constructor(options = {}) {
@@ -95,8 +100,9 @@ export class OpenAIResponsesProvider {
     return this.model;
   }
 
-  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, onProgress, onTextDelta }) {
+  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, onProgress, onTextDelta }) {
     const model = this.resolveModel({ model: modelOverride, tier, task });
+    const maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
     this.budgetGuard?.check();
 
@@ -120,8 +126,9 @@ export class OpenAIResponsesProvider {
     const toolCalls = [];
 
     let response;
-    for (let hop = 0; hop < this.maxToolHops; hop += 1) {
-      notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop: hop + 1, maxToolHops: this.maxToolHops });
+    let needsFinalAnswer = false;
+    for (let hop = 0; hop < maxToolHops; hop += 1) {
+      notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop: hop + 1, maxToolHops });
       const body = {
         model,
         instructions: baseInstructions,
@@ -152,7 +159,14 @@ export class OpenAIResponsesProvider {
         : await this.postResponses(body, context);
 
       const calls = extractFunctionCalls(response);
-      if (calls.length === 0) break;
+      if (calls.length === 0) {
+        // A provider can occasionally finish a successful response with no
+        // visible message. Treat that as incomplete and make one safe retry
+        // with tools disabled; replaying this request WITH tools could repeat
+        // a side effect the user already approved.
+        needsFinalAnswer = !extractResponseText(response);
+        break;
+      }
 
       // Append the assistant's function_call items so the model can see its own
       // last turn on the next hop (replaces what previous_response_id would've done).
@@ -177,19 +191,18 @@ export class OpenAIResponsesProvider {
         // as base64. function_call_output is text-only, so the model can't see
         // it there — strip the bytes from the JSON output and re-attach them as
         // a real input_image in a following user turn so the model can ground on it.
-        const image = invocation.ok && result && typeof result === "object" && result.image && result.format ? result : null;
+        const image = invocation.ok ? toolResultImage(result) : null;
         if (image) {
-          const { image: bytes, ...meta } = result;
           conversationInput.push({
             type: "function_call_output",
             call_id: call.call_id,
-            output: JSON.stringify({ ...meta, image: "[attached as image below]" })
+            output: JSON.stringify({ ...image.meta, image: "[attached as image below]" })
           });
           conversationInput.push({
             role: "user",
             content: [
-              { type: "input_text", text: `Screenshot (${meta.width}×${meta.height}, click coordinates are in this image's space):` },
-              { type: "input_image", image_url: `data:image/${image.format};base64,${bytes}` }
+              { type: "input_text", text: `Screenshot (${image.meta.width}×${image.meta.height}, click coordinates are in this image's space):` },
+              { type: "input_image", image_url: `data:image/${image.format};base64,${image.data}` }
             ]
           });
         } else {
@@ -200,13 +213,49 @@ export class OpenAIResponsesProvider {
           });
         }
       }
+
+      // maxToolHops caps tool-use rounds, not the final prose answer. The old
+      // loop stopped here with the last function_call response and persisted
+      // "(no text)". Reserve one additional model call with no tools so it can
+      // summarize the results without any chance of invoking them twice.
+      if (hop === maxToolHops - 1) needsFinalAnswer = true;
     }
 
+    if (!response || needsFinalAnswer) {
+      const hop = maxToolHops + 1;
+      notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop, maxToolHops: hop });
+      const body = {
+        model,
+        instructions: `${baseInstructions}\n\n${FINAL_ANSWER_INSTRUCTION}`,
+        input: conversationInput,
+        prompt_cache_key: `openagi:${agent?.name ?? "default"}`
+      };
+      if (this.reasoningEffort) body.reasoning = { effort: this.reasoningEffort };
+      let firstVisibleDelta = true;
+      const emitText = typeof onTextDelta === "function"
+        ? (text) => {
+            notifyTextDelta(onTextDelta, {
+              text,
+              reset: firstVisibleDelta,
+              provider: "openai",
+              model,
+              hop
+            });
+            firstVisibleDelta = false;
+          }
+        : null;
+      response = emitText
+        ? await this.postResponsesStream(body, context, emitText)
+        : await this.postResponses(body, context);
+    }
+
+    const finalText = extractResponseText(response);
+    if (!finalText) throw emptyModelResponseError("OpenAI");
     return {
       provider: "openai",
       model,
       id: response?.id,
-      text: extractResponseText(response) || "(no text)",
+      text: finalText,
       toolCalls
     };
   }
@@ -333,9 +382,10 @@ export class AnthropicProvider {
     return this.model;
   }
 
-  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task, onProgress, onTextDelta }) {
+  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, onProgress, onTextDelta }) {
     if (!this.apiKey) throw new Error("ANTHROPIC_API_KEY is not configured.");
     const model = this.resolveModel({ model: modelOverride, tier, task });
+    const maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     this.budgetGuard?.check();
 
     const tools = toolRegistry?.toAnthropicTools?.() ?? [];
@@ -361,9 +411,10 @@ export class AnthropicProvider {
 
     const toolCalls = [];
     let response;
+    let needsFinalAnswer = false;
 
-    for (let hop = 0; hop < this.maxToolHops; hop += 1) {
-      notifyProgress(onProgress, { stage: "model", provider: "anthropic", model, hop: hop + 1, maxToolHops: this.maxToolHops });
+    for (let hop = 0; hop < maxToolHops; hop += 1) {
+      notifyProgress(onProgress, { stage: "model", provider: "anthropic", model, hop: hop + 1, maxToolHops });
       const body = {
         model,
         max_tokens: this.maxTokens,
@@ -388,24 +439,77 @@ export class AnthropicProvider {
         ? await this.postMessagesStream(body, context, emitText)
         : await this.postMessages(body, context);
 
-      convo.push({ role: "assistant", content: response.content });
+      const responseContent = Array.isArray(response.content) ? response.content : [];
+      // Do not echo a malformed empty assistant turn into the no-tools retry.
+      // Anthropic rejects empty assistant content, which would turn the recovery
+      // path itself into a request-validation failure.
+      if (responseContent.length > 0) convo.push({ role: "assistant", content: responseContent });
 
-      const toolUses = (response.content ?? []).filter((c) => c.type === "tool_use");
-      if (toolUses.length === 0) break;
+      const toolUses = responseContent.filter((c) => c.type === "tool_use");
+      if (toolUses.length === 0) {
+        needsFinalAnswer = !responseContent.some((c) => c.type === "text" && String(c.text ?? "").trim());
+        break;
+      }
 
       const toolResults = [];
       for (const use of toolUses) {
         notifyProgress(onProgress, { stage: "tool", provider: "anthropic", model, hop: hop + 1, tool: use.name });
         const invocation = await (toolRegistry?.invoke?.(use.name, use.input ?? {}, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: use.name, arguments: use.input, result: invocation });
+        const result = invocation.ok ? invocation.result : { error: invocation.error };
+        const image = invocation.ok ? toolResultImage(result) : null;
+        const content = image
+          ? [
+              {
+                type: "text",
+                text: JSON.stringify({ ...image.meta, image: "[attached as image below]" })
+              },
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: `image/${image.format}`,
+                  data: image.data
+                }
+              }
+            ]
+          : JSON.stringify(result);
         toolResults.push({
           type: "tool_result",
           tool_use_id: use.id,
-          content: JSON.stringify(invocation.ok ? invocation.result : { error: invocation.error }),
+          content,
           is_error: !invocation.ok
         });
       }
       convo.push({ role: "user", content: toolResults });
+      if (hop === maxToolHops - 1) needsFinalAnswer = true;
+    }
+
+    if (!response || needsFinalAnswer) {
+      const hop = maxToolHops + 1;
+      notifyProgress(onProgress, { stage: "model", provider: "anthropic", model, hop, maxToolHops: hop });
+      const body = {
+        model,
+        max_tokens: this.maxTokens,
+        system: [...system, { type: "text", text: FINAL_ANSWER_INSTRUCTION }],
+        messages: convo
+      };
+      let firstVisibleDelta = true;
+      const emitText = typeof onTextDelta === "function"
+        ? (text) => {
+            notifyTextDelta(onTextDelta, {
+              text,
+              reset: firstVisibleDelta,
+              provider: "anthropic",
+              model,
+              hop
+            });
+            firstVisibleDelta = false;
+          }
+        : null;
+      response = emitText
+        ? await this.postMessagesStream(body, context, emitText)
+        : await this.postMessages(body, context);
     }
 
     const text = (response?.content ?? [])
@@ -413,12 +517,13 @@ export class AnthropicProvider {
       .map((c) => c.text)
       .join("\n")
       .trim();
+    if (!text) throw emptyModelResponseError("Anthropic");
 
     return {
       provider: "anthropic",
       model,
       id: response?.id,
-      text: text || "(no text)",
+      text,
       toolCalls
     };
   }
@@ -673,6 +778,25 @@ function safeParseJson(value) {
   }
 }
 
+// Screenshot tools share one provider-neutral result shape. Attach those
+// bytes as a native vision block; leaving base64 inside JSON would make the
+// screen opaque to the model and prevent grounded follow-up clicks.
+function toolResultImage(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  if (typeof result.image !== "string" || !result.image) return null;
+  const rawFormat = String(result.format ?? "").toLowerCase();
+  const format = rawFormat === "jpg" ? "jpeg" : rawFormat;
+  if (!["png", "jpeg", "gif", "webp"].includes(format)) return null;
+  const { image, format: _format, ...meta } = result;
+  return { data: image, format, meta };
+}
+
+function emptyModelResponseError(provider) {
+  const error = new Error(`${provider} returned an empty final response after a no-tools retry.`);
+  error.code = "EMPTY_MODEL_RESPONSE";
+  return error;
+}
+
 function truncate(value, max) {
   const text = String(value ?? "");
   if (text.length <= max) return text;
@@ -800,6 +924,14 @@ function normalizeSseLimits(value = {}) {
 
 function positiveInteger(value, fallback) {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function boundedToolHops(value, fallback) {
+  const requested = Number(value);
+  const base = Number.isSafeInteger(fallback) && fallback > 0 ? fallback : 6;
+  return Number.isSafeInteger(requested) && requested > 0
+    ? Math.min(64, requested)
+    : Math.min(64, base);
 }
 
 function assertAnthropicContentBlockIndex(index) {

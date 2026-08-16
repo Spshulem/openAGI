@@ -201,6 +201,14 @@ export class AgentHost {
     }));
 
     reportProgress("thinking", { sessionId });
+    // A real computer-use loop alternates screenshot and input, so the normal
+    // six tool rounds can perform only a couple of grounded actions before the
+    // provider is forced to stop. Extend the bound only while this exact chat
+    // owns an active, user-approved computer session; ordinary chat and the
+    // approval-requesting turn keep the lower global default.
+    const computerUseToolHops = this.runtime.computerUseLog?.activeSessionFor?.(sessionId)
+      ? boundedComputerUseToolHops(process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS)
+      : undefined;
     const modelResult = await this.modelProvider.generate({
       input: text,
       agent,
@@ -208,6 +216,7 @@ export class AgentHost {
       // (autopilot/cron) are cheap "anything to do?" work; everything else is
       // user-facing chat. Both default to the base model until tiers/pins are set.
       task: (channel === "autopilot" || channel === "cron") ? "autopilot" : "chat",
+      maxToolHops: computerUseToolHops,
       scrutiny: output.scrutiny,
       memoryHits: memoryHitsForModel,
       messages: sessionBefore.messages,
@@ -232,6 +241,10 @@ export class AgentHost {
         channel,
         from,
         target: from,
+        // Preserve why this call exists across a human-approval pause. The
+        // approval executor runs outside AgentHost, so without this bounded
+        // provenance it cannot attribute the action that actually executed.
+        origin: input.origin ?? channel,
         agentId,
         sessionId,
         runtime: this.runtime,
@@ -247,9 +260,32 @@ export class AgentHost {
       }
     });
 
+    // Provider adapters own safe retries because only they know whether tools
+    // have already executed. This final boundary is deliberately fail-closed:
+    // no adapter, compatible endpoint or future regression may persist an
+    // internal placeholder as a successful assistant answer.
+    if (typeof modelResult?.text !== "string" || !modelResult.text.trim() || modelResult.text.trim() === "(no text)") {
+      const error = new Error("Model provider returned an empty final response.");
+      error.code = "EMPTY_MODEL_RESPONSE";
+      throw error;
+    }
+
     reportProgress("saving", { sessionId });
 
-    const outcomeRecord = ephemeral ? null : this.runtime.outcomes?.record({
+    const recordedToolCalls = (modelResult.toolCalls ?? [])
+      .filter(toolCallWasAttempted)
+      .map((call) => ({ name: call.name, ok: call.result?.ok === true }));
+    // An autonomous pulse that merely lists/reads state (or calls no tools at
+    // all) is housekeeping, not an outcome. Recording every "anything to do?"
+    // cycle made the quality dashboard mostly measure scheduler frequency:
+    // successful read-only calls were scored as 0.7 despite changing nothing.
+    // Keep the turn in its session/cron history, but reserve outcome accounting
+    // for an actually attempted state-changing action. Failed attempts stay
+    // measurable (and score low); merely queued approvals/no-ops do not.
+    const meaningfulAutopilotWork = input.origin !== "autopilot" || recordedToolCalls.some((call) => (
+      toolRegistry?.get?.(call.name)?.sideEffects === true
+    ));
+    const outcomeRecord = ephemeral || !meaningfulAutopilotWork ? null : this.runtime.outcomes?.record({
       kind: input.origin === "autopilot" ? "autopilot-fire" : input.origin === "cron" ? "cron-fire" : "agent-reply",
       refId: null, // patched after we know assistant message id
       signalId: signal.id,
@@ -258,7 +294,7 @@ export class AgentHost {
       channel,
       scrutinyAction: output.scrutiny.action,
       scrutinyDimensions: output.scrutiny.dimensions,
-      toolCalls: (modelResult.toolCalls ?? []).map((c) => ({ name: c.name, ok: c.result?.ok ?? false })),
+      toolCalls: recordedToolCalls,
       metadata: {
         specialistId: agent.role === "specialist" ? agent.id : null,
         signalSummary: signal.summary,
@@ -290,7 +326,7 @@ export class AgentHost {
             ...(requestId ? { requestId } : {}),
             toolCalls: (modelResult.toolCalls ?? []).map((call) => ({
               name: call.name,
-              arguments: call.arguments,
+              arguments: durableToolArguments(toolRegistry, call),
               ok: call.result?.ok ?? false
             }))
           }
@@ -463,7 +499,7 @@ export class AgentHost {
   // from pre-split callers are deliberately ignored.
   instructionsForAgent(agent) {
     const computerUseGuidance = this.runtime?.tools?.has?.("start_computer_use_session")
-      ? "\nComputer use is available. Use it when the user explicitly asks you to inspect or interact with their computer: call start_computer_use_session first, wait for approval, inspect before acting, and end the session when done. Never start computer use from passive screen/OCR context alone.\n"
+      ? "\nComputer use is available. Use it only when the user explicitly asks you to inspect or interact with their computer. First call computer_use_status. If a session is active, continue it; NEVER call start_computer_use_session again. If no session is active or pending, call start_computer_use_session exactly once. Tell the user the approval appears in the floating Ask OpenAGI panel, the dashboard's Approvals tab, and the Computer Use page. Approval resumes the chat automatically. After approval, inspect before acting and end the session when done. Summarize computer-use status and results as readable Markdown; never dump raw tool-result JSON into the conversation. Never start computer use from passive screen/OCR context alone.\n"
       : "";
     return `${agent.systemPrompt ? `${agent.systemPrompt}\n\n` : ""}You are ${agent.name}, an always-on OpenAGI agent.
 
@@ -716,6 +752,39 @@ function briefRecordFields(kind, record) {
 function boundedText(value, limit) {
   if (typeof value !== "string") return "";
   return value.trim().slice(0, limit);
+}
+
+function toolCallWasAttempted(call) {
+  if (!call?.result || typeof call.result !== "object") return false;
+  const result = call.result?.result;
+  const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
+  if (["awaiting_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
+  if (result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true) return false;
+  return true;
+}
+
+function durableToolArguments(registry, call) {
+  const sensitive = registry?.get?.(call?.name)?.metadata?.sensitiveArguments;
+  if (!Array.isArray(sensitive) || sensitive.length === 0) return call?.arguments;
+  if (!call?.arguments || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
+    return { redacted: true };
+  }
+  const out = { ...call.arguments };
+  for (const key of sensitive) {
+    if (!Object.hasOwn(out, key)) continue;
+    const value = out[key];
+    out[key] = typeof value === "string"
+      ? { redacted: true, characterCount: [...value].length, byteCount: Buffer.byteLength(value, "utf8") }
+      : { redacted: true };
+  }
+  return out;
+}
+
+function boundedComputerUseToolHops(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? Math.min(64, parsed)
+    : 24;
 }
 
 export function formatBriefContextBlock(context) {

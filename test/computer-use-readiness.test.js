@@ -4,15 +4,11 @@ import { computerUseReadiness } from "../src/integrations/computer-use.js";
 
 test("computer-use readiness distinguishes disabled, observe-only, and control-ready", async () => {
   const disabled = await computerUseReadiness({ env: {}, fetchImpl: null, toolsRegistered: false });
-  assert.deepEqual(disabled, {
-    enabled: false,
-    toolsRegistered: false,
-    mode: "disabled",
-    nodeConfigured: false,
-    nodeReachable: false,
-    screenshot: "disabled",
-    inputAvailable: false
-  });
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabled.toolsRegistered, false);
+  assert.equal(disabled.mode, "disabled");
+  assert.equal(disabled.nodeConfigured, false);
+  assert.equal(disabled.inputAvailable, false);
 
   const observeOnly = await computerUseReadiness({
     env: { OPENAGI_COMPUTER_USE: "1" },
@@ -31,8 +27,18 @@ test("computer-use readiness distinguishes disabled, observe-only, and control-r
     },
     fetchImpl: async (url, options) => {
       assert.equal(url, "https://computer.example/health");
-      assert.equal(options.headers.authorization, undefined, "public health probe must not send the node token");
-      return { ok: true };
+      assert.equal(options.headers.authorization, "Bearer must-not-leak", "health is authenticated with the scoped service token");
+      return {
+        ok: true,
+        json: async () => ({
+          capability: {
+            id: "computer-use",
+            screenshotReady: true,
+            inputReady: true,
+            operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+          }
+        })
+      };
     },
     toolsRegistered: true
   });
@@ -41,6 +47,24 @@ test("computer-use readiness distinguishes disabled, observe-only, and control-r
   assert.equal(ready.inputAvailable, true);
   assert.equal(JSON.stringify(ready).includes("must-not-leak"), false);
   assert.equal(JSON.stringify(ready).includes("computer.example"), false, "status must not expose the private node endpoint");
+});
+
+test("a reachable node without verified input permissions is not control-ready", async () => {
+  const status = await computerUseReadiness({
+    env: {
+      OPENAGI_COMPUTER_USE: "1",
+      OPENAGI_COMPUTER_NODE: "https://computer.example",
+      OPENAGI_COMPUTER_NODE_TOKEN: "scoped"
+    },
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => ({ capability: { id: "computer-use", screenshotReady: true, inputReady: false, operations: ["screenshot"] } })
+    }),
+    toolsRegistered: true
+  });
+  assert.equal(status.nodeReachable, true);
+  assert.equal(status.mode, "permissions-required");
+  assert.equal(status.inputAvailable, false);
 });
 
 test("an unreachable configured node is explicit, not fake-ready", async () => {

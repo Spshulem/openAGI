@@ -27,6 +27,8 @@
 // BEFORE attempting execution. The "reasoning" is whatever the model
 // produced in its assistant text turn alongside the tool call — captured
 // via a separate `reasoning` param that the agent is instructed to fill.
+import crypto from "node:crypto";
+import { pinnedRemoteOrigin } from "../node-control.js";
 
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
@@ -36,6 +38,7 @@ const EXECUTION_UNAVAILABLE = "no reachable computer-use node is configured. The
 // dynamic unregister path (used by the dashboard toggle) can remove
 // exactly what was added without guessing.
 export const COMPUTER_USE_TOOL_NAMES = [
+  "computer_use_status",
   "start_computer_use_session",
   "end_computer_use_session",
   "computer_screenshot",
@@ -60,31 +63,62 @@ export function isComputerUseEnabled() {
 export async function computerUseReadiness({
   env = process.env,
   fetchImpl = globalThis.fetch,
+  runtime = null,
   toolsRegistered = null,
   timeoutMs = 1_200
 } = {}) {
   const value = String(env.OPENAGI_COMPUTER_USE ?? "").toLowerCase();
   const enabled = value === "1" || value === "true" || value === "yes";
-  const nodeUrl = String(env.OPENAGI_COMPUTER_NODE ?? "").replace(/\/$/, "");
-  const nodeConfigured = Boolean(nodeUrl);
+  await runtime?.nodeCapabilities?.refresh?.().catch?.(() => {});
+  const explicit = explicitComputerNode(env);
+  const discovered = runtime?.nodeCapabilities?.resolve?.("computer-use") ?? null;
+  const node = explicit ?? (discovered ? relayComputerNode(runtime, discovered) : null);
+  const nodeConfigured = Boolean(node);
   let nodeReachable = false;
-  if (nodeConfigured && typeof fetchImpl === "function") {
+  let liveScreenshot = false;
+  let inputAvailable = false;
+  let operations = [];
+  let detail = null;
+  if (node?.kind === "relay") {
+    const capability = discovered.capabilities?.find?.((entry) => entry.id === "computer-use") ?? null;
+    nodeReachable = Boolean(capability);
+    liveScreenshot = capability?.ready === true && capability.operations?.includes?.("screenshot");
+    operations = capability?.operations ?? [];
+    inputAvailable = capability?.ready === true
+      && ["click", "move", "type", "key", "scroll"].every((operation) => operations.includes(operation));
+    detail = capability?.detail ?? null;
+  } else if (node?.kind === "invalid") {
+    detail = node.detail;
+  } else if (nodeConfigured && typeof fetchImpl === "function") {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetchImpl(`${nodeUrl}/health`, {
+      const response = await fetchImpl(`${node.url}/health`, {
         method: "GET",
-        headers: { accept: "application/json" },
+        headers: {
+          accept: "application/json",
+          ...(node.token ? { authorization: `Bearer ${node.token}` } : {})
+        },
+        redirect: "manual",
         signal: controller.signal
       });
       nodeReachable = Boolean(response?.ok);
+      if (response?.ok) {
+        const body = await response.json().catch(() => null);
+        const capability = body?.capability?.id === "computer-use" ? body.capability : null;
+        operations = Array.isArray(capability?.operations) ? capability.operations : [];
+        liveScreenshot = capability?.screenshotReady === true && operations.includes("screenshot");
+        inputAvailable = capability?.inputReady === true
+          && ["click", "move", "type", "key", "scroll"].every((operation) => operations.includes(operation));
+        detail = typeof capability?.detail === "string" ? capability.detail.slice(0, 300) : null;
+      }
     } catch { /* unreachable is reported below */ }
     finally { clearTimeout(timer); }
   }
   const mode = !enabled
     ? "disabled"
     : nodeReachable
-      ? "control-ready"
+      ? (liveScreenshot && inputAvailable ? "control-ready" : "permissions-required")
       : nodeConfigured
         ? "node-unreachable"
         : "observe-only";
@@ -94,28 +128,85 @@ export async function computerUseReadiness({
     mode,
     nodeConfigured,
     nodeReachable,
-    screenshot: enabled ? (nodeReachable ? "live-image" : "recent-ocr") : "disabled",
-    inputAvailable: enabled && nodeReachable
+    screenshot: enabled ? (liveScreenshot ? "live-image" : "recent-ocr") : "disabled",
+    inputAvailable: enabled && nodeReachable && inputAvailable,
+    operations,
+    detail
   };
 }
 
 /// A configured computer-use node (a Mac running `openagi computer-server`)
 /// turns the stub into real execution: screenshots + input synthesis run on
 /// that node. Without it, input is logged and refused (no fake success).
-function computerNode() {
-  const url = (process.env.OPENAGI_COMPUTER_NODE ?? "").replace(/\/$/, "");
+function explicitComputerNode(env = process.env) {
+  const url = String(env.OPENAGI_COMPUTER_NODE ?? "").replace(/\/$/, "");
   if (!url) return null;
-  return { url, token: process.env.OPENAGI_COMPUTER_NODE_TOKEN ?? null };
+  try {
+    const safeUrl = pinnedRemoteOrigin(url, {
+      allowInsecureRemote: env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
+        || String(env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true"
+    });
+    return { kind: "http", id: "explicit", url: safeUrl, token: env.OPENAGI_COMPUTER_NODE_TOKEN ?? null };
+  } catch (error) {
+    return { kind: "invalid", id: "explicit", detail: error.message };
+  }
 }
 
-async function callNode(node, path, body, fetchImpl) {
-  const res = await fetchImpl(`${node.url}${path}`, {
+function relayComputerNode(runtime, record) {
+  return {
+    kind: "relay",
+    id: record.nodeId,
+    record,
+    dispatch: (operation, payload, opts) => runtime.nodeCapabilities.dispatch(record.nodeId, "computer-use", operation, payload, opts)
+  };
+}
+
+function computerNode(runtime, session = null) {
+  if (session && session.capability !== "computer-use") return null;
+  const explicit = explicitComputerNode();
+  if (explicit?.kind === "invalid") return null;
+  if (explicit) return session?.targetNodeId && session.targetNodeId !== explicit.id ? null : explicit;
+  if (!runtime?.nodeCapabilities?.resolve) return null;
+  const record = runtime.nodeCapabilities.resolve("computer-use", {
+    nodeId: session?.targetNodeId ?? null
+  });
+  return record ? relayComputerNode(runtime, record) : null;
+}
+
+const NODE_PATHS = {
+  "session.start": "/session/start",
+  "session.end": "/session/end",
+  screenshot: "/screenshot",
+  click: "/click",
+  move: "/move",
+  type: "/type",
+  key: "/key",
+  scroll: "/scroll"
+};
+
+async function callNode(node, operation, body, fetchImpl, timeoutMs = 30_000, opts = {}) {
+  if (node.kind === "relay") return await node.dispatch(operation, body, opts);
+  const path = NODE_PATHS[operation];
+  if (!path) throw new Error("unsupported computer node operation");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  let res;
+  try {
+    res = await fetchImpl(`${node.url}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json", ...(node.token ? { authorization: `Bearer ${node.token}` } : {}) },
-    body: JSON.stringify(body ?? {})
-  });
+      body: JSON.stringify(body ?? {}),
+      redirect: "manual",
+      signal: controller.signal
+    });
+  } finally { clearTimeout(timer); }
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json.error || `computer node HTTP ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(json.error || `computer node HTTP ${res.status}`);
+    error.nodeAcknowledged = true;
+    throw error;
+  }
   return json;
 }
 
@@ -136,27 +227,213 @@ export function unregisterComputerUseTools(registry) {
 export function registerComputerUseTools(registry, runtime, { fetchImpl = globalThis.fetch } = {}) {
   if (!runtime.computerUseLog) return { registered: false, reason: "no computer-use log bound" };
 
-  const requireActiveSession = () => {
-    const active = runtime.computerUseLog.listSessions({ status: "active" })[0];
+  const requireActiveSession = (context = {}) => {
+    const sourceSessionId = context.sessionId;
+    if (typeof sourceSessionId !== "string" || !sourceSessionId) {
+      throw new Error("Computer-use action is missing its source chat session.");
+    }
+    const active = runtime.computerUseLog.activeSessionFor(sourceSessionId);
     if (!active) throw new Error("No active computer-use session. Call start_computer_use_session first and have the user approve.");
     return active;
   };
 
+  runtime.__computerNodeLeases ??= new Map();
+
+  const ensureNodeLease = async (node, session) => {
+    const existing = runtime.__computerNodeLeases.get(session.id);
+    if (existing) {
+      if (existing.nodeId !== node.id) throw new Error("approved computer-use session is bound to a different node");
+      return existing;
+    }
+    const goalHash = crypto.createHash("sha256")
+      .update(`${session.sourceSessionId}\0${session.targetNodeId}\0${session.goal}`, "utf8")
+      .digest("hex");
+    const opened = await callNode(node, "session.start", {
+      sessionId: session.id,
+      goalHash,
+      expiresAt: session.expiresAt,
+      maxActions: 200,
+      allowedOperations: ["session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+    }, fetchImpl);
+    const lease = {
+      nodeId: node.id,
+      leaseId: opened.leaseId,
+      nextSequence: Number.isSafeInteger(opened.nextSequence) ? opened.nextSequence : 1
+    };
+    runtime.__computerNodeLeases.set(session.id, lease);
+    return lease;
+  };
+
+  const invokeNodeAction = async (node, session, action, operation, payload = {}) => {
+    const lease = await ensureNodeLease(node, session);
+    try {
+      const result = await callNode(node, operation, {
+        ...payload,
+        leaseId: lease.leaseId,
+        actionId: action.id,
+        sequence: lease.nextSequence
+      }, fetchImpl, 30_000, { sessionId: session.id });
+      lease.nextSequence += 1;
+      return result;
+    } catch (error) {
+      throw error;
+    }
+  };
+
+  const abortSession = async (session, reason = "computer-use session was stopped", status = "aborted") => {
+    if (!session) return false;
+    // Revoke the main-side authority synchronously before any network wait so
+    // a concurrent tool cannot reopen a lease while Stop is in progress.
+    runtime.computerUseLog.endSession(session.id, { reason, status });
+    runtime.nodeCapabilities?.cancelSession?.(session.id, reason);
+    const lease = runtime.__computerNodeLeases.get(session.id);
+    const node = computerNode(runtime, session);
+    runtime.__computerNodeLeases.delete(session.id);
+    if (lease && node) {
+      try {
+        await callNode(node, "session.end", {
+          leaseId: lease.leaseId,
+          actionId: `abort_${crypto.randomUUID().replaceAll("-", "")}`,
+          sequence: lease.nextSequence
+        }, fetchImpl, 5_000);
+      } catch { /* best-effort node-side lease revocation */ }
+    }
+    return true;
+  };
+  runtime.abortComputerUseSession = async (sessionOrId, reason) => {
+    const session = typeof sessionOrId === "string"
+      ? runtime.computerUseLog.getSession(sessionOrId)
+      : sessionOrId;
+    return await abortSession(session, reason, "aborted");
+  };
+
+  registry.register({
+    name: "computer_use_status",
+    sideEffects: false,
+    description: "Check whether a computer-use session is already active or awaiting approval. Call this before start_computer_use_session and after the user approves; never create a second start request when a session is active.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false
+    },
+    handler: async (_args, context = {}) => {
+      await runtime.nodeCapabilities?.refresh?.();
+      const active = runtime.computerUseLog.activeSessionFor(context.sessionId) ?? null;
+      const pending = runtime.pendingActions?.list?.({ status: "pending" })
+        .filter((action) => action.toolName === "start_computer_use_session" && action.context?.sessionId === context.sessionId) ?? [];
+      const discoveredNodes = runtime.nodeCapabilities?.list?.("computer-use")?.map?.((entry) => ({
+        nodeId: entry.nodeId,
+        name: entry.name ?? null,
+        ready: entry.capabilities?.some?.((capability) => capability.id === "computer-use" && capability.ready) ?? false
+      })) ?? [];
+      const explicitStatus = explicitComputerNode();
+      const availableNodes = explicitStatus
+        ? [{ nodeId: "explicit", name: null, ready: explicitStatus.kind !== "invalid" }, ...discoveredNodes]
+        : discoveredNodes;
+      return {
+        active: Boolean(active),
+        session: active ? {
+          id: active.id,
+          goal: active.goal,
+          startedAt: active.startedAt
+        } : null,
+        awaitingApproval: pending.length > 0,
+        pendingActionId: pending[0]?.id ?? null,
+        availableNodes,
+        note: active
+          ? "A user-approved computer-use session is active. Continue with computer_screenshot and the computer action tools; do not call start again."
+          : pending.length > 0
+            ? "A start request is already waiting in Approvals. Do not create another."
+            : "No computer-use session is active or awaiting approval."
+      };
+    }
+  });
+
   registry.register({
     name: "start_computer_use_session",
-    description: "Open a computer-use session for a user-stated goal. THIS REQUIRES USER APPROVAL — once approved, subsequent computer_* actions in this session won't re-prompt. " + SAFETY_NOTE,
+    description: "Open a computer-use session for a user-stated goal. First call computer_use_status. If a session is active, continue it and do not call this tool again. Otherwise this creates ONE request in the dashboard's Approvals tab and Computer Use page. Approval automatically resumes the chat; subsequent computer_* actions in the approved session won't re-prompt. " + SAFETY_NOTE,
     parameters: {
       type: "object",
       properties: {
-        goal: { type: "string", description: "What the user is trying to accomplish, in one sentence. Will be shown verbatim in the approval card." }
+        goal: { type: "string", description: "What the user is trying to accomplish, in one sentence. Will be shown verbatim in the approval card." },
+        node: { type: "string", description: "Optional node name or id. Use a value returned by computer_use_status when the user names a specific Mac." },
+        nodeId: { type: "string", description: "Immutable node id resolved before approval. Do not invent this value." },
+        nodeName: { type: "string", description: "Display name resolved before approval. Do not invent this value." }
       },
       required: ["goal"],
       additionalProperties: false
     },
     needsConfirmation: true,
-    summarize: (args) => `Open computer-use session: "${String(args.goal ?? "").slice(0, 120)}"`,
-    handler: async (args) => {
-      const session = runtime.computerUseLog.startSession({ goal: args.goal, approvedBy: "user" });
+    approvalTtlMs: 5 * 60 * 1000,
+    prepareApprovalArgs: async (args, context) => {
+      const goal = String(args.goal ?? "").trim().slice(0, 500);
+      if (!goal) throw new Error("Computer-use session goal is required.");
+      await runtime.nodeCapabilities?.refresh?.();
+      const explicit = explicitComputerNode();
+      if (explicit?.kind === "invalid") throw new Error(explicit.detail);
+      const record = explicit
+        ? { nodeId: explicit.id, name: "Configured computer node" }
+        : runtime.nodeCapabilities?.resolve?.("computer-use", {
+            nodeId: args.nodeId ?? args.node ?? null,
+            nodeName: args.node ?? null
+          });
+      if (!record) {
+        const ready = runtime.nodeCapabilities?.list?.("computer-use")
+          ?.filter?.((entry) => entry.capabilities?.some?.((capability) => capability.ready)) ?? [];
+        if (!args.node && ready.length > 1) {
+          throw new Error("More than one computer-use node is ready. Choose a specific node before requesting approval.");
+        }
+        throw new Error(args.node
+          ? "The requested computer-use node is not online and control-ready."
+          : "No computer-use node is online and control-ready.");
+      }
+      const nodeId = record.nodeId ?? record.id;
+      const nodeName = record.name ?? nodeId;
+      const existing = runtime.computerUseLog.activeSessionFor(context?.sessionId);
+      if (existing && (existing.goal !== goal || existing.targetNodeId !== nodeId)) {
+        throw new Error("This chat already controls a different goal or node. End that session before requesting another approval.");
+      }
+      return { goal, ...(args.node ? { node: String(args.node).slice(0, 200) } : {}), nodeId, nodeName };
+    },
+    confirmationRequired: (args, context) => {
+      const active = runtime.computerUseLog.activeSessionFor(context?.sessionId);
+      if (!active) return true;
+      return active.goal !== String(args.goal ?? "").trim() || active.targetNodeId !== args.nodeId;
+    },
+    approvalDedupeKey: (_args, context) =>
+      "computer-use-session:" + (context.sessionId || [context.channel, context.from, context.agentId].filter(Boolean).join(":") || "global"),
+    summarize: (args) => `Open computer-use session on ${String(args.nodeName ?? args.nodeId ?? "selected node").slice(0, 80)}: "${String(args.goal ?? "").slice(0, 120)}"`,
+    handler: async (args, context = {}) => {
+      if (typeof context.sessionId !== "string" || !context.sessionId) {
+        throw new Error("Computer-use approval cannot start without a source chat session.");
+      }
+      const existing = runtime.computerUseLog.activeSessionFor(context.sessionId);
+      if (existing) {
+        if (existing.goal !== String(args.goal ?? "").trim() || existing.targetNodeId !== args.nodeId) {
+          throw new Error("The active computer-use approval belongs to a different goal or node.");
+        }
+        return {
+          sessionId: existing.id,
+          goal: existing.goal,
+          alreadyActive: true,
+          note: "The approved computer-use session is already active. Continue with computer_screenshot / computer_click / etc; do not request approval again."
+        };
+      }
+      const explicit = explicitComputerNode();
+      const selected = explicit?.kind === "http" && explicit.id === args.nodeId
+        ? explicit
+        : runtime.nodeCapabilities?.resolve?.("computer-use", { nodeId: args.nodeId }) ?? null;
+      if (!selected || (selected.id ?? selected.nodeId) !== args.nodeId) {
+        throw new Error("The computer-use node approved by the user is no longer online and control-ready.");
+      }
+      const session = runtime.computerUseLog.startSession({
+        goal: args.goal,
+        approvedBy: "user",
+        approvalActionId: context.__confirmationActionId ?? null,
+        sourceSessionId: context.sessionId,
+        targetNodeId: args.nodeId,
+        capability: "computer-use"
+      });
       return {
         sessionId: session.id,
         goal: session.goal,
@@ -175,10 +452,10 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       },
       additionalProperties: false
     },
-    handler: async (args) => {
-      const active = runtime.computerUseLog.listSessions({ status: "active" })[0];
+    handler: async (args, context = {}) => {
+      const active = runtime.computerUseLog.activeSessionFor(context.sessionId);
       if (!active) return { ended: false, reason: "no active session" };
-      runtime.computerUseLog.endSession(active.id, { reason: args.reason, status: "ended" });
+      await abortSession(active, args.reason ?? "computer-use session ended", "ended");
       return { ended: true, sessionId: active.id };
     }
   });
@@ -194,18 +471,18 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       },
       additionalProperties: false
     },
-    handler: async (args) => {
-      const session = requireActiveSession();
+    handler: async (args, context = {}) => {
+      const session = requireActiveSession(context);
       const action = runtime.computerUseLog.recordAction({
         sessionId: session.id,
         kind: "screenshot",
         args: {},
         reasoning: args.reasoning ?? null
       });
-      const node = computerNode();
+      const node = computerNode(runtime, session);
       if (node) {
         try {
-          const shot = await callNode(node, "/screenshot", {}, fetchImpl);
+          const shot = await invokeNodeAction(node, session, action, "screenshot", {});
           runtime.computerUseLog.markActionResult(action.id, {
             status: "executed",
             result: { width: shot.width, height: shot.height, bytes: shot.bytes }
@@ -216,10 +493,12 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
             format: shot.format ?? "png",
             width: shot.width,
             height: shot.height,
+            frameId: shot.frameId,
             note: "Live screenshot from the computer-use node."
           };
         } catch (error) {
-          runtime.computerUseLog.markActionResult(action.id, { status: "error", result: { error: error.message } });
+          runtime.computerUseLog.markActionResult(action.id, { status: "error", error: error.message });
+          await abortSession(session, "computer-use node action failed; approval must be renewed", "aborted");
           throw new Error(`computer-use node screenshot failed: ${error.message}`);
         }
       }
@@ -244,28 +523,35 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   // node is configured the action executes ON that node (real input); without
   // one, the intent + reasoning are logged and the handler THROWS so the agent
   // gets an explicit failure instead of a fabricated success. No silent stub.
-  function registerAction(name, nodePath, description, paramShape, payloadOf) {
+  function registerAction(name, nodePath, description, paramShape, payloadOf, required = [], metadata = {}, includeReasoning = true) {
     registry.register({
       name,
-      description: description + " Executes on the connected computer-use node; without one (OPENAGI_COMPUTER_NODE unset) the call is logged and refused.",
+      description: description + " Executes on the selected connected computer-use node; without one the call is logged and refused.",
       parameters: {
         type: "object",
         properties: {
           ...paramShape,
-          reasoning: { type: "string", description: "Why you're doing this (one short sentence). Captured to the action log for the user to review." }
+          ...(includeReasoning ? {
+            reasoning: { type: "string", description: "Why you're doing this (one short sentence). Captured to the action log for the user to review." }
+          } : {})
         },
+        required,
         additionalProperties: false
       },
-      handler: async (args) => {
-        const session = requireActiveSession();
-        const { reasoning, ...actionArgs } = args;
+      metadata,
+      handler: async (args, context = {}) => {
+        const session = requireActiveSession(context);
+        const reasoning = includeReasoning ? args.reasoning : null;
+        const actionArgs = includeReasoning
+          ? Object.fromEntries(Object.entries(args).filter(([key]) => key !== "reasoning"))
+          : args;
         const action = runtime.computerUseLog.recordAction({
           sessionId: session.id,
           kind: name.replace(/^computer_/, ""),
           args: actionArgs,
           reasoning: reasoning ?? null
         });
-        const node = computerNode();
+        const node = computerNode(runtime, session);
         if (!node) {
           runtime.computerUseLog.markActionResult(action.id, {
             status: "unavailable",
@@ -274,38 +560,50 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           throw new Error(EXECUTION_UNAVAILABLE);
         }
         try {
-          await callNode(node, nodePath, payloadOf(actionArgs), fetchImpl);
+          await invokeNodeAction(node, session, action, nodePath, payloadOf(actionArgs));
+          if (runtime.computerUseLog.getSession(session.id)?.status !== "active") {
+            runtime.computerUseLog.markActionResult(action.id, { status: "aborted", error: "session-stopped" });
+            throw Object.assign(new Error("computer-use session was stopped before the action result was accepted"), {
+              nodeAcknowledged: true
+            });
+          }
           runtime.computerUseLog.markActionResult(action.id, { status: "executed", result: { via: "node" } });
           return { actionId: action.id, ok: true };
         } catch (error) {
-          runtime.computerUseLog.markActionResult(action.id, { status: "error", result: { error: error.message } });
+          runtime.computerUseLog.markActionResult(action.id, { status: "error", error: error.message });
+          await abortSession(session, "computer-use node action failed; approval must be renewed", "aborted");
           throw new Error(`computer-use node ${name} failed: ${error.message}`);
         }
       }
     });
   }
 
-  registerAction("computer_click", "/click", "Click at (x, y) coordinates on the screen. Coordinates are screen-space pixels with (0,0) at top-left.", {
+  registerAction("computer_click", "click", "Click at (x, y) coordinates on the screen. Coordinates are screen-space pixels with (0,0) at top-left.", {
+    frameId: { type: "string", description: "frameId from the screenshot these coordinates refer to." },
     x: { type: "integer", description: "Screen x (pixels)." },
     y: { type: "integer", description: "Screen y (pixels)." },
-    button: { type: "string", enum: ["left", "right", "middle"], description: "Default left." }
-  }, (a) => ({ x: a.x, y: a.y, button: a.button ?? "left" }));
-  registerAction("computer_type", "/type", "Type a string into the focused app.", {
+    button: { type: "string", enum: ["left", "right", "middle"] }
+  }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y, button: a.button }), ["frameId", "x", "y", "button"]);
+  registerAction("computer_type", "type", "Type a string into the focused app.", {
+    frameId: { type: "string", description: "Fresh frameId from the screenshot that established the current focus." },
     text: { type: "string", description: "Text to type. Use computer_key for non-printable keys." }
-  }, (a) => ({ text: a.text ?? "" }));
-  registerAction("computer_key", "/key", "Press a key chord. Examples: 'cmd+a', 'enter', 'esc', 'cmd+shift+t'.", {
+  }, (a) => ({ frameId: a.frameId, text: a.text }), ["frameId", "text"], { sensitiveArguments: ["text"] }, false);
+  registerAction("computer_key", "key", "Press a key chord. Examples: 'cmd+a', 'enter', 'esc', 'cmd+shift+t'.", {
+    frameId: { type: "string", description: "Fresh frameId from the screenshot that established the current focus." },
     chord: { type: "string", description: "Key chord, plus-separated. Modifiers: cmd, shift, alt, ctrl. Then the key name." }
-  }, (a) => ({ chord: a.chord }));
-  registerAction("computer_scroll", "/scroll", "Scroll at (x, y).", {
+  }, (a) => ({ frameId: a.frameId, chord: a.chord }), ["frameId", "chord"]);
+  registerAction("computer_scroll", "scroll", "Scroll at (x, y).", {
+    frameId: { type: "string", description: "frameId from the screenshot these coordinates refer to." },
     x: { type: "integer" },
     y: { type: "integer" },
     deltaX: { type: "integer", description: "Horizontal scroll delta in lines." },
     deltaY: { type: "integer", description: "Vertical scroll delta in lines. Negative = down." }
-  }, (a) => ({ x: a.x, y: a.y, deltaX: a.deltaX, deltaY: a.deltaY }));
-  registerAction("computer_move", "/move", "Move the mouse to (x, y) without clicking.", {
+  }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y, deltaX: a.deltaX, deltaY: a.deltaY }), ["frameId", "x", "y", "deltaX", "deltaY"]);
+  registerAction("computer_move", "move", "Move the mouse to (x, y) without clicking.", {
+    frameId: { type: "string", description: "frameId from the screenshot these coordinates refer to." },
     x: { type: "integer" },
     y: { type: "integer" }
-  }, (a) => ({ x: a.x, y: a.y }));
+  }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y }), ["frameId", "x", "y"]);
 
-  return { registered: true, node: Boolean(computerNode()) };
+  return { registered: true, node: Boolean(explicitComputerNode() ?? runtime.nodeCapabilities?.resolve?.("computer-use")) };
 }

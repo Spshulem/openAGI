@@ -3,6 +3,7 @@ const PUBLIC_FAILURES = Object.freeze({
   "provider-auth": "The model provider needs attention. Check its API key in Settings.",
   "provider-rate-limit": "The model provider is temporarily rate-limited. Try again shortly.",
   "provider-timeout": "The model provider timed out. Check its connection and try again.",
+  "provider-empty-response": "The model returned no answer after retrying. Please try again.",
   "provider-unavailable": "The model provider is unavailable. Check its connection and try again.",
   "agent-error": "The agent couldn't complete that request. Check the local daemon log for details."
 });
@@ -29,6 +30,9 @@ export function classifyAgentFailure(error) {
   }
   if (/AbortError|TimeoutError|timed? out|absolute timeout|idle timeout|ETIMEDOUT/i.test(detail)) {
     return { code: "provider-timeout", message: PUBLIC_FAILURES["provider-timeout"] };
+  }
+  if (code === "EMPTY_MODEL_RESPONSE" || /empty final response|returned no answer/i.test(detail)) {
+    return { code: "provider-empty-response", message: PUBLIC_FAILURES["provider-empty-response"] };
   }
   if (/\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|UND_ERR_[A-Z_]+)\b|network|fetch failed|provider unavailable|request failed with 5\d\d|stream (?:ended|was unavailable)/i.test(detail)) {
     return { code: "provider-unavailable", message: PUBLIC_FAILURES["provider-unavailable"] };

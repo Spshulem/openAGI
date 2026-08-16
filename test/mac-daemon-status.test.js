@@ -94,14 +94,14 @@ test("AppState publishes why the daemon is unreachable", () => {
   );
   assert.match(
     body,
-    /reachability = await DaemonController\.shared\.isPortHeld\(\)/,
-    `${APPSTATE} must actually probe the port in the /health failure path — otherwise ` +
+    /switch await DaemonController\.shared\.listenerOwnership\(\)/,
+    `${APPSTATE} must actually classify the listener in the /health failure path — otherwise ` +
       `reachability is a field nothing ever sets.`
   );
   assert.match(
     code(DAEMON),
-    /func isPortHeld\(\) async -> Bool/,
-    `${DAEMON} must expose the LISTEN-socket probe AppState needs; pidListeningOnPort ` +
+    /func listenerOwnership\(\) async -> ListenerOwnership/,
+    `${DAEMON} must expose the LISTEN-socket classification AppState needs; pidListeningOnPort ` +
       `is a blocking process spawn and pollOnce() is @MainActor.`
   );
 });
@@ -266,8 +266,26 @@ test("Restart daemon never terminates a listener managed outside the app", () =>
   );
   assert.match(code(TRAY), /guard !DaemonController\.shared\.restart\(force: true\)/);
   assert.match(code(TRAY), /managed outside OpenAGI/);
-  assert.match(code(TRAY), /canManageCurrentListener\(\)[\s\S]*Daemon managed externally/);
-  assert.match(daemon, /func canManageCurrentListener\(\) -> Bool/);
+  assert.match(code(TRAY), /state\.daemonManagedExternally[\s\S]*Daemon managed externally/);
+  assert.match(
+    code(APPSTATE),
+    /@Published var daemonManagedExternally[\s\S]*listenerOwnership\(\) == \.external/,
+    "listener ownership must be published by AppState rather than computed during SwiftUI rendering"
+  );
+  assert.match(
+    daemon,
+    /func listenerOwnership\(\) async -> ListenerOwnership[\s\S]*DispatchQueue\.global[\s\S]*pidListeningOnPort/,
+    "the lsof-backed ownership probe must run off the main thread"
+  );
+  const restartLabel = code(TRAY).slice(
+    code(TRAY).indexOf("private var restartLabel"),
+    code(TRAY).indexOf("private var statusLine")
+  );
+  assert.doesNotMatch(
+    restartLabel,
+    /DaemonController\.shared/,
+    "SwiftUI's restart label must read cached state and never invoke daemon process discovery"
+  );
 });
 
 test("app launch replaces only a daemon running this bundle's Node binary", () => {

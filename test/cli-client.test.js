@@ -45,6 +45,15 @@ test("resolveTarget precedence: flag > env > node.json > local", (t) => {
   assert.equal(tgt.token, "paired-tok");
   assert.equal(tgt.remote, true);
 
+  fs.writeFileSync(path.join(dir, "identity.json"), JSON.stringify({ nodeId: "stable-node", name: "Node" }));
+  writeNodeConfig({
+    remote: "https://main.example.com", token: null,
+    nodeToken: "n".repeat(43), nodeEnrollmentConfirmed: true
+  }, dir);
+  tgt = resolveTarget({ dataDir: dir });
+  assert.equal(tgt.token, "n".repeat(43));
+  assert.equal(tgt.nodeId, "stable-node");
+
   // env beats node.json
   process.env.OPENAGI_REMOTE = "main.example.com:9000";
   process.env.OPENAGI_REMOTE_TOKEN = "env-tok";
@@ -66,7 +75,9 @@ test("node config round-trips and clears, with 0600 perms", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-node2-"));
   const file = writeNodeConfig({ remote: "http://x:43210", token: "t" }, dir);
   assert.equal((fs.statSync(file).mode & 0o777), 0o600);
-  assert.deepEqual(readNodeConfig(dir), { remote: "http://x:43210", token: "t" });
+  assert.deepEqual(readNodeConfig(dir), {
+    remote: "http://x:43210", token: "t", nodeToken: null, nodeEnrollmentConfirmed: null
+  });
   assert.equal(clearNodeConfig(dir), true);
   assert.equal(readNodeConfig(dir), null);
   fs.rmSync(dir, { recursive: true });

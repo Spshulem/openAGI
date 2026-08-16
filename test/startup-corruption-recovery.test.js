@@ -216,7 +216,7 @@ test("TaskStore: a corrupt JSONL line is skipped and the surrounding events stil
 test("ComputerUseLog: a corrupt snapshot falls through to the journal replay", () => {
   const dir = tmpDir("cu");
   const seed = new ComputerUseLog({ dir });
-  const session = seed.startSession({ goal: "book the flight", approvedBy: "user" });
+  const session = seed.startSession({ goal: "book the flight", approvedBy: "user", sourceSessionId: "test:corruption" });
   const action = seed.recordAction({ sessionId: session.id, kind: "click", args: { x: 1 }, reasoning: "the button" });
   seed.markActionResult(action.id, { result: "ok" });
   seed.snapshot();
@@ -224,6 +224,7 @@ test("ComputerUseLog: a corrupt snapshot falls through to the journal replay", (
 
   const { value: log } = captureWarn(() => new ComputerUseLog({ dir }));
   assert.equal(log.getSession(session.id)?.goal, "book the flight", "the session replayed from the journal");
+  assert.equal(log.getSession(session.id)?.status, "aborted", "a restarted daemon never revives an old control approval");
   const actions = log.listActions({ sessionId: session.id });
   assert.equal(actions.length, 1, "the action replayed");
   assert.equal(actions[0].status, "executed", "the action RESULT replayed too");

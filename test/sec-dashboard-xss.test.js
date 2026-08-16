@@ -67,9 +67,9 @@ function shippedEscapeHtml(script) {
 function shippedRenderMarkdown(script) {
   const start = script.indexOf("const BT = String.fromCharCode(96);");
   assert.ok(start >= 0, "could not locate the markdown renderer preamble");
-  const endMarker = script.indexOf('return "<p>" + s + "</p>";', start);
+  const endMarker = script.indexOf("\n\n// Small chat composer", start);
   assert.ok(endMarker >= 0, "could not locate the end of renderMarkdown");
-  const end = script.indexOf("\n}", endMarker) + 2;
+  const end = endMarker;
   const src = `${script.slice(start, end)}\n${escapeHtmlSource(script)}`;
   return new Function(`${src}; return renderMarkdown;`)();
 }
@@ -131,6 +131,46 @@ test("SEC-4: renderMarkdown refuses non-http(s) link schemes", async () => {
   // …and still renders ordinary links.
   const ok = renderMarkdown("[docs](https://example.com/a?b=1)");
   assert.match(ok, /<a href="https:\/\/example\.com\/a\?b=1"/);
+});
+
+test("chat markdown renders GFM tables with inline formatting and alignment", async () => {
+  const { script } = await dashboard();
+  const renderMarkdown = shippedRenderMarkdown(script);
+  const out = renderMarkdown([
+    "| Area | Score | Assessment |",
+    "|:---|---:|:---:|",
+    "| **Memory quality** | 4/10 | Retrieval works |",
+    "| Tasks | 6/10 | [Open docs](https://example.com/docs) |"
+  ].join("\n"));
+
+  assert.match(out, /<table class="md-table">/);
+  assert.match(out, /<thead><tr><th>Area<\/th><th class="md-align-right">Score<\/th><th class="md-align-center">Assessment<\/th><\/tr><\/thead>/);
+  assert.match(out, /<strong>Memory quality<\/strong>/);
+  assert.match(out, /<a href="https:\/\/example\.com\/docs"/);
+  assert.doesNotMatch(out, /\|:---/);
+});
+
+test("chat markdown keeps table syntax inside fenced code literal and escapes table-cell HTML", async () => {
+  const { script } = await dashboard();
+  const renderMarkdown = shippedRenderMarkdown(script);
+  const fence = String.fromCharCode(96).repeat(3);
+  const out = renderMarkdown([
+    fence,
+    "| not | a table |",
+    "| --- | --- |",
+    fence,
+    "",
+    "| Safe | Value |",
+    "| --- | --- |",
+    '| cell | <img src=x onerror="window.PWNED=1"> |'
+  ].join("\n"));
+
+  assert.equal((out.match(/<table class="md-table">/g) ?? []).length, 1);
+  assert.match(out, /<pre class="md-code"><code/);
+  assert.match(out, /\| not \| a table \|/);
+  assert.doesNotMatch(out, /<img/i);
+  assert.doesNotMatch(out, /onerror\s*=\s*["']/i);
+  assert.match(out, /&lt;img src=x onerror=&quot;window\.PWNED=1&quot;&gt;/);
 });
 
 test("SEC-4: task source links use the same http(s)-only URL gate", async () => {

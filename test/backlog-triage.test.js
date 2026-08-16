@@ -13,6 +13,7 @@ import {
   candidateTitle,
   classifyDeterministic,
   jaccard,
+  llmReviewDue,
   parseJsonArray,
   rankCritical,
   readLatestTriageReport,
@@ -432,9 +433,16 @@ test("a provider that throws degrades instead of taking the job down", async () 
   const report = await new BacklogTriage({ runtime, dataDir: dir, batchSize: 2 }).run({ now: NOW });
   assert.equal(provider.calls, 1, "stops after the first failure rather than hammering a dead provider");
   assert.equal(report.llm.stoppedEarly, "provider-error");
+  assert.equal(report.llm.lastAttemptAt, NOW.toISOString());
   assert.ok(report.degraded.some((d) => d.includes("upstream 503")));
   assert.equal(report.llm.deferred, 10);
   assert.equal(report.applied.suggestions, 0);
+
+  const nextDay = await new BacklogTriage({ runtime, dataDir: dir, batchSize: 2 }).run({
+    now: new Date(NOW.getTime() + DAY)
+  });
+  assert.equal(nextDay.llm.skipped, "cadence");
+  assert.equal(provider.calls, 1, "a failing provider is not hammered again by the next daily cleanup");
 });
 
 test("batching sends one call per batch, not one per item, and routes by task", async () => {
@@ -490,7 +498,7 @@ test("bounded passes advance through untouched rows before rejudging pending kee
     reason: i === 0 ? "This still names open work." : "There is not enough evidence yet."
   })));
   const runtime = makeRuntime({ dir, provider });
-  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2 });
+  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2, llmIntervalDays: 0 });
 
   const first = await triage.run({ now: NOW });
   assert.equal(first.llm.itemsSent, 2);
@@ -685,7 +693,7 @@ test("a wholly malformed batch rotates behind untouched rows on the next pass", 
     return originalGenerate(args);
   };
   const runtime = makeRuntime({ dir, provider });
-  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2 });
+  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2, llmIntervalDays: 0 });
 
   const first = await triage.run({ now: NOW });
   assert.equal(first.llm.itemsJudged, 0);
@@ -926,19 +934,67 @@ test("summarizeTriagePass is small and carries the counts that matter", async ()
 
 // ─── wiring ──────────────────────────────────────────────────────────────
 
-test("the runtime registers the triage job weekly, on a Sunday morning", async () => {
+test("the runtime registers daily deterministic triage while model review stays weekly", async () => {
   const { createDurableRuntime } = await import("../src/abi-runtime.js");
   const runtime = createDurableRuntime({ dataDir: tempDataDir(), autoConnectMcp: false });
   const job = runtime.cron.listJobs().find((j) => j.id === "backlog-triage");
   assert.ok(job, "backlog-triage job is registered");
   assert.equal(job.task, "backlog-triage");
   assert.equal(job.enabled, true);
-  assert.equal(job.intervalMs, 7 * 24 * 60 * 60 * 1000);
+  assert.equal(job.intervalMs, null);
+  assert.equal(job.dailyAt, "05:15");
   const next = new Date(job.nextRunAt);
-  assert.equal(next.getDay(), 0, "fires on a Sunday");
   assert.equal(next.getHours(), 5);
   assert.equal(next.getMinutes(), 15);
   assert.ok(runtime.backlogTriage instanceof BacklogTriage);
+});
+
+test("backlog hygiene stays at 05:15 after a late catch-up and disabled migration stays unscheduled", async () => {
+  const { CronScheduler } = await import("../src/cron-scheduler.js");
+  const cron = new CronScheduler();
+  const late = new Date(2026, 7, 14, 12, 0, 0, 0);
+  const job = cron.addJob({ id: "backlog-triage", task: "backlog-triage", dailyAt: "05:15" });
+  const next = cron.computeNextRun(job, late);
+  assert.equal(next.getHours(), 5);
+  assert.equal(next.getMinutes(), 15);
+  assert.equal(next.getDate(), late.getDate() + 1);
+
+  cron.updateJob(job.id, { enabled: false, intervalMs: null, dailyAt: "05:15", nextRunAt: null });
+  assert.equal(cron.listJobs().find((entry) => entry.id === job.id).nextRunAt, null);
+});
+
+test("model review cadence is weekly even when deterministic cleanup runs daily", () => {
+  const previous = "2026-07-27T05:15:00.000Z";
+  assert.equal(llmReviewDue(previous, new Date("2026-07-28T05:15:00.000Z"), 7), false);
+  assert.equal(llmReviewDue(previous, new Date("2026-08-03T05:15:00.000Z"), 7), true);
+  assert.equal(llmReviewDue(null, NOW, 7), true);
+});
+
+test("daily passes keep deterministic cleanup active without paying for daily model review", async () => {
+  const dir = tempDataDir();
+  writeSuggestion(dir, observer("prop_ambiguous", { title: "Review the vendor agreement" }));
+  const provider = stubProvider((items) => items.map((item) => ({
+    i: item.i,
+    verdict: "keep",
+    confidence: 0.9,
+    reason: "The agreement still needs an explicit decision.",
+    stillMattersScore: 0.7
+  })));
+  const runtime = makeRuntime({ dir, provider });
+  const triage = new BacklogTriage({ runtime, dataDir: dir });
+
+  const first = await triage.run({ now: NOW });
+  assert.equal(first.llm.itemsSent, 1);
+  provider.calls.length = 0;
+
+  writeSuggestion(dir, observer("prop_dead_tomorrow", {
+    category: "automation",
+    proposedAt: new Date(NOW.getTime() - 40 * DAY).toISOString()
+  }));
+  const second = await triage.run({ now: new Date(NOW.getTime() + DAY) });
+  assert.equal(second.llm.skipped, "cadence");
+  assert.equal(provider.calls.length, 0, "daily cleanup does not become a daily model bill");
+  assert.equal(second.applied.suggestions, 1, "safe deterministic retirement still runs daily");
 });
 
 test("the cron handler runs the pass and returns the small summary", async () => {

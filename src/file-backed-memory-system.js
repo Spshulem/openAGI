@@ -10,6 +10,7 @@ export class FileBackedMemorySystem extends MemorySystem {
     this.dir = options.dir ?? path.join(resolveDataDir(), "memory");
     this.snapshotPath = options.snapshotPath ?? path.join(this.dir, "memory-state.json");
     this.eventsPath = options.eventsPath ?? path.join(this.dir, "memory-events.jsonl");
+    this.duplicateArchivePath = options.duplicateArchivePath ?? path.join(this.dir, "duplicate-archive.jsonl");
     ensureDir(this.dir);
     if (options.autoLoad !== false) this.load();
   }
@@ -50,10 +51,34 @@ export class FileBackedMemorySystem extends MemorySystem {
 
   decay(now = new Date()) {
     const result = super.decay(now);
-    if (result.removed.length > 0 || result.promoted.length > 0) {
+    if (result.removed.length > 0 || result.promoted.length > 0 || result.decayed.length > 0 || result.initialized.length > 0) {
       this.persist("decay", {
         removed: result.removed.map((item) => item.id),
-        promoted: result.promoted.map((item) => item.id)
+        promoted: result.promoted.map((item) => item.id),
+        decayed: result.decayed.map((item) => item.id),
+        initialized: result.initialized.map((item) => item.id),
+        repaired: result.repaired.map((item) => item.id)
+      });
+    }
+    return result;
+  }
+
+  consolidateAutomatedDuplicates(options = {}) {
+    const result = super.consolidateAutomatedDuplicates({
+      ...options,
+      // Archive the complete duplicate row before removing it from active
+      // recall. If this append fails, MemorySystem leaves the row untouched.
+      archive: (entry) => appendJsonLine(this.duplicateArchivePath, {
+        version: 1,
+        op: "consolidate-exact-duplicate",
+        ...entry
+      })
+    });
+    if (result.removed.length > 0) {
+      this.persist("consolidate-duplicates", {
+        removed: result.removed.map((item) => item.id),
+        retained: result.retained.map((item) => item.id),
+        archivePath: path.basename(this.duplicateArchivePath)
       });
     }
     return result;

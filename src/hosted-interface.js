@@ -29,13 +29,19 @@ import {
   newestOf
 } from "./node-registry.js";
 import { ServiceProbe, adoptRemoteServices, mergeServices } from "./service-nodes.js";
-import { readNodeConfig } from "./cli-client.js";
+import { readNodeConfig, writeNodeConfig } from "./cli-client.js";
 import { composeBrief, dismissFocus } from "./daily-brief.js";
 import { queryReviewQueue, ReviewQueueQueryError } from "./review-queue.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
+import { NodeControlBroker, createNodeControlWorker, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
+import { createComputerExecutor } from "./integrations/computer-server.js";
+import {
+  createImessageNodeCapability,
+  isImessageSearchEnabled
+} from "./integrations/imessage-node-capability.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -64,6 +70,64 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
+  const nodeControlBroker = options.nodeControlBroker ?? new NodeControlBroker(options.nodeControlOptions);
+  const localIdentity = readOrCreateIdentity(dataDir);
+  let localCapabilityCache = [];
+  const capabilityFacade = {
+    list(capabilityId) {
+      const names = new Map(nodeRegistry.list().map((entry) => [entry.nodeId, entry.name]));
+      const localCapabilities = capabilityId
+        ? localCapabilityCache.filter((capability) => capability.id === capabilityId)
+        : localCapabilityCache;
+      const local = localCapabilities.length ? [{
+        nodeId: localIdentity.nodeId,
+        name: localIdentity.name || "This Mac",
+        capabilities: localCapabilities,
+        local: true,
+        seenAt: new Date().toISOString()
+      }] : [];
+      const remote = nodeControlBroker.list(capabilityId)
+        .filter((entry) => entry.nodeId !== localIdentity.nodeId)
+        .map((entry) => ({ ...entry, name: names.get(entry.nodeId) ?? null }));
+      return [...local, ...remote];
+    },
+    resolve(capabilityId, selector = {}) {
+      const candidates = this.list(capabilityId).filter((entry) => (
+        entry.capabilities?.some?.((capability) => capability.id === capabilityId && capability.ready)
+      ));
+      const rawSelector = selector.nodeId ?? selector.nodeName ?? null;
+      if (typeof rawSelector !== "string" || !rawSelector.trim()) return candidates.length === 1 ? candidates[0] : null;
+      const value = rawSelector.trim().toLowerCase();
+      const byId = candidates.find((entry) => entry.nodeId.toLowerCase() === value);
+      if (byId) return byId;
+      const named = candidates.filter((entry) => typeof entry.name === "string" && entry.name.toLowerCase() === value);
+      return named.length === 1 ? named[0] : null;
+    },
+    async refresh() {
+      localCapabilityCache = await localNodeCapabilities().catch(() => []);
+      return this.list();
+    },
+    async dispatch(nodeId, capability, operation, payload, opts) {
+      if (nodeId === localIdentity.nodeId) {
+        const provider = activeNodeCapabilityProviders().get(capability);
+        if (!provider) throw new Error("local node capability is disabled");
+        const status = (await provider.health()).capability;
+        if (status?.ready !== true || !status.operations?.includes?.(operation)) {
+          throw new Error(status?.detail || "local node capability is not ready");
+        }
+        return await provider.invoke(operation, payload ?? {});
+      }
+      return nodeControlBroker.dispatch(nodeId, capability, operation, payload, opts);
+    },
+    cancelSession(sessionId, reason) {
+      computerExecutor?.cancelSession?.(sessionId);
+      return nodeControlBroker.cancelSession(sessionId, reason);
+    },
+    removeNode(nodeId, reason) {
+      return nodeControlBroker.removeNode(nodeId, reason);
+    }
+  };
+  runtime.nodeCapabilities = capabilityFacade;
   const nodesCachePath = path.join(dataDir, "nodes", "cache.json");
   // Service nodes (see service-nodes.js) are configured in the environment,
   // not registered by heartbeat. One probe instance per interface so its
@@ -71,6 +135,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // that need a main and a node with different configuration in one process.
   const serviceProbe = options.serviceProbe ?? new ServiceProbe(options.serviceProbeOptions);
   const getServiceEnv = () => options.serviceEnv ?? process.env;
+  const allowInsecureNodeRelay = options.allowInsecureNodeRelay === true
+    || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true"
+    || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
   events.setMaxListeners(50);
@@ -103,6 +170,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("task-reminder", (data) => broadcast("task-reminder", data));
   events.on("task-auto-changed", (data) => broadcast("task-auto-changed", data));
   events.on("pending-action", (data) => broadcast("pending-action", data));
+  events.on("pending-action-resolved", (data) => {
+    broadcast("pending-action-resolved", data);
+    // A decision made through the dashboard's direct approval route must also
+    // clear the durable outreach copy used by the Mac overlay. Otherwise the
+    // notification disappears but the same request remains actionable there.
+    const outreachItem = runtime.outreach?.list?.().find((item) =>
+      (item.status === "unseen" || item.status === "seen")
+      && item.sourceRef?.kind === "pending-action"
+      && item.sourceRef?.id === data.id
+    );
+    if (outreachItem) {
+      const executionSucceeded = data.status === "approved" && data.executionSucceeded === true;
+      const userDenied = data.status === "denied";
+      const resolutionStatus = executionSucceeded ? "acted" : userDenied ? "dismissed" : "error";
+      const decisionAction = data.status === "approved" || data.status === "interrupted" ? "do" : "dismiss";
+      runtime.outreach.resolve(outreachItem.id, {
+        action: decisionAction,
+        by: data.decidedBy ?? (userDenied ? "user" : "system")
+      }, {
+        status: resolutionStatus,
+        error: resolutionStatus === "error"
+          ? data.error ?? "Approved action did not complete successfully."
+          : null
+      });
+    }
+  });
   events.on("daily-recap", (data) => broadcast("daily-recap", data));
   events.on("daily-plan", (data) => broadcast("daily-plan", data));
   events.on("task-unblocked", (data) => broadcast("task-unblocked", data));
@@ -270,15 +363,178 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     };
   }
 
+  const queuedApprovalContinuations = new Set();
+  function queueApprovalContinuation(action, invokeResult) {
+    if (
+      action?.toolName !== "start_computer_use_session"
+      || !invokeResult?.ok
+      || !channels?.handleLocalMessage
+      || !action.context?.sessionId
+      || queuedApprovalContinuations.has(action.id)
+    ) {
+      return null;
+    }
+    queuedApprovalContinuations.add(action.id);
+    const goal = String(action.args?.goal ?? action.summary ?? "the approved computer-use goal").slice(0, 500);
+    const sessionId = action.context.sessionId;
+    setImmediate(() => {
+      channels.handleLocalMessage({
+        channel: action.context.channel ?? "local",
+        from: action.context.from ?? "user",
+        agentId: action.context.agentId ?? "main",
+        sessionId,
+        text: "OpenAGI approval update: the user approved and started the computer-use session for this goal: "
+          + goal
+          + "\nContinue the original request now. First call computer_use_status and use the active session. Do not call start_computer_use_session again.",
+        metadata: {
+          requestId: "approval_" + action.id,
+          runtimeEvent: "approval",
+          approvalActionId: action.id
+        }
+      }).catch((error) => {
+        logAgentFailure(error, { sessionId, requestId: "approval_" + action.id });
+      });
+    });
+    return { status: "queued", sessionId };
+  }
+
   let tickerHandle = null;
   let heartbeatHandle = null;
+  let nodeControlWorker = null;
+  let computerExecutor = null;
+  let imessageNodeCapability = null;
   const tickerMs = options.tickerMs ?? Number.parseInt(process.env.OPENAGI_TICKER_MS ?? "10000", 10);
+
+  const computerUseEnabledHere = () => {
+    const value = String(process.env.OPENAGI_COMPUTER_USE ?? "").toLowerCase();
+    return options.nodeControlEnabled ?? (value === "1" || value === "true" || value === "yes");
+  };
+  const activeNodeCapabilityProviders = () => {
+    const providers = new Map();
+    if (computerUseEnabledHere()) {
+      computerExecutor ??= options.computerExecutor ?? createComputerExecutor();
+      providers.set("computer-use", computerExecutor);
+    }
+    const serviceEnv = getServiceEnv();
+    if (isImessageSearchEnabled(serviceEnv)) {
+      imessageNodeCapability ??= options.imessageNodeCapability
+        ?? createImessageNodeCapability({ env: serviceEnv });
+      providers.set(imessageNodeCapability.id, imessageNodeCapability);
+    }
+    return providers;
+  };
+  const localNodeCapabilities = async () => {
+    const capabilities = await Promise.all([...activeNodeCapabilityProviders().values()].map(async (provider) => {
+      try { return (await provider.health()).capability; } catch { return null; }
+    }));
+    localCapabilityCache = sanitizeNodeCapabilities(capabilities.filter(Boolean));
+    return localCapabilityCache;
+  };
+  const ensureNodeControlWorker = () => {
+    if (nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
+    const pairing = readNodeConfig(dataDir);
+    if (!pairing?.remote || !pairing.nodeToken || pairing.nodeEnrollmentConfirmed !== true) return null;
+    const identity = readOrCreateIdentity(dataDir);
+    nodeControlWorker = createNodeControlWorker({
+      remote: pairing.remote,
+      token: pairing.nodeToken,
+      nodeId: identity.nodeId,
+      capabilities: localNodeCapabilities,
+      execute: async (command) => {
+        if (typeof command?.capability !== "string" || typeof command?.operation !== "string") {
+          throw new Error("unsupported node capability command");
+        }
+        const provider = activeNodeCapabilityProviders().get(command.capability);
+        if (!provider) throw new Error("node capability is disabled or unavailable");
+        const capability = (await provider.health()).capability;
+        if (capability?.ready !== true || !capability.operations?.includes?.(command.operation)) {
+          throw new Error(capability?.detail || "node capability operation is not ready");
+        }
+        return await provider.invoke(command.operation, command.payload ?? {});
+      },
+      fetchImpl: options.nodeControlFetch ?? globalThis.fetch,
+      pollMs: options.nodeControlPollMs,
+      retryMs: options.nodeControlRetryMs,
+      allowInsecureRemote: allowInsecureNodeRelay
+    });
+    nodeControlWorker.start();
+    return nodeControlWorker;
+  };
+  const stopNodeControlWorker = async () => {
+    const worker = nodeControlWorker;
+    nodeControlWorker = null;
+    await worker?.stop?.();
+  };
+  const ensureScopedNodeToken = async (pairing, identity) => {
+    if (!pairing?.remote) return null;
+    pinnedRemoteOrigin(pairing.remote, { allowInsecureRemote: allowInsecureNodeRelay });
+    // Generate and persist the scoped credential BEFORE enrollment. If the
+    // main stores its hash but the response is lost, this installation can
+    // safely retry with the same token after a restart instead of becoming
+    // permanently locked out of its stable node id.
+    if (pairing.nodeToken && pairing.nodeEnrollmentConfirmed === true) return pairing.nodeToken;
+    if (!pairing.token) throw new Error("node enrollment requires a one-time main pairing credential");
+    const nodeToken = pairing.nodeToken ?? randomBytes(32).toString("base64url");
+    pairing.nodeToken = nodeToken;
+    pairing.nodeEnrollmentConfirmed = false;
+    writeNodeConfig({
+      remote: pairing.remote,
+      token: pairing.token,
+      nodeToken,
+      nodeEnrollmentConfirmed: false
+    }, dataDir);
+    const enrollmentController = new AbortController();
+    const enrollmentTimer = setTimeout(() => enrollmentController.abort(), 5_000);
+    let response;
+    try {
+      response = await (options.nodeControlFetch ?? globalThis.fetch)(`${pairing.remote}/nodes/enroll`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${pairing.token}`
+        },
+        body: JSON.stringify({ nodeId: identity.nodeId, nodeToken }),
+        redirect: "manual",
+        signal: enrollmentController.signal
+      });
+    } finally { clearTimeout(enrollmentTimer); }
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.error || `node enrollment rejected: ${response.status}`);
+    }
+    pairing.nodeEnrollmentConfirmed = true;
+    pairing.token = null;
+    writeNodeConfig({
+      remote: pairing.remote,
+      token: null,
+      nodeToken,
+      nodeEnrollmentConfirmed: true
+    }, dataDir);
+    return nodeToken;
+  };
 
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
       const pathname = url.pathname;
       const method = req.method;
+      const nodeScopedRoute = method === "POST" && [
+        "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke"
+      ].includes(pathname);
+      const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
+        || (method === "POST" && pathname === "/message");
+      const requestNodeId = typeof req.headers["x-openagi-node-id"] === "string"
+        ? req.headers["x-openagi-node-id"]
+        : null;
+      const scopedBearer = String(req.headers.authorization ?? "").startsWith("Bearer ")
+        ? String(req.headers.authorization).slice(7)
+        : null;
+      // On an authenticated main, operational node routes accept ONLY the
+      // credential enrolled for this stable node id. A main-wide dashboard
+      // token must never let one paired node poll another node's control queue.
+      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute)
+        ? nodeRegistry.authenticate(requestNodeId, scopedBearer)
+        : false;
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -306,7 +562,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const extraCookies = [];
       const setupBypass = setupActive && setupRoutes;
       if (!isPublicRoute(pathname) && !setupBypass) {
-        const auth = checkAuth(req, url, getAuthToken());
+        const auth = (nodeScopedRoute || nodeClientRoute) && requestNodeId
+          ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
+          : checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
           // Browsers (Accept: text/html) get the login form on ANY failed GET,
           // not just GET /. After sign-in, redirect back to the original path.
@@ -464,8 +722,35 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, runtime.agentHost?.store.getSession(id) ?? { error: "agent-host-disabled" });
       }
       if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
+      if (method === "POST" && /^\/nodes\/[^/]+\/revoke$/.test(pathname)) {
+        const nodeId = decodeURIComponent(pathname.slice("/nodes/".length, -"/revoke".length));
+        if (!nodeRegistry.isEnrolled(nodeId) && !nodeRegistry.list().some((entry) => entry.nodeId === nodeId)) {
+          return sendJson(res, 404, { error: "unknown node" });
+        }
+        nodeControlBroker.removeNode(nodeId, "node credential was revoked by the main owner");
+        nodeRegistry.revoke(nodeId);
+        return sendJson(res, 200, { ok: true, nodeId, revoked: true });
+      }
+      if (method === "POST" && pathname === "/nodes/enroll") {
+        const body = await readJsonLimited(req, 16 * 1024);
+        if (typeof body.nodeId !== "string" || !body.nodeId || typeof body.nodeToken !== "string") {
+          return sendJson(res, 400, { error: "nodeId and nodeToken are required" });
+        }
+        try {
+          const enrollment = nodeRegistry.enroll(body.nodeId, body.nodeToken);
+          return sendJson(res, 200, { nodeId: body.nodeId, enrolled: true, created: enrollment.created });
+        } catch (error) {
+          if (error.code === "NODE_ALREADY_ENROLLED") {
+            return sendJson(res, 409, { error: error.message });
+          }
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
       if (method === "POST" && pathname === "/nodes/heartbeat") {
-        const body = await readJson(req).catch(() => ({}));
+        const body = await readJsonLimited(req, 128 * 1024).catch(() => ({}));
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
         // Type-checked, not just truthy: a non-string name/nodeId previously
         // persisted and crashed NodeRegistry.list()'s name.localeCompare sort
         // with a TypeError, taking down GET /nodes with a 500 until the
@@ -486,6 +771,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 400, { error: `${field} must be a string or null` });
           }
         }
+        if (body.capabilities !== undefined && !Array.isArray(body.capabilities)) {
+          return sendJson(res, 400, { error: "capabilities must be an array" });
+        }
         nodeRegistry.upsert({
           nodeId: body.nodeId, name: body.name, role: body.role,
           url: body.url ?? null, version: body.version ?? null,
@@ -493,9 +781,49 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           // number). Without it a roster can only show package.json versions,
           // which have drifted behind the release tags and so cannot answer
           // "is this node up to date" — the whole point of the column.
-          build: body.build ?? null, buildSource: body.buildSource ?? null
+          build: body.build ?? null, buildSource: body.buildSource ?? null,
+          capabilities: sanitizeNodeCapabilities(body.capabilities)
         });
         return sendJson(res, 200, { ok: true });
+      }
+      if (method === "POST" && pathname === "/nodes/revoke") {
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
+        nodeControlBroker.removeNode(requestNodeId, "node credential was revoked");
+        nodeRegistry.revoke(requestNodeId);
+        return sendJson(res, 200, { ok: true, revoked: true });
+      }
+      if (method === "POST" && pathname === "/nodes/control/poll") {
+        const body = await readJsonLimited(req, 128 * 1024);
+        if (typeof body.nodeId !== "string" || !body.nodeId) {
+          return sendJson(res, 400, { error: "nodeId is required" });
+        }
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
+        const registered = nodeRegistry.list().find((entry) => entry.nodeId === body.nodeId);
+        if (!registered || statusFor(registered.lastSeenAt) !== "online") {
+          return sendJson(res, 409, { error: "node must heartbeat before polling for control work" });
+        }
+        const timeoutMs = Math.max(1, Math.min(25_000, Number(body.timeoutMs) || 20_000));
+        const command = await nodeControlBroker.poll(body.nodeId, body.capabilities, { timeoutMs });
+        return sendJson(res, 200, { command });
+      }
+      if (method === "POST" && pathname === "/nodes/control/result") {
+        const body = await readJsonLimited(req, 12 * 1024 * 1024);
+        if (typeof body.nodeId !== "string" || typeof body.commandId !== "string") {
+          return sendJson(res, 400, { error: "nodeId and commandId are required" });
+        }
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
+        const accepted = nodeControlBroker.deliver(body.nodeId, body.commandId, {
+          result: body.result,
+          error: typeof body.error === "string" ? body.error.slice(0, 500) : null
+        });
+        return sendJson(res, accepted ? 200 : 409, accepted ? { ok: true } : { error: "unknown or mismatched command" });
       }
       if (method === "GET" && pathname === "/nodes") {
         const identity = readOrCreateIdentity(dataDir);
@@ -512,6 +840,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const localServicesPromise = Promise.resolve()
           .then(() => serviceProbe.describe({ env: getServiceEnv(), now }))
           .catch(() => []);
+        const localCapabilitiesPromise = localNodeCapabilities().catch(() => []);
 
         // Every roster row is rebuilt from primitive facts — a name, a
         // timestamp, a version. A `status` that arrived over the wire or came
@@ -532,6 +861,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           version: typeof entry.version === "string" ? entry.version : null,
           build: typeof entry.build === "string" ? entry.build : null,
           buildSource: typeof entry.buildSource === "string" ? entry.buildSource : null,
+          capabilities: sanitizeNodeCapabilities(entry.capabilities),
           lastSeenAt: typeof entry.lastSeenAt === "string" ? entry.lastSeenAt : null,
           status,
           statusAsOf: statusAsOf ?? null,
@@ -545,7 +875,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           {
             ...identity, role, url: getPublicUrl(),
             version: build.version, build: build.build, buildSource: build.buildSource,
-            lastSeenAt: nowIso
+            lastSeenAt: nowIso, capabilities: localCapabilities
           },
           { self: true, status: "online", statusAsOf: nowIso }
         );
@@ -627,6 +957,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           });
         };
 
+        const localCapabilities = await localCapabilitiesPromise;
+
         if (!pairing?.remote) {
           const others = nodeRegistry.list({ now })
             .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: nowIso }));
@@ -636,12 +968,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           });
         }
         try {
+          pinnedRemoteOrigin(pairing.remote, { allowInsecureRemote: allowInsecureNodeRelay });
           const ctrl = new AbortController();
           const timer = setTimeout(() => ctrl.abort(), 5000);
           let upstream;
           try {
             upstream = await fetch(`${pairing.remote}/nodes`, {
-              headers: pairing.token ? { authorization: `Bearer ${pairing.token}` } : {},
+              headers: (pairing.nodeToken ?? pairing.token) ? {
+                authorization: `Bearer ${pairing.nodeToken ?? pairing.token}`,
+                ...(pairing.nodeToken ? { "x-openagi-node-id": identity.nodeId } : {})
+              } : {},
+              redirect: "manual",
               signal: ctrl.signal
             });
           } finally { clearTimeout(timer); }
@@ -1216,11 +1553,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const body = await readJson(req).catch(() => ({}));
         const action = String(body.action ?? "");
         try {
-          await applyOutreachAction(runtime, item, action, body.note);
+          const applied = await applyOutreachAction(runtime, item, action, body.note);
+          if (applied?.pendingAction) {
+            queueApprovalContinuation(applied.pendingAction, applied.invokeResult);
+          }
           const status = action === "dismiss" ? "dismissed" : "acted";
           const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });
           return sendJson(res, 200, { item: updated });
         } catch (error) {
+          if (error?.code === "OUTREACH_ACTION_CONFLICT") {
+            return sendJson(res, 409, { item: runtime.outreach.get(id), error: error.message });
+          }
           const updated = runtime.outreach.resolve(id, { action, by: "user" }, { status: "error", error: error.message });
           return sendJson(res, 400, { item: updated, error: error.message });
         }
@@ -1263,22 +1606,39 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/approve")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/approve".length));
-        const action = runtime.pendingActions?.get(id);
+        let action = runtime.pendingActions?.get(id);
         if (!action) return sendJson(res, 404, { error: "unknown pending action" });
+        if (action.status === "expired") {
+          return sendJson(res, 410, { error: "approval expired; request it again" });
+        }
         if (action.status !== "pending") return sendJson(res, 409, { error: `action already ${action.status}` });
+        const claim = runtime.pendingActions?.claimForExecution?.(id, { claimedBy: "user" });
+        if (!claim) {
+          action = runtime.pendingActions?.get(id);
+          return sendJson(res, 409, { error: `action already ${action?.status ?? "claimed"}` });
+        }
+        action = claim.action;
         // Re-invoke the original tool with the bypass flag so the gate
         // doesn't re-queue the same call. Persist the result on the action.
         const invokeResult = await runtime.tools.invoke(action.toolName, action.args, {
           ...action.context,
-          __confirmed: true
+          __confirmed: true,
+          __confirmationActionId: action.id
         });
+        const executionError = invokeResult?.ok ? null : invokeResult?.error ?? "approved tool execution failed";
+        recordApprovedActionOutcome(runtime, action, invokeResult);
         runtime.pendingActions.decide(id, {
           decision: "approve",
           decidedBy: "user",
           result: invokeResult.ok ? invokeResult.result : null,
-          error: invokeResult.ok ? null : invokeResult.error
+          error: executionError,
+          executionId: claim.executionId
         });
-        return sendJson(res, invokeResult.ok ? 200 : 400, invokeResult);
+        const continuation = queueApprovalContinuation(action, invokeResult);
+        return sendJson(res, invokeResult.ok ? 200 : 400, {
+          ...invokeResult,
+          ...(continuation ? { continuation } : {})
+        });
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/deny")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/deny".length));
@@ -1300,7 +1660,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const sessions = runtime.computerUseLog.listSessions();
         const actions = runtime.computerUseLog.listActions({ limit });
         const readiness = await computerUseReadiness({
-          toolsRegistered: runtime.tools?.has?.("start_computer_use_session") ?? false
+          toolsRegistered: runtime.tools?.has?.("start_computer_use_session") ?? false,
+          runtime
         });
         return sendJson(res, 200, {
           enabled: readiness.enabled,
@@ -1320,10 +1681,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const enable = Boolean(body.enable);
         const { saveEnv } = await import("./setup-wizard.js");
         const { registerComputerUseTools, unregisterComputerUseTools } = await import("./integrations/computer-use.js");
-        const dataDir = resolveDataDir();
         // saveEnv writes only allowlisted keys; OPENAGI_COMPUTER_USE has
         // to be in WIZARD_FIELDS (added in this commit) for the write to
-        // land in .env.
+        // land in .env. Use the interface's captured dataDir rather than
+        // resolving it again: explicit per-instance overrides are authoritative
+        // and resolveDataDir() memoizes globally within the process.
         if (enable) {
           saveEnv({ dataDir, values: { OPENAGI_COMPUTER_USE: "1" } });
           process.env.OPENAGI_COMPUTER_USE = "1";
@@ -1334,19 +1696,27 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         if (enable) {
           registerComputerUseTools(runtime.tools, runtime);
+          ensureNodeControlWorker();
         } else {
           // Close any active session before removing tools.
           const active = runtime.computerUseLog?.listSessions?.({ status: "active" }) ?? [];
           for (const s of active) {
-            runtime.computerUseLog.endSession(s.id, { reason: "disabled via toggle", status: "aborted" });
+            if (runtime.abortComputerUseSession) await runtime.abortComputerUseSession(s, "disabled via toggle");
+            else runtime.computerUseLog.endSession(s.id, { reason: "disabled via toggle", status: "aborted" });
           }
+          await computerExecutor?.close?.();
           unregisterComputerUseTools(runtime.tools);
+          if (activeNodeCapabilityProviders().size === 0) await stopNodeControlWorker();
         }
         return sendJson(res, 200, { enabled: enable, tools: enable ? "registered" : "unregistered" });
       }
       if (method === "POST" && pathname.startsWith("/computer-use/sessions/") && pathname.endsWith("/abort")) {
         const id = decodeURIComponent(pathname.slice("/computer-use/sessions/".length, -"/abort".length));
-        const session = runtime.computerUseLog?.endSession(id, { reason: "aborted via dashboard", status: "aborted" });
+        const existing = runtime.computerUseLog?.getSession?.(id);
+        if (!existing) return sendJson(res, 404, { error: "unknown session" });
+        if (runtime.abortComputerUseSession) await runtime.abortComputerUseSession(existing, "aborted via dashboard");
+        else runtime.computerUseLog?.endSession(id, { reason: "aborted via dashboard", status: "aborted" });
+        const session = runtime.computerUseLog?.getSession?.(id);
         if (!session) return sendJson(res, 404, { error: "unknown session" });
         return sendJson(res, 200, { id, status: session.status });
       }
@@ -2202,14 +2572,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             const sendHeartbeat = async () => {
               try {
                 const identity = readOrCreateIdentity(dataDir);
+                const scopedToken = await ensureScopedNodeToken(pairing, identity);
                 const ctrl = new AbortController();
                 const timer = setTimeout(() => ctrl.abort(), 5000);
                 try {
-                  const res = await fetch(`${pairing.remote}/nodes/heartbeat`, {
+                  const res = await (options.nodeControlFetch ?? globalThis.fetch)(`${pairing.remote}/nodes/heartbeat`, {
                     method: "POST",
                     headers: {
                       "content-type": "application/json",
-                      ...(pairing.token ? { authorization: `Bearer ${pairing.token}` } : {})
+                      "x-openagi-node-id": identity.nodeId,
+                      ...(scopedToken ? { authorization: `Bearer ${scopedToken}` } : {})
                     },
                     body: JSON.stringify({
                       nodeId: identity.nodeId, name: identity.name, role: "node",
@@ -2220,8 +2592,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                       // they are actually running.
                       version: heartbeatBuild.version ?? PACKAGE_VERSION,
                       build: heartbeatBuild.build,
-                      buildSource: heartbeatBuild.buildSource
+                      buildSource: heartbeatBuild.buildSource,
+                      capabilities: await localNodeCapabilities().catch(() => [])
                     }),
+                    redirect: "manual",
                     signal: ctrl.signal
                   });
                   if (!res.ok) throw new Error(`heartbeat rejected: ${res.status}`);
@@ -2230,6 +2604,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                   console.warn("[openagi] heartbeat to main recovered");
                 }
                 heartbeatFailStreak = 0;
+                ensureNodeControlWorker();
               } catch (error) {
                 heartbeatFailStreak += 1;
                 if (heartbeatFailStreak === 1) {
@@ -2242,6 +2617,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             // (or longer when a custom interval was configured).
             sendHeartbeat().catch(() => {});
             heartbeatHandle = setInterval(() => { sendHeartbeat().catch(() => {}); }, heartbeatIntervalMs);
+            ensureNodeControlWorker();
           }
           const address = server.address();
           const actualPort = typeof address === "object" && address ? address.port : port;
@@ -2258,7 +2634,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         channels?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
-        server.close((error) => (error ? reject(error) : resolve()));
+        Promise.resolve(computerExecutor?.close?.())
+          .catch(() => {})
+          .then(() => stopNodeControlWorker())
+          .catch(() => {})
+          .finally(() => {
+            nodeControlBroker.close();
+            server.close((error) => (error ? reject(error) : resolve()));
+          });
       });
     }
   };
@@ -2641,13 +3024,33 @@ async function applyOutreachAction(runtime, item, action, note) {
       throw new Error(`unsupported task action: ${action}`);
     case "pending-action":
       if (action === "do") {
-        const a = runtime.pendingActions?.get(ref.id);
+        let a = runtime.pendingActions?.get(ref.id);
         if (!a) throw new Error("pending action gone");
-        if (a.status !== "pending") return; // already decided elsewhere — don't re-run the side-effecting tool
-        const r = await runtime.tools.invoke(a.toolName, a.args, { ...a.context, __confirmed: true });
-        runtime.pendingActions.decide(ref.id, { decision: "approve", decidedBy: "user", result: r.ok ? r.result : null, error: r.ok ? null : r.error });
-        if (!r.ok) throw new Error(r.error ?? "tool failed");
-        return;
+        if (a.status !== "pending") {
+          throw outreachActionConflict(`pending action already ${a.status}`);
+        }
+        const claim = runtime.pendingActions?.claimForExecution?.(ref.id, { claimedBy: "user" });
+        if (!claim) {
+          const latest = runtime.pendingActions?.get(ref.id);
+          throw outreachActionConflict(`pending action already ${latest?.status ?? "claimed"}`);
+        }
+        a = claim.action;
+        const r = await runtime.tools.invoke(a.toolName, a.args, {
+          ...a.context,
+          __confirmed: true,
+          __confirmationActionId: a.id
+        });
+        const executionError = r?.ok ? null : r?.error ?? "approved tool execution failed";
+        recordApprovedActionOutcome(runtime, a, r);
+        runtime.pendingActions.decide(ref.id, {
+          decision: "approve",
+          decidedBy: "user",
+          result: r.ok ? r.result : null,
+          error: executionError,
+          executionId: claim.executionId
+        });
+        if (!r.ok) throw new Error(executionError);
+        return { pendingAction: a, invokeResult: r };
       }
       throw new Error(`unsupported pending-action action: ${action}`);
     case "suggestion":
@@ -2676,6 +3079,54 @@ async function applyOutreachAction(runtime, item, action, note) {
       // the outreach history (the caller marks the item "acted" either way).
       throw new Error(`no handler for outreach item kind "${ref.kind}" with action "${action}"`);
   }
+}
+
+function outreachActionConflict(message) {
+  const error = new Error(message);
+  error.code = "OUTREACH_ACTION_CONFLICT";
+  return error;
+}
+
+// Approval is only intent. Record an outcome at the point the confirmed tool
+// actually returns, preserving the original autonomous/user provenance. This
+// keeps queued approvals out of the scorecard while making the eventual work
+// (including a real failure) measurable once—and only once—it executes.
+function recordApprovedActionOutcome(runtime, action, invokeResult) {
+  if (!runtime.outcomes?.record || !approvedInvocationWasAttempted(invokeResult)) return null;
+  const origin = String(action?.context?.origin ?? action?.context?.channel ?? "local").toLowerCase();
+  const kind = origin === "autopilot"
+    ? "autopilot-fire"
+    : origin === "cron"
+      ? "cron-fire"
+      : "tool-call";
+  try {
+    return runtime.outcomes.record({
+      kind,
+      refId: action.id,
+      sessionId: action.context?.sessionId ?? null,
+      agentId: action.context?.agentId ?? "main",
+      channel: action.context?.channel ?? null,
+      toolCalls: [{ name: action.toolName, ok: invokeResult?.ok === true }],
+      metadata: {
+        approvalActionId: action.id,
+        approvedExecution: true,
+        origin
+      }
+    });
+  } catch {
+    // Outcome accounting is an audit side effect. It must never undo a tool
+    // action the user explicitly approved.
+    return null;
+  }
+}
+
+function approvedInvocationWasAttempted(invokeResult) {
+  if (!invokeResult || typeof invokeResult !== "object") return false;
+  if (invokeResult.ok !== true) return true;
+  const result = invokeResult.result;
+  const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
+  if (["awaiting_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
+  return !(result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true);
 }
 
 async function applyOutreachFeedback(runtime, item, verdict, note = null) {
@@ -2709,6 +3160,37 @@ function readJson(req) {
       catch (error) { reject(error); }
     });
     req.on("error", reject);
+  });
+}
+
+function readJsonLimited(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    req.on("data", (chunk) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        fail(new Error("request body too large"));
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      if (!chunks.length) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+      catch (error) { reject(error); }
+    });
+    req.on("error", fail);
   });
 }
 
@@ -2878,22 +3360,35 @@ function renderApp() {
     .msg { max-width: 720px; padding: 10px 12px; border-radius: 10px; line-height: 1.5; word-wrap: break-word; }
     .msg.user { background: var(--user); align-self: flex-end; white-space: pre-wrap; }
     .msg.assistant { background: var(--assistant); border: 1px solid var(--line); align-self: flex-start; }
+    .msg.runtime { max-width: 680px; align-self: center; background: var(--accent-bg); border: 1px solid var(--accent); color: var(--text); }
     .msg .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
     .msg .body { display: block; }
     .msg .body p { margin: 0 0 8px; }
     .msg .body p:last-child { margin-bottom: 0; }
-    .msg .body h2, .msg .body h3, .msg .body h4 { margin: 12px 0 6px; line-height: 1.25; }
+    .msg .body h2, .msg .body h3, .msg .body h4, .msg .body h5, .msg .body h6 { margin: 12px 0 6px; line-height: 1.25; }
     .msg .body h2 { font-size: 18px; }
     .msg .body h3 { font-size: 16px; }
     .msg .body h4 { font-size: 14px; color: var(--accent); }
+    .msg .body h5, .msg .body h6 { font-size: 13px; color: var(--accent); }
     .msg .body ul, .msg .body ol { margin: 6px 0 8px; padding-left: 22px; }
     .msg .body li { margin: 2px 0; }
     .msg .body blockquote { margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--accent); color: var(--muted); }
+    .msg .body blockquote p { margin: 0; }
     .msg .body a { color: var(--accent); }
     .msg .body code.md-inline { background: var(--bg); padding: 1px 5px; border-radius: 3px; font: 12px ui-monospace, Menlo, monospace; border: 1px solid var(--line); }
     .msg .body pre.md-code { margin: 8px 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; overflow-x: auto; }
     .msg .body pre.md-code code { font: 12px/1.5 ui-monospace, Menlo, monospace; }
     .msg .body strong { font-weight: 700; }
+    .msg .body .md-table-wrap { max-width: 100%; margin: 8px 0 12px; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+    .msg .body table.md-table { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 1.4; }
+    .msg .body table.md-table th, .msg .body table.md-table td { padding: 7px 9px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .msg .body table.md-table th:last-child, .msg .body table.md-table td:last-child { border-right: 0; }
+    .msg .body table.md-table tbody tr:last-child td { border-bottom: 0; }
+    .msg .body table.md-table th { background: var(--panel-2); font-weight: 700; white-space: nowrap; }
+    .msg .body table.md-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.025); }
+    .msg .body table.md-table .md-align-center { text-align: center; }
+    .msg .body table.md-table .md-align-right { text-align: right; }
+    .msg .body hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
     .composer { border-top: 1px solid var(--line); padding: 12px 16px; background: var(--panel); display: flex; gap: 8px; align-items: flex-end; }
     .composer textarea {
       flex: 1; min-height: 38px; max-height: 200px; resize: none;
@@ -3137,6 +3632,7 @@ function renderApp() {
       <button data-tab="chat" class="active" title="Talk to your agent in natural language.">Chat</button>
       <button data-tab="tasks" title="My tasks + agent tasks. The agent's own queue gets drained every 30 min by the autopilot pulse.">Tasks</button>
       <button data-tab="review" title="Search and work through every open task, draft, clarification, and suggestion behind Quick Ask.">Review</button>
+      <button data-tab="approvals" id="approvalsNav" title="Agent actions that require your explicit approval before they run.">Approvals <span id="approvalsNavCount" class="badge" hidden></span></button>
       <button data-tab="suggestions" title="Things the proactive observer noticed + agent actions awaiting your approval.">Suggestions</button>
       <button data-tab="memory" title="Short, medium, and long-term memory. Promotion happens automatically.">Memory</button>
       <button data-tab="integrations" title="Connect MCPs (Linear, GitHub, Stripe, …), sources (BuildBetter, Rize, inbox folder), and channels (Telegram).">Integrations</button>
@@ -3247,13 +3743,18 @@ document.getElementById("setupBtn")?.addEventListener("click", () => {
   window.location.href = "/setup";
 });
 
-// Tiny markdown renderer for chat replies. No backtick characters in this
-// function's source so it can live inside the dashboard's outer template
-// literal without escaping wars. BT = backtick built from char code.
+// Small, dependency-free Markdown renderer for chat replies. It is block-aware
+// so table syntax and list markers inside fenced code remain literal. Raw HTML
+// is always escaped before any known-safe tags are created below.
+// No backtick characters in this function's source so it can live inside the
+// dashboard's outer template literal without escaping wars.
 const BT = String.fromCharCode(96);
 const FENCE = BT + BT + BT;
-const FENCE_RE = new RegExp(FENCE + "(\\\\w+)?\\\\n([\\\\s\\\\S]*?)" + FENCE, "g");
 const INLINE_RE = new RegExp(BT + "([^" + BT + "\\\\n]+)" + BT, "g");
+const FENCE_OPEN_RE = new RegExp("^ {0,3}" + FENCE + "([A-Za-z0-9_-]+)?\\\\s*$");
+const FENCE_CLOSE_RE = new RegExp("^ {0,3}" + FENCE + "\\\\s*$");
+const INLINE_TOKEN_OPEN = String.fromCharCode(0xE000);
+const INLINE_TOKEN_CLOSE = String.fromCharCode(0xE001);
 
 // Decide whether a markdown link target may become an href, and return the
 // attribute-safe value if so. Parse with the URL parser rather than a regex:
@@ -3275,78 +3776,189 @@ function safeLinkHref(rawUrl) {
   return escapeHtml(parsed.href);
 }
 
-function renderMarkdown(input) {
-  if (!input) return "";
-  let s = String(input);
-
-  // Escape HTML first — guarantees XSS safety even if the renderer is buggy.
-  // Quotes included: the rules below build attributes (href=, class=) out of
-  // captured text, and a bare " or ' in that text closes the attribute and
-  // opens a new one. Reproduced with
-  // [Open](https://x.co"style="position:fixed;inset:0"onmouseover="...).
-  s = s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-
-  // Fenced code blocks
-  s = s.replace(FENCE_RE, (_, lang, code) => {
-    const langClass = lang ? ' class="md-code-block lang-' + lang + '"' : ' class="md-code-block"';
-    return '<pre class="md-code"><code' + langClass + '>' + code.replace(/\\n$/, "") + '</code></pre>';
+function renderInlineMarkdown(input) {
+  let s = String(input ?? "");
+  const codeSpans = [];
+  s = s.replace(INLINE_RE, (_, code) => {
+    const token = INLINE_TOKEN_OPEN + codeSpans.length + INLINE_TOKEN_CLOSE;
+    codeSpans.push('<code class="md-inline">' + code + '</code>');
+    return token;
   });
 
-  // Inline code
-  s = s.replace(INLINE_RE, '<code class="md-inline">$1</code>');
-
-  // Headings
-  s = s.replace(/^### (.*)$/gm, "<h4>$1</h4>");
-  s = s.replace(/^## (.*)$/gm, "<h3>$1</h3>");
-  s = s.replace(/^# (.*)$/gm, "<h2>$1</h2>");
-
-  // Blockquotes
-  s = s.replace(/^&gt; (.*)$/gm, "<blockquote>$1</blockquote>");
-
-  // Bold then italic
   s = s.replace(/\\*\\*([^*\\n]+)\\*\\*/g, "<strong>$1</strong>");
+  s = s.replace(/~~([^~\\n]+)~~/g, "<s>$1</s>");
   s = s.replace(/(?<!\\w)\\*([^*\\n]+?)\\*(?!\\w)/g, "<em>$1</em>");
   s = s.replace(/(?<!\\w)_([^_\\n]+?)_(?!\\w)/g, "<em>$1</em>");
 
   // Links [text](url). The URL is parsed, not pattern-matched: only http(s)
-  // becomes an anchor, everything else (javascript:, data:, vbscript:, or
-  // anything URL parsing rejects) is left as literal text. Splicing the raw
-  // capture into href="..." is what let an injected page put three real
-  // attributes on the anchor.
+  // becomes an anchor; unsafe or malformed targets remain literal text.
   s = s.replace(/\\[([^\\]]+)\\]\\(([^\\s)]+)\\)/g, (whole, text, rawUrl) => {
     const href = safeLinkHref(rawUrl);
     if (!href) return whole;
     return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
   });
 
-  // Lists
-  const lines = s.split(/\\n/);
-  const out = [];
-  let ulOpen = false, olOpen = false;
-  for (const line of lines) {
-    const ulMatch = /^[-*] (.*)$/.exec(line);
-    const olMatch = /^\\d+\\. (.*)$/.exec(line);
-    if (ulMatch) {
-      if (olOpen) { out.push("</ol>"); olOpen = false; }
-      if (!ulOpen) { out.push("<ul>"); ulOpen = true; }
-      out.push("<li>" + ulMatch[1] + "</li>");
-    } else if (olMatch) {
-      if (ulOpen) { out.push("</ul>"); ulOpen = false; }
-      if (!olOpen) { out.push("<ol>"); olOpen = true; }
-      out.push("<li>" + olMatch[1] + "</li>");
+  for (let i = 0; i < codeSpans.length; i += 1) {
+    s = s.replace(INLINE_TOKEN_OPEN + i + INLINE_TOKEN_CLOSE, codeSpans[i]);
+  }
+  return s;
+}
+
+function splitMarkdownTableRow(line) {
+  let source = String(line ?? "").trim();
+  if (source.startsWith("|")) source = source.slice(1);
+  if (source.endsWith("|") && !source.endsWith("\\\\|")) source = source.slice(0, -1);
+  const cells = [];
+  let cell = "";
+  let inCode = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === "\\\\" && source[i + 1] === "|") {
+      cell += "|";
+      i += 1;
+    } else if (ch === BT) {
+      inCode = !inCode;
+      cell += ch;
+    } else if (ch === "|" && !inCode) {
+      cells.push(cell.trim());
+      cell = "";
     } else {
-      if (ulOpen) { out.push("</ul>"); ulOpen = false; }
-      if (olOpen) { out.push("</ol>"); olOpen = false; }
-      out.push(line);
+      cell += ch;
     }
   }
-  if (ulOpen) out.push("</ul>");
-  if (olOpen) out.push("</ol>");
-  s = out.join("\\n");
+  cells.push(cell.trim());
+  return cells;
+}
 
-  // Paragraphs
-  s = s.replace(/\\n{2,}/g, "</p><p>").replace(/\\n/g, "<br>");
-  return "<p>" + s + "</p>";
+function markdownTableAlignments(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (cells.length < 2 || !cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
+  return cells.map((cell) => cell.startsWith(":") && cell.endsWith(":")
+    ? "center"
+    : cell.endsWith(":") ? "right" : "left");
+}
+
+function renderMarkdownTable(headers, alignments, rows) {
+  const classFor = (alignment) => alignment === "center"
+    ? ' class="md-align-center"'
+    : alignment === "right" ? ' class="md-align-right"' : "";
+  const head = headers.map((cell, i) => '<th' + classFor(alignments[i]) + '>' + renderInlineMarkdown(cell) + '</th>').join("");
+  const body = rows.map((row) => {
+    const normalized = Array.from({ length: headers.length }, (_, i) => row[i] ?? "");
+    return "<tr>" + normalized.map((cell, i) => '<td' + classFor(alignments[i]) + '>' + renderInlineMarkdown(cell) + '</td>').join("") + "</tr>";
+  }).join("");
+  return '<div class="md-table-wrap"><table class="md-table"><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+}
+
+function renderMarkdown(input) {
+  if (!input) return "";
+  // Escape HTML first. All HTML emitted after this point is a fixed tag or a
+  // URL accepted and re-escaped by safeLinkHref.
+  const escaped = String(input).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const lines = escaped.split(/\\n/);
+  const blocks = [];
+  let paragraph = [];
+  let listTag = null;
+  let listItems = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return;
+    blocks.push("<p>" + paragraph.map(renderInlineMarkdown).join("<br>") + "</p>");
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!listTag) return;
+    blocks.push("<" + listTag + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
+    listTag = null;
+    listItems = [];
+  };
+  const flushText = () => { flushParagraph(); flushList(); };
+
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+    const fence = FENCE_OPEN_RE.exec(line);
+    if (fence) {
+      flushText();
+      const code = [];
+      i += 1;
+      while (i < lines.length && !FENCE_CLOSE_RE.test(lines[i])) {
+        code.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length) i += 1;
+      const langClass = fence[1] ? "md-code-block lang-" + fence[1] : "md-code-block";
+      blocks.push('<pre class="md-code"><code class="' + langClass + '">' + code.join("\\n") + '</code></pre>');
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushText();
+      i += 1;
+      continue;
+    }
+
+    const headers = line.includes("|") ? splitMarkdownTableRow(line) : [];
+    const alignments = i + 1 < lines.length ? markdownTableAlignments(lines[i + 1]) : null;
+    if (headers.length >= 2 && alignments && alignments.length === headers.length) {
+      flushText();
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+        const row = splitMarkdownTableRow(lines[i]);
+        if (row.length < 2) break;
+        rows.push(row);
+        i += 1;
+      }
+      blocks.push(renderMarkdownTable(headers, alignments, rows));
+      continue;
+    }
+
+    const heading = /^(#{1,6})\\s+(.*)$/.exec(line);
+    if (heading) {
+      flushText();
+      const level = Math.min(6, heading[1].length + 1);
+      blocks.push("<h" + level + ">" + renderInlineMarkdown(heading[2]) + "</h" + level + ">");
+      i += 1;
+      continue;
+    }
+
+    if (/^ {0,3}(?:-{3,}|_{3,}|\\*{3,})\\s*$/.test(line)) {
+      flushText();
+      blocks.push("<hr>");
+      i += 1;
+      continue;
+    }
+
+    if (line.startsWith("&gt;")) {
+      flushText();
+      const quote = [];
+      while (i < lines.length && lines[i].startsWith("&gt;")) {
+        quote.push(lines[i].replace(/^&gt; ?/, ""));
+        i += 1;
+      }
+      blocks.push("<blockquote><p>" + quote.map(renderInlineMarkdown).join("<br>") + "</p></blockquote>");
+      continue;
+    }
+
+    const unordered = /^ {0,3}[-*+]\\s+(.*)$/.exec(line);
+    const ordered = /^ {0,3}\\d+[.)]\\s+(.*)$/.exec(line);
+    if (unordered || ordered) {
+      flushParagraph();
+      const nextTag = unordered ? "ul" : "ol";
+      if (listTag && listTag !== nextTag) flushList();
+      listTag = nextTag;
+      listItems.push((unordered ?? ordered)[1]);
+      i += 1;
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+    i += 1;
+  }
+
+  flushText();
+  return blocks.join("");
 }
 
 // Small chat composer surface that any tab can embed at the top so the
@@ -3582,6 +4194,9 @@ async function switchTab(tab) {
   } else if (tab === "review") {
     showSidebar(false);
     await renderReview();
+  } else if (tab === "approvals") {
+    showSidebar(false);
+    await renderApprovals();
   } else if (tab === "tasks") {
     showSidebar(false);
     await renderTasks();
@@ -4240,16 +4855,23 @@ async function renderChatDeepLink() {
         </div>
       \`;
       const handle = async (decision) => {
+        document.getElementById("dl-approve").disabled = true;
+        document.getElementById("dl-deny").disabled = true;
         try {
           const res = await postJson(\`/pending-actions/\${encodeURIComponent(pendingId)}/\${decision}\`, {});
-          const summary = res?.result?.note ?? res?.result?.message ?? \`Action \${decision}d.\`;
+          const summary = res?.continuation?.status === "queued"
+            ? "Approved — the agent is continuing in this chat."
+            : res?.result?.note ?? res?.result?.message ?? \`Action \${decision}d.\`;
           showToast(\`✓ \${summary}\`, true);
-          host.innerHTML = "";
+          host.innerHTML = '<div class="card ok" style="padding:10px 14px;">✓ ' + escapeHtml(summary) + '</div>';
+          await refreshApprovalBadge();
           const url = new URL(window.location.href);
           url.searchParams.delete("pending");
           history.replaceState(null, "", url.toString());
         } catch (err) {
           showToast(\`\${decision} failed: \${err.message}\`, false);
+          document.getElementById("dl-approve").disabled = false;
+          document.getElementById("dl-deny").disabled = false;
         }
       };
       document.getElementById("dl-approve").addEventListener("click", () => handle("approve"));
@@ -4323,10 +4945,13 @@ function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   const thread = $("thread");
   if (!thread) return;
   const div = document.createElement("div");
-  div.className = "msg " + (msg.role === "user" ? "user" : "assistant");
-  const meta = msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
+  const runtimeApproval = msg.metadata?.runtimeEvent === "approval";
+  div.className = "msg " + (runtimeApproval ? "runtime" : msg.role === "user" ? "user" : "assistant");
+  const meta = runtimeApproval
+    ? "OpenAGI approval"
+    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
   // Assistant replies render markdown; user messages stay literal.
-  const body = msg.role === "assistant" ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
+  const body = msg.role === "assistant" && !runtimeApproval ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
   const context = msg.role === "user" ? screenContextChip(msg.metadata) : "";
   const pendingNote = pending
     ? '<div class="meta" style="margin-top:5px;">◌ Agent is still working — this request is saved.</div>'
@@ -5243,14 +5868,28 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     } else {
       update = \`<span class="sub">last known \${escapeHtml(n.version)}\${data.cachedAt ? " (" + escapeHtml(timeAgo(data.cachedAt)) + ")" : ""} — can't verify now</span>\`;
     }
+    const revoke = !isNode && !n.self
+      ? \`<div style="margin-top:6px;"><button class="ui-btn ui-btn-destructive ui-btn-sm" data-revoke-node="\${escapeHtml(n.nodeId)}">Remove node</button></div>\`
+      : "";
+    const capabilityLabels = { "computer-use": "Computer use", "imessage-search": "iMessage search" };
+    const capabilities = (Array.isArray(n.capabilities) ? n.capabilities : []).map((capability) => {
+      const label = capabilityLabels[capability.id] ?? String(capability.id ?? "capability").replaceAll("-", " ");
+      const stateLabel = capability.ready === true ? "ready" : "not ready";
+      const stateClass = capability.ready === true ? "ok" : "warn";
+      const operations = Array.isArray(capability.operations) && capability.operations.length
+        ? \` · \${escapeHtml(capability.operations.join(", "))}\`
+        : "";
+      const detail = capability.detail ? \` · \${escapeHtml(capability.detail)}\` : "";
+      return \`<div class="sub"><span class="badge \${stateClass}">\${escapeHtml(label)}: \${stateLabel}</span>\${operations}\${detail}</div>\`;
+    }).join("");
     return \`
       <tr>
-        <td>\${escapeHtml(n.name ?? "unknown")}\${n.self ? \` <span class="badge">this machine</span>\` : ""}\${n.staleRegistration ? \` <span class="badge muted" title="Same hostname as this machine but a different node id — an earlier install that never checked in again.">old registration</span>\` : ""}\${n.url ? \`<div class="sub">\${escapeHtml(n.url)}</div>\` : ""}</td>
+        <td>\${escapeHtml(n.name ?? "unknown")}\${n.self ? \` <span class="badge">this machine</span>\` : ""}\${n.staleRegistration ? \` <span class="badge muted" title="Same hostname as this machine but a different node id — an earlier install that never checked in again.">old registration</span>\` : ""}\${n.url ? \`<div class="sub">\${escapeHtml(n.url)}</div>\` : ""}\${capabilities}</td>
         <td>\${escapeHtml(n.role)}</td>
         <td><span class="badge \${s.badge}">\${escapeHtml(s.label)}</span>\${asOf}</td>
         <td>\${seen}</td>
         <td>\${escapeHtml(n.version ?? "unknown")}<div class="sub">\${escapeHtml(nodeBuildLabel(n))}</div></td>
-        <td>\${update}</td>
+        <td>\${update}\${revoke}</td>
       </tr>\`;
   }).join("");
 
@@ -5355,6 +5994,20 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     c.style.verticalAlign = "top";
   });
   document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes({ showLoading: false }));
+  main.querySelectorAll("[data-revoke-node]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const nodeId = button.getAttribute("data-revoke-node");
+      if (!nodeId || !confirm("Remove this node and revoke its control credential? It must be paired again before reconnecting.")) return;
+      const response = await fetch(\`/nodes/\${encodeURIComponent(nodeId)}/revoke\`, { method: "POST", credentials: "include" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        showToast("Couldn't remove node: " + (body.error || response.status), false);
+        return;
+      }
+      showToast("Node removed and credential revoked.", true);
+      renderNodes({ showLoading: false });
+    });
+  });
 }
 
 async function renderChannels() {
@@ -5648,6 +6301,86 @@ async function renderHealth() {
   \`;
 }
 
+function pendingActionCardHtml(action) {
+  return '<div class="card" style="padding:14px; margin-bottom:10px;" data-pending-id="' + escapeHtml(action.id) + '">'
+    + '<div style="display:flex; gap:8px; align-items:center;">'
+    + '<span style="font-size:18px;">🤖</span>'
+    + '<span style="font-weight:600;">' + escapeHtml(action.summary || action.toolName) + '</span>'
+    + '<span class="badge">' + escapeHtml(action.toolName) + '</span>'
+    + '</div>'
+    + (action.reason ? '<div class="muted" style="margin-top:6px; font-size:12px;">' + escapeHtml(action.reason) + '</div>' : '')
+    + '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px;">'
+    + escapeHtml(JSON.stringify(action.args, null, 2))
+    + '</pre></details>'
+    + '<div class="muted" style="margin-top:4px; font-size:11px;">queued ' + escapeHtml(new Date(action.createdAt).toLocaleString()) + '</div>'
+    + '<div class="row" style="gap:8px; margin-top:10px;">'
+    + '<button data-pending-action="approve">Approve & run</button>'
+    + '<button data-pending-action="deny" class="secondary">Deny</button>'
+    + '</div></div>';
+}
+
+function pendingActionsSectionHtml(actions, {
+  heading = "Agent actions awaiting approval",
+  empty = ""
+} = {}) {
+  if (!Array.isArray(actions) || actions.length === 0) return empty;
+  return '<h3 style="margin-top:8px;">' + escapeHtml(heading) + ' <span class="badge">' + actions.length + '</span></h3>'
+    + '<p class="muted">These actions have not run. Review the visible arguments, then approve or deny each one.</p>'
+    + actions.map(pendingActionCardHtml).join("");
+}
+
+function decidedActionCardHtml(action) {
+  const ok = action.status === "approved" && !action.error;
+  const statusClass = ok ? "ok" : action.status === "denied" ? "muted" : "err";
+  const outcome = action.error
+    ? '<div class="desc err" style="margin-top:6px;">Failed: ' + escapeHtml(action.error) + '</div>'
+    : action.result
+      ? '<details style="margin-top:6px;"><summary class="muted" style="font-size:11px;">result</summary><pre style="font-size:11px; margin-top:4px;">' + escapeHtml(JSON.stringify(action.result, null, 2)) + '</pre></details>'
+      : "";
+  return '<div class="card" style="padding:12px; margin-bottom:8px;">'
+    + '<div class="row between"><span class="name">' + escapeHtml(action.summary || action.toolName) + '</span>'
+    + '<span class="badge ' + statusClass + '">' + escapeHtml(action.status) + '</span></div>'
+    + '<div class="muted" style="font-size:11px; margin-top:4px;">'
+    + escapeHtml(action.toolName) + ' · decided ' + escapeHtml(new Date(action.decidedAt || action.createdAt).toLocaleString())
+    + '</div>' + outcome + '</div>';
+}
+
+async function refreshApprovalBadge() {
+  const count = document.getElementById("approvalsNavCount");
+  if (!count) return;
+  try {
+    const data = await fetchJson("/pending-actions?status=pending");
+    const n = data.actions?.length ?? 0;
+    count.textContent = String(n);
+    count.hidden = n === 0;
+  } catch {
+    count.hidden = true;
+  }
+}
+
+async function renderApprovals() {
+  const data = await fetchJson("/pending-actions").catch(() => ({ actions: [] }));
+  const actions = data.actions ?? [];
+  const pending = actions.filter((action) => action.status === "pending");
+  const decided = actions.filter((action) => action.status !== "pending").slice(0, 20);
+  main.innerHTML = '<div class="pane">'
+    + '<h2>Approvals</h2>'
+    + '<p class="muted">This is the durable approval queue. A notification is only a shortcut to the same records shown here.</p>'
+    + pendingActionsSectionHtml(pending, {
+        empty: '<div class="ui-empty">Nothing is waiting for approval.</div>'
+      })
+    + '<h3 style="margin-top:18px;">Recent decisions</h3>'
+    + (decided.length > 0
+        ? decided.map(decidedActionCardHtml).join("")
+        : '<div class="ui-empty">No approval decisions recorded yet.</div>')
+    + '</div>';
+  bindPendingActionButtons(async () => {
+    await renderApprovals();
+    await refreshApprovalBadge();
+  });
+  await refreshApprovalBadge();
+}
+
 async function renderSuggestions() {
   // Live view of everything the proactive observer has proposed and is
   // waiting on the user to accept/reject. Tasks → Tasks tab, MCPs →
@@ -5828,7 +6561,10 @@ async function renderSuggestions() {
   revealDeepLinkedRecord("suggestion", "[data-suggestion-id]", "suggestionId");
 }
 
-function bindPendingActionButtons() {
+function bindPendingActionButtons(onResolved = async () => {
+  await renderSuggestions();
+  await refreshApprovalBadge();
+}) {
   document.querySelectorAll("[data-pending-id]").forEach((card) => {
     const id = card.dataset.pendingId;
     card.querySelectorAll("[data-pending-action]").forEach((btn) => {
@@ -5840,12 +6576,14 @@ function bindPendingActionButtons() {
         try {
           const res = await postJson(\`/pending-actions/\${encodeURIComponent(id)}/\${decision}\`, {});
           if (decision === "approve") {
-            const summary = res?.result?.note ?? res?.result?.message ?? \`Action ran (\${JSON.stringify(res?.result ?? res)})\`;
+            const summary = res?.continuation?.status === "queued"
+              ? "Approved — the agent is continuing in Chat."
+              : res?.result?.note ?? res?.result?.message ?? \`Action ran (\${JSON.stringify(res?.result ?? res)})\`;
             showToast(\`✓ \${summary}\`, true);
           } else {
             showToast("Action denied.", true);
           }
-          await renderSuggestions();
+          await onResolved();
         } catch (err) {
           showToast(\`\${decision} failed: \${err.message}\`, false);
           btn.disabled = false;
@@ -6675,16 +7413,44 @@ async function renderComputerUse() {
   // action the agent decided to take in a session, with the reasoning it gave.
   // A connected node executes; observation-only mode reads recent OCR and
   // refuses input honestly.
-  const data = await fetchJson("/computer-use/log?limit=200").catch(() => ({ sessions: [], actions: [], stats: {} }));
+  const [data, pendingData] = await Promise.all([
+    fetchJson("/computer-use/log?limit=200").catch(() => ({ sessions: [], actions: [], stats: {} })),
+    fetchJson("/pending-actions?status=pending").catch(() => ({ actions: [] }))
+  ]);
   const { sessions = [], actions = [], stats = {}, enabled = false, readiness = {} } = data;
+  const computerApprovals = (pendingData.actions ?? []).filter((action) => action.toolName === "start_computer_use_session");
   const active = sessions.find((s) => s.status === "active");
   const modeCopy = readiness.mode === "control-ready"
-    ? "Ready — live screenshots plus click, type, key, and move actions execute through the connected computer-use node. Scroll is not supported by the current node backend."
+    ? "Ready — privacy-filtered live screenshots plus click, type, key, move, and scroll actions execute through the selected computer-use node."
     : readiness.mode === "node-unreachable"
       ? "Enabled, but the configured computer-use node is unreachable. Screen reads fall back to recent OCR; input is refused."
       : readiness.mode === "observe-only"
         ? "Observation-only — the agent can inspect recent local OCR. Click, type, key, and move require a connected computer-use node; scroll is not yet supported."
         : "Off — enable it here before asking the agent to inspect or control the computer.";
+
+  const computerActionCopy = (action) => {
+    const args = action?.args && typeof action.args === "object" ? action.args : {};
+    const text = (value, max = 100) => {
+      if (value == null) return "";
+      const valueText = typeof value === "string" ? value : String(value);
+      return valueText.length > max ? valueText.slice(0, max) + "…" : valueText;
+    };
+    switch (action?.kind) {
+      case "screenshot": return "Inspect the current screen";
+      case "click": return "Click at x " + text(args.x) + ", y " + text(args.y);
+      case "type": return "Type " + text(args.characterCount ?? 0) + " redacted character" + (args.characterCount === 1 ? "" : "s");
+      case "key": return "Press “" + text(args.chord) + "”";
+      case "move": return "Move the pointer to x " + text(args.x) + ", y " + text(args.y);
+      case "scroll": return "Scroll by x " + text(args.deltaX ?? 0) + ", y " + text(args.deltaY ?? 0);
+      default: {
+        const details = Object.entries(args).slice(0, 4).map(([key, value]) => {
+          const readable = value != null && typeof value === "object" ? "details recorded" : text(value, 60);
+          return key.replaceAll("_", " ") + ": " + readable;
+        });
+        return details.length > 0 ? details.join(" · ") : "No extra details";
+      }
+    }
+  };
 
   const sessionCard = (s) => {
     const sActions = actions.filter((a) => a.sessionId === s.id);
@@ -6711,7 +7477,7 @@ async function renderComputerUse() {
             <ol style="margin: var(--space-2) 0 0; padding-left: var(--space-4);">
               \${sActions.slice().reverse().map((a) => \`
                 <li style="margin-bottom: var(--space-2);">
-                  <div><strong>\${escapeHtml(a.kind)}</strong> \${escapeHtml(JSON.stringify(a.args)).slice(0, 140)}</div>
+                  <div><strong>\${escapeHtml(a.kind.replaceAll("_", " "))}</strong> — \${escapeHtml(computerActionCopy(a))}</div>
                   \${a.reasoning ? \`<div class="ui-meta">"\${escapeHtml(a.reasoning)}"</div>\` : '<div class="ui-meta" style="opacity:0.6;">(no reasoning given)</div>'}
                   <div class="ui-meta">\${escapeHtml(a.status)} · \${escapeHtml(new Date(a.createdAt).toLocaleTimeString())}</div>
                 </li>
@@ -6740,6 +7506,14 @@ async function renderComputerUse() {
 
       <p class="ui-muted">Every action the agent intends to take is recorded here with its stated reasoning. Sessions are user-approved (via the standard approval gate). You can abort an active session at any time.</p>
 
+      \${pendingActionsSectionHtml(computerApprovals, {
+        heading: "Computer-use requests awaiting approval"
+      })}
+
+      \${(stats.active ?? 0) > 1
+        ? '<div class="card warn-banner"><div class="name">Multiple active sessions detected</div><div class="desc">This came from the old approval-loop bug. Only the newest session is used; stop the older sessions below. New approvals can no longer create duplicates.</div></div>'
+        : ""}
+
       <div class="ui-card" style="margin: var(--space-3) 0;">
         <div class="ui-row" style="gap:var(--space-2); flex-wrap:wrap;">
           <span class="ui-badge \${readiness.screenshot && readiness.screenshot !== "disabled" ? "ui-badge-accent" : ""}">screen: \${escapeHtml(readiness.screenshot ?? "disabled")}</span>
@@ -6763,6 +7537,11 @@ async function renderComputerUse() {
         : sessions.map(sessionCard).join("")}
     </div>
   \`;
+
+  bindPendingActionButtons(async () => {
+    await renderComputerUse();
+    await refreshApprovalBadge();
+  });
 
   document.querySelectorAll("[data-abort]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -7179,6 +7958,15 @@ evt.addEventListener("mcp", (e) => {
   } catch {}
 });
 
+function refreshApprovalSurfaces() {
+  refreshApprovalBadge();
+  if (state.tab === "approvals") renderApprovals();
+  else if (state.tab === "computer-use") renderComputerUse();
+  else if (state.tab === "suggestions") renderSuggestions();
+}
+evt.addEventListener("pending-action", refreshApprovalSurfaces);
+evt.addEventListener("pending-action-resolved", refreshApprovalSurfaces);
+
 // New skill candidate proposed by the pattern miner or session miner.
 // Refresh the Skills tab if the user is on it; otherwise show a browser
 // notification (the Mac app also fires its own native notification — see
@@ -7299,6 +8087,7 @@ evt.addEventListener("cron-catchup", (e) => {
 
 setInterval(refreshHealth, 5000);
 refreshHealth();
+refreshApprovalBadge();
 setInterval(refreshAmbientBadge, 15000);
 refreshAmbientBadge();
 // Recovery path for a missed SSE event (dashboard opened after completion,
@@ -7326,7 +8115,7 @@ setInterval(() => {
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","review","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");

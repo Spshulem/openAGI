@@ -18,6 +18,7 @@ import { createId, nowIso } from "./utils.js";
 import { matchCatalog } from "./mcp-catalog.js";
 import { buildReconciliationCalibration } from "./reconciliation-calibration.js";
 import { resolveDataDir } from "./data-dir.js";
+import { suggestionAdmissionStatus, withSuggestionAdmission } from "./suggestion-admission.js";
 
 const SUGGEST_DIR = "proactive/suggestions";
 const DEDUPE_WINDOW_MS = 6 * 60 * 60 * 1000; // 6h — don't repeat the same proposal within a 6h window
@@ -59,6 +60,7 @@ export class ProactiveObserver {
   constructor(options = {}) {
     this.runtime = options.runtime;
     this.dataDir = options.dataDir ?? resolveDataDir();
+    this.maxPendingSuggestions = options.maxPendingSuggestions;
     this.suggestDir = path.join(this.dataDir, SUGGEST_DIR);
     this.lookbackMinutes = options.lookbackMinutes ?? 15;
     this.lastRunAt = 0;
@@ -73,6 +75,11 @@ export class ProactiveObserver {
       return { skipped: true, reason: "rate-limited" };
     }
     this.lastRunAt = Date.now();
+
+    const admission = suggestionAdmissionStatus({ dataDir: this.dataDir, limit: this.maxPendingSuggestions });
+    if (!admission.allowed) {
+      return { skipped: true, reason: "pending suggestion queue at review limit", ...admission };
+    }
 
     if (!this.runtime?.observations?.getRecentContext) {
       return { skipped: true, reason: "no observation store" };
@@ -276,16 +283,27 @@ export class ProactiveObserver {
     // accepting materializes the task (hosted-interface accept endpoint).
     // OPENAGI_AUTO_TASKS=1 restores the old behavior of silently creating the
     // task the moment the observer proposes it.
-    const autoCreate = process.env.OPENAGI_AUTO_TASKS === "1";
-    const task = autoCreate ? materializeTaskFromSuggestion(this.runtime, candidate) : null;
-    if (task) {
-      candidate.status = "accepted";
-      candidate.resolvedAt = nowIso();
-      candidate.taskId = task.id;
-      candidate.taskAutoCreated = true;
-      candidate.note = "Auto-created task from proactive observer (OPENAGI_AUTO_TASKS=1).";
+    const admitted = withSuggestionAdmission({
+      dataDir: this.dataDir,
+      limit: this.maxPendingSuggestions,
+      write: () => {
+        const autoCreate = process.env.OPENAGI_AUTO_TASKS === "1";
+        const task = autoCreate ? materializeTaskFromSuggestion(this.runtime, candidate) : null;
+        if (task) {
+          candidate.status = "accepted";
+          candidate.resolvedAt = nowIso();
+          candidate.taskId = task.id;
+          candidate.taskAutoCreated = true;
+          candidate.note = "Auto-created task from proactive observer (OPENAGI_AUTO_TASKS=1).";
+        }
+        writeJsonAtomic(path.join(this.suggestDir, `${id}.json`), candidate);
+        return { task };
+      }
+    });
+    if (!admitted.written) {
+      return { suggested: 0, skipped: true, reason: "pending suggestion queue at review limit", ...admitted };
     }
-    writeJsonAtomic(path.join(this.suggestDir, `${id}.json`), candidate);
+    const task = admitted.value.task;
     if (task) {
       this.runtime?.events?.emit?.("task-reminder", {
         kind: "created",

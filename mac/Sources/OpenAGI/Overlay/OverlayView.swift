@@ -4,6 +4,7 @@ struct OverlayView: View {
   @ObservedObject var state = OverlayState.shared
   @ObservedObject var app = AppState.shared
   @ObservedObject var outreach = OutreachConsumer.shared
+  @ObservedObject var approvals = PendingApprovalConsumer.shared
   @ObservedObject var brief = BriefConsumer.shared
   @ObservedObject var briefEditor = BriefEditorState.shared
   @FocusState private var fieldFocused: Bool
@@ -79,6 +80,10 @@ struct OverlayView: View {
     // .ingest can drop an acted item and add a pending one in the same batch, so
     // the count holds while the rows — and the panel's height — change. Equatable.
     .onChange(of: outreach.items) { _, _ in onContentChange() }
+    .onChange(of: approvals.items) { _, _ in onContentChange() }
+    .onChange(of: approvals.inFlight) { _, _ in onContentChange() }
+    .onChange(of: approvals.lastOutcome) { _, _ in onContentChange() }
+    .onChange(of: approvals.lastError) { _, _ in onContentChange() }
   }
 
   private func briefWatchers<V: View>(_ content: V) -> some View {
@@ -112,7 +117,9 @@ struct OverlayView: View {
   }
 
   // Combined attention count shown on the collapsed pill badge.
-  private var pillBadgeCount: Int { brief.items.count + outreach.items.count }
+  private var pillBadgeCount: Int {
+    brief.items.count + outreach.items.filter { $0.type != "pending-action" }.count + approvals.items.count
+  }
 
   private var pill: some View {
     Button(action: {
@@ -252,12 +259,55 @@ struct OverlayView: View {
           .help("Clear the answer")
         }
       }
-      if !outreach.items.isEmpty {
+      if !approvals.items.isEmpty || approvals.lastOutcome != nil || approvals.lastError != nil {
+        Divider()
+        HStack {
+          Text(approvals.items.count == 1 ? "Approval needed" : "Approvals needed")
+            .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+          Spacer()
+          if !approvals.items.isEmpty {
+            Text("\(approvals.items.count)")
+              .font(.system(size: 9, weight: .bold))
+              .foregroundStyle(.white)
+              .padding(.horizontal, 6).padding(.vertical, 2)
+              .background(Capsule().fill(Color.accentColor))
+          }
+        }
+        if let outcome = approvals.lastOutcome {
+          HStack(spacing: 6) {
+            Text(outcome).font(.system(size: 11)).foregroundStyle(.green)
+            Spacer()
+            Button("Dismiss") { approvals.clearOutcome() }
+              .buttonStyle(.borderless).font(.system(size: 10))
+          }
+        }
+        if let error = approvals.lastError {
+          Text(error).font(.system(size: 11)).foregroundStyle(.red)
+        }
+        if !approvals.items.isEmpty {
+          ScrollView {
+            VStack(alignment: .leading, spacing: 7) {
+              ForEach(approvals.items) { approval in
+                approvalRow(approval)
+              }
+            }
+          }
+          .frame(maxHeight: 230)
+          if approvals.items.count > 1 {
+            Button("Open all approvals in main app") {
+              app.openDashboard(path: "/?tab=approvals")
+            }
+            .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.blue)
+          }
+        }
+      }
+      let visibleOutreach = outreach.items.filter { $0.type != "pending-action" }
+      if !visibleOutreach.isEmpty {
         Divider()
         Text("Needs you").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
         ScrollView {
           VStack(alignment: .leading, spacing: 8) {
-            ForEach(outreach.items.prefix(6)) { item in
+            ForEach(visibleOutreach.prefix(6)) { item in
               outreachRow(item)
             }
           }
@@ -278,8 +328,45 @@ struct OverlayView: View {
     .frame(width: 320)
     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.1), lineWidth: 1))
-    .onAppear { fieldFocused = true; Task { await brief.refresh() } }
+    .onAppear {
+      fieldFocused = true
+      Task {
+        await brief.refresh()
+        await approvals.refresh()
+      }
+    }
     .onChange(of: state.expanded) { _, expanded in if expanded { fieldFocused = true } }
+  }
+
+  @ViewBuilder private func approvalRow(_ approval: PendingApproval) -> some View {
+    VStack(alignment: .leading, spacing: 5) {
+      HStack(alignment: .firstTextBaseline, spacing: 6) {
+        Image(systemName: "hand.raised.fill").foregroundStyle(Color.accentColor)
+        Text(approval.summary).font(.system(size: 12, weight: .semibold)).lineLimit(3)
+      }
+      Text(approval.toolName == "start_computer_use_session"
+           ? "Computer Use"
+           : approval.toolName.replacingOccurrences(of: "_", with: " ").capitalized)
+        .font(.system(size: 10)).foregroundStyle(.secondary)
+      HStack(spacing: 8) {
+        Button("Approve & run") {
+          Task { await approvals.approve(approval.id) }
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.small)
+        Button("Deny") {
+          Task { await approvals.deny(approval.id) }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        if approvals.inFlight.contains(approval.id) {
+          ProgressView().controlSize(.small)
+        }
+      }
+      .disabled(approvals.inFlight.contains(approval.id))
+    }
+    .padding(8)
+    .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
   }
 
   // The agent answers in markdown ("## Open old tasks to triage", "**19 old

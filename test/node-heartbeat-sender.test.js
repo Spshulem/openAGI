@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
-import { writeNodeConfig } from "../src/cli-client.js";
+import { readNodeConfig, writeNodeConfig } from "../src/cli-client.js";
 
 test("a paired instance heartbeats immediately on listen instead of waiting for its interval", async () => {
   // dataDir is passed explicitly to both createDurableRuntime and
@@ -63,6 +63,40 @@ test("a failed heartbeat POST does not crash the sender or the process", async (
     // If the sender threw, this line is never reached — the process test
     // runner would report an uncaught exception for this file.
     assert.ok(true, "still running after a failed heartbeat attempt");
+  } finally { await app.close(); }
+});
+
+test("a scoped node credential is persisted before the enrollment request can lose its response", async () => {
+  const nodeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-enroll-persist-"));
+  writeNodeConfig({ remote: "http://127.0.0.1:1", token: "main-admin" }, nodeDir);
+  const runtime = createDurableRuntime({ dataDir: nodeDir });
+  const attempts = [];
+  let observeRetry;
+  const retried = new Promise((resolve) => { observeRetry = resolve; });
+  const app = createHostedInterface(runtime, {
+    host: "127.0.0.1",
+    port: 0,
+    tickerMs: 0,
+    dataDir: nodeDir,
+    heartbeatIntervalMs: 20,
+    nodeControlFetch: async (_url, options) => {
+      const sent = JSON.parse(options.body);
+      const saved = readNodeConfig(nodeDir);
+      attempts.push({ sent, saved });
+      if (attempts.length === 1) throw new Error("simulated lost enrollment response");
+      observeRetry();
+      return { ok: true, status: 200, json: async () => ({ enrolled: true, created: false }) };
+    }
+  });
+  await app.listen();
+  try {
+    await retried;
+    assert.match(attempts[0].sent.nodeToken, /^[a-zA-Z0-9_-]{43}$/);
+    assert.equal(attempts[0].saved.nodeToken, attempts[0].sent.nodeToken);
+    assert.equal(attempts[0].saved.nodeEnrollmentConfirmed, false);
+    assert.equal(attempts[1].sent.nodeToken, attempts[0].sent.nodeToken, "retry reuses the persisted credential");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(readNodeConfig(nodeDir).nodeEnrollmentConfirmed, true);
   } finally { await app.close(); }
 });
 

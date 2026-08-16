@@ -8,7 +8,7 @@
 //   openagi status                        health + provider + task counts
 //   openagi doctor                        diagnose setup/connection, print fixes
 //   openagi setup                         print the dashboard/setup URL + token
-//   openagi pair <url> [--token T]        save a remote main as this node's target
+//   OPENAGI_REMOTE_TOKEN=… openagi pair <url>  pair to an HTTPS remote main
 //   openagi unpair                        forget the saved remote main
 //   openagi tick                          fire a scheduler tick
 //
@@ -17,7 +17,8 @@
 
 import readline from "node:readline";
 import { resolveDataDir } from "../src/data-dir.js";
-import { resolveTarget, CliClient, runDoctor, writeNodeConfig, clearNodeConfig, normalizeBase } from "../src/cli-client.js";
+import { resolveTarget, CliClient, runDoctor, writeNodeConfig, clearNodeConfig, normalizeBase, readNodeConfig } from "../src/cli-client.js";
+import { pinnedRemoteOrigin } from "../src/node-control.js";
 
 const RESET = "\x1b[0m", DIM = "\x1b[2m", BOLD = "\x1b[1m", GREEN = "\x1b[32m", RED = "\x1b[31m", YELLOW = "\x1b[33m";
 const tty = process.stdout.isTTY;
@@ -59,10 +60,9 @@ async function cmdServe(flags) {
   const { address, host } = await startServer({ host: flags.host, port: flags.port });
   console.log(c(GREEN, `OpenAGI main listening at ${address.url}`));
   if (host === "127.0.0.1") {
-    console.log(c(DIM, "Bound to localhost only. To let other devices connect as nodes, run with --host 0.0.0.0"));
-    console.log(c(DIM, "(auth token required — set one via `openagi setup` first)."));
+    console.log(c(DIM, "Bound to localhost. Remote nodes require an HTTPS endpoint (or an explicitly configured encrypted tunnel)."));
   } else {
-    console.log(c(DIM, `Reachable from your network. Nodes: \`openagi pair http://<this-host>:${address.url.split(":").pop()} --token <token>\``));
+    console.log(c(YELLOW, "Non-loopback HTTP must stay behind an authenticated HTTPS reverse proxy or encrypted tunnel before pairing nodes."));
   }
   // Keep the process alive; the server holds the event loop open.
 }
@@ -148,18 +148,42 @@ async function cmdSetup(flags) {
 
 function cmdPair(positional, flags) {
   const url = positional[0];
-  if (!url) { console.error(c(RED, "usage: openagi pair <main-url> [--token <token>]")); return 1; }
-  const file = writeNodeConfig({ remote: normalizeBase(url), token: flags.token ?? null }, resolveDataDir());
-  console.log(c(GREEN, `✓ paired with ${normalizeBase(url)}`));
+  if (!url) { console.error(c(RED, "usage: OPENAGI_REMOTE_TOKEN=… openagi pair <main-url>")); return 1; }
+  if (flags.token) {
+    console.error(c(RED, "refusing a pairing credential on the command line; set OPENAGI_REMOTE_TOKEN in the environment instead"));
+    return 1;
+  }
+  const remote = normalizeBase(url);
+  try {
+    pinnedRemoteOrigin(remote, {
+      allowInsecureRemote: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1"
+        || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true"
+    });
+  } catch (error) {
+    console.error(c(RED, `✗ ${error.message}`));
+    return 1;
+  }
+  const file = writeNodeConfig({ remote, token: process.env.OPENAGI_REMOTE_TOKEN ?? null }, resolveDataDir());
+  console.log(c(GREEN, `✓ paired with ${remote}`));
   console.log(c(DIM, `saved to ${file}. This device is now a node; \`openagi chat/status/doctor\` target the main.`));
-  if (!flags.token) console.log(c(YELLOW, "No --token given. If the main enforces auth, re-run with --token <main's OPENAGI_AUTH_TOKEN>."));
+  if (!process.env.OPENAGI_REMOTE_TOKEN) console.log(c(YELLOW, "No OPENAGI_REMOTE_TOKEN was set. An authenticated main cannot enroll this node until it is provided for the first handshake."));
   return 0;
 }
 
-function cmdUnpair() {
-  const removed = clearNodeConfig(resolveDataDir());
+async function cmdUnpair() {
+  const dataDir = resolveDataDir();
+  const pairing = readNodeConfig(dataDir);
+  let revokeFailed = false;
+  if (pairing?.remote && pairing.nodeToken) {
+    const target = resolveTarget({ dataDir });
+    const client = new CliClient(target, { timeoutMs: 5_000 });
+    const revoked = await client.request("POST", "/nodes/revoke", { nodeId: target.nodeId });
+    revokeFailed = !revoked.ok;
+  }
+  const removed = clearNodeConfig(dataDir);
   console.log(removed ? c(GREEN, "✓ unpaired — commands target the local daemon again.") : c(DIM, "no pairing was set."));
-  return 0;
+  if (revokeFailed) console.log(c(YELLOW, "The main was unreachable, so its scoped node credential could not be revoked yet; remove the node from the main when it is reachable."));
+  return revokeFailed ? 1 : 0;
 }
 
 async function cmdMigrate(positional, flags) {
@@ -225,15 +249,19 @@ async function cmdImessageServer(flags) {
 
 async function cmdComputerServer(flags) {
   const { createComputerServer } = await import("../src/integrations/computer-server.js");
-  const token = flags.token ?? process.env.OPENAGI_COMPUTER_NODE_TOKEN ?? null;
-  if (!token) { console.error(c(RED, "a token is required — pass --token <secret> (the main uses the same as OPENAGI_COMPUTER_NODE_TOKEN)")); return 1; }
+  if (flags.token) {
+    console.error(c(RED, "refusing a computer-server token on the command line — set OPENAGI_COMPUTER_NODE_TOKEN in the process environment instead"));
+    return 1;
+  }
+  const token = process.env.OPENAGI_COMPUTER_NODE_TOKEN ?? null;
+  if (!token) { console.error(c(RED, "OPENAGI_COMPUTER_NODE_TOKEN is required")); return 1; }
   const port = Number(flags.port ?? process.env.OPENAGI_COMPUTER_NODE_PORT ?? 43299);
-  const host = flags.host ?? "0.0.0.0";
+  const host = flags.host ?? "127.0.0.1";
   const server = createComputerServer({ token });
   await new Promise((resolve) => server.listen(port, host, resolve));
   console.log(c(GREEN, `computer-use node service on http://${host}:${port}`));
-  console.log(c(DIM, `On the main, set OPENAGI_COMPUTER_NODE=http://<this-host>:${port} and OPENAGI_COMPUTER_NODE_TOKEN=<the token>, then restart — the computer_* tools execute here.`));
-  console.log(c(DIM, "Requires: a display (or virtual display), Screen Recording (capture) + Accessibility (input) for this process, and `cliclick` installed. Ctrl-C to stop."));
+  console.log(c(DIM, "Loopback is the safe default. Paired OpenAGI nodes use the authenticated outbound relay and do not need this legacy server."));
+  console.log(c(DIM, "Requires a live display plus Screen Recording, Accessibility, and OPENAGI_COMPUTER_HELPER pointing to the signed helper bundled with the distributed app. Ctrl-C to stop."));
   await new Promise(() => {}); // run until killed
 }
 
@@ -342,7 +370,7 @@ function printHelp() {
   console.log(`${c(BOLD, "openagi")} — proactive local agent · CLI
 
 ${c(BOLD, "Run the main (the brain — holds all integrations):")}
-  openagi serve [--host 0.0.0.0] [--port 43210]
+  openagi serve [--host HOST] [--port 43210]
 
 ${c(BOLD, "Use it (local, or a remote main):")}
   openagi chat [message]      send a message; interactive REPL if no message
@@ -360,7 +388,9 @@ ${c(BOLD, "Use it (local, or a remote main):")}
   openagi models              show the model tiering plan + savings tips
 
 ${c(BOLD, "Turn this device into a node of a remote main:")}
-  openagi pair <main-url> [--token T]    save the main as this device's target
+  OPENAGI_REMOTE_TOKEN=… openagi pair <https-main-url>
+                                         enroll once, then retain only a
+                                         revocable node-scoped credential
   openagi unpair                         forget it
   openagi imessage-bridge [opts]         (macOS) relay incoming iMessages to the
                                          main and text its replies back. Opts:
@@ -374,8 +404,9 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
                                          [--from h] [--days N] [--limit N]
   openagi imessage-server --token T      (macOS) serve iMessage search to a
                                          remote main (gives it search_imessages)
-  openagi computer-server --token T      (macOS) serve screen capture + input to
-                                         a remote main (powers the computer_* tools)
+  openagi computer-server                (macOS) legacy explicit endpoint;
+                                         reads OPENAGI_COMPUTER_NODE_TOKEN and
+                                         binds to loopback unless --host is set
 
 ${c(BOLD, "Global flags:")} --remote <url>  --token <token>  --json
 
@@ -394,7 +425,7 @@ async function main() {
       case "doctor": return await cmdDoctor(flags);
       case "setup": return await cmdSetup(flags);
       case "pair": return cmdPair(positional, flags);
-      case "unpair": return cmdUnpair();
+      case "unpair": return await cmdUnpair();
       case "update": return await cmdUpdate(positional, flags);
       case "migrate": return await cmdMigrate(positional, flags);
       case "purge-outcomes": return await cmdPurgeOutcomes(flags);

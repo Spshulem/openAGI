@@ -48,12 +48,38 @@ export class DraftStore {
   /// Save a draft for review. `kind` is normalized to a known type so the
   /// UI can pick an icon; unknown kinds collapse to "other".
   add({ taskId, kind, title, body, recipient, sourceMeta } = {}) {
+    const normalizedKind = DRAFT_KINDS.includes(kind) ? kind : "other";
+    const normalizedTitle = String(title ?? "").trim() || "(untitled draft)";
+    const normalizedBody = String(body ?? "");
+    // Repeated agent execution for the same task must not create an exact
+    // stack of indistinguishable drafts. Never coalesce free-standing drafts,
+    // user-edited drafts, or merely similar content.
+    if (taskId && normalizedBody.trim()) {
+      const existing = [...this.items.values()].find((draft) =>
+        draft.status === "pending" &&
+        draft.taskId === taskId &&
+        !draft.editedAt &&
+        draft.kind === normalizedKind &&
+        draft.title === normalizedTitle &&
+        draft.body === normalizedBody &&
+        (draft.recipient ?? null) === (recipient ?? null)
+      );
+      if (existing) {
+        existing.sourceMeta = {
+          ...(existing.sourceMeta ?? {}),
+          duplicateCount: Math.max(1, Number(existing.sourceMeta?.duplicateCount) || 1) + 1,
+          duplicateLastSeenAt: nowIso()
+        };
+        this.snapshot();
+        return existing;
+      }
+    }
     const draft = {
       id: createId("draft"),
       taskId: taskId ?? null,
-      kind: DRAFT_KINDS.includes(kind) ? kind : "other",
-      title: String(title ?? "").trim() || "(untitled draft)",
-      body: String(body ?? ""),
+      kind: normalizedKind,
+      title: normalizedTitle,
+      body: normalizedBody,
       recipient: recipient ?? null,
       status: "pending",
       createdAt: nowIso(),

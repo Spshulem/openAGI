@@ -483,30 +483,29 @@ export class AbiRuntime {
         task: "task-sweep",
         intervalMs: sweepMin * 60 * 1000
       });
-      // Weekly backlog triage. A CLEANUP CADENCE, not a pulse — the whole
-      // complaint it answers is "there are 1,901 and 1,096 older ones", so a
-      // job that runs every 30 minutes would be answering a noise problem with
-      // more noise, and would re-judge the same items over and over for real
-      // money. Weekly is also the shortest useful period: an item has to sit
-      // unanswered for at least a week before this module will even look at it
-      // (freshDays = 7), so a daily run would spend most of its passes finding
-      // nothing new to judge.
-      //
-      // Sunday 05:15 local. The nightly chain (pattern-mine 02:30, memory
-      // condense + session-mine 03:30, retirement sweep 04:00, self-update
-      // 04:30, weekly scrutiny fit 05:00) is finished by then, so triage reads
-      // a settled queue rather than racing the miners that fill it, and it
-      // lands hours before the 08:00 daily plan + task digest — so Monday's
-      // first brief is the first thing that reads the cleaned backlog.
+      // Daily deterministic cleanup drains legacy duplicate/dead suggestions
+      // in bounded reversible passes. BacklogTriage itself rate-limits the LLM
+      // judgement phase to weekly, so this faster housekeeping cadence does
+      // not multiply model cost. 05:15 stays clear of the nightly miners and
+      // lands before the morning plan reads the review queue.
+      const existingBacklogTriageJob = this.cron.listJobs().find((job) => job.id === "backlog-triage") ?? null;
       this.cron.addJob({
         id: "backlog-triage",
-        name: "Weekly backlog triage — retire dead suggestions, surface what still matters",
+        name: "Daily backlog hygiene — retire duplicates; review relevance weekly",
         enabled: true,
         task: "backlog-triage",
-        intervalMs: 7 * 24 * 60 * 60 * 1000,
-        // +15 min so it does not share a tick with weekly-scrutiny-fit (05:00).
-        nextRunAt: new Date(nextSundayMorning(5).getTime() + 15 * 60 * 1000).toISOString()
+        dailyAt: "05:15"
       });
+      // FileBackedCronScheduler preserves existing rows. Upgrade the old
+      // weekly default without changing a user's enabled/disabled choice.
+      if (existingBacklogTriageJob?.intervalMs === 7 * 24 * 60 * 60 * 1000) {
+        this.cron.updateJob("backlog-triage", {
+          name: "Daily backlog hygiene — retire duplicates; review relevance weekly",
+          intervalMs: null,
+          dailyAt: "05:15",
+          ...(existingBacklogTriageJob.enabled ? {} : { nextRunAt: null })
+        });
+      }
       this.cron.addJob({
         id: "outreach-digest",
         name: `Outreach digest every ${this.outreachConfig.cadenceHours}h`,
