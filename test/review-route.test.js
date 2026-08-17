@@ -70,6 +70,12 @@ test("served dashboard recognizes and renders the Review tab", async (t) => {
   assert.match(html, /const pollDeadline = Date\.now\(\) \+ 11 \* 60 \* 1000/);
   assert.match(html, /const finalResult = await fetchJson\(run\.poll\)/);
   assert.match(html, /button\.disabled = false/);
+  assert.match(html, /requestGeneration !== review\.requestGeneration \|\| state\.tab !== "review"/);
+  assert.match(html, /append && review\.loadingAppend/);
+  assert.match(html, /revealDeepLinkedRecord\("task", "\.task", "taskId"\)/);
+  assert.match(html, /revealDeepLinkedRecord\("suggestion", "\[data-suggestion-id\]", "suggestionId"\)/);
+  assert.match(html, /revealDeepLinkedRecord\("draft", "\[data-draft\]", "draft"\)/);
+  assert.match(html, /revealDeepLinkedRecord\("clarification", "\[data-clar\]", "clar"\)/);
   const script = html.match(/<script[^>]*>([\s\S]*)<\/script>/)?.[1];
   assert.ok(script, "dashboard includes its client script");
   assert.doesNotThrow(() => new Function(script), "generated dashboard JavaScript parses");

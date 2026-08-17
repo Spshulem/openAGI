@@ -2637,12 +2637,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!authPath) return sendJson(res, 400, { error: "invalid MCP server name" });
         pendingOauth.delete(name);
         // "Forget login" is stronger than a transport disconnect: close the
-        // active client and unregister its tools before deleting the cache, so
-        // the dashboard and model cannot keep using a supposedly-forgotten
-        // credential until restart.
+        // active client, cancel any in-flight callback/handshake, invalidate
+        // stale completions, unregister tools, and only then delete the cache.
         try {
-          await runtime.mcp.disconnect?.(name);
-          if (fsSync.existsSync(authPath)) fsSync.unlinkSync(authPath);
+          const forgotten = await runtime.mcp.forgetOAuth?.(name);
+          if (!forgotten) return sendJson(res, 404, { error: "unknown OAuth MCP server" });
         } catch (error) {
           return sendJson(res, 500, { error: `could not forget OAuth login: ${error.message}` });
         }
@@ -4054,7 +4053,9 @@ const state = {
     nextCursor: null,
     total: 0,
     byKind: {},
-    summary: null
+    summary: null,
+    requestGeneration: 0,
+    loadingAppend: false
   }
 };
 
@@ -7333,6 +7334,9 @@ async function renderTasks() {
 
 async function renderReview({ append = false } = {}) {
   const review = state.review;
+  if (append && review.loadingAppend) return;
+  const requestGeneration = ++review.requestGeneration;
+  if (append) review.loadingAppend = true;
   const previousScroll = append ? (main.querySelector(".pane")?.scrollTop ?? 0) : 0;
   const params = new URLSearchParams({ limit: "50", sort: review.sort });
   if (review.q) params.set("q", review.q);
@@ -7347,6 +7351,8 @@ async function renderReview({ append = false } = {}) {
   try {
     page = await fetchJson("/review-queue?" + params.toString());
   } catch (error) {
+    if (requestGeneration !== review.requestGeneration || state.tab !== "review") return;
+    review.loadingAppend = false;
     main.innerHTML = \`
       <div class="pane">
         <h2>Review</h2>
@@ -7356,6 +7362,13 @@ async function renderReview({ append = false } = {}) {
     $("reviewRetry")?.addEventListener("click", () => renderReview());
     return;
   }
+
+  // A search/filter/sort/tab change may have started a newer render while
+  // this request was in flight. Only the newest Review request owns the view;
+  // stale responses stay ignored instead of publishing old rows under new
+  // controls or replacing the tab the user navigated to.
+  if (requestGeneration !== review.requestGeneration || state.tab !== "review") return;
+  review.loadingAppend = false;
 
   review.items = append ? [...review.items, ...(page.items ?? [])] : (page.items ?? []);
   review.nextCursor = page.nextCursor ?? null;

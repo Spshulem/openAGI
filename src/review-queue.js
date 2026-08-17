@@ -1,11 +1,10 @@
 // Searchable, paginated view of every store-backed row eligible for Quick Ask.
 //
-// This deliberately composes through daily-brief.js rather than reading tasks,
-// drafts, clarifications and suggestions independently. "N more" and Review
-// therefore share one eligibility policy, including muted categories and the
-// focus-backed-task de-duplication that prevents the same task appearing twice.
+// Eligibility lives in daily-brief.js, but Review enumerates raw records
+// through listReviewEntities() rather than asking the brief composer to score
+// and build actions for the whole backlog on every page request.
 
-import { composeBrief } from "./daily-brief.js";
+import { composeBrief, listReviewEntities } from "./daily-brief.js";
 
 const REVIEW_KINDS = new Set(["task", "draft", "clarification", "suggestion"]);
 const MAX_PAGE_SIZE = 100;
@@ -24,22 +23,22 @@ export function queryReviewQueue(runtime, options = {}) {
   const query = String(options.q ?? "").trim().slice(0, 300).toLowerCase();
   const sort = options.sort === "newest" ? "newest" : "oldest";
   const limit = clampInt(options.limit, 1, MAX_PAGE_SIZE, 50);
-  const cursorKey = decodeCursor(options.cursor);
+  const cursor = decodeCursor(options.cursor);
 
+  // Only the handful of Quick Ask rows need scores and action menus. This call
+  // is task-bounded; the full Review inventory below is lightweight.
   const quick = composeBrief(runtime, {
     now,
     dataDir: options.dataDir,
-    limit: clampInt(options.quickAskLimit, 1, 10, 5),
-    includeReviewMeta: true
+    limit: clampInt(options.quickAskLimit, 1, 10, 5)
   });
-
-  // One composition is enough: includeReviewMeta keeps the five slot-selected
-  // rows in `items` and exposes the complete eligible set in `reviewItems`.
-  // A second 100k-item composition used to parse every suggestion file twice
-  // and duplicate the full queue in memory on every page request.
-  const all = (quick.reviewItems ?? quick.items)
-    .filter((item) => item?.entityRef?.id && REVIEW_KINDS.has(item.entityRef.kind))
-    .map(toReviewRow);
+  const entities = listReviewEntities(runtime, { dataDir: options.dataDir });
+  const all = [
+    ...entities.tasks.map(taskReviewRow),
+    ...entities.drafts.map(draftReviewRow),
+    ...entities.clarifications.map(clarificationReviewRow),
+    ...entities.suggestions.map(suggestionReviewRow)
+  ];
   const summary = summarize(all);
   const quickAskIds = new Set(quick.items
     .filter((item) => item?.entityRef?.id)
@@ -47,13 +46,12 @@ export function queryReviewQueue(runtime, options = {}) {
 
   let matches = all.filter((row) => !kind || row.kind === kind);
   if (query) matches = matches.filter((row) => row._search.includes(query));
-  matches.sort((a, b) => sort === "newest"
-    ? compareSortKeys(b._sortKey, a._sortKey)
-    : compareSortKeys(a._sortKey, b._sortKey));
+  matches.sort((a, b) => compareReviewRows(a, b, sort));
   const matchingTotal = matches.length;
   const matchingByKind = summarize(matches).byKind;
-  if (cursorKey) {
-    matches = matches.filter((row) => sort === "newest" ? row._sortKey < cursorKey : row._sortKey > cursorKey);
+  if (cursor) {
+    const cursorRow = { createdAt: cursor.createdAt, _sortKey: cursor.key };
+    matches = matches.filter((row) => compareReviewRows(row, cursorRow, sort) > 0);
   }
 
   const page = matches.slice(0, limit);
@@ -76,35 +74,87 @@ export function queryReviewQueue(runtime, options = {}) {
       quickAskShown: quickAskIds.size,
       moreThanQuickAsk: Math.max(0, summary.total - quickAskIds.size)
     },
-    nextCursor: hasMore && page.length > 0 ? encodeCursor(page.at(-1)._sortKey) : null,
-    degraded: [...new Set(quick.degraded ?? [])]
+    nextCursor: hasMore && page.length > 0 ? encodeCursor(page.at(-1)) : null,
+    degraded: [...new Set([...(quick.degraded ?? []), ...(entities.degraded ?? [])])]
   };
 }
 
-function toReviewRow(item) {
-  const kind = item.entityRef.kind;
-  const id = String(item.entityRef.id);
-  const createdAt = validIso(item.reviewCreatedAt);
-  const title = String(item.reviewTitle ?? item.title ?? "(untitled)");
-  const preview = kind === "draft" && typeof item.editValue === "string"
-    ? truncate(item.editValue.replace(/\s+/g, " ").trim(), 320)
-    : null;
-  const searchable = [kind, title, item.title, item.why, item.source, item.editValue, item.reviewSearchText]
-    .filter(Boolean)
-    .join("\n")
-    .toLowerCase();
+function reviewRow({ kind, id, title, summary = null, preview = null, source = null, createdAt = null, search = [] }) {
+  const normalizedId = String(id);
+  const normalizedCreatedAt = validIso(createdAt);
+  const normalizedTitle = String(title ?? "(untitled)");
   return {
     kind,
-    id,
-    title,
-    summary: item.why ? String(item.why) : null,
+    id: normalizedId,
+    title: normalizedTitle,
+    summary: summary ? String(summary) : null,
     preview,
-    source: item.source ? String(item.source) : null,
-    createdAt,
-    deepLink: deepLinkFor(kind, id),
-    _search: searchable,
-    _sortKey: `${createdAt ?? "9999-12-31T23:59:59.999Z"}\u0000${kind}\u0000${id}`
+    source: source ? String(source) : null,
+    createdAt: normalizedCreatedAt,
+    deepLink: deepLinkFor(kind, normalizedId),
+    _search: [kind, normalizedTitle, summary, source, ...search]
+      .filter(Boolean).join("\n").toLowerCase(),
+    _sortKey: `${normalizedCreatedAt ?? ""}\u0000${kind}\u0000${normalizedId}`
   };
+}
+
+function taskReviewRow(task) {
+  return reviewRow({
+    kind: "task",
+    id: task.id,
+    title: task.title,
+    summary: task.description || null,
+    source: task.source,
+    createdAt: task.createdAt,
+    search: [task.description, task.status, task.bucket, task.sourceMeta?.identifier]
+  });
+}
+
+function draftReviewRow(draft) {
+  const body = typeof draft.body === "string" ? draft.body : "";
+  return reviewRow({
+    kind: "draft",
+    id: draft.id,
+    title: draft.title,
+    summary: ["draft waiting", draft.kind && draft.kind !== "other" ? draft.kind : null].filter(Boolean).join(" · "),
+    preview: truncate(body.replace(/\s+/g, " ").trim(), 320),
+    source: "agent",
+    createdAt: draft.createdAt,
+    search: [body, draft.kind, draft.recipient, draft.taskId]
+  });
+}
+
+function clarificationReviewRow(clarification) {
+  return reviewRow({
+    kind: "clarification",
+    id: clarification.id,
+    title: clarification.question || "Did you finish this?",
+    summary: clarification.context || "needs your call",
+    source: "agent",
+    createdAt: clarification.createdAt,
+    search: [clarification.context, clarification.taskId, ...(clarification.sources ?? [])]
+  });
+}
+
+function suggestionReviewRow(suggestion) {
+  const described = firstSentence(suggestion.proposal?.description);
+  const sequence = suggestion.sequence;
+  const summary = sequence
+    ? [
+        sequence.count ? `seen ${sequence.count}x` : null,
+        sequence.distinctDays > 1 ? `across ${sequence.distinctDays} days` : null,
+        sequence.cadence?.type && sequence.cadence.type !== "irregular" ? `${sequence.cadence.type} cadence` : null
+      ].filter(Boolean).join(" · ")
+    : suggestion.rationale || null;
+  return reviewRow({
+    kind: "suggestion",
+    id: suggestion.id,
+    title: described || suggestion.title || "OpenAGI noticed something",
+    summary,
+    source: suggestion.source,
+    createdAt: suggestion.proposedAt,
+    search: [suggestion.title, suggestion.rationale, suggestion.proposal?.description, suggestion.proposal?.body]
+  });
 }
 
 function summarize(rows) {
@@ -126,8 +176,8 @@ function normalizeKind(value) {
   return singular;
 }
 
-function encodeCursor(key) {
-  return Buffer.from(JSON.stringify({ key }), "utf8").toString("base64url");
+function encodeCursor(row) {
+  return Buffer.from(JSON.stringify({ key: row._sortKey, createdAt: row.createdAt }), "utf8").toString("base64url");
 }
 
 function decodeCursor(value) {
@@ -137,7 +187,8 @@ function decodeCursor(value) {
   try {
     const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
     if (!decoded || typeof decoded.key !== "string" || decoded.key.length > 1_000) throw new Error("bad key");
-    return decoded.key;
+    if (decoded.createdAt !== null && validIso(decoded.createdAt) === null) throw new Error("bad date");
+    return decoded;
   } catch {
     throw new ReviewQueueQueryError("invalid review cursor");
   }
@@ -145,9 +196,19 @@ function decodeCursor(value) {
 
 function entityKey(kind, id) { return `${kind}:${id}`; }
 
-// Cursor filtering must use exactly the same bytewise ordering as the sort.
-// String.localeCompare() is locale/case dependent, while `<` is not; mixing
-// the two can skip rows whose ids differ only in case at the same timestamp.
+// Missing timestamps are always last. Reversing the timestamp comparison for
+// newest-first must not reverse that placement and put malformed legacy rows
+// ahead of genuinely recent work.
+function compareReviewRows(a, b, sort) {
+  const aUndated = !a.createdAt;
+  const bUndated = !b.createdAt;
+  if (aUndated !== bUndated) return aUndated ? 1 : -1;
+  if (aUndated) return compareSortKeys(a._sortKey, b._sortKey);
+  return sort === "newest"
+    ? compareSortKeys(b._sortKey, a._sortKey)
+    : compareSortKeys(a._sortKey, b._sortKey);
+}
+
 function compareSortKeys(a, b) {
   return a === b ? 0 : (a < b ? -1 : 1);
 }
@@ -174,4 +235,11 @@ function clampInt(value, min, max, fallback) {
 function truncate(value, max) {
   const text = String(value ?? "");
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+function firstSentence(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  const match = text.match(/^[\s\S]*?[.!?](?=\s|$)/);
+  return (match ? match[0] : text).trim();
 }

@@ -147,6 +147,19 @@ test("an unknown suggestion category never renders an accept action", () => {
   assert.equal(brief.older.count, 0, "and an invisible row is not 'older' either");
 });
 
+test("ordinary Quick Ask bounds task enumeration instead of scanning the whole backlog", () => {
+  const rt = makeRuntime({ tasks: Array.from({ length: 1_000 }, (_, i) => task({ id: `t${i}` })) });
+  const limits = [];
+  const originalList = rt.tasks.list;
+  rt.tasks.list = (options = {}) => {
+    limits.push(options.limit);
+    return originalList(options).slice(0, options.limit);
+  };
+
+  composeBrief(rt, { now: NOW, limit: 5 });
+  assert.deepEqual(limits, [200, 200]);
+});
+
 // The other half of the invariant: closing the filter must not close it on the
 // categories hosted-interface.js really does materialize (mcp → registerServer,
 // task → materializeTaskFromSuggestion, skill → createSkillFrom*, knowledge →

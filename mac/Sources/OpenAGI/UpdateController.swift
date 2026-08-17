@@ -14,7 +14,7 @@ import UserNotifications
 // start" — so we detect that and degrade to a no-op + friendly dialog.
 
 @MainActor
-final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate, @preconcurrency SPUStandardUserDriverDelegate {
+final class UpdateController: NSObject, ObservableObject, SPUUpdaterDelegate, SPUStandardUserDriverDelegate {
   static let shared = UpdateController()
 
   nonisolated static let notificationIdentifier = "app.openagi.update.available"

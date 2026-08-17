@@ -76,10 +76,12 @@ const ACCEPT_LABELS = {
 // can tap from a one-row popover would unblock one. "completed"/"cancelled"
 // are done.
 const ACTIVE_TASK_STATUSES = ["pending", "in_progress"];
-// TaskStore applies its limit after filtering. Review uses the same composer
-// to enumerate its complete queue, so the old 200-per-status cap could make
-// hundreds of real open tasks disappear from both the count and search.
-const ACTIVE_TASK_QUERY_LIMIT = 100_000;
+// Quick Ask renders at most ten rows, so its hot path stays bounded even when
+// the durable task store has years of history. Review uses the separate,
+// lightweight listReviewEntities() path below to enumerate the full queue
+// without scoring every task or constructing action menus on each page.
+const BRIEF_TASK_QUERY_LIMIT = 200;
+const REVIEW_TASK_QUERY_LIMIT = 100_000;
 const MOVABLE_TASK_BUCKETS = ["today", "this_week", "this_month", "this_quarter", "this_year", "someday"];
 const BUCKET_LABELS = {
   today: "Today",
@@ -125,7 +127,9 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir, in
   // read fine. Worst case the pinned row comes back and can be dismissed again.
   const dismissedFocus = readFocusDismissals(resolvedDataDir, now);
 
-  const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime), []);
+  const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime, {
+    limit: includeReviewMeta ? REVIEW_TASK_QUERY_LIMIT : BRIEF_TASK_QUERY_LIMIT
+  }), []);
   const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
   const clarifications = safely(degraded, "clarifications", () => runtime.clarifications?.list?.({ status: "pending" }) ?? [], []);
   const suggestions = safely(degraded, "suggestions", () => listAllSuggestions(runtime, { status: "pending" }) ?? [], []);
@@ -276,6 +280,48 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir, in
     }));
   }
   return response;
+}
+
+// Full, lightweight source enumeration for the Review page. This deliberately
+// returns raw records grouped by kind: review-queue.js creates only searchable
+// row metadata, while composeBrief remains responsible for scores, due-date
+// prose, snooze dates, and actions for the handful of Quick Ask rows.
+// Keeping eligibility here prevents Review and Quick Ask from drifting on
+// active task statuses, muted suggestions, or unsupported suggestion kinds.
+export function listReviewEntities(runtime, { dataDir } = {}) {
+  const degraded = [];
+  const resolvedDataDir = dataDir ?? runtime?.dataDir ?? resolveDataDir();
+  const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime, {
+    limit: REVIEW_TASK_QUERY_LIMIT
+  }), []);
+  const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
+  const clarifications = safely(
+    degraded,
+    "clarifications",
+    () => runtime.clarifications?.list?.({ status: "pending" }) ?? [],
+    []
+  );
+  const suggestions = safely(
+    degraded,
+    "suggestions",
+    () => listAllSuggestions(runtime, { status: "pending" }) ?? [],
+    []
+  );
+  if (!degraded.includes("suggestions") && suggestionStoreUnreadable(suggestionDataDir(runtime, resolvedDataDir))) {
+    degraded.push("suggestions");
+  }
+  const isMuted = (category) => {
+    try { return runtime.suggestionFeedback?.isMuted?.(category) === true; } catch { return false; }
+  };
+  return {
+    tasks,
+    drafts,
+    clarifications,
+    suggestions: suggestions.filter(
+      (suggestion) => ACTIONABLE_SUGGESTION_CATEGORIES.has(suggestion.category) && !isMuted(suggestion.category)
+    ),
+    degraded
+  };
 }
 
 // ─── per-kind builders ───────────────────────────────────────────────────
@@ -438,10 +484,10 @@ function titleKey(s) { return String(s ?? "").trim().replace(/\s+/g, " ").toLowe
 /// that answers this call — a stub (or a future store) that ignores the filter
 /// must not double every row — and re-filtered for the same reason, so a store
 /// that hands back terminal tasks cannot slip a completed one into the brief.
-function listActiveTasks(runtime) {
+function listActiveTasks(runtime, { limit = BRIEF_TASK_QUERY_LIMIT } = {}) {
   const byId = new Map();
   for (const status of ACTIVE_TASK_STATUSES) {
-    const rows = runtime?.tasks?.list?.({ queue: "user", status, limit: ACTIVE_TASK_QUERY_LIMIT }) ?? [];
+    const rows = runtime?.tasks?.list?.({ queue: "user", status, limit }) ?? [];
     for (const t of rows) if (t?.id && !byId.has(t.id)) byId.set(t.id, t);
   }
   return [...byId.values()].filter((t) => ACTIVE_TASK_STATUSES.includes(t.status ?? "pending"));

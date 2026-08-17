@@ -171,3 +171,24 @@ test("oldest and newest cursors both exhaust a large queue without gaps or dupli
   assert.equal(new Set(oldest.map((item) => item.id)).size, tasks.length);
   assert.deepEqual(newest.map((item) => item.id), oldest.map((item) => item.id).reverse());
 });
+
+test("undated rows stay last for both sort directions and paginate after dated rows", () => {
+  const rt = runtime({ tasks: [
+    task("old", "2026-01-01T00:00:00.000Z"),
+    task("new", "2026-02-01T00:00:00.000Z"),
+    task("missing", null),
+    task("malformed", "not-a-date")
+  ] });
+
+  for (const sort of ["oldest", "newest"]) {
+    const ids = [];
+    let cursor = null;
+    do {
+      const page = queryReviewQueue(rt, { now: NOW, sort, cursor, limit: 1 });
+      ids.push(...page.items.map((item) => item.id));
+      cursor = page.nextCursor;
+    } while (cursor);
+    assert.deepEqual(new Set(ids.slice(-2)), new Set(["missing", "malformed"]));
+    assert.equal(ids.length, 4);
+  }
+});

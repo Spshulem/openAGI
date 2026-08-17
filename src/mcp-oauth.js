@@ -39,6 +39,8 @@ export class McpOAuthClient {
     this.cachePath = path.join(this.dataDir, "mcp", "auth", `${this.name}.json`);
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.printAuthUrlFn = options.printAuthUrlFn ?? defaultPrintAuthUrl;
+    this.activeAuthorization = null;
+    this.authorizationGeneration = 0;
     // Optional pre-registered client (for auth servers without dynamic
     // client registration). When set, we skip RFC 7591 entirely.
     this.staticClient = options.clientId
@@ -50,6 +52,15 @@ export class McpOAuthClient {
         }
       : null;
     ensureDir(path.dirname(this.cachePath));
+  }
+
+  cancelAuthorization(reason = "OAuth authorization cancelled") {
+    this.authorizationGeneration += 1;
+    const active = this.activeAuthorization;
+    if (!active) return false;
+    active.cancelled = true;
+    active.cancel(reason);
+    return true;
   }
 
   loadCache() {
@@ -65,13 +76,15 @@ export class McpOAuthClient {
    * has a refresh_token, otherwise runs the full authorization code flow.
    */
   async ensureToken({ interactive = true } = {}) {
+    const generation = this.authorizationGeneration;
     const cache = this.loadCache() ?? {};
     if (cache.access_token && !this.isExpired(cache)) {
       return cache.access_token;
     }
     if (cache.refresh_token && cache.discovery && cache.client) {
       try {
-        await this.refresh(cache);
+        await this.refresh(cache, { generation });
+        this.assertAuthorizationCurrent(generation);
         return this.loadCache().access_token;
       } catch (error) {
         // fall through to full flow
@@ -86,8 +99,13 @@ export class McpOAuthClient {
       err.code = "OAUTH_INTERACTIVE_REQUIRED";
       throw err;
     }
-    await this.authorize();
+    await this.authorize({ generation });
+    this.assertAuthorizationCurrent(generation);
     return this.loadCache().access_token;
+  }
+
+  assertAuthorizationCurrent(generation) {
+    if (generation !== this.authorizationGeneration) throw oauthCancelledError();
   }
 
   isExpired(cache) {
@@ -119,18 +137,22 @@ export class McpOAuthClient {
     return inter.length ? inter.join(" ") : null;
   }
 
-  async authorize() {
+  async authorize({ generation = this.authorizationGeneration } = {}) {
     const discovery = await this.discover();
+    this.assertAuthorizationCurrent(generation);
     const scope = this.resolveScope(discovery);
     const cache = this.loadCache() ?? {};
     const client = this.staticClient ?? cache.client ?? (await this.registerClient(discovery, scope));
+    this.assertAuthorizationCurrent(generation);
 
     const codeVerifier = base64url(randomBytes(48));
     const codeChallenge = base64url(createHash("sha256").update(codeVerifier).digest());
     const state = base64url(randomBytes(16));
 
     // Spin a one-shot loopback listener.
-    const { server, port, callback } = await startCallbackServer();
+    const { server, port, callback, cancel } = await startCallbackServer();
+    const active = { server, cancel, cancelled: false };
+    this.activeAuthorization = active;
     const redirectUri = `http://127.0.0.1:${port}/callback`;
 
     const authUrl = new URL(discovery.serverMeta.authorization_endpoint);
@@ -148,29 +170,35 @@ export class McpOAuthClient {
     // declared instead of blindly echoing the discovery seed URL.
     authUrl.searchParams.set("resource", discovery.resourceMeta?.resource ?? this.resourceUrl);
 
-    this.printAuthUrlFn({ name: this.name, url: authUrl.toString() });
-    openInBrowser(authUrl.toString());
-
-    let codeResult;
+    let timeout = null;
     try {
-      codeResult = await Promise.race([
+      this.assertAuthorizationCurrent(generation);
+      this.printAuthUrlFn({ name: this.name, url: authUrl.toString() });
+      openInBrowser(authUrl.toString());
+      const codeResult = await Promise.race([
         callback,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("OAuth callback timed out")), this.timeoutMs))
+        new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("OAuth callback timed out")), this.timeoutMs);
+        })
       ]);
+      if (active.cancelled) throw oauthCancelledError();
+      if (codeResult.state !== state) throw new Error("OAuth state mismatch (CSRF protection)");
+      if (!codeResult.code) throw new Error("OAuth callback missing code");
+
+      const tokens = await this.exchangeCode({
+        discovery, client,
+        code: codeResult.code,
+        codeVerifier,
+        redirectUri
+      });
+      this.assertAuthorizationCurrent(generation);
+      if (active.cancelled) throw oauthCancelledError();
+      this.persistTokens({ tokens, discovery, client });
     } finally {
+      if (timeout) clearTimeout(timeout);
       try { server.close(); } catch { /* ignore */ }
+      if (this.activeAuthorization === active) this.activeAuthorization = null;
     }
-    if (codeResult.state !== state) throw new Error("OAuth state mismatch (CSRF protection)");
-    if (!codeResult.code) throw new Error("OAuth callback missing code");
-
-    const tokens = await this.exchangeCode({
-      discovery, client,
-      code: codeResult.code,
-      codeVerifier,
-      redirectUri
-    });
-
-    this.persistTokens({ tokens, discovery, client });
   }
 
   /**
@@ -198,7 +226,7 @@ export class McpOAuthClient {
   /**
    * Refresh access token using a stored refresh_token.
    */
-  async refresh(cache) {
+  async refresh(cache, { generation = this.authorizationGeneration } = {}) {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: cache.refresh_token,
@@ -212,6 +240,7 @@ export class McpOAuthClient {
     });
     const json = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(json?.error_description ?? `refresh failed (${response.status})`);
+    this.assertAuthorizationCurrent(generation);
     this.persistTokens({ tokens: json, discovery: cache.discovery, client: cache.client });
   }
 
@@ -349,6 +378,7 @@ export function openInBrowser(url, { platform = process.platform, env = process.
 export function startCallbackServer() {
   return new Promise((resolve, reject) => {
     let resolveCb, rejectCb;
+    let callbackSettled = false;
     const callback = new Promise((res, rej) => { resolveCb = res; rejectCb = rej; });
     const server = http.createServer((req, res) => {
       try {
@@ -367,6 +397,7 @@ export function startCallbackServer() {
           res.end(`<!doctype html><meta charset=utf-8><title>OAuth error</title><body style=font-family:system-ui;padding:40px>` +
             `<h2>Authorization failed</h2><p>${escapeHtml(error)}: ${escapeHtml(desc)}</p>` +
             `<p>You can close this window.</p></body>`);
+          callbackSettled = true;
           rejectCb(new Error(`${error}: ${desc}`));
           return;
         }
@@ -378,9 +409,11 @@ export function startCallbackServer() {
           `<h2 style=color:#6fe1b1>✓ Authorized</h2>` +
           `<p>OpenAGI is finishing the connection. Returning to Integrations…</p>` +
           `<p><a style=color:#6fe1b1 href="${escapeHtml(dashboardUrl)}">Return now</a></p></body>`);
+        callbackSettled = true;
         resolveCb({ code, state });
       } catch (err) {
         try { res.writeHead(500); res.end(); } catch { /* ignore */ }
+        callbackSettled = true;
         rejectCb(err);
       }
     });
@@ -396,9 +429,22 @@ export function startCallbackServer() {
     const listenPort = Number.isInteger(fixed) && fixed > 0 ? fixed : 0;
     server.listen(listenPort, "127.0.0.1", () => {
       const port = server.address().port;
-      resolve({ server, port, callback });
+      const cancel = (reason = "OAuth authorization cancelled") => {
+        if (!callbackSettled) {
+          callbackSettled = true;
+          rejectCb(oauthCancelledError(reason));
+        }
+        try { server.close(); } catch { /* already closed */ }
+      };
+      resolve({ server, port, callback, cancel });
     });
   });
+}
+
+function oauthCancelledError(message = "OAuth authorization cancelled") {
+  const error = new Error(message);
+  error.code = "OAUTH_CANCELLED";
+  return error;
 }
 
 function oauthReturnUrl() {
