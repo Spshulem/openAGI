@@ -304,6 +304,63 @@ test("computer-use approval stores an immutable target and refuses cross-goal re
   }
 });
 
+test("approved explicit node is re-authenticated and permission-checked before session activation", async () => {
+  const previous = {
+    node: process.env.OPENAGI_COMPUTER_NODE,
+    token: process.env.OPENAGI_COMPUTER_NODE_TOKEN,
+    insecure: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY
+  };
+  process.env.OPENAGI_COMPUTER_NODE = "https://computer.example";
+  process.env.OPENAGI_COMPUTER_NODE_TOKEN = "scoped-test-token";
+  delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-explicit-approval-"));
+  const tools = new ToolRegistry();
+  const pendingActions = new PendingActionStore({ dir: path.join(dataDir, "pending") });
+  tools.bindPendingActions(pendingActions);
+  const runtime = {
+    tools,
+    pendingActions,
+    computerUseLog: new ComputerUseLog({ dir: path.join(dataDir, "computer-use") }),
+    observations: { search: async () => [] }
+  };
+  let probes = 0;
+  registerComputerUseTools(tools, runtime, {
+    fetchImpl: async (url, options) => {
+      probes += 1;
+      assert.equal(url, "https://computer.example/health");
+      assert.equal(options.headers.authorization, "Bearer scoped-test-token");
+      return new Response(JSON.stringify({
+        capability: {
+          id: "computer-use",
+          screenshotReady: true,
+          inputReady: false,
+          operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+        }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+  });
+  const context = { sessionId: "chat:explicit", channel: "local", from: "user" };
+  try {
+    const queued = await tools.invoke("start_computer_use_session", { goal: "Prepare the report" }, context);
+    assert.equal(queued.result.status, "awaiting_confirmation");
+    const pending = pendingActions.get(queued.result.actionId);
+    assert.equal(probes, 0, "preparing an approval does not create main-side authority");
+    const approved = await tools.invoke(pending.toolName, pending.args, { ...context, __confirmed: true });
+    assert.equal(approved.ok, false);
+    assert.match(approved.error, /no longer online and control-ready/);
+    assert.equal(probes, 1);
+    assert.equal(runtime.computerUseLog.listSessions({ status: "active" }).length, 0);
+  } finally {
+    if (previous.node === undefined) delete process.env.OPENAGI_COMPUTER_NODE;
+    else process.env.OPENAGI_COMPUTER_NODE = previous.node;
+    if (previous.token === undefined) delete process.env.OPENAGI_COMPUTER_NODE_TOKEN;
+    else process.env.OPENAGI_COMPUTER_NODE_TOKEN = previous.token;
+    if (previous.insecure === undefined) delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+    else process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY = previous.insecure;
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("approved computer actions bypass scrutiny re-confirmation without persisting typed text", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-sensitive-"));
   const tools = new ToolRegistry();

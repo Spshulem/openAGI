@@ -31,4 +31,16 @@ final class PendingApprovalTests: XCTestCase {
     XCTAssertEqual(item.summary, "Agent action needs approval")
     XCTAssertEqual(item.status, "pending")
   }
+
+  @MainActor
+  func testTerminalApprovalFailureKeepsTheExecutionError() {
+    let data = Data(#"{"ok":false,"error":"input permissions changed"}"#.utf8)
+    XCTAssertEqual(
+      PendingApprovalConsumer.terminalDecisionError(statusCode: 400, data: data),
+      "input permissions changed")
+    XCTAssertEqual(
+      PendingApprovalConsumer.terminalDecisionError(statusCode: 409, data: Data()),
+      "This approval is no longer pending.")
+    XCTAssertNil(PendingApprovalConsumer.terminalDecisionError(statusCode: 500, data: data))
+  }
 }

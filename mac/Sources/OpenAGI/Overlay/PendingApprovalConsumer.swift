@@ -33,6 +33,10 @@ private struct PendingApprovalsResponse: Decodable {
   let actions: [PendingApproval]
 }
 
+private struct PendingApprovalDecisionResponse: Decodable {
+  let error: String?
+}
+
 @MainActor
 final class PendingApprovalConsumer: ObservableObject {
   static let shared = PendingApprovalConsumer()
@@ -42,7 +46,13 @@ final class PendingApprovalConsumer: ObservableObject {
   @Published private(set) var lastOutcome: String? = nil
   @Published private(set) var lastError: String? = nil
 
+  /// Only the newest reconciliation may publish. Refreshes arrive from panel
+  /// appearance, SSE, and decisions, so response order is not request order.
+  private var refreshGeneration: UInt64 = 0
+
   func refresh() async {
+    refreshGeneration &+= 1
+    let generation = refreshGeneration
     var req = URLRequest(url: AppState.buildURL(
       base: AppState.shared.baseURL,
       path: "/pending-actions?status=pending"))
@@ -53,9 +63,11 @@ final class PendingApprovalConsumer: ObservableObject {
         throw URLError(.badServerResponse)
       }
       let decoded = try JSONDecoder().decode(PendingApprovalsResponse.self, from: data)
+      guard generation == refreshGeneration else { return }
       items = decoded.actions.filter { $0.status == "pending" }
       lastError = nil
     } catch {
+      guard generation == refreshGeneration else { return }
       lastError = "Couldn't refresh approvals."
     }
   }
@@ -76,8 +88,23 @@ final class PendingApprovalConsumer: ObservableObject {
     req.httpBody = Data("{}".utf8)
     authed(&req)
     do {
-      let (_, response) = try await URLSession.shared.data(for: req)
-      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+      let (data, response) = try await URLSession.shared.data(for: req)
+      guard let http = response as? HTTPURLResponse else {
+        throw URLError(.badServerResponse)
+      }
+      if !(200..<300).contains(http.statusCode) {
+        if let terminalError = Self.terminalDecisionError(statusCode: http.statusCode, data: data) {
+          // 400 means the approved handler ran and failed; 409 means another
+          // surface already claimed/decided it. Either way it is no longer a
+          // pending action, so never offer a retry that can only fail again.
+          items.removeAll { $0.id == id }
+          await refresh()
+          lastOutcome = decision == "approve"
+            ? "Approval recorded, but the action did not complete."
+            : "The request was already being handled."
+          lastError = terminalError
+          return
+        }
         throw URLError(.badServerResponse)
       }
       items.removeAll { $0.id == id }
@@ -92,6 +119,16 @@ final class PendingApprovalConsumer: ObservableObject {
   }
 
   func clearOutcome() { lastOutcome = nil }
+
+  static func terminalDecisionError(statusCode: Int, data: Data) -> String? {
+    guard statusCode == 400 || statusCode == 409 else { return nil }
+    let decoded = try? JSONDecoder().decode(PendingApprovalDecisionResponse.self, from: data)
+    let message = decoded?.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let message, !message.isEmpty { return String(message.prefix(300)) }
+    return statusCode == 400
+      ? "The approved action failed during execution."
+      : "This approval is no longer pending."
+  }
 
   private func authed(_ req: inout URLRequest) {
     if let token = AppState.shared.authToken(), !token.isEmpty {

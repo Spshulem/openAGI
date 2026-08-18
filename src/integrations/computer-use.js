@@ -33,6 +33,7 @@ import { pinnedRemoteOrigin } from "../node-control.js";
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
 const EXECUTION_UNAVAILABLE = "no reachable computer-use node is configured. The intent was recorded to the audit log but NOT performed. Do not assume the action succeeded.";
+const REQUIRED_INPUT_OPERATIONS = ["click", "move", "type", "key", "scroll"];
 
 // Tool names that this module registers. Kept here in one place so the
 // dynamic unregister path (used by the dashboard toggle) can remove
@@ -90,30 +91,12 @@ export async function computerUseReadiness({
   } else if (node?.kind === "invalid") {
     detail = node.detail;
   } else if (nodeConfigured && typeof fetchImpl === "function") {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const response = await fetchImpl(`${node.url}/health`, {
-        method: "GET",
-        headers: {
-          accept: "application/json",
-          ...(node.token ? { authorization: `Bearer ${node.token}` } : {})
-        },
-        redirect: "manual",
-        signal: controller.signal
-      });
-      nodeReachable = Boolean(response?.ok);
-      if (response?.ok) {
-        const body = await readNodeJsonLimited(response, 256 * 1024).catch(() => null);
-        const capability = body?.capability?.id === "computer-use" ? body.capability : null;
-        operations = Array.isArray(capability?.operations) ? capability.operations : [];
-        liveScreenshot = capability?.screenshotReady === true && operations.includes("screenshot");
-        inputAvailable = capability?.inputReady === true
-          && ["click", "move", "type", "key", "scroll"].every((operation) => operations.includes(operation));
-        detail = typeof capability?.detail === "string" ? capability.detail.slice(0, 300) : null;
-      }
-    } catch { /* unreachable is reported below */ }
-    finally { clearTimeout(timer); }
+    const status = await probeExplicitComputerNode(node, fetchImpl, timeoutMs);
+    nodeReachable = status.reachable;
+    operations = status.operations;
+    liveScreenshot = status.liveScreenshot;
+    inputAvailable = status.inputAvailable;
+    detail = status.detail;
   }
   const mode = !enabled
     ? "disabled"
@@ -155,6 +138,45 @@ function explicitComputerNode(env = process.env) {
     return { kind: "http", id: "explicit", url: safeUrl, token };
   } catch (error) {
     return { kind: "invalid", id: "explicit", detail: error.message };
+  }
+}
+
+async function probeExplicitComputerNode(node, fetchImpl, timeoutMs = 1_200) {
+  if (node?.kind !== "http" || typeof fetchImpl !== "function") {
+    return { reachable: false, liveScreenshot: false, inputAvailable: false, operations: [], detail: null };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetchImpl(`${node.url}/health`, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${node.token}`
+      },
+      redirect: "manual",
+      signal: controller.signal
+    });
+    if (!response?.ok) {
+      try { await response?.body?.cancel?.(); } catch { /* best effort */ }
+      return { reachable: false, liveScreenshot: false, inputAvailable: false, operations: [], detail: null };
+    }
+    const body = await readNodeJsonLimited(response, 256 * 1024).catch(() => null);
+    const capability = body?.capability?.id === "computer-use" ? body.capability : null;
+    const operations = Array.isArray(capability?.operations) ? capability.operations : [];
+    return {
+      reachable: Boolean(capability),
+      liveScreenshot: capability?.screenshotReady === true && operations.includes("screenshot"),
+      inputAvailable: capability?.inputReady === true
+        && REQUIRED_INPUT_OPERATIONS.every((operation) => operations.includes(operation)),
+      operations,
+      detail: typeof capability?.detail === "string" ? capability.detail.slice(0, 300) : null
+    };
+  } catch {
+    return { reachable: false, liveScreenshot: false, inputAvailable: false, operations: [], detail: null };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -486,6 +508,16 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         : runtime.nodeCapabilities?.resolve?.("computer-use", { nodeId: args.nodeId }) ?? null;
       if (!selected || (selected.id ?? selected.nodeId) !== args.nodeId) {
         throw new Error("The computer-use node approved by the user is no longer online and control-ready.");
+      }
+      if (selected.kind === "http") {
+        // Approval can sit for minutes after it was prepared. Re-authenticate
+        // the immutable explicit target and re-check its current screenshot +
+        // input permissions before creating any main-side authority.
+        const status = await probeExplicitComputerNode(selected, fetchImpl);
+        if (!status.reachable || !status.liveScreenshot || !status.inputAvailable
+            || !status.operations.includes("session.start")) {
+          throw new Error("The computer-use node approved by the user is no longer online and control-ready.");
+        }
       }
       const session = runtime.computerUseLog.startSession({
         goal: args.goal,

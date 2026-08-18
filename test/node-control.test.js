@@ -166,6 +166,60 @@ test("worker pins the remote origin, refuses redirects, and sends only generic e
   await worker.stop();
 });
 
+test("worker stop aborts a poll that stalled after response headers", async () => {
+  let pollSignal;
+  let markBodyRead;
+  const bodyRead = new Promise((resolve) => { markBodyRead = resolve; });
+  const fetchImpl = async (url, options) => {
+    assert.match(url, /\/nodes\/control\/poll$/);
+    pollSignal = options.signal;
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      body: {
+        getReader() {
+          return {
+            read() {
+              markBodyRead();
+              return new Promise((resolve, reject) => {
+                const abort = () => reject(Object.assign(new Error("stopped"), { name: "AbortError" }));
+                if (options.signal.aborted) abort();
+                else options.signal.addEventListener("abort", abort, { once: true });
+              });
+            },
+            cancel: async () => {}
+          };
+        }
+      }
+    };
+  };
+  const worker = createNodeControlWorker({
+    remote: "https://main.example.test",
+    token: "scoped",
+    nodeId: "node-a",
+    capabilities: async () => capability(),
+    execute: async () => ({}),
+    fetchImpl,
+    pollMs: 50,
+    retryMs: 1
+  });
+  worker.start();
+  await bodyRead;
+  let timeout;
+  try {
+    await Promise.race([
+      worker.stop(),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("worker stop hung on the response body")), 500);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+  assert.equal(pollSignal.aborted, true);
+});
+
 test("worker keeps polling so session stop can overtake and cancel an in-flight action", async () => {
   const broker = new NodeControlBroker({ commandTimeoutMs: 2_000 });
   const advertised = capability();

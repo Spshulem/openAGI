@@ -403,19 +403,20 @@ export function createNodeControlWorker({
     timer = setTimeout(finish, ms);
     retryWakeups.add(finish);
   });
-  const post = async (path, body, timeout) => {
+  const post = async (path, body, timeout, consume) => {
     const controller = new AbortController();
     controllers.add(controller);
     const timer = setTimeout(() => controller.abort(), timeout);
     timer.unref?.();
     try {
-      return await fetchImpl(`${base}${path}`, {
+      const response = await fetchImpl(`${base}${path}`, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
         redirect: "manual",
         signal: controller.signal
       });
+      return await consume(response);
     } finally {
       clearTimeout(timer);
       controllers.delete(controller);
@@ -539,14 +540,15 @@ export function createNodeControlWorker({
         // run while that probe is pending, after its controller-abort sweep;
         // never create a fresh long-poll once shutdown has begun.
         if (stopped) break;
-        const response = await post("/nodes/control/poll", {
+        const body = await post("/nodes/control/poll", {
           nodeId,
           capabilities: advertised,
           timeoutMs: effectivePollMs,
           ...(revocationsOnly ? { revocationsOnly: true } : {})
-        }, effectivePollMs + 5_000);
-        if (!response.ok) throw new Error(`control poll rejected: ${response.status}`);
-        const body = await readJsonResponseLimited(response, MAX_POLL_RESPONSE_BYTES);
+        }, effectivePollMs + 5_000, async (response) => {
+          if (!response.ok) throw new Error(`control poll rejected: ${response.status}`);
+          return await readJsonResponseLimited(response, MAX_POLL_RESPONSE_BYTES);
+        });
         const command = body?.command;
         if (!command || typeof command.id !== "string") continue;
         if (revocationsOnly && command.operation !== "session.end") {
@@ -568,10 +570,11 @@ export function createNodeControlWorker({
       }
       const envelope = resultQueue[0];
       try {
-        const delivered = await post("/nodes/control/result", envelope, 10_000);
-        const accepted = delivered.ok;
-        const status = delivered.status;
-        try { await delivered.body?.cancel?.(); } catch { /* the ACK body is intentionally ignored */ }
+        const { accepted, status } = await post("/nodes/control/result", envelope, 10_000, async (delivered) => {
+          const outcome = { accepted: delivered.ok, status: delivered.status };
+          try { await delivered.body?.cancel?.(); } catch { /* the ACK body is intentionally ignored */ }
+          return outcome;
+        });
         if (!accepted) throw new Error(`control result rejected: ${status}`);
         resultQueue.shift();
         queuedResultIds.delete(envelope.commandId);
