@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       LoginItem.registerOnFirstLaunchIfNeeded()
       _ = AppState.sourceMachineId()
 
+      LegacyLaunchAgentCleanup.run()
       DaemonController.shared.start()
       AppState.shared.startPolling()
       AppState.shared.startSSE()
