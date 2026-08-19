@@ -609,7 +609,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       nodeEnrollmentConfirmed: false
     }, dataDir);
     const enrollmentController = new AbortController();
-    const enrollmentTimer = setTimeout(() => enrollmentController.abort(), 5_000);
+    const enrollmentTimeoutMs = Math.max(1_000, Math.min(30_000,
+      Number(options.nodeEnrollmentTimeoutMs) || 15_000));
+    const enrollmentTimer = setTimeout(() => enrollmentController.abort(), enrollmentTimeoutMs);
     let response;
     try {
       response = await (options.nodeControlFetch ?? globalThis.fetch)(`${pairing.remote}/nodes/enroll`, {
@@ -2819,7 +2821,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 const identity = readOrCreateIdentity(dataDir);
                 const scopedToken = await ensureScopedNodeToken(pairing, identity);
                 const ctrl = new AbortController();
-                const timer = setTimeout(() => ctrl.abort(), 5000);
+                const heartbeatTimeoutMs = Math.max(1_000, Math.min(30_000,
+                  Number(options.heartbeatTimeoutMs) || 15_000));
+                const timer = setTimeout(() => ctrl.abort(), heartbeatTimeoutMs);
                 try {
                   const res = await (options.nodeControlFetch ?? globalThis.fetch)(`${pairing.remote}/nodes/heartbeat`, {
                     method: "POST",
