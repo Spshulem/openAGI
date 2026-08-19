@@ -47,8 +47,10 @@ struct PrivacyPanel: View {
 
         section(title: "Status") {
           HStack {
-            Toggle("Capture enabled", isOn: $settings.enabled)
-              .onChange(of: settings.enabled) { _, _ in CaptureController.shared.apply() }
+            Toggle("Capture enabled", isOn: Binding(
+              get: { settings.enabled },
+              set: { CaptureController.shared.setEnabledFromExplicitUserAction($0) }
+            ))
             Spacer()
             if let until = settings.pausedUntil, Date() < until {
               Text("Paused until \(until.formatted(date: .omitted, time: .shortened))")
@@ -165,9 +167,9 @@ struct PrivacyPanel: View {
   }
 
   // macOS permission state. Screen capture is dead without Screen Recording,
-  // and macOS will NOT ask again once the user has answered — every later
-  // request is a silent no-op — so the only honest UI is: say it's off, say
-  // why, and hand the user a link straight to the right Settings pane.
+  // so say it's off, say why, and hand the user a link straight to the right
+  // Settings pane. Automatic requests are separately guarded by the last code
+  // identity observed as granted, so this status UI never drives a prompt.
   // Granting there resumes capture on its own (no relaunch): CapturePermissions
   // re-checks with the non-prompting preflight when the app is next activated.
   private var permissionsSection: some View {
@@ -183,7 +185,7 @@ struct PrivacyPanel: View {
         // kind of confident-but-wrong claim this panel exists to eliminate.
         detail: permissions.screenRecordingGranted
           ? "Screen frames + OCR are running."
-          : "Screen capture is OFF. macOS won't ask again — turn it on in System Settings, then switch back here. If it still says OFF, quit and reopen OpenAGI.",
+          : "Screen capture is OFF. Turn it on in System Settings, then switch back here. If it still says OFF, use Request Permission from the tray's Capture menu or quit and reopen OpenAGI.",
         action: { permissions.openScreenRecordingSettings() })
 
       permissionRow(

@@ -13,6 +13,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { sanitizeNodeCapabilities } from "./node-control.js";
 
 export const ONLINE_WINDOW_MS = 90_000;
 export const PRUNE_AFTER_MS = 30 * 24 * 60 * 60 * 1000;
@@ -174,7 +175,7 @@ export class NodeRegistry {
     this.storePath = path.join(this.dir, "registry.json");
   }
 
-  upsert({ nodeId, name, role, url, version, build, buildSource }, { now = Date.now() } = {}) {
+  upsert({ nodeId, name, role, url, version, build, buildSource, capabilities }, { now = Date.now() } = {}) {
     // Prune against the SAME in-memory store we're about to update, rather
     // than pruning (its own read+maybe-write) and then re-reading the file
     // again from disk for the upsert — one read, one write, per call.
@@ -189,10 +190,66 @@ export class NodeRegistry {
       version,
       build: build ?? null,
       buildSource: buildSource ?? null,
+      capabilities: sanitizeNodeCapabilities(capabilities),
       firstSeenAt: existing?.firstSeenAt ?? new Date(now).toISOString(),
       lastSeenAt: new Date(now).toISOString()
     };
     writeJsonAtomic(this.storePath, store);
+  }
+
+  enroll(nodeId, token, { now = Date.now() } = {}) {
+    if (typeof nodeId !== "string" || !/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
+      throw new Error("nodeId is required and malformed");
+    }
+    // The node generates and durably stores this credential before sending
+    // the enrollment request. That makes enrollment safe to retry when the
+    // main committed the hash but the HTTP response was lost.
+    if (typeof token !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(token)) {
+      throw new Error("nodeToken must be a 32-byte base64url credential");
+    }
+    const store = this._read();
+    const tokenHash = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+    const existing = store.credentials[nodeId];
+    if (existing) {
+      const actual = Buffer.from(tokenHash, "hex");
+      const expected = Buffer.from(existing.tokenHash ?? "", "hex");
+      if (actual.length === expected.length && crypto.timingSafeEqual(actual, expected)) {
+        return { created: false };
+      }
+      const error = new Error("node is already enrolled; use its existing scoped credential");
+      error.code = "NODE_ALREADY_ENROLLED";
+      throw error;
+    }
+    store.credentials[nodeId] = {
+      tokenHash,
+      createdAt: new Date(now).toISOString()
+    };
+    writeJsonAtomic(this.storePath, store);
+    return { created: true };
+  }
+
+  authenticate(nodeId, token) {
+    if (typeof nodeId !== "string" || typeof token !== "string" || !token) return false;
+    const expected = this._read().credentials[nodeId]?.tokenHash;
+    if (typeof expected !== "string") return false;
+    const actual = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+    const a = Buffer.from(actual, "hex");
+    const b = Buffer.from(expected, "hex");
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  }
+
+  revoke(nodeId) {
+    if (typeof nodeId !== "string" || !nodeId) return false;
+    const store = this._read();
+    const existed = Boolean(store.credentials[nodeId] || store.entries[nodeId]);
+    delete store.credentials[nodeId];
+    delete store.entries[nodeId];
+    if (existed) writeJsonAtomic(this.storePath, store);
+    return existed;
+  }
+
+  isEnrolled(nodeId) {
+    return Boolean(this._read().credentials[nodeId]);
   }
 
   list({ now = Date.now() } = {}) {
@@ -209,9 +266,11 @@ export class NodeRegistry {
     return removed;
   }
 
-  // Mutates `store.entries` in place, deleting anything stale; returns the
-  // count removed. Shared by prune() (which persists unconditionally when
-  // something changed) and upsert() (which persists anyway right after).
+  // Mutates only the ephemeral roster entries, deleting anything stale;
+  // returns the count removed. Scoped credentials survive liveness pruning:
+  // a sleeping node must be able to authenticate its first returning
+  // heartbeat. Credentials are removed only by explicit revoke/unpair.
+  // Shared by prune() and upsert().
   _pruneStore(store, now) {
     let removed = 0;
     for (const [nodeId, entry] of Object.entries(store.entries)) {
@@ -224,6 +283,9 @@ export class NodeRegistry {
   }
 
   _read() {
-    return readJsonFile(this.storePath, { version: 1, entries: {} });
+    const store = readJsonFile(this.storePath, { version: 2, entries: {}, credentials: {} });
+    store.entries ??= {};
+    store.credentials ??= {};
+    return store;
   }
 }

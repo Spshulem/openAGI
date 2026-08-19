@@ -8,6 +8,12 @@ OpenAGI ships in three forms, each released by tagging `vX.Y.Z` on `main`:
 
 After this guide is finished once, releasing is `git tag -a v0.0.2 -m "..." && git push origin v0.0.2`.
 
+For a notarized test build from a branch, run the **Mac — notarized test build
+or release** workflow manually. It uploads a seven-day `.app` ZIP artifact and
+does not create a tag, GitHub Release, appcast, or public update. This is the
+preferred way to test a branch under Gatekeeper without copying Apple account
+credentials into a developer's shell.
+
 ---
 
 ## One-time setup: GitHub repository secrets
@@ -88,6 +94,20 @@ Two GitHub Actions workflows run in parallel:
 | `release-mac.yml` | `OpenAGI-0.0.2.dmg` + `appcast.xml` on the GitHub Release | ~15–25 min (notarization is the slow part) |
 
 When `release-mac.yml` finishes, the `.dmg` is at `https://github.com/Spshulem/openAGI/releases/download/v0.0.2/OpenAGI-0.0.2.dmg` and the appcast at `…/appcast.xml`. Existing installs see the update next time Sparkle polls (default daily).
+
+## Notarized branch build (no release)
+
+From GitHub Actions, select **Mac — notarized test build or release**, choose the
+branch, and click **Run workflow**. From the CLI:
+
+```bash
+gh workflow run release-mac.yml --ref <branch>
+```
+
+When the run completes, download the `OpenAGI-<version>-notarized-<sha>`
+artifact. Its ZIP contains a Developer ID-signed, Apple-notarized, stapled
+`OpenAGI.app`. Manual branch runs never publish release assets or update the
+Sparkle feed.
 
 ---
 

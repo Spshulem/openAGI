@@ -1,12 +1,10 @@
 // test/service-nodes.test.js
 //
 // The Nodes view was built entirely out of heartbeats, so it could only ever
-// see machines that run an OpenAGI daemon. The user's third machine — a Mac
-// mini on the tailnet running `openagi imessage-server` — has no daemon, no
-// identity.json and never heartbeats. It is reached only because the MAIN's
-// environment names it (OPENAGI_IMESSAGE_NODE). It is healthy, it is
-// load-bearing (every `search_imessages` answer comes from it), and the
-// topology view said it did not exist.
+// see machines that run an OpenAGI daemon. A service-only host running
+// `openagi imessage-server` has no daemon identity and never heartbeats. It is
+// reached only because the main's environment names it
+// (OPENAGI_IMESSAGE_NODE), so the topology needs a separate service model.
 //
 // These tests pin the four things that make surfacing it safe rather than just
 // pretty:
@@ -18,7 +16,7 @@
 //      and how old that cache is. Replaying a cached verdict as a live one is
 //      the exact bug that had this view reporting a two-week-dead machine as
 //      "online"; it must not come back one field over.
-//   3. The probe must never hold the response hostage. A sleeping Mac mini
+//   3. The probe must never hold the response hostage. A sleeping service host
 //      cannot stop the rest of the topology from rendering.
 //   4. The token never leaves this process — not in the JSON, not in the
 //      dashboard HTML, not in an error string.
@@ -174,6 +172,25 @@ test("a service that answers non-2xx is unreachable and says so — 'up but refu
   } finally { await svc.close(); }
 });
 
+test("a health probe cancels its response body instead of buffering untrusted bytes", async () => {
+  let cancelled = 0;
+  let buffered = 0;
+  const probe = new ServiceProbe({
+    timeoutMs: 1000,
+    budgetMs: 900,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      body: { cancel: async () => { cancelled += 1; } },
+      arrayBuffer: async () => { buffered += 1; return new ArrayBuffer(0); }
+    })
+  });
+  const [imsg] = await probe.describe({ env: { OPENAGI_IMESSAGE_NODE: "http://service.example" } });
+  assert.equal(imsg.reachability, "reachable");
+  assert.equal(cancelled, 1, "the unread body is released");
+  assert.equal(buffered, 0, "the probe never allocates the response body");
+});
+
 test("an unconfigured service says not-configured — never a fabricated status", async () => {
   const probe = new ServiceProbe({ timeoutMs: 1000, budgetMs: 900 });
   const [imsg] = await probe.describe({ env: {} });
@@ -243,10 +260,37 @@ test("credentials embedded in the endpoint URL are stripped from everything rend
   } finally { await svc.close(); }
 });
 
+test("the exported endpoint sanitizer never returns private parsing material", () => {
+  const sanitized = scrubEndpoint(`http://svcuser:${TOKEN}@example.test/private-route`);
+  assert.deepEqual(sanitized, {
+    endpoint: "http://example.test",
+    host: "example.test",
+    invalid: false
+  });
+  assert.ok(!JSON.stringify(sanitized).includes(TOKEN));
+  assert.ok(!JSON.stringify(sanitized).includes("private-route"));
+});
+
 test("a query-string credential in the endpoint is dropped from the displayed address", () => {
-  const s = scrubEndpoint(`http://100.91.55.78:43298/?token=${TOKEN}#frag`);
-  assert.equal(s.endpoint, "http://100.91.55.78:43298");
+  const s = scrubEndpoint(`http://192.0.2.45:43298/?token=${TOKEN}#frag`);
+  assert.equal(s.endpoint, "http://192.0.2.45:43298");
   assert.ok(!JSON.stringify(s).includes(TOKEN));
+});
+
+test("a credential-like path stays private while the probe keeps the configured base path", async () => {
+  const svc = await startFakeService();
+  const pathSecret = "route-secret-6c2858f1";
+  const configured = `${svc.url}/gateway/${pathSecret}?token=${TOKEN}#frag`;
+  try {
+    const probe = new ServiceProbe({ timeoutMs: 1000, budgetMs: 900 });
+    const out = await probe.describe({ env: { OPENAGI_IMESSAGE_NODE: configured } });
+    const [imsg] = out;
+    assert.equal(imsg.endpoint, svc.url, "only the origin is safe to display or propagate");
+    assert.equal(imsg.host, new URL(svc.url).host);
+    assert.equal(svc.seen[0].url, `/gateway/${pathSecret}/health`, "the private path still reaches the configured health route");
+    assert.ok(!JSON.stringify(out).includes(pathSecret), "the path credential never reaches /nodes output");
+    assert.ok(!JSON.stringify(out).includes(TOKEN), "query credentials are still discarded");
+  } finally { await svc.close(); }
 });
 
 test("an unparseable endpoint is reported as misconfigured rather than crashing the roster", async () => {
@@ -367,8 +411,8 @@ test("a paired node sees the main's service node, attributed to the main and nev
     const { app: mainApp, base: mainBase } = await bootApp(mainDir);
     const nodeDir = tmp("openagi-svc-prop-node-");
     writeNodeConfig({ remote: mainBase, token: null }, nodeDir);
-    // The NODE has no iMessage config of its own — this is the user's real
-    // setup: the Mac is where they look, the Distiller is where it's wired.
+    // The node has no iMessage config of its own: the local node renders the
+    // topology while the remote main owns the service configuration.
     const { app: nodeApp, base: nodeBase } = await bootApp(nodeDir, { serviceEnv: {} });
     try {
       const res = await fetch(`${nodeBase}/nodes`);
@@ -376,7 +420,7 @@ test("a paired node sees the main's service node, attributed to the main and nev
       const json = JSON.parse(text);
       assert.equal(json.stale, false);
       const imsg = json.services.find((s) => s.id === "imessage" && s.origin === "main");
-      assert.ok(imsg, "the Mac's Nodes tab shows the Mac mini too");
+      assert.ok(imsg, "the local Nodes tab shows the service host too");
       assert.equal(imsg.endpoint, svc.url, "the address is carried onward so the row is identifiable");
       assert.ok(imsg.originName, "and the row says which machine has it configured");
       assert.equal(imsg.checkBasis, "reported", "this node did not probe it — the main did");
@@ -394,13 +438,13 @@ test("adoptRemoteServices refuses to inherit a main's placeholder or a credentia
     { kind: "service", id: "ghost", configured: false, reachability: "not-configured" },
     { id: "weird", configured: true, reachability: "totally-fine" },
     "garbage"
-  ], { originName: "distiller-a270", basis: "reported" });
+  ], { originName: "Primary host", basis: "reported" });
   assert.equal(adopted.length, 2, "unconfigured placeholders are not propagated");
   const imsg = adopted.find((s) => s.id === "imessage");
   assert.equal(imsg.endpoint, "http://host:1", "re-scrubbed on receipt — we do not trust the main to have done it");
   assert.ok(!JSON.stringify(adopted).includes(TOKEN));
   assert.equal(imsg.origin, "main");
-  assert.equal(imsg.originName, "distiller-a270");
+  assert.equal(imsg.originName, "Primary host");
   assert.ok(imsg.checkAgeMs >= 4000);
   assert.equal(adopted.find((s) => s.id === "weird").reachability, "unknown",
     "a reachability value we do not recognise is not passed through");
@@ -449,11 +493,11 @@ test("a paired node whose main is unreachable shows the inherited service as rec
   fs.mkdirSync(path.join(dataDir, "nodes"), { recursive: true });
   const twoWeeksAgo = new Date(Date.now() - 14 * 86400000).toISOString();
   fs.writeFileSync(path.join(dataDir, "nodes", "cache.json"), JSON.stringify({
-    self: { nodeId: "main-6a46", name: "distiller-a270", role: "main" },
+    self: { nodeId: "main-node", name: "Primary host", role: "main" },
     nodes: [],
     services: [{
       kind: "service", id: "imessage", name: "iMessage pass-through", configured: true,
-      endpoint: "http://100.91.55.78:43298", host: "100.91.55.78:43298",
+      endpoint: "http://192.0.2.45:43298", host: "192.0.2.45:43298",
       reachability: "reachable", checkedAt: twoWeeksAgo, checkBasis: "live", origin: "local"
     }],
     cachedAt: twoWeeksAgo

@@ -37,9 +37,9 @@
   <key>NSAppleEventsUsageDescription</key>
   <string>OpenAGI uses AppleEvents to read window titles for ambient activity tracking. No keystrokes are captured.</string>
   <key>NSAccessibilityUsageDescription</key>
-  <string>OpenAGI uses Accessibility to read the title of the active window so it can label captured frames. No keystrokes are captured.</string>
+  <string>OpenAGI uses Accessibility to read active-window titles and, during a session you approve, control the mouse and keyboard for Computer Use. It does not record your keystrokes.</string>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>OpenAGI captures periodic screenshots locally for OCR + recall. Frames stay on this Mac. Excluded apps (e.g. password managers) are never captured.</string>
+  <string>OpenAGI captures screenshots for local OCR and recall. During an approved Computer Use session, a live frame may be sent to your authenticated paired OpenAGI main. Pause Computer Use before opening sensitive content.</string>
 
   <!-- Sparkle EdDSA public key. The matching private key lives in the
        OpenAGI keychain on the release-signing machine (and as the
@@ -50,6 +50,10 @@
   <string>unOtVkyA3akAScIoYYZ8UkqoBx56Ze1mDcEni8K1964=</string>
   <key>SUEnableAutomaticChecks</key>
   <true/>
+  <!-- Users can opt into immediate background install + relaunch from the
+       tray. Keep that disruptive choice off for a fresh installation. -->
+  <key>SUAutomaticallyUpdate</key>
+  <false/>
   <key>SUScheduledCheckInterval</key>
   <integer>86400</integer>
 </dict>

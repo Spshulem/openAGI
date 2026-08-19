@@ -136,6 +136,7 @@ final class BriefEditorState: ObservableObject {
 struct BriefSection: View {
   @ObservedObject var brief = BriefConsumer.shared
   @ObservedObject var editor = BriefEditorState.shared
+  @ObservedObject var overlay = OverlayState.shared
   /// Only for `openDashboard` — the escape hatch out of the popover to the full
   /// artifact. Observed rather than reached for statically so this view follows
   /// the same convention as OverlayView.
@@ -193,7 +194,22 @@ struct BriefSection: View {
       }
 
       if brief.olderCount > 0 {
-        Text("▾ \(brief.olderCount) older").font(.system(size: 10)).foregroundStyle(.tertiary)
+        Button {
+          app.openDashboard(path: "/?tab=review")
+        } label: {
+          HStack(spacing: 4) {
+            Text(brief.olderDisclosureLabel)
+              .lineLimit(2)
+              .multilineTextAlignment(.leading)
+            Image(systemName: "arrow.up.right")
+              .font(.system(size: 8, weight: .semibold))
+          }
+          .font(.system(size: 10))
+          .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help("Open and search every pending task, draft, clarification, and suggestion")
+        .accessibilityLabel("Open remaining items: \(brief.olderDisclosureLabel)")
       }
     }
   }
@@ -219,7 +235,20 @@ struct BriefSection: View {
     let deliberate = item.actions.filter { isDeliberate($0) }
     let readable = item.editValue != nil && !editor.isOpen(item)
     return VStack(alignment: .leading, spacing: 3) {
-      titleLine(item, readable: readable)
+      HStack(alignment: .top, spacing: 4) {
+        titleLine(item, readable: readable)
+        Menu { itemMenu(item) } label: {
+          Image(systemName: "ellipsis")
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: 18, height: 18)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("More actions")
+      }
       if !item.why.isEmpty {
         Text(item.why).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
       }
@@ -248,6 +277,25 @@ struct BriefSection: View {
       }
       if editor.isOpen(item) {
         editorField(item)
+      }
+    }
+    .contentShape(Rectangle())
+    .contextMenu { itemMenu(item) }
+  }
+
+  /// The visible ellipsis and the native right-click menu deliberately share
+  /// one builder so their capabilities cannot drift apart.
+  @ViewBuilder private func itemMenu(_ item: BriefItem) -> some View {
+    Button("Chat about this") { overlay.chatAbout(item) }
+    Button("Add related task…") { overlay.addRelatedTask(to: item) }
+    Button("Open in dashboard") { app.openDashboard(path: item.deepLink) }
+    if !item.menuActions.isEmpty {
+      Divider()
+      Menu("Move to") {
+        ForEach(item.menuActions) { action in
+          Button(action.label) { Task { await brief.act(item, action) } }
+            .disabled(brief.inFlight.contains(item.id))
+        }
       }
     }
   }
@@ -286,7 +334,16 @@ struct BriefSection: View {
         .buttonStyle(.plain)
         .help(expanded ? "Hide the full text" : "Show the full text")
       } else {
-        Text(item.title).font(.system(size: 12, weight: .semibold)).lineLimit(2)
+        Button { overlay.chatAbout(item) } label: {
+          Text(item.title)
+            .font(.system(size: 12, weight: .semibold))
+            .lineLimit(2)
+            .multilineTextAlignment(.leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Chat about this item")
       }
     }
   }

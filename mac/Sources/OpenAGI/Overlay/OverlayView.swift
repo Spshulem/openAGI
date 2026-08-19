@@ -4,6 +4,7 @@ struct OverlayView: View {
   @ObservedObject var state = OverlayState.shared
   @ObservedObject var app = AppState.shared
   @ObservedObject var outreach = OutreachConsumer.shared
+  @ObservedObject var approvals = PendingApprovalConsumer.shared
   @ObservedObject var brief = BriefConsumer.shared
   @ObservedObject var briefEditor = BriefEditorState.shared
   @FocusState private var fieldFocused: Bool
@@ -60,8 +61,14 @@ struct OverlayView: View {
     // something that changes our height lands (answer, error, nudges, …).
     .onChange(of: state.answer) { _, _ in onContentChange() }
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
+    .onChange(of: state.progressStage) { _, _ in onContentChange() }
     .onChange(of: state.error) { _, _ in onContentChange() }
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
+    .onChange(of: state.briefContext) { _, _ in onContentChange() }
+    .onChange(of: state.composerFocusRequest) { _, _ in
+      fieldFocused = true
+      onContentChange()
+    }
     .onChange(of: app.status) { _, _ in onContentChange() }
     // Swaps the answer footer's button between "Continue in chat" and the
     // shorter "Open chat". Same single row at the default text size, but that
@@ -73,6 +80,10 @@ struct OverlayView: View {
     // .ingest can drop an acted item and add a pending one in the same batch, so
     // the count holds while the rows — and the panel's height — change. Equatable.
     .onChange(of: outreach.items) { _, _ in onContentChange() }
+    .onChange(of: approvals.items) { _, _ in onContentChange() }
+    .onChange(of: approvals.inFlight) { _, _ in onContentChange() }
+    .onChange(of: approvals.lastOutcome) { _, _ in onContentChange() }
+    .onChange(of: approvals.lastError) { _, _ in onContentChange() }
   }
 
   private func briefWatchers<V: View>(_ content: V) -> some View {
@@ -106,7 +117,9 @@ struct OverlayView: View {
   }
 
   // Combined attention count shown on the collapsed pill badge.
-  private var pillBadgeCount: Int { brief.items.count + outreach.items.count }
+  private var pillBadgeCount: Int {
+    brief.items.count + outreach.items.filter { $0.type != "pending-action" }.count + approvals.items.count
+  }
 
   private var pill: some View {
     Button(action: {
@@ -149,23 +162,79 @@ struct OverlayView: View {
       if app.status == .down {
         Text("OpenAGI is offline").font(.caption).foregroundStyle(.red)
       }
-      TextField("Ask about what you're looking at…", text: $state.question)
+      TextField(state.briefContext == nil ? "Ask about what you're looking at…" : "Ask about this item…", text: $state.question)
         .textFieldStyle(.roundedBorder)
         .focused($fieldFocused)
-        .disabled(app.status == .down)
+        .disabled(app.status == .down || state.isLoading || state.isDetached)
         .onSubmit { Task { await state.ask() } }
+      if let selected = state.briefContext {
+        HStack(spacing: 5) {
+          Text("About: \(selected.title)")
+            .font(.system(size: 10, weight: .medium))
+            .lineLimit(1)
+          Spacer(minLength: 4)
+          Button { state.clearBriefContext() } label: {
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+          }
+          .buttonStyle(.plain)
+          .help("Stop chatting about this item")
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.10)))
+      }
       if let note = state.contextNote {
         Text(note).font(.system(size: 10)).foregroundStyle(.tertiary)
       }
       if state.isLoading {
         HStack(spacing: 6) {
           ProgressView().controlSize(.small)
-          Text("Thinking…").font(.system(size: 11)).foregroundStyle(.secondary)
+          Text(state.progressLabel).font(.system(size: 11)).foregroundStyle(.secondary)
+          Spacer()
+          Button("Continue in main app") {
+            app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
+          }
+          .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 2)
+        if !state.answer.isEmpty {
+          ScrollView {
+            answerBody
+          }
+          .frame(maxHeight: 220)
+        }
+      } else if state.isDetached {
+        VStack(alignment: .leading, spacing: 5) {
+          Text("Connection lost before completion was confirmed. Open the main app to see whether the request is still running.")
+            .font(.caption).foregroundStyle(.secondary).lineLimit(4)
+          HStack {
+            Button("Open in main app") {
+              app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
+            }
+            .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
+            Spacer()
+            Button(action: { state.clearAnswer() }) {
+              Text("Clear").font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+          }
+        }
       } else if let err = state.error {
-        Text(err).font(.caption).foregroundStyle(.red).lineLimit(4)
+        VStack(alignment: .leading, spacing: 5) {
+          Text(err).font(.caption).foregroundStyle(.red).lineLimit(4)
+          HStack {
+            Button("Open in main app") {
+              app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
+            }
+            .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
+            Spacer()
+            Button(action: { state.clearAnswer() }) {
+              Text("Clear").font(.caption).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+          }
+        }
       } else if !state.answer.isEmpty {
         ScrollView {
           answerBody
@@ -176,7 +245,7 @@ struct OverlayView: View {
           // Without an id (daemon answered 200 but named no session) the label
           // stops promising continuity it cannot deliver.
           Button(app.lastAskSessionId == nil ? "Open chat" : "Continue in chat") {
-            app.openChatSession(app.lastAskSessionId)
+            app.openChatSession(app.lastAskSessionId, requestId: app.lastAskRequestId)
           }
           .font(.caption).buttonStyle(.plain).foregroundStyle(.blue)
           .help(app.lastAskSessionId == nil
@@ -190,12 +259,55 @@ struct OverlayView: View {
           .help("Clear the answer")
         }
       }
-      if !outreach.items.isEmpty {
+      if !approvals.items.isEmpty || approvals.lastOutcome != nil || approvals.lastError != nil {
+        Divider()
+        HStack {
+          Text(approvals.items.count == 1 ? "Approval needed" : "Approvals needed")
+            .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+          Spacer()
+          if !approvals.items.isEmpty {
+            Text("\(approvals.items.count)")
+              .font(.system(size: 9, weight: .bold))
+              .foregroundStyle(.white)
+              .padding(.horizontal, 6).padding(.vertical, 2)
+              .background(Capsule().fill(Color.accentColor))
+          }
+        }
+        if let outcome = approvals.lastOutcome {
+          HStack(spacing: 6) {
+            Text(outcome).font(.system(size: 11)).foregroundStyle(.green)
+            Spacer()
+            Button("Dismiss") { approvals.clearOutcome() }
+              .buttonStyle(.borderless).font(.system(size: 10))
+          }
+        }
+        if let error = approvals.lastError {
+          Text(error).font(.system(size: 11)).foregroundStyle(.red)
+        }
+        if !approvals.items.isEmpty {
+          ScrollView {
+            VStack(alignment: .leading, spacing: 7) {
+              ForEach(approvals.items) { approval in
+                approvalRow(approval)
+              }
+            }
+          }
+          .frame(maxHeight: 230)
+          if approvals.items.count > 1 {
+            Button("Open all approvals in main app") {
+              app.openDashboard(path: "/?tab=approvals")
+            }
+            .buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.blue)
+          }
+        }
+      }
+      let visibleOutreach = outreach.items.filter { $0.type != "pending-action" }
+      if !visibleOutreach.isEmpty {
         Divider()
         Text("Needs you").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
         ScrollView {
           VStack(alignment: .leading, spacing: 8) {
-            ForEach(outreach.items.prefix(6)) { item in
+            ForEach(visibleOutreach.prefix(6)) { item in
               outreachRow(item)
             }
           }
@@ -216,8 +328,45 @@ struct OverlayView: View {
     .frame(width: 320)
     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
     .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.1), lineWidth: 1))
-    .onAppear { fieldFocused = true; Task { await brief.refresh() } }
+    .onAppear {
+      fieldFocused = true
+      Task {
+        await brief.refresh()
+        await approvals.refresh()
+      }
+    }
     .onChange(of: state.expanded) { _, expanded in if expanded { fieldFocused = true } }
+  }
+
+  @ViewBuilder private func approvalRow(_ approval: PendingApproval) -> some View {
+    VStack(alignment: .leading, spacing: 5) {
+      HStack(alignment: .firstTextBaseline, spacing: 6) {
+        Image(systemName: "hand.raised.fill").foregroundStyle(Color.accentColor)
+        Text(approval.summary).font(.system(size: 12, weight: .semibold)).lineLimit(3)
+      }
+      Text(approval.toolName == "start_computer_use_session"
+           ? "Computer Use"
+           : approval.toolName.replacingOccurrences(of: "_", with: " ").capitalized)
+        .font(.system(size: 10)).foregroundStyle(.secondary)
+      HStack(spacing: 8) {
+        Button("Approve & run") {
+          Task { await approvals.approve(approval.id) }
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.small)
+        Button("Deny") {
+          Task { await approvals.deny(approval.id) }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        if approvals.inFlight.contains(approval.id) {
+          ProgressView().controlSize(.small)
+        }
+      }
+      .disabled(approvals.inFlight.contains(approval.id))
+    }
+    .padding(8)
+    .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
   }
 
   // The agent answers in markdown ("## Open old tasks to triage", "**19 old

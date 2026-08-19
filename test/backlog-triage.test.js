@@ -13,6 +13,7 @@ import {
   candidateTitle,
   classifyDeterministic,
   jaccard,
+  llmReviewDue,
   parseJsonArray,
   rankCritical,
   readLatestTriageReport,
@@ -311,8 +312,8 @@ test("a weak mined pattern younger than the stale window is never retired by rul
 
 test("only superseded re-drafts are retired — a completed parent task never justifies it", () => {
   // The trap this guards: for a draft-only task, "completed" means the AGENT
-  // finished the draft, not that the user acted on it. 96 of the 97 pending
-  // drafts on the real install sit under a completed+archived task.
+  // finished the draft, not that the user acted on it. Pending drafts can
+  // legitimately remain under completed or archived agent tasks.
   const drafts = [
     { id: "draft_a", taskId: "task_1", title: "First attempt", createdAt: new Date(NOW.getTime() - 40 * DAY).toISOString() },
     { id: "draft_b", taskId: "task_1", title: "Second attempt", createdAt: new Date(NOW.getTime() - 30 * DAY).toISOString() },
@@ -432,9 +433,16 @@ test("a provider that throws degrades instead of taking the job down", async () 
   const report = await new BacklogTriage({ runtime, dataDir: dir, batchSize: 2 }).run({ now: NOW });
   assert.equal(provider.calls, 1, "stops after the first failure rather than hammering a dead provider");
   assert.equal(report.llm.stoppedEarly, "provider-error");
+  assert.equal(report.llm.lastAttemptAt, NOW.toISOString());
   assert.ok(report.degraded.some((d) => d.includes("upstream 503")));
   assert.equal(report.llm.deferred, 10);
   assert.equal(report.applied.suggestions, 0);
+
+  const nextDay = await new BacklogTriage({ runtime, dataDir: dir, batchSize: 2 }).run({
+    now: new Date(NOW.getTime() + DAY)
+  });
+  assert.equal(nextDay.llm.skipped, "cadence");
+  assert.equal(provider.calls, 1, "a failing provider is not hammered again by the next daily cleanup");
 });
 
 test("batching sends one call per batch, not one per item, and routes by task", async () => {
@@ -472,6 +480,81 @@ test("the cap bounds one pass and defers the rest instead of spending more", asy
   const sent = provider.calls.flatMap((c) => c.items.map((i) => i.ageDays));
   assert.deepEqual(sent, [...sent].sort((a, b) => b - a));
   assert.equal(sent[0], 39);
+});
+
+test("bounded passes advance through untouched rows before rejudging pending keeps", async () => {
+  const dir = tempDataDir();
+  for (let i = 0; i < 4; i += 1) {
+    writeSuggestion(dir, observer(`prop_${i}`, {
+      title: distinctTitle(i),
+      proposedAt: new Date(NOW.getTime() - (13 - i) * DAY).toISOString()
+    }));
+  }
+  const provider = stubProvider((items) => items.map((it, i) => ({
+    i: it.i,
+    verdict: i === 0 ? "keep" : "unsure",
+    confidence: 0.9,
+    stillMattersScore: i === 0 ? 0.7 : undefined,
+    reason: i === 0 ? "This still names open work." : "There is not enough evidence yet."
+  })));
+  const runtime = makeRuntime({ dir, provider });
+  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2, llmIntervalDays: 0 });
+
+  const first = await triage.run({ now: NOW });
+  assert.equal(first.llm.itemsSent, 2);
+  assert.equal(first.applied.keepsAnnotated, 1);
+  assert.equal(first.applied.deferralsAnnotated, 1);
+  const firstTitles = provider.calls.flatMap((call) => call.items.map((item) => item.title));
+  assert.deepEqual(firstTitles, [distinctTitle(0), distinctTitle(1)], "the first pass starts with the oldest untouched rows");
+
+  provider.calls.length = 0;
+  const second = await triage.run({ now: NOW });
+  assert.equal(second.llm.itemsSent, 2);
+  const secondTitles = provider.calls.flatMap((call) => call.items.map((item) => item.title));
+  assert.deepEqual(secondTitles, [distinctTitle(2), distinctTitle(3)], "the next pass advances to untouched rows even though reviewed rows are older");
+
+  const reviewed = listAllSuggestions(runtime, { status: "pending" })
+    .filter((suggestion) => suggestion.autoTriage?.decidedBy?.startsWith("llm:"));
+  assert.equal(reviewed.length, 4, "both keep and unsure judgements become visible to the next scheduler pass");
+});
+
+test("reconsideration rotates by oldest review time instead of item age", async () => {
+  const dir = tempDataDir();
+  writeSuggestion(dir, observer("prop_oldest_item", {
+    title: distinctTitle(0),
+    proposedAt: new Date(NOW.getTime() - 40 * DAY).toISOString(),
+    autoTriage: { at: "2026-07-29T12:00:00.000Z", verdict: "keep", decidedBy: "llm:test" }
+  }));
+  writeSuggestion(dir, observer("prop_oldest_review", {
+    title: distinctTitle(1),
+    proposedAt: new Date(NOW.getTime() - 20 * DAY).toISOString(),
+    autoTriage: { at: "2026-07-20T12:00:00.000Z", verdict: "unsure", decidedBy: "llm:test" }
+  }));
+  const provider = stubProvider((items) => items.map((item) => ({
+    i: item.i, verdict: "unsure", confidence: 0.5, reason: "There is not enough evidence yet."
+  })));
+  const runtime = makeRuntime({ dir, provider });
+
+  await new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 1, batchSize: 1 }).run({ now: NOW });
+  assert.equal(provider.calls[0].items[0].title, distinctTitle(1), "the least-recently reviewed row gets the next turn");
+});
+
+test("mined suggestion normalization preserves prior triage scheduling metadata", () => {
+  const dir = tempDataDir();
+  writeSuggestion(dir, mined("sug_reviewed", {
+    fingerprint: "app.a→app.b",
+    autoTriage: {
+      passId: "triage_previous",
+      at: "2026-07-20T12:00:00.000Z",
+      verdict: "keep",
+      decidedBy: "llm:test",
+      reason: "This still names open work.",
+      confidence: 0.9
+    }
+  }));
+  const [suggestion] = listAllSuggestions(makeRuntime({ dir }), { status: "pending" });
+  assert.equal(suggestion.autoTriage.passId, "triage_previous");
+  assert.equal(suggestion.autoTriage.verdict, "keep");
 });
 
 test("the LLM deadline is measured on the wall clock, not the injected `now`", async () => {
@@ -558,8 +641,69 @@ test("malformed verdicts are counted and resolve nothing", async () => {
 
   const report = await new BacklogTriage({ runtime, dataDir: dir }).run({ now: NOW });
   assert.equal(report.llm.verdicts.invalid, 3);
+  assert.equal(report.llm.verdicts.missing, 2);
+  assert.equal(report.llm.itemsJudged, 0);
+  assert.equal(report.llm.deferred, 2);
   assert.equal(report.applied.suggestions, 0);
+  assert.equal(report.applied.deferralsAnnotated, 2, "unjudged rows rotate without being resolved");
   assert.equal(listAllSuggestions(runtime, { status: "pending" }).length, 2);
+});
+
+test("duplicate model indexes are ignored and cannot decide one row twice", async () => {
+  const dir = tempDataDir();
+  for (let i = 0; i < 3; i += 1) writeSuggestion(dir, observer(`prop_${i}`, { title: distinctTitle(i) }));
+  const provider = stubProvider(() => [
+    { i: 0, verdict: "keep", confidence: 0.9, stillMattersScore: 0.7, reason: "This still describes unfinished work." },
+    { i: 0, verdict: "dismiss", confidence: 0.99, reason: "A conflicting duplicate verdict must be ignored." },
+    { i: 1, verdict: "unsure", confidence: 0.5, reason: "There is not enough evidence yet." }
+  ]);
+  const runtime = makeRuntime({ dir, provider });
+
+  const report = await new BacklogTriage({ runtime, dataDir: dir }).run({ now: NOW });
+  assert.equal(report.llm.verdicts.duplicate, 1);
+  assert.equal(report.llm.verdicts.missing, 1);
+  assert.equal(report.llm.itemsJudged, 2);
+  assert.equal(report.llm.deferred, 1);
+  assert.equal(report.applied.suggestions, 0, "the duplicate dismiss cannot override the first verdict");
+  const rows = listAllSuggestions(runtime, { status: "pending" });
+  assert.equal(rows.find((row) => row.id === "prop_0").autoTriage.modelVerdict, "keep");
+  assert.equal(rows.find((row) => row.id === "prop_2").autoTriage.modelVerdict, "missing");
+});
+
+test("a wholly malformed batch rotates behind untouched rows on the next pass", async () => {
+  const dir = tempDataDir();
+  for (let i = 0; i < 4; i += 1) {
+    writeSuggestion(dir, observer(`prop_${i}`, {
+      title: distinctTitle(i),
+      proposedAt: new Date(NOW.getTime() - (13 - i) * DAY).toISOString()
+    }));
+  }
+  const provider = stubProvider((items) => items.map((item) => ({
+    i: item.i, verdict: "unsure", confidence: 0.5, reason: "There is not enough evidence yet."
+  })));
+  const originalGenerate = provider.generate.bind(provider);
+  let malformedOnce = true;
+  provider.generate = async function generate(args) {
+    if (malformedOnce) {
+      malformedOnce = false;
+      const items = args.input.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+      this.calls.push({ task: args.task, instructions: args.instructions, items });
+      return { provider: "stub", model: this.model, text: "not a JSON array" };
+    }
+    return originalGenerate(args);
+  };
+  const runtime = makeRuntime({ dir, provider });
+  const triage = new BacklogTriage({ runtime, dataDir: dir, maxLlmItems: 2, batchSize: 2, llmIntervalDays: 0 });
+
+  const first = await triage.run({ now: NOW });
+  assert.equal(first.llm.itemsJudged, 0);
+  assert.equal(first.llm.verdicts.missing, 2);
+  assert.deepEqual(provider.calls[0].items.map((item) => item.title), [distinctTitle(0), distinctTitle(1)]);
+
+  provider.calls.length = 0;
+  const second = await triage.run({ now: NOW });
+  assert.equal(second.llm.itemsJudged, 2);
+  assert.deepEqual(provider.calls[0].items.map((item) => item.title), [distinctTitle(2), distinctTitle(3)]);
 });
 
 test("a rule-side keep is never overturned by the model — rules run first and win", async () => {
@@ -790,19 +934,67 @@ test("summarizeTriagePass is small and carries the counts that matter", async ()
 
 // ─── wiring ──────────────────────────────────────────────────────────────
 
-test("the runtime registers the triage job weekly, on a Sunday morning", async () => {
+test("the runtime registers daily deterministic triage while model review stays weekly", async () => {
   const { createDurableRuntime } = await import("../src/abi-runtime.js");
   const runtime = createDurableRuntime({ dataDir: tempDataDir(), autoConnectMcp: false });
   const job = runtime.cron.listJobs().find((j) => j.id === "backlog-triage");
   assert.ok(job, "backlog-triage job is registered");
   assert.equal(job.task, "backlog-triage");
   assert.equal(job.enabled, true);
-  assert.equal(job.intervalMs, 7 * 24 * 60 * 60 * 1000);
+  assert.equal(job.intervalMs, null);
+  assert.equal(job.dailyAt, "05:45");
   const next = new Date(job.nextRunAt);
-  assert.equal(next.getDay(), 0, "fires on a Sunday");
   assert.equal(next.getHours(), 5);
-  assert.equal(next.getMinutes(), 15);
+  assert.equal(next.getMinutes(), 45);
   assert.ok(runtime.backlogTriage instanceof BacklogTriage);
+});
+
+test("backlog hygiene stays at 05:45 after a late catch-up and disabled migration stays unscheduled", async () => {
+  const { CronScheduler } = await import("../src/cron-scheduler.js");
+  const cron = new CronScheduler();
+  const late = new Date(2026, 7, 14, 12, 0, 0, 0);
+  const job = cron.addJob({ id: "backlog-triage", task: "backlog-triage", dailyAt: "05:45" });
+  const next = cron.computeNextRun(job, late);
+  assert.equal(next.getHours(), 5);
+  assert.equal(next.getMinutes(), 45);
+  assert.equal(next.getDate(), late.getDate() + 1);
+
+  cron.updateJob(job.id, { enabled: false, intervalMs: null, dailyAt: "05:45", nextRunAt: null });
+  assert.equal(cron.listJobs().find((entry) => entry.id === job.id).nextRunAt, null);
+});
+
+test("model review cadence is weekly even when deterministic cleanup runs daily", () => {
+  const previous = "2026-07-27T05:15:00.000Z";
+  assert.equal(llmReviewDue(previous, new Date("2026-07-28T05:15:00.000Z"), 7), false);
+  assert.equal(llmReviewDue(previous, new Date("2026-08-03T05:15:00.000Z"), 7), true);
+  assert.equal(llmReviewDue(null, NOW, 7), true);
+});
+
+test("daily passes keep deterministic cleanup active without paying for daily model review", async () => {
+  const dir = tempDataDir();
+  writeSuggestion(dir, observer("prop_ambiguous", { title: "Review the vendor agreement" }));
+  const provider = stubProvider((items) => items.map((item) => ({
+    i: item.i,
+    verdict: "keep",
+    confidence: 0.9,
+    reason: "The agreement still needs an explicit decision.",
+    stillMattersScore: 0.7
+  })));
+  const runtime = makeRuntime({ dir, provider });
+  const triage = new BacklogTriage({ runtime, dataDir: dir });
+
+  const first = await triage.run({ now: NOW });
+  assert.equal(first.llm.itemsSent, 1);
+  provider.calls.length = 0;
+
+  writeSuggestion(dir, observer("prop_dead_tomorrow", {
+    category: "automation",
+    proposedAt: new Date(NOW.getTime() - 40 * DAY).toISOString()
+  }));
+  const second = await triage.run({ now: new Date(NOW.getTime() + DAY) });
+  assert.equal(second.llm.skipped, "cadence");
+  assert.equal(provider.calls.length, 0, "daily cleanup does not become a daily model bill");
+  assert.equal(second.applied.suggestions, 1, "safe deterministic retirement still runs daily");
 });
 
 test("the cron handler runs the pass and returns the small summary", async () => {

@@ -59,6 +59,13 @@ struct BriefAction: Decodable, Equatable, Identifiable {
   enum CodingKeys: String, CodingKey { case id, label, style, method, path, body, bodyField }
 }
 
+/// Stable reference to the store record behind a brief row. Optional because
+/// an unbacked daily-plan focus is real UI content but has no durable record.
+struct BriefEntityRef: Decodable, Equatable {
+  let kind: String
+  let id: String
+}
+
 // init(from:) lives in an extension ON PURPOSE: declaring it in the body above
 // would suppress the synthesized memberwise init that previews and tests use.
 extension BriefAction {
@@ -85,7 +92,11 @@ struct BriefItem: Decodable, Equatable, Identifiable {
   let dueAt: String?
   let source: String
   let actions: [BriefAction]
+  /// Secondary actions intended for a menu. Kept separate from `actions` so an
+  /// older app ignores them instead of rendering every move target inline.
+  let menuActions: [BriefAction]
   let deepLink: String
+  let entityRef: BriefEntityRef?
   /// The row's full, verbatim current text, for an action that opens an inline
   /// editor (drafts: the draft body). nil = the daemon sent no seed, which is
   /// the ONLY signal that an editor must not be opened: `title` and `why` are a
@@ -96,7 +107,7 @@ struct BriefItem: Decodable, Equatable, Identifiable {
   // Decode defensively: a slightly newer or older daemon must never break the
   // popover. `id` is the only required field — everything else, including a
   // whole malformed action, degrades rather than throwing.
-  enum CodingKeys: String, CodingKey { case id, kind, title, why, score, dueAt, source, actions, deepLink, editValue }
+  enum CodingKeys: String, CodingKey { case id, kind, title, why, score, dueAt, source, actions, menuActions, deepLink, entityRef, editValue }
 
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -108,7 +119,9 @@ struct BriefItem: Decodable, Equatable, Identifiable {
     dueAt = c.lenient(String.self, .dueAt)
     source = c.lenient(String.self, .source, or: "unknown")
     actions = c.lenientArray(BriefAction.self, .actions)
+    menuActions = c.lenientArray(BriefAction.self, .menuActions)
     deepLink = c.lenient(String.self, .deepLink, or: "/")
+    entityRef = c.lenient(BriefEntityRef.self, .entityRef)
     // Absent OR wrong-typed both land on nil, and nil disables the editor.
     // Degrading a seed we could not parse into "" would be the one failure mode
     // this field exists to prevent.
@@ -116,9 +129,91 @@ struct BriefItem: Decodable, Equatable, Identifiable {
   }
 }
 
+/// The small, non-content snapshot sent with a scoped Quick Ask. The daemon
+/// resolves entityRef against its live stores; title/why are only a fallback
+/// for an unbacked focus row.
+struct BriefChatContext: Equatable {
+  let kind: String
+  let title: String
+  let why: String
+  let entityRef: BriefEntityRef?
+
+  init(item: BriefItem) {
+    kind = item.kind
+    title = item.title
+    why = item.why
+    entityRef = item.entityRef
+  }
+
+  var jsonObject: [String: Any] {
+    var value: [String: Any] = ["kind": kind, "title": title, "why": why]
+    if let ref = entityRef { value["entityRef"] = ["kind": ref.kind, "id": ref.id] }
+    return value
+  }
+}
+
+/// Counts of renderable rows that did not fit in the brief, after the daemon
+/// has applied the same eligibility filters used for visible rows.
+struct BriefOlderBreakdown: Decodable, Equatable {
+  let clarifications: Int
+  let drafts: Int
+  let tasks: Int
+  let suggestions: Int
+
+  enum CodingKeys: String, CodingKey { case clarifications, drafts, tasks, suggestions }
+}
+
+extension BriefOlderBreakdown {
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    clarifications = max(0, c.lenient(Int.self, .clarifications, or: 0))
+    drafts = max(0, c.lenient(Int.self, .drafts, or: 0))
+    tasks = max(0, c.lenient(Int.self, .tasks, or: 0))
+    suggestions = max(0, c.lenient(Int.self, .suggestions, or: 0))
+  }
+}
+
 struct BriefOlder: Decodable, Equatable {
   let count: Int
   let oldestAt: String?
+  /// Nil means an older daemon that only knows the aggregate `count`.
+  let byKind: BriefOlderBreakdown?
+
+  enum CodingKeys: String, CodingKey { case count, oldestAt, byKind }
+}
+
+extension BriefOlder {
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    count = max(0, c.lenient(Int.self, .count, or: 0))
+    oldestAt = c.lenient(String.self, .oldestAt)
+    // Missing OR malformed is an older/unknown peer, not a reason to lose the
+    // still-useful aggregate count.
+    byKind = c.lenient(BriefOlderBreakdown.self, .byKind)
+  }
+
+  /// A truthful footer for both wire generations. The aggregate leads because
+  /// it remains authoritative; additive kind counts explain that a large
+  /// backlog may mostly be suggestions rather than unfinished tasks.
+  var disclosureLabel: String {
+    var parts = ["\(formattedBriefCount(count)) more \(count == 1 ? "item" : "items")"]
+    if let byKind {
+      appendBriefCount(byKind.clarifications, singular: "clarification", plural: "clarifications", to: &parts)
+      appendBriefCount(byKind.drafts, singular: "draft", plural: "drafts", to: &parts)
+      appendBriefCount(byKind.tasks, singular: "task", plural: "tasks", to: &parts)
+      appendBriefCount(byKind.suggestions, singular: "suggestion", plural: "suggestions", to: &parts)
+    }
+    return parts.joined(separator: " · ")
+  }
+}
+
+private func appendBriefCount(_ count: Int, singular: String, plural: String, to parts: inout [String]) {
+  guard count > 0 else { return }
+  parts.append("\(formattedBriefCount(count)) \(count == 1 ? singular : plural)")
+}
+
+private func formattedBriefCount(_ count: Int) -> String {
+  NumberFormatter.localizedString(from: NSNumber(value: count), number: .decimal)
 }
 
 struct BriefResponse: Decodable, Equatable {
@@ -133,7 +228,7 @@ struct BriefResponse: Decodable, Equatable {
   init(from decoder: Decoder) throws {
     let c = try decoder.container(keyedBy: CodingKeys.self)
     items = c.lenientArray(BriefItem.self, .items)
-    older = c.lenient(BriefOlder.self, .older, or: BriefOlder(count: 0, oldestAt: nil))
+    older = c.lenient(BriefOlder.self, .older, or: BriefOlder(count: 0, oldestAt: nil, byKind: nil))
     generatedAt = c.lenient(String.self, .generatedAt)
     planCachedAt = c.lenient(String.self, .planCachedAt)
     degraded = c.lenientArray(String.self, .degraded)

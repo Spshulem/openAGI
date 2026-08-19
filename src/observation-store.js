@@ -25,6 +25,15 @@ const TRANSCRIPT_SEARCH_TEXT_CAP = 1000;
 const WINDOW_SEARCH_TEXT_CAP = 2000;
 const WINDOW_SEARCH_LIMIT = 100;
 const WINDOW_TEXT_KINDS = new Set(["activity", "frame"]);
+const SEARCH_KINDS = new Set(["activity", "frame", "transcript"]);
+
+function normalizeSearchKinds(kinds) {
+  if (kinds === undefined || kinds === null) return null;
+  const values = Array.isArray(kinds) ? kinds : String(kinds).split(",");
+  return [...new Set(values
+    .map((kind) => kind === "frame-summary" ? "frame" : String(kind ?? "").trim())
+    .filter((kind) => SEARCH_KINDS.has(kind)))];
+}
 
 function capTranscriptText(row) {
   if (row && row.kind === "transcript" && typeof row.text === "string" && row.text.length > TRANSCRIPT_SEARCH_TEXT_CAP) {
@@ -186,13 +195,18 @@ export class ObservationStore {
     return { count, mode: "sqlite" };
   }
 
-  async search({ query, since, until, app, machine, limit = 25 } = {}) {
+  async search({ query, since, until, app, machine, kinds, limit = 25 } = {}) {
     await this.ready;
+    const normalizedKinds = normalizeSearchKinds(kinds);
+    if (normalizedKinds && normalizedKinds.length === 0) return [];
     if (this.fallback) {
       // Naive fallback search through the JSONL log.
       let rows = [];
       try { rows = fs.readFileSync(this.fallbackPath, "utf8").split("\n").filter(Boolean).map(JSON.parse); } catch { return []; }
       let out = rows;
+      if (normalizedKinds) {
+        out = out.filter((o) => normalizedKinds.includes(o.kind === "frame-summary" ? "frame" : o.kind));
+      }
       if (query) {
         const q = query.toLowerCase();
         out = out.filter((o) => (o.ocrText || "").toLowerCase().includes(q) || (o.window || "").toLowerCase().includes(q) || (o.text || "").toLowerCase().includes(q));
@@ -223,6 +237,7 @@ export class ObservationStore {
       const rows = this.db.prepare(
         `SELECT kind, ref, at, app, window, snippet(texts, 5, '<mark>', '</mark>', '…', 16) AS snippet, text
          FROM texts WHERE texts MATCH ?
+         ${normalizedKinds ? `AND kind IN (${normalizedKinds.map(() => "?").join(", ")})` : ""}
          ${app ? "AND app = ?" : ""}
          ${since ? "AND at >= ?" : ""}
          ${until ? "AND at <= ?" : ""}
@@ -230,6 +245,7 @@ export class ObservationStore {
          ORDER BY at DESC LIMIT ?`
       );
       const params = [matchExpr];
+      if (normalizedKinds) params.push(...normalizedKinds);
       if (app) params.push(app);
       if (since) params.push(since);
       if (until) params.push(until);
@@ -238,6 +254,7 @@ export class ObservationStore {
       return rows.all(...params).map(capTranscriptText);
     }
     // No query → return recent activity by default.
+    if (normalizedKinds && !normalizedKinds.includes("activity")) return [];
     const params = [];
     let where = "1=1";
     if (app) { where += " AND app = ?"; params.push(app); }

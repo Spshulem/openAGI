@@ -1,158 +1,256 @@
-# OpenAGI: 3-Minute Workflow Demo
+# OpenAGI: 3-Minute Demo
 
-## Demo Thesis
+This script uses fictional examples so it is safe to reuse in any installation.
 
-**OpenAGI turns ambient activity into a routed task system.**
+## The One-Line Position
 
-Most agents wait for a prompt. OpenAGI watches local activity, decides what
-matters, and routes work into either:
+**Text it, let it watch, and OpenAGI turns your real work into owned tasks and
+reusable skills that improve with you.**
 
-- **My tasks**: work the user should do.
-- **Agent tasks**: work OpenAGI has committed to prepare or complete.
-
-The strongest short demo is the workflow loop, not a long autonomous run:
+Hermes and OpenClaw can also execute tools, run background jobs, use memory, and
+connect channels. Do not compete on feature count. Show OpenAGI's closed loop:
 
 ```text
-Local activity -> proactive observation -> task routing -> agent queue -> review
+iMessage or Quick Ask
+  -> human task / agent task
+  -> ambient on-device observation
+  -> repeated workflow detected with evidence
+  -> user approves a durable SKILL.md
+  -> OpenAGI runs the improved workflow next time
+  -> one Review queue keeps the user in control
 ```
 
-## What Works
+## What Is Demo-Ready
 
-- Local screen and activity capture.
-- A proactive observer that reviews recent activity every 10 minutes.
-- Suggestions grounded in observed apps and on-screen text.
-- Separate user and agent task queues.
-- A task lifecycle scan every 15 minutes.
-- An agent pulse every 30 minutes that drains the agent queue.
-- Due-date reminders, daily plans, and daily recaps.
-- Draft-first handling for observer-created agent work.
+- **iMessage conversational bridge:** an incoming message can reach the main
+  agent and the plain-text answer is sent back through Messages.app.
+- **iMessage inbox:** a private self-chat can be read locally and converted into
+  tasks. It is opt-in, read-only, forward-only by default, and requires Full
+  Disk Access.
+- **Task ownership:** Tasks visibly separates **My tasks** from **Agent tasks**.
+  Observer-created agent work is draft-first when an external action is implied.
+- **Ambient observation:** about every 30 seconds the Mac batches window titles
+  and on-device OCR. Images stay local; the observer reasons from text evidence.
+- **Multi-horizon learning:** hourly and nightly miners look for repeated action
+  sequences across sessions, days, and weeks instead of treating one click as a
+  habit.
+- **Evidence-backed skill suggestions:** the Skills view shows observed count,
+  confidence, time, horizons, action sequence, and the proposed skill body.
+- **One-click materialization:** accepting a learned skill writes a real
+  `SKILL.md` with its observation provenance and reloads it immediately.
+- **Unified Review:** tasks, drafts, clarifications, and suggestions are
+  searchable in one queue.
+- **Latest `main`: conversational skill authoring:** the approval-gated
+  `create_skill` tool can save a workflow requested in normal chat, reload it,
+  and later schedule it. This is only demoable after the latest `main` changes
+  are integrated and the daemon is rebuilt/restarted.
 
-In the inspected local app data, OpenAGI had already generated 78 proactive
-suggestions, including 58 task proposals. The previous empty task list was
-caused by task proposals remaining in Suggestions instead of being written to
-the task store. That path has been fixed for new observer output.
+Do not quote volatile totals in the presentation; preselect one fictional or
+non-sensitive item from each surface.
 
-> When demonstrating the fix, restart the source server. If using the packaged
-> Mac app, rebuild and restart it so the bundled runtime includes the change.
+## Required Preflight
 
-## Timed Demo
+Do this before the audience is present.
 
-### 0:00-0:20 - Frame the Difference
+1. **Build and restart the intended version.** Confirm the checkout is clean and
+   the packaged runtime matches the code you intend to demonstrate.
+2. Run `openagi doctor` and confirm the daemon and Mac node are healthy.
+3. In **Integrations**, confirm iMessage is enabled with the intended self-chat
+   handle.
+4. Verify macOS grants the OpenAGI process **Full Disk Access** and
+   **Automation -> Messages**.
+5. Verify local iMessage access without changing anything:
+
+   ```bash
+   openagi imessage-search "demo preflight" --days 1 --limit 1
+   ```
+
+6. Start the conversational bridge in a separate terminal. Use the trigger mode
+   so unrelated texts never invoke the agent:
+
+   ```bash
+   SELF_HANDLE="your iCloud email or phone"
+   openagi imessage-bridge \
+     --allow "$SELF_HANDLE" \
+     --respond trigger \
+     --trigger OpenAGI \
+     --capture allow
+   ```
+
+7. In **Skills**, preselect one safe suggested workflow with a clear action
+   sequence and more than one observation. Do not depend on a miner producing a
+   new candidate during the demo.
+8. In **Tasks**, seed a fictional recording-migration task as the fallback item.
+   In **Review**, pre-apply the search term `recording migration`.
+9. Open these surfaces in order: Messages, Tasks, Skills, Review.
+
+## The Three-Minute Script
+
+### 0:00-0:15 - Hook
+
+Show Messages on the phone or Mac.
 
 Say:
 
-> Most agents wait for a prompt. OpenAGI watches local activity, decides what
-> matters, and routes work into human tasks or agent tasks.
+> Most agents wait inside a chat box. OpenAGI can meet me in iMessage, watch the
+> work happening on my Mac, and learn the workflows I repeat.
 
-### 0:20-0:55 - Show Proactive Suggestions
+### 0:15-0:45 - iMessage to Owned Work
 
-Open the **Suggestions** view.
+Send this to the configured self-chat:
 
-Say:
+> OpenAGI, add "Review the recording migration plan" to my tasks today. Prepare
+> a migration checklist as an agent task. Draft only; do not contact anyone.
 
-> This is what OpenAGI noticed from screen and app activity. These did not
-> originate as chat prompts; they came from the proactive observer.
-
-Point out:
-
-- The concrete title and rationale.
-- Whether the proposal is for the `user` or `agent` queue.
-- The task bucket, such as `today` or `this_week`.
-- References to real work such as PRs, tickets, meetings, or branches.
-
-### 0:55-1:35 - Show Task Routing
-
-Open the **Tasks** view.
+Show the plain-text iMessage response. Move on after 12 seconds even if the
+response is still in flight; the fictional migration task is the fallback.
 
 Say:
 
-> The important difference is routing. Some work is mine. Some work the agent
-> has committed to. It is not a chat transcript pretending to be a task list.
+> One message creates two different commitments: what I need to do and what the
+> agent has agreed to prepare. That ownership survives this conversation.
+
+### 0:45-1:15 - My Tasks Versus Agent Tasks
+
+Open **Tasks** and filter to **today**.
 
 Show:
 
-- **My tasks** for human-owned work.
-- **Agent tasks** for work OpenAGI is preparing.
-- Buckets, priorities, status, and source attribution.
-
-If a reliable task needs to be seeded immediately:
-
-```bash
-curl -s -X POST http://127.0.0.1:43210/tasks \
-  -H 'content-type: application/json' \
-  -d '{
-    "title": "Draft follow-up notes from the BuildBetter demo call",
-    "queue": "agent",
-    "bucket": "today",
-    "description": "Produce a draft only. Do not send."
-  }'
-```
-
-Refresh the Tasks view after running the command.
-
-### 1:35-2:15 - Show the Always-On Loop
-
-Open the **Cron** view.
+- The recording-migration item under **My tasks**.
+- The checklist or draft under **Agent tasks**.
+- Its source, bucket, status, and draft-only constraint.
 
 Say:
 
-> The system keeps running after this conversation ends. The observer notices
-> work, the lifecycle scan reconciles progress, reminders track deadlines, and
-> the agent pulse drains work from its own queue.
+> This is not a transcript pretending to be a task list. Human work and agent
+> work have separate owners, statuses, deadlines, and review rules.
 
-Point out:
+Do not wait for the agent queue to finish live. The ownership transition is the
+point; long execution is not.
 
-- Proactive observer: every 10 minutes.
-- Task lifecycle scan: every 15 minutes.
-- Task reminders: every 15 minutes.
-- Agent queue pulse: every 30 minutes.
-- Daily planning and retrospective jobs.
+### 1:15-2:05 - Watching Becomes a Skill
 
-### 2:15-2:50 - Show Safety and Review
+Open **Skills** and select the prepared suggested workflow.
 
-Show a suggestion, approval, or draft-review surface that already has data.
+Point to:
 
-Say:
-
-> OpenAGI separates noticing, queuing, drafting, and approval. Observer-created
-> agent work is draft-first, so noticing something does not automatically send,
-> publish, or take an irreversible action.
-
-### 2:50-3:00 - Close with the Positioning
+- `observed N x`, confidence, time, and day/week horizon badges;
+- the detected app/action sequence;
+- the complete proposed skill body;
+- **Accept - write SKILL.md**.
 
 Say:
 
-> Hermes is strong as a self-improving execution runtime. OpenClaw is strong as
-> a gateway and task-automation platform. OpenAGI's wedge is ambient local
-> observation: it notices what you are doing, turns that into routed tasks, and
-> uses memory and scrutiny to decide what should become agent work.
+> OpenAGI does not call one observation a habit. It mines repeated sequences
+> across sessions, days, and weeks, then shows the evidence and the exact skill
+> it wants to create.
 
-## Competitive Framing
+Click **Accept - write SKILL.md** only if the selected workflow is safe.
 
-Do not position OpenAGI as having more integrations, channels, or tools. The
-credible distinction is the shape of the workflow.
+Say:
 
-| Product | Strongest framing | OpenAGI distinction |
+> Approval writes a real, inspectable skill with its provenance and reloads it
+> immediately. The next time this pattern appears, OpenAGI has a reusable way to
+> help instead of starting from zero.
+
+### 2:05-2:35 - Review and Safety
+
+Open **Review** with the prepared `recording migration` search.
+
+Show that tasks, drafts, and suggestions can be searched and handled from one
+place. Approve nothing irreversible.
+
+Say:
+
+> Watching does not mean acting without control. OpenAGI separates noticing,
+> queuing, drafting, and approval. Anything consequential stays reviewable.
+
+### 2:35-3:00 - Close the Loop
+
+Return briefly to the accepted skill or the two task owners.
+
+Say:
+
+> Hermes and OpenClaw are capable agent runtimes and gateways. OpenAGI's
+> difference is where the work comes from and what happens afterward: it learns
+> from my actual activity, decides whether I or the agent owns the next step,
+> and turns repeated behavior into an approved skill. Text it, let it watch, and
+> it gets better at the work I actually do.
+
+Stop there. Do not open Cron or explain the architecture.
+
+## Optional Latest-Main Ending
+
+Use this instead of the Review segment only after `create_skill` is verified in
+the running daemon.
+
+Ask in chat:
+
+> Create a reusable skill named `recording-migration-review`. It should inspect
+> open recording-migration tasks, draft a concise checklist, flag missing context, and
+> never send or delete anything. Show me the full skill before saving it.
+
+Then show the approval card and say:
+
+> OpenAGI can learn from observation, or I can teach it directly in normal
+> language. Either path produces the same durable, reviewable skill artifact.
+
+Approve only if the displayed instructions match the request. Do not run the
+new skill during the three-minute version.
+
+## Why This Is Different
+
+| Capability | Hermes / OpenClaw overlap | OpenAGI demo distinction |
 | --- | --- | --- |
-| Hermes | Skills, tools, MCP, execution backends, self-improving agent runtime | Ambient local observation feeding a persistent human/agent task system |
-| OpenClaw | Messaging gateway, scheduled/background work, channels, task automation | Screen-to-task routing and observation-driven task lifecycle as a first-class workflow |
-| OpenAGI | Proactive observer, scrutiny, tiered memory, bounded specialists | Notices work before a prompt and decides who should own it |
+| Messaging | Channels can invoke an agent | iMessage is both a conversational gateway and a private local inbox |
+| Background work | Jobs and automation are expected | Work is explicitly routed to human or agent ownership |
+| Memory | Persistent context is expected | Ambient local activity feeds tasks, suggestions, and workflow evidence |
+| Skills | Reusable tools and skills are expected | Repeated real behavior proposes a skill with count, confidence, horizons, and provenance |
+| Safety | Approvals and permissions may exist | Noticing, tasking, drafting, skill creation, and consequential action are separate gates |
+| Daily workflow | Agents can summarize and execute | Tasks, drafts, clarifications, and suggestions converge in one Review queue |
+
+The defensible claim is not "OpenAGI has features they lack." It is:
+
+> OpenAGI closes the loop from ambient work signal to ownership to learned,
+> user-approved capability.
+
+## Failure Plan
+
+- **No iMessage reply:** move to Tasks after 12 seconds and use the prepared
+  fictional migration item. Say the bridge is asynchronous; do not troubleshoot on stage.
+- **New task is delayed:** show the existing task and agent draft. Do not refresh
+  repeatedly.
+- **Suggested skill is weak:** use the preselected candidate; never force a new
+  observer/miner run live.
+- **Skill acceptance fails:** show the full evidence and proposed body, then say
+  materialization is approval-gated. Do not open a terminal to debug.
+- **Latest `create_skill` is absent:** skip the optional ending. The learned-skill
+  acceptance path is the primary self-improvement proof.
+- **Review is noisy:** keep the prepared `recording migration` search active.
 
 ## Claims to Avoid
 
-- Do not claim Hermes or OpenClaw cannot run background tasks.
-- Do not claim they lack memory, skills, MCP support, or automation.
-- Do not claim OpenAGI wins on integration count or tool breadth.
-- Do not rely on a live model producing the perfect suggestion during the demo.
-- Do not demo irreversible autonomous actions.
-- Do not spend the three minutes explaining the full architecture.
+- Do not say Hermes or OpenClaw lack memory, skills, MCP, channels, scheduling,
+  background work, or approvals.
+- Do not claim every observation becomes a task or skill.
+- Do not say screenshots are uploaded. OpenAGI's documented path keeps images
+  local and sends on-device OCR text for reasoning.
+- Do not claim fully autonomous external action. Emphasize draft-first work and
+  explicit approval.
+- Do not promise that skill learning is instant; candidates come from repeated
+  patterns across multiple time horizons.
+- Do not show giant queue totals. Show one coherent workflow.
 
 ## Presenter Checklist
 
-- Restart the runtime containing the latest source.
-- Confirm the Tasks, Suggestions, and Cron views load.
-- Keep one concrete task proposal available.
-- Seed one agent task before the presentation if necessary.
-- Verify the agent task says draft-only.
-- Keep the comparison focused on ambient observation and task routing.
-- End on the workflow difference, not a feature-count comparison.
+- [ ] Latest intended code is integrated, rebuilt, and restarted.
+- [ ] `openagi doctor` passes.
+- [ ] iMessage ingestion is enabled and the bridge is running.
+- [ ] Full Disk Access and Messages automation permissions work.
+- [ ] The self-chat trigger replies once without looping.
+- [ ] One human task and one draft-only agent task are visible.
+- [ ] One safe learned-skill candidate is preselected.
+- [ ] The candidate shows repeated observations and provenance.
+- [ ] `recording migration` is prepared in Review search.
+- [ ] The optional `create_skill` ending is used only if verified live.
+- [ ] A timer is visible to the presenter, not the audience.

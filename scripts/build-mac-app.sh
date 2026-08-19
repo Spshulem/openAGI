@@ -8,6 +8,7 @@
 #   ./scripts/build-mac-app.sh                      # release build, no signing
 #   SIGN_IDENTITY="Developer ID Application: ..." ./scripts/build-mac-app.sh
 #   SIGN_IDENTITY="..." NOTARIZE=1 ./scripts/build-mac-app.sh
+#   SIGN_IDENTITY="..." NOTARIZE=1 AC_KEYCHAIN_PROFILE=openagi ./scripts/build-mac-app.sh
 #
 # Output:
 #   build/OpenAGI.app
@@ -76,6 +77,9 @@ echo "▶ Compiling Swift binary"
 (cd "${MAC_DIR}" && swift build -c release --product OpenAGI)
 BIN="$(cd "${MAC_DIR}" && swift build -c release --product OpenAGI --show-bin-path)/OpenAGI"
 [[ -x "${BIN}" ]] || { echo "Build failed: ${BIN} not found" >&2; exit 1; }
+(cd "${MAC_DIR}" && swift build -c release --product OpenAGIComputerHelper)
+HELPER="$(cd "${MAC_DIR}" && swift build -c release --product OpenAGIComputerHelper --show-bin-path)/OpenAGIComputerHelper"
+[[ -x "${HELPER}" ]] || { echo "Build failed: ${HELPER} not found" >&2; exit 1; }
 
 # 2. Fetch Node 22 runtime if not cached
 if [[ ! -f "${NODE_TGZ}" ]]; then
@@ -90,6 +94,8 @@ mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 
 cp "${BIN}" "${APP}/Contents/MacOS/OpenAGI"
 chmod +x "${APP}/Contents/MacOS/OpenAGI"
+cp "${HELPER}" "${APP}/Contents/Resources/OpenAGIComputerHelper"
+chmod +x "${APP}/Contents/Resources/OpenAGIComputerHelper"
 
 # Add @executable_path/../Frameworks to rpath so dyld finds Sparkle.framework
 # inside the bundle. Idempotent: ignore the "already present" error on re-runs.
@@ -198,6 +204,12 @@ if [[ -n "${SIGN_USED}" ]]; then
       --entitlements "${MAC_DIR}/Resources/node-entitlements.plist" \
       --sign "${SIGN_IDENTITY}" "${NODE_BINARY}"
   fi
+  # Computer Use input runs in its own nested executable. Sign it explicitly
+  # before sealing the outer app so Developer ID/notarization covers the code
+  # that synthesizes CGEvents; --deep is intentionally not used below.
+  if [[ -f "${APP}/Contents/Resources/OpenAGIComputerHelper" ]]; then
+    codesign "${CS_FLAGS[@]}" "${APP}/Contents/Resources/OpenAGIComputerHelper"
+  fi
   # Sign other nested executables (npm/npx are scripts; just sign anything binary).
   find "${APP}/Contents/Resources/node" -type f -perm +111 ! -path "*/node" -exec \
     codesign "${CS_FLAGS[@]}" {} \; 2>/dev/null || true
@@ -248,19 +260,40 @@ fi
 
 # 6. Optional: notarize
 if [[ "${NOTARIZE:-0}" == "1" ]]; then
-  if [[ -z "${AC_USERNAME:-}" || -z "${AC_TEAM_ID:-}" ]]; then
-    echo "Set AC_USERNAME, AC_PASSWORD, AC_TEAM_ID env vars to notarize." >&2
+  NOTARY_AUTH=()
+  if [[ -n "${AC_KEYCHAIN_PROFILE:-}" ]]; then
+    NOTARY_AUTH=(--keychain-profile "${AC_KEYCHAIN_PROFILE}")
+  elif [[ -n "${AC_USERNAME:-}" && -n "${AC_PASSWORD:-}" && -n "${AC_TEAM_ID:-}" ]]; then
+    NOTARY_AUTH=(
+      --apple-id "${AC_USERNAME}"
+      --password "${AC_PASSWORD}"
+      --team-id "${AC_TEAM_ID}"
+    )
+  else
+    echo "Set AC_KEYCHAIN_PROFILE or all of AC_USERNAME, AC_PASSWORD, AC_TEAM_ID to notarize." >&2
     exit 1
   fi
-  TARGET="${DMG_PATH:-${APP}}"
-  echo "▶ Submitting ${TARGET} for notarization"
+
+  # notarytool accepts ZIP, PKG, and DMG containers—not a raw .app bundle.
+  # A branch/test build skips the DMG, so submit a ditto ZIP and staple the
+  # resulting ticket back onto the original app after Apple accepts it.
+  if [[ -n "${DMG_PATH:-}" ]]; then
+    SUBMIT_TARGET="${DMG_PATH}"
+    STAPLE_TARGET="${DMG_PATH}"
+    ASSESS_TYPE="install"
+  else
+    SUBMIT_TARGET="${BUILD_DIR}/OpenAGI-${VERSION}-notarization.zip"
+    STAPLE_TARGET="${APP}"
+    ASSESS_TYPE="execute"
+    rm -f "${SUBMIT_TARGET}"
+    ditto -c -k --sequesterRsrc --keepParent "${APP}" "${SUBMIT_TARGET}"
+  fi
+  echo "▶ Submitting ${SUBMIT_TARGET} for notarization"
 
   # Capture submit output so we can parse status + submission id.
   NOTARY_LOG="${BUILD_DIR}/notarize-submit.log"
-  xcrun notarytool submit "${TARGET}" \
-    --apple-id "${AC_USERNAME}" \
-    --password "${AC_PASSWORD}" \
-    --team-id "${AC_TEAM_ID}" \
+  xcrun notarytool submit "${SUBMIT_TARGET}" \
+    "${NOTARY_AUTH[@]}" \
     --wait 2>&1 | tee "${NOTARY_LOG}"
 
   STATUS="$(grep -E '^[[:space:]]*status:' "${NOTARY_LOG}" | tail -1 | awk -F': ' '{print $2}' | tr -d '[:space:]')"
@@ -274,16 +307,15 @@ if [[ "${NOTARIZE:-0}" == "1" ]]; then
       echo "" >&2
       echo "▶ Fetching Apple's notarization log:" >&2
       xcrun notarytool log "${SUBMISSION_ID}" \
-        --apple-id "${AC_USERNAME}" \
-        --password "${AC_PASSWORD}" \
-        --team-id "${AC_TEAM_ID}" >&2 || true
+        "${NOTARY_AUTH[@]}" >&2 || true
     fi
     exit 1
   fi
 
-  echo "▶ Stapling notarization ticket"
-  # stapler accepts both .app directories and .dmg files.
-  xcrun stapler staple "${TARGET}"
+  echo "▶ Stapling and validating notarization ticket"
+  xcrun stapler staple "${STAPLE_TARGET}"
+  xcrun stapler validate "${STAPLE_TARGET}"
+  spctl --assess --type "${ASSESS_TYPE}" --verbose=4 "${STAPLE_TARGET}"
 fi
 
 echo "▶ Done. ${APP}"

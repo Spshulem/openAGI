@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 // Manages the lifecycle of the bundled Node daemon. Spawns once at app launch,
 // passes data dir + port via env, captures stdout/stderr to a log file, kills
@@ -7,10 +8,16 @@ import Foundation
 final class DaemonController {
   static let shared = DaemonController()
 
+  enum ListenerOwnership: Sendable {
+    case none
+    case managed
+    case external
+  }
+
   private var process: Process?
   private var logHandle: FileHandle?
 
-  /// When restart() last ran — manual (tray) or automatic (AppState's
+  /// When restart() was last requested — manual (tray) or automatic (AppState's
   /// /health-failure recovery). One shared clock, deliberately: the auto path
   /// throttles off this, so a restart the user just triggered holds it off for
   /// the same minute. With separate clocks the poller would SIGKILL the daemon
@@ -54,24 +61,34 @@ final class DaemonController {
       return
     }
     // If something is already listening on 43210 and answering /health like
-    // OpenAGI, just adopt it instead of spawning a duplicate that will fail
-    // with EADDRINUSE in a tight restart loop. Common when the user runs
-    // `npm run serve` in a terminal alongside the .app.
+    // OpenAGI, adopt it only when it is a separately-launched daemon (most
+    // commonly `npm run serve`). A daemon running this app bundle's own Node
+    // binary belongs to the app: replace it on launch so a Sparkle relaunch
+    // cannot leave the previous bundle's JavaScript alive behind the new UI.
+    //
+    // If PID/executable discovery fails, preserve the process. Killing a
+    // healthy listener is safe only after positively identifying it as ours.
     if adoptExisting, isExistingDaemonHealthy() {
-      NSLog("OpenAGI: existing daemon detected on 127.0.0.1:43210; adopting it")
-      return
+      if let listenerPid = Self.pidListeningOnPort(43210),
+         Self.isBundledDaemon(listenerPid, currentNodeBinary: nodeBinary) {
+        NSLog("OpenAGI: bundled daemon pid \(listenerPid) survived app relaunch; replacing it")
+      } else {
+        NSLog("OpenAGI: healthy external daemon detected on 127.0.0.1:43210; adopting it")
+        return
+      }
     }
 
-    // The health check just failed, but something may still be holding the
-    // port (e.g. a previously-adopted daemon whose event loop hung, or one
-    // pegged at 100% CPU no longer servicing requests). We have no Process
-    // handle for it if we didn't spawn it ourselves, so `process` can't tell
-    // us what to kill. Without this, every restart attempt spawns a new
-    // child that immediately dies with EADDRINUSE and gets kept alive as a
-    // zombie — auto-recovery loops forever without ever actually replacing
-    // the stuck daemon.
+    // The health check either failed or positively identified a healthy
+    // bundle-owned daemon left over from the previous app process. In both
+    // cases something may still hold the port, and we have no Process handle
+    // for it. Without this cleanup, respawn immediately dies with EADDRINUSE
+    // and auto-recovery loops forever without replacing the stale runtime.
     if let stalePid = Self.pidListeningOnPort(43210) {
-      NSLog("OpenAGI: port 43210 held by unresponsive pid \(stalePid); killing it before respawn")
+      guard ownsDaemon(listenerPid: stalePid) else {
+        NSLog("OpenAGI: port 43210 is owned by external pid \(stalePid); refusing to terminate it")
+        return
+      }
+      NSLog("OpenAGI: port 43210 held by pid \(stalePid); terminating it before respawn")
       kill(stalePid, SIGTERM)
       Thread.sleep(forTimeInterval: 1.0)
       if Self.pidListeningOnPort(43210) == stalePid {
@@ -95,6 +112,7 @@ final class DaemonController {
     env["OPENAGI_DATA_DIR"] = dataDir.path
     env["HOST"] = "127.0.0.1"
     env["PORT"] = "43210"
+    env["OPENAGI_COMPUTER_HELPER"] = bundleResources.appendingPathComponent("OpenAGIComputerHelper").path
     proc.environment = env
 
     let stdoutPipe = Pipe()
@@ -111,9 +129,18 @@ final class DaemonController {
     }
     proc.terminationHandler = { [weak self] p in
       NSLog("OpenAGI: daemon exited with \(p.terminationStatus)")
-      // Auto-restart on unexpected exit (e.g. crash) after a backoff.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-        if self?.process != nil { self?.process = nil; self?.start() }
+      DispatchQueue.main.async {
+        guard let self, self.process === p else { return }
+        // Release only the handle for the process that actually exited. A
+        // manual restart during this crash backoff may already own a new,
+        // healthy child; a stale termination callback must never clear it.
+        self.process = nil
+        // Auto-restart an unexpected exit (e.g. crash) after a backoff, but
+        // yield to any manual or health-poll restart that starts first.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+          guard let self, self.process == nil else { return }
+          self.start()
+        }
       }
     }
 
@@ -137,13 +164,36 @@ final class DaemonController {
     }
   }
 
+  /// AppKit does not keep the process alive for asynchronous termination
+  /// cleanup. Quit therefore uses a short synchronous grace period and a
+  /// final signal while this parent still exists; restart paths keep using the
+  /// non-blocking stop() above so ordinary UI work never stalls.
+  func stopForApplicationTermination() {
+    guard let proc = process else { return }
+    process = nil
+    proc.terminationHandler = nil
+    proc.terminate()
+    let gracefulDeadline = Date().addingTimeInterval(0.75)
+    while proc.isRunning && Date() < gracefulDeadline {
+      Thread.sleep(forTimeInterval: 0.025)
+    }
+    if proc.isRunning {
+      kill(proc.processIdentifier, SIGKILL)
+      let killDeadline = Date().addingTimeInterval(0.25)
+      while proc.isRunning && Date() < killDeadline {
+        Thread.sleep(forTimeInterval: 0.01)
+      }
+    }
+  }
+
   /// Bounce the daemon.
   ///
-  /// `force: true` means "replace whatever is on 43210", and it is what the tray
-  /// button and the health-poll recovery both want. Without it, restart is
+  /// `force: true` means "replace an app-owned listener instead of adopting
+  /// it", and it is what the tray button and health-poll recovery both want.
+  /// External listeners are always preserved. Without the flag, restart is
   /// frequently a silent no-op: start() adopts an already-healthy daemon and
   /// returns without setting `process` (which happens on every relaunch while an
-  /// older daemon is still alive — the user's is orphaned to PPID 1 right now),
+  /// older bundle-owned daemon is still alive and reparented to launchd),
   /// and with `process` nil, stop() short-circuits on its `guard let proc`. So
   /// restart degraded into a no-op stop plus a start() that re-adopted the very
   /// daemon it was asked to replace. That same nil handle is why Quit leaves the
@@ -152,28 +202,47 @@ final class DaemonController {
   /// Opt-in rather than the default because AppDelegate restarts on
   /// wake-from-sleep off a single 2s probe; a daemon merely slow to answer as
   /// the machine wakes should be adopted once it responds, not killed.
-  func restart(force: Bool = false) {
+  @discardableResult
+  func restart(force: Bool = false) -> Bool {
+    // Stamp attempts too, so automatic recovery does not hammer an external
+    // listener every five seconds after a safe refusal.
     lastRestartAt = Date()
+    // A manual/forced restart may replace an app-bundled daemon that survived
+    // a relaunch, but it must never kill a terminal-managed server or an
+    // unrelated process that happens to own the product port. start() repeats
+    // this ownership check after the one-second delay to close the bind race.
+    if force, let listenerPid = Self.pidListeningOnPort(43210),
+       !ownsDaemon(listenerPid: listenerPid) {
+      NSLog("OpenAGI: restart refused — port 43210 is managed by external pid \(listenerPid)")
+      return false
+    }
     stop()
     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start(adoptExisting: !force) }
+    return true
   }
 
-  /// Is anything LISTENING on the daemon port right now?
-  ///
-  /// Paired with a failing /health this is what separates the two failures that
-  /// look identical from the outside: false means the process is gone, true
-  /// means it is alive, still owns 43210, and has stopped answering — the state
-  /// the user's daemon sat in for 25 hours (process state T, socket LISTENing).
-  /// They need different words in the tray and different actions behind it.
-  ///
-  /// Hops off the main thread because pidListeningOnPort spawns lsof and blocks
-  /// on it, and the only caller (AppState.pollOnce) is @MainActor.
-  func isPortHeld() async -> Bool {
-    await withCheckedContinuation { cont in
-      // Static, so this @Sendable closure captures nothing but a port number —
-      // DaemonController itself is not Sendable.
+  private func ownsDaemon(listenerPid: Int32) -> Bool {
+    if process?.processIdentifier == listenerPid { return true }
+    return Self.isBundledDaemon(listenerPid, currentNodeBinary: nodeBinary)
+  }
+
+  /// Classify the current listener for the tray and health poll without ever
+  /// launching `lsof` on the main actor. The result is display state only:
+  /// restart(force:) repeats the ownership check immediately before signaling
+  /// a process, so a listener change between poll and click remains safe.
+  func listenerOwnership() async -> ListenerOwnership {
+    let currentNodeBinary = nodeBinary
+    return await withCheckedContinuation { cont in
       DispatchQueue.global(qos: .utility).async {
-        cont.resume(returning: Self.pidListeningOnPort(43210) != nil)
+        guard let listenerPid = Self.pidListeningOnPort(43210) else {
+          cont.resume(returning: .none)
+          return
+        }
+        let ownership: ListenerOwnership = Self.isBundledDaemon(
+          listenerPid,
+          currentNodeBinary: currentNodeBinary
+        ) ? .managed : .external
+        cont.resume(returning: ownership)
       }
     }
   }
@@ -257,5 +326,61 @@ final class DaemonController {
       .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
     let firstLine = text.split(separator: "\n").first.map(String.init) ?? text
     return Int32(firstLine)
+  }
+
+  /// Resolve the executable behind a listener without trusting its command
+  /// line (which a process controls). `proc_pidpath` asks the kernel for the
+  /// executable vnode path and does not mutate or signal the process.
+  private static func executablePath(for pid: Int32) -> String? {
+    // PROC_PIDPATHINFO_MAXSIZE is a C expression macro (4 * MAXPATHLEN) and
+    // therefore is not imported by Swift; spell out the same SDK contract.
+    var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+    let length = buffer.withUnsafeMutableBufferPointer { pointer in
+      proc_pidpath(pid, pointer.baseAddress, UInt32(pointer.count))
+    }
+    guard length > 0 else { return nil }
+    return canonicalPath(URL(fileURLWithPath: String(cString: buffer)))
+  }
+
+  /// Sparkle atomically moves the old app into its installation cache before
+  /// relaunching the new one. A Node process from that old bundle keeps its
+  /// executable vnode open, but `proc_pidpath` can then return ENOENT. `lsof`
+  /// still exposes the kernel-backed text vnode path, so accept only Sparkle's
+  /// bundle-specific cache shape as the legacy fallback. A Homebrew/npm Node
+  /// daemon cannot match either branch and remains adopted.
+  private static func isBundledDaemon(_ pid: Int32, currentNodeBinary: URL) -> Bool {
+    if executablePath(for: pid) == canonicalPath(currentNodeBinary) { return true }
+    guard let movedExecutable = textExecutablePath(for: pid) else { return false }
+    let cacheRoot = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Caches/app.openagi.daemon/org.sparkle-project.Sparkle/Installation", isDirectory: true)
+      .standardizedFileURL.path + "/"
+    return movedExecutable.hasPrefix(cacheRoot)
+      && movedExecutable.hasSuffix("/OpenAGI.app/Contents/Resources/node/bin/node")
+  }
+
+  private static func textExecutablePath(for pid: Int32) -> String? {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    proc.arguments = ["-a", "-p", String(pid), "-d", "txt", "-Fn"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = Pipe()
+    do {
+      try proc.run()
+      proc.waitUntilExit()
+    } catch {
+      return nil
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let text = String(data: data, encoding: .utf8) else { return nil }
+    return text.split(separator: "\n")
+      .lazy
+      .filter { $0.first == "n" }
+      .map { String($0.dropFirst()) }
+      .first { $0.hasSuffix("/node/bin/node") }
+  }
+
+  private static func canonicalPath(_ url: URL) -> String {
+    url.standardizedFileURL.resolvingSymlinksInPath().path
   }
 }

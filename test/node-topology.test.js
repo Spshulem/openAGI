@@ -31,6 +31,21 @@ async function bootApp(dataDir, opts = {}) {
   return { runtime, app, base };
 }
 
+async function enrolledHeaders(base, nodeId) {
+  const nodeToken = Buffer.from(nodeId.padEnd(32, "_").slice(0, 32), "utf8").toString("base64url");
+  const enrollment = await fetch(`${base}/nodes/enroll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nodeId, nodeToken })
+  });
+  assert.equal(enrollment.status, 200);
+  return {
+    "content-type": "application/json",
+    authorization: `Bearer ${nodeToken}`,
+    "x-openagi-node-id": nodeId
+  };
+}
+
 function tmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -109,7 +124,7 @@ test("GET /nodes recomputes status even on a FRESH proxy, rather than trusting t
   // Backdate the sibling's heartbeat directly in the registry so the roster
   // carries an old lastSeenAt.
   await fetch(`${mainBase}/nodes/heartbeat`, {
-    method: "POST", headers: { "content-type": "application/json" },
+    method: "POST", headers: await enrolledHeaders(mainBase, "old"),
     body: JSON.stringify({ nodeId: "old", name: "Ancient", role: "node", version: "0.0.6" })
   });
   const registryPath = path.join(mainDir, "nodes", "registry.json");
@@ -171,7 +186,7 @@ test("GET /nodes on a paired node with a reachable main returns the full topolog
   const mainDir = tmp("openagi-topo-full-main-");
   const { app: mainApp, base: mainBase } = await bootApp(mainDir);
   await fetch(`${mainBase}/nodes/heartbeat`, {
-    method: "POST", headers: { "content-type": "application/json" },
+    method: "POST", headers: await enrolledHeaders(mainBase, "sibling"),
     body: JSON.stringify({ nodeId: "sibling", name: "Mac mini", role: "node", url: "http://10.0.0.9:43210", version: "0.0.10" })
   });
 
@@ -228,11 +243,11 @@ test("GET /nodes marks which nodes are behind the newest version it can see", as
   const { app, base } = await bootApp(dataDir);
   try {
     await fetch(`${base}/nodes/heartbeat`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers: await enrolledHeaders(base, "old"),
       body: JSON.stringify({ nodeId: "old", name: "Old box", role: "node", version: "9.0.6", build: "abc1234", buildSource: "git" })
     });
     await fetch(`${base}/nodes/heartbeat`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers: await enrolledHeaders(base, "new"),
       body: JSON.stringify({ nodeId: "new", name: "New box", role: "node", version: "9.0.10", build: "def5678", buildSource: "git" })
     });
     const json = await (await fetch(`${base}/nodes`)).json();
@@ -257,7 +272,7 @@ test("GET /nodes never builds a --remote update command out of a node-reported a
   const { app, base } = await bootApp(dataDir);
   try {
     await fetch(`${base}/nodes/heartbeat`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers: await enrolledHeaders(base, "evil"),
       body: JSON.stringify({ nodeId: "evil", name: "Totally Legit", role: "node", url: "http://attacker.example", version: "0.0.1" })
     });
     const json = await (await fetch(`${base}/nodes`)).json();

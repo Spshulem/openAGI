@@ -7,6 +7,7 @@ import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { assertSafePublicUrl } from "./url-guard.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
+import { migrateCatalogRegistration } from "./mcp-catalog.js";
 
 // Whitelist of executables permitted as the `command` for stdio MCP servers.
 // Anything not in this set is rejected at registerServer().
@@ -209,6 +210,7 @@ export class McpRegistry {
     // Set by hosted-interface so OAuth-required surfaces in the dashboard SSE.
     this.onOauthRequired = options.onOauthRequired ?? null;
     this.connecting = new Map(); // name → Promise (in-flight connect)
+    this.connectionEpochs = new Map(); // name → invalidation generation
     // Allowlist of env-var names the user has opted into via .openagi/.env.
     // Only these can flow into ${VAR} substitutions; references to anything
     // else (AWS_*, GITHUB_TOKEN, etc.) throw at registerServer().
@@ -340,13 +342,19 @@ export class McpRegistry {
     if (!config) return [];
     const registered = [];
     const servers = config.servers ?? config.mcpServers ?? {};
+    let migrated = false;
     this._suppressPersist = true;
     this.rejectedFromConfig = [];
     try {
-    for (const [name, spec] of Object.entries(servers)) {
+    for (const [name, originalSpec] of Object.entries(servers)) {
       // Skip comment-only entries (keys like "_comment", "//", "//2").
       if (name.startsWith("_") || name === "//" || /^\/\/\d*$/.test(name)) continue;
-      if (typeof spec !== "object" || spec === null) continue;
+      if (typeof originalSpec !== "object" || originalSpec === null) continue;
+      const spec = migrateCatalogRegistration(name, originalSpec);
+      if (spec !== originalSpec) {
+        servers[name] = spec;
+        migrated = true;
+      }
       // SEC-5 widened what registerServer refuses (argv, not just the
       // executable). This loop runs at boot, so one bad entry must disable
       // that ONE server — not stop the daemon from starting. Recorded and
@@ -385,6 +393,16 @@ export class McpRegistry {
     }
     } finally {
       this._suppressPersist = false;
+    }
+    if (migrated) {
+      try {
+        writeJsonAtomic(filePath, config);
+      } catch (error) {
+        // The repaired endpoint is already active in memory. A read-only
+        // config should not take the whole daemon down; make the persistence
+        // failure visible and retry the exact migration next launch.
+        try { process.stderr.write(`[openagi] MCP catalog endpoint migration could not update ${filePath}: ${error.message}\n`); } catch { /* ignore */ }
+      }
     }
     return registered;
   }
@@ -449,7 +467,8 @@ export class McpRegistry {
         () => this.connect(name, { silent: false })
       );
     }
-    const promise = this.doConnect(name, { silent });
+    const epoch = this.connectionEpochs.get(name) ?? 0;
+    const promise = this.doConnect(name, { silent, epoch });
     const entry = { promise, silent };
     this.connecting.set(name, entry);
     // The caller awaits `promise` and handles its rejection; this cleanup chain
@@ -513,7 +532,7 @@ export class McpRegistry {
     }
   }
 
-  async doConnect(name, { silent = false } = {}) {
+  async doConnect(name, { silent = false, epoch = this.connectionEpochs.get(name) ?? 0 } = {}) {
     const server = this.servers.get(name);
     if (!server) throw new Error(`Unknown MCP server: ${name}`);
     if (!server.enabled) throw new Error(`MCP server ${name} is disabled.`);
@@ -575,6 +594,12 @@ export class McpRegistry {
     }
     // silent → never open a browser for OAuth; fail fast if a token isn't cached.
     await client.connect({ interactive: !silent });
+    if ((this.connectionEpochs.get(name) ?? 0) !== epoch) {
+      await client.close?.();
+      const error = new Error(`MCP connection cancelled for ${name}`);
+      error.code = "MCP_CONNECT_CANCELLED";
+      throw error;
+    }
     this.exposeAsTools(server.name);
     return client.status();
   }
@@ -600,9 +625,12 @@ export class McpRegistry {
   }
 
   async disconnect(name) {
+    const inflight = this.connecting.get(name) ?? null;
+    this.connectionEpochs.set(name, (this.connectionEpochs.get(name) ?? 0) + 1);
+    this.connecting.delete(name);
     const client = this.clients.get(name);
-    if (!client) return false;
-    client.close();
+    if (!client && !inflight) return false;
+    await client?.close?.();
     this.clients.delete(name);
     if (this.toolRegistry) {
       for (const toolName of [...this.toolRegistry.tools.keys()]) {
@@ -610,6 +638,33 @@ export class McpRegistry {
       }
     }
     return true;
+  }
+
+  /// Disconnect an OAuth MCP and remove only its cached login. The server
+  /// registration remains, so the user can authorize it again later without
+  /// reconstructing its URL/trust settings. A valid orphaned cache is also
+  /// removable after a catalog/config change; the filename is still confined
+  /// to the auth directory by the same strict label validation.
+  async forgetOAuth(name) {
+    const server = this.servers.get(name);
+    await this.disconnect(name);
+    const cachePath = safeJoinOrNull(
+      path.join(this.dataDir, "mcp", "auth"),
+      `${name}.json`,
+      { pattern: LABEL_SEGMENT, label: "MCP server name" }
+    );
+    if (!cachePath) return false;
+    let cleared = false;
+    try {
+      if (fs.existsSync(cachePath)) {
+        fs.unlinkSync(cachePath);
+        cleared = true;
+      }
+    } catch (error) {
+      throw new Error(`Could not forget OAuth login for ${name}: ${error.message}`);
+    }
+    if (!cleared && (!server || server.auth !== "oauth")) return false;
+    return { cleared, disconnected: true };
   }
 
   async disconnectAll() {

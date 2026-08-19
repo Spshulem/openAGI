@@ -17,6 +17,7 @@ import { createId, nowIso, tokenize } from "./utils.js";
 const MIN_GROUP_SIZE = 3;
 const MAX_GROUPS_PER_RUN = 8;
 const QUARANTINE_DAYS = 7;
+const MAX_DUPLICATES_PER_RUN = 250;
 
 export class MemoryCondenser {
   constructor(options = {}) {
@@ -24,10 +25,18 @@ export class MemoryCondenser {
     this.minGroupSize = options.minGroupSize ?? MIN_GROUP_SIZE;
     this.maxGroupsPerRun = options.maxGroupsPerRun ?? MAX_GROUPS_PER_RUN;
     this.quarantineDays = options.quarantineDays ?? QUARANTINE_DAYS;
+    this.maxDuplicateRemovals = options.maxDuplicateRemovals ?? MAX_DUPLICATES_PER_RUN;
   }
 
   async condense({ now = new Date(), scope = null, writeScope = null, originSpecialistId = null } = {}) {
     if (!this.runtime?.memory) throw new Error("MemoryCondenser requires a runtime with memory.");
+    // Admission dedupe prevents new exact automated repeats. This bounded,
+    // recoverable pass drains pre-upgrade duplicates from active recall before
+    // clustering, so repeated copies cannot manufacture a false principle.
+    const maintenance = this.runtime.memory.consolidateAutomatedDuplicates?.({
+      maxRemovals: this.maxDuplicateRemovals,
+      now
+    }) ?? { groups: 0, removed: [] };
     let candidates = [...this.runtime.memory.byTier("medium"), ...this.runtime.memory.byTier("short")]
       .filter((item) => item.kind !== "principle" && !item.metadata?.condensedInto);
     if (scope) {
@@ -36,7 +45,7 @@ export class MemoryCondenser {
       candidates = candidates.filter((item) => !item.scope || item.scope === "main");
     }
     if (candidates.length < this.minGroupSize) {
-      return { groups: 0, principles: 0, reason: "not enough items in scope" };
+      return { groups: 0, principles: 0, duplicatesConsolidated: maintenance.removed.length, reason: "not enough items in scope" };
     }
     const groups = clusterByTagOverlap(candidates, this.minGroupSize).slice(0, this.maxGroupsPerRun);
     const principles = [];
@@ -81,7 +90,7 @@ export class MemoryCondenser {
     }
 
     if (typeof this.runtime.memory.persist === "function") this.runtime.memory.persist("condense", { count: principles.length });
-    return { groups: groups.length, principles: principles.length, items: principles };
+    return { groups: groups.length, principles: principles.length, items: principles, duplicatesConsolidated: maintenance.removed.length };
   }
 
   async distill(items) {

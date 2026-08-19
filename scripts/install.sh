@@ -341,8 +341,18 @@ case "${INSTALLED_MODE}" in
   Stored in ${COMPOSE_PATH} (mode 0600). To read it back later:
     sudo grep OPENAGI_AUTH_TOKEN ${COMPOSE_PATH}
 
-  Pair another device:
-    openagi pair http://${ip:-<your IP>}:43210 --token <the token above>
+  Pair another device only after putting this main behind HTTPS (for example,
+  an authenticated reverse proxy or encrypted tunnel). On the node (in bash
+  or zsh), read the pairing token without echoing it or putting it in shell
+  history:
+    printf 'Main pairing token: ' >&2
+    IFS= read -rs OPENAGI_REMOTE_TOKEN; printf '\\n' >&2
+    export OPENAGI_REMOTE_TOKEN
+    openagi pair https://<your-main-host>
+    unset OPENAGI_REMOTE_TOKEN
+
+  Plain HTTP pairing is accepted only on loopback for same-machine testing;
+  http://${ip:-<your IP>}:43210 is not a secure cross-device pairing URL.
 
   Tail logs:
     docker logs -f openagi

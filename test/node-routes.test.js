@@ -23,6 +23,21 @@ async function bootApp(dataDir, opts = {}) {
   return { runtime, app, base };
 }
 
+async function enrollNode(base, nodeId, adminToken = null) {
+  const nodeToken = "n".repeat(43);
+  const response = await fetch(`${base}/nodes/enroll`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...(adminToken ? { authorization: `Bearer ${adminToken}` } : {}) },
+    body: JSON.stringify({ nodeId, nodeToken })
+  });
+  assert.equal(response.status, 200);
+  return {
+    "content-type": "application/json",
+    authorization: `Bearer ${nodeToken}`,
+    "x-openagi-node-id": nodeId
+  };
+}
+
 // `nodes` is the whole topology, so a main with nothing paired to it has a
 // topology of exactly one machine: itself. (It used to be [] — the roster
 // listed only *other* machines, which is why a paired node could never see
@@ -48,8 +63,9 @@ test("POST /nodes/heartbeat upserts the sender, then GET /nodes includes it", as
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-main2-"));
   const { app, base } = await bootApp(dataDir);
   try {
+    const headers = await enrollNode(base, "n1");
     const hb = await fetch(`${base}/nodes/heartbeat`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers,
       body: JSON.stringify({ nodeId: "n1", name: "Mac mini", role: "node", url: "http://100.1.2.3:43210", version: "0.0.10" })
     });
     assert.equal(hb.status, 200);
@@ -62,12 +78,84 @@ test("POST /nodes/heartbeat upserts the sender, then GET /nodes includes it", as
   } finally { await app.close(); }
 });
 
+test("authenticated mains require a credential scoped to the exact node id", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-scoped-auth-"));
+  const { app, base } = await bootApp(dataDir, { authToken: "main-admin" });
+  try {
+    const nodeToken = "a".repeat(43);
+    const enroll = await fetch(`${base}/nodes/enroll`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer main-admin" },
+      body: JSON.stringify({ nodeId: "node-a", nodeToken })
+    });
+    const enrolled = await enroll.json();
+    assert.equal(enroll.status, 200);
+    assert.equal(enrolled.created, true);
+
+    // Simulate a lost first response: the client repeats the same enrollment
+    // with its already-persisted credential and receives success, not a 409.
+    const retry = await fetch(`${base}/nodes/enroll`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer main-admin" },
+      body: JSON.stringify({ nodeId: "node-a", nodeToken })
+    });
+    assert.equal(retry.status, 200);
+    assert.equal((await retry.json()).created, false);
+
+    const conflict = await fetch(`${base}/nodes/enroll`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer main-admin" },
+      body: JSON.stringify({ nodeId: "node-a", nodeToken: "b".repeat(43) })
+    });
+    assert.equal(conflict.status, 409);
+
+    const adminHeartbeat = await fetch(`${base}/nodes/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer main-admin", "x-openagi-node-id": "node-a" },
+      body: JSON.stringify({ nodeId: "node-a", name: "Node A", role: "node" })
+    });
+    assert.equal(adminHeartbeat.status, 401, "main-wide credential cannot operate a node route");
+
+    const mismatched = await fetch(`${base}/nodes/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${nodeToken}`, "x-openagi-node-id": "node-a" },
+      body: JSON.stringify({ nodeId: "node-b", name: "Node B", role: "node" })
+    });
+    assert.equal(mismatched.status, 403);
+
+    const heartbeat = await fetch(`${base}/nodes/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${nodeToken}`, "x-openagi-node-id": "node-a" },
+      body: JSON.stringify({ nodeId: "node-a", name: "Node A", role: "node", capabilities: [{ id: "computer-use", ready: true, operations: ["screenshot"] }] })
+    });
+    assert.equal(heartbeat.status, 200);
+    const revoked = await fetch(`${base}/nodes/node-a/revoke`, {
+      method: "POST",
+      headers: { authorization: "Bearer main-admin" }
+    });
+    assert.equal(revoked.status, 200);
+    const oldCredential = await fetch(`${base}/nodes/heartbeat`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${nodeToken}`, "x-openagi-node-id": "node-a" },
+      body: JSON.stringify({ nodeId: "node-a", name: "Node A", role: "node" })
+    });
+    assert.equal(oldCredential.status, 401, "revocation permanently disables the old node credential");
+    const repaired = await fetch(`${base}/nodes/enroll`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer main-admin" },
+      body: JSON.stringify({ nodeId: "node-a", nodeToken: "c".repeat(43) })
+    });
+    assert.equal(repaired.status, 200, "a removed node can be paired again with a fresh credential");
+  } finally { await app.close(); }
+});
+
 test("POST /nodes/heartbeat rejects a malformed body", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-main3-"));
   const { app, base } = await bootApp(dataDir);
   try {
+    const headers = await enrollNode(base, "n1");
     const res = await fetch(`${base}/nodes/heartbeat`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "no id or role" })
+      method: "POST", headers, body: JSON.stringify({ nodeId: "n1" })
     });
     assert.equal(res.status, 400);
   } finally { await app.close(); }
@@ -82,8 +170,9 @@ test("POST /nodes/heartbeat rejects non-string fields instead of persisting a po
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-poison-"));
   const { app, base } = await bootApp(dataDir);
   try {
+    const headers = await enrollNode(base, "n1");
     const res = await fetch(`${base}/nodes/heartbeat`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers,
       body: JSON.stringify({ nodeId: "n1", name: { evil: true }, role: "node" })
     });
     assert.equal(res.status, 400);
@@ -104,8 +193,9 @@ test("POST /nodes/heartbeat rejects a claimed role other than \"node\"", async (
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-fakemain-"));
   const { app, base } = await bootApp(dataDir);
   try {
+    const headers = await enrollNode(base, "n1");
     const res = await fetch(`${base}/nodes/heartbeat`, {
-      method: "POST", headers: { "content-type": "application/json" },
+      method: "POST", headers,
       body: JSON.stringify({ nodeId: "n1", name: "Impersonator", role: "main" })
     });
     assert.equal(res.status, 400);
@@ -117,13 +207,14 @@ test("GET /nodes on a paired instance proxies to its main and caches the result"
   const { app: mainApp, base: mainBase } = await bootApp(mainDir);
   // role is "node" — only a node ever heartbeats to a main; a main never
   // claims role "main" via heartbeat (that's synthesized as the self-entry).
+  const otherHeaders = await enrollNode(mainBase, "other");
   await fetch(`${mainBase}/nodes/heartbeat`, {
-    method: "POST", headers: { "content-type": "application/json" },
+    method: "POST", headers: otherHeaders,
     body: JSON.stringify({ nodeId: "other", name: "Mac mini", role: "node", url: mainBase, version: "0.0.10" })
   });
 
   const nodeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-selfnode-"));
-  writeNodeConfig({ remote: mainBase, token: null }, nodeDir);
+  writeNodeConfig({ remote: mainBase, token: "bootstrap" }, nodeDir);
   const { app: nodeApp, base: nodeBase } = await bootApp(nodeDir);
   try {
     const res = await fetch(`${nodeBase}/nodes`);
@@ -150,13 +241,14 @@ test("GET /nodes on a paired instance proxies to its main and caches the result"
 test("GET /nodes on a paired instance still returns the fresh roster even if writing the local cache fails", async () => {
   const mainDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-cachefail-main-"));
   const { app: mainApp, base: mainBase } = await bootApp(mainDir);
+  const otherHeaders = await enrollNode(mainBase, "other");
   await fetch(`${mainBase}/nodes/heartbeat`, {
-    method: "POST", headers: { "content-type": "application/json" },
+    method: "POST", headers: otherHeaders,
     body: JSON.stringify({ nodeId: "other", name: "Mac mini", role: "node", url: mainBase, version: "0.0.10" })
   });
 
   const nodeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-nodes-cachefail-node-"));
-  writeNodeConfig({ remote: mainBase, token: null }, nodeDir);
+  writeNodeConfig({ remote: mainBase, token: "bootstrap" }, nodeDir);
   // Make cache.json itself a directory (not the "nodes" parent — NodeRegistry
   // shares that same parent dir for its own registry.json and must still be
   // able to construct). writeJsonAtomic's rename-into-place then fails

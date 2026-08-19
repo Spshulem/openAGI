@@ -1,9 +1,9 @@
-name: Release — signed Mac .dmg + Sparkle appcast
+name: Mac — notarized test build or release
 
-# Triggered when a tag matching v* is pushed (eg. v0.0.2).
-# Builds the Mac native app, codesigns with Apple Developer ID, notarizes
-# with Apple, signs the .dmg with the Sparkle EdDSA key, generates appcast.xml,
-# and uploads both as assets on the corresponding GitHub Release.
+# Tag pushes build the public release DMG + Sparkle appcast. A manual dispatch
+# builds a notarized, stapled .app ZIP for testing without creating a tag,
+# GitHub Release, or Sparkle update. Both paths use repository secrets so Apple
+# credentials never need to be copied into a local shell or committed.
 #
 # Required repository secrets:
 #   APPLE_DEVELOPER_ID_CERT_P12_BASE64   - base64 of your Developer ID Application .p12
@@ -63,15 +63,26 @@ jobs:
           fi
           echo "✓ all 6 release secrets are configured"
 
-      - name: Resolve version from tag
+      - name: Resolve build kind and version
         id: ver
         run: |
-          # ${GITHUB_REF#refs/tags/} → "v0.0.2"
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+            PUBLISH="true"
+            DMG="1"
+          else
+            TAG=""
+            VERSION="$(node -p "require('./package.json').version")"
+            PUBLISH="false"
+            DMG="0"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "build=$(date -u +%y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
 
       - name: Cache SwiftPM dependencies
         uses: actions/cache@v4
@@ -115,11 +126,11 @@ jobs:
           fi
           echo "identity=$IDENT" >> "$GITHUB_OUTPUT"
 
-      - name: Build + sign + notarize + DMG
+      - name: Build + sign + notarize
         env:
           SIGN_IDENTITY: ${{ steps.signid.outputs.identity }}
           NOTARIZE: "1"
-          DMG: "1"
+          DMG: ${{ steps.ver.outputs.dmg }}
           AC_USERNAME: ${{ secrets.APPLE_ID }}
           AC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           AC_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -129,7 +140,28 @@ jobs:
           ./scripts/build-mac-app.sh
           ls -lh build/
 
+      - name: Verify and package notarized test app
+        if: steps.ver.outputs.publish == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          xcrun stapler validate build/OpenAGI.app
+          spctl --assess --type execute --verbose=4 build/OpenAGI.app
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/OpenAGI.app "build/OpenAGI-${VERSION}-notarized.zip"
+
+      - name: Upload notarized test app
+        if: steps.ver.outputs.publish == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-${{ steps.ver.outputs.version }}-notarized-${{ github.sha }}
+          path: build/OpenAGI-${{ steps.ver.outputs.version }}-notarized.zip
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Generate Sparkle appcast.xml
+        if: steps.ver.outputs.publish == 'true'
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
@@ -144,6 +176,7 @@ jobs:
           ls -lh build/appcast.xml
 
       - name: Upload assets to GitHub Release
+        if: steps.ver.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}

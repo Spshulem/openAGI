@@ -1442,6 +1442,35 @@ test("PendingActionStore: enqueue + decide + replay across instances", async () 
   fs.rmSync(dir, { recursive: true });
 });
 
+test("sensitive approvals expire durably before their handler can be authorized", async () => {
+  const { ToolRegistry } = await import("../src/tool-registry.js");
+  const { PendingActionStore } = await import("../src/pending-actions.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-pending-expiry-"));
+  let now = Date.parse("2026-08-14T12:00:00.000Z");
+  const pending = new PendingActionStore({ dir, now: () => now });
+  const tools = new ToolRegistry();
+  tools.bindPendingActions(pending);
+  let ran = 0;
+  tools.register({
+    name: "control_computer",
+    needsConfirmation: true,
+    approvalTtlMs: 5 * 60 * 1000,
+    handler: async () => { ran += 1; return { ok: true }; }
+  });
+
+  const queued = await tools.invoke("control_computer", {}, { sessionId: "chat_1" });
+  const id = queued.result.actionId;
+  assert.equal(pending.get(id).expiresAt, "2026-08-14T12:05:00.000Z");
+  now += 5 * 60 * 1000;
+  assert.equal(pending.get(id).status, "expired");
+  assert.equal(pending.decide(id, { decision: "approve", decidedBy: "user" }).status, "expired");
+  assert.equal(ran, 0, "an expired approval never reaches the tool handler");
+
+  const recovered = new PendingActionStore({ dir, now: () => now + 1 });
+  assert.equal(recovered.get(id).status, "expired", "expiry survives daemon restart");
+  fs.rmSync(dir, { recursive: true });
+});
+
 test("task-store: dependsOn — blocked tasks auto-unblock when all deps complete", async () => {
   const { TaskStore } = await import("../src/task-store.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-deps-"));
@@ -2037,7 +2066,7 @@ test("ComputerUseLog: session lifecycle + action recording with reasoning", asyn
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cu-"));
   const log = new ComputerUseLog({ dir });
 
-  const session = log.startSession({ goal: "Reply to my last email", approvedBy: "user" });
+  const session = log.startSession({ goal: "Reply to my last email", approvedBy: "user", sourceSessionId: "test:lifecycle" });
   assert.equal(session.status, "active");
   assert.equal(session.goal, "Reply to my last email");
 
@@ -2071,6 +2100,50 @@ test("ComputerUseLog: session lifecycle + action recording with reasoning", asyn
   assert.equal(recovered.endReason, "test");
   assert.equal(log2.listActions({ sessionId: session.id }).length, 1);
 
+  const privateSession = log2.startSession({ goal: "Type a private value", approvedBy: "user", sourceSessionId: "test:privacy" });
+  const privateAction = log2.recordAction({
+    sessionId: privateSession.id,
+    kind: "type",
+    args: { text: "do-not-persist-this" },
+    reasoning: "Enter do-not-persist-this into the field"
+  });
+  assert.equal(privateAction.args.text, undefined);
+  assert.equal(privateAction.args.textRedacted, true);
+  assert.equal(JSON.stringify(privateAction).includes("do-not-persist-this"), false);
+  log2.markActionResult(privateAction.id, {
+    status: "error",
+    result: { echoed: "do-not-persist-this" },
+    error: "provider echoed do-not-persist-this"
+  });
+  assert.equal(fs.readFileSync(path.join(dir, "journal.jsonl"), "utf8").includes("do-not-persist-this"), false);
+
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("ComputerUseLog: startup atomically scrubs legacy typed secrets from snapshot and journal", async () => {
+  const { ComputerUseLog } = await import("../src/computer-use-log.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cu-migrate-"));
+  const secret = "legacy-private-value";
+  const session = {
+    id: "cus_legacy", goal: "legacy", sourceSessionId: "chat:legacy", status: "ended",
+    startedAt: new Date(0).toISOString(), actionIds: ["act_legacy"]
+  };
+  const action = {
+    id: "act_legacy", sessionId: session.id, kind: "type", args: { text: secret },
+    reasoning: `type ${secret}`, status: "failed", error: secret, result: { echoed: secret }
+  };
+  fs.writeFileSync(path.join(dir, "snapshot.json"), JSON.stringify({ version: 1, sessions: [session], actions: [action] }));
+  fs.writeFileSync(path.join(dir, "journal.jsonl"), [
+    JSON.stringify({ op: "session-start", session }),
+    JSON.stringify({ op: "action-record", action }),
+    JSON.stringify({ op: "action-result", id: action.id, status: "failed", error: secret, result: { echoed: secret } })
+  ].join("\n") + "\n");
+  const log = new ComputerUseLog({ dir });
+  const loaded = log.listActions({ sessionId: session.id })[0];
+  assert.equal(loaded.reasoning, null);
+  assert.equal(loaded.args.textRedacted, true);
+  assert.equal(fs.readFileSync(path.join(dir, "snapshot.json"), "utf8").includes(secret), false);
+  assert.equal(fs.readFileSync(path.join(dir, "journal.jsonl"), "utf8").includes(secret), false);
   fs.rmSync(dir, { recursive: true });
 });
 
@@ -2988,29 +3061,38 @@ test("computer-use: input-synthesis tools refuse honestly (record intent, then t
   const log = new ComputerUseLog({ dir });
   registerComputerUseTools(registry, { tools: registry, computerUseLog: log, observations: { search: async () => [] } });
 
-  // Open a session (this genuinely works).
-  const start = await registry.get("start_computer_use_session").handler({ goal: "do a thing" });
-  assert.ok(start.sessionId);
+  // Seed the already-approved observation-only session directly. The public
+  // start tool now (correctly) requires an immutable, online target before it
+  // can consume an approval; this regression is specifically about the
+  // no-node input handlers remaining honest once a legacy/local session exists.
+  const context = { sessionId: "test:honest" };
+  const start = log.startSession({
+    goal: "do a thing",
+    approvedBy: "user",
+    sourceSessionId: context.sessionId,
+    targetNodeId: null
+  });
+  assert.ok(start.id);
 
   // computer_click must THROW — never report success.
   await assert.rejects(
-    () => registry.get("computer_click").handler({ x: 10, y: 20, reasoning: "click the button" }),
-    /not available in this build/
+    () => registry.get("computer_click").handler({ frameId: "frame", x: 10, y: 20, button: "left", reasoning: "click the button" }, context),
+    /no reachable computer-use node/
   );
 
   // But the intent must still be recorded to the audit log, marked unavailable.
-  const actions = log.listActions({ sessionId: start.sessionId });
+  const actions = log.listActions({ sessionId: start.id });
   const click = actions.find((a) => a.kind === "click");
   assert.ok(click, "click intent recorded for audit");
   assert.equal(click.status, "unavailable");
   assert.equal(click.args.x, 10);
 
   // computer_type + computer_key likewise refuse.
-  await assert.rejects(() => registry.get("computer_type").handler({ text: "hi", reasoning: "type" }), /not available/);
-  await assert.rejects(() => registry.get("computer_key").handler({ chord: "cmd+a", reasoning: "select" }), /not available/);
+  await assert.rejects(() => registry.get("computer_type").handler({ text: "hi", reasoning: "type" }, context), /no reachable computer-use node/);
+  await assert.rejects(() => registry.get("computer_key").handler({ chord: "cmd+a", reasoning: "select" }, context), /no reachable computer-use node/);
 
   // computer_screenshot returns REAL data (no fake-success flag).
-  const shot = await registry.get("computer_screenshot").handler({ reasoning: "look" });
+  const shot = await registry.get("computer_screenshot").handler({ reasoning: "look" }, context);
   assert.equal(shot.stubbed, undefined, "no 'stubbed' fake-success flag");
   assert.ok("ocrSample" in shot, "returns real OCR readback");
 

@@ -61,7 +61,12 @@ async function openChatDbReadOnly(dbPath) {
 
 export class IMessageBridge {
   constructor(options = {}) {
-    this.client = options.client; // CliClient pointed at the main
+    // Long-running bridge processes can outlive node enrollment. A provider is
+    // resolved for every main-bound operation so the bridge can drop the
+    // one-time pairing credential and begin using the saved scoped credential
+    // without a restart. `client` remains as the test/back-compat seam.
+    this.client = options.client ?? null;
+    this.clientProvider = options.clientProvider ?? null;
     this.dbPath = options.dbPath ?? DEFAULT_DB;
     this.statePath = options.statePath ?? path.join(options.dataDir ?? path.join(os.homedir(), ".openagi"), "imessage-bridge.json");
     // "Note to self": also read your OWN texts in your self-thread so you can
@@ -128,6 +133,14 @@ export class IMessageBridge {
     //   allow → save messages from allowlisted senders
     //   all   → save every incoming message
     this.captureMode = options.captureMode ?? "none";
+  }
+
+  _resolveClient(operation) {
+    const client = this.clientProvider ? this.clientProvider() : this.client;
+    if (!client || typeof client[operation] !== "function") {
+      throw new Error("iMessage bridge main client is unavailable");
+    }
+    return client;
   }
 
   _loadState() {
@@ -205,7 +218,12 @@ export class IMessageBridge {
       // 1. Ambient memory capture (independent of replying).
       if (this.shouldCapture(row.handle)) {
         try {
-          const cap = await this.client.request("POST", "/memory/remember", {
+          const client = this._resolveClient("request");
+          // Remote bridges use the least-privilege node route. A bridge aimed
+          // at its own local daemon has no node identity, so it keeps using the
+          // owner-authenticated local route rather than silently losing capture.
+          const captureRoute = client.target?.remote === false ? "/memory/remember" : "/nodes/capture-memory";
+          const cap = await client.request("POST", captureRoute, {
             content: `iMessage from ${row.handle}: ${text}`,
             tags: ["imessage", row.handle], importance: "normal"
           });
@@ -219,7 +237,7 @@ export class IMessageBridge {
       try {
         // Session keys off the conversation so a group has one shared thread.
         const sessionKey = row.isGroup ? row.chatId : row.handle;
-        const res = await this.client.chat(decision.forward, { from: `imessage:${sessionKey}` });
+        const res = await this._resolveClient("chat").chat(decision.forward, { from: `imessage:${sessionKey}` });
         const reply = toPlainText(res?.json?.reply);
         if (res?.ok && reply) {
           // Reply to the GROUP chat if it's a group; otherwise DM the sender.

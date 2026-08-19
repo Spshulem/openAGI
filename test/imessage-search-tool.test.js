@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ToolRegistry } from "../src/index.js";
+import { createHostedInterface, ToolRegistry } from "../src/index.js";
 import { registerImessageSearchTool } from "../src/integrations/imessage-search-tool.js";
 import { createImessageServer } from "../src/integrations/imessage-server.js";
 
@@ -15,7 +15,7 @@ const withEnv = (k, v, fn) => {
   try { return fn(); } finally { if (saved === undefined) delete process.env[k]; else process.env[k] = saved; }
 };
 
-test("tool not registered without OPENAGI_IMESSAGE_NODE", () => {
+test("tool is not registered before either transport exists", () => {
   withEnv("OPENAGI_IMESSAGE_NODE", undefined, () => {
     const runtime = { tools: new ToolRegistry() };
     const r = registerImessageSearchTool(runtime);
@@ -24,37 +24,147 @@ test("tool not registered without OPENAGI_IMESSAGE_NODE", () => {
   });
 });
 
-test("tool registers + proxies to the node with auth", async () => {
-  await withEnv("OPENAGI_IMESSAGE_NODE", "http://node:43298", async () => {
-    await withEnv("OPENAGI_IMESSAGE_NODE_TOKEN", "secret", async () => {
-      const seen = [];
-      const fetchImpl = async (url, opts) => {
-        seen.push({ url, auth: opts.headers.authorization, body: JSON.parse(opts.body) });
-        return { ok: true, json: async () => ({ results: [{ handle: "+1555", fromMe: false, date: "2026-04-13T12:00:00Z", text: "dinner at 7" }] }) };
-      };
-      const runtime = { tools: new ToolRegistry() };
-      assert.equal(registerImessageSearchTool(runtime, { fetchImpl }).registered, true);
-      assert.equal(runtime.tools.get("search_imessages").sideEffects, false, "search is read-only");
-
-      const out = await runtime.tools.invoke("search_imessages", { query: "dinner", person: "sarah", days: 7 });
-      assert.ok(out.ok);
-      assert.equal(out.result.count, 1);
-      assert.equal(out.result.results[0].from, "+1555");
-      assert.match(out.result.results[0].text, /dinner at 7/);
-      assert.equal(seen[0].url, "http://node:43298/search");
-      assert.equal(seen[0].auth, "Bearer secret");
-      assert.deepEqual(seen[0].body, { query: "dinner", handle: "sarah", days: 7, limit: 20 });
+test("hosted startup registers paired search after installing the capability facade", () => {
+  withEnv("OPENAGI_IMESSAGE_NODE", undefined, () => {
+    const runtime = { tools: new ToolRegistry() };
+    createHostedInterface(runtime, {
+      dataDir: fs.mkdtempSync(path.join(os.tmpdir(), "imessage-hosted-")),
+      tickerMs: 0
     });
+    assert.equal(runtime.tools.has("search_imessages"), true);
   });
 });
 
-test("tool returns a friendly error when the node is unreachable", async () => {
-  await withEnv("OPENAGI_IMESSAGE_NODE", "http://node:43298", async () => {
-    const runtime = { tools: new ToolRegistry() };
-    registerImessageSearchTool(runtime, { fetchImpl: async () => { throw new Error("ECONNREFUSED"); } });
-    const out = await runtime.tools.invoke("search_imessages", { query: "x" });
-    assert.match(out.result.error, /couldn't reach the iMessage node/);
+test("hosted startup preserves an integrations-disabled runtime", () => {
+  const runtime = { integrations: false, tools: new ToolRegistry() };
+  createHostedInterface(runtime, {
+    dataDir: fs.mkdtempSync(path.join(os.tmpdir(), "imessage-hosted-off-")),
+    tickerMs: 0
   });
+  assert.equal(runtime.tools.has("search_imessages"), false);
+});
+
+function pairedRuntime(nodes, dispatch) {
+  return {
+    tools: new ToolRegistry(),
+    nodeCapabilities: {
+      list: () => nodes,
+      resolve: (_capability, selector = {}) => {
+        const wanted = selector.nodeId ?? selector.nodeName ?? null;
+        if (!wanted) return nodes.length === 1 ? nodes[0] : null;
+        return nodes.find((node) => node.nodeId === wanted || node.name === wanted) ?? null;
+      },
+      dispatch
+    }
+  };
+}
+
+const readyNode = (nodeId, name = null) => ({
+  nodeId,
+  name,
+  capabilities: [{ id: "imessage-search", ready: true, operations: ["search"] }]
+});
+
+test("tool dispatches through the authenticated paired-node capability", async () => {
+  const seen = [];
+  const runtime = pairedRuntime([readyNode("node-1", "Office Mac")], async (...args) => {
+    seen.push(args);
+    return { results: [{ handle: "+1555", fromMe: false, date: "2026-04-13T12:00:00Z", text: "dinner at 7" }] };
+  });
+  assert.equal(registerImessageSearchTool(runtime).registered, true);
+  assert.equal(runtime.tools.get("search_imessages").sideEffects, false, "search is read-only");
+
+  const out = await runtime.tools.invoke("search_imessages", { query: "dinner", person: "sarah", days: 7 });
+  assert.equal(out.ok, true);
+  assert.equal(out.result.count, 1);
+  assert.equal(out.result.results[0].from, "+1555");
+  assert.match(out.result.results[0].text, /dinner at 7/);
+  assert.deepEqual(seen[0].slice(0, 4), [
+    "node-1",
+    "imessage-search",
+    "search",
+    { query: "dinner", person: "sarah", days: 7, limit: 20 }
+  ]);
+});
+
+test("first invocation refreshes a newly available local capability", async () => {
+  const node = readyNode("local", "This Mac");
+  let refreshed = false;
+  const runtime = pairedRuntime([], async () => ({ results: [] }));
+  runtime.nodeCapabilities.list = () => refreshed ? [node] : [];
+  runtime.nodeCapabilities.resolve = () => refreshed ? node : null;
+  runtime.nodeCapabilities.refresh = async () => { refreshed = true; };
+  registerImessageSearchTool(runtime);
+
+  const out = await runtime.tools.invoke("search_imessages", { query: "hello" });
+  assert.equal(refreshed, true);
+  assert.equal(out.ok, true);
+  assert.equal(out.result.count, 0);
+});
+
+test("multiple paired nodes require an explicit immutable selector", async () => {
+  const seen = [];
+  const nodes = [readyNode("one", "Work Mac"), readyNode("two", "Home Mac")];
+  const runtime = pairedRuntime(nodes, async (...args) => { seen.push(args); return { results: [] }; });
+  registerImessageSearchTool(runtime);
+  const ambiguous = await runtime.tools.invoke("search_imessages", { query: "x" });
+  assert.match(ambiguous.result.error, /Multiple/);
+  assert.equal(seen.length, 0);
+
+  const selected = await runtime.tools.invoke("search_imessages", { query: "x", node: "Home Mac" });
+  assert.equal(selected.ok, true);
+  assert.equal(seen[0][0], "two");
+});
+
+test("paired transport returns categorical errors without leaking node diagnostics", async () => {
+  const runtime = pairedRuntime([readyNode("node-1")], async () => {
+    throw new Error("secret token at /Users/private/Library/Messages/chat.db");
+  });
+  registerImessageSearchTool(runtime);
+  const out = await runtime.tools.invoke("search_imessages", { query: "x" });
+  assert.match(out.result.error, /could not complete/);
+  assert.doesNotMatch(out.result.error, /secret|Users|chat\.db/i);
+});
+
+test("legacy transport requires HTTPS outside loopback", () => {
+  const runtime = { tools: new ToolRegistry() };
+  const result = registerImessageSearchTool(runtime, {
+    env: { OPENAGI_IMESSAGE_NODE: "http://node.example.test:43298", OPENAGI_IMESSAGE_NODE_TOKEN: "secret" }
+  });
+  assert.equal(result.registered, false);
+  assert.equal(runtime.tools.has("search_imessages"), false);
+});
+
+test("secure legacy transport is bounded, authenticated, and does not expose its endpoint", async () => {
+  const seen = [];
+  const fetchImpl = async (url, opts) => {
+    seen.push({ url, auth: opts.headers.authorization, redirect: opts.redirect, body: JSON.parse(opts.body) });
+    return { ok: true, json: async () => ({ results: [{ handle: "+1555", fromMe: false, date: "2026-04-13T12:00:00Z", text: "dinner at 7" }] }) };
+  };
+  const runtime = { tools: new ToolRegistry() };
+  assert.equal(registerImessageSearchTool(runtime, {
+    fetchImpl,
+    env: { OPENAGI_IMESSAGE_NODE: "https://messages.example.test", OPENAGI_IMESSAGE_NODE_TOKEN: "secret" }
+  }).registered, true);
+
+  const out = await runtime.tools.invoke("search_imessages", { query: "dinner", person: "sarah", days: 7 });
+  assert.equal(out.result.count, 1);
+  assert.equal(seen[0].url, "https://messages.example.test/search");
+  assert.equal(seen[0].auth, "Bearer secret");
+  assert.equal(seen[0].redirect, "manual");
+  assert.deepEqual(seen[0].body, { query: "dinner", handle: "sarah", days: 7, limit: 20 });
+});
+
+test("legacy failures and oversized bodies return a generic bounded error", async () => {
+  const env = { OPENAGI_IMESSAGE_NODE: "https://messages.example.test" };
+  const runtime = { tools: new ToolRegistry() };
+  registerImessageSearchTool(runtime, {
+    env,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ secret: "x".repeat(1024 * 1024 + 1) }) })
+  });
+  const out = await runtime.tools.invoke("search_imessages", { query: "x" });
+  assert.match(out.result.error, /legacy iMessage service/);
+  assert.doesNotMatch(out.result.error, /example|secret/i);
 });
 
 async function makeChatDb() {

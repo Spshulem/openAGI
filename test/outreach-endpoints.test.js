@@ -87,6 +87,138 @@ test("POST /outreach/:id/act errors on an unhandled item kind instead of silentl
   await app.close?.();
 });
 
+test("pending-action outreach returns conflict when another approval surface already claimed it", async () => {
+  const { runtime, app, base } = await bootApp();
+  runtime.tools.register({
+    name: "outreach_claim_race",
+    needsConfirmation: true,
+    handler: async () => ({ ok: true })
+  });
+  const queued = await runtime.tools.invoke("outreach_claim_race", {}, { sessionId: "race-chat" });
+  const actionId = queued.result.actionId;
+  const item = runtime.outreach.list().find((candidate) => candidate.sourceRef?.id === actionId);
+  assert.ok(item, "the approval is mirrored into durable outreach");
+
+  assert.ok(runtime.pendingActions.claimForExecution(actionId), "another surface claims execution first");
+  const res = await fetch(`${base}/outreach/${item.id}/act`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "do" })
+  });
+  const json = await res.json();
+  assert.equal(res.status, 409);
+  assert.match(json.error, /already executing/);
+  assert.notEqual(runtime.outreach.get(item.id).status, "acted", "an in-flight execution is not reported as completed");
+  await app.close?.();
+});
+
+test("stale pending-action outreach returns conflict for an already terminal approval", async () => {
+  const { runtime, app, base } = await bootApp();
+  const action = runtime.pendingActions.enqueue({ toolName: "already_done", summary: "Already done" });
+  runtime.pendingActions.decide(action.id, { decision: "approve", decidedBy: "user", result: { ok: true } });
+  // Model a durable mirror that was written after the resolution event (for
+  // example, a restored older outreach snapshot). It must not replay work or
+  // turn a no-op into a successful action.
+  const stale = runtime.outreach.append({
+    type: "pending-action",
+    sourceRef: { kind: "pending-action", id: action.id },
+    title: "Already done",
+    needsDecision: true,
+    actions: ["do", "dismiss"]
+  });
+  const res = await fetch(`${base}/outreach/${stale.id}/act`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "do" })
+  });
+  assert.equal(res.status, 409);
+  assert.notEqual(runtime.outreach.get(stale.id).status, "acted");
+  await app.close?.();
+});
+
+test("pending-action outreach becomes acted only after confirmed execution succeeds", async () => {
+  const { runtime, app, base } = await bootApp();
+  let release;
+  let markStarted;
+  const executing = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  runtime.tools.register({
+    name: "outreach_slow_success",
+    needsConfirmation: true,
+    handler: async () => { markStarted(); await executing; return { completed: true }; }
+  });
+  const queued = await runtime.tools.invoke("outreach_slow_success", {}, { sessionId: "success-chat" });
+  const item = runtime.outreach.list().find((candidate) => candidate.sourceRef?.id === queued.result.actionId);
+  const request = fetch(`${base}/outreach/${item.id}/act`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "do" })
+  });
+
+  // Let the route claim the approval and enter the handler. While the side
+  // effect is still running, the user-facing item must remain unresolved.
+  await started;
+  assert.equal(runtime.pendingActions.get(queued.result.actionId).status, "executing");
+  assert.notEqual(runtime.outreach.get(item.id).status, "acted");
+  release();
+  const res = await request;
+  assert.equal(res.status, 200);
+  assert.equal(runtime.outreach.get(item.id).status, "acted");
+  await app.close?.();
+});
+
+test("failed confirmed outreach execution remains an honest error", async () => {
+  const { runtime, app, base } = await bootApp();
+  runtime.tools.register({
+    name: "outreach_confirmed_failure",
+    needsConfirmation: true,
+    handler: async () => { throw new Error("synthetic execution failure"); }
+  });
+  const queued = await runtime.tools.invoke("outreach_confirmed_failure", {}, { sessionId: "failure-chat" });
+  const item = runtime.outreach.list().find((candidate) => candidate.sourceRef?.id === queued.result.actionId);
+  const res = await fetch(`${base}/outreach/${item.id}/act`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "do" })
+  });
+  assert.equal(res.status, 400);
+  assert.equal(runtime.pendingActions.get(queued.result.actionId).error, "synthetic execution failure");
+  assert.equal(runtime.outreach.get(item.id).status, "error");
+  assert.equal(runtime.outreach.get(item.id).error, "synthetic execution failure");
+  await app.close?.();
+});
+
+test("startup recovery reconciles executing approvals with their linked outreach", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "out-interrupted-"));
+  const seedRuntime = createDurableRuntime({ dataDir });
+  let recoveredRuntime = null;
+  try {
+    // Constructing the interface attaches the outreach mapper; listening is not
+    // required to persist the mirror generated by enqueue().
+    createHostedInterface(seedRuntime, { host: "127.0.0.1", port: 0 });
+    const action = seedRuntime.pendingActions.enqueue({
+      toolName: "interrupted_side_effect",
+      summary: "Interrupted side effect",
+      context: { sessionId: "restart-chat" }
+    });
+    const outreach = seedRuntime.outreach.list().find((candidate) => candidate.sourceRef?.id === action.id);
+    assert.ok(outreach);
+    assert.ok(seedRuntime.pendingActions.claimForExecution(action.id));
+
+    recoveredRuntime = createDurableRuntime({ dataDir });
+    assert.equal(recoveredRuntime.pendingActions.get(action.id).status, "interrupted");
+    // bindEvents flushes the constructor-time recovery event after the hosted
+    // listener exists, resolving the already-durable outreach copy.
+    createHostedInterface(recoveredRuntime, { host: "127.0.0.1", port: 0 });
+    const reconciled = recoveredRuntime.outreach.get(outreach.id);
+    assert.equal(reconciled.status, "error");
+    assert.match(reconciled.error, /interrupted by a daemon restart/);
+  } finally {
+    seedRuntime.tunnelWatcher?.stop?.();
+    recoveredRuntime?.tunnelWatcher?.stop?.();
+  }
+});
+
 test("POST /outreach/:id/act on unknown id returns 404", async () => {
   const { app, base } = await bootApp();
   const res = await fetch(`${base}/outreach/nope/act`, {

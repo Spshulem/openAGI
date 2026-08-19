@@ -10,6 +10,7 @@ export class FileBackedMemorySystem extends MemorySystem {
     this.dir = options.dir ?? path.join(resolveDataDir(), "memory");
     this.snapshotPath = options.snapshotPath ?? path.join(this.dir, "memory-state.json");
     this.eventsPath = options.eventsPath ?? path.join(this.dir, "memory-events.jsonl");
+    this.duplicateArchivePath = options.duplicateArchivePath ?? path.join(this.dir, "duplicate-archive.jsonl");
     ensureDir(this.dir);
     if (options.autoLoad !== false) this.load();
   }
@@ -50,10 +51,43 @@ export class FileBackedMemorySystem extends MemorySystem {
 
   decay(now = new Date()) {
     const result = super.decay(now);
-    if (result.removed.length > 0 || result.promoted.length > 0) {
+    if (result.removed.length > 0 || result.promoted.length > 0 || result.decayed.length > 0 || result.initialized.length > 0) {
       this.persist("decay", {
         removed: result.removed.map((item) => item.id),
-        promoted: result.promoted.map((item) => item.id)
+        promoted: result.promoted.map((item) => item.id),
+        decayed: result.decayed.map((item) => item.id),
+        initialized: result.initialized.map((item) => item.id),
+        repaired: result.repaired.map((item) => item.id)
+      });
+    }
+    return result;
+  }
+
+  consolidateAutomatedDuplicates(options = {}) {
+    const result = super.consolidateAutomatedDuplicates({
+      ...options,
+      // Keep an auditable removal receipt without creating a second,
+      // indefinite copy of private memory content or metadata. If this append
+      // fails, MemorySystem leaves the active row untouched.
+      archive: ({ at, canonicalId, item }) => appendJsonLine(this.duplicateArchivePath, {
+        version: 1,
+        op: "consolidate-exact-duplicate",
+        at,
+        canonicalId,
+        removedId: item.id,
+        rawContentHash: item.rawContentHash ?? null,
+        tier: item.tier ?? null,
+        source: item.source ?? null,
+        scope: item.scope ?? null,
+        createdAt: item.createdAt ?? null,
+        lastObservedAt: item.lastObservedAt ?? null
+      })
+    });
+    if (result.removed.length > 0) {
+      this.persist("consolidate-duplicates", {
+        removed: result.removed.map((item) => item.id),
+        retained: result.retained.map((item) => item.id),
+        archivePath: path.basename(this.duplicateArchivePath)
       });
     }
     return result;

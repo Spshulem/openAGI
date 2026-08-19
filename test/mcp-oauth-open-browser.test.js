@@ -77,3 +77,18 @@ test("OPENAGI_OAUTH_CALLBACK_PORT pins the callback port (else random)", async (
     else process.env.OPENAGI_OAUTH_CALLBACK_PORT = saved;
   }
 });
+
+test("successful callback offers a timed return to the Integrations tab", async () => {
+  const { startCallbackServer } = await import("../src/mcp-oauth.js");
+  const callback = await startCallbackServer();
+  try {
+    const response = await fetch(`http://127.0.0.1:${callback.port}/callback?code=ok&state=expected`);
+    const html = await response.text();
+    assert.match(html, /Authorized/);
+    assert.match(html, /\?tab=integrations/);
+    assert.match(html, /http-equiv="refresh"/);
+    assert.deepEqual(await callback.callback, { code: "ok", state: "expected" });
+  } finally {
+    callback.server.close();
+  }
+});

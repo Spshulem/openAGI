@@ -32,6 +32,7 @@ final class CaptureController {
   func stop() {
     if #available(macOS 12.3, *) { ScreenCapturer.shared.stop() }
     ActivityTracker.shared.stop()
+    CapturePermissions.shared.cancelAutomaticScreenRecordingRequest()
     CapturePermissions.shared.stopWatchingForGrant()
     CaptureBridge.shared.stop()
     retentionTimer?.invalidate()
@@ -48,6 +49,7 @@ final class CaptureController {
     } else {
       ActivityTracker.shared.stop()
       if #available(macOS 12.3, *) { ScreenCapturer.shared.stop() }
+      CapturePermissions.shared.cancelAutomaticScreenRecordingRequest()
       // Capture is off by the user's own choice — stop listening for a
       // permission grant we no longer need (nothing to resume).
       CapturePermissions.shared.stopWatchingForGrant()
@@ -76,7 +78,18 @@ final class CaptureController {
   }
 
   func toggleEnabled() {
-    CaptureSettings.shared.enabled.toggle()
+    setEnabledFromExplicitUserAction(!CaptureSettings.shared.enabled)
+  }
+
+  /// Used by the tray and privacy-panel toggles. Explicit enabling may request
+  /// permission immediately; startup goes through the identity-aware grace
+  /// policy in CapturePermissions instead.
+  func setEnabledFromExplicitUserAction(_ enabled: Bool) {
+    CaptureSettings.shared.enabled = enabled
+    if enabled && !CapturePermissions.shared.refreshScreenRecording() {
+      CapturePermissions.shared.requestScreenRecordingForFeatureUseIfNeeded()
+      CapturePermissions.shared.beginWatchingForGrant()
+    }
     apply()
   }
 

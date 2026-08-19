@@ -42,3 +42,24 @@ test("search caps long transcript text but keeps the match snippet", async () =>
   assert.ok(results[0].text.endsWith("…"), "capped text should end with an ellipsis");
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("kind-filtered history search paginates activity independently of newer transcripts", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-kind-page-"));
+  const store = new ObservationStore({ dir });
+  await store.record({
+    kind: "activity", at: "2026-06-01T10:00:00.000Z", app: "Editor",
+    window: "Migration planning", event: "focus"
+  });
+  for (let index = 0; index < 50; index += 1) {
+    await store.record({
+      kind: "transcript", at: `2026-06-02T10:${String(index).padStart(2, "0")}:00.000Z`,
+      app: "Calls", window: "Migration call", text: "migration planning", ref: `call:${index}`
+    });
+  }
+
+  const results = await store.search({ query: "migration", kinds: ["activity", "frame"], limit: 2 });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].kind, "activity");
+  assert.equal(results[0].app, "Editor");
+  fs.rmSync(dir, { recursive: true, force: true });
+});

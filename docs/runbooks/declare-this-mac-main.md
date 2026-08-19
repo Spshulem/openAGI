@@ -68,8 +68,15 @@ open that file yourself and do not paste secrets into an agent chat.
 
 ## Reversal
 
-```sh
+```bash
 cp ~/.openagi/node.json.bak ~/.openagi/node.json
 # or re-pair from scratch:
-openagi pair http://<distiller-host>:43210 --token "<the main's OPENAGI_AUTH_TOKEN>"
+printf 'Main pairing token: ' >&2
+IFS= read -rs OPENAGI_REMOTE_TOKEN; printf '\n' >&2
+export OPENAGI_REMOTE_TOKEN
+openagi pair https://<main-host>
+unset OPENAGI_REMOTE_TOKEN
 ```
+
+The main must have a trusted HTTPS origin for cross-device pairing. Plain HTTP
+is supported only on loopback for same-machine development.

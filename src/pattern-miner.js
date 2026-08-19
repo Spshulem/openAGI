@@ -16,6 +16,7 @@ import fs from "node:fs";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { suggestionAdmissionStatus, withSuggestionAdmission } from "./suggestion-admission.js";
 import { analyzeActivityPatterns } from "./activity-patterns.js";
 import { safeJoinOrNull } from "./path-guard.js";
 
@@ -31,6 +32,7 @@ export class PatternMiner {
   constructor(options = {}) {
     this.runtime = options.runtime;
     this.dataDir = options.dataDir ?? resolveDataDir();
+    this.maxPendingSuggestions = options.maxPendingSuggestions;
     this.lookbackDays = options.lookbackDays ?? DEFAULT_LOOKBACK_DAYS;
     this.minOccurrences = options.minOccurrences ?? MIN_OCCURRENCES;
     this.minSequenceLen = options.minSequenceLen ?? MIN_SEQUENCE_LEN;
@@ -112,6 +114,7 @@ export class PatternMiner {
         continue;
       }
       if (this.judgePassIsFresh(seq, now)) continue;
+      if (!suggestionAdmissionStatus({ dataDir: this.dataDir, limit: this.maxPendingSuggestions }).allowed) break;
       if (proposalAttempts >= proposalLimit) break;
       proposalAttempts += 1;
       const proposal = await this.llmProposal(seq);
@@ -142,6 +145,7 @@ export class PatternMiner {
       // trigger and reserve clock scheduling for time-driven routines.
       if (proposal.triggerHint?.type === "after_action") proposal.scheduleHint = null;
       const candidate = this.persistCandidate(seq, proposal, { judgeBypass });
+      if (!candidate) break;
       candidates.push(candidate);
       this.runtime?.events?.emit?.("skill-candidate", {
         source: "pattern-miner",
@@ -322,8 +326,15 @@ export class PatternMiner {
       judgeBypass,
       status: "pending"
     };
-    writeJsonAtomic(path.join(this.suggestedDir, `${id}.json`), candidate);
-    return candidate;
+    const admitted = withSuggestionAdmission({
+      dataDir: this.dataDir,
+      limit: this.maxPendingSuggestions,
+      write: () => {
+        writeJsonAtomic(path.join(this.suggestedDir, `${id}.json`), candidate);
+        return candidate;
+      }
+    });
+    return admitted.written ? admitted.value : null;
   }
 
   list() {

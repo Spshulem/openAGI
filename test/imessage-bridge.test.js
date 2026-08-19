@@ -137,7 +137,7 @@ function policyBridge(opts) {
   const sent = [], forwarded = [], remembered = [];
   const client = {
     chat: async (text, o) => { forwarded.push({ text, from: o.from }); return { ok: true, json: { reply: "ok-reply" } }; },
-    request: async (m, route, body) => { if (route === "/memory/remember") remembered.push(body); return { ok: true }; }
+    request: async (m, route, body) => { if (route === "/nodes/capture-memory") remembered.push(body); return { ok: true }; }
   };
   const bridge = new IMessageBridge({
     client, dataDir: dir,
@@ -292,6 +292,59 @@ test("capture=allow only saves allowlisted senders", async () => {
   const r = await b.bridge.poll();
   assert.equal(r.captured, 1);
   assert.match(b.remembered[0].content, /trusted/);
+});
+
+test("a local-only bridge keeps capture on the owner-authenticated local route", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-imsg-local-"));
+  const routes = [];
+  const bridge = new IMessageBridge({
+    client: {
+      target: { remote: false },
+      request: async (_method, route) => { routes.push(route); return { ok: true }; }
+    },
+    dataDir: dir,
+    respondMode: "none",
+    captureMode: "all",
+    readMessages: async () => [{ rowid: 1, appleDate: "1", handle: "+15550000001", text: "local" }],
+    sendMessage: async () => {}
+  });
+  bridge._saveState({ lastDate: "0", initialized: true });
+  const result = await bridge.poll();
+  assert.equal(result.captured, 1);
+  assert.deepEqual(routes, ["/memory/remember"]);
+});
+
+test("long-running bridge resolves a fresh main client for every operation", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-imsg-refresh-"));
+  const calls = [];
+  const makeClient = (credential) => ({
+    request: async () => { calls.push({ credential, operation: "capture" }); return { ok: true }; },
+    chat: async () => { calls.push({ credential, operation: "chat" }); return { ok: true, json: { reply: "ok" } }; }
+  });
+  let currentClient = makeClient("pairing");
+  const bridge = new IMessageBridge({
+    clientProvider: () => currentClient,
+    dataDir: dir,
+    respondMode: "all",
+    captureMode: "all",
+    readMessages: async () => [],
+    sendMessage: async () => {}
+  });
+  bridge._saveState({ lastDate: "0", initialized: true });
+  bridge.readMessages = async () => [{ rowid: 1, appleDate: "1", handle: "+15550000001", text: "first" }];
+  await bridge.poll();
+
+  currentClient = makeClient("scoped");
+  bridge.readMessages = async () => [{ rowid: 2, appleDate: "2", handle: "+15550000001", text: "second" }];
+  await bridge.poll();
+
+  assert.deepEqual(calls, [
+    { credential: "pairing", operation: "capture" },
+    { credential: "pairing", operation: "chat" },
+    { credential: "scoped", operation: "capture" },
+    { credential: "scoped", operation: "chat" }
+  ]);
+  assert.equal(bridge.client, null, "the bridge itself retains no resolved credential-bearing client");
 });
 
 // ── search ──────────────────────────────────────────────────────────────────

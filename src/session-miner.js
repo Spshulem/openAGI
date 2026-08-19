@@ -19,6 +19,7 @@ import fs from "node:fs";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { suggestionAdmissionStatus, withSuggestionAdmission } from "./suggestion-admission.js";
 
 const DEFAULT_LOOKBACK_DAYS = 21;
 const MIN_OCCURRENCES = 2;
@@ -50,6 +51,7 @@ export class SessionMiner {
   constructor(options = {}) {
     this.runtime = options.runtime;
     this.dataDir = options.dataDir ?? resolveDataDir();
+    this.maxPendingSuggestions = options.maxPendingSuggestions;
     this.lookbackDays = options.lookbackDays ?? DEFAULT_LOOKBACK_DAYS;
     this.minOccurrences = options.minOccurrences ?? MIN_OCCURRENCES;
     this.suggestedDir = path.join(this.dataDir, SUGGESTED_DIR);
@@ -90,9 +92,11 @@ export class SessionMiner {
     const candidates = [];
     for (const cluster of top) {
       if (this.alreadyProposed(cluster)) continue;
+      if (!suggestionAdmissionStatus({ dataDir: this.dataDir, limit: this.maxPendingSuggestions }).allowed) break;
       const proposal = await this.llmProposal(cluster);
       if (!proposal || proposal.pass === true) continue;
       const candidate = this.persistCandidate(cluster, proposal);
+      if (!candidate) break;
       candidates.push(candidate);
       this.runtime?.events?.emit?.("skill-candidate", {
         source: "session-miner",
@@ -156,8 +160,15 @@ export class SessionMiner {
       proposal,
       status: "pending"
     };
-    writeJsonAtomic(path.join(this.suggestedDir, `${id}.json`), candidate);
-    return candidate;
+    const admitted = withSuggestionAdmission({
+      dataDir: this.dataDir,
+      limit: this.maxPendingSuggestions,
+      write: () => {
+        writeJsonAtomic(path.join(this.suggestedDir, `${id}.json`), candidate);
+        return candidate;
+      }
+    });
+    return admitted.written ? admitted.value : null;
   }
 }
 

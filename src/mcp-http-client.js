@@ -37,6 +37,7 @@ export class McpHttpClient {
     this.tools = [];
     this.connected = false;
     this.lastError = null;
+    this.activeControllers = new Set();
   }
 
   status() {
@@ -121,6 +122,7 @@ export class McpHttpClient {
     if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
 
     const controller = new AbortController();
+    this.activeControllers.add(controller);
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let response;
     try {
@@ -132,10 +134,12 @@ export class McpHttpClient {
       });
     } catch (error) {
       clearTimeout(timer);
+      this.activeControllers.delete(controller);
       this.log("error", { method: message.method, error: error.message });
       throw error;
     }
     clearTimeout(timer);
+    this.activeControllers.delete(controller);
 
     // Capture or update session id.
     const sid = response.headers.get("mcp-session-id");
@@ -230,6 +234,9 @@ export class McpHttpClient {
 
   async close() {
     this.connected = false;
+    this.oauth?.cancelAuthorization?.();
+    for (const controller of this.activeControllers) controller.abort();
+    this.activeControllers.clear();
   }
 }
 

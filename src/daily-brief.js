@@ -76,6 +76,21 @@ const ACCEPT_LABELS = {
 // can tap from a one-row popover would unblock one. "completed"/"cancelled"
 // are done.
 const ACTIVE_TASK_STATUSES = ["pending", "in_progress"];
+// Quick Ask renders at most ten rows, so its hot path stays bounded even when
+// the durable task store has years of history. Review uses the separate,
+// lightweight listReviewEntities() path below to enumerate the full queue
+// without scoring every task or constructing action menus on each page.
+const BRIEF_TASK_QUERY_LIMIT = 200;
+const REVIEW_TASK_QUERY_LIMIT = 100_000;
+const MOVABLE_TASK_BUCKETS = ["today", "this_week", "this_month", "this_quarter", "this_year", "someday"];
+const BUCKET_LABELS = {
+  today: "Today",
+  this_week: "This week",
+  this_month: "This month",
+  this_quarter: "This quarter",
+  this_year: "This year",
+  someday: "Someday"
+};
 
 // Statuses a draft's GENERATING task can be retired from, i.e. the states in
 // which "stop asking" is a thing that can still happen. Deliberately excludes
@@ -97,7 +112,7 @@ function slotPlan(limit) {
   return { focus: 1, clarification: 1, draft: 1, task: 2, suggestionFloor: 1, limit };
 }
 
-export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } = {}) {
+export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir, includeReviewMeta = false } = {}) {
   const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
   const degraded = [];
   // AbiRuntime does NOT carry a dataDir property, and resolveDataDir() memoizes
@@ -112,7 +127,9 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   // read fine. Worst case the pinned row comes back and can be dismissed again.
   const dismissedFocus = readFocusDismissals(resolvedDataDir, now);
 
-  const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime), []);
+  const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime, {
+    limit: includeReviewMeta ? REVIEW_TASK_QUERY_LIMIT : BRIEF_TASK_QUERY_LIMIT
+  }), []);
   const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
   const clarifications = safely(degraded, "clarifications", () => runtime.clarifications?.list?.({ status: "pending" }) ?? [], []);
   const suggestions = safely(degraded, "suggestions", () => listAllSuggestions(runtime, { status: "pending" }) ?? [], []);
@@ -218,12 +235,91 @@ export function composeBrief(runtime, { now = new Date(), limit = 5, dataDir } =
   const unshown = [...rankedClarifications, ...rankedDrafts, ...rankedTasks, ...rankedSuggestions];
   const olderCount = unshown.length;
   const oldestAt = oldestOf(unshown);
+  // `count` stays in place for older clients. Newer ones can name what is
+  // actually behind the fold instead of letting a suggestion-heavy queue read
+  // like hundreds of unfinished tasks. These are the already-filtered,
+  // post-allocation arrays, so every number describes a row the popover could
+  // really render and the four values sum to `count`.
+  const olderByKind = {
+    clarifications: rankedClarifications.length,
+    drafts: rankedDrafts.length,
+    tasks: rankedTasks.length,
+    suggestions: rankedSuggestions.length
+  };
 
-  return {
-    items: items.map(stripInternal),
-    older: { count: olderCount, oldestAt },
+  const response = {
+    // Review/search uses the same eligibility and de-duplication as this brief
+    // instead of rebuilding four subtly different queues. The timestamp is an
+    // opt-in server-side field only; the normal /brief/today wire contract is
+    // unchanged for every existing Mac and dashboard client.
+    items: items.map((item) => includeReviewMeta
+      ? {
+          ...stripInternal(item),
+          reviewCreatedAt: item.sourceCreatedAt ?? null,
+          reviewTitle: item.reviewTitle ?? item.title ?? null,
+          reviewDeepLink: item.reviewDeepLink ?? item.deepLink ?? null,
+          reviewSearchText: item.reviewSearchText ?? null
+        }
+      : stripInternal(item)),
+    older: { count: olderCount, oldestAt, byKind: olderByKind },
     generatedAt: new Date(nowMs).toISOString(),
     planCachedAt: plan?.cachedAt ?? null,
+    degraded
+  };
+  if (includeReviewMeta) {
+    // `items` is intentionally slot-limited (one draft, two tasks, etc.) even
+    // when the numeric limit is huge. Review needs the complete eligible set,
+    // so expose the selected rows plus the exact leftovers that power `older`.
+    // This property is never sent by /brief/today.
+    response.reviewItems = [...items, ...unshown].map((item) => ({
+      ...stripInternal(item),
+      reviewCreatedAt: item.sourceCreatedAt ?? null,
+      reviewTitle: item.reviewTitle ?? item.title ?? null,
+      reviewDeepLink: item.reviewDeepLink ?? item.deepLink ?? null,
+      reviewSearchText: item.reviewSearchText ?? null
+    }));
+  }
+  return response;
+}
+
+// Full, lightweight source enumeration for the Review page. This deliberately
+// returns raw records grouped by kind: review-queue.js creates only searchable
+// row metadata, while composeBrief remains responsible for scores, due-date
+// prose, snooze dates, and actions for the handful of Quick Ask rows.
+// Keeping eligibility here prevents Review and Quick Ask from drifting on
+// active task statuses, muted suggestions, or unsupported suggestion kinds.
+export function listReviewEntities(runtime, { dataDir } = {}) {
+  const degraded = [];
+  const resolvedDataDir = dataDir ?? runtime?.dataDir ?? resolveDataDir();
+  const tasks = safely(degraded, "tasks", () => listActiveTasks(runtime, {
+    limit: REVIEW_TASK_QUERY_LIMIT
+  }), []);
+  const drafts = safely(degraded, "drafts", () => runtime.drafts?.list?.({ status: "pending" }) ?? [], []);
+  const clarifications = safely(
+    degraded,
+    "clarifications",
+    () => runtime.clarifications?.list?.({ status: "pending" }) ?? [],
+    []
+  );
+  const suggestions = safely(
+    degraded,
+    "suggestions",
+    () => listAllSuggestions(runtime, { status: "pending" }) ?? [],
+    []
+  );
+  if (!degraded.includes("suggestions") && suggestionStoreUnreadable(suggestionDataDir(runtime, resolvedDataDir))) {
+    degraded.push("suggestions");
+  }
+  const isMuted = (category) => {
+    try { return runtime.suggestionFeedback?.isMuted?.(category) === true; } catch { return false; }
+  };
+  return {
+    tasks,
+    drafts,
+    clarifications,
+    suggestions: suggestions.filter(
+      (suggestion) => ACTIONABLE_SUGGESTION_CATEGORIES.has(suggestion.category) && !isMuted(suggestion.category)
+    ),
     degraded
   };
 }
@@ -261,8 +357,20 @@ function buildFocus(plan, tasks, max, nowMs, runtime, dismissed = EMPTY_SET) {
       // Without one, the row gets BOTH offers and neither is recommended. See
       // unbackedFocusActions for why there is no advice-vs-work classifier.
       actions: task ? taskActions(task, nowMs) : unbackedFocusActions(title),
+      ...(task ? { menuActions: taskMoveActions(task) } : {}),
       deepLink: "/?tab=today",
-      sourceTaskId: task?.id ?? null
+      ...(task ? { entityRef: { kind: "task", id: task.id } } : {}),
+      sourceTaskId: task?.id ?? null,
+      // Quick Ask is allowed to use the planner's framing. Review/search is a
+      // task inventory, so a pinned task must keep its canonical task title,
+      // timestamp and Tasks destination instead of becoming an unsearchable
+      // pseudo-task named after today's plan wording.
+      sourceCreatedAt: task?.createdAt ?? null,
+      reviewTitle: task?.title ?? null,
+      reviewDeepLink: task ? "/?tab=tasks" : null,
+      reviewSearchText: task
+        ? [task.title, task.description, task.source, task.sourceMeta?.identifier].filter(Boolean).join("\n")
+        : null
     });
   }
   return rows;
@@ -376,10 +484,10 @@ function titleKey(s) { return String(s ?? "").trim().replace(/\s+/g, " ").toLowe
 /// that answers this call — a stub (or a future store) that ignores the filter
 /// must not double every row — and re-filtered for the same reason, so a store
 /// that hands back terminal tasks cannot slip a completed one into the brief.
-function listActiveTasks(runtime) {
+function listActiveTasks(runtime, { limit = BRIEF_TASK_QUERY_LIMIT } = {}) {
   const byId = new Map();
   for (const status of ACTIVE_TASK_STATUSES) {
-    const rows = runtime?.tasks?.list?.({ queue: "user", status, limit: 200 }) ?? [];
+    const rows = runtime?.tasks?.list?.({ queue: "user", status, limit }) ?? [];
     for (const t of rows) if (t?.id && !byId.has(t.id)) byId.set(t.id, t);
   }
   return [...byId.values()].filter((t) => ACTIVE_TASK_STATUSES.includes(t.status ?? "pending"));
@@ -428,7 +536,12 @@ function buildTask(t, nowMs) {
     dueAt: t.dueDate ?? null,
     source: t.source ?? "manual",
     actions: taskActions(t, nowMs),
+    // Context-menu actions live on a separate, optional wire field. An older
+    // Mac client ignores this field; putting them in `actions` would make that
+    // client render every destination as an inline button.
+    menuActions: taskMoveActions(t),
     deepLink: "/?tab=tasks",
+    entityRef: { kind: "task", id: t.id },
     sourceCreatedAt: t.createdAt ?? null
   };
 }
@@ -538,6 +651,7 @@ function buildSuggestion(s, nowMs, multipliers) {
       { id: "reject", label: "Dismiss", style: "secondary", method: "POST", path: `/proactive/suggestions/${encodeURIComponent(s.id)}/reject`, body: null }
     ],
     deepLink: "/?tab=suggestions",
+    entityRef: { kind: "suggestion", id: s.id },
     sourceCreatedAt: s.proposedAt ?? null
   };
 }
@@ -659,6 +773,7 @@ function buildDraft(d, nowMs, generator, draftsFromTask) {
         : [])
     ],
     deepLink: "/?tab=today",
+    entityRef: { kind: "draft", id: d.id },
     sourceCreatedAt: d.createdAt ?? null
   };
 }
@@ -726,6 +841,7 @@ function buildClarification(c, nowMs) {
       body: { answer: a }
     })),
     deepLink: "/?tab=today",
+    entityRef: { kind: "clarification", id: c.id },
     sourceCreatedAt: c.createdAt ?? null
   };
 }
@@ -838,6 +954,21 @@ function taskActions(t, nowMs) {
       body: snoozeBody
     }
   ];
+}
+
+/// Server-declared placement choices for the Mac row menu. Kept out of the
+/// inline action list for backwards compatibility; see buildTask().
+function taskMoveActions(t) {
+  return MOVABLE_TASK_BUCKETS
+    .filter((bucket) => bucket !== t.bucket)
+    .map((bucket) => ({
+      id: `move:${bucket}`,
+      label: BUCKET_LABELS[bucket],
+      style: "secondary",
+      method: "PATCH",
+      path: `/tasks/${encodeURIComponent(t.id)}`,
+      body: { bucket }
+    }));
 }
 
 /// Snooze has to actually move the row. dueUrgency short-circuits on dueDate
@@ -1026,7 +1157,7 @@ function safely(degraded, name, fn, fallback) {
 /// Composer bookkeeping never reaches the wire. sourceTaskId resolves the focus
 /// row to a task; sourceCreatedAt feeds older.oldestAt across kinds.
 function stripInternal(item) {
-  const { sourceTaskId, sourceCreatedAt, ...rest } = item;
+  const { sourceTaskId, sourceCreatedAt, reviewTitle, reviewDeepLink, reviewSearchText, ...rest } = item;
   return rest;
 }
 

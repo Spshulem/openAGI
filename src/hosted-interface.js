@@ -6,7 +6,7 @@ import { createDefaultRuntime } from "./abi-runtime.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
 import {
@@ -29,11 +29,20 @@ import {
   newestOf
 } from "./node-registry.js";
 import { ServiceProbe, adoptRemoteServices, mergeServices } from "./service-nodes.js";
-import { readNodeConfig } from "./cli-client.js";
+import { readNodeConfig, writeNodeConfig } from "./cli-client.js";
 import { composeBrief, dismissFocus } from "./daily-brief.js";
+import { queryReviewQueue, ReviewQueueQueryError } from "./review-queue.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
+import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
+import { NodeControlBroker, createNodeControlWorker, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
+import { createComputerExecutor } from "./integrations/computer-server.js";
+import {
+  createImessageNodeCapability,
+  isImessageSearchEnabled
+} from "./integrations/imessage-node-capability.js";
+import { registerImessageSearchTool } from "./integrations/imessage-search-tool.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -62,6 +71,69 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
+  const nodeControlBroker = options.nodeControlBroker ?? new NodeControlBroker(options.nodeControlOptions);
+  const localIdentity = readOrCreateIdentity(dataDir);
+  let localCapabilityCache = [];
+  const capabilityFacade = {
+    list(capabilityId) {
+      const names = new Map(nodeRegistry.list().map((entry) => [entry.nodeId, entry.name]));
+      const localCapabilities = capabilityId
+        ? localCapabilityCache.filter((capability) => capability.id === capabilityId)
+        : localCapabilityCache;
+      const local = localCapabilities.length ? [{
+        nodeId: localIdentity.nodeId,
+        name: localIdentity.name || "This Mac",
+        capabilities: localCapabilities,
+        local: true,
+        seenAt: new Date().toISOString()
+      }] : [];
+      const remote = nodeControlBroker.list(capabilityId)
+        .filter((entry) => entry.nodeId !== localIdentity.nodeId)
+        .map((entry) => ({ ...entry, name: names.get(entry.nodeId) ?? null }));
+      return [...local, ...remote];
+    },
+    resolve(capabilityId, selector = {}) {
+      const candidates = this.list(capabilityId).filter((entry) => (
+        entry.capabilities?.some?.((capability) => capability.id === capabilityId && capability.ready)
+      ));
+      const rawSelector = selector.nodeId ?? selector.nodeName ?? null;
+      if (typeof rawSelector !== "string" || !rawSelector.trim()) return candidates.length === 1 ? candidates[0] : null;
+      const value = rawSelector.trim().toLowerCase();
+      const byId = candidates.find((entry) => entry.nodeId.toLowerCase() === value);
+      if (byId) return byId;
+      const named = candidates.filter((entry) => typeof entry.name === "string" && entry.name.toLowerCase() === value);
+      return named.length === 1 ? named[0] : null;
+    },
+    async refresh() {
+      localCapabilityCache = await localNodeCapabilities().catch(() => []);
+      return this.list();
+    },
+    async dispatch(nodeId, capability, operation, payload, opts) {
+      if (nodeId === localIdentity.nodeId) {
+        const provider = activeNodeCapabilityProviders().get(capability);
+        if (!provider) throw new Error("local node capability is disabled");
+        const status = (await provider.health()).capability;
+        if (status?.ready !== true || !status.operations?.includes?.(operation)) {
+          throw new Error(status?.detail || "local node capability is not ready");
+        }
+        return await provider.invoke(operation, payload ?? {});
+      }
+      return nodeControlBroker.dispatch(nodeId, capability, operation, payload, opts);
+    },
+    cancelSession(sessionId, reason) {
+      computerExecutor?.cancelSession?.(sessionId);
+      return nodeControlBroker.cancelSession(sessionId, reason);
+    },
+    removeNode(nodeId, reason) {
+      return nodeControlBroker.removeNode(nodeId, reason);
+    }
+  };
+  runtime.nodeCapabilities = capabilityFacade;
+  // AbiRuntime is constructed before the hosted node-capability facade exists,
+  // so its first registration attempt cannot see paired iMessage providers.
+  // Register again after the facade is installed; the helper is idempotent and
+  // preserves an already-configured legacy transport.
+  if (runtime.integrations !== false && runtime.tools?.register) registerImessageSearchTool(runtime);
   const nodesCachePath = path.join(dataDir, "nodes", "cache.json");
   // Service nodes (see service-nodes.js) are configured in the environment,
   // not registered by heartbeat. One probe instance per interface so its
@@ -69,6 +141,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // that need a main and a node with different configuration in one process.
   const serviceProbe = options.serviceProbe ?? new ServiceProbe(options.serviceProbeOptions);
   const getServiceEnv = () => options.serviceEnv ?? process.env;
+  const allowInsecureNodeRelay = options.allowInsecureNodeRelay === true
+    || String(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY ?? "").toLowerCase() === "true"
+    || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
   events.setMaxListeners(50);
@@ -101,6 +176,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("task-reminder", (data) => broadcast("task-reminder", data));
   events.on("task-auto-changed", (data) => broadcast("task-auto-changed", data));
   events.on("pending-action", (data) => broadcast("pending-action", data));
+  events.on("pending-action-resolved", (data) => {
+    broadcast("pending-action-resolved", data);
+    // A decision made through the dashboard's direct approval route must also
+    // clear the durable outreach copy used by the Mac overlay. Otherwise the
+    // notification disappears but the same request remains actionable there.
+    const outreachItem = runtime.outreach?.list?.().find((item) =>
+      (item.status === "unseen" || item.status === "seen")
+      && item.sourceRef?.kind === "pending-action"
+      && item.sourceRef?.id === data.id
+    );
+    if (outreachItem) {
+      const executionSucceeded = data.status === "approved" && data.executionSucceeded === true;
+      const userDenied = data.status === "denied";
+      const resolutionStatus = executionSucceeded ? "acted" : userDenied ? "dismissed" : "error";
+      const decisionAction = data.status === "approved" || data.status === "interrupted" ? "do" : "dismiss";
+      runtime.outreach.resolve(outreachItem.id, {
+        action: decisionAction,
+        by: data.decidedBy ?? (userDenied ? "user" : "system")
+      }, {
+        status: resolutionStatus,
+        error: resolutionStatus === "error"
+          ? data.error ?? "Approved action did not complete successfully."
+          : null
+      });
+    }
+  });
   events.on("daily-recap", (data) => broadcast("daily-recap", data));
   events.on("daily-plan", (data) => broadcast("daily-plan", data));
   events.on("task-unblocked", (data) => broadcast("task-unblocked", data));
@@ -207,7 +308,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         pendingOauth.delete(name);
         events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
       },
-      (error) => { events.emit("mcp", { op: "connect-error", name, error: error?.message ?? String(error) }); }
+      (error) => {
+        // Once a usable token exists, the browser part succeeded. A later MCP
+        // handshake failure must not keep the stale "OAuth required" banner.
+        if (runtime.mcp?.hasOAuthToken?.(name)) pendingOauth.delete(name);
+        events.emit("mcp", { op: "connect-error", name, error: error?.message ?? String(error) });
+      }
     );
 
     let timer = null;
@@ -231,27 +337,317 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   if (runtime.agentHost) {
     const original = runtime.agentHost.handleMessage.bind(runtime.agentHost);
-    runtime.agentHost.handleMessage = async (input) => {
-      const result = await original(input);
-      events.emit("message", {
-        sessionId: result.session.id,
-        agent: result.agent,
-        reply: result.reply,
-        toolCalls: result.output?.scrutiny?.action ? [] : []
-      });
-      return result;
+    runtime.agentHost.handleMessage = async (input, handleOptions) => {
+      try {
+        const result = await original(input, handleOptions);
+        events.emit("message", {
+          sessionId: result.session.id,
+          requestId: boundedProgressText(input?.metadata?.requestId, 200) || null,
+          status: "complete",
+          agent: result.agent,
+          reply: result.reply,
+          toolCalls: result.output?.scrutiny?.action ? [] : []
+        });
+        return result;
+      } catch (error) {
+        logAgentFailure(error, {
+          sessionId: error?.openagiSessionId ?? null,
+          requestId: error?.openagiRequestId ?? input?.metadata?.requestId ?? null
+        });
+        if (error?.openagiSessionId) {
+          const failure = messageFailure(error, error.openagiSessionId);
+          events.emit("message", {
+            sessionId: error.openagiSessionId,
+            requestId: error.openagiRequestId ?? null,
+            status: "failed",
+            code: failure.code,
+            error: failure.error
+          });
+        }
+        throw error;
+      }
     };
   }
 
+  const approvalContinuationTimers = new Set();
+  let approvalContinuationsClosing = false;
+
+  function successfulContinuationAlreadyPersisted(action, requestId) {
+    const session = runtime.agentHost?.store?.getSession?.(action.context?.sessionId);
+    return Boolean(session?.messages?.some((message) =>
+      message.role === "assistant"
+      && message.metadata?.requestId === requestId
+      && message.metadata?.status !== "failed"
+    ));
+  }
+
+  function scheduleApprovalContinuation(actionId, delayMs = 0) {
+    if (approvalContinuationsClosing) return;
+    const timer = setTimeout(() => {
+      approvalContinuationTimers.delete(timer);
+      deliverApprovalContinuation(actionId).catch(() => {});
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    approvalContinuationTimers.add(timer);
+  }
+
+  async function deliverApprovalContinuation(actionId) {
+    if (approvalContinuationsClosing) return;
+    const claim = runtime.pendingActions?.claimContinuation?.(actionId, { maxAttempts: 5 });
+    if (!claim) return;
+    const { action, continuation, deliveryId } = claim;
+    const requestId = continuation.requestId;
+    const sessionId = continuation.sessionId;
+    if (successfulContinuationAlreadyPersisted(action, requestId)) {
+      runtime.pendingActions.finishContinuation(actionId, { deliveryId, delivered: true });
+      return;
+    }
+    const goal = String(action.args?.goal ?? action.summary ?? "the approved computer-use goal").slice(0, 500);
+    let toolAttempted = false;
+    try {
+      await channels.handleLocalMessage({
+        channel: action.context.channel ?? "local",
+        from: action.context.from ?? "user",
+        agentId: action.context.agentId ?? "main",
+        sessionId,
+        text: "OpenAGI approval update: the user approved and started the computer-use session for this goal: "
+          + goal
+          + "\nContinue the original request now. First call computer_use_status and use the active session. Do not call start_computer_use_session again.",
+        metadata: {
+          requestId,
+          runtimeEvent: "approval",
+          approvalActionId: action.id,
+          continuationAttempt: continuation.attempts
+        }
+      }, {
+        // Once a model has reached any tool, replaying a failed turn is not
+        // provably safe: a physical action may have completed before the
+        // provider failed. Only pre-tool transport/provider failures retry.
+        onProgress(progress) {
+          if (progress?.stage === "tool") toolAttempted = true;
+        }
+      });
+      runtime.pendingActions.finishContinuation(actionId, { deliveryId, delivered: true });
+    } catch (error) {
+      logAgentFailure(error, { sessionId, requestId });
+      if (toolAttempted) {
+        const active = runtime.computerUseLog?.activeSessionFor?.(sessionId) ?? null;
+        if (active) {
+          try {
+            await runtime.abortComputerUseSession?.(
+              active,
+              "continuation failed after a tool attempt; renew approval before resuming"
+            );
+          } catch { /* main-side authority is already revoked synchronously */ }
+        }
+        runtime.pendingActions.finishContinuation(actionId, {
+          deliveryId,
+          delivered: false,
+          terminal: true,
+          error: "manual reapproval required after a tool attempt"
+        });
+        return;
+      }
+      const failed = runtime.pendingActions.finishContinuation(actionId, {
+        deliveryId,
+        delivered: false,
+        // Durable state is deliberately categorical; provider diagnostics stay
+        // in protected logs and cannot leak into searchable approval history.
+        error: "transient continuation failure"
+      });
+      if (failed && failed.attempts < 5 && !approvalContinuationsClosing) {
+        const delays = [1_000, 5_000, 30_000, 120_000];
+        scheduleApprovalContinuation(actionId, delays[Math.min(failed.attempts - 1, delays.length - 1)]);
+      }
+    }
+  }
+
+  function queueApprovalContinuation(action, invokeResult, { resetFailed = false } = {}) {
+    if (
+      action?.toolName !== "start_computer_use_session"
+      || !invokeResult?.ok
+      || !channels?.handleLocalMessage
+      || !action.context?.sessionId
+    ) {
+      return null;
+    }
+    const sessionId = action.context.sessionId;
+    const continuation = runtime.pendingActions?.prepareContinuation?.(action.id, {
+      requestId: "approval_" + action.id,
+      sessionId,
+      resetFailed
+    });
+    if (!continuation) return null;
+    if (["pending", "failed"].includes(continuation.status)) scheduleApprovalContinuation(action.id);
+    return {
+      status: continuation.status === "delivered"
+        ? "delivered"
+        : continuation.status === "blocked"
+          ? "manual-reapproval-required"
+          : "queued",
+      sessionId
+    };
+  }
+
+  // Recover approvals committed before a daemon exit or transient provider
+  // failure. A deterministic request id lets us recognize a response that was
+  // persisted before the delivery receipt and avoid re-running it on restart.
+  setImmediate(() => {
+    for (const action of runtime.pendingActions?.recoverableContinuations?.({
+      toolName: "start_computer_use_session"
+    }) ?? []) {
+      queueApprovalContinuation(action, { ok: true });
+    }
+    for (const action of runtime.pendingActions?.list?.() ?? []) {
+      if (action.toolName === "start_computer_use_session"
+          && action.status === "approved" && action.error == null && !action.continuation) {
+        queueApprovalContinuation(action, { ok: true });
+      }
+    }
+  });
+
   let tickerHandle = null;
   let heartbeatHandle = null;
+  let nodeControlWorker = null;
+  let computerExecutor = null;
+  let imessageNodeCapability = null;
   const tickerMs = options.tickerMs ?? Number.parseInt(process.env.OPENAGI_TICKER_MS ?? "10000", 10);
+
+  const computerUseEnabledHere = () => {
+    const value = String(process.env.OPENAGI_COMPUTER_USE ?? "").toLowerCase();
+    return options.nodeControlEnabled ?? (value === "1" || value === "true" || value === "yes");
+  };
+  const activeNodeCapabilityProviders = () => {
+    const providers = new Map();
+    if (computerUseEnabledHere()) {
+      computerExecutor ??= options.computerExecutor ?? createComputerExecutor();
+      providers.set("computer-use", computerExecutor);
+    }
+    const serviceEnv = getServiceEnv();
+    if (isImessageSearchEnabled(serviceEnv)) {
+      imessageNodeCapability ??= options.imessageNodeCapability
+        ?? createImessageNodeCapability({ env: serviceEnv });
+      providers.set(imessageNodeCapability.id, imessageNodeCapability);
+    }
+    return providers;
+  };
+  const localNodeCapabilities = async () => {
+    const capabilities = await Promise.all([...activeNodeCapabilityProviders().values()].map(async (provider) => {
+      try { return (await provider.health()).capability; } catch { return null; }
+    }));
+    localCapabilityCache = sanitizeNodeCapabilities(capabilities.filter(Boolean));
+    return localCapabilityCache;
+  };
+  const ensureNodeControlWorker = () => {
+    if (nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
+    const pairing = readNodeConfig(dataDir);
+    if (!pairing?.remote || !pairing.nodeToken || pairing.nodeEnrollmentConfirmed !== true) return null;
+    const identity = readOrCreateIdentity(dataDir);
+    nodeControlWorker = createNodeControlWorker({
+      remote: pairing.remote,
+      token: pairing.nodeToken,
+      nodeId: identity.nodeId,
+      capabilities: localNodeCapabilities,
+      execute: async (command) => {
+        if (typeof command?.capability !== "string" || typeof command?.operation !== "string") {
+          throw new Error("unsupported node capability command");
+        }
+        const provider = activeNodeCapabilityProviders().get(command.capability);
+        if (!provider) throw new Error("node capability is disabled or unavailable");
+        const revocation = command.capability === "computer-use" && command.operation === "session.end";
+        // Stop is an authenticated, idempotent lease revocation. Do not put a
+        // potentially slow helper health probe in front of it: that would let
+        // input continue while the user is explicitly trying to stop it.
+        if (revocation) return await provider.invoke(command.operation, command.payload ?? {});
+        const capability = (await provider.health()).capability;
+        if (capability?.ready !== true || !capability.operations?.includes?.(command.operation)) {
+          throw new Error(capability?.detail || "node capability operation is not ready");
+        }
+        return await provider.invoke(command.operation, command.payload ?? {});
+      },
+      fetchImpl: options.nodeControlFetch ?? globalThis.fetch,
+      pollMs: options.nodeControlPollMs,
+      retryMs: options.nodeControlRetryMs,
+      allowInsecureRemote: allowInsecureNodeRelay
+    });
+    nodeControlWorker.start();
+    return nodeControlWorker;
+  };
+  const stopNodeControlWorker = async () => {
+    const worker = nodeControlWorker;
+    nodeControlWorker = null;
+    await worker?.stop?.();
+  };
+  const ensureScopedNodeToken = async (pairing, identity) => {
+    if (!pairing?.remote) return null;
+    pinnedRemoteOrigin(pairing.remote, { allowInsecureRemote: allowInsecureNodeRelay });
+    // Generate and persist the scoped credential BEFORE enrollment. If the
+    // main stores its hash but the response is lost, this installation can
+    // safely retry with the same token after a restart instead of becoming
+    // permanently locked out of its stable node id.
+    if (pairing.nodeToken && pairing.nodeEnrollmentConfirmed === true) return pairing.nodeToken;
+    const nodeToken = pairing.nodeToken ?? randomBytes(32).toString("base64url");
+    pairing.nodeToken = nodeToken;
+    pairing.nodeEnrollmentConfirmed = false;
+    writeNodeConfig({
+      remote: pairing.remote,
+      token: pairing.token,
+      nodeToken,
+      nodeEnrollmentConfirmed: false
+    }, dataDir);
+    const enrollmentController = new AbortController();
+    const enrollmentTimer = setTimeout(() => enrollmentController.abort(), 5_000);
+    let response;
+    try {
+      response = await (options.nodeControlFetch ?? globalThis.fetch)(`${pairing.remote}/nodes/enroll`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(pairing.token ? { authorization: `Bearer ${pairing.token}` } : {})
+        },
+        body: JSON.stringify({ nodeId: identity.nodeId, nodeToken }),
+        redirect: "manual",
+        signal: enrollmentController.signal
+      });
+    } finally { clearTimeout(enrollmentTimer); }
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.error || `node enrollment rejected: ${response.status}`);
+    }
+    pairing.nodeEnrollmentConfirmed = true;
+    pairing.token = null;
+    writeNodeConfig({
+      remote: pairing.remote,
+      token: null,
+      nodeToken,
+      nodeEnrollmentConfirmed: true
+    }, dataDir);
+    return nodeToken;
+  };
 
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
       const pathname = url.pathname;
       const method = req.method;
+      const nodeScopedRoute = method === "POST" && [
+        "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
+        "/nodes/capture-memory"
+      ].includes(pathname);
+      const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
+        || (method === "POST" && pathname === "/message");
+      const requestNodeId = typeof req.headers["x-openagi-node-id"] === "string"
+        ? req.headers["x-openagi-node-id"]
+        : null;
+      const scopedBearer = String(req.headers.authorization ?? "").startsWith("Bearer ")
+        ? String(req.headers.authorization).slice(7)
+        : null;
+      // On an authenticated main, operational node routes accept ONLY the
+      // credential enrolled for this stable node id. A main-wide dashboard
+      // token must never let one paired node poll another node's control queue.
+      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute)
+        ? nodeRegistry.authenticate(requestNodeId, scopedBearer)
+        : false;
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -279,7 +675,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const extraCookies = [];
       const setupBypass = setupActive && setupRoutes;
       if (!isPublicRoute(pathname) && !setupBypass) {
-        const auth = checkAuth(req, url, getAuthToken());
+        const auth = nodeScopedRoute
+          ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
+          : nodeClientRoute && requestNodeId
+            ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
+            : checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
           // Browsers (Accept: text/html) get the login form on ANY failed GET,
           // not just GET /. After sign-in, redirect back to the original path.
@@ -345,7 +745,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup", ephemeral: true });
           return sendJson(res, 200, { reply: turn.reply, model: turn.model });
         } catch (error) {
-          return sendJson(res, 500, { error: error.message });
+          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
         }
       }
 
@@ -437,8 +837,35 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, runtime.agentHost?.store.getSession(id) ?? { error: "agent-host-disabled" });
       }
       if (method === "GET" && pathname === "/agent-host") return sendJson(res, 200, runtime.agentHost?.status() ?? { enabled: false });
+      if (method === "POST" && /^\/nodes\/[^/]+\/revoke$/.test(pathname)) {
+        const nodeId = decodeURIComponent(pathname.slice("/nodes/".length, -"/revoke".length));
+        if (!nodeRegistry.isEnrolled(nodeId) && !nodeRegistry.list().some((entry) => entry.nodeId === nodeId)) {
+          return sendJson(res, 404, { error: "unknown node" });
+        }
+        nodeControlBroker.removeNode(nodeId, "node credential was revoked by the main owner");
+        nodeRegistry.revoke(nodeId);
+        return sendJson(res, 200, { ok: true, nodeId, revoked: true });
+      }
+      if (method === "POST" && pathname === "/nodes/enroll") {
+        const body = await readJsonLimited(req, 16 * 1024);
+        if (typeof body.nodeId !== "string" || !body.nodeId || typeof body.nodeToken !== "string") {
+          return sendJson(res, 400, { error: "nodeId and nodeToken are required" });
+        }
+        try {
+          const enrollment = nodeRegistry.enroll(body.nodeId, body.nodeToken);
+          return sendJson(res, 200, { nodeId: body.nodeId, enrolled: true, created: enrollment.created });
+        } catch (error) {
+          if (error.code === "NODE_ALREADY_ENROLLED") {
+            return sendJson(res, 409, { error: error.message });
+          }
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
       if (method === "POST" && pathname === "/nodes/heartbeat") {
-        const body = await readJson(req).catch(() => ({}));
+        const body = await readJsonLimited(req, 128 * 1024).catch(() => ({}));
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
         // Type-checked, not just truthy: a non-string name/nodeId previously
         // persisted and crashed NodeRegistry.list()'s name.localeCompare sort
         // with a TypeError, taking down GET /nodes with a 500 until the
@@ -459,6 +886,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 400, { error: `${field} must be a string or null` });
           }
         }
+        if (body.capabilities !== undefined && !Array.isArray(body.capabilities)) {
+          return sendJson(res, 400, { error: "capabilities must be an array" });
+        }
         nodeRegistry.upsert({
           nodeId: body.nodeId, name: body.name, role: body.role,
           url: body.url ?? null, version: body.version ?? null,
@@ -466,9 +896,89 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           // number). Without it a roster can only show package.json versions,
           // which have drifted behind the release tags and so cannot answer
           // "is this node up to date" — the whole point of the column.
-          build: body.build ?? null, buildSource: body.buildSource ?? null
+          build: body.build ?? null, buildSource: body.buildSource ?? null,
+          capabilities: sanitizeNodeCapabilities(body.capabilities)
         });
         return sendJson(res, 200, { ok: true });
+      }
+      if (method === "POST" && pathname === "/nodes/capture-memory") {
+        const body = await readJsonLimited(req, 12 * 1024);
+        const keys = Object.keys(body ?? {});
+        if (keys.some((key) => !["content", "tags", "importance"].includes(key))) {
+          return sendJson(res, 400, { error: "capture contains unsupported fields" });
+        }
+        const content = typeof body?.content === "string" ? body.content.trim() : "";
+        if (!content || content.includes("\0") || Buffer.byteLength(content, "utf8") > 8 * 1024) {
+          return sendJson(res, 400, { error: "content must be non-empty text of at most 8 KiB without NUL" });
+        }
+        const rawTags = body.tags ?? [];
+        if (!Array.isArray(rawTags) || rawTags.length > 16
+            || rawTags.some((tag) => typeof tag !== "string" || !tag.trim()
+              || tag.includes("\0") || Buffer.byteLength(tag, "utf8") > 128)) {
+          return sendJson(res, 400, { error: "tags must be at most 16 bounded non-empty strings" });
+        }
+        const importance = body.importance ?? "normal";
+        if (!new Set(["low", "normal", "high"]).has(importance)) {
+          return sendJson(res, 400, { error: "importance must be low, normal, or high" });
+        }
+        const tags = [...new Set(["imessage", "node-capture", ...rawTags.map((tag) => tag.trim())])];
+        const item = runtime.memory.remember(
+          {
+            source: "imessage-bridge",
+            scope: "main",
+            content,
+            tags,
+            risk: importance === "high" ? 0.8 : importance === "low" ? 0.2 : 0.45,
+            specificity: 0.7,
+            repetition: 0.4,
+            novelty: 0.5,
+            metadata: { nodeId: requestNodeId }
+          },
+          { source: "imessage-bridge", strength: importance === "high" ? 0.85 : 0.6 }
+        );
+        return sendJson(res, 200, { id: item.id, tier: item.tier });
+      }
+      if (method === "POST" && pathname === "/nodes/revoke") {
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
+        nodeControlBroker.removeNode(requestNodeId, "node credential was revoked");
+        nodeRegistry.revoke(requestNodeId);
+        return sendJson(res, 200, { ok: true, revoked: true });
+      }
+      if (method === "POST" && pathname === "/nodes/control/poll") {
+        const body = await readJsonLimited(req, 128 * 1024);
+        if (typeof body.nodeId !== "string" || !body.nodeId) {
+          return sendJson(res, 400, { error: "nodeId is required" });
+        }
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
+        const registered = nodeRegistry.list().find((entry) => entry.nodeId === body.nodeId);
+        if (!registered || statusFor(registered.lastSeenAt) !== "online") {
+          return sendJson(res, 409, { error: "node must heartbeat before polling for control work" });
+        }
+        const timeoutMs = Math.max(1, Math.min(25_000, Number(body.timeoutMs) || 20_000));
+        const command = await nodeControlBroker.poll(body.nodeId, body.capabilities, {
+          timeoutMs,
+          revocationsOnly: body.revocationsOnly === true
+        });
+        return sendJson(res, 200, { command });
+      }
+      if (method === "POST" && pathname === "/nodes/control/result") {
+        const body = await readJsonLimited(req, 12 * 1024 * 1024);
+        if (typeof body.nodeId !== "string" || typeof body.commandId !== "string") {
+          return sendJson(res, 400, { error: "nodeId and commandId are required" });
+        }
+        if (body.nodeId !== requestNodeId) {
+          return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
+        }
+        const accepted = nodeControlBroker.deliver(body.nodeId, body.commandId, {
+          result: body.result,
+          error: typeof body.error === "string" ? body.error.slice(0, 500) : null
+        });
+        return sendJson(res, accepted ? 200 : 409, accepted ? { ok: true } : { error: "unknown or mismatched command" });
       }
       if (method === "GET" && pathname === "/nodes") {
         const identity = readOrCreateIdentity(dataDir);
@@ -478,13 +988,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const nowIso = new Date(now).toISOString();
 
         // Kick the service probes off BEFORE the first await below, so a
-        // sleeping Mac mini and a slow main are waited on concurrently rather
-        // than one after the other. describe() is budget-bounded and never
+        // sleeping service host and a slow main are waited on concurrently
+        // rather than one after the other. describe() is budget-bounded and never
         // rejects; the .catch is only there so a programming error in the
         // probe can never turn the whole topology view into a 500.
         const localServicesPromise = Promise.resolve()
           .then(() => serviceProbe.describe({ env: getServiceEnv(), now }))
           .catch(() => []);
+        const localCapabilitiesPromise = localNodeCapabilities().catch(() => []);
 
         // Every roster row is rebuilt from primitive facts — a name, a
         // timestamp, a version. A `status` that arrived over the wire or came
@@ -505,6 +1016,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           version: typeof entry.version === "string" ? entry.version : null,
           build: typeof entry.build === "string" ? entry.build : null,
           buildSource: typeof entry.buildSource === "string" ? entry.buildSource : null,
+          capabilities: sanitizeNodeCapabilities(entry.capabilities),
           lastSeenAt: typeof entry.lastSeenAt === "string" ? entry.lastSeenAt : null,
           status,
           statusAsOf: statusAsOf ?? null,
@@ -518,7 +1030,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           {
             ...identity, role, url: getPublicUrl(),
             version: build.version, build: build.build, buildSource: build.buildSource,
-            lastSeenAt: nowIso
+            lastSeenAt: nowIso, capabilities: localCapabilities
           },
           { self: true, status: "online", statusAsOf: nowIso }
         );
@@ -600,6 +1112,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           });
         };
 
+        const localCapabilities = await localCapabilitiesPromise;
+
         if (!pairing?.remote) {
           const others = nodeRegistry.list({ now })
             .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: nowIso }));
@@ -609,12 +1123,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           });
         }
         try {
+          pinnedRemoteOrigin(pairing.remote, { allowInsecureRemote: allowInsecureNodeRelay });
           const ctrl = new AbortController();
           const timer = setTimeout(() => ctrl.abort(), 5000);
           let upstream;
           try {
             upstream = await fetch(`${pairing.remote}/nodes`, {
-              headers: pairing.token ? { authorization: `Bearer ${pairing.token}` } : {},
+              headers: (pairing.nodeToken ?? pairing.token) ? {
+                authorization: `Bearer ${pairing.nodeToken ?? pairing.token}`,
+                ...(pairing.nodeToken ? { "x-openagi-node-id": identity.nodeId } : {})
+              } : {},
+              redirect: "manual",
               signal: ctrl.signal
             });
           } finally { clearTimeout(timer); }
@@ -629,7 +1148,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           try { writeJsonAtomic(nodesCachePath, cached); } catch { /* best-effort */ }
           // The main's own identity is upstream.self. Dropping it is why the
           // roster only ever contained this machine and the user could never
-          // see the Distiller it is paired to.
+          // see the remote main it is paired to.
           const mainRow = row(
             { ...(upstreamJson?.self ?? {}), role: "main", url: pairing.remote, lastSeenAt: nowIso },
             { status: "online", statusAsOf: nowIso }
@@ -686,6 +1205,27 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // rather than letting the composer call the memoizing resolveDataDir().
         return sendJson(res, 200, composeBrief(runtime, { now: new Date(), limit, dataDir }));
       }
+      // Searchable, cursor-paginated view of everything eligible for the
+      // Quick Ask review queue. It deliberately shares daily-brief's
+      // eligibility rules, so the footer count and this destination cannot
+      // describe different sets of records.
+      if (method === "GET" && pathname === "/review-queue") {
+        try {
+          return sendJson(res, 200, queryReviewQueue(runtime, {
+            dataDir,
+            q: url.searchParams.get("q"),
+            kind: url.searchParams.get("kind"),
+            cursor: url.searchParams.get("cursor"),
+            limit: url.searchParams.get("limit"),
+            sort: url.searchParams.get("sort")
+          }));
+        } catch (error) {
+          if (error instanceof ReviewQueueQueryError) {
+            return sendJson(res, error.statusCode, { error: error.message });
+          }
+          throw error;
+        }
+      }
       // "Not today" on a daily-plan focus row that maps to no task. The whole
       // decision — where the record lives, how it expires, what a key is — is
       // in daily-brief.js next to the composer that has to honour it; this is
@@ -733,11 +1273,47 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
-        const body = await readJson(req);
+        let body = await readJsonLimited(req, requestNodeId ? 128 * 1024 : 2 * 1024 * 1024);
+        if (requestNodeId) {
+          const allowed = new Set(["text", "from", "sessionId"]);
+          if (!body || typeof body !== "object" || Array.isArray(body)
+              || Object.keys(body).some((key) => !allowed.has(key))) {
+            return sendJson(res, 400, { error: "node message contains unsupported fields" });
+          }
+          if (typeof body.text !== "string" || !body.text.trim()
+              || body.text.includes("\0") || Buffer.byteLength(body.text, "utf8") > 64 * 1024) {
+            return sendJson(res, 400, { error: "node message text must be non-empty and at most 64 KiB" });
+          }
+          for (const field of ["from", "sessionId"]) {
+            if (body[field] !== undefined && (typeof body[field] !== "string"
+                || !body[field] || body[field].includes("\0")
+                || Buffer.byteLength(body[field], "utf8") > 500)) {
+              return sendJson(res, 400, { error: `${field} must be bounded non-empty text` });
+            }
+          }
+          // A node credential proves only which installation sent the
+          // message. It does not grant authority to impersonate an owner chat
+          // or select an existing session. Keep the caller's bounded `from`
+          // value solely as a conversation discriminator (the iMessage bridge
+          // uses one per sender/group), then bind both provenance and the
+          // durable session to the authenticated node id. Hashing the two
+          // components separately makes the namespace unambiguous even when a
+          // custom node id or conversation contains `:`. A supplied sessionId
+          // is deliberately ignored, so a leaked owner session id can never
+          // inherit that chat's approved computer-use lease.
+          body = bindScopedNodeMessage(body, requestNodeId);
+        }
         // `ephemeral` (no session/memory/task) is an INTERNAL flag for the
         // setup-test path only — never let a public /message caller set it to
         // evade persistence.
         if (body && typeof body === "object") delete body.ephemeral;
+        // Opt-in streaming keeps the existing JSON contract untouched. The
+        // same auth and Origin gates above protect both forms; this is a direct
+        // response stream, not a broadcast that another signed-in client can
+        // accidentally observe.
+        if (acceptsEventStream(req)) {
+          return streamLocalMessage(res, channels, body);
+        }
         // Chat must return a structured error, not a generic 500: the
         // dashboard needs to distinguish "budget cap hit" / "provider auth
         // failed" / "network blip" to show something actionable.
@@ -745,8 +1321,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const result = await channels.handleLocalMessage(body);
           return sendJson(res, 200, result);
         } catch (error) {
-          const code = error?.code === "BUDGET_EXCEEDED" || /budget/i.test(error?.message ?? "") ? "budget" : "agent-error";
-          return sendJson(res, 500, { error: error.message ?? String(error), code });
+          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
         }
       }
 
@@ -823,8 +1398,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const until = url.searchParams.get("until") ?? null;
         const app = url.searchParams.get("app") ?? null;
         const machine = url.searchParams.get("machine") ?? null;
+        const kinds = url.searchParams.get("kinds")?.split(",").map((kind) => kind.trim()).filter(Boolean) ?? null;
         const limit = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
-        const results = await runtime.observations.search({ query, since, until, app, machine, limit });
+        const results = await runtime.observations.search({ query, since, until, app, machine, kinds, limit });
         return sendJson(res, 200, results);
       }
       if (method === "GET" && pathname === "/observations/timeline") {
@@ -1162,11 +1738,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const body = await readJson(req).catch(() => ({}));
         const action = String(body.action ?? "");
         try {
-          await applyOutreachAction(runtime, item, action, body.note);
+          const applied = await applyOutreachAction(runtime, item, action, body.note);
+          if (applied?.pendingAction) {
+            queueApprovalContinuation(applied.pendingAction, applied.invokeResult);
+          }
           const status = action === "dismiss" ? "dismissed" : "acted";
           const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });
           return sendJson(res, 200, { item: updated });
         } catch (error) {
+          if (error?.code === "OUTREACH_ACTION_CONFLICT") {
+            return sendJson(res, 409, { item: runtime.outreach.get(id), error: error.message });
+          }
           const updated = runtime.outreach.resolve(id, { action, by: "user" }, { status: "error", error: error.message });
           return sendJson(res, 400, { item: updated, error: error.message });
         }
@@ -1209,22 +1791,48 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/approve")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/approve".length));
-        const action = runtime.pendingActions?.get(id);
+        let action = runtime.pendingActions?.get(id);
         if (!action) return sendJson(res, 404, { error: "unknown pending action" });
+        if (action.status === "expired") {
+          return sendJson(res, 410, { error: "approval expired; request it again" });
+        }
+        if (action.status === "approved" && action.error == null
+            && action.toolName === "start_computer_use_session") {
+          const continuation = queueApprovalContinuation(action, { ok: true }, { resetFailed: true });
+          return sendJson(res, 200, {
+            ok: true,
+            alreadyApproved: true,
+            ...(continuation ? { continuation } : {})
+          });
+        }
         if (action.status !== "pending") return sendJson(res, 409, { error: `action already ${action.status}` });
+        const claim = runtime.pendingActions?.claimForExecution?.(id, { claimedBy: "user" });
+        if (!claim) {
+          action = runtime.pendingActions?.get(id);
+          return sendJson(res, 409, { error: `action already ${action?.status ?? "claimed"}` });
+        }
+        action = claim.action;
         // Re-invoke the original tool with the bypass flag so the gate
         // doesn't re-queue the same call. Persist the result on the action.
         const invokeResult = await runtime.tools.invoke(action.toolName, action.args, {
           ...action.context,
-          __confirmed: true
+          __confirmed: true,
+          __confirmationActionId: action.id
         });
+        const executionError = invokeResult?.ok ? null : invokeResult?.error ?? "approved tool execution failed";
+        recordApprovedActionOutcome(runtime, action, invokeResult);
         runtime.pendingActions.decide(id, {
           decision: "approve",
           decidedBy: "user",
           result: invokeResult.ok ? invokeResult.result : null,
-          error: invokeResult.ok ? null : invokeResult.error
+          error: executionError,
+          executionId: claim.executionId
         });
-        return sendJson(res, invokeResult.ok ? 200 : 400, invokeResult);
+        const continuation = queueApprovalContinuation(action, invokeResult);
+        return sendJson(res, invokeResult.ok ? 200 : 400, {
+          ...invokeResult,
+          ...(continuation ? { continuation } : {})
+        });
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/deny")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/deny".length));
@@ -1232,20 +1840,29 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!action) return sendJson(res, 404, { error: "unknown pending action" });
         if (action.status !== "pending") return sendJson(res, 409, { error: `action already ${action.status}` });
         const body = await readJson(req).catch(() => ({}));
-        runtime.pendingActions.decide(id, {
+        const decided = runtime.pendingActions.decide(id, {
           decision: "deny",
           decidedBy: "user",
           error: body.reason ?? "denied by user"
         });
+        if (decided?.status !== "denied") {
+          return sendJson(res, 409, { error: `action already ${decided?.status ?? "claimed"}` });
+        }
         return sendJson(res, 200, { id, status: "denied" });
       }
       if (method === "GET" && pathname === "/computer-use/log") {
         if (!runtime.computerUseLog) return sendJson(res, 503, { error: "no computer-use log" });
+        const { computerUseReadiness } = await import("./integrations/computer-use.js");
         const limit = Number(url.searchParams.get("limit") ?? 100);
         const sessions = runtime.computerUseLog.listSessions();
         const actions = runtime.computerUseLog.listActions({ limit });
+        const readiness = await computerUseReadiness({
+          toolsRegistered: runtime.tools?.has?.("start_computer_use_session") ?? false,
+          runtime
+        });
         return sendJson(res, 200, {
-          enabled: process.env.OPENAGI_COMPUTER_USE === "1" || process.env.OPENAGI_COMPUTER_USE === "true",
+          enabled: readiness.enabled,
+          readiness,
           stats: runtime.computerUseLog.stats(),
           sessions,
           actions
@@ -1261,10 +1878,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const enable = Boolean(body.enable);
         const { saveEnv } = await import("./setup-wizard.js");
         const { registerComputerUseTools, unregisterComputerUseTools } = await import("./integrations/computer-use.js");
-        const dataDir = resolveDataDir();
         // saveEnv writes only allowlisted keys; OPENAGI_COMPUTER_USE has
         // to be in WIZARD_FIELDS (added in this commit) for the write to
-        // land in .env.
+        // land in .env. Use the interface's captured dataDir rather than
+        // resolving it again: explicit per-instance overrides are authoritative
+        // and resolveDataDir() memoizes globally within the process.
         if (enable) {
           saveEnv({ dataDir, values: { OPENAGI_COMPUTER_USE: "1" } });
           process.env.OPENAGI_COMPUTER_USE = "1";
@@ -1275,19 +1893,27 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         if (enable) {
           registerComputerUseTools(runtime.tools, runtime);
+          ensureNodeControlWorker();
         } else {
           // Close any active session before removing tools.
           const active = runtime.computerUseLog?.listSessions?.({ status: "active" }) ?? [];
           for (const s of active) {
-            runtime.computerUseLog.endSession(s.id, { reason: "disabled via toggle", status: "aborted" });
+            if (runtime.abortComputerUseSession) await runtime.abortComputerUseSession(s, "disabled via toggle");
+            else runtime.computerUseLog.endSession(s.id, { reason: "disabled via toggle", status: "aborted" });
           }
+          await computerExecutor?.close?.();
           unregisterComputerUseTools(runtime.tools);
+          if (activeNodeCapabilityProviders().size === 0) await stopNodeControlWorker();
         }
         return sendJson(res, 200, { enabled: enable, tools: enable ? "registered" : "unregistered" });
       }
       if (method === "POST" && pathname.startsWith("/computer-use/sessions/") && pathname.endsWith("/abort")) {
         const id = decodeURIComponent(pathname.slice("/computer-use/sessions/".length, -"/abort".length));
-        const session = runtime.computerUseLog?.endSession(id, { reason: "aborted via dashboard", status: "aborted" });
+        const existing = runtime.computerUseLog?.getSession?.(id);
+        if (!existing) return sendJson(res, 404, { error: "unknown session" });
+        if (runtime.abortComputerUseSession) await runtime.abortComputerUseSession(existing, "aborted via dashboard");
+        else runtime.computerUseLog?.endSession(id, { reason: "aborted via dashboard", status: "aborted" });
+        const session = runtime.computerUseLog?.getSession?.(id);
         if (!session) return sendJson(res, 404, { error: "unknown session" });
         return sendJson(res, 200, { id, status: session.status });
       }
@@ -1325,10 +1951,26 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // entry shows up here, with whichever paths apply (API key vs.
         // MCP) so the user has ONE place to configure everything.
         const { MCP_CATALOG, CATEGORIES } = await import("./mcp-catalog.js");
-        const registeredMcps = new Set(
-          (runtime.mcp?.listServers?.() ?? []).map((s) => (s.name ?? "").toLowerCase())
-        );
-        const mcpInCatalog = (id) => registeredMcps.has(id) || registeredMcps.has(id.replace(/-/g, ""));
+        const registeredMcps = runtime.mcp?.listServers?.() ?? [];
+        const mcpStatus = (id) => {
+          const wanted = String(id).toLowerCase();
+          const compact = wanted.replace(/-/g, "");
+          const server = registeredMcps.find((candidate) => {
+            const name = String(candidate.name ?? "").toLowerCase();
+            return name === wanted || name === compact;
+          });
+          const registered = Boolean(server);
+          const authenticated = server?.auth === "oauth"
+            ? Boolean(runtime.mcp.hasOAuthToken?.(server.name))
+            : registered;
+          return {
+            registered,
+            connected: Boolean(server?.connected),
+            authenticated,
+            configured: Boolean(server?.connected),
+            mcpName: server?.name ?? null
+          };
+        };
         const integrations = [
           {
             id: "linear",
@@ -1349,7 +1991,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "MCP (on-demand)",
                 catalogId: "linear",
-                configured: mcpInCatalog("linear")
+                ...mcpStatus("linear")
               }
             ]
           },
@@ -1372,7 +2014,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "MCP (on-demand)",
                 catalogId: "buildbetter",
-                configured: mcpInCatalog("buildbetter")
+                ...mcpStatus("buildbetter")
               }
             ]
           },
@@ -1393,7 +2035,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "MCP (on-demand)",
                 catalogId: "rize",
-                configured: mcpInCatalog("rize")
+                ...mcpStatus("rize")
               }
             ]
           },
@@ -1413,7 +2055,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 kind: "mcp",
                 label: "reMarkable MCP",
                 catalogId: "remarkable",
-                configured: mcpInCatalog("remarkable")
+                ...mcpStatus("remarkable")
               }
             ]
           },
@@ -1476,7 +2118,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             apiKeyHelp: entry.apiKeyHelp ?? null,
             apiKeyConfigured: entry.apiKeyEnvVar ? Boolean(process.env[entry.apiKeyEnvVar]) : true,
             connectable: entry.status === "available" && Boolean(entry.register),
-            configured: mcpInCatalog(entry.id),
+            ...mcpStatus(entry.id),
             featured: featuredIds.has(entry.id)
           }));
         return sendJson(res, 200, { integrations, catalog, categories: CATEGORIES });
@@ -1499,6 +2141,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const task = runtime.tasks.add(body, { source: body.source ?? "manual", queue: body.queue ?? "user" });
           return sendJson(res, 200, task);
         } catch (error) { return sendJson(res, 400, { error: error.message }); }
+      }
+      if (method === "GET" && pathname.match(/^\/tasks\/[^/]+$/)) {
+        if (!runtime.tasks?.get) return sendJson(res, 503, { error: "no task store" });
+        const id = decodeURIComponent(pathname.split("/")[2]);
+        const task = runtime.tasks.get(id);
+        return task ? sendJson(res, 200, task) : sendJson(res, 404, { error: "unknown task" });
       }
       if (method === "PATCH" && pathname.match(/^\/tasks\/[^/]+$/)) {
         if (!runtime.tasks?.update) return sendJson(res, 503, { error: "no task store" });
@@ -1667,9 +2315,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // the same card shape; source badge tells them apart.
         const { listAllSuggestions } = await import("./suggestion-feed.js");
         const status = url.searchParams.get("status");
-        return sendJson(res, 200, listAllSuggestions(runtime, {
+        const id = url.searchParams.get("id");
+        const suggestions = listAllSuggestions(runtime, {
           status: status === "null" ? null : (status ?? "pending")
-        }));
+        });
+        return sendJson(res, 200, id ? suggestions.filter((item) => item.id === id) : suggestions);
       }
       if (method === "POST" && pathname === "/proactive/observe") {
         if (!runtime.proactiveObserver?.observe) return sendJson(res, 503, { error: "no observer" });
@@ -1935,7 +2585,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const servers = runtime.mcp.listServers().map((s) => ({
           ...s,
           connecting: runtime.mcp.isConnecting?.(s.name) ?? false,
-          pendingAuthUrl: pendingOauth.get(s.name)?.url ?? null
+          authenticated: s.auth === "oauth" ? Boolean(runtime.mcp.hasOAuthToken?.(s.name)) : null,
+          // The authorization page may already have returned while the MCP
+          // initialize request is still settling. Token presence is the
+          // authoritative signal that login finished; don't render an old URL
+          // as if the user still needs to authorize.
+          pendingAuthUrl: runtime.mcp.hasOAuthToken?.(s.name)
+            ? null
+            : (pendingOauth.get(s.name)?.url ?? null)
         }));
         return sendJson(res, 200, servers);
       }
@@ -1957,6 +2614,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             events.emit("mcp", { op: "connected", name, tools: status?.tools ?? [] });
           })
           .catch((error) => {
+            if (runtime.mcp.hasOAuthToken?.(name)) pendingOauth.delete(name);
             events.emit("mcp", { op: "connect-error", name, error: error.message });
           });
         events.emit("mcp", { op: "connecting", name });
@@ -1972,17 +2630,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // spaces: the live install has "buildbetter staging.json") and assert
         // the resolved path is inside <dataDir>/mcp/auth before deleting.
         const authPath = safeJoinOrNull(
-          path.join(resolveDataDir(), "mcp", "auth"),
+          path.join(dataDir, "mcp", "auth"),
           `${name}.json`,
           { pattern: LABEL_SEGMENT, label: "MCP server name" }
         );
         if (!authPath) return sendJson(res, 400, { error: "invalid MCP server name" });
         pendingOauth.delete(name);
-        // Wipe cached OAuth tokens so the next connect starts a fresh flow.
+        // "Forget login" is stronger than a transport disconnect: close the
+        // active client, cancel any in-flight callback/handshake, invalidate
+        // stale completions, unregister tools, and only then delete the cache.
         try {
-          if (fsSync.existsSync(authPath)) fsSync.unlinkSync(authPath);
-        } catch { /* ignore */ }
-        return sendJson(res, 200, { ok: true });
+          const forgotten = await runtime.mcp.forgetOAuth?.(name);
+          if (!forgotten) return sendJson(res, 404, { error: "unknown OAuth MCP server" });
+        } catch (error) {
+          return sendJson(res, 500, { error: `could not forget OAuth login: ${error.message}` });
+        }
+        events.emit("mcp", { op: "oauth-forgotten", name });
+        return sendJson(res, 200, { ok: true, disconnected: true, authenticated: false });
       }
       if (method === "POST" && pathname.match(/^\/mcp\/disconnect\/[^/]+$/)) {
         const name = decodeURIComponent(pathname.split("/")[3]);
@@ -2059,6 +2723,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       return sendJson(res, 404, { error: "not-found" });
     } catch (error) {
+      if (error?.openagiSessionId) {
+        logAgentFailure(error, {
+          sessionId: error.openagiSessionId,
+          requestId: error.openagiRequestId ?? null
+        });
+        return sendJson(res, 500, messageFailure(error, error.openagiSessionId));
+      }
       // Log so we can diagnose 500s instead of swallowing them.
       const logLine = `[${new Date().toISOString()}] 500 ${req.method} ${req.url} — ${error.message}\n${error.stack ?? ""}\n`;
       try { process.stderr.write(logLine); } catch { /* ignore */ }
@@ -2097,14 +2768,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             const sendHeartbeat = async () => {
               try {
                 const identity = readOrCreateIdentity(dataDir);
+                const scopedToken = await ensureScopedNodeToken(pairing, identity);
                 const ctrl = new AbortController();
                 const timer = setTimeout(() => ctrl.abort(), 5000);
                 try {
-                  const res = await fetch(`${pairing.remote}/nodes/heartbeat`, {
+                  const res = await (options.nodeControlFetch ?? globalThis.fetch)(`${pairing.remote}/nodes/heartbeat`, {
                     method: "POST",
                     headers: {
                       "content-type": "application/json",
-                      ...(pairing.token ? { authorization: `Bearer ${pairing.token}` } : {})
+                      "x-openagi-node-id": identity.nodeId,
+                      ...(scopedToken ? { authorization: `Bearer ${scopedToken}` } : {})
                     },
                     body: JSON.stringify({
                       nodeId: identity.nodeId, name: identity.name, role: "node",
@@ -2115,8 +2788,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                       // they are actually running.
                       version: heartbeatBuild.version ?? PACKAGE_VERSION,
                       build: heartbeatBuild.build,
-                      buildSource: heartbeatBuild.buildSource
+                      buildSource: heartbeatBuild.buildSource,
+                      capabilities: await localNodeCapabilities().catch(() => [])
                     }),
+                    redirect: "manual",
                     signal: ctrl.signal
                   });
                   if (!res.ok) throw new Error(`heartbeat rejected: ${res.status}`);
@@ -2125,6 +2800,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                   console.warn("[openagi] heartbeat to main recovered");
                 }
                 heartbeatFailStreak = 0;
+                ensureNodeControlWorker();
               } catch (error) {
                 heartbeatFailStreak += 1;
                 if (heartbeatFailStreak === 1) {
@@ -2132,7 +2808,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                 }
               }
             };
+            // Check in as soon as the listener is ready. Waiting one full
+            // interval made a freshly-started node invisible for 30 seconds
+            // (or longer when a custom interval was configured).
+            sendHeartbeat().catch(() => {});
             heartbeatHandle = setInterval(() => { sendHeartbeat().catch(() => {}); }, heartbeatIntervalMs);
+            ensureNodeControlWorker();
           }
           const address = server.address();
           const actualPort = typeof address === "object" && address ? address.port : port;
@@ -2142,6 +2823,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     },
     close() {
       return new Promise((resolve, reject) => {
+        approvalContinuationsClosing = true;
+        for (const timer of approvalContinuationTimers) clearTimeout(timer);
+        approvalContinuationTimers.clear();
         if (tickerHandle) clearInterval(tickerHandle);
         if (heartbeatHandle) clearInterval(heartbeatHandle);
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
@@ -2149,7 +2833,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         channels?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
-        server.close((error) => (error ? reject(error) : resolve()));
+        Promise.resolve(computerExecutor?.close?.())
+          .catch(() => {})
+          .then(() => stopNodeControlWorker())
+          .catch(() => {})
+          .finally(() => {
+            nodeControlBroker.close();
+            server.close((error) => (error ? reject(error) : resolve()));
+          });
       });
     }
   };
@@ -2172,6 +2863,173 @@ function handleSse(req, res, clients) {
     clearInterval(heartbeat);
     clients.delete(res);
   });
+}
+
+function acceptsEventStream(req) {
+  return String(req.headers.accept ?? "")
+    .split(",")
+    .some((part) => part.trim().toLowerCase().split(";")[0] === "text/event-stream");
+}
+
+function bindScopedNodeMessage(body, requestNodeId) {
+  const conversation = body.from ?? "cli";
+  const nodeNamespace = createHash("sha256").update(requestNodeId, "utf8").digest("base64url");
+  const conversationNamespace = createHash("sha256").update(conversation, "utf8").digest("base64url");
+  return {
+    text: body.text,
+    channel: "node",
+    from: `node:${requestNodeId}:${conversationNamespace}`,
+    agentId: "main",
+    sessionId: `node:${nodeNamespace}:${conversationNamespace}:main`,
+    metadata: { sourceNodeId: requestNodeId }
+  };
+}
+
+// Stream lifecycle for POST /message + Accept: text/event-stream:
+//   status    { stage, at, ...safe progress fields }
+//   session   { id, messageCount, agent } once the user turn is persisted
+//   heartbeat { at, stage, sessionId } every 15s while work is outstanding
+//   delta     { text, reset, at, provider, model, hop, sessionId, requestId }
+//             visible assistant text only; reset replaces an earlier tool hop
+//   final     the exact object returned by the legacy JSON endpoint
+//   failure   { code, error, sessionId } for a terminal provider/agent error
+//
+// Delta frames are private to this direct authenticated response. They are not
+// broadcast on /events or persisted as partial messages; the final durable
+// assistant record remains authoritative and a disconnected client recovers it
+// from the named session. Provider adapters expose text only, never reasoning,
+// tool arguments or tool results.
+async function streamLocalMessage(res, channels, body) {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no"
+  });
+  res.flushHeaders?.();
+
+  let connected = true;
+  let stage = "queued";
+  let sessionId = boundedProgressText(body?.sessionId, 500) || null;
+  const requestId = boundedProgressText(body?.metadata?.requestId, 200) || null;
+  const write = (event, data) => {
+    if (!connected || res.destroyed || res.writableEnded) return false;
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      return true;
+    } catch {
+      connected = false;
+      return false;
+    }
+  };
+
+  write("status", { stage, at: new Date().toISOString(), ...(sessionId ? { sessionId } : {}), ...(requestId ? { requestId } : {}) });
+  const heartbeat = setInterval(() => {
+    write("heartbeat", { at: new Date().toISOString(), stage, sessionId, ...(requestId ? { requestId } : {}) });
+  }, 15_000);
+  res.on("close", () => {
+    connected = false;
+    clearInterval(heartbeat);
+  });
+
+  const onProgress = (raw) => {
+    const progress = normalizeMessageProgress(raw);
+    stage = progress.stage;
+    if (progress.session?.id) {
+      sessionId = progress.session.id;
+      write("session", {
+        id: progress.session.id,
+        messageCount: progress.session.messageCount,
+        agent: progress.agent ?? null,
+        ...(requestId ? { requestId } : {})
+      });
+    } else if (progress.sessionId) {
+      sessionId = progress.sessionId;
+    }
+    write("status", { ...progress, ...(requestId ? { requestId } : {}) });
+  };
+
+  const onTextDelta = (raw) => {
+    const delta = normalizeMessageTextDelta(raw);
+    if (!delta) return;
+    if (delta.sessionId) sessionId = delta.sessionId;
+    write("delta", {
+      ...delta,
+      ...(sessionId && !delta.sessionId ? { sessionId } : {}),
+      ...(requestId ? { requestId } : {})
+    });
+  };
+
+  try {
+    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta });
+    sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
+    write("final", result);
+  } catch (error) {
+    write("failure", { ...messageFailure(error, error?.openagiSessionId ?? sessionId), ...(requestId ? { requestId } : {}) });
+  } finally {
+    clearInterval(heartbeat);
+    if (connected && !res.writableEnded) res.end();
+  }
+}
+
+function normalizeMessageTextDelta(raw) {
+  if (typeof raw?.text !== "string" || raw.text.length === 0) return null;
+  const delta = {
+    // Do not trim: leading/trailing spaces are real model output tokens.
+    text: raw.text.slice(0, 64_000),
+    reset: raw.reset === true,
+    at: boundedProgressText(raw?.at, 50) || new Date().toISOString()
+  };
+  for (const key of ["provider", "model"]) {
+    const value = boundedProgressText(raw?.[key], 300);
+    if (value) delta[key] = value;
+  }
+  const deltaSessionId = boundedProgressText(raw?.sessionId, 500);
+  if (deltaSessionId) delta.sessionId = deltaSessionId;
+  if (Number.isFinite(raw?.hop)) delta.hop = raw.hop;
+  return delta;
+}
+
+function normalizeMessageProgress(raw) {
+  const stage = boundedProgressText(raw?.stage, 40) || "thinking";
+  const progress = {
+    stage,
+    at: boundedProgressText(raw?.at, 50) || new Date().toISOString()
+  };
+  const sessionId = boundedProgressText(raw?.sessionId, 500);
+  if (sessionId) progress.sessionId = sessionId;
+  const sessionRecordId = boundedProgressText(raw?.session?.id, 500);
+  if (sessionRecordId) {
+    progress.session = {
+      id: sessionRecordId,
+      messageCount: Number.isFinite(raw?.session?.messageCount) ? raw.session.messageCount : null
+    };
+  }
+  const agentId = boundedProgressText(raw?.agent?.id, 300);
+  if (agentId) {
+    progress.agent = {
+      id: agentId,
+      name: boundedProgressText(raw?.agent?.name, 300) || agentId,
+      role: boundedProgressText(raw?.agent?.role, 100) || null
+    };
+  }
+  for (const key of ["provider", "model", "tool"]) {
+    const value = boundedProgressText(raw?.[key], 300);
+    if (value) progress[key] = value;
+  }
+  if (Number.isFinite(raw?.hop)) progress.hop = raw.hop;
+  if (Number.isFinite(raw?.maxToolHops)) progress.maxToolHops = raw.maxToolHops;
+  const code = boundedProgressText(raw?.code, 100);
+  if (code) progress.code = code;
+  return progress;
+}
+
+function boundedProgressText(value, max) {
+  return typeof value === "string" ? value.trim().slice(0, max) : "";
+}
+
+function messageFailure(error, sessionId = null) {
+  return publicAgentFailure(error, sessionId);
 }
 
 // SEC-4: every HTML response this daemon serves gets a per-response nonce and
@@ -2379,13 +3237,33 @@ async function applyOutreachAction(runtime, item, action, note) {
       throw new Error(`unsupported task action: ${action}`);
     case "pending-action":
       if (action === "do") {
-        const a = runtime.pendingActions?.get(ref.id);
+        let a = runtime.pendingActions?.get(ref.id);
         if (!a) throw new Error("pending action gone");
-        if (a.status !== "pending") return; // already decided elsewhere — don't re-run the side-effecting tool
-        const r = await runtime.tools.invoke(a.toolName, a.args, { ...a.context, __confirmed: true });
-        runtime.pendingActions.decide(ref.id, { decision: "approve", decidedBy: "user", result: r.ok ? r.result : null, error: r.ok ? null : r.error });
-        if (!r.ok) throw new Error(r.error ?? "tool failed");
-        return;
+        if (a.status !== "pending") {
+          throw outreachActionConflict(`pending action already ${a.status}`);
+        }
+        const claim = runtime.pendingActions?.claimForExecution?.(ref.id, { claimedBy: "user" });
+        if (!claim) {
+          const latest = runtime.pendingActions?.get(ref.id);
+          throw outreachActionConflict(`pending action already ${latest?.status ?? "claimed"}`);
+        }
+        a = claim.action;
+        const r = await runtime.tools.invoke(a.toolName, a.args, {
+          ...a.context,
+          __confirmed: true,
+          __confirmationActionId: a.id
+        });
+        const executionError = r?.ok ? null : r?.error ?? "approved tool execution failed";
+        recordApprovedActionOutcome(runtime, a, r);
+        runtime.pendingActions.decide(ref.id, {
+          decision: "approve",
+          decidedBy: "user",
+          result: r.ok ? r.result : null,
+          error: executionError,
+          executionId: claim.executionId
+        });
+        if (!r.ok) throw new Error(executionError);
+        return { pendingAction: a, invokeResult: r };
       }
       throw new Error(`unsupported pending-action action: ${action}`);
     case "suggestion":
@@ -2414,6 +3292,54 @@ async function applyOutreachAction(runtime, item, action, note) {
       // the outreach history (the caller marks the item "acted" either way).
       throw new Error(`no handler for outreach item kind "${ref.kind}" with action "${action}"`);
   }
+}
+
+function outreachActionConflict(message) {
+  const error = new Error(message);
+  error.code = "OUTREACH_ACTION_CONFLICT";
+  return error;
+}
+
+// Approval is only intent. Record an outcome at the point the confirmed tool
+// actually returns, preserving the original autonomous/user provenance. This
+// keeps queued approvals out of the scorecard while making the eventual work
+// (including a real failure) measurable once—and only once—it executes.
+function recordApprovedActionOutcome(runtime, action, invokeResult) {
+  if (!runtime.outcomes?.record || !approvedInvocationWasAttempted(invokeResult)) return null;
+  const origin = String(action?.context?.origin ?? action?.context?.channel ?? "local").toLowerCase();
+  const kind = origin === "autopilot"
+    ? "autopilot-fire"
+    : origin === "cron"
+      ? "cron-fire"
+      : "tool-call";
+  try {
+    return runtime.outcomes.record({
+      kind,
+      refId: action.id,
+      sessionId: action.context?.sessionId ?? null,
+      agentId: action.context?.agentId ?? "main",
+      channel: action.context?.channel ?? null,
+      toolCalls: [{ name: action.toolName, ok: invokeResult?.ok === true }],
+      metadata: {
+        approvalActionId: action.id,
+        approvedExecution: true,
+        origin
+      }
+    });
+  } catch {
+    // Outcome accounting is an audit side effect. It must never undo a tool
+    // action the user explicitly approved.
+    return null;
+  }
+}
+
+function approvedInvocationWasAttempted(invokeResult) {
+  if (!invokeResult || typeof invokeResult !== "object") return false;
+  if (invokeResult.ok !== true) return true;
+  const result = invokeResult.result;
+  const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
+  if (["awaiting_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
+  return !(result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true);
 }
 
 async function applyOutreachFeedback(runtime, item, verdict, note = null) {
@@ -2447,6 +3373,37 @@ function readJson(req) {
       catch (error) { reject(error); }
     });
     req.on("error", reject);
+  });
+}
+
+function readJsonLimited(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    req.on("data", (chunk) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        fail(new Error("request body too large"));
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      if (!chunks.length) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+      catch (error) { reject(error); }
+    });
+    req.on("error", fail);
   });
 }
 
@@ -2616,22 +3573,35 @@ function renderApp() {
     .msg { max-width: 720px; padding: 10px 12px; border-radius: 10px; line-height: 1.5; word-wrap: break-word; }
     .msg.user { background: var(--user); align-self: flex-end; white-space: pre-wrap; }
     .msg.assistant { background: var(--assistant); border: 1px solid var(--line); align-self: flex-start; }
+    .msg.runtime { max-width: 680px; align-self: center; background: var(--accent-bg); border: 1px solid var(--accent); color: var(--text); }
     .msg .meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
     .msg .body { display: block; }
     .msg .body p { margin: 0 0 8px; }
     .msg .body p:last-child { margin-bottom: 0; }
-    .msg .body h2, .msg .body h3, .msg .body h4 { margin: 12px 0 6px; line-height: 1.25; }
+    .msg .body h2, .msg .body h3, .msg .body h4, .msg .body h5, .msg .body h6 { margin: 12px 0 6px; line-height: 1.25; }
     .msg .body h2 { font-size: 18px; }
     .msg .body h3 { font-size: 16px; }
     .msg .body h4 { font-size: 14px; color: var(--accent); }
+    .msg .body h5, .msg .body h6 { font-size: 13px; color: var(--accent); }
     .msg .body ul, .msg .body ol { margin: 6px 0 8px; padding-left: 22px; }
     .msg .body li { margin: 2px 0; }
     .msg .body blockquote { margin: 6px 0; padding: 4px 12px; border-left: 3px solid var(--accent); color: var(--muted); }
+    .msg .body blockquote p { margin: 0; }
     .msg .body a { color: var(--accent); }
     .msg .body code.md-inline { background: var(--bg); padding: 1px 5px; border-radius: 3px; font: 12px ui-monospace, Menlo, monospace; border: 1px solid var(--line); }
     .msg .body pre.md-code { margin: 8px 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; overflow-x: auto; }
     .msg .body pre.md-code code { font: 12px/1.5 ui-monospace, Menlo, monospace; }
     .msg .body strong { font-weight: 700; }
+    .msg .body .md-table-wrap { max-width: 100%; margin: 8px 0 12px; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+    .msg .body table.md-table { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 1.4; }
+    .msg .body table.md-table th, .msg .body table.md-table td { padding: 7px 9px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .msg .body table.md-table th:last-child, .msg .body table.md-table td:last-child { border-right: 0; }
+    .msg .body table.md-table tbody tr:last-child td { border-bottom: 0; }
+    .msg .body table.md-table th { background: var(--panel-2); font-weight: 700; white-space: nowrap; }
+    .msg .body table.md-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.025); }
+    .msg .body table.md-table .md-align-center { text-align: center; }
+    .msg .body table.md-table .md-align-right { text-align: right; }
+    .msg .body hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
     .composer { border-top: 1px solid var(--line); padding: 12px 16px; background: var(--panel); display: flex; gap: 8px; align-items: flex-end; }
     .composer textarea {
       flex: 1; min-height: 38px; max-height: 200px; resize: none;
@@ -2708,6 +3678,147 @@ function renderApp() {
     .ok { color: var(--accent); }
     .err { color: var(--err); }
     .empty { color: var(--muted); padding: 16px; text-align: center; }
+
+    /* Computer history — a quiet, scan-first timeline based on the native
+       desktop history pattern. Capture controls stay honest: this web surface
+       can verify received observations, while pause/privacy remain owned by
+       the Mac app that performs capture. */
+    .history-page { padding-top: var(--space-6); }
+    .history-page-header { margin-bottom: var(--space-5); }
+    .history-page-header h2 {
+      margin: 0; font-size: 28px; line-height: 1.2; font-weight: 650;
+      letter-spacing: -0.025em;
+    }
+    .history-page-subtitle {
+      margin: var(--space-2) 0 0; max-width: 680px;
+      color: var(--muted-foreground); font-size: var(--font-size-sm);
+    }
+    .history-status-card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); overflow: hidden;
+    }
+    .history-status-row {
+      display: flex; align-items: center; gap: var(--space-4);
+      padding: var(--space-4) var(--space-5);
+    }
+    .history-status-row + .history-status-row { border-top: 1px solid var(--border); }
+    .history-status-copy { flex: 1; min-width: 0; }
+    .history-status-title {
+      display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+      font-weight: 650; font-size: var(--font-size-base);
+    }
+    .history-status-description {
+      margin: var(--space-1) 0 0; color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.5;
+    }
+    .history-status-pill {
+      display: inline-flex; align-items: center; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--muted-bg);
+      color: var(--muted-foreground); padding: 3px 9px;
+      font-size: var(--font-size-xs); font-weight: 600; white-space: nowrap;
+    }
+    .history-status-pill.receiving {
+      color: var(--accent-foreground); background: var(--accent-bg);
+      border-color: rgba(111,225,177,.28);
+    }
+    .history-status-pill.problem {
+      color: var(--warn); background: rgba(240,180,84,.08);
+      border-color: rgba(240,180,84,.3);
+    }
+    .history-control-help {
+      margin: 0 var(--space-5) var(--space-4); padding: 10px 12px;
+      border-radius: var(--radius); border: 1px solid var(--border);
+      background: var(--muted-bg); color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.5;
+    }
+    .history-control-help[hidden] { display: none; }
+    .history-section { margin-top: 36px; }
+    .history-section-header {
+      display: flex; align-items: flex-end; justify-content: space-between;
+      gap: var(--space-4); margin-bottom: var(--space-4);
+    }
+    .history-section-heading { min-width: 0; }
+    .history-section-heading h3 {
+      margin: 0; color: var(--foreground); font-size: 20px; line-height: 1.25;
+      text-transform: none; letter-spacing: -0.015em; font-weight: 650;
+    }
+    .history-section-meta {
+      margin-top: 3px; color: var(--muted-foreground);
+      font-size: var(--font-size-xs);
+    }
+    .history-filters {
+      display: grid; grid-template-columns: minmax(220px, 1fr) 170px;
+      gap: var(--space-2); margin-bottom: var(--space-4);
+    }
+    .history-filter-label {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+    .history-days {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); overflow: hidden;
+    }
+    .history-day { padding: var(--space-4) var(--space-5) 0; }
+    .history-day + .history-day { border-top: 1px solid var(--border); }
+    .history-day-title {
+      margin: 0; padding-bottom: var(--space-3); color: var(--foreground);
+      font-size: var(--font-size-base); font-weight: 650;
+    }
+    .history-entry {
+      display: grid; grid-template-columns: 88px minmax(0, 1fr);
+      gap: var(--space-4);
+    }
+    .history-entry-time {
+      padding-top: 2px; color: var(--muted-foreground);
+      font-size: var(--font-size-xs); text-align: right; white-space: nowrap;
+    }
+    .history-entry-body {
+      min-width: 0; border-left: 1px solid var(--border);
+      padding: 0 0 var(--space-5) var(--space-4);
+    }
+    .history-entry-title {
+      margin: 0; color: var(--foreground); font-size: var(--font-size-base);
+      font-weight: 600; line-height: 1.4; overflow-wrap: anywhere;
+    }
+    .history-entry-summary {
+      margin: var(--space-1) 0 0; color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.55; overflow-wrap: anywhere;
+    }
+    .history-apps {
+      display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--space-2);
+    }
+    .history-app-label {
+      display: inline-flex; align-items: center; min-width: 0;
+      padding: 2px 8px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--background);
+      color: var(--muted-foreground); font-size: var(--font-size-xs);
+      white-space: nowrap; max-width: 260px; overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .history-state {
+      padding: 56px var(--space-5); text-align: center;
+      color: var(--muted-foreground); font-size: var(--font-size-sm);
+    }
+    .history-state strong {
+      display: block; margin-bottom: var(--space-1);
+      color: var(--foreground); font-size: var(--font-size-base);
+    }
+    .history-state .ui-btn { margin-top: var(--space-3); }
+    .history-load-more { display: flex; justify-content: center; margin-top: var(--space-4); }
+    .history-load-more[hidden] { display: none; }
+    @media (max-width: 720px) {
+      .history-page { padding: var(--space-5) var(--space-4) 48px; }
+      .history-page-header h2 { font-size: 24px; }
+      .history-status-row { align-items: flex-start; flex-wrap: wrap; padding: var(--space-4); }
+      .history-status-row .ui-btn { width: 100%; }
+      .history-control-help { margin-left: var(--space-4); margin-right: var(--space-4); }
+      .history-section-header { align-items: stretch; flex-direction: column; }
+      .history-section-header .ui-btn { width: 100%; }
+      .history-filters { grid-template-columns: 1fr; }
+      .history-day { padding-left: var(--space-4); padding-right: var(--space-4); }
+      .history-entry { grid-template-columns: 66px minmax(0, 1fr); gap: var(--space-2); }
+      .history-entry-body { padding-left: var(--space-3); }
+    }
 
     /* ─── Primitive components (shadcn-style, vanilla CSS) ───────────────
        Every new feature should compose these instead of inline styles. */
@@ -2870,10 +3981,12 @@ function renderApp() {
     <h1>OpenAGI</h1>
     <span id="status" class="status">connecting…</span>
     <nav id="nav">
-      <!-- Primary tabs — the 5 everyday surfaces. Keeps the nav readable
+      <!-- Primary tabs — the everyday surfaces. Keeps the nav readable
            on narrow windows; the other 11 tabs live behind "More ▾". -->
       <button data-tab="chat" class="active" title="Talk to your agent in natural language.">Chat</button>
       <button data-tab="tasks" title="My tasks + agent tasks. The agent's own queue gets drained every 30 min by the autopilot pulse.">Tasks</button>
+      <button data-tab="review" title="Search and work through every open task, draft, clarification, and suggestion behind Quick Ask.">Review</button>
+      <button data-tab="approvals" id="approvalsNav" title="Agent actions that require your explicit approval before they run.">Approvals <span id="approvalsNavCount" class="badge" hidden></span></button>
       <button data-tab="suggestions" title="Things the proactive observer noticed + agent actions awaiting your approval.">Suggestions</button>
       <button data-tab="memory" title="Short, medium, and long-term memory. Promotion happens automatically.">Memory</button>
       <button data-tab="integrations" title="Connect MCPs (Linear, GitHub, Stripe, …), sources (BuildBetter, Rize, inbox folder), and channels (Telegram).">Integrations</button>
@@ -2892,7 +4005,7 @@ function renderApp() {
           <div class="nav-more-section">
             <div class="nav-more-label">Diagnostics</div>
             <button data-tab="today" title="What you got done today — completed tasks, skills run, actions approved, time tracked, themes.">Today</button>
-            <button data-tab="activity" title="Ambient capture log — what you were doing on screen (if capture is enabled).">Activity</button>
+            <button data-tab="activity" title="A day-by-day timeline of activity received from screen capture.">Computer History</button>
             <button data-tab="computer-use" title="Computer use (beta) — every action the agent intended to take, with the reasoning it gave.">Computer Use</button>
             <button data-tab="budget" title="Today's LLM spend + 14-day history.">Credits</button>
             <button data-tab="outcomes" title="Quality scores for completed agent work, 7d + 30d rolling.">Outcomes</button>
@@ -2919,12 +4032,31 @@ function renderApp() {
 const state = {
   tab: "chat",
   sessionId: null,
+  activeRequestId: null,
+  activeRequestStage: null,
+  activeRequestError: null,
+  activeRequestMissingSince: null,
+  activeRequestText: "",
+  activeRequestModel: "",
+  freshChatRequested: false,
   sessions: [],
   agentId: "main",
   channel: "local",
   from: "browser",
   messages: [],
-  health: null
+  health: null,
+  review: {
+    q: "",
+    kind: "all",
+    sort: "oldest",
+    items: [],
+    nextCursor: null,
+    total: 0,
+    byKind: {},
+    summary: null,
+    requestGeneration: 0,
+    loadingAppend: false
+  }
 };
 
 const $ = (id) => document.getElementById(id);
@@ -2967,13 +4099,18 @@ document.getElementById("setupBtn")?.addEventListener("click", () => {
   window.location.href = "/setup";
 });
 
-// Tiny markdown renderer for chat replies. No backtick characters in this
-// function's source so it can live inside the dashboard's outer template
-// literal without escaping wars. BT = backtick built from char code.
+// Small, dependency-free Markdown renderer for chat replies. It is block-aware
+// so table syntax and list markers inside fenced code remain literal. Raw HTML
+// is always escaped before any known-safe tags are created below.
+// No backtick characters in this function's source so it can live inside the
+// dashboard's outer template literal without escaping wars.
 const BT = String.fromCharCode(96);
 const FENCE = BT + BT + BT;
-const FENCE_RE = new RegExp(FENCE + "(\\\\w+)?\\\\n([\\\\s\\\\S]*?)" + FENCE, "g");
 const INLINE_RE = new RegExp(BT + "([^" + BT + "\\\\n]+)" + BT, "g");
+const FENCE_OPEN_RE = new RegExp("^ {0,3}" + FENCE + "([A-Za-z0-9_-]+)?\\\\s*$");
+const FENCE_CLOSE_RE = new RegExp("^ {0,3}" + FENCE + "\\\\s*$");
+const INLINE_TOKEN_OPEN = String.fromCharCode(0xE000);
+const INLINE_TOKEN_CLOSE = String.fromCharCode(0xE001);
 
 // Decide whether a markdown link target may become an href, and return the
 // attribute-safe value if so. Parse with the URL parser rather than a regex:
@@ -2995,78 +4132,189 @@ function safeLinkHref(rawUrl) {
   return escapeHtml(parsed.href);
 }
 
-function renderMarkdown(input) {
-  if (!input) return "";
-  let s = String(input);
-
-  // Escape HTML first — guarantees XSS safety even if the renderer is buggy.
-  // Quotes included: the rules below build attributes (href=, class=) out of
-  // captured text, and a bare " or ' in that text closes the attribute and
-  // opens a new one. Reproduced with
-  // [Open](https://x.co"style="position:fixed;inset:0"onmouseover="...).
-  s = s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-
-  // Fenced code blocks
-  s = s.replace(FENCE_RE, (_, lang, code) => {
-    const langClass = lang ? ' class="md-code-block lang-' + lang + '"' : ' class="md-code-block"';
-    return '<pre class="md-code"><code' + langClass + '>' + code.replace(/\\n$/, "") + '</code></pre>';
+function renderInlineMarkdown(input) {
+  let s = String(input ?? "");
+  const codeSpans = [];
+  s = s.replace(INLINE_RE, (_, code) => {
+    const token = INLINE_TOKEN_OPEN + codeSpans.length + INLINE_TOKEN_CLOSE;
+    codeSpans.push('<code class="md-inline">' + code + '</code>');
+    return token;
   });
 
-  // Inline code
-  s = s.replace(INLINE_RE, '<code class="md-inline">$1</code>');
-
-  // Headings
-  s = s.replace(/^### (.*)$/gm, "<h4>$1</h4>");
-  s = s.replace(/^## (.*)$/gm, "<h3>$1</h3>");
-  s = s.replace(/^# (.*)$/gm, "<h2>$1</h2>");
-
-  // Blockquotes
-  s = s.replace(/^&gt; (.*)$/gm, "<blockquote>$1</blockquote>");
-
-  // Bold then italic
   s = s.replace(/\\*\\*([^*\\n]+)\\*\\*/g, "<strong>$1</strong>");
+  s = s.replace(/~~([^~\\n]+)~~/g, "<s>$1</s>");
   s = s.replace(/(?<!\\w)\\*([^*\\n]+?)\\*(?!\\w)/g, "<em>$1</em>");
   s = s.replace(/(?<!\\w)_([^_\\n]+?)_(?!\\w)/g, "<em>$1</em>");
 
   // Links [text](url). The URL is parsed, not pattern-matched: only http(s)
-  // becomes an anchor, everything else (javascript:, data:, vbscript:, or
-  // anything URL parsing rejects) is left as literal text. Splicing the raw
-  // capture into href="..." is what let an injected page put three real
-  // attributes on the anchor.
+  // becomes an anchor; unsafe or malformed targets remain literal text.
   s = s.replace(/\\[([^\\]]+)\\]\\(([^\\s)]+)\\)/g, (whole, text, rawUrl) => {
     const href = safeLinkHref(rawUrl);
     if (!href) return whole;
     return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
   });
 
-  // Lists
-  const lines = s.split(/\\n/);
-  const out = [];
-  let ulOpen = false, olOpen = false;
-  for (const line of lines) {
-    const ulMatch = /^[-*] (.*)$/.exec(line);
-    const olMatch = /^\\d+\\. (.*)$/.exec(line);
-    if (ulMatch) {
-      if (olOpen) { out.push("</ol>"); olOpen = false; }
-      if (!ulOpen) { out.push("<ul>"); ulOpen = true; }
-      out.push("<li>" + ulMatch[1] + "</li>");
-    } else if (olMatch) {
-      if (ulOpen) { out.push("</ul>"); ulOpen = false; }
-      if (!olOpen) { out.push("<ol>"); olOpen = true; }
-      out.push("<li>" + olMatch[1] + "</li>");
+  for (let i = 0; i < codeSpans.length; i += 1) {
+    s = s.replace(INLINE_TOKEN_OPEN + i + INLINE_TOKEN_CLOSE, codeSpans[i]);
+  }
+  return s;
+}
+
+function splitMarkdownTableRow(line) {
+  let source = String(line ?? "").trim();
+  if (source.startsWith("|")) source = source.slice(1);
+  if (source.endsWith("|") && !source.endsWith("\\\\|")) source = source.slice(0, -1);
+  const cells = [];
+  let cell = "";
+  let inCode = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === "\\\\" && source[i + 1] === "|") {
+      cell += "|";
+      i += 1;
+    } else if (ch === BT) {
+      inCode = !inCode;
+      cell += ch;
+    } else if (ch === "|" && !inCode) {
+      cells.push(cell.trim());
+      cell = "";
     } else {
-      if (ulOpen) { out.push("</ul>"); ulOpen = false; }
-      if (olOpen) { out.push("</ol>"); olOpen = false; }
-      out.push(line);
+      cell += ch;
     }
   }
-  if (ulOpen) out.push("</ul>");
-  if (olOpen) out.push("</ol>");
-  s = out.join("\\n");
+  cells.push(cell.trim());
+  return cells;
+}
 
-  // Paragraphs
-  s = s.replace(/\\n{2,}/g, "</p><p>").replace(/\\n/g, "<br>");
-  return "<p>" + s + "</p>";
+function markdownTableAlignments(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (cells.length < 2 || !cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
+  return cells.map((cell) => cell.startsWith(":") && cell.endsWith(":")
+    ? "center"
+    : cell.endsWith(":") ? "right" : "left");
+}
+
+function renderMarkdownTable(headers, alignments, rows) {
+  const classFor = (alignment) => alignment === "center"
+    ? ' class="md-align-center"'
+    : alignment === "right" ? ' class="md-align-right"' : "";
+  const head = headers.map((cell, i) => '<th' + classFor(alignments[i]) + '>' + renderInlineMarkdown(cell) + '</th>').join("");
+  const body = rows.map((row) => {
+    const normalized = Array.from({ length: headers.length }, (_, i) => row[i] ?? "");
+    return "<tr>" + normalized.map((cell, i) => '<td' + classFor(alignments[i]) + '>' + renderInlineMarkdown(cell) + '</td>').join("") + "</tr>";
+  }).join("");
+  return '<div class="md-table-wrap"><table class="md-table"><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+}
+
+function renderMarkdown(input) {
+  if (!input) return "";
+  // Escape HTML first. All HTML emitted after this point is a fixed tag or a
+  // URL accepted and re-escaped by safeLinkHref.
+  const escaped = String(input).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const lines = escaped.split(/\\n/);
+  const blocks = [];
+  let paragraph = [];
+  let listTag = null;
+  let listItems = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return;
+    blocks.push("<p>" + paragraph.map(renderInlineMarkdown).join("<br>") + "</p>");
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!listTag) return;
+    blocks.push("<" + listTag + ">" + listItems.map((item) => "<li>" + renderInlineMarkdown(item) + "</li>").join("") + "</" + listTag + ">");
+    listTag = null;
+    listItems = [];
+  };
+  const flushText = () => { flushParagraph(); flushList(); };
+
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+    const fence = FENCE_OPEN_RE.exec(line);
+    if (fence) {
+      flushText();
+      const code = [];
+      i += 1;
+      while (i < lines.length && !FENCE_CLOSE_RE.test(lines[i])) {
+        code.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length) i += 1;
+      const langClass = fence[1] ? "md-code-block lang-" + fence[1] : "md-code-block";
+      blocks.push('<pre class="md-code"><code class="' + langClass + '">' + code.join("\\n") + '</code></pre>');
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushText();
+      i += 1;
+      continue;
+    }
+
+    const headers = line.includes("|") ? splitMarkdownTableRow(line) : [];
+    const alignments = i + 1 < lines.length ? markdownTableAlignments(lines[i + 1]) : null;
+    if (headers.length >= 2 && alignments && alignments.length === headers.length) {
+      flushText();
+      const rows = [];
+      i += 2;
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+        const row = splitMarkdownTableRow(lines[i]);
+        if (row.length < 2) break;
+        rows.push(row);
+        i += 1;
+      }
+      blocks.push(renderMarkdownTable(headers, alignments, rows));
+      continue;
+    }
+
+    const heading = /^(#{1,6})\\s+(.*)$/.exec(line);
+    if (heading) {
+      flushText();
+      const level = Math.min(6, heading[1].length + 1);
+      blocks.push("<h" + level + ">" + renderInlineMarkdown(heading[2]) + "</h" + level + ">");
+      i += 1;
+      continue;
+    }
+
+    if (/^ {0,3}(?:-{3,}|_{3,}|\\*{3,})\\s*$/.test(line)) {
+      flushText();
+      blocks.push("<hr>");
+      i += 1;
+      continue;
+    }
+
+    if (line.startsWith("&gt;")) {
+      flushText();
+      const quote = [];
+      while (i < lines.length && lines[i].startsWith("&gt;")) {
+        quote.push(lines[i].replace(/^&gt; ?/, ""));
+        i += 1;
+      }
+      blocks.push("<blockquote><p>" + quote.map(renderInlineMarkdown).join("<br>") + "</p></blockquote>");
+      continue;
+    }
+
+    const unordered = /^ {0,3}[-*+]\\s+(.*)$/.exec(line);
+    const ordered = /^ {0,3}\\d+[.)]\\s+(.*)$/.exec(line);
+    if (unordered || ordered) {
+      flushParagraph();
+      const nextTag = unordered ? "ul" : "ol";
+      if (listTag && listTag !== nextTag) flushList();
+      listTag = nextTag;
+      listItems.push((unordered ?? ordered)[1]);
+      i += 1;
+      continue;
+    }
+
+    flushList();
+    paragraph.push(line);
+    i += 1;
+  }
+
+  flushText();
+  return blocks.join("");
 }
 
 // Small chat composer surface that any tab can embed at the top so the
@@ -3104,20 +4352,42 @@ function renderPageChatComposer(host, { placeholder = "Talk to your agent…", o
     sendBtn.disabled = true;
     reply.style.display = "block";
     reply.innerHTML = '<div class="muted" style="padding:10px 12px;">Thinking…</div>';
+    const requestId = newChatRequestId();
+    let streamedText = "";
+    const showStreamedReply = (model = "") => {
+      reply.innerHTML = \`
+        <div class="card" style="padding:12px; margin-bottom:14px;">
+          <div class="muted" style="font-size:11px; margin-bottom:6px;">openagi\${model ? " → " + escapeHtml(model) : " is replying…"}</div>
+          <div>\${renderMarkdown(streamedText)}</div>
+          <div class="muted" style="margin-top:8px; font-size:11px;">Response is still streaming…</div>
+        </div>
+      \`;
+    };
     try {
-      const result = await postJson("/message", {
+      const result = await postMessageStream({
         text,
         channel: state.channel ?? "local",
         from: state.from ?? "browser",
         agentId: state.agentId,
-        sessionId: state.sessionId
+        sessionId: state.sessionId,
+        metadata: { requestId, requestSource: "page-chat" }
+      }, (event, data) => {
+        if (event === "session" && data?.id) state.sessionId = data.id;
+        if (event === "delta" && typeof data?.text === "string") {
+          streamedText = data.reset === true ? data.text : streamedText + data.text;
+          showStreamedReply(data.model ?? "");
+        } else if ((event === "status" || event === "heartbeat") && !streamedText) {
+          const label = data?.stage === "tool" ? "Using tools…" : data?.stage === "saving" ? "Saving the answer…" : "Thinking…";
+          reply.innerHTML = '<div class="muted" style="padding:10px 12px;">' + label + '</div>';
+        }
       });
       if (result.session?.id) state.sessionId = result.session.id;
+      const continueHref = "/?tab=chat" + (state.sessionId ? "&session=" + encodeURIComponent(state.sessionId) : "");
       reply.innerHTML = \`
         <div class="card" style="padding:12px; margin-bottom:14px;">
           <div class="muted" style="font-size:11px; margin-bottom:6px;">openagi → \${escapeHtml(result.model?.model ?? "")}</div>
           <div>\${renderMarkdown(result.reply ?? "")}</div>
-          <div style="margin-top:8px; font-size:11px;"><a href="/?tab=chat">continue in chat →</a></div>
+          <div style="margin-top:8px; font-size:11px;"><a href="\${escapeHtml(continueHref)}">continue in chat →</a></div>
         </div>
       \`;
       input.value = "";
@@ -3167,6 +4437,11 @@ newBtn.addEventListener("click", async () => {
   if (state.tab === "chat") {
     state.sessionId = null;
     state.messages = [];
+    state.activeRequestId = null;
+    state.activeRequestStage = null;
+    state.activeRequestError = null;
+    state.activeRequestMissingSince = null;
+    state.freshChatRequested = true;
     state.from = "browser-" + Date.now();
     renderTab();
   } else if (state.tab === "cron") {
@@ -3201,6 +4476,7 @@ newBtn.addEventListener("click", async () => {
 
 async function switchTab(tab) {
   state.tab = tab;
+  syncNodesAutoRefresh();
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   const body = document.querySelector(".body");
   const showSidebar = (yes) => {
@@ -3213,6 +4489,15 @@ async function switchTab(tab) {
     sidebarTitle.textContent = "Sessions";
     newBtn.textContent = "+ New";
     await refreshSessions();
+    // A bare Chat open should look like chat history, not an unexplained blank
+    // composer. Select the newest human-facing session unless the user
+    // explicitly pressed + New or a specific ?session= handoff is about to be
+    // resolved. Background cron/autopilot transcripts stay out of this choice.
+    const requestedSession = deepLinkSessionId(window.location.search);
+    if (!state.sessionId && !state.freshChatRequested && !requestedSession) {
+      const latest = latestInteractiveSession(state.sessions);
+      if (latest) await loadSession(latest.id);
+    }
   } else if (tab === "cron") {
     showSidebar(true);
     sidebarTitle.textContent = "Schedules";
@@ -3262,6 +4547,12 @@ async function switchTab(tab) {
   } else if (tab === "today") {
     showSidebar(false);
     await renderToday();
+  } else if (tab === "review") {
+    showSidebar(false);
+    await renderReview();
+  } else if (tab === "approvals") {
+    showSidebar(false);
+    await renderApprovals();
   } else if (tab === "tasks") {
     showSidebar(false);
     await renderTasks();
@@ -3283,6 +4574,9 @@ function renderTab() {
 async function refreshSessions() {
   const sessions = await fetchJson("/sessions");
   state.sessions = sessions;
+  // A session refresh can finish after the user has switched to another tab.
+  // Keep the cached list current, but never replace another tab's sidebar.
+  if (state.tab !== "chat") return sessions;
   sidebarList.innerHTML = "";
   if (sessions.length === 0) {
     sidebarList.innerHTML = '<li class="empty">No sessions yet</li>';
@@ -3294,16 +4588,39 @@ async function refreshSessions() {
     li.addEventListener("click", () => loadSession(s.id));
     sidebarList.appendChild(li);
   }
+  return sessions;
 }
 
 async function loadSession(id) {
   state.sessionId = id;
+  state.freshChatRequested = false;
   const session = await fetchJson("/sessions/" + encodeURIComponent(id));
+  // Sidebar clicks can race. If B (or + New) was selected while A's history
+  // was in flight, A's late response must not overwrite B's conversation.
+  if (state.tab !== "chat" || state.sessionId !== id) return false;
+  const resolvedId = session?.id || id;
+  state.sessionId = resolvedId;
   state.messages = session.messages ?? [];
+  state.activeRequestId = latestChatRequestId(state.messages);
+  state.activeRequestStage = null;
+  state.activeRequestError = null;
+  state.activeRequestMissingSince = null;
+  state.activeRequestText = "";
+  state.activeRequestModel = "";
   state.channel = state.messages[0]?.channel ?? "local";
   state.from = state.messages[0]?.from ?? "browser";
   await refreshSessions();
+  if (state.tab !== "chat" || state.sessionId !== resolvedId) return false;
   renderChat();
+  return true;
+}
+
+function latestInteractiveSession(sessions) {
+  if (!Array.isArray(sessions)) return null;
+  return sessions.find((session) => {
+    const id = String(session?.id ?? "").toLowerCase();
+    return id && !id.startsWith("autopilot:") && !id.startsWith("cron:");
+  }) ?? null;
 }
 
 // Read the session id out of a chat deep link. The Quick Ask popover's
@@ -3323,16 +4640,46 @@ function deepLinkSessionId(search) {
   }
 }
 
+function deepLinkRequestId(search) {
+  try {
+    const raw = new URLSearchParams(search).get("request");
+    const id = (raw ?? "").trim();
+    return id === "" ? null : id;
+  } catch {
+    return null;
+  }
+}
+
 // Land the user on the conversation named by the deep link. Returns true when
 // the thread was actually loaded, false when we said so and left them on a
 // fresh chat instead.
-async function openSessionDeepLink(id) {
+async function openSessionDeepLink(id, requestId = null) {
   let session = null;
-  try {
-    session = await fetchJson("/sessions/" + encodeURIComponent(id));
-  } catch (err) {
-    showToast("Could not open that conversation: " + err.message, false);
-    return false;
+  // The popup knows the session id before it opens POST /message, specifically
+  // so its handoff is available while work is running. If the user clicks in
+  // the tiny interval before the daemon persists the user turn, retry this
+  // named request rather than declaring its brand-new session "gone".
+  const attempts = requestId ? 4 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      session = await fetchJson("/sessions/" + encodeURIComponent(id));
+    } catch (err) {
+      if (attempt === attempts - 1) {
+        showToast("Could not open that conversation: " + err.message, false);
+        return false;
+      }
+    }
+    const candidateMessages = Array.isArray(session?.messages) ? session.messages : [];
+    const requestedTurnIsPresent = !requestId || candidateMessages.some((message) => {
+      const metadata = message?.metadata;
+      const value = metadata?.requestId ?? metadata?.request?.id;
+      return typeof value === "string" && value.trim() === requestId;
+    });
+    // A reused overlay session already has old messages. Do not mistake that
+    // history for the new handoff: wait briefly for this exact request to be
+    // persisted, then adopt it as a durable queued request below.
+    if (candidateMessages.length > 0 && requestedTurnIsPresent) break;
+    if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
   const messages = Array.isArray(session && session.messages) ? session.messages : [];
   // GET /sessions/:id answers with an empty shell for an id it has never seen
@@ -3340,14 +4687,39 @@ async function openSessionDeepLink(id) {
   // messages" is exactly how a purged or mistyped deep link looks. Say that,
   // rather than rendering an empty thread that looks identical to the bug this
   // whole deep link exists to fix.
-  if (messages.length === 0) {
+  if (messages.length === 0 && !requestId) {
     state.sessionId = null;
     state.messages = [];
     showToast("That conversation is no longer available — starting a new one.", false);
     return false;
   }
   state.sessionId = (session && session.id) || id;
+  state.freshChatRequested = false;
   state.messages = messages;
+  state.activeRequestId = requestId;
+  if (!state.activeRequestId) {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const value = messages[i]?.metadata?.requestId ?? messages[i]?.metadata?.request?.id;
+      if (typeof value === "string" && value.trim()) {
+        state.activeRequestId = value.trim();
+        break;
+      }
+    }
+  }
+  state.activeRequestStage = null;
+  state.activeRequestError = null;
+  state.activeRequestText = "";
+  state.activeRequestModel = "";
+  const requestedTurnIsPresent = Boolean(requestId && messages.some((message) => {
+    const metadata = message?.metadata;
+    const value = metadata?.requestId ?? metadata?.request?.id;
+    return typeof value === "string" && value.trim() === requestId;
+  }));
+  // The popup can hand off before routing or a same-session queue reaches the
+  // store. Keep that named request visibly queued, block duplicate sends, and
+  // let the recovery poll reconcile it once its user/assistant records appear.
+  state.activeRequestMissingSince = requestId && !requestedTurnIsPresent ? Date.now() : null;
+  if (state.activeRequestMissingSince) state.activeRequestStage = "queued";
   // Keep replying on the channel the conversation started on. An overlay ask
   // is channel "overlay" / from "user"; sending the follow-up as local/browser
   // would compute a different session key and fork the thread in two.
@@ -3358,9 +4730,212 @@ async function openSessionDeepLink(id) {
   return true;
 }
 
+function newChatRequestId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return "req_" + globalThis.crypto.randomUUID().replaceAll("-", "");
+  } catch { /* deterministic fallback below */ }
+  return "req_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+// Direct response streams outlive the DOM that started them. Only the request
+// still selected in Chat may mutate visible conversation state; a completion
+// for a session the user left remains durable on the server and is picked up
+// from the session list/history instead.
+function chatRequestOwnsVisibleState(current, sessionIds, requestId) {
+  return current?.tab === "chat"
+    && current?.activeRequestId === requestId
+    && sessionIds.some((id) => Boolean(id) && current?.sessionId === id);
+}
+
+function messageRequestId(message) {
+  const metadata = message?.metadata;
+  const value = metadata?.requestId ?? metadata?.request?.id;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function messageRequestStatus(message) {
+  const metadata = message?.metadata;
+  const value = metadata?.requestStatus ?? metadata?.request?.status ?? metadata?.status;
+  return typeof value === "string" ? value.toLowerCase() : null;
+}
+
+// Six provider hops can each consume the 120-second provider timeout. Thirty
+// minutes leaves ample room for that plus tools while preventing a user turn
+// stranded by a daemon crash from saying “working” and polling forever.
+const CHAT_REQUEST_STALE_MS = 30 * 60 * 1000;
+// A disconnected request is recoverable too: the daemon deliberately keeps a queued
+// turn running after the direct HTTP stream drops. Keep reconciling its durable
+// history until the same 30-minute stale cutoff used by every pending request.
+const CHAT_REQUEST_LIVE_STAGES = ["queued", "routing", "accepted", "thinking", "model", "tool", "saving", "disconnected"];
+
+function latestChatRequestId(messages) {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i -= 1) {
+    const id = messageRequestId(messages[i]);
+    if (id) return id;
+  }
+  return null;
+}
+
+function requestState(messages, requestId) {
+  if (!requestId) return null;
+  const userIndex = messages.findIndex((message) => message.role === "user" && messageRequestId(message) === requestId);
+  if (userIndex < 0) return null;
+  let laterIdentifiedRequest = false;
+  for (let i = userIndex + 1; i < messages.length; i += 1) {
+    const message = messages[i];
+    const messageId = messageRequestId(message);
+    if (message.role === "user" && messageId) {
+      laterIdentifiedRequest = true;
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    // New records carry requestId on both sides. Legacy assistant records do
+    // not, so adjacency remains the fallback only when no overlapping request
+    // makes that inference ambiguous.
+    if (messageId && messageId !== requestId) continue;
+    if (!messageId && laterIdentifiedRequest) continue;
+    const status = messageRequestStatus(message);
+    if (status === "failed") return { status: "failed", message };
+    return { status: "complete", message };
+  }
+  const userMessage = messages[userIndex];
+  const createdAt = Date.parse(userMessage?.createdAt ?? "");
+  if (Number.isFinite(createdAt) && Date.now() - createdAt > CHAT_REQUEST_STALE_MS) {
+    return { status: "interrupted", message: userMessage };
+  }
+  return { status: "pending", message: userMessage };
+}
+
+function isPendingUserMessage(messages, index) {
+  const message = messages[index];
+  if (message?.role !== "user") return false;
+  const id = messageRequestId(message);
+  return Boolean(id && requestState(messages, id)?.status === "pending");
+}
+
+function activeChatRequestIsPending() {
+  const id = state.activeRequestId || latestChatRequestId(state.messages);
+  const persisted = requestState(state.messages, id);
+  return persisted?.status === "pending"
+    || (!persisted && Boolean(id) && CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage));
+}
+
+function chatStageLabel(stage) {
+  return ({
+    queued: "Queued",
+    routing: "Choosing the right agent",
+    accepted: "Request saved",
+    thinking: "Thinking",
+    model: "Waiting for the model",
+    tool: "Using tools",
+    saving: "Saving the answer",
+    disconnected: "Connection lost — checking the saved request"
+  })[stage] ?? "Working";
+}
+
+function renderChatRequestStatus() {
+  const host = document.getElementById("chat-request-status");
+  if (!host) return;
+  const id = state.activeRequestId || latestChatRequestId(state.messages);
+  const persisted = requestState(state.messages, id);
+  const hasLiveProgress = CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage);
+  const failed = state.activeRequestStage === "failed" || persisted?.status === "failed";
+  const interrupted = state.activeRequestStage === "interrupted" || (!hasLiveProgress && persisted?.status === "interrupted");
+  const pending = !failed && !interrupted && (persisted?.status === "pending" || hasLiveProgress);
+  if (!failed && !interrupted && !pending) {
+    host.innerHTML = "";
+    return;
+  }
+  if (failed) {
+    const persistedText = persisted?.message?.content;
+    const detail = state.activeRequestError || persistedText || "The agent could not complete this request.";
+    host.innerHTML = \`
+      <div class="card err" style="padding:10px 12px; margin-bottom:10px;" role="status">
+        <strong>Request failed.</strong> \${escapeHtml(detail)}
+      </div>
+    \`;
+    return;
+  }
+  if (interrupted) {
+    host.innerHTML = \`
+      <div class="card warn-banner" style="padding:10px 12px; margin-bottom:10px;" role="status">
+        <strong>Request interrupted.</strong> No completion was recorded. Review any task changes before retrying.
+      </div>
+    \`;
+    return;
+  }
+  host.innerHTML = \`
+    <div class="card" style="padding:10px 12px; margin-bottom:10px;" role="status" aria-live="polite">
+      <span class="muted">◌ \${escapeHtml(chatStageLabel(state.activeRequestStage))}… This conversation updates automatically; you can keep this window open or come back later.</span>
+    </div>
+  \`;
+}
+
+let activeChatRefresh = null;
+async function refreshActiveChatSession(id = state.sessionId, { force = false } = {}) {
+  if (!id || state.tab !== "chat") return false;
+  if (activeChatRefresh && !force) return activeChatRefresh;
+  const request = (async () => {
+    const session = await fetchJson("/sessions/" + encodeURIComponent(id));
+    // The fetch may finish after a sidebar click or + New. Applying that stale
+    // response would reopen the old conversation even though its stream handler
+    // correctly detached, so verify the selection again at the async boundary.
+    if (state.tab !== "chat" || state.sessionId !== id) return false;
+    const messages = Array.isArray(session?.messages) ? session.messages : [];
+    const before = state.messages.map((message) => message.id ?? [message.role, message.createdAt, message.content].join(":"))
+      .join("|");
+    const after = messages.map((message) => message.id ?? [message.role, message.createdAt, message.content].join(":"))
+      .join("|");
+    if (!force && before === after) return false;
+
+    const draft = document.getElementById("input")?.value ?? "";
+    const wasFocused = document.activeElement?.id === "input";
+    state.sessionId = session?.id || id;
+    state.messages = messages;
+    state.channel = messages[0]?.channel ?? state.channel ?? "local";
+    state.from = messages[0]?.from ?? state.from ?? "browser";
+    const outcome = requestState(messages, state.activeRequestId);
+    if (outcome) state.activeRequestMissingSince = null;
+    else if (state.activeRequestId && CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage)) {
+      // A disconnect can happen while this turn is still queued behind another
+      // same-session turn, before AgentHost persists its user record. Remember
+      // when it first went missing so polling recovers a late write but still
+      // terminates at CHAT_REQUEST_STALE_MS after a daemon crash.
+      state.activeRequestMissingSince ??= Date.now();
+    }
+    if (outcome?.status === "complete") {
+      state.activeRequestStage = "complete";
+      state.activeRequestError = null;
+      state.activeRequestText = "";
+      state.activeRequestModel = "";
+    } else if (outcome?.status === "failed") {
+      state.activeRequestStage = "failed";
+      state.activeRequestText = "";
+      state.activeRequestModel = "";
+    } else if (outcome?.status === "interrupted") {
+      state.activeRequestStage = "interrupted";
+      state.activeRequestText = "";
+      state.activeRequestModel = "";
+    }
+    renderChat();
+    const input = document.getElementById("input");
+    if (input && draft) {
+      input.value = draft;
+      input.dispatchEvent(new Event("input"));
+      if (wasFocused) input.focus();
+    }
+    await refreshSessions();
+    return true;
+  })();
+  activeChatRefresh = request;
+  try { return await request; }
+  finally { if (activeChatRefresh === request) activeChatRefresh = null; }
+}
+
 function renderChat() {
   main.innerHTML = \`
     <div id="chat-deeplink" style="margin-bottom:8px;"></div>
+    <div id="chat-request-status"></div>
     <div class="thread" id="thread"></div>
     <form class="composer" id="composer">
       <textarea id="input" placeholder="Message your OpenAGI agent…" rows="1"></textarea>
@@ -3379,7 +4954,11 @@ function renderChat() {
     try { dismissed = localStorage.getItem("openagi.welcomeDismissed") === "1"; } catch { /* ignore */ }
     thread.innerHTML = (noSessions && !dismissed) ? renderFirstRunWelcome() : renderChatPlaceholder();
   }
-  for (const m of state.messages) appendMessage(m, false);
+  for (let i = 0; i < state.messages.length; i += 1) {
+    appendMessage(state.messages[i], false, { pending: isPendingUserMessage(state.messages, i) });
+  }
+  renderStreamingAssistant();
+  renderChatRequestStatus();
   thread.scrollTop = thread.scrollHeight;
   // Render a deep-link panel above the thread when the user arrived
   // here via a notification with ?suggestion=<id> or ?pending=<id>.
@@ -3409,18 +4988,22 @@ function renderChat() {
     if (thread) thread.innerHTML = renderChatPlaceholder();
   });
   const input = $("input");
+  const composerBlocked = activeChatRequestIsPending();
+  input.disabled = composerBlocked;
+  $("send").disabled = composerBlocked;
+  if (composerBlocked) input.placeholder = "Wait for the current request to finish…";
   // ?compose=<intent> seeds the input with a starter sentence so the user
   // can finish typing and Enter — agent picks up via add_task /
-  // connect_catalog_mcp / etc tools. Used by the menu-bar "+ Add task"
-  // button so its click drops you straight into a conversation rather
-  // than a structured form.
+  // connect_catalog_mcp / etc tools. Menu-bar shortcuts and Computer
+  // History use this to land in a ready-to-edit prompt.
   const composeIntent = new URLSearchParams(window.location.search).get("compose");
-  if (composeIntent && state.messages.length === 0) {
+  if (composeIntent && (state.messages.length === 0 || composeIntent === "ask-history")) {
     const seed = ({
       "add-task": "Add a task: ",
       "add-mcp": "Connect this MCP: ",
       "schedule": "Remind me to ",
-      "remember": "Remember that "
+      "remember": "Remember that ",
+      "ask-history": "Summarize what I was working on recently from my computer history, group it by workstream, and tell me where I left off."
     })[composeIntent];
     if (seed) {
       input.value = seed;
@@ -3435,7 +5018,7 @@ function renderChat() {
       history.replaceState(null, "", url.toString());
     }
   }
-  input.focus();
+  if (!composerBlocked) input.focus();
   input.addEventListener("input", () => {
     input.style.height = "auto";
     input.style.height = Math.min(200, input.scrollHeight) + "px";
@@ -3450,26 +5033,97 @@ function renderChat() {
     e.preventDefault();
     const text = input.value.trim();
     if (!text) return;
+    const sendBtn = $("send");
+    if (sendBtn.disabled) return;
+    const requestId = newChatRequestId();
+    if (!state.sessionId) {
+      if (!state.from || state.from === "browser") state.from = "browser-" + newChatRequestId();
+      state.sessionId = state.channel + ":" + state.from + ":" + state.agentId;
+    }
+    const submittedSessionId = state.sessionId;
+    let requestSessionId = submittedSessionId;
+    const ownsVisibleRequest = () => chatRequestOwnsVisibleState(
+      state,
+      [submittedSessionId, requestSessionId],
+      requestId
+    );
+    const refreshDetachedSessionList = async () => {
+      if (state.tab === "chat") await refreshSessions().catch(() => {});
+    };
+    state.freshChatRequested = false;
+    state.activeRequestId = requestId;
+    state.activeRequestStage = "queued";
+    state.activeRequestError = null;
+    state.activeRequestMissingSince = null;
+    state.activeRequestText = "";
+    state.activeRequestModel = "";
     input.value = "";
     input.style.height = "auto";
-    appendMessage({ role: "user", content: text, from: state.from, channel: state.channel, createdAt: new Date().toISOString() });
-    const sendBtn = $("send");
+    const optimistic = {
+      role: "user",
+      content: text,
+      from: state.from,
+      channel: state.channel,
+      createdAt: new Date().toISOString(),
+      metadata: { requestId, requestSource: "dashboard" }
+    };
+    state.messages.push(optimistic);
+    appendMessage(optimistic, true, { pending: true });
+    renderChatRequestStatus();
     sendBtn.disabled = true;
     try {
-      const result = await postJson("/message", {
+      const result = await postMessageStream({
         text,
         channel: state.channel,
         from: state.from,
         agentId: state.agentId,
-        sessionId: state.sessionId
+        sessionId: submittedSessionId,
+        metadata: { requestId, requestSource: "dashboard" }
+      }, (event, data) => {
+        if (event === "session" && data?.id) {
+          const wasVisible = ownsVisibleRequest();
+          requestSessionId = data.id;
+          if (wasVisible) state.sessionId = data.id;
+          return;
+        }
+        if (!ownsVisibleRequest()) return;
+        if (event === "status" || event === "heartbeat") {
+          state.activeRequestStage = data?.stage ?? state.activeRequestStage;
+          renderChatRequestStatus();
+        } else if (event === "delta") {
+          updateStreamingAssistant(requestId, data);
+        }
       });
-      state.sessionId = result.session.id;
-      appendMessage({ role: "assistant", content: result.reply, from: "openagi", channel: state.channel, createdAt: result.createdAt, metadata: result.model });
-      refreshSessions();
+      const finalSessionId = result.session?.id || requestSessionId;
+      if (ownsVisibleRequest()) {
+        requestSessionId = finalSessionId;
+        state.sessionId = finalSessionId;
+        state.activeRequestStage = "complete";
+        await refreshActiveChatSession(finalSessionId, { force: true });
+      } else {
+        await refreshDetachedSessionList();
+      }
     } catch (err) {
-      appendMessage({ role: "assistant", content: "[error] " + err.message });
+      // An explicit daemon failure is terminal. A broken HTTP/SSE transport is
+      // not: the daemon intentionally continues the already-persisted turn.
+      // Keep it pending and let the session poll/global SSE reconcile it.
+      if (ownsVisibleRequest()) {
+        state.activeRequestStage = err.terminal === true ? "failed" : "disconnected";
+        state.activeRequestError = err.message;
+        // Prefer the daemon's persisted failure record when available. If the
+        // connection itself died first, the local status remains visible and the
+        // pending-session poll can still pick up a later completion.
+        await refreshActiveChatSession(requestSessionId, { force: true }).catch(() => {});
+        renderChatRequestStatus();
+      } else {
+        await refreshDetachedSessionList();
+      }
     } finally {
-      sendBtn.disabled = false;
+      if (ownsVisibleRequest()) {
+        const currentSend = $("send");
+        const outcome = requestState(state.messages, state.activeRequestId);
+        if (currentSend) currentSend.disabled = outcome?.status === "pending" || activeChatRequestIsPending();
+      }
     }
   });
 }
@@ -3557,16 +5211,23 @@ async function renderChatDeepLink() {
         </div>
       \`;
       const handle = async (decision) => {
+        document.getElementById("dl-approve").disabled = true;
+        document.getElementById("dl-deny").disabled = true;
         try {
           const res = await postJson(\`/pending-actions/\${encodeURIComponent(pendingId)}/\${decision}\`, {});
-          const summary = res?.result?.note ?? res?.result?.message ?? \`Action \${decision}d.\`;
+          const summary = res?.continuation?.status === "queued"
+            ? "Approved — the agent is continuing in this chat."
+            : res?.result?.note ?? res?.result?.message ?? \`Action \${decision}d.\`;
           showToast(\`✓ \${summary}\`, true);
-          host.innerHTML = "";
+          host.innerHTML = '<div class="card ok" style="padding:10px 14px;">✓ ' + escapeHtml(summary) + '</div>';
+          await refreshApprovalBadge();
           const url = new URL(window.location.href);
           url.searchParams.delete("pending");
           history.replaceState(null, "", url.toString());
         } catch (err) {
           showToast(\`\${decision} failed: \${err.message}\`, false);
+          document.getElementById("dl-approve").disabled = false;
+          document.getElementById("dl-deny").disabled = false;
         }
       };
       document.getElementById("dl-approve").addEventListener("click", () => handle("approve"));
@@ -3636,18 +5297,57 @@ function screenContextChip(metadata) {
     escapeHtml(where + size) + "</div>";
 }
 
-function appendMessage(msg, autoscroll = true) {
+function appendMessage(msg, autoscroll = true, { pending = false } = {}) {
   const thread = $("thread");
   if (!thread) return;
   const div = document.createElement("div");
-  div.className = "msg " + (msg.role === "user" ? "user" : "assistant");
-  const meta = msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
+  const runtimeApproval = msg.metadata?.runtimeEvent === "approval";
+  div.className = "msg " + (runtimeApproval ? "runtime" : msg.role === "user" ? "user" : "assistant");
+  const meta = runtimeApproval
+    ? "OpenAGI approval"
+    : msg.role === "assistant" && msg.metadata?.model ? \`\${msg.metadata.model} · \${msg.metadata.provider ?? ""}\` : msg.from ?? "";
   // Assistant replies render markdown; user messages stay literal.
-  const body = msg.role === "assistant" ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
+  const body = msg.role === "assistant" && !runtimeApproval ? renderMarkdown(msg.content ?? "") : escapeHtml(msg.content ?? "");
   const context = msg.role === "user" ? screenContextChip(msg.metadata) : "";
-  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\`;
+  const pendingNote = pending
+    ? '<div class="meta" style="margin-top:5px;">◌ Agent is still working — this request is saved.</div>'
+    : "";
+  div.innerHTML = \`<div class="meta">\${escapeHtml(meta)}</div>\${context}<div class="body">\${body}</div>\${pendingNote}\`;
   thread.appendChild(div);
   if (autoscroll) thread.scrollTop = thread.scrollHeight;
+}
+
+// Keep transient model text outside state.messages: only the exact provider
+// result that AgentHost persisted belongs in conversation history. The small
+// buffer survives a tab re-render or a transport disconnect, then disappears
+// as soon as the durable completed/failed record is fetched.
+function updateStreamingAssistant(requestId, delta) {
+  if (!requestId || requestId !== state.activeRequestId) return;
+  if (typeof delta?.text !== "string" || delta.text.length === 0) return;
+  state.activeRequestText = delta.reset === true
+    ? delta.text
+    : (state.activeRequestText ?? "") + delta.text;
+  if (typeof delta.model === "string" && delta.model) state.activeRequestModel = delta.model;
+  renderStreamingAssistant();
+}
+
+function renderStreamingAssistant() {
+  const thread = $("thread");
+  if (!thread || !state.activeRequestText || !activeChatRequestIsPending()) return;
+  let div = Array.from(thread.querySelectorAll(".msg.assistant.streaming"))
+    .find((candidate) => candidate.dataset.requestId === state.activeRequestId);
+  if (!div) {
+    div = document.createElement("div");
+    div.className = "msg assistant streaming";
+    div.dataset.requestId = state.activeRequestId ?? "";
+    div.innerHTML = '<div class="meta"></div><div class="body" aria-live="polite"></div>';
+    thread.appendChild(div);
+  }
+  const meta = div.querySelector(".meta");
+  const body = div.querySelector(".body");
+  if (meta) meta.textContent = state.activeRequestModel ? state.activeRequestModel + " · replying…" : "openagi · replying…";
+  if (body) body.innerHTML = renderMarkdown(state.activeRequestText);
+  thread.scrollTop = thread.scrollHeight;
 }
 
 async function refreshCron() {
@@ -4026,6 +5726,9 @@ function renderMcpDetail(server) {
   const connectingBanner = server.connecting && !server.connected
     ? \`<div class="card"><div class="row" style="align-items:center; gap:10px; flex-wrap:wrap;"><span class="name">⏳ Connecting…</span><span class="muted" style="flex:1; min-width:0;">waiting for handshake</span></div></div>\`
     : "";
+  const errorBanner = server.lastError && !server.connecting && !server.connected
+    ? \`<div class="card err"><div class="name">Connection failed</div><div class="desc">\${escapeHtml(server.lastError)}</div></div>\`
+    : "";
   main.innerHTML = \`
     <div class="pane">
       <h2>\${escapeHtml(server.name)}</h2>
@@ -4033,17 +5736,19 @@ function renderMcpDetail(server) {
         <span class="badge \${server.connected ? 'ok' : ''}">\${server.connected ? "connected" : "disconnected"}</span>
         <span class="badge">trust: \${escapeHtml(server.trustLevel)}</span>
         <span class="badge">transport: \${transportLabel}</span>
+        \${server.auth === "oauth" ? \`<span class="badge \${server.authenticated ? 'ok' : ''}">\${server.authenticated ? "authorized" : "not authorized"}</span>\` : ""}
         \${server.pendingAuthUrl ? '<span class="badge warn">awaiting auth</span>' : ""}
       </div>
       \${oauthBanner}
       \${connectingBanner}
+      \${errorBanner}
       <h3>Endpoint</h3>
       \${endpoint}
       <h3>Tools</h3>
       <pre>\${escapeHtml((server.tools ?? []).join("\\n") || "(none — connect to discover)")}</pre>
       <div class="row" style="gap: 8px; margin-top: 12px;flex-wrap:wrap;">
         <button id="connBtn" \${server.connecting ? "disabled" : ""}>\${server.connected ? "Disconnect" : "Connect"}</button>
-        \${server.transport === "http" && server.auth === "oauth" ? \`<button class="secondary" id="clearAuthBtn">Re-auth (clear cached token)</button>\` : ""}
+        \${server.transport === "http" && server.auth === "oauth" ? \`<button class="secondary" id="clearAuthBtn">Forget login</button>\` : ""}
         <button class="secondary" id="callBtn">Call tool…</button>
       </div>
       <pre id="mcpOut" class="ok" style="margin-top: 12px;"></pre>
@@ -4061,9 +5766,14 @@ function renderMcpDetail(server) {
   });
   const clearBtn = $("clearAuthBtn");
   if (clearBtn) clearBtn.addEventListener("click", async () => {
-    if (!confirm("Clear cached OAuth token for " + server.name + "? Next Connect will run the auth flow again.")) return;
-    await postJson(\`/mcp/clear-auth/\${encodeURIComponent(server.name)}\`, {});
-    refreshMcp();
+    if (!confirm("Disconnect " + server.name + " and forget its saved OAuth login? You can connect and authorize it again later.")) return;
+    try {
+      await postJson(\`/mcp/clear-auth/\${encodeURIComponent(server.name)}\`, {});
+      showToast("Login forgotten. The integration is disconnected.", true);
+      refreshMcp();
+    } catch (error) {
+      showToast("Could not forget login: " + error.message, false);
+    }
   });
   $("callBtn").addEventListener("click", () => {
     const tool = prompt("Tool name?");
@@ -4389,8 +6099,80 @@ function nodeBuildLabel(n) {
   return origin ? origin + " " + n.build : n.build;
 }
 
-async function renderNodes() {
-  const data = await fetchJson("/nodes");
+let nodesRenderPromise = null;
+let nodesRefreshTimer = null;
+
+// Keep topology reasonably fresh without polling a panel the user cannot see.
+// Re-entering the browser tab gets an immediate refresh; the 30-second timer
+// exists only while both the Nodes app tab and this document are visible.
+function syncNodesAutoRefresh() {
+  if (nodesRefreshTimer) {
+    clearInterval(nodesRefreshTimer);
+    nodesRefreshTimer = null;
+  }
+  if (state.tab === "nodes" && !document.hidden) {
+    nodesRefreshTimer = setInterval(() => {
+      renderNodes({ showLoading: false });
+    }, 30_000);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  syncNodesAutoRefresh();
+  if (state.tab === "nodes" && !document.hidden) {
+    renderNodes({ showLoading: false });
+  }
+});
+
+// A slow main can make several refresh triggers coincide (tab entry, timer,
+// visibility, and the button). Share one promise so those triggers produce one
+// request and a late response cannot overwrite a different app tab.
+function renderNodes(options = {}) {
+  if (nodesRenderPromise) return nodesRenderPromise;
+  let request;
+  request = renderNodesOnce(options).finally(() => {
+    if (nodesRenderPromise === request) nodesRenderPromise = null;
+  });
+  nodesRenderPromise = request;
+  return request;
+}
+
+async function renderNodesOnce({ showLoading = true } = {}) {
+  if (state.tab !== "nodes") return;
+  if (showLoading) {
+    main.innerHTML = \`
+      <div class="pane" aria-busy="true">
+        <h2>Nodes</h2>
+        <div class="card"><div class="name">Loading nodes…</div><div class="desc">Checking this machine, paired installs, and connected services.</div></div>
+      </div>
+    \`;
+  } else {
+    const refresh = document.getElementById("nodesRefresh");
+    if (refresh) {
+      refresh.disabled = true;
+      refresh.textContent = "Checking…";
+    }
+  }
+
+  let data;
+  try {
+    data = await fetchJson("/nodes");
+  } catch (error) {
+    if (state.tab !== "nodes") return;
+    main.innerHTML = \`
+      <div class="pane">
+        <h2>Nodes</h2>
+        <div class="card">
+          <div class="name err">Couldn't load nodes</div>
+          <div class="desc">\${escapeHtml(error?.message ?? String(error))}</div>
+          <div class="row" style="margin-top:8px;"><button id="nodesRetry">Try again</button></div>
+        </div>
+      </div>
+    \`;
+    document.getElementById("nodesRetry")?.addEventListener("click", () => renderNodes());
+    return;
+  }
+  if (state.tab !== "nodes") return;
   const self = data.self ?? {};
   const nodes = Array.isArray(data.nodes) ? data.nodes : [];
   const isNode = self.role === "node";
@@ -4442,20 +6224,34 @@ async function renderNodes() {
     } else {
       update = \`<span class="sub">last known \${escapeHtml(n.version)}\${data.cachedAt ? " (" + escapeHtml(timeAgo(data.cachedAt)) + ")" : ""} — can't verify now</span>\`;
     }
+    const revoke = !isNode && !n.self
+      ? \`<div style="margin-top:6px;"><button class="ui-btn ui-btn-destructive ui-btn-sm" data-revoke-node="\${escapeHtml(n.nodeId)}">Remove node</button></div>\`
+      : "";
+    const capabilityLabels = { "computer-use": "Computer use", "imessage-search": "iMessage search" };
+    const capabilities = (Array.isArray(n.capabilities) ? n.capabilities : []).map((capability) => {
+      const label = capabilityLabels[capability.id] ?? String(capability.id ?? "capability").replaceAll("-", " ");
+      const stateLabel = capability.ready === true ? "ready" : "not ready";
+      const stateClass = capability.ready === true ? "ok" : "warn";
+      const operations = Array.isArray(capability.operations) && capability.operations.length
+        ? \` · \${escapeHtml(capability.operations.join(", "))}\`
+        : "";
+      const detail = capability.detail ? \` · \${escapeHtml(capability.detail)}\` : "";
+      return \`<div class="sub"><span class="badge \${stateClass}">\${escapeHtml(label)}: \${stateLabel}</span>\${operations}\${detail}</div>\`;
+    }).join("");
     return \`
       <tr>
-        <td>\${escapeHtml(n.name ?? "unknown")}\${n.self ? \` <span class="badge">this machine</span>\` : ""}\${n.staleRegistration ? \` <span class="badge muted" title="Same hostname as this machine but a different node id — an earlier install that never checked in again.">old registration</span>\` : ""}\${n.url ? \`<div class="sub">\${escapeHtml(n.url)}</div>\` : ""}</td>
+        <td>\${escapeHtml(n.name ?? "unknown")}\${n.self ? \` <span class="badge">this machine</span>\` : ""}\${n.staleRegistration ? \` <span class="badge muted" title="Same hostname as this machine but a different node id — an earlier install that never checked in again.">old registration</span>\` : ""}\${n.url ? \`<div class="sub">\${escapeHtml(n.url)}</div>\` : ""}\${capabilities}</td>
         <td>\${escapeHtml(n.role)}</td>
         <td><span class="badge \${s.badge}">\${escapeHtml(s.label)}</span>\${asOf}</td>
         <td>\${seen}</td>
         <td>\${escapeHtml(n.version ?? "unknown")}<div class="sub">\${escapeHtml(nodeBuildLabel(n))}</div></td>
-        <td>\${update}</td>
+        <td>\${update}\${revoke}</td>
       </tr>\`;
   }).join("");
 
   // Service nodes: machines that do work for this installation without being
-  // installs themselves (the Mac mini that serves iMessage search). They sit in
-  // the SAME table so the whole topology reads as one thing, but every column
+  // installs themselves (for example, a host that serves iMessage search).
+  // They sit in the SAME table so the whole topology reads as one thing, but every column
   // that only means something for a peer says so instead of being left blank —
   // a service has no heartbeat, no version and nothing to update.
   const services = Array.isArray(data.services) ? data.services : [];
@@ -4553,7 +6349,21 @@ async function renderNodes() {
     c.style.borderBottom = "1px solid var(--line)";
     c.style.verticalAlign = "top";
   });
-  document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes());
+  document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes({ showLoading: false }));
+  main.querySelectorAll("[data-revoke-node]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const nodeId = button.getAttribute("data-revoke-node");
+      if (!nodeId || !confirm("Remove this node and revoke its control credential? It must be paired again before reconnecting.")) return;
+      const response = await fetch(\`/nodes/\${encodeURIComponent(nodeId)}/revoke\`, { method: "POST", credentials: "include" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        showToast("Couldn't remove node: " + (body.error || response.status), false);
+        return;
+      }
+      showToast("Node removed and credential revoked.", true);
+      renderNodes({ showLoading: false });
+    });
+  });
 }
 
 async function renderChannels() {
@@ -4847,14 +6657,97 @@ async function renderHealth() {
   \`;
 }
 
+function pendingActionCardHtml(action) {
+  return '<div class="card" style="padding:14px; margin-bottom:10px;" data-pending-id="' + escapeHtml(action.id) + '">'
+    + '<div style="display:flex; gap:8px; align-items:center;">'
+    + '<span style="font-size:18px;">🤖</span>'
+    + '<span style="font-weight:600;">' + escapeHtml(action.summary || action.toolName) + '</span>'
+    + '<span class="badge">' + escapeHtml(action.toolName) + '</span>'
+    + '</div>'
+    + (action.reason ? '<div class="muted" style="margin-top:6px; font-size:12px;">' + escapeHtml(action.reason) + '</div>' : '')
+    + '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px;">'
+    + escapeHtml(JSON.stringify(action.args, null, 2))
+    + '</pre></details>'
+    + '<div class="muted" style="margin-top:4px; font-size:11px;">queued ' + escapeHtml(new Date(action.createdAt).toLocaleString()) + '</div>'
+    + '<div class="row" style="gap:8px; margin-top:10px;">'
+    + '<button data-pending-action="approve">Approve & run</button>'
+    + '<button data-pending-action="deny" class="secondary">Deny</button>'
+    + '</div></div>';
+}
+
+function pendingActionsSectionHtml(actions, {
+  heading = "Agent actions awaiting approval",
+  empty = ""
+} = {}) {
+  if (!Array.isArray(actions) || actions.length === 0) return empty;
+  return '<h3 style="margin-top:8px;">' + escapeHtml(heading) + ' <span class="badge">' + actions.length + '</span></h3>'
+    + '<p class="muted">These actions have not run. Review the visible arguments, then approve or deny each one.</p>'
+    + actions.map(pendingActionCardHtml).join("");
+}
+
+function decidedActionCardHtml(action) {
+  const ok = action.status === "approved" && !action.error;
+  const statusClass = ok ? "ok" : action.status === "denied" ? "muted" : "err";
+  const outcome = action.error
+    ? '<div class="desc err" style="margin-top:6px;">Failed: ' + escapeHtml(action.error) + '</div>'
+    : action.result
+      ? '<details style="margin-top:6px;"><summary class="muted" style="font-size:11px;">result</summary><pre style="font-size:11px; margin-top:4px;">' + escapeHtml(JSON.stringify(action.result, null, 2)) + '</pre></details>'
+      : "";
+  return '<div class="card" style="padding:12px; margin-bottom:8px;">'
+    + '<div class="row between"><span class="name">' + escapeHtml(action.summary || action.toolName) + '</span>'
+    + '<span class="badge ' + statusClass + '">' + escapeHtml(action.status) + '</span></div>'
+    + '<div class="muted" style="font-size:11px; margin-top:4px;">'
+    + escapeHtml(action.toolName) + ' · decided ' + escapeHtml(new Date(action.decidedAt || action.createdAt).toLocaleString())
+    + '</div>' + outcome + '</div>';
+}
+
+async function refreshApprovalBadge() {
+  const count = document.getElementById("approvalsNavCount");
+  if (!count) return;
+  try {
+    const data = await fetchJson("/pending-actions?status=pending");
+    const n = data.actions?.length ?? 0;
+    count.textContent = String(n);
+    count.hidden = n === 0;
+  } catch {
+    count.hidden = true;
+  }
+}
+
+async function renderApprovals() {
+  const data = await fetchJson("/pending-actions").catch(() => ({ actions: [] }));
+  const actions = data.actions ?? [];
+  const pending = actions.filter((action) => action.status === "pending");
+  const decided = actions.filter((action) => action.status !== "pending").slice(0, 20);
+  main.innerHTML = '<div class="pane">'
+    + '<h2>Approvals</h2>'
+    + '<p class="muted">This is the durable approval queue. A notification is only a shortcut to the same records shown here.</p>'
+    + pendingActionsSectionHtml(pending, {
+        empty: '<div class="ui-empty">Nothing is waiting for approval.</div>'
+      })
+    + '<h3 style="margin-top:18px;">Recent decisions</h3>'
+    + (decided.length > 0
+        ? decided.map(decidedActionCardHtml).join("")
+        : '<div class="ui-empty">No approval decisions recorded yet.</div>')
+    + '</div>';
+  bindPendingActionButtons(async () => {
+    await renderApprovals();
+    await refreshApprovalBadge();
+  });
+  await refreshApprovalBadge();
+}
+
 async function renderSuggestions() {
   // Live view of everything the proactive observer has proposed and is
   // waiting on the user to accept/reject. Tasks → Tasks tab, MCPs →
   // auto-register, automations → notes, knowledge → just FYI.
   // Plus: pending agent-initiated actions (catalog connects, daemon
   // restarts) that need explicit human approval before they run.
+  const targetSuggestionId = new URLSearchParams(window.location.search).get("suggestion");
+  const suggestionPath = "/proactive/suggestions?status=pending"
+    + (targetSuggestionId ? "&id=" + encodeURIComponent(targetSuggestionId) : "");
   const [list, pendingActions] = await Promise.all([
-    fetchJson("/proactive/suggestions?status=pending").catch(() => []),
+    fetchJson(suggestionPath).catch(() => []),
     fetchJson("/pending-actions?status=pending").catch(() => ({ actions: [] }))
   ]);
   const actions = pendingActions?.actions ?? [];
@@ -4947,7 +6840,7 @@ async function renderSuggestions() {
       sequenceMeta = "observed " + s.sequence.count + "× · confidence " + conf + hourPart;
     }
     return \`
-      <div class="card" style="padding:14px; margin-bottom:10px;" data-suggestion-id="\${s.id}">
+      <div class="card" style="padding:14px; margin-bottom:10px;" data-suggestion-id="\${escapeHtml(s.id)}">
         <div class="row between" style="align-items:flex-start; gap:8px;">
           <div style="flex:1; min-width:0;">
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
@@ -4974,9 +6867,12 @@ async function renderSuggestions() {
 
   main.innerHTML = \`
     <div class="pane">
-      <h2>Suggestions <span class="badge">\${list.length}</span></h2>
+      <div class="ui-row" style="justify-content:space-between; align-items:flex-start;">
+        <h2>Suggestions <span class="badge">\${list.length}</span></h2>
+        \${targetSuggestionId ? '<button class="ui-btn ui-btn-ghost ui-btn-sm" id="showAllSuggestions">Show all suggestions</button>' : ""}
+      </div>
       <div id="suggestionsPageChat"></div>
-      <p class="muted">Proactive observer proposed these from your recent on-screen activity. Accept routes to the right place — tasks land in the Tasks tab, MCPs auto-register, skills become drafts.</p>
+      <p class="muted">\${targetSuggestionId ? "Selected from Review. " : ""}Proactive observer proposed these from your recent on-screen activity. Accept routes to the right place — tasks land in the Tasks tab, MCPs auto-register, skills become drafts.</p>
       \${list.map(card).join("")}
       \${pendingActionsHtml}
     </div>
@@ -4986,6 +6882,12 @@ async function renderSuggestions() {
     onAfterSend: async () => { await renderSuggestions(); }
   });
   bindPendingActionButtons();
+  $("showAllSuggestions")?.addEventListener("click", () => {
+    const next = new URL(window.location.href);
+    next.searchParams.delete("suggestion");
+    history.replaceState(null, "", next.toString());
+    renderSuggestions();
+  });
 
   document.querySelectorAll("[data-suggestion-id]").forEach((el) => {
     const id = el.dataset.suggestionId;
@@ -5012,9 +6914,13 @@ async function renderSuggestions() {
       });
     });
   });
+  revealDeepLinkedRecord("suggestion", "[data-suggestion-id]", "suggestionId");
 }
 
-function bindPendingActionButtons() {
+function bindPendingActionButtons(onResolved = async () => {
+  await renderSuggestions();
+  await refreshApprovalBadge();
+}) {
   document.querySelectorAll("[data-pending-id]").forEach((card) => {
     const id = card.dataset.pendingId;
     card.querySelectorAll("[data-pending-action]").forEach((btn) => {
@@ -5026,12 +6932,14 @@ function bindPendingActionButtons() {
         try {
           const res = await postJson(\`/pending-actions/\${encodeURIComponent(id)}/\${decision}\`, {});
           if (decision === "approve") {
-            const summary = res?.result?.note ?? res?.result?.message ?? \`Action ran (\${JSON.stringify(res?.result ?? res)})\`;
+            const summary = res?.continuation?.status === "queued"
+              ? "Approved — the agent is continuing in Chat."
+              : res?.result?.note ?? res?.result?.message ?? \`Action ran (\${JSON.stringify(res?.result ?? res)})\`;
             showToast(\`✓ \${summary}\`, true);
           } else {
             showToast("Action denied.", true);
           }
-          await renderSuggestions();
+          await onResolved();
         } catch (err) {
           showToast(\`\${decision} failed: \${err.message}\`, false);
           btn.disabled = false;
@@ -5050,8 +6958,12 @@ async function renderIntegrations() {
 
   const catalogCard = (e) => {
     let badge;
-    if (e.configured) {
+    if (e.connected) {
       badge = '<span class="ui-badge ui-badge-accent">on</span>';
+    } else if (e.authenticated) {
+      badge = '<span class="ui-badge">authorized</span>';
+    } else if (e.registered) {
+      badge = '<span class="ui-badge">sign in required</span>';
     } else if (e.status === "coming-soon") {
       badge = '<span class="ui-badge">soon</span>';
     } else {
@@ -5060,11 +6972,11 @@ async function renderIntegrations() {
     // Bearer-auth entries need an API key. Reveal an inline input here
     // when the env var isn't set yet — the click handler reads the value
     // from this field and POSTs it alongside the catalogId.
-    const needsKey = e.connectable && !e.configured && e.apiKeyEnvVar && !e.apiKeyConfigured;
+    const needsKey = e.connectable && !e.registered && e.apiKeyEnvVar && !e.apiKeyConfigured;
     const keyFieldId = \`cat-key-\${e.id}\`;
     let action;
-    if (e.configured) {
-      action = \`<a class="ui-btn ui-btn-ghost ui-btn-sm" href="/?tab=mcp">Manage →</a>\`;
+    if (e.registered) {
+      action = \`<a class="ui-btn ui-btn-ghost ui-btn-sm" href="/?tab=mcp">Manage →</a>\${e.authType === "oauth" ? \` <button class="ui-btn ui-btn-ghost ui-btn-sm" data-forget-mcp="\${escapeHtml(e.mcpName)}">Forget login</button>\` : ""}\`;
     } else if (e.connectable) {
       action = \`<button class="ui-btn ui-btn-sm add-mcp-btn" data-catalog-id="\${escapeHtml(e.id)}" data-int-id="\${escapeHtml(e.id)}" \${needsKey ? \`data-key-field-id="\${keyFieldId}"\` : ""}>+ Connect</button>\`;
     } else {
@@ -5096,9 +7008,15 @@ async function renderIntegrations() {
   };
 
   const pathBlock = (it, p) => {
-    const status = p.configured
-      ? '<span class="badge ok">on</span>'
-      : '<span class="badge">off</span>';
+    const status = p.kind === "mcp"
+      ? (p.connected
+          ? '<span class="badge ok">on</span>'
+          : p.authenticated
+            ? '<span class="badge">authorized</span>'
+            : p.registered
+              ? '<span class="badge warn">sign in required</span>'
+              : '<span class="badge">off</span>')
+      : (p.configured ? '<span class="badge ok">on</span>' : '<span class="badge">off</span>');
     const lastSync = p.lastSyncedAt
       ? \`<div class="muted" style="font-size:11px; margin-top:4px;">last sync: \${escapeHtml(new Date(p.lastSyncedAt).toLocaleString())}</div>\`
       : "";
@@ -5131,10 +7049,10 @@ async function renderIntegrations() {
           </div>
         </form>
       \`;
-    } else if (p.kind === "mcp" && !p.configured) {
+    } else if (p.kind === "mcp" && !p.registered) {
       actions = \`<button class="add-mcp-btn" data-catalog-id="\${escapeHtml(p.catalogId)}" data-int-id="\${escapeHtml(it.id)}" style="font-size:11px; padding:3px 8px;">+ Connect this MCP</button>\`;
-    } else if (p.kind === "mcp" && p.configured) {
-      actions = \`<a href="/?tab=mcp" style="font-size:11px;">Manage in MCP tab →</a>\`;
+    } else if (p.kind === "mcp" && p.registered) {
+      actions = \`<a href="/?tab=mcp" style="font-size:11px;">Manage →</a> <button class="secondary" data-forget-mcp="\${escapeHtml(p.mcpName)}" style="font-size:11px; padding:3px 8px;">Forget login</button>\`;
     } else if (p.kind === "folder" && p.configured) {
       actions = \`<a href="/?tab=tasks" style="font-size:11px;">View tasks →</a>\`;
     }
@@ -5225,6 +7143,22 @@ async function renderIntegrations() {
     });
   });
 
+  document.querySelectorAll("[data-forget-mcp]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const name = btn.dataset.forgetMcp;
+      if (!name || !confirm("Disconnect " + name + " and forget its saved OAuth login? You can authorize it again later.")) return;
+      btn.disabled = true;
+      try {
+        await postJson(\`/mcp/clear-auth/\${encodeURIComponent(name)}\`, {});
+        showToast("Login forgotten. The integration is disconnected.", true);
+        await renderIntegrations();
+      } catch (error) {
+        showToast("Could not forget login: " + error.message, false);
+        btn.disabled = false;
+      }
+    });
+  });
+
   // Inline credential edit forms — show/hide and submit to /setup/save.
   document.querySelectorAll(".edit-creds-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -5265,17 +7199,24 @@ async function renderIntegrations() {
 
 async function renderTasks() {
   state.taskFilter = state.taskFilter || { bucket: "all" };
+  const targetTaskId = new URLSearchParams(window.location.search).get("task");
+  if (targetTaskId) state.taskFilter.bucket = "all";
   const data = await fetchJson("/tasks?limit=200").catch(() => ({ tasks: [], stats: {} }));
-  const tasks = data.tasks ?? [];
+  let tasks = data.tasks ?? [];
+  if (targetTaskId && !tasks.some((task) => task.id === targetTaskId)) {
+    const target = await fetchJson("/tasks/" + encodeURIComponent(targetTaskId)).catch(() => null);
+    if (target) tasks = [target, ...tasks];
+  }
   const stats = data.stats ?? {};
   const filterB = state.taskFilter.bucket;
 
   const taskRow = (t) => {
     const isOverdue = t.dueDate && Date.parse(t.dueDate) < Date.now() && t.status !== "completed";
     const dueDateStr = t.dueDate ? new Date(t.dueDate).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+    const sourceHref = t.sourceUrl ? safeLinkHref(t.sourceUrl) : null;
     const sourceBadge = t.source && t.source !== "manual"
-      ? (t.sourceUrl
-          ? \`<a class="ui-badge" href="\${escapeHtml(t.sourceUrl)}" target="_blank" rel="noopener" style="text-decoration:none;">\${escapeHtml(t.source)} ↗</a>\`
+      ? (sourceHref
+          ? \`<a class="ui-badge" href="\${sourceHref}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;">\${escapeHtml(t.source)} ↗</a>\`
           : \`<span class="ui-badge">\${escapeHtml(t.source)}</span>\`)
       : "";
     const titleStyle = t.status === "completed" ? "text-decoration:line-through; color:var(--muted-foreground);" : "";
@@ -5388,6 +7329,195 @@ async function renderTasks() {
       await renderTasks();
     });
   });
+  revealDeepLinkedRecord("task", ".task", "taskId");
+}
+
+async function renderReview({ append = false } = {}) {
+  const review = state.review;
+  if (append && review.loadingAppend) return;
+  const requestGeneration = ++review.requestGeneration;
+  if (append) review.loadingAppend = true;
+  const previousScroll = append ? (main.querySelector(".pane")?.scrollTop ?? 0) : 0;
+  const params = new URLSearchParams({ limit: "50", sort: review.sort });
+  if (review.q) params.set("q", review.q);
+  if (review.kind !== "all") params.set("kind", review.kind);
+  if (append && review.nextCursor) params.set("cursor", review.nextCursor);
+
+  if (!append) {
+    main.innerHTML = '<div class="pane"><h2>Review</h2><div class="ui-empty">Loading open items…</div></div>';
+  }
+
+  let page;
+  try {
+    page = await fetchJson("/review-queue?" + params.toString());
+  } catch (error) {
+    if (requestGeneration !== review.requestGeneration || state.tab !== "review") return;
+    review.loadingAppend = false;
+    main.innerHTML = \`
+      <div class="pane">
+        <h2>Review</h2>
+        <div class="ui-empty">Couldn\\'t load the review queue. <button class="ui-btn ui-btn-sm" id="reviewRetry">Try again</button></div>
+      </div>
+    \`;
+    $("reviewRetry")?.addEventListener("click", () => renderReview());
+    return;
+  }
+
+  // A search/filter/sort/tab change may have started a newer render while
+  // this request was in flight. Only the newest Review request owns the view;
+  // stale responses stay ignored instead of publishing old rows under new
+  // controls or replacing the tab the user navigated to.
+  if (requestGeneration !== review.requestGeneration || state.tab !== "review") return;
+  review.loadingAppend = false;
+
+  review.items = append ? [...review.items, ...(page.items ?? [])] : (page.items ?? []);
+  review.nextCursor = page.nextCursor ?? null;
+  review.total = page.total ?? 0;
+  review.byKind = page.byKind ?? {};
+  review.summary = page.summary ?? { total: review.total, byKind: review.byKind };
+
+  const allCounts = review.summary.byKind ?? {};
+  const kinds = [
+    { key: "all", label: "All", count: review.summary.total ?? 0 },
+    { key: "task", label: "Tasks", count: allCounts.tasks ?? 0 },
+    { key: "draft", label: "Drafts", count: allCounts.drafts ?? 0 },
+    { key: "clarification", label: "Clarifications", count: allCounts.clarifications ?? 0 },
+    { key: "suggestion", label: "Suggestions", count: allCounts.suggestions ?? 0 }
+  ];
+  const icon = { task: "✓", draft: "📝", clarification: "?", suggestion: "💡" };
+  const kindName = { task: "task", draft: "draft", clarification: "clarification", suggestion: "suggestion" };
+  const cards = review.items.map((item) => {
+    const created = item.createdAt && Number.isFinite(Date.parse(item.createdAt))
+      ? new Date(item.createdAt).toLocaleString()
+      : null;
+    const meta = [
+      kindName[item.kind] ?? item.kind,
+      item.source,
+      created,
+      item.shownInQuickAsk ? "shown in Quick Ask" : null
+    ].filter(Boolean);
+    return \`
+      <article class="ui-card" data-review-id="\${escapeHtml(item.id)}" style="margin-bottom:var(--space-2);">
+        <div class="ui-row" style="align-items:flex-start; gap:var(--space-3);">
+          <span aria-hidden="true" style="font-size:18px; line-height:1.4;">\${icon[item.kind] ?? "•"}</span>
+          <div class="ui-grow">
+            <div style="font-weight:600; line-height:1.4;">\${escapeHtml(item.title)}</div>
+            \${item.summary ? \`<div class="ui-meta" style="margin-top:3px;">\${escapeHtml(item.summary)}</div>\` : ""}
+            \${item.preview ? \`<div style="margin-top:7px; font-size:13px; line-height:1.5;">\${escapeHtml(item.preview)}</div>\` : ""}
+            <div class="ui-meta" style="margin-top:7px;">\${meta.map(escapeHtml).join(" · ")}</div>
+          </div>
+          <a class="ui-btn ui-btn-ghost ui-btn-sm" href="\${escapeHtml(item.deepLink)}">Open</a>
+        </div>
+      </article>
+    \`;
+  }).join("");
+  const quickReviewable = review.summary.quickAskReviewable ?? review.summary.quickAskShown ?? 0;
+  const more = review.summary.moreThanQuickAsk ?? Math.max(0, (review.summary.total ?? 0) - quickReviewable);
+  const filtered = Boolean(review.q || review.kind !== "all");
+
+  main.innerHTML = \`
+    <div class="pane">
+      <div class="ui-row" style="justify-content:space-between; align-items:flex-start; gap:var(--space-4);">
+        <div>
+          <h2 style="margin:0;">Review <span class="ui-badge">\${review.summary.total ?? 0} open items</span></h2>
+          <p class="ui-meta" style="margin:6px 0 0;">
+            These are not all Tasks: the queue contains tasks, drafts, clarifications, and suggestions.
+            Quick Ask currently shows \${quickReviewable} reviewable item\${quickReviewable === 1 ? "" : "s"}; \${more} more are searchable here.
+          </p>
+        </div>
+        <button class="ui-btn ui-btn-ghost ui-btn-sm" id="reviewCleanup">Run cleanup now</button>
+      </div>
+
+      <form id="reviewSearchForm" class="ui-row" style="margin:var(--space-4) 0 var(--space-3); gap:var(--space-2); align-items:center;">
+        <input class="ui-input ui-grow" id="reviewSearch" type="search" maxlength="300" value="\${escapeHtml(review.q)}" placeholder="Search titles, descriptions, sources, and draft text…">
+        <select class="ui-input" id="reviewSort" aria-label="Sort review items">
+          <option value="oldest" \${review.sort === "oldest" ? "selected" : ""}>Oldest first</option>
+          <option value="newest" \${review.sort === "newest" ? "selected" : ""}>Newest first</option>
+        </select>
+        <button class="ui-btn ui-btn-sm" type="submit">Search</button>
+      </form>
+
+      <div class="ui-row" style="flex-wrap:wrap; gap:var(--space-2); margin-bottom:var(--space-3);">
+        \${kinds.map((entry) => \`
+          <button type="button" class="ui-btn ui-btn-sm \${review.kind === entry.key ? "" : "ui-btn-ghost"}" data-review-kind="\${entry.key}">
+            \${entry.label} <span style="opacity:.75;">\${entry.count}</span>
+          </button>
+        \`).join("")}
+      </div>
+
+      <div class="ui-meta" style="margin-bottom:var(--space-2);">
+        \${filtered ? \`\${review.total} matching · \` : ""}showing \${review.items.length}\${review.nextCursor ? " so far" : ""}
+      </div>
+      <div id="reviewCleanupStatus" class="ui-meta" style="margin-bottom:var(--space-2);" aria-live="polite"></div>
+      \${cards || '<div class="ui-empty">No open items match this search.</div>'}
+      \${review.nextCursor ? '<div style="text-align:center; margin-top:var(--space-4);"><button class="ui-btn ui-btn-ghost" id="reviewMore">Load 50 more</button></div>' : ""}
+    </div>
+  \`;
+
+  $("reviewSearchForm")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    review.q = $("reviewSearch")?.value.trim() ?? "";
+    review.nextCursor = null;
+    renderReview();
+  });
+  document.querySelectorAll("[data-review-kind]").forEach((button) => {
+    button.addEventListener("click", () => {
+      review.kind = button.dataset.reviewKind;
+      review.nextCursor = null;
+      renderReview();
+    });
+  });
+  $("reviewSort")?.addEventListener("change", (event) => {
+    review.sort = event.target.value === "newest" ? "newest" : "oldest";
+    review.nextCursor = null;
+    renderReview();
+  });
+  $("reviewMore")?.addEventListener("click", () => renderReview({ append: true }));
+  $("reviewCleanup")?.addEventListener("click", async () => {
+    if (!confirm("Run conservative backlog cleanup now? It may retire stale duplicates and dead suggestions or drafts. Every automatic resolution records its evidence and can be reversed.")) return;
+    const button = $("reviewCleanup");
+    const status = $("reviewCleanupStatus");
+    button.disabled = true;
+    status.textContent = "Starting cleanup…";
+    try {
+      const run = await postJson("/cron/backlog-triage/run", {});
+      if (run.status === "ran") {
+        showToast("Cleanup finished.", true);
+        await renderReview();
+        return;
+      }
+      if (run.status !== "accepted" || !run.poll) {
+        throw new Error(run.error || run.message || "Cleanup did not start (" + (run.status || "unknown status") + ").");
+      }
+      status.textContent = "Cleanup is running in the background. This page will refresh when it finishes.";
+      // The scheduler's hard timeout is ten minutes. Poll through that
+      // boundary with a grace minute, then make one authoritative final read;
+      // an exact 300×2s loop could stop a fraction before the timeout status
+      // landed and leave this button disabled forever.
+      const pollDeadline = Date.now() + 11 * 60 * 1000;
+      while (Date.now() < pollDeadline && state.tab === "review") {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const result = await fetchJson(run.poll).catch(() => null);
+        if (!result || result.status === "running") continue;
+        showToast(result.status === "ok" ? "Cleanup finished." : "Cleanup stopped: " + (result.error || result.status), result.status === "ok");
+        await renderReview();
+        return;
+      }
+      if (state.tab !== "review") return;
+      const finalResult = await fetchJson(run.poll).catch(() => null);
+      if (finalResult && finalResult.status !== "running") {
+        showToast(finalResult.status === "ok" ? "Cleanup finished." : "Cleanup stopped: " + (finalResult.error || finalResult.status), finalResult.status === "ok");
+        await renderReview();
+        return;
+      }
+      throw new Error("Cleanup is still running or its final status could not be confirmed. Refresh this page to check again.");
+    } catch (error) {
+      status.textContent = "Cleanup status: " + (error.message || String(error));
+      button.disabled = false;
+    }
+  });
+
+  if (append) main.querySelector(".pane")?.scrollTo({ top: previousScroll });
 }
 
 async function renderToday() {
@@ -5642,16 +7772,53 @@ async function renderToday() {
       renderToday();
     });
   });
+  revealDeepLinkedRecord("draft", "[data-draft]", "draft");
+  revealDeepLinkedRecord("clarification", "[data-clar]", "clar");
 }
 
 async function renderComputerUse() {
   // Computer-use beta — the agent's intent + reasoning log. Shows every
-  // action the agent decided to take in a session, with the reasoning
-  // it gave. Phase 1a: actions are stubbed (logged but not executed);
-  // phase 1b will execute real input via the Mac app.
-  const data = await fetchJson("/computer-use/log?limit=200").catch(() => ({ sessions: [], actions: [], stats: {} }));
-  const { sessions = [], actions = [], stats = {}, enabled = false } = data;
+  // action the agent decided to take in a session, with the reasoning it gave.
+  // A connected node executes; observation-only mode reads recent OCR and
+  // refuses input honestly.
+  const [data, pendingData] = await Promise.all([
+    fetchJson("/computer-use/log?limit=200").catch(() => ({ sessions: [], actions: [], stats: {} })),
+    fetchJson("/pending-actions?status=pending").catch(() => ({ actions: [] }))
+  ]);
+  const { sessions = [], actions = [], stats = {}, enabled = false, readiness = {} } = data;
+  const computerApprovals = (pendingData.actions ?? []).filter((action) => action.toolName === "start_computer_use_session");
   const active = sessions.find((s) => s.status === "active");
+  const modeCopy = readiness.mode === "control-ready"
+    ? "Ready — privacy-filtered live screenshots plus click, type, key, move, and scroll actions execute through the selected computer-use node."
+    : readiness.mode === "node-unreachable"
+      ? "Enabled, but the configured computer-use node is unreachable. Screen reads fall back to recent OCR; input is refused."
+      : readiness.mode === "observe-only"
+        ? "Observation-only — the agent can inspect recent local OCR. Click, type, key, and move require a connected computer-use node; scroll is not yet supported."
+        : "Off — enable it here before asking the agent to inspect or control the computer.";
+
+  const computerActionCopy = (action) => {
+    const args = action?.args && typeof action.args === "object" ? action.args : {};
+    const text = (value, max = 100) => {
+      if (value == null) return "";
+      const valueText = typeof value === "string" ? value : String(value);
+      return valueText.length > max ? valueText.slice(0, max) + "…" : valueText;
+    };
+    switch (action?.kind) {
+      case "screenshot": return "Inspect the current screen";
+      case "click": return "Click at x " + text(args.x) + ", y " + text(args.y);
+      case "type": return "Type " + text(args.characterCount ?? 0) + " redacted character" + (args.characterCount === 1 ? "" : "s");
+      case "key": return "Press “" + text(args.chord) + "”";
+      case "move": return "Move the pointer to x " + text(args.x) + ", y " + text(args.y);
+      case "scroll": return "Scroll by x " + text(args.deltaX ?? 0) + ", y " + text(args.deltaY ?? 0);
+      default: {
+        const details = Object.entries(args).slice(0, 4).map(([key, value]) => {
+          const readable = value != null && typeof value === "object" ? "details recorded" : text(value, 60);
+          return key.replaceAll("_", " ") + ": " + readable;
+        });
+        return details.length > 0 ? details.join(" · ") : "No extra details";
+      }
+    }
+  };
 
   const sessionCard = (s) => {
     const sActions = actions.filter((a) => a.sessionId === s.id);
@@ -5678,7 +7845,7 @@ async function renderComputerUse() {
             <ol style="margin: var(--space-2) 0 0; padding-left: var(--space-4);">
               \${sActions.slice().reverse().map((a) => \`
                 <li style="margin-bottom: var(--space-2);">
-                  <div><strong>\${escapeHtml(a.kind)}</strong> \${escapeHtml(JSON.stringify(a.args)).slice(0, 140)}</div>
+                  <div><strong>\${escapeHtml(a.kind.replaceAll("_", " "))}</strong> — \${escapeHtml(computerActionCopy(a))}</div>
                   \${a.reasoning ? \`<div class="ui-meta">"\${escapeHtml(a.reasoning)}"</div>\` : '<div class="ui-meta" style="opacity:0.6;">(no reasoning given)</div>'}
                   <div class="ui-meta">\${escapeHtml(a.status)} · \${escapeHtml(new Date(a.createdAt).toLocaleTimeString())}</div>
                 </li>
@@ -5695,7 +7862,7 @@ async function renderComputerUse() {
       <div class="ui-row" style="justify-content: space-between; align-items: flex-start; margin-bottom: var(--space-3);">
         <div>
           <h2 style="margin: 0;">Computer Use <span class="ui-badge">beta</span></h2>
-          <div class="ui-meta" style="margin-top: 2px;">Phase 1a — actions are logged with reasoning but NOT executed yet (Mac CGEvent integration ships in phase 1b).</div>
+          <div class="ui-meta" style="margin-top: 2px;">\${escapeHtml(modeCopy)}</div>
         </div>
         <button
           id="computerUseToggle"
@@ -5706,6 +7873,26 @@ async function renderComputerUse() {
       </div>
 
       <p class="ui-muted">Every action the agent intends to take is recorded here with its stated reasoning. Sessions are user-approved (via the standard approval gate). You can abort an active session at any time.</p>
+
+      \${pendingActionsSectionHtml(computerApprovals, {
+        heading: "Computer-use requests awaiting approval"
+      })}
+
+      \${(stats.active ?? 0) > 1
+        ? '<div class="card warn-banner"><div class="name">Multiple active sessions detected</div><div class="desc">This came from the old approval-loop bug. Only the newest session is used; stop the older sessions below. New approvals can no longer create duplicates.</div></div>'
+        : ""}
+
+      <div class="ui-card" style="margin: var(--space-3) 0;">
+        <div class="ui-row" style="gap:var(--space-2); flex-wrap:wrap;">
+          <span class="ui-badge \${readiness.screenshot && readiness.screenshot !== "disabled" ? "ui-badge-accent" : ""}">screen: \${escapeHtml(readiness.screenshot ?? "disabled")}</span>
+          <span class="ui-badge \${readiness.inputAvailable ? "ui-badge-accent" : ""}">input: \${readiness.inputAvailable ? "ready" : "not ready"}</span>
+          <span class="ui-badge">tools: \${readiness.toolsRegistered ? "registered" : "hidden"}</span>
+        </div>
+        <div style="margin-top:var(--space-3);">
+          <button id="computerUseTry" class="ui-btn ui-btn-sm" \${enabled ? "" : "disabled"}>Try in Chat</button>
+          <span class="ui-meta" style="margin-left:8px;">Starts with an explicit screen-inspection request; the session approval still appears before use.</span>
+        </div>
+      </div>
 
       <div class="ui-row" style="gap: var(--space-2); margin: var(--space-3) 0;">
         <span class="ui-badge">\${stats.sessions ?? 0} sessions</span>
@@ -5719,6 +7906,11 @@ async function renderComputerUse() {
     </div>
   \`;
 
+  bindPendingActionButtons(async () => {
+    await renderComputerUse();
+    await refreshApprovalBadge();
+  });
+
   document.querySelectorAll("[data-abort]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.abort;
@@ -5730,6 +7922,17 @@ async function renderComputerUse() {
       } catch (err) {
         showToast("Abort failed: " + err.message, false);
       }
+    });
+  });
+
+  document.getElementById("computerUseTry")?.addEventListener("click", () => {
+    switchTab("chat");
+    requestAnimationFrame(() => {
+      const input = document.getElementById("input");
+      if (!input) return;
+      input.value = "Use computer use to inspect what is on my screen right now. Tell me what you can see before taking any action.";
+      input.dispatchEvent(new Event("input"));
+      input.focus();
     });
   });
 
@@ -5759,52 +7962,130 @@ async function renderComputerUse() {
 }
 
 async function renderActivity() {
-  const stats = await fetchJson("/observations/stats").catch(() => ({}));
-  state.activityFilter = state.activityFilter || { query: "" };
+  // The store records individual focus changes. Pull a bounded window large
+  // enough to distill into useful ten-minute work periods instead of showing
+  // a noisy wall of repeated bundle identifiers.
+  const HISTORY_PAGE_SIZE = 400;
+  state.activityFilter = state.activityFilter || { query: "", since: "7d", limit: HISTORY_PAGE_SIZE };
+  if (typeof state.activityFilter.since !== "string") state.activityFilter.since = "7d";
+  if (!Number.isFinite(state.activityFilter.limit)) state.activityFilter.limit = HISTORY_PAGE_SIZE;
   main.innerHTML = \`
-    <div class="pane">
-      <h2>Activity <span class="muted" style="font-weight:400;font-size:14px;">· \${stats.mode === "sqlite" ? \`\${stats.activity ?? 0} events · \${stats.frames ?? 0} frames\` : \`mode: \${escapeHtml(stats.mode ?? "—")}\`}</span></h2>
-
-      \${stats.mode !== "sqlite" && stats.mode !== "fallback-jsonl"
-        ? '<div class="card warn-banner"><div class="name">Capture not running</div><div class="desc">Install the Mac app and grant Screen Recording + Accessibility permissions, or this view will be empty. Activity events appear as soon as the Mac app starts pushing.</div></div>'
-        : ""}
-
-      <div class="row" style="gap:10px;margin:14px 0;">
-        <input type="search" id="actSearch" placeholder="Search OCR text or window titles…" value="\${escapeHtml(state.activityFilter.query)}" style="flex:1;">
-        <select id="actSince" style="width:160px;">
-          <option value="">All time</option>
-          <option value="1h">Last hour</option>
-          <option value="6h">Last 6 hours</option>
-          <option value="24h" selected>Last 24 hours</option>
-          <option value="7d">Last 7 days</option>
-        </select>
+    <div class="pane history-page">
+      <div class="history-page-header">
+        <h2>Computer history</h2>
+        <p class="history-page-subtitle">A timeline of activity OpenAGI has received from your capture Mac. Search it when you need to remember where you left off.</p>
       </div>
 
-      <h3>Timeline (last 24h)</h3>
-      <div id="timeline" class="card" style="padding:14px;"></div>
+      <section id="historyStatusCard" class="history-status-card" aria-label="Computer history capture status" aria-live="polite" aria-busy="true">
+        <div class="history-status-row">
+          <div class="history-status-copy">
+            <div class="history-status-title">Checking capture status</div>
+            <p class="history-status-description">Looking for the most recently received activity.</p>
+          </div>
+          <span class="history-status-pill">Checking…</span>
+        </div>
+      </section>
 
-      <h3>Results</h3>
-      <div id="actResults" class="grid"></div>
+      <section class="history-section" aria-labelledby="historyHeading">
+        <div class="history-section-header">
+          <div class="history-section-heading">
+            <h3 id="historyHeading">History</h3>
+            <div id="historyResultMeta" class="history-section-meta">Loading activity…</div>
+          </div>
+          <button id="askHistory" class="ui-btn ui-btn-secondary" type="button">Ask about your history</button>
+        </div>
+
+        <div class="history-filters">
+          <label class="history-filter-label" for="actSearch">Search computer history</label>
+          <input class="ui-input" type="search" id="actSearch" placeholder="Search window titles or captured text…" value="\${escapeHtml(state.activityFilter.query)}" autocomplete="off">
+          <label class="history-filter-label" for="actSince">History time range</label>
+          <select class="ui-select" id="actSince">
+            <option value="1h" \${state.activityFilter.since === "1h" ? "selected" : ""}>Last hour</option>
+            <option value="6h" \${state.activityFilter.since === "6h" ? "selected" : ""}>Last 6 hours</option>
+            <option value="24h" \${state.activityFilter.since === "24h" ? "selected" : ""}>Last 24 hours</option>
+            <option value="7d" \${state.activityFilter.since === "7d" ? "selected" : ""}>Last 7 days</option>
+            <option value="" \${state.activityFilter.since === "" ? "selected" : ""}>All time</option>
+          </select>
+        </div>
+
+        <div id="actResults" class="history-days" aria-live="polite" aria-busy="true">
+          <div class="history-state"><strong>Loading computer history</strong>Gathering the latest activity into a timeline.</div>
+        </div>
+        <div id="historyLoadMoreWrap" class="history-load-more" hidden>
+          <button id="historyLoadMore" class="ui-btn ui-btn-secondary" type="button">Load more</button>
+        </div>
+      </section>
     </div>
   \`;
-  const reload = async () => {
-    const since = sinceFromOption($("actSince").value);
-    const q = $("actSearch").value.trim();
+
+  let listRequest = 0;
+  const loadStatus = async () => {
+    const card = $("historyStatusCard");
+    if (card) card.setAttribute("aria-busy", "true");
+    try {
+      const [stats, latest] = await Promise.all([
+        fetchJson("/observations/stats"),
+        fetchJson("/observations/search?limit=1")
+      ]);
+      if (state.tab !== "activity") return;
+      renderHistoryStatus(stats, Array.isArray(latest) ? latest[0] : null, null, loadStatus);
+    } catch (error) {
+      if (state.tab !== "activity") return;
+      renderHistoryStatus(null, null, error, loadStatus);
+    }
+  };
+  const reload = async ({ resetLimit = false } = {}) => {
+    const search = $("actSearch");
+    const range = $("actSince");
+    const list = $("actResults");
+    const loadWrap = $("historyLoadMoreWrap");
+    if (!search || !range || !list || !loadWrap) return;
+    if (resetLimit) state.activityFilter.limit = HISTORY_PAGE_SIZE;
+    const since = sinceFromOption(range.value);
+    const q = search.value.trim();
     state.activityFilter.query = q;
-    const results = await fetchJson("/observations/search?" + new URLSearchParams({
-      ...(q ? { q } : {}),
-      ...(since ? { since } : {}),
-      limit: "60"
-    }).toString());
-    renderActivityResults(results);
+    state.activityFilter.since = range.value;
+    const requestedLimit = state.activityFilter.limit;
+    const requestId = ++listRequest;
+    list.setAttribute("aria-busy", "true");
+    if (resetLimit) {
+      list.innerHTML = '<div class="history-state"><strong>Loading computer history</strong>Gathering matching activity.</div>';
+    }
+    loadWrap.hidden = true;
+    try {
+      const results = await fetchJson("/observations/search?" + new URLSearchParams({
+        ...(q ? { q } : {}),
+        ...(since ? { since } : {}),
+        kinds: "activity,frame",
+        limit: String(requestedLimit + 1)
+      }).toString());
+      if (requestId !== listRequest || state.tab !== "activity") return;
+      const rows = (Array.isArray(results) ? results : [])
+        .slice(0, requestedLimit)
+        .filter((row) => row?.kind !== "transcript");
+      const hasMore = Array.isArray(results) && results.length > requestedLimit;
+      renderActivityResults(rows, { query: q, hasMore });
+    } catch (error) {
+      if (requestId !== listRequest || state.tab !== "activity") return;
+      renderActivityError(error, () => reload({ resetLimit: true }));
+    }
   };
-  const reloadTimeline = async () => {
-    const tl = await fetchJson("/observations/timeline?since=" + encodeURIComponent(new Date(Date.now() - 24*3600*1000).toISOString()));
-    renderTimeline(tl);
-  };
-  $("actSearch").addEventListener("input", debounce(reload, 250));
-  $("actSince").addEventListener("change", reload);
-  await Promise.all([reload(), reloadTimeline()]);
+
+  $("actSearch").addEventListener("input", debounce(() => reload({ resetLimit: true }), 250));
+  $("actSince").addEventListener("change", () => reload({ resetLimit: true }));
+  $("historyLoadMore").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.textContent = "Loading…";
+    state.activityFilter.limit += HISTORY_PAGE_SIZE;
+    await reload();
+    if (state.tab === "activity" && document.body.contains(button)) {
+      button.disabled = false;
+      button.textContent = "Load more";
+    }
+  });
+  $("askHistory").addEventListener("click", openHistoryChat);
+  await Promise.all([reload({ resetLimit: true }), loadStatus()]);
 }
 
 function sinceFromOption(value) {
@@ -5815,64 +8096,280 @@ function sinceFromOption(value) {
   return new Date(Date.now() - hours * 3600 * 1000).toISOString();
 }
 
-function renderActivityResults(results) {
-  const list = $("actResults");
-  if (!list) return;
-  if (!results || results.length === 0) {
-    list.innerHTML = '<div class="empty">No matching activity yet.</div>';
-    return;
-  }
-  list.innerHTML = results.map((r) => {
-    const meta = [r.app, r.window].filter(Boolean).map(escapeHtml).join(" · ");
-    const when = r.at ? new Date(r.at).toLocaleString() : "";
-    const rawSnippet = r.snippet || r.text || r.window || r.event || "";
-    // Stored observation text (BuildBetter transcripts, OCR of viewed pages)
-    // is untrusted — escape it before innerHTML, but keep the FTS <mark>
-    // highlight tags the search injects.
-    const snippet = escapeHtml(rawSnippet).replaceAll("&lt;mark&gt;", "<mark>").replaceAll("&lt;/mark&gt;", "</mark>");
-    return \`<div class="card">
-      <div class="row between"><span class="name">\${escapeHtml(meta) || "(no app)"}</span><span class="muted" style="font-size:11px;">\${escapeHtml(when)}</span></div>
-      <div class="desc" style="margin-top:6px;line-height:1.5;">\${snippet}</div>
-    </div>\`;
-  }).join("");
+function historyCleanText(value) {
+  return String(value ?? "").replace(/<\\/?mark>/gi, "").replace(/\\s+/g, " ").trim();
 }
 
-function renderTimeline(rows) {
-  const host = $("timeline");
-  if (!host) return;
-  if (!rows || rows.length === 0) { host.innerHTML = '<div class="muted">No data in this window.</div>'; return; }
-  // Group by hour, then show per-app stacked bars
-  const byHour = new Map();
-  const apps = new Set();
-  for (const r of rows) {
-    if (!byHour.has(r.hour)) byHour.set(r.hour, {});
-    byHour.get(r.hour)[r.app || "—"] = r.n;
-    apps.add(r.app || "—");
+function historyTruncate(value, length = 180) {
+  const text = historyCleanText(value);
+  return text.length > length ? text.slice(0, length - 1).trimEnd() + "…" : text;
+}
+
+function historyDate(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function historyDayKey(value) {
+  const date = historyDate(value);
+  if (!date) return "unknown";
+  return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
+}
+
+function historyDayLabel(value) {
+  const date = historyDate(value);
+  if (!date) return "Earlier";
+  const today = new Date();
+  const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const startDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const daysAgo = Math.round((startToday.getTime() - startDate.getTime()) / 86_400_000);
+  if (daysAgo === 0) return "Today";
+  if (daysAgo === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+}
+
+function historyTimeLabel(value) {
+  const date = historyDate(value);
+  return date ? date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "Time unavailable";
+}
+
+function historyAppLabel(value) {
+  const raw = historyCleanText(value);
+  if (!raw) return "";
+  const known = {
+    "com.apple.finder": "Finder",
+    "com.apple.safari": "Safari",
+    "com.google.chrome": "Chrome",
+    "com.microsoft.edgemac": "Microsoft Edge",
+    "com.openai.chat": "ChatGPT",
+    "com.openai.codex": "Codex",
+    "com.blizzard.worldofwarcraft": "World of Warcraft",
+    "worldofwarcraft": "World of Warcraft",
+    "com.wispr.wispr-flow": "Wispr Flow",
+    "wispr flow": "Wispr Flow",
+    "wine preloader": "Wine"
+  };
+  const exact = known[raw.toLocaleLowerCase()];
+  if (exact) return exact;
+  const parts = raw.split(".").filter(Boolean);
+  let candidate = parts.at(-1) ?? raw;
+  if (/^(app|desktop|mac|client)$/i.test(candidate) && parts.length > 1) candidate = parts.at(-2);
+  return candidate
+    .replace(/[-_]+/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\b\w/g, (letter) => letter.toLocaleUpperCase())
+    .trim() || raw;
+}
+
+function historyBucketKey(row) {
+  const date = historyDate(row?.at);
+  if (!date) return "unknown:" + historyCleanText(row?.at);
+  return historyDayKey(row.at) + ":" + Math.floor(date.getTime() / (10 * 60_000));
+}
+
+function historyPeriodCopy(rows) {
+  const apps = [...new Set(rows.map((row) => historyAppLabel(row?.app)).filter(Boolean))];
+  const details = [];
+  for (const row of rows) {
+    const windowTitle = historyCleanText(row?.window);
+    const snippet = historyCleanText(row?.snippet || row?.text);
+    for (const candidate of [windowTitle, snippet]) {
+      if (candidate && !details.some((value) => value.toLocaleLowerCase() === candidate.toLocaleLowerCase())) {
+        details.push(candidate);
+      }
+      if (details.length >= 2) break;
+    }
+    if (details.length >= 2) break;
   }
-  const sortedHours = [...byHour.keys()].sort();
-  const max = Math.max(...rows.map((r) => r.n));
-  const palette = ["#6fe1b1", "#f0b454", "#a98ef5", "#7ab8ff", "#f08080", "#94a9b1"];
-  const appColor = {};
-  [...apps].forEach((a, i) => appColor[a] = palette[i % palette.length]);
-  host.innerHTML = \`
-    <div style="display:grid;grid-template-columns:repeat(\${sortedHours.length},1fr);gap:2px;align-items:end;height:80px;">
-      \${sortedHours.map((h) => {
-        const cell = byHour.get(h);
-        const total = Object.values(cell).reduce((a, b) => a + b, 0);
-        const stack = Object.entries(cell).map(([app, n]) =>
-          \`<div style="height:\${(n / max) * 100}%;background:\${appColor[app]};" title="\${escapeHtml(app)}: \${n}"></div>\`
-        ).join("");
-        return \`<div title="\${escapeHtml(h)}: \${total}" style="display:flex;flex-direction:column-reverse;height:100%;">\${stack}</div>\`;
+  const appSummary = apps.length === 0
+    ? "Captured computer"
+    : apps.length === 1
+      ? apps[0]
+      : apps.length === 2
+        ? apps.join(" and ")
+        : apps.slice(0, 2).join(", ") + ", and " + (apps.length - 2) + " more app" + (apps.length === 3 ? "" : "s");
+  const title = details[0]
+    ? historyTruncate(details[0], 180)
+    : apps.length > 2
+      ? "Activity across " + appSummary
+      : appSummary + " activity";
+  const summary = details.length > 0
+    ? details.map((value) => historyTruncate(value, 220)).join(" · ")
+    : apps.length === 1
+      ? "You were active in " + apps[0] + " during this period."
+      : apps.length > 1
+        ? "You moved between " + appSummary + " during this period."
+        : "OpenAGI received activity during this period, but no app or window detail was available.";
+  return { apps, title, summary };
+}
+
+function historyPeriods(results) {
+  const periods = [];
+  const byBucket = new Map();
+  for (const row of results) {
+    const key = historyBucketKey(row);
+    let period = byBucket.get(key);
+    if (!period) {
+      period = { at: row?.at, rows: [] };
+      byBucket.set(key, period);
+      periods.push(period);
+    }
+    period.rows.push(row);
+  }
+  return periods.map((period) => ({ ...period, ...historyPeriodCopy(period.rows) }));
+}
+
+function historyRelativeTime(value) {
+  const date = historyDate(value);
+  if (!date) return null;
+  const elapsed = Math.max(0, Date.now() - date.getTime());
+  if (elapsed < 60_000) return "just now";
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 60) return minutes + " min ago";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + " hr" + (hours === 1 ? "" : "s") + " ago";
+  const days = Math.floor(hours / 24);
+  return days + " day" + (days === 1 ? "" : "s") + " ago";
+}
+
+function historySnippetHtml(value) {
+  // Observation text is private, untrusted content. Strip the only markup the
+  // FTS endpoint emits, then escape everything before inserting into HTML.
+  return escapeHtml(historyTruncate(value, 360));
+}
+
+function renderActivityResults(results, { query = "", hasMore = false } = {}) {
+  const list = $("actResults");
+  if (!list) return;
+  list.setAttribute("aria-busy", "false");
+  const meta = $("historyResultMeta");
+  const loadWrap = $("historyLoadMoreWrap");
+  if (!results || results.length === 0) {
+    list.innerHTML = query
+      ? '<div class="history-state"><strong>No matching activity</strong>Try a different phrase or a wider time range.</div>'
+      : '<div class="history-state"><strong>No computer history yet</strong>Activity will appear here after the Mac app sends its first observation.</div>';
+    if (meta) meta.textContent = query ? "No matches" : "No activity received";
+    if (loadWrap) loadWrap.hidden = true;
+    return;
+  }
+  const periods = historyPeriods(results);
+  const days = new Map();
+  for (const period of periods) {
+    const key = historyDayKey(period?.at);
+    if (!days.has(key)) days.set(key, { at: period?.at, periods: [] });
+    days.get(key).periods.push(period);
+  }
+  list.innerHTML = [...days.values()].map((day) => \`
+    <section class="history-day">
+      <h4 class="history-day-title">\${escapeHtml(historyDayLabel(day.at))}</h4>
+      \${day.periods.map((period) => {
+        const timestamp = historyDate(period?.at)?.toISOString() ?? "";
+        return \`<article class="history-entry">
+          <time class="history-entry-time"\${timestamp ? \` datetime="\${escapeHtml(timestamp)}"\` : ""}>\${escapeHtml(historyTimeLabel(period?.at))}</time>
+          <div class="history-entry-body">
+            <h5 class="history-entry-title">\${escapeHtml(period.title)}</h5>
+            <p class="history-entry-summary">\${historySnippetHtml(period.summary)}</p>
+            \${period.apps.length ? \`<div class="history-apps">\${period.apps.slice(0, 6).map((app) => \`<span class="history-app-label" aria-label="Application: \${escapeHtml(app)}">\${escapeHtml(app)}</span>\`).join("")}\${period.apps.length > 6 ? \`<span class="history-app-label" aria-label="\${period.apps.length - 6} additional applications">+\${period.apps.length - 6} more</span>\` : ""}</div>\` : ""}
+          </div>
+        </article>\`;
       }).join("")}
+    </section>
+  \`).join("");
+  if (meta) meta.textContent = "Showing " + periods.length + " work period" + (periods.length === 1 ? "" : "s")
+    + " from " + results.length + " observation" + (results.length === 1 ? "" : "s")
+    + (hasMore ? " · more available" : "");
+  if (loadWrap) loadWrap.hidden = !hasMore;
+}
+
+function renderActivityError(error, retry) {
+  const list = $("actResults");
+  if (!list) return;
+  list.setAttribute("aria-busy", "false");
+  list.innerHTML = '<div class="history-state"><strong>Couldn’t load computer history</strong>The local history service did not answer.<br><button id="historyRetry" class="ui-btn ui-btn-secondary" type="button">Try again</button></div>';
+  const meta = $("historyResultMeta");
+  if (meta) meta.textContent = "History unavailable";
+  const loadWrap = $("historyLoadMoreWrap");
+  if (loadWrap) loadWrap.hidden = true;
+  $("historyRetry")?.addEventListener("click", retry);
+}
+
+function renderHistoryStatus(stats, latest, error, retry) {
+  const host = $("historyStatusCard");
+  if (!host) return;
+  const available = stats?.mode === "sqlite" || stats?.mode === "fallback-jsonl";
+  const relative = historyRelativeTime(latest?.at);
+  const latestDate = historyDate(latest?.at);
+  const receiving = Boolean(available && latestDate && Date.now() - latestDate.getTime() <= 10 * 60_000);
+  const count = stats?.mode === "sqlite"
+    ? (Number(stats.activity ?? 0).toLocaleString() + " events · " + Number(stats.frames ?? 0).toLocaleString() + " frames")
+    : stats?.mode === "fallback-jsonl"
+      ? Number(stats.observations ?? 0).toLocaleString() + " observations"
+      : "Status could not be measured";
+  const title = error ? "Capture status unavailable"
+    : receiving ? "Activity received recently"
+      : latestDate ? "History is available" : "No activity received yet";
+  const description = error
+    ? "The dashboard could not reach the local observation service. Existing history may still be on disk."
+    : receiving
+      ? "Last activity arrived " + relative + ". This confirms history is reaching OpenAGI; the capture switch remains controlled by the Mac app."
+      : latestDate
+        ? "Last activity arrived " + relative + ". This dashboard cannot tell whether capture is paused, disabled, or the capture Mac is offline."
+        : "The history store is ready, but it has not received activity. Enable capture from the OpenAGI menu bar app on the Mac you want to observe.";
+  const pillClass = receiving ? " receiving" : (error || !latestDate ? " problem" : "");
+  const pill = error ? "Unavailable" : receiving ? "Receiving" : latestDate ? "Last received " + relative : "No history";
+  host.setAttribute("aria-busy", "false");
+  host.innerHTML = \`
+    <div class="history-status-row">
+      <div class="history-status-copy">
+        <div class="history-status-title">\${escapeHtml(title)} <span class="history-status-pill\${pillClass}">\${escapeHtml(pill)}</span></div>
+        <p class="history-status-description">\${escapeHtml(description)} \${escapeHtml(count)}.</p>
+      </div>
+      \${error ? '<button id="historyStatusRetry" class="ui-btn ui-btn-secondary" type="button">Retry status</button>' : '<button id="historyPauseHelp" class="ui-btn ui-btn-secondary" type="button" aria-controls="historyControlHelp" aria-expanded="false">How to pause</button>'}
     </div>
-    <div style="display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-top:6px;">
-      <span>\${escapeHtml(sortedHours[0] ?? "")}</span>
-      <span>\${escapeHtml(sortedHours.at(-1) ?? "")}</span>
+    <div class="history-status-row">
+      <div class="history-status-copy">
+        <div class="history-status-title">Privacy exclusions</div>
+        <p class="history-status-description">Choose apps and window-title patterns that must never enter computer history.</p>
+      </div>
+      <button id="historyPrivacyHelp" class="ui-btn ui-btn-secondary" type="button" aria-controls="historyControlHelp" aria-expanded="false">Manage exclusions</button>
     </div>
-    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;">
-      \${[...apps].map((a) => \`<span class="chip" style="border-color:\${appColor[a]};color:\${appColor[a]};">\${escapeHtml(a)}</span>\`).join("")}
-    </div>
+    <div id="historyControlHelp" class="history-control-help" role="status" tabindex="-1" hidden></div>
   \`;
+  $("historyPauseHelp")?.addEventListener("click", () => showHistoryControlHelp("pause"));
+  $("historyPrivacyHelp")?.addEventListener("click", () => showHistoryControlHelp("privacy"));
+  $("historyStatusRetry")?.addEventListener("click", retry);
+}
+
+function showHistoryControlHelp(kind) {
+  const host = $("historyControlHelp");
+  if (!host) return;
+  const pause = kind === "pause";
+  host.textContent = pause
+    ? "On the Mac running capture, open the OpenAGI menu bar icon, choose Capture, then Pause for 1 hour or Pause until tomorrow. That Mac remains the source of truth for capture state."
+    : "On the Mac running capture, open the OpenAGI menu bar icon, choose Capture, then Privacy settings. Matching apps or window-title patterns are skipped on that Mac before observations are sent.";
+  host.hidden = false;
+  $("historyPauseHelp")?.setAttribute("aria-expanded", String(pause));
+  $("historyPrivacyHelp")?.setAttribute("aria-expanded", String(!pause));
+  host.focus();
+}
+
+async function openHistoryChat() {
+  const url = new URL(window.location.href);
+  url.searchParams.set("tab", "chat");
+  url.searchParams.set("compose", "ask-history");
+  history.replaceState(null, "", url.toString());
+  await switchTab("chat");
+}
+
+function revealDeepLinkedRecord(paramName, selector, datasetKey) {
+  const id = new URLSearchParams(window.location.search).get(paramName);
+  if (!id) return;
+  const row = [...main.querySelectorAll(selector)].find((candidate) => candidate.dataset?.[datasetKey] === id);
+  if (!row) return;
+  row.scrollIntoView({ block: "center" });
+  row.style.outline = "2px solid var(--accent)";
+  row.style.outlineOffset = "2px";
 }
 
 function debounce(fn, ms) {
@@ -5896,6 +8393,84 @@ async function postJson(path, body) {
     throw err;
   }
   return r.json();
+}
+
+// Opt in to the daemon's direct lifecycle stream for a single chat request.
+// Visible model text arrives incrementally as delta frames while provider
+// adapters still reconstruct complete structured responses for tool loops. The
+// final frame remains the exact JSON object legacy callers receive.
+async function postMessageStream(body, onEvent = () => {}) {
+  const r = await fetch("/message", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify(body ?? {})
+  });
+  const contentType = (r.headers.get("content-type") ?? "").toLowerCase();
+  if (!contentType.includes("text/event-stream")) {
+    const payload = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const err = new Error(payload.code === "budget"
+        ? (payload.error ?? "Daily budget exceeded") + " — raise OPENAGI_DAILY_USD_LIMIT in setup."
+        : (payload.error ?? "/message -> " + r.status));
+      err.code = payload.code; err.status = r.status;
+      err.terminal = true;
+      throw err;
+    }
+    return payload;
+  }
+  if (!r.ok) {
+    const err = new Error("/message -> " + r.status);
+    err.status = r.status; err.terminal = true;
+    throw err;
+  }
+  if (!r.body) throw new Error("The agent response stream was unavailable.");
+
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let final = null;
+  let failure = null;
+
+  const consume = (frame) => {
+    let event = "message";
+    const data = [];
+    for (const rawLine of frame.split(/\\r?\\n/)) {
+      if (!rawLine || rawLine.startsWith(":")) continue;
+      const colon = rawLine.indexOf(":");
+      const field = colon < 0 ? rawLine : rawLine.slice(0, colon);
+      let value = colon < 0 ? "" : rawLine.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") event = value || "message";
+      if (field === "data") data.push(value);
+    }
+    if (data.length === 0) return;
+    let payload;
+    try { payload = JSON.parse(data.join("\\n")); }
+    catch { return; }
+    onEvent(event, payload);
+    if (event === "final") final = payload;
+    if (event === "failure") failure = payload;
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+    const frames = buffer.split(/\\r?\\n\\r?\\n/);
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) consume(frame);
+    if (done) break;
+  }
+  if (buffer.trim()) consume(buffer);
+  if (failure) {
+    const err = new Error(failure.code === "budget"
+      ? (failure.error ?? "Daily budget exceeded") + " — raise OPENAGI_DAILY_USD_LIMIT in setup."
+      : (failure.error ?? "The agent could not complete that request."));
+    err.code = failure.code;
+    err.terminal = true;
+    throw err;
+  }
+  if (!final) throw new Error("The response stream ended before the agent finished.");
+  return final;
 }
 // Both quote characters are escaped: nearly every caller drops the result into
 // an attribute inside a template literal, and an unescaped ' or " ends that
@@ -6000,8 +8575,13 @@ const evt = new EventSource("/events");
 evt.addEventListener("message", (e) => {
   try {
     const data = JSON.parse(e.data);
-    if (state.tab === "chat" && data.sessionId === state.sessionId && data.reply) {
-      // already shown via direct response, skip
+    if (state.tab === "chat" && data.sessionId === state.sessionId) {
+      // A dashboard opened while Quick Ask is still working did not make the
+      // direct POST and therefore has no response callback of its own. Reload
+      // the named session when the daemon announces completion. The old skip
+      // left that dashboard showing "pending" forever even though the answer
+      // had already been persisted.
+      refreshActiveChatSession(data.sessionId, { force: true }).catch(() => {});
     } else {
       refreshSessions();
     }
@@ -6029,6 +8609,15 @@ evt.addEventListener("mcp", (e) => {
     }
   } catch {}
 });
+
+function refreshApprovalSurfaces() {
+  refreshApprovalBadge();
+  if (state.tab === "approvals") renderApprovals();
+  else if (state.tab === "computer-use") renderComputerUse();
+  else if (state.tab === "suggestions") renderSuggestions();
+}
+evt.addEventListener("pending-action", refreshApprovalSurfaces);
+evt.addEventListener("pending-action-resolved", refreshApprovalSurfaces);
 
 // New skill candidate proposed by the pattern miner or session miner.
 // Refresh the Skills tab if the user is on it; otherwise show a browser
@@ -6150,12 +8739,35 @@ evt.addEventListener("cron-catchup", (e) => {
 
 setInterval(refreshHealth, 5000);
 refreshHealth();
+refreshApprovalBadge();
 setInterval(refreshAmbientBadge, 15000);
 refreshAmbientBadge();
+// Recovery path for a missed SSE event (dashboard opened after completion,
+// laptop wake, EventSource reconnect). Poll only while the selected durable
+// request genuinely has no terminal assistant message, so ordinary chat costs
+// no background requests.
+setInterval(() => {
+  if (state.tab !== "chat" || !state.sessionId) return;
+  const id = state.activeRequestId || latestChatRequestId(state.messages);
+  const outcome = requestState(state.messages, id);
+  const waitingForPersistence = !outcome && Boolean(id)
+    && CHAT_REQUEST_LIVE_STAGES.includes(state.activeRequestStage);
+  if (waitingForPersistence && state.activeRequestMissingSince
+      && Date.now() - state.activeRequestMissingSince > CHAT_REQUEST_STALE_MS) {
+    state.activeRequestStage = "interrupted";
+    state.activeRequestMissingSince = null;
+    renderChat();
+  } else if (outcome?.status === "pending" || waitingForPersistence) {
+    refreshActiveChatSession(state.sessionId).catch(() => {});
+  } else if (outcome?.status === "interrupted" && state.activeRequestStage !== "interrupted") {
+    state.activeRequestStage = "interrupted";
+    renderChat();
+  }
+}, 2000);
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");
@@ -6169,9 +8781,10 @@ const initialTab = (() => {
 // whether the dashboard was closed, already open on Tasks, or already open on
 // a different chat session — every click is a fresh navigation.
 const initialSession = deepLinkSessionId(window.location.search);
+const initialRequest = deepLinkRequestId(window.location.search);
 (async () => {
   await switchTab(initialTab);
-  if (initialTab === "chat" && initialSession) await openSessionDeepLink(initialSession);
+  if (initialTab === "chat" && initialSession) await openSessionDeepLink(initialSession, initialRequest);
 })();
 </script>
 </body>

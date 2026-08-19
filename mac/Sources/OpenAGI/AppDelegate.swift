@@ -69,13 +69,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
   }
 
   nonisolated func applicationWillTerminate(_ notification: Notification) {
+    // Stop the child synchronously while AppKit is still keeping this process
+    // alive. Cleanup below crosses an await and is not guaranteed to finish
+    // before termination; putting stop() inside that Task orphaned the daemon.
+    DaemonController.shared.stopForApplicationTermination()
     Task { @MainActor in
       ReplayController.shared.stop()
       CaptureController.shared.stop()
-      _ = await CaptureBridge.flushNow()
+      // Unpushed observations remain in local SQLite and retry next launch.
+      // A quit-time network flush is not reliable here: this Task does not
+      // extend process lifetime, and the local daemon has already been stopped.
       OverlayController.shared.persistPosition()
       HotkeyManager.shared.unregister()
-      DaemonController.shared.stop()
     }
   }
 
@@ -91,6 +96,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     if NotificationPresenter.isOutreachResponse(response) {
       Task { @MainActor in
         _ = NotificationPresenter.shared.handleAction(response)
+        completionHandler()
+      }
+      return
+    }
+
+    // A scheduled Sparkle check for this dockless app uses a Notification
+    // Center reminder. Clicking it must foreground Sparkle's update UI, not
+    // fall through to the dashboard deep-link path below.
+    if UpdateController.isUpdateNotification(response) {
+      Task { @MainActor in
+        UpdateController.shared.handleUpdateNotificationTap()
         completionHandler()
       }
       return

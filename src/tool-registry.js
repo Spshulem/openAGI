@@ -1,6 +1,11 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 
+// Stable, locale-independent order. Copies rather than sorting in place so a
+// caller's array (and the registry's own values) are never reordered underneath
+// them. See _modelToolList for why byte-stable ordering is load-bearing.
+const sortByName = (tools) => [...tools].sort((a, b) => String(a.name).localeCompare(String(b.name), "en"));
+
 export class ToolRegistry {
   constructor() {
     this.tools = new Map();
@@ -19,6 +24,31 @@ export class ToolRegistry {
       // {status:"awaiting_confirmation"} instead of running. The action is
       // surfaced in the dashboard for the user to approve/deny.
       needsConfirmation: Boolean(tool.needsConfirmation),
+      // Optional dynamic guard for idempotent tools. Returning false means the
+      // already-approved state is still active, so invoking the handler is a
+      // no-op/readback and must not create a fresh approval request.
+      confirmationRequired: typeof tool.confirmationRequired === "function" ? tool.confirmationRequired : null,
+      // Scrutiny normally routes every side-effecting call through the pending
+      // action store. A tool may return false here only when a narrower,
+      // already-approved capability boundary authorizes the call itself (for
+      // example an active, chat-bound computer-use session). Keeping this
+      // separate from confirmationRequired prevents that exemption from
+      // weakening the tool's own initial approval gate.
+      scrutinyConfirmationRequired: typeof tool.scrutinyConfirmationRequired === "function"
+        ? tool.scrutinyConfirmationRequired
+        : null,
+      // Resolve approval-critical facts (for example the immutable target
+      // node) before the card is created. The prepared args are what the user
+      // sees, approves, and the confirmed handler later receives.
+      prepareApprovalArgs: typeof tool.prepareApprovalArgs === "function" ? tool.prepareApprovalArgs : null,
+      // Optional stable identity used to collapse repeated requests for the
+      // same approval while the first card is still pending.
+      approvalDedupeKey: typeof tool.approvalDedupeKey === "function" ? tool.approvalDedupeKey : null,
+      // Particularly sensitive approvals (for example physical computer
+      // control) expire even if the dashboard card is left untouched.
+      approvalTtlMs: Number.isFinite(Number(tool.approvalTtlMs)) && Number(tool.approvalTtlMs) > 0
+        ? Math.trunc(Number(tool.approvalTtlMs))
+        : null,
       // Short human-readable summary used in the approval UI when the args
       // alone don't describe the action well. Optional fn(args) -> string.
       summarize: typeof tool.summarize === "function" ? tool.summarize : null,
@@ -52,7 +82,14 @@ export class ToolRegistry {
   }
 
   list({ readOnly = false } = {}) {
-    const all = [...this.tools.values()].map(({ handler, ...rest }) => rest);
+    const all = [...this.tools.values()].map(({
+      handler,
+      confirmationRequired,
+      scrutinyConfirmationRequired,
+      prepareApprovalArgs,
+      approvalDedupeKey,
+      ...rest
+    }) => rest);
     return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
   }
 
@@ -64,10 +101,18 @@ export class ToolRegistry {
   // first, so many small integrations beat one giant one). Anything not
   // advertised is STILL invokable via run_mcp_tool + discoverable via
   // list_mcp_tools — no capability is lost, just the direct function affordance.
+  // The advertised tool array is the largest STATIC block in every request —
+  // ~67k tokens on a live install — which makes it the bulk of what a provider
+  // can serve from prompt cache. Caching needs an exact prefix match, and
+  // list() returns Map insertion order, i.e. the order MCP servers happened to
+  // finish connecting. That reordered the block between restarts and produced a
+  // 0% cache hit rate on tens of millions of input tokens a day. Ordering is
+  // otherwise meaningless to the model, so it is pinned by name. Core stays
+  // ahead of MCP, matching the comment above.
   _modelToolList(options = {}) {
     const all = this.list(options);
     const max = Number(process.env.OPENAGI_MAX_MODEL_TOOLS) || 128;
-    if (all.length <= max) return all;
+    if (all.length <= max) return sortByName(all);
     const core = all.filter((t) => t.source !== "mcp");
     const mcp = all.filter((t) => t.source === "mcp");
     const budget = Math.max(0, max - core.length);
@@ -77,7 +122,10 @@ export class ToolRegistry {
       if (!byServer.has(s)) byServer.set(s, []);
       byServer.get(s).push(t);
     }
-    const servers = [...byServer.entries()].sort((a, b) => a[1].length - b[1].length);
+    // Tie-break by server name. Without it, equal-sized servers were ordered by
+    // Map insertion — i.e. by whichever MCP server finished connecting first —
+    // so the advertised set could differ between restarts for no real reason.
+    const servers = [...byServer.entries()].sort((a, b) => a[1].length - b[1].length || a[0].localeCompare(b[0]));
     const picked = [];
     const advertised = [];
     const overflow = [];
@@ -86,7 +134,7 @@ export class ToolRegistry {
       else overflow.push(`${name}(${tools.length})`);
     }
     this._logToolCap(all.length, max, advertised, overflow);
-    return [...core, ...picked];
+    return [...sortByName(core), ...sortByName(picked)];
   }
 
   // Surface what got capped (once per distinct overflow set) — never silently
@@ -153,15 +201,32 @@ export class ToolRegistry {
     // queue UNLESS context.__confirmed is true (which the approve endpoint
     // sets after a human OKs the action). Scrutiny 'ask' turns extend this
     // to EVERY side-effecting tool, not just the always-gated ones.
-    const scrutinyConfirm = context?.__scrutinyPolicy === "confirm" && tool.sideEffects;
-    if ((tool.needsConfirmation || scrutinyConfirm) && !context?.__confirmed && this.pendingActions) {
-      const summary = tool.summarize ? safeSummarize(tool.summarize, args) : `Run ${name}`;
+    let invocationArgs = args ?? {};
+    if (tool.needsConfirmation && !context?.__confirmed && tool.prepareApprovalArgs) {
+      try {
+        invocationArgs = await tool.prepareApprovalArgs(invocationArgs, context ?? {});
+        if (!invocationArgs || typeof invocationArgs !== "object" || Array.isArray(invocationArgs)) {
+          throw new Error("approval preparation returned invalid arguments");
+        }
+      } catch (error) {
+        return { ok: false, error: error?.message ?? String(error) };
+      }
+    }
+    const toolConfirm = tool.needsConfirmation && safeConfirmationRequired(tool.confirmationRequired, invocationArgs, context);
+    const scrutinyConfirm = context?.__scrutinyPolicy === "confirm"
+      && tool.sideEffects
+      && safeConfirmationRequired(tool.scrutinyConfirmationRequired, invocationArgs, context);
+    if ((toolConfirm || scrutinyConfirm) && !context?.__confirmed && this.pendingActions) {
+      const summary = tool.summarize ? safeSummarize(tool.summarize, invocationArgs) : `Run ${name}`;
+      const dedupeKey = safeApprovalDedupeKey(tool.approvalDedupeKey, invocationArgs, context);
       const action = this.pendingActions.enqueue({
         toolName: name,
-        args,
+        args: invocationArgs,
         context,
         summary,
-        reason: context.__reason ?? null
+        reason: context.__reason ?? null,
+        dedupeKey,
+        ttlMs: toolConfirm ? tool.approvalTtlMs : null
       });
       return {
         ok: true,
@@ -169,12 +234,12 @@ export class ToolRegistry {
           status: "awaiting_confirmation",
           actionId: action.id,
           summary: action.summary,
-          message: `Queued for human approval. Visit the dashboard's Approvals tab (or run /pending-actions) to approve or deny.`
+          message: `Queued for human approval. Open the dashboard's Approvals tab, or the Computer Use page for a computer-use request.`
         }
       };
     }
     try {
-      const result = await tool.handler(args ?? {}, context);
+      const result = await tool.handler(invocationArgs, context);
       return { ok: true, result };
     } catch (error) {
       return { ok: false, error: error.message ?? String(error) };
@@ -184,6 +249,21 @@ export class ToolRegistry {
 
 function safeSummarize(fn, args) {
   try { return String(fn(args ?? {})).slice(0, 240); } catch { return null; }
+}
+
+function safeConfirmationRequired(fn, args, context) {
+  if (typeof fn !== "function") return true;
+  try { return fn(args ?? {}, context ?? {}) !== false; } catch { return true; }
+}
+
+function safeApprovalDedupeKey(fn, args, context) {
+  if (typeof fn !== "function") return null;
+  try {
+    const value = fn(args ?? {}, context ?? {});
+    return typeof value === "string" && value ? value.slice(0, 500) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function registerCoreTools(registry, runtime) {
