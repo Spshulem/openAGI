@@ -93,6 +93,34 @@ export class FileBackedMemorySystem extends MemorySystem {
     return result;
   }
 
+  retireWeakAutomatedNoise(options = {}) {
+    const result = super.retireWeakAutomatedNoise({
+      ...options,
+      // Recovery receipt is deliberately content-free. The active snapshot is
+      // rebuilt atomically only after every receipt append succeeds.
+      archive: ({ at, item }) => appendJsonLine(this.duplicateArchivePath, {
+        version: 1,
+        op: "retire-weak-automated-memory",
+        at,
+        removedId: item.id,
+        rawContentHash: item.rawContentHash ?? null,
+        tier: item.tier ?? null,
+        source: item.source ?? null,
+        scope: item.scope ?? null,
+        createdAt: item.createdAt ?? null,
+        lastObservedAt: item.lastObservedAt ?? null
+      })
+    });
+    if (result.removed.length > 0) {
+      this.persist("retire-weak-automated-memory", {
+        removed: result.removed.map((item) => item.id),
+        archivePath: path.basename(this.duplicateArchivePath),
+        deferred: result.deferred
+      });
+    }
+    return result;
+  }
+
   compactEventLog() {
     writeTextAtomic(this.eventsPath, `${JSON.stringify({
       version: 1,

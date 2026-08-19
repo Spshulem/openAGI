@@ -111,9 +111,10 @@ const DEFAULTS = {
   deadlineMs: 7 * 60 * 1000,
   // Share of the remaining daily budget one pass is allowed to plan to spend.
   budgetFraction: 0.25,
-  // Deterministic cleanup is cheap and safe enough to run daily. The model
-  // judgement remains weekly so faster queue draining does not multiply cost.
-  llmIntervalDays: 7
+  // The model pass is also daily, but remains capped and budget-fraction
+  // bounded. A four-figure legacy queue should rotate through review in days,
+  // not remain misleadingly attached to the task surface for months.
+  llmIntervalDays: 1
 };
 
 function envNumber(name, fallback) {
@@ -269,12 +270,15 @@ export class BacklogTriage {
     const latest = safely(degraded, "read-latest", () => readJsonFile(path.join(dir, "backlog-triage", "latest.json"), null), null);
     const previousLlmAt = latest?.llm?.lastAttemptAt
       ?? (latest?.llm?.itemsSent > 0 ? latest.startedAt : null);
+    const previousProviderFailure = latest?.llm?.stoppedEarly === "provider-error";
     report.llm.lastAttemptAt = previousLlmAt;
     if (!useLLM) {
       report.llm.skipped = "disabled";
     } else if (plan.ambiguous.length === 0) {
       report.llm.skipped = "no-candidates";
-    } else if (!llmReviewDue(previousLlmAt, startedAt, this.options.llmIntervalDays)) {
+    } else if (!llmReviewDue(previousLlmAt, startedAt, previousProviderFailure
+      ? Math.max(7, this.options.llmIntervalDays)
+      : this.options.llmIntervalDays)) {
       report.llm.skipped = "cadence";
       report.llm.deferred = plan.ambiguous.length;
     } else {

@@ -467,6 +467,45 @@ export class MemorySystem {
     return { groups: retained.length, removed, retained };
   }
 
+  retireWeakAutomatedNoise({
+    maxRemovals = 100,
+    minAgeDays = 30,
+    maxStrength = 0.25,
+    archive = null,
+    now = new Date()
+  } = {}) {
+    const at = now instanceof Date ? now : new Date(now);
+    const cutoff = at.getTime() - Math.max(1, Number(minAgeDays) || 30) * 24 * 60 * 60 * 1000;
+    const cap = Math.max(0, Math.min(500, Number(maxRemovals) || 0));
+    const removed = [];
+    const candidates = [...this.items.values()]
+      .filter((item) => {
+        const lastEvidence = Date.parse(item.lastObservedAt ?? item.lastAccessedAt ?? item.createdAt ?? "");
+        return !isProtectedMemory(item)
+          && item.kind !== "principle"
+          && !item.metadata?.supersededBy
+          && Number(item.strength ?? 0) <= maxStrength
+          && Number(item.risk ?? 0) < 0.3
+          && Number(item.novelty ?? 0) < 0.3
+          && Number(item.repetition ?? 0) < 0.2
+          && Number.isFinite(lastEvidence)
+          && lastEvidence < cutoff;
+      })
+      .sort((a, b) => String(a.lastObservedAt ?? a.createdAt).localeCompare(String(b.lastObservedAt ?? b.createdAt)));
+
+    for (const item of candidates.slice(0, cap)) {
+      try {
+        archive?.({ at: at.toISOString(), item });
+      } catch {
+        continue;
+      }
+      this.items.delete(item.id);
+      this.dropPrincipleVector(item.id);
+      removed.push(item);
+    }
+    return { removed, deferred: Math.max(0, candidates.length - removed.length) };
+  }
+
   snapshot() {
     return {
       short: this.byTier("short"),
