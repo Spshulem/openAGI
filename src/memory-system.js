@@ -13,6 +13,9 @@ const DEFAULT_TTL_MS = {
 };
 
 const DECAY_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const AUTOMATED_MEMORY_SOURCES = new Set([
+  "agent-host", "ambient-digest", "autopilot", "condenser", "daily-plan", "daily-recap", "runtime"
+]);
 
 // These memories exist because the user explicitly asked OpenAGI to retain
 // them (or approved a knowledge suggestion). They are never admission-deduped
@@ -471,6 +474,7 @@ export class MemorySystem {
     maxRemovals = 100,
     minAgeDays = 30,
     maxStrength = 0.25,
+    maxInactiveStrength = 0.4,
     archive = null,
     now = new Date()
   } = {}) {
@@ -481,15 +485,30 @@ export class MemorySystem {
     const candidates = [...this.items.values()]
       .filter((item) => {
         const lastEvidence = Date.parse(item.lastObservedAt ?? item.lastAccessedAt ?? item.createdAt ?? "");
-        return !isProtectedMemory(item)
-          && item.kind !== "principle"
-          && !item.metadata?.supersededBy
+        const lastRecall = Date.parse(item.lastAccessedAt ?? item.createdAt ?? "");
+        const strictlyLowSignal = item.kind !== "principle"
           && Number(item.strength ?? 0) <= maxStrength
           && Number(item.risk ?? 0) < 0.3
           && Number(item.novelty ?? 0) < 0.3
-          && Number(item.repetition ?? 0) < 0.2
+          && Number(item.repetition ?? 0) < 0.2;
+        const source = String(item.source ?? "");
+        const syntheticCondenserPrinciple = source === "condenser" && item.kind === "principle";
+        const inactiveAutomated = AUTOMATED_MEMORY_SOURCES.has(source)
+          && Number(item.strength ?? 0) < maxInactiveStrength
+          && Number(item.dangerLevel ?? 0) < 0.75
+          // Strong recurrence remains evidence even when recall is quiet. The
+          // legacy low-signal path above already requires <0.2. Condenser
+          // principles are the exception: the condenser assigns 0.8 to every
+          // output as a construction default, so that value is not independent
+          // evidence that this particular principle kept recurring.
+          && (syntheticCondenserPrinciple || Number(item.repetition ?? 0) < 0.8)
+          && Number.isFinite(lastRecall)
+          && lastRecall < cutoff;
+        return !isProtectedMemory(item)
+          && !item.metadata?.supersededBy
           && Number.isFinite(lastEvidence)
-          && lastEvidence < cutoff;
+          && lastEvidence < cutoff
+          && (strictlyLowSignal || inactiveAutomated);
       })
       .sort((a, b) => String(a.lastObservedAt ?? a.createdAt).localeCompare(String(b.lastObservedAt ?? b.createdAt)));
 

@@ -310,6 +310,36 @@ test("a weak mined pattern younger than the stale window is never retired by rul
   assert.deepEqual(ambiguous.map((a) => a.id), ["sug_weak"]);
 });
 
+test("a strong mined pattern retires only when its own occurrence ledger stopped recurring", () => {
+  const proposedAt = new Date(NOW.getTime() - 60 * DAY).toISOString();
+  const recentOccurrence = new Date(NOW.getTime() - 5 * DAY).toISOString();
+  const staleOccurrence = new Date(NOW.getTime() - 45 * DAY).toISOString();
+  const { resolved, ambiguous } = classifyDeterministic({
+    suggestions: [
+      mined("sug_stale", {
+        fingerprint: "a→b",
+        proposedAt,
+        sequence: { count: 30, distinctDays: 9, confidence: 0.99, occurrences: [staleOccurrence] }
+      }),
+      mined("sug_recurring", {
+        fingerprint: "c→d",
+        proposedAt,
+        sequence: { count: 30, distinctDays: 9, confidence: 0.99, occurrences: [staleOccurrence, recentOccurrence] }
+      }),
+      mined("sug_no_ledger", {
+        fingerprint: "e→f",
+        proposedAt,
+        sequence: { count: 30, distinctDays: 9, confidence: 0.99 }
+      })
+    ],
+    now: NOW
+  });
+  assert.deepEqual(resolved.map((item) => item.id), ["sug_stale"]);
+  assert.equal(resolved[0].rule, "stale-mined-nonrecurrence");
+  assert.equal(resolved[0].evidence.daysSinceLastOccurrence, 45);
+  assert.deepEqual(ambiguous.map((item) => item.id).sort(), ["sug_no_ledger", "sug_recurring"]);
+});
+
 test("only superseded re-drafts are retired — a completed parent task never justifies it", () => {
   // The trap this guards: for a draft-only task, "completed" means the AGENT
   // finished the draft, not that the user acted on it. Pending drafts can
