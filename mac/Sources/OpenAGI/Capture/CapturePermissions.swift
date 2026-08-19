@@ -387,6 +387,22 @@ final class CapturePermissions: ObservableObject {
          watchForGrant: false)
   }
 
+  /// Accessibility has its own explicit prompt API. Keep it behind a literal
+  /// user action just like Screen Recording so ordinary status refreshes never
+  /// produce recurring system prompts.
+  func requestAccessibilityFromPermissionButton() {
+    let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+    let options = [key: true] as CFDictionary
+    accessibilityGranted = AXIsProcessTrustedWithOptions(options)
+  }
+
+  /// macOS exposes no request API for Full Disk Access. The only honest
+  /// recovery path is the system pane where the user can enable the signed app.
+  func openFullDiskAccessSettings() {
+    open("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+         watchForGrant: false)
+  }
+
   private func open(_ urlString: String, watchForGrant: Bool = true) {
     guard let url = URL(string: urlString) else { return }
     NSWorkspace.shared.open(url)

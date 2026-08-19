@@ -222,6 +222,7 @@ struct TrayMenu: View {
       Button("Open health audit…") { state.openDashboard(path: "/?tab=health") }
       Button("Open activity log…") { state.openDashboard(path: "/?tab=activity") }
       Button("Settings…") { state.openDashboard(path: "/setup") }
+      Button("Permissions & privacy…") { PrivacyWindowController.shared.show() }
       Button("Copy auth token") { copyAuthToken() }
 
       Divider()
