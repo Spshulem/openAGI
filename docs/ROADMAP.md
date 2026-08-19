@@ -153,6 +153,16 @@ Native scrolling uses CGEvent. Every coordinate action is bound to a recent
 screenshot frame, and node leases enforce the approved goal, selected node,
 expiry, monotonic sequence, action limit, and idempotent action id.
 
+An optional Cua Driver backend is available for users who already operate a
+reviewed Cua installation. Set `OPENAGI_COMPUTER_BACKEND=cua` and
+`OPENAGI_CUA_DRIVER_PATH` to the absolute executable path on that Mac. OpenAGI
+does not download, install, update, or expose Cua's MCP tools directly: all Cua
+actions stay behind the same OpenAGI approval, fresh-frame, lease, Stop,
+redaction, and node-authentication boundary. The signed OpenAGI helper remains
+the default. Cua's experimental Computer History preview is separate and is
+not treated as ambient screen history: it records metadata only for actions
+performed through Cua Driver.
+
 ## Other items currently in the README's roadmap
 
 | Item | Effort | Notes |
