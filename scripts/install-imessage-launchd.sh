@@ -4,12 +4,16 @@
 # the Mac that's signed into iMessage (the "node"); it relays iMessages to a
 # remote OpenAGI main you've already paired with (`openagi pair <main>`).
 #
+# The normal supported path is now the signed OpenAGI app/daemon. Keeping the
+# bridge under that identity makes the Full Disk Access grant survive runtime
+# and checkout updates. This script remains only for explicit legacy recovery.
+#
 # Usage:
-#   ./scripts/install-imessage-launchd.sh            # install + load
+#   ./scripts/install-imessage-launchd.sh legacy-install  # unsupported fallback
 #   ./scripts/install-imessage-launchd.sh uninstall  # stop + remove
 #
 # Config (env vars):
-#   IMESSAGE_RESPOND   all|allow|trigger|none   reply policy (default: all)
+#   IMESSAGE_RESPOND   all|allow|trigger|none   reply policy (default: trigger)
 #   IMESSAGE_ALLOW     h1,h2                     sender allowlist (for respond=allow)
 #   IMESSAGE_ALLOW_CHATS c1,c2                   group chat ids where ANY member
 #                                                can invoke the trigger (chat787…)
@@ -46,12 +50,26 @@ if [[ "${1:-install}" == "uninstall" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" != "legacy-install" ]]; then
+  cat >&2 <<'EOF'
+This installer is deprecated. The supported iMessage node runs inside the
+signed OpenAGI app so its Full Disk Access permission remains attached to a
+stable identity.
+
+Enable OPENAGI_IMESSAGE_BRIDGE=1 (and optionally
+OPENAGI_IMESSAGE_SEARCH=1) in OpenAGI Setup, grant Full Disk Access to
+OpenAGI.app, then restart OpenAGI. Run this script with "uninstall" to remove
+old Node-based agents, or "legacy-install" only for temporary recovery.
+EOF
+  exit 2
+fi
+
 [[ -n "${NODE_BIN}" ]] || { echo "ERROR: node not found. Install Node 22+ or set OPENAGI_NODE_BIN." >&2; exit 1; }
 [[ -f "${BIN}" ]] || { echo "ERROR: ${BIN} not found. Set OPENAGI_DIR to your openAGI checkout." >&2; exit 1; }
 mkdir -p "$(dirname "${BRIDGE_PLIST}")" "${LOG_DIR}"
 
 # Build the bridge argument array.
-bridge_args=("imessage-bridge" "--respond" "${IMESSAGE_RESPOND:-all}")
+bridge_args=("imessage-bridge" "--respond" "${IMESSAGE_RESPOND:-trigger}" "--trigger" "${IMESSAGE_TRIGGER:-openagi}")
 [[ -n "${IMESSAGE_ALLOW:-}" ]]   && bridge_args+=("--allow" "${IMESSAGE_ALLOW}")
 [[ -n "${IMESSAGE_ALLOW_CHATS:-}" ]] && bridge_args+=("--allow-chat" "${IMESSAGE_ALLOW_CHATS}")
 [[ -n "${IMESSAGE_TRIGGER:-}" ]] && bridge_args+=("--trigger" "${IMESSAGE_TRIGGER}")
@@ -91,7 +109,7 @@ EOF
 emit_plist "${BRIDGE_LABEL}" "imessage-bridge" "${bridge_args[@]}" > "${BRIDGE_PLIST}"
 launchctl bootout "${GUI}" "${BRIDGE_PLIST}" 2>/dev/null || true
 launchctl bootstrap "${GUI}" "${BRIDGE_PLIST}"
-echo "Installed ${BRIDGE_LABEL} (respond=${IMESSAGE_RESPOND:-all}, capture=${IMESSAGE_CAPTURE:-none})."
+echo "Installed unsupported legacy ${BRIDGE_LABEL} (respond=${IMESSAGE_RESPOND:-trigger}, capture=${IMESSAGE_CAPTURE:-none})."
 
 if [[ -n "${IMESSAGE_NODE_TOKEN:-}" ]]; then
   emit_plist "${SERVER_LABEL}" "imessage-server" \
