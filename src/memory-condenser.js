@@ -18,6 +18,7 @@ const MIN_GROUP_SIZE = 3;
 const MAX_GROUPS_PER_RUN = 8;
 const QUARANTINE_DAYS = 7;
 const MAX_DUPLICATES_PER_RUN = 250;
+const MAX_WEAK_NOISE_PER_RUN = 100;
 
 export class MemoryCondenser {
   constructor(options = {}) {
@@ -26,6 +27,7 @@ export class MemoryCondenser {
     this.maxGroupsPerRun = options.maxGroupsPerRun ?? MAX_GROUPS_PER_RUN;
     this.quarantineDays = options.quarantineDays ?? QUARANTINE_DAYS;
     this.maxDuplicateRemovals = options.maxDuplicateRemovals ?? MAX_DUPLICATES_PER_RUN;
+    this.maxWeakNoiseRemovals = options.maxWeakNoiseRemovals ?? MAX_WEAK_NOISE_PER_RUN;
   }
 
   async condense({ now = new Date(), scope = null, writeScope = null, originSpecialistId = null } = {}) {
@@ -37,6 +39,10 @@ export class MemoryCondenser {
       maxRemovals: this.maxDuplicateRemovals,
       now
     }) ?? { groups: 0, removed: [] };
+    const weakNoise = this.runtime.memory.retireWeakAutomatedNoise?.({
+      maxRemovals: this.maxWeakNoiseRemovals,
+      now
+    }) ?? { removed: [], deferred: 0 };
     let candidates = [...this.runtime.memory.byTier("medium"), ...this.runtime.memory.byTier("short")]
       .filter((item) => item.kind !== "principle" && !item.metadata?.condensedInto);
     if (scope) {
@@ -45,7 +51,7 @@ export class MemoryCondenser {
       candidates = candidates.filter((item) => !item.scope || item.scope === "main");
     }
     if (candidates.length < this.minGroupSize) {
-      return { groups: 0, principles: 0, duplicatesConsolidated: maintenance.removed.length, reason: "not enough items in scope" };
+      return { groups: 0, principles: 0, duplicatesConsolidated: maintenance.removed.length, weakNoiseRetired: weakNoise.removed.length, weakNoiseDeferred: weakNoise.deferred, reason: "not enough items in scope" };
     }
     const groups = clusterByTagOverlap(candidates, this.minGroupSize).slice(0, this.maxGroupsPerRun);
     const principles = [];
@@ -90,7 +96,7 @@ export class MemoryCondenser {
     }
 
     if (typeof this.runtime.memory.persist === "function") this.runtime.memory.persist("condense", { count: principles.length });
-    return { groups: groups.length, principles: principles.length, items: principles, duplicatesConsolidated: maintenance.removed.length };
+    return { groups: groups.length, principles: principles.length, items: principles, duplicatesConsolidated: maintenance.removed.length, weakNoiseRetired: weakNoise.removed.length, weakNoiseDeferred: weakNoise.deferred };
   }
 
   async distill(items) {

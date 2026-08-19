@@ -223,3 +223,29 @@ test("daily condenser runs bounded duplicate maintenance before principle cluste
   assert.equal(memory.items.size, 1);
   assert.equal(result.principles, 0);
 });
+
+test("daily condenser retires only old weak automated noise with a content-free recovery receipt", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-memory-weak-noise-"));
+  const memory = new FileBackedMemorySystem({ dir, autoLoad: false });
+  const old = "2026-06-01T00:00:00.000Z";
+  memory.remember({ source: "agent-host", content: "low value internal runtime trace" }, {
+    id: "weak", tier: "medium", strength: 0.2, now: old
+  });
+  memory.remember({ source: "local", content: "explicit preference", tags: ["tool:remember"] }, {
+    id: "protected", tier: "medium", strength: 0.1, now: old
+  });
+  memory.remember({ source: "agent-host", content: "repeated useful evidence", repetition: 0.8 }, {
+    id: "repeated", tier: "medium", strength: 0.2, now: old
+  });
+
+  const condenser = new MemoryCondenser({ runtime: { memory }, minGroupSize: 99 });
+  const result = await condenser.condense({ now: new Date("2026-08-18T00:00:00.000Z") });
+  assert.equal(result.weakNoiseRetired, 1);
+  assert.equal(memory.items.has("weak"), false);
+  assert.equal(memory.items.has("protected"), true);
+  assert.equal(memory.items.has("repeated"), true);
+  const receipt = fs.readFileSync(memory.duplicateArchivePath, "utf8").trim().split("\n").map(JSON.parse)
+    .find((entry) => entry.op === "retire-weak-automated-memory");
+  assert.equal(receipt.removedId, "weak");
+  assert.doesNotMatch(JSON.stringify(receipt), /low value internal runtime trace/);
+});

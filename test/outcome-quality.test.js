@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { OutcomeStore, scoreFromToolCalls } from "../src/outcome-store.js";
+import { OutcomeStore, isQualityEligibleOutcome, scoreFromToolCalls } from "../src/outcome-store.js";
 import { SkillRegistry } from "../src/skills.js";
 
 test("scoreFromToolCalls grades runs by per-call ok flags", () => {
@@ -67,6 +67,21 @@ test("resolveSweep still scores a quiet old cron fire 0.5", () => {
   assert.equal(sweep[0].id, quiet.id);
   assert.equal(sweep[0].score, 0.5);
   assert.equal(sweep[0].source, "system-inferred");
+});
+
+test("quality aggregates exclude legacy no-op autopilot pulses without deleting audit history", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-outcome-housekeeping-"));
+  const store = new OutcomeStore({ dir });
+  store.record({ kind: "autopilot-fire", toolCalls: [] });
+  store.record({ kind: "autopilot-fire", toolCalls: [{ name: "agent_pick_next", ok: true }] });
+  store.record({ kind: "autopilot-fire", toolCalls: [{ name: "add_task", ok: true }] });
+  store.record({ kind: "agent-reply", toolCalls: [] });
+
+  const aggregate = store.aggregate(30);
+  assert.equal(store.recent(10).length, 4, "audit history stays intact");
+  assert.equal(aggregate.total, 2);
+  assert.equal(aggregate.excludedHousekeeping, 2);
+  assert.equal(isQualityEligibleOutcome({ kind: "autopilot-fire", metadata: { qualityEligible: false }, toolCalls: [{ name: "add_task" }] }), false);
 });
 
 test("skill run grades completion by tool-call results; tool-free run keeps 0.7", async () => {

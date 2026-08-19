@@ -118,11 +118,12 @@ export class OutcomeStore {
 
   aggregate(windowDays = 7, filter = null) {
     const cutoff = Date.now() - windowDays * 24 * 3600 * 1000;
-    const list = [...this.outcomes.values()].filter((o) => {
+    const inWindow = [...this.outcomes.values()].filter((o) => {
       if (new Date(o.at).getTime() < cutoff) return false;
       if (filter && !filter(o)) return false;
       return true;
     });
+    const list = inWindow.filter(isQualityEligibleOutcome);
     const resolved = list.filter((o) => o.resolved && typeof o.qualityScore === "number");
     const avgQuality = resolved.length === 0 ? null : resolved.reduce((a, b) => a + b.qualityScore, 0) / resolved.length;
     const byKind = {};
@@ -132,6 +133,7 @@ export class OutcomeStore {
       total: list.length,
       resolved: resolved.length,
       pending: list.length - resolved.length,
+      excludedHousekeeping: inWindow.length - list.length,
       avgQuality: avgQuality === null ? null : Number(avgQuality.toFixed(3)),
       byKind
     };
@@ -247,6 +249,19 @@ export class OutcomeStore {
       this.outcomes = new Map([...pending, ...resolved].map((o) => [o.id, o]));
     }
   }
+}
+
+// Historical versions recorded every autonomous pulse as an outcome, even
+// when it only asked the scheduler for the next item or did nothing. Those
+// rows are valid operational audit history, but treating them as successful
+// work makes the quality score measure cron frequency instead of usefulness.
+// Keep them in the store/recent feed and exclude only from quality aggregates.
+export function isQualityEligibleOutcome(outcome = {}) {
+  if (typeof outcome.metadata?.qualityEligible === "boolean") return outcome.metadata.qualityEligible;
+  if (outcome.kind !== "autopilot-fire") return true;
+  const calls = Array.isArray(outcome.toolCalls) ? outcome.toolCalls : [];
+  if (calls.length === 0) return false;
+  return !calls.every((call) => call?.name === "agent_pick_next");
 }
 
 /**

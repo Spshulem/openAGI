@@ -934,7 +934,7 @@ test("summarizeTriagePass is small and carries the counts that matter", async ()
 
 // ─── wiring ──────────────────────────────────────────────────────────────
 
-test("the runtime registers daily deterministic triage while model review stays weekly", async () => {
+test("the runtime registers daily bounded triage", async () => {
   const { createDurableRuntime } = await import("../src/abi-runtime.js");
   const runtime = createDurableRuntime({ dataDir: tempDataDir(), autoConnectMcp: false });
   const job = runtime.cron.listJobs().find((j) => j.id === "backlog-triage");
@@ -963,14 +963,16 @@ test("backlog hygiene stays at 05:45 after a late catch-up and disabled migratio
   assert.equal(cron.listJobs().find((entry) => entry.id === job.id).nextRunAt, null);
 });
 
-test("model review cadence is weekly even when deterministic cleanup runs daily", () => {
+test("model review cadence can run daily while preserving an explicit weekly interval", () => {
   const previous = "2026-07-27T05:15:00.000Z";
+  assert.equal(llmReviewDue(previous, new Date("2026-07-27T20:15:00.000Z"), 1), false);
+  assert.equal(llmReviewDue(previous, new Date("2026-07-28T05:15:00.000Z"), 1), true);
   assert.equal(llmReviewDue(previous, new Date("2026-07-28T05:15:00.000Z"), 7), false);
   assert.equal(llmReviewDue(previous, new Date("2026-08-03T05:15:00.000Z"), 7), true);
   assert.equal(llmReviewDue(null, NOW, 7), true);
 });
 
-test("daily passes keep deterministic cleanup active without paying for daily model review", async () => {
+test("daily passes keep deterministic cleanup and bounded model review active", async () => {
   const dir = tempDataDir();
   writeSuggestion(dir, observer("prop_ambiguous", { title: "Review the vendor agreement" }));
   const provider = stubProvider((items) => items.map((item) => ({
@@ -992,8 +994,8 @@ test("daily passes keep deterministic cleanup active without paying for daily mo
     proposedAt: new Date(NOW.getTime() - 40 * DAY).toISOString()
   }));
   const second = await triage.run({ now: new Date(NOW.getTime() + DAY) });
-  assert.equal(second.llm.skipped, "cadence");
-  assert.equal(provider.calls.length, 0, "daily cleanup does not become a daily model bill");
+  assert.equal(second.llm.skipped, null);
+  assert.equal(provider.calls.length, 1, "the next bounded slice advances each day");
   assert.equal(second.applied.suggestions, 1, "safe deterministic retirement still runs daily");
 });
 

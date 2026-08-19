@@ -296,6 +296,7 @@ export class AgentHost {
       scrutinyDimensions: output.scrutiny.dimensions,
       toolCalls: recordedToolCalls,
       metadata: {
+        qualityEligible: input.origin !== "autopilot" || meaningfulAutopilotWork,
         specialistId: agent.role === "specialist" ? agent.id : null,
         signalSummary: signal.summary,
         scrutinyScore: output.scrutiny.score,
