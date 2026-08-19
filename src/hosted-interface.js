@@ -37,7 +37,7 @@ import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { NodeControlBroker, createNodeControlWorker, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
-import { createComputerExecutor } from "./integrations/computer-server.js";
+import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import { createImessageBridgeRuntime } from "./integrations/imessage-bridge-runtime.js";
 import {
   createImessageNodeCapability,
@@ -522,7 +522,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
     if (computerUseEnabledHere()) {
-      computerExecutor ??= options.computerExecutor ?? createComputerExecutor();
+      computerExecutor ??= options.computerExecutor ?? createConfiguredComputerExecutor();
       providers.set("computer-use", computerExecutor);
     }
     const serviceEnv = getServiceEnv();
