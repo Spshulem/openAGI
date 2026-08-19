@@ -91,6 +91,10 @@ const DEFAULTS = {
   freshDays: 7,
   // Below this age nothing is ever auto-retired by the weak-evidence rule.
   staleDays: 30,
+  // A mined workflow is evidence-backed only while it continues to occur.
+  // Once its own occurrence ledger has been quiet for this long, retirement
+  // is based on measured non-recurrence rather than proposal age alone.
+  staleRecurrenceDays: 30,
   // Title-token Jaccard at which two observer suggestions are treated as the
   // same ask. Tuned against the real queue: 0.65 collapses "Run the agent
   // autopilot pulse" into "Run the next agent autopilot pulse" and leaves
@@ -191,6 +195,7 @@ export class BacklogTriage {
     this.options = {
       freshDays: envNumber("OPENAGI_BACKLOG_TRIAGE_FRESH_DAYS", DEFAULTS.freshDays),
       staleDays: envNumber("OPENAGI_BACKLOG_TRIAGE_STALE_DAYS", DEFAULTS.staleDays),
+      staleRecurrenceDays: envNumber("OPENAGI_BACKLOG_TRIAGE_STALE_RECURRENCE_DAYS", DEFAULTS.staleRecurrenceDays),
       duplicateThreshold: DEFAULTS.duplicateThreshold,
       maxLlmItems: envNumber("OPENAGI_BACKLOG_TRIAGE_MAX_LLM", DEFAULTS.maxLlmItems),
       batchSize: envNumber("OPENAGI_BACKLOG_TRIAGE_BATCH", DEFAULTS.batchSize),
@@ -253,6 +258,7 @@ export class BacklogTriage {
       now: startedAt,
       freshDays: this.options.freshDays,
       staleDays: this.options.staleDays,
+      staleRecurrenceDays: this.options.staleRecurrenceDays,
       duplicateThreshold: this.options.duplicateThreshold
     });
 
@@ -669,6 +675,7 @@ export class BacklogTriage {
 export function classifyDeterministic({
   suggestions = [], drafts = [], taskIndex = new Map(), now = new Date(),
   freshDays = DEFAULTS.freshDays, staleDays = DEFAULTS.staleDays,
+  staleRecurrenceDays = DEFAULTS.staleRecurrenceDays,
   duplicateThreshold = DEFAULTS.duplicateThreshold
 } = {}) {
   const nowMs = now instanceof Date ? now.getTime() : new Date(now).getTime();
@@ -768,6 +775,27 @@ export function classifyDeterministic({
       resolved.push(makeResolution(s, nowMs, "weak-mined-evidence",
         `Mined pattern never recurred: seen ${seq.count ?? 0}× across ${seq.distinctDays ?? 0} day(s), confidence ${fmt(seq.confidence)}.`,
         { count: seq.count ?? null, distinctDays: seq.distinctDays ?? null, confidence: seq.confidence ?? null, ageDays: round1(ageDays) }));
+      continue;
+    }
+    const lastOccurrenceAt = latestOccurrenceAt(seq?.occurrences);
+    const daysSinceLastOccurrence = Number.isFinite(lastOccurrenceAt)
+      ? (nowMs - lastOccurrenceAt) / DAY_MS
+      : null;
+    if (
+      seq
+      && ageDays >= staleDays
+      && daysSinceLastOccurrence !== null
+      && daysSinceLastOccurrence >= staleRecurrenceDays
+    ) {
+      resolved.push(makeResolution(s, nowMs, "stale-mined-nonrecurrence",
+        `Mined pattern has not recurred for ${Math.floor(daysSinceLastOccurrence)} days, despite a ${seq.count ?? 0}-occurrence history.`,
+        {
+          count: seq.count ?? null,
+          distinctDays: seq.distinctDays ?? null,
+          lastOccurrenceAt: new Date(lastOccurrenceAt).toISOString(),
+          daysSinceLastOccurrence: round1(daysSinceLastOccurrence),
+          ageDays: round1(ageDays)
+        }));
       continue;
     }
     ambiguous.push(toCandidate(s, ageDays));
@@ -881,6 +909,16 @@ function weakEvidence(seq) {
   return (Number.isFinite(confidence) && confidence < 0.5)
     || (Number.isFinite(count) && count < 3)
     || (Number.isFinite(days) && days < 2);
+}
+
+function latestOccurrenceAt(occurrences) {
+  if (!Array.isArray(occurrences)) return Number.NaN;
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const occurrence of occurrences) {
+    const at = Date.parse(occurrence ?? "");
+    if (Number.isFinite(at) && at > latest) latest = at;
+  }
+  return latest;
 }
 
 // ─── ranking the survivors ───────────────────────────────────────────────

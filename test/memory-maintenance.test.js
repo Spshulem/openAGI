@@ -249,3 +249,25 @@ test("daily condenser retires only old weak automated noise with a content-free 
   assert.equal(receipt.removedId, "weak");
   assert.doesNotMatch(JSON.stringify(receipt), /low value internal runtime trace/);
 });
+
+test("daily condenser retires inactive weak automated principles but preserves danger and user evidence", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-memory-inactive-noise-"));
+  const memory = new FileBackedMemorySystem({ dir, autoLoad: false });
+  const old = "2026-06-01T00:00:00.000Z";
+  memory.remember({ source: "condenser", kind: "principle", content: "old automated principle", repetition: 0.8 }, {
+    id: "inactive-principle", tier: "long", strength: 0.35, now: old
+  });
+  memory.remember({ source: "condenser", kind: "principle", content: "dangerous specific principle", risk: 1, specificity: 1 }, {
+    id: "danger-principle", tier: "long", strength: 0.35, now: old
+  });
+  memory.remember({ source: "local", content: "explicit preference", tags: ["tool:remember"] }, {
+    id: "protected", tier: "medium", strength: 0.1, now: old
+  });
+
+  const condenser = new MemoryCondenser({ runtime: { memory }, minGroupSize: 99 });
+  const result = await condenser.condense({ now: new Date("2026-08-18T00:00:00.000Z") });
+  assert.equal(result.weakNoiseRetired, 1);
+  assert.equal(memory.items.has("inactive-principle"), false);
+  assert.equal(memory.items.has("danger-principle"), true);
+  assert.equal(memory.items.has("protected"), true);
+});
