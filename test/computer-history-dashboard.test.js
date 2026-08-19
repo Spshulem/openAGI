@@ -11,6 +11,7 @@ let dataDir;
 let dashboardHtml;
 let dashboardScript;
 let previousProviderKey;
+const hostedSource = fs.readFileSync(new URL("../src/hosted-interface.js", import.meta.url), "utf8");
 
 test.before(async () => {
   previousProviderKey = process.env.OPENAI_API_KEY;
@@ -60,11 +61,14 @@ test("Computer History uses measured capture status and a day-grouped, paginated
 
   assert.match(renderer, /historyBucketKey\(row\)/, "raw focus events must be distilled into bounded work periods");
   assert.match(renderer, /historyDayKey\(period\?\.at\)/, "work periods must be grouped by local day");
+  assert.match(renderer, /historyHourKey\(period\?\.at\)/, "work periods must be grouped into expandable hours");
   assert.match(renderer, /kinds: "activity,frame"/, "transcripts must be excluded before server-side pagination");
   assert.match(renderer, /history-entry-time/, "each history row must keep a readable time");
   assert.match(renderer, /history-app-label/, "each history row must identify its source app with text");
   assert.match(renderer, /state\.activityFilter\.limit \+= HISTORY_PAGE_SIZE/, "Load more must expand the bounded query");
   assert.match(renderer, /results\.length > requestedLimit/, "pagination must be based on a one-row lookahead");
+  assert.match(hostedSource, /Math\.min\(5_000, Number\.isFinite\(parsedLimit\)/,
+    "private OCR search responses must remain server-bounded");
 
   assert.match(renderer, /This dashboard cannot tell whether capture is paused, disabled, or the capture Mac is offline/);
   assert.match(renderer, /How to pause/);
@@ -107,7 +111,8 @@ test("history rows escape observation content and expose empty/load-more states"
   }], { query: "needle", hasMore: true });
 
   const rendered = elements.actResults.innerHTML;
-  assert.match(rendered, /<section class="history-day">/);
+  assert.match(rendered, /<details class="history-day" open>/);
+  assert.match(rendered, /<details class="history-hour" open>/);
   assert.match(rendered, /<time class="history-entry-time"/);
   assert.match(rendered, /class="history-app-label"/);
   assert.doesNotMatch(rendered, /<script>|<img\s/, "private observation text must never become executable markup");
@@ -154,6 +159,39 @@ test("history coalesces repeated focus events into ten-minute work periods and h
   assert.match(rendered, />Finder</);
   assert.doesNotMatch(rendered, /com\.google\.Chrome|com\.openai\.codex|com\.apple\.finder/);
   assert.match(elements.historyResultMeta.textContent, /2 work periods from 3 observations/);
+});
+
+test("history exposes OCR-backed screen evidence inside day and hour groups", () => {
+  const helpers = between(dashboardScript, "function historyCleanText", "function renderActivityError");
+  const elements = {
+    actResults: { innerHTML: "", setAttribute() {} },
+    historyResultMeta: { textContent: "" },
+    historyLoadMoreWrap: { hidden: true }
+  };
+  const context = vm.createContext({
+    Map,
+    Date,
+    Intl,
+    Number,
+    String,
+    $: (id) => elements[id] ?? null,
+    escapeHtml: (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    })[character])
+  });
+  vm.runInContext(`${helpers}\nthis.renderActivityResults = renderActivityResults;`, context);
+
+  context.renderActivityResults([
+    { kind: "frame", ref: "safe-frame", at: "2026-08-19T17:08:00.000Z", app: "com.openai.codex", window: "History UI", text: "OCR source" },
+    { kind: "activity", ref: "42", at: "2026-08-19T17:04:00.000Z", app: "com.openai.codex", window: "History UI" },
+    { kind: "activity", ref: "41", at: "2026-08-19T16:54:00.000Z", app: "com.apple.finder", window: "Files" }
+  ]);
+
+  const rendered = elements.actResults.innerHTML;
+  assert.equal((rendered.match(/class="history-hour"/g) ?? []).length, 2);
+  assert.match(rendered, /1 OCR-backed screen capture/);
+  assert.match(rendered, /data-source-count="2"/);
+  assert.match(rendered, /class="history-app-mark"/);
 });
 
 test("history keeps long multi-app periods readable", () => {

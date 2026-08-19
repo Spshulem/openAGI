@@ -1414,7 +1414,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const app = url.searchParams.get("app") ?? null;
         const machine = url.searchParams.get("machine") ?? null;
         const kinds = url.searchParams.get("kinds")?.split(",").map((kind) => kind.trim()).filter(Boolean) ?? null;
-        const limit = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
+        const parsedLimit = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
+        // Search includes private OCR rows and may merge two large source
+        // tables for Computer History. Keep an authenticated-but-compromised
+        // client from turning an arbitrary limit into an unbounded allocation.
+        const limit = Math.max(1, Math.min(5_000, Number.isFinite(parsedLimit) ? parsedLimit : 25));
         const results = await runtime.observations.search({ query, since, until, app, machine, kinds, limit });
         return sendJson(res, 200, results);
       }
@@ -3820,12 +3824,50 @@ function renderApp() {
       background: var(--card); border: 1px solid var(--border);
       border-radius: var(--radius-lg); overflow: hidden;
     }
-    .history-day { padding: var(--space-4) var(--space-5) 0; }
+    .history-day { padding: var(--space-4) var(--space-5); }
     .history-day + .history-day { border-top: 1px solid var(--border); }
-    .history-day-title {
-      margin: 0; padding-bottom: var(--space-3); color: var(--foreground);
-      font-size: var(--font-size-base); font-weight: 650;
+    .history-day > summary, .history-hour > summary {
+      list-style: none; cursor: pointer; user-select: none;
     }
+    .history-day > summary::-webkit-details-marker,
+    .history-hour > summary::-webkit-details-marker { display: none; }
+    .history-day-summary {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: var(--space-3); color: var(--foreground);
+    }
+    .history-day-title {
+      margin: 0; font-size: var(--font-size-base); font-weight: 650;
+    }
+    .history-day-meta, .history-hour-meta {
+      color: var(--muted-foreground); font-size: var(--font-size-xs);
+      font-weight: 500;
+    }
+    .history-disclosure::before {
+      content: "›"; display: inline-block; margin-right: 8px;
+      color: var(--muted-foreground); transform: rotate(0deg);
+      transition: transform .14s ease;
+    }
+    details[open] > summary .history-disclosure::before { transform: rotate(90deg); }
+    .history-hours { margin-top: var(--space-4); }
+    .history-hour {
+      position: relative; margin-left: 88px; padding-left: var(--space-4);
+      border-left: 1px solid var(--border);
+    }
+    .history-hour + .history-hour { padding-top: var(--space-4); }
+    .history-hour-summary {
+      position: relative; display: flex; align-items: baseline;
+      justify-content: space-between; gap: var(--space-3);
+      padding: 0 0 var(--space-3);
+    }
+    .history-hour-summary::before {
+      content: ""; position: absolute; left: calc(-1 * var(--space-4) - 4px);
+      top: 7px; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--muted-foreground); box-shadow: 0 0 0 4px var(--card);
+    }
+    .history-hour-title {
+      color: var(--foreground); font-size: var(--font-size-sm); font-weight: 650;
+    }
+    .history-hour-entries { margin-left: calc(-88px - var(--space-4)); }
     .history-entry {
       display: grid; grid-template-columns: 88px minmax(0, 1fr);
       gap: var(--space-4);
@@ -3835,8 +3877,13 @@ function renderApp() {
       font-size: var(--font-size-xs); text-align: right; white-space: nowrap;
     }
     .history-entry-body {
-      min-width: 0; border-left: 1px solid var(--border);
+      position: relative; min-width: 0; border-left: 1px solid var(--border);
       padding: 0 0 var(--space-5) var(--space-4);
+    }
+    .history-entry-body::before {
+      content: ""; position: absolute; left: -4px; top: 7px;
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--border-strong); box-shadow: 0 0 0 4px var(--card);
     }
     .history-entry-title {
       margin: 0; color: var(--foreground); font-size: var(--font-size-base);
@@ -3857,6 +3904,18 @@ function renderApp() {
       white-space: nowrap; max-width: 260px; overflow: hidden;
       text-overflow: ellipsis;
     }
+    .history-app-mark {
+      display: inline-grid; place-items: center; width: 16px; height: 16px;
+      margin-right: 5px; border-radius: 4px; color: var(--foreground);
+      background: var(--muted-bg); font-size: 9px; font-weight: 700;
+      flex: 0 0 auto;
+    }
+    .history-evidence {
+      display: inline-flex; align-items: center; gap: 5px;
+      margin-top: var(--space-2); color: var(--muted-foreground);
+      font-size: var(--font-size-xs);
+    }
+    .history-evidence::before { content: "▣"; color: var(--accent); }
     .history-state {
       padding: 56px var(--space-5); text-align: center;
       color: var(--muted-foreground); font-size: var(--font-size-sm);
@@ -3878,6 +3937,9 @@ function renderApp() {
       .history-section-header .ui-btn { width: 100%; }
       .history-filters { grid-template-columns: 1fr; }
       .history-day { padding-left: var(--space-4); padding-right: var(--space-4); }
+      .history-day-summary { align-items: flex-start; flex-direction: column; gap: 2px; }
+      .history-hour { margin-left: 66px; padding-left: var(--space-3); }
+      .history-hour-entries { margin-left: calc(-66px - var(--space-3)); }
       .history-entry { grid-template-columns: 66px minmax(0, 1fr); gap: var(--space-2); }
       .history-entry-body { padding-left: var(--space-3); }
     }
@@ -8035,7 +8097,7 @@ async function renderActivity() {
     <div class="pane history-page">
       <div class="history-page-header">
         <h2>Computer history</h2>
-        <p class="history-page-subtitle">A timeline of activity OpenAGI has received from your capture Mac. Search it when you need to remember where you left off.</p>
+        <p class="history-page-subtitle">A day-by-day log distilled from app activity and privacy-filtered screen OCR. Live screenshots stay in approved Computer Use sessions; history keeps searchable text and source references.</p>
       </div>
 
       <section id="historyStatusCard" class="history-status-card" aria-label="Computer history capture status" aria-live="polite" aria-busy="true">
@@ -8196,6 +8258,17 @@ function historyTimeLabel(value) {
   return date ? date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "Time unavailable";
 }
 
+function historyHourKey(value) {
+  const date = historyDate(value);
+  if (!date) return "unknown";
+  return historyDayKey(value) + ":" + String(date.getHours()).padStart(2, "0");
+}
+
+function historyHourLabel(value) {
+  const date = historyDate(value);
+  return date ? date.toLocaleTimeString(undefined, { hour: "numeric" }) : "Time unavailable";
+}
+
 function historyAppLabel(value) {
   const raw = historyCleanText(value);
   if (!raw) return "";
@@ -8232,6 +8305,7 @@ function historyBucketKey(row) {
 
 function historyPeriodCopy(rows) {
   const apps = [...new Set(rows.map((row) => historyAppLabel(row?.app)).filter(Boolean))];
+  const screenCount = rows.filter((row) => row?.kind === "frame" || row?.kind === "frame-summary").length;
   const details = [];
   for (const row of rows) {
     const windowTitle = historyCleanText(row?.window);
@@ -8263,7 +8337,7 @@ function historyPeriodCopy(rows) {
       : apps.length > 1
         ? "You moved between " + appSummary + " during this period."
         : "OpenAGI received activity during this period, but no app or window detail was available.";
-  return { apps, title, summary };
+  return { apps, title, summary, screenCount, sourceCount: rows.length };
 }
 
 function historyPeriods(results) {
@@ -8280,6 +8354,31 @@ function historyPeriods(results) {
     period.rows.push(row);
   }
   return periods.map((period) => ({ ...period, ...historyPeriodCopy(period.rows) }));
+}
+
+function historyGroupPeriods(periods) {
+  const days = new Map();
+  for (const period of periods) {
+    const dayKey = historyDayKey(period?.at);
+    if (!days.has(dayKey)) days.set(dayKey, { at: period?.at, hours: new Map(), periods: [] });
+    const day = days.get(dayKey);
+    const hourKey = historyHourKey(period?.at);
+    if (!day.hours.has(hourKey)) day.hours.set(hourKey, { at: period?.at, periods: [] });
+    day.hours.get(hourKey).periods.push(period);
+    day.periods.push(period);
+  }
+  return [...days.values()].map((day) => ({ ...day, hours: [...day.hours.values()] }));
+}
+
+function historyGroupMeta(periods) {
+  const apps = [...new Set(periods.flatMap((period) => period.apps))];
+  const sourceCount = periods.reduce((sum, period) => sum + period.sourceCount, 0);
+  const screenCount = periods.reduce((sum, period) => sum + period.screenCount, 0);
+  const pieces = [periods.length + " period" + (periods.length === 1 ? "" : "s")];
+  if (apps.length) pieces.push(apps.slice(0, 2).join(", ") + (apps.length > 2 ? " +" + (apps.length - 2) : ""));
+  if (screenCount) pieces.push(screenCount + " screen capture" + (screenCount === 1 ? "" : "s"));
+  else if (sourceCount) pieces.push(sourceCount + " event" + (sourceCount === 1 ? "" : "s"));
+  return pieces.join(" · ");
 }
 
 function historyRelativeTime(value) {
@@ -8316,27 +8415,35 @@ function renderActivityResults(results, { query = "", hasMore = false } = {}) {
     return;
   }
   const periods = historyPeriods(results);
-  const days = new Map();
-  for (const period of periods) {
-    const key = historyDayKey(period?.at);
-    if (!days.has(key)) days.set(key, { at: period?.at, periods: [] });
-    days.get(key).periods.push(period);
-  }
-  list.innerHTML = [...days.values()].map((day) => \`
-    <section class="history-day">
-      <h4 class="history-day-title">\${escapeHtml(historyDayLabel(day.at))}</h4>
-      \${day.periods.map((period) => {
-        const timestamp = historyDate(period?.at)?.toISOString() ?? "";
-        return \`<article class="history-entry">
-          <time class="history-entry-time"\${timestamp ? \` datetime="\${escapeHtml(timestamp)}"\` : ""}>\${escapeHtml(historyTimeLabel(period?.at))}</time>
-          <div class="history-entry-body">
-            <h5 class="history-entry-title">\${escapeHtml(period.title)}</h5>
-            <p class="history-entry-summary">\${historySnippetHtml(period.summary)}</p>
-            \${period.apps.length ? \`<div class="history-apps">\${period.apps.slice(0, 6).map((app) => \`<span class="history-app-label" aria-label="Application: \${escapeHtml(app)}">\${escapeHtml(app)}</span>\`).join("")}\${period.apps.length > 6 ? \`<span class="history-app-label" aria-label="\${period.apps.length - 6} additional applications">+\${period.apps.length - 6} more</span>\` : ""}</div>\` : ""}
-          </div>
-        </article>\`;
-      }).join("")}
-    </section>
+  const days = historyGroupPeriods(periods);
+  const renderPeriod = (period) => {
+    const timestamp = historyDate(period?.at)?.toISOString() ?? "";
+    return \`<article class="history-entry" data-source-count="\${period.sourceCount}">
+      <time class="history-entry-time"\${timestamp ? \` datetime="\${escapeHtml(timestamp)}"\` : ""}>\${escapeHtml(historyTimeLabel(period?.at))}</time>
+      <div class="history-entry-body">
+        <h5 class="history-entry-title">\${escapeHtml(period.title)}</h5>
+        <p class="history-entry-summary">\${historySnippetHtml(period.summary)}</p>
+        \${period.screenCount ? \`<div class="history-evidence">\${period.screenCount} OCR-backed screen capture\${period.screenCount === 1 ? "" : "s"}</div>\` : ""}
+        \${period.apps.length ? \`<div class="history-apps">\${period.apps.slice(0, 6).map((app) => \`<span class="history-app-label" aria-label="Application: \${escapeHtml(app)}"><span class="history-app-mark" aria-hidden="true">\${escapeHtml(app.slice(0, 1).toLocaleUpperCase())}</span>\${escapeHtml(app)}</span>\`).join("")}\${period.apps.length > 6 ? \`<span class="history-app-label" aria-label="\${period.apps.length - 6} additional applications">+\${period.apps.length - 6} more</span>\` : ""}</div>\` : ""}
+      </div>
+    </article>\`;
+  };
+  list.innerHTML = days.map((day) => \`
+    <details class="history-day" open>
+      <summary class="history-day-summary">
+        <h4 class="history-day-title history-disclosure">\${escapeHtml(historyDayLabel(day.at))}</h4>
+        <span class="history-day-meta">\${escapeHtml(historyGroupMeta(day.periods))}</span>
+      </summary>
+      <div class="history-hours">
+        \${day.hours.map((hour) => \`<details class="history-hour" open>
+          <summary class="history-hour-summary">
+            <span class="history-hour-title history-disclosure">\${escapeHtml(historyHourLabel(hour.at))}</span>
+            <span class="history-hour-meta">\${escapeHtml(historyGroupMeta(hour.periods))}</span>
+          </summary>
+          <div class="history-hour-entries">\${hour.periods.map(renderPeriod).join("")}</div>
+        </details>\`).join("")}
+      </div>
+    </details>
   \`).join("");
   if (meta) meta.textContent = "Showing " + periods.length + " work period" + (periods.length === 1 ? "" : "s")
     + " from " + results.length + " observation" + (results.length === 1 ? "" : "s")
