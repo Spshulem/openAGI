@@ -186,7 +186,12 @@ struct PrivacyPanel: View {
         detail: permissions.screenRecordingGranted
           ? "Screen frames + OCR are running."
           : "Screen capture is OFF. Turn it on in System Settings, then switch back here. If it still says OFF, use Request Permission from the tray's Capture menu or quit and reopen OpenAGI.",
-        action: { permissions.openScreenRecordingSettings() })
+        requestLabel: "Request Permission",
+        requestAction: {
+          permissions.requestScreenRecordingFromPermissionButton()
+          permissions.beginWatchingForGrant()
+        },
+        settingsAction: { permissions.openScreenRecordingSettings() })
 
       permissionRow(
         name: "Accessibility",
@@ -199,7 +204,14 @@ struct PrivacyPanel: View {
         detail: permissions.accessibilityGranted
           ? "Window titles are recorded alongside app names."
           : "Optional. Without it, activity is recorded with app names but no window titles. Window-title exclusions still apply during capture — those titles come from the window list, not Accessibility.",
-        action: { permissions.openAccessibilitySettings() })
+        requestLabel: "Request Permission",
+        requestAction: { permissions.requestAccessibilityFromPermissionButton() },
+        settingsAction: { permissions.openAccessibilitySettings() })
+
+      permissionLinkRow(
+        name: "Full Disk Access",
+        detail: "Required for iMessage history search and the paired-node conversation bridge. macOS does not provide a permission prompt for this access; enable OpenAGI in System Settings, then quit and reopen it.",
+        action: { permissions.openFullDiskAccessSettings() })
 
       if let failure = permissions.lastCaptureFailure {
         Text("⚠ \(failure)")
@@ -210,7 +222,14 @@ struct PrivacyPanel: View {
     }
   }
 
-  private func permissionRow(name: String, granted: Bool, detail: String, action: @escaping () -> Void) -> some View {
+  private func permissionRow(
+    name: String,
+    granted: Bool,
+    detail: String,
+    requestLabel: String,
+    requestAction: @escaping () -> Void,
+    settingsAction: @escaping () -> Void
+  ) -> some View {
     VStack(alignment: .leading, spacing: 4) {
       HStack {
         Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
@@ -220,7 +239,27 @@ struct PrivacyPanel: View {
           .font(.caption)
           .foregroundColor(granted ? .secondary : .orange)
         Spacer()
-        Button("Open System Settings…", action: action)
+        if !granted { Button(requestLabel, action: requestAction) }
+        Button("Open Settings…", action: settingsAction)
+      }
+      Text(detail)
+        .font(.caption)
+        .foregroundColor(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+
+  private func permissionLinkRow(name: String, detail: String, action: @escaping () -> Void) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack {
+        Image(systemName: "externaldrive.badge.questionmark")
+          .foregroundColor(.secondary)
+        Text(name).bold()
+        Text("Check in System Settings")
+          .font(.caption)
+          .foregroundColor(.secondary)
+        Spacer()
+        Button("Open Settings…", action: action)
       }
       Text(detail)
         .font(.caption)
