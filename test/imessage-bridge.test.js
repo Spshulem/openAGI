@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { IMessageBridge, extractAttributedText, toPlainText } from "../src/integrations/imessage-bridge.js";
+import { IMessageBridge, classifyBridgeError, extractAttributedText, toPlainText } from "../src/integrations/imessage-bridge.js";
 
 test("toPlainText strips markdown so iMessage replies aren't wack", () => {
   const md = "## Plan\n\nHere's the **budget**:\n- venue: $12k\n- food: *catered*\n\nSee [the doc](https://x.com/d) and `run this`.\n\n~~old~~ done";
@@ -95,6 +95,29 @@ test("advances the date high-water mark even when a send errors", async () => {
   assert.equal(r.errors, 1);
   const state = JSON.parse(fs.readFileSync(path.join(dir, "imessage-bridge.json"), "utf8"));
   assert.equal(state.lastDate, "101", "won't reprocess the same failed message forever");
+});
+
+test("bridge state is atomic, owner-only, and operational events contain no private message data", async () => {
+  const events = [];
+  const { bridge, dir } = makeBridge({});
+  bridge.onEvent = (event) => events.push(event);
+  bridge._saveState({ lastDate: "0", initialized: true });
+  bridge.readMessages = async () => [{ rowid: 1, appleDate: "1", handle: "private@example.test", text: "secret body" }];
+  bridge.client.chat = async () => ({ ok: true, json: { reply: "private reply" } });
+  await bridge.poll();
+
+  const file = path.join(dir, "imessage-bridge.json");
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal(fs.readdirSync(dir).some((name) => name.endsWith(".tmp")), false);
+  const serializedEvents = JSON.stringify(events);
+  assert.doesNotMatch(serializedEvents, /private@example|secret body|private reply/);
+  assert.ok(events.some((event) => event.kind === "relayed"));
+});
+
+test("bridge failures are reported as stable categories, never raw diagnostics", () => {
+  assert.equal(classifyBridgeError(new Error("SQLITE_CANTOPEN: unable to open database file at /private/path")), "full-disk-access-required");
+  assert.equal(classifyBridgeError(new Error("fetch failed ECONNREFUSED 10.0.0.8")), "main-unavailable");
+  assert.equal(classifyBridgeError(new Error("unexpected database format at /private/path")), "database-unavailable");
 });
 
 test("extractAttributedText pulls text from an attributedBody blob", () => {

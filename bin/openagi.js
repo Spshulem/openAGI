@@ -388,15 +388,15 @@ async function cmdImessageBridge(flags) {
   const bridge = new IMessageBridge({
     clientProvider, allowFrom, allowChats, respondMode, captureMode, trigger: flags.trigger,
     onEvent: (e) => {
-      if (e.kind === "relayed") console.log(c(GREEN, `↔ ${e.handle}: `) + c(DIM, `"${e.in}" → "${e.out}"`));
-      else if (e.kind === "captured") console.log(c(DIM, `· saved to memory — ${e.handle}: "${e.in}"`));
-      else if (e.kind && e.error) console.error(c(YELLOW, `! ${e.kind} ${e.handle ?? ""}: ${e.error}`));
+      if (e.kind === "relayed") console.log(c(GREEN, "↔ relayed one iMessage"));
+      else if (e.kind === "captured") console.log(c(DIM, "· saved one iMessage to memory"));
+      else if (e.detailCode) console.error(c(YELLOW, `! ${e.kind}: ${e.detailCode}`));
     }
   });
   console.log(c(GREEN, `iMessage bridge → main at ${probe.url}`));
-  const respondDesc = respondMode === "all" ? "everyone" : respondMode === "allow" ? `allowlist (${allowFrom.join(", ")})` : respondMode === "trigger" ? `messages containing "${flags.trigger}"` : "no one (capture-only)";
+  const respondDesc = respondMode === "all" ? "everyone" : respondMode === "allow" ? `the ${allowFrom.length + allowChats.length} allowlisted conversation(s)` : respondMode === "trigger" ? "messages containing the configured trigger" : "no one (capture-only)";
   console.log(c(DIM, `Reply to: ${respondDesc}.${captureMode !== "none" ? ` Save to memory: ${captureMode}.` : ""} Ctrl-C to stop.`));
-  if (allowChats.length) console.log(c(DIM, `Group chats where anyone can invoke: ${allowChats.join(", ")}`));
+  if (allowChats.length) console.log(c(DIM, `${allowChats.length} group chat(s) can invoke the trigger.`));
   console.log(c(DIM, "Requires: Full Disk Access (read chat.db) + Automation→Messages (send) for this process."));
   bridge.start(); // default 10s, read-only-safe
   await new Promise(() => {}); // run until killed

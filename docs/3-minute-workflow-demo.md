@@ -65,17 +65,19 @@ Do this before the audience is present.
    openagi imessage-search "demo preflight" --days 1 --limit 1
    ```
 
-6. Start the conversational bridge in a separate terminal. Use the trigger mode
-   so unrelated texts never invoke the agent:
+6. In OpenAGI Setup, enable the signed-app conversational bridge with trigger
+   mode so unrelated texts never invoke the agent:
 
    ```bash
-   SELF_HANDLE="your iCloud email or phone"
-   openagi imessage-bridge \
-     --allow "$SELF_HANDLE" \
-     --respond trigger \
-     --trigger OpenAGI \
-     --capture allow
+   OPENAGI_IMESSAGE_BRIDGE=1
+   IMESSAGE_ALLOW="your iCloud email or phone"
+   IMESSAGE_RESPOND=trigger
+   IMESSAGE_TRIGGER=OpenAGI
+   IMESSAGE_CAPTURE=none
    ```
+
+   Restart OpenAGI after saving. Do not use the deprecated Node LaunchAgent;
+   the signed app must own the Full Disk Access grant.
 
 7. In **Skills**, preselect one safe suggested workflow with a clear action
    sequence and more than one observation. Do not depend on a miner producing a

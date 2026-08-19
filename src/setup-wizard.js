@@ -24,6 +24,8 @@ const WIZARD_FIELDS = [
   // Staging/dev environment overrides (default to prod when unset).
   "BUILDBETTER_API_URL", "BUILDBETTER_APP_URL", "BUILDBETTER_MCP_URL",
   "IMESSAGE_ENABLED", "IMESSAGE_SELF_HANDLE", "IMESSAGE_INTERVAL_MS", "IMESSAGE_MODE", "IMESSAGE_BACKFILL_DAYS",
+  "OPENAGI_IMESSAGE_BRIDGE", "OPENAGI_IMESSAGE_SEARCH", "IMESSAGE_RESPOND", "IMESSAGE_TRIGGER",
+  "IMESSAGE_ALLOW", "IMESSAGE_ALLOW_CHAT", "IMESSAGE_ALLOW_CHATS", "IMESSAGE_CAPTURE",
   "OPENAGI_COMPUTER_USE",
   "OPENAGI_PUBLIC_URL",
   "OPENAGI_DAILY_USD_LIMIT",
@@ -342,6 +344,21 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
           <input type="text" name="IMESSAGE_SELF_HANDLE" placeholder="+14155551234 or you@icloud.com">
           <label style="margin-top:8px;">IMESSAGE_BACKFILL_DAYS <span class="sub">— optional; leave blank for forward-only. Set to e.g. <code>7</code> to also seed the last week's self-texts</span></label>
           <input type="number" name="IMESSAGE_BACKFILL_DAYS" placeholder="0" min="0" max="365">
+          <hr style="margin:18px 0;border:0;border-top:1px solid #333;">
+          <p class="sub"><strong>Paired Mac node:</strong> the signed OpenAGI app can also relay explicitly invoked conversations to your main and offer bounded history search over the authenticated outbound node connection. No extra listener or Node LaunchAgent is required.</p>
+          <div class="opt" style="margin-top:8px;">
+            <input type="checkbox" id="imBridge" name="OPENAGI_IMESSAGE_BRIDGE" value="1">
+            <label for="imBridge" style="margin:0;">Enable the signed-app conversation bridge</label>
+          </div>
+          <label style="margin-top:8px;">IMESSAGE_TRIGGER <span class="sub">— only messages containing this whole word invoke the agent; defaults to <code>openagi</code></span></label>
+          <input type="text" name="IMESSAGE_TRIGGER" placeholder="openagi" value="${val("IMESSAGE_TRIGGER")}">
+          <label style="margin-top:8px;">IMESSAGE_ALLOW <span class="sub">— optional comma-separated sender handles; leave blank to allow the trigger in any conversation</span></label>
+          <input type="text" name="IMESSAGE_ALLOW" placeholder="you@icloud.com,+14155551234" value="${val("IMESSAGE_ALLOW")}">
+          <div class="opt" style="margin-top:8px;">
+            <input type="checkbox" id="imSearch" name="OPENAGI_IMESSAGE_SEARCH" value="1">
+            <label for="imSearch" style="margin:0;">Let the paired main run bounded read-only history searches on this Mac</label>
+          </div>
+          <p class="sub">Privacy defaults: the bridge responds to nobody until a self-handle/allowlist exists, then requires the trigger; ambient message capture remains off. Advanced installs can set <code>IMESSAGE_RESPOND</code>, <code>IMESSAGE_ALLOW_CHAT</code>, or <code>IMESSAGE_CAPTURE</code> in <code>.env</code>.</p>
         </div>
       </details>
     </div>

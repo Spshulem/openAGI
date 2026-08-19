@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { resolveDataDir } from "../data-dir.js";
+import { writeJsonAtomic } from "../file-utils.js";
 
 // iMessage bridge (node-side). Turns a Mac into a conversational gateway for a
 // remote OpenAGI "main": new INCOMING iMessages are forwarded to the main's
@@ -68,7 +70,7 @@ export class IMessageBridge {
     this.client = options.client ?? null;
     this.clientProvider = options.clientProvider ?? null;
     this.dbPath = options.dbPath ?? DEFAULT_DB;
-    this.statePath = options.statePath ?? path.join(options.dataDir ?? path.join(os.homedir(), ".openagi"), "imessage-bridge.json");
+    this.statePath = options.statePath ?? path.join(options.dataDir ?? resolveDataDir(), "imessage-bridge.json");
     // "Note to self": also read your OWN texts in your self-thread so you can
     // command the agent by texting yourself. On by default; your handles come
     // from the allowlist. (Resolved lazily at poll time — allowFrom is set below.)
@@ -104,6 +106,15 @@ export class IMessageBridge {
     });
     this.sendMessage = options.sendMessage ?? sendViaIMessage;
     this.onEvent = options.onEvent ?? (() => {});
+    this._status = {
+      running: false,
+      startedAt: null,
+      lastPollAt: null,
+      lastSuccessAt: null,
+      lastErrorAt: null,
+      detailCode: "stopped",
+      totals: { processed: 0, replied: 0, captured: 0, skipped: 0, errors: 0 }
+    };
     // Texts the bridge itself just sent — so reading the self-thread doesn't
     // echo our own replies back into capture/reply (would otherwise loop).
     this._recentSends = [];
@@ -147,8 +158,33 @@ export class IMessageBridge {
     try { return JSON.parse(fs.readFileSync(this.statePath, "utf8")); } catch { return { lastRowid: null }; }
   }
   _saveState(state) {
-    fs.mkdirSync(path.dirname(this.statePath), { recursive: true });
-    fs.writeFileSync(this.statePath, JSON.stringify(state, null, 2) + "\n", { mode: 0o600 });
+    writeJsonAtomic(this.statePath, state, 0o600);
+  }
+
+  status() {
+    return structuredClone(this._status);
+  }
+
+  _recordEvent(kind, detailCode = null, summary = null) {
+    const at = new Date().toISOString();
+    if (kind === "poll-success") {
+      this._status.lastPollAt = at;
+      this._status.lastSuccessAt = at;
+      this._status.detailCode = Number(summary?.errors ?? 0) > 0
+        ? (this._status.detailCode === "starting" ? "partial-failure" : this._status.detailCode)
+        : "ready";
+      for (const key of Object.keys(this._status.totals)) {
+        this._status.totals[key] += Number(summary?.[key] ?? 0);
+      }
+    } else if (kind.endsWith("error")) {
+      this._status.lastPollAt = at;
+      this._status.lastErrorAt = at;
+      this._status.detailCode = detailCode ?? "runtime-error";
+    }
+    // This event boundary is intentionally metadata-only. Handles, message
+    // text, replies, paths, URLs, and raw provider/SQLite errors must never
+    // enter daemon logs, SSE, or integration status.
+    this.onEvent({ kind, at, ...(detailCode ? { detailCode } : {}) });
   }
 
   onAllowlist(handle) {
@@ -227,7 +263,7 @@ export class IMessageBridge {
             content: `iMessage from ${row.handle}: ${text}`,
             tags: ["imessage", row.handle], importance: "normal"
           });
-          if (cap.ok) { captured++; this.onEvent({ kind: "captured", handle: row.handle, in: text.slice(0, 80) }); }
+          if (cap.ok) { captured++; this.onEvent({ kind: "captured" }); }
         } catch { /* capture is best-effort */ }
       }
 
@@ -247,14 +283,14 @@ export class IMessageBridge {
           this._recentSends.push(reply.trim());
           if (this._recentSends.length > 50) this._recentSends.shift();
           replied++;
-          this.onEvent({ kind: "relayed", handle: row.handle, in: text.slice(0, 80), out: reply.slice(0, 80) });
+          this.onEvent({ kind: "relayed" });
         } else {
           errors++;
-          this.onEvent({ kind: "main-error", handle: row.handle, error: res?.error ?? `HTTP ${res?.status}` });
+          this._recordEvent("main-error", "main-unavailable");
         }
-      } catch (error) {
+      } catch {
         errors++;
-        this.onEvent({ kind: "send-error", handle: row.handle, error: error.message });
+        this._recordEvent("send-error", "send-unavailable");
       }
     }
     this._saveState({ ...state, lastDate: highest });
@@ -265,20 +301,41 @@ export class IMessageBridge {
   // gentle, but a longer interval further reduces any chance of contending with
   // Messages, and iMessage commands don't need sub-10s latency.
   start({ intervalMs = 10000 } = {}) {
+    if (this._status.running) return;
     this._stopped = false;
+    this._status.running = true;
+    this._status.startedAt = new Date().toISOString();
+    this._status.detailCode = "starting";
     const tick = async () => {
       if (this._stopped) return;
-      try { await this.poll(); } catch (error) { this.onEvent({ kind: "poll-error", error: error.message }); }
+      try {
+        const result = await this.poll();
+        this._recordEvent("poll-success", null, result);
+      } catch (error) {
+        this._recordEvent("poll-error", classifyBridgeError(error));
+      }
       if (!this._stopped) this._timer = setTimeout(tick, intervalMs);
     };
     tick();
   }
   stop() {
     this._stopped = true;
+    this._status.running = false;
+    this._status.detailCode = "stopped";
     if (this._timer) clearTimeout(this._timer);
     try { this._db?.close(); } catch { /* ignore */ } // release chat.db
     this._db = null;
   }
+}
+
+export function classifyBridgeError(error) {
+  const value = `${error?.code ?? ""} ${error?.message ?? error ?? ""}`.toLowerCase();
+  if (/sqlite.*(unavailable|not found)|cannot find.*node:sqlite/.test(value)) return "sqlite-unavailable";
+  if (/operation not permitted|permission denied|not authorized|full disk|cantopen|unable to open/.test(value)) {
+    return "full-disk-access-required";
+  }
+  if (/main client|fetch|timeout|econn|main.*unavailable/.test(value)) return "main-unavailable";
+  return "database-unavailable";
 }
 
 // Read new messages newer than `sinceDate`. By default only INCOMING

@@ -38,6 +38,7 @@ import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { NodeControlBroker, createNodeControlWorker, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createComputerExecutor } from "./integrations/computer-server.js";
+import { createImessageBridgeRuntime } from "./integrations/imessage-bridge-runtime.js";
 import {
   createImessageNodeCapability,
   isImessageSearchEnabled
@@ -511,6 +512,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   let nodeControlWorker = null;
   let computerExecutor = null;
   let imessageNodeCapability = null;
+  let imessageBridgeRuntime = null;
   const tickerMs = options.tickerMs ?? Number.parseInt(process.env.OPENAGI_TICKER_MS ?? "10000", 10);
 
   const computerUseEnabledHere = () => {
@@ -537,6 +539,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }));
     localCapabilityCache = sanitizeNodeCapabilities(capabilities.filter(Boolean));
     return localCapabilityCache;
+  };
+  const ensureImessageBridge = () => {
+    imessageBridgeRuntime ??= options.imessageBridgeRuntime
+      ?? createImessageBridgeRuntime({
+        dataDir,
+        env: getServiceEnv(),
+        fetchImpl: options.nodeControlFetch ?? globalThis.fetch,
+        allowInsecureRemote: allowInsecureNodeRelay
+      });
+    imessageBridgeRuntime.start();
+    return imessageBridgeRuntime;
   };
   const ensureNodeControlWorker = () => {
     if (nodeControlWorker || activeNodeCapabilityProviders().size === 0) return nodeControlWorker;
@@ -2061,8 +2074,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           },
           {
             id: "imessage",
-            name: "iMessage (text yourself as inbox)",
-            description: "Reads ~/Library/Messages/chat.db read-only and converts messages from a 1:1 self-chat into tasks. macOS only · requires Full Disk Access · opt-in.",
+            name: "iMessage",
+            description: "Read-only local Messages access for task inbox, paired-node conversations, and explicitly enabled history search. macOS only · requires Full Disk Access · opt-in.",
             paths: [
               (() => {
                 const s = runtime.imessagePoller?.status?.() ?? null;
@@ -2082,6 +2095,42 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                         : !s.selfHandle
                           ? "Set IMESSAGE_SELF_HANDLE to the iCloud email or phone you text yourself from."
                           : `Reading from ${s.selfHandle}. Last imported ROWID: ${s.lastImportedRowid ?? 0}.`
+                };
+              })(),
+              (() => {
+                const s = imessageBridgeRuntime?.status?.() ?? {
+                  enabled: false, running: false, detailCode: "disabled", lastSuccessAt: null
+                };
+                return {
+                  kind: "channel",
+                  label: "Paired-node conversation bridge",
+                  configured: Boolean(s.enabled && s.running && s.detailCode === "ready"),
+                  envKeys: ["OPENAGI_IMESSAGE_BRIDGE", "IMESSAGE_RESPOND", "IMESSAGE_TRIGGER", "IMESSAGE_ALLOW", "IMESSAGE_ALLOW_CHAT", "IMESSAGE_CAPTURE"],
+                  lastSyncedAt: s.lastSuccessAt ?? null,
+                  feeds: "messages",
+                  detail: !s.enabled
+                    ? "Disabled. Set OPENAGI_IMESSAGE_BRIDGE=1; the safe default requires a self-handle/allowlist plus the ‘openagi’ trigger and captures no ambient messages."
+                    : s.detailCode === "full-disk-access-required"
+                      ? "Full Disk Access is required for the signed OpenAGI app; restart OpenAGI after granting it."
+                      : s.detailCode === "ready"
+                        ? "Running under the signed OpenAGI daemon identity with scoped node authentication."
+                        : `Bridge ${s.running ? "is running" : "is stopped"}; status: ${s.detailCode}.`
+                };
+              })(),
+              (() => {
+                const enabled = isImessageSearchEnabled(getServiceEnv());
+                const capability = localCapabilityCache.find((item) => item.id === "imessage-search");
+                return {
+                  kind: "node-capability",
+                  label: "Paired-node history search",
+                  configured: Boolean(enabled && capability?.ready),
+                  envKeys: ["OPENAGI_IMESSAGE_SEARCH"],
+                  feeds: "agent-tools",
+                  detail: !enabled
+                    ? "Disabled. Enable explicitly to let the main ask this node for bounded read-only message searches."
+                    : capability?.ready
+                      ? "Ready and advertised through the authenticated outbound node relay."
+                      : `Enabled but not ready${capability?.detail ? `: ${capability.detail}` : "."}`
                 };
               })()
             ]
@@ -2796,6 +2845,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                   });
                   if (!res.ok) throw new Error(`heartbeat rejected: ${res.status}`);
                 } finally { clearTimeout(timer); }
+                // Do not advance the private message cursor until scoped node
+                // enrollment and a live main heartbeat both succeed. Starting
+                // earlier could consume a message that cannot yet be relayed.
+                ensureImessageBridge();
                 if (heartbeatFailStreak > 0) {
                   console.warn("[openagi] heartbeat to main recovered");
                 }
@@ -2814,6 +2867,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             sendHeartbeat().catch(() => {});
             heartbeatHandle = setInterval(() => { sendHeartbeat().catch(() => {}); }, heartbeatIntervalMs);
             ensureNodeControlWorker();
+          } else {
+            // A standalone/main Mac can bridge to its own authenticated local
+            // daemon as soon as that daemon is listening.
+            ensureImessageBridge();
           }
           const address = server.address();
           const actualPort = typeof address === "object" && address ? address.port : port;
@@ -2831,6 +2888,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
         sseClients.clear();
         channels?.stop?.();
+        imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
         Promise.resolve(computerExecutor?.close?.())
