@@ -60,3 +60,17 @@ test("envFilePath() returns absolute ~/.openagi/.env when OPENAGI_DATA_DIR is un
   if (prev !== undefined) process.env.OPENAGI_DATA_DIR = prev;
   _resetDataDirCache();
 });
+
+test("saveEnv persists the explicit encrypted-tunnel assertion for paired nodes", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-node-relay-env-"));
+  const previous = process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+  try {
+    saveEnv({ dataDir: tmp, values: { OPENAGI_ALLOW_INSECURE_NODE_RELAY: "1" } });
+    assert.match(fs.readFileSync(path.join(tmp, ".env"), "utf8"), /OPENAGI_ALLOW_INSECURE_NODE_RELAY=1/);
+    assert.equal(process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY, "1");
+  } finally {
+    if (previous === undefined) delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+    else process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY = previous;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
