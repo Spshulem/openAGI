@@ -1,6 +1,23 @@
 import Foundation
 import SQLite3
 
+struct CaptureStats: Equatable {
+  let frames: Int
+  let activity: Int
+  let storedThumbnails: Int
+  let diskBytes: Int
+  let latestFrameAt: Date?
+  let latestActivityAt: Date?
+
+  static let empty = CaptureStats(
+    frames: 0,
+    activity: 0,
+    storedThumbnails: 0,
+    diskBytes: 0,
+    latestFrameAt: nil,
+    latestActivityAt: nil)
+}
+
 // Local SQLite store for captured frames + activity. The OCR text and
 // activity events get pushed to the daemon via Bridge for cross-machine
 // recall; this local store is the source of truth for thumbnails and
@@ -159,12 +176,20 @@ final class CaptureStorage {
     }
   }
 
-  func stats() -> (frames: Int, activity: Int, diskBytes: Int) {
+  func stats() -> CaptureStats {
     queue.sync {
       let f = scalarInt("SELECT COUNT(*) FROM frames")
       let a = scalarInt("SELECT COUNT(*) FROM activity")
+      let thumbnails = scalarInt(
+        "SELECT COUNT(*) FROM frames WHERE thumbnail_path IS NOT NULL AND length(trim(thumbnail_path)) > 0")
       let bytes = directorySize(at: CaptureSettings.captureDir)
-      return (f, a, bytes)
+      return CaptureStats(
+        frames: f,
+        activity: a,
+        storedThumbnails: thumbnails,
+        diskBytes: bytes,
+        latestFrameAt: latestStoredThumbnailDate(),
+        latestActivityAt: scalarDate("SELECT MAX(at) FROM activity"))
     }
   }
 
@@ -199,6 +224,28 @@ final class CaptureStorage {
 
       let delT = "DELETE FROM texts WHERE frame_uid NOT IN (SELECT frame_uid FROM frames)"
       sqlite3_exec(db, delT, nil, nil, nil)
+
+      // A crash between writing a JPEG and recording its row can leave an
+      // orphan that SQL retention will never see. Sweep only files older than
+      // the same cutoff; a just-written image is never touched even if its row
+      // is still waiting on OCR.
+      _ = Self.removeExpiredThumbnails(
+        in: CaptureSettings.captureDir.appendingPathComponent("thumbnails"),
+        olderThan: framesOlderThan)
+
+      // DELETE releases SQLite pages for reuse but does not shrink the file or
+      // erase free pages. Compact only after enough space has accumulated to
+      // justify the I/O; this keeps retention truthful without vacuuming every
+      // six-hour maintenance tick.
+      let pageCount = scalarInt("PRAGMA page_count")
+      let freePages = scalarInt("PRAGMA freelist_count")
+      let pageSize = scalarInt("PRAGMA page_size")
+      if Self.shouldCompactDatabase(
+        pageCount: pageCount,
+        freePages: freePages,
+        pageSize: pageSize) {
+        sqlite3_exec(db, "VACUUM", nil, nil, nil)
+      }
     }
   }
 
@@ -217,6 +264,68 @@ final class CaptureStorage {
     guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
     if sqlite3_step(stmt) == SQLITE_ROW { return Int(sqlite3_column_int64(stmt, 0)) }
     return 0
+  }
+
+  private func scalarDate(_ sql: String) -> Date? {
+    var stmt: OpaquePointer?
+    defer { sqlite3_finalize(stmt) }
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+          sqlite3_step(stmt) == SQLITE_ROW,
+          let raw = columnText(stmt, 0) else { return nil }
+    return ISO8601DateFormatter().date(from: raw)
+  }
+
+  /// The database path is not enough: older builds recorded the intended path
+  /// even when JPEG encoding or the write failed. Check a bounded set of the
+  /// newest candidates so the UI only calls capture healthy when an image can
+  /// actually be opened from disk.
+  private func latestStoredThumbnailDate() -> Date? {
+    let sql = """
+      SELECT captured_at, thumbnail_path FROM frames
+      WHERE thumbnail_path IS NOT NULL AND length(trim(thumbnail_path)) > 0
+      ORDER BY captured_at DESC LIMIT 100
+      """
+    var stmt: OpaquePointer?
+    defer { sqlite3_finalize(stmt) }
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+    while sqlite3_step(stmt) == SQLITE_ROW {
+      guard let rawDate = columnText(stmt, 0),
+            let path = columnText(stmt, 1),
+            FileManager.default.isReadableFile(atPath: path),
+            let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+            let size = attrs[.size] as? NSNumber,
+            size.int64Value > 0 else { continue }
+      if let date = ISO8601DateFormatter().date(from: rawDate) { return date }
+    }
+    return nil
+  }
+
+  @discardableResult
+  nonisolated static func removeExpiredThumbnails(in directory: URL, olderThan cutoff: Date) -> Int {
+    let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
+    guard let files = try? FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: Array(keys),
+      options: [.skipsHiddenFiles]) else { return 0 }
+    var removed = 0
+    for file in files where file.pathExtension.lowercased() == "jpg" {
+      guard let values = try? file.resourceValues(forKeys: keys),
+            values.isRegularFile == true,
+            let modified = values.contentModificationDate,
+            modified < cutoff else { continue }
+      if (try? FileManager.default.removeItem(at: file)) != nil { removed += 1 }
+    }
+    return removed
+  }
+
+  nonisolated static func shouldCompactDatabase(
+    pageCount: Int,
+    freePages: Int,
+    pageSize: Int
+  ) -> Bool {
+    guard pageCount > 0, freePages > 0, pageSize > 0 else { return false }
+    let freeBytes = Int64(freePages) * Int64(pageSize)
+    return freeBytes >= 16 * 1024 * 1024 && freePages * 4 >= pageCount
   }
 }
 

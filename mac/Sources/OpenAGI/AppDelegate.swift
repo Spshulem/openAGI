@@ -36,6 +36,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
       HotkeyManager.shared.onHotkey = { OverlayController.shared.toggle() }
       HotkeyManager.shared.register()
 
+      // Support and automated verification need a deterministic way to open
+      // the native permission/retention surface in this dockless menu-bar app.
+      // `open OpenAGI.app --args --show-permissions` does not change a setting;
+      // it only reveals the same panel as the tray-menu item.
+      if ProcessInfo.processInfo.arguments.contains("--show-permissions") {
+        PrivacyWindowController.shared.show()
+      }
+
       // Start the durable outreach consumer if a remote main is configured.
       // Backfills from the persisted cursor so nothing queued while the app was
       // closed is lost.

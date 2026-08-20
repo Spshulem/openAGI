@@ -152,7 +152,11 @@ final class ScreenCapturer {
 
       // Thumbnail (640px wide max, JPEG 50%) — best-effort.
       let thumbPath = thumbnailsDir.appendingPathComponent("\(uid).jpg").path
-      _ = saveThumbnail(image: nsImage, to: thumbPath, maxWidth: 640, quality: 0.5)
+      let savedThumbnailPath = saveThumbnail(
+        image: nsImage,
+        to: thumbPath,
+        maxWidth: 640,
+        quality: 0.5) ? thumbPath : nil
 
       // OCR off the main thread.
       ocrQueue.async {
@@ -162,7 +166,10 @@ final class ScreenCapturer {
             capturedAt: Date(),
             app: appName,
             window: windowTitle,
-            thumbnailPath: thumbPath,
+            // Never persist a path to an image that was not actually written.
+            // Capture health and history use this field as evidence that a
+            // recoverable screenshot exists, not merely that OCR ran.
+            thumbnailPath: savedThumbnailPath,
             ocrText: text,
             confidence: confidence
           )

@@ -49,6 +49,13 @@ enum CaptureDecision: Equatable {
 final class CaptureSettings: ObservableObject {
   static let shared = CaptureSettings()
 
+  /// Screenshots are the most sensitive and storage-heavy capture artifact.
+  /// Keep a short, useful default while letting the user opt into a longer
+  /// local history from Capture Privacy. Existing persisted choices are never
+  /// overwritten by this default.
+  nonisolated static let defaultFrameRetentionDays = 1
+  nonisolated static let frameRetentionPresets = [1, 3, 7, 30, 90]
+
   @Published var enabled: Bool {
     didSet { persist() }
   }
@@ -230,7 +237,9 @@ final class CaptureSettings: ObservableObject {
     self.appliedDefaultBundleIds = Self.defaultExcludedBundleIds
     self.appliedDefaultWindowPatterns = Self.defaultExcludedWindowPatterns
 
-    self.frameRetentionDays = (loaded["frameRetentionDays"] as? Int) ?? 7
+    self.frameRetentionDays = max(
+      1,
+      (loaded["frameRetentionDays"] as? Int) ?? Self.defaultFrameRetentionDays)
     self.textRetentionDays = (loaded["textRetentionDays"] as? Int) ?? 90
     self.maxDiskBytes = (loaded["maxDiskBytes"] as? Int) ?? (5 * 1024 * 1024 * 1024)
 

@@ -33,7 +33,7 @@ final class PrivacyWindowController {
 struct PrivacyPanel: View {
   @ObservedObject private var settings = CaptureSettings.shared
   @ObservedObject private var permissions = CapturePermissions.shared
-  @State private var stats: (frames: Int, activity: Int, diskBytes: Int) = (0, 0, 0)
+  @State private var stats = CaptureStats.empty
   @State private var newBundleId: String = ""
   @State private var newPattern: String = ""
   @State private var statsTimer: Timer?
@@ -65,6 +65,7 @@ struct PrivacyPanel: View {
             }
             Spacer()
           }
+          captureHealthRow
         }
 
         section(title: "Frequency") {
@@ -129,11 +130,19 @@ struct PrivacyPanel: View {
 
         section(title: "Retention") {
           HStack {
-            Text("Frames + thumbnails kept for")
-            Stepper(value: $settings.frameRetentionDays, in: 1...90) {
-              Text("\(settings.frameRetentionDays) days").monospacedDigit()
+            Text("Screenshot history")
+            Spacer()
+            Picker("Screenshot history", selection: $settings.frameRetentionDays) {
+              ForEach(frameRetentionOptions, id: \.self) { days in
+                Text(frameRetentionLabel(days)).tag(days)
+              }
             }
+            .labelsHidden()
+            .pickerStyle(.menu)
           }
+          Text("JPEG thumbnails stay only on this Mac. The default is 24 hours; longer options trade privacy and disk space for more visual recall.")
+            .font(.caption).foregroundColor(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
           HStack {
             Text("OCR text + activity kept for")
             Stepper(value: $settings.textRetentionDays, in: 7...365) {
@@ -144,9 +153,16 @@ struct PrivacyPanel: View {
 
         section(title: "Storage") {
           HStack {
-            stat("Frames", "\(stats.frames)")
+            stat("Screenshots", "\(stats.storedThumbnails)")
             stat("Activity events", "\(stats.activity)")
             stat("Disk usage", formatBytes(stats.diskBytes))
+          }
+          HStack {
+            Text("Last screenshot")
+              .font(.caption).foregroundColor(.secondary)
+            Spacer()
+            Text(relativeDate(stats.latestFrameAt, empty: "Never"))
+              .font(.caption).monospacedDigit()
           }
           HStack {
             Button(role: .destructive) {
@@ -184,7 +200,7 @@ struct PrivacyPanel: View {
         // it "resumes automatically" and then leaving capture off is exactly the
         // kind of confident-but-wrong claim this panel exists to eliminate.
         detail: permissions.screenRecordingGranted
-          ? "Screen frames + OCR are running."
+          ? "Screen Recording is available. The live capture status below confirms whether screenshots are actually being saved."
           : "Screen capture is OFF. Turn it on in System Settings, then switch back here. If it still says OFF, use Request Permission from the tray's Capture menu or quit and reopen OpenAGI.",
         requestLabel: "Request Permission",
         requestAction: {
@@ -220,6 +236,77 @@ struct PrivacyPanel: View {
           .fixedSize(horizontal: false, vertical: true)
       }
     }
+  }
+
+  private var captureHealthRow: some View {
+    let health = CaptureHealth.evaluate(
+      enabled: settings.enabled,
+      pausedUntil: settings.pausedUntil,
+      screenRecordingGranted: permissions.screenRecordingGranted,
+      latestFrameAt: stats.latestFrameAt,
+      captureIntervalSeconds: settings.captureIntervalSeconds)
+    return HStack(alignment: .top, spacing: 8) {
+      Image(systemName: captureHealthIsHealthy(health)
+        ? "checkmark.circle.fill"
+        : "exclamationmark.triangle.fill")
+        .foregroundColor(captureHealthIsHealthy(health) ? .green : .orange)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(captureHealthTitle(health)).bold()
+        Text(captureHealthDetail(health))
+          .font(.caption).foregroundColor(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      Spacer()
+    }
+  }
+
+  private var frameRetentionOptions: [Int] {
+    let presets = CaptureSettings.frameRetentionPresets
+    return presets.contains(settings.frameRetentionDays)
+      ? presets
+      : (presets + [settings.frameRetentionDays]).sorted()
+  }
+
+  private func frameRetentionLabel(_ days: Int) -> String {
+    days == 1 ? "24 hours" : "\(days) days"
+  }
+
+  private func captureHealthIsHealthy(_ state: CaptureHealthState) -> Bool {
+    if case .healthy = state { return true }
+    return false
+  }
+
+  private func captureHealthTitle(_ state: CaptureHealthState) -> String {
+    switch state {
+    case .disabled: return "Screenshot capture is off"
+    case .paused: return "Screenshot capture is paused"
+    case .permissionRequired: return "Screen Recording permission required"
+    case .waitingForFirstFrame: return "Waiting for the first screenshot"
+    case .healthy: return "Screenshots are being saved"
+    case .stale: return "Screenshot capture has stopped"
+    }
+  }
+
+  private func captureHealthDetail(_ state: CaptureHealthState) -> String {
+    switch state {
+    case .disabled:
+      return "Turn on Capture enabled to begin a private local history."
+    case .paused(let until):
+      return "Paused until \(until.formatted(date: .abbreviated, time: .shortened))."
+    case .permissionRequired:
+      return "Activity may still list app names, but no screenshots or OCR are being recorded."
+    case .waitingForFirstFrame:
+      return "Permission is granted and capture is enabled, but no image has been persisted yet."
+    case .healthy(let latest):
+      return "Last screenshot saved \(relativeDate(latest, empty: "just now"))."
+    case .stale(let latest):
+      return "The last screenshot was saved \(relativeDate(latest, empty: "at an unknown time")); app-focus activity can continue even while images are unavailable."
+    }
+  }
+
+  private func relativeDate(_ date: Date?, empty: String) -> String {
+    guard let date else { return empty }
+    return date.formatted(.relative(presentation: .named))
   }
 
   private func permissionRow(
