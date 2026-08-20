@@ -272,7 +272,7 @@ export class ObservationStore {
       }
       sources.push(`SELECT 'frame' AS kind, f.frame_uid AS ref, f.captured_at AS at,
         f.app, f.window, 'screen' AS event, f.source_machine_id AS sourceMachineId,
-        (SELECT text FROM texts WHERE kind = 'frame' AND ref = f.frame_uid LIMIT 1) AS text
+        NULL AS text
         FROM frames f`);
       const params = [];
       const clauses = ["1=1"];

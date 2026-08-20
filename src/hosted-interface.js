@@ -2371,10 +2371,38 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const { listAllSuggestions } = await import("./suggestion-feed.js");
         const status = url.searchParams.get("status");
         const id = url.searchParams.get("id");
-        const suggestions = listAllSuggestions(runtime, {
+        const category = url.searchParams.get("category");
+        const view = url.searchParams.get("view");
+        const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+        let suggestions = listAllSuggestions(runtime, {
           status: status === "null" ? null : (status ?? "pending")
         });
-        return sendJson(res, 200, id ? suggestions.filter((item) => item.id === id) : suggestions);
+        if (id) suggestions = suggestions.filter((item) => item.id === id);
+        if (category) suggestions = suggestions.filter((item) => item.category === category);
+        if (Number.isFinite(requestedLimit)) {
+          suggestions = suggestions.slice(0, Math.max(1, Math.min(500, requestedLimit)));
+        }
+        if (view === "summary") {
+          const summarizeApps = (values) => (Array.isArray(values) ? values : [])
+            .slice(0, 32)
+            .map((item) => typeof item === "string"
+              ? item.slice(0, 200)
+              : (typeof item?.app === "string" ? { app: item.app.slice(0, 200) } : null))
+            .filter(Boolean);
+          suggestions = suggestions.map((item) => ({
+            id: item.id,
+            proposedAt: item.proposedAt ?? null,
+            category: item.category ?? null,
+            title: String(item.title ?? "").slice(0, 240),
+            rationale: String(item.rationale ?? "").slice(0, 1_000),
+            status: item.status ?? null,
+            source: item.source ?? null,
+            context: { apps: summarizeApps(item.context?.apps) },
+            sequence: { apps: summarizeApps(item.sequence?.apps) },
+            proposal: { description: String(item.proposal?.description ?? "").slice(0, 1_000) }
+          }));
+        }
+        return sendJson(res, 200, suggestions);
       }
       if (method === "POST" && pathname === "/proactive/observe") {
         if (!runtime.proactiveObserver?.observe) return sendJson(res, 503, { error: "no observer" });
@@ -3896,20 +3924,44 @@ function renderApp() {
     .history-apps {
       display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--space-2);
     }
-    .history-app-label {
-      display: inline-flex; align-items: center; min-width: 0;
-      padding: 2px 8px; border-radius: 999px;
-      border: 1px solid var(--border); background: var(--background);
-      color: var(--muted-foreground); font-size: var(--font-size-xs);
-      white-space: nowrap; max-width: 260px; overflow: hidden;
-      text-overflow: ellipsis;
+    .history-app-icon {
+      display: inline-grid; place-items: center; width: 28px; height: 28px;
+      border-radius: 7px; border: 1px solid rgba(255,255,255,.12);
+      color: #fff; background: linear-gradient(145deg, #50545c, #25272b);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.12), 0 1px 2px rgba(0,0,0,.2);
+      font-size: 10px; font-weight: 750; letter-spacing: -.02em;
     }
-    .history-app-mark {
-      display: inline-grid; place-items: center; width: 16px; height: 16px;
-      margin-right: 5px; border-radius: 4px; color: var(--foreground);
-      background: var(--muted-bg); font-size: 9px; font-weight: 700;
-      flex: 0 0 auto;
+    .history-app-icon.tone-blue { background: linear-gradient(145deg, #5b9cff, #315ccf); }
+    .history-app-icon.tone-purple { background: linear-gradient(145deg, #9b7cff, #5d3fb4); }
+    .history-app-icon.tone-green { background: linear-gradient(145deg, #59ce8f, #188151); }
+    .history-app-icon.tone-orange { background: linear-gradient(145deg, #ffac5c, #c35c24); }
+    .history-app-icon.tone-dark { background: linear-gradient(145deg, #474b54, #17181b); }
+    .history-app-more {
+      display: inline-grid; place-items: center; min-width: 28px; height: 28px;
+      padding: 0 7px; border-radius: 7px; border: 1px solid var(--border);
+      color: var(--muted-foreground); background: var(--background);
+      font-size: 10px; font-weight: 650;
     }
+    .history-skill-card {
+      margin-top: var(--space-4); padding: var(--space-4);
+      border: 1px solid var(--border); border-radius: var(--radius-lg);
+      background: linear-gradient(145deg, rgba(255,255,255,.035), rgba(255,255,255,.015));
+    }
+    .history-skill-kicker {
+      margin: 0; color: var(--foreground); font-size: var(--font-size-sm);
+      font-weight: 650;
+    }
+    .history-skill-description {
+      margin: var(--space-2) 0 0; color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.5;
+    }
+    .history-skill-create {
+      margin-top: var(--space-2); padding: 0; border: 0; background: transparent;
+      color: var(--accent); font: inherit; font-size: var(--font-size-sm);
+      font-weight: 600; text-align: left; cursor: pointer;
+    }
+    .history-skill-create:hover { text-decoration: underline; }
+    .history-skill-create:disabled { opacity: .6; cursor: wait; text-decoration: none; }
     .history-evidence {
       display: inline-flex; align-items: center; gap: 5px;
       margin-top: var(--space-2); color: var(--muted-foreground);
@@ -8177,18 +8229,26 @@ async function renderActivity() {
     }
     loadWrap.hidden = true;
     try {
-      const results = await fetchJson("/observations/search?" + new URLSearchParams({
-        ...(q ? { q } : {}),
-        ...(since ? { since } : {}),
-        kinds: "activity,frame",
-        limit: String(requestedLimit + 1)
-      }).toString());
+      const [results, suggestions] = await Promise.all([
+        fetchJson("/observations/search?" + new URLSearchParams({
+          ...(q ? { q } : {}),
+          ...(since ? { since } : {}),
+          kinds: "activity,frame",
+          limit: String(requestedLimit + 1)
+        }).toString()),
+        // Skill cards enrich history but must never become a dependency for
+        // reading it: a damaged suggestion store degrades to no cards.
+        fetchJson("/proactive/suggestions?status=pending&category=skill&limit=200&view=summary").catch(() => [])
+      ]);
       if (requestId !== listRequest || state.tab !== "activity") return;
       const rows = (Array.isArray(results) ? results : [])
         .slice(0, requestedLimit)
         .filter((row) => row?.kind !== "transcript");
       const hasMore = Array.isArray(results) && results.length > requestedLimit;
-      renderActivityResults(rows, { query: q, hasMore });
+      const skillSuggestions = (Array.isArray(suggestions) ? suggestions : [])
+        .filter((suggestion) => suggestion?.category === "skill" && suggestion?.status === "pending");
+      renderActivityResults(rows, { query: q, hasMore, suggestions: skillSuggestions });
+      bindHistorySkillButtons(() => reload());
     } catch (error) {
       if (requestId !== listRequest || state.tab !== "activity") return;
       renderActivityError(error, () => reload({ resetLimit: true }));
@@ -8279,6 +8339,11 @@ function historyAppLabel(value) {
     "com.microsoft.edgemac": "Microsoft Edge",
     "com.openai.chat": "ChatGPT",
     "com.openai.codex": "Codex",
+    "com.tinyspeck.slackmacgap": "Slack",
+    "us.zoom.xos": "Zoom",
+    "com.apple.mobilesms": "Messages",
+    "com.apple.calendar": "Calendar",
+    "com.github.githubclient": "GitHub",
     "com.blizzard.worldofwarcraft": "World of Warcraft",
     "worldofwarcraft": "World of Warcraft",
     "com.wispr.wispr-flow": "Wispr Flow",
@@ -8340,7 +8405,85 @@ function historyPeriodCopy(rows) {
   return { apps, title, summary, screenCount, sourceCount: rows.length };
 }
 
-function historyPeriods(results) {
+function historyAppVisual(value) {
+  const label = historyAppLabel(value);
+  const key = label.toLocaleLowerCase();
+  const known = {
+    "finder": ["F", "blue"], "chrome": ["◉", "orange"], "safari": ["↗", "blue"],
+    "slack": ["S", "purple"], "codex": ["⌘", "dark"], "chatgpt": ["✦", "green"],
+    "github": ["GH", "dark"], "zoom": ["▣", "blue"], "messages": ["●", "green"],
+    "calendar": ["31", "orange"], "conductor": ["C", "dark"], "rize": ["R", "purple"],
+    "system settings": ["⚙", "dark"]
+  };
+  const match = known[key];
+  return {
+    label,
+    glyph: match?.[0] ?? (label.slice(0, 2).toLocaleUpperCase() || "APP"),
+    tone: match?.[1] ?? "dark"
+  };
+}
+
+function historyAppIconHtml(value) {
+  const visual = historyAppVisual(value);
+  return \`<span class="history-app-icon tone-\${visual.tone}" aria-label="Application: \${escapeHtml(visual.label)}" title="\${escapeHtml(visual.label)}"><span aria-hidden="true">\${escapeHtml(visual.glyph)}</span></span>\`;
+}
+
+function historySuggestionApps(suggestion) {
+  const values = [];
+  for (const item of suggestion?.context?.apps ?? []) {
+    const value = typeof item === "string" ? item : item?.app;
+    if (value) values.push(historyAppLabel(value).toLocaleLowerCase());
+  }
+  for (const value of suggestion?.sequence?.apps ?? []) {
+    if (value) values.push(historyAppLabel(value).toLocaleLowerCase());
+  }
+  return new Set(values.filter(Boolean));
+}
+
+function historyAttachSkillSuggestions(periods, suggestions) {
+  const attached = periods.map((period) => ({ ...period, skillSuggestions: [] }));
+  for (const suggestion of suggestions ?? []) {
+    const proposedAt = historyDate(suggestion?.proposedAt);
+    if (!proposedAt) continue;
+    const suggestionApps = historySuggestionApps(suggestion);
+    let best = null;
+    for (const period of attached) {
+      if (period.skillSuggestions.length > 0) continue;
+      const periodAt = historyDate(period?.at);
+      if (!periodAt) continue;
+      const distanceHours = Math.abs(proposedAt.getTime() - periodAt.getTime()) / 3_600_000;
+      const periodApps = new Set(period.apps.map((app) => app.toLocaleLowerCase()));
+      const overlap = [...suggestionApps].filter((app) => periodApps.has(app)).length;
+      // Evidence-bearing suggestions may attach to a matching work period on
+      // the same half-day. Suggestions without app evidence must be nearly
+      // contemporaneous, so unrelated cards do not drift into history.
+      if (suggestionApps.size > 0 ? (overlap === 0 || distanceHours > 12) : distanceHours > 0.5) continue;
+      const score = overlap * 100 - distanceHours;
+      if (!best || score > best.score) best = { period, score };
+    }
+    if (best) best.period.skillSuggestions.push(suggestion);
+  }
+  return attached;
+}
+
+function historySkillName(value) {
+  const raw = historyCleanText(value).replace(/[-_]+/g, " ");
+  return raw.replace(/\\b[a-z]/g, (letter) => letter.toLocaleUpperCase()) || "Suggested";
+}
+
+function historySkillCardHtml(suggestion) {
+  const name = historySkillName(suggestion?.title);
+  const description = historyTruncate(
+    suggestion?.proposal?.description || suggestion?.rationale || "Turn this repeated workflow into a reusable skill.",
+    280);
+  return \`<aside class="history-skill-card" aria-label="Suggested skill: \${escapeHtml(name)}">
+    <p class="history-skill-kicker">Suggested skill</p>
+    <p class="history-skill-description">\${escapeHtml(description)}</p>
+    <button class="history-skill-create" type="button" data-history-skill="\${escapeHtml(suggestion?.id ?? "")}" data-history-skill-name="\${escapeHtml(name)}">Create \${escapeHtml(name)} skill</button>
+  </aside>\`;
+}
+
+function historyPeriods(results, suggestions = []) {
   const periods = [];
   const byBucket = new Map();
   for (const row of results) {
@@ -8353,7 +8496,9 @@ function historyPeriods(results) {
     }
     period.rows.push(row);
   }
-  return periods.map((period) => ({ ...period, ...historyPeriodCopy(period.rows) }));
+  return historyAttachSkillSuggestions(
+    periods.map((period) => ({ ...period, ...historyPeriodCopy(period.rows) })),
+    suggestions);
 }
 
 function historyGroupPeriods(periods) {
@@ -8400,7 +8545,7 @@ function historySnippetHtml(value) {
   return escapeHtml(historyTruncate(value, 360));
 }
 
-function renderActivityResults(results, { query = "", hasMore = false } = {}) {
+function renderActivityResults(results, { query = "", hasMore = false, suggestions = [] } = {}) {
   const list = $("actResults");
   if (!list) return;
   list.setAttribute("aria-busy", "false");
@@ -8414,7 +8559,7 @@ function renderActivityResults(results, { query = "", hasMore = false } = {}) {
     if (loadWrap) loadWrap.hidden = true;
     return;
   }
-  const periods = historyPeriods(results);
+  const periods = historyPeriods(results, suggestions);
   const days = historyGroupPeriods(periods);
   const renderPeriod = (period) => {
     const timestamp = historyDate(period?.at)?.toISOString() ?? "";
@@ -8424,7 +8569,8 @@ function renderActivityResults(results, { query = "", hasMore = false } = {}) {
         <h5 class="history-entry-title">\${escapeHtml(period.title)}</h5>
         <p class="history-entry-summary">\${historySnippetHtml(period.summary)}</p>
         \${period.screenCount ? \`<div class="history-evidence">\${period.screenCount} OCR-backed screen capture\${period.screenCount === 1 ? "" : "s"}</div>\` : ""}
-        \${period.apps.length ? \`<div class="history-apps">\${period.apps.slice(0, 6).map((app) => \`<span class="history-app-label" aria-label="Application: \${escapeHtml(app)}"><span class="history-app-mark" aria-hidden="true">\${escapeHtml(app.slice(0, 1).toLocaleUpperCase())}</span>\${escapeHtml(app)}</span>\`).join("")}\${period.apps.length > 6 ? \`<span class="history-app-label" aria-label="\${period.apps.length - 6} additional applications">+\${period.apps.length - 6} more</span>\` : ""}</div>\` : ""}
+        \${period.apps.length ? \`<div class="history-apps" aria-label="Applications used">\${period.apps.slice(0, 12).map(historyAppIconHtml).join("")}\${period.apps.length > 12 ? \`<span class="history-app-more" aria-label="\${period.apps.length - 12} additional applications">+\${period.apps.length - 12}</span>\` : ""}</div>\` : ""}
+        \${period.skillSuggestions.map(historySkillCardHtml).join("")}
       </div>
     </article>\`;
   };
@@ -8449,6 +8595,31 @@ function renderActivityResults(results, { query = "", hasMore = false } = {}) {
     + " from " + results.length + " observation" + (results.length === 1 ? "" : "s")
     + (hasMore ? " · more available" : "");
   if (loadWrap) loadWrap.hidden = !hasMore;
+}
+
+function bindHistorySkillButtons(reload) {
+  document.querySelectorAll("[data-history-skill]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const id = button.dataset.historySkill;
+      const name = button.dataset.historySkillName || "suggested";
+      if (!id) return;
+      button.disabled = true;
+      button.textContent = "Creating…";
+      try {
+        const result = await postJson(\`/proactive/suggestions/\${encodeURIComponent(id)}/accept\`, {});
+        // Accept deliberately returns HTTP 200 for materialization failures so
+        // the pending suggestion remains retryable. Handle that envelope here
+        // instead of falsely celebrating a skill that was never written.
+        if (result.skillCreateError) throw new Error(result.skillCreateError);
+        showToast("✓ " + name + " skill created", true);
+        await reload();
+      } catch (error) {
+        showToast("Couldn’t create skill: " + error.message, false);
+        button.disabled = false;
+        button.textContent = "Create " + name + " skill";
+      }
+    });
+  });
 }
 
 function renderActivityError(error, retry) {

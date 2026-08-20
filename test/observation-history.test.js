@@ -50,8 +50,13 @@ test("unfiltered Computer History merges focus activity with OCR-backed frames",
   });
   assert.deepEqual(merged.map((row) => row.kind), ["frame", "activity"]);
   assert.equal(merged[0].ref, "frame-safe-example");
-  assert.equal(merged[0].text, "screen text available to history");
+  assert.equal(merged[0].text, null,
+    "unfiltered history must not rescan the full OCR index once per recent frame");
   assert.ok(merged.every((row) => row.sourceMachineId === "node-a"));
+
+  const searched = await store.search({ query: "screen text available", kinds: ["frame"], limit: 10 });
+  assert.equal(searched[0].text, "screen text available to history",
+    "an explicit search still returns the bounded matching OCR text");
 
   const framesOnly = await store.search({ kinds: ["frame"], app: "com.apple.finder", limit: 10 });
   assert.equal(framesOnly.length, 1);
