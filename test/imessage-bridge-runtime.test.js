@@ -3,7 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createImessageBridgeRuntime, imessageBridgeConfig } from "../src/integrations/imessage-bridge-runtime.js";
+import {
+  createImessageBridgeRuntime,
+  imessageBridgeCapability,
+  imessageBridgeConfig
+} from "../src/integrations/imessage-bridge-runtime.js";
 import { writeNodeConfig } from "../src/cli-client.js";
 
 test("integrated bridge is opt-in and cannot answer anyone without an allowlist", () => {
@@ -35,7 +39,17 @@ test("daemon-owned bridge starts and stops once with bounded public status", () 
         lastSuccessAt: null,
         lastErrorAt: null,
         detailCode: "starting",
-        totals: { processed: 0, replied: 0, captured: 0, skipped: 0, errors: 0 }
+        lastDecisionCode: null,
+        totals: {
+          processed: 0,
+          replied: 0,
+          captured: 0,
+          skipped: 0,
+          triggerMisses: 0,
+          notAllowed: 0,
+          responsesDisabled: 0,
+          errors: 0
+        }
       };
     }
   };
@@ -59,11 +73,31 @@ test("daemon-owned bridge starts and stops once with bounded public status", () 
   assert.deepEqual(received.allowFrom, ["first@example.test", "second@example.test"]);
   assert.equal(received.start.intervalMs, 2_000, "poll interval is clamped to the safe minimum");
   assert.deepEqual(Object.keys(runtime.status()).sort(), [
-    "capture", "detailCode", "enabled", "lastErrorAt", "lastEvent", "lastPollAt",
-    "lastSuccessAt", "mode", "running", "startedAt", "totals"
+    "capture", "detailCode", "enabled", "lastDecisionCode", "lastErrorAt", "lastEvent",
+    "lastPollAt", "lastSuccessAt", "mode", "running", "startedAt", "totals"
   ]);
   runtime.stop();
   assert.equal(stops, 1);
+});
+
+test("bridge capability advertises only bounded categorical health", () => {
+  const capability = imessageBridgeCapability({
+    enabled: true,
+    running: true,
+    detailCode: "ready",
+    lastDecisionCode: "trigger-mismatch",
+    trigger: "private-trigger",
+    allowFrom: ["private@example.test"]
+  }, () => Date.parse("2026-08-20T12:00:00.000Z"));
+
+  assert.deepEqual(capability, {
+    id: "imessage-bridge",
+    ready: true,
+    operations: [],
+    detail: "ready:trigger-mismatch",
+    checkedAt: "2026-08-20T12:00:00.000Z"
+  });
+  assert.doesNotMatch(JSON.stringify(capability), /private-trigger|private@example/);
 });
 
 test("paired bridge refuses the broad enrollment credential until scoped enrollment is confirmed", () => {

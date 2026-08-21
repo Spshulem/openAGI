@@ -113,7 +113,20 @@ export class IMessageBridge {
       lastSuccessAt: null,
       lastErrorAt: null,
       detailCode: "stopped",
-      totals: { processed: 0, replied: 0, captured: 0, skipped: 0, errors: 0 }
+      // Operational counters are deliberately metadata-only. They make a
+      // silent policy skip diagnosable without exposing handles or message
+      // content through status, logs, heartbeats, or the dashboard.
+      lastDecisionCode: null,
+      totals: {
+        processed: 0,
+        replied: 0,
+        captured: 0,
+        skipped: 0,
+        triggerMisses: 0,
+        notAllowed: 0,
+        responsesDisabled: 0,
+        errors: 0
+      }
     };
     // Texts the bridge itself just sent — so reading the self-thread doesn't
     // echo our own replies back into capture/reply (would otherwise loop).
@@ -176,6 +189,19 @@ export class IMessageBridge {
       for (const key of Object.keys(this._status.totals)) {
         this._status.totals[key] += Number(summary?.[key] ?? 0);
       }
+      this._status.lastDecisionCode = Number(summary?.replied ?? 0) > 0
+        ? "replied"
+        : Number(summary?.errors ?? 0) > 0
+          ? "reply-error"
+          : Number(summary?.triggerMisses ?? 0) > 0
+            ? "trigger-mismatch"
+            : Number(summary?.notAllowed ?? 0) > 0
+              ? "not-allowed"
+              : Number(summary?.responsesDisabled ?? 0) > 0
+                ? "responses-disabled"
+                : Number(summary?.processed ?? 0) > 0
+                  ? "no-reply"
+                  : "idle";
     } else if (kind.endsWith("error")) {
       this._status.lastPollAt = at;
       this._status.lastErrorAt = at;
@@ -201,21 +227,26 @@ export class IMessageBridge {
     const allowed = noAllowlist
       || this.allowFrom.has(String(handle).toLowerCase())
       || (chatId != null && this.allowChats.has(String(chatId).toLowerCase()));
-    if (this.respondMode === "none") return { respond: false };
+    if (this.respondMode === "none") return { respond: false, reason: "responses-disabled" };
     if (this.respondMode === "all") return { respond: true, forward: text };
-    if (this.respondMode === "allow") return { respond: allowed, forward: text };
+    if (this.respondMode === "allow") {
+      return allowed
+        ? { respond: true, forward: text }
+        : { respond: false, reason: "not-allowed" };
+    }
     if (this.respondMode === "trigger") {
-      if (!allowed || !this.trigger) return { respond: false };
+      if (!allowed) return { respond: false, reason: "not-allowed" };
+      if (!this.trigger) return { respond: false, reason: "responses-disabled" };
       // Match the trigger as a whole word so "Peri, what's up?" fires but
       // "perimeter" / "period" don't.
       const wordRe = new RegExp(`\\b${escapeRe(this.trigger)}\\b`, "i");
-      if (!wordRe.test(text)) return { respond: false };
+      if (!wordRe.test(text)) return { respond: false, reason: "trigger-mismatch" };
       // Strip a leading "<trigger>" mention so it isn't echoed back into the
       // prompt ("Peri what's up" → "what's up"); a bare "Peri" forwards as-is.
       const stripped = text.replace(new RegExp(`^\\s*${escapeRe(this.trigger)}\\b[\\s,:!.?]*`, "i"), "").trim();
       return { respond: true, forward: stripped || text };
     }
-    return { respond: false };
+    return { respond: false, reason: "responses-disabled" };
   }
 
   shouldCapture(handle) {
@@ -240,6 +271,7 @@ export class IMessageBridge {
 
     const rows = await this.readMessages(state.lastDate);
     let processed = 0, replied = 0, captured = 0, skipped = 0, errors = 0;
+    let triggerMisses = 0, notAllowed = 0, responsesDisabled = 0;
     let highest = state.lastDate;
     for (const row of rows) {
       if (row.appleDate && BigInt(row.appleDate) > BigInt(highest || 0)) highest = row.appleDate;
@@ -269,7 +301,13 @@ export class IMessageBridge {
 
       // 2. Reply per the response policy.
       const decision = this.responseFor(row.handle, text, row.chatId);
-      if (!decision.respond) { skipped++; continue; }
+      if (!decision.respond) {
+        skipped++;
+        if (decision.reason === "trigger-mismatch") triggerMisses++;
+        else if (decision.reason === "not-allowed") notAllowed++;
+        else responsesDisabled++;
+        continue;
+      }
       try {
         // Session keys off the conversation so a group has one shared thread.
         const sessionKey = row.isGroup ? row.chatId : row.handle;
@@ -294,7 +332,16 @@ export class IMessageBridge {
       }
     }
     this._saveState({ ...state, lastDate: highest });
-    return { processed, replied, captured, skipped, errors };
+    return {
+      processed,
+      replied,
+      captured,
+      skipped,
+      triggerMisses,
+      notAllowed,
+      responsesDisabled,
+      errors
+    };
   }
 
   // Run the poll loop until stop() is called. Default 10s: a read-only reader is

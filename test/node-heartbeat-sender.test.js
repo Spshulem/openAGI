@@ -63,6 +63,63 @@ test("a paired instance heartbeats immediately on listen instead of waiting for 
   }
 });
 
+test("paired nodes advertise privacy-safe iMessage bridge reply health", async () => {
+  const mainDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-hb-imessage-main-"));
+  const credential = "test-only-imessage-pairing";
+  const mainRuntime = createDurableRuntime({ dataDir: mainDir });
+  const mainApp = createHostedInterface(mainRuntime, {
+    host: "127.0.0.1", port: 0, tickerMs: 0, dataDir: mainDir, authToken: credential
+  });
+  const mainBase = (await mainApp.listen()).url;
+
+  const nodeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-hb-imessage-node-"));
+  writeNodeConfig({ remote: mainBase, token: credential }, nodeDir);
+  const nodeRuntime = createDurableRuntime({ dataDir: nodeDir });
+  const bridgeStatus = {
+    enabled: true,
+    running: true,
+    detailCode: "ready",
+    lastDecisionCode: "not-allowed"
+  };
+  const nodeApp = createHostedInterface(nodeRuntime, {
+    host: "127.0.0.1",
+    port: 0,
+    tickerMs: 0,
+    dataDir: nodeDir,
+    heartbeatIntervalMs: 20,
+    serviceEnv: {
+      OPENAGI_IMESSAGE_BRIDGE: "1",
+      IMESSAGE_TRIGGER: "private-trigger",
+      IMESSAGE_ALLOW: "private@example.test"
+    },
+    imessageBridgeRuntime: {
+      start() {},
+      stop() {},
+      status: () => bridgeStatus
+    }
+  });
+  await nodeApp.listen();
+
+  try {
+    let capability = null;
+    for (let attempt = 0; attempt < 40 && !capability; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const roster = await (await fetch(`${mainBase}/nodes`, {
+        headers: { authorization: `Bearer ${credential}` }
+      })).json();
+      capability = roster.nodes
+        .find((node) => !node.self)?.capabilities
+        ?.find((entry) => entry.id === "imessage-bridge" && entry.ready) ?? null;
+    }
+    assert.deepEqual(capability?.operations, []);
+    assert.equal(capability?.detail, "ready:not-allowed");
+    assert.doesNotMatch(JSON.stringify(capability), /private-trigger|private@example/);
+  } finally {
+    await nodeApp.close();
+    await mainApp.close();
+  }
+});
+
 test("a failed heartbeat POST does not crash the sender or the process", async () => {
   const nodeDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-hb-fail-"));
   writeNodeConfig({ remote: "http://127.0.0.1:1", token: null }, nodeDir); // nothing listens on port 1
