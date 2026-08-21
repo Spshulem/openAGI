@@ -30,6 +30,34 @@ export function imessageBridgeConfig(env = process.env) {
   };
 }
 
+// A paired main needs to distinguish "the Messages database is searchable"
+// from "this Mac is actively polling and allowed to reply." Advertise that as
+// a status-only capability over the existing authenticated outbound relay.
+// No handles, trigger text, message text, paths, or raw errors cross machines.
+export function imessageBridgeCapability(status, now = () => Date.now()) {
+  const enabled = status?.enabled === true;
+  const running = status?.running === true;
+  const ready = enabled && running && status?.detailCode === "ready";
+  const decision = [
+    "trigger-mismatch",
+    "not-allowed",
+    "responses-disabled",
+    "reply-error"
+  ].includes(status?.lastDecisionCode)
+    ? status.lastDecisionCode
+    : null;
+  const detail = ready
+    ? (decision ? `ready:${decision}` : "ready")
+    : String(status?.detailCode ?? (enabled ? "not-started" : "disabled")).slice(0, 80);
+  return {
+    id: "imessage-bridge",
+    ready,
+    operations: [],
+    detail,
+    checkedAt: new Date(now()).toISOString()
+  };
+}
+
 export function createImessageBridgeRuntime(options = {}) {
   const dataDir = options.dataDir ?? resolveDataDir();
   const env = options.env ?? process.env;

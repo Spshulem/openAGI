@@ -38,7 +38,11 @@ import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
 import { NodeControlBroker, createNodeControlWorker, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
-import { createImessageBridgeRuntime } from "./integrations/imessage-bridge-runtime.js";
+import {
+  createImessageBridgeRuntime,
+  imessageBridgeCapability,
+  imessageBridgeConfig
+} from "./integrations/imessage-bridge-runtime.js";
 import {
   createImessageNodeCapability,
   isImessageSearchEnabled
@@ -530,6 +534,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       imessageNodeCapability ??= options.imessageNodeCapability
         ?? createImessageNodeCapability({ env: serviceEnv });
       providers.set(imessageNodeCapability.id, imessageNodeCapability);
+    }
+    if (imessageBridgeConfig(serviceEnv).enabled) {
+      providers.set("imessage-bridge", {
+        async health() {
+          const status = imessageBridgeRuntime?.status?.() ?? {
+            enabled: true,
+            running: false,
+            detailCode: "not-started",
+            lastDecisionCode: null
+          };
+          const capability = imessageBridgeCapability(status);
+          return { ok: capability.ready, service: "imessage", capability };
+        },
+        async invoke() {
+          throw new Error("iMessage bridge status has no remote operations");
+        }
+      });
     }
     return providers;
   };
@@ -2118,6 +2139,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
                     ? "Disabled. Set OPENAGI_IMESSAGE_BRIDGE=1; the safe default requires a self-handle/allowlist plus the ‘openagi’ trigger and captures no ambient messages."
                     : s.detailCode === "full-disk-access-required"
                       ? "Full Disk Access is required for the signed OpenAGI app; restart OpenAGI after granting it."
+                      : s.detailCode === "ready" && s.lastDecisionCode === "trigger-mismatch"
+                        ? "Running, but the most recent eligible message did not contain the configured trigger word."
+                      : s.detailCode === "ready" && s.lastDecisionCode === "not-allowed"
+                        ? "Running, but the most recent message was not in the configured sender or chat allowlist."
+                      : s.detailCode === "ready" && s.lastDecisionCode === "responses-disabled"
+                        ? "Running in capture-only mode; automatic replies are disabled."
+                      : s.detailCode === "ready" && s.lastDecisionCode === "reply-error"
+                        ? "Running, but the most recent attempted reply failed. Check main/provider health and Messages Automation permission."
                       : s.detailCode === "ready"
                         ? "Running under the signed OpenAGI daemon identity with scoped node authentication."
                         : `Bridge ${s.running ? "is running" : "is stopped"}; status: ${s.detailCode}.`
@@ -6403,7 +6432,11 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     const revoke = !isNode && !n.self
       ? \`<div style="margin-top:6px;"><button class="ui-btn ui-btn-destructive ui-btn-sm" data-revoke-node="\${escapeHtml(n.nodeId)}">Remove node</button></div>\`
       : "";
-    const capabilityLabels = { "computer-use": "Computer use", "imessage-search": "iMessage search" };
+    const capabilityLabels = {
+      "computer-use": "Computer use",
+      "imessage-search": "iMessage search",
+      "imessage-bridge": "iMessage replies"
+    };
     const capabilities = (Array.isArray(n.capabilities) ? n.capabilities : []).map((capability) => {
       const label = capabilityLabels[capability.id] ?? String(capability.id ?? "capability").replaceAll("-", " ");
       const stateLabel = capability.ready === true ? "ready" : "not ready";

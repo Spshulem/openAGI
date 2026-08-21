@@ -81,6 +81,7 @@ test("allowlist drops messages from non-allowed senders", async () => {
   bridge.client.chat = async () => ({ ok: true, json: { reply: "ok" } });
   const r = await bridge.poll();
   assert.equal(r.skipped, 1, "non-allowed sender skipped");
+  assert.equal(r.notAllowed, 1, "skip reason is counted without exposing the sender");
   assert.equal(r.replied, 1, "allowed sender answered");
   assert.equal(sent.length, 1);
   assert.equal(sent[0].handle, "+15551112222");
@@ -181,6 +182,7 @@ test("respond=all replies to everyone; respond=none never replies", async () => 
   b.bridge.readMessages = async () => [{ rowid: 1, handle: "+1999", text: "hi" }];
   const r = await b.bridge.poll();
   assert.equal(r.replied, 0);
+  assert.equal(r.responsesDisabled, 1);
   assert.equal(b.sent.length, 0);
 });
 
@@ -192,8 +194,30 @@ test("respond=trigger only replies on the trigger word, stripped before forwardi
   ];
   const r = await b.bridge.poll();
   assert.equal(r.replied, 1, "only the triggered message");
+  assert.equal(r.triggerMisses, 1, "a trigger miss is visible as metadata-only diagnostics");
   assert.equal(b.forwarded.length, 1);
   assert.equal(b.forwarded[0].text, "what's the weather?", "trigger prefix stripped");
+});
+
+test("bridge status records the latest policy decision without private message data", async () => {
+  const b = policyBridge({
+    respondMode: "trigger",
+    trigger: "peri",
+    allowFrom: ["private@example.test"]
+  });
+  b.bridge.readMessages = async () => [{
+    rowid: 1,
+    appleDate: "1",
+    handle: "private@example.test",
+    text: "private body without the trigger"
+  }];
+  const result = await b.bridge.poll();
+  b.bridge._recordEvent("poll-success", null, result);
+
+  const status = b.bridge.status();
+  assert.equal(status.lastDecisionCode, "trigger-mismatch");
+  assert.equal(status.totals.triggerMisses, 1);
+  assert.doesNotMatch(JSON.stringify(status), /private@example|private body|peri/);
 });
 
 test("respond=trigger matches the keyword as a whole word, not a substring", async () => {
