@@ -1414,7 +1414,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const app = url.searchParams.get("app") ?? null;
         const machine = url.searchParams.get("machine") ?? null;
         const kinds = url.searchParams.get("kinds")?.split(",").map((kind) => kind.trim()).filter(Boolean) ?? null;
-        const limit = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
+        const parsedLimit = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
+        // Search includes private OCR rows and may merge two large source
+        // tables for Computer History. Keep an authenticated-but-compromised
+        // client from turning an arbitrary limit into an unbounded allocation.
+        const limit = Math.max(1, Math.min(5_000, Number.isFinite(parsedLimit) ? parsedLimit : 25));
         const results = await runtime.observations.search({ query, since, until, app, machine, kinds, limit });
         return sendJson(res, 200, results);
       }
@@ -2367,10 +2371,38 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const { listAllSuggestions } = await import("./suggestion-feed.js");
         const status = url.searchParams.get("status");
         const id = url.searchParams.get("id");
-        const suggestions = listAllSuggestions(runtime, {
+        const category = url.searchParams.get("category");
+        const view = url.searchParams.get("view");
+        const requestedLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+        let suggestions = listAllSuggestions(runtime, {
           status: status === "null" ? null : (status ?? "pending")
         });
-        return sendJson(res, 200, id ? suggestions.filter((item) => item.id === id) : suggestions);
+        if (id) suggestions = suggestions.filter((item) => item.id === id);
+        if (category) suggestions = suggestions.filter((item) => item.category === category);
+        if (Number.isFinite(requestedLimit)) {
+          suggestions = suggestions.slice(0, Math.max(1, Math.min(500, requestedLimit)));
+        }
+        if (view === "summary") {
+          const summarizeApps = (values) => (Array.isArray(values) ? values : [])
+            .slice(0, 32)
+            .map((item) => typeof item === "string"
+              ? item.slice(0, 200)
+              : (typeof item?.app === "string" ? { app: item.app.slice(0, 200) } : null))
+            .filter(Boolean);
+          suggestions = suggestions.map((item) => ({
+            id: item.id,
+            proposedAt: item.proposedAt ?? null,
+            category: item.category ?? null,
+            title: String(item.title ?? "").slice(0, 240),
+            rationale: String(item.rationale ?? "").slice(0, 1_000),
+            status: item.status ?? null,
+            source: item.source ?? null,
+            context: { apps: summarizeApps(item.context?.apps) },
+            sequence: { apps: summarizeApps(item.sequence?.apps) },
+            proposal: { description: String(item.proposal?.description ?? "").slice(0, 1_000) }
+          }));
+        }
+        return sendJson(res, 200, suggestions);
       }
       if (method === "POST" && pathname === "/proactive/observe") {
         if (!runtime.proactiveObserver?.observe) return sendJson(res, 503, { error: "no observer" });
@@ -3820,12 +3852,50 @@ function renderApp() {
       background: var(--card); border: 1px solid var(--border);
       border-radius: var(--radius-lg); overflow: hidden;
     }
-    .history-day { padding: var(--space-4) var(--space-5) 0; }
+    .history-day { padding: var(--space-4) var(--space-5); }
     .history-day + .history-day { border-top: 1px solid var(--border); }
-    .history-day-title {
-      margin: 0; padding-bottom: var(--space-3); color: var(--foreground);
-      font-size: var(--font-size-base); font-weight: 650;
+    .history-day > summary, .history-hour > summary {
+      list-style: none; cursor: pointer; user-select: none;
     }
+    .history-day > summary::-webkit-details-marker,
+    .history-hour > summary::-webkit-details-marker { display: none; }
+    .history-day-summary {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: var(--space-3); color: var(--foreground);
+    }
+    .history-day-title {
+      margin: 0; font-size: var(--font-size-base); font-weight: 650;
+    }
+    .history-day-meta, .history-hour-meta {
+      color: var(--muted-foreground); font-size: var(--font-size-xs);
+      font-weight: 500;
+    }
+    .history-disclosure::before {
+      content: "›"; display: inline-block; margin-right: 8px;
+      color: var(--muted-foreground); transform: rotate(0deg);
+      transition: transform .14s ease;
+    }
+    details[open] > summary .history-disclosure::before { transform: rotate(90deg); }
+    .history-hours { margin-top: var(--space-4); }
+    .history-hour {
+      position: relative; margin-left: 88px; padding-left: var(--space-4);
+      border-left: 1px solid var(--border);
+    }
+    .history-hour + .history-hour { padding-top: var(--space-4); }
+    .history-hour-summary {
+      position: relative; display: flex; align-items: baseline;
+      justify-content: space-between; gap: var(--space-3);
+      padding: 0 0 var(--space-3);
+    }
+    .history-hour-summary::before {
+      content: ""; position: absolute; left: calc(-1 * var(--space-4) - 4px);
+      top: 7px; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--muted-foreground); box-shadow: 0 0 0 4px var(--card);
+    }
+    .history-hour-title {
+      color: var(--foreground); font-size: var(--font-size-sm); font-weight: 650;
+    }
+    .history-hour-entries { margin-left: calc(-88px - var(--space-4)); }
     .history-entry {
       display: grid; grid-template-columns: 88px minmax(0, 1fr);
       gap: var(--space-4);
@@ -3835,8 +3905,13 @@ function renderApp() {
       font-size: var(--font-size-xs); text-align: right; white-space: nowrap;
     }
     .history-entry-body {
-      min-width: 0; border-left: 1px solid var(--border);
+      position: relative; min-width: 0; border-left: 1px solid var(--border);
       padding: 0 0 var(--space-5) var(--space-4);
+    }
+    .history-entry-body::before {
+      content: ""; position: absolute; left: -4px; top: 7px;
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--border-strong); box-shadow: 0 0 0 4px var(--card);
     }
     .history-entry-title {
       margin: 0; color: var(--foreground); font-size: var(--font-size-base);
@@ -3849,14 +3924,50 @@ function renderApp() {
     .history-apps {
       display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--space-2);
     }
-    .history-app-label {
-      display: inline-flex; align-items: center; min-width: 0;
-      padding: 2px 8px; border-radius: 999px;
-      border: 1px solid var(--border); background: var(--background);
-      color: var(--muted-foreground); font-size: var(--font-size-xs);
-      white-space: nowrap; max-width: 260px; overflow: hidden;
-      text-overflow: ellipsis;
+    .history-app-icon {
+      display: inline-grid; place-items: center; width: 28px; height: 28px;
+      border-radius: 7px; border: 1px solid rgba(255,255,255,.12);
+      color: #fff; background: linear-gradient(145deg, #50545c, #25272b);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.12), 0 1px 2px rgba(0,0,0,.2);
+      font-size: 10px; font-weight: 750; letter-spacing: -.02em;
     }
+    .history-app-icon.tone-blue { background: linear-gradient(145deg, #5b9cff, #315ccf); }
+    .history-app-icon.tone-purple { background: linear-gradient(145deg, #9b7cff, #5d3fb4); }
+    .history-app-icon.tone-green { background: linear-gradient(145deg, #59ce8f, #188151); }
+    .history-app-icon.tone-orange { background: linear-gradient(145deg, #ffac5c, #c35c24); }
+    .history-app-icon.tone-dark { background: linear-gradient(145deg, #474b54, #17181b); }
+    .history-app-more {
+      display: inline-grid; place-items: center; min-width: 28px; height: 28px;
+      padding: 0 7px; border-radius: 7px; border: 1px solid var(--border);
+      color: var(--muted-foreground); background: var(--background);
+      font-size: 10px; font-weight: 650;
+    }
+    .history-skill-card {
+      margin-top: var(--space-4); padding: var(--space-4);
+      border: 1px solid var(--border); border-radius: var(--radius-lg);
+      background: linear-gradient(145deg, rgba(255,255,255,.035), rgba(255,255,255,.015));
+    }
+    .history-skill-kicker {
+      margin: 0; color: var(--foreground); font-size: var(--font-size-sm);
+      font-weight: 650;
+    }
+    .history-skill-description {
+      margin: var(--space-2) 0 0; color: var(--muted-foreground);
+      font-size: var(--font-size-sm); line-height: 1.5;
+    }
+    .history-skill-create {
+      margin-top: var(--space-2); padding: 0; border: 0; background: transparent;
+      color: var(--accent); font: inherit; font-size: var(--font-size-sm);
+      font-weight: 600; text-align: left; cursor: pointer;
+    }
+    .history-skill-create:hover { text-decoration: underline; }
+    .history-skill-create:disabled { opacity: .6; cursor: wait; text-decoration: none; }
+    .history-evidence {
+      display: inline-flex; align-items: center; gap: 5px;
+      margin-top: var(--space-2); color: var(--muted-foreground);
+      font-size: var(--font-size-xs);
+    }
+    .history-evidence::before { content: "▣"; color: var(--accent); }
     .history-state {
       padding: 56px var(--space-5); text-align: center;
       color: var(--muted-foreground); font-size: var(--font-size-sm);
@@ -3878,6 +3989,9 @@ function renderApp() {
       .history-section-header .ui-btn { width: 100%; }
       .history-filters { grid-template-columns: 1fr; }
       .history-day { padding-left: var(--space-4); padding-right: var(--space-4); }
+      .history-day-summary { align-items: flex-start; flex-direction: column; gap: 2px; }
+      .history-hour { margin-left: 66px; padding-left: var(--space-3); }
+      .history-hour-entries { margin-left: calc(-66px - var(--space-3)); }
       .history-entry { grid-template-columns: 66px minmax(0, 1fr); gap: var(--space-2); }
       .history-entry-body { padding-left: var(--space-3); }
     }
@@ -8035,7 +8149,7 @@ async function renderActivity() {
     <div class="pane history-page">
       <div class="history-page-header">
         <h2>Computer history</h2>
-        <p class="history-page-subtitle">A timeline of activity OpenAGI has received from your capture Mac. Search it when you need to remember where you left off.</p>
+        <p class="history-page-subtitle">A day-by-day log distilled from app activity and privacy-filtered screen OCR. Live screenshots stay in approved Computer Use sessions; history keeps searchable text and source references.</p>
       </div>
 
       <section id="historyStatusCard" class="history-status-card" aria-label="Computer history capture status" aria-live="polite" aria-busy="true">
@@ -8115,18 +8229,26 @@ async function renderActivity() {
     }
     loadWrap.hidden = true;
     try {
-      const results = await fetchJson("/observations/search?" + new URLSearchParams({
-        ...(q ? { q } : {}),
-        ...(since ? { since } : {}),
-        kinds: "activity,frame",
-        limit: String(requestedLimit + 1)
-      }).toString());
+      const [results, suggestions] = await Promise.all([
+        fetchJson("/observations/search?" + new URLSearchParams({
+          ...(q ? { q } : {}),
+          ...(since ? { since } : {}),
+          kinds: "activity,frame",
+          limit: String(requestedLimit + 1)
+        }).toString()),
+        // Skill cards enrich history but must never become a dependency for
+        // reading it: a damaged suggestion store degrades to no cards.
+        fetchJson("/proactive/suggestions?status=pending&category=skill&limit=200&view=summary").catch(() => [])
+      ]);
       if (requestId !== listRequest || state.tab !== "activity") return;
       const rows = (Array.isArray(results) ? results : [])
         .slice(0, requestedLimit)
         .filter((row) => row?.kind !== "transcript");
       const hasMore = Array.isArray(results) && results.length > requestedLimit;
-      renderActivityResults(rows, { query: q, hasMore });
+      const skillSuggestions = (Array.isArray(suggestions) ? suggestions : [])
+        .filter((suggestion) => suggestion?.category === "skill" && suggestion?.status === "pending");
+      renderActivityResults(rows, { query: q, hasMore, suggestions: skillSuggestions });
+      bindHistorySkillButtons(() => reload());
     } catch (error) {
       if (requestId !== listRequest || state.tab !== "activity") return;
       renderActivityError(error, () => reload({ resetLimit: true }));
@@ -8196,6 +8318,17 @@ function historyTimeLabel(value) {
   return date ? date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "Time unavailable";
 }
 
+function historyHourKey(value) {
+  const date = historyDate(value);
+  if (!date) return "unknown";
+  return historyDayKey(value) + ":" + String(date.getHours()).padStart(2, "0");
+}
+
+function historyHourLabel(value) {
+  const date = historyDate(value);
+  return date ? date.toLocaleTimeString(undefined, { hour: "numeric" }) : "Time unavailable";
+}
+
 function historyAppLabel(value) {
   const raw = historyCleanText(value);
   if (!raw) return "";
@@ -8206,6 +8339,11 @@ function historyAppLabel(value) {
     "com.microsoft.edgemac": "Microsoft Edge",
     "com.openai.chat": "ChatGPT",
     "com.openai.codex": "Codex",
+    "com.tinyspeck.slackmacgap": "Slack",
+    "us.zoom.xos": "Zoom",
+    "com.apple.mobilesms": "Messages",
+    "com.apple.calendar": "Calendar",
+    "com.github.githubclient": "GitHub",
     "com.blizzard.worldofwarcraft": "World of Warcraft",
     "worldofwarcraft": "World of Warcraft",
     "com.wispr.wispr-flow": "Wispr Flow",
@@ -8232,6 +8370,7 @@ function historyBucketKey(row) {
 
 function historyPeriodCopy(rows) {
   const apps = [...new Set(rows.map((row) => historyAppLabel(row?.app)).filter(Boolean))];
+  const screenCount = rows.filter((row) => row?.kind === "frame" || row?.kind === "frame-summary").length;
   const details = [];
   for (const row of rows) {
     const windowTitle = historyCleanText(row?.window);
@@ -8263,10 +8402,88 @@ function historyPeriodCopy(rows) {
       : apps.length > 1
         ? "You moved between " + appSummary + " during this period."
         : "OpenAGI received activity during this period, but no app or window detail was available.";
-  return { apps, title, summary };
+  return { apps, title, summary, screenCount, sourceCount: rows.length };
 }
 
-function historyPeriods(results) {
+function historyAppVisual(value) {
+  const label = historyAppLabel(value);
+  const key = label.toLocaleLowerCase();
+  const known = {
+    "finder": ["F", "blue"], "chrome": ["◉", "orange"], "safari": ["↗", "blue"],
+    "slack": ["S", "purple"], "codex": ["⌘", "dark"], "chatgpt": ["✦", "green"],
+    "github": ["GH", "dark"], "zoom": ["▣", "blue"], "messages": ["●", "green"],
+    "calendar": ["31", "orange"], "conductor": ["C", "dark"], "rize": ["R", "purple"],
+    "system settings": ["⚙", "dark"]
+  };
+  const match = known[key];
+  return {
+    label,
+    glyph: match?.[0] ?? (label.slice(0, 2).toLocaleUpperCase() || "APP"),
+    tone: match?.[1] ?? "dark"
+  };
+}
+
+function historyAppIconHtml(value) {
+  const visual = historyAppVisual(value);
+  return \`<span class="history-app-icon tone-\${visual.tone}" aria-label="Application: \${escapeHtml(visual.label)}" title="\${escapeHtml(visual.label)}"><span aria-hidden="true">\${escapeHtml(visual.glyph)}</span></span>\`;
+}
+
+function historySuggestionApps(suggestion) {
+  const values = [];
+  for (const item of suggestion?.context?.apps ?? []) {
+    const value = typeof item === "string" ? item : item?.app;
+    if (value) values.push(historyAppLabel(value).toLocaleLowerCase());
+  }
+  for (const value of suggestion?.sequence?.apps ?? []) {
+    if (value) values.push(historyAppLabel(value).toLocaleLowerCase());
+  }
+  return new Set(values.filter(Boolean));
+}
+
+function historyAttachSkillSuggestions(periods, suggestions) {
+  const attached = periods.map((period) => ({ ...period, skillSuggestions: [] }));
+  for (const suggestion of suggestions ?? []) {
+    const proposedAt = historyDate(suggestion?.proposedAt);
+    if (!proposedAt) continue;
+    const suggestionApps = historySuggestionApps(suggestion);
+    let best = null;
+    for (const period of attached) {
+      if (period.skillSuggestions.length > 0) continue;
+      const periodAt = historyDate(period?.at);
+      if (!periodAt) continue;
+      const distanceHours = Math.abs(proposedAt.getTime() - periodAt.getTime()) / 3_600_000;
+      const periodApps = new Set(period.apps.map((app) => app.toLocaleLowerCase()));
+      const overlap = [...suggestionApps].filter((app) => periodApps.has(app)).length;
+      // Evidence-bearing suggestions may attach to a matching work period on
+      // the same half-day. Suggestions without app evidence must be nearly
+      // contemporaneous, so unrelated cards do not drift into history.
+      if (suggestionApps.size > 0 ? (overlap === 0 || distanceHours > 12) : distanceHours > 0.5) continue;
+      const score = overlap * 100 - distanceHours;
+      if (!best || score > best.score) best = { period, score };
+    }
+    if (best) best.period.skillSuggestions.push(suggestion);
+  }
+  return attached;
+}
+
+function historySkillName(value) {
+  const raw = historyCleanText(value).replace(/[-_]+/g, " ");
+  return raw.replace(/\\b[a-z]/g, (letter) => letter.toLocaleUpperCase()) || "Suggested";
+}
+
+function historySkillCardHtml(suggestion) {
+  const name = historySkillName(suggestion?.title);
+  const description = historyTruncate(
+    suggestion?.proposal?.description || suggestion?.rationale || "Turn this repeated workflow into a reusable skill.",
+    280);
+  return \`<aside class="history-skill-card" aria-label="Suggested skill: \${escapeHtml(name)}">
+    <p class="history-skill-kicker">Suggested skill</p>
+    <p class="history-skill-description">\${escapeHtml(description)}</p>
+    <button class="history-skill-create" type="button" data-history-skill="\${escapeHtml(suggestion?.id ?? "")}" data-history-skill-name="\${escapeHtml(name)}">Create \${escapeHtml(name)} skill</button>
+  </aside>\`;
+}
+
+function historyPeriods(results, suggestions = []) {
   const periods = [];
   const byBucket = new Map();
   for (const row of results) {
@@ -8279,7 +8496,34 @@ function historyPeriods(results) {
     }
     period.rows.push(row);
   }
-  return periods.map((period) => ({ ...period, ...historyPeriodCopy(period.rows) }));
+  return historyAttachSkillSuggestions(
+    periods.map((period) => ({ ...period, ...historyPeriodCopy(period.rows) })),
+    suggestions);
+}
+
+function historyGroupPeriods(periods) {
+  const days = new Map();
+  for (const period of periods) {
+    const dayKey = historyDayKey(period?.at);
+    if (!days.has(dayKey)) days.set(dayKey, { at: period?.at, hours: new Map(), periods: [] });
+    const day = days.get(dayKey);
+    const hourKey = historyHourKey(period?.at);
+    if (!day.hours.has(hourKey)) day.hours.set(hourKey, { at: period?.at, periods: [] });
+    day.hours.get(hourKey).periods.push(period);
+    day.periods.push(period);
+  }
+  return [...days.values()].map((day) => ({ ...day, hours: [...day.hours.values()] }));
+}
+
+function historyGroupMeta(periods) {
+  const apps = [...new Set(periods.flatMap((period) => period.apps))];
+  const sourceCount = periods.reduce((sum, period) => sum + period.sourceCount, 0);
+  const screenCount = periods.reduce((sum, period) => sum + period.screenCount, 0);
+  const pieces = [periods.length + " period" + (periods.length === 1 ? "" : "s")];
+  if (apps.length) pieces.push(apps.slice(0, 2).join(", ") + (apps.length > 2 ? " +" + (apps.length - 2) : ""));
+  if (screenCount) pieces.push(screenCount + " screen capture" + (screenCount === 1 ? "" : "s"));
+  else if (sourceCount) pieces.push(sourceCount + " event" + (sourceCount === 1 ? "" : "s"));
+  return pieces.join(" · ");
 }
 
 function historyRelativeTime(value) {
@@ -8301,7 +8545,7 @@ function historySnippetHtml(value) {
   return escapeHtml(historyTruncate(value, 360));
 }
 
-function renderActivityResults(results, { query = "", hasMore = false } = {}) {
+function renderActivityResults(results, { query = "", hasMore = false, suggestions = [] } = {}) {
   const list = $("actResults");
   if (!list) return;
   list.setAttribute("aria-busy", "false");
@@ -8315,33 +8559,67 @@ function renderActivityResults(results, { query = "", hasMore = false } = {}) {
     if (loadWrap) loadWrap.hidden = true;
     return;
   }
-  const periods = historyPeriods(results);
-  const days = new Map();
-  for (const period of periods) {
-    const key = historyDayKey(period?.at);
-    if (!days.has(key)) days.set(key, { at: period?.at, periods: [] });
-    days.get(key).periods.push(period);
-  }
-  list.innerHTML = [...days.values()].map((day) => \`
-    <section class="history-day">
-      <h4 class="history-day-title">\${escapeHtml(historyDayLabel(day.at))}</h4>
-      \${day.periods.map((period) => {
-        const timestamp = historyDate(period?.at)?.toISOString() ?? "";
-        return \`<article class="history-entry">
-          <time class="history-entry-time"\${timestamp ? \` datetime="\${escapeHtml(timestamp)}"\` : ""}>\${escapeHtml(historyTimeLabel(period?.at))}</time>
-          <div class="history-entry-body">
-            <h5 class="history-entry-title">\${escapeHtml(period.title)}</h5>
-            <p class="history-entry-summary">\${historySnippetHtml(period.summary)}</p>
-            \${period.apps.length ? \`<div class="history-apps">\${period.apps.slice(0, 6).map((app) => \`<span class="history-app-label" aria-label="Application: \${escapeHtml(app)}">\${escapeHtml(app)}</span>\`).join("")}\${period.apps.length > 6 ? \`<span class="history-app-label" aria-label="\${period.apps.length - 6} additional applications">+\${period.apps.length - 6} more</span>\` : ""}</div>\` : ""}
-          </div>
-        </article>\`;
-      }).join("")}
-    </section>
+  const periods = historyPeriods(results, suggestions);
+  const days = historyGroupPeriods(periods);
+  const renderPeriod = (period) => {
+    const timestamp = historyDate(period?.at)?.toISOString() ?? "";
+    return \`<article class="history-entry" data-source-count="\${period.sourceCount}">
+      <time class="history-entry-time"\${timestamp ? \` datetime="\${escapeHtml(timestamp)}"\` : ""}>\${escapeHtml(historyTimeLabel(period?.at))}</time>
+      <div class="history-entry-body">
+        <h5 class="history-entry-title">\${escapeHtml(period.title)}</h5>
+        <p class="history-entry-summary">\${historySnippetHtml(period.summary)}</p>
+        \${period.screenCount ? \`<div class="history-evidence">\${period.screenCount} OCR-backed screen capture\${period.screenCount === 1 ? "" : "s"}</div>\` : ""}
+        \${period.apps.length ? \`<div class="history-apps" aria-label="Applications used">\${period.apps.slice(0, 12).map(historyAppIconHtml).join("")}\${period.apps.length > 12 ? \`<span class="history-app-more" aria-label="\${period.apps.length - 12} additional applications">+\${period.apps.length - 12}</span>\` : ""}</div>\` : ""}
+        \${period.skillSuggestions.map(historySkillCardHtml).join("")}
+      </div>
+    </article>\`;
+  };
+  list.innerHTML = days.map((day) => \`
+    <details class="history-day" open>
+      <summary class="history-day-summary">
+        <h4 class="history-day-title history-disclosure">\${escapeHtml(historyDayLabel(day.at))}</h4>
+        <span class="history-day-meta">\${escapeHtml(historyGroupMeta(day.periods))}</span>
+      </summary>
+      <div class="history-hours">
+        \${day.hours.map((hour) => \`<details class="history-hour" open>
+          <summary class="history-hour-summary">
+            <span class="history-hour-title history-disclosure">\${escapeHtml(historyHourLabel(hour.at))}</span>
+            <span class="history-hour-meta">\${escapeHtml(historyGroupMeta(hour.periods))}</span>
+          </summary>
+          <div class="history-hour-entries">\${hour.periods.map(renderPeriod).join("")}</div>
+        </details>\`).join("")}
+      </div>
+    </details>
   \`).join("");
   if (meta) meta.textContent = "Showing " + periods.length + " work period" + (periods.length === 1 ? "" : "s")
     + " from " + results.length + " observation" + (results.length === 1 ? "" : "s")
     + (hasMore ? " · more available" : "");
   if (loadWrap) loadWrap.hidden = !hasMore;
+}
+
+function bindHistorySkillButtons(reload) {
+  document.querySelectorAll("[data-history-skill]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const id = button.dataset.historySkill;
+      const name = button.dataset.historySkillName || "suggested";
+      if (!id) return;
+      button.disabled = true;
+      button.textContent = "Creating…";
+      try {
+        const result = await postJson(\`/proactive/suggestions/\${encodeURIComponent(id)}/accept\`, {});
+        // Accept deliberately returns HTTP 200 for materialization failures so
+        // the pending suggestion remains retryable. Handle that envelope here
+        // instead of falsely celebrating a skill that was never written.
+        if (result.skillCreateError) throw new Error(result.skillCreateError);
+        showToast("✓ " + name + " skill created", true);
+        await reload();
+      } catch (error) {
+        showToast("Couldn’t create skill: " + error.message, false);
+        button.disabled = false;
+        button.textContent = "Create " + name + " skill";
+      }
+    });
+  });
 }
 
 function renderActivityError(error, retry) {

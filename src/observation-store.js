@@ -215,7 +215,13 @@ export class ObservationStore {
       if (machine) out = out.filter((o) => o.sourceMachineId === machine);
       if (since) out = out.filter((o) => (o.at ?? "") >= since);
       if (until) out = out.filter((o) => (o.at ?? "") <= until);
-      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(0, limit).map(capTranscriptText);
+      return out.sort((a, b) => (b.at ?? "").localeCompare(a.at ?? "")).slice(0, limit).map((row) => capTranscriptText({
+        ...row,
+        kind: row.kind === "frame-summary" ? "frame" : row.kind,
+        ...(row.kind === "frame" || row.kind === "frame-summary"
+          ? { text: row.text ?? row.ocrText ?? null, ref: row.ref ?? row.frameId ?? null }
+          : {})
+      }));
     }
 
     if (query) {
@@ -253,7 +259,35 @@ export class ObservationStore {
       params.push(limit);
       return rows.all(...params).map(capTranscriptText);
     }
-    // No query → return recent activity by default.
+    // No query normally returns recent focus activity for backward
+    // compatibility. Computer History explicitly asks for activity + frame,
+    // so merge both source streams there; otherwise OCR-backed screen events
+    // disappeared from the timeline until the user typed a search.
+    if (normalizedKinds?.includes("frame")) {
+      const sources = [];
+      if (normalizedKinds.includes("activity")) {
+        sources.push(`SELECT 'activity' AS kind, CAST(id AS TEXT) AS ref, at,
+          app, window, event, source_machine_id AS sourceMachineId, NULL AS text
+          FROM activity`);
+      }
+      sources.push(`SELECT 'frame' AS kind, f.frame_uid AS ref, f.captured_at AS at,
+        f.app, f.window, 'screen' AS event, f.source_machine_id AS sourceMachineId,
+        NULL AS text
+        FROM frames f`);
+      const params = [];
+      const clauses = ["1=1"];
+      if (app) { clauses.push("app = ?"); params.push(app); }
+      if (since) { clauses.push("at >= ?"); params.push(since); }
+      if (until) { clauses.push("at <= ?"); params.push(until); }
+      if (machine) { clauses.push("sourceMachineId = ?"); params.push(machine); }
+      params.push(limit);
+      return this.db.prepare(
+        `SELECT kind, ref, at, app, window, event, sourceMachineId, text
+         FROM (${sources.join(" UNION ALL ")})
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY at DESC LIMIT ?`
+      ).all(...params).map(capWindowText);
+    }
     if (normalizedKinds && !normalizedKinds.includes("activity")) return [];
     const params = [];
     let where = "1=1";
