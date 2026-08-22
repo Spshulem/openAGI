@@ -1571,6 +1571,30 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         });
       }
 
+      const outcomeFeedbackMatch = pathname.match(/^\/outcomes\/([^/]+)\/feedback$/);
+      if (method === "POST" && outcomeFeedbackMatch) {
+        let outcomeId;
+        try { outcomeId = decodeURIComponent(outcomeFeedbackMatch[1]); }
+        catch { return sendJson(res, 400, { error: "invalid outcome id" }); }
+        const body = await readJsonLimited(req, 16 * 1024).catch(() => null);
+        if (!body) return sendJson(res, 400, { error: "invalid feedback body" });
+        const qualityScore = Number(body.qualityScore);
+        if (!Number.isFinite(qualityScore) || qualityScore < 0 || qualityScore > 1) {
+          return sendJson(res, 400, { error: "qualityScore must be between 0 and 1" });
+        }
+        const note = typeof body.note === "string" ? body.note.trim() : null;
+        if (note && note.length > 2000) return sendJson(res, 400, { error: "feedback note is too long" });
+        const result = runtime.outcomes?.rate?.(outcomeId, qualityScore, note || null);
+        if (!result) return sendJson(res, 404, { error: "outcome not found" });
+        return sendJson(res, 200, {
+          id: result.id,
+          resolved: result.resolved,
+          qualityScore: result.qualityScore,
+          source: result.source,
+          resolvedAt: result.resolvedAt
+        });
+      }
+
       if (method === "POST" && pathname === "/feedback") {
         const body = await readJson(req);
         const result = runtime.outcomes?.feedback(body.refId, body.qualityScore, body.note);
@@ -6782,8 +6806,11 @@ async function renderOutcomes() {
       <h2>Outcomes <span class="muted" style="font-size:14px;font-weight:400;">· last 7 days</span></h2>
       <div class="grid stats">
         <div class="card"><span class="desc">Avg quality</span><div class="stat-value">\${agg.avgQuality ?? "—"}</div></div>
-        <div class="card"><span class="desc">Resolved</span><div class="stat-value">\${agg.resolved ?? 0} <span class="muted" style="font-size:14px;">/ \${agg.total ?? 0}</span></div></div>
+        <div class="card"><span class="desc">Resolved</span><div class="stat-value">\${agg.resolved ?? 0} <span class="muted" style="font-size:14px;">/ \${agg.total ?? 0}</span></div><div class="muted" style="font-size:11px;">\${agg.scored ?? 0} scored · \${agg.timedOut ?? 0} timed out</div></div>
         <div class="card"><span class="desc">Pending</span><div class="stat-value">\${agg.pending ?? 0}</div></div>
+        <div class="card"><span class="desc">User-signal coverage</span><div class="stat-value">\${Math.round(Number(agg.userSignalCoverage ?? 0) * 100)}%</div><div class="muted" style="font-size:11px;">\${agg.explicitRatings ?? 0} ratings · \${agg.userFollowups ?? 0} follow-ups</div></div>
+        <div class="card"><span class="desc">Inferred scores</span><div class="stat-value">\${agg.inferredScores ?? 0}</div><div class="muted" style="font-size:11px;">avg \${agg.avgInferredQuality ?? "—"}</div></div>
+        <div class="card"><span class="desc">Explicit quality</span><div class="stat-value">\${agg.avgExplicitQuality ?? "—"}</div><div class="muted" style="font-size:11px;">direct ratings only</div></div>
       </div>
       \${byKindCards ? \`<h3>By kind</h3><div class="grid stats">\${byKindCards}</div>\` : ""}
       <h3>Recent</h3>
@@ -6797,29 +6824,29 @@ async function renderOutcomes() {
     const qBadge = typeof o.qualityScore === "number"
       ? \`<span class="badge \${o.qualityScore >= 0.7 ? "ok" : o.qualityScore >= 0.4 ? "warn" : "err"}">q=\${o.qualityScore.toFixed(2)}</span>\`
       : (o.resolved ? '<span class="badge">timeout</span>' : '<span class="badge warn">pending</span>');
+    const sourceBadge = \`<span class="badge">\${escapeHtml(o.source === "explicit-rating" ? "user rated" : o.source === "user-followup" ? "follow-up signal" : o.source ?? "unresolved")}</span>\`;
     el.innerHTML = \`
       <div class="row between">
         <span class="name">\${escapeHtml(o.kind)} · \${escapeHtml(o.scrutinyAction ?? "—")}</span>
-        \${qBadge}
+        <span>\${sourceBadge} \${qBadge}</span>
       </div>
       <div class="desc">\${escapeHtml(o.sessionId ?? "")} · \${escapeHtml(o.channel ?? "")} · \${escapeHtml(new Date(o.at).toLocaleString())}</div>
       <div class="row" style="gap:6px;margin-top:8px;">
-        <button class="secondary" data-feedback="\${escapeHtml(o.refId ?? "")}" data-score="0.95">👍 great</button>
-        <button class="secondary" data-feedback="\${escapeHtml(o.refId ?? "")}" data-score="0.5">😐 ok</button>
-        <button class="secondary" data-feedback="\${escapeHtml(o.refId ?? "")}" data-score="0.1">👎 bad</button>
+        <button class="secondary" data-outcome-feedback="\${escapeHtml(o.id)}" data-score="0.95">👍 great</button>
+        <button class="secondary" data-outcome-feedback="\${escapeHtml(o.id)}" data-score="0.5">😐 ok</button>
+        <button class="secondary" data-outcome-feedback="\${escapeHtml(o.id)}" data-score="0.1">👎 bad</button>
       </div>
     \`;
     list.appendChild(el);
   }
-  list.querySelectorAll("[data-feedback]").forEach((btn) => {
+  list.querySelectorAll("[data-outcome-feedback]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const refId = btn.getAttribute("data-feedback");
+      const outcomeId = btn.getAttribute("data-outcome-feedback");
       const score = Number(btn.getAttribute("data-score"));
-      if (!refId) { btn.textContent = "no refId"; return; }
+      if (!outcomeId) { btn.textContent = "missing outcome"; return; }
       try {
-        await postJson("/feedback", { refId, qualityScore: score });
-        btn.textContent = "✓ rated";
-        btn.disabled = true;
+        await postJson(\`/outcomes/\${encodeURIComponent(outcomeId)}/feedback\`, { qualityScore: score });
+        await renderOutcomes();
       } catch (err) { btn.textContent = "[err] " + err.message; }
     });
   });

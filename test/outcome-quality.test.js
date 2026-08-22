@@ -84,6 +84,54 @@ test("quality aggregates exclude legacy no-op autopilot pulses without deleting 
   assert.equal(isQualityEligibleOutcome({ kind: "autopilot-fire", metadata: { qualityEligible: false }, toolCalls: [{ name: "add_task" }] }), false);
 });
 
+test("explicit feedback replaces inferred scores and makes aggregate confidence measurable", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-outcome-rating-"));
+  const store = new OutcomeStore({ dir });
+  const inferred = store.record({ kind: "agent-reply", refId: "reply-1" });
+  const followedUp = store.record({ kind: "agent-reply", refId: "reply-2" });
+  store.resolve(inferred.id, 0.7, "system-inferred", "heuristic");
+  store.resolve(followedUp.id, 0.85, "user-followup", "positive follow-up");
+
+  const rated = store.rate(inferred.id, 0.1, "not useful");
+  assert.equal(rated.qualityScore, 0.1);
+  assert.equal(rated.source, "explicit-rating");
+  assert.equal(rated.metadata.resolutionNote, "not useful");
+
+  const aggregate = store.aggregate(30);
+  assert.equal(aggregate.explicitRatings, 1);
+  assert.equal(aggregate.userFollowups, 1);
+  assert.equal(aggregate.inferredScores, 0);
+  assert.equal(aggregate.userSignalCoverage, 1);
+  assert.equal(aggregate.avgExplicitQuality, 0.1);
+  assert.deepEqual(aggregate.bySource, { "explicit-rating": 1, "user-followup": 1 });
+
+  const events = fs.readFileSync(store.eventsPath, "utf8").trim().split("\n").map(JSON.parse);
+  const feedback = events.at(-1);
+  assert.equal(feedback.op, "feedback");
+  assert.equal(feedback.previousSource, "system-inferred");
+  assert.doesNotMatch(JSON.stringify(feedback), /not useful/, "feedback receipt excludes note text");
+
+  const restored = new OutcomeStore({ dir });
+  assert.equal(restored.outcomes.get(inferred.id).source, "explicit-rating");
+  assert.equal(restored.outcomes.get(inferred.id).qualityScore, 0.1);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("quality aggregates distinguish terminal timeouts from genuinely pending work", () => {
+  const store = new OutcomeStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "openagi-outcome-terminal-")) });
+  const now = new Date();
+  const timedOut = store.record({ kind: "agent-reply", at: new Date(now.getTime() - 48 * 3600 * 1000).toISOString() });
+  store.record({ kind: "agent-reply" });
+  store.resolveSweep({ now, timeoutHours: 24 });
+  const aggregate = store.aggregate(30);
+  assert.equal(store.outcomes.get(timedOut.id).source, "timeout");
+  assert.equal(aggregate.total, 2);
+  assert.equal(aggregate.resolved, 1);
+  assert.equal(aggregate.scored, 0);
+  assert.equal(aggregate.timedOut, 1);
+  assert.equal(aggregate.pending, 1);
+});
+
 test("skill run grades completion by tool-call results; tool-free run keeps 0.7", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-skill-quality-"));
   const skillsRoot = path.join(root, "skills");
