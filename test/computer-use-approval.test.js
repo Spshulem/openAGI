@@ -180,6 +180,49 @@ test("a transient approval continuation failure retries without requiring anothe
   }
 });
 
+test("a provider failure after a read-only computer tool retries without renewing approval", async () => {
+  let calls = 0;
+  const { runtime, app, base, dataDir } = await appWithComputerUse({
+    generate: async (request) => {
+      calls += 1;
+      if (calls === 1) {
+        request.onProgress?.({ stage: "tool", tool: "computer_screenshot" });
+        throw new Error("provider transport failed after screenshot");
+      }
+      return {
+        id: "approval_readonly_retry_success",
+        text: "The live screenshot was verified.",
+        provider: "test",
+        model: "test-model",
+        toolCalls: []
+      };
+    }
+  });
+  try {
+    const queued = await runtime.tools.invoke("start_computer_use_session", {
+      goal: "Verify live pixels without input"
+    }, {
+      sessionId: "local:approval-readonly-retry:main",
+      channel: "local",
+      from: "user",
+      agentId: "main"
+    });
+    const response = await fetch(`${base}/pending-actions/${encodeURIComponent(queued.result.actionId)}/approve`, {
+      method: "POST"
+    });
+    assert.equal(response.status, 200);
+    await until(() => runtime.pendingActions.get(queued.result.actionId)?.continuation?.status === "delivered", 4_000);
+    const action = runtime.pendingActions.get(queued.result.actionId);
+    assert.equal(action.continuation.attempts, 2);
+    assert.equal(calls, 2);
+    assert.equal(runtime.computerUseLog.listSessions({ status: "active" }).length, 1,
+      "a read-only provider failure keeps the approved session active for the safe retry");
+  } finally {
+    await app.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("a continuation failure after any tool attempt aborts instead of replaying physical work", async () => {
   let calls = 0;
   const { runtime, app, base, dataDir } = await appWithComputerUse({

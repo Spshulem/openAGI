@@ -408,7 +408,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return;
     }
     const goal = String(action.args?.goal ?? action.summary ?? "the approved computer-use goal").slice(0, 500);
-    let toolAttempted = false;
+    let mutatingToolAttempted = false;
     try {
       await channels.handleLocalMessage({
         channel: action.context.channel ?? "local",
@@ -425,17 +425,21 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           continuationAttempt: continuation.attempts
         }
       }, {
-        // Once a model has reached any tool, replaying a failed turn is not
-        // provably safe: a physical action may have completed before the
-        // provider failed. Only pre-tool transport/provider failures retry.
+        // A failed continuation may be replayed only while every tool reached
+        // so far is explicitly read-only. Screenshots and status probes are
+        // safe to repeat after a transport failure; clicks, typing, scrolling,
+        // and unknown tools are not. Unknown names fail closed because the
+        // registry defaults tools to side-effecting unless they opt out.
         onProgress(progress) {
-          if (progress?.stage === "tool") toolAttempted = true;
+          if (progress?.stage !== "tool") return;
+          const tool = runtime.tools?.get?.(progress.tool);
+          if (!tool || tool.sideEffects !== false) mutatingToolAttempted = true;
         }
       });
       runtime.pendingActions.finishContinuation(actionId, { deliveryId, delivered: true });
     } catch (error) {
       logAgentFailure(error, { sessionId, requestId });
-      if (toolAttempted) {
+      if (mutatingToolAttempted) {
         const active = runtime.computerUseLog?.activeSessionFor?.(sessionId) ?? null;
         if (active) {
           try {
