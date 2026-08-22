@@ -185,4 +185,7 @@ test("handleMessage injects live principles but never quarantined ones", async (
   assert.match(captured.turnContext, /block prep time before standup meetings/, "live principle injected as intuition");
   assert.doesNotMatch(captured.turnContext, /Quarantined hunch/, "quarantined principle NOT injected");
   assert.doesNotMatch(captured.instructions, /block prep time/, "static instructions stay principle-free (byte-stable for the prompt cache)");
+  assert.equal(live.metadata.recallCount, 1, "placing a principle in turn context records a recall");
+  assert.deepEqual(live.metadata.recallSources, { "principle-context": 1 });
+  assert.equal(quarantined.metadata.recallCount, undefined, "filtered principles are never credited as recalled");
 });

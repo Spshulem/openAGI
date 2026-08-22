@@ -856,6 +856,35 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         );
         return sendJson(res, 200, { id: item.id, tier: item.tier });
       }
+      if (method === "POST" && /^\/memory\/[^/]+\/correct$/.test(pathname)) {
+        const id = decodeURIComponent(pathname.slice("/memory/".length, -"/correct".length));
+        const body = await readJsonLimited(req, 16 * 1024).catch(() => null);
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return sendJson(res, 400, { error: "invalid correction request" });
+        }
+        const correction = String(body?.correction ?? "").trim();
+        if (!correction) return sendJson(res, 400, { error: "correction required" });
+        if (correction.length > 10_000) return sendJson(res, 400, { error: "correction too long" });
+        // Re-read after the only await in this branch. From here through
+        // correct() execution is synchronous, so concurrent submissions
+        // cannot both pass the active-row check and create conflicting fixes.
+        const current = runtime.memory?.items?.get?.(id);
+        if (!current) return sendJson(res, 404, { error: "unknown memory" });
+        if (current.metadata?.supersededBy) return sendJson(res, 409, { error: "memory already superseded" });
+        const result = runtime.memory.correct({
+          id,
+          content: correction,
+          scope: current.scope ?? "main",
+          source: "dashboard-correction",
+          metadata: { userAuthored: true, channel: "dashboard" }
+        });
+        return sendJson(res, 200, {
+          id: result.item.id,
+          tier: result.item.tier,
+          locked: result.item.locked,
+          supersededCount: result.superseded.length
+        });
+      }
       if (method === "GET" && pathname === "/agents") return sendJson(res, 200, runtime.agentHost?.store.listAgents() ?? runtime.propagation.list());
       if (method === "GET" && pathname === "/specialists") {
         const includeRetired = url.searchParams.get("retired") === "1";
@@ -3773,6 +3802,13 @@ function renderApp() {
     .mem-content { font-size: 13px; line-height: 1.5; max-height: 8.4em; overflow: hidden; position: relative; word-break: break-word; }
     .mem-content::after { content: ""; position: absolute; bottom: 0; left: 0; right: 0; height: 1.6em; background: linear-gradient(transparent, var(--panel)); pointer-events: none; }
     .mem-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+    .mem-actions { display: flex; gap: 8px; align-items: center; margin-top: auto; }
+    .mem-actions button { background: transparent; color: var(--accent); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; font-size: 11px; }
+    .mem-actions button:hover { border-color: var(--accent); }
+    .mem-correction { display: grid; gap: 7px; border-top: 1px solid var(--line); padding-top: 8px; }
+    .mem-correction[hidden] { display: none; }
+    .mem-correction textarea { min-height: 74px; resize: vertical; font-size: 12px; line-height: 1.4; }
+    .mem-correction .row button { font-size: 11px; padding: 5px 9px; }
     .chip { background: var(--bg); color: var(--muted); padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); white-space: nowrap; }
 
     /* OAuth banner */
@@ -6177,16 +6213,26 @@ async function renderMemory() {
 function renderMemoryView() {
   const snap = state.memorySnap || { short: [], medium: [], long: [] };
   const f = state.memoryFilter;
-  const counts = { short: snap.short.length, medium: snap.medium.length, long: snap.long.length };
+  const active = (items) => (items ?? []).filter((m) => !m.metadata?.supersededBy);
+  const counts = { short: active(snap.short).length, medium: active(snap.medium).length, long: active(snap.long).length };
   const total = counts.short + counts.medium + counts.long;
-  const principles = snap.long.filter((m) => m.kind === "principle").length;
+  const allActive = [...active(snap.short), ...active(snap.medium), ...active(snap.long)];
+  const principles = allActive.filter((m) => m.kind === "principle").length;
+  const corrections = allActive.filter((m) => m.kind === "correction" || m.locked).length;
+  const recalled = allActive.filter((m) => (m.metadata?.recallCount ?? 0) > 0 || (m.lastAccessedAt || "") > (m.lastObservedAt || "")).length;
+  const recallCoverage = total > 0 ? Math.round((recalled / total) * 100) : 0;
 
   main.innerHTML = \`
     <div class="pane">
       <div class="row between" style="margin-bottom:14px;align-items:center;flex-wrap:wrap;gap:10px;">
-        <h2 style="margin:0;">Memory <span class="muted" style="font-weight:400;font-size:14px;">· \${total} total · \${principles} principle\${principles===1?"":"s"}\${uiHelp("Principles are durable rules promoted from repeated raw memories. They live in long-tier and resist decay.")}</span></h2>
+        <h2 style="margin:0;">Memory <span class="muted" style="font-weight:400;font-size:14px;">· \${total} active · \${principles} principle\${principles===1?"":"s"} · \${corrections} correction\${corrections===1?"":"s"}\${uiHelp("Principles are durable rules promoted from repeated raw memories. Corrections are locked and replace stale facts.")}</span></h2>
       </div>
       <div id="memoryPageChat"></div>
+      <div class="grid stats" style="margin-bottom:14px;">
+        <div class="card"><span class="desc">Recall coverage</span><div class="stat-value">\${recallCoverage}%</div><div class="desc">\${recalled} of \${total} active memories have been used</div></div>
+        <div class="card"><span class="desc">Corrections locked</span><div class="stat-value">\${corrections}</div><div class="desc">Superseded facts stay hidden from recall</div></div>
+        <div class="card"><span class="desc">Durable principles</span><div class="stat-value">\${principles}</div><div class="desc">Long-term distilled guidance</div></div>
+      </div>
       <div class="row" style="gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
         <div class="tier-pills">
           <button data-tier="all" class="\${f.tier==='all'?'active':''}">All <span class="count">\${total}</span></button>
@@ -6231,6 +6277,7 @@ function fillMemoryGrid() {
   if (f.tier === "all" || f.tier === "short") items = items.concat((snap.short ?? []).map((m) => ({ ...m, _tier: "short" })));
   if (f.tier === "all" || f.tier === "medium") items = items.concat((snap.medium ?? []).map((m) => ({ ...m, _tier: "medium" })));
   if (f.tier === "all" || f.tier === "long") items = items.concat((snap.long ?? []).map((m) => ({ ...m, _tier: "long" })));
+  items = items.filter((m) => !m.metadata?.supersededBy);
 
   if (f.query) {
     const q = f.query.toLowerCase();
@@ -6252,20 +6299,60 @@ function fillMemoryGrid() {
     const kindBadge = m.kind === "principle" ? '<span class="badge ok">principle</span>' : "";
     const dangerBadge = (m.dangerLevel || 0) > 0.7 ? '<span class="badge err">⚠ danger</span>' : "";
     const scopeBadge = m.scope && m.scope !== "main" ? \`<span class="badge">\${escapeHtml(m.scope)}</span>\` : "";
+    const correctionBadge = m.kind === "correction" || m.locked ? '<span class="badge ok">corrected</span>' : "";
+    const recallCount = Math.max(0, Number(m.metadata?.recallCount) || 0);
+    const recallBadge = recallCount > 0 ? \`<span class="badge">recalled \${recallCount}×</span>\` : '<span class="badge muted">not recalled yet</span>';
     const age = m.createdAt ? timeAgo(m.createdAt) : "";
     return \`
-      <div class="mem-card tier-\${m._tier}">
+      <div class="mem-card tier-\${m._tier}" data-memory-id="\${escapeHtml(m.id)}">
         <div class="mem-head">
           <span class="badge tier-\${m._tier}">\${m._tier}</span>
-          \${kindBadge}\${dangerBadge}\${scopeBadge}
+          \${kindBadge}\${correctionBadge}\${dangerBadge}\${scopeBadge}\${recallBadge}
           <span class="badge">str \${(m.strength ?? 0).toFixed(2)}</span>
           <span class="mem-age">\${escapeHtml(age)}</span>
         </div>
         <div class="mem-content">\${escapeHtml(m.content || "")}</div>
         \${tags ? \`<div class="mem-tags">\${tags}</div>\` : ""}
+        <div class="mem-actions"><button type="button" data-memory-correct="\${escapeHtml(m.id)}">Correct this memory</button><span class="muted" data-memory-status></span></div>
+        <form class="mem-correction" data-memory-form="\${escapeHtml(m.id)}" hidden>
+          <label class="desc" for="memory-correction-\${escapeHtml(m.id)}">Replace it with the complete corrected fact</label>
+          <textarea id="memory-correction-\${escapeHtml(m.id)}" name="correction" required>\${escapeHtml(m.content || "")}</textarea>
+          <div class="row"><button type="submit">Save correction</button><button type="button" class="secondary" data-memory-cancel>Cancel</button></div>
+        </form>
       </div>
     \`;
   }).join("");
+
+  list.querySelectorAll("[data-memory-correct]").forEach((button) => button.addEventListener("click", () => {
+    const card = button.closest("[data-memory-id]");
+    const form = card?.querySelector("[data-memory-form]");
+    if (!form) return;
+    form.hidden = false;
+    form.querySelector("textarea")?.focus();
+  }));
+  list.querySelectorAll("[data-memory-cancel]").forEach((button) => button.addEventListener("click", () => {
+    const form = button.closest("[data-memory-form]");
+    if (form) form.hidden = true;
+  }));
+  list.querySelectorAll("[data-memory-form]").forEach((form) => form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const id = form.getAttribute("data-memory-form");
+    const correction = String(new FormData(form).get("correction") ?? "").trim();
+    const card = form.closest("[data-memory-id]");
+    const status = card?.querySelector("[data-memory-status]");
+    const submit = form.querySelector('button[type="submit"]');
+    if (!correction || !id) return;
+    submit.disabled = true;
+    if (status) status.textContent = "Saving…";
+    try {
+      await postJson(\`/memory/\${encodeURIComponent(id)}/correct\`, { correction });
+      state.memorySnap = await fetchJson("/memory");
+      renderMemoryView();
+    } catch (error) {
+      submit.disabled = false;
+      if (status) status.textContent = error.message || "Correction failed";
+    }
+  }));
 }
 
 function timeAgo(iso) {
@@ -6848,6 +6935,11 @@ async function renderHealth() {
         <div class="card"><span class="desc">Medium tier</span><div class="stat-value">\${mem.counts.medium ?? 0}</div><div class="desc">\${((mem.saturation.medium ?? 0) * 100).toFixed(0)}% saturated</div></div>
         <div class="card"><span class="desc">Long tier</span><div class="stat-value">\${mem.counts.long ?? 0}</div><div class="desc">\${((mem.saturation.long ?? 0) * 100).toFixed(0)}% saturated</div></div>
         <div class="card"><span class="desc">Principles</span><div class="stat-value">\${mem.principles ?? 0}</div></div>
+        <div class="card"><span class="desc">Recall coverage</span><div class="stat-value">\${Math.round((mem.quality?.recallCoverage ?? 0) * 100)}%</div><div class="desc">\${mem.quality?.recalled ?? 0} of \${mem.quality?.active ?? 0} active</div></div>
+        <div class="card"><span class="desc">Total recalls</span><div class="stat-value">\${mem.quality?.totalRecalls ?? 0}</div><div class="desc">Persisted across restarts</div></div>
+        <div class="card"><span class="desc">Corrections</span><div class="stat-value">\${mem.quality?.corrections ?? 0}</div><div class="desc">Locked user fixes</div></div>
+        <div class="card"><span class="desc">Weak memories</span><div class="stat-value">\${mem.quality?.weak ?? 0}</div><div class="desc">Strength below 0.30</div></div>
+        <div class="card"><span class="desc">Exact duplicates</span><div class="stat-value">\${mem.quality?.duplicateRows ?? 0}</div></div>
       </div>
 
       <h3>Outcomes</h3>

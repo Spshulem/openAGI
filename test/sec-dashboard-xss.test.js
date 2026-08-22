@@ -115,6 +115,13 @@ test("SEC-4: a markdown link URL cannot splice extra attributes into the anchor"
   assert.ok(!/onmouseover\s*=\s*["']/i.test(encoded), `handler survived on a parseable URL: ${encoded}`);
 });
 
+test("SEC-4: memory correction controls encode ids and escape stored content", async () => {
+  const { script } = await dashboard();
+  assert.ok(script.includes('/memory/${encodeURIComponent(id)}/correct'));
+  assert.ok(script.includes('${escapeHtml(m.content || "")}</textarea>'));
+  assert.ok(!script.includes('${m.content}</textarea>'));
+});
+
 test("SEC-4: renderMarkdown refuses non-http(s) link schemes", async () => {
   const { script } = await dashboard();
   const renderMarkdown = shippedRenderMarkdown(script);

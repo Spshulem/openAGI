@@ -139,6 +139,52 @@ test("corrections persist and restore through the file-backed store", () => {
   fs.rmSync(dir, { recursive: true });
 });
 
+test("file-backed recall telemetry survives restart without copying queries or content into the receipt", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-mem-recall-"));
+  const memory = new FileBackedMemorySystem({ dir });
+  const item = memory.remember(
+    { source: "test", content: "Private customer preference used only for this recall test", tags: ["preference"] },
+    { tier: "medium", now: "2026-08-21T08:00:00.000Z" }
+  );
+
+  const hits = memory.retrieve("private customer preference", { now: "2026-08-21T09:00:00.000Z" });
+  assert.equal(hits[0].item.id, item.id);
+  assert.equal(item.metadata.recallCount, 1);
+  assert.equal(item.metadata.lastRecalledAt, "2026-08-21T09:00:00.000Z");
+  assert.deepEqual(item.metadata.recallSources, { retrieve: 1 });
+
+  const events = fs.readFileSync(memory.eventsPath, "utf8").trim().split("\n").map(JSON.parse);
+  const receipt = events.at(-1);
+  assert.equal(receipt.op, "recall");
+  assert.deepEqual(receipt.payload.items.map((entry) => entry.id), [item.id]);
+  assert.doesNotMatch(JSON.stringify(receipt), /private customer preference/i);
+  assert.doesNotMatch(JSON.stringify(receipt), /Private customer preference used only/i);
+
+  const reloaded = new FileBackedMemorySystem({ dir });
+  assert.equal(reloaded.items.get(item.id).metadata.recallCount, 1);
+  assert.equal(reloaded.qualityStats().recallCoverage, 1);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("qualityStats excludes superseded rows and reports weak, correction, recall, and duplicate pressure", () => {
+  const memory = new MemorySystem();
+  const recalled = memory.remember({ source: "agent-host", content: "recallable automated fact", tags: ["fact"] }, { tier: "medium", strength: 0.4 });
+  const duplicate = { ...recalled, id: "duplicate-row", metadata: {} };
+  memory.items.set(duplicate.id, duplicate);
+  const stale = memory.remember({ source: "test", content: "meeting is at three", tags: ["meeting"] }, { tier: "medium", strength: 0.2 });
+  memory.recordRecalls([recalled.id], { now: "2026-08-21T10:00:00.000Z" });
+  memory.correct({ id: stale.id, content: "Meeting is at four" });
+
+  const quality = memory.qualityStats();
+  assert.equal(quality.active, 3, "the superseded source row is not active");
+  assert.equal(quality.recalled, 1);
+  assert.equal(quality.totalRecalls, 1);
+  assert.equal(quality.corrections, 1);
+  assert.equal(quality.duplicateGroups, 1);
+  assert.equal(quality.duplicateRows, 1);
+  assert.equal(quality.weak, 0, "the only weak row was superseded by its correction");
+});
+
 test("correct_memory tool wires through with scope + recall exposes confidence fields", async () => {
   const memory = new MemorySystem();
   const runtime = { memory };
