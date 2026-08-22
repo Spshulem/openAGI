@@ -394,6 +394,47 @@ test("outcome store explicit feedback resolves an outcome", () => {
   assert.equal(result.source, "explicit-rating");
 });
 
+test("specialist quality replaces an inferred contribution when direct feedback arrives", () => {
+  const propagation = new PropagationController();
+  const signal = {
+    summary: "Repeated bounded workflow",
+    content: "The same bounded workflow recurs with stable inputs.",
+    domain: "general",
+    taskType: "specialist-feedback-test",
+    citations: ["one", "two", "three"],
+    impact: 0.9,
+    externalPressure: 0.8,
+    novelty: 0.7,
+    repetition: 0.9,
+    risk: 0.5,
+    specificity: 0.9,
+    requiresSpecialist: true
+  };
+  const created = propagation.propagate({ signal, scrutiny: { action: "propagate", reasons: [] } }).specialist;
+  propagation.recordOutcomeQuality(created.id, 0.7);
+  propagation.replaceOutcomeQuality(created.id, 0.7, 0.1);
+  assert.equal(created.outcomeSamples, 1, "feedback replaces rather than double-counting the sample");
+  assert.ok(Math.abs(created.meanOutcomeQuality - 0.1) < 1e-12);
+});
+
+test("file-backed specialist recalibration survives restart", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-specialist-rating-"));
+  const storePath = path.join(root, "specialists.json");
+  const first = new FileBackedPropagationController({ storePath });
+  const created = first.propagate({
+    signal: { summary: "Repeated release triage", taskType: "release-triage", requiresSpecialist: true },
+    scrutiny: { action: "propagate", reasons: [] }
+  }).specialist;
+  first.recordOutcomeQuality(created.id, 0.7);
+  first.replaceOutcomeQuality(created.id, 0.7, 0.2);
+
+  const second = new FileBackedPropagationController({ storePath });
+  const restored = second.list().find((specialist) => specialist.id === created.id);
+  assert.equal(restored.outcomeSamples, 1);
+  assert.ok(Math.abs(restored.meanOutcomeQuality - 0.2) < 1e-12);
+  fs.rmSync(root, { recursive: true });
+});
+
 test("agent turn writes an outcome record into runtime.outcomes", async () => {
   const runtime = createDefaultRuntime();
   await runtime.agentHost.handleMessage({ channel: "local", from: "test", text: "hi" });

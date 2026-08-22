@@ -122,6 +122,13 @@ test("SEC-4: memory correction controls encode ids and escape stored content", a
   assert.ok(!script.includes('${m.content}</textarea>'));
 });
 
+test("SEC-4: outcome feedback uses escaped row ids and URL encoding", async () => {
+  const { script } = await dashboard();
+  assert.ok(script.includes('data-outcome-feedback="${escapeHtml(o.id)}"'));
+  assert.ok(script.includes('/outcomes/${encodeURIComponent(outcomeId)}/feedback'));
+  assert.ok(!script.includes('data-feedback="${o.refId'));
+});
+
 test("SEC-4: renderMarkdown refuses non-http(s) link schemes", async () => {
   const { script } = await dashboard();
   const renderMarkdown = shippedRenderMarkdown(script);

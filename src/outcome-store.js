@@ -59,6 +59,41 @@ export class OutcomeStore {
     return outcome;
   }
 
+  /**
+   * Record direct user feedback for one exact outcome. Unlike resolve(), this
+   * deliberately replaces an earlier heuristic score so the quality loop can
+   * be calibrated after the system has already inferred a result.
+   */
+  rate(id, qualityScore, note = null) {
+    const outcome = this.outcomes.get(id);
+    const score = clampScore(qualityScore);
+    if (!outcome || score === null) return null;
+    if (!outcome.resolved) return this.resolve(id, score, "explicit-rating", note);
+
+    const previousQualityScore = outcome.qualityScore;
+    const previousSource = outcome.source;
+    const { resolutionNote: _oldNote, ...metadata } = outcome.metadata ?? {};
+    outcome.qualityScore = score;
+    outcome.source = "explicit-rating";
+    outcome.resolvedAt = nowIso();
+    outcome.metadata = note ? { ...metadata, resolutionNote: note } : metadata;
+    appendJsonLine(this.eventsPath, {
+      op: "feedback",
+      id,
+      qualityScore: score,
+      previousQualityScore,
+      previousSource,
+      at: outcome.resolvedAt
+    });
+    if (typeof previousQualityScore === "number") {
+      if (this.onFeedback) this.onFeedback(outcome, { previousQualityScore, previousSource });
+    } else if (this.onResolve) {
+      this.onResolve(outcome);
+    }
+    this.persist();
+    return outcome;
+  }
+
   pending(maxAgeMs = null) {
     const cutoff = maxAgeMs ? Date.now() - maxAgeMs : null;
     const out = [];
@@ -102,14 +137,17 @@ export class OutcomeStore {
   aggregateBySuggestion(suggestionId) {
     const list = this.bySuggestion(suggestionId);
     if (list.length === 0) return null;
-    const resolved = list.filter((o) => o.resolved && typeof o.qualityScore === "number");
-    const avgQuality = resolved.length === 0 ? null : resolved.reduce((a, b) => a + b.qualityScore, 0) / resolved.length;
+    const terminal = list.filter((o) => o.resolved);
+    const scored = terminal.filter((o) => typeof o.qualityScore === "number");
+    const avgQuality = scored.length === 0 ? null : scored.reduce((a, b) => a + b.qualityScore, 0) / scored.length;
     const byKind = {};
     for (const o of list) byKind[o.kind] = (byKind[o.kind] || 0) + 1;
     return {
       total: list.length,
-      resolved: resolved.length,
-      pending: list.length - resolved.length,
+      resolved: terminal.length,
+      scored: scored.length,
+      pending: list.length - terminal.length,
+      timedOut: terminal.filter((o) => o.source === "timeout").length,
       avgQuality: avgQuality === null ? null : Number(avgQuality.toFixed(3)),
       byKind,
       lastAt: list[list.length - 1]?.at ?? null
@@ -124,18 +162,37 @@ export class OutcomeStore {
       return true;
     });
     const list = inWindow.filter(isQualityEligibleOutcome);
-    const resolved = list.filter((o) => o.resolved && typeof o.qualityScore === "number");
-    const avgQuality = resolved.length === 0 ? null : resolved.reduce((a, b) => a + b.qualityScore, 0) / resolved.length;
+    const terminal = list.filter((o) => o.resolved);
+    const scored = terminal.filter((o) => typeof o.qualityScore === "number");
+    const avgQuality = scored.length === 0 ? null : scored.reduce((a, b) => a + b.qualityScore, 0) / scored.length;
     const byKind = {};
+    const bySource = {};
     for (const o of list) byKind[o.kind] = (byKind[o.kind] || 0) + 1;
+    for (const o of list) bySource[o.source ?? "pending"] = (bySource[o.source ?? "pending"] || 0) + 1;
+    const explicit = scored.filter((o) => o.source === "explicit-rating");
+    const userFollowups = scored.filter((o) => o.source === "user-followup");
+    const inferred = scored.filter((o) => o.source !== "explicit-rating" && o.source !== "user-followup");
+    const avg = (items) => items.length === 0
+      ? null
+      : Number((items.reduce((sum, item) => sum + item.qualityScore, 0) / items.length).toFixed(3));
+    const userSignals = explicit.length + userFollowups.length;
     return {
       windowDays,
       total: list.length,
-      resolved: resolved.length,
-      pending: list.length - resolved.length,
+      resolved: terminal.length,
+      scored: scored.length,
+      pending: list.length - terminal.length,
       excludedHousekeeping: inWindow.length - list.length,
       avgQuality: avgQuality === null ? null : Number(avgQuality.toFixed(3)),
-      byKind
+      byKind,
+      bySource,
+      explicitRatings: explicit.length,
+      userFollowups: userFollowups.length,
+      inferredScores: inferred.length,
+      timedOut: terminal.filter((o) => o.source === "timeout").length,
+      userSignalCoverage: scored.length === 0 ? 0 : Number((userSignals / scored.length).toFixed(3)),
+      avgExplicitQuality: avg(explicit),
+      avgInferredQuality: avg(inferred)
     };
   }
 
@@ -219,7 +276,7 @@ export class OutcomeStore {
     const outcomes = this.byRef(refId);
     if (outcomes.length === 0) return null;
     const target = outcomes[outcomes.length - 1]; // latest
-    return this.resolve(target.id, qualityScore, "explicit-rating", note);
+    return this.rate(target.id, qualityScore, note);
   }
 
   /**

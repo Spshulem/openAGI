@@ -170,6 +170,12 @@ export class AbiRuntime {
         this.propagation.recordOutcomeQuality?.(specialistId, outcome.qualityScore);
       }
     };
+    this.outcomes.onFeedback = (outcome, previous) => {
+      const specialistId = outcome.metadata?.specialistId;
+      if (specialistId && typeof outcome.qualityScore === "number") {
+        this.propagation.replaceOutcomeQuality?.(specialistId, previous?.previousQualityScore, outcome.qualityScore);
+      }
+    };
     this.embedder = options.embedder ?? createEmbedder({ budgetGuard: this.budget, ...(options.embedderOptions ?? {}) });
     this.vectorStore = options.vectorStore ?? new VectorStore({ embedder: this.embedder, ...(options.vectorStoreOptions ?? {}) });
     if (typeof this.propagation.bindVectorStore === "function") this.propagation.bindVectorStore(this.vectorStore);

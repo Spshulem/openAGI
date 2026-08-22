@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-import { createDurableRuntime, DeterministicModelProvider, OutcomeStore } from "../src/index.js";
+import { createDurableRuntime, createHostedInterface, DeterministicModelProvider, OutcomeStore } from "../src/index.js";
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -33,6 +33,44 @@ test("negative followup tone scores low", async () => {
   const resolved = runtime.outcomes.recent(10).find((o) => o.id === first.id);
   assert.equal(resolved.source, "user-followup");
   assert.equal(resolved.qualityScore, 0.2);
+});
+
+test("authenticated outcome feedback targets exact rows and overrides inferred scores", async () => {
+  const runtime = createDurableRuntime({ dataDir: tmpDir("outcome-route-") });
+  const outcome = runtime.outcomes.record({ kind: "agent-reply", refId: null, sessionId: "private-session" });
+  runtime.outcomes.resolve(outcome.id, 0.7, "system-inferred", "heuristic score");
+  const app = createHostedInterface(runtime, { port: 0, authToken: "test-outcome-token" });
+  const address = await app.listen();
+  const submit = (id, body, authorized = true) => fetch(`${address.url}/outcomes/${encodeURIComponent(id)}/feedback`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(authorized ? { authorization: "Bearer test-outcome-token" } : {})
+    },
+    body: JSON.stringify(body)
+  });
+  try {
+    const denied = await submit(outcome.id, { qualityScore: 0.1 }, false);
+    assert.equal(denied.status, 401);
+    assert.equal(runtime.outcomes.outcomes.get(outcome.id).source, "system-inferred");
+
+    const accepted = await submit(outcome.id, { qualityScore: 0.1, note: "Direct correction" });
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(await accepted.json(), {
+      id: outcome.id,
+      resolved: true,
+      qualityScore: 0.1,
+      source: "explicit-rating",
+      resolvedAt: runtime.outcomes.outcomes.get(outcome.id).resolvedAt
+    });
+    assert.equal(runtime.outcomes.outcomes.get(outcome.id).metadata.resolutionNote, "Direct correction");
+
+    assert.equal((await submit(outcome.id, { qualityScore: 2 })).status, 400);
+    assert.equal((await submit(outcome.id, { qualityScore: 0.5, note: "x".repeat(2001) })).status, 400);
+    assert.equal((await submit("missing-outcome", { qualityScore: 0.5 })).status, 404);
+  } finally {
+    await app.close();
+  }
 });
 
 test("synthetic autopilot housekeeping does not create a quality outcome", async () => {

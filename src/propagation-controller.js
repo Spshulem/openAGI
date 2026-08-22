@@ -137,6 +137,15 @@ export class PropagationController {
     return sp;
   }
 
+  replaceOutcomeQuality(specialistId, previousScore, qualityScore) {
+    if (typeof previousScore !== "number" || typeof qualityScore !== "number") return null;
+    const sp = [...this.specialists.values()].find((s) => s.id === specialistId);
+    const n = sp?.outcomeSamples ?? 0;
+    if (!sp || n < 1 || typeof sp.meanOutcomeQuality !== "number") return null;
+    sp.meanOutcomeQuality = Math.max(0, Math.min(1, ((sp.meanOutcomeQuality * n) - previousScore + qualityScore) / n));
+    return sp;
+  }
+
   retire(specialistId, reason = "manual") {
     const sp = [...this.specialists.values()].find((s) => s.id === specialistId);
     if (!sp || sp.status === "retired") return null;

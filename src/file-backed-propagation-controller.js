@@ -54,6 +54,12 @@ export class FileBackedPropagationController extends PropagationController {
     return sp;
   }
 
+  replaceOutcomeQuality(id, previousScore, score) {
+    const sp = super.replaceOutcomeQuality(id, previousScore, score);
+    if (sp) this.save();
+    return sp;
+  }
+
   retire(id, reason) {
     const sp = super.retire(id, reason);
     if (sp) this.save();
