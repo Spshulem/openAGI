@@ -28,6 +28,7 @@ export class Introspector {
       medium: memSnap.medium.length / memLimits.medium,
       long: memSnap.long.length / memLimits.long
     };
+    const memQuality = r.memory.qualityStats?.() ?? null;
 
     const cron = r.cron?.listJobs?.() ?? [];
     const enabledCron = cron.filter((j) => j.enabled);
@@ -47,6 +48,12 @@ export class Introspector {
     const findings = [];
     if (memSaturation.short > 0.85) findings.push({ severity: "warn", area: "memory", note: "short tier > 85% — older items will start dropping." });
     if (memSaturation.long > 0.85) findings.push({ severity: "warn", area: "memory", note: "long tier > 85% — consider raising limit or curating principles." });
+    if (memQuality?.active >= 50 && memQuality.recallCoverage < 0.2) {
+      findings.push({ severity: "info", area: "memory", note: `Only ${Math.round(memQuality.recallCoverage * 100)}% of active memories have been recalled — improve retrieval or retire low-value rows.` });
+    }
+    if (memQuality?.duplicateRows > 0) {
+      findings.push({ severity: "warn", area: "memory", note: `${memQuality.duplicateRows} exact duplicate memory row(s) remain active.` });
+    }
     if (dormant.length > 0) findings.push({ severity: "info", area: "specialists", note: `${dormant.length} specialist(s) dormant >14d — retirement-sweep will handle at 30d.` });
     if (lowQuality.length > 0) findings.push({ severity: "warn", area: "specialists", note: `${lowQuality.length} specialist(s) under-performing (<0.4 mean quality).` });
     if (budget && budget.spentUsd / Math.max(budget.dailyUsdLimit, 0.0001) > 0.7) findings.push({ severity: "warn", area: "budget", note: `today's spend > 70% of daily cap.` });
@@ -80,7 +87,8 @@ export class Introspector {
       memory: {
         counts: { short: memSnap.short.length, medium: memSnap.medium.length, long: memSnap.long.length },
         saturation: memSaturation,
-        principles: memSnap.long.filter((m) => m.kind === "principle").length
+        principles: memSnap.long.filter((m) => m.kind === "principle" && !m.metadata?.supersededBy).length,
+        quality: memQuality
       },
       cron: { total: cron.length, enabled: enabledCron.length, upcoming },
       budget,

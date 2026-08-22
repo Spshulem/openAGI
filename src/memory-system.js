@@ -219,11 +219,43 @@ export class MemorySystem {
 
     scored.sort((a, b) => b.score - a.score);
     const now = options.now ?? nowIso();
-    for (const entry of scored.slice(0, limit)) {
-      entry.item.lastAccessedAt = now;
-      entry.item.strength = clamp(entry.item.strength + 0.03);
+    const selected = scored.slice(0, limit);
+    this.recordRecalls(selected.map((entry) => entry.item.id), {
+      now,
+      source: options.source ?? "retrieve"
+    });
+    return selected;
+  }
+
+  /**
+   * Record that stored memories were actually placed into a retrieval result.
+   * The base implementation updates only aggregate metadata on the item; the
+   * file-backed subclass persists the same mutation with a content-free
+   * receipt. Keeping this separate also lets vector-backed principle recall
+   * use the same accounting without copying private text into telemetry.
+   */
+  recordRecalls(ids, { now = nowIso(), source = "retrieve" } = {}) {
+    const recalledAt = now instanceof Date ? now.toISOString() : String(now);
+    const safeSource = ["retrieve", "principle-context"].includes(source) ? source : "retrieve";
+    const updated = [];
+    for (const id of new Set(Array.isArray(ids) ? ids : [])) {
+      const item = this.items.get(id);
+      if (!item || item.metadata?.supersededBy) continue;
+      const priorSources = item.metadata?.recallSources ?? {};
+      item.lastAccessedAt = recalledAt;
+      item.strength = clamp((item.strength ?? 0) + 0.03);
+      item.metadata = {
+        ...(item.metadata ?? {}),
+        recallCount: Math.max(0, Number(item.metadata?.recallCount) || 0) + 1,
+        lastRecalledAt: recalledAt,
+        recallSources: {
+          ...priorSources,
+          [safeSource]: Math.max(0, Number(priorSources[safeSource]) || 0) + 1
+        }
+      };
+      updated.push(item);
     }
-    return scored.slice(0, limit);
+    return updated;
   }
 
   reinforce(id, amount = 0.1) {
@@ -530,6 +562,56 @@ export class MemorySystem {
       short: this.byTier("short"),
       medium: this.byTier("medium"),
       long: this.byTier("long")
+    };
+  }
+
+  /**
+   * Content-free quality signals for health/audit surfaces. These are derived
+   * from active rows only: superseded facts remain in the local audit trail
+   * until retention removes them, but must not make recall coverage or memory
+   * pressure look healthier than the brain the agent can actually use.
+   */
+  qualityStats() {
+    const active = [...this.items.values()].filter((item) => !item.metadata?.supersededBy);
+    const recalled = active.filter((item) => (
+      Math.max(0, Number(item.metadata?.recallCount) || 0) > 0 ||
+      String(item.lastAccessedAt ?? "") > String(item.lastObservedAt ?? "")
+    ));
+    const weakByTier = { short: 0, medium: 0, long: 0 };
+    for (const item of active) {
+      if ((item.strength ?? 0) < 0.3 && Object.hasOwn(weakByTier, item.tier)) weakByTier[item.tier] += 1;
+    }
+
+    const duplicateGroups = new Map();
+    for (const item of active) {
+      if (isProtectedMemory(item) || !item.rawContentHash) continue;
+      const key = [
+        item.tier,
+        item.scope ?? "main",
+        item.kind ?? "raw",
+        item.source ?? "runtime",
+        [...(item.tags ?? [])].map(String).sort().join("\u0001"),
+        item.rawContentHash
+      ].join("\u0000");
+      duplicateGroups.set(key, (duplicateGroups.get(key) ?? 0) + 1);
+    }
+    const duplicateSizes = [...duplicateGroups.values()].filter((size) => size > 1);
+    const totalRecalls = active.reduce((sum, item) => sum + Math.max(0, Number(item.metadata?.recallCount) || 0), 0);
+    const principles = active.filter((item) => item.kind === "principle");
+
+    return {
+      active: active.length,
+      recalled: recalled.length,
+      neverRecalled: Math.max(0, active.length - recalled.length),
+      recallCoverage: active.length > 0 ? recalled.length / active.length : 0,
+      totalRecalls,
+      corrections: active.filter((item) => item.kind === "correction" || item.locked).length,
+      principles: principles.length,
+      specificPrinciples: principles.filter((item) => (item.specificity ?? 0) >= 0.6).length,
+      weak: Object.values(weakByTier).reduce((sum, count) => sum + count, 0),
+      weakByTier,
+      duplicateGroups: duplicateSizes.length,
+      duplicateRows: duplicateSizes.reduce((sum, size) => sum + size - 1, 0)
     };
   }
 

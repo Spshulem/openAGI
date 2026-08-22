@@ -824,9 +824,14 @@ test("propagation enforces max depth and breadth for sub-specialists", () => {
 
 test("introspector audit returns structural findings", () => {
   const runtime = createDefaultRuntime();
+  const recalled = runtime.memory.remember({ content: "Audit recall fixture" }, { tier: "medium" });
+  runtime.memory.recordRecalls([recalled.id]);
   const audit = runtime.introspector.audit();
   assert.ok(audit.specialists);
   assert.ok(audit.memory);
+  assert.equal(audit.memory.quality.active, 1);
+  assert.equal(audit.memory.quality.recallCoverage, 1);
+  assert.equal(audit.memory.quality.totalRecalls, 1);
   assert.ok(audit.cron);
   assert.ok(Array.isArray(audit.findings));
 });

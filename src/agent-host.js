@@ -177,6 +177,7 @@ export class AgentHost {
       try {
         const rawHits = await this.runtime.vectorStore.search("principle", text, { limit: 10, minScore: 0.1 });
         intuitions = filterPrincipleHits(rawHits, this.runtime.memory, { limit: 3 });
+        this.runtime.memory?.recordRecalls?.(intuitions.map((hit) => hit.id), { source: "principle-context" });
       } catch { /* best effort */ }
     }
 

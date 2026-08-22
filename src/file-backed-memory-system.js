@@ -37,6 +37,23 @@ export class FileBackedMemorySystem extends MemorySystem {
     return item;
   }
 
+  recordRecalls(ids, options = {}) {
+    const updated = super.recordRecalls(ids, options);
+    if (updated.length > 0) {
+      // Deliberately omit the query and memory content. IDs plus bounded
+      // counters are enough to audit usefulness without duplicating private
+      // material into the append-only event log.
+      this.persist("recall", {
+        items: updated.map((item) => ({
+          id: item.id,
+          recallCount: item.metadata.recallCount,
+          lastRecalledAt: item.metadata.lastRecalledAt
+        }))
+      });
+    }
+    return updated;
+  }
+
   correct(input) {
     // super.correct() routes the new locked item through this.remember()
     // (already persisted); this extra event captures the supersede mutations
