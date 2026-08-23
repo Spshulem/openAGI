@@ -197,7 +197,7 @@ npm run update                 # auto-detects mode (docker/systemd/launchd/sourc
 npm run install-update-timer   # Linux: install a weekly auto-update timer (Sundays 04:00)
 ```
 
-For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the OpenAGI container. The Mac native `.app` updates via Sparkle automatically.
+For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the OpenAGI container. Signed Mac `.app` releases check daily and install/restart automatically by default, which keeps unattended nodes current. The menu-bar **Updates** submenu remains the source of truth and lets a user disable either behavior; saved choices override the first-run defaults.
 
 ---
 

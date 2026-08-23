@@ -60,7 +60,7 @@ When you build a new release:
    ```
 3. Append a new entry to `appcast.xml` and upload it alongside the `.dmg` to GitHub Releases.
 
-Existing installs check daily and prompt the user to update.
+Fresh signed installs check daily and install/restart automatically so unattended nodes do not remain on an incompatible version. Users can disable automatic checks or automatic installation from the menu-bar **Updates** submenu; Sparkle persists that explicit choice across later releases. Existing installs that previously opted out remain opted out.
 
 ## How it runs
 
