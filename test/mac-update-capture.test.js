@@ -47,7 +47,7 @@ function between(source, start, end) {
   return source.slice(from, to);
 }
 
-test("Sparkle preserves preferences and exposes truthful tray settings", () => {
+test("Sparkle preserves preferences and defaults signed nodes to unattended updates", () => {
   const update = code(UPDATE);
   const start = between(update, "func start()", "func setAutomaticallyChecksForUpdates");
 
@@ -80,8 +80,8 @@ test("Sparkle preserves preferences and exposes truthful tray settings", () => {
 
   assert.match(
     read(INFO),
-    /<key>SUAutomaticallyUpdate<\/key>\s*<false\/>/,
-    "fresh installs must default the disruptive install-and-restart setting off"
+    /<key>SUEnableAutomaticChecks<\/key>\s*<true\/>[\s\S]*<key>SUAllowsAutomaticUpdates<\/key>\s*<true\/>[\s\S]*<key>SUAutomaticallyUpdate<\/key>\s*<true\/>/,
+    "fresh signed installs must check, download, install, and restart without an attended Mac"
   );
 });
 

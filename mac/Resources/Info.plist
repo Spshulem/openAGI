@@ -50,10 +50,14 @@
   <string>unOtVkyA3akAScIoYYZ8UkqoBx56Ze1mDcEni8K1964=</string>
   <key>SUEnableAutomaticChecks</key>
   <true/>
-  <!-- Users can opt into immediate background install + relaunch from the
-       tray. Keep that disruptive choice off for a fresh installation. -->
+  <!-- Signed releases update unattended by default so headless/login-item
+       nodes do not remain on an old protocol indefinitely. Sparkle treats
+       these plist values as first-run defaults; a user's saved tray toggle
+       still overrides them. -->
+  <key>SUAllowsAutomaticUpdates</key>
+  <true/>
   <key>SUAutomaticallyUpdate</key>
-  <false/>
+  <true/>
   <key>SUScheduledCheckInterval</key>
   <integer>86400</integer>
 </dict>
