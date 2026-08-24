@@ -49,7 +49,7 @@ async function start(executor) {
   return await executor.invoke("session.start", {
     sessionId: "chat:cua",
     goalHash: "a".repeat(64),
-    allowedOperations: ["session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+    allowedOperations: ["session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
   });
 }
 
@@ -74,23 +74,33 @@ test("Cua backend preserves OpenAGI leases and maps fresh-frame desktop actions"
   try {
     const health = await executor.health();
     assert.equal(health.capability.ready, true);
-    assert.deepEqual(health.capability.operations, ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]);
+    assert.deepEqual(health.capability.operations, ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]);
 
     const lease = await start(executor);
     let shot = await invoke(executor, lease, 1, "screenshot");
     assert.equal(shot.width, 100);
     assert.equal(shot.scale, 2);
-    await invoke(executor, lease, 2, "click", { frameId: shot.frameId, x: 10, y: 5, button: "left" });
+    await invoke(executor, lease, 2, "click", { frameId: shot.frameId, x: 10, y: 5, button: "left", count: 2 });
     shot = await invoke(executor, lease, 3, "screenshot");
-    await invoke(executor, lease, 4, "type", { frameId: shot.frameId, text: "private typed text" });
+    await invoke(executor, lease, 4, "drag", {
+      frameId: shot.frameId, fromX: 5, fromY: 5, toX: 25, toY: 20, button: "left", durationMs: 400
+    });
     shot = await invoke(executor, lease, 5, "screenshot");
-    await invoke(executor, lease, 6, "key", { frameId: shot.frameId, chord: "cmd+shift+t" });
+    await invoke(executor, lease, 6, "type", { frameId: shot.frameId, text: "private typed text" });
     shot = await invoke(executor, lease, 7, "screenshot");
-    await invoke(executor, lease, 8, "scroll", { frameId: shot.frameId, x: 20, y: 10, deltaX: 0, deltaY: -3 });
+    await invoke(executor, lease, 8, "key", { frameId: shot.frameId, chord: "cmd+shift+t" });
+    shot = await invoke(executor, lease, 9, "screenshot");
+    await invoke(executor, lease, 10, "scroll", { frameId: shot.frameId, x: 20, y: 10, deltaX: 0, deltaY: -3 });
 
     const click = cua.calls.find((call) => call.args[1] === "click");
     assert.deepEqual(click.payload.target, { kind: "window", pid: 42, window_id: 7 });
     assert.deepEqual([click.payload.x, click.payload.y], [20, 10], "OpenAGI frame scaling is preserved");
+    assert.equal(click.payload.count, 2);
+    const drag = cua.calls.find((call) => call.args[1] === "drag");
+    assert.deepEqual(
+      [drag.payload.from_x, drag.payload.from_y, drag.payload.to_x, drag.payload.to_y, drag.payload.duration_ms],
+      [10, 10, 50, 40, 400]
+    );
     const typed = cua.calls.find((call) => call.args[1] === "type_text");
     assert.equal(typed.payload.text, "private typed text");
     assert.doesNotMatch(JSON.stringify(typed.args), /private typed text/, "typed text never enters process argv");

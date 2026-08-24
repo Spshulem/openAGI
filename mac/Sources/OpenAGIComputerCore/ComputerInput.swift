@@ -12,6 +12,8 @@ public enum ComputerInputError: LocalizedError {
   case focusChanged
   case cancelled
   case invalidButton(String)
+  case invalidClickCount
+  case invalidDuration
   case invalidPoint
   case invalidText
   case unknownKey(String)
@@ -32,6 +34,10 @@ public enum ComputerInputError: LocalizedError {
       return "computer input was cancelled"
     case .invalidButton(let button):
       return "unknown mouse button '\(button)'"
+    case .invalidClickCount:
+      return "click count must be between 1 and 3"
+    case .invalidDuration:
+      return "drag duration must be between 0 and 2000 milliseconds"
     case .invalidPoint:
       return "coordinates are outside the main display"
     case .invalidText:
@@ -79,10 +85,11 @@ public enum ComputerInput {
     return session["CGSSessionScreenIsLocked"] as? Bool ?? false
   }
 
-  public static func click(x: Double, y: Double, button: String,
+  public static func click(x: Double, y: Double, button: String, count: Int = 1,
                            focus: ComputerFocusIdentity? = nil,
                            cancellation: ComputerInputCancellation? = nil) throws {
     try requirePoint(x: x, y: y)
+    guard (1...3).contains(count) else { throw ComputerInputError.invalidClickCount }
     let point = CGPoint(x: x, y: y)
     let source = CGEventSource(stateID: .hidSystemState)
     let downType: CGEventType
@@ -98,9 +105,63 @@ public enum ComputerInput {
     default:
       throw ComputerInputError.invalidButton(button)
     }
-    let down = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton)
-    let up = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton)
-    try postPhysicalPair(down, up, focus: focus, cancellation: cancellation)
+    for clickState in 1...count {
+      let down = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: mouseButton)
+      let up = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: mouseButton)
+      down?.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+      up?.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
+      try postPhysicalPair(down, up, focus: focus, cancellation: cancellation)
+    }
+  }
+
+  public static func drag(fromX: Double, fromY: Double, toX: Double, toY: Double,
+                          button: String, durationMs: Int = 350,
+                          focus: ComputerFocusIdentity? = nil,
+                          cancellation: ComputerInputCancellation? = nil) throws {
+    try requirePoint(x: fromX, y: fromY)
+    try requirePoint(x: toX, y: toY)
+    guard (0...2_000).contains(durationMs) else { throw ComputerInputError.invalidDuration }
+    let source = CGEventSource(stateID: .hidSystemState)
+    let downType: CGEventType
+    let dragType: CGEventType
+    let upType: CGEventType
+    let mouseButton: CGMouseButton
+    switch button.lowercased() {
+    case "right":
+      downType = .rightMouseDown; dragType = .rightMouseDragged; upType = .rightMouseUp; mouseButton = .right
+    case "middle":
+      downType = .otherMouseDown; dragType = .otherMouseDragged; upType = .otherMouseUp; mouseButton = .center
+    case "left":
+      downType = .leftMouseDown; dragType = .leftMouseDragged; upType = .leftMouseUp; mouseButton = .left
+    default:
+      throw ComputerInputError.invalidButton(button)
+    }
+    try cancellation?.check()
+    try requirePhysicalInputReady(focus: focus)
+    var current = CGPoint(x: fromX, y: fromY)
+    let down = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: current, mouseButton: mouseButton)
+    down?.post(tap: .cghidEventTap)
+    // Once mouse-down is posted, mouse-up is an unconditional cleanup boundary.
+    // Cancellation or a focus change can stop movement, but can never strand a
+    // pressed mouse button in the system event stream.
+    defer {
+      let up = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: current, mouseButton: mouseButton)
+      up?.post(tap: .cghidEventTap)
+    }
+    let steps = max(1, min(120, durationMs == 0 ? 1 : durationMs / 16))
+    let delay = steps > 0 ? Double(durationMs) / Double(steps) / 1_000.0 : 0
+    for step in 1...steps {
+      try cancellation?.check()
+      try requirePhysicalInputReady(focus: focus)
+      let progress = Double(step) / Double(steps)
+      current = CGPoint(
+        x: fromX + ((toX - fromX) * progress),
+        y: fromY + ((toY - fromY) * progress)
+      )
+      let movement = CGEvent(mouseEventSource: source, mouseType: dragType, mouseCursorPosition: current, mouseButton: mouseButton)
+      movement?.post(tap: .cghidEventTap)
+      if delay > 0 && step < steps { Thread.sleep(forTimeInterval: delay) }
+    }
   }
 
   public static func move(x: Double, y: Double, focus: ComputerFocusIdentity? = nil,

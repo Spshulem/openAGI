@@ -119,7 +119,8 @@ constraint.
 OpenAGI now has a provider-neutral Computer Use tool set rather than a
 provider-specific prompt convention. It includes an explicit, human-approved
 session boundary; live action and reasoning logs; a kill switch; screen reads;
-and click/type/key/move/scroll actions through a node-scoped authenticated relay. When
+and click (including double-click)/drag/type/key/move/scroll actions through a
+node-scoped authenticated relay. When
 no node is reachable, screen inspection falls back to recent local OCR and
 input calls fail explicitly instead of reporting fake success.
 
@@ -149,9 +150,11 @@ fallback. The execution contract is:
 - Local execution stays local; remote nodes use a scoped credential and never
   receive provider or integration secrets.
 
-Native scrolling uses CGEvent. Every coordinate action is bound to a recent
-screenshot frame, and node leases enforce the approved goal, selected node,
-expiry, monotonic sequence, action limit, and idempotent action id.
+Native scrolling and drag use CGEvent. Drag cancellation always releases the
+mouse button, even if focus or readiness changes during movement. Every
+coordinate action is bound to a recent screenshot frame, and node leases
+enforce the approved goal, selected node, expiry, monotonic sequence, action
+limit, and idempotent action id.
 
 An optional Cua Driver backend is available for users who already operate a
 reviewed Cua installation. Set `OPENAGI_COMPUTER_BACKEND=cua` and

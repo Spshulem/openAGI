@@ -9,7 +9,7 @@ import { NodeRegistry } from "../src/node-registry.js";
 const capability = () => [{
   id: "computer-use",
   ready: true,
-  operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"],
+  operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"],
   checkedAt: new Date().toISOString()
 }];
 
