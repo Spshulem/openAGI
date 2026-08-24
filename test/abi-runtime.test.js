@@ -2163,6 +2163,23 @@ test("ComputerUseLog: session lifecycle + action recording with reasoning", asyn
   });
   assert.equal(fs.readFileSync(path.join(dir, "journal.jsonl"), "utf8").includes("do-not-persist-this"), false);
 
+  for (const [kind, args, secret] of [
+    ["paste", { frameId: "f", elementIndex: 1, text: "paste-secret", format: "text" }, "paste-secret"],
+    ["set_value", { frameId: "f", elementIndex: 1, value: "value-secret" }, "value-secret"],
+    ["select_text", { frameId: "f", elementIndex: 1, text: "select-secret", prefix: "prefix-secret", suffix: "suffix-secret" }, "select-secret"]
+  ]) {
+    const sensitive = log2.recordAction({
+      sessionId: privateSession.id, kind, args, reasoning: `Use ${secret}`
+    });
+    assert.equal(JSON.stringify(sensitive).includes(secret), false, `${kind} value and reasoning are redacted`);
+    assert.equal(sensitive.reasoning, null);
+    log2.markActionResult(sensitive.id, { status: "error", result: { echoed: secret }, error: secret });
+  }
+  const privateJournal = fs.readFileSync(path.join(dir, "journal.jsonl"), "utf8");
+  for (const secret of ["paste-secret", "value-secret", "select-secret", "prefix-secret", "suffix-secret"]) {
+    assert.equal(privateJournal.includes(secret), false);
+  }
+
   fs.rmSync(dir, { recursive: true });
 });
 
@@ -2190,6 +2207,38 @@ test("ComputerUseLog: startup atomically scrubs legacy typed secrets from snapsh
   assert.equal(loaded.args.textRedacted, true);
   assert.equal(fs.readFileSync(path.join(dir, "snapshot.json"), "utf8").includes(secret), false);
   assert.equal(fs.readFileSync(path.join(dir, "journal.jsonl"), "utf8").includes(secret), false);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test("ComputerUseLog: startup scrubs legacy paste, value, and selection journals", async () => {
+  const { ComputerUseLog } = await import("../src/computer-use-log.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cu-semantic-migrate-"));
+  const session = {
+    id: "cus_semantic_legacy", goal: "legacy", sourceSessionId: "chat:legacy", status: "ended",
+    startedAt: new Date(0).toISOString(), actionIds: []
+  };
+  const actions = [
+    { id: "act_paste", kind: "paste", args: { text: "legacy-paste", format: "text" } },
+    { id: "act_value", kind: "set_value", args: { value: "legacy-value" } },
+    { id: "act_select", kind: "select_text", args: { text: "legacy-select", prefix: "legacy-prefix", suffix: "legacy-suffix" } }
+  ].map((action) => ({
+    ...action, sessionId: session.id, reasoning: JSON.stringify(action.args), status: "failed",
+    error: JSON.stringify(action.args), result: action.args
+  }));
+  session.actionIds = actions.map((action) => action.id);
+  fs.writeFileSync(path.join(dir, "journal.jsonl"), [
+    JSON.stringify({ op: "session-start", session }),
+    ...actions.flatMap((action) => [
+      JSON.stringify({ op: "action-record", action }),
+      JSON.stringify({ op: "action-result", id: action.id, status: "failed", error: action.error, result: action.result })
+    ])
+  ].join("\n") + "\n");
+  const log = new ComputerUseLog({ dir });
+  assert.equal(log.listActions({ sessionId: session.id }).every((action) => action.reasoning === null), true);
+  const journal = fs.readFileSync(path.join(dir, "journal.jsonl"), "utf8");
+  for (const secret of ["legacy-paste", "legacy-value", "legacy-select", "legacy-prefix", "legacy-suffix"]) {
+    assert.equal(journal.includes(secret), false);
+  }
   fs.rmSync(dir, { recursive: true });
 });
 

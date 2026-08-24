@@ -65,6 +65,8 @@ test("computer-use activity is described as readable copy instead of raw JSON", 
 
   assert.match(renderer, /const computerActionCopy = \(action\) =>/);
   assert.match(renderer, /redacted character/);
-  assert.match(renderer, /Click at x/);
+  assert.match(renderer, /Double-click/);
+  assert.match(renderer, /button at x/);
+  assert.match(renderer, /Drag .* button from x/);
   assert.doesNotMatch(renderer, /JSON\.stringify\(a\.args\)/);
 });

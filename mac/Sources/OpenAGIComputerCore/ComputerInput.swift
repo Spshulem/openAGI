@@ -275,6 +275,9 @@ public enum ComputerInput {
       guard ComputerScreenshot.focusStillMatches(focus) else {
         throw ComputerInputError.focusChanged
       }
+      guard !ComputerAccessibility.focusedElementIsSecure(
+        processIdentifier: focus.processIdentifier
+      ) else { throw ComputerAccessibilityError.secureElement }
     }
   }
 

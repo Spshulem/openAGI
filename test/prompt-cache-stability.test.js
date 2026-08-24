@@ -135,3 +135,15 @@ test("agent-host: instructionsForAgent is static and turnContextForAgent carries
   assert.match(ctx, /prefer smaller diffs/);
   assert.match(ctx, /\[\/context\]$/);
 });
+
+test("agent-host: computer-use guidance requires semantic targeting and post-action verification", async () => {
+  const { AgentHost } = await import("../src/agent-host.js");
+  const host = new AgentHost({
+    runtime: { tools: { has: (name) => name === "start_computer_use_session" } },
+    modelProvider: { isConfigured: () => true }
+  });
+  const prompt = host.instructionsForAgent({ id: "main", name: "Peri", role: "main" });
+  assert.match(prompt, /Prefer fresh Accessibility element indices over coordinates/);
+  assert.match(prompt, /computer_screenshot again after every/);
+  assert.match(prompt, /Never guess an element index or Accessibility action/);
+});

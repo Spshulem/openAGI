@@ -59,7 +59,7 @@ export function createCuaComputerExecutor({
         inputReady,
         operations: inputReady ? [...INPUT_OPERATIONS] : [],
         detail: screenshotReady && inputReady
-          ? "ready via Cua Driver"
+          ? "Cua Driver coordinate actions are available, but semantic element and app actions are not"
           : "Cua Driver needs Screen Recording and Accessibility permission"
       };
     } catch {

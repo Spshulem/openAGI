@@ -42,13 +42,18 @@ public struct ComputerScreenshotResult: Encodable, Equatable {
   public let offsetX: Double
   public let offsetY: Double
   public let base64: String
+  public let accessibility: String
+  /// Local-only element locators. The node executor strips these before the
+  /// state is returned to a model or a remote main.
+  public let elements: [ComputerAccessibilityElement]
   /// This identity is consumed only by the local signed input helper. The
   /// daemon strips it before returning the screenshot to a model or main.
   public let focus: ComputerFocusIdentity
 
   public init(width: Int, height: Int, bytes: Int, scale: Double,
               offsetX: Double, offsetY: Double, base64: String,
-              focus: ComputerFocusIdentity) {
+              focus: ComputerFocusIdentity, accessibility: String = "",
+              elements: [ComputerAccessibilityElement] = []) {
     self.format = "png"
     self.width = width
     self.height = height
@@ -58,6 +63,8 @@ public struct ComputerScreenshotResult: Encodable, Equatable {
     self.offsetY = offsetY
     self.base64 = base64
     self.focus = focus
+    self.accessibility = accessibility
+    self.elements = elements
   }
 }
 
@@ -204,6 +211,15 @@ public struct ComputerCapturePrivacy: Equatable {
     return true
   }
 
+  public func permitsBundle(_ bundleId: String?) -> Bool {
+    let bundle = Self.normalized(bundleId)
+    guard settingsReadable, !bundle.isEmpty, bundle.utf8.count <= 512 else { return false }
+    return !excludedBundleIds.contains(where: {
+      let excluded = Self.normalized($0)
+      return !excluded.isEmpty && (bundle == excluded || bundle.hasPrefix(excluded + "."))
+    })
+  }
+
   private static func union(_ defaults: [String], _ persisted: [String]) -> [String] {
     var seen = Set<String>()
     return (defaults + persisted).filter {
@@ -348,6 +364,7 @@ public enum ComputerScreenshot {
       title: focused.title,
       frame: focused.frame
     )
+    let accessibility = try ComputerAccessibility.capture(focus: focus)
     return ComputerScreenshotResult(
       width: image.width,
       height: image.height,
@@ -356,7 +373,9 @@ public enum ComputerScreenshot {
       offsetX: Double(window.frame.origin.x),
       offsetY: Double(window.frame.origin.y),
       base64: png.base64EncodedString(),
-      focus: focus
+      focus: focus,
+      accessibility: accessibility.text,
+      elements: accessibility.elements
     )
   }
 

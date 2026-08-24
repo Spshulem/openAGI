@@ -17,6 +17,15 @@ struct InputPayload: Decodable {
   var deltaX: Double?
   var deltaY: Double?
   var focus: ComputerFocusIdentity?
+  var locator: ComputerAccessibilityElement?
+  var bundleIdentifier: String?
+  var format: String?
+  var action: String?
+  var prefix: String?
+  var suffix: String?
+  var selectionType: String?
+  var direction: String?
+  var pages: Int?
 }
 
 func writeJSON(_ value: Any) throws {
@@ -74,7 +83,10 @@ do {
       // identity cannot be established fail-closed.
       "screenshotReady": screenshotReady,
       "inputReady": input,
-      "operations": ["screenshot", "click", "drag", "move", "type", "key", "scroll"],
+      "operations": [
+        "screenshot", "list_apps", "activate_app", "click", "click_element", "drag", "move",
+        "type", "paste", "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"
+      ],
       "detail": screenshotReady && input ? "ready" : blockers.joined(separator: "; ")
     ])
     exit(0)
@@ -86,11 +98,27 @@ do {
     FileHandle.standardOutput.write(Data("\n".utf8))
     exit(0)
   }
+  if operation == "list_apps" {
+    let encoded = try JSONEncoder().encode(["apps": ComputerApplications.list()])
+    FileHandle.standardOutput.write(encoded)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    exit(0)
+  }
   let data = FileHandle.standardInput.readDataToEndOfFile()
-  guard data.count <= 64 * 1024 else {
-    throw NSError(domain: "OpenAGIComputerHelper", code: 2, userInfo: [NSLocalizedDescriptionKey: "payload exceeds 64 KiB"])
+  guard data.count <= 96 * 1024 else {
+    throw NSError(domain: "OpenAGIComputerHelper", code: 2, userInfo: [NSLocalizedDescriptionKey: "payload exceeds 96 KiB"])
   }
   let payload = try JSONDecoder().decode(InputPayload.self, from: data)
+  if operation == "activate_app" {
+    guard let bundleIdentifier = payload.bundleIdentifier else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "activate_app requires a bundleIdentifier"])
+    }
+    let app = try await ComputerApplications.activate(bundleIdentifier: bundleIdentifier)
+    let encoded = try JSONEncoder().encode(app)
+    FileHandle.standardOutput.write(encoded)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    exit(0)
+  }
   guard let focus = payload.focus else {
     throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "input requires the exact focused-window identity from a fresh screenshot"])
   }
@@ -105,6 +133,11 @@ do {
       throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "click count must be between 1 and 3"])
     }
     try ComputerInput.click(x: x, y: y, button: button, count: count, focus: focus, cancellation: cancellation)
+  case "click_element":
+    guard let locator = payload.locator else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "click_element requires a fresh element locator"])
+    }
+    try ComputerAccessibility.click(locator: locator, focus: focus, cancellation: cancellation)
   case "drag":
     guard let fromX = payload.fromX, let fromY = payload.fromY,
           let toX = payload.toX, let toY = payload.toY,
@@ -129,6 +162,37 @@ do {
       throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "type requires text of at most 16 KiB without NUL"])
     }
     try ComputerInput.sendType(text, focus: focus, cancellation: cancellation)
+  case "paste":
+    guard let locator = payload.locator, let text = payload.text, let format = payload.format else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "paste requires a fresh element, text, and format"])
+    }
+    try ComputerAccessibility.paste(
+      locator: locator, text: text, format: format,
+      focus: focus, cancellation: cancellation
+    )
+  case "set_value":
+    guard let locator = payload.locator, let text = payload.text else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "set_value requires a fresh element and value"])
+    }
+    try ComputerAccessibility.setValue(
+      locator: locator, value: text, focus: focus, cancellation: cancellation
+    )
+  case "select_text":
+    guard let locator = payload.locator, let text = payload.text,
+          let selectionType = payload.selectionType else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "select_text requires a fresh element, text, and selectionType"])
+    }
+    try ComputerAccessibility.selectText(
+      locator: locator, text: text, prefix: payload.prefix, suffix: payload.suffix,
+      selectionType: selectionType, focus: focus, cancellation: cancellation
+    )
+  case "secondary_action":
+    guard let locator = payload.locator, let action = payload.action else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "secondary_action requires a fresh element and action"])
+    }
+    try ComputerAccessibility.performSecondaryAction(
+      locator: locator, action: action, focus: focus, cancellation: cancellation
+    )
   case "key":
     guard let chord = payload.chord, !chord.isEmpty else {
       throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "key requires a chord"])
@@ -147,6 +211,14 @@ do {
       deltaY: Int32(clamping: Int(deltaY)),
       focus: focus,
       cancellation: cancellation
+    )
+  case "scroll_element":
+    guard let locator = payload.locator, let direction = payload.direction else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "scroll_element requires a fresh element and direction"])
+    }
+    try ComputerAccessibility.scroll(
+      locator: locator, direction: direction, pages: payload.pages ?? 1,
+      focus: focus, cancellation: cancellation
     )
   default:
     throw NSError(domain: "OpenAGIComputerHelper", code: 3, userInfo: [NSLocalizedDescriptionKey: "unsupported operation"])

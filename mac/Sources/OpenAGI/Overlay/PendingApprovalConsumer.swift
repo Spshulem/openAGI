@@ -35,6 +35,11 @@ private struct PendingApprovalsResponse: Decodable {
 
 private struct PendingApprovalDecisionResponse: Decodable {
   let error: String?
+  let result: PendingApprovalExecutionResult?
+}
+
+private struct PendingApprovalExecutionResult: Decodable {
+  let sessionId: String?
 }
 
 @MainActor
@@ -49,6 +54,7 @@ final class PendingApprovalConsumer: ObservableObject {
   /// Only the newest reconciliation may publish. Refreshes arrive from panel
   /// appearance, SSE, and decisions, so response order is not request order.
   private var refreshGeneration: UInt64 = 0
+  private var activeComputerSessionId: String? = nil
 
   func refresh() async {
     refreshGeneration &+= 1
@@ -108,9 +114,16 @@ final class PendingApprovalConsumer: ObservableObject {
         throw URLError(.badServerResponse)
       }
       items.removeAll { $0.id == id }
-      lastOutcome = decision == "approve"
-        ? "Approved — the agent is continuing in Chat."
-        : "Request denied."
+      let decoded = try? JSONDecoder().decode(PendingApprovalDecisionResponse.self, from: data)
+      if decision == "approve" {
+        activeComputerSessionId = decoded?.result?.sessionId
+        lastOutcome = activeComputerSessionId == nil
+          ? "Approved — the agent is continuing in Chat."
+          : "Approved — the computer task is running in Chat."
+      } else {
+        activeComputerSessionId = nil
+        lastOutcome = "Request denied."
+      }
       lastError = nil
       await refresh()
     } catch {
@@ -118,7 +131,32 @@ final class PendingApprovalConsumer: ObservableObject {
     }
   }
 
-  func clearOutcome() { lastOutcome = nil }
+  func clearOutcome() {
+    lastOutcome = nil
+    activeComputerSessionId = nil
+  }
+
+  /// Reconcile the transient approval banner with the durable computer-use
+  /// session. Approval returns before the resumed agent finishes; a later SSE
+  /// session-end event is the authoritative terminal state.
+  func handleComputerUseEvent(_ data: String) {
+    guard let sessionId = activeComputerSessionId,
+          let terminal = Self.terminalComputerUseOutcome(sessionId: sessionId, data: data) else { return }
+    activeComputerSessionId = nil
+    lastOutcome = terminal.outcome
+    lastError = terminal.error
+  }
+
+  static func terminalComputerUseOutcome(sessionId: String, data: String) -> (outcome: String?, error: String?)? {
+    guard let json = try? JSONSerialization.jsonObject(with: Data(data.utf8)) as? [String: Any],
+          json["kind"] as? String == "session-end",
+          let session = json["session"] as? [String: Any],
+          session["id"] as? String == sessionId else { return nil }
+    if session["status"] as? String == "ended" {
+      return ("Computer task finished. Open Chat for the result.", nil)
+    }
+    return (nil, "Computer task stopped. Open Chat for details.")
+  }
 
   static func terminalDecisionError(statusCode: Int, data: Data) -> String? {
     guard statusCode == 400 || statusCode == 409 else { return nil }

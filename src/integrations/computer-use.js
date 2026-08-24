@@ -34,7 +34,14 @@ import { pinnedRemoteOrigin } from "../node-control.js";
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
 const EXECUTION_UNAVAILABLE = "no reachable computer-use node is configured. The intent was recorded to the audit log but NOT performed. Do not assume the action succeeded.";
-const REQUIRED_INPUT_OPERATIONS = ["click", "drag", "move", "type", "key", "scroll"];
+// Keep the compatibility floor deliberately small. New actions are negotiated
+// into each node lease from its advertised operations below; adding one here
+// would turn a staggered upgrade into a total loss of otherwise-safe control.
+const BASELINE_INPUT_OPERATIONS = ["click", "move", "type", "key", "scroll"];
+const SUPPORTED_INPUT_OPERATIONS = [
+  "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste",
+  "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"
+];
 
 // Tool names that this module registers. Kept here in one place so the
 // dynamic unregister path (used by the dashboard toggle) can remove
@@ -44,12 +51,20 @@ export const COMPUTER_USE_TOOL_NAMES = [
   "start_computer_use_session",
   "end_computer_use_session",
   "computer_screenshot",
+  "computer_list_apps",
+  "computer_activate_app",
   "computer_click",
+  "computer_click_element",
   "computer_drag",
   "computer_type",
+  "computer_paste",
+  "computer_set_value",
+  "computer_select_text",
+  "computer_secondary_action",
   "computer_key",
   "computer_scroll",
-  "computer_move"
+  "computer_move",
+  "computer_scroll_element"
 ];
 
 /// Reads the current enabled state from process.env. NOT cached — so when
@@ -88,7 +103,7 @@ export async function computerUseReadiness({
     liveScreenshot = capability?.ready === true && capability.operations?.includes?.("screenshot");
     operations = capability?.operations ?? [];
     inputAvailable = capability?.ready === true
-      && REQUIRED_INPUT_OPERATIONS.every((operation) => operations.includes(operation));
+      && BASELINE_INPUT_OPERATIONS.every((operation) => operations.includes(operation));
     detail = capability?.detail ?? null;
   } else if (node?.kind === "invalid") {
     detail = node.detail;
@@ -103,7 +118,9 @@ export async function computerUseReadiness({
   const mode = !enabled
     ? "disabled"
     : nodeReachable
-      ? (liveScreenshot && inputAvailable ? "control-ready" : "permissions-required")
+      ? (inputAvailable
+          ? (liveScreenshot ? "control-ready" : "app-selection-required")
+          : "permissions-required")
       : nodeConfigured
         ? "node-unreachable"
         : "observe-only";
@@ -171,7 +188,7 @@ async function probeExplicitComputerNode(node, fetchImpl, timeoutMs = 1_200) {
       reachable: Boolean(capability),
       liveScreenshot: capability?.screenshotReady === true && operations.includes("screenshot"),
       inputAvailable: capability?.inputReady === true
-        && REQUIRED_INPUT_OPERATIONS.every((operation) => operations.includes(operation)),
+        && BASELINE_INPUT_OPERATIONS.every((operation) => operations.includes(operation)),
       operations,
       detail: typeof capability?.detail === "string" ? capability.detail.slice(0, 300) : null
     };
@@ -189,6 +206,12 @@ function relayComputerNode(runtime, record) {
     record,
     dispatch: (operation, payload, opts) => runtime.nodeCapabilities.dispatch(record.nodeId, "computer-use", operation, payload, opts)
   };
+}
+
+function advertisedComputerOperations(node) {
+  if (node?.kind !== "relay") return [];
+  const capability = node.record?.capabilities?.find?.((entry) => entry.id === "computer-use");
+  return Array.isArray(capability?.operations) ? capability.operations : [];
 }
 
 function computerNode(runtime, session = null) {
@@ -217,11 +240,20 @@ const NODE_PATHS = {
   "session.start": "/session/start",
   "session.end": "/session/end",
   screenshot: "/screenshot",
+  list_apps: "/list-apps",
+  activate_app: "/activate-app",
   click: "/click",
+  click_element: "/click-element",
+  drag: "/drag",
   move: "/move",
   type: "/type",
+  paste: "/paste",
+  set_value: "/set-value",
+  select_text: "/select-text",
+  secondary_action: "/secondary-action",
   key: "/key",
-  scroll: "/scroll"
+  scroll: "/scroll",
+  scroll_element: "/scroll-element"
 };
 
 async function callNode(node, operation, body, fetchImpl, timeoutMs = 30_000, opts = {}) {
@@ -243,7 +275,7 @@ async function callNode(node, operation, body, fetchImpl, timeoutMs = 30_000, op
   } finally { clearTimeout(timer); }
   const json = await readNodeJsonLimited(
     res,
-    operation === "screenshot" ? 12 * 1024 * 1024 : 256 * 1024
+    operation === "screenshot" ? 16 * 1024 * 1024 : 256 * 1024
   ).catch(() => ({}));
   if (!res.ok) {
     const publicError = typeof json?.error === "string" ? json.error.slice(0, 300) : `computer node HTTP ${res.status}`;
@@ -299,6 +331,10 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     const opening = runtime.__computerNodeLeaseOpenings.get(session.id);
     if (opening) return await opening;
     const promise = (async () => {
+      const advertised = node.kind === "relay"
+        ? advertisedComputerOperations(node)
+        : (await probeExplicitComputerNode(node, fetchImpl)).operations;
+      const negotiatedInput = SUPPORTED_INPUT_OPERATIONS.filter((operation) => advertised.includes(operation));
       const goalHash = crypto.createHash("sha256")
         .update(`${session.sourceSessionId}\0${session.targetNodeId}\0${session.goal}`, "utf8")
         .digest("hex");
@@ -307,7 +343,11 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         goalHash,
         expiresAt: session.expiresAt,
         maxActions: 200,
-        allowedOperations: ["session.end", "screenshot", ...REQUIRED_INPUT_OPERATIONS]
+        allowedOperations: [
+          "session.end",
+          ...(advertised.includes("screenshot") ? ["screenshot"] : []),
+          ...negotiatedInput
+        ]
       }, fetchImpl);
       const lease = {
         nodeId: node.id,
@@ -406,14 +446,27 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       const active = runtime.computerUseLog.activeSessionFor(context.sessionId) ?? null;
       const pending = runtime.pendingActions?.list?.({ status: "pending" })
         .filter((action) => action.toolName === "start_computer_use_session" && action.context?.sessionId === context.sessionId) ?? [];
-      const discoveredNodes = runtime.nodeCapabilities?.list?.("computer-use")?.map?.((entry) => ({
-        nodeId: entry.nodeId,
-        name: entry.name ?? null,
-        ready: entry.capabilities?.some?.((capability) => capability.id === "computer-use" && capability.ready) ?? false
-      })) ?? [];
+      const discoveredNodes = runtime.nodeCapabilities?.list?.("computer-use")?.map?.((entry) => {
+        const capability = entry.capabilities?.find?.((candidate) => candidate.id === "computer-use") ?? null;
+        return {
+          nodeId: entry.nodeId,
+          name: entry.name ?? null,
+          ready: capability?.ready === true,
+          operations: Array.isArray(capability?.operations) ? capability.operations : []
+        };
+      }) ?? [];
       const explicitStatus = explicitComputerNode();
+      const explicitProbe = explicitStatus?.kind === "http"
+        ? await probeExplicitComputerNode(explicitStatus, fetchImpl)
+        : null;
       const availableNodes = explicitStatus
-        ? [{ nodeId: "explicit", name: null, ready: explicitStatus.kind !== "invalid" }, ...discoveredNodes]
+        ? [{
+            nodeId: "explicit",
+            name: null,
+            ready: Boolean(explicitProbe?.reachable && explicitProbe.inputAvailable
+              && explicitProbe.operations.includes("session.start")),
+            operations: explicitProbe?.operations ?? []
+          }, ...discoveredNodes]
         : discoveredNodes;
       return {
         active: Boolean(active),
@@ -513,10 +566,12 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       }
       if (selected.kind === "http") {
         // Approval can sit for minutes after it was prepared. Re-authenticate
-        // the immutable explicit target and re-check its current screenshot +
-        // input permissions before creating any main-side authority.
+        // the immutable explicit target and re-check its current input
+        // permissions before creating any main-side authority. A privacy-
+        // excluded approval overlay may temporarily prevent screenshots; the
+        // approved session must still be able to list/activate the target app.
         const status = await probeExplicitComputerNode(selected, fetchImpl);
-        if (!status.reachable || !status.liveScreenshot || !status.inputAvailable
+        if (!status.reachable || !status.inputAvailable
             || !status.operations.includes("session.start")) {
           throw new Error("The computer-use node approved by the user is no longer online and control-ready.");
         }
@@ -592,7 +647,8 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
             width: shot.width,
             height: shot.height,
             frameId: shot.frameId,
-            note: "Live screenshot from the computer-use node."
+            accessibility: typeof shot.accessibility === "string" ? shot.accessibility : "",
+            note: "Live screenshot and fresh Accessibility state from the computer-use node. Element indices are valid only for this frameId."
           };
         } catch (error) {
           runtime.computerUseLog.markActionResult(action.id, { status: "error", error: error.message });
@@ -621,7 +677,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   // node is configured the action executes ON that node (real input); without
   // one, the intent + reasoning are logged and the handler THROWS so the agent
   // gets an explicit failure instead of a fabricated success. No silent stub.
-  function registerAction(name, nodePath, description, paramShape, payloadOf, required = [], metadata = {}, includeReasoning = true) {
+  function registerAction(name, nodePath, description, paramShape, payloadOf, required = [], metadata = {}, includeReasoning = true, returnNodeResult = false) {
     registry.register({
       name,
       description: description + " Executes on the selected connected computer-use node; without one the call is logged and refused.",
@@ -663,7 +719,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           throw new Error(EXECUTION_UNAVAILABLE);
         }
         try {
-          await invokeNodeAction(node, session, action, nodePath, payloadOf(actionArgs));
+          const nodeResult = await invokeNodeAction(node, session, action, nodePath, payloadOf(actionArgs));
           if (runtime.computerUseLog.getSession(session.id)?.status !== "active") {
             runtime.computerUseLog.markActionResult(action.id, { status: "aborted", error: "session-stopped" });
             throw Object.assign(new Error("computer-use session was stopped before the action result was accepted"), {
@@ -671,7 +727,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
             });
           }
           runtime.computerUseLog.markActionResult(action.id, { status: "executed", result: { via: "node" } });
-          return { actionId: action.id, ok: true };
+          return returnNodeResult ? { actionId: action.id, ok: true, ...nodeResult } : { actionId: action.id, ok: true };
         } catch (error) {
           runtime.computerUseLog.markActionResult(action.id, { status: "error", error: error.message });
           await abortSession(session, "computer-use node action failed; approval must be renewed", "aborted");
@@ -681,6 +737,12 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     });
   }
 
+  registerAction("computer_list_apps", "list_apps", "List safe applications available on the selected Mac, returning names, bundle identifiers, and running state.", {
+  }, () => ({}), [], {}, true, true);
+  registerAction("computer_activate_app", "activate_app", "Launch or bring a safe application to the foreground by bundle identifier. Take a fresh computer_screenshot after activation.", {
+    bundleIdentifier: { type: "string", description: "Bundle identifier returned by computer_list_apps." }
+  }, (a) => ({ bundleIdentifier: a.bundleIdentifier }), ["bundleIdentifier"], {}, true, true);
+
   registerAction("computer_click", "click", "Click at (x, y) coordinates on the screen. Coordinates are screen-space pixels with (0,0) at top-left.", {
     frameId: { type: "string", description: "frameId from the screenshot these coordinates refer to." },
     x: { type: "integer", description: "Screen x (pixels)." },
@@ -688,6 +750,10 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     button: { type: "string", enum: ["left", "right", "middle"] },
     count: { type: "integer", minimum: 1, maximum: 3, description: "Click count. Use 2 for double-click and 3 for triple-click." }
   }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y, button: a.button, count: a.count ?? 1 }), ["frameId", "x", "y", "button"]);
+  registerAction("computer_click_element", "click_element", "Click a semantic element from the fresh Accessibility state. Prefer this over coordinates when an element index is available.", {
+    frameId: { type: "string", description: "Fresh frameId that produced the element index." },
+    elementIndex: { type: "integer", minimum: 0, description: "Element index from the Accessibility state." }
+  }, (a) => ({ frameId: a.frameId, elementIndex: a.elementIndex }), ["frameId", "elementIndex"]);
   registerAction("computer_drag", "drag", "Drag from one point to another in the referenced screenshot.", {
     frameId: { type: "string", description: "frameId from the screenshot these coordinates refer to." },
     fromX: { type: "integer" },
@@ -704,6 +770,36 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     frameId: { type: "string", description: "Fresh frameId from the screenshot that established the current focus." },
     text: { type: "string", description: "Text to type. Use computer_key for non-printable keys." }
   }, (a) => ({ frameId: a.frameId, text: a.text }), ["frameId", "text"], { sensitiveArguments: ["text"] }, false);
+  registerAction("computer_paste", "paste", "Paste plain text, Markdown, or HTML into a semantic editable element, then restore the previous clipboard.", {
+    frameId: { type: "string", description: "Fresh frameId that produced the element index." },
+    elementIndex: { type: "integer", minimum: 0 },
+    text: { type: "string" },
+    format: { type: "string", enum: ["text", "md", "html"] }
+  }, (a) => ({ frameId: a.frameId, elementIndex: a.elementIndex, text: a.text, format: a.format }),
+  ["frameId", "elementIndex", "text", "format"], { sensitiveArguments: ["text"] }, false);
+  registerAction("computer_set_value", "set_value", "Set an editable semantic element's value and require exact Accessibility readback.", {
+    frameId: { type: "string", description: "Fresh frameId that produced the element index." },
+    elementIndex: { type: "integer", minimum: 0 },
+    value: { type: "string" }
+  }, (a) => ({ frameId: a.frameId, elementIndex: a.elementIndex, text: a.value }),
+  ["frameId", "elementIndex", "value"], { sensitiveArguments: ["value"] }, false);
+  registerAction("computer_select_text", "select_text", "Select an exact text occurrence or place the cursor before/after it in a semantic editable element.", {
+    frameId: { type: "string", description: "Fresh frameId that produced the element index." },
+    elementIndex: { type: "integer", minimum: 0 },
+    text: { type: "string" },
+    prefix: { type: "string", description: "Optional exact prefix used to disambiguate repeated text." },
+    suffix: { type: "string", description: "Optional exact suffix used to disambiguate repeated text." },
+    selectionType: { type: "string", enum: ["text", "cursor_before", "cursor_after"] }
+  }, (a) => ({
+    frameId: a.frameId, elementIndex: a.elementIndex, text: a.text,
+    prefix: a.prefix, suffix: a.suffix, selectionType: a.selectionType ?? "text"
+  }), ["frameId", "elementIndex", "text"], { sensitiveArguments: ["text", "prefix", "suffix"] }, false);
+  registerAction("computer_secondary_action", "secondary_action", "Invoke an exact non-press Accessibility action exposed for an element, such as AXShowMenu or AXIncrement. Never guess action names.", {
+    frameId: { type: "string", description: "Fresh frameId that produced the element index." },
+    elementIndex: { type: "integer", minimum: 0 },
+    action: { type: "string", description: "Exact action name shown in the Accessibility state." }
+  }, (a) => ({ frameId: a.frameId, elementIndex: a.elementIndex, action: a.action }),
+  ["frameId", "elementIndex", "action"]);
   registerAction("computer_key", "key", "Press a key chord. Examples: 'cmd+a', 'enter', 'esc', 'cmd+shift+t'.", {
     frameId: { type: "string", description: "Fresh frameId from the screenshot that established the current focus." },
     chord: { type: "string", description: "Key chord, plus-separated. Modifiers: cmd, shift, alt, ctrl. Then the key name." }
@@ -720,6 +816,14 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     x: { type: "integer" },
     y: { type: "integer" }
   }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y }), ["frameId", "x", "y"]);
+  registerAction("computer_scroll_element", "scroll_element", "Scroll at a semantic element from the fresh Accessibility state.", {
+    frameId: { type: "string", description: "Fresh frameId that produced the element index." },
+    elementIndex: { type: "integer", minimum: 0 },
+    direction: { type: "string", enum: ["up", "down", "left", "right"] },
+    pages: { type: "integer", minimum: 1, maximum: 10 }
+  }, (a) => ({
+    frameId: a.frameId, elementIndex: a.elementIndex, direction: a.direction, pages: a.pages ?? 1
+  }), ["frameId", "elementIndex", "direction"]);
 
   return { registered: true, node: Boolean(explicitComputerNode() ?? runtime.nodeCapabilities?.resolve?.("computer-use")) };
 }

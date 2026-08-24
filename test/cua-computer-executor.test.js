@@ -73,7 +73,8 @@ test("Cua backend preserves OpenAGI leases and maps fresh-frame desktop actions"
   });
   try {
     const health = await executor.health();
-    assert.equal(health.capability.ready, true);
+    assert.equal(health.capability.ready, true, "the baseline coordinate contract remains control-ready without optional semantic actions");
+    assert.equal(health.capability.inputReady, true, "partial coordinate input remains reported truthfully");
     assert.deepEqual(health.capability.operations, ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]);
 
     const lease = await start(executor);

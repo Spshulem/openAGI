@@ -51,7 +51,7 @@ async function appWithComputerUse({ dataDir: suppliedDataDir = null, generate = 
       async health() {
         return { capability: {
           id: "computer-use", ready: true,
-          operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
+          operations: ["session.start", "session.end", "screenshot", "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste", "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"]
         } };
       },
       async invoke(operation) {
@@ -377,7 +377,7 @@ test("approved explicit node is re-authenticated and permission-checked before s
           id: "computer-use",
           screenshotReady: true,
           inputReady: false,
-          operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
+          operations: ["session.start", "session.end", "screenshot", "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste", "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"]
         }
       }), { status: 200, headers: { "content-type": "application/json" } });
     }
@@ -393,6 +393,150 @@ test("approved explicit node is re-authenticated and permission-checked before s
     assert.match(approved.error, /no longer online and control-ready/);
     assert.equal(probes, 1);
     assert.equal(runtime.computerUseLog.listSessions({ status: "active" }).length, 0);
+  } finally {
+    if (previous.node === undefined) delete process.env.OPENAGI_COMPUTER_NODE;
+    else process.env.OPENAGI_COMPUTER_NODE = previous.node;
+    if (previous.token === undefined) delete process.env.OPENAGI_COMPUTER_NODE_TOKEN;
+    else process.env.OPENAGI_COMPUTER_NODE_TOKEN = previous.token;
+    if (previous.insecure === undefined) delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+    else process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY = previous.insecure;
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("approved explicit node may activate an app while the approval overlay is privacy-excluded", async () => {
+  const previous = {
+    node: process.env.OPENAGI_COMPUTER_NODE,
+    token: process.env.OPENAGI_COMPUTER_NODE_TOKEN,
+    insecure: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY
+  };
+  process.env.OPENAGI_COMPUTER_NODE = "https://computer.example";
+  process.env.OPENAGI_COMPUTER_NODE_TOKEN = "scoped-test-token";
+  delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-overlay-approval-"));
+  const tools = new ToolRegistry();
+  const pendingActions = new PendingActionStore({ dir: path.join(dataDir, "pending") });
+  tools.bindPendingActions(pendingActions);
+  const runtime = {
+    tools,
+    pendingActions,
+    computerUseLog: new ComputerUseLog({ dir: path.join(dataDir, "computer-use") }),
+    observations: { search: async () => [] }
+  };
+  let healthChecks = 0;
+  registerComputerUseTools(tools, runtime, {
+    fetchImpl: async (url) => {
+      const route = new URL(url).pathname;
+      if (route === "/health") {
+        healthChecks += 1;
+        return new Response(JSON.stringify({
+          capability: {
+            id: "computer-use",
+            ready: true,
+            screenshotReady: false,
+            inputReady: true,
+            detail: "OpenAGI is the frontmost privacy-excluded window",
+            operations: ["session.start", "session.end", "screenshot", "list_apps", "activate_app", "click", "move", "type", "key", "scroll"]
+          }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (route === "/session/start") {
+        return new Response(JSON.stringify({ leaseId: "lease-overlay", nextSequence: 1 }), {
+          status: 200, headers: { "content-type": "application/json" }
+        });
+      }
+      if (route === "/list-apps") {
+        return new Response(JSON.stringify({ apps: [{ bundleIdentifier: "com.example.Editor", name: "Editor", running: true }] }), {
+          status: 200, headers: { "content-type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+  });
+  const context = { sessionId: "chat:overlay-approval", channel: "local", from: "user" };
+  try {
+    const queued = await tools.invoke("start_computer_use_session", { goal: "Open the editor" }, context);
+    const pending = pendingActions.get(queued.result.actionId);
+    const approved = await tools.invoke(pending.toolName, pending.args, { ...context, __confirmed: true });
+    assert.equal(approved.ok, true, "temporary screenshot exclusion must not reject the user's approval");
+    const apps = await tools.invoke("computer_list_apps", { reasoning: "Find the approved target app" }, context);
+    assert.equal(apps.ok, true);
+    assert.equal(apps.result.apps[0].bundleIdentifier, "com.example.Editor");
+    assert.equal(healthChecks >= 2, true, "approval and lease negotiation each authenticate current node capability");
+  } finally {
+    if (previous.node === undefined) delete process.env.OPENAGI_COMPUTER_NODE;
+    else process.env.OPENAGI_COMPUTER_NODE = previous.node;
+    if (previous.token === undefined) delete process.env.OPENAGI_COMPUTER_NODE_TOKEN;
+    else process.env.OPENAGI_COMPUTER_NODE_TOKEN = previous.token;
+    if (previous.insecure === undefined) delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+    else process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY = previous.insecure;
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("explicit node route map dispatches drag and negotiates it into the lease", async () => {
+  const previous = {
+    node: process.env.OPENAGI_COMPUTER_NODE,
+    token: process.env.OPENAGI_COMPUTER_NODE_TOKEN,
+    insecure: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY
+  };
+  process.env.OPENAGI_COMPUTER_NODE = "https://computer.example";
+  process.env.OPENAGI_COMPUTER_NODE_TOKEN = "scoped-test-token";
+  delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-explicit-drag-"));
+  const tools = new ToolRegistry();
+  const pendingActions = new PendingActionStore({ dir: path.join(dataDir, "pending") });
+  tools.bindPendingActions(pendingActions);
+  const runtime = {
+    tools,
+    pendingActions,
+    computerUseLog: new ComputerUseLog({ dir: path.join(dataDir, "computer-use") }),
+    observations: { search: async () => [] }
+  };
+  const requests = [];
+  registerComputerUseTools(tools, runtime, {
+    fetchImpl: async (url, options) => {
+      const route = new URL(url).pathname;
+      const body = options?.body ? JSON.parse(options.body) : null;
+      requests.push({ route, body });
+      if (route === "/health") {
+        return new Response(JSON.stringify({
+          capability: {
+            id: "computer-use",
+            screenshotReady: true,
+            inputReady: true,
+            operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
+          }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (route === "/session/start") {
+        return new Response(JSON.stringify({ leaseId: "lease-explicit", nextSequence: 1 }), {
+          status: 200, headers: { "content-type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200, headers: { "content-type": "application/json" }
+      });
+    }
+  });
+  const context = { sessionId: "chat:explicit-drag", channel: "local", from: "user" };
+  try {
+    const queued = await tools.invoke("start_computer_use_session", { goal: "Move the test card" }, context);
+    const pending = pendingActions.get(queued.result.actionId);
+    const approved = await tools.invoke(pending.toolName, pending.args, { ...context, __confirmed: true });
+    assert.equal(approved.ok, true);
+    const dragged = await tools.invoke("computer_drag", {
+      frameId: "frame-explicit", fromX: 10, fromY: 20, toX: 30, toY: 40,
+      button: "left", durationMs: 450, reasoning: "Move the test card"
+    }, context);
+    assert.equal(dragged.ok, true);
+    const leaseRequest = requests.find((request) => request.route === "/session/start");
+    assert.equal(leaseRequest.body.allowedOperations.includes("drag"), true);
+    const dragRequest = requests.find((request) => request.route === "/drag");
+    assert.deepEqual(
+      { fromX: dragRequest.body.fromX, fromY: dragRequest.body.fromY, toX: dragRequest.body.toX, toY: dragRequest.body.toY, button: dragRequest.body.button, durationMs: dragRequest.body.durationMs },
+      { fromX: 10, fromY: 20, toX: 30, toY: 40, button: "left", durationMs: 450 }
+    );
   } finally {
     if (previous.node === undefined) delete process.env.OPENAGI_COMPUTER_NODE;
     else process.env.OPENAGI_COMPUTER_NODE = previous.node;
@@ -424,11 +568,16 @@ test("approved computer actions bypass scrutiny re-confirmation without persisti
       operations: ["session.start", "session.end", "type"]
     }]
   };
+  let leaseAllowedOperations = null;
   runtime.nodeCapabilities = {
     resolve: () => record,
-    dispatch: async (_nodeId, _capability, operation) => operation === "session.start"
-      ? { leaseId: "lease-sensitive", nextSequence: 1 }
-      : { ok: true }
+    dispatch: async (_nodeId, _capability, operation, payload) => {
+      if (operation === "session.start") {
+        leaseAllowedOperations = payload.allowedOperations;
+        return { leaseId: "lease-sensitive", nextSequence: 1 };
+      }
+      return { ok: true };
+    }
   };
   registerComputerUseTools(tools, runtime);
   const context = {
@@ -448,6 +597,7 @@ test("approved computer actions bypass scrutiny re-confirmation without persisti
   try {
     const result = await tools.invoke("computer_type", { frameId: "frame-1", text: typed }, context);
     assert.equal(result.ok, true);
+    assert.deepEqual(leaseAllowedOperations, ["session.end", "type"], "optional operations are negotiated from the selected node");
     assert.equal(pendingActions.list().length, 0, "an active approved session does not create a second approval");
     const persisted = fs.readdirSync(dataDir, { recursive: true })
       .filter((entry) => fs.statSync(path.join(dataDir, entry)).isFile())

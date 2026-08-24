@@ -15,6 +15,30 @@ final class ComputerHelperSafetyTests: XCTestCase {
     XCTAssertFalse(privacy.permits(bundleId: "COM.1PASSWORD.browser-helper", title: "Vault"))
     XCTAssertFalse(privacy.permits(bundleId: "com.example.Browser", title: "Private Window"))
     XCTAssertTrue(privacy.permits(bundleId: "com.example.Editor", title: "Project Notes"))
+    XCTAssertFalse(privacy.permitsBundle("com.apple.MobileSMS"))
+    XCTAssertTrue(privacy.permitsBundle("com.example.Editor"))
+  }
+
+  func testAccessibilityLocatorRoundTripsWithoutBindingIdentityToEditableValue() throws {
+    let locator = ComputerAccessibilityElement(
+      index: 3,
+      path: [0, 2, 1],
+      role: "AXTextArea",
+      subrole: nil,
+      identifier: "editor",
+      title: "Notes",
+      value: "editable content",
+      frame: CGRect(x: 10, y: 20, width: 300, height: 180),
+      actions: ["AXPress", "AXShowMenu"],
+      secure: false
+    )
+    let decoded = try JSONDecoder().decode(
+      ComputerAccessibilityElement.self,
+      from: JSONEncoder().encode(locator)
+    )
+    XCTAssertEqual(decoded, locator)
+    XCTAssertEqual(decoded.frame, CGRect(x: 10, y: 20, width: 300, height: 180))
+    XCTAssertEqual(decoded.value, "editable content")
   }
 
   func testCapturePrivacyLoadsPersistedCustomExclusions() throws {

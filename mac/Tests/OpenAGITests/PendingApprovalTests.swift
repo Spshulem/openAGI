@@ -43,4 +43,23 @@ final class PendingApprovalTests: XCTestCase {
       "This approval is no longer pending.")
     XCTAssertNil(PendingApprovalConsumer.terminalDecisionError(statusCode: 500, data: data))
   }
+
+  @MainActor
+  func testComputerUseTerminalEventReconcilesOnlyTheApprovedSession() {
+    XCTAssertNil(PendingApprovalConsumer.terminalComputerUseOutcome(
+      sessionId: "cus_expected",
+      data: #"{"kind":"session-end","session":{"id":"cus_other","status":"ended"}}"#))
+
+    let finished = PendingApprovalConsumer.terminalComputerUseOutcome(
+      sessionId: "cus_expected",
+      data: #"{"kind":"session-end","session":{"id":"cus_expected","status":"ended"}}"#)
+    XCTAssertEqual(finished?.outcome, "Computer task finished. Open Chat for the result.")
+    XCTAssertNil(finished?.error)
+
+    let aborted = PendingApprovalConsumer.terminalComputerUseOutcome(
+      sessionId: "cus_expected",
+      data: #"{"kind":"session-end","session":{"id":"cus_expected","status":"aborted","endReason":"private runtime detail"}}"#)
+    XCTAssertNil(aborted?.outcome)
+    XCTAssertEqual(aborted?.error, "Computer task stopped. Open Chat for details.")
+  }
 }

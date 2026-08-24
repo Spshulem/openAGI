@@ -83,6 +83,24 @@ test("Computer History uses measured capture status and a day-grouped, paginated
   assert.doesNotMatch(renderer, /Clear history|Delete history|observations\/prune/, "the usability redesign must not add destructive history actions");
 });
 
+test("Computer Use history renders the complete semantic action vocabulary without exposing values", () => {
+  const renderer = between(dashboardScript, "async function renderComputerUse()", "async function renderActivity()");
+  for (const kind of [
+    "list_apps", "activate_app", "click_element", "drag", "paste", "set_value",
+    "select_text", "secondary_action", "scroll_element"
+  ]) {
+    assert.match(renderer, new RegExp(`case "${kind}"`), `missing readable ${kind} history copy`);
+  }
+  assert.match(renderer, /textCharacterCount/);
+  assert.match(renderer, /valueCharacterCount/);
+  assert.match(renderer, /Double-click/);
+  assert.match(renderer, /Triple-click/);
+  assert.match(renderer, /args\.button/);
+  assert.match(renderer, /args\.durationMs/);
+  assert.match(renderer, /args\.toY/);
+  assert.doesNotMatch(renderer, /args\.text\b|args\.value\b/, "sensitive values must never be rendered from action history");
+});
+
 test("history suggestion feed is category-filtered, bounded, and summary-only", async () => {
   const suggestedDir = path.join(dataDir, "skills-suggested");
   fs.mkdirSync(suggestedDir, { recursive: true });
