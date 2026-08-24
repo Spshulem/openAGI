@@ -51,7 +51,7 @@ async function appWithComputerUse({ dataDir: suppliedDataDir = null, generate = 
       async health() {
         return { capability: {
           id: "computer-use", ready: true,
-          operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+          operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
         } };
       },
       async invoke(operation) {
@@ -377,7 +377,7 @@ test("approved explicit node is re-authenticated and permission-checked before s
           id: "computer-use",
           screenshotReady: true,
           inputReady: false,
-          operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+          operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
         }
       }), { status: 200, headers: { "content-type": "application/json" } });
     }

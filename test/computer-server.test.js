@@ -8,7 +8,7 @@ import { createComputerExecutor, createComputerServer, runComputerHelper } from 
 const ready = async () => ({
   screenshotReady: true,
   inputReady: true,
-  operations: ["click", "move", "type", "key", "scroll"],
+  operations: ["click", "drag", "move", "type", "key", "scroll"],
   detail: "ready"
 });
 
@@ -39,7 +39,7 @@ async function lease(computer, sessionId = "chat:one", maxActions = 20) {
   return await computer.invoke("session.start", {
     sessionId,
     goalHash: "a".repeat(64),
-    allowedOperations: ["session.end", "screenshot", "click", "move", "type", "key", "scroll"],
+    allowedOperations: ["session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"],
     maxActions
   });
 }
@@ -78,14 +78,21 @@ test("executor binds coordinates to a screenshot frame and scales them", async (
   const active = await lease(computer);
   const shot = await action(computer, active, 1, "screenshot");
   assert.equal("focus" in shot, false, "private focus identity never leaves the node executor");
-  await action(computer, active, 2, "click", { frameId: shot.frameId, x: 100, y: 50, button: "right" });
+  await action(computer, active, 2, "click", { frameId: shot.frameId, x: 100, y: 50, button: "right", count: 2 });
   const nextShot = await action(computer, active, 3, "screenshot");
-  await action(computer, active, 4, "move", { frameId: nextShot.frameId, x: 640, y: 400 });
+  await action(computer, active, 4, "drag", {
+    frameId: nextShot.frameId, fromX: 10, fromY: 20, toX: 300, toY: 200, button: "left", durationMs: 500
+  });
+  const finalShot = await action(computer, active, 5, "screenshot");
+  await action(computer, active, 6, "move", { frameId: finalShot.frameId, x: 640, y: 400 });
   const inputCalls = calls.filter(([command]) => command === "/signed/helper");
-  assert.deepEqual(inputCalls.at(-2), ["/signed/helper", "click", { x: 200, y: 100, button: "right", focus: privateFocus }]);
+  assert.deepEqual(inputCalls.at(-3), ["/signed/helper", "click", { x: 200, y: 100, button: "right", count: 2, focus: privateFocus }]);
+  assert.deepEqual(inputCalls.at(-2), ["/signed/helper", "drag", {
+    fromX: 20, fromY: 40, toX: 600, toY: 400, button: "left", durationMs: 500, focus: privateFocus
+  }]);
   assert.deepEqual(inputCalls.at(-1), ["/signed/helper", "move", { x: 1280, y: 800, focus: privateFocus }]);
   await assert.rejects(
-    () => action(computer, active, 5, "click", { frameId: nextShot.frameId, x: 1280, y: 5, button: "left" }),
+    () => action(computer, active, 7, "click", { frameId: finalShot.frameId, x: 1280, y: 5, button: "left" }),
     /unknown, stale, or expired|outside the referenced screenshot/
   );
 });
@@ -154,6 +161,7 @@ test("all input, including type and key, requires a fresh screenshot frame", asy
   now += 1_001;
   const staleActions = [
     ["click", { frameId: shot.frameId, x: 1, y: 1, button: "left" }],
+    ["drag", { frameId: shot.frameId, fromX: 1, fromY: 1, toX: 2, toY: 2, button: "left" }],
     ["move", { frameId: shot.frameId, x: 1, y: 1 }],
     ["type", { frameId: shot.frameId, text: "never sent" }],
     ["key", { frameId: shot.frameId, chord: "enter" }],

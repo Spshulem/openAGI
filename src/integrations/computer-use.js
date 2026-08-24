@@ -17,6 +17,7 @@
 //                               since real screenshot transport needs the
 //                               Mac app).
 //   computer_click            — click at (x, y).
+//   computer_drag             — drag between two points.
 //   computer_type             — type a string.
 //   computer_key              — press a key chord.
 //   computer_scroll           — scroll at (x, y).
@@ -33,7 +34,7 @@ import { pinnedRemoteOrigin } from "../node-control.js";
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
 const EXECUTION_UNAVAILABLE = "no reachable computer-use node is configured. The intent was recorded to the audit log but NOT performed. Do not assume the action succeeded.";
-const REQUIRED_INPUT_OPERATIONS = ["click", "move", "type", "key", "scroll"];
+const REQUIRED_INPUT_OPERATIONS = ["click", "drag", "move", "type", "key", "scroll"];
 
 // Tool names that this module registers. Kept here in one place so the
 // dynamic unregister path (used by the dashboard toggle) can remove
@@ -44,6 +45,7 @@ export const COMPUTER_USE_TOOL_NAMES = [
   "end_computer_use_session",
   "computer_screenshot",
   "computer_click",
+  "computer_drag",
   "computer_type",
   "computer_key",
   "computer_scroll",
@@ -86,7 +88,7 @@ export async function computerUseReadiness({
     liveScreenshot = capability?.ready === true && capability.operations?.includes?.("screenshot");
     operations = capability?.operations ?? [];
     inputAvailable = capability?.ready === true
-      && ["click", "move", "type", "key", "scroll"].every((operation) => operations.includes(operation));
+      && REQUIRED_INPUT_OPERATIONS.every((operation) => operations.includes(operation));
     detail = capability?.detail ?? null;
   } else if (node?.kind === "invalid") {
     detail = node.detail;
@@ -305,7 +307,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         goalHash,
         expiresAt: session.expiresAt,
         maxActions: 200,
-        allowedOperations: ["session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+        allowedOperations: ["session.end", "screenshot", ...REQUIRED_INPUT_OPERATIONS]
       }, fetchImpl);
       const lease = {
         nodeId: node.id,
@@ -683,8 +685,21 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     frameId: { type: "string", description: "frameId from the screenshot these coordinates refer to." },
     x: { type: "integer", description: "Screen x (pixels)." },
     y: { type: "integer", description: "Screen y (pixels)." },
-    button: { type: "string", enum: ["left", "right", "middle"] }
-  }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y, button: a.button }), ["frameId", "x", "y", "button"]);
+    button: { type: "string", enum: ["left", "right", "middle"] },
+    count: { type: "integer", minimum: 1, maximum: 3, description: "Click count. Use 2 for double-click and 3 for triple-click." }
+  }, (a) => ({ frameId: a.frameId, x: a.x, y: a.y, button: a.button, count: a.count ?? 1 }), ["frameId", "x", "y", "button"]);
+  registerAction("computer_drag", "drag", "Drag from one point to another in the referenced screenshot.", {
+    frameId: { type: "string", description: "frameId from the screenshot these coordinates refer to." },
+    fromX: { type: "integer" },
+    fromY: { type: "integer" },
+    toX: { type: "integer" },
+    toY: { type: "integer" },
+    button: { type: "string", enum: ["left", "right", "middle"] },
+    durationMs: { type: "integer", minimum: 0, maximum: 2000, description: "Drag duration in milliseconds." }
+  }, (a) => ({
+    frameId: a.frameId, fromX: a.fromX, fromY: a.fromY, toX: a.toX, toY: a.toY,
+    button: a.button, durationMs: a.durationMs ?? 350
+  }), ["frameId", "fromX", "fromY", "toX", "toY", "button"]);
   registerAction("computer_type", "type", "Type a string into the focused app.", {
     frameId: { type: "string", description: "Fresh frameId from the screenshot that established the current focus." },
     text: { type: "string", description: "Text to type. Use computer_key for non-printable keys." }

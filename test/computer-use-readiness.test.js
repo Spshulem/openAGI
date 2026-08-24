@@ -35,7 +35,7 @@ test("computer-use readiness distinguishes disabled, observe-only, and control-r
             id: "computer-use",
             screenshotReady: true,
             inputReady: true,
-            operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+            operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
           }
         })
       };

@@ -15,6 +15,7 @@ const execFileAsync = promisify(execFile);
 //   POST /session/end   { leaseId, ... } -> revoke lease
 //   POST /screenshot {}                  -> { format, base64, width, height, scale, ... }
 //   POST /click  { x, y, button? }       -> { ok: true }
+//   POST /drag   { fromX, fromY, toX, toY } -> { ok: true }
 //   POST /move   { x, y }                -> { ok: true }
 //   POST /type   { text }                -> { ok: true }
 //   POST /key    { chord }               -> { ok: true }   ("cmd+a", "enter", …)
@@ -35,7 +36,7 @@ const execFileAsync = promisify(execFile);
 // sensitive action data must travel over the helper's stdin, not process argv.
 
 const SCALE_WIDTH = Number(process.env.OPENAGI_COMPUTER_SCALE_WIDTH ?? "1280") || 0; // 0 = no scaling
-const INPUT_OPERATIONS = ["click", "move", "type", "key", "scroll"];
+const INPUT_OPERATIONS = ["click", "drag", "move", "type", "key", "scroll"];
 const ALL_OPERATIONS = ["session.start", "session.end", "screenshot", ...INPUT_OPERATIONS];
 const DEFAULT_IDLE_LEASE_MS = 2 * 60 * 1000;
 const DEFAULT_ABSOLUTE_LEASE_MS = 15 * 60 * 1000;
@@ -346,6 +347,7 @@ function operationForPath(pathname) {
     "/session/end": "session.end",
     "/screenshot": "screenshot",
     "/click": "click",
+    "/drag": "drag",
     "/move": "move",
     "/type": "type",
     "/key": "key",
@@ -428,7 +430,23 @@ function normalizeInputPayload(operation, payload, lease, at, frameTtlMs) {
     const button = payload.button;
     if (!["left", "right", "middle"].includes(button)) throw new Error("button must be left, right, or middle");
     const point = pointInFrame(payload, lease, at, frameTtlMs);
-    return { x: scale(point.x, point.frame.scale), y: scale(point.y, point.frame.scale), button, focus: point.frame.focus };
+    const count = payload.count == null ? 1 : finiteInteger(payload.count, "count");
+    if (count < 1 || count > 3) throw new Error("count must be between 1 and 3");
+    return { x: scale(point.x, point.frame.scale), y: scale(point.y, point.frame.scale), button, count, focus: point.frame.focus };
+  }
+  if (operation === "drag") {
+    const button = payload.button;
+    if (!["left", "right", "middle"].includes(button)) throw new Error("button must be left, right, or middle");
+    const frame = requireFreshFrame(payload, lease, at, frameTtlMs);
+    const from = pointCoordinatesInFrame(payload.fromX, payload.fromY, frame, "from");
+    const to = pointCoordinatesInFrame(payload.toX, payload.toY, frame, "to");
+    const durationMs = payload.durationMs == null ? 350 : finiteInteger(payload.durationMs, "durationMs");
+    if (durationMs < 0 || durationMs > 2_000) throw new Error("durationMs must be between 0 and 2000");
+    return {
+      fromX: scale(from.x, frame.scale), fromY: scale(from.y, frame.scale),
+      toX: scale(to.x, frame.scale), toY: scale(to.y, frame.scale),
+      button, durationMs, focus: frame.focus
+    };
   }
   if (operation === "move") {
     const point = pointInFrame(payload, lease, at, frameTtlMs);
@@ -470,12 +488,17 @@ function boundedScrollDelta(value, label) {
 
 function pointInFrame(payload, lease, at, frameTtlMs) {
   const frame = requireFreshFrame(payload, lease, at, frameTtlMs);
-  const x = finiteInteger(payload.x, "x");
-  const y = finiteInteger(payload.y, "y");
+  const { x, y } = pointCoordinatesInFrame(payload.x, payload.y, frame);
+  return { x, y, frame };
+}
+
+function pointCoordinatesInFrame(rawX, rawY, frame, prefix = "") {
+  const x = finiteInteger(rawX, prefix ? `${prefix}X` : "x");
+  const y = finiteInteger(rawY, prefix ? `${prefix}Y` : "y");
   if (x < 0 || y < 0 || x >= frame.width || y >= frame.height) {
     throw new Error("coordinates are outside the referenced screenshot frame");
   }
-  return { x: x + (frame.offsetX / frame.scale), y: y + (frame.offsetY / frame.scale), frame };
+  return { x: x + (frame.offsetX / frame.scale), y: y + (frame.offsetY / frame.scale) };
 }
 
 function requireFreshFrame(payload, lease, at, frameTtlMs) {

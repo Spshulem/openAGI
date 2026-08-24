@@ -6,6 +6,12 @@ struct InputPayload: Decodable {
   var x: Double?
   var y: Double?
   var button: String?
+  var count: Int?
+  var fromX: Double?
+  var fromY: Double?
+  var toX: Double?
+  var toY: Double?
+  var durationMs: Int?
   var text: String?
   var chord: String?
   var deltaX: Double?
@@ -68,7 +74,7 @@ do {
       // identity cannot be established fail-closed.
       "screenshotReady": screenshotReady,
       "inputReady": input,
-      "operations": ["screenshot", "click", "move", "type", "key", "scroll"],
+      "operations": ["screenshot", "click", "drag", "move", "type", "key", "scroll"],
       "detail": screenshotReady && input ? "ready" : blockers.joined(separator: "; ")
     ])
     exit(0)
@@ -94,7 +100,25 @@ do {
           ["left", "right", "middle"].contains(button) else {
       throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "click requires x, y, and a valid button"])
     }
-    try ComputerInput.click(x: x, y: y, button: button, focus: focus, cancellation: cancellation)
+    let count = payload.count ?? 1
+    guard (1...3).contains(count) else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "click count must be between 1 and 3"])
+    }
+    try ComputerInput.click(x: x, y: y, button: button, count: count, focus: focus, cancellation: cancellation)
+  case "drag":
+    guard let fromX = payload.fromX, let fromY = payload.fromY,
+          let toX = payload.toX, let toY = payload.toY,
+          let button = payload.button, ["left", "right", "middle"].contains(button) else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "drag requires fromX, fromY, toX, toY, and a valid button"])
+    }
+    let durationMs = payload.durationMs ?? 350
+    guard (0...2_000).contains(durationMs) else {
+      throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "drag durationMs must be between 0 and 2000"])
+    }
+    try ComputerInput.drag(
+      fromX: fromX, fromY: fromY, toX: toX, toY: toY,
+      button: button, durationMs: durationMs, focus: focus, cancellation: cancellation
+    )
   case "move":
     guard let x = payload.x, let y = payload.y else {
       throw NSError(domain: "OpenAGIComputerHelper", code: 4, userInfo: [NSLocalizedDescriptionKey: "move requires x and y"])

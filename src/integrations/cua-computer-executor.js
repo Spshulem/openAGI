@@ -4,7 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { createComputerExecutor } from "./computer-server.js";
 
-const INPUT_OPERATIONS = ["click", "move", "type", "key", "scroll"];
+const INPUT_OPERATIONS = ["click", "drag", "move", "type", "key", "scroll"];
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 export function createConfiguredComputerExecutor({ env = process.env, ...options } = {}) {
@@ -159,7 +159,19 @@ function cuaAction(operation, payload = {}) {
     throw new Error("Cua Driver action is missing its captured window identity");
   }
   const base = { target: { kind: "window", pid, window_id: windowId }, session: "openagi" };
-  if (operation === "click") return { tool: "click", args: { ...base, x: payload.x, y: payload.y, button: payload.button } };
+  if (operation === "click") return { tool: "click", args: { ...base, x: payload.x, y: payload.y, button: payload.button, count: payload.count } };
+  if (operation === "drag") return {
+    tool: "drag",
+    args: {
+      ...base,
+      from_x: payload.fromX,
+      from_y: payload.fromY,
+      to_x: payload.toX,
+      to_y: payload.toY,
+      button: payload.button,
+      duration_ms: payload.durationMs
+    }
+  };
   if (operation === "move") return { tool: "move_cursor", args: { ...base, x: payload.x, y: payload.y } };
   if (operation === "type") return { tool: "type_text", args: { ...base, text: payload.text } };
   if (operation === "key") {
