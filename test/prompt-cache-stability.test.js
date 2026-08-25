@@ -146,4 +146,6 @@ test("agent-host: computer-use guidance requires semantic targeting and post-act
   assert.match(prompt, /Prefer fresh Accessibility element indices over coordinates/);
   assert.match(prompt, /computer_screenshot again after every/);
   assert.match(prompt, /Never guess an element index or Accessibility action/);
+  assert.match(prompt, /only when computer_use_status reports list_apps or activate_app/);
+  assert.match(prompt, /ask the user to foreground the target app/);
 });

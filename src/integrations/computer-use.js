@@ -100,9 +100,14 @@ export async function computerUseReadiness({
   if (node?.kind === "relay") {
     const capability = discovered.capabilities?.find?.((entry) => entry.id === "computer-use") ?? null;
     nodeReachable = Boolean(capability);
-    liveScreenshot = capability?.ready === true && capability.operations?.includes?.("screenshot");
+    // Older paired nodes did not advertise the split readiness flags. Keep
+    // those compatible, while respecting an explicit false from current nodes
+    // so a privacy-excluded foreground window is never called live-capturable.
+    liveScreenshot = capability?.ready === true
+      && capability?.screenshotReady !== false
+      && capability.operations?.includes?.("screenshot");
     operations = capability?.operations ?? [];
-    inputAvailable = capability?.ready === true
+    inputAvailable = capability?.ready === true && capability?.inputReady !== false
       && BASELINE_INPUT_OPERATIONS.every((operation) => operations.includes(operation));
     detail = capability?.detail ?? null;
   } else if (node?.kind === "invalid") {

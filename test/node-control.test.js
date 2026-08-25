@@ -27,6 +27,17 @@ test("capability advertisements discard endpoint, token, and executable fields",
   assert.equal("command" in out[0], false);
 });
 
+test("capability advertisements preserve only literal readiness booleans", () => {
+  const [current, malformed] = sanitizeNodeCapabilities([
+    { ...capability()[0], screenshotReady: false, inputReady: true },
+    { id: "legacy", ready: true, operations: ["screenshot"], screenshotReady: "yes", inputReady: 1 }
+  ]);
+  assert.equal(current.screenshotReady, false);
+  assert.equal(current.inputReady, true);
+  assert.equal("screenshotReady" in malformed, false);
+  assert.equal("inputReady" in malformed, false);
+});
+
 test("broker dispatches only to the selected ready node and rejects mismatched results", async () => {
   const broker = new NodeControlBroker({ commandTimeoutMs: 1_000 });
   broker.advertise("node-a", capability());

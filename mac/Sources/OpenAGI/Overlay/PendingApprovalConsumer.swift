@@ -92,7 +92,9 @@ final class PendingApprovalConsumer: ObservableObject {
     guard !inFlight.contains(id) else { return }
     inFlight.insert(id)
     defer { inFlight.remove(id) }
-    let sourceSessionId = items.first(where: { $0.id == id })?.sourceSessionId
+    let approval = items.first(where: { $0.id == id })
+    let sourceSessionId = approval?.sourceSessionId
+    let isComputerUseApproval = Self.isComputerUseApproval(approval?.toolName)
 
     var req = URLRequest(url: AppState.buildURL(
       base: AppState.shared.baseURL,
@@ -112,6 +114,10 @@ final class PendingApprovalConsumer: ObservableObject {
           // surface already claimed/decided it. Either way it is no longer a
           // pending action, so never offer a retry that can only fail again.
           items.removeAll { $0.id == id }
+          if isComputerUseApproval {
+            activeComputerSessionId = nil
+            lastChatSessionId = sourceSessionId ?? lastChatSessionId
+          }
           await refresh()
           lastOutcome = decision == "approve"
             ? "Approval recorded, but the action did not complete."
@@ -124,14 +130,20 @@ final class PendingApprovalConsumer: ObservableObject {
       items.removeAll { $0.id == id }
       let decoded = try? JSONDecoder().decode(PendingApprovalDecisionResponse.self, from: data)
       if decision == "approve" {
-        activeComputerSessionId = decoded?.result?.sessionId
-        lastChatSessionId = sourceSessionId
-        lastOutcome = activeComputerSessionId == nil
-          ? "Approved — the agent is continuing in Chat."
-          : "Approved — the computer task is running in Chat."
+        if isComputerUseApproval {
+          activeComputerSessionId = decoded?.result?.sessionId
+          lastChatSessionId = sourceSessionId
+          lastOutcome = activeComputerSessionId == nil
+            ? "Approved — the agent is continuing in Chat."
+            : "Approved — the computer task is running in Chat."
+        } else {
+          lastOutcome = "Approved."
+        }
       } else {
-        activeComputerSessionId = nil
-        lastChatSessionId = nil
+        if isComputerUseApproval {
+          activeComputerSessionId = nil
+          lastChatSessionId = nil
+        }
         lastOutcome = "Request denied."
       }
       lastError = nil
@@ -183,6 +195,10 @@ final class PendingApprovalConsumer: ObservableObject {
     return statusCode == 400
       ? "The approved action failed during execution."
       : "This approval is no longer pending."
+  }
+
+  static func isComputerUseApproval(_ toolName: String?) -> Bool {
+    toolName == "start_computer_use_session"
   }
 
   private func authed(_ req: inout URLRequest) {

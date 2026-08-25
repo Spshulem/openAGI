@@ -351,6 +351,8 @@ test("the scheduled job actually prunes when it fires", { skip: !hasSqlite }, as
   assert.ok(fired, "the tick dispatcher has no handler for the observation-retention task");
   assert.equal(fired.result.applied, true);
   assert.equal(fired.result.deleted.frames, 2);
+  assert.equal(fired.result.reclaim, null,
+    "scheduled retention must not block the daemon with a whole-file vacuum");
   assert.equal(counts(observations).frames, 2);
 
   await settleRuntime(runtime);

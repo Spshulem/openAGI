@@ -42,11 +42,7 @@ public enum ComputerApplications {
       home.appendingPathComponent("Applications")
     ]
     for directory in directories {
-      let urls = (try? FileManager.default.contentsOfDirectory(
-        at: directory, includingPropertiesForKeys: nil,
-        options: [.skipsHiddenFiles, .skipsPackageDescendants]
-      )) ?? []
-      for url in urls where url.pathExtension.lowercased() == "app" {
+      for url in discoverApplicationURLs(in: directory) {
         guard let bundle = Bundle(url: url), let identifier = bundle.bundleIdentifier,
               valid(identifier), privacy.permitsBundle(identifier),
               let name = bounded(bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
@@ -60,6 +56,38 @@ public enum ComputerApplications {
       if $0.running != $1.running { return $0.running && !$1.running }
       return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
     }.prefix(300).map { $0 }
+  }
+
+  /// Application folders commonly contain vendor subdirectories. Walk them
+  /// with explicit bounds while treating every package and symlink as a leaf,
+  /// so discovery cannot escape a configured root or descend into app bundles.
+  static func discoverApplicationURLs(in directory: URL, maxEntries: Int = 4_000) -> [URL] {
+    guard maxEntries > 0 else { return [] }
+    let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey]
+    guard let enumerator = FileManager.default.enumerator(
+      at: directory,
+      includingPropertiesForKeys: keys,
+      options: [.skipsHiddenFiles, .skipsPackageDescendants],
+      errorHandler: { _, _ in true }
+    ) else { return [] }
+    var applications: [URL] = []
+    var visited = 0
+    for case let url as URL in enumerator {
+      visited += 1
+      if visited > maxEntries { break }
+      let values = try? url.resourceValues(forKeys: Set(keys))
+      if values?.isSymbolicLink == true {
+        enumerator.skipDescendants()
+        continue
+      }
+      if url.pathExtension.lowercased() == "app" {
+        applications.append(url)
+        enumerator.skipDescendants()
+      } else if values?.isPackage == true {
+        enumerator.skipDescendants()
+      }
+    }
+    return applications
   }
 
   public static func activate(
@@ -130,9 +158,19 @@ public enum ComputerApplications {
     value.utf8.count <= 512 && value.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]+$", options: .regularExpression) != nil
   }
 
-  private static func bounded(_ value: String?) -> String? {
+  static func bounded(_ value: String?) -> String? {
     guard let value else { return nil }
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? nil : String(trimmed.prefix(240))
+    guard !trimmed.isEmpty else { return nil }
+    guard trimmed.utf8.count > 240 else { return trimmed }
+    var result = ""
+    var byteCount = 0
+    for character in trimmed {
+      let bytes = String(character).utf8.count
+      if byteCount + bytes > 240 { break }
+      result.append(character)
+      byteCount += bytes
+    }
+    return result.isEmpty ? nil : result
   }
 }

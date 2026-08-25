@@ -113,6 +113,33 @@ test("a privacy-excluded foreground window remains available for app selection",
   assert.equal(status.screenshot, "recent-ocr");
 });
 
+test("a relayed node preserves privacy-excluded screenshot readiness", async () => {
+  const record = {
+    nodeId: "paired-node",
+    capabilities: [{
+      id: "computer-use",
+      ready: true,
+      screenshotReady: false,
+      inputReady: true,
+      operations: ["session.start", "session.end", "screenshot", "list_apps", "activate_app", "click", "move", "type", "key", "scroll"]
+    }]
+  };
+  const status = await computerUseReadiness({
+    env: { OPENAGI_COMPUTER_USE: "1" },
+    runtime: {
+      nodeCapabilities: {
+        refresh: async () => {},
+        resolve: () => record,
+        dispatch: async () => ({ ok: true })
+      }
+    },
+    toolsRegistered: true
+  });
+  assert.equal(status.mode, "app-selection-required");
+  assert.equal(status.screenshot, "recent-ocr");
+  assert.equal(status.inputAvailable, true);
+});
+
 test("an unreachable configured node is explicit, not fake-ready", async () => {
   const status = await computerUseReadiness({
     env: { OPENAGI_COMPUTER_USE: "1", OPENAGI_COMPUTER_NODE: "https://offline.example" },

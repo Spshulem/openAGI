@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-import OpenAGIComputerCore
+@testable import OpenAGIComputerCore
 
 final class ComputerHelperSafetyTests: XCTestCase {
   func testCapturePrivacyFailsClosedOnUnknownIdentity() {
@@ -230,5 +230,46 @@ final class ComputerHelperSafetyTests: XCTestCase {
     XCTAssertNoThrow(try ComputerInput.validateInputReadiness(
       accessibilityGranted: true, consoleSessionActive: true,
       screenLocked: false, secureInputEnabled: false))
+  }
+
+  func testWireStringsAreBoundedByUTF8Bytes() {
+    let accessibility = ComputerAccessibility.bounded(String(repeating: "😀", count: 100), 121)
+    XCTAssertNotNil(accessibility)
+    XCTAssertLessThanOrEqual(accessibility?.utf8.count ?? .max, 121)
+
+    let application = ComputerApplications.bounded(String(repeating: "界", count: 100))
+    XCTAssertNotNil(application)
+    XCTAssertLessThanOrEqual(application?.utf8.count ?? .max, 240)
+  }
+
+  func testTextSelectionTreatsOverlappingMatchesAsAmbiguous() throws {
+    XCTAssertThrowsError(try ComputerAccessibility.uniqueTextRange(
+      content: "aaa", text: "aa", prefix: nil, suffix: nil
+    )) { error in
+      guard case ComputerAccessibilityError.ambiguousText = error else {
+        return XCTFail("expected ambiguousText, got \(error)")
+      }
+    }
+    XCTAssertEqual(
+      try ComputerAccessibility.uniqueTextRange(
+        content: "before aa and aa after", text: "aa", prefix: "before ", suffix: nil
+      ),
+      NSRange(location: 7, length: 2)
+    )
+  }
+
+  func testApplicationDiscoveryFindsNestedBundlesWithoutEnteringThem() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("openagi-app-discovery-\(UUID().uuidString)", isDirectory: true)
+    let nested = root.appendingPathComponent("Vendor/Product.app", isDirectory: true)
+    let inside = nested.appendingPathComponent("Contents/Hidden.app", isDirectory: true)
+    try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let discovered = ComputerApplications.discoverApplicationURLs(in: root)
+    XCTAssertEqual(
+      discovered.map { $0.resolvingSymlinksInPath() },
+      [nested.resolvingSymlinksInPath()]
+    )
   }
 }

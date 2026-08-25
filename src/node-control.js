@@ -43,13 +43,19 @@ export function sanitizeNodeCapabilities(raw) {
         .filter((entry) => entry && /^[a-z0-9][a-z0-9._-]*$/i.test(entry)))]
         .slice(0, 64)
       : [];
-    out.push({
+    const capability = {
       id,
       ready: value.ready === true,
       operations,
       detail: text(value.detail, 200),
       checkedAt: text(value.checkedAt, 40)
-    });
+    };
+    // These booleans distinguish an online input-capable Mac from one whose
+    // current window cannot be captured. Preserve only literal booleans; all
+    // other node-supplied fields remain discarded by this trust boundary.
+    if (typeof value.screenshotReady === "boolean") capability.screenshotReady = value.screenshotReady;
+    if (typeof value.inputReady === "boolean") capability.inputReady = value.inputReady;
+    out.push(capability);
   }
   return out;
 }

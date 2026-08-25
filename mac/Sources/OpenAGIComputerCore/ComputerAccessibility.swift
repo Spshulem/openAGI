@@ -73,14 +73,17 @@ public struct ComputerAccessibilitySnapshot: Codable, Equatable {
 public enum ComputerAccessibility {
   public static let maximumNodes = 2_000
   public static let maximumTextBytes = 96 * 1024
+  public static let maximumElementBytes = 4 * 1024 * 1024
 
   public static func capture(
     focus: ComputerFocusIdentity,
     maxNodes: Int = maximumNodes,
-    maxTextBytes: Int = maximumTextBytes
+    maxTextBytes: Int = maximumTextBytes,
+    maxElementBytes: Int = maximumElementBytes
   ) throws -> ComputerAccessibilitySnapshot {
     guard maxNodes > 0, maxNodes <= maximumNodes,
           maxTextBytes > 0, maxTextBytes <= maximumTextBytes,
+          maxElementBytes > 0, maxElementBytes <= maximumElementBytes,
           ComputerScreenshot.focusStillMatches(focus),
           let root = focusedWindow(processIdentifier: focus.processIdentifier) else {
       throw ComputerAccessibilityError.unavailable
@@ -88,6 +91,7 @@ public enum ComputerAccessibility {
     var elements: [ComputerAccessibilityElement] = []
     var lines: [String] = []
     var textBytes = 0
+    var elementBytes = 0
     var truncated = false
 
     func walk(_ element: AXUIElement, path: [Int], depth: Int) {
@@ -116,10 +120,13 @@ public enum ComputerAccessibility {
       }
       let line = String(repeating: "  ", count: min(depth, 12)) + parts.joined(separator: " ")
       let lineBytes = line.utf8.count + 1
-      guard textBytes + lineBytes <= maxTextBytes else { truncated = true; return }
+      let locatorBytes = ((try? JSONEncoder().encode(locator).count) ?? maxElementBytes) + 1
+      guard textBytes + lineBytes <= maxTextBytes,
+            elementBytes + locatorBytes <= maxElementBytes else { truncated = true; return }
       elements.append(locator)
       lines.append(line)
       textBytes += lineBytes
+      elementBytes += locatorBytes
 
       for (childIndex, child) in children(element).enumerated() {
         if elements.count >= maxNodes { truncated = true; break }
@@ -207,30 +214,7 @@ public enum ComputerAccessibility {
     let element = try resolveEditable(locator: locator, focus: focus, cancellation: cancellation)
     guard let content = stringAttribute(element, kAXValueAttribute as CFString),
           content.utf8.count <= 256 * 1024 else { throw ComputerAccessibilityError.ambiguousText }
-    let source = content as NSString
-    let needle = text as NSString
-    var matches: [NSRange] = []
-    var search = NSRange(location: 0, length: source.length)
-    while search.length >= needle.length {
-      let found = source.range(of: text, options: [], range: search)
-      if found.location == NSNotFound { break }
-      let prefixOK = prefix.map { value in
-        let length = (value as NSString).length
-        return found.location >= length
-          && source.substring(with: NSRange(location: found.location - length, length: length)) == value
-      } ?? true
-      let suffixOK = suffix.map { value in
-        let length = (value as NSString).length
-        let start = found.location + found.length
-        return start + length <= source.length
-          && source.substring(with: NSRange(location: start, length: length)) == value
-      } ?? true
-      if prefixOK && suffixOK { matches.append(found) }
-      let next = found.location + max(1, found.length)
-      search = NSRange(location: next, length: source.length - next)
-    }
-    guard matches.count == 1 else { throw ComputerAccessibilityError.ambiguousText }
-    let found = matches[0]
+    let found = try uniqueTextRange(content: content, text: text, prefix: prefix, suffix: suffix)
     var selected = CFRange(
       location: selectionType == "cursor_after" ? found.location + found.length : found.location,
       length: selectionType == "text" ? found.length : 0
@@ -253,9 +237,15 @@ public enum ComputerAccessibility {
     let element = try resolveEditable(locator: locator, focus: focus, cancellation: cancellation)
     try focusElement(element)
     let pasteboard = NSPasteboard.general
-    let saved = snapshotPasteboard(pasteboard)
-    defer { restorePasteboard(pasteboard, saved: saved) }
+    let saved = try snapshotPasteboard(pasteboard)
+    var temporaryChangeCount: Int?
+    defer {
+      if let temporaryChangeCount {
+        restorePasteboard(pasteboard, saved: saved, expectedChangeCount: temporaryChangeCount)
+      }
+    }
     pasteboard.clearContents()
+    temporaryChangeCount = pasteboard.changeCount
     let item = NSPasteboardItem()
     let type: NSPasteboard.PasteboardType = format == "html"
       ? .html
@@ -263,6 +253,7 @@ public enum ComputerAccessibility {
     guard item.setString(text, forType: type),
           (type == .string || item.setString(text, forType: .string)),
           pasteboard.writeObjects([item]) else { throw ComputerAccessibilityError.clipboardFailed }
+    temporaryChangeCount = pasteboard.changeCount
     try ComputerInput.sendShortcut("cmd+v", focus: focus, cancellation: cancellation)
     Thread.sleep(forTimeInterval: 0.1)
   }
@@ -287,11 +278,13 @@ public enum ComputerAccessibility {
                              focus: focus, cancellation: cancellation)
   }
 
-  public static func focusedElementIsSecure(processIdentifier: pid_t) -> Bool {
+  public static func focusedElementIsSecure(processIdentifier: pid_t) throws -> Bool {
     let application = AXUIElementCreateApplication(processIdentifier)
     var raw: AnyObject?
     guard AXUIElementCopyAttributeValue(application, kAXFocusedUIElementAttribute as CFString, &raw) == .success,
-          let raw, CFGetTypeID(raw) == AXUIElementGetTypeID() else { return false }
+          let raw, CFGetTypeID(raw) == AXUIElementGetTypeID() else {
+      throw ComputerAccessibilityError.unavailable
+    }
     let element = raw as! AXUIElement
     return isSecure(role: stringAttribute(element, kAXRoleAttribute as CFString) ?? "",
                     subrole: stringAttribute(element, kAXSubroleAttribute as CFString))
@@ -309,6 +302,7 @@ public enum ComputerAccessibility {
 
   private static func resolve(locator: ComputerAccessibilityElement,
                               focus: ComputerFocusIdentity) throws -> AXUIElement {
+    try ComputerInput.requireActionTimeReadiness(focus: focus)
     guard ComputerScreenshot.focusStillMatches(focus),
           let root = focusedWindow(processIdentifier: focus.processIdentifier) else {
       throw ComputerAccessibilityError.staleElement
@@ -411,35 +405,86 @@ public enum ComputerAccessibility {
       || (subrole?.localizedCaseInsensitiveContains("secure") ?? false)
   }
 
-  private static func bounded(_ value: String?, _ limit: Int) -> String? {
+  static func bounded(_ value: String?, _ limit: Int) -> String? {
     guard let value else { return nil }
     let normalized = value.replacingOccurrences(of: "[\\p{C}\\r\\n\\t]+", with: " ", options: .regularExpression)
       .trimmingCharacters(in: .whitespacesAndNewlines)
     guard !normalized.isEmpty else { return nil }
-    return String(normalized.prefix(limit))
+    guard normalized.utf8.count > limit else { return normalized }
+    var result = ""
+    var byteCount = 0
+    for character in normalized {
+      let bytes = String(character).utf8.count
+      if byteCount + bytes > limit { break }
+      result.append(character)
+      byteCount += bytes
+    }
+    return result.isEmpty ? nil : result
+  }
+
+  static func uniqueTextRange(
+    content: String,
+    text: String,
+    prefix: String?,
+    suffix: String?
+  ) throws -> NSRange {
+    let source = content as NSString
+    let needleLength = (text as NSString).length
+    guard needleLength > 0 else { throw ComputerAccessibilityError.ambiguousText }
+    var matches: [NSRange] = []
+    var search = NSRange(location: 0, length: source.length)
+    while search.length >= needleLength {
+      let found = source.range(of: text, options: [], range: search)
+      if found.location == NSNotFound { break }
+      let prefixOK = prefix.map { value in
+        let length = (value as NSString).length
+        return found.location >= length
+          && source.substring(with: NSRange(location: found.location - length, length: length)) == value
+      } ?? true
+      let suffixOK = suffix.map { value in
+        let length = (value as NSString).length
+        let start = found.location + found.length
+        return start + length <= source.length
+          && source.substring(with: NSRange(location: start, length: length)) == value
+      } ?? true
+      if prefixOK && suffixOK { matches.append(found) }
+      if matches.count > 1 { throw ComputerAccessibilityError.ambiguousText }
+      let firstCharacter = source.rangeOfComposedCharacterSequence(at: found.location)
+      let next = firstCharacter.location + max(1, firstCharacter.length)
+      search = NSRange(location: next, length: source.length - next)
+    }
+    guard matches.count == 1 else { throw ComputerAccessibilityError.ambiguousText }
+    return matches[0]
   }
 
   private static func escaped(_ value: String) -> String {
     value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
   }
 
-  private typealias PasteboardSnapshot = [[NSPasteboard.PasteboardType: Data]]
-
-  private static func snapshotPasteboard(_ pasteboard: NSPasteboard) -> PasteboardSnapshot {
-    (pasteboard.pasteboardItems ?? []).map { item in
-      Dictionary(uniqueKeysWithValues: item.types.compactMap { type in
-        item.data(forType: type).map { (type, $0) }
-      })
-    }
+  private struct PasteboardSnapshot {
+    let items: [NSPasteboardItem]
   }
 
-  private static func restorePasteboard(_ pasteboard: NSPasteboard, saved: PasteboardSnapshot) {
+  private static func snapshotPasteboard(_ pasteboard: NSPasteboard) throws -> PasteboardSnapshot {
+    let items = pasteboard.pasteboardItems ?? []
+    guard items.count <= 128,
+          items.allSatisfy({ item in
+            item.types.count <= 128 && item.types.allSatisfy { $0.rawValue.utf8.count <= 1_024 }
+          }) else { throw ComputerAccessibilityError.clipboardFailed }
+    // Keep the pasteboard items themselves. Reading every declared type here
+    // can force unbounded or expensive lazy providers before we ever paste.
+    return PasteboardSnapshot(items: items)
+  }
+
+  private static func restorePasteboard(
+    _ pasteboard: NSPasteboard,
+    saved: PasteboardSnapshot,
+    expectedChangeCount: Int
+  ) {
+    // Never overwrite a clipboard change the user or another application made
+    // while the synthetic paste was in flight.
+    guard pasteboard.changeCount == expectedChangeCount else { return }
     pasteboard.clearContents()
-    let items: [NSPasteboardItem] = saved.map { values in
-      let item = NSPasteboardItem()
-      for (type, data) in values { item.setData(data, forType: type) }
-      return item
-    }
-    if !items.isEmpty { _ = pasteboard.writeObjects(items) }
+    if !saved.items.isEmpty { _ = pasteboard.writeObjects(saved.items) }
   }
 }

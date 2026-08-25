@@ -389,6 +389,9 @@ test("Mac Quick Ask owns a durable inline approval surface", () => {
   assert.match(approvals, /terminalDecisionError\(statusCode: http\.statusCode, data: data\)[\s\S]{0,500}items\.removeAll/);
   assert.match(approvals, /sourceSessionId = try c\.decodeIfPresent\(Context\.self, forKey: \.context\)\?\.sessionId/);
   assert.match(approvals, /lastChatSessionId = terminal\.chatSessionId \?\? lastChatSessionId/);
+  assert.match(approvals, /let isComputerUseApproval = Self\.isComputerUseApproval/);
+  assert.match(approvals, /if isComputerUseApproval \{[\s\S]{0,250}lastChatSessionId = sourceSessionId \?\? lastChatSessionId/);
+  assert.match(approvals, /if isComputerUseApproval \{[\s\S]{0,350}activeComputerSessionId = decoded\?\.result\?\.sessionId/);
   assert.match(overlay, /"Approval needed" : "Approvals needed"/);
   assert.match(overlay, /Button\("Approve & run"\)/);
   assert.match(overlay, /Button\("Open chat"\) \{ app\.openChatSession\(approvals\.lastChatSessionId\) \}/);

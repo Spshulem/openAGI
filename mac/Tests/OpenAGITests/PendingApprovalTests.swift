@@ -67,4 +67,11 @@ final class PendingApprovalTests: XCTestCase {
     XCTAssertEqual(aborted?.error, "Computer task stopped.")
     XCTAssertNil(aborted?.chatSessionId)
   }
+
+  @MainActor
+  func testOnlyComputerUseApprovalsOwnComputerSessionTracking() {
+    XCTAssertTrue(PendingApprovalConsumer.isComputerUseApproval("start_computer_use_session"))
+    XCTAssertFalse(PendingApprovalConsumer.isComputerUseApproval("send_message"))
+    XCTAssertFalse(PendingApprovalConsumer.isComputerUseApproval(nil))
+  }
 }
