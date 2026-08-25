@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-import OpenAGIComputerCore
+@testable import OpenAGIComputerCore
 
 final class ComputerHelperSafetyTests: XCTestCase {
   func testCapturePrivacyFailsClosedOnUnknownIdentity() {
@@ -15,6 +15,30 @@ final class ComputerHelperSafetyTests: XCTestCase {
     XCTAssertFalse(privacy.permits(bundleId: "COM.1PASSWORD.browser-helper", title: "Vault"))
     XCTAssertFalse(privacy.permits(bundleId: "com.example.Browser", title: "Private Window"))
     XCTAssertTrue(privacy.permits(bundleId: "com.example.Editor", title: "Project Notes"))
+    XCTAssertFalse(privacy.permitsBundle("com.apple.MobileSMS"))
+    XCTAssertTrue(privacy.permitsBundle("com.example.Editor"))
+  }
+
+  func testAccessibilityLocatorRoundTripsWithoutBindingIdentityToEditableValue() throws {
+    let locator = ComputerAccessibilityElement(
+      index: 3,
+      path: [0, 2, 1],
+      role: "AXTextArea",
+      subrole: nil,
+      identifier: "editor",
+      title: "Notes",
+      value: "editable content",
+      frame: CGRect(x: 10, y: 20, width: 300, height: 180),
+      actions: ["AXPress", "AXShowMenu"],
+      secure: false
+    )
+    let decoded = try JSONDecoder().decode(
+      ComputerAccessibilityElement.self,
+      from: JSONEncoder().encode(locator)
+    )
+    XCTAssertEqual(decoded, locator)
+    XCTAssertEqual(decoded.frame, CGRect(x: 10, y: 20, width: 300, height: 180))
+    XCTAssertEqual(decoded.value, "editable content")
   }
 
   func testCapturePrivacyLoadsPersistedCustomExclusions() throws {
@@ -206,5 +230,64 @@ final class ComputerHelperSafetyTests: XCTestCase {
     XCTAssertNoThrow(try ComputerInput.validateInputReadiness(
       accessibilityGranted: true, consoleSessionActive: true,
       screenLocked: false, secureInputEnabled: false))
+  }
+
+  func testWireStringsAreBoundedByUTF8Bytes() {
+    let accessibility = ComputerAccessibility.bounded(String(repeating: "😀", count: 100), 121)
+    XCTAssertNotNil(accessibility)
+    XCTAssertLessThanOrEqual(accessibility?.utf8.count ?? .max, 121)
+
+    let application = ComputerApplications.bounded(String(repeating: "界", count: 100))
+    XCTAssertNotNil(application)
+    XCTAssertLessThanOrEqual(application?.utf8.count ?? .max, 240)
+  }
+
+  func testActivationRequiresTheTargetAndACapturableWindow() {
+    XCTAssertTrue(ComputerApplications.activationIsReady(
+      targetBundleIdentifier: "com.example.Editor",
+      frontmostBundleIdentifier: "com.example.Editor",
+      hasCapturableWindow: true
+    ))
+    XCTAssertFalse(ComputerApplications.activationIsReady(
+      targetBundleIdentifier: "com.example.Editor",
+      frontmostBundleIdentifier: "com.example.Editor",
+      hasCapturableWindow: false
+    ))
+    XCTAssertFalse(ComputerApplications.activationIsReady(
+      targetBundleIdentifier: "com.example.Editor",
+      frontmostBundleIdentifier: "com.example.Other",
+      hasCapturableWindow: true
+    ))
+  }
+
+  func testTextSelectionTreatsOverlappingMatchesAsAmbiguous() throws {
+    XCTAssertThrowsError(try ComputerAccessibility.uniqueTextRange(
+      content: "aaa", text: "aa", prefix: nil, suffix: nil
+    )) { error in
+      guard case ComputerAccessibilityError.ambiguousText = error else {
+        return XCTFail("expected ambiguousText, got \(error)")
+      }
+    }
+    XCTAssertEqual(
+      try ComputerAccessibility.uniqueTextRange(
+        content: "before aa and aa after", text: "aa", prefix: "before ", suffix: nil
+      ),
+      NSRange(location: 7, length: 2)
+    )
+  }
+
+  func testApplicationDiscoveryFindsNestedBundlesWithoutEnteringThem() throws {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("openagi-app-discovery-\(UUID().uuidString)", isDirectory: true)
+    let nested = root.appendingPathComponent("Vendor/Product.app", isDirectory: true)
+    let inside = nested.appendingPathComponent("Contents/Hidden.app", isDirectory: true)
+    try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let discovered = ComputerApplications.discoverApplicationURLs(in: root)
+    XCTAssertEqual(
+      discovered.map { $0.resolvingSymlinksInPath() },
+      [nested.resolvingSymlinksInPath()]
+    )
   }
 }

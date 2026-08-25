@@ -44,4 +44,12 @@ test("the build script notarizes an accepted container and staples the app", () 
   assert.match(buildScript, /spctl --assess --type "\$\{ASSESS_TYPE\}"/);
   assert.match(buildScript, /AC_KEYCHAIN_PROFILE/);
   assert.match(buildScript, /-n "\$\{AC_PASSWORD:-\}"/);
+  assert.match(buildScript, /has_framework_rpath/);
+  assert.match(buildScript, /@executable_path\/\.\.\/Frameworks/);
+  assert.match(buildScript, /missing the bundled-framework rpath/);
+  assert.doesNotMatch(
+    buildScript,
+    /install_name_tool -add_rpath[^\n]*\n[^\n]*2>\/dev\/null \|\| true/,
+    "a launch-critical rpath failure must not be suppressed"
+  );
 });

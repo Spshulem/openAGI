@@ -119,8 +119,11 @@ constraint.
 OpenAGI now has a provider-neutral Computer Use tool set rather than a
 provider-specific prompt convention. It includes an explicit, human-approved
 session boundary; live action and reasoning logs; a kill switch; screen reads;
-and click (including double-click)/drag/type/key/move/scroll actions through a
-node-scoped authenticated relay. When
+and semantic Accessibility state; safe app listing/activation; element or
+coordinate clicks (including double-click); drag; type; clipboard-restoring
+plain-text, Markdown, or HTML paste; exact value setting and text selection;
+exposed secondary Accessibility actions; key; move; and element or coordinate
+scroll actions through a node-scoped authenticated relay. When
 no node is reachable, screen inspection falls back to recent local OCR and
 input calls fail explicitly instead of reporting fake success.
 
@@ -141,12 +144,14 @@ fallback. The execution contract is:
 - Password fields, secure-input state, excluded apps/windows, and permission
   uncertainty fail closed.
 - Every requested action records redacted intent, coordinates/keys, and a
-  categorical result. Typed content and its free-form rationale are never
-  persisted. Stop immediately rejects queued/new work and kills a local helper;
+  categorical result. Typed, pasted, assigned, or selected content and its
+  free-form rationale are never persisted. Stop immediately rejects queued/new work and kills a local helper;
   a paired node action already executing remains bounded by the native helper
   timeout and is revoked before another action can run.
-- Image dimensions and display scale are part of the observation/action loop,
-  and each action is followed by a fresh observation before another action.
+- Image dimensions, display scale, and a bounded Accessibility tree are part of
+  the observation/action loop. Element locators never leave the selected node;
+  they are bound to one short-lived screenshot frame, and each action is
+  followed by a fresh observation before another action.
 - Local execution stays local; remote nodes use a scoped credential and never
   receive provider or integration secrets.
 
@@ -161,8 +166,10 @@ reviewed Cua installation. Set `OPENAGI_COMPUTER_BACKEND=cua` and
 `OPENAGI_CUA_DRIVER_PATH` to the absolute executable path on that Mac. OpenAGI
 does not download, install, update, or expose Cua's MCP tools directly: all Cua
 actions stay behind the same OpenAGI approval, fresh-frame, lease, Stop,
-redaction, and node-authentication boundary. The signed OpenAGI helper remains
-the default. Cua's experimental Computer History preview is separate and is
+redaction, and node-authentication boundary. The current reviewed Cua adapter
+advertises coordinate-only capability and is therefore reported as partial,
+not control-ready, until it can execute the complete semantic contract. The
+signed OpenAGI helper remains the default. Cua's experimental Computer History preview is separate and is
 not treated as ambient screen history: it records metadata only for actions
 performed through Cua Driver.
 

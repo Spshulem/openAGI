@@ -137,7 +137,7 @@ public enum ComputerInput {
       throw ComputerInputError.invalidButton(button)
     }
     try cancellation?.check()
-    try requirePhysicalInputReady(focus: focus)
+    try requireActionTimeReadiness(focus: focus)
     var current = CGPoint(x: fromX, y: fromY)
     let down = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: current, mouseButton: mouseButton)
     down?.post(tap: .cghidEventTap)
@@ -152,7 +152,7 @@ public enum ComputerInput {
     let delay = steps > 0 ? Double(durationMs) / Double(steps) / 1_000.0 : 0
     for step in 1...steps {
       try cancellation?.check()
-      try requirePhysicalInputReady(focus: focus)
+      try requireActionTimeReadiness(focus: focus)
       let progress = Double(step) / Double(steps)
       current = CGPoint(
         x: fromX + ((toX - fromX) * progress),
@@ -230,7 +230,8 @@ public enum ComputerInput {
     let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false)
     down?.flags = modifiers
     up?.flags = modifiers
-    try postPhysicalPair(down, up, focus: focus, cancellation: cancellation)
+    try postPhysicalPair(down, up, focus: focus, cancellation: cancellation,
+                         inspectFocusedElement: true)
   }
 
   public static func sendType(_ text: String, focus: ComputerFocusIdentity? = nil,
@@ -248,7 +249,8 @@ public enum ComputerInput {
       // Check before every character pair. Once key-down is posted, key-up is
       // an uninterruptible cleanup boundary so cancellation or a focus change
       // cannot strand a pressed key in the system event stream.
-      try postPhysicalPair(down, up, focus: focus, cancellation: cancellation)
+      try postPhysicalPair(down, up, focus: focus, cancellation: cancellation,
+                           inspectFocusedElement: true)
     }
   }
 
@@ -264,7 +266,7 @@ public enum ComputerInput {
     guard !secureInputEnabled else { throw ComputerInputError.secureInputEnabled }
   }
 
-  private static func requirePhysicalInputReady(focus: ComputerFocusIdentity?) throws {
+  static func requireActionTimeReadiness(focus: ComputerFocusIdentity?) throws {
     try validateInputReadiness(
       accessibilityGranted: accessibilityGranted,
       consoleSessionActive: consoleSessionActive,
@@ -278,18 +280,32 @@ public enum ComputerInput {
     }
   }
 
+  private static func requireTextInputReady(focus: ComputerFocusIdentity?) throws {
+    try requireActionTimeReadiness(focus: focus)
+    if let focus {
+      guard try !ComputerAccessibility.focusedElementIsSecure(
+        processIdentifier: focus.processIdentifier
+      ) else { throw ComputerAccessibilityError.secureElement }
+    }
+  }
+
   private static func postPhysicalEvent(_ event: CGEvent, focus: ComputerFocusIdentity?,
                                         cancellation: ComputerInputCancellation?) throws {
     try cancellation?.check()
-    try requirePhysicalInputReady(focus: focus)
+    try requireActionTimeReadiness(focus: focus)
     event.post(tap: .cghidEventTap)
   }
 
   private static func postPhysicalPair(_ down: CGEvent?, _ up: CGEvent?,
                                        focus: ComputerFocusIdentity?,
-                                       cancellation: ComputerInputCancellation?) throws {
+                                       cancellation: ComputerInputCancellation?,
+                                       inspectFocusedElement: Bool = false) throws {
     try cancellation?.check()
-    try requirePhysicalInputReady(focus: focus)
+    if inspectFocusedElement {
+      try requireTextInputReady(focus: focus)
+    } else {
+      try requireActionTimeReadiness(focus: focus)
+    }
     // Never insert a cancellation/readiness check between these posts. A Stop
     // request is observed before the next pair, after the release is complete.
     down?.post(tap: .cghidEventTap)

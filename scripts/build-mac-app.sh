@@ -98,9 +98,23 @@ cp "${HELPER}" "${APP}/Contents/Resources/OpenAGIComputerHelper"
 chmod +x "${APP}/Contents/Resources/OpenAGIComputerHelper"
 
 # Add @executable_path/../Frameworks to rpath so dyld finds Sparkle.framework
-# inside the bundle. Idempotent: ignore the "already present" error on re-runs.
-install_name_tool -add_rpath "@executable_path/../Frameworks" \
-  "${APP}/Contents/MacOS/OpenAGI" 2>/dev/null || true
+# inside the bundle. A missing rpath produces a correctly signed app that
+# crashes before main(), so treat it as a checked packaging invariant instead
+# of suppressing install_name_tool failures.
+has_framework_rpath() {
+  otool -l "$1" | awk '
+    $1 == "path" && $2 == "@executable_path/../Frameworks" { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+if ! has_framework_rpath "${APP}/Contents/MacOS/OpenAGI"; then
+  install_name_tool -add_rpath "@executable_path/../Frameworks" \
+    "${APP}/Contents/MacOS/OpenAGI"
+fi
+if ! has_framework_rpath "${APP}/Contents/MacOS/OpenAGI"; then
+  echo "Build failed: OpenAGI executable is missing the bundled-framework rpath" >&2
+  exit 1
+fi
 
 # Info.plist with placeholders substituted
 sed -e "s/__VERSION__/${VERSION}/g" -e "s/__BUILD__/${BUILD_NUM}/g" \

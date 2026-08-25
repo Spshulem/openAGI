@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 const DEFAULT_ONLINE_MS = 90_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_MS = 20_000;
-const MAX_RESULT_BYTES = 12 * 1024 * 1024;
+const MAX_RESULT_BYTES = 16 * 1024 * 1024;
 const MAX_COMMAND_BYTES = 256 * 1024;
 const MAX_POLL_RESPONSE_BYTES = 256 * 1024;
 const MAX_QUEUED_COMMANDS = 20;
@@ -43,13 +43,19 @@ export function sanitizeNodeCapabilities(raw) {
         .filter((entry) => entry && /^[a-z0-9][a-z0-9._-]*$/i.test(entry)))]
         .slice(0, 64)
       : [];
-    out.push({
+    const capability = {
       id,
       ready: value.ready === true,
       operations,
       detail: text(value.detail, 200),
       checkedAt: text(value.checkedAt, 40)
-    });
+    };
+    // These booleans distinguish an online input-capable Mac from one whose
+    // current window cannot be captured. Preserve only literal booleans; all
+    // other node-supplied fields remain discarded by this trust boundary.
+    if (typeof value.screenshotReady === "boolean") capability.screenshotReady = value.screenshotReady;
+    if (typeof value.inputReady === "boolean") capability.inputReady = value.inputReady;
+    out.push(capability);
   }
   return out;
 }

@@ -470,6 +470,9 @@ final class AppState: ObservableObject {
     if event == "pending-action-resolved" {
       Task { await PendingApprovalConsumer.shared.refresh() }
     }
+    if event == "computer-use" {
+      PendingApprovalConsumer.shared.handleComputerUseEvent(data)
+    }
   }
 
   private func urlEncode(_ s: String) -> String {

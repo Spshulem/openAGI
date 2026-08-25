@@ -798,6 +798,14 @@ export class AbiRuntime {
       const result = await pruneObservations(this.observations, {
         now,
         logger: (line) => console.log(`[openagi] ${line}`),
+        // Whole-file VACUUM is synchronous in node:sqlite. On a mature capture
+        // database it can block /health long enough for the Mac supervisor to
+        // restart the daemon, after which catch-up retries the same job and
+        // creates a permanent restart loop. Scheduled retention still deletes
+        // expired rows (SQLite reuses those pages); explicit maintenance can
+        // request full/incremental compaction through job.input or the admin
+        // retention route where the user can see the operation in progress.
+        reclaim: "none",
         ...(job.input ?? {})
       });
       this.events?.emit?.("observation-retention", {

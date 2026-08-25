@@ -152,9 +152,9 @@ export class ComputerUseLog {
   markActionResult(id, { result, error, status = "executed" }) {
     const action = this.actions.get(id);
     if (!action) return null;
-    if (action.kind === "type") {
+    if (isSensitiveActionKind(action.kind)) {
       result = { redacted: true, outcome: error ? "failed" : String(status).slice(0, 40) };
-      error = error === undefined || error === null ? undefined : "type-action-failed";
+      error = error === undefined || error === null ? undefined : `${action.kind}-action-failed`;
     }
     action.status = error ? "failed" : status;
     action.executedAt = new Date(this.now()).toISOString();
@@ -227,9 +227,9 @@ export class ComputerUseLog {
         if (a) {
           a.status = event.status;
           a.executedAt = event.executedAt;
-          if (a.kind === "type") {
+          if (isSensitiveActionKind(a.kind)) {
             a.result = { redacted: true, outcome: event.error ? "failed" : String(event.status ?? "executed").slice(0, 40) };
-            a.error = event.error === undefined || event.error === null ? null : "type-action-failed";
+            a.error = event.error === undefined || event.error === null ? null : `${a.kind}-action-failed`;
           } else {
             if (event.result !== undefined) a.result = event.result;
             if (event.error !== undefined) a.error = event.error;
@@ -262,21 +262,22 @@ export class ComputerUseLog {
       const parsed = raw.split("\n").filter((line) => line.trim()).flatMap((line) => {
         try { return [JSON.parse(line)]; } catch { return []; }
       });
-      const typeIds = new Set(parsed
-        .filter((event) => event.op === "action-record" && event.action?.kind === "type")
-        .map((event) => event.action.id));
+      const sensitiveActions = new Map(parsed
+        .filter((event) => event.op === "action-record" && isSensitiveActionKind(event.action?.kind))
+        .map((event) => [event.action.id, event.action.kind]));
       let changed = parsed.length !== raw.split("\n").filter((line) => line.trim()).length;
       const safeEvents = parsed.map((event) => {
-        if (event.op === "action-record" && event.action?.kind === "type") {
+        if (event.op === "action-record" && isSensitiveActionKind(event.action?.kind)) {
           const action = sanitizeLoadedAction(event.action);
           if (JSON.stringify(action) !== JSON.stringify(event.action)) changed = true;
           return { ...event, action };
         }
-        if (event.op === "action-result" && typeIds.has(event.id)) {
+        if (event.op === "action-result" && sensitiveActions.has(event.id)) {
+          const kind = sensitiveActions.get(event.id);
           const safe = {
             ...event,
             result: { redacted: true, outcome: event.error ? "failed" : String(event.status ?? "executed").slice(0, 40) },
-            error: event.error === undefined || event.error === null ? undefined : "type-action-failed"
+            error: event.error === undefined || event.error === null ? undefined : `${kind}-action-failed`
           };
           if (JSON.stringify(safe) !== JSON.stringify(event)) changed = true;
           return safe;
@@ -325,7 +326,19 @@ export class ComputerUseLog {
 }
 
 function sanitizeActionArgs(kind, args) {
-  if (kind !== "type") return { ...args };
+  if (!isSensitiveActionKind(kind)) return { ...args };
+  if (kind !== "type") {
+    const out = { ...args };
+    for (const field of SENSITIVE_ACTION_FIELDS[kind] ?? []) {
+      if (!Object.hasOwn(out, field)) continue;
+      const value = typeof out[field] === "string" ? out[field] : "";
+      delete out[field];
+      out[`${field}Redacted`] = true;
+      out[`${field}CharacterCount`] = [...value].length;
+      out[`${field}ByteCount`] = Buffer.byteLength(value, "utf8");
+    }
+    return out;
+  }
   if (typeof args?.text !== "string" && args?.textRedacted === true) {
     return {
       textRedacted: true,
@@ -344,23 +357,34 @@ function sanitizeActionArgs(kind, args) {
 function sanitizeReasoning(reasoning, kind, args) {
   // A model's rationale for typing commonly repeats or paraphrases the value.
   // Persist no free-form reasoning for this action class.
-  if (kind === "type") return null;
+  if (isSensitiveActionKind(kind)) return null;
   if (reasoning == null) return null;
   return String(reasoning).slice(0, 500);
 }
 
 function sanitizeLoadedAction(action) {
   if (!action || typeof action !== "object") return action;
-  if (action.kind !== "type") return action;
+  if (!isSensitiveActionKind(action.kind)) return action;
   const hadError = action.error !== undefined && action.error !== null;
   return {
     ...action,
-    args: sanitizeActionArgs("type", action.args),
+    args: sanitizeActionArgs(action.kind, action.args),
     reasoning: null,
     result: action.result == null ? action.result : {
       redacted: true,
       outcome: hadError ? "failed" : String(action.status ?? "executed").slice(0, 40)
     },
-    error: hadError ? "type-action-failed" : action.error
+    error: hadError ? `${action.kind}-action-failed` : action.error
   };
+}
+
+const SENSITIVE_ACTION_FIELDS = Object.freeze({
+  type: ["text"],
+  paste: ["text"],
+  set_value: ["value"],
+  select_text: ["text", "prefix", "suffix"]
+});
+
+function isSensitiveActionKind(kind) {
+  return Object.hasOwn(SENSITIVE_ACTION_FIELDS, kind);
 }

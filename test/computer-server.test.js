@@ -5,10 +5,15 @@ import os from "node:os";
 import path from "node:path";
 import { createComputerExecutor, createComputerServer, runComputerHelper } from "../src/integrations/computer-server.js";
 
+const FULL_INPUT_OPERATIONS = [
+  "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste",
+  "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"
+];
+
 const ready = async () => ({
   screenshotReady: true,
   inputReady: true,
-  operations: ["click", "drag", "move", "type", "key", "scroll"],
+  operations: FULL_INPUT_OPERATIONS,
   detail: "ready"
 });
 
@@ -24,7 +29,15 @@ const privateFocus = Object.freeze({
 });
 
 function screenshotResult(overrides = {}) {
-  return { format: "png", base64: "x", width: 100, height: 100, bytes: 1, scale: 1, focus: privateFocus, ...overrides };
+  return {
+    format: "png", base64: "x", width: 100, height: 100, bytes: 1, scale: 1,
+    accessibility: "[0] AXButton \"Save\" actions=AXPress",
+    elements: [{
+      index: 0, path: [2], role: "AXButton", subrole: null, identifier: "save-button",
+      title: "Save", x: 10, y: 20, width: 80, height: 30, actions: ["AXPress", "AXShowMenu"], secure: false
+    }],
+    focus: privateFocus, ...overrides
+  };
 }
 
 function executor(opts = {}) {
@@ -39,7 +52,7 @@ async function lease(computer, sessionId = "chat:one", maxActions = 20) {
   return await computer.invoke("session.start", {
     sessionId,
     goalHash: "a".repeat(64),
-    allowedOperations: ["session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"],
+    allowedOperations: ["session.end", "screenshot", ...FULL_INPUT_OPERATIONS],
     maxActions
   });
 }
@@ -65,6 +78,109 @@ test("health is capability-specific and the HTTP wrapper authenticates every rou
     assert.equal(body.capability.id, "computer-use");
     assert.equal(body.capability.ready, true);
     assert.ok(body.capability.operations.includes("scroll"));
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test("legacy or malformed helper readiness never invents semantic operations", async () => {
+  const computer = createComputerExecutor({
+    capabilityStatus: async () => ({ screenshotReady: true, inputReady: true, detail: "legacy helper" })
+  });
+  const health = await computer.health();
+  assert.equal(health.capability.inputReady, false);
+  assert.deepEqual(health.capability.operations, ["session.start", "session.end", "screenshot"]);
+});
+
+test("a privacy-excluded foreground window keeps app activation ready until screenshots recover", async () => {
+  let screenshotReady = false;
+  const calls = [];
+  const computer = createComputerExecutor({
+    capabilityStatus: async () => ({
+      screenshotReady,
+      capturePrerequisitesReady: true,
+      inputReady: true,
+      operations: FULL_INPUT_OPERATIONS,
+      detail: screenshotReady ? "ready" : "OpenAGI is the frontmost privacy-excluded window"
+    }),
+    helperPath: "/signed/helper",
+    helperRun: async (_command, operation) => {
+      calls.push(operation);
+      if (operation === "list_apps") {
+        return { stdout: Buffer.from('{"apps":[{"bundleIdentifier":"com.example.Editor","name":"Editor","running":true}]}'), stderr: Buffer.alloc(0) };
+      }
+      if (operation === "activate_app") {
+        screenshotReady = true;
+        return { stdout: Buffer.from('{"bundleIdentifier":"com.example.Editor","name":"Editor","running":true}'), stderr: Buffer.alloc(0) };
+      }
+      if (operation === "screenshot") {
+        return { stdout: Buffer.from(JSON.stringify(screenshotResult())), stderr: Buffer.alloc(0) };
+      }
+      return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) };
+    }
+  });
+
+  const obscured = await computer.health();
+  assert.equal(obscured.capability.ready, true, "the approval overlay must not make the node disappear");
+  assert.equal(obscured.capability.screenshotReady, false);
+  assert.ok(obscured.capability.operations.includes("screenshot"), "temporary availability does not erase supported operations");
+
+  const active = await computer.invoke("session.start", {
+    sessionId: "chat:overlay",
+    goalHash: "a".repeat(64),
+    allowedOperations: ["session.end", "screenshot", "list_apps", "activate_app"]
+  });
+  await assert.rejects(() => action(computer, active, 1, "screenshot"), /privacy-excluded/);
+  const apps = await action(computer, active, 2, "list_apps");
+  assert.equal(apps.apps[0].bundleIdentifier, "com.example.Editor");
+  await action(computer, active, 3, "activate_app", { bundleIdentifier: "com.example.Editor" });
+  const shot = await action(computer, active, 4, "screenshot");
+  assert.equal(typeof shot.frameId, "string");
+  assert.deepEqual(calls, ["list_apps", "activate_app", "screenshot"]);
+});
+
+test("health rejects input-only nodes when capture prerequisites are missing", async () => {
+  const computer = createComputerExecutor({
+    capabilityStatus: async () => ({
+      screenshotReady: false,
+      capturePrerequisitesReady: false,
+      inputReady: true,
+      operations: FULL_INPUT_OPERATIONS,
+      detail: "grant Screen Recording to OpenAGI"
+    })
+  });
+  const health = await computer.health();
+  assert.equal(health.ok, false);
+  assert.equal(health.capability.ready, false);
+  assert.equal(health.capability.inputReady, true, "raw input permission remains diagnostic only");
+  assert.equal(health.capability.capturePrerequisitesReady, false);
+});
+
+test("HTTP wrapper exposes drag and every semantic action route", async () => {
+  const calls = [];
+  const server = createComputerServer({
+    token: "secret",
+    executor: {
+      health: async () => ({ ok: true }),
+      invoke: async (operation, payload) => { calls.push([operation, payload]); return { ok: true }; }
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (const [route, operation] of [
+      ["/drag", "drag"], ["/click-element", "click_element"], ["/paste", "paste"],
+      ["/set-value", "set_value"], ["/select-text", "select_text"],
+      ["/secondary-action", "secondary_action"], ["/scroll-element", "scroll_element"]
+    ]) {
+      const response = await fetch(`${base}${route}`, {
+        method: "POST",
+        headers: { authorization: "Bearer secret", "content-type": "application/json" },
+        body: JSON.stringify({ marker: operation })
+      });
+      assert.equal(response.status, 200, `${route} is reachable`);
+    }
+    assert.deepEqual(calls.map(([operation]) => operation), [
+      "drag", "click_element", "paste", "set_value", "select_text", "secondary_action", "scroll_element"
+    ]);
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
@@ -94,6 +210,54 @@ test("executor binds coordinates to a screenshot frame and scales them", async (
   await assert.rejects(
     () => action(computer, active, 7, "click", { frameId: finalShot.frameId, x: 1280, y: 5, button: "left" }),
     /unknown, stale, or expired|outside the referenced screenshot/
+  );
+});
+
+test("executor keeps semantic locators node-private and maps the complete app/element action contract", async () => {
+  const calls = [];
+  const computer = executor({
+    helperPath: "/signed/helper",
+    helperRun: async (command, operation, payload) => {
+      calls.push([command, operation, payload]);
+      if (operation === "list_apps") {
+        return { stdout: Buffer.from(JSON.stringify({ apps: [{ bundleIdentifier: "com.example.Editor", name: "Editor", running: true }] })), stderr: Buffer.alloc(0) };
+      }
+      if (operation === "activate_app") {
+        return { stdout: Buffer.from(JSON.stringify({ bundleIdentifier: "com.example.Editor", name: "Editor", running: true })), stderr: Buffer.alloc(0) };
+      }
+      return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) };
+    },
+    screenshot: async () => screenshotResult()
+  });
+  const active = await lease(computer, "chat:semantic", 40);
+  const apps = await action(computer, active, 1, "list_apps");
+  assert.deepEqual(apps.apps, [{ bundleIdentifier: "com.example.Editor", name: "Editor", running: true }]);
+  const activated = await action(computer, active, 2, "activate_app", { bundleIdentifier: "com.example.Editor" });
+  assert.equal(activated.app.bundleIdentifier, "com.example.Editor");
+
+  const operations = [
+    ["click_element", { elementIndex: 0 }],
+    ["set_value", { elementIndex: 0, text: "private value" }],
+    ["paste", { elementIndex: 0, text: "private paste", format: "md" }],
+    ["select_text", { elementIndex: 0, text: "private", prefix: "", suffix: " value", selectionType: "text" }],
+    ["secondary_action", { elementIndex: 0, action: "AXShowMenu" }],
+    ["scroll_element", { elementIndex: 0, direction: "down", pages: 2 }]
+  ];
+  let sequence = 3;
+  for (const [operation, payload] of operations) {
+    const shot = await action(computer, active, sequence++, "screenshot");
+    await action(computer, active, sequence++, operation, { ...payload, frameId: shot.frameId });
+  }
+
+  const state = await action(computer, active, sequence++, "screenshot");
+  assert.equal(state.accessibility.includes("AXButton"), true);
+  assert.equal("elements" in state, false, "private locator paths never leave the node executor");
+  const semanticCall = calls.find(([, operation]) => operation === "click_element");
+  assert.equal(semanticCall[2].locator.identifier, "save-button");
+  assert.deepEqual(semanticCall[2].focus, privateFocus);
+  await assert.rejects(
+    () => action(computer, active, sequence, "click_element", { frameId: state.frameId, elementIndex: 99 }),
+    /elementIndex is unknown or stale/
   );
 });
 

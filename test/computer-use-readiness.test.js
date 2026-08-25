@@ -35,7 +35,7 @@ test("computer-use readiness distinguishes disabled, observe-only, and control-r
             id: "computer-use",
             screenshotReady: true,
             inputReady: true,
-            operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"]
+            operations: ["session.start", "session.end", "screenshot", "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste", "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"]
           }
         })
       };
@@ -65,6 +65,101 @@ test("a reachable node without verified input permissions is not control-ready",
   assert.equal(status.nodeReachable, true);
   assert.equal(status.mode, "permissions-required");
   assert.equal(status.inputAvailable, false);
+});
+
+test("a baseline node remains control-ready when optional drag and semantic actions are unavailable", async () => {
+  const status = await computerUseReadiness({
+    env: {
+      OPENAGI_COMPUTER_USE: "1",
+      OPENAGI_COMPUTER_NODE: "https://computer.example",
+      OPENAGI_COMPUTER_NODE_TOKEN: "scoped"
+    },
+    fetchImpl: async () => new Response(JSON.stringify({
+      capability: {
+        id: "computer-use",
+        screenshotReady: true,
+        inputReady: true,
+        operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+      }
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+    toolsRegistered: true
+  });
+  assert.equal(status.mode, "control-ready");
+  assert.equal(status.inputAvailable, true);
+  assert.equal(status.operations.includes("drag"), false, "optional actions are reported honestly, not invented");
+});
+
+test("a privacy-excluded foreground window remains available for app selection", async () => {
+  const status = await computerUseReadiness({
+    env: {
+      OPENAGI_COMPUTER_USE: "1",
+      OPENAGI_COMPUTER_NODE: "https://computer.example",
+      OPENAGI_COMPUTER_NODE_TOKEN: "scoped"
+    },
+    fetchImpl: async () => new Response(JSON.stringify({
+      capability: {
+        id: "computer-use",
+        ready: true,
+        screenshotReady: false,
+        inputReady: true,
+        operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+      }
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+    toolsRegistered: true
+  });
+  assert.equal(status.mode, "app-selection-required");
+  assert.equal(status.nodeReachable, true);
+  assert.equal(status.inputAvailable, true);
+  assert.equal(status.screenshot, "recent-ocr");
+});
+
+test("an explicit node with input but missing capture prerequisites requires permissions", async () => {
+  const status = await computerUseReadiness({
+    env: {
+      OPENAGI_COMPUTER_USE: "1",
+      OPENAGI_COMPUTER_NODE: "https://computer.example",
+      OPENAGI_COMPUTER_NODE_TOKEN: "scoped"
+    },
+    fetchImpl: async () => new Response(JSON.stringify({
+      capability: {
+        id: "computer-use",
+        ready: false,
+        screenshotReady: false,
+        inputReady: true,
+        operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+      }
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+    toolsRegistered: true
+  });
+  assert.equal(status.mode, "permissions-required");
+  assert.equal(status.inputAvailable, false);
+});
+
+test("a relayed node preserves privacy-excluded screenshot readiness", async () => {
+  const record = {
+    nodeId: "paired-node",
+    capabilities: [{
+      id: "computer-use",
+      ready: true,
+      screenshotReady: false,
+      inputReady: true,
+      operations: ["session.start", "session.end", "screenshot", "list_apps", "activate_app", "click", "move", "type", "key", "scroll"]
+    }]
+  };
+  const status = await computerUseReadiness({
+    env: { OPENAGI_COMPUTER_USE: "1" },
+    runtime: {
+      nodeCapabilities: {
+        refresh: async () => {},
+        resolve: () => record,
+        dispatch: async () => ({ ok: true })
+      }
+    },
+    toolsRegistered: true
+  });
+  assert.equal(status.mode, "app-selection-required");
+  assert.equal(status.screenshot, "recent-ocr");
+  assert.equal(status.inputAvailable, true);
 });
 
 test("an unreachable configured node is explicit, not fake-ready", async () => {

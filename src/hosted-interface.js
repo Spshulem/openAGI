@@ -8121,11 +8121,13 @@ async function renderComputerUse() {
   const computerApprovals = (pendingData.actions ?? []).filter((action) => action.toolName === "start_computer_use_session");
   const active = sessions.find((s) => s.status === "active");
   const modeCopy = readiness.mode === "control-ready"
-    ? "Ready — privacy-filtered live screenshots plus click, type, key, move, and scroll actions execute through the selected computer-use node."
+    ? "Ready — privacy-filtered live screenshots, semantic Accessibility elements, app activation, clicking, dragging, text editing, key presses, pointer movement, and scrolling execute through the selected computer-use node."
+    : readiness.mode === "app-selection-required"
+      ? "Ready to choose an app — input control is available, but the current window is privacy-protected or not capturable. The agent can list and activate the approved target app, then take a fresh screenshot before acting."
     : readiness.mode === "node-unreachable"
       ? "Enabled, but the configured computer-use node is unreachable. Screen reads fall back to recent OCR; input is refused."
       : readiness.mode === "observe-only"
-        ? "Observation-only — the agent can inspect recent local OCR. Click, type, key, and move require a connected computer-use node; scroll is not yet supported."
+        ? "Observation-only — the agent can inspect recent local OCR. Live screenshots and every input action require a connected, fully permissioned computer-use node."
         : "Off — enable it here before asking the agent to inspect or control the computer.";
 
   const computerActionCopy = (action) => {
@@ -8137,11 +8139,24 @@ async function renderComputerUse() {
     };
     switch (action?.kind) {
       case "screenshot": return "Inspect the current screen";
-      case "click": return "Click at x " + text(args.x) + ", y " + text(args.y);
+      case "list_apps": return "List safe applications";
+      case "activate_app": return "Activate “" + text(args.bundleIdentifier) + "”";
+      case "click": {
+        const count = Number.isInteger(args.count) && args.count >= 1 && args.count <= 3 ? args.count : 1;
+        const verb = count === 2 ? "Double-click" : count === 3 ? "Triple-click" : "Click";
+        return verb + " " + text(args.button ?? "left") + " button at x " + text(args.x) + ", y " + text(args.y);
+      }
+      case "click_element": return "Click element " + text(args.elementIndex);
+      case "drag": return "Drag " + text(args.button ?? "left") + " button from x " + text(args.fromX) + ", y " + text(args.fromY) + " to x " + text(args.toX) + ", y " + text(args.toY) + " over " + text(args.durationMs ?? 350) + " ms";
       case "type": return "Type " + text(args.characterCount ?? 0) + " redacted character" + (args.characterCount === 1 ? "" : "s");
+      case "paste": return "Paste " + text(args.textCharacterCount ?? 0) + " redacted character" + (args.textCharacterCount === 1 ? "" : "s") + " as " + text(args.format ?? "text");
+      case "set_value": return "Set element " + text(args.elementIndex) + " to " + text(args.valueCharacterCount ?? 0) + " redacted character" + (args.valueCharacterCount === 1 ? "" : "s");
+      case "select_text": return "Select " + text(args.textCharacterCount ?? 0) + " redacted character" + (args.textCharacterCount === 1 ? "" : "s") + " in element " + text(args.elementIndex);
+      case "secondary_action": return "Perform “" + text(args.action) + "” on element " + text(args.elementIndex);
       case "key": return "Press “" + text(args.chord) + "”";
       case "move": return "Move the pointer to x " + text(args.x) + ", y " + text(args.y);
       case "scroll": return "Scroll by x " + text(args.deltaX ?? 0) + ", y " + text(args.deltaY ?? 0);
+      case "scroll_element": return "Scroll " + text(args.direction) + " in element " + text(args.elementIndex);
       default: {
         const details = Object.entries(args).slice(0, 4).map(([key, value]) => {
           const readable = value != null && typeof value === "object" ? "details recorded" : text(value, 60);

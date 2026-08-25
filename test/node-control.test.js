@@ -9,7 +9,7 @@ import { NodeRegistry } from "../src/node-registry.js";
 const capability = () => [{
   id: "computer-use",
   ready: true,
-  operations: ["session.start", "session.end", "screenshot", "click", "drag", "move", "type", "key", "scroll"],
+  operations: ["session.start", "session.end", "screenshot", "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste", "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"],
   checkedAt: new Date().toISOString()
 }];
 
@@ -25,6 +25,17 @@ test("capability advertisements discard endpoint, token, and executable fields",
   assert.equal("url" in out[0], false);
   assert.equal("token" in out[0], false);
   assert.equal("command" in out[0], false);
+});
+
+test("capability advertisements preserve only literal readiness booleans", () => {
+  const [current, malformed] = sanitizeNodeCapabilities([
+    { ...capability()[0], screenshotReady: false, inputReady: true },
+    { id: "legacy", ready: true, operations: ["screenshot"], screenshotReady: "yes", inputReady: 1 }
+  ]);
+  assert.equal(current.screenshotReady, false);
+  assert.equal(current.inputReady, true);
+  assert.equal("screenshotReady" in malformed, false);
+  assert.equal("inputReady" in malformed, false);
 });
 
 test("broker dispatches only to the selected ready node and rejects mismatched results", async () => {

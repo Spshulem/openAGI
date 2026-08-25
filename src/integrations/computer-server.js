@@ -14,7 +14,10 @@ const execFileAsync = promisify(execFile);
 //   POST /session/start { sessionId }    -> short-lived node-side lease
 //   POST /session/end   { leaseId, ... } -> revoke lease
 //   POST /screenshot {}                  -> { format, base64, width, height, scale, ... }
+//   POST /list-apps {}                   -> safe app names + bundle identifiers
+//   POST /activate-app { bundleIdentifier } -> { app }
 //   POST /click  { x, y, button? }       -> { ok: true }
+//   POST /click-element { frameId, elementIndex } -> { ok: true }
 //   POST /drag   { fromX, fromY, toX, toY } -> { ok: true }
 //   POST /move   { x, y }                -> { ok: true }
 //   POST /type   { text }                -> { ok: true }
@@ -36,7 +39,16 @@ const execFileAsync = promisify(execFile);
 // sensitive action data must travel over the helper's stdin, not process argv.
 
 const SCALE_WIDTH = Number(process.env.OPENAGI_COMPUTER_SCALE_WIDTH ?? "1280") || 0; // 0 = no scaling
-const INPUT_OPERATIONS = ["click", "drag", "move", "type", "key", "scroll"];
+const INPUT_OPERATIONS = [
+  "list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "paste",
+  "set_value", "select_text", "secondary_action", "key", "scroll", "scroll_element"
+];
+// A frontmost OpenAGI approval surface is intentionally excluded from screen
+// capture. That must not make the node disappear: app discovery/activation can
+// move focus to the user-approved target and restore a capturable frame. Keep
+// readiness tied to the long-standing input floor while negotiating newer
+// operations independently.
+const BASELINE_INPUT_OPERATIONS = ["click", "move", "type", "key", "scroll"];
 const ALL_OPERATIONS = ["session.start", "session.end", "screenshot", ...INPUT_OPERATIONS];
 const DEFAULT_IDLE_LEASE_MS = 2 * 60 * 1000;
 const DEFAULT_ABSOLUTE_LEASE_MS = 15 * 60 * 1000;
@@ -119,7 +131,9 @@ export function createComputerExecutor({
       return leasePublic(existing);
     }
     const status = await inspect();
-    const supported = ["session.end", ...(status.screenshotReady ? ["screenshot"] : []), ...status.operations];
+    // Screenshot is a supported operation even when the current foreground
+    // window is privacy-excluded. Its invoke path re-checks live availability.
+    const supported = ["session.end", "screenshot", ...status.operations];
     const requested = Array.isArray(payload?.allowedOperations)
       ? payload.allowedOperations.filter((operation) => supported.includes(operation))
       : supported;
@@ -197,7 +211,8 @@ export function createComputerExecutor({
       return result;
     } catch (error) {
       // A helper must never turn typed content into an HTTP/node-control error.
-      const message = operation === "type" ? "computer type action failed" : mapError(error);
+      const sensitiveOperation = ["type", "paste", "set_value", "select_text"].includes(operation);
+      const message = sensitiveOperation ? `computer ${operation} action failed` : mapError(error);
       lease.results.set(actionId, { sequence, operation, signature, error: message });
       trimResults(lease.results);
       const failure = new Error(message);
@@ -237,12 +252,13 @@ export function createComputerExecutor({
         ));
         const frameId = `cuframe_${crypto.randomUUID().replaceAll("-", "")}`;
         const focus = normalizePrivateFocus(shot.focus);
-        const { focus: _privateFocus, ...publicShot } = shot;
+        const { focus: _privateFocus, elements: _privateElements, ...publicShot } = shot;
         lease.frames.clear();
         lease.frames.set(frameId, {
           width: Number(shot.width), height: Number(shot.height), scale: Number(shot.scale) || 1,
           offsetX: Number(shot.offsetX) || 0, offsetY: Number(shot.offsetY) || 0,
           focus,
+          elements: Array.isArray(shot.elements) ? shot.elements : [],
           createdAt: now()
         });
         return { ...publicShot, frameId };
@@ -257,12 +273,14 @@ export function createComputerExecutor({
         // Typed text goes through stdin, never argv: command arguments are
         // visible to other local processes via ps even when the audit log is
         // properly redacted.
-        await runForLease(lease, (signal) => helperRun(helperPath, operation, action, {
+        const helperResult = await runForLease(lease, (signal) => helperRun(helperPath, operation, action, {
           timeoutMs: 10_000,
           maxStdoutBytes: 128 * 1024,
           signal
         }));
-        lease.frames.clear();
+        if (operation !== "list_apps") lease.frames.clear();
+        if (operation === "list_apps") return normalizeApplicationList(helperResult.stdout);
+        if (operation === "activate_app") return normalizeActivatedApplication(helperResult.stdout);
         return { ok: true };
       }
       throw new Error("computer input requires the signed OpenAGI computer helper");
@@ -272,17 +290,24 @@ export function createComputerExecutor({
   return {
     async health() {
       const status = await inspect();
+      const baselineInput = status.inputReady
+        && BASELINE_INPUT_OPERATIONS.every((operation) => status.operations.includes(operation));
+      // Input alone is insufficient: the agent needs a fresh visual frame
+      // before acting. Privacy exclusion is recoverable through app activation;
+      // missing Screen Recording or an active display is not.
+      const recoverableCapture = status.screenshotReady || status.capturePrerequisitesReady;
       return {
-        ok: status.screenshotReady && status.inputReady,
+        ok: baselineInput && recoverableCapture,
         service: "computer",
         capability: {
           id: "computer-use",
-          ready: status.screenshotReady && status.inputReady,
+          ready: baselineInput && recoverableCapture,
           operations: ALL_OPERATIONS.filter((operation) => (
             !INPUT_OPERATIONS.includes(operation) || status.operations.includes(operation)
           )),
           screenshotReady: status.screenshotReady,
           inputReady: status.inputReady,
+          capturePrerequisitesReady: status.capturePrerequisitesReady,
           detail: status.detail,
           checkedAt: new Date(now()).toISOString()
         }
@@ -346,12 +371,20 @@ function operationForPath(pathname) {
     "/session/start": "session.start",
     "/session/end": "session.end",
     "/screenshot": "screenshot",
+    "/list-apps": "list_apps",
+    "/activate-app": "activate_app",
     "/click": "click",
+    "/click-element": "click_element",
     "/drag": "drag",
     "/move": "move",
     "/type": "type",
+    "/paste": "paste",
+    "/set-value": "set_value",
+    "/select-text": "select_text",
+    "/secondary-action": "secondary_action",
     "/key": "key",
-    "/scroll": "scroll"
+    "/scroll": "scroll",
+    "/scroll-element": "scroll_element"
   })[pathname] ?? null;
 }
 
@@ -368,11 +401,15 @@ function authorized(req, token) {
 function normalizeCapabilityStatus(raw = {}) {
   const operations = Array.isArray(raw.operations)
     ? raw.operations.filter((operation) => INPUT_OPERATIONS.includes(operation))
-    : (raw.inputReady === true ? [...INPUT_OPERATIONS] : []);
+    : [];
+  const screenshotReady = typeof raw.screenshotReady === "boolean" ? raw.screenshotReady : raw.screenRecording === true;
   return {
-    screenshotReady: typeof raw.screenshotReady === "boolean" ? raw.screenshotReady : raw.screenRecording === true,
+    screenshotReady,
+    capturePrerequisitesReady: typeof raw.capturePrerequisitesReady === "boolean"
+      ? raw.capturePrerequisitesReady
+      : screenshotReady,
     inputReady: (typeof raw.inputReady === "boolean" ? raw.inputReady : raw.accessibility === true)
-      && INPUT_OPERATIONS.every((operation) => operations.includes(operation)),
+      && operations.length > 0,
     operations,
     detail: typeof raw.detail === "string" ? raw.detail.slice(0, 300) : null
   };
@@ -426,6 +463,14 @@ function finiteInteger(value, label) {
 }
 
 function normalizeInputPayload(operation, payload, lease, at, frameTtlMs) {
+  if (operation === "list_apps") return {};
+  if (operation === "activate_app") {
+    const bundleIdentifier = String(payload.bundleIdentifier ?? "").trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]+$/.test(bundleIdentifier) || Buffer.byteLength(bundleIdentifier, "utf8") > 512) {
+      throw new Error("bundleIdentifier is malformed");
+    }
+    return { bundleIdentifier };
+  }
   if (operation === "click") {
     const button = payload.button;
     if (!["left", "right", "middle"].includes(button)) throw new Error("button must be left, right, or middle");
@@ -447,6 +492,42 @@ function normalizeInputPayload(operation, payload, lease, at, frameTtlMs) {
       toX: scale(to.x, frame.scale), toY: scale(to.y, frame.scale),
       button, durationMs, focus: frame.focus
     };
+  }
+  if (["click_element", "paste", "set_value", "select_text", "secondary_action", "scroll_element"].includes(operation)) {
+    const target = elementInFrame(payload, lease, at, frameTtlMs);
+    const base = { locator: target.locator, focus: target.frame.focus };
+    if (operation === "click_element") return base;
+    if (operation === "paste" || operation === "set_value" || operation === "select_text") {
+      const text = payload.text;
+      const limit = operation === "paste" ? 64 * 1024 : 16 * 1024;
+      if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > limit || text.includes("\0")) {
+        throw new Error(`${operation} text is missing, too large, or contains NUL`);
+      }
+      if (operation === "paste") {
+        const format = String(payload.format ?? "");
+        if (!["text", "md", "html"].includes(format)) throw new Error("paste format must be text, md, or html");
+        return { ...base, text, format };
+      }
+      if (operation === "set_value") return { ...base, text };
+      const prefix = optionalBoundedText(payload.prefix, "prefix", 4 * 1024);
+      const suffix = optionalBoundedText(payload.suffix, "suffix", 4 * 1024);
+      const selectionType = String(payload.selectionType ?? "text");
+      if (!["text", "cursor_before", "cursor_after"].includes(selectionType)) throw new Error("selectionType is invalid");
+      return { ...base, text, prefix, suffix, selectionType };
+    }
+    if (operation === "secondary_action") {
+      const action = String(payload.action ?? "");
+      if (!action || action.length > 120 || action.includes("\0") || !target.locator.actions.includes(action) || action === "AXPress") {
+        throw new Error("secondary action is not exposed by the referenced element");
+      }
+      return { ...base, action };
+    }
+    const direction = String(payload.direction ?? "");
+    const pages = payload.pages == null ? 1 : finiteInteger(payload.pages, "pages");
+    if (!["up", "down", "left", "right"].includes(direction) || pages < 1 || pages > 10) {
+      throw new Error("scroll element direction or pages is invalid");
+    }
+    return { ...base, direction, pages };
   }
   if (operation === "move") {
     const point = pointInFrame(payload, lease, at, frameTtlMs);
@@ -490,6 +571,24 @@ function pointInFrame(payload, lease, at, frameTtlMs) {
   const frame = requireFreshFrame(payload, lease, at, frameTtlMs);
   const { x, y } = pointCoordinatesInFrame(payload.x, payload.y, frame);
   return { x, y, frame };
+}
+
+function elementInFrame(payload, lease, at, frameTtlMs) {
+  const frame = requireFreshFrame(payload, lease, at, frameTtlMs);
+  const elementIndex = finiteInteger(payload.elementIndex, "elementIndex");
+  const locator = frame.elements?.[elementIndex];
+  if (!locator || locator.index !== elementIndex) {
+    throw new Error("elementIndex is unknown or stale; take a fresh computer state");
+  }
+  return { locator, frame };
+}
+
+function optionalBoundedText(value, label, limit) {
+  if (value == null) return null;
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > limit || value.includes("\0")) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value;
 }
 
 function pointCoordinatesInFrame(rawX, rawY, frame, prefix = "") {
@@ -625,7 +724,7 @@ async function screenshotFromHelper(helperRun, helperPath, { signal = null } = {
   if (!helperPath) throw new Error("the signed OpenAGI computer helper is unavailable");
   const { stdout } = await helperRun(helperPath, "screenshot", null, {
     timeoutMs: 10_000,
-    maxStdoutBytes: 12 * 1024 * 1024,
+    maxStdoutBytes: 16 * 1024 * 1024,
     maxStderrBytes: 32 * 1024,
     signal
   });
@@ -645,8 +744,67 @@ async function screenshotFromHelper(helperRun, helperPath, { signal = null } = {
     scale: Number.isFinite(shot.scale) && shot.scale > 0 ? shot.scale : 1,
     offsetX: Number.isFinite(shot.offsetX) ? shot.offsetX : 0,
     offsetY: Number.isFinite(shot.offsetY) ? shot.offsetY : 0,
+    accessibility: typeof shot.accessibility === "string" && Buffer.byteLength(shot.accessibility, "utf8") <= 96 * 1024
+      ? shot.accessibility
+      : "",
+    elements: normalizePrivateElements(shot.elements),
     focus: normalizePrivateFocus(shot.focus)
   };
+}
+
+function normalizePrivateElements(raw) {
+  if (!Array.isArray(raw) || raw.length > 2_000) throw new Error("computer helper returned invalid Accessibility elements");
+  return raw.map((entry, index) => {
+    if (entry?.index !== index || !Array.isArray(entry.path) || entry.path.length > 32
+        || !entry.path.every((part) => Number.isSafeInteger(part) && part >= 0 && part <= 100_000)
+        || typeof entry.role !== "string" || !entry.role || Buffer.byteLength(entry.role, "utf8") > 120
+        || !Array.isArray(entry.actions) || entry.actions.length > 32
+        || !entry.actions.every((action) => typeof action === "string" && Buffer.byteLength(action, "utf8") <= 120)) {
+      throw new Error("computer helper returned invalid Accessibility elements");
+    }
+    const optionalText = (value, limit) => {
+      if (value == null) return null;
+      if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > limit) {
+        throw new Error("computer helper returned invalid Accessibility elements");
+      }
+      return value;
+    };
+    const numeric = [entry.x, entry.y, entry.width, entry.height];
+    if (!numeric.every((value) => value == null || Number.isFinite(value))) throw new Error("computer helper returned invalid Accessibility elements");
+    return {
+      index, path: [...entry.path], role: entry.role,
+      subrole: optionalText(entry.subrole, 120), identifier: optionalText(entry.identifier, 240),
+      title: optionalText(entry.title, 500), value: optionalText(entry.value, 2_000),
+      x: entry.x ?? null, y: entry.y ?? null,
+      width: entry.width ?? null, height: entry.height ?? null,
+      actions: [...entry.actions], secure: entry.secure === true
+    };
+  });
+}
+
+function normalizeApplicationList(stdout) {
+  let parsed;
+  try { parsed = JSON.parse(String(stdout)); } catch { throw new Error("computer helper returned an invalid application list"); }
+  const apps = Array.isArray(parsed?.apps) ? parsed.apps : [];
+  if (apps.length > 300) throw new Error("computer helper returned an invalid application list");
+  return { apps: apps.map(normalizeApplication) };
+}
+
+function normalizeActivatedApplication(stdout) {
+  let parsed;
+  try { parsed = JSON.parse(String(stdout)); } catch { throw new Error("computer helper returned an invalid application result"); }
+  return { app: normalizeApplication(parsed) };
+}
+
+function normalizeApplication(entry) {
+  const bundleIdentifier = typeof entry?.bundleIdentifier === "string" ? entry.bundleIdentifier : "";
+  const name = typeof entry?.name === "string" ? entry.name : "";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]+$/.test(bundleIdentifier)
+      || Buffer.byteLength(bundleIdentifier, "utf8") > 512 || !name
+      || Buffer.byteLength(name, "utf8") > 240 || typeof entry?.running !== "boolean") {
+    throw new Error("computer helper returned an invalid application result");
+  }
+  return { bundleIdentifier, name, running: entry.running };
 }
 
 // Logical (point) size of the main display + the downscale factor we apply.

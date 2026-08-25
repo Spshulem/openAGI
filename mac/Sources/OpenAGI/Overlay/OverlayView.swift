@@ -84,6 +84,7 @@ struct OverlayView: View {
     .onChange(of: approvals.inFlight) { _, _ in onContentChange() }
     .onChange(of: approvals.lastOutcome) { _, _ in onContentChange() }
     .onChange(of: approvals.lastError) { _, _ in onContentChange() }
+    .onChange(of: approvals.lastChatSessionId) { _, _ in onContentChange() }
   }
 
   private func briefWatchers<V: View>(_ content: V) -> some View {
@@ -262,7 +263,9 @@ struct OverlayView: View {
       if !approvals.items.isEmpty || approvals.lastOutcome != nil || approvals.lastError != nil {
         Divider()
         HStack {
-          Text(approvals.items.count == 1 ? "Approval needed" : "Approvals needed")
+          Text(approvals.items.isEmpty
+               ? "Computer Use"
+               : approvals.items.count == 1 ? "Approval needed" : "Approvals needed")
             .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
           Spacer()
           if !approvals.items.isEmpty {
@@ -277,12 +280,25 @@ struct OverlayView: View {
           HStack(spacing: 6) {
             Text(outcome).font(.system(size: 11)).foregroundStyle(.green)
             Spacer()
+            if approvals.lastChatSessionId != nil {
+              Button("Open chat") { app.openChatSession(approvals.lastChatSessionId) }
+                .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.blue)
+            }
             Button("Dismiss") { approvals.clearOutcome() }
               .buttonStyle(.borderless).font(.system(size: 10))
           }
         }
         if let error = approvals.lastError {
-          Text(error).font(.system(size: 11)).foregroundStyle(.red)
+          HStack(spacing: 6) {
+            Text(error).font(.system(size: 11)).foregroundStyle(.red)
+            Spacer()
+            if approvals.lastChatSessionId != nil {
+              Button("Open chat") { app.openChatSession(approvals.lastChatSessionId) }
+                .buttonStyle(.borderless).font(.system(size: 10)).foregroundStyle(.blue)
+            }
+            Button("Dismiss") { approvals.clearOutcome() }
+              .buttonStyle(.borderless).font(.system(size: 10))
+          }
         }
         if !approvals.items.isEmpty {
           ScrollView {
