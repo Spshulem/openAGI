@@ -192,7 +192,7 @@ async function probeExplicitComputerNode(node, fetchImpl, timeoutMs = 1_200) {
     return {
       reachable: Boolean(capability),
       liveScreenshot: capability?.screenshotReady === true && operations.includes("screenshot"),
-      inputAvailable: capability?.inputReady === true
+      inputAvailable: capability?.ready !== false && capability?.inputReady === true
         && BASELINE_INPUT_OPERATIONS.every((operation) => operations.includes(operation)),
       operations,
       detail: typeof capability?.detail === "string" ? capability.detail.slice(0, 300) : null
@@ -682,9 +682,10 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   // node is configured the action executes ON that node (real input); without
   // one, the intent + reasoning are logged and the handler THROWS so the agent
   // gets an explicit failure instead of a fabricated success. No silent stub.
-  function registerAction(name, nodePath, description, paramShape, payloadOf, required = [], metadata = {}, includeReasoning = true, returnNodeResult = false) {
+  function registerAction(name, nodePath, description, paramShape, payloadOf, required = [], metadata = {}, includeReasoning = true, returnNodeResult = false, sideEffects = true) {
     registry.register({
       name,
+      sideEffects,
       description: description + " Executes on the selected connected computer-use node; without one the call is logged and refused.",
       parameters: {
         type: "object",
@@ -743,7 +744,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   }
 
   registerAction("computer_list_apps", "list_apps", "List safe applications available on the selected Mac, returning names, bundle identifiers, and running state.", {
-  }, () => ({}), [], {}, true, true);
+  }, () => ({}), [], {}, true, true, false);
   registerAction("computer_activate_app", "activate_app", "Launch or bring a safe application to the foreground by bundle identifier. Take a fresh computer_screenshot after activation.", {
     bundleIdentifier: { type: "string", description: "Bundle identifier returned by computer_list_apps." }
   }, (a) => ({ bundleIdentifier: a.bundleIdentifier }), ["bundleIdentifier"], {}, true, true);

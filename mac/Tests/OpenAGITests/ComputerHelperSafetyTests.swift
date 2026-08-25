@@ -242,6 +242,24 @@ final class ComputerHelperSafetyTests: XCTestCase {
     XCTAssertLessThanOrEqual(application?.utf8.count ?? .max, 240)
   }
 
+  func testActivationRequiresTheTargetAndACapturableWindow() {
+    XCTAssertTrue(ComputerApplications.activationIsReady(
+      targetBundleIdentifier: "com.example.Editor",
+      frontmostBundleIdentifier: "com.example.Editor",
+      hasCapturableWindow: true
+    ))
+    XCTAssertFalse(ComputerApplications.activationIsReady(
+      targetBundleIdentifier: "com.example.Editor",
+      frontmostBundleIdentifier: "com.example.Editor",
+      hasCapturableWindow: false
+    ))
+    XCTAssertFalse(ComputerApplications.activationIsReady(
+      targetBundleIdentifier: "com.example.Editor",
+      frontmostBundleIdentifier: "com.example.Other",
+      hasCapturableWindow: true
+    ))
+  }
+
   func testTextSelectionTreatsOverlappingMatchesAsAmbiguous() throws {
     XCTAssertThrowsError(try ComputerAccessibility.uniqueTextRange(
       content: "aaa", text: "aa", prefix: nil, suffix: nil

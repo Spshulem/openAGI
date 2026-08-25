@@ -74,6 +74,7 @@ do {
     if screen && !privacyReady { blockers.append("focus a window allowed by Capture privacy settings") }
     try writeJSON([
       "screenRecording": screen,
+      "capturePrerequisitesReady": screen,
       "accessibility": accessibility,
       "consoleActive": console,
       "screenLocked": locked,

@@ -118,7 +118,11 @@ public enum ComputerApplications {
     // allow enough time for that asynchronous transition instead of aborting a
     // valid session at the old three-second boundary.
     for attempt in 0..<80 {
-      if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleIdentifier,
+      if activationIsReady(
+           targetBundleIdentifier: bundleIdentifier,
+           frontmostBundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+           hasCapturableWindow: ComputerScreenshot.focusedWindowPrivacyReady(privacy: privacy)
+         ),
          let descriptor = list(privacy: privacy).first(where: { $0.bundleIdentifier == bundleIdentifier }) {
         return descriptor
       }
@@ -135,6 +139,14 @@ public enum ComputerApplications {
       try await Task.sleep(nanoseconds: 100_000_000)
     }
     throw ComputerApplicationError.activationFailed
+  }
+
+  static func activationIsReady(
+    targetBundleIdentifier: String,
+    frontmostBundleIdentifier: String?,
+    hasCapturableWindow: Bool
+  ) -> Bool {
+    frontmostBundleIdentifier == targetBundleIdentifier && hasCapturableWindow
   }
 
   private static func openApplication(at url: URL) async throws {

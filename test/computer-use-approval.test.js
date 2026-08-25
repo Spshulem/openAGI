@@ -64,6 +64,23 @@ async function appWithComputerUse({ dataDir: suppliedDataDir = null, generate = 
   return { runtime, app, base: address.url, dataDir, generatedRequests };
 }
 
+test("computer_list_apps is read-only for safe continuation retry classification", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-list-apps-read-only-"));
+  const tools = new ToolRegistry();
+  const runtime = {
+    tools,
+    computerUseLog: new ComputerUseLog({ dir: path.join(dataDir, "computer-use") }),
+    observations: { search: async () => [] }
+  };
+  try {
+    registerComputerUseTools(tools, runtime);
+    assert.equal(tools.get("computer_list_apps").sideEffects, false);
+    assert.equal(tools.get("computer_activate_app").sideEffects, true);
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("computer-use approval deduplicates requests, starts once, and resumes the original chat", async () => {
   const previousComputerHops = process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS;
   delete process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS;

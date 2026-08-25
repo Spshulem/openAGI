@@ -74,4 +74,19 @@ final class PendingApprovalTests: XCTestCase {
     XCTAssertFalse(PendingApprovalConsumer.isComputerUseApproval("send_message"))
     XCTAssertFalse(PendingApprovalConsumer.isComputerUseApproval(nil))
   }
+
+  @MainActor
+  func testDismissingOutcomeKeepsRunningSessionReconciliation() {
+    let consumer = PendingApprovalConsumer()
+    consumer.trackComputerSession("cus_running", chatSessionId: "overlay:user:main")
+
+    consumer.clearOutcome()
+    XCTAssertNil(consumer.lastOutcome)
+    XCTAssertNil(consumer.lastChatSessionId)
+
+    consumer.handleComputerUseEvent(
+      #"{"kind":"session-end","session":{"id":"cus_running","status":"ended","sourceSessionId":"overlay:user:main"}}"#)
+    XCTAssertEqual(consumer.lastOutcome, "Computer task finished.")
+    XCTAssertEqual(consumer.lastChatSessionId, "overlay:user:main")
+  }
 }

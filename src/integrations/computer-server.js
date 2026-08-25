@@ -292,17 +292,22 @@ export function createComputerExecutor({
       const status = await inspect();
       const baselineInput = status.inputReady
         && BASELINE_INPUT_OPERATIONS.every((operation) => status.operations.includes(operation));
+      // Input alone is insufficient: the agent needs a fresh visual frame
+      // before acting. Privacy exclusion is recoverable through app activation;
+      // missing Screen Recording or an active display is not.
+      const recoverableCapture = status.screenshotReady || status.capturePrerequisitesReady;
       return {
-        ok: baselineInput,
+        ok: baselineInput && recoverableCapture,
         service: "computer",
         capability: {
           id: "computer-use",
-          ready: baselineInput,
+          ready: baselineInput && recoverableCapture,
           operations: ALL_OPERATIONS.filter((operation) => (
             !INPUT_OPERATIONS.includes(operation) || status.operations.includes(operation)
           )),
           screenshotReady: status.screenshotReady,
           inputReady: status.inputReady,
+          capturePrerequisitesReady: status.capturePrerequisitesReady,
           detail: status.detail,
           checkedAt: new Date(now()).toISOString()
         }
@@ -397,8 +402,12 @@ function normalizeCapabilityStatus(raw = {}) {
   const operations = Array.isArray(raw.operations)
     ? raw.operations.filter((operation) => INPUT_OPERATIONS.includes(operation))
     : [];
+  const screenshotReady = typeof raw.screenshotReady === "boolean" ? raw.screenshotReady : raw.screenRecording === true;
   return {
-    screenshotReady: typeof raw.screenshotReady === "boolean" ? raw.screenshotReady : raw.screenRecording === true,
+    screenshotReady,
+    capturePrerequisitesReady: typeof raw.capturePrerequisitesReady === "boolean"
+      ? raw.capturePrerequisitesReady
+      : screenshotReady,
     inputReady: (typeof raw.inputReady === "boolean" ? raw.inputReady : raw.accessibility === true)
       && operations.length > 0,
     operations,

@@ -391,7 +391,13 @@ test("Mac Quick Ask owns a durable inline approval surface", () => {
   assert.match(approvals, /lastChatSessionId = terminal\.chatSessionId \?\? lastChatSessionId/);
   assert.match(approvals, /let isComputerUseApproval = Self\.isComputerUseApproval/);
   assert.match(approvals, /if isComputerUseApproval \{[\s\S]{0,250}lastChatSessionId = sourceSessionId \?\? lastChatSessionId/);
-  assert.match(approvals, /if isComputerUseApproval \{[\s\S]{0,350}activeComputerSessionId = decoded\?\.result\?\.sessionId/);
+  assert.match(approvals, /if isComputerUseApproval \{[\s\S]{0,350}trackComputerSession\(decoded\?\.result\?\.sessionId, chatSessionId: sourceSessionId\)/);
+  assert.match(approvals, /func clearOutcome\(\) \{[\s\S]{0,180}lastChatSessionId = nil[\s\S]{0,40}\}/);
+  assert.doesNotMatch(
+    approvals.match(/func clearOutcome\(\) \{[\s\S]*?\n  \}/)?.[0] ?? "",
+    /activeComputerSessionId = nil/,
+    "dismissing the running banner must preserve terminal session reconciliation"
+  );
   assert.match(overlay, /"Approval needed" : "Approvals needed"/);
   assert.match(overlay, /Button\("Approve & run"\)/);
   assert.match(overlay, /Button\("Open chat"\) \{ app\.openChatSession\(approvals\.lastChatSessionId\) \}/);

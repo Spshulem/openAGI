@@ -113,6 +113,28 @@ test("a privacy-excluded foreground window remains available for app selection",
   assert.equal(status.screenshot, "recent-ocr");
 });
 
+test("an explicit node with input but missing capture prerequisites requires permissions", async () => {
+  const status = await computerUseReadiness({
+    env: {
+      OPENAGI_COMPUTER_USE: "1",
+      OPENAGI_COMPUTER_NODE: "https://computer.example",
+      OPENAGI_COMPUTER_NODE_TOKEN: "scoped"
+    },
+    fetchImpl: async () => new Response(JSON.stringify({
+      capability: {
+        id: "computer-use",
+        ready: false,
+        screenshotReady: false,
+        inputReady: true,
+        operations: ["session.start", "session.end", "screenshot", "click", "move", "type", "key", "scroll"]
+      }
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+    toolsRegistered: true
+  });
+  assert.equal(status.mode, "permissions-required");
+  assert.equal(status.inputAvailable, false);
+});
+
 test("a relayed node preserves privacy-excluded screenshot readiness", async () => {
   const record = {
     nodeId: "paired-node",

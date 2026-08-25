@@ -151,6 +151,7 @@ public enum ComputerAccessibility {
     let element = try resolve(locator: locator, focus: focus)
     try cancellation?.check()
     if locator.actions.contains(kAXPressAction as String) {
+      try ComputerInput.requireActionTimeReadiness(focus: focus)
       guard AXUIElementPerformAction(element, kAXPressAction as CFString) == .success else {
         throw ComputerAccessibilityError.unsupportedAction
       }
@@ -173,7 +174,10 @@ public enum ComputerAccessibility {
     let element = try resolveEditable(locator: locator, focus: focus, cancellation: cancellation)
     var settable = DarwinBoolean(false)
     guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
-          settable.boolValue,
+          settable.boolValue else { throw ComputerAccessibilityError.invalidValue }
+    try cancellation?.check()
+    try ComputerInput.requireActionTimeReadiness(focus: focus)
+    guard
           AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, value as CFString) == .success,
           stringAttribute(element, kAXValueAttribute as CFString) == value else {
       throw ComputerAccessibilityError.invalidValue
@@ -192,6 +196,7 @@ public enum ComputerAccessibility {
     }
     let element = try resolve(locator: locator, focus: focus)
     try cancellation?.check()
+    try ComputerInput.requireActionTimeReadiness(focus: focus)
     guard AXUIElementPerformAction(element, action as CFString) == .success else {
       throw ComputerAccessibilityError.unsupportedAction
     }
@@ -219,7 +224,12 @@ public enum ComputerAccessibility {
       location: selectionType == "cursor_after" ? found.location + found.length : found.location,
       length: selectionType == "text" ? found.length : 0
     )
-    guard let rangeValue = AXValueCreate(.cfRange, &selected),
+    guard let rangeValue = AXValueCreate(.cfRange, &selected) else {
+      throw ComputerAccessibilityError.ambiguousText
+    }
+    try cancellation?.check()
+    try ComputerInput.requireActionTimeReadiness(focus: focus)
+    guard
           AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, rangeValue) == .success else {
       throw ComputerAccessibilityError.ambiguousText
     }
@@ -235,7 +245,7 @@ public enum ComputerAccessibility {
     guard text.utf8.count <= 64 * 1024, !text.contains("\0"),
           ["text", "md", "html"].contains(format) else { throw ComputerAccessibilityError.invalidValue }
     let element = try resolveEditable(locator: locator, focus: focus, cancellation: cancellation)
-    try focusElement(element)
+    try focusElement(element, focus: focus, cancellation: cancellation)
     let pasteboard = NSPasteboard.general
     let saved = try snapshotPasteboard(pasteboard)
     var temporaryChangeCount: Int?
@@ -297,7 +307,18 @@ public enum ComputerAccessibility {
   ) throws -> AXUIElement {
     guard !locator.secure else { throw ComputerAccessibilityError.secureElement }
     try cancellation?.check()
-    return try resolve(locator: locator, focus: focus)
+    let element = try resolve(locator: locator, focus: focus)
+    guard attributeIsSettable(element, kAXValueAttribute as CFString)
+            || attributeIsSettable(element, kAXSelectedTextRangeAttribute as CFString) else {
+      throw ComputerAccessibilityError.unsupportedAction
+    }
+    return element
+  }
+
+  private static func attributeIsSettable(_ element: AXUIElement, _ attribute: CFString) -> Bool {
+    var settable = DarwinBoolean(false)
+    return AXUIElementIsAttributeSettable(element, attribute, &settable) == .success
+      && settable.boolValue
   }
 
   private static func resolve(locator: ComputerAccessibilityElement,
@@ -313,9 +334,12 @@ public enum ComputerAccessibility {
       guard childIndex >= 0, childIndex < values.count else { throw ComputerAccessibilityError.staleElement }
       current = values[childIndex]
     }
-    let role = stringAttribute(current, kAXRoleAttribute as CFString) ?? "AXUnknown"
-    let subrole = stringAttribute(current, kAXSubroleAttribute as CFString)
-    let identifier = stringAttribute(current, kAXIdentifierAttribute as CFString)
+    // Capture stores bounded, control-normalized locator fields. Apply the
+    // same transformation before stale comparisons so a freshly captured
+    // long or unusual AX string remains usable.
+    let role = bounded(stringAttribute(current, kAXRoleAttribute as CFString), 120) ?? "AXUnknown"
+    let subrole = bounded(stringAttribute(current, kAXSubroleAttribute as CFString), 120)
+    let identifier = bounded(stringAttribute(current, kAXIdentifierAttribute as CFString), 240)
     let title = firstText(current)
     guard role == locator.role, subrole == locator.subrole,
           (locator.identifier == nil || identifier == locator.identifier),
@@ -326,15 +350,18 @@ public enum ComputerAccessibility {
     return current
   }
 
-  private static func focusElement(_ element: AXUIElement) throws {
+  private static func focusElement(
+    _ element: AXUIElement,
+    focus: ComputerFocusIdentity,
+    cancellation: ComputerInputCancellation?
+  ) throws {
     var settable = DarwinBoolean(false)
-    if AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable) == .success,
-       settable.boolValue,
-       AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success {
-      return
-    }
-    guard actionNames(element).contains(kAXPressAction as String),
-          AXUIElementPerformAction(element, kAXPressAction as CFString) == .success else {
+    guard AXUIElementIsAttributeSettable(element, kAXFocusedAttribute as CFString, &settable) == .success,
+          settable.boolValue else { throw ComputerAccessibilityError.unsupportedAction }
+    try cancellation?.check()
+    try ComputerInput.requireActionTimeReadiness(focus: focus)
+    guard
+          AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success else {
       throw ComputerAccessibilityError.unsupportedAction
     }
   }

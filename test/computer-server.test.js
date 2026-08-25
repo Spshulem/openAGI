@@ -96,6 +96,7 @@ test("a privacy-excluded foreground window keeps app activation ready until scre
   const computer = createComputerExecutor({
     capabilityStatus: async () => ({
       screenshotReady,
+      capturePrerequisitesReady: true,
       inputReady: true,
       operations: FULL_INPUT_OPERATIONS,
       detail: screenshotReady ? "ready" : "OpenAGI is the frontmost privacy-excluded window"
@@ -134,6 +135,23 @@ test("a privacy-excluded foreground window keeps app activation ready until scre
   const shot = await action(computer, active, 4, "screenshot");
   assert.equal(typeof shot.frameId, "string");
   assert.deepEqual(calls, ["list_apps", "activate_app", "screenshot"]);
+});
+
+test("health rejects input-only nodes when capture prerequisites are missing", async () => {
+  const computer = createComputerExecutor({
+    capabilityStatus: async () => ({
+      screenshotReady: false,
+      capturePrerequisitesReady: false,
+      inputReady: true,
+      operations: FULL_INPUT_OPERATIONS,
+      detail: "grant Screen Recording to OpenAGI"
+    })
+  });
+  const health = await computer.health();
+  assert.equal(health.ok, false);
+  assert.equal(health.capability.ready, false);
+  assert.equal(health.capability.inputReady, true, "raw input permission remains diagnostic only");
+  assert.equal(health.capability.capturePrerequisitesReady, false);
 });
 
 test("HTTP wrapper exposes drag and every semantic action route", async () => {

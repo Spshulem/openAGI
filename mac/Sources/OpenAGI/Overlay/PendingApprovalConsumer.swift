@@ -131,8 +131,7 @@ final class PendingApprovalConsumer: ObservableObject {
       let decoded = try? JSONDecoder().decode(PendingApprovalDecisionResponse.self, from: data)
       if decision == "approve" {
         if isComputerUseApproval {
-          activeComputerSessionId = decoded?.result?.sessionId
-          lastChatSessionId = sourceSessionId
+          trackComputerSession(decoded?.result?.sessionId, chatSessionId: sourceSessionId)
           lastOutcome = activeComputerSessionId == nil
             ? "Approved — the agent is continuing in Chat."
             : "Approved — the computer task is running in Chat."
@@ -156,8 +155,15 @@ final class PendingApprovalConsumer: ObservableObject {
   func clearOutcome() {
     lastOutcome = nil
     lastError = nil
-    activeComputerSessionId = nil
     lastChatSessionId = nil
+  }
+
+  /// Hide the current banner without abandoning the authoritative session-end
+  /// reconciliation. Internal visibility keeps this transition testable
+  /// without driving the localhost approval route.
+  func trackComputerSession(_ sessionId: String?, chatSessionId: String?) {
+    activeComputerSessionId = sessionId
+    lastChatSessionId = chatSessionId
   }
 
   /// Reconcile the transient approval banner with the durable computer-use
