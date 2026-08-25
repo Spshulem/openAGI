@@ -14,9 +14,14 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
   let summary: String
   let status: String
   let createdAt: String?
+  let sourceSessionId: String?
+
+  private struct Context: Decodable {
+    let sessionId: String?
+  }
 
   enum CodingKeys: String, CodingKey {
-    case id, toolName, summary, status, createdAt
+    case id, toolName, summary, status, createdAt, context
   }
 
   init(from decoder: Decoder) throws {
@@ -26,6 +31,7 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
     summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? "Agent action needs approval"
     status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
     createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+    sourceSessionId = try c.decodeIfPresent(Context.self, forKey: .context)?.sessionId
   }
 }
 
@@ -50,6 +56,7 @@ final class PendingApprovalConsumer: ObservableObject {
   @Published private(set) var inFlight: Set<String> = []
   @Published private(set) var lastOutcome: String? = nil
   @Published private(set) var lastError: String? = nil
+  @Published private(set) var lastChatSessionId: String? = nil
 
   /// Only the newest reconciliation may publish. Refreshes arrive from panel
   /// appearance, SSE, and decisions, so response order is not request order.
@@ -85,6 +92,7 @@ final class PendingApprovalConsumer: ObservableObject {
     guard !inFlight.contains(id) else { return }
     inFlight.insert(id)
     defer { inFlight.remove(id) }
+    let sourceSessionId = items.first(where: { $0.id == id })?.sourceSessionId
 
     var req = URLRequest(url: AppState.buildURL(
       base: AppState.shared.baseURL,
@@ -117,11 +125,13 @@ final class PendingApprovalConsumer: ObservableObject {
       let decoded = try? JSONDecoder().decode(PendingApprovalDecisionResponse.self, from: data)
       if decision == "approve" {
         activeComputerSessionId = decoded?.result?.sessionId
+        lastChatSessionId = sourceSessionId
         lastOutcome = activeComputerSessionId == nil
           ? "Approved — the agent is continuing in Chat."
           : "Approved — the computer task is running in Chat."
       } else {
         activeComputerSessionId = nil
+        lastChatSessionId = nil
         lastOutcome = "Request denied."
       }
       lastError = nil
@@ -133,7 +143,9 @@ final class PendingApprovalConsumer: ObservableObject {
 
   func clearOutcome() {
     lastOutcome = nil
+    lastError = nil
     activeComputerSessionId = nil
+    lastChatSessionId = nil
   }
 
   /// Reconcile the transient approval banner with the durable computer-use
@@ -143,19 +155,24 @@ final class PendingApprovalConsumer: ObservableObject {
     guard let sessionId = activeComputerSessionId,
           let terminal = Self.terminalComputerUseOutcome(sessionId: sessionId, data: data) else { return }
     activeComputerSessionId = nil
+    lastChatSessionId = terminal.chatSessionId ?? lastChatSessionId
     lastOutcome = terminal.outcome
     lastError = terminal.error
   }
 
-  static func terminalComputerUseOutcome(sessionId: String, data: String) -> (outcome: String?, error: String?)? {
+  static func terminalComputerUseOutcome(
+    sessionId: String,
+    data: String
+  ) -> (outcome: String?, error: String?, chatSessionId: String?)? {
     guard let json = try? JSONSerialization.jsonObject(with: Data(data.utf8)) as? [String: Any],
           json["kind"] as? String == "session-end",
           let session = json["session"] as? [String: Any],
           session["id"] as? String == sessionId else { return nil }
+    let chatSessionId = session["sourceSessionId"] as? String
     if session["status"] as? String == "ended" {
-      return ("Computer task finished. Open Chat for the result.", nil)
+      return ("Computer task finished.", nil, chatSessionId)
     }
-    return (nil, "Computer task stopped. Open Chat for details.")
+    return (nil, "Computer task stopped.", chatSessionId)
   }
 
   static func terminalDecisionError(statusCode: Int, data: Data) -> String? {

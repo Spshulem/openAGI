@@ -68,33 +68,62 @@ public enum ComputerApplications {
   ) async throws -> ComputerApplicationDescriptor {
     guard valid(bundleIdentifier) else { throw ComputerApplicationError.invalidIdentifier }
     guard privacy.permitsBundle(bundleIdentifier) else { throw ComputerApplicationError.excluded }
-    if let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
-      .first(where: { !$0.isTerminated }) {
-      guard running.activate(options: [.activateAllWindows]) else {
-        throw ComputerApplicationError.activationFailed
-      }
-    } else {
-      guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
-        throw ComputerApplicationError.unavailable
-      }
-      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
-          if let error { continuation.resume(throwing: error) }
-          else if app == nil { continuation.resume(throwing: ComputerApplicationError.activationFailed) }
-          else { continuation.resume(returning: ()) }
-        }
-      }
+    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
+      throw ComputerApplicationError.unavailable
     }
-    for _ in 0..<30 {
+
+    // `NSRunningApplication.activate` can legitimately return false for an
+    // already-running app that has no active window (TextEdit after its last
+    // document closes is a common example). Treat it as the fast path, not the
+    // only launch path. `openApplication` is the same generic LaunchServices
+    // route used by Finder/open(1); with `activates = true` it can create the
+    // app's normal initial window and bring it forward.
+    let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+      .first(where: { !$0.isTerminated })
+    if running?.activate(options: [.activateAllWindows]) != true {
+      try await openApplication(at: url)
+    }
+
+    // LaunchServices may acknowledge activation before macOS completes the
+    // foreground transition (especially when Notification Center or an
+    // always-on-top panel is yielding focus). Keep the helper bounded, but
+    // allow enough time for that asynchronous transition instead of aborting a
+    // valid session at the old three-second boundary.
+    for attempt in 0..<80 {
       if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundleIdentifier,
          let descriptor = list(privacy: privacy).first(where: { $0.bundleIdentifier == bundleIdentifier }) {
         return descriptor
       }
+      // An app may accept the fast-path activation but still have no window to
+      // raise. Retry once through LaunchServices before declaring the request
+      // failed; never spin up a second process because LaunchServices resolves
+      // the existing bundle instance.
+      if attempt == 9 { try await openApplication(at: url) }
+      if attempt == 39 {
+        _ = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+          .first(where: { !$0.isTerminated })?
+          .activate(options: [.activateAllWindows])
+      }
       try await Task.sleep(nanoseconds: 100_000_000)
     }
     throw ComputerApplicationError.activationFailed
+  }
+
+  private static func openApplication(at url: URL) async throws {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let configuration = NSWorkspace.OpenConfiguration()
+      configuration.activates = true
+      NSWorkspace.shared.openApplication(at: url, configuration: configuration) { app, error in
+        if let error { continuation.resume(throwing: error) }
+        else if let app {
+          // The open completion only promises that LaunchServices resolved the
+          // application. Ask the returned process to foreground as well; this
+          // closes the gap for already-running, windowless applications.
+          _ = app.activate(options: [.activateAllWindows])
+          continuation.resume(returning: ())
+        } else { continuation.resume(throwing: ComputerApplicationError.activationFailed) }
+      }
+    }
   }
 
   private static func valid(_ value: String) -> Bool {

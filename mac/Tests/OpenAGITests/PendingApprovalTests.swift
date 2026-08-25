@@ -11,6 +11,7 @@ final class PendingApprovalTests: XCTestCase {
       "summary":"Open a computer-use session",
       "status":"pending",
       "createdAt":"2026-08-14T12:00:00.000Z",
+      "context":{"sessionId":"overlay:user:main"},
       "args":{"goal":"ignored by the compact approval card"}
     }
     """#.utf8)
@@ -20,6 +21,7 @@ final class PendingApprovalTests: XCTestCase {
     XCTAssertEqual(item.toolName, "start_computer_use_session")
     XCTAssertEqual(item.summary, "Open a computer-use session")
     XCTAssertEqual(item.status, "pending")
+    XCTAssertEqual(item.sourceSessionId, "overlay:user:main")
   }
 
   func testPendingApprovalUsesReadableDefaultsForOlderServers() throws {
@@ -30,6 +32,7 @@ final class PendingApprovalTests: XCTestCase {
     XCTAssertEqual(item.toolName, "agent_action")
     XCTAssertEqual(item.summary, "Agent action needs approval")
     XCTAssertEqual(item.status, "pending")
+    XCTAssertNil(item.sourceSessionId)
   }
 
   @MainActor
@@ -52,14 +55,16 @@ final class PendingApprovalTests: XCTestCase {
 
     let finished = PendingApprovalConsumer.terminalComputerUseOutcome(
       sessionId: "cus_expected",
-      data: #"{"kind":"session-end","session":{"id":"cus_expected","status":"ended"}}"#)
-    XCTAssertEqual(finished?.outcome, "Computer task finished. Open Chat for the result.")
+      data: #"{"kind":"session-end","session":{"id":"cus_expected","status":"ended","sourceSessionId":"overlay:user:main"}}"#)
+    XCTAssertEqual(finished?.outcome, "Computer task finished.")
     XCTAssertNil(finished?.error)
+    XCTAssertEqual(finished?.chatSessionId, "overlay:user:main")
 
     let aborted = PendingApprovalConsumer.terminalComputerUseOutcome(
       sessionId: "cus_expected",
       data: #"{"kind":"session-end","session":{"id":"cus_expected","status":"aborted","endReason":"private runtime detail"}}"#)
     XCTAssertNil(aborted?.outcome)
-    XCTAssertEqual(aborted?.error, "Computer task stopped. Open Chat for details.")
+    XCTAssertEqual(aborted?.error, "Computer task stopped.")
+    XCTAssertNil(aborted?.chatSessionId)
   }
 }
