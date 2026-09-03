@@ -43,6 +43,7 @@ export function clearCookie() {
 export function isPublicRoute(pathname) {
   // Webhooks self-authenticate; /health stays open as a liveness check.
   // /sign-in is the path you use to GET auth — must be reachable unauthenticated.
+  // Node enrollment exchange carries its own short-lived, single-use code.
   //
   // "Public" here waives BOTH the auth gate and the CSRF gate, so a route on
   // this list has to be safe for an anonymous caller by construction — the
@@ -54,6 +55,7 @@ export function isPublicRoute(pathname) {
   return (
     pathname === "/health" ||
     pathname === "/sign-in" ||
+    pathname === "/nodes/enroll/exchange" ||
     pathname === "/channels/telegram/webhook" ||
     pathname === "/webhooks/buildbetter"
   );

@@ -551,14 +551,32 @@ test("node enrollment stores only a hash and binds authentication to node id", (
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-node-auth-"));
   const registry = new NodeRegistry({ dir });
   const token = "a".repeat(43);
-  assert.deepEqual(registry.enroll("node-a", token), { created: true });
+  assert.deepEqual(registry.enroll("node-a", token, {
+    platform: "even_g2",
+    name: "Test G2",
+    capabilities: [{ id: "g2-voice-input", ready: true, operations: ["ask"], token: "discard-me" }]
+  }), { created: true });
   assert.equal(registry.authenticate("node-a", token), true);
   assert.equal(registry.authenticate("node-b", token), false);
   assert.equal(registry.authenticate("node-a", "wrong"), false);
   assert.deepEqual(registry.enroll("node-a", token), { created: false }, "a lost enrollment response is safe to retry");
   assert.throws(() => registry.enroll("node-a", "b".repeat(43)), /already enrolled/);
+  assert.deepEqual(registry.enrollment("node-a"), {
+    nodeId: "node-a",
+    createdAt: registry.enrollment("node-a").createdAt,
+    platform: "even_g2",
+    name: "Test G2",
+    capabilities: [{
+      id: "g2-voice-input",
+      ready: true,
+      operations: ["ask"],
+      detail: null,
+      checkedAt: null
+    }]
+  });
   const persisted = fs.readFileSync(path.join(dir, "registry.json"), "utf8");
   assert.equal(persisted.includes(token), false, "scoped node token is hashed at rest");
+  assert.equal(persisted.includes("discard-me"), false, "node enrollment metadata is capability-sanitized");
   assert.equal(registry.revoke("node-a"), true);
   assert.equal(registry.authenticate("node-a", token), false);
   assert.deepEqual(registry.enroll("node-a", "b".repeat(43)), { created: true });
