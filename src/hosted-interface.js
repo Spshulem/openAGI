@@ -48,6 +48,12 @@ import {
   isImessageSearchEnabled
 } from "./integrations/imessage-node-capability.js";
 import { registerImessageSearchTool } from "./integrations/imessage-search-tool.js";
+import {
+  EVEN_G2_CAPABILITIES,
+  EVEN_G2_PLATFORM,
+  G2ChannelError
+} from "./integrations/g2-channel.js";
+import { NodeEnrollmentCodes } from "./node-enrollment.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -56,17 +62,6 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   const getAuthToken = () => options.authToken ?? process.env.OPENAGI_AUTH_TOKEN ?? null;
   const getPublicUrl = () => options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null;
   const getTelegramSecret = () => options.telegramSecret ?? process.env.TELEGRAM_WEBHOOK_SECRET ?? null;
-  let channels =
-    options.channels ??
-    (runtime.agentHost
-      ? new ChannelManager({
-          agentHost: runtime.agentHost,
-          runtime,
-          dir: options.channelsDir,
-          telegramToken: options.telegramToken
-        })
-      : null);
-
   // dataDir is resolved ONCE here and threaded explicitly into both
   // NodeRegistry's dir and the cache path below — NodeRegistry must NOT be
   // allowed to fall back to its own default (which calls resolveDataDir()
@@ -76,6 +71,19 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
+  const nodeEnrollment = options.nodeEnrollment
+    ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM] });
+  let channels =
+    options.channels ??
+    (runtime.agentHost
+      ? new ChannelManager({
+          agentHost: runtime.agentHost,
+          runtime,
+          dir: options.channelsDir,
+          telegramToken: options.telegramToken,
+          nodeRegistry
+        })
+      : null);
   const nodeControlBroker = options.nodeControlBroker ?? new NodeControlBroker(options.nodeControlOptions);
   const localIdentity = readOrCreateIdentity(dataDir);
   let localCapabilityCache = [];
@@ -672,7 +680,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
-        "/nodes/capture-memory"
+        "/nodes/capture-memory", "/nodes/g2/ask"
       ].includes(pathname);
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message");
@@ -682,17 +690,33 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const scopedBearer = String(req.headers.authorization ?? "").startsWith("Bearer ")
         ? String(req.headers.authorization).slice(7)
         : null;
+      const requestEnrollment = requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null;
+      const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask"].includes(pathname);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
       const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute)
-        ? nodeRegistry.authenticate(requestNodeId, scopedBearer)
+        ? g2NodeRouteAllowed && nodeRegistry.authenticate(requestNodeId, scopedBearer)
         : false;
+      // Even Hub runs the G2 client in a phone webview whose Origin is not the
+      // daemon's origin. Bypass only the browser-origin check, and only after
+      // the request has proven its G2 node id + scoped bearer credential. The
+      // normal auth gate below still runs; this does not make the route public.
+      const authenticatedG2CrossOrigin = requestEnrollment?.platform === EVEN_G2_PLATFORM
+        && nodeScopedAuth
+        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask"].includes(pathname);
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
       const setupActive = isFirstRun();
       const setupRoutes = pathname === "/setup" || pathname === "/setup/save" || pathname === "/setup/test";
+
+      if (isG2NodeCorsRoute(pathname)) applyG2NodeCorsHeaders(res);
+      if (method === "OPTIONS" && isG2NodeCorsRoute(pathname)) {
+        res.writeHead(204);
+        return res.end();
+      }
 
       if (setupActive && method === "GET" && pathname === "/") {
         res.writeHead(302, { Location: "/setup" });
@@ -702,7 +726,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // CSRF gate — block cross-origin browser POSTs against any state-changing
       // route (always on, even before auth is configured). Webhook routes
       // self-authenticate so we exempt them.
-      if (!isPublicRoute(pathname)) {
+      if (!isPublicRoute(pathname) && !authenticatedG2CrossOrigin) {
         const origin = checkOrigin(req);
         if (!origin.ok) {
           res.writeHead(403, { "content-type": "application/json; charset=utf-8" });
@@ -930,6 +954,71 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: error.message });
         }
       }
+      if (method === "POST" && pathname === "/nodes/enrollment-code") {
+        if (readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, { error: "Even G2 nodes must be enrolled on the main OpenAGI" });
+        }
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
+        if (body.platform !== EVEN_G2_PLATFORM) {
+          return sendJson(res, 400, { error: `platform must be ${EVEN_G2_PLATFORM}` });
+        }
+        const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM);
+        console.log(`[openagi] Even G2 node enrollment code ${issued.code} (valid 10 min, single use)`);
+        return sendJson(res, 200, {
+          ...issued,
+          publicUrl: getPublicUrl(),
+          transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
+        });
+      }
+      if (method === "POST" && pathname === "/nodes/enroll/exchange") {
+        const body = await readJsonLimited(req, 16 * 1024).catch(() => ({}));
+        const keys = Object.keys(body ?? {});
+        if (keys.some((key) => !["code", "platform", "nodeId", "name"].includes(key))) {
+          return sendG2NodeJson(res, 400, { error: "enrollment contains unsupported fields" });
+        }
+        const code = typeof body.code === "string" ? body.code.trim() : "";
+        const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
+        const name = boundedG2NodeName(body.name);
+        if (!/^\d{6}$/.test(code)) {
+          return sendG2NodeJson(res, 400, { error: "invalid_enrollment_code", message: "Enter the 6-digit code shown by OpenAGI." });
+        }
+        if (body.platform !== EVEN_G2_PLATFORM) {
+          return sendG2NodeJson(res, 400, { error: "invalid_platform", message: "This enrollment code is for an Even G2 node." });
+        }
+        if (!/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
+          return sendG2NodeJson(res, 400, { error: "invalid_node_id", message: "The G2 node identity is malformed." });
+        }
+        if (nodeRegistry.isEnrolled(nodeId)) {
+          return sendG2NodeJson(res, 409, { error: "node_already_enrolled", message: "Remove this G2 node in OpenAGI before pairing it again." });
+        }
+        const consumed = nodeEnrollment.consume(code, EVEN_G2_PLATFORM);
+        if (!consumed.ok) {
+          const locked = consumed.reason === "locked";
+          return sendG2NodeJson(res, locked ? 429 : 401, {
+            error: locked ? "enrollment_locked" : "invalid_enrollment_code",
+            message: locked
+              ? "Too many incorrect codes. Wait 15 minutes and generate a new one."
+              : "That enrollment code is invalid or expired. Generate a new one in OpenAGI."
+          });
+        }
+        const nodeToken = randomBytes(32).toString("base64url");
+        nodeRegistry.enroll(nodeId, nodeToken, {
+          platform: EVEN_G2_PLATFORM,
+          name,
+          capabilities: EVEN_G2_CAPABILITIES
+        });
+        const enrollment = nodeRegistry.enrollment(nodeId);
+        return sendG2NodeJson(res, 200, {
+          node: {
+            id: nodeId,
+            name,
+            platform: EVEN_G2_PLATFORM,
+            enrolledAt: enrollment.createdAt
+          },
+          nodeToken,
+          capabilities: EVEN_G2_CAPABILITIES
+        });
+      }
       if (method === "POST" && pathname === "/nodes/heartbeat") {
         const body = await readJsonLimited(req, 128 * 1024).catch(() => ({}));
         if (body.nodeId !== requestNodeId) {
@@ -958,17 +1047,24 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (body.capabilities !== undefined && !Array.isArray(body.capabilities)) {
           return sendJson(res, 400, { error: "capabilities must be an array" });
         }
+        const g2Enrollment = requestEnrollment?.platform === EVEN_G2_PLATFORM
+          ? requestEnrollment
+          : null;
         nodeRegistry.upsert({
-          nodeId: body.nodeId, name: body.name, role: body.role,
+          nodeId: body.nodeId, name: g2Enrollment?.name ?? body.name, role: body.role,
           url: body.url ?? null, version: body.version ?? null,
           // A node reports its own build identity (git SHA or bundle build
           // number). Without it a roster can only show package.json versions,
           // which have drifted behind the release tags and so cannot answer
           // "is this node up to date" — the whole point of the column.
           build: body.build ?? null, buildSource: body.buildSource ?? null,
-          capabilities: sanitizeNodeCapabilities(body.capabilities)
+          platform: g2Enrollment?.platform ?? null,
+          capabilities: g2Enrollment?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
         });
-        return sendJson(res, 200, { ok: true });
+        return sendJson(res, 200, {
+          ok: true,
+          capabilities: g2Enrollment?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
+        });
       }
       if (method === "POST" && pathname === "/nodes/capture-memory") {
         const body = await readJsonLimited(req, 12 * 1024);
@@ -1085,6 +1181,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           version: typeof entry.version === "string" ? entry.version : null,
           build: typeof entry.build === "string" ? entry.build : null,
           buildSource: typeof entry.buildSource === "string" ? entry.buildSource : null,
+          platform: typeof entry.platform === "string" ? entry.platform : null,
           capabilities: sanitizeNodeCapabilities(entry.capabilities),
           lastSeenAt: typeof entry.lastSeenAt === "string" ? entry.lastSeenAt : null,
           status,
@@ -1125,7 +1222,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           nodes.sort((a, b) => (
             a.role === b.role ? (a.name ?? "").localeCompare(b.name ?? "") : (a.role === "main" ? -1 : 1)
           ));
-          const newestVersion = newestOf(nodes.map((n) => n.version));
+          const newestVersion = newestOf(nodes.filter((n) => !n.platform).map((n) => n.version));
           // A machine that was re-registered (identity.json regenerated after
           // a reinstall or a moved data dir) leaves an old row behind under
           // the same hostname. Dedupe can't merge them — the ids genuinely
@@ -1138,7 +1235,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           for (const n of nodes) {
             // Only claim "behind" when both versions actually parsed —
             // compareVersions returns null rather than pretending.
-            n.behind = compareVersions(n.version, newestVersion) === -1;
+            n.behind = !n.platform && compareVersions(n.version, newestVersion) === -1;
             // Surfacing the EXISTING authenticated updater (bin/openagi.js ->
             // POST /control/update), not a new remote-execution channel: the
             // command runs from the operator's shell with their own token.
@@ -1338,6 +1435,21 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const body = await readJson(req);
         const outputs = runtime.processIntegrationEvent(body.source ?? "abi", body.payload ?? body);
         return sendJson(res, 200, { outputs });
+      }
+
+      if (method === "POST" && pathname === "/nodes/g2/ask") {
+        if (!channels?.g2) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const body = await readJsonLimited(req, 1536 * 1024);
+          if (!body || typeof body !== "object" || Array.isArray(body)
+              || Object.keys(body).some((key) => !["audioBase64", "conversationId", "language"].includes(key))) {
+            return sendG2NodeJson(res, 400, { error: "G2 request contains unsupported fields" });
+          }
+          const result = await channels.g2.ask(body, requestNodeId);
+          return sendG2NodeJson(res, 200, result);
+        } catch (error) {
+          return sendG2NodeError(res, error);
+        }
       }
 
       if (method === "POST" && pathname === "/message") {
@@ -3297,6 +3409,48 @@ function sendJson(res, status, value) {
   const body = JSON.stringify(value, null, 2);
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body) });
   res.end(body);
+}
+
+function isG2NodeCorsRoute(pathname) {
+  return [
+    "/nodes/enroll/exchange",
+    "/nodes/heartbeat",
+    "/nodes/revoke",
+    "/nodes/g2/ask"
+  ].includes(pathname);
+}
+
+function applyG2NodeCorsHeaders(res) {
+  const headers = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "POST, OPTIONS",
+    "access-control-allow-headers": "Authorization, Content-Type, X-OpenAGI-Node-ID",
+    "access-control-max-age": "600",
+    "cache-control": "no-store",
+    "vary": "Origin"
+  };
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+}
+
+function sendG2NodeJson(res, status, value) {
+  return sendJson(res, status, value);
+}
+
+function sendG2NodeError(res, error) {
+  if (error instanceof G2ChannelError) {
+    return sendG2NodeJson(res, error.status, { error: error.code, message: error.message });
+  }
+  if (error?.message === "request body too large") {
+    return sendG2NodeJson(res, 413, { error: "audio_too_large", message: "Keep G2 questions under 30 seconds." });
+  }
+  return sendG2NodeJson(res, 500, { error: "g2_request_failed", message: "OpenAGI could not complete the G2 request." });
+}
+
+function boundedG2NodeName(value) {
+  const name = typeof value === "string"
+    ? value.trim().replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 80)
+    : "";
+  return name || "Even G2";
 }
 
 // Task statuses a "stop asking" may retire FROM. Mirrors the allowlist in
@@ -6514,6 +6668,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
 
   const rows = nodes.map((n) => {
     const s = NODE_STATUS[n.status] ?? NODE_STATUS.unknown;
+    const isG2 = n.platform === "even_g2";
     // Only rows we are recalling get an "as of" — a measured status (this
     // machine, or a main we just failed to open a connection to) is true now,
     // and dating it would imply doubt we don't have.
@@ -6533,7 +6688,9 @@ async function renderNodesOnce({ showLoading = true } = {}) {
       ? \`<div class="sub"><code>\${escapeHtml(n.updateCommand)}</code></div>\`
       : \`<div class="sub">run <code>openagi update</code> on that machine</div>\`;
     let update;
-    if (n.behind) {
+    if (isG2) {
+      update = \`<span class="sub">managed through Even Hub</span>\`;
+    } else if (n.behind) {
       update = \`<span class="badge warn">behind\${data.newestVersion ? " " + escapeHtml(data.newestVersion) : ""}</span>\`
         + (versionIsCurrent ? "" : \`<div class="sub">as of \${escapeHtml(timeAgo(data.cachedAt))}</div>\`)
         + howToUpdate;
@@ -6550,7 +6707,9 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     const capabilityLabels = {
       "computer-use": "Computer use",
       "imessage-search": "iMessage search",
-      "imessage-bridge": "iMessage replies"
+      "imessage-bridge": "iMessage replies",
+      "g2-voice-input": "G2 voice input",
+      "g2-text-display": "G2 text display"
     };
     const capabilities = (Array.isArray(n.capabilities) ? n.capabilities : []).map((capability) => {
       const label = capabilityLabels[capability.id] ?? String(capability.id ?? "capability").replaceAll("-", " ");
@@ -6565,10 +6724,10 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     return \`
       <tr>
         <td>\${escapeHtml(n.name ?? "unknown")}\${n.self ? \` <span class="badge">this machine</span>\` : ""}\${n.staleRegistration ? \` <span class="badge muted" title="Same hostname as this machine but a different node id — an earlier install that never checked in again.">old registration</span>\` : ""}\${n.url ? \`<div class="sub">\${escapeHtml(n.url)}</div>\` : ""}\${capabilities}</td>
-        <td>\${escapeHtml(n.role)}</td>
+        <td>\${escapeHtml(n.role)}\${isG2 ? \`<div class="sub">wearable</div>\` : ""}</td>
         <td><span class="badge \${s.badge}">\${escapeHtml(s.label)}</span>\${asOf}</td>
         <td>\${seen}</td>
-        <td>\${escapeHtml(n.version ?? "unknown")}<div class="sub">\${escapeHtml(nodeBuildLabel(n))}</div></td>
+        <td>\${isG2 ? "G2 client" : escapeHtml(n.version ?? "unknown")}<div class="sub">\${isG2 ? "Even Hub" : escapeHtml(nodeBuildLabel(n))}</div></td>
         <td>\${update}\${revoke}</td>
       </tr>\`;
   }).join("");
@@ -6627,6 +6786,13 @@ async function renderNodesOnce({ showLoading = true } = {}) {
   const selfBuild = self.build
     ? escapeHtml(nodeBuildLabel(self)) + " · " + escapeHtml(self.buildSource ?? "")
     : "build unknown — this install can't identify which commit it is running";
+  const g2EnrollmentCard = isNode ? "" : \`
+      <div class="card">
+        <div class="name">Add an Even Realities G2 node</div>
+        <div class="desc">The glasses receive their own revocable node identity with voice-input and text-display capabilities only.</div>
+        <button class="ui-btn ui-btn-sm" id="g2NodeEnrollBtn" style="margin-top:10px;">Generate enrollment code</button>
+        <div class="desc" id="g2NodeEnrollOut" style="margin-top:8px;"></div>
+      </div>\`;
 
   main.innerHTML = \`
     <div class="pane">
@@ -6642,10 +6808,11 @@ async function renderNodesOnce({ showLoading = true } = {}) {
           : ""}
         <div class="row" style="margin-top:8px;"><button id="nodesRefresh">Re-check now</button></div>
       </div>
+      \${g2EnrollmentCard}
       \${banner}
       <div class="desc" style="margin-top:12px;">
         Everything this installation talks to. <b>main</b> is the machine that holds the
-        brain; <b>node</b>s are OpenAGI installs paired to it that check in every 30s;
+        brain; <b>node</b>s are paired OpenAGI installs or wearables that check in every 30s;
         <b>service</b>s are machines that do one job for it (and never check in, so their
         row is a live probe, not a memory).
       </div>
@@ -6674,6 +6841,23 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     c.style.verticalAlign = "top";
   });
   document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes({ showLoading: false }));
+  document.getElementById("g2NodeEnrollBtn")?.addEventListener("click", async () => {
+    const out = document.getElementById("g2NodeEnrollOut");
+    try {
+      const response = await fetch("/nodes/enrollment-code", {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ platform: "even_g2" })
+      });
+      const enrollment = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(enrollment.error || \`HTTP \${response.status}\`);
+      if (out) out.innerHTML = \`Enter <code>\${escapeHtml(enrollment.code)}</code> in the G2 phone companion before \${escapeHtml(new Date(enrollment.expiresAt).toLocaleTimeString())}.\`
+        + (enrollment.transcriptionConfigured ? "" : \` <span class="warn">Set <code>OPENAI_API_KEY</code> before asking by voice.</span>\`);
+    } catch (error) {
+      if (out) out.textContent = error.message || "Could not create an enrollment code.";
+    }
+  });
   main.querySelectorAll("[data-revoke-node]").forEach((button) => {
     button.addEventListener("click", async () => {
       const nodeId = button.getAttribute("data-revoke-node");

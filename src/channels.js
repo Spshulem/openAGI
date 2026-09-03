@@ -3,6 +3,7 @@ import path from "node:path";
 import { nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { TelegramPairing } from "./telegram-pairing.js";
+import { G2Channel } from "./integrations/g2-channel.js";
 
 export class ChannelManager {
   constructor(options = {}) {
@@ -15,6 +16,11 @@ export class ChannelManager {
       agentHost: this.agentHost,
       dir: path.join(this.dir, "telegram"),
       token: options.telegramToken ?? process.env.TELEGRAM_BOT_TOKEN
+    });
+    this.g2 = options.g2 ?? new G2Channel({
+      agentHost: this.agentHost,
+      nodeRegistry: options.nodeRegistry,
+      dir: path.join(this.dir, "g2")
     });
     if (this.runtime) this.runtime.channels = this;
   }
@@ -77,7 +83,8 @@ export class ChannelManager {
   status() {
     return {
       local: { enabled: true, mode: "http+sse" },
-      telegram: this.telegram.status()
+      telegram: this.telegram.status(),
+      g2: this.g2.status()
     };
   }
 }

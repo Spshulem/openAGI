@@ -214,6 +214,7 @@ For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the O
 | **MCP execution** | Register stdio or HTTP+OAuth MCP servers in `.openagi/mcp.json` (or via the UI). On connect, every tool the server advertises becomes a callable agent tool (`mcp_<server>_<tool>`). |
 | **Cron prompts** | The agent can call `schedule_message({prompt, delaySeconds | intervalSeconds | dailyAt, channel, target})`. When the job fires, the daemon runs the prompt and routes the reply to the originating channel (Telegram, local). |
 | **Telegram** | Webhook (`/channels/telegram/webhook`) or long polling (`TELEGRAM_POLLING=1`). |
+| **Even Realities G2 node** | Enroll from the Nodes tab, speak through the glasses microphone, and read OpenAGI's answer on the display. G2 gets a constrained, revocable node credential; question audio is transcribed transiently and is not saved. [Setup guide](docs/setup/even-g2.md). |
 | **Persistent state** | All under `.openagi/`: memory (JSONL audit + atomic snapshot), cron jobs, agent/session store, specialist workspaces, MCP logs. |
 
 ### Credits

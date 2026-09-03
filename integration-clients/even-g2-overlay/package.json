@@ -1,0 +1,45 @@
+{
+  "name": "@buildbetter/even-g2",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.24.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "dev:openagi": "VITE_G2_MODE=openagi vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "package": "pnpm run build && evenhub pack app.json dist",
+    "package:openagi": "node scripts/package-openagi.mjs",
+    "simulate": "evenhub-simulator http://localhost:5173",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "agents:doctor": "node scripts/agent-supervisor/agentctl.mjs doctor",
+    "agents:status": "node scripts/agent-supervisor/agentctl.mjs status",
+    "agents:watch": "node scripts/agent-supervisor/agentctl.mjs watch",
+    "agents:test": "node --test scripts/agent-supervisor/lib.test.mjs",
+    "lint": "eslint .",
+    "check:bundle": "node scripts/check-bundle.mjs",
+    "check:secrets": "node scripts/check-secrets.mjs",
+    "check": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run build && pnpm run check:bundle && pnpm run check:secrets"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "0.0.13",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@evenrealities/evenhub-cli": "0.1.13",
+    "@evenrealities/evenhub-simulator": "0.8.0",
+    "eslint": "10.8.1",
+    "jsdom": "^30.0.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.66.0",
+    "vite": "8.2.1",
+    "vitest": "4.1.10"
+  }
+}
