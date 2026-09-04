@@ -16,7 +16,14 @@ final class AppState: ObservableObject {
 
   // Health snapshot
   @Published var providerName: String = "—"
-  @Published var providerConfigured: Bool = false
+  // Missing health data is unknown, not evidence that a saved key disappeared.
+  @Published var providerConfigured: Bool? = nil
+  var providerSetupStatus: ProviderSetupStatus {
+    ProviderSetupStatus.resolve(
+      daemonResponding: status != .unknown && status != .down,
+      configured: providerConfigured
+    )
+  }
   @Published var memoryShort: Int = 0
   @Published var memoryMedium: Int = 0
   @Published var memoryLong: Int = 0
@@ -186,11 +193,12 @@ final class AppState: ObservableObject {
       // interval, so a wedge shows up on the next tick; local /health answers
       // in ~0.3s, so the headroom is ~13x.
       let h: HealthResponse = try await get("/health", timeout: 4)
+      let recoveredFromOutage = consecutiveFailures > 0
       status = computeStatus(h)
       reachability = .serving
       daemonManagedExternally = await DaemonController.shared.listenerOwnership() == .external
       providerName = h.status?.agentHost?.provider ?? "—"
-      providerConfigured = h.status?.agentHost?.providerConfigured ?? false
+      providerConfigured = h.status?.agentHost?.providerConfigured
       memoryShort = h.status?.memory?.short ?? 0
       memoryMedium = h.status?.memory?.medium ?? 0
       memoryLong = h.status?.memory?.long ?? 0
@@ -201,15 +209,19 @@ final class AppState: ObservableObject {
       // brief items, so without this it reads 0 until the user opens the
       // popover: the one always-visible "something needs you" signal was blank
       // exactly when there was something to see.
-      if !didInitialBriefRefresh {
+      if !didInitialBriefRefresh || recoveredFromOutage {
         didInitialBriefRefresh = true
         scheduleBriefRefresh()
+        // SSE notifications emitted while disconnected are not replayed.
+        // Reconcile durable approvals on recovery, without requiring the user
+        // to close and reopen a panel that still displays an outage error.
+        Task { await PendingApprovalConsumer.shared.refresh() }
       }
       if h.firstRun == true && !offeredSetupThisLaunch {
         offeredSetupThisLaunch = true
         notify(title: "Welcome to OpenAGI", body: "Two minutes of setup and your agent is live.", path: "/setup")
         openDashboard(path: "/setup")
-      } else if h.firstRun != true && !providerConfigured && !offeredSetupThisLaunch {
+      } else if h.firstRun != true && providerSetupStatus == .needsSetup && !offeredSetupThisLaunch {
         // Partially-configured install (auth token saved, model key missing —
         // isFirstRun() is false but the agent can't think). Nudge once per
         // launch with a notification only; don't grab a window from someone

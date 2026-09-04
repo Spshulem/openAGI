@@ -79,10 +79,11 @@ export function createFatalUncaughtExceptionHandler({ write, exit } = {}) {
       if (typeof error?.message === "string" && error.message.trim()) message = error.message.trim();
       else if (error != null) message = String(error);
     } catch { /* hostile Error accessors must not trap the fatal handler */ }
+    name = name.replace(/[\r\n\t]+/g, " ");
     message = message.replace(/[\r\n\t]+/g, " ").slice(0, 1_000);
 
     try {
-      writeLine(`[openagi] fatal uncaught exception ${livenessNote()}: ${name}: ${message}\n`);
+      writeLine(`[openagi] fatal uncaught exception (exiting for recovery): ${name}: ${message}\n`);
     } finally {
       exitNow(1);
     }

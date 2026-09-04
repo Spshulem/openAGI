@@ -119,10 +119,13 @@ struct TrayMenu: View {
         Text("⚠ \(err)").disabled(true).foregroundStyle(.red).lineLimit(3)
         Button("Show daemon log…") { revealDaemonLog() }
       }
-      if state.providerConfigured {
+      switch state.providerSetupStatus {
+      case .configured:
         Text("Model: \(state.providerName)").disabled(true)
-      } else {
+      case .needsSetup:
         Button("⚠ Finish setup — agent has no model key") { state.openDashboard(path: "/setup") }
+      case .unknown:
+        Text("Model setup cannot be checked until the daemon responds").disabled(true)
       }
       Text("Today: $\(formatUsd(state.spentToday)) / $\(formatUsd(state.spentLimit))")
         .disabled(true)
@@ -175,7 +178,7 @@ struct TrayMenu: View {
   private var statusLine: String {
     // An unconfigured agent isn't "online" in any sense the user cares
     // about — say so before anything else.
-    if state.status == .healthy && !state.providerConfigured { return "● setup needed" }
+    if state.providerSetupStatus == .needsSetup { return "● setup needed" }
     switch state.status {
     case .healthy: return "● online"
     case .degraded: return "● needs attention"

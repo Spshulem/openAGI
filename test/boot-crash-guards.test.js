@@ -62,6 +62,27 @@ test("fatal exception handler emits one bounded line and exits non-zero", () => 
   assert.equal(written[0].split("\n").length, 2, "embedded newlines are flattened");
   assert.ok(written[0].length < 1_200, "fatal diagnostic is bounded");
   assert.doesNotMatch(written[0], /\bat\s+/, "V8 stack formatting is never requested");
+  assert.match(written[0], /exiting for recovery/);
+  assert.doesNotMatch(written[0], /kept alive/);
+});
+
+test("fatal exception diagnostics remain single-line with a custom error name", () => {
+  const written = [];
+  const error = new Error("failed");
+  error.name = "Provider\nError";
+  createFatalUncaughtExceptionHandler({ write: (line) => written.push(line), exit: () => {} })(error);
+  assert.equal(written[0].split("\n").length, 2);
+});
+
+test("fatal exception exit survives hostile accessors and a failed diagnostic writer", () => {
+  const exits = [];
+  const handler = createFatalUncaughtExceptionHandler({
+    write: () => { throw new Error("closed stderr"); },
+    exit: (code) => exits.push(code)
+  });
+  const error = Object.defineProperty({}, "name", { get() { throw new Error("bad getter"); } });
+  assert.throws(() => handler(error), /closed stderr/);
+  assert.deepEqual(exits, [1]);
 });
 
 test("an installed handler terminates a child daemon process on an uncaught exception", () => {
@@ -80,4 +101,20 @@ test("an installed handler terminates a child daemon process on an uncaught exce
   assert.equal(child.signal, null);
   assert.match(child.stderr, /fatal uncaught exception/);
   assert.match(child.stderr, /child-fatal-marker/);
+});
+
+test("a daemon with closed stderr still exits instead of looping on its logger", () => {
+  const bootUrl = new URL("../src/boot.js", import.meta.url).href;
+  const script = `
+    import fs from "node:fs";
+    import { installCrashGuards } from ${JSON.stringify(bootUrl)};
+    installCrashGuards();
+    fs.closeSync(2);
+    setImmediate(() => { throw new Error("closed-stderr-fatal"); });
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+    encoding: "utf8", timeout: 5_000
+  });
+  assert.equal(child.status, 1);
+  assert.equal(child.signal, null);
 });

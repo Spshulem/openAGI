@@ -29,6 +29,31 @@ function code(rel) {
     .join("\n");
 }
 
+test("provider setup is unknown until health explicitly reports configuration", () => {
+  const appstate = code(APPSTATE);
+  assert.match(appstate, /@Published var providerConfigured: Bool\? = nil/);
+  assert.match(appstate, /providerConfigured = h\.status\?\.agentHost\?\.providerConfigured\s*\n/);
+  assert.match(appstate, /providerSetupStatus == \.needsSetup && !offeredSetupThisLaunch/);
+  const tray = code(TRAY);
+  assert.match(tray, /switch state\.providerSetupStatus/);
+  assert.match(tray, /case \.unknown:\s*Text\("Model setup cannot be checked until the daemon responds"\)/);
+  assert.doesNotMatch(tray, /!state\.providerConfigured/);
+});
+
+test("health recovery reconciles approvals even when no SSE event is replayed", () => {
+  const appstate = code(APPSTATE);
+  assert.match(appstate, /let recoveredFromOutage = consecutiveFailures > 0/);
+  assert.match(appstate, /if !didInitialBriefRefresh \|\| recoveredFromOutage \{[^}]*scheduleBriefRefresh\(\)[^}]*PendingApprovalConsumer\.shared\.refresh\(\)/);
+});
+
+test("daemon logging does not depend on the parent draining a pipe", () => {
+  const daemon = code(DAEMON);
+  assert.match(daemon, /proc\.standardOutput = logHandle \?\? FileHandle\.nullDevice/);
+  assert.match(daemon, /proc\.standardError = logHandle \?\? FileHandle\.nullDevice/);
+  assert.doesNotMatch(daemon, /readabilityHandler/);
+  assert.match(daemon, /attributes: \[\.posixPermissions: 0o600\]/);
+});
+
 test("tray restart action never labels itself with recovery jargon", () => {
   // Shipped label: `Button(state.status == .down ? "↻ Restart daemon" : "↻ Restart daemon (recover)")`.
   // "(recover)" names an implementation detail — that bouncing a daemon which

@@ -70,6 +70,7 @@ final class PendingApprovalConsumer: ObservableObject {
       base: AppState.shared.baseURL,
       path: "/pending-actions?status=pending"))
     authed(&req)
+    req.timeoutInterval = 4
     do {
       let (data, response) = try await URLSession.shared.data(for: req)
       guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
