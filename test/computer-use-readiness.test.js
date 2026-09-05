@@ -1,6 +1,54 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { computerUseReadiness } from "../src/integrations/computer-use.js";
+import { NodeControlBroker } from "../src/node-control.js";
+import fs from "node:fs";
+import vm from "node:vm";
+
+test("a fresh permission-blocked advertisement remains configured without enabling control", async () => {
+  let now = 1000;
+  const broker = new NodeControlBroker({ now: () => now });
+  broker.advertise("fixture-node", [{ id: "computer-use", ready: false, inputReady: false,
+    operations: ["screenshot", "click"], detail: "private error fixture" }]);
+  let dispatches = 0;
+  broker.dispatch = async () => { dispatches++; throw new Error("must not execute"); };
+  const args = { env: { OPENAGI_COMPUTER_USE: "1" }, runtime: { nodeCapabilities: broker } };
+  const status = await computerUseReadiness(args);
+  assert.equal(broker.resolve("computer-use"), null, "execution resolution remains fail-closed");
+  assert.equal(status.nodeConfigured, true);
+  assert.equal(status.nodeReachable, true);
+  assert.equal(status.mode, "permissions-required");
+  assert.equal(status.inputAvailable, false);
+  assert.equal(status.screenshot, "recent-ocr");
+  assert.deepEqual(status.operations, []);
+  assert.doesNotMatch(JSON.stringify(status), /fixture-node|private error/);
+  assert.equal(dispatches, 0);
+  now += 91_000;
+  assert.equal((await computerUseReadiness(args)).mode, "observe-only", "expired advertisements cannot imply reachability");
+});
+
+test("ambiguous nodes require selection without choosing one or overriding explicit configuration", async () => {
+  const broker = new NodeControlBroker();
+  for (const id of ["fixture-one", "fixture-two"]) broker.advertise(id, [{ id: "computer-use", ready: true, operations: ["screenshot"] }]);
+  const runtime = { nodeCapabilities: broker };
+  const status = await computerUseReadiness({ env: { OPENAGI_COMPUTER_USE: "1" }, runtime });
+  assert.equal(status.mode, "node-selection-required");
+  assert.equal(status.nodeConfigured, true);
+  assert.equal(status.inputAvailable, false);
+  const explicit = await computerUseReadiness({ env: { OPENAGI_COMPUTER_USE: "1", OPENAGI_COMPUTER_NODE: "https://node.example" }, runtime });
+  assert.equal(explicit.mode, "node-unreachable", "explicit missing-token configuration never falls back to a different node");
+  assert.equal((await computerUseReadiness({ env: {}, runtime })).mode, "disabled");
+});
+
+test("dashboard describes blocked and ambiguous control states without calling them off", () => {
+  const source = fs.readFileSync(new URL("../src/hosted-interface.js", import.meta.url), "utf8");
+  const expression = source.match(/const modeCopy = ([\s\S]*?);\n/)?.[1];
+  assert.ok(expression);
+  const copy = (mode) => vm.runInNewContext(expression, { readiness: { mode } });
+  assert.match(copy("permissions-required"), /Connected.*Input remains refused/);
+  assert.match(copy("node-selection-required"), /Select the intended node/);
+  assert.match(copy("disabled"), /^Off/);
+});
 
 test("computer-use readiness distinguishes disabled, observe-only, and control-ready", async () => {
   const disabled = await computerUseReadiness({ env: {}, fetchImpl: null, toolsRegistered: false });
