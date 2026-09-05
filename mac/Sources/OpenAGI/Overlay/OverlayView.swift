@@ -364,12 +364,30 @@ struct OverlayView: View {
            ? "Computer Use"
            : approval.toolName.replacingOccurrences(of: "_", with: " ").capitalized)
         .font(.system(size: 10)).foregroundStyle(.secondary)
-      HStack(spacing: 8) {
-        Button("Approve & run") {
-          Task { await approvals.approve(approval.id) }
+      if let review = approval.codingReply {
+        // The generic summary is capped at 240 characters. Keep the complete
+        // bound instruction reviewable before the adjacent approval button.
+        ScrollView {
+          Text(review.text)
+            .font(.system(size: 11))
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
         }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.small)
+        .frame(height: 160)
+      }
+      HStack(spacing: 8) {
+        if approval.toolName == "reply_to_coding_agent" && approval.codingReply == nil {
+          Button("Review in dashboard") { app.openDashboard(path: "/?tab=approvals") }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        } else {
+          Button("Approve & run") {
+            Task { await approvals.approve(approval.id) }
+          }
+          .buttonStyle(.borderedProminent)
+          .controlSize(.small)
+        }
         Button("Deny") {
           Task { await approvals.deny(approval.id) }
         }

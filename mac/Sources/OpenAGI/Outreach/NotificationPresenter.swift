@@ -32,6 +32,8 @@ final class NotificationPresenter {
     UNUserNotificationCenter.current().setNotificationCategories([
       cat("stalled-task", [("close", "Close it"), ("keep", "Keep"), ("snooze", "Snooze")]),
       cat("pending-action", [("do", "Do it"), ("dismiss", "Not now")]),
+      cat("coding-approval", [("review", "Review instruction")]),
+      cat("coding-agent", [("review", "Review session")]),
       cat("clarification", [("yes", "Yes"), ("no", "No"), ("in_progress", "In progress")]),
       cat("draft", [("approve", "Approve"), ("dismiss", "Dismiss")]),
       cat("digest", [("review", "Review")])
@@ -44,16 +46,28 @@ final class NotificationPresenter {
   func present(_ item: OutreachItem) {
     // Hold live decisions during quiet hours — they'll show in the next digest
     // and remain in the overlay list regardless.
-    if OutreachConsumer.shared.inQuietHours() && item.needsDecision { return }
-    guard item.needsDecision || item.type == "digest" else { return }
+    guard Self.shouldNotify(type: item.type, needsDecision: item.needsDecision,
+      quiet: OutreachConsumer.shared.inQuietHours()) else { return }
 
     let content = UNMutableNotificationContent()
     content.title = item.title
     content.body = item.summary
     content.categoryIdentifier = item.type
     content.userInfo = [outreachUserInfoKey: item.id]
+    if let path = Self.reviewPath(type: item.type) { content.userInfo["path"] = path }
     UNUserNotificationCenter.current().add(
       UNNotificationRequest(identifier: item.id, content: content, trigger: nil))
+  }
+
+  static func shouldNotify(type: String, needsDecision: Bool, quiet: Bool) -> Bool {
+    if quiet && (needsDecision || type == "coding-agent") { return false }
+    return needsDecision || type == "digest" || type == "coding-agent"
+  }
+
+  static func reviewPath(type: String) -> String? {
+    if type == "coding-agent" { return "/?tab=coding-agents" }
+    if type == "coding-approval" { return "/?tab=approvals" }
+    return nil
   }
 
   // True when a tapped notification belongs to the outreach feed.
@@ -69,6 +83,10 @@ final class NotificationPresenter {
     }
     let action = response.actionIdentifier
     if action == UNNotificationDefaultActionIdentifier || action == "review" {
+      if Self.reviewPath(type: response.notification.request.content.categoryIdentifier) != nil {
+        OutreachConsumer.shared.openCodingReview(approvals: response.notification.request.content.categoryIdentifier == "coding-approval")
+        return true
+      }
       // Body tap or the digest "Review" button: open the overlay list.
       OverlayController.shared.show()
       OverlayState.shared.expanded = true

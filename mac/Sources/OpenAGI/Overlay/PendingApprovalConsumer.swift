@@ -15,13 +15,25 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
   let status: String
   let createdAt: String?
   let sourceSessionId: String?
+  let codingReply: CodingReplyReview?
+
+  struct CodingReplyReview: Decodable, Equatable {
+    let provider: String
+    let sessionId: String
+    let project: String?
+    let message: String
+
+    var text: String {
+      "\(provider) · \(project ?? "Coding session")\nSession: \(sessionId)\n\n\(message)\n\nProvider usage may be charged. Later provider permission requests need a separate decision."
+    }
+  }
 
   private struct Context: Decodable {
     let sessionId: String?
   }
 
   enum CodingKeys: String, CodingKey {
-    case id, toolName, summary, status, createdAt, context
+    case id, toolName, summary, status, createdAt, context, args
   }
 
   init(from decoder: Decoder) throws {
@@ -32,6 +44,8 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
     status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
     createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
     sourceSessionId = try c.decodeIfPresent(Context.self, forKey: .context)?.sessionId
+    codingReply = toolName == "reply_to_coding_agent"
+      ? try? c.decode(CodingReplyReview.self, forKey: .args) : nil
   }
 }
 
@@ -46,6 +60,7 @@ private struct PendingApprovalDecisionResponse: Decodable {
 
 private struct PendingApprovalExecutionResult: Decodable {
   let sessionId: String?
+  let note: String?
 }
 
 @MainActor
@@ -136,7 +151,7 @@ final class PendingApprovalConsumer: ObservableObject {
             ? "Approved — the agent is continuing in Chat."
             : "Approved — the computer task is running in Chat."
         } else {
-          lastOutcome = "Approved."
+          lastOutcome = decoded?.result?.note ?? "Approved."
         }
       } else {
         if isComputerUseApproval {

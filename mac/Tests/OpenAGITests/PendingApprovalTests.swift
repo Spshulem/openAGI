@@ -3,6 +3,28 @@ import XCTest
 @testable import OpenAGI
 
 final class PendingApprovalTests: XCTestCase {
+  @MainActor
+  func testCodingAttentionNotifiesAndReviewsWithoutInlineExecution() {
+    XCTAssertTrue(NotificationPresenter.shouldNotify(type: "coding-agent", needsDecision: false, quiet: false))
+    XCTAssertFalse(NotificationPresenter.shouldNotify(type: "coding-agent", needsDecision: false, quiet: true))
+    XCTAssertFalse(NotificationPresenter.shouldNotify(type: "suggestion", needsDecision: false, quiet: false))
+    XCTAssertEqual(NotificationPresenter.reviewPath(type: "coding-agent"), "/?tab=coding-agents")
+    XCTAssertEqual(NotificationPresenter.reviewPath(type: "coding-approval"), "/?tab=approvals")
+  }
+  func testCodingApprovalKeepsCompleteInstructionForReview() throws {
+    let instruction = String(repeating: "Reviewable instruction. ", count: 150) + "IMPORTANT FINAL SENTENCE"
+    let data = try JSONSerialization.data(withJSONObject: [
+      "id": "fixture-approval", "toolName": "reply_to_coding_agent", "status": "pending",
+      "summary": "Short summary", "args": [
+        "provider": "codex", "sessionId": "fixture-session", "project": "Fixture", "message": instruction
+      ]
+    ])
+    let item = try JSONDecoder().decode(PendingApproval.self, from: data)
+    XCTAssertEqual(item.codingReply?.message, instruction)
+    XCTAssertTrue(item.codingReply?.text.contains("IMPORTANT FINAL SENTENCE") == true)
+    XCTAssertTrue(item.codingReply?.text.contains("separate decision") == true)
+  }
+
   func testPendingApprovalDecodesDurableQueueFields() throws {
     let data = Data(#"""
     {

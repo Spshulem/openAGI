@@ -3,6 +3,8 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { createDefaultRuntime } from "./abi-runtime.js";
+import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
+import { codingSupervisorUi } from "./coding-supervisor-ui.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
@@ -216,6 +218,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("computer-use", (data) => broadcast("computer-use", data));
   events.on("outreach", (data) => broadcast("outreach", data));
   events.on("outreach-resolved", (data) => broadcast("outreach-resolved", data));
+  events.on("coding-agents", (data) => broadcast("coding-agents", data));
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -1810,6 +1813,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           actions: runtime.pendingActions?.list({ status }) ?? []
         });
       }
+      if (pathname === "/coding-agents" || pathname.startsWith("/coding-agents/")) {
+        const result = await codingSupervisorRoute(runtime, method, pathname, url, () => readJsonLimited(req, 24 * 1024));
+        return sendJson(res, result.status, result.body);
+      }
       if (method === "GET" && pathname === "/outreach/feed") {
         const since = Number(url.searchParams.get("since") ?? 0);
         const items = runtime.outreach?.since(since) ?? [];
@@ -2921,6 +2928,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve) => {
         server.listen(port, host, () => {
           channels?.start();
+          runtime.codingSupervisor?.start();
           if (tickerMs > 0) {
             tickerHandle = setInterval(() => {
               runtime.tick().catch(() => { /* swallow */ });
@@ -3010,6 +3018,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
         sseClients.clear();
         channels?.stop?.();
+        runtime.codingSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
@@ -3419,6 +3428,9 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (action === "do") {
         let a = runtime.pendingActions?.get(ref.id);
         if (!a) throw new Error("pending action gone");
+        if (a.toolName === "reply_to_coding_agent") {
+          throw outreachActionConflict("Open Approvals to review the complete coding instruction before sending.");
+        }
         if (a.status !== "pending") {
           throw outreachActionConflict(`pending action already ${a.status}`);
         }
@@ -4269,6 +4281,7 @@ function renderApp() {
             <button data-tab="cron" title="Scheduled prompts + the agent's autopilot pulse cron jobs.">Cron</button>
             <button data-tab="channels" title="Telegram / webhook channels the agent can deliver through.">Channels</button>
             <button data-tab="agents" title="Specialists the propagation controller has spawned for repeated tasks.">Agents</button>
+            <button data-tab="coding-agents" title="Inspect and coordinate Claude Code and Codex sessions through your local supervisor.">Coding Agents</button>
             <button data-tab="nodes" title="Which machines are paired, which one is main, and who's online right now.">Nodes</button>
           </div>
           <div class="nav-more-section">
@@ -4786,6 +4799,9 @@ async function switchTab(tab) {
   } else if (tab === "agents") {
     showSidebar(false);
     await renderAgents();
+  } else if (tab === "coding-agents") {
+    showSidebar(false);
+    await renderCodingAgents();
   } else if (tab === "memory") {
     showSidebar(false);
     await renderMemory();
@@ -6219,6 +6235,8 @@ function openMcpComposer() {
   });
 }
 
+${codingSupervisorUi}
+
 async function renderAgents() {
   const agents = await fetchJson("/agents");
   main.innerHTML = '<div class="pane"><h2>Agents</h2><div class="grid" id="agentList"></div></div>';
@@ -6990,6 +7008,13 @@ async function renderHealth() {
 }
 
 function pendingActionCardHtml(action) {
+  const coding = action.toolName === 'reply_to_coding_agent';
+  const details = coding
+    ? '<p>' + escapeHtml(action.args?.provider || '') + ' · ' + escapeHtml(action.args?.project || 'Coding session')
+      + '<br>Session: ' + escapeHtml(action.args?.sessionId || '') + '</p><pre style="white-space:pre-wrap; overflow-wrap:anywhere;">'
+      + escapeHtml(action.args?.message || '') + '</pre><p class="muted">Provider usage may be charged. Later provider permission requests need a separate decision.</p>'
+    : '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px; white-space:pre-wrap; overflow-wrap:anywhere;">'
+      + escapeHtml(JSON.stringify(action.args, null, 2)) + '</pre></details>';
   return '<div class="card" style="padding:14px; margin-bottom:10px;" data-pending-id="' + escapeHtml(action.id) + '">'
     + '<div style="display:flex; gap:8px; align-items:center;">'
     + '<span style="font-size:18px;">🤖</span>'
@@ -6997,9 +7022,7 @@ function pendingActionCardHtml(action) {
     + '<span class="badge">' + escapeHtml(action.toolName) + '</span>'
     + '</div>'
     + (action.reason ? '<div class="muted" style="margin-top:6px; font-size:12px;">' + escapeHtml(action.reason) + '</div>' : '')
-    + '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px;">'
-    + escapeHtml(JSON.stringify(action.args, null, 2))
-    + '</pre></details>'
+    + details
     + '<div class="muted" style="margin-top:4px; font-size:11px;">queued ' + escapeHtml(new Date(action.createdAt).toLocaleString()) + '</div>'
     + '<div class="row" style="gap:8px; margin-top:10px;">'
     + '<button data-pending-action="approve">Approve & run</button>'
@@ -9129,6 +9152,10 @@ function refreshApprovalSurfaces() {
 }
 evt.addEventListener("pending-action", refreshApprovalSurfaces);
 evt.addEventListener("pending-action-resolved", refreshApprovalSurfaces);
+evt.addEventListener("coding-agents", () => {
+  // Do not redraw while someone is composing a reply.
+  if (state.tab === "coding-agents" && $("codingRefresh")) $("codingRefresh").textContent = "Refresh status";
+});
 
 // New skill candidate proposed by the pattern miner or session miner.
 // Refresh the Skills tab if the user is on it; otherwise show a browser
@@ -9278,7 +9305,7 @@ setInterval(() => {
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");
