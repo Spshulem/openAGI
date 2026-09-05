@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 // Durable consumer of a remote "main" Distiller's proactive-outreach feed.
 //
@@ -79,6 +80,17 @@ final class OutreachConsumer: ObservableObject {
 
   private func authed(_ req: inout URLRequest) {
     if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+  }
+
+  // Review the same main that produced the notification, not an unrelated
+  // local daemon. Reuse its browser login; never put the service token in a URL.
+  func openCodingReview(approvals: Bool) {
+    guard let base = baseURL,
+      var components = URLComponents(url: base, resolvingAgainstBaseURL: false) else { return }
+    components.path = "/"
+    components.queryItems = [URLQueryItem(name: "tab", value: approvals ? "approvals" : "coding-agents")]
+    components.fragment = nil
+    if let url = components.url { NSWorkspace.shared.open(url) }
   }
 
   // Pull everything we missed since our last cursor — lossless on reconnect.

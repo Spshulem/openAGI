@@ -23,13 +23,13 @@ const MAP = {
     actions: ["accept", "dismiss", "up", "down"]
   }),
   "pending-action": (d) => ({
-    type: "pending-action",
+    type: d.toolName === "reply_to_coding_agent" ? "coding-approval" : "pending-action",
     sourceRef: { kind: "pending-action", id: d.id },
     outcomeId: d.outcomeId ?? null,
     title: d.summary ?? "Action needs approval",
-    summary: d.reason ?? "",
+    summary: d.toolName === "reply_to_coding_agent" ? "Open Approvals to review the complete instruction before sending." : d.reason ?? "",
     needsDecision: true,
-    actions: ["do", "dismiss"]
+    actions: d.toolName === "reply_to_coding_agent" ? ["dismiss"] : ["do", "dismiss"]
   }),
   "clarification-created": (d) => ({
     type: "clarification",
