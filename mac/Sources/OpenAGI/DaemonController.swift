@@ -98,7 +98,8 @@ final class DaemonController {
     }
 
     if !FileManager.default.fileExists(atPath: logFile.path) {
-      FileManager.default.createFile(atPath: logFile.path, contents: nil)
+      FileManager.default.createFile(atPath: logFile.path, contents: nil,
+                                     attributes: [.posixPermissions: 0o600])
     }
     logHandle = try? FileHandle(forWritingTo: logFile)
     logHandle?.seekToEndOfFile()
@@ -115,18 +116,11 @@ final class DaemonController {
     env["OPENAGI_COMPUTER_HELPER"] = bundleResources.appendingPathComponent("OpenAGIComputerHelper").path
     proc.environment = env
 
-    let stdoutPipe = Pipe()
-    let stderrPipe = Pipe()
-    proc.standardOutput = stdoutPipe
-    proc.standardError = stderrPipe
-    stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-      let d = h.availableData
-      if !d.isEmpty { self?.logHandle?.write(d) }
-    }
-    stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-      let d = h.availableData
-      if !d.isEmpty { self?.logHandle?.write(d) }
-    }
+    // Inherit the log file directly. A parent app crash must not leave the
+    // daemon writing to orphaned pipes (EPIPE), and log delivery must not rely
+    // on an app-side readability callback continuing to drain the pipes.
+    proc.standardOutput = logHandle ?? FileHandle.nullDevice
+    proc.standardError = logHandle ?? FileHandle.nullDevice
     proc.terminationHandler = { [weak self] p in
       NSLog("OpenAGI: daemon exited with \(p.terminationStatus)")
       DispatchQueue.main.async {

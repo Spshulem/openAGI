@@ -161,6 +161,12 @@ npm run install-launchd      # macOS — auto-start at login + auto-restart on c
 npm run install-systemd      # Linux — same, via systemd (sudo for system-wide; pass 'user' for rootless)
 ```
 
+Supervised installs intentionally exit non-zero after an uncaught synchronous
+exception so launchd/systemd can replace a potentially corrupted process. A PID
+that still owns the port is not considered healthy unless `GET /health` answers;
+recoverable asynchronous integration failures remain logged without stopping
+the daemon.
+
 ### macOS native menu bar app
 
 A SwiftUI menubar app that bundles Node + the runtime + Sparkle auto-update + screen capture + replay confirmation:
