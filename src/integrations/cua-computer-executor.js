@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createComputerExecutor } from "./computer-server.js";
+import { createOpenComputerUseExecutor } from "./open-computer-use-executor.js";
 
 const INPUT_OPERATIONS = ["click", "drag", "move", "type", "key", "scroll"];
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -10,6 +11,9 @@ const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0
 export function createConfiguredComputerExecutor({ env = process.env, ...options } = {}) {
   const backend = String(env.OPENAGI_COMPUTER_BACKEND ?? "native").trim().toLowerCase();
   if (backend === "native" || backend === "openagi") return createComputerExecutor(options);
+  if (backend === "open-computer-use") return createOpenComputerUseExecutor({
+    binaryPath: env.OPENAGI_OCU_PATH, helperPath: env.OPENAGI_COMPUTER_HELPER, ...options
+  });
   if (backend === "cua") {
     return createCuaComputerExecutor({
       binaryPath: env.OPENAGI_CUA_DRIVER_PATH,
