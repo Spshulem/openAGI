@@ -389,6 +389,19 @@ export const MCP_CATALOG = [
 
   // ─── Communication ──────────────────────────────────────────────────
   {
+    id: "superhuman-mail",
+    name: "Superhuman Mail",
+    description: "Search email and calendar, prepare drafts, and manage events. Requires Superhuman Mail Business or higher, Ask AI, and its Chrome extension for OAuth sign-in.",
+    category: "communication",
+    authType: "oauth",
+    status: "available",
+    matches: { hostnames: ["mail.superhuman.com"], keywords: ["superhuman mail"] },
+    // Official server, with dynamic OAuth client registration. Catalog
+    // discovery does not connect an account or grant permission to send mail.
+    // https://help.superhuman.com/hc/en-us/articles/46005696690317-Superhuman-Mail-MCP-Server
+    register: { url: "https://mcp.mail.superhuman.com/mcp", transport: "http", auth: "oauth" }
+  },
+  {
     id: "slack",
     name: "Slack",
     description: "Access Slack channels, messages, and user data. Coming soon — Slack's hosted MCP requires you to register your own Slack app and provide its client_id + client_secret, which the wizard doesn't collect yet.",

@@ -52,6 +52,44 @@ export function loadBootEnv() {
 // before the runtime/MCP connects, so it covers every daemon launch (the CLI,
 // this example, systemd, the Mac DaemonController) identically.
 let crashGuardsInstalled = false;
+
+// Node explicitly warns that normal operation after an uncaught synchronous
+// exception is unsafe: application state may already be corrupted. Keeping the
+// event loop alive can be worse than a crash — a repeating callback can throw
+// forever while the process still owns its port, making liveness checks hang
+// and preventing launchd/systemd from replacing it. Keep this handler small,
+// synchronous, and independently testable. In production it writes one bounded
+// line without asking V8 to format a potentially huge/recursive stack, then
+// exits non-zero so the existing supervisor can recover the daemon.
+export function createFatalUncaughtExceptionHandler({ write, exit } = {}) {
+  const writeLine = write ?? ((line) => {
+    try { fs.writeSync(2, line); } catch { /* stderr may already be unavailable */ }
+  });
+  const exitNow = exit ?? ((code) => process.exit(code));
+  let exiting = false;
+
+  return (error) => {
+    if (exiting) return exitNow(1);
+    exiting = true;
+
+    let name = "Error";
+    let message = "unknown synchronous failure";
+    try {
+      if (typeof error?.name === "string" && error.name.trim()) name = error.name.trim().slice(0, 80);
+      if (typeof error?.message === "string" && error.message.trim()) message = error.message.trim();
+      else if (error != null) message = String(error);
+    } catch { /* hostile Error accessors must not trap the fatal handler */ }
+    name = name.replace(/[\r\n\t]+/g, " ");
+    message = message.replace(/[\r\n\t]+/g, " ").slice(0, 1_000);
+
+    try {
+      writeLine(`[openagi] fatal uncaught exception (exiting for recovery): ${name}: ${message}\n`);
+    } finally {
+      exitNow(1);
+    }
+  };
+}
+
 export function installCrashGuards() {
   if (crashGuardsInstalled) return;
   crashGuardsInstalled = true;
@@ -59,12 +97,10 @@ export function installCrashGuards() {
     const err = reason instanceof Error ? reason : new Error(String(reason));
     console.error(`[openagi] unhandled rejection ${livenessNote()}: ${err.stack || err.message}`);
   });
-  // An uncaught synchronous exception can leave state undefined, but for a
-  // supervised, always-on daemon staying up beats crash-looping; the error is
-  // logged loudly so it's still diagnosable in daemon.log / journald.
-  process.on("uncaughtException", (err) => {
-    console.error(`[openagi] uncaught exception ${livenessNote()}: ${err?.stack || err}`);
-  });
+  // Unlike a recoverable integration rejection, an uncaught synchronous
+  // exception is fatal. Exit once and let launchd/systemd replace the process;
+  // retaining a possibly corrupted event loop can leave a port-owning zombie.
+  process.on("uncaughtException", createFatalUncaughtExceptionHandler());
 }
 
 // ─── Startup failures must be non-zero ────────────────────────────────────
