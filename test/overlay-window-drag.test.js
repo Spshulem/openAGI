@@ -17,6 +17,7 @@ test("Mac Quick Ask exposes draggable pill and header surfaces", () => {
   assert.match(controller, /if didDrag \{ OverlayController\.shared\.persistPosition\(\) \}/);
   assert.match(controller, /private func dragTarget[\s\S]{0,500}view as\? DragHandleView/);
   assert.match(controller, /p\.isMovable = true[\s\S]{0,100}p\.isMovableByWindowBackground = true/);
-  assert.match(controller, /host\.sizingOptions = \[\]/);
+  assert.match(controller, /host\.sizingOptions = \[\.intrinsicContentSize\]/);
+  assert.match(controller, /host\.setFrameSize\(NSSize\(width: newW, height: host\.frame\.height\)\)[\s\S]{0,160}host\.layoutSubtreeIfNeeded\(\)[\s\S]{0,100}host\.fittingSize/);
   assert.doesNotMatch(controller, /p\.animator\(\)\.setFrame/);
 });
