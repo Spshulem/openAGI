@@ -90,8 +90,16 @@ export async function computerUseReadiness({
   await runtime?.nodeCapabilities?.refresh?.().catch?.(() => {});
   const explicit = explicitComputerNode(env);
   const discovered = runtime?.nodeCapabilities?.resolve?.("computer-use") ?? null;
+  // Resolution deliberately excludes nodes that cannot execute. Diagnostics
+  // must not mistake that refusal for missing setup. list() contains only
+  // current local health / fresh authenticated advertisements, not /nodes' cache.
+  const advertised = !explicit && !discovered ? runtime?.nodeCapabilities?.list?.("computer-use") ?? [] : [];
+  const blocked = !explicit && !discovered && advertised.length === 1
+    ? advertised[0].capabilities?.find?.((entry) => entry.id === "computer-use" && entry.ready === false)
+    : null;
+  const needsSelection = !explicit && !discovered && advertised.length > 1;
   const node = explicit ?? (discovered ? relayComputerNode(runtime, discovered) : null);
-  const nodeConfigured = Boolean(node);
+  const nodeConfigured = Boolean(node || blocked || needsSelection);
   let nodeReachable = false;
   let liveScreenshot = false;
   let inputAvailable = false;
@@ -112,7 +120,7 @@ export async function computerUseReadiness({
     detail = capability?.detail ?? null;
   } else if (node?.kind === "invalid") {
     detail = node.detail;
-  } else if (nodeConfigured && typeof fetchImpl === "function") {
+  } else if (node?.kind === "http" && typeof fetchImpl === "function") {
     const status = await probeExplicitComputerNode(node, fetchImpl, timeoutMs);
     nodeReachable = status.reachable;
     operations = status.operations;
@@ -120,8 +128,17 @@ export async function computerUseReadiness({
     inputAvailable = status.inputAvailable;
     detail = status.detail;
   }
+  if (blocked) {
+    nodeReachable = true;
+    // Do not copy arbitrary node-provided errors into status. No command is
+    // dispatched and neither capture nor input is enabled by this fallback.
+    detail = "A connected computer node reports that control prerequisites are not met. Check its Screen Recording, Accessibility, unlocked screen, and Secure Input status in Nodes.";
+  }
+  if (needsSelection) detail = "Multiple computer nodes are connected. Select a node and check its current permissions in Nodes.";
   const mode = !enabled
     ? "disabled"
+    : needsSelection
+      ? "node-selection-required"
     : nodeReachable
       ? (inputAvailable
           ? (liveScreenshot ? "control-ready" : "app-selection-required")
