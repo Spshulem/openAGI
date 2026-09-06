@@ -46,6 +46,16 @@ test("proactive-suggestion maps to a digest suggestion", () => {
   assert.equal(item.sourceRef.id, "prop_1");
 });
 
+test("coding replies notify for full review without a truncated-preview execution shortcut", () => {
+  const { events, store } = harness();
+  events.emit("pending-action", { id: "act_coding", toolName: "reply_to_coding_agent", summary: "Truncated instruction" });
+  const item = store.list()[0];
+  assert.equal(item.type, "coding-approval");
+  assert.equal(item.needsDecision, true);
+  assert.deepEqual(item.actions, ["dismiss"]);
+  assert.match(item.summary, /complete instruction/);
+});
+
 test("unknown events are ignored (no item created)", () => {
   const { events, store } = harness();
   events.emit("miner-result", { source: "task-sweep" });

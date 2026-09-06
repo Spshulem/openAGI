@@ -3,6 +3,8 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { createDefaultRuntime } from "./abi-runtime.js";
+import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
+import { codingSupervisorUi } from "./coding-supervisor-ui.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
@@ -224,6 +226,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("computer-use", (data) => broadcast("computer-use", data));
   events.on("outreach", (data) => broadcast("outreach", data));
   events.on("outreach-resolved", (data) => broadcast("outreach-resolved", data));
+  events.on("coding-agents", (data) => broadcast("coding-agents", data));
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -1922,6 +1925,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           actions: runtime.pendingActions?.list({ status }) ?? []
         });
       }
+      if (pathname === "/coding-agents" || pathname.startsWith("/coding-agents/")) {
+        const result = await codingSupervisorRoute(runtime, method, pathname, url, () => readJsonLimited(req, 24 * 1024));
+        return sendJson(res, result.status, result.body);
+      }
       if (method === "GET" && pathname === "/outreach/feed") {
         const since = Number(url.searchParams.get("since") ?? 0);
         const items = runtime.outreach?.since(since) ?? [];
@@ -3033,6 +3040,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve) => {
         server.listen(port, host, () => {
           channels?.start();
+          runtime.codingSupervisor?.start();
           if (tickerMs > 0) {
             tickerHandle = setInterval(() => {
               runtime.tick().catch(() => { /* swallow */ });
@@ -3122,6 +3130,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
         sseClients.clear();
         channels?.stop?.();
+        runtime.codingSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
@@ -3573,6 +3582,9 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (action === "do") {
         let a = runtime.pendingActions?.get(ref.id);
         if (!a) throw new Error("pending action gone");
+        if (["reply_to_coding_agent", "start_coding_agent"].includes(a.toolName)) {
+          throw outreachActionConflict("Open Approvals to review the complete coding instruction before sending.");
+        }
         if (a.status !== "pending") {
           throw outreachActionConflict(`pending action already ${a.status}`);
         }
@@ -3831,9 +3843,9 @@ function renderApp() {
       height: 100vh;
       overflow: hidden;
     }
-    .app { display: grid; grid-template-rows: 48px 1fr; height: 100vh; }
+    .app { display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100vh; }
     header {
-      display: flex; align-items: center; gap: 16px;
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap; min-height: 48px;
       padding: 0 16px;
       background: var(--panel);
       border-bottom: 1px solid var(--line);
@@ -3841,7 +3853,7 @@ function renderApp() {
     header h1 { font-size: 14px; font-weight: 700; margin: 0; letter-spacing: 0.02em; }
     header .status { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
     header .status .status-pill { white-space: nowrap; padding: 2px 8px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); }
-    nav { display: flex; gap: 4px; margin-left: auto; align-items: center; }
+    nav { display: flex; gap: 4px; margin-left: auto; align-items: center; flex-wrap: wrap; min-width: 0; }
     nav button {
       background: transparent; border: 1px solid transparent; color: var(--muted);
       padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
@@ -3883,7 +3895,10 @@ function renderApp() {
     .nav-more-panel button.active { background: var(--accent-bg); color: var(--accent-foreground); }
 
     .body { display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
-    .body.no-sidebar { grid-template-columns: 1fr; }
+    .body.no-sidebar { grid-template-columns: minmax(0, 1fr); }
+    main, .pane, .card { min-width: 0; overflow-wrap: anywhere; }
+    #codingDetail pre { overflow-wrap: anywhere; }
+    #codingList ~ section, #codingList { min-width: 0; }
     .sidebar {
       background: var(--panel);
       border-right: 1px solid var(--line);
@@ -3955,7 +3970,7 @@ function renderApp() {
     .pane h3 { margin: 22px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
     .pane > .row, .pane > .grid { max-width: 1180px; margin-left: auto; margin-right: auto; }
     .pane pre { max-height: 320px; overflow: auto; }
-    .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); }
     .grid.two { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); }
     .grid.stats { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
     .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
@@ -4423,6 +4438,7 @@ function renderApp() {
             <button data-tab="cron" title="Scheduled prompts + the agent's autopilot pulse cron jobs.">Cron</button>
             <button data-tab="channels" title="Telegram / webhook channels the agent can deliver through.">Channels</button>
             <button data-tab="agents" title="Specialists the propagation controller has spawned for repeated tasks.">Agents</button>
+            <button data-tab="coding-agents" title="Inspect and coordinate Claude Code and Codex sessions through your local supervisor.">Coding Agents</button>
             <button data-tab="nodes" title="Which machines are paired, which one is main, and who's online right now.">Nodes</button>
           </div>
           <div class="nav-more-section">
@@ -4940,6 +4956,9 @@ async function switchTab(tab) {
   } else if (tab === "agents") {
     showSidebar(false);
     await renderAgents();
+  } else if (tab === "coding-agents") {
+    showSidebar(false);
+    await renderCodingAgents();
   } else if (tab === "memory") {
     showSidebar(false);
     await renderMemory();
@@ -6373,6 +6392,8 @@ function openMcpComposer() {
   });
 }
 
+${codingSupervisorUi}
+
 async function renderAgents() {
   const agents = await fetchJson("/agents");
   main.innerHTML = '<div class="pane"><h2>Agents</h2><div class="grid" id="agentList"></div></div>';
@@ -7174,6 +7195,15 @@ async function renderHealth() {
 }
 
 function pendingActionCardHtml(action) {
+  const coding = ['reply_to_coding_agent', 'start_coding_agent'].includes(action.toolName);
+  const details = coding
+    ? '<p>' + escapeHtml(action.args?.provider || '') + ' · ' + escapeHtml(action.args?.project || 'Coding session')
+      + '<br>Session: ' + escapeHtml(action.args?.sessionId || '')
+      + (action.toolName === 'start_coding_agent' ? '<br>Model: ' + escapeHtml(action.args?.model || 'Provider default') + ' · Effort: ' + escapeHtml(action.args?.effort || 'Provider default') + '<br>Codex: read-only. Claude: manual permissions. No automatic permission approvals.' : '')
+      + '</p><pre style="white-space:pre-wrap; overflow-wrap:anywhere;">'
+      + escapeHtml(action.args?.message || '') + '</pre><p class="muted">Provider usage may be charged. CLI usage is not capped by the OpenAGI chat budget. Later provider permission requests need a separate decision.</p>'
+    : '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px; white-space:pre-wrap; overflow-wrap:anywhere;">'
+      + escapeHtml(JSON.stringify(action.args, null, 2)) + '</pre></details>';
   return '<div class="card" style="padding:14px; margin-bottom:10px;" data-pending-id="' + escapeHtml(action.id) + '">'
     + '<div style="display:flex; gap:8px; align-items:center;">'
     + '<span style="font-size:18px;">🤖</span>'
@@ -7181,9 +7211,7 @@ function pendingActionCardHtml(action) {
     + '<span class="badge">' + escapeHtml(action.toolName) + '</span>'
     + '</div>'
     + (action.reason ? '<div class="muted" style="margin-top:6px; font-size:12px;">' + escapeHtml(action.reason) + '</div>' : '')
-    + '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px;">'
-    + escapeHtml(JSON.stringify(action.args, null, 2))
-    + '</pre></details>'
+    + details
     + '<div class="muted" style="margin-top:4px; font-size:11px;">queued ' + escapeHtml(new Date(action.createdAt).toLocaleString()) + '</div>'
     + '<div class="row" style="gap:8px; margin-top:10px;">'
     + '<button data-pending-action="approve">Approve & run</button>'
@@ -8308,6 +8336,10 @@ async function renderComputerUse() {
     ? "Ready — privacy-filtered live screenshots, semantic Accessibility elements, app activation, clicking, dragging, text editing, key presses, pointer movement, and scrolling execute through the selected computer-use node."
     : readiness.mode === "app-selection-required"
       ? "Ready to choose an app — input control is available, but the current window is privacy-protected or not capturable. The agent can list and activate the approved target app, then take a fresh screenshot before acting."
+    : readiness.mode === "permissions-required"
+      ? "Connected, but control prerequisites are not met. Check Screen Recording, Accessibility, an unlocked screen, and Secure Input on the node in Nodes. Input remains refused."
+    : readiness.mode === "node-selection-required"
+      ? "Multiple computer nodes are connected. Select the intended node and check its permissions in Nodes; no node has been selected automatically."
     : readiness.mode === "node-unreachable"
       ? "Enabled, but the configured computer-use node is unreachable. Screen reads fall back to recent OCR; input is refused."
       : readiness.mode === "observe-only"
@@ -9313,6 +9345,10 @@ function refreshApprovalSurfaces() {
 }
 evt.addEventListener("pending-action", refreshApprovalSurfaces);
 evt.addEventListener("pending-action-resolved", refreshApprovalSurfaces);
+evt.addEventListener("coding-agents", () => {
+  // Do not redraw while someone is composing a reply.
+  if (state.tab === "coding-agents" && $("codingRefresh")) $("codingRefresh").textContent = "Refresh status";
+});
 
 // New skill candidate proposed by the pattern miner or session miner.
 // Refresh the Skills tab if the user is on it; otherwise show a browser
@@ -9462,7 +9498,7 @@ setInterval(() => {
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");
