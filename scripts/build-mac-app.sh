@@ -146,7 +146,10 @@ JS_DEST="${APP}/Contents/Resources/openAGI"
 mkdir -p "${JS_DEST}"
 rsync -a --exclude '.openagi' --exclude '.git' --exclude 'node_modules' --exclude 'mac' --exclude 'build' \
   --exclude 'docs/verification' --exclude 'logs' --exclude 'test' \
-  "${ROOT}/src" "${ROOT}/examples" "${ROOT}/package.json" "${JS_DEST}/"
+  "${ROOT}/src" "${ROOT}/examples" "${ROOT}/scripts" "${ROOT}/package.json" "${ROOT}/package-lock.json" "${JS_DEST}/"
+# Install only locked production dependencies inside the distributable runtime.
+# Use its bundled Node, not whichever Node happens to be on the builder's PATH.
+(cd "${JS_DEST}" && PATH="${NODE_DEST}/bin:${PATH}" npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
 
 # Sparkle framework — copy from SPM build artifacts
 SPARKLE_FW=$(find "${MAC_DIR}/.build" -name "Sparkle.framework" -type d 2>/dev/null | head -1 || true)

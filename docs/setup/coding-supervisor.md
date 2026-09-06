@@ -111,7 +111,44 @@ For G2, retain the scoped OpenAGI node connection. Once that transport is
 connected, the same OpenAGI tools and approvals apply; do not replace a scoped
 G2 credential with an owner token. This adapter does not change G2 enrollment.
 
-## Validate
+## Main on another computer
+
+The main can delegate to a dedicated coding-supervisor node over the existing
+authenticated outbound node-control transport. The node opens no inbound port
+and holds only its own scoped node credential, never the main's owner token.
+Set `OPENAGI_CODING_SUPERVISOR_NODE` on the main to that enrolled node's exact ID.
+Changing the selected node invalidates previously prepared coding approvals.
+
+On the coding computer, run `scripts/coding-supervisor-node.mjs` with an absolute
+path to its owner-only (0600) JSON configuration. The configuration contains
+`remote` (the HTTPS main origin), `nodeId`, `nodeToken`, `dataDir`, optional `name`,
+and optionally `backendDir` / `stateFile` for the external discovery adapter.
+`scripts/setup-coding-node.mjs` can provision this configuration with an
+operator-selected enrollment helper that receives the new node credential on
+stdin and returns the authenticated `/nodes/enroll` receipt. It refuses to
+overwrite existing pairing. Run the node with a login/background service using
+an absolute Node executable and a PATH containing the authenticated provider CLIs.
+
+The main's Coding Agents view then lists sessions, inspects recent turns, and
+queues starts/replies for approval. Workspace selection refers to folders on
+the coding computer. Starts, Stop, and interrupted-workspace reconciliation
+apply only to runs owned by this supervisor. The node also persists reply
+receipts so replaying an approval after a main restart cannot resend it.
+
+Existing external chats can be discovered without a delivery bridge. They are
+read-only until their external adapter has a safe configured reply route;
+installing this node does not unlock or take over an active Codex/Claude writer.
+Managed sessions use the restricted built-in provider profiles above.
+
+## Validate the node path
+
+`node --test test/coding-supervisor-node.test.js test/coding-supervisor-http.test.js`
+checks node identity binding, exact-session routing, unsupported-operation
+refusal, and two-sided replay protection. Also exercise a real disposable
+provider session through main-side start approval, completion, reply approval,
+and completion. Fixtures do not establish real account access or G2 hardware.
+
+## Validate the supervisor
 
 Run `node --test test/coding-supervisor*.test.js` with the repository's supported
 Node runtime. Tests use temporary state and fake sessions, covering authenticated

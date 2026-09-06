@@ -1,6 +1,6 @@
 {
   "name": "openagi",
-  "version": "0.0.21",
+  "version": "0.0.22",
   "private": true,
   "type": "module",
   "description": "Generic ABI runtime scaffold for directional adaptive scrutiny, tiered memory, and propagation.",
@@ -27,6 +27,9 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
   },
   "bin": {
     "openagi": "bin/openagi.js"

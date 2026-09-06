@@ -4,22 +4,26 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const rawOrigin = process.argv.slice(2).find(argument => argument !== '--') ?? process.env.OPENAGI_PUBLIC_ORIGIN
-if (!rawOrigin) fail('Usage: pnpm package:openagi -- https://your-openagi-host')
-let origin
-try { origin = new URL(rawOrigin) } catch { fail('OpenAGI origin must be a valid HTTPS URL.') }
-if (origin.protocol !== 'https:' || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== '/') fail('OpenAGI origin must be one exact HTTPS origin with no path, query, or credentials.')
-const normalizedOrigin = origin.origin
+const rawOrigins = process.argv.slice(2).filter(argument => argument !== '--')
+const origins = [...new Set(rawOrigins.map(normalizeOrigin))]
+if (origins.length > 16) fail('Agents packages support at most 16 exact origins.')
+// Keep the generic policy generic; restricted packages need WSS to their main
+// for relayed speech, plus the optional direct Deepgram destination.
+// This does not add Deepgram to the app's separate main-server URL allowlist.
+const networkOrigins = origins.length ? [...new Set([...origins, ...origins.map(origin => origin.replace(/^https:/, 'wss:')), 'https://api.deepgram.com', 'wss://api.deepgram.com'])] : []
 
-run('pnpm', ['run', 'build'], { VITE_G2_MODE: 'openagi', VITE_OPENAGI_ORIGIN: normalizedOrigin })
+run('pnpm', ['run', 'build'], {
+  VITE_G2_MODE: 'openagi', VITE_OPENAGI_ORIGIN: origins[0] ?? '', VITE_AGENT_DEFAULT_ORIGIN: origins[0] ?? '',
+  VITE_AGENT_ALLOWED_ORIGINS: origins.join(','),
+})
 const manifestDir = path.join(root, 'build', 'openagi-g2')
 fs.mkdirSync(manifestDir, { recursive: true })
 const manifestPath = path.join(manifestDir, 'app.json')
 fs.writeFileSync(manifestPath, JSON.stringify({
-  package_id: 'sh.openagi.even.g2', edition: '202601', name: 'OpenAGI', version: '0.1.0', min_app_version: '2.0.0', min_sdk_version: '0.0.13', entrypoint: 'index.html',
+  package_id: 'sh.agents.even.g2', edition: '202601', name: 'Agents', version: '0.4.2', min_app_version: '2.2.6', min_sdk_version: '0.0.13', entrypoint: 'index.html',
   permissions: [
-    { name: 'g2-microphone', desc: 'Listen to a spoken OpenAGI question only after you explicitly tap Ask.' },
-    { name: 'network', desc: 'Send a spoken question to your paired OpenAGI and receive its answer.', whitelist: [normalizedOrigin] },
+    { name: 'g2-microphone', desc: 'Listen after you tap Ask or explicitly enable foreground always-listening.' },
+    { name: 'network', desc: 'Connect to your selected agent. Optional live speech streams through your main or directly to Deepgram.', whitelist: networkOrigins },
   ], supported_languages: ['en'],
 }, null, 2) + '\n')
 run('pnpm', ['exec', 'evenhub', 'pack', manifestPath, path.join(root, 'dist')])
@@ -29,3 +33,12 @@ function run(command, args, extraEnv = {}) {
   if (result.status !== 0) process.exit(result.status ?? 1)
 }
 function fail(message) { console.error(message); process.exit(1) }
+
+function normalizeOrigin(value) {
+  let origin
+  try { origin = new URL(value) } catch { fail(`Agent origin is not a valid HTTPS URL: ${value}`) }
+  if (origin.protocol !== 'https:' || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== '/') {
+    fail(`Agent origin must be exact HTTPS with no path, query, or credentials: ${value}`)
+  }
+  return origin.origin
+}

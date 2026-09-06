@@ -2,9 +2,57 @@
 
 This workspace contains the implemented phone-hosted Even Realities G2 plugin. It records in-person audio into a durable BuildBetter recording, shows live captions, follows accessible live meetings, and answers workspace or recording questions through BuildBetter's Quick Agent and configured MCP tools.
 
-## OpenAGI voice mode
+## Agents voice mode
 
-The same G2 shell can now be packaged as a private OpenAGI client. Tap once to
+### Version 0.3.0: conversations and progress
+
+### Version 0.4.0: separate speech from work; readable, interruptible answers
+
+Requires the matching main update. Ambient requests now use `transcribeOnly`
+on `/nodes/g2/listen`: they transcribe and classify the wake/question trigger,
+but do not wait for agent work. A triggered prompt starts a separate streamed
+text question on `/nodes/g2/ask`. Speech segments continue to be transcribed
+while that turn runs; additional triggers are not silently queued as actions.
+This is still buffered OpenAI speech transcription after pauses, not a
+word-by-word Deepgram stream. No Deepgram credential is bundled or inferred.
+
+Streaming uses a 60-second no-data watchdog reset by events, not a fixed
+75/180-second total request deadline. Heartbeats mean only transport liveness.
+Tool names and stage timestamps are visible without tool arguments, results,
+or hidden reasoning. Cancel on the phone aborts the response, propagates to
+provider fetches, and stops subsequent model tool calls; it cannot undo actions
+already executed, and a running tool may finish if it does not support abort.
+There is no automatic request replay. Partial text is saved as incomplete.
+
+Glasses pages are plain text, 260 characters each, with no tail clipping.
+Partial pages support scrolling and retain the selected page as more text
+arrives. In 0.4.2, tap a completed answer to record a follow-up in the same
+conversation; tap again to send. The previous answer stays in Recent. Swipe
+to read pages and double-tap to go back without starting the microphone.
+Use phone Ask, Previous/Next page, Last answer, and Recent answers. No historical
+answers are backfilled from the main. Foreground microphone limits still apply.
+
+The phone stores the latest 30 answers in Even native storage. Reopening restores
+the most recent answer in the selected conversation. Select a recent answer on
+the phone to resume that thread, swipe glasses pages, and tap for a follow-up.
+New conversation starts a separate thread. Disconnecting or switching main
+clears the phone history; earlier versions' answers are not backfilled.
+
+The updated main supports opt-in `Accept: application/x-ndjson` on the existing
+authenticated `/nodes/g2/ask` route. Events are `progress`, `delta`, `heartbeat`,
+`result`, and `error`. Only transcription text, public answer text, and stage
+labels are exposed, never tool arguments or hidden reasoning. Old clients still
+receive JSON; the new client also accepts JSON from older mains. Voice requests
+are never automatically replayed after a stream interruption. The phone shows
+elapsed time, partial answers, and terminal errors. Ambient mode retains its
+existing non-streaming transport, but completed ambient answers enter history.
+
+Deploy the matching main changes for streaming and the G2-only concise-answer
+instruction (about 60 words by default, expandable by asking for more detail).
+No pairing reset is required. Device acceptance: ask, observe progress, reopen,
+select an older answer, ask a follow-up, and explicitly start a new conversation.
+
+The same G2 shell can be packaged as a generic private **Agents** client. Tap once to
 start the glasses microphone, speak for up to 30 seconds, and tap again. The
 question is transcribed by the OpenAI key on your OpenAGI daemon, sent through
 the normal OpenAGI agent/tool loop, and paginated on the glasses display. G2
@@ -20,24 +68,40 @@ For simulator development:
 
 ```bash
 cp .env.example .env.local
-# Set VITE_G2_MODE=openagi and your exact VITE_OPENAGI_ORIGIN in .env.local.
+# Set VITE_G2_MODE=openagi and the VITE_AGENT_* origins in .env.local.
 pnpm dev:openagi
 # In a second terminal:
 pnpm simulate
 ```
 
-For a device package, the exact HTTPS origin is mandatory because Even Hub
-network permissions are compile-time allowlisted:
+For a device package, every reachable exact HTTPS origin is mandatory because
+Even Hub network permissions are compile-time allowlisted (maximum 16):
 
 ```bash
-pnpm package:openagi -- https://your-openagi-host.example.com
+pnpm package:agents
 ```
 
-Start/restart the matching openAGI branch with `OPENAI_API_KEY` and
-`OPENAGI_PUBLIC_URL` configured. In its dashboard, open **Nodes**, generate an
-Even G2 enrollment code, enter that code in the phone companion, and then tap
-the glasses to talk. **New conversation** clears only the current chat thread;
-**Remove this G2 node** revokes the scoped server credential.
+Start/restart the matching OpenAGI branch with `OPENAI_API_KEY` and
+`OPENAGI_PUBLIC_URL` configured. In **Nodes**, either generate an enrollment
+code or generate a one-time agent URL + scoped token. The latter can be pasted
+into the Agents phone companion without an OpenAGI-specific client build, as
+long as its exact origin is in the package allowlist. Tokens stay in the app's
+Even's native app storage and are never bundled. Version 0.2.3 restores the URL,
+node credential, and preferences across embedded browser sessions, migrating
+older browser storage when it is still available. If the old credential has
+already been lost, one final enrollment is required. Verify on a phone by
+pairing, fully closing and reopening Agents, then asking a question without
+entering another code. Native storage write failures are reported rather than
+claiming that the connection was saved. Direct connections are revoked from
+the Nodes row; disconnecting in the phone app only forgets the local copy.
+
+The phone companion also offers an opt-in **Always listening while this app is
+open** mode. It segments foreground microphone audio locally, transiently
+transcribes each spoken utterance, and answers only after the configured wake
+phrase (default `open agi`) or an optionally detected question. A wake phrase by
+itself arms the next utterance for eight seconds. Tap the glasses to pause. This
+does not claim background or phone-lock operation; those behaviors, microphone
+thresholds, and battery impact require testing on physical G2 hardware.
 
 ## Run it
 
@@ -86,3 +150,7 @@ The work spans three repositories and should be delivered as separate, ordered p
 - `/Users/shooby/Dev/bb-recorder`: existing claim-bound publisher for no-bot desktop transcript events; the backend now activates its dormant relay contract.
 
 Do not try to make one atomic cross-repository release. The backend contracts land dark first, then the G2 client is distributed against the feature-gated backend. No BB Recorder source change is required for the relay because its publisher and follower were already implemented behind server-advertised capabilities.
+
+## Generic package verification
+
+The default build starts without an address and declares network permission with an empty whitelist, which the official packager accepts. Runtime access to user-entered HTTPS servers and store acceptance still need verification in Even Hub; packager acceptance alone does not establish either. Do not claim universal server support until this device check passes. No wildcard syntax is assumed.

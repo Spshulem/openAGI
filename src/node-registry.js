@@ -250,6 +250,20 @@ export class NodeRegistry {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
+  enrollmentForToken(token) {
+    if (typeof token !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(token)) return null;
+    const actualHash = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+    const actual = Buffer.from(actualHash, "hex");
+    const store = this._read();
+    for (const [nodeId, credential] of Object.entries(store.credentials)) {
+      const expected = Buffer.from(credential?.tokenHash ?? "", "hex");
+      if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) continue;
+      const { tokenHash: _tokenHash, ...safe } = credential;
+      return { nodeId, ...safe, capabilities: sanitizeNodeCapabilities(safe.capabilities) };
+    }
+    return null;
+  }
+
   revoke(nodeId) {
     if (typeof nodeId !== "string" || !nodeId) return false;
     const store = this._read();
@@ -274,6 +288,42 @@ export class NodeRegistry {
       ...safe,
       capabilities: sanitizeNodeCapabilities(safe.capabilities)
     };
+  }
+
+  listEnrollments() {
+    return Object.entries(this._read().credentials)
+      .map(([nodeId, credential]) => {
+        const { tokenHash: _tokenHash, ...safe } = credential;
+        return {
+          nodeId,
+          ...safe,
+          capabilities: sanitizeNodeCapabilities(safe.capabilities)
+        };
+      })
+      .sort((a, b) => (a.name ?? a.nodeId).localeCompare(b.name ?? b.nodeId));
+  }
+
+  touchEnrollment(nodeId, { now = Date.now() } = {}) {
+    if (typeof nodeId !== "string" || !nodeId) return false;
+    const store = this._read();
+    const credential = store.credentials[nodeId];
+    if (!credential) return false;
+    const existing = store.entries[nodeId];
+    store.entries[nodeId] = {
+      nodeId,
+      name: existing?.name ?? credential.name ?? nodeId,
+      role: "node",
+      url: existing?.url ?? null,
+      version: existing?.version ?? null,
+      build: existing?.build ?? null,
+      buildSource: existing?.buildSource ?? null,
+      platform: credential.platform ?? existing?.platform ?? null,
+      capabilities: sanitizeNodeCapabilities(credential.capabilities ?? existing?.capabilities),
+      firstSeenAt: existing?.firstSeenAt ?? new Date(now).toISOString(),
+      lastSeenAt: new Date(now).toISOString()
+    };
+    writeJsonAtomic(this.storePath, store);
+    return true;
   }
 
   list({ now = Date.now() } = {}) {

@@ -13,7 +13,7 @@ async function renderCodingAgents() {
   catch { snapshot = { error: 'Could not reach the supervisor. No session was changed.', sessions: [] }; }
   if (generation !== codingRenderGeneration || state.tab !== 'coding-agents') return;
   main.innerHTML = '<div class="pane"><div class="row between"><h2>Coding Agents</h2><button id="codingRefresh">Refresh</button></div><p>Talk to OpenAGI; it coordinates your existing coding sessions. Replies require approval. Reported activity is not proof of completion.</p><p id="codingStatus" role="status"></p><div class="grid" id="codingList"></div><section id="codingDetail"></section></div>';
-  $('codingStatus').textContent = snapshot.error || (snapshot.configured ? 'Checked ' + new Date(snapshot.checkedAt).toLocaleTimeString() : 'Set up the built-in supervisor below. No separate supervisor or G2 installation is required.');
+  $('codingStatus').textContent = snapshot.error || snapshot.warning || (snapshot.configured ? 'Checked ' + new Date(snapshot.checkedAt).toLocaleTimeString() : 'Set up the built-in supervisor below. No separate supervisor or G2 installation is required.');
   $('codingRefresh').onclick = renderCodingAgents;
   const setupPanel = document.createElement('section');
   $('codingList').before(setupPanel);

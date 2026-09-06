@@ -76,8 +76,16 @@ export function runSupervisorAdapter(request, { backendDir, stateFile, timeoutMs
 
 export class CodingSupervisor {
   constructor({ dataDir, runtime, backendDir = process.env.OPENAGI_CODING_SUPERVISOR_DIR,
-    stateFile = process.env.OPENAGI_CODING_SUPERVISOR_STATE_FILE, call, builtinOptions = {}, now = () => Date.now(), intervalMs = 30_000 } = {}) {
+    stateFile = process.env.OPENAGI_CODING_SUPERVISOR_STATE_FILE, remoteNodeId = process.env.OPENAGI_CODING_SUPERVISOR_NODE,
+    call, builtinOptions = {}, now = () => Date.now(), intervalMs = 30_000 } = {}) {
     this.runtime = runtime;
+    this.remoteNodeId = remoteNodeId || null;
+    this.remote = Boolean(this.remoteNodeId);
+    if (this.remote) call = async (request) => {
+      if (!runtime?.nodeCapabilities) throw new Error("The coding node transport is not ready.");
+      return runtime.nodeCapabilities.dispatch(this.remoteNodeId, "coding-supervisor", request.operation, request,
+        { timeoutMs: request.operation === "reply" ? 65_000 : 30_000 });
+    };
     this.now = now;
     this.external = Boolean(call) || (typeof backendDir === "string" && path.isAbsolute(backendDir));
     this.builtin = new BuiltinCodingSupervisor({ dataDir: path.resolve(dataDir ?? resolveDataDir()), ...builtinOptions,
@@ -106,8 +114,21 @@ export class CodingSupervisor {
     writeJsonAtomic(this.file, this.state);
   }
 
-  setup() { return { ...this.builtin.setup(), external: this.external }; }
+  setup() {
+    return this.remote ? this.request({ operation: "setup" }).then(value => ({ ...value, remote: true, nodeId: this.remoteNodeId, external: false }))
+      : { ...this.builtin.setup(), external: this.external };
+  }
+  async prepareStart(args) {
+    if (!this.remote) return this.builtin.prepare(args);
+    return { ...await this.request({ operation: "prepare-start", ...args }), codingNodeId: this.remoteNodeId };
+  }
+  async startApproved(args) {
+    if (!this.remote) return this.builtin.start(args);
+    if (args.codingNodeId !== this.remoteNodeId) throw new Error("The coding node changed since approval.");
+    return this.request({ ...args, operation: "start" });
+  }
   configure(args) {
+    if (this.remote) return this.request({ operation: "configure", enabled: args.enabled, workspaces: args.workspaces });
     if (this.external) throw new Error("Remove the optional external adapter setting before configuring the built-in supervisor.");
     const result = this.builtin.configure(args);
     this.configured = result.enabled;
@@ -149,7 +170,9 @@ export class CodingSupervisor {
         model: clean(item.model, 100) || null, route: clean(item.route, 40),
         replyAvailable: item.replyAvailable === true, fingerprint: item.fingerprint };
     });
-    this.lastSnapshot = { configured: true, checkedAt: new Date(this.now()).toISOString(), sessions, error: null };
+    this.lastSnapshot = { configured: true, checkedAt: new Date(this.now()).toISOString(), sessions, error: null,
+      discoveryIncomplete: result.discoveryIncomplete === true,
+      warning: result.discoveryIncomplete === true ? 'Some desktop sessions could not be listed safely. Valid discovered sessions and managed coding sessions are shown; this is not a complete inventory.' : null };
     return this.lastSnapshot;
   }
 
@@ -168,11 +191,12 @@ export class CodingSupervisor {
     const snapshot = await this.list();
     const session = snapshot.sessions.find((item) => item.provider === target.provider && item.sessionId === target.sessionId);
     if (!session?.replyAvailable) throw new Error("This session cannot receive a safe programmatic reply. Open it in its owning app.");
-    return { ...target, message: args.message, project: session.project,
+    return { ...target, message: args.message, project: session.project, ...(this.remote ? { codingNodeId: this.remoteNodeId } : {}),
       fingerprint: session.fingerprint, requestId: crypto.randomUUID(), preparedAt: this.now() };
   }
 
   async reply(args) {
+    if (this.remote && args.codingNodeId !== this.remoteNodeId) throw new Error("The coding node changed since approval.");
     const target = validateCodingTarget(args);
     if (!/^[a-f0-9-]{36}$/.test(args.requestId ?? "") || !/^[a-f0-9]{64}$/.test(args.fingerprint ?? "")
       || typeof args.message !== "string" || !args.message.trim() || args.message.length > 4_000 || args.message.includes("\0")) {
@@ -185,7 +209,9 @@ export class CodingSupervisor {
       if (existing.messageHash !== messageHash) throw new Error("Reply request ID was reused for a different action.");
       return existing;
     }
-    if (!Number.isFinite(args.preparedAt) || args.preparedAt > this.now() || this.now() - args.preparedAt > 10 * 60_000) {
+    // Main and enrolled node clocks can differ slightly. Keep a bounded skew
+    // allowance without extending the ten-minute approval age or replay window.
+    if (!Number.isFinite(args.preparedAt) || args.preparedAt > this.now() + 30_000 || this.now() - args.preparedAt > 10 * 60_000) {
       throw new Error("The reply approval expired; request fresh approval.");
     }
     const current = (await this.list()).sessions.find((item) => item.provider === target.provider && item.sessionId === target.sessionId);
@@ -202,7 +228,8 @@ export class CodingSupervisor {
     this.state.receipts[key] = receipt;
     this.save();
     try {
-      const result = await this.request({ operation: "reply", ...target, message: args.message, fingerprint: args.fingerprint });
+      const result = await this.request({ operation: "reply", ...target, message: args.message, fingerprint: args.fingerprint,
+        requestId: args.requestId, preparedAt: args.preparedAt });
       if (!["accepted", "queued", "blocked"].includes(result?.status)
         || result.sessionId !== target.sessionId || result.provider !== target.provider) throw new Error("Unconfirmed delivery.");
       receipt.status = result.status;
@@ -267,15 +294,15 @@ export function registerCodingSupervisorTools(registry, supervisor) {
   for (const name of ["list_coding_agents", "inspect_coding_agent", "reply_to_coding_agent", "start_coding_agent", "list_coding_workspaces"]) registry.unregister(name);
   if (!supervisor.configured) return;
   const targetSchema = { provider: { type: "string", enum: ["claude", "codex"] }, sessionId: { type: "string" } };
-  if (!supervisor.external) registry.register({ name: "start_coding_agent", source: "integration:coding-supervisor", needsConfirmation: true,
+  if (!supervisor.external || supervisor.remote) registry.register({ name: "start_coding_agent", source: "integration:coding-supervisor", needsConfirmation: true,
     description: "Start an OpenAGI-managed coding CLI in an owner-selected Git workspace after approval. Codex is read-only; Claude retains manual permissions. Never claim acceptance means task completion. Use list_coding_workspaces for exact workspace IDs.",
     parameters: { type: "object", properties: { provider: targetSchema.provider, workspaceId: { type: "string" }, message: { type: "string", maxLength: 4000 }, model: { type: "string" }, effort: { type: "string", enum: ["low", "medium", "high"] } }, required: ["provider", "workspaceId", "message"], additionalProperties: false },
-    prepareApprovalArgs: args => supervisor.builtin.prepare(args), approvalTtlMs: 600_000,
+    prepareApprovalArgs: args => supervisor.prepareStart(args), approvalTtlMs: 600_000,
     approvalDedupeKey: (args, context) => digest(JSON.stringify([context.sessionId, args.provider, args.workspaceId, args.message, args.model, args.effort])),
     summarize: args => `Start ${args.provider} in ${args.project}: ${args.message}`,
-    handler: (args, context) => { if (!context?.__confirmed) throw new Error("Explicit approval is required."); return supervisor.builtin.start(args); }
+    handler: (args, context) => { if (!context?.__confirmed) throw new Error("Explicit approval is required."); return supervisor.startApproved(args); }
   });
-  if (!supervisor.external) registry.register({ name: "list_coding_workspaces", source: "integration:coding-supervisor", sideEffects: false,
+  if (!supervisor.external || supervisor.remote) registry.register({ name: "list_coding_workspaces", source: "integration:coding-supervisor", sideEffects: false,
     description: "List the owner's configured coding workspace IDs and installed provider CLIs. Installation does not prove authentication.",
     parameters: { type: "object", properties: {}, additionalProperties: false }, handler: () => supervisor.setup() });
   registry.register({ name: "list_coding_agents", source: "integration:coding-supervisor", sideEffects: false,

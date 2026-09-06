@@ -79,6 +79,56 @@ test("an enrolled G2 node is transiently transcribed into a node-bound chat", as
   assert.equal(turns[0].metadata.audioDurationSeconds, 0.2);
 });
 
+test("transcription-only listening returns a trigger without starting agent work", async () => {
+  const { channel, turns, nodeId } = makeChannel();
+  const conversationId = crypto.randomUUID();
+  const result = await channel.listen({ audioBase64: wavBase64(), conversationId, triggerMode: "wake_or_question", transcribeOnly: true }, nodeId);
+  assert.equal(result.triggered, true);
+  assert.equal(result.prompt, "What is on my calendar?");
+  assert.equal(turns.length, 0);
+  await channel.ask({ text: result.prompt, conversationId }, nodeId);
+  assert.equal(turns.length, 1);
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(() => channel.ask({ text: "Another question", conversationId }, nodeId, { signal: controller.signal }));
+  assert.equal(turns.length, 1);
+  await assert.rejects(() => channel.ask({ text: "x".repeat(4001), conversationId }, nodeId));
+});
+
+test("ambient G2 listening transcribes every utterance but answers only on an explicit trigger", async () => {
+  const { channel, turns, nodeId } = makeChannel();
+  const conversationId = crypto.randomUUID();
+  let transcript = "The room is quiet.";
+  channel.transcribe = async () => transcript;
+
+  const ignored = await channel.listen({
+    audioBase64: wavBase64(), conversationId, wakePhrase: "open agi", triggerMode: "wake_only"
+  }, nodeId);
+  assert.deepEqual(ignored, { question: transcript, triggered: false, armed: false, reason: "no_trigger" });
+  assert.equal(turns.length, 0);
+
+  transcript = "Open AGI";
+  const armed = await channel.listen({
+    audioBase64: wavBase64(), conversationId, wakePhrase: "open agi", triggerMode: "wake_only"
+  }, nodeId);
+  assert.equal(armed.armed, true);
+  assert.equal(turns.length, 0);
+
+  transcript = "What is on my calendar?";
+  const forced = await channel.listen({
+    audioBase64: wavBase64(), conversationId, wakePhrase: "open agi", triggerMode: "wake_only", forceAnswer: true
+  }, nodeId);
+  assert.equal(forced.triggered, true);
+  assert.equal(forced.reply, "You have a planning call at 2 PM.");
+  assert.equal(turns.length, 1);
+
+  transcript = "How many meetings do I have?";
+  const question = await channel.listen({
+    audioBase64: wavBase64(), conversationId, wakePhrase: "open agi", triggerMode: "wake_or_question"
+  }, nodeId);
+  assert.equal(question.triggered, true);
+  assert.equal(turns.length, 2);
+});
+
 test("unregistered nodes, other node platforms, and malformed audio never reach the agent", async () => {
   const { channel, turns, nodeRegistry } = makeChannel();
   await assert.rejects(
@@ -104,7 +154,18 @@ test("only the one-time node exchange bypasses owner auth", () => {
   assert.equal(isPublicRoute("/nodes/enrollment-code"), false);
   assert.equal(isPublicRoute("/nodes/heartbeat"), false);
   assert.equal(isPublicRoute("/nodes/g2/ask"), false);
+  assert.equal(isPublicRoute("/nodes/g2/listen"), false);
+  assert.equal(isPublicRoute("/nodes/g2/direct-token"), false);
   assert.equal(isPublicRoute("/nodes"), false);
+});
+
+test("requests made before a G2 enrollment code exists cannot pre-lock pairing", () => {
+  const enrollment = new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM] });
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    assert.equal(enrollment.consume("000000", EVEN_G2_PLATFORM).reason, "no-active-code");
+  }
+  const issued = enrollment.issue(EVEN_G2_PLATFORM);
+  assert.equal(enrollment.consume(issued.code, EVEN_G2_PLATFORM).ok, true);
 });
 
 test("G2 HTTP enrollment uses bounded node authority and revocation", async () => {
@@ -139,7 +200,8 @@ test("G2 HTTP enrollment uses bounded node authority and revocation", async () =
     dataDir,
     channels,
     nodeRegistry,
-    nodeEnrollment
+    nodeEnrollment,
+    publicUrl: "https://openagi.example.test"
   });
   let listening = false;
   try {
@@ -151,6 +213,35 @@ test("G2 HTTP enrollment uses bounded node authority and revocation", async () =
       body: JSON.stringify({ platform: EVEN_G2_PLATFORM })
     });
     assert.equal(denied.status, 401);
+
+    const directResponse = await fetch(`${url}/nodes/g2/direct-token`, {
+      method: "POST",
+      headers: { authorization: "Bearer admin-only-token", "content-type": "application/json" },
+      body: JSON.stringify({ name: "Direct G2" })
+    });
+    assert.equal(directResponse.status, 201);
+    assert.equal(directResponse.headers.get("cache-control"), "no-store");
+    const direct = await directResponse.json();
+    assert.equal(direct.agentUrl, "https://openagi.example.test");
+    assert.match(direct.token, /^[a-zA-Z0-9_-]{43}$/);
+    assert.equal(nodeRegistry.authenticate(direct.node.id, direct.token), true);
+    assert.equal(fs.readFileSync(nodeRegistry.storePath, "utf8").includes(direct.token), false);
+
+    const rosterResponse = await fetch(`${url}/nodes`, {
+      headers: { authorization: "Bearer admin-only-token" }
+    });
+    const roster = await rosterResponse.json();
+    const directRow = roster.nodes.find((entry) => entry.nodeId === direct.node.id);
+    assert.equal(directRow.name, "Direct G2");
+    assert.equal(directRow.platform, EVEN_G2_PLATFORM);
+    assert.equal(directRow.status, "unknown");
+
+    const directRemoved = await fetch(`${url}/nodes/${encodeURIComponent(direct.node.id)}/revoke`, {
+      method: "POST",
+      headers: { authorization: "Bearer admin-only-token" }
+    });
+    assert.equal(directRemoved.status, 200);
+    assert.equal(nodeRegistry.authenticate(direct.node.id, direct.token), false);
 
     const issuedResponse = await fetch(`${url}/nodes/enrollment-code`, {
       method: "POST",
@@ -166,15 +257,17 @@ test("G2 HTTP enrollment uses bounded node authority and revocation", async () =
     assert.match(preflight.headers.get("access-control-allow-headers"), /X-OpenAGI-Node-ID/i);
 
     const nodeId = crypto.randomUUID();
+    const clientCreatedToken = "c".repeat(43);
     const exchange = await fetch(`${url}/nodes/enroll/exchange`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: "null" },
-      body: JSON.stringify({ code: issued.code, platform: EVEN_G2_PLATFORM, nodeId, name: "Route G2" })
+      body: JSON.stringify({ code: issued.code, platform: EVEN_G2_PLATFORM, nodeId, nodeToken: clientCreatedToken, name: "Route G2" })
     });
     assert.equal(exchange.status, 200);
     const enrolled = await exchange.json();
     assert.equal(enrolled.node.id, nodeId);
     assert.equal(enrolled.node.platform, EVEN_G2_PLATFORM);
+    assert.equal(enrolled.nodeToken, clientCreatedToken);
     assert.equal(nodeRegistry.authenticate(nodeId, enrolled.nodeToken), true);
     assert.equal(fs.readFileSync(nodeRegistry.storePath, "utf8").includes(enrolled.nodeToken), false);
 
@@ -232,6 +325,46 @@ test("G2 HTTP enrollment uses bounded node authority and revocation", async () =
     assert.equal((await asked.json()).reply, "Hello G2");
     assert.equal(turns.length, 1);
     assert.equal(turns[0].metadata.sourceNodeId, nodeId);
+
+    const streamed = await fetch(`${url}/nodes/g2/ask`, {
+      method: "POST", headers: { ...nodeHeaders, accept: "application/x-ndjson" },
+      body: JSON.stringify({ audioBase64: wavBase64(), conversationId: crypto.randomUUID() })
+    });
+    assert.match(streamed.headers.get("content-type"), /ndjson/);
+    const events = (await streamed.text()).trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(events[0].stage, "transcribing");
+    assert.equal(events[1].stage, "transcribed");
+    assert.equal(events.at(-1).reply, "Hello G2");
+    turns.pop(); // Keep the existing JSON-route assertions independent.
+    const invalidStream = await fetch(`${url}/nodes/g2/ask`, {
+      method: "POST", headers: { ...nodeHeaders, accept: "application/x-ndjson" },
+      body: JSON.stringify({ audioBase64: "AAAA", conversationId: crypto.randomUUID() })
+    });
+    assert.equal(JSON.parse((await invalidStream.text()).trim()).type, "error");
+
+    const tokenOnlyAsk = await fetch(`${url}/nodes/g2/ask`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${enrolled.nodeToken}`,
+        "content-type": "application/json",
+        origin: "null"
+      },
+      body: JSON.stringify({ audioBase64: wavBase64(), conversationId: crypto.randomUUID() })
+    });
+    assert.equal(tokenOnlyAsk.status, 200, "generic agent URL + token can reach only the G2 voice contract");
+    assert.equal(turns.length, 2);
+
+    const listened = await fetch(`${url}/nodes/g2/listen`, {
+      method: "POST",
+      headers: nodeHeaders,
+      body: JSON.stringify({
+        audioBase64: wavBase64(), conversationId: crypto.randomUUID(), wakePhrase: "open agi",
+        triggerMode: "wake_only", forceAnswer: true
+      })
+    });
+    assert.equal(listened.status, 200);
+    assert.equal((await listened.json()).triggered, true);
+    assert.equal(turns.length, 3);
 
     const revoked = await fetch(`${url}/nodes/revoke`, {
       method: "POST",

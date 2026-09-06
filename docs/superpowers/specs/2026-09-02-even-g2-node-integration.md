@@ -27,23 +27,32 @@ parallel channel-specific account.
   accepted.
 - Existing node removal and self-revocation semantics. Revocation invalidates
   heartbeat and voice access on the next request.
+- Optional foreground-only always-listening mode with local voice-activity
+  segmentation, a configurable wake phrase, optional deterministic question
+  detection, and an eight-second armed follow-up after a wake-only utterance.
+  Non-triggering utterances are transcribed but never enter AgentHost.
 - A Nodes-tab enrollment control and wearable row; a reviewable Even Hub client
   overlay with microphone, pagination, conversation reset, heartbeat, exact
   origin packaging, and no bundled owner/provider credentials.
+- A generic Agents mode that accepts a compile-time-allowlisted agent URL and
+  a runtime scoped token. OpenAGI can mint that pair from the owner-authenticated
+  Nodes tab, and credential-only rows remain visible and revocable before first use.
 
 ## Explicit authority boundary
 
 The G2 credential is accepted only for heartbeat, self-revocation, and the G2
-voice request. It is rejected for generic `/message`, topology/tasks/integration
+tap-to-talk or foreground-listening voice requests. It is rejected for generic `/message`, topology/tasks/integration
 reads, direct memory capture, and node-control poll/result routes. CORS is
-enabled only for the enrollment exchange and those three credential-bound
+enabled only for the enrollment exchange and those credential-bound
 operations. Cross-origin browser POSTs skip the normal same-origin check only
-after the exact G2 node id and bearer token authenticate.
+after the G2 bearer token authenticates. Heartbeat and self-revocation require
+the matching node id; token-only lookup is limited to the two G2 voice routes.
 
 ## Out of scope and release gates
 
 - No speaker/audio reply: G2 answers are visual.
-- No continuous listening or background recording.
+- No background or phone-lock listening. Continuous foreground capture is
+  available only after explicit opt-in and remains a physical-device release gate.
 - No model key, OpenAGI owner token, or arbitrary OpenAGI capability on G2.
 - No changes to the non-Git `/Users/shooby/Dev/g2` workspace in this PR. The
   verified overlay is retained in `integration-clients/even-g2-overlay/` until
