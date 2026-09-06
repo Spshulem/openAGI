@@ -5,6 +5,7 @@ import { detectTaskInChat } from "./task-store.js";
 import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZE_RE } from "./signal-axes.js";
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
+import { agentTurnTask } from "./model-router.js";
 
 // Internal tools every specialist gets regardless of scope: its own memory
 // and the task queue it drains. Everything else comes from the specialist's
@@ -41,6 +42,7 @@ export class AgentHost {
   }
 
   async handleMessageNow(input, options = {}) {
+    options.signal?.throwIfAborted();
     const reportProgress = progressReporter(options.onProgress);
     const reportTextDelta = textDeltaReporter(options.onTextDelta);
     const channel = input.channel ?? "local";
@@ -120,6 +122,10 @@ export class AgentHost {
 
     let assistantPersisted = false;
     try {
+    // Refuse known budget-blocked requests before expensive memory/signal
+    // processing and snapshot writes. Keep the provider's own later check
+    // for concurrent spending, and retain the normal durable failure reply.
+    this.modelProvider.budgetGuard?.check?.();
     // Incremental session indexing (search_sessions): every persisted message
     // is added to the FTS index as it lands. Best-effort — an indexing failure
     // must never block a chat reply. Ephemeral turns leave no trace anywhere,
@@ -213,15 +219,14 @@ export class AgentHost {
     const modelResult = await this.modelProvider.generate({
       input: text,
       agent,
-      // Route by what the call IS, so model tiering applies: autonomous pulses
-      // (autopilot/cron) are cheap "anything to do?" work; everything else is
-      // user-facing chat. Both default to the base model until tiers/pins are set.
-      task: (channel === "autopilot" || channel === "cron") ? "autopilot" : "chat",
+      // Delivery channel is not provenance: scheduled work can deliver to
+      // local/iMessage/G2 without becoming foreground chat on the main model.
+      task: agentTurnTask(input),
       maxToolHops: computerUseToolHops,
       scrutiny: output.scrutiny,
       memoryHits: memoryHitsForModel,
       messages: sessionBefore.messages,
-      instructions: this.instructionsForAgent(agent),
+      instructions: this.instructionsForAgent(agent) + (channel === "g2" ? "\nThe user is reading on small smart glasses. Default to a direct answer of about 60 words or fewer, with no tables. Offer more detail when useful; expand when the user asks for detail. Preserve important safety information." : ""),
       turnContext: this.turnContextForAgent(output, memoryHitsForModel, intuitions, ambientContext, metadata.screenContext ?? null, briefContext),
       tools,
       toolRegistry,
@@ -239,6 +244,7 @@ export class AgentHost {
         ...(requestId ? { requestId } : {})
       }),
       context: {
+        signal: options.signal,
         channel,
         from,
         target: from,
@@ -246,6 +252,7 @@ export class AgentHost {
         // approval executor runs outside AgentHost, so without this bounded
         // provenance it cannot attribute the action that actually executed.
         origin: input.origin ?? channel,
+        scheduledJobId: metadata.scheduledJobId ?? null,
         agentId,
         sessionId,
         runtime: this.runtime,
@@ -413,7 +420,7 @@ export class AgentHost {
             }
           });
           failure.openagiFailurePersisted = true;
-          if (this.runtime.sessionIndex) {
+          if (this.runtime.sessionIndex && publicFailure.code !== "budget") {
             this.runtime.sessionIndex.indexMessage(sessionId, agentId, failedSession.messages.at(-1)).catch(() => {});
           }
         } catch { /* retain and rethrow the original provider/tool failure */ }

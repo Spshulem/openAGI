@@ -1276,6 +1276,9 @@ export class AbiRuntime {
   async runScheduledPrompt(job) {
     if (!this.agentHost) return { skipped: true, reason: "agent-host-disabled" };
     const input = job.input ?? {};
+    // Persist consumption before spending or delivering. A failed one-shot
+    // stays paused for inspection, not retried forever as a recurring job.
+    if (input.oneShot) this.cron.enableJob(job.id, false);
     const result = await this.agentHost.handleMessage({
       channel: input.channel ?? "cron",
       from: input.target ?? "cron",
