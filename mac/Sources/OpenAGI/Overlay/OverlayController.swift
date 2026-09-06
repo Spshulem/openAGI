@@ -77,11 +77,11 @@ final class OverlayController {
       // reply rendered clipped / spilling past the panel edge.
       onContentChange: { [weak self] in self?.scheduleSizeToContent() }
     ))
-    // The controller owns the panel frame. Prevent NSHostingView from also
-    // pushing SwiftUI's changing content constraints back into the window.
-    // Two sizing authorities can recurse through AppKit while a drag or panel
-    // resize is in flight.
-    host.sizingOptions = []
+    // The controller owns the panel frame, but it still needs SwiftUI's ideal
+    // content size to measure the expanded panel. Intrinsic measurement keeps
+    // fittingSize truthful while the plain container below prevents the host
+    // from independently rewriting the window's min/max constraints.
+    host.sizingOptions = [.intrinsicContentSize]
     host.translatesAutoresizingMaskIntoConstraints = true
     let container = NSView(frame: p.contentView?.bounds ?? p.contentLayoutRect)
     host.frame = container.bounds
@@ -115,8 +115,14 @@ final class OverlayController {
     let m = Self.screenMargin
     let expanded = OverlayState.shared.expanded
 
-    let fitting = host.fittingSize
     let newW = expanded ? Self.expandedWidth : Self.pillSize
+    // Apply the width proposal before measuring so the first expanded render
+    // is not measured against the old 44pt pill width.
+    if host.frame.width != newW {
+      host.setFrameSize(NSSize(width: newW, height: host.frame.height))
+    }
+    host.layoutSubtreeIfNeeded()
+    let fitting = host.fittingSize
     let maxH = vf.height - m * 2
     let newH = expanded ? min(max(Self.pillSize, fitting.height), maxH) : Self.pillSize
 
