@@ -8,6 +8,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { CronScheduler, TIMEOUT_MS, resolveJobTimeoutMs } from "../src/cron-scheduler.js";
 import { createDefaultRuntime } from "../src/index.js";
 
@@ -78,7 +81,8 @@ test("a throwing handler records a failed fire instead of aborting the loop", as
 });
 
 test("runtime tick emits cron-job-timeout on the event bus for a hung task", { timeout: 5000 }, async () => {
-  const runtime = createDefaultRuntime({ agentHost: false });
+  const runtime = createDefaultRuntime({ agentHost: false,
+    dataDir: fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cron-timeout-")) });
   runtime.condenser.condense = () => new Promise(() => {}); // hang the handler
   runtime.cron.addJob({
     id: "hung-condense",

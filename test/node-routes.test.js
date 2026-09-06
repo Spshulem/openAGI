@@ -176,11 +176,17 @@ test("POST /nodes/heartbeat rejects non-string fields instead of persisting a po
       body: JSON.stringify({ nodeId: "n1", name: { evil: true }, role: "node" })
     });
     assert.equal(res.status, 400);
-    // GET /nodes must still work afterward — nothing was persisted.
+    // Enrollment stays visible for revocation, but a rejected heartbeat
+    // must not populate its untrusted name or mark the node as seen.
     const getRes = await fetch(`${base}/nodes`);
     assert.equal(getRes.status, 200);
     const json = await getRes.json();
-    assert.deepEqual(json.nodes.filter((n) => !n.self), [], "nothing was persisted — only this machine is listed");
+    const enrolled = json.nodes.filter((n) => !n.self);
+    assert.equal(enrolled.length, 1);
+    assert.equal(enrolled[0].nodeId, "n1");
+    assert.equal(enrolled[0].name, null);
+    assert.equal(enrolled[0].lastSeenAt, null);
+    assert.equal(enrolled[0].status, "unknown");
   } finally { await app.close(); }
 });
 
