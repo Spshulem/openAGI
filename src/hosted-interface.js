@@ -3428,7 +3428,7 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (action === "do") {
         let a = runtime.pendingActions?.get(ref.id);
         if (!a) throw new Error("pending action gone");
-        if (a.toolName === "reply_to_coding_agent") {
+        if (["reply_to_coding_agent", "start_coding_agent"].includes(a.toolName)) {
           throw outreachActionConflict("Open Approvals to review the complete coding instruction before sending.");
         }
         if (a.status !== "pending") {
@@ -3689,9 +3689,9 @@ function renderApp() {
       height: 100vh;
       overflow: hidden;
     }
-    .app { display: grid; grid-template-rows: 48px 1fr; height: 100vh; }
+    .app { display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100vh; }
     header {
-      display: flex; align-items: center; gap: 16px;
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap; min-height: 48px;
       padding: 0 16px;
       background: var(--panel);
       border-bottom: 1px solid var(--line);
@@ -3699,7 +3699,7 @@ function renderApp() {
     header h1 { font-size: 14px; font-weight: 700; margin: 0; letter-spacing: 0.02em; }
     header .status { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
     header .status .status-pill { white-space: nowrap; padding: 2px 8px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); }
-    nav { display: flex; gap: 4px; margin-left: auto; align-items: center; }
+    nav { display: flex; gap: 4px; margin-left: auto; align-items: center; flex-wrap: wrap; min-width: 0; }
     nav button {
       background: transparent; border: 1px solid transparent; color: var(--muted);
       padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
@@ -3741,7 +3741,10 @@ function renderApp() {
     .nav-more-panel button.active { background: var(--accent-bg); color: var(--accent-foreground); }
 
     .body { display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
-    .body.no-sidebar { grid-template-columns: 1fr; }
+    .body.no-sidebar { grid-template-columns: minmax(0, 1fr); }
+    main, .pane, .card { min-width: 0; overflow-wrap: anywhere; }
+    #codingDetail pre { overflow-wrap: anywhere; }
+    #codingList ~ section, #codingList { min-width: 0; }
     .sidebar {
       background: var(--panel);
       border-right: 1px solid var(--line);
@@ -3813,7 +3816,7 @@ function renderApp() {
     .pane h3 { margin: 22px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
     .pane > .row, .pane > .grid { max-width: 1180px; margin-left: auto; margin-right: auto; }
     .pane pre { max-height: 320px; overflow: auto; }
-    .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 280px), 1fr)); }
     .grid.two { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); }
     .grid.stats { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
     .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
@@ -7008,11 +7011,13 @@ async function renderHealth() {
 }
 
 function pendingActionCardHtml(action) {
-  const coding = action.toolName === 'reply_to_coding_agent';
+  const coding = ['reply_to_coding_agent', 'start_coding_agent'].includes(action.toolName);
   const details = coding
     ? '<p>' + escapeHtml(action.args?.provider || '') + ' · ' + escapeHtml(action.args?.project || 'Coding session')
-      + '<br>Session: ' + escapeHtml(action.args?.sessionId || '') + '</p><pre style="white-space:pre-wrap; overflow-wrap:anywhere;">'
-      + escapeHtml(action.args?.message || '') + '</pre><p class="muted">Provider usage may be charged. Later provider permission requests need a separate decision.</p>'
+      + '<br>Session: ' + escapeHtml(action.args?.sessionId || '')
+      + (action.toolName === 'start_coding_agent' ? '<br>Model: ' + escapeHtml(action.args?.model || 'Provider default') + ' · Effort: ' + escapeHtml(action.args?.effort || 'Provider default') + '<br>Codex: read-only. Claude: manual permissions. No automatic permission approvals.' : '')
+      + '</p><pre style="white-space:pre-wrap; overflow-wrap:anywhere;">'
+      + escapeHtml(action.args?.message || '') + '</pre><p class="muted">Provider usage may be charged. CLI usage is not capped by the OpenAGI chat budget. Later provider permission requests need a separate decision.</p>'
     : '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px; white-space:pre-wrap; overflow-wrap:anywhere;">'
       + escapeHtml(JSON.stringify(action.args, null, 2)) + '</pre></details>';
   return '<div class="card" style="padding:14px; margin-bottom:10px;" data-pending-id="' + escapeHtml(action.id) + '">'

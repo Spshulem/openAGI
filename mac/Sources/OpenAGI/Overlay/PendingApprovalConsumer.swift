@@ -22,9 +22,14 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
     let sessionId: String
     let project: String?
     let message: String
+    let workspaceId: String?
+    let model: String?
+    let effort: String?
 
     var text: String {
-      "\(provider) · \(project ?? "Coding session")\nSession: \(sessionId)\n\n\(message)\n\nProvider usage may be charged. Later provider permission requests need a separate decision."
+      "\(provider) · \(project ?? "Coding session")\nSession: \(sessionId)\n"
+        + (workspaceId == nil ? "" : "Model: \(model ?? "Provider default") · Effort: \(effort ?? "Provider default")\nCodex: read-only. Claude: manual permissions. No automatic permission approvals.\n")
+        + "\n\(message)\n\nProvider usage may be charged. CLI usage is not capped by the OpenAGI chat budget. Later provider permission requests need a separate decision."
     }
   }
 
@@ -44,7 +49,7 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
     status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
     createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
     sourceSessionId = try c.decodeIfPresent(Context.self, forKey: .context)?.sessionId
-    codingReply = toolName == "reply_to_coding_agent"
+    codingReply = ["reply_to_coding_agent", "start_coding_agent"].contains(toolName)
       ? try? c.decode(CodingReplyReview.self, forKey: .args) : nil
   }
 }

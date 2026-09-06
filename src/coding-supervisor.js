@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { BuiltinCodingSupervisor } from "./builtin-coding-supervisor.js";
 
 const ATTENTION = new Set(["waiting", "stuck", "failed", "interrupted"]);
 const STATES = new Set([...ATTENTION, "working", "idle"]);
@@ -75,11 +76,14 @@ export function runSupervisorAdapter(request, { backendDir, stateFile, timeoutMs
 
 export class CodingSupervisor {
   constructor({ dataDir, runtime, backendDir = process.env.OPENAGI_CODING_SUPERVISOR_DIR,
-    stateFile = process.env.OPENAGI_CODING_SUPERVISOR_STATE_FILE, call, now = () => Date.now(), intervalMs = 30_000 } = {}) {
+    stateFile = process.env.OPENAGI_CODING_SUPERVISOR_STATE_FILE, call, builtinOptions = {}, now = () => Date.now(), intervalMs = 30_000 } = {}) {
     this.runtime = runtime;
     this.now = now;
-    this.configured = Boolean(call) || (typeof backendDir === "string" && path.isAbsolute(backendDir));
-    this.call = call ?? ((request, options) => runSupervisorAdapter(request, { backendDir, stateFile, ...options }));
+    this.external = Boolean(call) || (typeof backendDir === "string" && path.isAbsolute(backendDir));
+    this.builtin = new BuiltinCodingSupervisor({ dataDir: path.resolve(dataDir ?? resolveDataDir()), ...builtinOptions,
+      onChange: () => { void this.refresh(); } });
+    this.configured = this.external || this.builtin.config.enabled === true;
+    this.call = call ?? (this.external ? ((request, options) => runSupervisorAdapter(request, { backendDir, stateFile, ...options })) : request => this.builtin.call(request));
     this.intervalMs = Math.min(300_000, Math.max(15_000, Number(intervalMs) || 30_000));
     this.file = path.join(path.resolve(dataDir ?? resolveDataDir()), "coding-supervisor", "state.json");
     const saved = readJsonFile(this.file, {});
@@ -100,6 +104,16 @@ export class CodingSupervisor {
   save() {
     ensureDir(path.dirname(this.file));
     writeJsonAtomic(this.file, this.state);
+  }
+
+  setup() { return { ...this.builtin.setup(), external: this.external }; }
+  configure(args) {
+    if (this.external) throw new Error("Remove the optional external adapter setting before configuring the built-in supervisor.");
+    const result = this.builtin.configure(args);
+    this.configured = result.enabled;
+    this.lastSnapshot = { configured: this.configured, checkedAt: null, sessions: [], error: null };
+    if (this.configured) this.start();
+    return result;
   }
 
   async request(request) {
@@ -242,6 +256,7 @@ export class CodingSupervisor {
     this.timer.unref?.();
   }
   stop() {
+    this.builtin.stop();
     clearInterval(this.timer);
     this.timer = null;
     for (const controller of this.controllers) controller.abort();
@@ -249,8 +264,20 @@ export class CodingSupervisor {
 }
 
 export function registerCodingSupervisorTools(registry, supervisor) {
+  for (const name of ["list_coding_agents", "inspect_coding_agent", "reply_to_coding_agent", "start_coding_agent", "list_coding_workspaces"]) registry.unregister(name);
   if (!supervisor.configured) return;
   const targetSchema = { provider: { type: "string", enum: ["claude", "codex"] }, sessionId: { type: "string" } };
+  if (!supervisor.external) registry.register({ name: "start_coding_agent", source: "integration:coding-supervisor", needsConfirmation: true,
+    description: "Start an OpenAGI-managed coding CLI in an owner-selected Git workspace after approval. Codex is read-only; Claude retains manual permissions. Never claim acceptance means task completion. Use list_coding_workspaces for exact workspace IDs.",
+    parameters: { type: "object", properties: { provider: targetSchema.provider, workspaceId: { type: "string" }, message: { type: "string", maxLength: 4000 }, model: { type: "string" }, effort: { type: "string", enum: ["low", "medium", "high"] } }, required: ["provider", "workspaceId", "message"], additionalProperties: false },
+    prepareApprovalArgs: args => supervisor.builtin.prepare(args), approvalTtlMs: 600_000,
+    approvalDedupeKey: (args, context) => digest(JSON.stringify([context.sessionId, args.provider, args.workspaceId, args.message, args.model, args.effort])),
+    summarize: args => `Start ${args.provider} in ${args.project}: ${args.message}`,
+    handler: (args, context) => { if (!context?.__confirmed) throw new Error("Explicit approval is required."); return supervisor.builtin.start(args); }
+  });
+  if (!supervisor.external) registry.register({ name: "list_coding_workspaces", source: "integration:coding-supervisor", sideEffects: false,
+    description: "List the owner's configured coding workspace IDs and installed provider CLIs. Installation does not prove authentication.",
+    parameters: { type: "object", properties: {}, additionalProperties: false }, handler: () => supervisor.setup() });
   registry.register({ name: "list_coding_agents", source: "integration:coding-supervisor", sideEffects: false,
     description: "List recent Claude Code and Codex sessions, reported status, attention, model, and safe reply availability. Does not resume or change sessions.",
     parameters: { type: "object", properties: {}, additionalProperties: false }, handler: () => supervisor.list() });

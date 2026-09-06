@@ -3,6 +3,18 @@ import XCTest
 @testable import OpenAGI
 
 final class PendingApprovalTests: XCTestCase {
+  func testManagedStartShowsWorkspaceModelEffortAndPermissionBoundary() throws {
+    let data = try JSONSerialization.data(withJSONObject: [
+      "id": "fixture-start", "toolName": "start_coding_agent", "status": "pending",
+      "args": ["provider": "codex", "sessionId": "fixture-session", "workspaceId": "fixture-workspace",
+        "project": "/fixture/project", "message": "Inspect the fixture", "model": "fixture-model", "effort": "high"]
+    ])
+    let review = try JSONDecoder().decode(PendingApproval.self, from: data).codingReply
+    XCTAssertTrue(review?.text.contains("/fixture/project") == true)
+    XCTAssertTrue(review?.text.contains("fixture-model") == true)
+    XCTAssertTrue(review?.text.contains("high") == true)
+    XCTAssertTrue(review?.text.contains("read-only") == true)
+  }
   @MainActor
   func testCodingAttentionNotifiesAndReviewsWithoutInlineExecution() {
     XCTAssertTrue(NotificationPresenter.shouldNotify(type: "coding-agent", needsDecision: false, quiet: false))

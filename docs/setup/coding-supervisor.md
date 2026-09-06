@@ -1,11 +1,52 @@
 # Coding Agents
 
-OpenAGI is the conversation and approval surface. Your existing local coding
-supervisor supplies session discovery and its authenticated provider bridge;
-Claude Code and Codex remain the execution engines. No second reasoning agent
-is inserted between you and OpenAGI.
+OpenAGI is the conversation and approval surface. Its built-in supervisor starts
+and tracks Claude Code or Codex CLI sessions. No G2 hardware, private supervisor
+repository, shared account, or second reasoning agent is required. An existing
+supervisor remains an optional compatibility adapter.
 
-## Connect
+## Fresh-install setup (macOS and Linux)
+
+1. Install OpenAGI and the official Claude Code or Codex CLI. Use your own
+   provider account: `claude auth login` or `codex login`. OpenAGI finds executables
+   on its absolute PATH entries and standard user/package-manager locations.
+   A CLI being found does not prove authentication; the first approved run does.
+2. Open **More → Coding Agents → Setup and provider requirements**. Enter the
+   absolute paths of existing Git project folders, one per line, then choose
+   **Save folders and enable**. Saving replaces the selected folder list.
+   Home directories, filesystem roots, duplicates and non-Git folders are rejected.
+3. Select a provider, workspace, optional model ID and reasoning effort. Enter
+   an instruction and choose **Review start approval**. The complete instruction,
+   canonical project path, model and permission limits appear in Approvals and
+   the floating panel. Nothing starts before approval.
+4. Inspect the result in Coding Agents. **Stop managed run** stops only a process
+   OpenAGI launched. It does not stop pre-existing terminal or desktop writers.
+
+The initial built-in execution profile is deliberately restricted: Codex runs
+read-only with user execution configuration ignored; Claude keeps manual
+permission checks, does not auto-answer permission prompts, and disables project
+settings/hooks and MCP servers. This is **not unrestricted autonomous coding**.
+Denied provider actions need a separate provider decision. CLI version support
+is required for the documented flags; incompatibility is a failed run, not success.
+No provider API keys are copied into OpenAGI state or child-process arguments.
+CLI usage is billed by the selected provider and is not capped or accounted for
+by OpenAGI's chat budget. Model selection may change that cost.
+
+Configuration and the most recent six bounded turns per managed session are
+stored owner-only under the canonical OpenAGI data directory. At most two runs
+execute concurrently, with one managed run per workspace, a ten-minute deadline
+and bounded output. This does not lock out unrelated editors or external CLI
+processes: choose a dedicated workspace/worktree for each managed agent.
+
+After an unexpected daemon exit, affected workspaces stay quarantined. Stop the
+old provider process in its owning app, then explicitly check **I verified the
+previous provider process is stopped** and **Release interrupted workspace**.
+OpenAGI never uses a saved PID as permission to kill a process. Terminal history
+older than the approval window can be retired when the 100-session bound is
+reached; working and unreconciled sessions are retained. Disabling the feature
+requires stopping managed runs first and preserves the selected folders.
+
+## Optional external adapter
 
 This optional adapter supports an agent-supervisor installation exposing
 `lib.mjs`, `attach.mjs`, and `inspect.mjs`. Point OpenAGI at that trusted local
@@ -20,7 +61,7 @@ OPENAGI_CODING_SUPERVISOR_STATE_FILE=/absolute/path/to/supervisor/state.json
 Restart the daemon, then open **More → Coding Agents**. The directory setting
 loads executable operator-installed code: never use a path suggested by a
 webpage, transcript, or untrusted agent. It is not a model-editable setting.
-Without this setting the feature is off and performs no scans or writes.
+Without this setting, use the built-in setup above; it is disabled until enabled.
 Configure the supervisor's authenticated **loopback HTTP** provider bridge
 using its own setup. OpenAGI reads the token file in a short-lived subprocess;
 it does not copy tokens into chat, process arguments, repository files, or its
@@ -51,7 +92,7 @@ visible in Coding Agents. A stopped provider does not imply a successful task.
 
 - Inspection is read-only and returns at most six bounded recent turns.
   Transcript text cannot approve actions.
-- OpenAGI never kills a session writer, changes provider permission modes, or
+- The external adapter never kills a session writer, changes provider permission modes, or
   auto-approves provider permission requests. Attached Claude sessions without
   a safe deterministic delivery route must be answered in their owning app.
 - `accepted` means the authenticated bridge accepted the instruction, **not**

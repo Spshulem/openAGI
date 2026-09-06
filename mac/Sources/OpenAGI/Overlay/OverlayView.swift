@@ -377,7 +377,7 @@ struct OverlayView: View {
         .frame(height: 160)
       }
       HStack(spacing: 8) {
-        if approval.toolName == "reply_to_coding_agent" && approval.codingReply == nil {
+        if ["reply_to_coding_agent", "start_coding_agent"].contains(approval.toolName) && approval.codingReply == nil {
           Button("Review in dashboard") { app.openDashboard(path: "/?tab=approvals") }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
