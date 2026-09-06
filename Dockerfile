@@ -22,7 +22,8 @@
 
 FROM node:22-alpine AS test
 WORKDIR /build
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 COPY src ./src
 COPY examples ./examples
 COPY test ./test
@@ -37,9 +38,11 @@ LABEL org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 RUN addgroup -g 1001 openagi && adduser -D -u 1001 -G openagi openagi
 
 WORKDIR /opt/openagi
-COPY --chown=openagi:openagi package.json ./
+COPY --chown=openagi:openagi package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 COPY --chown=openagi:openagi src ./src
 COPY --chown=openagi:openagi examples ./examples
+COPY --chown=openagi:openagi scripts ./scripts
 
 # Persistent state lives at /data so users mount a volume there.
 RUN mkdir -p /data && chown openagi:openagi /data

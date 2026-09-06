@@ -276,7 +276,7 @@ export class CronScheduler {
         source: "cron"
       });
       job.lastRunAt = (now instanceof Date ? now : new Date(now)).toISOString();
-      job.nextRunAt = this.computeNextRun(job, new Date(job.lastRunAt)).toISOString();
+      job.nextRunAt = job.enabled ? this.computeNextRun(job, new Date(job.lastRunAt)).toISOString() : null;
       results.push({ job, result });
     }
     return results;

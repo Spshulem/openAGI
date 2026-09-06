@@ -101,6 +101,7 @@ update_systemd() {
     exit 1
   fi
   (cd "${PROJECT_DIR}" && need_sudo git fetch origin && need_sudo git pull --ff-only)
+  (cd "${PROJECT_DIR}" && need_sudo npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
   if [ "$1" = "user" ]; then
     systemctl --user restart openagi
   else
@@ -116,6 +117,7 @@ update_launchd() {
     exit 1
   fi
   (cd "${PROJECT_DIR}" && git fetch origin && git pull --ff-only)
+  (cd "${PROJECT_DIR}" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
   launchctl bootout "gui/$(id -u)" "${LAUNCHD_PLIST}" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "${LAUNCHD_PLIST}"
   color_green "✓ Daemon reloaded."
@@ -155,6 +157,7 @@ fi
 if [ -d "${PROJECT_DIR}/.git" ]; then
   color_yellow "▶ No managed service detected. Doing a bare git pull. Restart the daemon manually."
   (cd "${PROJECT_DIR}" && git pull --ff-only)
+  (cd "${PROJECT_DIR}" && npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
   exit 0
 fi
 

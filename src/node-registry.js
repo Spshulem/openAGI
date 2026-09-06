@@ -175,7 +175,7 @@ export class NodeRegistry {
     this.storePath = path.join(this.dir, "registry.json");
   }
 
-  upsert({ nodeId, name, role, url, version, build, buildSource, capabilities }, { now = Date.now() } = {}) {
+  upsert({ nodeId, name, role, url, version, build, buildSource, capabilities, platform }, { now = Date.now() } = {}) {
     // Prune against the SAME in-memory store we're about to update, rather
     // than pruning (its own read+maybe-write) and then re-reading the file
     // again from disk for the upsert — one read, one write, per call.
@@ -190,6 +190,7 @@ export class NodeRegistry {
       version,
       build: build ?? null,
       buildSource: buildSource ?? null,
+      platform: typeof platform === "string" ? platform : existing?.platform ?? null,
       capabilities: sanitizeNodeCapabilities(capabilities),
       firstSeenAt: existing?.firstSeenAt ?? new Date(now).toISOString(),
       lastSeenAt: new Date(now).toISOString()
@@ -197,7 +198,9 @@ export class NodeRegistry {
     writeJsonAtomic(this.storePath, store);
   }
 
-  enroll(nodeId, token, { now = Date.now() } = {}) {
+  enroll(nodeId, token, {
+    now = Date.now(), platform = null, name = null, capabilities = []
+  } = {}) {
     if (typeof nodeId !== "string" || !/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
       throw new Error("nodeId is required and malformed");
     }
@@ -220,9 +223,18 @@ export class NodeRegistry {
       error.code = "NODE_ALREADY_ENROLLED";
       throw error;
     }
+    const normalizedPlatform = typeof platform === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/i.test(platform)
+      ? platform
+      : null;
+    const normalizedName = typeof name === "string" && name.trim()
+      ? name.trim().replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 80)
+      : null;
     store.credentials[nodeId] = {
       tokenHash,
-      createdAt: new Date(now).toISOString()
+      createdAt: new Date(now).toISOString(),
+      ...(normalizedPlatform ? { platform: normalizedPlatform } : {}),
+      ...(normalizedName ? { name: normalizedName } : {}),
+      ...(normalizedPlatform ? { capabilities: sanitizeNodeCapabilities(capabilities) } : {})
     };
     writeJsonAtomic(this.storePath, store);
     return { created: true };
@@ -238,6 +250,20 @@ export class NodeRegistry {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
+  enrollmentForToken(token) {
+    if (typeof token !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(token)) return null;
+    const actualHash = crypto.createHash("sha256").update(token, "utf8").digest("hex");
+    const actual = Buffer.from(actualHash, "hex");
+    const store = this._read();
+    for (const [nodeId, credential] of Object.entries(store.credentials)) {
+      const expected = Buffer.from(credential?.tokenHash ?? "", "hex");
+      if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) continue;
+      const { tokenHash: _tokenHash, ...safe } = credential;
+      return { nodeId, ...safe, capabilities: sanitizeNodeCapabilities(safe.capabilities) };
+    }
+    return null;
+  }
+
   revoke(nodeId) {
     if (typeof nodeId !== "string" || !nodeId) return false;
     const store = this._read();
@@ -250,6 +276,54 @@ export class NodeRegistry {
 
   isEnrolled(nodeId) {
     return Boolean(this._read().credentials[nodeId]);
+  }
+
+  enrollment(nodeId) {
+    if (typeof nodeId !== "string" || !nodeId) return null;
+    const credential = this._read().credentials[nodeId];
+    if (!credential) return null;
+    const { tokenHash: _tokenHash, ...safe } = credential;
+    return {
+      nodeId,
+      ...safe,
+      capabilities: sanitizeNodeCapabilities(safe.capabilities)
+    };
+  }
+
+  listEnrollments() {
+    return Object.entries(this._read().credentials)
+      .map(([nodeId, credential]) => {
+        const { tokenHash: _tokenHash, ...safe } = credential;
+        return {
+          nodeId,
+          ...safe,
+          capabilities: sanitizeNodeCapabilities(safe.capabilities)
+        };
+      })
+      .sort((a, b) => (a.name ?? a.nodeId).localeCompare(b.name ?? b.nodeId));
+  }
+
+  touchEnrollment(nodeId, { now = Date.now() } = {}) {
+    if (typeof nodeId !== "string" || !nodeId) return false;
+    const store = this._read();
+    const credential = store.credentials[nodeId];
+    if (!credential) return false;
+    const existing = store.entries[nodeId];
+    store.entries[nodeId] = {
+      nodeId,
+      name: existing?.name ?? credential.name ?? nodeId,
+      role: "node",
+      url: existing?.url ?? null,
+      version: existing?.version ?? null,
+      build: existing?.build ?? null,
+      buildSource: existing?.buildSource ?? null,
+      platform: credential.platform ?? existing?.platform ?? null,
+      capabilities: sanitizeNodeCapabilities(credential.capabilities ?? existing?.capabilities),
+      firstSeenAt: existing?.firstSeenAt ?? new Date(now).toISOString(),
+      lastSeenAt: new Date(now).toISOString()
+    };
+    writeJsonAtomic(this.storePath, store);
+    return true;
   }
 
   list({ now = Date.now() } = {}) {

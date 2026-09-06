@@ -20,6 +20,7 @@
 export const TASK_PROFILES = {
   chat:      { tier: "base", label: "User chat",            why: "Real reasoning, user-facing replies — keep this on your best model." },
   autopilot: { tier: "base", label: "Autopilot task work", why: "Plans and executes real work with tools — needs the strong model." },
+  scheduled: { tier: "mini", label: "Scheduled reminders", why: "Background prompts use a smaller model, independent of their delivery channel." },
   observer:  { tier: "nano", label: "Proactive observer",  why: "Mostly 'suggest one thing or stay quiet', runs often — nano is plenty." },
   scrutiny:  { tier: "nano", label: "Scrutiny judges",     why: "Short act/ask/watch/ignore classification, very frequent — nano is plenty." },
   condense:  { tier: "mini", label: "Memory condensing",   why: "Summarize a cluster of notes into one — a mini model handles it." },
@@ -31,6 +32,12 @@ export const TASK_PROFILES = {
 
 // Order matters for display (strongest → cheapest).
 export const TIERS = ["base", "mini", "nano"];
+
+export function agentTurnTask(input = {}) {
+  if (input.origin === 'autopilot' || input.channel === 'autopilot') return 'autopilot';
+  if (input.origin === 'cron' || input.channel === 'cron' || input.metadata?.scheduledJobId) return 'scheduled';
+  return 'chat';
+}
 
 export class ModelRouter {
   // envPrefix: "OPENAI" | "ANTHROPIC". baseModel: the already-resolved base model.

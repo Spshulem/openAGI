@@ -290,6 +290,8 @@ install_via_systemd() {
     (cd "${INSTALL_DIR}" && need_sudo git pull --ff-only)
   fi
 
+  (cd "${INSTALL_DIR}" && need_sudo npm ci --omit=dev --ignore-scripts --no-audit --no-fund)
+
   need_sudo mkdir -p "${INSTALL_DIR}/.openagi"
   need_sudo touch "${INSTALL_DIR}/.openagi/.env"
 

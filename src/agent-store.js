@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
-import { ensureDir, readJsonFile, safeFilename, writeJsonAtomic } from "./file-utils.js";
+import { createHash } from "node:crypto";
+import { ensureDir, readJsonFile, safeFilename, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 
@@ -90,6 +91,13 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
     this.dir = options.dir ?? path.join(resolveDataDir(), "agent-host");
     this.agentsPath = path.join(this.dir, "agents.json");
     this.sessionsDir = path.join(this.dir, "sessions");
+    this.archivesDir = path.join(this.dir, "session-archives");
+    this.maxActiveMessages = options.maxActiveMessages ?? 2000;
+    this.retainedMessages = options.retainedMessages ?? 1000;
+    this.maxSessionBytes = options.maxSessionBytes ?? 16 * 1024 * 1024;
+    if (!Number.isSafeInteger(this.maxActiveMessages) || this.maxActiveMessages < 2
+      || !Number.isSafeInteger(this.retainedMessages) || this.retainedMessages < 1 || this.retainedMessages >= this.maxActiveMessages
+      || !Number.isSafeInteger(this.maxSessionBytes) || this.maxSessionBytes < 1024) throw new Error("Invalid session history limits");
     ensureDir(this.sessionsDir);
     this._migrateLegacyComputerTypeSessions();
     this.load();
@@ -157,6 +165,7 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
 
   getSession(sessionId) {
     const filePath = this.sessionPath(sessionId);
+    this.assertSessionSize(filePath);
     const session = readJsonFile(filePath, {
       id: sessionId,
       createdAt: nowIso(),
@@ -168,11 +177,36 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
   }
 
   saveSession(session) {
-    const persisted = sanitizePersistedSession({
+    let persisted = sanitizePersistedSession({
       ...session,
       updatedAt: nowIso()
     }).session;
-    writeJsonAtomic(this.sessionPath(session.id), persisted);
+    // Models already use only the most recent turns. Preserve older messages
+    // in immutable owner-only chunks instead of rewriting months of history
+    // synchronously on every foreground/background message.
+    if (Array.isArray(persisted.messages) && persisted.messages.length > this.maxActiveMessages) {
+      const archived = persisted.messages.slice(0, -this.retainedMessages);
+      const chunk = { sessionId: session.id, messages: archived };
+      const hash = createHash("sha256").update(JSON.stringify(chunk)).digest("hex");
+      const archive = path.join(this.archivesDir, `${safeFilename(session.id)}.history`, `${hash}.json`);
+      // Archive first: a failed active write leaves the old history intact;
+      // replay uses the same content-addressed chunk, not a duplicate archive.
+      if (!fs.existsSync(archive)) writeJsonAtomic(archive, chunk);
+      persisted = { ...persisted, messages: persisted.messages.slice(-this.retainedMessages),
+        metadata: { ...persisted.metadata, archivedMessageCount: (persisted.metadata?.archivedMessageCount ?? 0) + archived.length,
+          historyArchived: true } };
+    }
+    const serialized = `${JSON.stringify(persisted, null, 2)}\n`;
+    if (Buffer.byteLength(serialized) > this.maxSessionBytes) {
+      throw Object.assign(new Error("Session history exceeds the safe size limit. Preserve an archive before repairing it."), { code: "SESSION_TOO_LARGE" });
+    }
+    writeTextAtomic(this.sessionPath(session.id), serialized);
+  }
+
+  assertSessionSize(filePath) {
+    let size;
+    try { size = fs.statSync(filePath).size; } catch (error) { if (error.code === "ENOENT") return; throw error; }
+    if (size > this.maxSessionBytes) throw Object.assign(new Error("Session history is too large to load safely. It has not been changed; archive and repair it first."), { code: "SESSION_TOO_LARGE" });
   }
 
   appendMessage(sessionId, message) {
@@ -181,7 +215,7 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
       ...normalizeMessage(message)
     });
     this.saveSession(session);
-    return session;
+    return this.getSession(sessionId);
   }
 
   listSessions() {
@@ -189,6 +223,12 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
     for (const entry of readDirSafe(this.sessionsDir)) {
       if (!entry.endsWith(".json")) continue;
       const filePath = path.join(this.sessionsDir, entry);
+      try { this.assertSessionSize(filePath); } catch (error) {
+        if (error.code !== "SESSION_TOO_LARGE") throw error;
+        entries.push({ id: entry.slice(0, -5), recoveryNeeded: true, messageCount: null, createdAt: "", updatedAt: "",
+          lastMessage: "History is too large to load safely. The original file is preserved." });
+        continue;
+      }
       const session = sanitizeSessionFile(filePath, readJsonFile(filePath, null));
       if (session) {
         entries.push({

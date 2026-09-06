@@ -3,11 +3,14 @@ import { registerCodingSupervisorTools } from "./coding-supervisor.js";
 export async function codingSupervisorRoute(runtime, method, pathname, url, readBody) {
   if (!pathname.startsWith("/coding-agents")) return null;
   const supervisor = runtime.codingSupervisor;
-  if (method === "GET" && pathname === "/coding-agents/setup") return { status: 200, body: supervisor?.setup() ?? { enabled: false } };
+  if (method === "GET" && pathname === "/coding-agents/setup") {
+    try { return { status: 200, body: await supervisor?.setup() ?? { enabled: false } }; }
+    catch { return { status: 503, body: { enabled: false, error: "The coding node is unavailable." } }; }
+  }
   if (method === "POST" && pathname === "/coding-agents/configure") {
     try {
       const body = await readBody();
-      const result = supervisor.configure({ enabled: body.enabled, workspaces: body.workspaces });
+      const result = await supervisor.configure({ enabled: body.enabled, workspaces: body.workspaces });
       registerCodingSupervisorTools(runtime.tools, supervisor);
       return { status: 200, body: result };
     } catch { return { status: 400, body: { error: "Choose existing absolute Git project folders. Stop managed sessions before changing setup; external adapters must be configured separately." } }; }
@@ -18,8 +21,9 @@ export async function codingSupervisorRoute(runtime, method, pathname, url, read
   }
   if (!supervisor?.configured) return { status: 503, body: { error: "Coding supervisor is not configured. See the coding-supervisor setup guide." } };
   try {
-    if (method === "POST" && pathname === "/coding-agents/reconcile" && !supervisor.external) {
+    if (method === "POST" && pathname === "/coding-agents/reconcile" && (!supervisor.external || supervisor.remote)) {
       const body = await readBody();
+      if (supervisor.remote) return { status: 200, body: await supervisor.request({ operation: "reconcile", provider: body.provider, sessionId: body.sessionId, confirmedStopped: body.confirmedStopped }) };
       return { status: 200, body: supervisor.builtin.reconcile({ provider: body.provider, sessionId: body.sessionId, confirmedStopped: body.confirmedStopped }) };
     }
     if (method === "POST" && pathname === "/coding-agents/start") {
@@ -28,8 +32,9 @@ export async function codingSupervisorRoute(runtime, method, pathname, url, read
         ...(body.model ? { model: body.model } : {}), ...(body.effort ? { effort: body.effort } : {}) }, { source: "http", route: pathname });
       return { status: result.ok ? 202 : 400, body: result.ok ? result.result : { error: result.error } };
     }
-    if (method === "POST" && pathname === "/coding-agents/stop" && !supervisor.external) {
+    if (method === "POST" && pathname === "/coding-agents/stop" && (!supervisor.external || supervisor.remote)) {
       const body = await readBody();
+      if (supervisor.remote) return { status: 200, body: await supervisor.request({ operation: "stop", provider: body.provider, sessionId: body.sessionId }) };
       return { status: 200, body: supervisor.builtin.cancel({ provider: body.provider, sessionId: body.sessionId }) };
     }
     if (method === "GET" && pathname === "/coding-agents/session") {

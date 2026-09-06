@@ -1,6 +1,6 @@
 {
   "name": "openagi",
-  "version": "0.0.21",
+  "version": "0.0.22",
   "private": true,
   "type": "module",
   "description": "Generic ABI runtime scaffold for directional adaptive scrutiny, tiered memory, and propagation.",
@@ -22,11 +22,14 @@
     "build-mac-app": "./scripts/build-mac-app.sh",
     "docker:build": "docker build -t openagi:local .",
     "docker:run": "docker run --rm -p 43210:43210 -v openagi-data:/data openagi:local",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
     "cli": "node bin/openagi.js"
   },
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
   },
   "bin": {
     "openagi": "bin/openagi.js"

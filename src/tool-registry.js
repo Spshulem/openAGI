@@ -1,5 +1,6 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
 
 // Stable, locale-independent order. Copies rather than sorting in place so a
 // caller's array (and the registry's own values) are never reordered underneath
@@ -382,13 +383,13 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "schedule_message",
-    description: "Schedule a future prompt that will be run through this agent. When fired, the result is delivered back to the originating channel (or a target you specify). Use for reminders, recurring check-ins, or scheduled work.",
+    description: "Schedule a future prompt. Choose exactly one timing field: delaySeconds for a one-time reminder, intervalSeconds for explicit recurrence (minimum 5 minutes), or dailyAt. Do not turn a one-time reminder into a recurring check-in. Identical schedules are reused. Scheduled reminders cannot create more schedules.",
     parameters: {
       type: "object",
       properties: {
         prompt: { type: "string", description: "The prompt the agent should run when this fires." },
         delaySeconds: { type: "integer", minimum: 30, description: "One-shot: fire this many seconds from now." },
-        intervalSeconds: { type: "integer", minimum: 30, description: "Recurring: fire every N seconds." },
+        intervalSeconds: { type: "integer", minimum: 300, description: "Recurring: fire every N seconds, only when the user requested recurrence." },
         dailyAt: { type: "string", description: "Recurring HH:MM (24h) daily fire time, e.g. '09:00'." },
         channel: { type: "string", description: "Channel to deliver to: local, telegram. Defaults to the originating channel." },
         target: { type: "string", description: "Channel target (phone number, chat id, etc). Defaults to the originating sender." },
@@ -399,31 +400,18 @@ export function registerCoreTools(registry, runtime) {
     },
     handler: async (args, context) => {
       if (!runtime.cron) throw new Error("Cron scheduler is not available.");
+      const spec = scheduledPromptSpec(args, context);
+      const existing = runtime.cron.listJobs().find(job => sameScheduledPrompt(job, spec));
+      if (existing) return { id: existing.id, name: existing.name, nextRunAt: existing.nextRunAt, task: existing.task,
+        reused: true, enabled: existing.enabled, note: existing.enabled ? 'This reminder already exists.' : 'This reminder is paused; it was not re-enabled.' };
       const job = {
         id: args.id ?? createId("job"),
         name: args.name ?? `prompt-${nowIso()}`,
         enabled: true,
         task: "prompt",
         replace: true,
-        input: {
-          prompt: String(args.prompt ?? "").trim(),
-          channel: args.channel ?? context.channel ?? "local",
-          target: args.target ?? context.from ?? context.target ?? null,
-          agentId: context.agentId ?? "main",
-          sessionId: context.sessionId,
-          oneShot: Boolean(args.delaySeconds && !args.intervalSeconds && !args.dailyAt)
-        }
+        ...spec
       };
-      if (args.delaySeconds) {
-        job.intervalMs = args.delaySeconds * 1000;
-        job.nextRunAt = new Date(Date.now() + args.delaySeconds * 1000).toISOString();
-      } else if (args.intervalSeconds) {
-        job.intervalMs = args.intervalSeconds * 1000;
-      } else if (args.dailyAt) {
-        job.dailyAt = args.dailyAt;
-      } else {
-        throw new Error("Provide one of delaySeconds, intervalSeconds, or dailyAt.");
-      }
       const created = runtime.cron.addJob(job);
       return { id: created.id, name: created.name, nextRunAt: created.nextRunAt, task: created.task };
     }

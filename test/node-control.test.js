@@ -38,6 +38,24 @@ test("capability advertisements preserve only literal readiness booleans", () =>
   assert.equal("inputReady" in malformed, false);
 });
 
+test("credential-only nodes are listable for owner revocation without exposing token hashes", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-enrollment-list-"));
+  const registry = new NodeRegistry({ dir });
+  registry.enroll("g2-direct", "t".repeat(43), {
+    name: "Direct G2",
+    platform: "even_g2",
+    capabilities: [{ id: "g2-voice-input", ready: true, operations: ["ask"] }]
+  });
+  const [enrollment] = registry.listEnrollments();
+  assert.equal(enrollment.nodeId, "g2-direct");
+  assert.equal(enrollment.name, "Direct G2");
+  assert.equal("tokenHash" in enrollment, false);
+  assert.equal(JSON.stringify(enrollment).includes("t".repeat(43)), false);
+  assert.equal(registry.list().length, 0);
+  assert.equal(registry.touchEnrollment("g2-direct", { now: 1_000 }), true);
+  assert.equal(registry.list({ now: 1_000 })[0].status, "online");
+});
+
 test("broker dispatches only to the selected ready node and rejects mismatched results", async () => {
   const broker = new NodeControlBroker({ commandTimeoutMs: 1_000 });
   broker.advertise("node-a", capability());
@@ -551,14 +569,34 @@ test("node enrollment stores only a hash and binds authentication to node id", (
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-node-auth-"));
   const registry = new NodeRegistry({ dir });
   const token = "a".repeat(43);
-  assert.deepEqual(registry.enroll("node-a", token), { created: true });
+  assert.deepEqual(registry.enroll("node-a", token, {
+    platform: "even_g2",
+    name: "Test G2",
+    capabilities: [{ id: "g2-voice-input", ready: true, operations: ["ask"], token: "discard-me" }]
+  }), { created: true });
   assert.equal(registry.authenticate("node-a", token), true);
+  assert.deepEqual(registry.enrollmentForToken(token), registry.enrollment("node-a"));
+  assert.equal(registry.enrollmentForToken("wrong"), null);
   assert.equal(registry.authenticate("node-b", token), false);
   assert.equal(registry.authenticate("node-a", "wrong"), false);
   assert.deepEqual(registry.enroll("node-a", token), { created: false }, "a lost enrollment response is safe to retry");
   assert.throws(() => registry.enroll("node-a", "b".repeat(43)), /already enrolled/);
+  assert.deepEqual(registry.enrollment("node-a"), {
+    nodeId: "node-a",
+    createdAt: registry.enrollment("node-a").createdAt,
+    platform: "even_g2",
+    name: "Test G2",
+    capabilities: [{
+      id: "g2-voice-input",
+      ready: true,
+      operations: ["ask"],
+      detail: null,
+      checkedAt: null
+    }]
+  });
   const persisted = fs.readFileSync(path.join(dir, "registry.json"), "utf8");
   assert.equal(persisted.includes(token), false, "scoped node token is hashed at rest");
+  assert.equal(persisted.includes("discard-me"), false, "node enrollment metadata is capability-sanitized");
   assert.equal(registry.revoke("node-a"), true);
   assert.equal(registry.authenticate("node-a", token), false);
   assert.deepEqual(registry.enroll("node-a", "b".repeat(43)), { created: true });
