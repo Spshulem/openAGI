@@ -32,16 +32,10 @@ struct OverlayView: View {
     Group {
       if state.expanded {
         expandedPanel
-          .transition(.asymmetric(
-            insertion: .scale(scale: 0.96, anchor: .top).combined(with: .opacity),
-            removal: .opacity
-          ))
       } else {
         pill
-          .transition(.scale(scale: 0.8).combined(with: .opacity))
       }
     }
-    .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.expanded)
   }
 
   private func panelWatchers<V: View>(_ content: V) -> some View {
@@ -123,10 +117,7 @@ struct OverlayView: View {
   }
 
   private var pill: some View {
-    Button(action: {
-      withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = true }
-      onExpand()
-    }) {
+    ZStack {
       ZStack {
         Circle().fill(Color.accentColor).frame(width: 18, height: 18)
         if pillBadgeCount > 0 {
@@ -136,8 +127,14 @@ struct OverlayView: View {
       }
       .padding(9)
       .contentShape(Circle())
+      .allowsHitTesting(false)
+      WindowDragHandle(onClick: {
+        state.expanded = true
+        onExpand()
+      })
+      .accessibilityLabel("Quick Ask")
     }
-    .buttonStyle(.plain)
+    .frame(width: 44, height: 44)
     .background(.ultraThinMaterial, in: Circle())
     .overlay(Circle().strokeBorder(.white.opacity(pillHovered ? 0.25 : 0.1), lineWidth: 1))
     .scaleEffect(pillHovered ? 1.08 : 1.0)
@@ -150,9 +147,11 @@ struct OverlayView: View {
     VStack(alignment: .leading, spacing: 8) {
       HStack {
         Text("Ask OpenAGI").font(.caption).foregroundStyle(.secondary)
-        Spacer()
+        WindowDragHandle()
+          .frame(maxWidth: .infinity, minHeight: 18)
+          .accessibilityLabel("Move OpenAGI window")
         Button(action: {
-          withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = false }
+          state.expanded = false
           onCollapse()
         }) {
           Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
