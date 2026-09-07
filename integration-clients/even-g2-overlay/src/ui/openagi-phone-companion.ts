@@ -26,6 +26,7 @@ export interface OpenAGIPhoneActions {
   refreshInbox?(): void
   openInbox?(): void
   memoryConsent?(enabled: boolean, consent: boolean): void
+  returnToLifelog?(consent: boolean): void
   inboxAction?(op: InboxOperation, id?: string, extra?: Record<string, unknown>): void
   markMoment?(): void
   configureIdleTap?(action: 'talk' | 'highlight'): void
@@ -87,6 +88,7 @@ export class OpenAGIPhoneCompanion {
             <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
             <label><input id="memory-enabled" type="checkbox"> Start lifelog · listen and save final transcripts</label>
             <p id="memory-status">Off. Give consent, then Start lifelog. Listening starts automatically; no separate switch is required. Switch off to stop retaining text.</p>
+            <button id="memory-resume">Return / resume lifelog</button>
             <details><summary>Privacy and retention</summary><p>Final text is batched to your main, not raw audio. Speakers are unverified. Suggestions need your confirmation. Retention stops on pause, app hiding or exit, and expires after 4 hours.</p>
             <button id="delete-memory">Stop memory & delete retained transcripts</button>
             </details>
@@ -170,6 +172,7 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#refresh-inbox')?.addEventListener('click', () => actions.refreshInbox?.())
     root.querySelector('#open-inbox')?.addEventListener('click', () => actions.openInbox?.())
     root.querySelector('#memory-enabled')?.addEventListener('change', () => actions.memoryConsent?.(root.querySelector<HTMLInputElement>('#memory-enabled')?.checked === true, root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
+    root.querySelector('#memory-resume')?.addEventListener('click', () => actions.returnToLifelog?.(root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
     root.querySelector('#recording-consent')?.addEventListener('change', () => {
       if (root.querySelector<HTMLInputElement>('#recording-consent')?.checked !== true) actions.memoryConsent?.(false, false)
     })
@@ -268,6 +271,7 @@ export class OpenAGIPhoneCompanion {
   saveStatus(text: string): void { const p = this.actionsSection.querySelector('#save-status'); if (p) p.textContent = text }
   idleTapAction(action: 'talk' | 'highlight'): void { requiredSelect(this.actionsSection, '#idle-tap').value = action }
   memoryPending(pending: boolean): void {
+    const resume = this.actionsSection.querySelector<HTMLButtonElement>('#memory-resume'); if (resume) resume.disabled = pending
     const input = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled')
     if (input) { input.disabled = pending; input.setAttribute('aria-busy', String(pending)) }
   }

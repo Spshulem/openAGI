@@ -12,7 +12,7 @@ import type { OpenAGIGlassesRenderer } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
 import { G2ProactiveClient, type InboxItem } from '../openagi/proactive'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'paused' | 'resume-consent' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 
 export class OpenAGIG2App {
   readonly proactive: G2ProactiveClient
@@ -36,13 +36,16 @@ export class OpenAGIG2App {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private ambientRunning = false
   private memoryRequest = 0
+  private pausedLifelog = false
   private resumeAfterAsk = false
   private lastListeningPulse = 0
   private foregroundActive = true
   private lifelogRequest = 0
   private onVisibility = (): void => { this.setForeground(document.visibilityState !== 'hidden') }
   setForeground(active: boolean): void {
+    if (!active && this.proactive.memoryActive) this.pausedLifelog = true
     this.foregroundActive = active; this.proactive.setForeground(active)
+    if (active && this.pausedLifelog && this.mode === 'home') this.showPaused()
     if (!active) {
       this.clearNotice()
       this.renderer.message('Listening paused', 'App is not in the foreground. Resume on phone.')
@@ -50,7 +53,7 @@ export class OpenAGIG2App {
       this.audioBuffer = null
       if (this.preparingDraft) this.cancelRequest()
       this.stopLiveSpeech(); void this.stopAmbient()
-      if (this.mode === 'ambient' || this.mode === 'listening') this.mode = 'home'
+      if (this.mode === 'ambient' || this.mode === 'listening' || (this.mode === 'thinking' && !this.requestController)) this.mode = 'home'
       this.phone.memoryStatus?.(false, 'Lifelog stopped when the app left the foreground. Start it again with current participant consent.')
     }
   }
@@ -147,13 +150,23 @@ export class OpenAGIG2App {
   async configureIdleTap(action: 'talk' | 'highlight'): Promise<void> {
     await this.store.update({ idleTapAction: action }); this.phone.idleTapAction?.(action)
   }
+  async returnToLifelog(consent: boolean): Promise<void> {
+    if (this.exited || !this.foregroundActive || document.visibilityState === 'hidden' || this.navigationBusy || this.requestController || this.microphoneOpening || ['review', 'listening', 'pairing'].includes(this.mode)) return
+    if (this.proactive.memoryActive && this.ambientRunning) { this.showHome(); return }
+    await this.configureMemory(true, consent)
+  }
   async configureMemory(enabled: boolean, consent: boolean): Promise<void> {
     const request = ++this.memoryRequest
-    if (!enabled || !consent) { this.phone.memoryPending?.(false); this.proactive.pauseMemory(); return }
+    if (!enabled || !consent) {
+      this.phone.memoryPending?.(false); this.proactive.pauseMemory()
+      if (enabled) this.phone.memoryStatus?.(false, 'Confirm participant consent above, then tap Return / resume lifelog.')
+      return
+    }
     if (!this.foregroundActive || document.visibilityState === 'hidden') { this.proactive.pauseMemory(); return }
     if (this.navigationBusy || this.requestController || this.microphoneOpening || ['review', 'listening', 'pairing'].includes(this.mode)) {
       this.phone.memoryStatus?.(false, 'Finish the current microphone operation, then start lifelog.'); return
     }
+    if (this.proactive.memoryActive && this.ambientRunning) { this.showHome(); return }
     this.phone.memoryPending?.(true)
     this.phone.memoryStatus?.(false, 'Starting lifelog… opening the microphone, then requesting retention consent.')
     try {
@@ -164,12 +177,12 @@ export class OpenAGIG2App {
         return
       }
       if (!this.ambientRunning) { this.phone.memoryStatus?.(false, 'Lifelog could not start: microphone unavailable. Check the connection, then retry.'); return }
-      await this.proactive.enableMemory(true)
+      if (!this.proactive.memoryActive) await this.proactive.enableMemory(true)
       if (startedHere && !this.proactive.memoryActive) {
         await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
         this.phone.memoryStatus?.(false, 'Lifelog did not start. Microphone stopped because retention consent was not granted. Retry Start lifelog.')
       }
-      this.listeningPulse(true)
+      if (this.proactive.memoryActive && this.ambientRunning && this.foregroundActive && !this.exited) { this.pausedLifelog = false; this.showHome() }
     } catch (error) { this.proactive.pauseMemory(`Could not start lifelog: ${safeOpenAGIError(error)}`) }
     finally { this.phone.memoryPending?.(false) }
   }
@@ -251,7 +264,12 @@ export class OpenAGIG2App {
       else if (!this.preparingDraft) { this.activityView = !this.activityView; this.renderActiveProgress?.() }
       return
     }
-    if (this.mode === 'review') void this.sendDraft()
+    if (this.mode === 'paused') {
+      if (this.pausedLifelog) { this.mode = 'resume-consent'; this.renderer.paused?.(true, true) }
+      else void this.configureAmbient(true, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
+    }
+    else if (this.mode === 'resume-consent') void this.configureMemory(true, true)
+    else if (this.mode === 'review') void this.sendDraft()
     else if (this.mode === 'inbox') { this.mode = 'inbox-detail'; this.showInboxPage(); void this.proactive.action('seen', this.inboxItems[this.inboxIndex]?.id) }
     else if (this.mode === 'inbox-detail') { this.actionTarget = { ...this.inboxItems[this.inboxIndex] }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
     else if (this.mode === 'inbox-action' || this.mode === 'inbox-confirm') void this.chooseInboxAction()
@@ -329,11 +347,18 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'review') { await this.discardDraft(); return }
+    if (this.mode === 'resume-consent') { this.showPaused(); return }
+    if (this.mode === 'paused') { this.showHome(); return }
     if (this.mode === 'inbox-confirm') { this.mode = 'inbox-action'; this.showInboxAction(); await this.resumeListening(); return }
     if (this.mode === 'inbox-action') { if (!this.actionTarget?.id) this.showHome(); else { this.mode = 'inbox-detail'; this.showInboxPage() }; return }
     if (this.mode === 'inbox-detail') { this.showInboxItem(); return }
     if (this.mode === 'inbox') { this.showHome(); return }
-    if (this.mode === 'ambient') { await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions); this.mode = 'message'; this.renderer.message('Listening paused', 'Microphone off. Resume on phone.'); return }
+    if (this.mode === 'ambient') {
+      this.pausedLifelog = this.proactive.memoryActive
+      await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
+      if (!this.exited && this.foregroundActive && !this.ambientRunning) this.showPaused()
+      return
+    }
     if (this.mode === 'home') { this.showRecent(this.store.snapshot().history.length - 1); return }
     this.navigationBusy = true
     try {
@@ -505,7 +530,7 @@ export class OpenAGIG2App {
     if (this.mode === 'listening') { await this.finishAsk(); return }
     this.clearNotice()
     if (this.mode.startsWith('inbox')) { const selected = this.mode === 'inbox-action' || this.mode === 'inbox-confirm' ? this.actionTarget : this.inboxItems[this.inboxIndex]; this.voiceTarget = selected?.id ? { ...selected } : null; this.showHome() }
-    if (this.mode === 'message' || this.mode === 'answer' || this.mode === 'recent') this.showHome()
+    if (this.mode === 'message' || this.mode === 'answer' || this.mode === 'recent' || this.mode === 'paused' || this.mode === 'resume-consent') this.showHome()
     if (this.ambientRunning) {
       this.resumeAfterAsk = true
       await this.stopAmbient(true)
@@ -556,7 +581,7 @@ export class OpenAGIG2App {
     }
     if (this.microphoneOpening || this.mode !== 'listening' || !this.audioBuffer) return
     this.mode = 'thinking'; await this.audio.stop().catch(() => undefined)
-    if (this.exited) return
+    if (this.exited || !this.foregroundActive || !this.audioBuffer) return
     const audio = this.audioBuffer; this.audioBuffer = null
     if (audio.durationSeconds < 0.1) {
       this.fail(new Error(audio.durationSeconds === 0 ? 'No microphone audio arrived from G2. Check the glasses connection, then try Ask again.' : 'The recording was too short. Speak your question before sending.'))
@@ -677,6 +702,10 @@ export class OpenAGIG2App {
     } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false); await this.resumeListening() }
   }
   private showUnpaired(): void { this.proactive.stop(); this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
+  private showPaused(): void {
+    this.mode = 'paused'; this.renderer.paused?.(this.pausedLifelog)
+    this.phone.set(this.pausedLifelog ? 'Lifelog paused' : 'Listening paused', 'Microphone off. Tap on glasses to resume, or use Return / resume lifelog on the phone.')
+  }
   private showHome(): void {
     this.phone.history?.(this.store.snapshot().history)
     const state = this.store.snapshot(); if (!state.nodeToken) { this.showUnpaired(); return }

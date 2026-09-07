@@ -28,7 +28,7 @@ async function fixture(initial: { ambientEnabled?: boolean } = {}) {
   const audio = { active: true, start: vi.fn((cb: typeof receive) => { receive = cb; return Promise.resolve() }), stop: vi.fn(() => Promise.resolve()) }
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon' })), ask: vi.fn(), listen: vi.fn() }
-  const renderer = { inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
+  const renderer = { paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
   const phone = { set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return speech as unknown as LiveSpeech })
@@ -141,6 +141,72 @@ it('opening a recent answer preserves active lifelog consent and microphone', as
     f.audio.stop.mockClear(); await f.app.selectAnswer(0)
     expect(f.audio.stop).not.toHaveBeenCalled(); expect(f.app.proactive.memoryActive).toBe(true)
     f.app.doubleTap(); await Promise.resolve(); expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, 'open agi')
+  } finally { await f.app.systemExit() }
+})
+
+it('resumes paused lifelog on glasses only after explicit participant consent', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  const proactive = vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] })
+  Object.assign(f.api, { proactive })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.doubleTap(); await vi.advanceTimersByTimeAsync(500)
+    expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
+    expect(f.app.proactive.memoryActive).toBe(false)
+    f.audio.start.mockClear(); proactive.mockClear()
+    f.app.tap()
+    expect(f.renderer.paused).toHaveBeenLastCalledWith(true, true)
+    expect(f.audio.start).not.toHaveBeenCalled()
+    f.app.doubleTap(); await vi.advanceTimersByTimeAsync(500)
+    expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
+    expect(proactive.mock.calls.some(([b]) => b.op === 'consent' && b.enabled)).toBe(false)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, 'open agi')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('phone return to active lifelog leaves the consent and microphone intact', async () => {
+  const f = await fixture()
+  const proactive = vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] })
+  Object.assign(f.api, { proactive })
+  try {
+    await f.store.remember('Earlier question', 'Earlier answer'); await f.app.configureMemory(true, true)
+    await f.app.selectAnswer(0); f.audio.start.mockClear(); proactive.mockClear()
+    await f.app.returnToLifelog(false)
+    expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, 'open agi')
+    expect(f.audio.start).not.toHaveBeenCalled()
+    expect(proactive.mock.calls.some(([b]) => b.op === 'consent')).toBe(false)
+  } finally { await f.app.systemExit() }
+})
+
+it('does not revive retention after backgrounding without a new confirmation', async () => {
+  const f = await fixture()
+  Object.assign(f.api, { proactive: vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] }) })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.setForeground(false); await Promise.resolve(); f.app.setForeground(true)
+    expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
+    await f.app.configureMemory(true, false)
+    expect(f.app.proactive.memoryActive).toBe(false)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit() }
+})
+
+it('safely discards buffered Stop when backgrounding clears the recording', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureSpeech('openai-buffered'); await f.app.startAsk()
+    f.receive(new Uint8Array(6400))
+    let stopped!: () => void
+    f.audio.stop.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
+    const finishing = f.app.finishAsk()
+    f.app.setForeground(false); stopped(); await expect(finishing).resolves.toBeUndefined()
+    expect(f.api.listen).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
+    f.app.setForeground(true); await f.app.startAsk()
+    expect(f.audio.start).toHaveBeenCalledTimes(2)
   } finally { await f.app.systemExit() }
 })
 

@@ -52,6 +52,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     refreshInbox: () => { void app.proactive.refresh() },
     openInbox: () => app.openInbox(),
     memoryConsent: (enabled, consent) => { void app.configureMemory(enabled, consent) },
+    returnToLifelog: consent => { void app.returnToLifelog(consent) },
     configureListeningMode: mode => { void app.configureListeningMode(mode) },
     readLifelog: (query, offset) => { void app.readLifelog(query, offset) },
     inboxAction: (op, id, extra) => { void app.proactive.action(op, id, extra) },

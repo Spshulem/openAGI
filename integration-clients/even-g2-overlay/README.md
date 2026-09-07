@@ -4,6 +4,22 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.9: quiet lifelog and resume
+
+Quiet lifelog shows only `●` while the microphone and retention session are
+active. Tap to ask (or mark a moment if configured); double-tap from an answer
+returns to the active lifelog. Double-tap on the dot pauses the microphone.
+On the paused screen, tap Resume, then tap to confirm current participant
+consent and restart lifelog; double-tap cancels. Returning from the background
+does not silently restart recording or renew consent.
+
+On the phone, Listen → Return / resume lifelog returns to an active session
+without reopening the microphone or renewing consent. A paused/expired session
+requires the participant-consent checkbox before resuming. Lifelog remains
+foreground-only. This client patch uses the existing main APIs; no server
+update is required. Physical glasses gesture and dot rendering tests remain
+required for each device build.
+
 ### Version 0.4.4: proactive inbox and optional conversation memory
 
 Requires the matching main-side proactive routes. Both new features default

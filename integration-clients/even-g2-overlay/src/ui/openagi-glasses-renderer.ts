@@ -8,7 +8,12 @@ export class OpenAGIGlassesRenderer {
   private pulse = 0
   passive(retaining: boolean, wake: boolean, phrase: string): void {
     const dots = '.'.repeat(this.pulse++ % 3 + 1)
-    this.show(retaining && !wake ? `Listening ${dots}` : `Listening ${dots}\n\n${wake ? `Say “${phrase}” or tap to ask` : 'Tap to ask'}`, false)
+    this.show(retaining && !wake ? '●' : `Listening ${dots}\n\n${wake ? `Say “${phrase}” or tap to ask` : 'Tap to ask'}`, false)
+  }
+  paused(lifelog: boolean, confirm = false): void {
+    this.show(confirm
+      ? 'Resume lifelog?\n\nI have consent to save this conversation,\nincluding from other participants.\n\nTap: confirm and resume\nDouble-tap: cancel'
+      : `${lifelog ? 'Lifelog' : 'Listening'} paused\n\nMicrophone off\n\nTap: resume · Double-tap: back`, true)
   }
   inboxCount(count: number): void { this.pendingInbox = count }
   memory(active: boolean): void { this.memoryActive = active }

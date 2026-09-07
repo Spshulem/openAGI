@@ -3,6 +3,18 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('resumes lifelog with current explicit consent and disables duplicate requests while starting', () => {
+  const returnToLifelog = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), returnToLifelog }, [])
+  const resume = document.querySelector<HTMLButtonElement>('#memory-resume')!
+  resume.click(); expect(returnToLifelog).toHaveBeenLastCalledWith(false)
+  document.querySelector<HTMLInputElement>('#recording-consent')!.click()
+  resume.click(); expect(returnToLifelog).toHaveBeenLastCalledWith(true)
+  returnToLifelog.mockClear(); phone.memoryPending(true); resume.click()
+  expect(returnToLifelog).not.toHaveBeenCalled()
+  phone.memoryPending(false); resume.click(); expect(returnToLifelog).toHaveBeenCalledOnce()
+})
+
 it('provides peer pages and bounded, collapsed inbox details without hiding lifelog behind tasks', () => {
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn() }, [])
   phone.paired(true)
