@@ -20,7 +20,7 @@ const manifestDir = path.join(root, 'build', 'openagi-g2')
 fs.mkdirSync(manifestDir, { recursive: true })
 const manifestPath = path.join(manifestDir, 'app.json')
 fs.writeFileSync(manifestPath, JSON.stringify({
-  package_id: 'sh.agents.even.g2', edition: '202601', name: 'Agents', version: '0.4.7', min_app_version: '2.2.6', min_sdk_version: '0.0.13', entrypoint: 'index.html',
+  package_id: 'sh.agents.even.g2', edition: '202601', name: 'Agents', version: '0.4.8', min_app_version: '2.2.6', min_sdk_version: '0.0.13', entrypoint: 'index.html',
   permissions: [
     { name: 'g2-microphone', desc: 'Listen after you tap Ask or explicitly enable foreground always-listening.' },
     { name: 'network', desc: 'Connect to your selected agent. Optional live speech streams through your main or directly to Deepgram.', whitelist: networkOrigins },

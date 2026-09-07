@@ -39,6 +39,7 @@ export class OpenAGIPhoneCompanion {
   private sendOnStop = true
   private lifelogNext: number | null = null
   private lifelogOffset = 0
+  private lifelogQuery = ''
 
   constructor(actions: OpenAGIPhoneActions, allowedOrigins: string[]) {
     const root = document.querySelector<HTMLDivElement>('#app')
@@ -138,13 +139,14 @@ export class OpenAGIPhoneCompanion {
     const wakePhrase = root.querySelector<HTMLInputElement>('#wake-phrase')
     const answerQuestions = root.querySelector<HTMLInputElement>('#answer-questions')
     root.querySelector('#listening-mode')?.addEventListener('change', () => actions.configureListeningMode?.(requiredSelect(root, '#listening-mode').value as 'passive' | 'wake'))
-    const readHistory = (offset = 0): void => {
+    const readHistory = (offset = 0, submit = false): void => {
+      if (submit) this.lifelogQuery = root.querySelector<HTMLInputElement>('#lifelog-query')?.value ?? ''
       this.lifelogOffset = offset
       showPage('lifelog')
-      actions.readLifelog?.(root.querySelector<HTMLInputElement>('#lifelog-query')?.value ?? '', offset)
+      actions.readLifelog?.(this.lifelogQuery, offset)
     }
-    root.querySelector('#read-lifelog')?.addEventListener('click', () => readHistory())
-    root.querySelector('#lifelog-search')?.addEventListener('click', () => readHistory())
+    root.querySelector('#read-lifelog')?.addEventListener('click', () => readHistory(0, true))
+    root.querySelector('#lifelog-search')?.addEventListener('click', () => readHistory(0, true))
     root.querySelector('#lifelog-next')?.addEventListener('click', () => { if (this.lifelogNext !== null) readHistory(this.lifelogNext) })
     root.querySelector('#lifelog-previous')?.addEventListener('click', () => readHistory(Math.max(0, this.lifelogOffset - 25)))
     root.querySelector('#lifelog-close')?.addEventListener('click', () => showPage('listen'))
