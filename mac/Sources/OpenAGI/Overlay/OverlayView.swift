@@ -19,13 +19,11 @@ struct OverlayView: View {
   var onExpand: () -> Void = {}
   var onContentChange: () -> Void = {}
 
-  // The resize watchers are applied in two chunks rather than one chain because
-  // the whole thing — the Group's ViewBuilder plus fifteen generic .onChange
-  // overloads — stopped type-checking in reasonable time as a single expression.
-  // Splitting it is purely a compile-time concern; the modifier order, and so
-  // the behaviour, is identical to writing them end to end.
+  // Keep the resize watcher chains short: the release compiler times out on
+  // a single chain of sixteen generic .onChange overloads. Opaque helper
+  // boundaries preserve modifier order without changing view identity/state.
   var body: some View {
-    briefWatchers(panelWatchers(panelBody))
+    briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))
   }
 
   private var panelBody: some View {
@@ -62,6 +60,10 @@ struct OverlayView: View {
     .onChange(of: state.answer) { _, _ in onContentChange() }
     .onChange(of: state.isLoading) { _, _ in onContentChange() }
     .onChange(of: state.progressStage) { _, _ in onContentChange() }
+  }
+
+  private func composerWatchers<V: View>(_ content: V) -> some View {
+    content
     .onChange(of: state.error) { _, _ in onContentChange() }
     .onChange(of: state.contextNote) { _, _ in onContentChange() }
     .onChange(of: state.briefContext) { _, _ in onContentChange() }
@@ -69,6 +71,10 @@ struct OverlayView: View {
       fieldFocused = true
       onContentChange()
     }
+  }
+
+  private func applicationWatchers<V: View>(_ content: V) -> some View {
+    content
     .onChange(of: app.status) { _, _ in onContentChange() }
     // Swaps the answer footer's button between "Continue in chat" and the
     // shorter "Open chat". Same single row at the default text size, but that
@@ -81,6 +87,10 @@ struct OverlayView: View {
     // the count holds while the rows — and the panel's height — change. Equatable.
     .onChange(of: outreach.items) { _, _ in onContentChange() }
     .onChange(of: approvals.items) { _, _ in onContentChange() }
+  }
+
+  private func approvalWatchers<V: View>(_ content: V) -> some View {
+    content
     .onChange(of: approvals.inFlight) { _, _ in onContentChange() }
     .onChange(of: approvals.lastOutcome) { _, _ in onContentChange() }
     .onChange(of: approvals.lastError) { _, _ in onContentChange() }
