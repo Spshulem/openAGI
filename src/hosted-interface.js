@@ -3,6 +3,8 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
+import { G2Proactive } from "./g2-proactive.js";
+import { g2ProactivePage } from "./g2-proactive-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
 import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
 import { codingSupervisorUi } from "./coding-supervisor-ui.js";
@@ -162,6 +164,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     || process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY === "1";
 
   const events = new EventEmitter();
+  const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  const g2RetentionTimer = setInterval(() => { try { g2Proactive.prune(); } catch { /* retried on the next read or sweep */ } }, 60_000);
+  g2RetentionTimer.unref?.();
   events.setMaxListeners(50);
 
   const sseClients = new Set();
@@ -684,7 +689,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
-        "/nodes/capture-memory", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"
+        "/nodes/capture-memory", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
       ].includes(pathname);
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message");
@@ -699,14 +704,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // the G2 voice routes; all generic node/control routes still require
       // the explicit X-OpenAGI-Node-ID header.
       const tokenOnlyG2Enrollment = !headerNodeId
-        && ["/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"].includes(pathname)
+        && ["/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         ? nodeRegistry.enrollmentForToken(scopedBearer)
         : null;
       const requestNodeId = headerNodeId ?? tokenOnlyG2Enrollment?.nodeId ?? null;
       const requestEnrollment = tokenOnlyG2Enrollment
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
-        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"].includes(pathname);
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
@@ -720,7 +725,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // normal auth gate below still runs; this does not make the route public.
       const authenticatedG2CrossOrigin = requestEnrollment?.platform === EVEN_G2_PLATFORM
         && nodeScopedAuth
-        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"].includes(pathname);
+        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -1511,6 +1516,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, { outputs });
       }
 
+      if (method === "GET" && pathname === "/g2/proactive") {
+        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
+      }
+      if (method === "POST" && ["/nodes/g2/proactive", "/g2/proactive"].includes(pathname)) {
+        res.setHeader("Cache-Control", "no-store");
+        const scoped = pathname.startsWith("/nodes/");
+        if (scoped && (!nodeScopedAuth || requestEnrollment?.platform !== EVEN_G2_PLATFORM)) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
+        try {
+          const body = await readJsonLimited(req, 16 * 1024);
+          if (!body || typeof body !== "object" || Array.isArray(body)) return sendG2NodeJson(res, 400, { error: "Invalid request" });
+          if (!scoped && body.op === "devices") return sendJson(res, 200, { nodes: nodeRegistry.list().filter(n => n.platform === EVEN_G2_PLATFORM).map(n => ({ nodeId: n.nodeId, name: n.name })) });
+          if (scoped && Object.hasOwn(body, "nodeId")) return sendG2NodeJson(res, 400, { error: "Cannot select another node" });
+          const nodeId = scoped ? requestNodeId : body.nodeId;
+          if (typeof nodeId !== "string" || nodeRegistry.enrollment(nodeId)?.platform !== EVEN_G2_PLATFORM) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
+          return sendG2NodeJson(res, 200, g2Proactive.dispatch(nodeId, body));
+        } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
+      }
       if (method === "POST" && pathname === "/nodes/g2/ask") {
         if (!channels?.g2) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
         try {
@@ -3246,6 +3268,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
+      clearInterval(g2RetentionTimer);
       return new Promise((resolve, reject) => {
         speechRelay.close();
         approvalContinuationsClosing = true;
@@ -3553,7 +3576,8 @@ function isG2NodeCorsRoute(pathname) {
     "/nodes/revoke",
     "/nodes/g2/ask",
     "/nodes/g2/listen",
-    "/nodes/g2/speech-token"
+    "/nodes/g2/speech-token",
+    "/nodes/g2/proactive"
   ].includes(pathname);
 }
 

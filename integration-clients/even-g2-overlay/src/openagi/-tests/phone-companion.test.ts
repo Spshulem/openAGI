@@ -3,6 +3,26 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('keeps memory separate from wake listening and renders inbox evidence safely', () => {
+  const memoryConsent = vi.fn(), inboxAction = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), memoryConsent, inboxAction }, [])
+  expect(document.querySelector<HTMLInputElement>('#memory-enabled')?.checked).toBe(false)
+  expect(document.querySelector<HTMLInputElement>('#recording-consent')?.checked).toBe(false)
+  document.querySelector<HTMLInputElement>('#memory-enabled')?.click()
+  expect(memoryConsent).toHaveBeenCalledWith(true, false)
+  phone.memoryStatus(false, 'Consent required')
+  phone.inbox([{ id: 'candidate', title: '<img src=x>', summary: 'Unverified speaker', important: false, seen: false, action: 'accept-task', category: 'memory' }])
+  expect(document.querySelector('#proactive-items img')).toBeNull()
+  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+  document.querySelector<HTMLButtonElement>('[data-inbox-op="accept-task"]')?.click()
+  expect(inboxAction).not.toHaveBeenCalled()
+  confirm.mockReturnValue(true); document.querySelector<HTMLButtonElement>('[data-inbox-op="accept-task"]')?.click()
+  expect(inboxAction).toHaveBeenCalledWith('accept-task', 'candidate')
+  confirm.mockRestore()
+  phone.mainInbox('https://main.example.test')
+  expect(document.querySelector<HTMLAnchorElement>('#main-inbox')?.href).toBe('https://main.example.test/g2/proactive')
+})
+
 it('exposes auto-send and labels Talk and Stop according to the saved setting', () => {
   const configureAutoSend = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureAutoSend }, [])

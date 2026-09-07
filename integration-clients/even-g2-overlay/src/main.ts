@@ -48,6 +48,11 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     discardDraft: () => { void app.discardDraft() },
     rerecordDraft: () => { void app.rerecordDraft() },
     configureAutoSend: enabled => { void app.configureAutoSend(enabled) },
+    configureProactive: settings => { void app.proactive.configure(settings) },
+    refreshInbox: () => { void app.proactive.refresh() },
+    openInbox: () => app.openInbox(),
+    memoryConsent: (enabled, consent) => app.configureMemory(enabled, consent),
+    inboxAction: (op, id) => { void app.proactive.action(op, id) },
     previousPage: () => app.scrollUp(),
     nextPage: () => app.scrollDown(),
     recentAnswer: () => { void app.recentAnswer() },
@@ -57,7 +62,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     configureAmbient: (enabled, wakePhrase, answerQuestions) => { void app.configureAmbient(enabled, wakePhrase, answerQuestions) },
   }, config.allowedOrigins)
   app = new OpenAGIG2App(api, store, new SerializedAudioSource(bridge), renderer, phone, config.allowedOrigins)
-  const input = new AgentsInputController(bridge, { tap: () => app.tap(), scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), systemExit: () => { void app.systemExit() } })
+  const input = new AgentsInputController(bridge, { tap: () => app.tap(), scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), foreground: active => app.proactive.setForeground(active), systemExit: () => { void app.systemExit() } })
   input.start()
   try { await app.boot() }
   catch (error) { renderer.message('OpenAGI could not start', safeOpenAGIError(error)); phone.set('Startup failed', safeOpenAGIError(error)) }

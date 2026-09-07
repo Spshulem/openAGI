@@ -83,6 +83,11 @@ test("authenticated dashboard → exact-session inspection → approval → one 
     return { status: res.status, body: await res.json() };
   };
   assert.equal((await fetch(url + "/coding-agents")).status, 401);
+  assert.equal((await fetch(url + "/coding-agents/watch", { method: "POST", body: "{}" })).status, 401);
+  assert.equal((await fetch(url + "/coding-agents/watch", { method: "POST", headers: { ...headers, Origin: "https://example.com" }, body: "{}" })).status, 403);
+  assert.equal((await json("/coding-agents/watch", { ...session, enabled: true })).status, 200);
+  assert.equal((await json("/coding-agents")).body.watches.length, 1);
+  assert.equal((await json("/coding-agents/watch", { ...session, enabled: false })).status, 200);
   assert.equal((await fetch(url + "/coding-agents/session?provider=codex&sessionId=session-fixture-1234")).status, 401);
   assert.equal((await fetch(url + "/coding-agents/reply", { method: "POST", headers: { ...headers, Origin: "https://example.com" }, body: "{}" })).status, 403);
   const listed = await json("/coding-agents");

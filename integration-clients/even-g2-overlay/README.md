@@ -4,6 +4,38 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.4: proactive inbox and optional conversation memory
+
+Requires the matching main-side proactive routes. Both new features default
+off. In Proactive inbox, enable sources and Save; the client refreshes every
+60 seconds while visible without model calls. Swipe up from Home to read the
+inbox (tap next item, swipe pages, double-tap back). Phone cards support
+dismiss/snooze. Quiet hours and a 3/hour default cap bound idle interruptions;
+active recordings, requests, answers and sleeping displays are not replaced.
+Email/calendar depend on existing connected sources reaching OpenAGI outreach;
+this is not a new mailbox/calendar connector or a guarantee of background alerts.
+
+For memory: enable always-listening, acknowledge participants' recording consent,
+then enable Retain final transcripts. Memory is separate from wake listening,
+lasts at most 4 hours, and pauses on listening stop, app hide/exit or upload error.
+Final text batches go to main every 30 seconds; there is no durable upload queue
+or replay. Storage caps at 200 segments of at most 1000 characters per device,
+then pauses with an explanation. Retention is 1 day by default (7/30 optional).
+No raw audio is stored. Providers' speech processing policies still apply.
+
+Task suggestions use conservative commitment-phrase matching, not a general
+LLM analyzer. Speakers/dates are unverified. Review evidence before accepting;
+accept creates a user task once, not an agent action. Delete removes retained
+text and suggestions; already accepted tasks remain. The authenticated main
+page at `/g2/proactive` exposes the same inbox, transcripts and controls, linked
+from the phone without an owner token. Deletion/expiry removes application
+records; it cannot erase operating-system backups or external provider copies.
+
+Install the main update before this bundle. No recording consent is enabled
+by installation. Physical foreground behavior, layout and battery impact still
+need testing on G2; native foreground events and document visibility both pause
+memory, but phone-lock/background delivery is not claimed.
+
 ### Version 0.4.3: review before send and glasses activity
 
 Manual questions: tap to record, tap to stop and send by default. Turn off

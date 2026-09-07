@@ -1,4 +1,5 @@
 import type { SpeechModel } from '../openagi/live-speech'
+import type { InboxItem, ProactiveSettings } from '../openagi/proactive'
 
 export interface OpenAGIPhoneActions {
   pair(code: string, origin: string): void
@@ -19,6 +20,11 @@ export interface OpenAGIPhoneActions {
   discardDraft?(): void
   rerecordDraft?(): void
   configureAutoSend?(enabled: boolean): void
+  configureProactive?(settings: Partial<ProactiveSettings>): void
+  refreshInbox?(): void
+  openInbox?(): void
+  memoryConsent?(enabled: boolean, consent: boolean): void
+  inboxAction?(op: 'dismiss' | 'snooze' | 'accept-task' | 'delete-memory', id?: string): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -57,6 +63,23 @@ export class OpenAGIPhoneCompanion {
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
           <button id="blank-display">Blank glasses display</button>
+          <section class="ambient"><h2>Proactive inbox</h2>
+            <label><input type="checkbox" id="proactive-enabled"> Show updates from my main</label>
+            <div id="proactive-categories">${['approvals', 'tasks', 'discoveries', 'email', 'calendar'].map(c => `<label><input type="checkbox" value="${c}" checked> ${c}</label>`).join('')}</div>
+            <p>Email/calendar require connected sources feeding OpenAGI. Alerts never approve actions. Foreground delivery only.</p>
+            <label>Quiet hours start (0–23)<input id="quiet-start" type="number" min="0" max="23" value="22"></label>
+            <label>Quiet hours end (0–23)<input id="quiet-end" type="number" min="0" max="23" value="8"></label>
+            <label>Maximum interruptions/hour<input id="alert-limit" type="number" min="0" max="10" value="3"></label>
+            <label>Transcript retention<select id="memory-retention"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option></select></label>
+            <button id="save-proactive">Save inbox & retention settings</button><button id="refresh-inbox">Refresh inbox</button><button id="open-inbox">Read inbox on glasses</button>
+            <a id="main-inbox" target="_blank" rel="noopener noreferrer" hidden>Continue on main · inbox and transcripts</a><div id="proactive-items"></div>
+            <h2>Conversation memory · separate opt-in</h2>
+            <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
+            <label><input id="memory-enabled" type="checkbox"> Retain final transcripts during this listening session</label>
+            <p id="memory-status">Off. Enable always-listening first. Wake listening alone does not retain ambient transcripts.</p>
+            <p>Final text is batched to your main, not raw audio. Speakers are unverified. Simple commitment phrases suggest user tasks; no action is executed. Memory stops on pause, app hiding or exit, and expires after 4 hours. Review/delete transcripts on main.</p>
+            <button id="delete-memory">Stop memory & delete retained transcripts</button>
+          </section>
           <section class="ambient"><h2>Talk controls</h2>
             <p>On glasses: tap Talk, speak, then tap Stop talking.</p>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
@@ -79,7 +102,7 @@ export class OpenAGIPhoneCompanion {
           <button class="secondary" data-action="unlink">Disconnect agent</button>
           <button class="secondary" id="exit-agents">Exit Agents (keep pairing)</button>
         </section>
-        <footer>Tap-to-talk is the default. Always listening is optional, foreground-only, and can be paused from the phone or glasses. Audio is not saved by the G2 bridge.</footer>
+        <footer>Tap-to-talk is the default. Always listening is optional, foreground-only, and can be paused from the phone or glasses. Raw audio is not saved by the G2 bridge. Separately opted-in conversation memory retains final transcripts on your main.</footer>
       </main>`
     this.status = required(root.querySelector('#status'))
     this.detail = required(root.querySelector('#detail'))
@@ -101,6 +124,24 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#rerecord-draft')?.addEventListener('click', () => actions.rerecordDraft?.())
     root.querySelector('#discard-draft')?.addEventListener('click', () => actions.discardDraft?.())
     root.querySelector('#auto-send')?.addEventListener('change', event => actions.configureAutoSend?.((event.target as HTMLInputElement).checked))
+    root.querySelector('#save-proactive')?.addEventListener('click', () => actions.configureProactive?.({
+      enabled: root.querySelector<HTMLInputElement>('#proactive-enabled')?.checked === true,
+      categories: [...root.querySelectorAll<HTMLInputElement>('#proactive-categories input:checked')].map(i => i.value),
+      quietStart: Number(root.querySelector<HTMLInputElement>('#quiet-start')?.value), quietEnd: Number(root.querySelector<HTMLInputElement>('#quiet-end')?.value),
+      maxPerHour: Number(root.querySelector<HTMLInputElement>('#alert-limit')?.value), retentionDays: Number(requiredSelect(root, '#memory-retention').value),
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    }))
+    root.querySelector('#refresh-inbox')?.addEventListener('click', () => actions.refreshInbox?.())
+    root.querySelector('#open-inbox')?.addEventListener('click', () => actions.openInbox?.())
+    root.querySelector('#memory-enabled')?.addEventListener('change', () => actions.memoryConsent?.(root.querySelector<HTMLInputElement>('#memory-enabled')?.checked === true, root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
+    root.querySelector('#delete-memory')?.addEventListener('click', () => { if (window.confirm('Stop memory and delete transcripts and suggestions on main? Previously accepted tasks remain.')) actions.inboxAction?.('delete-memory') })
+    root.querySelector('#proactive-items')?.addEventListener('click', event => {
+      const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-inbox-op]') : null
+      const op = button?.dataset.inboxOp as 'dismiss' | 'snooze' | 'accept-task' | undefined
+      if (!op || !button?.dataset.id) return
+      if (op === 'accept-task' && !window.confirm(`Add this as YOUR task? Speaker and due date are unverified.\n\n${button.closest('article')?.textContent ?? ''}`)) return
+      actions.inboxAction?.(op, button.dataset.id)
+    })
     root.querySelector('#previous-page')?.addEventListener('click', () => actions.previousPage?.())
     root.querySelector('#next-page')?.addEventListener('click', () => actions.nextPage?.())
     root.querySelector('#last-answer')?.addEventListener('click', () => actions.recentAnswer?.())
@@ -127,6 +168,36 @@ export class OpenAGIPhoneCompanion {
     if (/failed|could not|check|not allowed/i.test(status)) this.status.scrollIntoView?.({ block: 'center' })
   }
   paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value }
+  mainInbox(origin: string): void {
+    const a = this.actionsSection.querySelector<HTMLAnchorElement>('#main-inbox')
+    try { const url = new URL('/g2/proactive', origin); if (url.protocol !== 'https:') return; if (a) { a.href = url.href; a.hidden = false } } catch { /* not configured */ }
+  }
+  proactiveSettings(settings: ProactiveSettings): void {
+    const enabled = this.actionsSection.querySelector<HTMLInputElement>('#proactive-enabled'); if (enabled) enabled.checked = settings.enabled
+    for (const i of this.actionsSection.querySelectorAll<HTMLInputElement>('#proactive-categories input')) i.checked = settings.categories.includes(i.value)
+    for (const [selector, value] of [['#quiet-start', settings.quietStart], ['#quiet-end', settings.quietEnd], ['#alert-limit', settings.maxPerHour], ['#memory-retention', settings.retentionDays]] as const) {
+      const i = this.actionsSection.querySelector<HTMLInputElement | HTMLSelectElement>(selector); if (i) i.value = String(value)
+    }
+  }
+  memoryStatus(active: boolean, detail: string): void {
+    const i = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled'); if (i) i.checked = active
+    const p = this.actionsSection.querySelector('#memory-status'); if (p) p.textContent = detail
+  }
+  inbox(items: InboxItem[]): void {
+    const root = this.actionsSection.querySelector('#proactive-items'); if (!root) return
+    root.replaceChildren()
+    for (const item of items) {
+      const card = document.createElement('article'); card.className = 'ambient'
+      const title = document.createElement('h2'); title.textContent = item.title
+      const summary = document.createElement('p'); summary.textContent = item.summary
+      card.append(title, summary)
+      for (const [op, text] of [['dismiss', 'Dismiss'], ['snooze', 'Snooze 1 hour'], ...(item.action === 'accept-task' ? [['accept-task', 'Review and add user task']] : [])]) {
+        const b = document.createElement('button'); b.textContent = text; b.dataset.inboxOp = op; b.dataset.id = item.id; card.append(b)
+      }
+      if (item.action !== 'accept-task') { const p = document.createElement('p'); p.textContent = 'Review details and approve any actions on your main.'; card.append(p) }
+      root.append(card)
+    }
+  }
   autoSend(enabled: boolean): void {
     this.sendOnStop = enabled
     const input = this.actionsSection.querySelector<HTMLInputElement>('#auto-send')

@@ -18,6 +18,21 @@ async function renderCodingAgents() {
   const setupPanel = document.createElement('section');
   $('codingList').before(setupPanel);
   void renderCodingSetup(setupPanel);
+  const watchNote = document.createElement('p');
+  watchNote.textContent = 'Watch selected sessions for new responses or attention. Short output previews are saved on main and shared with opted-in G2 devices (Discoveries). No automatic nudges or paid model polling. Stop watching does not delete existing outreach history.';
+  $('codingList').before(watchNote);
+  for (const watch of snapshot.watches || []) {
+    if (!watch.active || !(snapshot.sessions || []).some(s => s.provider === watch.provider && s.sessionId === watch.sessionId)) {
+      const note = document.createElement('p');
+      note.textContent = watch.provider + ' · ' + watch.sessionId + ': watch paused; ' + (watch.active ? 'session is not visible. Missing sessions are not treated as complete.' : 'switch back to its coding node to manage this watch.');
+      if (watch.active) {
+        const stop = document.createElement('button'); stop.textContent = 'Stop watching';
+        stop.onclick = async () => { try { await postJson('/coding-agents/watch', { ...watch, enabled: false }); await renderCodingAgents(); } catch { stop.textContent = 'Could not stop watch. Retry'; } };
+        note.append(stop);
+      }
+      $('codingList').before(note);
+    }
+  }
   for (const session of snapshot.sessions || []) {
     const card = document.createElement('div');
     card.className = 'card';
@@ -32,6 +47,16 @@ async function renderCodingAgents() {
     open.textContent = 'Inspect / reply';
     open.onclick = () => inspectCodingAgent({ ...session, replyAvailable: session.replyAvailable && !snapshot.error });
     card.append(title, info, id, document.createElement('br'), open);
+    const watching = (snapshot.watches || []).some(w => w.active && w.provider === session.provider && w.sessionId === session.sessionId);
+    const watch = document.createElement('button'); watch.textContent = watching ? 'Stop watching' : 'Watch session';
+    watch.disabled = Boolean(snapshot.error);
+    watch.onclick = async () => {
+      if (!watching && !confirm('Watch this session and save short output previews on main, visible to opted-in G2 devices? Replies will still require approval.')) return;
+      watch.disabled = true;
+      try { await postJson('/coding-agents/watch', { provider: session.provider, sessionId: session.sessionId, enabled: !watching }); await renderCodingAgents(); }
+      catch { $('codingStatus').textContent = 'Could not change this watch. Refresh and retry (20 watches maximum).'; watch.disabled = false; }
+    };
+    card.append(watch);
     if (session.route === 'builtin-cli' && session.status === 'interrupted') {
       const label = document.createElement('label');
       const check = document.createElement('input'); check.type = 'checkbox';
@@ -57,6 +82,9 @@ async function renderCodingAgents() {
     $('codingList').append(card);
   }
   if (snapshot.configured && !snapshot.error && !snapshot.sessions.length) $('codingStatus').textContent += ' · No sessions reported.';
+  const params = new URLSearchParams(window.location.search);
+  const selected = (snapshot.sessions || []).find(s => s.provider === params.get('provider') && s.sessionId === params.get('sessionId'));
+  if (selected && !snapshot.error) void inspectCodingAgent(selected);
 }
 
 async function renderCodingSetup(panel) {

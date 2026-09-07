@@ -97,7 +97,7 @@ export class CodingSupervisor {
     const saved = readJsonFile(this.file, {});
     const object = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
     this.state = { version: 1, initialized: saved?.initialized === true,
-      sessions: object(saved?.sessions), receipts: object(saved?.receipts) };
+      sessions: object(saved?.sessions), receipts: object(saved?.receipts), watches: object(saved?.watches) };
     // A daemon crash after transmission is not safe to retry automatically.
     for (const receipt of Object.values(this.state.receipts)) {
       if (receipt?.status === "sending") receipt.status = "unconfirmed";
@@ -107,6 +107,7 @@ export class CodingSupervisor {
     this.timer = null;
     this.inFlight = null;
     this.listInFlight = null;
+    this.watchGeneration = 0;
   }
 
   save() {
@@ -183,6 +184,82 @@ export class CodingSupervisor {
       turns: result.turns.slice(-6).map((turn) => ({ role: clean(turn.role, 30), text: clean(turn.text, 4_000) })) };
   }
 
+  watchKey(target) {
+    return `${this.remoteNodeId || "local"}:${target.provider}:${target.sessionId}`;
+  }
+
+  watches() {
+    return Object.values(this.state.watches).map(({ provider, sessionId, nodeId }) => ({
+      provider, sessionId, nodeId, active: nodeId === (this.remoteNodeId || "local")
+    }));
+  }
+
+  async setWatch(args) {
+    const target = validateCodingTarget(args);
+    if (typeof args.enabled !== "boolean") throw new Error("Choose whether to watch this session.");
+    const key = this.watchKey(target);
+    if (!args.enabled) {
+      delete this.state.watches[key];
+      this.save();
+      return { ...target, watching: false };
+    }
+    if (this.state.watches[key]) return { ...target, watching: true };
+    const session = (await this.list()).sessions.find(s => s.provider === target.provider && s.sessionId === target.sessionId);
+    if (!session) throw new Error("Refresh and select a currently visible session.");
+    if (Object.keys(this.state.watches).length >= 20) throw new Error("Stop an existing watch first (20 maximum).");
+    // Establish a baseline without reading or announcing historical output.
+    this.state.watches[key] = { ...target, nodeId: this.remoteNodeId || "local",
+      status: session.status, lastActivityAt: session.lastActivityAt };
+    this.save();
+    return { ...target, watching: true };
+  }
+
+  async refreshWatches(snapshot) {
+    const generation = this.watchGeneration;
+    let inspections = 0;
+    for (const item of snapshot.sessions) {
+      const key = this.watchKey(item), watch = this.state.watches[key];
+      if (!watch) continue;
+      const changed = watch.status !== item.status;
+      const responseChanged = (item.status === "idle" || item.attention) && item.lastActivityAt
+        && watch.lastActivityAt && watch.lastActivityAt !== item.lastActivityAt;
+      const notify = (changed && (item.attention || item.status === "idle")) || responseChanged;
+      if (notify) {
+        if (inspections >= 4) continue; // Deferred changes keep their baseline for the next tick.
+        inspections++;
+        let preview = "Recent output unavailable. Inspect the session on main.";
+        let hasPreview = false;
+        try {
+          const transcript = await this.inspect(item);
+          const last = transcript.turns.filter(t => t.role === "assistant" && t.text.trim()).at(-1);
+          if (last) { preview = `Recent assistant output (untrusted): ${clean(last.text, 500)}`; hasPreview = true; }
+        } catch { /* A failed preview must not hide a status transition. */ }
+        // Unwatch or node reconfiguration during a read revokes delivery.
+        if (generation !== this.watchGeneration || this.state.watches[key] !== watch || this.watchKey(item) !== key) continue;
+        const ref = { kind: "coding-watch", id: key, provider: item.provider,
+          sessionId: item.sessionId, nodeId: watch.nodeId };
+        const previous = this.runtime?.outreach?.list?.().find(r => r.sourceRef?.kind === ref.kind
+          && r.sourceRef?.id === key && ["unseen", "seen"].includes(r.status));
+        if (previous) this.runtime.outreach.resolve(previous.id, { action: "superseded", by: "system" }, { status: "acted" });
+        const next = item.status === "idle" ? "Review the response and choose a follow-up; task completion is not verified."
+          : item.status === "waiting" ? "Review the question or permission request in the owning app."
+          : "Inspect the latest output, then choose whether to send a nudge or retry. Nothing is sent automatically.";
+        this.runtime?.outreach?.append({ type: "coding-watch", sourceRef: ref,
+          title: `${item.provider === "claude" ? "Claude Code" : "Codex"}: ${item.status === "idle" ? (hasPreview ? "response ready to review" : "session became idle") : "needs attention"}`,
+          summary: `${item.project || "Coding session"}: ${item.status} (${item.attentionBasis}). ${next}\n${preview}`,
+          needsDecision: false, actions: ["dismiss"], dedupeOpen: true });
+      }
+      if (item.status === "working" && changed) {
+        for (const row of this.runtime?.outreach?.list?.() || []) {
+          if (row.sourceRef?.kind === "coding-watch" && row.sourceRef.id === key && ["unseen", "seen"].includes(row.status))
+            this.runtime.outreach.resolve(row.id, { action: "resumed", by: "system" }, { status: "acted" });
+        }
+      }
+      watch.status = item.status;
+      watch.lastActivityAt = item.lastActivityAt;
+    }
+  }
+
   async prepareReply(args) {
     const target = validateCodingTarget(args);
     if (typeof args.message !== "string" || !args.message.trim() || args.message.length > 4_000 || args.message.includes("\0")) {
@@ -248,21 +325,8 @@ export class CodingSupervisor {
     this.inFlight = (async () => {
       try {
         const snapshot = await this.list();
-        for (const item of snapshot.sessions) {
-          const key = `${item.provider}:${item.sessionId}`;
-          const previous = this.state.sessions[key];
-          const ref = { kind: "coding-agent", id: key };
-          if (item.attention && this.state.initialized && previous !== item.status) {
-            this.runtime?.outreach?.append({ type: "coding-agent", sourceRef: ref,
-              title: `${item.provider === "claude" ? "Claude Code" : "Codex"} needs attention`,
-              summary: `${item.project || "Coding session"}: ${item.status} (${item.attentionBasis}). Open Coding Agents to inspect and reply.`,
-              needsDecision: false, actions: ["dismiss"], dedupeOpen: true });
-          } else if (!item.attention && ATTENTION.has(previous)) {
-            const alert = this.runtime?.outreach?.list?.().find((row) => row.sourceRef?.kind === ref.kind
-              && row.sourceRef?.id === ref.id && ["unseen", "seen"].includes(row.status));
-            if (alert) this.runtime.outreach.resolve(alert.id, { action: "recovered", by: "system" }, { status: "acted" });
-          }
-        }
+        await this.refreshWatches(snapshot);
+        snapshot.watches = this.watches();
         this.state.sessions = Object.fromEntries(snapshot.sessions.map((item) => [`${item.provider}:${item.sessionId}`, item.status]));
         this.state.initialized = true;
         this.save();
@@ -283,6 +347,7 @@ export class CodingSupervisor {
     this.timer.unref?.();
   }
   stop() {
+    this.watchGeneration++;
     this.builtin.stop();
     clearInterval(this.timer);
     this.timer = null;
@@ -291,9 +356,22 @@ export class CodingSupervisor {
 }
 
 export function registerCodingSupervisorTools(registry, supervisor) {
-  for (const name of ["list_coding_agents", "inspect_coding_agent", "reply_to_coding_agent", "start_coding_agent", "list_coding_workspaces"]) registry.unregister(name);
+  for (const name of ["list_coding_agents", "inspect_coding_agent", "reply_to_coding_agent", "start_coding_agent", "list_coding_workspaces", "watch_coding_agent", "list_coding_watches"]) registry.unregister(name);
   if (!supervisor.configured) return;
   const targetSchema = { provider: { type: "string", enum: ["claude", "codex"] }, sessionId: { type: "string" } };
+  registry.register({ name: "list_coding_watches", source: "integration:coding-supervisor", sideEffects: false,
+    description: "List selected session watches, including watches paused because the configured coding node changed.",
+    parameters: { type: "object", properties: {}, additionalProperties: false }, handler: () => supervisor.watches() });
+  registry.register({ name: "watch_coding_agent", source: "integration:coding-supervisor", needsConfirmation: true,
+    description: "After user approval, watch or stop watching one exact coding session. Watching reads recent assistant output on status changes and retains previews in main outreach, visible to opted-in G2 devices. No automatic replies, retries or provider permission approvals. Polling makes no model calls.",
+    parameters: { type: "object", properties: { ...targetSchema, enabled: { type: "boolean" } }, required: ["provider", "sessionId", "enabled"], additionalProperties: false },
+    prepareApprovalArgs: args => ({ ...validateCodingTarget(args), enabled: args.enabled, codingNodeId: supervisor.remoteNodeId || "local" }),
+    approvalTtlMs: 600_000,
+    summarize: args => `${args.enabled ? "Watch and share recent output from" : "Stop watching"} ${args.provider} ${args.sessionId} on ${args.codingNodeId}. Previews are saved in main outreach and available to opted-in G2 devices.`,
+    handler: (args, context) => {
+      if (!context?.__confirmed || args.codingNodeId !== (supervisor.remoteNodeId || "local")) throw new Error("Approve the watch for the current coding node first.");
+      return supervisor.setWatch(args);
+    } });
   if (!supervisor.external || supervisor.remote) registry.register({ name: "start_coding_agent", source: "integration:coding-supervisor", needsConfirmation: true,
     description: "Start an OpenAGI-managed coding CLI in an owner-selected Git workspace after approval. Codex is read-only; Claude retains manual permissions. Never claim acceptance means task completion. Use list_coding_workspaces for exact workspace IDs.",
     parameters: { type: "object", properties: { provider: targetSchema.provider, workspaceId: { type: "string" }, message: { type: "string", maxLength: 4000 }, model: { type: "string" }, effort: { type: "string", enum: ["low", "medium", "high"] } }, required: ["provider", "workspaceId", "message"], additionalProperties: false },
