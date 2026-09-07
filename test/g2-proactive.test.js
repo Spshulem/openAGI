@@ -145,6 +145,14 @@ test("HTTP scope rejects unauthenticated, non-G2, owner-token and cross-node acc
   assert.equal((await post({ op: "feed", nodeId: second }, "first-test-token-123456789")).status, 400);
   const consent = await (await post({ op: "consent", enabled: true, recordingConsent: true }, "first-test-token-123456789")).json();
   assert.equal((await post({ op: "capture", consentId: consent.consent.id, batchId: crypto.randomUUID(), texts: ["I need to send the plan."] }, "first-test-token-123456789")).status, 200);
+  assert.equal((await fetch(url + "/g2/lifelog")).status, 401);
+  const history = await (await post({ op: "lifelog" }, "first-test-token-123456789")).json(); assert.equal(history.total, 1);
+  assert.equal((await post({ op: "lifelog-context", id: history.moments[0].id }, "first-test-token-123456789")).status, 403);
+  const recalled = await runtime.tools.invoke("search_conversation_lifelog", { query: "plan" }, { channel: "g2", sourceNodeId: first });
+  assert.equal(recalled.ok, true, recalled.error); assert.equal(recalled.result.moments.length, 1);
+  const isolated = await runtime.tools.invoke("search_conversation_lifelog", { query: "plan" }, { channel: "g2", sourceNodeId: second });
+  assert.equal(isolated.result.moments.length, 0);
+  assert.equal((await runtime.tools.invoke("search_conversation_lifelog", {}, { channel: "telegram" })).ok, false);
   const other = await (await post({ op: "transcripts" }, "second-test-token-123456789")).json(); assert.equal(other.segments.length, 0);
   assert.equal((await post({ op: "transcripts", nodeId: first }, "first-test-token-123456789", undefined, "/g2/proactive")).status, 401);
   const owner = await (await post({ op: "transcripts", nodeId: first }, "test-owner-g2-inbox", undefined, "/g2/proactive")).json(); assert.equal(owner.segments.length, 1);

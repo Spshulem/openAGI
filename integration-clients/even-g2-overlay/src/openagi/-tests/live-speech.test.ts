@@ -4,7 +4,7 @@ import { OpenAGIGlassesRenderer } from '../../ui/openagi-glasses-renderer'
 
 function fixture() {
   const socket = { bufferedAmount: 0, readyState: 1, send: vi.fn(), close: vi.fn(), onopen: null as null | (() => void), onmessage: null as null | ((event: { data: string }) => void), onclose: null as null | ((event: { code: number }) => void), onerror: null as null | (() => void) }
-  const callbacks = { transcript: vi.fn(), utterance: vi.fn(), error: vi.fn() }
+  const callbacks = { transcript: vi.fn(), utterance: vi.fn(), error: vi.fn(), segment: vi.fn() }
   const factory = vi.fn<(url: string, protocols: string[]) => WebSocket>(() => socket as unknown as WebSocket)
   const speech = new LiveSpeech(callbacks, factory)
   const emit = (event: object) => socket.onmessage?.({ data: JSON.stringify(event) })
@@ -12,6 +12,20 @@ function fixture() {
   return { speech, socket, callbacks, factory, emit, result, open: async () => { const pending = speech.open('ephemeral-token', 'nova-3', 'Peri'); socket.onopen?.(); await pending } }
 }
 afterEach(() => { vi.useRealTimers() })
+
+it('preserves final speaker turns once while interim words never enter memory', async () => {
+  const f = fixture(); await f.open()
+  const event = { type: 'Results', start: 0, duration: 3, channel: { alternatives: [{ transcript: 'Hello. Hi.', words: [
+    { word: 'Hello', punctuated_word: 'Hello.', start: 0, end: 1, speaker: 0 },
+    { word: 'Hi', punctuated_word: 'Hi.', start: 1.1, end: 2, speaker: 1 },
+  ] }] } }
+  f.emit({ ...event, is_final: false }); expect(f.callbacks.segment).not.toHaveBeenCalled()
+  f.emit({ ...event, is_final: true }); f.emit({ ...event, is_final: true })
+  expect(f.callbacks.segment).toHaveBeenCalledTimes(2)
+  expect(f.callbacks.segment).toHaveBeenNthCalledWith(1, 'Hello.', expect.objectContaining({ speaker: 0, streamId: expect.any(String) }))
+  expect(f.callbacks.segment).toHaveBeenNthCalledWith(2, 'Hi.', expect.objectContaining({ speaker: 1 }))
+  expect(f.factory.mock.calls[0]?.[0]).toContain('diarize=true'); f.speech.close()
+})
 
 it('waits for relay Ready before opening the microphone and never puts credentials in the URL', async () => {
   const { speech, socket, factory, emit } = fixture()

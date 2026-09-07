@@ -2,6 +2,15 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { G2ProactiveClient } from '../proactive'
 
 afterEach(() => vi.useRealTimers())
+
+it('coalesces rapid final events from one speaker without losing stream metadata', async () => {
+  vi.useFakeTimers(); const f = fixture(); f.client.start(); await f.client.enableMemory(true)
+  const start = Date.now()
+  for (let i = 0; i < 20; i++) f.client.capture('word', { at: start + i * 1000, endAt: start + (i + 1) * 1000, streamId: 'fixture-stream', speaker: 0 })
+  await vi.advanceTimersByTimeAsync(30000)
+  expect(f.api.proactive).toHaveBeenCalledWith(expect.objectContaining({ op: 'capture', texts: [Array(20).fill('word').join(' ')], segments: [expect.objectContaining({ speaker: 0, at: start, endAt: start + 20000 })] }), expect.any(AbortSignal))
+  f.client.stop()
+})
 function fixture() {
   const api = { proactive: vi.fn(async (body: { op: string }) => body.op === 'consent' ? { consent: { id: 'session-consent', until: Date.now() + 3600_000 } } : body.op === 'notify' ? { notify: true } : {
     settings: { enabled: true, categories: ['approvals'], retentionDays: 1, quietStart: 22, quietEnd: 8, timeZone: 'UTC', maxPerHour: 3 },

@@ -623,9 +623,11 @@ export class OpenAGIG2App {
           lastDisplay = Date.now(); this.renderer.transcript?.(text, ambient)
         }
       },
+      segment: (text, metadata) => {
+        if (ambient && this.ambientRunning && this.liveSpeech === speech && !this.exited) this.proactive.capture(text, metadata)
+      },
       utterance: text => {
         if (!ambient || !this.ambientRunning || this.liveSpeech !== speech || this.exited) return
-        this.proactive.capture(text)
         if (this.requestController) { this.ambientArmedUntil = 0; return }
         const preferences = this.store.snapshot()
         const trigger = speechTrigger(text, preferences.wakePhrase, preferences.answerQuestions, Date.now() < this.ambientArmedUntil)

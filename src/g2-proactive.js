@@ -2,6 +2,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
+import { lifelogState, lifelogDispatch, pruneLifelog, moments, reviewLifelog } from "./conversation-lifelog.js";
 
 const DAY = 86400_000;
 const categories = ["approvals", "tasks", "discoveries", "email", "calendar"];
@@ -17,6 +18,7 @@ export class G2Proactive {
     this.file = path.join(dir ?? path.join(resolveDataDir(), "g2-proactive"), "state.json");
     this.runtime = runtime;
     this.now = now;
+    this.reviewing = false; this.closed = false; this.reviewController = null;
     this.nodes = readJsonFile(this.file, { nodes: {} }).nodes;
     this.prune();
   }
@@ -37,6 +39,7 @@ export class G2Proactive {
       const ids = new Set(n.segments.map(s => s.id));
       const oldCandidates = n.candidates.length;
       n.candidates = n.candidates.filter(c => ids.has(c.segmentId));
+      pruneLifelog(n);
       if (n.consent?.until <= this.now()) { n.consent = null; changed = true; }
       changed ||= before !== n.segments.length || oldCandidates !== n.candidates.length;
     }
@@ -46,6 +49,21 @@ export class G2Proactive {
     if (!body || typeof body !== "object" || Array.isArray(body)) reject("Expected an object");
     this.prune();
     const n = this.node(nodeId);
+    if (body.op === "lifelog-task") {
+      const s = n.segments.find(s => s.id === body.segmentId);
+      if (!s || body.confirm !== true || typeof body.title !== "string" || !body.title.trim() || body.title.length > 180) reject("Confirm a task with current transcript evidence");
+      const id = `life-task-${hash(s.id + body.title.trim().toLowerCase()).slice(0, 32)}`;
+      const tasks = this.runtime?.tasks; if (!tasks?.add || !tasks?.list) reject("Task store unavailable", 503);
+      const existing = tasks.list({ queue: "user", limit: 100000 }).find(t => t.sourceId === id);
+      const task = existing || tasks.add({ title: clean(body.title, 180), bucket: "today", sourceId: id,
+        sourceMeta: { kind: "lifelog-confirmed", segmentId: s.id }, description: "Confirmed by the owner from a lifelog conversation. Original transcript is subject to deletion and retention." }, { source: "lifelog-confirmed", queue: "user" });
+      return { taskId: task.id };
+    }
+    if (body.op === "lifelog" || (typeof body.op === "string" && body.op.startsWith("lifelog-"))) {
+      const result = lifelogDispatch(n, body, this.now());
+      if (body.op === "lifelog-settings" || body.op === "lifelog-delete" || body.op === "lifelog-edit") this.reviewController?.abort();
+      this.save(); return result;
+    }
     switch (body.op) {
       case "settings": return { settings: n.settings, consentActive: Boolean(n.consent) };
       case "configure": {
@@ -69,6 +87,7 @@ export class G2Proactive {
       case "transcripts": return { segments: [...n.segments].reverse(), candidates: n.candidates };
       case "delete-memory": {
         n.consent = null; n.segments = []; n.candidates = []; n.batches = [];
+        delete n.lifelog; this.reviewController?.abort();
         this.save(); return { ok: true };
       }
       case "capture": return this.capture(n, body);
@@ -115,9 +134,17 @@ export class G2Proactive {
       || body.texts.some(t => typeof t !== "string" || !t.trim() || t.length > 1000)) reject("Invalid transcript batch");
     if (n.batches.includes(body.batchId)) return { saved: 0, duplicate: true };
     if (n.lastBatchAt && this.now() - n.lastBatchAt < 15000) reject("Transcript batches are limited to one per 15 seconds", 429);
-    if (n.segments.length + body.texts.length > 200) reject("Memory full; delete stored transcripts before continuing", 429);
-    for (const text of body.texts) {
-      const segment = { id: randomUUID(), text: clean(text, 1000), at: this.now(), speakerVerified: false };
+    if (n.segments.length + body.texts.length > 20000) reject("Memory full; export or delete older conversations before continuing", 429);
+    if (body.segments !== undefined && (!Array.isArray(body.segments) || body.segments.length !== body.texts.length
+      || body.segments.some(s => !s || typeof s !== "object" || !Number.isFinite(s.at) || !Number.isFinite(s.endAt)
+        || s.endAt < s.at || s.endAt - s.at > 120000 || s.at < this.now() - 300000 || s.endAt > this.now() + 30000
+        || typeof s.streamId !== "string" || !/^[a-zA-Z0-9-]{8,80}$/.test(s.streamId)
+        || (s.speaker !== null && s.speaker !== undefined && (!Number.isInteger(s.speaker) || s.speaker < 0 || s.speaker > 99))))) reject("Invalid timed transcript segments");
+    for (const [index, text] of body.texts.entries()) {
+      const meta = body.segments?.[index];
+      const segment = { id: randomUUID(), text: clean(text, 1000), at: meta?.at ?? this.now(), endAt: meta?.endAt ?? this.now(),
+        captureSession: `${body.consentId}:${meta?.streamId || "buffered"}`, source: "g2",
+        speakerKey: meta?.speaker == null ? null : `${body.consentId}:${meta.streamId}:${meta.speaker}`, speakerVerified: false };
       n.segments.push(segment);
       // Evidence, never instructions: conservative first-pass extraction has
       // zero tool access. No claim that the speaker is the owner.
@@ -129,6 +156,31 @@ export class G2Proactive {
     }
     n.batches = [...n.batches, body.batchId].slice(-200); n.lastBatchAt = this.now(); this.save();
     return { saved: body.texts.length };
+  }
+  async reviewPending() {
+    if (this.closed || this.reviewing) return;
+    this.reviewing = true; this.reviewController = new AbortController();
+    const signal = this.reviewController.signal;
+    try {
+      this.prune();
+      for (const n of Object.values(this.nodes)) {
+        const before = lifelogState(n).lastAttempt;
+        await reviewLifelog(n, { provider: this.runtime?.agentHost?.modelProvider, now: this.now(),
+          signal, alive: () => !this.closed && !signal.aborted, save: () => this.save() });
+        if (lifelogState(n).lastAttempt !== before || signal.aborted) break;
+      }
+    } finally { this.reviewing = false; this.reviewController = null; }
+  }
+  close() { this.closed = true; this.reviewController?.abort(); }
+  async screenContext(nodeId, id) {
+    const n = this.node(nodeId); this.prune();
+    if (!lifelogState(n).settings.screenContext) reject("Enable screen context first", 403);
+    const state = n.lifelog, generation = state.generation;
+    const m = moments(n).find(m => m.id === id); if (!m) reject("Moment expired", 404);
+    const rows = await this.runtime?.observations?.searchTextWindow?.({ since: new Date(m.at - 60000).toISOString(), until: new Date(m.endAt + 60000).toISOString(), limit: 10 }) || [];
+    this.prune();
+    if (n.lifelog !== state || state.generation !== generation || !state.settings.screenContext || !moments(n).some(item => item.id === id)) reject("Screen context consent or moment changed", 403);
+    return { items: rows.map(r => ({ at: r.at, app: r.app, text: clean(r.text, 500) })), relation: "nearby-in-time-only" };
   }
   quiet(n) {
     const hour = Number(new Intl.DateTimeFormat("en-GB", { timeZone: n.settings.timeZone, hour: "2-digit", hourCycle: "h23" }).format(this.now()));
@@ -158,7 +210,15 @@ export class G2Proactive {
         items.push({ id: `due:${t.id}:${t.dueDate}`, title: clean(t.title, 160), summary: `Due ${t.dueDate}`, category: "tasks", important: true, at: due, action: "review-on-main" });
       }
     }
-    for (const c of n.candidates) if (!c.taskId) items.push({ id: c.id, title: `Possible task: ${c.title}`, summary: c.evidence, category: "memory", important: false, at: c.at, action: "accept-task", speakerVerified: false });
+    for (const c of n.candidates) if (!c.taskId) items.push({ id: c.id, title: `Possible task: ${c.title}`, summary: c.evidence, category: "memory", important: n.settings.enabled && selected.has("discoveries"), at: c.at, action: "accept-task", speakerVerified: false });
+    if (n.settings.enabled && selected.has("discoveries")) {
+      const l = lifelogState(n);
+      for (const m of moments(n)) if (m.review?.claims.length) items.push({ id: `moment-${m.id}-${m.review.fingerprint}`,
+        title: m.title, summary: m.review.summary, category: "discoveries", important: true, at: m.endAt, action: "review-lifelog", momentId: m.id });
+      for (const f of Object.values(l.followups)) if (f.status === "confirmed" && f.dueAt !== null && f.dueAt <= this.now() + 3600000)
+        items.push({ id: `${f.id}-${f.updatedAt}`, title: `Follow up: ${f.title}`, summary: "You confirmed this follow-up. Review the original conversation before acting.",
+          category: "discoveries", important: true, at: f.dueAt, action: "review-lifelog" });
+    }
     return items.filter(i => !n.marks[i.id]?.dismissed && !(n.marks[i.id]?.snoozedUntil > this.now()))
       .map(i => ({ ...i, seen: n.marks[i.id]?.seen === true, notified: n.marks[i.id]?.notified === true })).sort((a, b) => Number(b.important) - Number(a.important) || b.at - a.at).slice(0, 80);
   }
