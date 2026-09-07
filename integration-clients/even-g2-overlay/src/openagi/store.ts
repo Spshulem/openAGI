@@ -8,6 +8,8 @@ const StateSchema = z.object({
   node: z.object({ id: z.string().uuid(), name: z.string(), platform: z.literal('even_g2'), enrolledAt: z.string() }).nullable(),
   conversationId: z.string().uuid().nullable(),
   ambientEnabled: z.boolean().default(false),
+  listeningMode: z.enum(['passive', 'wake']).default('passive'),
+  idleTapAction: z.enum(['talk', 'highlight']).default('talk'),
   wakePhrase: z.string().trim().min(1).max(40).default('open agi'),
   answerQuestions: z.boolean().default(true),
   speechModel: z.enum(['openai-buffered', 'nova-3', 'nova-2']).default('openai-buffered'),
@@ -20,10 +22,12 @@ const StateSchema = z.object({
 export type OpenAGIState = z.infer<typeof StateSchema>
 const KEY = 'openagi.g2.state.v2'
 
-function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
+function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'listeningMode' | 'idleTapAction' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
   return {
     version: 2, nodeId, nodeToken: null, node: null, conversationId: null,
     ambientEnabled: preferences?.ambientEnabled ?? false, wakePhrase: preferences?.wakePhrase ?? 'open agi',
+    listeningMode: preferences?.listeningMode ?? 'passive',
+    idleTapAction: preferences?.idleTapAction ?? 'talk',
     answerQuestions: preferences?.answerQuestions ?? true,
     speechModel: preferences?.speechModel ?? 'openai-buffered',
     speechTransport: preferences?.speechTransport ?? 'relay',

@@ -13,6 +13,7 @@ export interface OpenAGINodeCredential { nodeId?: string; nodeToken: string }
 export interface OpenAGIAskResult { question: string; reply: string; sessionId: string }
 export interface AskProgress { type: string; stage?: string; tool?: string; question?: string; text?: string; reset?: boolean }
 export interface OpenAGIListenResult { question: string; triggered: boolean; armed: boolean; prompt?: string; reason?: string; reply?: string; sessionId?: string }
+export interface G2LifelogPage { moments?: { id: string; at: number; title: string; segments: { text: string; speakerKey?: string }[] }[]; labels?: Record<string, string>; total?: number; nextOffset?: number | null }
 
 const CAPABILITIES = [
   { id: 'g2-voice-input', ready: true, operations: ['ask', 'listen'] },
@@ -20,7 +21,7 @@ const CAPABILITIES = [
 ]
 
 export class OpenAGIApiClient {
-  proactive(body: object, signal?: AbortSignal): Promise<{ items?: InboxItem[]; settings?: ProactiveSettings; consent?: { id: string; until: number }; quiet?: boolean; notify?: boolean }> {
+  proactive(body: object, signal?: AbortSignal): Promise<G2LifelogPage & { items?: InboxItem[]; settings?: ProactiveSettings; consent?: { id: string; until: number }; quiet?: boolean; notify?: boolean }> {
     return this.json('/nodes/g2/proactive', { method: 'POST', body: JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) })
   }
   private readonly fetchImpl: Fetch

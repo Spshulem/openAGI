@@ -1,5 +1,5 @@
 import type { SpeechModel } from '../openagi/live-speech'
-import type { InboxItem, ProactiveSettings } from '../openagi/proactive'
+import type { InboxItem, InboxOperation, ProactiveSettings } from '../openagi/proactive'
 
 export interface OpenAGIPhoneActions {
   pair(code: string, origin: string): void
@@ -8,6 +8,8 @@ export interface OpenAGIPhoneActions {
   unlink(): void
   connectAgent(origin: string, token: string): void
   configureAmbient(enabled: boolean, wakePhrase: string, answerQuestions: boolean): void
+  configureListeningMode?(mode: 'passive' | 'wake'): void
+  readLifelog?(query: string, offset: number): void
   selectAnswer?(index: number): void
   cancel?(): void
   previousPage?(): void
@@ -24,7 +26,9 @@ export interface OpenAGIPhoneActions {
   refreshInbox?(): void
   openInbox?(): void
   memoryConsent?(enabled: boolean, consent: boolean): void
-  inboxAction?(op: 'dismiss' | 'snooze' | 'accept-task' | 'delete-memory', id?: string): void
+  inboxAction?(op: InboxOperation, id?: string, extra?: Record<string, unknown>): void
+  markMoment?(): void
+  configureIdleTap?(action: 'talk' | 'highlight'): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -33,6 +37,9 @@ export class OpenAGIPhoneCompanion {
   private pairSection: HTMLElement
   private actionsSection: HTMLElement
   private sendOnStop = true
+  private lifelogNext: number | null = null
+  private lifelogOffset = 0
+  private lifelogQuery = ''
 
   constructor(actions: OpenAGIPhoneActions, allowedOrigins: string[]) {
     const root = document.querySelector<HTMLDivElement>('#app')
@@ -57,13 +64,14 @@ export class OpenAGIPhoneCompanion {
           <p>No pairing code is needed for this option. Use a G2-scoped token from your main, never its owner token. Connection details stay in this app's local phone storage.</p></details>
         </section>
         <section id="actions" class="actions" hidden>
+          <nav class="page-nav" aria-label="Agent pages"><button data-page-link="listen" aria-pressed="true">Listen</button><button id="read-lifelog" data-page-link="lifelog">Lifelog</button><button data-page-link="inbox">Inbox</button><button data-page-link="recent">Recent</button></nav>
           <button data-action="ask">Ask agent</button><button data-action="newConversation">New conversation</button>
           <button id="cancel-request" hidden>Cancel request</button>
           <section id="draft-review" class="ambient" hidden><h2>Review question · not sent</h2><p id="draft-text"></p><button id="send-draft">Send question</button><button id="rerecord-draft">Re-record</button><button id="discard-draft">Discard</button></section>
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
           <button id="blank-display">Blank glasses display</button>
-          <section class="ambient"><h2>Proactive inbox</h2>
+          <section class="ambient" data-page="inbox"><h2>Inbox</h2><details><summary>Notification and retention settings</summary>
             <label><input type="checkbox" id="proactive-enabled"> Show updates from my main</label>
             <div id="proactive-categories">${['approvals', 'tasks', 'discoveries', 'email', 'calendar'].map(c => `<label><input type="checkbox" value="${c}" checked> ${c}</label>`).join('')}</div>
             <p>Email/calendar require connected sources feeding OpenAGI. Alerts never approve actions. Foreground delivery only.</p>
@@ -71,49 +79,77 @@ export class OpenAGIPhoneCompanion {
             <label>Quiet hours end (0–23)<input id="quiet-end" type="number" min="0" max="23" value="8"></label>
             <label>Maximum interruptions/hour<input id="alert-limit" type="number" min="0" max="10" value="3"></label>
             <label>Transcript retention<select id="memory-retention"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option></select></label>
-            <button id="save-proactive">Save inbox & retention settings</button><button id="refresh-inbox">Refresh inbox</button><button id="open-inbox">Read inbox on glasses</button>
-            <a id="main-inbox" target="_blank" rel="noopener noreferrer" hidden>Continue on main · inbox and transcripts</a><a id="main-lifelog" target="_blank" rel="noopener noreferrer" hidden>Conversation lifelog · timeline, speakers & follow-ups</a><div id="proactive-items"></div>
-            <h2>Conversation memory · separate opt-in</h2>
-            <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
-            <label><input id="memory-enabled" type="checkbox"> Retain final transcripts during this listening session</label>
-            <p id="memory-status">Off. Enable always-listening first. Wake listening alone does not retain ambient transcripts.</p>
-            <p>Final text is batched to your main, not raw audio. Speakers are unverified. Simple commitment phrases suggest user tasks; no action is executed. Memory stops on pause, app hiding or exit, and expires after 4 hours. Review/delete transcripts on main.</p>
-            <button id="delete-memory">Stop memory & delete retained transcripts</button>
+            <button id="save-proactive">Save inbox & retention settings</button></details><button id="refresh-inbox">Refresh inbox</button><button id="open-inbox">Read inbox on glasses</button>
+            <section id="lifelog-panel" hidden><h2>Saved conversations on main</h2><label>Search this G2’s history<input id="lifelog-query" maxlength="200" type="search"></label><button id="lifelog-search">Search / refresh</button><p id="lifelog-status" role="status"></p><div id="lifelog-moments"></div><button id="lifelog-previous" hidden>Previous conversations</button><button id="lifelog-next" hidden>Older conversations</button><button id="lifelog-close">Close history</button></section>
+            <details><summary>Advanced owner controls · main sign-in required</summary><p>This G2 pairing can read its own history here. Owner sign-in is still required for analysis models, speaker edits, screen context and other devices. Your owner token is never put in a link.</p><a id="main-inbox" target="_blank" rel="noopener noreferrer" hidden>Main owner inbox</a><a id="main-lifelog" target="_blank" rel="noopener noreferrer" hidden>Owner lifelog settings</a></details><div id="proactive-items"></div>
           </section>
-          <section class="ambient"><h2>Talk controls</h2>
+          <section class="ambient" data-page="listen"><h2>Lifelog</h2><p id="save-status" role="status">No text saved this session yet.</p><button id="mark-moment">Mark moment</button>
+            <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
+            <label><input id="memory-enabled" type="checkbox"> Start lifelog · listen and save final transcripts</label>
+            <p id="memory-status">Off. Give consent, then Start lifelog. Listening starts automatically; no separate switch is required. Switch off to stop retaining text.</p>
+            <details><summary>Privacy and retention</summary><p>Final text is batched to your main, not raw audio. Speakers are unverified. Suggestions need your confirmation. Retention stops on pause, app hiding or exit, and expires after 4 hours.</p>
+            <button id="delete-memory">Stop memory & delete retained transcripts</button>
+            </details>
+          </section>
+          <details class="ambient" data-page="listen"><summary>Talk, speech and activity settings</summary><h2>Talk controls</h2>
+            <label>Tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (default)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down while listening for Talk / Mark moment controls. Swipe up for Inbox. Double-tap pauses. Holding is not supported.</p>
             <p>On glasses: tap Talk, speak, then tap Stop talking.</p>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
-            <p>Turn off to review the transcript and confirm Send first. Applies to manual questions; optional wake listening still triggers automatically.</p>
+            <p>Turn off to review the transcript and confirm Send first. Passive listening resumes after a manual question; optional wake responses are controlled separately.</p>
             <p>Hold to talk / release to finish is unavailable on G2: the current Even SDK does not provide press and release events.</p>
             <h2>Speech recognition</h2><label for="speech-model">Speech model (not the agent's reasoning model)</label>
             <select id="speech-model"><option value="openai-buffered">OpenAI · buffered recording</option><option value="nova-3">Deepgram Nova 3 · live</option><option value="nova-2">Deepgram Nova 2 · live</option></select>
             <label for="speech-transport">Live speech connection</label>
             <select id="speech-transport"><option value="relay">Through OpenAGI main · standard key</option><option value="direct">Direct to Deepgram · Member key required</option></select>
             <p>Through main works with a regular Deepgram speech key. Audio is forwarded live, not saved or uploaded as a whole recording. Direct mode skips that network hop but needs permission to create temporary tokens. Neither mode stores your permanent Deepgram key on the phone.</p>
-            <h2>Speech heard</h2><p id="live-transcript">Waiting for speech.</p><p id="speech-timing">Select Deepgram for live words, or OpenAI for transcription after recording.</p><h2>Activity</h2><ol id="activity-log"></ol></section>
-          <section class="ambient"><h2>Recent answers</h2><p>Select an answer to resume its conversation. Stored on this phone; disconnect clears history.</p><div id="recent-answers"></div><p id="answer-preview"></p></section>
-          <section class="ambient">
-            <label><input id="ambient-enabled" type="checkbox"> Always listening while this app is open</label>
+            <details><summary>Live transcript · optional phone preview</summary><p id="live-transcript">Waiting for speech.</p><p id="speech-timing">Select Deepgram for live words, or OpenAI for transcription after recording.</p></details><h2>Activity</h2><ol id="activity-log"></ol></details>
+          <section class="ambient" data-page="recent"><h2>Recent answers</h2><p>Select an answer to resume its conversation. Stored on this phone; disconnect clears history.</p><div id="recent-answers"></div><p id="answer-preview"></p></section>
+          <section class="ambient" data-page="listen">
+            <h2>Listening controls</h2><label><input id="ambient-enabled" type="checkbox"> Keep microphone listening while this app is open</label>
+            <label>What should listening do?<select id="listening-mode"><option value="passive">Quiet listening · tap Talk for answers</option><option value="wake">Wake responses · answer when triggered</option></select></label>
+            <p>Quiet listening does not answer overheard questions. Start lifelog above to save text. Enable main updates for alerts. Lifelog suggestions never execute actions automatically; AI analysis is a separate owner opt-in.</p>
             <button id="ambient-retry">Retry listening</button>
-            <label for="wake-phrase">Wake phrase</label><input id="wake-phrase" maxlength="40" value="open agi">
+            <div id="wake-settings" hidden><label for="wake-phrase">Wake phrase</label><input id="wake-phrase" maxlength="40" value="open agi">
             <label><input id="answer-questions" type="checkbox" checked> Also answer clearly phrased questions</label>
+            </div>
             <p>While enabled, your speech provider receives all microphone audio, even before the wake phrase. OpenAGI does not save this audio. Provider retention terms apply. Blank display hides text only; it does not pause the microphone.</p>
           </section>
           <button class="secondary" data-action="unlink">Disconnect agent</button>
           <button class="secondary" id="exit-agents">Exit Agents (keep pairing)</button>
         </section>
-        <footer>Tap-to-talk is the default. Always listening is optional, foreground-only, and can be paused from the phone or glasses. Raw audio is not saved by the G2 bridge. Separately opted-in conversation memory retains final transcripts on your main.</footer>
+        <footer>Foreground listening · double-tap glasses to pause</footer>
       </main>`
     this.status = required(root.querySelector('#status'))
     this.detail = required(root.querySelector('#detail'))
     this.pairSection = required(root.querySelector('#pair'))
     this.actionsSection = required(root.querySelector('#actions'))
+    const historyPanel = required(root.querySelector('#lifelog-panel')); historyPanel.dataset.page = 'lifelog'; historyPanel.className = 'ambient'; this.actionsSection.append(historyPanel)
+    const showPage = (page: string): void => {
+      for (const panel of root.querySelectorAll<HTMLElement>('[data-page]')) panel.hidden = panel.dataset.page !== page
+      for (const button of root.querySelectorAll<HTMLElement>('[data-page-link]')) button.setAttribute('aria-pressed', String(button.dataset.pageLink === page))
+    }
+    for (const button of root.querySelectorAll<HTMLElement>('[data-page-link]')) button.addEventListener('click', () => showPage(button.dataset.pageLink!))
+    showPage('listen')
+    root.querySelector('#mark-moment')?.addEventListener('click', () => actions.markMoment?.())
+    root.querySelector('#idle-tap')?.addEventListener('change', () => actions.configureIdleTap?.(requiredSelect(root, '#idle-tap').value as 'talk' | 'highlight'))
     const input = root.querySelector<HTMLInputElement>('#pair-code')
     const agentOrigin = root.querySelector<HTMLInputElement>('#agent-origin')
     const agentToken = root.querySelector<HTMLInputElement>('#agent-token')
     const ambient = root.querySelector<HTMLInputElement>('#ambient-enabled')
     const wakePhrase = root.querySelector<HTMLInputElement>('#wake-phrase')
     const answerQuestions = root.querySelector<HTMLInputElement>('#answer-questions')
+    root.querySelector('#listening-mode')?.addEventListener('change', () => actions.configureListeningMode?.(requiredSelect(root, '#listening-mode').value as 'passive' | 'wake'))
+    const readHistory = (offset = 0, submit = false): void => {
+      if (submit) this.lifelogQuery = root.querySelector<HTMLInputElement>('#lifelog-query')?.value ?? ''
+      this.lifelogOffset = offset
+      showPage('lifelog')
+      actions.readLifelog?.(this.lifelogQuery, offset)
+    }
+    root.querySelector('#read-lifelog')?.addEventListener('click', () => readHistory(0, true))
+    root.querySelector('#lifelog-search')?.addEventListener('click', () => readHistory(0, true))
+    root.querySelector('#lifelog-next')?.addEventListener('click', () => { if (this.lifelogNext !== null) readHistory(this.lifelogNext) })
+    root.querySelector('#lifelog-previous')?.addEventListener('click', () => readHistory(Math.max(0, this.lifelogOffset - 25)))
+    root.querySelector('#lifelog-close')?.addEventListener('click', () => showPage('listen'))
     root.querySelector('#pair-button')?.addEventListener('click', () => actions.pair(input?.value.trim() ?? '', agentOrigin?.value.trim() ?? ''))
     root.querySelector('#agent-connect')?.addEventListener('click', () => {
       actions.connectAgent(agentOrigin?.value ?? '', agentToken?.value ?? '')
@@ -140,10 +176,22 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#delete-memory')?.addEventListener('click', () => { if (window.confirm('Stop memory and delete transcripts and suggestions on main? Previously accepted tasks remain.')) actions.inboxAction?.('delete-memory') })
     root.querySelector('#proactive-items')?.addEventListener('click', event => {
       const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-inbox-op]') : null
-      const op = button?.dataset.inboxOp as 'dismiss' | 'snooze' | 'accept-task' | undefined
+      const op = button?.dataset.inboxOp as InboxOperation | undefined
       if (!op || !button?.dataset.id) return
-      if (op === 'accept-task' && !window.confirm(`Add this as YOUR task? Speaker and due date are unverified.\n\n${button.closest('article')?.textContent ?? ''}`)) return
-      actions.inboxAction?.(op, button.dataset.id)
+      const item = this.currentInbox.find(i => i.id === button.dataset.id); if (!item) return
+      let extra: Record<string, unknown> | undefined
+      if (op === 'accept-task' && item.reminder) {
+        const local = window.prompt(`When should OpenAGI remind you? Enter YYYY-MM-DD HH:MM in your phone timezone (${Intl.DateTimeFormat().resolvedOptions().timeZone}). Suggested date: ${item.suggestedDate ?? 'choose a date'} (${item.timeZone ?? 'main timezone'}).`, item.suggestedDate ? `${item.suggestedDate} ` : '')
+        if (!local || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(local)) return
+        const date = new Date(local.replace(' ', 'T')); if (!Number.isFinite(date.getTime()) || date.getTime() <= Date.now()) { window.alert('Choose a valid future date and time.'); return }
+        if (!window.confirm(`Create this reminder on main?\n${item.title}\n${date.toLocaleString()}\nDue alerts follow your notification settings. Speaker is unverified.`)) return
+        extra = { dueAt: date.toISOString() }
+      } else if (op === 'accept-task' && !window.confirm(`Add this as YOUR task? Speaker and due date are unverified.\n\n${item.title}`)) return
+      if (op === 'complete-task') {
+        if (!window.confirm(`Complete this task in OpenAGI?\n\n${item.title}\n\nThis does not update an external source.`)) return
+        extra = { taskId: item.taskId, title: item.title, dueDate: item.dueDate }
+      }
+      if (extra) actions.inboxAction?.(op, item.id, extra); else actions.inboxAction?.(op, item.id)
     })
     root.querySelector('#previous-page')?.addEventListener('click', () => actions.previousPage?.())
     root.querySelector('#next-page')?.addEventListener('click', () => actions.nextPage?.())
@@ -170,9 +218,36 @@ export class OpenAGIPhoneCompanion {
     if (ask) ask.textContent = /Opening microphone|Recording question/.test(status) ? (this.sendOnStop ? 'Stop talking · send' : 'Stop talking · review') : status.startsWith('Review question') ? 'Send question' : 'Talk'
     if (/failed|could not|check|not allowed/i.test(status)) this.status.scrollIntoView?.({ block: 'center' })
   }
-  paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value }
+  paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value; if (!value) this.lifelogStatus('') }
+  listeningMode(mode: 'passive' | 'wake'): void {
+    requiredSelect(this.actionsSection, '#listening-mode').value = mode
+    const wake = this.actionsSection.querySelector<HTMLElement>('#wake-settings'); if (wake) wake.hidden = mode !== 'wake'
+  }
+  lifelogStatus(message: string): void {
+    const status = this.actionsSection.querySelector('#lifelog-status'); if (status) status.textContent = message
+    this.actionsSection.querySelector('#lifelog-moments')?.replaceChildren()
+  }
+  lifelog(data: { moments?: { id: string; at: number; title: string; beats?: { kind: string; at: number }[]; segments: { text: string; speakerKey?: string }[] }[]; labels?: Record<string, string>; total?: number; nextOffset?: number | null }): void {
+    const rows = data.moments ?? []
+    this.lifelogStatus(rows.length ? `${data.total ?? rows.length} conversations · saved on your main, not this phone` : 'No saved conversations yet. Give consent and Start lifelog, then allow about 30 seconds for final text to save.')
+    const root = this.actionsSection.querySelector('#lifelog-moments'); if (!root) return
+    for (const moment of rows) {
+      const card = document.createElement('details'), title = document.createElement('summary')
+      title.textContent = `${new Date(moment.at).toLocaleString()} · ${moment.title}`; card.append(title)
+      for (const beat of moment.beats ?? []) if (beat.kind === 'highlight') { const p = document.createElement('p'); p.textContent = `★ Marked moment · ${new Date(beat.at).toLocaleTimeString()}`; card.append(p) }
+      for (const segment of moment.segments) {
+        const p = document.createElement('p'); const speaker = segment.speakerKey ? data.labels?.[segment.speakerKey] : null
+        p.textContent = `${speaker ? `${speaker}: ` : ''}${segment.text}`; card.append(p)
+      }
+      root.append(card)
+    }
+    this.lifelogNext = data.nextOffset ?? null
+    const next = this.actionsSection.querySelector<HTMLButtonElement>('#lifelog-next'); if (next) next.hidden = this.lifelogNext === null
+    const previous = this.actionsSection.querySelector<HTMLButtonElement>('#lifelog-previous'); if (previous) previous.hidden = this.lifelogOffset === 0
+  }
   mainInbox(origin: string): void {
     const a = this.actionsSection.querySelector<HTMLAnchorElement>('#main-inbox')
+    if (a?.href && new URL(a.href).origin !== new URL(origin).origin) this.lifelogStatus('')
     try { const url = new URL('/g2/proactive', origin); if (url.protocol !== 'https:') return; if (a) { a.href = url.href; a.hidden = false } } catch { /* not configured */ }
   }
   proactiveSettings(settings: ProactiveSettings): void {
@@ -188,19 +263,28 @@ export class OpenAGIPhoneCompanion {
   memoryStatus(active: boolean, detail: string): void {
     const i = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled'); if (i) i.checked = active
     const p = this.actionsSection.querySelector('#memory-status'); if (p) p.textContent = detail
+    if (!active) this.saveStatus(detail)
   }
+  saveStatus(text: string): void { const p = this.actionsSection.querySelector('#save-status'); if (p) p.textContent = text }
+  idleTapAction(action: 'talk' | 'highlight'): void { requiredSelect(this.actionsSection, '#idle-tap').value = action }
+  memoryPending(pending: boolean): void {
+    const input = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled')
+    if (input) { input.disabled = pending; input.setAttribute('aria-busy', String(pending)) }
+  }
+  private currentInbox: InboxItem[] = []
   inbox(items: InboxItem[]): void {
+    this.currentInbox = items
     const root = this.actionsSection.querySelector('#proactive-items'); if (!root) return
     root.replaceChildren()
     for (const item of items) {
-      const card = document.createElement('article'); card.className = 'ambient'
-      const title = document.createElement('h2'); title.textContent = item.title
+      const card = document.createElement('details'); card.className = 'ambient'
+      const title = document.createElement('summary'); title.textContent = item.title
       const summary = document.createElement('p'); summary.textContent = item.summary
       card.append(title, summary)
-      for (const [op, text] of [['dismiss', 'Dismiss'], ['snooze', 'Snooze 1 hour'], ...(item.action === 'accept-task' ? [['accept-task', 'Review and add user task']] : [])]) {
+      for (const [op, text] of [['dismiss', 'Dismiss alert'], ['snooze', 'Snooze 1 hour'], ...(item.action === 'accept-task' ? [['accept-task', item.reminder ? 'Review reminder date & time' : 'Review and add user task']] : []), ...(item.action === 'complete-task' ? [['complete-task', 'Complete task on main']] : [])]) {
         const b = document.createElement('button'); b.textContent = text; b.dataset.inboxOp = op; b.dataset.id = item.id; card.append(b)
       }
-      if (item.action !== 'accept-task') { const p = document.createElement('p'); p.textContent = 'Review details and approve any actions on your main.'; card.append(p) }
+      if (!['accept-task', 'complete-task'].includes(item.action)) { const p = document.createElement('p'); p.textContent = 'Review details and approve any actions on your main.'; card.append(p) }
       root.append(card)
     }
   }
@@ -281,6 +365,7 @@ function injectStyles(): void {
   const style = document.createElement('style')
   style.textContent = `
     [hidden]{display:none!important}
+    .page-nav{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;position:sticky;top:0;z-index:2;background:#0d1110;padding:8px 0}.page-nav button{padding:10px 3px;font-size:13px;background:#17241d;color:#e5eee8;border-color:#3b5043}.page-nav button[aria-pressed="true"]{background:#54f59c;color:#07120c}#proactive-items,#lifelog-moments,#recent-answers{max-height:55vh;overflow-y:auto;overscroll-behavior:contain;display:grid;gap:12px}details:not([open])>:not(summary){display:none}summary{cursor:pointer;line-height:1.5}details[open]>summary{margin-bottom:12px}details button{margin:6px 0}#proactive-items:empty::before{content:'No inbox items yet.'}
     :root{color-scheme:dark;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0d1110;color:#f5f7f5}*{box-sizing:border-box}
     body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#17352a,#0d1110 48%)}.shell{width:min(620px,100%);margin:0 auto;padding:28px 20px;display:grid;gap:20px}
     header{display:flex;align-items:end;justify-content:space-between}.brand{font-size:24px;font-weight:760}.eyebrow{color:#72f5ac;text-transform:uppercase;letter-spacing:.15em;font-size:11px}

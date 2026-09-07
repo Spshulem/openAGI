@@ -6,7 +6,6 @@ node_modules
 docs/verification
 logs
 mac
-scripts
 *.md
 .env
 .env.example

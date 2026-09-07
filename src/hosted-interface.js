@@ -1560,7 +1560,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendJson(res, 200, await g2Proactive.screenContext(nodeId, body.id));
           }
           return sendG2NodeJson(res, 200, g2Proactive.dispatch(nodeId, body));
-        } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
+        } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 409, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
       }
       if (method === "POST" && pathname === "/nodes/g2/ask") {
         if (!channels?.g2) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });

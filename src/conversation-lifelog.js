@@ -7,7 +7,7 @@ const kinds = new Set(["commitment", "decision", "question", "topic", "meeting"]
 export function lifelogState(n) {
   const l = n.lifelog ??= { settings: { analysis: false, model: "", maxReviewsPerDay: 12, screenContext: false },
     labels: {}, edits: {}, reviews: {}, followups: {}, generation: 0, attempts: 0, day: "", lastAttempt: 0 };
-  l.failed ??= {}; return l;
+  l.failed ??= {}; l.bookmarks ??= {}; return l;
 }
 
 // Derived from canonical segments, never a second copy of the transcript.
@@ -27,6 +27,7 @@ export function moments(n) {
       result.push(m); previous = null;
     }
     m.segments.push(s); m.endAt = Math.max(m.endAt, s.endAt ?? s.at);
+    if (state.bookmarks[s.id]) m.beats.push({ kind: "highlight", segmentId: s.id, at: state.bookmarks[s.id].at, label: "Marked moment" });
     if (s.speakerKey && !m.speakers.includes(s.speakerKey)) m.speakers.push(s.speakerKey);
     if (s.speakerKey && s.speakerKey !== previous?.speakerKey) m.beats.push({ kind: "speaker", segmentId: s.id, at: s.at, label: state.labels[s.speakerKey] || "Unidentified speaker" });
     for (const [kind, pattern] of [["commitment", /\b(?:I(?:['’]ll| will| need to)|we (?:will|need to)|remember to)\b/i],
@@ -49,7 +50,7 @@ export function pruneLifelog(n) {
   const l = lifelogState(n), ids = new Set(n.segments.map(s => s.id));
   const speakers = new Set(n.segments.map(s => s.speakerKey).filter(Boolean));
   for (const key of Object.keys(l.labels)) if (!speakers.has(key)) delete l.labels[key];
-  for (const name of ["edits", "reviews", "failed"]) for (const key of Object.keys(l[name])) if (!ids.has(key)) delete l[name][key];
+  for (const name of ["edits", "reviews", "failed", "bookmarks"]) for (const key of Object.keys(l[name])) if (!ids.has(key)) delete l[name][key];
   for (const [key, f] of Object.entries(l.followups)) if (!ids.has(f.segmentId)) delete l.followups[key];
   // A partially expired conversation must not retain analysis of expired words.
   const valid = new Map(moments(n).map(m => [m.id, m.fingerprint]));

@@ -1,18 +1,21 @@
 import type { OpenAGIApiClient } from './api-client'
 
-export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string }
+export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string }
+export type InboxOperation = 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'delete-memory'
 export interface ProactiveSettings { enabled: boolean; categories: string[]; retentionDays: number; quietStart: number; quietEnd: number; timeZone: string; maxPerHour: number }
 export interface ProactiveView {
   proactiveSettings?(settings: ProactiveSettings): void
   inbox?(items: InboxItem[]): void
   memoryStatus?(active: boolean, detail: string): void
   activity?(text: string): void
+  saveStatus?(text: string): void
 }
 
 // This timer only reads persisted notifications; it never starts agent work.
 // Ambient uploads are final text only, opt-in, ephemeral and never replayed.
 export class G2ProactiveClient {
   items: InboxItem[] = []
+  get memoryActive(): boolean { return Boolean(this.consent && this.consent.until > Date.now()) }
   private timer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private consent: { id: string; until: number } | null = null
@@ -109,6 +112,7 @@ export class G2ProactiveClient {
     }
     if (trimmed.length > 1000 || this.queue.length >= 100) { this.pauseMemory('Memory paused: transcript buffer full. No unsent text was saved.'); return }
     this.queue.push({ text: trimmed, ...(metadata ?? { at: Date.now(), endAt: Date.now(), streamId: this.bufferedStreamId, speaker: null }) })
+    this.view.saveStatus?.('Final text waiting to save on main')
     if (!this.flushTimer) this.flushTimer = setTimeout(() => { this.flushTimer = null; void this.flush() }, 30_000)
   }
   private async flush(): Promise<void> {
@@ -117,16 +121,28 @@ export class G2ProactiveClient {
     const segments = this.queue.splice(0, 10), texts = segments.map(s => s.text), generation = this.generation
     try {
       await this.api.proactive({ op: 'capture', consentId: this.consent.id, batchId: crypto.randomUUID(), texts, segments: segments.map(({ text: _text, ...metadata }) => metadata) }, this.controller.signal)
-      if (generation === this.generation) this.view.activity?.(`Saved ${texts.length} final transcript segment(s) to main; checking explicit commitments.`)
+      if (generation === this.generation) {
+        this.view.activity?.(`Saved ${texts.length} final transcript segment(s) to main; checking explicit commitments.`)
+        this.view.saveStatus?.(`Saved on main at ${new Date().toLocaleTimeString()}`)
+        await this.refresh()
+      }
     } catch { if (generation === this.generation) this.pauseMemory('Memory paused: upload failed. No automatic replay; some submitted text may already be saved on main.') }
     finally { this.uploading = false; if (this.queue.length && this.consent && this.running && !this.flushTimer) this.flushTimer = setTimeout(() => { this.flushTimer = null; void this.flush() }, 16_000) }
   }
-  async action(op: 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'delete-memory', id?: string): Promise<void> {
+  async markMoment(): Promise<boolean> {
+    if (!this.memoryActive || this.hidden()) { this.view.activity?.('Start consented lifelog before marking a moment.'); return false }
+    try {
+      await this.api.proactive({ op: 'mark-moment', consentId: this.consent!.id }, this.controller.signal)
+      this.view.activity?.('Moment marked on main, linked to the latest saved words.'); return true
+    } catch (error) { this.view.activity?.(`Moment not marked: ${String(error)}`); return false }
+  }
+  async action(op: InboxOperation, id?: string, extra: Record<string, unknown> = {}): Promise<boolean> {
     if (op === 'delete-memory') this.pauseMemory()
     try {
-      await this.api.proactive({ op, id, ...(op === 'accept-task' ? { confirm: true } : {}) }, this.controller.signal)
-      this.view.activity?.(op === 'accept-task' ? 'Added to your user tasks on main. No agent action was started.' : op === 'delete-memory' ? 'Retained transcripts and suggestions deleted; accepted tasks remain.' : 'Inbox updated')
+      await this.api.proactive({ ...extra, op, id, ...(['accept-task', 'complete-task'].includes(op) ? { confirm: true } : {}) }, this.controller.signal)
+      this.view.activity?.(op === 'complete-task' ? 'Task completed on OpenAGI main. External source was not changed.' : op === 'accept-task' ? 'Added to your user tasks on main. No agent action was started.' : op === 'delete-memory' ? 'Retained transcripts and suggestions deleted; accepted tasks remain.' : 'Inbox updated')
       await this.refresh()
-    } catch (error) { this.view.activity?.(`Inbox action failed: ${String(error)}`) }
+      return true
+    } catch (error) { this.view.activity?.(`Inbox action failed: ${String(error)}`); return false }
   }
 }

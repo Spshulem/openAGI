@@ -3,6 +3,46 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('provides peer pages and bounded, collapsed inbox details without hiding lifelog behind tasks', () => {
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn() }, [])
+  phone.paired(true)
+  expect(document.querySelectorAll('[data-page-link]')).toHaveLength(4)
+  phone.inbox(Array.from({ length: 80 }, (_, i) => ({ id: String(i), title: `Task ${i}`, summary: 'Details', category: 'tasks', action: 'complete-task', important: false, seen: false })))
+  expect(document.querySelectorAll('#proactive-items details:not([open])')).toHaveLength(80)
+  expect(parseFloat(getComputedStyle(document.querySelector('#proactive-items')!).maxHeight)).toBeCloseTo(window.innerHeight * 0.55)
+  document.querySelector<HTMLButtonElement>('#read-lifelog')!.click()
+  expect(document.querySelector<HTMLElement>('#lifelog-panel')!.hidden).toBe(false)
+  expect(document.querySelector<HTMLElement>('[data-page="inbox"]')!.hidden).toBe(true)
+  phone.saveStatus('Saved on main at noon')
+  expect(document.querySelector('#save-status')!.textContent).toBe('Saved on main at noon')
+})
+
+it('keeps Older and Previous bound to the submitted search, including offset zero', () => {
+  const readLifelog = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), readLifelog }, [])
+  const input = document.querySelector<HTMLInputElement>('#lifelog-query')!
+  input.value = 'first'; document.querySelector<HTMLButtonElement>('#lifelog-search')!.click()
+  phone.lifelog({ nextOffset: 25 }); input.value = 'unsubmitted'
+  document.querySelector<HTMLButtonElement>('#lifelog-next')!.click(); expect(readLifelog).toHaveBeenLastCalledWith('first', 25)
+  document.querySelector<HTMLButtonElement>('#lifelog-previous')!.click(); expect(readLifelog).toHaveBeenLastCalledWith('first', 0)
+  document.querySelector<HTMLButtonElement>('#lifelog-search')!.click(); expect(readLifelog).toHaveBeenLastCalledWith('unsubmitted', 0)
+})
+
+it('offers paired lifelog reading without a token link and separates wake responses', () => {
+  const readLifelog = vi.fn(), configureListeningMode = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), readLifelog, configureListeningMode }, [])
+  phone.paired(true); phone.listeningMode('passive')
+  expect(document.querySelector<HTMLElement>('#wake-settings')?.hidden).toBe(true)
+  document.querySelector<HTMLButtonElement>('#read-lifelog')?.click()
+  expect(readLifelog).toHaveBeenCalledWith('', 0)
+  phone.lifelog({ total: 1, moments: [{ id: 'one', at: 1, title: '<img src=x>', segments: [{ text: '<script>untrusted</script>' }] }] })
+  expect(document.querySelector('#lifelog-moments img')).toBeNull()
+  expect(document.querySelector('#lifelog-moments script')).toBeNull()
+  expect(document.querySelector('#lifelog-moments')?.textContent).toContain('untrusted')
+  expect(document.querySelector('#lifelog-panel a')).toBeNull()
+  phone.paired(false); expect(document.querySelector('#lifelog-moments')?.textContent).toBe('')
+})
+
 it('keeps memory separate from wake listening and renders inbox evidence safely', () => {
   const memoryConsent = vi.fn(), inboxAction = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), memoryConsent, inboxAction }, [])
