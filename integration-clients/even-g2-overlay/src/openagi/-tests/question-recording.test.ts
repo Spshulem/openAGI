@@ -6,19 +6,21 @@ async function fixture() {
   const store = new OpenAGIStore({ get: () => Promise.resolve(null), set: () => Promise.resolve(), remove: () => Promise.resolve() })
   await store.update({ nodeToken: 'test-scoped-token-1234', connectionMode: 'direct', agentOrigin: 'https://main.example.com', conversationId: crypto.randomUUID() })
   let receive: (pcm: Uint8Array) => void = () => {}
+  await store.update({ autoSend: false })
   const ask = vi.fn(() => Promise.resolve({ question: 'Hello', reply: 'Hi' }))
+  const listen = vi.fn(() => Promise.resolve({ question: 'Hello', triggered: false, armed: false }))
   const set = vi.fn()
   const audio = { active: false, start: vi.fn((callback: typeof receive) => { receive = callback; return Promise.resolve() }), stop: vi.fn(() => Promise.resolve()) }
-  const renderer = { home: vi.fn(), recent: vi.fn(), listening: vi.fn(), thinking: vi.fn(), message: vi.fn(), answer: vi.fn(), progress: vi.fn() }
+  const renderer = { home: vi.fn(), recent: vi.fn(), review: vi.fn(), confirmCancel: vi.fn(), listening: vi.fn(), thinking: vi.fn(), message: vi.fn(), answer: vi.fn(), progress: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(
-    { ask } as unknown as Args[0], store,
+    { ask, askText: ask, listen } as unknown as Args[0], store,
     audio,
     renderer as unknown as Args[3],
     { set, paired: vi.fn(), ambient: vi.fn() } as unknown as Args[4], [],
   )
   await app.boot()
-  return { app, ask, set, store, audio, renderer, receive: (pcm: Uint8Array) => receive(pcm) }
+  return { app, ask, listen, set, store, audio, renderer, receive: (pcm: Uint8Array) => receive(pcm) }
 }
 
 it('starts buffered follow-up on tap without deleting the saved answer', async () => {
@@ -30,6 +32,37 @@ it('starts buffered follow-up on tap without deleting the saved answer', async (
   expect(store.snapshot().history[0].reply).toBe('# Answer\n**Plain** text')
   expect(renderer.answer).toHaveBeenLastCalledWith('Answer Plain text', 0, 1)
   await app.systemExit()
+})
+
+it('auto-send uploads buffered audio once without a separate transcription request', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureAutoSend(true)
+    await f.app.startAsk(); f.receive(new Uint8Array(32000))
+    await f.app.configureAutoSend(false) // Must not change an active recording.
+    expect(f.store.snapshot().autoSend).toBe(true)
+    await f.app.finishAsk()
+    expect(f.listen).not.toHaveBeenCalled()
+    expect(f.ask).toHaveBeenCalledWith(expect.any(Blob), expect.any(String), expect.any(Function), expect.any(AbortSignal))
+    expect(f.ask).toHaveBeenCalledOnce()
+    await f.app.sendDraft(); expect(f.ask).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit() }
+})
+
+it('defaults older pairings to auto-send and persists explicit confirmation preference', async () => {
+  let saved: string | null = null
+  const storage = { get: async () => saved, set: async (_key: string, value: string) => { saved = value }, remove: async () => {} }
+  const store = new OpenAGIStore(storage)
+  await store.update({ nodeToken: 'test-scoped-token-1234' })
+  const legacy = JSON.parse(saved!); delete legacy.autoSend; saved = JSON.stringify(legacy)
+  const reopened = new OpenAGIStore(storage)
+  expect((await reopened.load()).autoSend).toBe(true)
+  await reopened.update({ autoSend: false })
+  const again = new OpenAGIStore(storage)
+  expect((await again.load()).autoSend).toBe(false)
+  expect(again.snapshot().nodeToken).toBe('test-scoped-token-1234')
+  await again.clearCredential()
+  expect(again.snapshot().autoSend).toBe(false)
 })
 
 it('returns from an answer to Ask and browses Recent on glasses without changing the conversation', async () => {
@@ -63,9 +96,10 @@ it('allows paging partial text and preserves it when cancelled', async () => {
   }
   ask.mockImplementation(implementation as unknown as () => Promise<{ question: string; reply: string }>)
   await app.startAsk(); receive(new Uint8Array(32000))
-  const request = app.finishAsk(); await ready
+  await app.finishAsk()
+  const request = app.sendDraft(); await ready
   app.scrollDown()
-  expect(renderer.progress).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), expect.stringContaining('2/'))
+  expect(renderer.progress).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), expect.stringContaining('2/'), expect.any(String))
   app.cancelRequest(); await request
   expect(store.snapshot().history[0].reply).toContain('Incomplete answer:')
   expect(store.snapshot().history[0].reply).toContain('Partial words')
@@ -108,6 +142,7 @@ it('selects an older conversation for follow-up and keeps a new conversation sep
   await app.startAsk()
   receive(new Uint8Array(32000))
   await app.finishAsk()
+  await app.sendDraft()
   expect((ask.mock.calls as unknown as [Blob, string][])[0][1]).toBe(original)
   expect(store.snapshot().history).toHaveLength(2)
   await app.systemExit()
@@ -134,14 +169,15 @@ it('rejects recordings shorter than the server minimum', async () => {
   await app.systemExit()
 })
 
-it('shows received audio and sends a valid 16 kHz mono PCM WAV on the second phone press', async () => {
-  const { app, ask, receive, set } = await fixture()
+it('transcribes a valid WAV on Stop but only sends the reviewed text on confirmation', async () => {
+  const { app, ask, listen, receive, set } = await fixture()
   await app.startAsk()
   receive(new Uint8Array(32000))
   expect(set).toHaveBeenLastCalledWith('Recording question', expect.stringContaining('1.0 seconds'))
   await app.startAsk()
-  expect(ask).toHaveBeenCalledOnce()
-  const blob = (ask.mock.calls as unknown as [Blob, string][])[0][0]
+  expect(ask).not.toHaveBeenCalled()
+  expect(listen).toHaveBeenCalledOnce()
+  const blob = (listen.mock.calls as unknown as [Blob, string][])[0][0]
   const bytes = await blob.arrayBuffer()
   const header = new DataView(bytes)
   expect(bytes.byteLength).toBe(32044)
@@ -150,5 +186,77 @@ it('shows received audio and sends a valid 16 kHz mono PCM WAV on the second pho
   expect(header.getUint32(24, true)).toBe(16000)
   expect(header.getUint16(34, true)).toBe(16)
   expect(header.getUint32(40, true)).toBe(32000)
+  await app.sendDraft()
+  expect(ask).toHaveBeenCalledWith('Hello', expect.any(String), expect.any(Function), expect.any(AbortSignal))
   await app.systemExit()
+})
+
+it('discards a reviewed question without sending or losing the previous answer', async () => {
+  const { app, ask, receive, store } = await fixture()
+  await store.remember('Previous question', 'Previous answer')
+  await app.startAsk(); receive(new Uint8Array(32000)); await app.finishAsk()
+  app.doubleTap(); await Promise.resolve()
+  await app.sendDraft()
+  expect(ask).not.toHaveBeenCalled()
+  expect(store.snapshot().history).toHaveLength(1)
+  await app.systemExit()
+})
+
+it('keeps a draft in its original conversation until discarded or sent', async () => {
+  const { app, ask, receive, store } = await fixture()
+  const id = store.snapshot().conversationId
+  await app.startAsk(); receive(new Uint8Array(32000)); await app.finishAsk()
+  await app.newConversation(); await app.configureAmbient(true, 'Peri', false)
+  expect(store.snapshot().conversationId).toBe(id)
+  expect(store.snapshot().ambientEnabled).toBe(false)
+  await app.rerecordDraft(); receive(new Uint8Array(32000)); await app.finishAsk(); await app.sendDraft()
+  expect(ask).toHaveBeenCalledOnce()
+  await app.systemExit()
+})
+
+it('does not resurrect a cancelled transcription when a late response arrives', async () => {
+  const { app, ask, listen, receive } = await fixture()
+  let complete!: (value: { question: string; triggered: boolean; armed: boolean }) => void
+  listen.mockImplementationOnce(() => new Promise(resolve => { complete = resolve }))
+  await app.startAsk(); receive(new Uint8Array(32000))
+  const pending = app.finishAsk()
+  await vi.waitFor(() => expect(listen).toHaveBeenCalledOnce())
+  app.cancelRequest(); complete({ question: 'Do something', triggered: false, armed: false }); await pending
+  await app.sendDraft()
+  expect(ask).not.toHaveBeenCalled()
+  await app.systemExit()
+})
+
+it('streams tool history without stealing answer pages and confirms cancellation on glasses', async () => {
+  vi.useFakeTimers()
+  const { app, ask, receive, renderer } = await fixture()
+  let progress!: (event: { type: string; stage?: string; tool?: string; text?: string }) => void
+  let signal!: AbortSignal
+  ask.mockImplementation(((_text: string, _id: string, cb: typeof progress, abort: AbortSignal) => {
+    progress = cb; signal = abort
+    return new Promise((_resolve, reject) => abort.addEventListener('abort', () => reject(new Error('Interrupted')), { once: true }))
+  }) as typeof ask)
+  try {
+    await app.startAsk(); receive(new Uint8Array(32000)); await app.finishAsk()
+    const request = app.sendDraft()
+    progress({ type: 'progress', stage: 'tool', tool: 'computer_list_apps' })
+    progress({ type: 'progress', stage: 'model' })
+    expect(renderer.progress).toHaveBeenLastCalledWith('Thinking', expect.any(String), '', expect.stringContaining('Tool: computer_list_apps'))
+    progress({ type: 'delta', text: 'Visible answer '.repeat(70) })
+    app.scrollDown()
+    expect(renderer.progress).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), expect.stringContaining('2/'), expect.any(String))
+    app.tap()
+    expect(renderer.progress).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), '', expect.stringContaining('computer_list_apps'))
+    app.doubleTap()
+    expect(renderer.confirmCancel).toHaveBeenCalledOnce()
+    expect(signal.aborted).toBe(false)
+    const count = renderer.progress.mock.calls.length
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(renderer.progress).toHaveBeenCalledTimes(count)
+    app.doubleTap() // Keep waiting; does not cancel.
+    expect(signal.aborted).toBe(false)
+    app.doubleTap(); await vi.advanceTimersByTimeAsync(401); app.tap()
+    expect(signal.aborted).toBe(true)
+    await request
+  } finally { await app.systemExit(); vi.useRealTimers() }
 })

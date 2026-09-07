@@ -15,6 +15,10 @@ export interface OpenAGIPhoneActions {
   exit?(): void
   configureSpeech?(model: SpeechModel, transport: 'relay' | 'direct'): void
   toggleDisplay?(): void
+  sendDraft?(): void
+  discardDraft?(): void
+  rerecordDraft?(): void
+  configureAutoSend?(enabled: boolean): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -22,6 +26,7 @@ export class OpenAGIPhoneCompanion {
   private detail: HTMLElement
   private pairSection: HTMLElement
   private actionsSection: HTMLElement
+  private sendOnStop = true
 
   constructor(actions: OpenAGIPhoneActions, allowedOrigins: string[]) {
     const root = document.querySelector<HTMLDivElement>('#app')
@@ -48,11 +53,16 @@ export class OpenAGIPhoneCompanion {
         <section id="actions" class="actions" hidden>
           <button data-action="ask">Ask agent</button><button data-action="newConversation">New conversation</button>
           <button id="cancel-request" hidden>Cancel request</button>
+          <section id="draft-review" class="ambient" hidden><h2>Review question · not sent</h2><p id="draft-text"></p><button id="send-draft">Send question</button><button id="rerecord-draft">Re-record</button><button id="discard-draft">Discard</button></section>
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
           <button id="blank-display">Blank glasses display</button>
-          <section class="ambient"><h2>Speech recognition</h2>
-            <label for="speech-model">Speech model (not the agent's reasoning model)</label>
+          <section class="ambient"><h2>Talk controls</h2>
+            <p>On glasses: tap Talk, speak, then tap Stop talking.</p>
+            <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
+            <p>Turn off to review the transcript and confirm Send first. Applies to manual questions; optional wake listening still triggers automatically.</p>
+            <p>Hold to talk / release to finish is unavailable on G2: the current Even SDK does not provide press and release events.</p>
+            <h2>Speech recognition</h2><label for="speech-model">Speech model (not the agent's reasoning model)</label>
             <select id="speech-model"><option value="openai-buffered">OpenAI · buffered recording</option><option value="nova-3">Deepgram Nova 3 · live</option><option value="nova-2">Deepgram Nova 2 · live</option></select>
             <label for="speech-transport">Live speech connection</label>
             <select id="speech-transport"><option value="relay">Through OpenAGI main · standard key</option><option value="direct">Direct to Deepgram · Member key required</option></select>
@@ -87,6 +97,10 @@ export class OpenAGIPhoneCompanion {
     })
     for (const name of ['ask', 'newConversation', 'unlink'] as const) root.querySelector(`[data-action="${name}"]`)?.addEventListener('click', () => actions[name]())
     root.querySelector('#cancel-request')?.addEventListener('click', () => actions.cancel?.())
+    root.querySelector('#send-draft')?.addEventListener('click', () => actions.sendDraft?.())
+    root.querySelector('#rerecord-draft')?.addEventListener('click', () => actions.rerecordDraft?.())
+    root.querySelector('#discard-draft')?.addEventListener('click', () => actions.discardDraft?.())
+    root.querySelector('#auto-send')?.addEventListener('change', event => actions.configureAutoSend?.((event.target as HTMLInputElement).checked))
     root.querySelector('#previous-page')?.addEventListener('click', () => actions.previousPage?.())
     root.querySelector('#next-page')?.addEventListener('click', () => actions.nextPage?.())
     root.querySelector('#last-answer')?.addEventListener('click', () => actions.recentAnswer?.())
@@ -109,10 +123,21 @@ export class OpenAGIPhoneCompanion {
   set(status: string, detail: string): void {
     this.status.textContent = status; this.detail.textContent = detail
     const ask = this.actionsSection.querySelector<HTMLButtonElement>('[data-action="ask"]')
-    if (ask) ask.textContent = /Opening microphone|Recording question/.test(status) ? 'Stop and send' : 'Ask agent'
+    if (ask) ask.textContent = /Opening microphone|Recording question/.test(status) ? (this.sendOnStop ? 'Stop talking · send' : 'Stop talking · review') : status.startsWith('Review question') ? 'Send question' : 'Talk'
     if (/failed|could not|check|not allowed/i.test(status)) this.status.scrollIntoView?.({ block: 'center' })
   }
   paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value }
+  autoSend(enabled: boolean): void {
+    this.sendOnStop = enabled
+    const input = this.actionsSection.querySelector<HTMLInputElement>('#auto-send')
+    if (input) input.checked = enabled
+  }
+  draft(text: string | null): void {
+    const panel = this.actionsSection.querySelector<HTMLElement>('#draft-review')
+    if (panel) panel.hidden = text === null
+    const preview = this.actionsSection.querySelector('#draft-text')
+    if (preview) preview.textContent = text ?? ''
+  }
   requestActive(active: boolean): void {
     const cancel = this.actionsSection.querySelector<HTMLButtonElement>('#cancel-request')
     if (cancel) cancel.hidden = !active
