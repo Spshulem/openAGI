@@ -1,4 +1,22 @@
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+
+function engineEnvironment() {
+  const env = Object.fromEntries(["HOME", "USER", "PATH", "LANG", "TMPDIR"]
+    .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+  env.OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS = "0";
+  env.OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY = "1";
+  return env;
+}
+
+export function readOcuPermissions(command, run = execFile) {
+  return new Promise((resolve, reject) => {
+    run(command, ["doctor"], { env: engineEnvironment(), timeout: 3000,
+      maxBuffer: 16 * 1024, killSignal: "SIGKILL", encoding: "utf8" }, (error, stdout) => {
+      if (error) reject(new Error("Open Computer Use permission probe failed."));
+      else resolve(stdout);
+    });
+  });
+}
 
 // A private stdio connection, not an unrestricted MCP registration. No tool
 // arguments, screenshots, stderr, or provider credentials enter daemon logs.
@@ -14,14 +32,16 @@ export class OcuTransport {
   async connect(signal) {
     if (this.proc) return;
     signal?.throwIfAborted();
-    const env = Object.fromEntries(["HOME", "USER", "PATH", "LANG", "TMPDIR"]
-      .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
-    env.OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS = "0";
+    // v0.3.3 otherwise proxies even the native executable to a shared,
+    // LaunchServices-owned app agent. Killing that proxy does NOT cancel the
+    // app agent's input. Own the actual dispatcher and its snapshot cache.
+    const env = engineEnvironment();
     const child = this.spawn(this.command, ["mcp"], { stdio: ["pipe", "pipe", "pipe"], env });
     this.proc = child;
     child.stderr.resume();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", chunk => {
+      if (this.proc !== child) return;
       this.buffer += chunk;
       if (Buffer.byteLength(this.buffer) > 16 * 1024 * 1024) return this.close();
       let end;
@@ -39,9 +59,9 @@ export class OcuTransport {
         else pending.resolve(value.result);
       }
     });
-    child.on("error", () => this.close());
+    child.on("error", () => { if (this.proc === child) this.close(); });
     child.on("exit", () => { if (this.proc === child) this.close(); });
-    child.stdin.on("error", () => this.close());
+    child.stdin.on("error", () => { if (this.proc === child) this.close(); });
     const result = await this.request("initialize", { protocolVersion: "2024-11-05", capabilities: {},
       clientInfo: { name: "openagi-computer-node", version: "1" } }, signal);
     if (!result?.serverInfo) { this.close(); throw new Error("Invalid Open Computer Use initialization."); }

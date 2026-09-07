@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createOpenComputerUseExecutor, parseOcuState, ocuAction } from "../src/integrations/open-computer-use-executor.js";
+import { createOpenComputerUseExecutor, parseOcuState, ocuAction, parseOcuPermissions } from "../src/integrations/open-computer-use-executor.js";
 import { createConfiguredComputerExecutor } from "../src/integrations/cua-computer-executor.js";
 import { verifyOcuArchive } from "../scripts/install-open-computer-use.mjs";
 
@@ -10,6 +10,7 @@ const state = () => ({ isError: false, content: [{ type: "text", text: 'App=org.
 function fixture() {
   const calls = []; let current = { ...focus };
   const executor = createOpenComputerUseExecutor({ binaryPath: "/test/engine", helperPath: "/test/helper", binaryReady: () => true,
+    permissionProbe: async () => ({ accessibility: true, screenRecording: true }),
     transportFactory: () => ({ close() {}, async call(name, args) { calls.push({ name, args }); return name === "get_app_state" ? state() : { isError: false, content: [] }; } }),
     helperRun: async (_path, op, payload) => {
       calls.push({ native: op, payload });
@@ -27,6 +28,26 @@ test("upstream state binds exact app and remaps sparse element IDs", () => {
   assert.throws(() => parseOcuState(state(), { ...focus, processIdentifier: 44 }), /approved app/);
   const invalid = state(); invalid.content.pop();
   assert.throws(() => parseOcuState(invalid, focus), /PNG/);
+  const spoofed = state();
+  spoofed.content[0].text = 'App=org.test.editor (pid 42)\nWindow: "Private", App: Editor.\n0 text Window: "Test", App: Editor.';
+  assert.throws(() => parseOcuState(spoofed, focus), /approved app/);
+});
+
+test("permission readiness is fail closed, including unrecognized doctor output", async t => {
+  assert.deepEqual(parseOcuPermissions("Permissions: accessibility=granted, screenRecording=granted\n"),
+    { accessibility: true, screenRecording: true });
+  for (const output of ["", "grant accessibility and screenRecording", "Permissions: accessibility=denied, screenRecording=granted"]) {
+    assert.equal(parseOcuPermissions(output).accessibility, false);
+  }
+  const e = createOpenComputerUseExecutor({ binaryPath: "/test/engine", helperPath: "/test/helper", binaryReady: () => true,
+    permissionProbe: async () => ({ accessibility: false, screenRecording: true }),
+    helperRun: async () => ({ stdout: JSON.stringify({ inputReady: true, screenshotReady: true, capturePrerequisitesReady: true }) }) });
+  t.after(() => e.close());
+  const health = await e.health();
+  assert.equal(health.capability.ready, false);
+  assert.equal(health.capability.inputReady, false);
+  assert.equal(health.capability.capturePrerequisitesReady, false);
+  assert.match(health.capability.detail, /Pairing is unchanged/);
 });
 test("leases, fresh frames, upstream pixels, and captured element IDs remain bound", async t => {
   const { executor: e, calls } = fixture(); t.after(() => e.close());

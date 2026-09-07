@@ -5,9 +5,9 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolveDataDir } from "../src/data-dir.js";
-import { OCU_VERSION } from "../src/integrations/open-computer-use-executor.js";
+import { OCU_VERSION, OCU_RELEASE } from "../src/integrations/ocu-release.js";
 
-export const OCU_INTEGRITY = "A4xCoXgu+Mwi2OdhL15FHY/VcnhhxIJwRgSmC2LwX9mTya85VO2NZN8PNholvgQeTeOlPpej+eEucHXtPhhVrA==";
+export const OCU_INTEGRITY = OCU_RELEASE.integrity;
 export function verifyOcuArchive(bytes) {
   if (crypto.createHash("sha512").update(bytes).digest("base64") !== OCU_INTEGRITY) throw new Error("Open Computer Use archive integrity mismatch; nothing installed.");
 }
@@ -15,7 +15,7 @@ export async function installOpenComputerUse() {
   if (process.platform !== "darwin" || Number(os.release().split(".")[0]) < 23) throw new Error("This OpenAGI adapter currently requires macOS 14 or later.");
   const destination = path.join(resolveDataDir(), "tools", "open-computer-use", OCU_VERSION);
   if (fs.existsSync(destination)) throw new Error("This version's install directory already exists; inspect it rather than overwriting it.");
-  const response = await fetch(`https://registry.npmjs.org/open-computer-use/-/open-computer-use-${OCU_VERSION}.tgz`, { signal: AbortSignal.timeout(60_000) });
+  const response = await fetch(OCU_RELEASE.archive, { signal: AbortSignal.timeout(60_000) });
   if (!response.ok) throw new Error("Could not download the pinned Open Computer Use package.");
   const chunks = []; let total = 0;
   for await (const chunk of response.body) {
