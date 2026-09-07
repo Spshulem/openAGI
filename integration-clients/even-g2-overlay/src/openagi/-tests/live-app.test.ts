@@ -28,7 +28,7 @@ async function fixture() {
   const audio = { active: true, start: vi.fn((cb: typeof receive) => { receive = cb; return Promise.resolve() }), stop: vi.fn(() => Promise.resolve()) }
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon' })), ask: vi.fn(), listen: vi.fn() }
-  const renderer = { home: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
+  const renderer = { home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
   const phone = { set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return speech as unknown as LiveSpeech })
@@ -46,7 +46,7 @@ it('returns from inbox to listening, redraws new counts, and preserves services 
   f.app.openInbox(); f.app.doubleTap()
   await Promise.resolve()
   expect(f.store.snapshot().ambientEnabled).toBe(true)
-  expect(f.renderer.ambient).toHaveBeenLastCalledWith('Peri')
+  expect(f.renderer.passive).toHaveBeenLastCalledWith(false, false, 'Peri')
   await f.app.systemExit()
 })
 
@@ -70,6 +70,7 @@ it('streams packets before Stop, then reviews without sending until confirmed', 
 
 it('triggers once from finalized wake speech, keeps interim words live during agent work and drops extra triggers', async () => {
   const f = await fixture()
+  await f.app.configureListeningMode('wake')
   let complete!: (value: { question: string; reply: string }) => void
   f.api.askText.mockImplementation(() => new Promise(resolve => { complete = resolve }))
   await f.app.configureAmbient(true, 'Peri', false)
@@ -81,6 +82,70 @@ it('triggers once from finalized wake speech, keeps interim words live during ag
   expect(f.phone.transcript).toHaveBeenLastCalledWith('More speech')
   expect(f.api.askText).toHaveBeenCalledOnce()
   complete({ question: 'What time is it?', reply: 'Noon' }); await Promise.resolve(); await Promise.resolve()
+  await f.app.systemExit()
+})
+
+it('quiet listening captures no automatic questions and keeps words off the glasses', async () => {
+  const f = await fixture()
+  try {
+    expect(f.store.snapshot().listeningMode).toBe('passive')
+    await f.app.configureAmbient(true, 'Peri', true)
+    f.callbacks().transcript('Peri what time is it?', true, 0)
+    f.callbacks().utterance('Peri what time is it?')
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.renderer.transcript).not.toHaveBeenCalled()
+    expect(f.renderer.passive).toHaveBeenCalledWith(false, false, 'Peri')
+    f.app.tap(); await vi.waitFor(() => expect(f.audio.start).toHaveBeenCalledTimes(2))
+    await f.app.finishAsk(); await f.app.sendDraft()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+    expect(f.audio.start).toHaveBeenCalledTimes(3)
+    expect(f.store.snapshot().ambientEnabled).toBe(true)
+    expect(f.renderer.answer).toHaveBeenLastCalledWith('Noon', 0, 1)
+  } finally { await f.app.systemExit() }
+})
+
+it('buffered quiet listening ignores trigger results while still capturing final text', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureSpeech('openai-buffered')
+    f.api.listen.mockResolvedValue({ question: 'Peri do something', triggered: true, armed: true, prompt: 'do something' })
+    const capture = vi.spyOn(f.app.proactive, 'capture')
+    await f.app.configureAmbient(true, 'Peri', true)
+    const frame = (amplitude: number): Uint8Array => new Uint8Array(new Int16Array(1600).fill(amplitude).buffer)
+    for (let i = 0; i < 4; i++) f.receive(frame(2000))
+    for (let i = 0; i < 8; i++) f.receive(frame(0))
+    await vi.waitFor(() => expect(capture).toHaveBeenCalledWith('Peri do something'))
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
+    expect(f.api.listen).toHaveBeenCalledWith(expect.any(Blob), expect.any(String), expect.objectContaining({ answerQuestions: false, forceAnswer: false }))
+  } finally { await f.app.systemExit() }
+})
+
+it('start lifelog opens the microphone automatically and foreground exit revokes retention', async () => {
+  const f = await fixture()
+  const proactive = vi.fn(async (body: { op: string; enabled?: boolean }) => body.op === 'consent' && body.enabled ? { consent: { id: 'fixture-consent', until: Date.now() + 60000 } } : { items: [] })
+  Object.assign(f.api, { proactive })
+  try {
+    await f.app.configureMemory(true, true)
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(true)
+    f.app.setForeground(false); await Promise.resolve()
+    expect(f.app.proactive.memoryActive).toBe(false); expect(f.speech.close).toHaveBeenCalled()
+    expect(proactive).toHaveBeenCalledWith(expect.objectContaining({ op: 'consent', enabled: false, consentId: 'fixture-consent' }))
+    f.app.setForeground(true); await Promise.resolve()
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit() }
+})
+
+it('withdrawn consent during microphone startup never enables retention', async () => {
+  const f = await fixture()
+  const proactive = vi.fn(async (_body: { op: string }) => ({ items: [] }))
+  Object.assign(f.api, { proactive })
+  let opened!: () => void
+  f.speech.open.mockImplementationOnce(() => new Promise<void>(resolve => { opened = resolve }))
+  const pending = f.app.configureMemory(true, true)
+  await vi.waitFor(() => expect(opened).toBeTypeOf('function'))
+  await f.app.configureMemory(false, false); opened(); await pending
+  expect(f.app.proactive.memoryActive).toBe(false)
+  expect(proactive.mock.calls.some(args => (args[0] as { op?: string } | undefined)?.op === 'consent')).toBe(false)
+  expect(f.store.snapshot().ambientEnabled).toBe(false)
   await f.app.systemExit()
 })
 

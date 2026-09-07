@@ -13,6 +13,7 @@ export interface ProactiveView {
 // Ambient uploads are final text only, opt-in, ephemeral and never replayed.
 export class G2ProactiveClient {
   items: InboxItem[] = []
+  get memoryActive(): boolean { return Boolean(this.consent && this.consent.until > Date.now()) }
   private timer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private consent: { id: string; until: number } | null = null

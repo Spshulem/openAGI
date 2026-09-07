@@ -5,6 +5,11 @@ export class OpenAGIGlassesRenderer {
   private sendOnStop = true
   private memoryActive = false
   private pendingInbox = 0
+  private pulse = 0
+  passive(retaining: boolean, wake: boolean, phrase: string): void {
+    const dots = '.'.repeat(this.pulse++ % 3 + 1)
+    this.show(`Listening ${dots}\n\n${retaining ? 'Lifelog ON · saving final text' : 'Lifelog OFF · not retaining text'}\n${wake ? `Wake phrase: ${phrase}` : 'Quiet mode · tap to ask'}\n\nTap: Talk · Double-tap: pause\n${this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})` : 'Main updates appear when ready'}\nForeground only`, false)
+  }
   inboxCount(count: number): void { this.pendingInbox = count }
   memory(active: boolean): void { this.memoryActive = active }
   autoSend(enabled: boolean): void { this.sendOnStop = enabled }

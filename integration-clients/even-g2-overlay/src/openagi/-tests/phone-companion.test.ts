@@ -3,6 +3,21 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('offers paired lifelog reading without a token link and separates wake responses', () => {
+  const readLifelog = vi.fn(), configureListeningMode = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), readLifelog, configureListeningMode }, [])
+  phone.paired(true); phone.listeningMode('passive')
+  expect(document.querySelector<HTMLElement>('#wake-settings')?.hidden).toBe(true)
+  document.querySelector<HTMLButtonElement>('#read-lifelog')?.click()
+  expect(readLifelog).toHaveBeenCalledWith('', 0)
+  phone.lifelog({ total: 1, moments: [{ id: 'one', at: 1, title: '<img src=x>', segments: [{ text: '<script>untrusted</script>' }] }] })
+  expect(document.querySelector('#lifelog-moments img')).toBeNull()
+  expect(document.querySelector('#lifelog-moments script')).toBeNull()
+  expect(document.querySelector('#lifelog-moments')?.textContent).toContain('untrusted')
+  expect(document.querySelector('#lifelog-panel a')).toBeNull()
+  phone.paired(false); expect(document.querySelector('#lifelog-moments')?.textContent).toBe('')
+})
+
 it('keeps memory separate from wake listening and renders inbox evidence safely', () => {
   const memoryConsent = vi.fn(), inboxAction = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), memoryConsent, inboxAction }, [])
