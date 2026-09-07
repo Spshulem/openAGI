@@ -401,8 +401,10 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     }
   };
 
-  const invokeNodeAction = async (node, session, action, operation, payload = {}) => {
+  const invokeNodeAction = async (node, session, action, operation, payload = {}, signal) => {
+    signal?.throwIfAborted();
     const lease = await ensureNodeLease(node, session);
+    signal?.throwIfAborted();
     if (lease.inFlightSequence != null) {
       throw new Error("another computer-use action is already in progress");
     }
@@ -452,6 +454,23 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       ? runtime.computerUseLog.getSession(sessionOrId)
       : sessionOrId;
     return await abortSession(session, reason, "aborted");
+  };
+
+  const invokeCancellableNodeAction = async (node, session, action, operation, payload, signal) => {
+    // G2's streaming request already carries this signal through AgentHost.
+    // Aborting a provider stream alone does not stop a dispatched desktop tool.
+    const stop = () => {
+      void abortSession(session, "source request cancelled; renew computer-use approval").catch(() => {});
+    };
+    if (signal?.aborted) { stop(); signal.throwIfAborted(); }
+    signal?.addEventListener("abort", stop, { once: true });
+    try {
+      const result = await invokeNodeAction(node, session, action, operation, payload, signal);
+      signal?.throwIfAborted();
+      return result;
+    } finally {
+      signal?.removeEventListener("abort", stop);
+    }
   };
 
   registry.register({
@@ -657,7 +676,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       const node = computerNode(runtime, session);
       if (node) {
         try {
-          const shot = await invokeNodeAction(node, session, action, "screenshot", {});
+          const shot = await invokeCancellableNodeAction(node, session, action, "screenshot", {}, context.signal);
           runtime.computerUseLog.markActionResult(action.id, {
             status: "executed",
             result: { width: shot.width, height: shot.height, bytes: shot.bytes }
@@ -742,7 +761,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           throw new Error(EXECUTION_UNAVAILABLE);
         }
         try {
-          const nodeResult = await invokeNodeAction(node, session, action, nodePath, payloadOf(actionArgs));
+          const nodeResult = await invokeCancellableNodeAction(node, session, action, nodePath, payloadOf(actionArgs), context.signal);
           if (runtime.computerUseLog.getSession(session.id)?.status !== "active") {
             runtime.computerUseLog.markActionResult(action.id, { status: "aborted", error: "session-stopped" });
             throw Object.assign(new Error("computer-use session was stopped before the action result was accepted"), {

@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createComputerExecutor, runComputerHelper } from "./computer-server.js";
-import { OcuTransport } from "./ocu-transport.js";
+import { OcuTransport, readOcuPermissions } from "./ocu-transport.js";
+import { OCU_VERSION } from "./ocu-release.js";
 
-export const OCU_VERSION = "0.3.3";
+export { OCU_VERSION };
 const OPERATIONS = ["list_apps", "activate_app", "click", "click_element", "drag", "move", "type", "key", "scroll", "set_value", "scroll_element"];
 const sameFocus = (a, b) => ["windowID", "processIdentifier", "bundleIdentifier", "title", "x", "y", "width", "height"].every(key => a?.[key] === b?.[key]);
 
@@ -11,6 +12,7 @@ const sameFocus = (a, b) => ["windowID", "processIdentifier", "bundleIdentifier"
 // privacy/focus gate and handles operations absent from upstream 0.3.3.
 export function createOpenComputerUseExecutor({ binaryPath, helperPath = process.env.OPENAGI_COMPUTER_HELPER,
   helperRun = runComputerHelper, transportFactory = () => new OcuTransport(binaryPath),
+  permissionProbe = async () => parseOcuPermissions(await readOcuPermissions(binaryPath)),
   binaryReady = file => { try { fs.accessSync(file, fs.constants.X_OK); return path.isAbsolute(file); } catch { return false; } },
   ...options } = {}) {
   let transport = null, snapshot = null, activeFrame = null, busy = false;
@@ -27,9 +29,18 @@ export function createOpenComputerUseExecutor({ binaryPath, helperPath = process
       if (!binaryReady(binaryPath) || !helperPath) return { operations: [], inputReady: false, screenshotReady: false,
         detail: "Install Open Computer Use 0.3.3 and configure the signed OpenAGI privacy helper." };
       try {
-        const status = JSON.parse(String((await native("status", null, { timeoutMs: 3000 })).stdout));
-        return { ...status, operations: OPERATIONS, detail: "Experimental Open Computer Use 0.3.3; upstream permissions are verified on use. Native privacy and lease checks remain enforced." };
-      } catch { return { operations: [], inputReady: false, screenshotReady: false, detail: "OpenAGI privacy/permission checks are unavailable." }; }
+        const [permissions, result] = await Promise.all([
+          permissionProbe(), native("status", null, { timeoutMs: 3000 })
+        ]);
+        const status = JSON.parse(String(result.stdout));
+        if (!permissions.accessibility || !permissions.screenRecording) return {
+          operations: [], inputReady: false, screenshotReady: false, capturePrerequisitesReady: false,
+          detail: "Open Computer Use needs Accessibility and Screen Recording permission on this Mac. Pairing is unchanged."
+        };
+        return { ...status, operations: OPERATIONS, detail: status.inputReady && status.screenshotReady
+          ? `Experimental Open Computer Use ${OCU_VERSION}; isolated engine process. Physical input safety acceptance is still required.`
+          : status.detail || "Focus an allowed window on the unlocked target Mac, then take a fresh screenshot." };
+      } catch { return { operations: [], inputReady: false, screenshotReady: false, detail: "OpenAGI or Open Computer Use permission checks are unavailable. Check both helpers on the target Mac." }; }
     },
     screenshot: async (_run, _geometry, { signal }) => {
       reset();
@@ -82,7 +93,7 @@ export function createOpenComputerUseExecutor({ binaryPath, helperPath = process
 export function parseOcuState(result, focus) {
   const text = result.content.filter(item => item.type === "text").map(item => item.text).join("\n");
   if (!text.startsWith(`App=${focus.bundleIdentifier} (pid ${focus.processIdentifier})\n`)
-    || !text.includes(`Window: ${JSON.stringify(focus.title)},`)) throw new Error("Upstream did not capture the approved app/window.");
+    || !text.split("\n")[1]?.startsWith(`Window: ${JSON.stringify(focus.title)}, App: `)) throw new Error("Upstream did not capture the approved app/window.");
   const image = result.content.find(item => item.type === "image" && item.mimeType === "image/png");
   if (!image || typeof image.data !== "string" || image.data.length > 12 * 1024 * 1024) throw new Error("Upstream did not return a bounded PNG screenshot.");
   const png = Buffer.from(image.data, "base64");
@@ -99,6 +110,12 @@ export function parseOcuState(result, focus) {
   });
   if (Buffer.byteLength(accessibility) > 96 * 1024) throw new Error("Upstream tree limit exceeded.");
   return { base64: image.data, width, height, bytes: png.length, accessibility, elements };
+}
+
+export function parseOcuPermissions(output) {
+  // Do not interpret arbitrary permission-related text as a successful grant.
+  const match = /^Permissions: accessibility=(granted|missing), screenRecording=(granted|missing)$/m.exec(output.trim());
+  return { accessibility: match?.[1] === "granted", screenRecording: match?.[2] === "granted" };
 }
 
 export function ocuAction(operation, payload) {

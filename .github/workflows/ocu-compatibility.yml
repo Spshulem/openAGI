@@ -1,0 +1,32 @@
+name: Open Computer Use compatibility
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'src/integrations/*computer*'
+      - 'src/integrations/ocu-*'
+      - 'src/integrations/g2-channel.js'
+      - 'src/agent-host.js'
+      - 'src/node-control.js'
+      - 'scripts/install-open-computer-use.mjs'
+      - 'test/*computer*'
+      - 'test/ocu-*'
+      - 'test/node-control.test.js'
+      - 'test/g2-cancellation.test.js'
+      - '.github/workflows/ocu-compatibility.yml'
+permissions:
+  contents: read
+jobs:
+  guarded-adapter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node --test test/open-computer-use.test.js test/ocu-transport.test.js test/computer-use-request-cancel.test.js test/computer-server.test.js test/computer-use-approval.test.js test/node-control.test.js test/g2-cancellation.test.js
