@@ -67,7 +67,8 @@ export function lifelogDispatch(n, body, now) {
       || s.model.length > 100 || !Number.isInteger(s.maxReviewsPerDay) || s.maxReviewsPerDay < 1 || s.maxReviewsPerDay > 48
       || (s.analysis && !/^[a-zA-Z0-9._:/-]{1,100}$/.test(s.model))) fail("Select an explicit analysis model and a daily limit (1–48)");
     if (s.model !== l.settings.model) l.failed = {};
-    l.settings = s; l.generation++; return { settings: s };
+    l.settings = s; l.generation++; l.status = s.analysis ? "Waiting for review" : "Analysis off"; l.error = null;
+    return { settings: s };
   }
   if (body.op === "lifelog-label") {
     if (!n.segments.some(s => s.speakerKey === body.speakerKey) || typeof body.label !== "string" || body.label.length > 80) fail("Select an existing speaker and a label of at most 80 characters");
@@ -113,9 +114,11 @@ export function lifelogDispatch(n, body, now) {
   });
   const offset = Math.max(0, Math.min(20000, Number.isInteger(body.offset) ? body.offset : 0));
   const selected = body.op === "lifelog-export" ? [...all].reverse() : [...all].reverse().slice(offset, offset + 25);
+  const selectedSegments = new Set(selected.flatMap(m => m.segments.map(s => s.id)));
+  const selectedSpeakers = new Set(selected.flatMap(m => m.speakers));
   const relatedIndex = new Map();
   const keysFor = m => [...m.topics.map(t => 'topic:' + t.toLowerCase()), ...m.speakers.map(s => l.labels[s]).filter(Boolean).map(s => 'person:' + s)];
-  for (const m of history) for (const key of keysFor(m)) {
+  for (const m of (body.op === "lifelog-export" ? selected : history)) for (const key of keysFor(m)) {
     const entries = relatedIndex.get(key) || []; entries.push(m); relatedIndex.set(key, entries.slice(-9));
   }
   for (const m of selected) {
@@ -129,8 +132,10 @@ export function lifelogDispatch(n, body, now) {
     }).slice(-8);
   }
   return { moments: selected, total: all.length, nextOffset: offset + 25 < all.length ? offset + 25 : null,
-    labels: l.labels, settings: l.settings, retentionDays: n.settings.retentionDays, followups: Object.values(l.followups),
-    digest: selected.map(m => ({ id: m.id, title: m.title, at: m.at, summary: m.review?.summary || text(m.segments[0]?.text, 240), inferred: Boolean(m.review) })),
+    labels: Object.fromEntries(Object.entries(l.labels).filter(([key]) => selectedSpeakers.has(key))), settings: l.settings, retentionDays: n.settings.retentionDays,
+    followups: Object.values(l.followups).filter(f => selectedSegments.has(f.segmentId)),
+    digest: [...all].reverse().slice(0, 200).map(m => ({ id: m.id, title: m.title, at: m.at, summary: m.review?.summary || text(m.segments[0]?.text, 240), inferred: Boolean(m.review) })),
+    digestTotal: all.length, digestTruncated: all.length > 200,
     analysis: { attempts: l.attempts, day: l.day, status: l.status || "Not reviewed", error: l.error || null },
     consentActive: Boolean(n.consent), exportedAt: body.op === "lifelog-export" ? now : undefined };
 }

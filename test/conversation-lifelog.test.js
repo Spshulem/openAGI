@@ -124,3 +124,29 @@ test("invalid model output is not automatically retried or allowed to monopolize
   await run(); f.advance(360000); await run(); assert.equal(calls, 1);
   f.call({ op: "lifelog-retry" }); await run(); assert.equal(calls, 2);
 });
+
+test("filtered export excludes unrelated labels, followups and related titles; reads do not write", t => {
+  const f = fixture(t); f.capture("Public launch plan"); const first = f.n.segments[0];
+  f.call({ op: "lifelog-label", speakerKey: first.speakerKey, label: "Alex" });
+  f.call({ op: "lifelog-edit", id: first.id, topics: ["Shared"] });
+  f.advance(360000); f.renew(); f.capture("Unrelated private discussion", 1); const second = f.n.segments[1];
+  f.call({ op: "lifelog-label", speakerKey: second.speakerKey, label: "Private Person" });
+  f.call({ op: "lifelog-edit", id: second.id, topics: ["Shared"] });
+  f.call({ op: "lifelog-followup", segmentId: second.id, title: "Private followup", status: "confirmed" });
+  let writes = 0; f.store.save = () => { writes++; };
+  const result = f.call({ op: "lifelog-export", query: "Public" });
+  assert.equal(result.moments.length, 1); assert.deepEqual(Object.values(result.labels), ["Alex"]);
+  assert.deepEqual(result.followups, []); assert.deepEqual(result.moments[0].related, []);
+  f.call({ op: "lifelog" }); assert.equal(writes, 0);
+});
+
+test("daily digest covers more than one page and cancellation clears active status", async t => {
+  const f = fixture(t);
+  for (let i = 0; i < 26; i++) { f.n.segments.push({ id: `segment-${i}`, text: "Meeting", at: f.now() - i * 360000, captureSession: `stream-${i}` }); }
+  const result = f.call({ op: "lifelog" }); assert.equal(result.moments.length, 25); assert.equal(result.digest.length, 26);
+  f.call({ op: "lifelog-settings", settings: { analysis: true, model: "fixture-model" } });
+  await reviewLifelog(f.n, { provider: { isConfigured: () => true, generate: async () => {
+    f.call({ op: "lifelog-settings", settings: { analysis: false } }); return { text: "{}" };
+  } }, now: f.now(), save: () => f.store.save() });
+  assert.equal(lifelogState(f.n).status, "Analysis off");
+});

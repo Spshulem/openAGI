@@ -3,6 +3,26 @@ import { G2ProactiveClient } from '../proactive'
 
 afterEach(() => vi.useRealTimers())
 
+it('retains eleven separate utterances across bounded batches', async () => {
+  vi.useFakeTimers(); const f = fixture(); f.client.start(); await f.client.enableMemory(true)
+  for (let i = 0; i < 11; i++) f.client.capture(`Utterance ${i}`)
+  await vi.advanceTimersByTimeAsync(47000)
+  const batches = f.api.proactive.mock.calls.filter(([b]) => b.op === 'capture').map(([b]) => (b as { texts?: string[] }).texts!)
+  expect(batches.map(b => b.length)).toEqual([10, 1]); f.client.stop()
+})
+
+it('does not acknowledge a notification when the app becomes busy during permission check', async () => {
+  vi.useFakeTimers(); const f = fixture(); f.idle.mockReturnValue(true)
+  const original = f.api.proactive.getMockImplementation()!
+  f.api.proactive.mockImplementation(async body => {
+    if (body.op === 'can-notify') f.idle.mockReturnValue(false)
+    return original(body)
+  })
+  f.client.start(); await vi.advanceTimersByTimeAsync(1)
+  expect(f.notify).not.toHaveBeenCalled()
+  expect(f.api.proactive.mock.calls.some(([b]) => b.op === 'notify')).toBe(false); f.client.stop()
+})
+
 it('coalesces rapid final events from one speaker without losing stream metadata', async () => {
   vi.useFakeTimers(); const f = fixture(); f.client.start(); await f.client.enableMemory(true)
   const start = Date.now()
@@ -12,7 +32,7 @@ it('coalesces rapid final events from one speaker without losing stream metadata
   f.client.stop()
 })
 function fixture() {
-  const api = { proactive: vi.fn(async (body: { op: string }) => body.op === 'consent' ? { consent: { id: 'session-consent', until: Date.now() + 3600_000 } } : body.op === 'notify' ? { notify: true } : {
+  const api = { proactive: vi.fn(async (body: { op: string }) => body.op === 'consent' ? { consent: { id: 'session-consent', until: Date.now() + 3600_000 } } : ['notify', 'can-notify'].includes(body.op) ? { notify: true } : {
     settings: { enabled: true, categories: ['approvals'], retentionDays: 1, quietStart: 22, quietEnd: 8, timeZone: 'UTC', maxPerHour: 3 },
     quiet: false, items: [{ id: 'approval', title: 'Review needed', summary: 'Open main', important: true, seen: false, action: 'review-on-main', category: 'approvals' }],
   }) }

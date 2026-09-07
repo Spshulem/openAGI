@@ -175,9 +175,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const targets = context.channel === "g2" ? (nodeRegistry.enrollment(context.sourceNodeId)?.platform === EVEN_G2_PLATFORM ? [{ nodeId: context.sourceNodeId }] : [])
         : ["web", "desktop", "mac", "http", "api", "cli", "local"].includes(context.channel) ? enrolled : [];
       if (!targets.length) throw new Error("Lifelog recall requires an enrolled G2 or owner desktop chat.");
-      return { untrusted: true, moments: targets.flatMap(n => g2Proactive.dispatch(n.nodeId, { op: "lifelog", query: args.query, date: args.date }).moments.slice(0, 5).map(m => ({
-        id: m.id, at: m.at, title: m.title, summary: m.review?.summary || null, inferred: Boolean(m.review),
-        evidence: m.segments.slice(0, 4).map(s => ({ id: s.id, at: s.at, text: s.text.slice(0, 500), speakerVerified: false })) }))).slice(0, 10) };
+      const query = (args.query || "").toLowerCase();
+      return { untrusted: true, moments: targets.flatMap(n => g2Proactive.dispatch(n.nodeId, { op: "lifelog", query: args.query, date: args.date }).moments.slice(0, 10).map(m => {
+        const matching = query ? m.segments.filter(s => s.text.toLowerCase().includes(query)) : [];
+        const evidence = [...new Map([...matching, ...m.segments].map(s => [s.id, s])).values()].slice(0, 4).map(s => {
+          const start = query ? Math.max(0, s.text.toLowerCase().indexOf(query) - 100) : 0;
+          return { id: s.id, at: s.at, text: s.text.slice(start, start + 500), speakerVerified: false };
+        });
+        return { nodeId: n.nodeId, id: m.id, at: m.at, title: m.title, summary: m.review?.summary || null, inferred: Boolean(m.review), evidence };
+      })).sort((a, b) => b.at - a.at).slice(0, 10) };
     } });
   const g2RetentionTimer = setInterval(() => { try { g2Proactive.prune(); void g2Proactive.reviewPending().catch(() => {}); } catch { /* retried on the next read or sweep */ } }, 60_000);
   g2RetentionTimer.unref?.();
@@ -1545,6 +1551,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (!body || typeof body !== "object" || Array.isArray(body)) return sendG2NodeJson(res, 400, { error: "Invalid request" });
           if (!scoped && body.op === "devices") return sendJson(res, 200, { nodes: nodeRegistry.listEnrollments().filter(n => n.platform === EVEN_G2_PLATFORM).map(n => ({ nodeId: n.nodeId, name: n.name })) });
           if (scoped && Object.hasOwn(body, "nodeId")) return sendG2NodeJson(res, 400, { error: "Cannot select another node" });
+          if (scoped && typeof body.op === "string" && body.op.startsWith("lifelog-") && body.op !== "lifelog-export")
+            return sendG2NodeJson(res, 403, { error: "Lifelog changes and screen context are owner-only" });
           const nodeId = scoped ? requestNodeId : body.nodeId;
           if (typeof nodeId !== "string" || nodeRegistry.enrollment(nodeId)?.platform !== EVEN_G2_PLATFORM) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
           if (body.op === "lifelog-context") {

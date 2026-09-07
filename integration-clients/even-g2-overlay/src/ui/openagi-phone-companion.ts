@@ -134,6 +134,9 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#refresh-inbox')?.addEventListener('click', () => actions.refreshInbox?.())
     root.querySelector('#open-inbox')?.addEventListener('click', () => actions.openInbox?.())
     root.querySelector('#memory-enabled')?.addEventListener('change', () => actions.memoryConsent?.(root.querySelector<HTMLInputElement>('#memory-enabled')?.checked === true, root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
+    root.querySelector('#recording-consent')?.addEventListener('change', () => {
+      if (root.querySelector<HTMLInputElement>('#recording-consent')?.checked !== true) actions.memoryConsent?.(false, false)
+    })
     root.querySelector('#delete-memory')?.addEventListener('click', () => { if (window.confirm('Stop memory and delete transcripts and suggestions on main? Previously accepted tasks remain.')) actions.inboxAction?.('delete-memory') })
     root.querySelector('#proactive-items')?.addEventListener('click', event => {
       const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-inbox-op]') : null

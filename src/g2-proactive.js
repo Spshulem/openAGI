@@ -62,7 +62,8 @@ export class G2Proactive {
     if (body.op === "lifelog" || (typeof body.op === "string" && body.op.startsWith("lifelog-"))) {
       const result = lifelogDispatch(n, body, this.now());
       if (body.op === "lifelog-settings" || body.op === "lifelog-delete" || body.op === "lifelog-edit") this.reviewController?.abort();
-      this.save(); return result;
+      if (!["lifelog", "lifelog-export"].includes(body.op)) this.save();
+      return result;
     }
     switch (body.op) {
       case "settings": return { settings: n.settings, consentActive: Boolean(n.consent) };
@@ -92,14 +93,15 @@ export class G2Proactive {
       }
       case "capture": return this.capture(n, body);
       case "feed": return { settings: n.settings, items: this.feed(n), quiet: this.quiet(n) };
-      case "seen": case "dismiss": case "snooze": case "notify": {
+      case "seen": case "dismiss": case "snooze": case "notify": case "can-notify": {
         const item = this.feed(n).find(i => i.id === body.id);
         if (!item) reject("Inbox item not available", 404);
         const mark = n.marks[item.id] ?? {};
-        if (body.op === "notify") {
+        if (body.op === "notify" || body.op === "can-notify") {
           const hour = Math.floor(this.now() / 3600_000);
-          if (!n.settings.enabled || this.quiet(n) || !item.important || mark.notified || mark.seen
+          if (!n.settings.enabled || this.quiet(n) || !item.important || mark.notified || (mark.seen && body.op === "can-notify")
             || (n.hour === hour && n.notifications >= n.settings.maxPerHour) || n.settings.maxPerHour === 0) return { notify: false };
+          if (body.op === "can-notify") return { notify: true };
           n.notifications = n.hour === hour ? n.notifications + 1 : 1; n.hour = hour; mark.notified = true;
         } else if (body.op === "seen") mark.seen = true;
         else if (body.op === "dismiss") mark.dismissed = true;
@@ -169,7 +171,14 @@ export class G2Proactive {
           signal, alive: () => !this.closed && !signal.aborted, save: () => this.save() });
         if (lifelogState(n).lastAttempt !== before || signal.aborted) break;
       }
-    } finally { this.reviewing = false; this.reviewController = null; }
+    } finally {
+      let changed = false;
+      for (const n of Object.values(this.nodes)) if (n.lifelog?.status === "Reviewing a settled conversation") {
+        n.lifelog.status = n.lifelog.settings.analysis ? "Review interrupted; waiting for next sweep" : "Analysis off"; changed = true;
+      }
+      if (changed) this.save();
+      this.reviewing = false; this.reviewController = null;
+    }
   }
   close() { this.closed = true; this.reviewController?.abort(); }
   async screenContext(nodeId, id) {
@@ -193,7 +202,9 @@ export class G2Proactive {
     if (n.settings.enabled) {
       for (const i of (this.runtime?.outreach?.list?.() ?? []).slice(0, 200)) {
         if (!["unseen", "seen"].includes(i.status) || Date.parse(i.createdAt) < this.now() - 7 * DAY) continue;
-        const kind = i.sourceRef?.kind;
+        const kind = i.sourceRef?.kind === "draft"
+          ? this.runtime?.drafts?.get?.(i.sourceRef.id)?.kind ?? "draft"
+          : i.sourceRef?.kind;
         const coding = kind === "coding-watch";
         const supervisor = this.runtime?.codingSupervisor;
         if (coding && (!supervisor?.configured || !supervisor.state.watches?.[i.sourceRef.id]
@@ -204,7 +215,7 @@ export class G2Proactive {
           important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: "review-on-main",
           ...(coding ? { codingTarget: { provider: i.sourceRef.provider, sessionId: i.sourceRef.sessionId } } : {}) });
       }
-      if (selected.has("tasks")) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: 100 }) ?? []) {
+      if (selected.has("tasks")) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: Infinity }) ?? []) {
         const due = Date.parse(t.dueDate);
         if (!["pending", "in_progress", "blocked"].includes(t.status) || !Number.isFinite(due) || due > this.now() + 3600_000 || due < this.now() - 7 * DAY) continue;
         items.push({ id: `due:${t.id}:${t.dueDate}`, title: clean(t.title, 160), summary: `Due ${t.dueDate}`, category: "tasks", important: true, at: due, action: "review-on-main" });

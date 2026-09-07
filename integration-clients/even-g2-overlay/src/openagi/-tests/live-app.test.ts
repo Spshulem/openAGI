@@ -36,6 +36,20 @@ async function fixture() {
   return { app, api, audio, renderer, phone, speech, store, storage, receive: (pcm: Uint8Array) => receive(pcm), callbacks: () => callbacks }
 }
 
+it('returns from inbox to listening, redraws new counts, and preserves services on invalid agent input', async () => {
+  const f = await fixture()
+  const stop = vi.spyOn(f.app.proactive, 'stop')
+  await f.app.connectAgent('not an origin', 'invalid')
+  expect(stop).not.toHaveBeenCalled()
+  await f.app.configureAmbient(true, 'Peri', false)
+  f.app.proactive.items = [{ id: 'one', title: 'Test', summary: 'Update', important: false, seen: false, category: 'discoveries', action: 'review-on-main' }]
+  f.app.openInbox(); f.app.doubleTap()
+  await Promise.resolve()
+  expect(f.store.snapshot().ambientEnabled).toBe(true)
+  expect(f.renderer.ambient).toHaveBeenLastCalledWith('Peri')
+  await f.app.systemExit()
+})
+
 it('streams packets before Stop, then reviews without sending until confirmed', async () => {
   const f = await fixture(); await f.app.startAsk()
   expect(f.api.speechToken).not.toHaveBeenCalled()

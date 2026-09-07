@@ -58,8 +58,12 @@ export class G2ProactiveClient {
       // Do not claim a notification until the app says it can show it safely.
       const item = this.items.find(i => i.important && !i.seen && !i.notified)
       if (item && !result.quiet && result.settings?.enabled && this.canNotify()) {
-        const allowed = await this.api.proactive({ op: 'notify', id: item.id }, signal)
-        if (!signal.aborted && this.running && allowed.notify && this.canNotify()) this.notify(item)
+        const allowed = await this.api.proactive({ op: 'can-notify', id: item.id }, signal)
+        if (!signal.aborted && this.running && allowed.notify && this.canNotify()) {
+          this.notify(item)
+          item.notified = true
+          await this.api.proactive({ op: 'notify', id: item.id }, signal)
+        }
       }
     } catch (error) { if (!signal.aborted) this.view.activity?.(`Inbox unavailable: ${error instanceof Error ? error.message : 'check main connection'}`) }
     finally { this.refreshing = false }
@@ -74,7 +78,10 @@ export class G2ProactiveClient {
     const generation = this.generation
     try {
       const result = await this.api.proactive({ op: 'consent', enabled: true, recordingConsent }, this.controller.signal)
-      if (generation !== this.generation || !this.running || this.hidden()) return
+      if (generation !== this.generation || !this.running || this.hidden()) {
+        if (result.consent) void this.api.proactive({ op: 'consent', enabled: false, consentId: result.consent.id }).catch(() => {})
+        return
+      }
       this.consent = result.consent ?? null
       this.view.memoryStatus?.(Boolean(this.consent), 'Memory armed for this foreground listening session (up to 4 hours). Final transcripts are retained on your main; speakers are unverified.')
     } catch (error) { this.view.memoryStatus?.(false, `Could not enable memory: ${String(error)}`) }

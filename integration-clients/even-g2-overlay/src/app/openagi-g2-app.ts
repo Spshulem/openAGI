@@ -61,6 +61,7 @@ export class OpenAGIG2App {
       proactiveSettings: settings => phone.proactiveSettings?.(settings),
       inbox: items => {
         phone.inbox?.(items); renderer.inboxCount?.(items.length)
+        if (this.mode === 'home') renderer.home(this.store.snapshot().node?.name)
         if (this.mode === 'inbox') {
           const current = this.inboxItems[this.inboxIndex]?.id
           this.inboxItems = [...items]; this.inboxIndex = items.findIndex(i => i.id === current)
@@ -89,7 +90,7 @@ export class OpenAGIG2App {
     this.renderer.inbox?.(this.pages[this.page] ?? '', this.inboxIndex + 1, this.inboxItems.length, this.page + 1, this.pages.length)
   }
   configureMemory(enabled: boolean, consent: boolean): void {
-    if (!enabled) { this.proactive.pauseMemory(); return }
+    if (!enabled || !consent) { this.proactive.pauseMemory(); return }
     if (!this.ambientRunning) { this.phone.memoryStatus?.(false, 'Enable always-listening first, then explicitly enable conversation memory.'); return }
     void this.proactive.enableMemory(consent)
   }
@@ -202,6 +203,7 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'review') { await this.discardDraft(); return }
+    if (this.mode === 'inbox') { this.showHome(); return }
     if (this.mode === 'home') { this.showRecent(this.store.snapshot().history.length - 1); return }
     this.navigationBusy = true
     try {
@@ -308,7 +310,6 @@ export class OpenAGIG2App {
   }
   async connectAgent(origin: string, token: string): Promise<void> {
     if (this.requestController || this.mode === 'review' || this.mode === 'listening' || this.microphoneOpening) return
-    this.proactive.stop()
     let normalizedOrigin: string
     try { normalizedOrigin = AgentOriginSchema.parse(origin) } catch { this.phone.set('Could not add agent', 'Enter your main server HTTPS origin without a path or credentials.'); return }
     if (this.allowedOrigins.length > 0 && !this.allowedOrigins.includes(normalizedOrigin)) {
@@ -320,6 +321,7 @@ export class OpenAGIG2App {
       this.phone.set('Could not add agent', 'Paste a scoped bearer token between 16 and 4096 characters.')
       return
     }
+    this.proactive.stop()
     await this.stopAmbient()
     await this.store.update({
       connectionMode: 'direct', agentOrigin: normalizedOrigin, nodeToken: cleanToken,

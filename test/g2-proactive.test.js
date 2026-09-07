@@ -147,6 +147,10 @@ test("HTTP scope rejects unauthenticated, non-G2, owner-token and cross-node acc
   assert.equal((await post({ op: "capture", consentId: consent.consent.id, batchId: crypto.randomUUID(), texts: ["I need to send the plan."] }, "first-test-token-123456789")).status, 200);
   assert.equal((await fetch(url + "/g2/lifelog")).status, 401);
   const history = await (await post({ op: "lifelog" }, "first-test-token-123456789")).json(); assert.equal(history.total, 1);
+  for (const op of ["lifelog-settings", "lifelog-retry", "lifelog-label", "lifelog-edit", "lifelog-delete", "lifelog-followup", "lifelog-task"])
+    assert.equal((await post({ op, settings: { analysis: true, model: "fixture" } }, "first-test-token-123456789")).status, 403, op);
+  const devices = await (await post({ op: "devices" }, "test-owner-g2-inbox", undefined, "/g2/proactive")).json();
+  assert.equal(devices.nodes.length, 2);
   assert.equal((await post({ op: "lifelog-context", id: history.moments[0].id }, "first-test-token-123456789")).status, 403);
   const recalled = await runtime.tools.invoke("search_conversation_lifelog", { query: "plan" }, { channel: "g2", sourceNodeId: first });
   assert.equal(recalled.ok, true, recalled.error); assert.equal(recalled.result.moments.length, 1);
@@ -159,6 +163,35 @@ test("HTTP scope rejects unauthenticated, non-G2, owner-token and cross-node acc
   const preflight = await fetch(url + "/nodes/g2/proactive", { method: "OPTIONS", headers: { origin: "https://even.example" } }); assert.equal(preflight.status, 204);
   const cors = await fetch(url + "/nodes/g2/proactive", { method: "POST", headers: { origin: "https://even.example", authorization: "Bearer " + "first-test-token-123456789".padEnd(43, "x"), "content-type": "application/json" }, body: JSON.stringify({ op: "feed" }) }); assert.equal(cors.status, 200);
   assert.equal((await fetch(url + "/g2/proactive")).status, 401);
+  const now = Date.now(); let newest;
+  for (let device = 0; device < 3; device++) {
+    const nodeId = crypto.randomUUID(), token = `fixture-recall-${device}`.padEnd(43, "x"); newest = nodeId;
+    registry.enroll(nodeId, token, { platform: "even_g2", name: `Recall ${device}` });
+    const session = await (await post({ op: "consent", enabled: true, recordingConsent: true }, token)).json();
+    const texts = device === 2 ? ["Opening", "More context", "Other text", "Fourth", "The needle evidence is here", "Closing"] : Array(10).fill("needle older conversation");
+    const segments = texts.map((_, i) => ({ at: now - (3 - device) * 30000 + i * 100, endAt: now - (3 - device) * 30000 + i * 100,
+      streamId: device === 2 ? "same-stream" : `separate-${i}`, speaker: null }));
+    assert.equal((await post({ op: "capture", consentId: session.consent.id, batchId: crypto.randomUUID(), texts, segments }, token)).status, 200);
+  }
+  const recall = await runtime.tools.invoke("search_conversation_lifelog", { query: "needle" }, { channel: "web" });
+  assert.equal(recall.result.moments.length, 10); assert.equal(recall.result.moments[0].nodeId, newest);
+  assert.match(recall.result.moments[0].evidence[0].text, /needle evidence/);
   registry.revoke(first);
   assert.equal((await post({ op: "feed" }, "first-test-token-123456789")).status, 401);
+});
+
+test("due tasks outside the first page and email drafts retain their categories", t => {
+  const f = fixture(t);
+  f.runtime.tasks.list = ({ limit }) => [...Array.from({ length: 101 }, (_, i) => ({ id: i, status: "pending" })),
+    { id: "due", title: "Due task", status: "pending", dueDate: new Date(f.now()).toISOString() }].slice(0, limit);
+  f.runtime.drafts = { get: () => ({ kind: "email" }) };
+  f.outreach.push({ id: "draft-email", title: "Email", sourceRef: { kind: "draft", id: "mail" }, status: "unseen", createdAt: new Date(f.now()).toISOString() });
+  f.call({ op: "configure", settings: { enabled: true, categories: ["email", "tasks"] } });
+  const items = f.call({ op: "feed" }).items;
+  assert.equal(items.length, 2); assert.equal(items.find(i => i.id === "draft-email").category, "email");
+  const due = items.find(i => i.category === "tasks");
+  for (let i = 0; i < 5; i++) assert.equal(f.call({ op: "can-notify", id: due.id }).notify, true);
+  assert.equal(f.store.node("one").notifications, undefined);
+  f.call({ op: "seen", id: due.id }); f.call({ op: "notify", id: due.id });
+  assert.equal(f.store.node("one").notifications, 1);
 });
