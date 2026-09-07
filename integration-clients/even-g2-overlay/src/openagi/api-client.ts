@@ -1,5 +1,6 @@
 import type { OpenAGIConfig } from './config'
 import { OpenAGIApiError } from './config'
+import type { InboxItem, ProactiveSettings } from './proactive'
 
 type Fetch = typeof fetch
 export interface OpenAGINode {
@@ -19,6 +20,9 @@ const CAPABILITIES = [
 ]
 
 export class OpenAGIApiClient {
+  proactive(body: object, signal?: AbortSignal): Promise<{ items?: InboxItem[]; settings?: ProactiveSettings; consent?: { id: string; until: number }; quiet?: boolean; notify?: boolean }> {
+    return this.json('/nodes/g2/proactive', { method: 'POST', body: JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) })
+  }
   private readonly fetchImpl: Fetch
   constructor(
     private readonly config: OpenAGIConfig,

@@ -10,16 +10,22 @@ import { LiveSpeech, speechTrigger, type SpeechModel, type SpeechCallbacks } fro
 import type { OpenAGIStore } from '../openagi/store'
 import type { OpenAGIGlassesRenderer } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
+import { G2ProactiveClient, type InboxItem } from '../openagi/proactive'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'ambient' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'ambient' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 
 export class OpenAGIG2App {
+  readonly proactive: G2ProactiveClient
+  private inboxIndex = 0
+  private inboxItems: InboxItem[] = []
   private mode: Mode = 'unpaired'
   private audioBuffer: QuestionAudioBuffer | null = null
   private pages: string[] = []
   private page = 0
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private ambientRunning = false
+  private ambientEpoch = 0
+  private lastAmbientSpeechAt = Date.now()
   private ambientSegmenter: AmbientAudioSegmenter | null = null
   private ambientQueue: Blob[] = []
   private ambientProcessing = false
@@ -50,7 +56,43 @@ export class OpenAGIG2App {
     private readonly phone: OpenAGIPhoneCompanion,
     private readonly allowedOrigins: string[],
     private readonly speechFactory: (callbacks: SpeechCallbacks) => LiveSpeech = callbacks => new LiveSpeech(callbacks),
-  ) {}
+  ) {
+    this.proactive = new G2ProactiveClient(api, {
+      proactiveSettings: settings => phone.proactiveSettings?.(settings),
+      inbox: items => {
+        phone.inbox?.(items); renderer.inboxCount?.(items.length)
+        if (this.mode === 'inbox') {
+          const current = this.inboxItems[this.inboxIndex]?.id
+          this.inboxItems = [...items]; this.inboxIndex = items.findIndex(i => i.id === current)
+          if (this.inboxIndex < 0) { this.pages = []; this.mode = 'home'; renderer.home(this.store.snapshot().node?.name) }
+        }
+      },
+      activity: text => phone.activity?.(text),
+      memoryStatus: (active, detail) => { phone.memoryStatus?.(active, detail); renderer.memory?.(active) },
+    },
+      () => (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.displaySleeping && !this.requestController,
+      item => this.openInbox(item.id))
+  }
+  openInbox(id?: string): void {
+    if (this.exited || this.navigationBusy || this.microphoneOpening || this.requestController || this.displaySleeping || ['listening', 'review', 'pairing'].includes(this.mode)) return
+    this.inboxItems = [...this.proactive.items]
+    if (!this.inboxItems.length) { this.phone.set('Inbox empty', 'Enable proactive updates on the phone, then Refresh.'); return }
+    this.inboxIndex = Math.max(0, this.inboxItems.findIndex(i => i.id === id)); this.showInboxItem()
+  }
+  private showInboxItem(): void {
+    const item = this.inboxItems[this.inboxIndex]; if (!item) return
+    this.mode = 'inbox'; this.pages = paginateText(plainAnswer(`${item.title}\n\n${item.summary}`), 220); this.page = 0
+    this.showInboxPage()
+    void this.proactive.action('seen', item.id)
+  }
+  private showInboxPage(): void {
+    this.renderer.inbox?.(this.pages[this.page] ?? '', this.inboxIndex + 1, this.inboxItems.length, this.page + 1, this.pages.length)
+  }
+  configureMemory(enabled: boolean, consent: boolean): void {
+    if (!enabled) { this.proactive.pauseMemory(); return }
+    if (!this.ambientRunning) { this.phone.memoryStatus?.(false, 'Enable always-listening first, then explicitly enable conversation memory.'); return }
+    void this.proactive.enableMemory(consent)
+  }
 
   async boot(): Promise<void> {
     const stored = await this.store.load()
@@ -93,6 +135,7 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'review') void this.sendDraft()
+    else if (this.mode === 'inbox') { this.inboxIndex = (this.inboxIndex + 1) % this.inboxItems.length; this.showInboxItem() }
     else if (this.mode === 'home') void this.startAsk()
     else if (this.mode === 'listening') void this.finishAsk()
     else if (this.mode === 'ambient') void this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
@@ -105,14 +148,15 @@ export class OpenAGIG2App {
   scrollDown(): void { this.movePage(1) }
   private movePage(direction: number): void {
     if (this.exited || this.navigationBusy || this.displaySleeping) return
-    if (this.mode === 'review') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showDraftPage() }
+    if (this.mode === 'inbox') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showInboxPage() }
+    else if (this.mode === 'review') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showDraftPage() }
     else if (this.requestController) {
       if (this.activityView || !this.pages.length) this.activityOffset = Math.max(0, Math.min(Math.max(0, this.activityLines.length - 3), this.activityOffset - direction))
       else this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction))
       this.renderActiveProgress?.()
     }
     else if (this.mode === 'answer') this.showAnswer(Math.max(0, Math.min(this.pages.length - 1, this.page + direction)))
-    else if (this.mode === 'home') this.showRecent(this.store.snapshot().history.length - 1)
+    else if (this.mode === 'home') { if (direction < 0 && this.proactive.items.length) this.openInbox(); else this.showRecent(this.store.snapshot().history.length - 1) }
     else if (this.mode === 'recent') this.showRecent(this.recentIndex - direction)
   }
   cancelRequest(): void { this.cancelConfirmation = false; this.requestController?.abort(); if (this.preparingDraft) this.stopLiveSpeech() }
@@ -174,6 +218,7 @@ export class OpenAGIG2App {
     this.renderer.recent?.(plainAnswer(history[this.recentIndex].question), history.length - this.recentIndex, history.length)
   }
   async systemExit(): Promise<void> {
+    this.proactive.stop()
     this.exited = true
     this.stopLiveSpeech()
     this.cancelRequest()
@@ -263,6 +308,7 @@ export class OpenAGIG2App {
   }
   async connectAgent(origin: string, token: string): Promise<void> {
     if (this.requestController || this.mode === 'review' || this.mode === 'listening' || this.microphoneOpening) return
+    this.proactive.stop()
     let normalizedOrigin: string
     try { normalizedOrigin = AgentOriginSchema.parse(origin) } catch { this.phone.set('Could not add agent', 'Enter your main server HTTPS origin without a path or credentials.'); return }
     if (this.allowedOrigins.length > 0 && !this.allowedOrigins.includes(normalizedOrigin)) {
@@ -478,10 +524,12 @@ export class OpenAGIG2App {
       this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
     } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false) }
   }
-  private showUnpaired(): void { this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
+  private showUnpaired(): void { this.proactive.stop(); this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
   private showHome(): void {
     this.phone.history?.(this.store.snapshot().history)
     const state = this.store.snapshot(); if (!state.nodeToken) { this.showUnpaired(); return }
+    this.proactive.start()
+    if (state.agentOrigin) this.phone.mainInbox?.(state.agentOrigin)
     if (this.ambientRunning) {
       this.mode = 'ambient'; this.phone.paired(true); this.renderer.ambient(state.wakePhrase)
       this.phone.set('Always listening', `Say “${state.wakePhrase}”${state.answerQuestions ? ' or ask a clear question' : ''}. Foreground only.`)
@@ -522,6 +570,8 @@ export class OpenAGIG2App {
     } finally { this.microphoneOpening = false }
   }
   private async stopAmbient(): Promise<void> {
+    this.ambientEpoch++
+    this.proactive.pauseMemory()
     this.stopLiveSpeech()
     this.ambientRunning = false
     this.ambientSegmenter?.reset()
@@ -564,6 +614,7 @@ export class OpenAGIG2App {
     const speech = this.speechFactory({
       transcript: (text, final, lagMs) => {
         if (this.liveSpeech !== speech || this.exited) return
+        if (ambient) this.lastAmbientSpeechAt = Date.now()
         this.phone.transcript?.(text)
         this.phone.speechTiming?.(`${final ? 'Final segment' : 'Live words'} · audio backlog ~${lagMs}ms`)
         if (firstTranscript) { firstTranscript = false; this.phone.activity?.(`First speech text ${(Date.now() - started) / 1000}s after connecting`) }
@@ -574,6 +625,7 @@ export class OpenAGIG2App {
       },
       utterance: text => {
         if (!ambient || !this.ambientRunning || this.liveSpeech !== speech || this.exited) return
+        this.proactive.capture(text)
         if (this.requestController) { this.ambientArmedUntil = 0; return }
         const preferences = this.store.snapshot()
         const trigger = speechTrigger(text, preferences.wakePhrase, preferences.answerQuestions, Date.now() < this.ambientArmedUntil)
@@ -646,13 +698,16 @@ export class OpenAGIG2App {
         const utterance = this.ambientQueue.shift()
         if (!utterance || !state.conversationId) continue
         if (!this.requestController && this.mode === 'ambient') this.phone.set('Always listening · transcribing', 'Checking this speech segment for your wake phrase. Please wait.')
+        const epoch = this.ambientEpoch
         const result = await this.api.listen(utterance, state.conversationId, {
           wakePhrase: state.wakePhrase,
           answerQuestions: state.answerQuestions,
           forceAnswer: Date.now() < this.ambientArmedUntil,
         })
-        if (!this.ambientRunning) continue
+        if (!this.ambientRunning || epoch !== this.ambientEpoch) continue
         this.phone.transcript?.(result.question)
+        this.lastAmbientSpeechAt = Date.now()
+        this.proactive.capture(result.question)
         if (this.requestController) continue // Transcription stays live; never queue hidden agent actions.
         if (result.armed) {
           this.ambientArmedUntil = Date.now() + 8_000

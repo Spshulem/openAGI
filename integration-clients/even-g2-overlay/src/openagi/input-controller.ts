@@ -5,7 +5,7 @@ import { eventTypeOf, type InputHandlers } from '../even/input-controller'
 export class AgentsInputController {
   private unsubscribe: (() => void) | null = null
   private pendingTap: ReturnType<typeof setTimeout> | null = null
-  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers) {}
+  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers & { foreground?(active: boolean): void }) {}
   start(): void {
     if (this.unsubscribe) return
     this.unsubscribe = this.bridge.onEvenHubEvent(event => {
@@ -13,6 +13,8 @@ export class AgentsInputController {
       if (types.includes(OsEventTypeList.SYSTEM_EXIT_EVENT) || types.includes(OsEventTypeList.ABNORMAL_EXIT_EVENT)) {
         this.stop(); this.handlers.systemExit(); return
       }
+      if (types.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) { this.clearTap(); this.handlers.foreground?.(false); return }
+      if (types.includes(OsEventTypeList.FOREGROUND_ENTER_EVENT)) { this.handlers.foreground?.(true); return }
       if (types.includes(OsEventTypeList.DOUBLE_CLICK_EVENT)) {
         this.clearTap(); this.handlers.doubleTap(); return
       }
