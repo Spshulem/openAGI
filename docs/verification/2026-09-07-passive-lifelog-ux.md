@@ -1,5 +1,10 @@
 # G2 passive lifelog UX: 0.4.6
 
+Follow-on user-requested UX scope:
+[minimal listening, visible lifelog and actionable inbox](../g2-minimal-lifelog-ux-scope.md).
+Those additions have a separate 0.4.7 candidate verification record; the
+validation below applies only to 0.4.6.
+
 Validation: 91 assembled-client tests across 15 files and TypeScript checking
 passed. Regressions cover passive live/buffered speech, explicit wake opt-in,
 manual-question resume, consent during startup, foreground exit, safe in-app

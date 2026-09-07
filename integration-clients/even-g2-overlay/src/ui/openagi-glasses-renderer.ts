@@ -8,7 +8,7 @@ export class OpenAGIGlassesRenderer {
   private pulse = 0
   passive(retaining: boolean, wake: boolean, phrase: string): void {
     const dots = '.'.repeat(this.pulse++ % 3 + 1)
-    this.show(`Listening ${dots}\n\n${retaining ? 'Lifelog ON · saving final text' : 'Lifelog OFF · not retaining text'}\n${wake ? `Wake phrase: ${phrase}` : 'Quiet mode · tap to ask'}\n\nTap: Talk · Double-tap: pause\n${this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})` : 'Main updates appear when ready'}\nForeground only`, false)
+    this.show(retaining && !wake ? `Listening ${dots}` : `Listening ${dots}\n\n${wake ? `Say “${phrase}” or tap to ask` : 'Tap to ask'}`, false)
   }
   inboxCount(count: number): void { this.pendingInbox = count }
   memory(active: boolean): void { this.memoryActive = active }
@@ -30,8 +30,11 @@ export class OpenAGIGlassesRenderer {
   home(device?: string): void { this.show(`Agent${device ? ` · ${device}` : ''}\n\nTap to ask / follow up\nin this conversation.\n\n${this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})\nSwipe down / double-tap: Recent` : 'Swipe or double-tap: Recent'}`, true) }
   recent(question: string, position: number, total: number): void { this.show(`Recent answers · ${position}/${total}\n\n${question.slice(0, 220)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true) }
   inbox(text: string, item: number, total: number, page: number, pages: number): void {
-    this.show(`Inbox ${item}/${total}\n\n${text}\n\nPage ${page}/${pages} · Swipe: read\nTap: next item · Double-tap: back\nReview actions on phone / main`, true)
+    this.show(`Inbox ${item}/${total}\n\n${text}\n\nPage ${page}/${pages} · Swipe: read\nTap: actions · Double-tap: list`, true)
   }
+  inboxList(title: string, item: number, total: number): void { this.show(`Inbox ${item}/${total}\n\n${title.slice(0, 180)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true) }
+  notice(label: string, title: string): void { this.show(`${label}\n\n${title.slice(0, 150)}`, false) }
+  inboxAction(label: string, title: string, confirming = false): void { this.show(`${confirming ? 'Confirm: ' : ''}${label}\n\n${title.slice(0, 160)}\n\n${confirming ? 'Tap: confirm · Double-tap: cancel' : 'Swipe: choose action · Tap: select\nDouble-tap: details'}`, true) }
   ambient(wakePhrase: string): void { this.show(`AGENT · ALWAYS LISTENING${this.memoryActive ? ' · MEMORY ON' : ''}\n\nSay “${wakePhrase}” then ask.\nTap to pause.\n\nForeground only`, true) }
   listening(): void { this.show(`Ask agent\n\nListening…\n\n${this.sendOnStop ? 'Tap: stop and send' : 'Tap: stop and review'}\nMaximum 30 seconds.`, true) }
   thinking(question?: string): void { this.show(`Ask agent\n\n${question ? tail(question, 300) : 'Transcribing your question…'}\n\nThinking…`, true) }

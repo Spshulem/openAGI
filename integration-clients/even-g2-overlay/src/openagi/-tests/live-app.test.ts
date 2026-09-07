@@ -28,13 +28,62 @@ async function fixture() {
   const audio = { active: true, start: vi.fn((cb: typeof receive) => { receive = cb; return Promise.resolve() }), stop: vi.fn(() => Promise.resolve()) }
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon' })), ask: vi.fn(), listen: vi.fn() }
-  const renderer = { home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
+  const renderer = { inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
   const phone = { set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return speech as unknown as LiveSpeech })
   await app.boot()
   return { app, api, audio, renderer, phone, speech, store, storage, receive: (pcm: Uint8Array) => receive(pcm), callbacks: () => callbacks }
 }
+
+it('browses all 80 inbox items with swipes and returns from details to the same item', async () => {
+  const f = await fixture()
+  try {
+    f.app.proactive.items = Array.from({ length: 80 }, (_, i) => ({ id: String(i), title: `Task ${i}`, summary: 'Details', category: 'tasks', action: 'review-on-main', seen: false, important: false }))
+    f.app.openInbox()
+    for (let i = 1; i < 80; i++) f.app.scrollUp()
+    expect(f.renderer.inboxList).toHaveBeenLastCalledWith('Task 79', 80, 80)
+    f.app.scrollUp(); expect(f.renderer.inboxList).toHaveBeenLastCalledWith('Task 79', 80, 80)
+    f.app.tap(); expect(f.renderer.inbox).toHaveBeenCalled()
+    f.app.doubleTap(); expect(f.renderer.inboxList).toHaveBeenLastCalledWith('Task 79', 80, 80)
+    f.app.scrollDown(); expect(f.renderer.inboxList).toHaveBeenLastCalledWith('Task 78', 79, 80)
+  } finally { await f.app.systemExit() }
+})
+
+it('freezes the selected voice task and requires confirmation even with auto-send', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  try {
+    const action = vi.spyOn(f.app.proactive, 'action').mockResolvedValue(true)
+    await f.app.configureAutoSend(true)
+    const target = { id: 'due:one:date', title: 'Send proposal', taskId: 'one', dueDate: 'date', summary: 'Due', category: 'tasks', action: 'complete-task', seen: false, important: true }
+    f.app.proactive.items = [target]; f.app.openInbox(); await f.app.startAsk()
+    f.app.proactive.items = [{ ...target, id: 'other', title: 'Do not complete this' }]
+    f.speech.finish.mockResolvedValue("This one's done")
+    await f.app.finishAsk()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    expect(action).not.toHaveBeenCalledWith('complete-task', expect.anything(), expect.anything())
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Complete task on main', 'Send proposal', true)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(action).toHaveBeenCalledWith('complete-task', target.id, { title: target.title, taskId: 'one', dueDate: 'date' })
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('transient notices return to idle, but cannot overwrite a new question', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  try {
+    const item = { id: 'candidate', title: 'Send proposal', summary: '', category: 'memory', action: 'accept-task', seen: false, important: true }
+    const app = f.app as unknown as { showNotice(value: typeof item): void }
+    app.showNotice(item)
+    expect(f.renderer.notice).toHaveBeenLastCalledWith('Action identified', 'Send proposal')
+    f.renderer.home.mockClear(); await vi.advanceTimersByTimeAsync(4500)
+    expect(f.renderer.home).toHaveBeenCalledOnce()
+    app.showNotice(item); await f.app.startAsk(); f.renderer.home.mockClear()
+    await vi.advanceTimersByTimeAsync(4500)
+    expect(f.renderer.home).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
 
 it('returns from inbox to listening, redraws new counts, and preserves services on invalid agent input', async () => {
   const f = await fixture()

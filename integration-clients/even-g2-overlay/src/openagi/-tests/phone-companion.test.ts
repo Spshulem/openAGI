@@ -3,6 +3,20 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('provides peer pages and bounded, collapsed inbox details without hiding lifelog behind tasks', () => {
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn() }, [])
+  phone.paired(true)
+  expect(document.querySelectorAll('[data-page-link]')).toHaveLength(4)
+  phone.inbox(Array.from({ length: 80 }, (_, i) => ({ id: String(i), title: `Task ${i}`, summary: 'Details', category: 'tasks', action: 'complete-task', important: false, seen: false })))
+  expect(document.querySelectorAll('#proactive-items details:not([open])')).toHaveLength(80)
+  expect(parseFloat(getComputedStyle(document.querySelector('#proactive-items')!).maxHeight)).toBeCloseTo(window.innerHeight * 0.55)
+  document.querySelector<HTMLButtonElement>('#read-lifelog')!.click()
+  expect(document.querySelector<HTMLElement>('#lifelog-panel')!.hidden).toBe(false)
+  expect(document.querySelector<HTMLElement>('[data-page="inbox"]')!.hidden).toBe(true)
+  phone.saveStatus('Saved on main at noon')
+  expect(document.querySelector('#save-status')!.textContent).toBe('Saved on main at noon')
+})
+
 it('offers paired lifelog reading without a token link and separates wake responses', () => {
   const readLifelog = vi.fn(), configureListeningMode = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), readLifelog, configureListeningMode }, [])

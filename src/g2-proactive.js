@@ -92,6 +92,33 @@ export class G2Proactive {
         this.save(); return { ok: true };
       }
       case "capture": return this.capture(n, body);
+      case "mark-moment": {
+        if (!n.consent || n.consent.id !== body.consentId) reject("Start consented lifelog first", 403);
+        const s = n.segments.at(-1);
+        if (!s || !s.captureSession.startsWith(`${n.consent.id}:`) || this.now() - s.endAt > 60000) reject("No recent saved words yet. Wait for text to save, then retry.");
+        const l = lifelogState(n);
+        // One mark per retained segment; retries cannot multiply bookmarks.
+        l.bookmarks[s.id] ??= { segmentId: s.id, at: this.now() };
+        this.save(); return { bookmark: l.bookmarks[s.id] };
+      }
+      case "complete-task": {
+        if (body.confirm !== true) reject("Confirm task completion first");
+        const tasks = this.runtime?.tasks;
+        if (!tasks?.get || !tasks?.complete) reject("Task completion unavailable", 503);
+        const t = tasks.get(body.taskId);
+        if (!t || t.queue !== "user" || clean(t.title, 160) !== body.title || t.dueDate !== body.dueDate
+          || body.id !== `due:${t.id}:${t.dueDate}`) reject("Task changed or disappeared; review it again", 409);
+        const receipt = n.completions?.[body.id];
+        if (receipt && t.status === "completed") return { taskId: t.id, status: "completed", externalSourceUpdated: false };
+        if (!this.feed(n).some(i => i.id === body.id && i.action === "complete-task")) reject("Task is not available in this G2 inbox", 403);
+        // Save exact-target intent before TaskStore writes, for response-loss recovery.
+        n.completions ??= {}; n.completions[body.id] = this.now();
+        for (const id of Object.keys(n.completions).slice(0, -1000)) delete n.completions[id];
+        this.save();
+        const result = tasks.complete(t.id, "user");
+        if (!result || result.status !== "completed") reject("Main did not confirm completion", 503);
+        return { taskId: t.id, status: "completed", externalSourceUpdated: false };
+      }
       case "feed": return { settings: n.settings, items: this.feed(n), quiet: this.quiet(n) };
       case "seen": case "dismiss": case "snooze": case "notify": case "can-notify": {
         const item = this.feed(n).find(i => i.id === body.id);
@@ -121,9 +148,16 @@ export class G2Proactive {
         const existing = tasks.list({ queue: "user", limit: 100000 }).find(t => t.sourceId === c.id);
         if (existing) { c.taskId = existing.id; this.save(); return { taskId: existing.id }; }
         if (c.taskId) return { taskId: c.taskId };
+        let dueDate;
+        if (c.reminder) {
+          const due = typeof body.dueAt === "string" && /(?:Z|[+-]\d\d:\d\d)$/.test(body.dueAt) ? Date.parse(body.dueAt) : NaN;
+          if (!Number.isFinite(due) || due <= this.now() || due > this.now() + 366 * DAY) reject("Confirm an explicit future reminder date and time (including timezone)");
+          dueDate = new Date(due).toISOString();
+        }
         const task = tasks.add({ title: c.title, bucket: "today", sourceId: c.id,
+          ...(dueDate ? { dueDate } : {}),
           sourceMeta: { kind: "g2-confirmed-suggestion", speakerVerified: false },
-          description: "Explicitly accepted from G2 conversation memory. Speaker identity and due date were not inferred." }, { source: "g2-confirmed", queue: "user" });
+          description: dueDate ? "Reminder confirmed from G2 memory. Due alerts follow OpenAGI notification settings; no external calendar was changed." : "Explicitly accepted from G2 conversation memory. Speaker identity and due date were not inferred." }, { source: "g2-confirmed", queue: "user" });
         c.taskId = task.id; this.save(); return { taskId: task.id };
       }
       default: reject("Unsupported proactive operation");
@@ -150,11 +184,16 @@ export class G2Proactive {
       n.segments.push(segment);
       // Evidence, never instructions: conservative first-pass extraction has
       // zero tool access. No claim that the speaker is the owner.
-      const match = segment.text.match(/\b(?:I(?:['’]ll| will| need to)|we need to|remember to)\s+([^.!?]{5,180})/i);
+      const reminderMatch = segment.text.match(/\bremind me to\s+([^.!?]{5,180})/i);
+      const reminder = Boolean(reminderMatch);
+      const match = reminderMatch || segment.text.match(/\b(?:I(?:['’]ll| will| need to)|we need to|remember to)\s+([^.!?]{5,180})/i);
       if (!match || n.candidates.length >= 50) continue;
       const title = clean(match[1], 180);
       const id = `g2-task-${hash(`${body.consentId}:${title.toLowerCase()}`).slice(0, 32)}`;
-      if (!n.candidates.some(c => c.id === id)) n.candidates.push({ id, segmentId: segment.id, title, evidence: segment.text, at: segment.at, taskId: null });
+      const localDate = new Intl.DateTimeFormat("en-CA", { timeZone: n.settings.timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(segment.at);
+      const suggestedDate = /\btomorrow\b/i.test(title) ? new Date(Date.parse(`${localDate}T12:00:00Z`) + DAY).toISOString().slice(0, 10) : /\btoday\b/i.test(title) ? localDate : null;
+      if (!n.candidates.some(c => c.id === id)) n.candidates.push({ id, segmentId: segment.id, title, evidence: segment.text, at: segment.at, taskId: null,
+        ...(reminder ? { reminder: true, suggestedDate, timeZone: n.settings.timeZone } : {}) });
     }
     n.batches = [...n.batches, body.batchId].slice(-200); n.lastBatchAt = this.now(); this.save();
     return { saved: body.texts.length };
@@ -218,10 +257,11 @@ export class G2Proactive {
       if (selected.has("tasks")) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: Infinity }) ?? []) {
         const due = Date.parse(t.dueDate);
         if (!["pending", "in_progress", "blocked"].includes(t.status) || !Number.isFinite(due) || due > this.now() + 3600_000 || due < this.now() - 7 * DAY) continue;
-        items.push({ id: `due:${t.id}:${t.dueDate}`, title: clean(t.title, 160), summary: `Due ${t.dueDate}`, category: "tasks", important: true, at: due, action: "review-on-main" });
+        items.push({ id: `due:${t.id}:${t.dueDate}`, title: clean(t.title, 160), summary: `Due ${t.dueDate}`, category: "tasks", important: true, at: due, action: "complete-task", taskId: t.id, dueDate: t.dueDate });
       }
     }
-    for (const c of n.candidates) if (!c.taskId) items.push({ id: c.id, title: `Possible task: ${c.title}`, summary: c.evidence, category: "memory", important: n.settings.enabled && selected.has("discoveries"), at: c.at, action: "accept-task", speakerVerified: false });
+    for (const c of n.candidates) if (!c.taskId) items.push({ id: c.id, title: `${c.reminder ? 'Reminder suggested' : 'Possible task'}: ${c.title}`, summary: c.evidence, category: "memory", important: n.settings.enabled && selected.has("discoveries"), at: c.at, action: "accept-task", speakerVerified: false,
+      ...(c.reminder ? { reminder: true, suggestedDate: c.suggestedDate, timeZone: c.timeZone } : {}) });
     if (n.settings.enabled && selected.has("discoveries")) {
       const l = lifelogState(n);
       for (const m of moments(n)) if (m.review?.claims.length) items.push({ id: `moment-${m.id}-${m.review.fingerprint}`,
