@@ -43,3 +43,15 @@ it('handles invalid timestamps and renders questions as text, not HTML', () => {
   phone.history([])
   expect(document.querySelectorAll('#recent-answers button')).toHaveLength(0)
 })
+
+it('shows a safe transcript review with explicit send, re-record and discard controls', () => {
+  const sendDraft = vi.fn(), discardDraft = vi.fn(), rerecordDraft = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), sendDraft, discardDraft, rerecordDraft }, [])
+  phone.paired(true); phone.draft('<img src=x>'); phone.set('Review question · not sent', 'Tap to send')
+  expect(document.querySelector('#draft-text')?.textContent).toBe('<img src=x>')
+  expect(document.querySelector('#draft-text img')).toBeNull()
+  for (const id of ['send-draft', 'rerecord-draft', 'discard-draft']) document.querySelector<HTMLButtonElement>(`#${id}`)?.click()
+  expect(sendDraft).toHaveBeenCalledOnce(); expect(rerecordDraft).toHaveBeenCalledOnce(); expect(discardDraft).toHaveBeenCalledOnce()
+  phone.draft(null)
+  expect(document.querySelector<HTMLElement>('#draft-review')?.hidden).toBe(true)
+})

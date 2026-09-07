@@ -15,6 +15,9 @@ export interface OpenAGIPhoneActions {
   exit?(): void
   configureSpeech?(model: SpeechModel, transport: 'relay' | 'direct'): void
   toggleDisplay?(): void
+  sendDraft?(): void
+  discardDraft?(): void
+  rerecordDraft?(): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -48,6 +51,7 @@ export class OpenAGIPhoneCompanion {
         <section id="actions" class="actions" hidden>
           <button data-action="ask">Ask agent</button><button data-action="newConversation">New conversation</button>
           <button id="cancel-request" hidden>Cancel request</button>
+          <section id="draft-review" class="ambient" hidden><h2>Review question · not sent</h2><p id="draft-text"></p><button id="send-draft">Send question</button><button id="rerecord-draft">Re-record</button><button id="discard-draft">Discard</button></section>
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
           <button id="blank-display">Blank glasses display</button>
@@ -87,6 +91,9 @@ export class OpenAGIPhoneCompanion {
     })
     for (const name of ['ask', 'newConversation', 'unlink'] as const) root.querySelector(`[data-action="${name}"]`)?.addEventListener('click', () => actions[name]())
     root.querySelector('#cancel-request')?.addEventListener('click', () => actions.cancel?.())
+    root.querySelector('#send-draft')?.addEventListener('click', () => actions.sendDraft?.())
+    root.querySelector('#rerecord-draft')?.addEventListener('click', () => actions.rerecordDraft?.())
+    root.querySelector('#discard-draft')?.addEventListener('click', () => actions.discardDraft?.())
     root.querySelector('#previous-page')?.addEventListener('click', () => actions.previousPage?.())
     root.querySelector('#next-page')?.addEventListener('click', () => actions.nextPage?.())
     root.querySelector('#last-answer')?.addEventListener('click', () => actions.recentAnswer?.())
@@ -109,10 +116,16 @@ export class OpenAGIPhoneCompanion {
   set(status: string, detail: string): void {
     this.status.textContent = status; this.detail.textContent = detail
     const ask = this.actionsSection.querySelector<HTMLButtonElement>('[data-action="ask"]')
-    if (ask) ask.textContent = /Opening microphone|Recording question/.test(status) ? 'Stop and send' : 'Ask agent'
+    if (ask) ask.textContent = /Opening microphone|Recording question/.test(status) ? 'Stop and review' : status.startsWith('Review question') ? 'Send question' : 'Ask agent'
     if (/failed|could not|check|not allowed/i.test(status)) this.status.scrollIntoView?.({ block: 'center' })
   }
   paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value }
+  draft(text: string | null): void {
+    const panel = this.actionsSection.querySelector<HTMLElement>('#draft-review')
+    if (panel) panel.hidden = text === null
+    const preview = this.actionsSection.querySelector('#draft-text')
+    if (preview) preview.textContent = text ?? ''
+  }
   requestActive(active: boolean): void {
     const cancel = this.actionsSection.querySelector<HTMLButtonElement>('#cancel-request')
     if (cancel) cancel.hidden = !active

@@ -11,7 +11,7 @@ import type { OpenAGIStore } from '../openagi/store'
 import type { OpenAGIGlassesRenderer } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'ambient' | 'listening' | 'thinking' | 'answer' | 'message'
+type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'ambient' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 
 export class OpenAGIG2App {
   private mode: Mode = 'unpaired'
@@ -36,6 +36,12 @@ export class OpenAGIG2App {
   private speechStart: AbortController | null = null
   private liveCaptureTimer: ReturnType<typeof setTimeout> | undefined
   private displaySleeping = false
+  private draft = ''
+  private preparingDraft = false
+  private cancelConfirmation = false
+  private activityView = false
+  private activityLines: string[] = []
+  private activityOffset = 0
   constructor(
     private readonly api: OpenAGIApiClient,
     private readonly store: OpenAGIStore,
@@ -79,7 +85,13 @@ export class OpenAGIG2App {
     if (this.displaySleeping) return
     if (this.exited || this.navigationBusy || this.microphoneOpening || Date.now() - this.lastTapAt < 400) return
     this.lastTapAt = Date.now()
-    if (this.mode === 'home') void this.startAsk()
+    if (this.requestController) {
+      if (this.cancelConfirmation) this.cancelRequest()
+      else if (!this.preparingDraft) { this.activityView = !this.activityView; this.renderActiveProgress?.() }
+      return
+    }
+    if (this.mode === 'review') void this.sendDraft()
+    else if (this.mode === 'home') void this.startAsk()
     else if (this.mode === 'listening') void this.finishAsk()
     else if (this.mode === 'ambient') void this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
     else if (this.mode === 'answer') void this.startAsk()
@@ -91,12 +103,37 @@ export class OpenAGIG2App {
   scrollDown(): void { this.movePage(1) }
   private movePage(direction: number): void {
     if (this.exited || this.navigationBusy || this.displaySleeping) return
-    if (this.requestController) { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.renderActiveProgress?.() }
+    if (this.mode === 'review') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showDraftPage() }
+    else if (this.requestController) {
+      if (this.activityView || !this.pages.length) this.activityOffset = Math.max(0, Math.min(Math.max(0, this.activityLines.length - 3), this.activityOffset - direction))
+      else this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction))
+      this.renderActiveProgress?.()
+    }
     else if (this.mode === 'answer') this.showAnswer(Math.max(0, Math.min(this.pages.length - 1, this.page + direction)))
     else if (this.mode === 'home') this.showRecent(this.store.snapshot().history.length - 1)
     else if (this.mode === 'recent') this.showRecent(this.recentIndex - direction)
   }
-  cancelRequest(): void { this.requestController?.abort() }
+  cancelRequest(): void { this.cancelConfirmation = false; this.requestController?.abort(); if (this.preparingDraft) this.stopLiveSpeech() }
+  async discardDraft(): Promise<void> {
+    if (this.mode !== 'review') return
+    this.draft = ''; this.phone.draft?.(null); this.showHome()
+  }
+  async rerecordDraft(): Promise<void> { if (this.mode !== 'review') return; await this.discardDraft(); await this.startAsk() }
+  async sendDraft(): Promise<void> {
+    if (this.mode !== 'review' || !this.draft || this.requestController) return
+    const text = this.draft; this.draft = ''; this.phone.draft?.(null)
+    await this.runQuestion(text)
+  }
+  private reviewDraft(text: string): void {
+    const clean = text.trim()
+    if (!clean) throw new Error('No speech was recognized. Nothing was sent; please retry.')
+    if (clean.length > 4000) throw new Error('Question is too long. Nothing was sent; please record a shorter question.')
+    this.draft = clean; this.mode = 'review'; this.pages = paginateText(plainAnswer(clean), 220); this.page = 0
+    this.phone.transcript?.(clean); this.phone.draft?.(clean)
+    this.phone.set('Review question · not sent', 'Tap to send. Double-tap to discard. Swipe to read the whole transcript, or re-record on the phone.')
+    this.showDraftPage()
+  }
+  private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length) }
   async recentAnswer(): Promise<void> { await this.selectAnswer(this.store.snapshot().history.length - 1) }
   doubleTap(): void {
     if (this.displaySleeping) { this.toggleDisplay(); return }
@@ -111,7 +148,13 @@ export class OpenAGIG2App {
   private async navigateBack(): Promise<void> {
     if (this.exited || this.navigationBusy || this.microphoneOpening || this.mode === 'pairing') return
     this.lastTapAt = Date.now()
-    if (this.requestController) { this.phone.set('Request still active', 'Swipe to read partial text. Use Cancel on the phone to interrupt. Double-tap does not exit Agents.'); return }
+    if (this.requestController) {
+      this.cancelConfirmation = !this.cancelConfirmation
+      if (this.cancelConfirmation) this.renderer.confirmCancel?.()
+      else this.renderActiveProgress?.()
+      return
+    }
+    if (this.mode === 'review') { await this.discardDraft(); return }
     if (this.mode === 'home') { this.showRecent(this.store.snapshot().history.length - 1); return }
     this.navigationBusy = true
     try {
@@ -182,6 +225,7 @@ export class OpenAGIG2App {
     }
   }
   async unlink(): Promise<void> {
+    if (this.mode === 'review') { this.phone.set('Question not sent', 'Send or discard the transcript before disconnecting.'); return }
     if (this.mode === 'thinking' || this.mode === 'listening' || this.ambientProcessing) { this.phone.set('Question in progress', 'Wait for the current question before disconnecting.'); return }
     await this.stopAmbient()
     if (this.audio.active) await this.audio.stop().catch(() => undefined)
@@ -198,11 +242,13 @@ export class OpenAGIG2App {
     await this.store.clearCredential(); this.showUnpaired()
   }
   async newConversation(): Promise<void> {
+    if (this.mode === 'review') return
     if (this.mode === 'thinking' || this.mode === 'listening' || this.mode === 'pairing' || this.ambientProcessing) return
     await this.stopAmbient()
     await this.store.update({ conversationId: crypto.randomUUID() }); this.pages = []; this.phone.preview?.(''); this.showHome(); this.phone.set('New conversation', 'Your next question starts a fresh agent chat.')
   }
   async selectAnswer(index: number): Promise<void> {
+    if (this.mode === 'review') return
     if (this.mode === 'thinking' || this.mode === 'listening' || this.mode === 'pairing' || this.ambientProcessing) return
     const entry = this.store.snapshot().history[index]
     if (!entry) return
@@ -213,6 +259,7 @@ export class OpenAGIG2App {
     this.phone.set('Conversation resumed', `${entry.question} — Tap the glasses to ask a follow-up, or use Ask on the phone.`)
   }
   async connectAgent(origin: string, token: string): Promise<void> {
+    if (this.requestController || this.mode === 'review' || this.mode === 'listening' || this.microphoneOpening) return
     let normalizedOrigin: string
     try { normalizedOrigin = AgentOriginSchema.parse(origin) } catch { this.phone.set('Could not add agent', 'Enter your main server HTTPS origin without a path or credentials.'); return }
     if (this.allowedOrigins.length > 0 && !this.allowedOrigins.includes(normalizedOrigin)) {
@@ -247,7 +294,7 @@ export class OpenAGIG2App {
       this.phone.ambient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
       return
     }
-    if (this.navigationBusy || this.microphoneOpening || this.mode === 'listening' || this.mode === 'thinking') {
+    if (this.navigationBusy || this.microphoneOpening || this.mode === 'review' || this.mode === 'listening' || this.mode === 'thinking') {
       const state = this.store.snapshot()
       this.phone.ambient(state.ambientEnabled, state.wakePhrase, state.answerQuestions)
       this.phone.set('Microphone busy', 'Finish the current question before changing listening mode.')
@@ -270,6 +317,7 @@ export class OpenAGIG2App {
   }
   async startAsk(): Promise<void> {
     if (this.exited || this.navigationBusy || this.microphoneOpening || this.requestController) return
+    if (this.mode === 'review') { await this.sendDraft(); return }
     if (this.mode === 'listening') { await this.finishAsk(); return }
     if (this.mode === 'message' || this.mode === 'answer' || this.mode === 'recent') this.showHome()
     if (this.ambientRunning) {
@@ -288,7 +336,7 @@ export class OpenAGIG2App {
         const duration = this.audioBuffer?.durationSeconds ?? 0
         if (duration > 0 && Math.floor(duration) !== displayedSecond) {
           displayedSecond = Math.floor(duration)
-          this.phone.set('Recording question', `${duration.toFixed(1)} seconds received from G2. Tap again to send your question.`)
+          this.phone.set('Recording question', `${duration.toFixed(1)} seconds received from G2. Tap again to review your question before sending.`)
         }
       } catch (error) { void this.audio.stop(); this.fail(error) }
     }) }
@@ -299,27 +347,48 @@ export class OpenAGIG2App {
     if (!this.microphoneOpening && this.mode === 'listening' && this.liveSpeech) {
       const speech = this.liveSpeech
       this.mode = 'thinking'; clearTimeout(this.liveCaptureTimer)
-      this.phone.set('Finishing live transcript', 'Audio has already been streamed. Waiting for final words, then sending text only.')
+      const controller = new AbortController(); this.requestController = controller; this.preparingDraft = true
+      this.phone.requestActive?.(true)
+      this.renderActiveProgress = () => { if (!this.cancelConfirmation) this.renderer.progress?.('Finishing transcript', 'Not sent to agent') }
+      this.renderActiveProgress()
+      this.phone.set('Finishing live transcript', 'Waiting for final words. You will review the text before sending it to the agent.')
       try {
         await this.audio.stop()
         const started = Date.now()
         const text = await speech.finish()
-        if (this.exited || this.liveSpeech !== speech) return
+        if (this.exited || controller.signal.aborted || this.liveSpeech !== speech) return
         this.liveSpeech = null; this.speechStart = null
         if (!text) throw new Error('No speech was recognized. Your question was not sent; please retry.')
-        this.phone.activity?.(`Speech finalized in ${Date.now() - started}ms; sending text only`)
-        await this.runQuestion(text)
-      } catch (error) { this.stopLiveSpeech(); if (!this.exited) this.fail(error) }
+        this.phone.activity?.(`Speech finalized in ${Date.now() - started}ms; awaiting confirmation`)
+        this.reviewDraft(text)
+      } catch (error) { this.stopLiveSpeech(); if (!this.exited && !controller.signal.aborted) this.fail(error) }
+      finally { this.finishDraftPreparation(controller) }
       return
     }
     if (this.microphoneOpening || this.mode !== 'listening' || !this.audioBuffer) return
     this.mode = 'thinking'; await this.audio.stop().catch(() => undefined)
+    if (this.exited) return
     const audio = this.audioBuffer; this.audioBuffer = null
     if (audio.durationSeconds < 0.1) {
       this.fail(new Error(audio.durationSeconds === 0 ? 'No microphone audio arrived from G2. Check the glasses connection, then try Ask again.' : 'The recording was too short. Speak your question before sending.'))
       return
     }
-    await this.runQuestion(audio.toWav())
+    const controller = new AbortController(); this.requestController = controller; this.preparingDraft = true
+    this.phone.requestActive?.(true)
+    this.phone.set('Transcribing for review', 'OpenAI transcribes after recording. Nothing is sent to the agent until you confirm.')
+    this.renderActiveProgress = () => { if (!this.cancelConfirmation) this.renderer.progress?.('Transcribing speech', 'Review before sending') }
+    this.renderActiveProgress()
+    try {
+      const state = this.store.snapshot()
+      const result = await this.api.listen(audio.toWav(), state.conversationId!, { wakePhrase: state.wakePhrase, answerQuestions: false }, controller.signal)
+      if (!controller.signal.aborted && !this.exited) this.reviewDraft(result.question)
+    } catch (error) { if (!controller.signal.aborted && !this.exited) this.fail(error) }
+    finally { this.finishDraftPreparation(controller) }
+  }
+  private finishDraftPreparation(controller: AbortController): void {
+    this.requestController = null; this.preparingDraft = false; this.cancelConfirmation = false; this.renderActiveProgress = null
+    this.phone.requestActive?.(false)
+    if (controller.signal.aborted && !this.exited) this.showHome()
   }
   private async runQuestion(input: Blob | string): Promise<void> {
     if (this.requestController) return
@@ -327,6 +396,7 @@ export class OpenAGIG2App {
     if (!conversationId) { this.fail(new Error('Start a conversation before asking.')); return }
     const controller = new AbortController()
     this.requestController = controller; this.mode = 'thinking'; this.pages = []; this.page = 0
+    this.cancelConfirmation = false; this.activityView = false; this.activityLines = []; this.activityOffset = 0
     this.phone.requestActive?.(true)
     const started = Date.now()
     let stage = typeof input === 'string' ? 'Sending question' : 'Uploading audio'
@@ -339,8 +409,11 @@ export class OpenAGIG2App {
     const renderProgress = (): void => {
       const detail = progressDetail(started, lastEvent, streaming)
       this.phone.set(stage, `${detail}. Last activity ${Math.floor((Date.now() - lastWork) / 1000)}s ago. Cancel stops further work; completed actions cannot be undone.`)
+      if (this.cancelConfirmation) return
       const preview = this.pages.length ? `${this.page + 1}/${this.pages.length} (partial)\n${this.pages[this.page] ?? ''}` : ''
-      this.renderer.progress?.(stage, detail, preview)
+      const end = this.activityLines.length - this.activityOffset
+      const activity = this.activityLines.slice(Math.max(0, end - 3), end).join('\n')
+      this.renderer.progress?.(stage, detail, this.activityView ? '' : preview, activity)
     }
     this.renderActiveProgress = renderProgress
     renderProgress()
@@ -352,6 +425,10 @@ export class OpenAGIG2App {
           lastWork = lastEvent
           stage = event.stage === 'tool' && event.tool ? `Tool: ${event.tool}` : progressLabel(event.stage)
           this.phone.activity?.(stage)
+          if (this.activityOffset > 0) this.activityOffset++
+          this.activityLines.push(`${Math.floor((lastEvent - started) / 1000)}s  ${stage.replace(/[\r\n\t]/g, ' ').slice(0, 58)}`)
+          if (this.activityLines.length > 80) this.activityLines.shift()
+          this.activityOffset = Math.min(this.activityOffset, Math.max(0, this.activityLines.length - 3))
           if (event.question) { question = event.question; this.phone.transcript?.(question) }
           renderProgress()
         } else if (event.type === 'delta' && event.text) {
@@ -360,6 +437,7 @@ export class OpenAGIG2App {
           stage = 'Answer arriving'; partial = ((event.reset ? '' : partial) + event.text).slice(0, 16000)
           this.pages = paginateText(plainAnswer(partial), 260); this.page = Math.min(this.page, this.pages.length - 1)
           this.phone.preview?.(plainAnswer(partial))
+          renderProgress()
         }
       }
       const result = typeof input === 'string'
@@ -374,9 +452,11 @@ export class OpenAGIG2App {
         await this.store.remember(question, `Incomplete answer:\n${plainAnswer(partial)}`).catch(() => undefined)
         this.phone.history?.(this.store.snapshot().history)
         this.pages = paginateText(`Incomplete answer:\n${plainAnswer(partial)}`, 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
+      } else if (controller.signal.aborted) {
+        this.mode = 'message'; this.renderer.message('Request stopped', 'No automatic retry. Completed actions cannot be undone. Your recent answers are still saved.')
       } else this.fail(error)
       this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
-    } finally { clearInterval(timer); this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false) }
+    } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false) }
   }
   private showUnpaired(): void { this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
   private showHome(): void {
@@ -431,7 +511,7 @@ export class OpenAGIG2App {
     if (this.audio.active) await this.audio.stop().catch(() => undefined)
   }
   async configureSpeech(model: SpeechModel, transport = this.store.snapshot().speechTransport): Promise<void> {
-    if (this.microphoneOpening || this.navigationBusy || this.requestController || this.mode === 'listening' || this.mode === 'pairing') {
+    if (this.microphoneOpening || this.navigationBusy || this.requestController || this.mode === 'review' || this.mode === 'listening' || this.mode === 'pairing') {
       this.phone.speechModel?.(this.store.snapshot().speechModel)
       this.phone.speechTransport?.(this.store.snapshot().speechTransport)
       this.phone.set('Speech model unchanged', 'Finish the current question before switching speech models.'); return
@@ -516,7 +596,7 @@ export class OpenAGIG2App {
       this.renderer.listening()
       await this.audio.start(pcm => { if (this.mode === 'listening') speech.push(pcm) })
       if (this.exited || this.liveSpeech !== speech) { await this.audio.stop(); return }
-      this.phone.set('Recording question · live', `Words appear while you speak. Tap Stop and send when finished. Audio streams ${this.store.snapshot().speechTransport === 'relay' ? 'through your main to' : 'directly to'} Deepgram.`)
+      this.phone.set('Recording question · live', `Words appear while you speak. Tap Stop and review when finished. Audio streams ${this.store.snapshot().speechTransport === 'relay' ? 'through your main to' : 'directly to'} Deepgram.`)
       this.liveCaptureTimer = setTimeout(() => { void this.finishAsk() }, 30_000)
     } catch (error) { this.stopLiveSpeech(); if (!this.exited) this.fail(error) }
     finally { this.microphoneOpening = false }

@@ -9,6 +9,17 @@ it('distinguishes tool work from thinking and transcription', () => {
   expect(progressLabel('routing')).toBe('Choosing agent')
 })
 
+it('shows thinking and retained tool activity instead of an empty-answer placeholder', () => {
+  const show = vi.fn()
+  const renderer = new OpenAGIGlassesRenderer({ show, initialize: () => Promise.resolve() })
+  renderer.progress('Thinking', '12s elapsed', '', '5s Tool: computer_list_apps\n9s Thinking')
+  expect(show.mock.calls[0][0]).toContain('\nThinking\n')
+  expect(show.mock.calls[0][0]).toContain('computer_list_apps')
+  expect(show.mock.calls[0][0]).not.toContain('No public answer')
+  renderer.confirmCancel()
+  expect(show.mock.calls[1][0]).toContain('Double-tap: keep waiting')
+})
+
 it('distinguishes connected progress from silence and no streaming response', () => {
   expect(progressDetail(0, 29000, true, 30000)).toContain('not task progress')
   expect(progressDetail(0, 0, true, 30000)).toContain('No server data for 30s')

@@ -82,9 +82,10 @@ export class OpenAGIApiClient {
   askText(text: string, conversationId: string, progress: (event: AskProgress) => void, signal: AbortSignal): Promise<OpenAGIAskResult> {
     return this.json('/nodes/g2/ask', { method: 'POST', signal, body: JSON.stringify({ text, conversationId }) }, true, progress)
   }
-  async listen(wav: Blob, conversationId: string, options: { wakePhrase: string; answerQuestions: boolean; forceAnswer?: boolean }): Promise<OpenAGIListenResult> {
+  async listen(wav: Blob, conversationId: string, options: { wakePhrase: string; answerQuestions: boolean; forceAnswer?: boolean }, signal?: AbortSignal): Promise<OpenAGIListenResult> {
     return this.json('/nodes/g2/listen', {
       method: 'POST',
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(75_000)]) : undefined,
       body: JSON.stringify({
         audioBase64: await blobToBase64(wav), conversationId, language: 'en', wakePhrase: options.wakePhrase,
         triggerMode: options.answerQuestions ? 'wake_or_question' : 'wake_only', forceAnswer: options.forceAnswer === true, transcribeOnly: true,

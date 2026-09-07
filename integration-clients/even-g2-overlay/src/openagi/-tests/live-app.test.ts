@@ -20,7 +20,7 @@ async function fixture() {
   return { app, api, audio, renderer, phone, speech, store, storage, receive: (pcm: Uint8Array) => receive(pcm), callbacks: () => callbacks }
 }
 
-it('streams packets before Stop, then sends final text in the paired conversation without uploading a WAV', async () => {
+it('streams packets before Stop, then reviews without sending until confirmed', async () => {
   const f = await fixture(); await f.app.startAsk()
   expect(f.api.speechToken).not.toHaveBeenCalled()
   expect(f.speech.open).toHaveBeenCalledWith('saved-scoped-token-123', 'nova-3', 'open agi', expect.stringContaining('wss://main.example.com/nodes/g2/speech'))
@@ -28,6 +28,10 @@ it('streams packets before Stop, then sends final text in the paired conversatio
   expect(f.speech.push).toHaveBeenCalledOnce(); expect(f.api.askText).not.toHaveBeenCalled()
   expect(f.phone.transcript).toHaveBeenCalledWith('What time')
   await f.app.finishAsk()
+  expect(f.api.askText).not.toHaveBeenCalled()
+  await f.app.sendDraft()
+  await f.app.sendDraft()
+  expect(f.api.askText).toHaveBeenCalledOnce()
   expect(f.api.askText).toHaveBeenCalledWith('What time is it?', f.store.snapshot().conversationId, expect.any(Function), expect.any(AbortSignal))
   expect(f.api.ask).not.toHaveBeenCalled(); expect(f.api.listen).not.toHaveBeenCalled()
   expect(JSON.stringify(f.storage.set.mock.calls)).not.toContain('short-lived-token')
@@ -74,13 +78,14 @@ it('discards live capture on Back and wakes a blank display without exiting or c
 it('tap on a completed answer records a follow-up in that conversation and keeps history', async () => {
   const f = await fixture()
   try {
-    await f.app.startAsk(); await f.app.finishAsk()
+    await f.app.startAsk(); await f.app.finishAsk(); await f.app.sendDraft()
     const conversationId = f.store.snapshot().conversationId
     const previous = f.store.snapshot().history[0]
     f.app.tap()
     await vi.waitFor(() => expect(f.audio.start).toHaveBeenCalledTimes(2))
     expect(f.store.snapshot().history[0]).toEqual(previous)
     await f.app.finishAsk()
+    await f.app.sendDraft()
     expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', conversationId, expect.any(Function), expect.any(AbortSignal))
     expect(f.store.snapshot().history).toHaveLength(2)
   } finally { await f.app.systemExit() }
@@ -89,7 +94,7 @@ it('tap on a completed answer records a follow-up in that conversation and keeps
 it('tap on a reopened recent answer follows that original thread, not a newer one', async () => {
   const f = await fixture()
   try {
-    await f.app.startAsk(); await f.app.finishAsk()
+    await f.app.startAsk(); await f.app.finishAsk(); await f.app.sendDraft()
     const original = f.store.snapshot().conversationId
     await f.app.newConversation()
     expect(f.store.snapshot().conversationId).not.toBe(original)
@@ -97,6 +102,7 @@ it('tap on a reopened recent answer follows that original thread, not a newer on
     f.app.tap()
     await vi.waitFor(() => expect(f.audio.start).toHaveBeenCalledTimes(2))
     await f.app.finishAsk()
+    await f.app.sendDraft()
     expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', original, expect.any(Function), expect.any(AbortSignal))
   } finally { await f.app.systemExit() }
 })

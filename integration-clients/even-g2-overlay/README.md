@@ -4,6 +4,25 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.3: review before send and glasses activity
+
+Manual questions: tap to record, tap to stop, review the transcript, then tap
+to send. Swipe through longer transcripts; double-tap discards without sending.
+The phone also offers Send, Re-record and Discard. Deepgram streams speech live;
+OpenAI buffered mode transcribes after Stop, using the existing transcribe-only
+listen route. Both wait for confirmation before starting agent work. Optional
+wake listening keeps its explicitly enabled automatic-trigger behavior.
+
+While working, Thinking and a bounded timestamped tool/stage trail replace the
+empty-answer placeholder. Tap switches between partial text and activity; swipe
+reads pages or older activity. Double-tap opens Stop confirmation: tap stops,
+double-tap keeps waiting. Completed actions cannot be undone. This shows public
+progress and tool names only, never private reasoning or raw tool payloads.
+
+The pinned Even SDK 0.0.13 has no press/release events, so hold-to-talk is not
+advertised. The supported tap flow is deliberate, not a simulated long press.
+No pairing migration or new server endpoint is required for this client patch.
+
 ### Version 0.3.0: conversations and progress
 
 ### Version 0.4.0: separate speech from work; readable, interruptible answers
