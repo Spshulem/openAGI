@@ -246,6 +246,7 @@ export class AgentHost {
       context: {
         signal: options.signal,
         channel,
+        ...(channel === "g2" ? { sourceNodeId: metadata.sourceNodeId } : {}),
         from,
         target: from,
         // Preserve why this call exists across a human-approval pause. The

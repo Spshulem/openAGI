@@ -4,10 +4,11 @@ const SpeechEvent = z.object({
   type: z.string(), is_final: z.boolean().optional(), speech_final: z.boolean().optional(),
   message: z.string().max(250).optional(),
   start: z.number().nonnegative().optional(), duration: z.number().nonnegative().optional(),
-  channel: z.object({ alternatives: z.array(z.object({ transcript: z.string().max(8000).optional() })).max(10).optional() }).optional(),
+  channel: z.object({ alternatives: z.array(z.object({ transcript: z.string().max(8000).optional(), words: z.array(z.object({ word: z.string().max(100), punctuated_word: z.string().max(100).optional(), start: z.number().nonnegative(), end: z.number().nonnegative(), speaker: z.number().int().min(0).max(99).optional() })).max(2000).optional() })).max(10).optional() }).optional(),
 })
 export type SpeechModel = 'openai-buffered' | 'nova-3' | 'nova-2'
 export interface SpeechCallbacks {
+  segment?(text: string, metadata: { at: number; endAt: number; streamId: string; speaker: number | null }): void
   transcript(text: string, final: boolean, lagMs: number): void
   utterance(text: string): void
   error(error: Error): void
@@ -24,6 +25,8 @@ export class LiveSpeech {
   private stable = ''
   private full = ''
   private lastFinalEnd = -1
+  private streamId = crypto.randomUUID()
+  private streamAt = Date.now()
   private keepalive: ReturnType<typeof setInterval> | undefined
   private rejectOpen: ((error: Error) => void) | undefined
   private finishResolve: ((text: string) => void) | undefined
@@ -33,7 +36,7 @@ export class LiveSpeech {
 
   async open(token: string, model: Exclude<SpeechModel, 'openai-buffered'>, wakePhrase: string, relayUrl?: string): Promise<void> {
     if (this.closed) throw new Error('Speech start cancelled.')
-    const params = new URLSearchParams({ model, encoding: 'linear16', sample_rate: '16000', channels: '1', language: 'en', interim_results: 'true', endpointing: '500', utterance_end_ms: '1000', vad_events: 'true', smart_format: 'true', mip_opt_out: 'true' })
+    const params = new URLSearchParams({ model, encoding: 'linear16', sample_rate: '16000', channels: '1', language: 'en', interim_results: 'true', endpointing: '500', utterance_end_ms: '1000', vad_events: 'true', smart_format: 'true', mip_opt_out: 'true', diarize: 'true' })
     if (model === 'nova-3' && wakePhrase.trim()) params.set('keyterm', wakePhrase.trim().slice(0, 40))
     const ws = this.factory(relayUrl ?? `wss://api.deepgram.com/v1/listen?${params}`, [relayUrl ? 'openagi-g2-speech' : 'bearer', token])
     this.socket = ws
@@ -71,6 +74,7 @@ export class LiveSpeech {
     if (!this.ready || !this.socket || this.socket.readyState !== 1) { this.failure('Live speech is not connected. Please retry.'); return }
     // Stop instead of building seconds of latency or silently dropping words.
     if (this.socket.bufferedAmount + pcm.byteLength > 64_000) { this.failure('Speech upload fell more than two seconds behind. Listening paused; check the connection.'); return }
+    if (this.bytes === 0) this.streamAt = Date.now()
     this.bytes += pcm.byteLength
     this.socket.send(pcm)
   }
@@ -113,6 +117,18 @@ export class LiveSpeech {
     const end = (event.start ?? 0) + (event.duration ?? 0)
     if (event.is_final && text && end > this.lastFinalEnd) {
       this.lastFinalEnd = end
+      const words = event.channel?.alternatives?.[0]?.words
+      if (words?.length) {
+        let group = '', start = 0, stop = 0, speaker: number | null = null
+        const emit = (): void => { if (group) this.callbacks.segment?.(group, { at: this.streamAt + start * 1000, endAt: this.streamAt + stop * 1000, streamId: this.streamId, speaker }) }
+        for (const w of words) {
+          if (w.end < w.start || w.end > end + 1) continue
+          if (group && ((w.speaker ?? null) !== speaker || group.length > 800)) { emit(); group = '' }
+          if (!group) { start = w.start; speaker = w.speaker ?? null }
+          group = `${group} ${w.punctuated_word || w.word}`.trim(); stop = w.end
+        }
+        emit()
+      } else this.callbacks.segment?.(text, { at: this.streamAt + (event.start ?? 0) * 1000, endAt: this.streamAt + end * 1000, streamId: this.streamId, speaker: null })
       this.stable = `${this.stable} ${text}`.trim().slice(-4000)
       this.full = `${this.full} ${text}`.trim().slice(-4000)
     }

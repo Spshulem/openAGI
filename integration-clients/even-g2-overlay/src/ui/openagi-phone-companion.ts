@@ -72,7 +72,7 @@ export class OpenAGIPhoneCompanion {
             <label>Maximum interruptions/hour<input id="alert-limit" type="number" min="0" max="10" value="3"></label>
             <label>Transcript retention<select id="memory-retention"><option value="1">1 day</option><option value="7">7 days</option><option value="30">30 days</option></select></label>
             <button id="save-proactive">Save inbox & retention settings</button><button id="refresh-inbox">Refresh inbox</button><button id="open-inbox">Read inbox on glasses</button>
-            <a id="main-inbox" target="_blank" rel="noopener noreferrer" hidden>Continue on main · inbox and transcripts</a><div id="proactive-items"></div>
+            <a id="main-inbox" target="_blank" rel="noopener noreferrer" hidden>Continue on main · inbox and transcripts</a><a id="main-lifelog" target="_blank" rel="noopener noreferrer" hidden>Conversation lifelog · timeline, speakers & follow-ups</a><div id="proactive-items"></div>
             <h2>Conversation memory · separate opt-in</h2>
             <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
             <label><input id="memory-enabled" type="checkbox"> Retain final transcripts during this listening session</label>
@@ -134,6 +134,9 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#refresh-inbox')?.addEventListener('click', () => actions.refreshInbox?.())
     root.querySelector('#open-inbox')?.addEventListener('click', () => actions.openInbox?.())
     root.querySelector('#memory-enabled')?.addEventListener('change', () => actions.memoryConsent?.(root.querySelector<HTMLInputElement>('#memory-enabled')?.checked === true, root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
+    root.querySelector('#recording-consent')?.addEventListener('change', () => {
+      if (root.querySelector<HTMLInputElement>('#recording-consent')?.checked !== true) actions.memoryConsent?.(false, false)
+    })
     root.querySelector('#delete-memory')?.addEventListener('click', () => { if (window.confirm('Stop memory and delete transcripts and suggestions on main? Previously accepted tasks remain.')) actions.inboxAction?.('delete-memory') })
     root.querySelector('#proactive-items')?.addEventListener('click', event => {
       const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-inbox-op]') : null
@@ -173,6 +176,9 @@ export class OpenAGIPhoneCompanion {
     try { const url = new URL('/g2/proactive', origin); if (url.protocol !== 'https:') return; if (a) { a.href = url.href; a.hidden = false } } catch { /* not configured */ }
   }
   proactiveSettings(settings: ProactiveSettings): void {
+    const inbox = this.actionsSection.querySelector<HTMLAnchorElement>('#main-inbox')
+    const lifelog = this.actionsSection.querySelector<HTMLAnchorElement>('#main-lifelog')
+    if (inbox?.href && !inbox.hidden && lifelog) { lifelog.href = new URL('/g2/lifelog', inbox.href).href; lifelog.hidden = false }
     const enabled = this.actionsSection.querySelector<HTMLInputElement>('#proactive-enabled'); if (enabled) enabled.checked = settings.enabled
     for (const i of this.actionsSection.querySelectorAll<HTMLInputElement>('#proactive-categories input')) i.checked = settings.categories.includes(i.value)
     for (const [selector, value] of [['#quiet-start', settings.quietStart], ['#quiet-end', settings.quietEnd], ['#alert-limit', settings.maxPerHour], ['#memory-retention', settings.retentionDays]] as const) {

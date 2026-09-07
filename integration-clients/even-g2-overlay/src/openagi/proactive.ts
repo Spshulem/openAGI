@@ -16,7 +16,8 @@ export class G2ProactiveClient {
   private timer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private consent: { id: string; until: number } | null = null
-  private queue: string[] = []
+  private queue: { text: string; at: number; endAt: number; streamId: string; speaker: number | null }[] = []
+  private bufferedStreamId = crypto.randomUUID()
   private generation = 0
   private controller = new AbortController()
   private refreshing = false
@@ -57,8 +58,12 @@ export class G2ProactiveClient {
       // Do not claim a notification until the app says it can show it safely.
       const item = this.items.find(i => i.important && !i.seen && !i.notified)
       if (item && !result.quiet && result.settings?.enabled && this.canNotify()) {
-        const allowed = await this.api.proactive({ op: 'notify', id: item.id }, signal)
-        if (!signal.aborted && this.running && allowed.notify && this.canNotify()) this.notify(item)
+        const allowed = await this.api.proactive({ op: 'can-notify', id: item.id }, signal)
+        if (!signal.aborted && this.running && allowed.notify && this.canNotify()) {
+          this.notify(item)
+          item.notified = true
+          await this.api.proactive({ op: 'notify', id: item.id }, signal)
+        }
       }
     } catch (error) { if (!signal.aborted) this.view.activity?.(`Inbox unavailable: ${error instanceof Error ? error.message : 'check main connection'}`) }
     finally { this.refreshing = false }
@@ -73,7 +78,10 @@ export class G2ProactiveClient {
     const generation = this.generation
     try {
       const result = await this.api.proactive({ op: 'consent', enabled: true, recordingConsent }, this.controller.signal)
-      if (generation !== this.generation || !this.running || this.hidden()) return
+      if (generation !== this.generation || !this.running || this.hidden()) {
+        if (result.consent) void this.api.proactive({ op: 'consent', enabled: false, consentId: result.consent.id }).catch(() => {})
+        return
+      }
       this.consent = result.consent ?? null
       this.view.memoryStatus?.(Boolean(this.consent), 'Memory armed for this foreground listening session (up to 4 hours). Final transcripts are retained on your main; speakers are unverified.')
     } catch (error) { this.view.memoryStatus?.(false, `Could not enable memory: ${String(error)}`) }
@@ -86,24 +94,32 @@ export class G2ProactiveClient {
     this.flushTimer = null; this.view.memoryStatus?.(false, detail)
     if (consent) void this.api.proactive({ op: 'consent', enabled: false, consentId: consent.id }).catch(() => {})
   }
-  capture(text: string): void {
+  capture(text: string, metadata?: { at: number; endAt: number; streamId: string; speaker: number | null }): void {
     if (!this.consent || !this.running || this.hidden()) return
     if (this.consent.until <= Date.now()) { this.pauseMemory('Memory consent expired; enable it again.'); return }
     const trimmed = text.trim()
     if (!trimmed) return
-    if (trimmed.length > 1000 || this.queue.length >= 10) { this.pauseMemory('Memory paused: transcript buffer full. No unsent text was saved.'); return }
-    this.queue.push(trimmed)
+    const previous = this.queue.at(-1)
+    // Provider final events can arrive much faster than the upload cadence.
+    // Coalesce adjacent words from the same speaker without crossing streams.
+    if (metadata && previous && previous.streamId === metadata.streamId && previous.speaker === metadata.speaker
+      && metadata.at >= previous.endAt && metadata.at - previous.endAt < 5000 && metadata.endAt - previous.at <= 60000
+      && previous.text.length + trimmed.length < 950) {
+      previous.text += ` ${trimmed}`; previous.endAt = metadata.endAt; return
+    }
+    if (trimmed.length > 1000 || this.queue.length >= 100) { this.pauseMemory('Memory paused: transcript buffer full. No unsent text was saved.'); return }
+    this.queue.push({ text: trimmed, ...(metadata ?? { at: Date.now(), endAt: Date.now(), streamId: this.bufferedStreamId, speaker: null }) })
     if (!this.flushTimer) this.flushTimer = setTimeout(() => { this.flushTimer = null; void this.flush() }, 30_000)
   }
   private async flush(): Promise<void> {
     if (!this.consent || !this.queue.length || this.uploading || !this.running) return
     this.uploading = true
-    const texts = this.queue.splice(0, 10), generation = this.generation
+    const segments = this.queue.splice(0, 10), texts = segments.map(s => s.text), generation = this.generation
     try {
-      await this.api.proactive({ op: 'capture', consentId: this.consent.id, batchId: crypto.randomUUID(), texts }, this.controller.signal)
+      await this.api.proactive({ op: 'capture', consentId: this.consent.id, batchId: crypto.randomUUID(), texts, segments: segments.map(({ text: _text, ...metadata }) => metadata) }, this.controller.signal)
       if (generation === this.generation) this.view.activity?.(`Saved ${texts.length} final transcript segment(s) to main; checking explicit commitments.`)
     } catch { if (generation === this.generation) this.pauseMemory('Memory paused: upload failed. No automatic replay; some submitted text may already be saved on main.') }
-    finally { this.uploading = false }
+    finally { this.uploading = false; if (this.queue.length && this.consent && this.running && !this.flushTimer) this.flushTimer = setTimeout(() => { this.flushTimer = null; void this.flush() }, 16_000) }
   }
   async action(op: 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'delete-memory', id?: string): Promise<void> {
     if (op === 'delete-memory') this.pauseMemory()

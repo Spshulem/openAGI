@@ -111,7 +111,7 @@ export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstream
       }
     });
 
-    const params = new URLSearchParams({ model, encoding: "linear16", sample_rate: "16000", channels: "1", language: "en", interim_results: "true", endpointing: "500", utterance_end_ms: "1000", vad_events: "true", smart_format: "true", mip_opt_out: "true" });
+    const params = new URLSearchParams({ model, encoding: "linear16", sample_rate: "16000", channels: "1", language: "en", interim_results: "true", endpointing: "500", utterance_end_ms: "1000", vad_events: "true", smart_format: "true", mip_opt_out: "true", diarize: "true" });
     if (model === "nova-3" && wakePhrase.trim()) params.set("keyterm", wakePhrase.trim());
     try {
       upstream = upstreamFactory(`wss://api.deepgram.com/v1/listen?${params}`, {
@@ -135,7 +135,11 @@ export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstream
       if (event?.type === "Results") {
         const transcript = event.channel?.alternatives?.[0]?.transcript;
         if (typeof transcript !== "string" || transcript.length > 8000 || !Number.isFinite(event.start) || !Number.isFinite(event.duration)) { fail("Invalid speech provider response."); return; }
-        sendClient(JSON.stringify({ type: "Results", is_final: event.is_final === true, speech_final: event.speech_final === true, start: event.start, duration: event.duration, channel: { alternatives: [{ transcript }] } }));
+        const inputWords = event.channel?.alternatives?.[0]?.words;
+        const words = Array.isArray(inputWords) ? inputWords.slice(0, 2000).filter(w => typeof w?.word === "string" && w.word.length <= 100 && Number.isFinite(w.start) && w.start >= 0 && Number.isFinite(w.end) && w.end >= w.start).map(w => ({ word: w.word,
+          ...(typeof w.punctuated_word === "string" && w.punctuated_word.length <= 100 ? { punctuated_word: w.punctuated_word } : {}), start: w.start, end: w.end,
+          ...(Number.isInteger(w.speaker) && w.speaker >= 0 && w.speaker <= 99 ? { speaker: w.speaker } : {}) })) : undefined;
+        sendClient(JSON.stringify({ type: "Results", is_final: event.is_final === true, speech_final: event.speech_final === true, start: event.start, duration: event.duration, channel: { alternatives: [{ transcript, ...(words ? { words } : {}) }] } }));
       } else if (event?.type === "UtteranceEnd" || event?.type === "SpeechStarted") sendClient(JSON.stringify({ type: event.type }));
     });
     upstream.on("error", () => fail("Deepgram live speech failed. Check the main's speech key, credit and network."));
