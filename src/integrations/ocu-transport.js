@@ -30,6 +30,9 @@ export class OcuTransport {
         if (!line.trim()) continue;
         let value;
         try { value = JSON.parse(line); } catch { this.close(); return; }
+        if (!value || typeof value !== "object" || Array.isArray(value) || value.jsonrpc !== "2.0") {
+          this.close(); return;
+        }
         const pending = this.pending.get(value.id);
         if (!pending) continue;
         if (value.error || !Object.hasOwn(value, "result")) pending.reject(new Error("Open Computer Use rejected the request."));

@@ -4,13 +4,14 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import { OcuTransport } from "../src/integrations/ocu-transport.js";
 
-function fixture({ hang = false, malformed = false, refused = false } = {}) {
+function fixture({ hang = false, malformed = false, refused = false, responseLine } = {}) {
   const child = new EventEmitter(); let killed = false, spawnArgs, requests = [];
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
   child.kill = () => { killed = true; };
   child.stdin = new Writable({ write(chunk, _encoding, done) {
     const request = JSON.parse(String(chunk)); requests.push(request);
     if (request.id && !(hang && request.method === "tools/call")) queueMicrotask(() => {
+      if (responseLine) { child.stdout.write(responseLine + "\n"); return; }
       if (malformed) { child.stdout.write("not json\n"); return; }
       const result = request.method === "initialize" ? { serverInfo: { name: "fixture", version: "0.3.3" } }
         : { isError: refused, content: [] };
@@ -50,4 +51,11 @@ test("malformed responses and tool refusals are errors", async () => {
   const refused = fixture({ refused: true });
   try { await assert.rejects(() => refused.client.call("type_text", {}), /could not complete/); }
   finally { refused.client.close(); }
+});
+test("valid JSON that is not an RPC object cannot crash the daemon", async () => {
+  for (const responseLine of ["null", "[]", "42", '"text"', '{"id":1,"result":{}}']) {
+    const f = fixture({ responseLine });
+    await assert.rejects(() => f.client.call("get_app_state", {}), /unconfirmed/);
+    assert.equal(f.killed, true);
+  }
 });
