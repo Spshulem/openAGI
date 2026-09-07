@@ -3,9 +3,25 @@ import { OpenAGIG2App } from '../../app/openagi-g2-app'
 import { OpenAGIStore } from '../store'
 import type { LiveSpeech, SpeechCallbacks } from '../live-speech'
 
+it('auto-sends finalized live text once after Stop when enabled', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureAutoSend(true)
+    await f.app.startAsk()
+    f.callbacks().transcript('What time', false, 0)
+    expect(f.api.askText).not.toHaveBeenCalled()
+    await f.app.finishAsk()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+    await f.app.sendDraft()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+    expect(f.api.ask).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
+})
+
 async function fixture() {
   const storage = { get: vi.fn(() => Promise.resolve(null as string | null)), set: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve()) }
   const store = new OpenAGIStore(storage)
+  await store.update({ autoSend: false })
   await store.update({ nodeToken: 'saved-scoped-token-123', connectionMode: 'direct', agentOrigin: 'https://main.example.com', conversationId: crypto.randomUUID(), speechModel: 'nova-3' })
   let receive: (pcm: Uint8Array) => void = () => {}
   let callbacks!: SpeechCallbacks

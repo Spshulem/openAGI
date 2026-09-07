@@ -56,6 +56,8 @@ export class OpenAGIG2App {
     const stored = await this.store.load()
     this.phone.speechModel?.(stored.speechModel)
     this.phone.speechTransport?.(stored.speechTransport)
+    this.phone.autoSend?.(stored.autoSend)
+    this.renderer.autoSend?.(stored.autoSend)
     if (stored.nodeToken) {
       try {
         if (stored.connectionMode === 'enrollment') {
@@ -129,6 +131,7 @@ export class OpenAGIG2App {
     if (!clean) throw new Error('No speech was recognized. Nothing was sent; please retry.')
     if (clean.length > 4000) throw new Error('Question is too long. Nothing was sent; please record a shorter question.')
     this.draft = clean; this.mode = 'review'; this.pages = paginateText(plainAnswer(clean), 220); this.page = 0
+    if (this.store.snapshot().autoSend) { this.phone.transcript?.(clean); return }
     this.phone.transcript?.(clean); this.phone.draft?.(clean)
     this.phone.set('Review question · not sent', 'Tap to send. Double-tap to discard. Swipe to read the whole transcript, or re-record on the phone.')
     this.showDraftPage()
@@ -336,7 +339,7 @@ export class OpenAGIG2App {
         const duration = this.audioBuffer?.durationSeconds ?? 0
         if (duration > 0 && Math.floor(duration) !== displayedSecond) {
           displayedSecond = Math.floor(duration)
-          this.phone.set('Recording question', `${duration.toFixed(1)} seconds received from G2. Tap again to review your question before sending.`)
+          this.phone.set('Recording question', `${duration.toFixed(1)} seconds received from G2. ${this.stopInstruction()}`)
         }
       } catch (error) { void this.audio.stop(); this.fail(error) }
     }) }
@@ -351,7 +354,7 @@ export class OpenAGIG2App {
       this.phone.requestActive?.(true)
       this.renderActiveProgress = () => { if (!this.cancelConfirmation) this.renderer.progress?.('Finishing transcript', 'Not sent to agent') }
       this.renderActiveProgress()
-      this.phone.set('Finishing live transcript', 'Waiting for final words. You will review the text before sending it to the agent.')
+      this.phone.set('Finishing live transcript', this.store.snapshot().autoSend ? 'Waiting for final words, then sending automatically.' : 'Waiting for final words. Review the text before sending it to the agent.')
       try {
         await this.audio.stop()
         const started = Date.now()
@@ -359,10 +362,11 @@ export class OpenAGIG2App {
         if (this.exited || controller.signal.aborted || this.liveSpeech !== speech) return
         this.liveSpeech = null; this.speechStart = null
         if (!text) throw new Error('No speech was recognized. Your question was not sent; please retry.')
-        this.phone.activity?.(`Speech finalized in ${Date.now() - started}ms; awaiting confirmation`)
+        this.phone.activity?.(`Speech finalized in ${Date.now() - started}ms`)
         this.reviewDraft(text)
       } catch (error) { this.stopLiveSpeech(); if (!this.exited && !controller.signal.aborted) this.fail(error) }
       finally { this.finishDraftPreparation(controller) }
+      if (!controller.signal.aborted && !this.exited && this.store.snapshot().autoSend) await this.sendDraft()
       return
     }
     if (this.microphoneOpening || this.mode !== 'listening' || !this.audioBuffer) return
@@ -373,6 +377,7 @@ export class OpenAGIG2App {
       this.fail(new Error(audio.durationSeconds === 0 ? 'No microphone audio arrived from G2. Check the glasses connection, then try Ask again.' : 'The recording was too short. Speak your question before sending.'))
       return
     }
+    if (this.store.snapshot().autoSend) { await this.runQuestion(audio.toWav()); return }
     const controller = new AbortController(); this.requestController = controller; this.preparingDraft = true
     this.phone.requestActive?.(true)
     this.phone.set('Transcribing for review', 'OpenAI transcribes after recording. Nothing is sent to the agent until you confirm.')
@@ -389,6 +394,21 @@ export class OpenAGIG2App {
     this.requestController = null; this.preparingDraft = false; this.cancelConfirmation = false; this.renderActiveProgress = null
     this.phone.requestActive?.(false)
     if (controller.signal.aborted && !this.exited) this.showHome()
+  }
+  private stopInstruction(): string { return this.store.snapshot().autoSend ? 'Tap Stop talking to send automatically.' : 'Tap Stop talking to review before sending.' }
+  async configureAutoSend(enabled: boolean): Promise<void> {
+    if (this.exited || this.microphoneOpening || this.navigationBusy || this.requestController || ['listening', 'thinking', 'review', 'pairing'].includes(this.mode)) {
+      this.phone.autoSend?.(this.store.snapshot().autoSend)
+      this.phone.activity?.('Send preference unchanged: finish or discard the current question first.')
+      return
+    }
+    this.navigationBusy = true
+    try {
+      await this.store.update({ autoSend: enabled })
+      this.phone.autoSend?.(enabled); this.renderer.autoSend?.(enabled)
+      this.phone.set('Send preference saved', this.stopInstruction())
+    } catch (error) { this.phone.autoSend?.(this.store.snapshot().autoSend); this.phone.set('Could not save preference', safeOpenAGIError(error)) }
+    finally { this.navigationBusy = false }
   }
   private async runQuestion(input: Blob | string): Promise<void> {
     if (this.requestController) return
@@ -596,7 +616,7 @@ export class OpenAGIG2App {
       this.renderer.listening()
       await this.audio.start(pcm => { if (this.mode === 'listening') speech.push(pcm) })
       if (this.exited || this.liveSpeech !== speech) { await this.audio.stop(); return }
-      this.phone.set('Recording question · live', `Words appear while you speak. Tap Stop and review when finished. Audio streams ${this.store.snapshot().speechTransport === 'relay' ? 'through your main to' : 'directly to'} Deepgram.`)
+      this.phone.set('Recording question · live', `Words appear while you speak. ${this.stopInstruction()} Audio streams ${this.store.snapshot().speechTransport === 'relay' ? 'through your main to' : 'directly to'} Deepgram.`)
       this.liveCaptureTimer = setTimeout(() => { void this.finishAsk() }, 30_000)
     } catch (error) { this.stopLiveSpeech(); if (!this.exited) this.fail(error) }
     finally { this.microphoneOpening = false }

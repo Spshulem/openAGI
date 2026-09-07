@@ -1,7 +1,7 @@
 # G2 0.4.3: transcript review and activity
 
-Manual voice now stops at a draft, not an agent invocation. Both buffered and
-live speech require explicit Send; discard and re-record leave saved answers
+Manual voice sends on Stop by default. A persisted auto-send setting can be
+disabled to require explicit Send for both buffered and live speech; discard and re-record leave saved answers
 and conversation identity intact. Wake listening remains explicitly opt-in
 and automatic. Drafts are transient and are not restored after app exit.
 
@@ -15,7 +15,11 @@ hold-to-talk is unsupported. This patch does not invent a long-press gesture.
 
 ## Verification
 
-- 71 focused client tests passed; assembled-client TypeScript check passed.
+- 75 focused client tests passed; assembled-client TypeScript check passed.
+- Auto-send defaults on for older pairings. An explicit confirmation preference
+  persists through reopen/disconnect and cannot change during an active question.
+  Buffered auto-send uses one ask request; live auto-send waits for finalized
+  text and sends exactly once. Deepgram interim text remains visible while recording.
 - Coverage includes no send before confirmation, duplicate Send, draft discard,
   re-record, conversation identity, cancelled/late transcription, streamed tool
   activity, stable partial answer paging and two-step glasses cancellation.
@@ -34,9 +38,10 @@ hold-to-talk is unsupported. This patch does not invent a long-press gesture.
 ## Physical acceptance still required
 
 1. Install the new bundle without disconnecting; verify pairing survives reopen.
-2. Tap, speak, tap: verify the whole transcript is reviewable and no agent work
+2. Disable auto-send. Tap, speak, tap: verify the whole transcript is reviewable and no agent work
    starts until Send. Discard once and re-record once. Repeat with both speech
-   modes (buffered OpenAI is not live transcription).
+   modes (buffered OpenAI is not live transcription). Enable auto-send and verify
+   Stop sends once without review, then reopen and check the saved preference.
 3. Send a read-only request to list apps on a named Mac. Verify tool names appear
    on the glasses, swipes retain partial pages, and Recent retains the answer.
 4. Double-tap while working, choose keep waiting, then repeat and confirm Stop.

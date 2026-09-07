@@ -47,6 +47,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     sendDraft: () => { void app.sendDraft() },
     discardDraft: () => { void app.discardDraft() },
     rerecordDraft: () => { void app.rerecordDraft() },
+    configureAutoSend: enabled => { void app.configureAutoSend(enabled) },
     previousPage: () => app.scrollUp(),
     nextPage: () => app.scrollDown(),
     recentAnswer: () => { void app.recentAnswer() },

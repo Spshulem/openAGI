@@ -12,6 +12,7 @@ const StateSchema = z.object({
   answerQuestions: z.boolean().default(true),
   speechModel: z.enum(['openai-buffered', 'nova-3', 'nova-2']).default('openai-buffered'),
   speechTransport: z.enum(['relay', 'direct']).default('relay'),
+  autoSend: z.boolean().default(true),
   connectionMode: z.enum(['enrollment', 'direct']).default('enrollment'),
   agentOrigin: z.string().url().nullable().default(null),
   history: z.array(z.object({ conversationId: z.string().uuid(), question: z.string(), reply: z.string(), at: z.string() })).max(30).default([]),
@@ -19,13 +20,14 @@ const StateSchema = z.object({
 export type OpenAGIState = z.infer<typeof StateSchema>
 const KEY = 'openagi.g2.state.v2'
 
-function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport'>): OpenAGIState {
+function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
   return {
     version: 2, nodeId, nodeToken: null, node: null, conversationId: null,
     ambientEnabled: preferences?.ambientEnabled ?? false, wakePhrase: preferences?.wakePhrase ?? 'open agi',
     answerQuestions: preferences?.answerQuestions ?? true,
     speechModel: preferences?.speechModel ?? 'openai-buffered',
     speechTransport: preferences?.speechTransport ?? 'relay',
+    autoSend: preferences?.autoSend ?? true,
     connectionMode: 'enrollment', agentOrigin: null, history: [],
   }
 }

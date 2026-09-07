@@ -2,6 +2,19 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
+
+it('exposes auto-send and labels Talk and Stop according to the saved setting', () => {
+  const configureAutoSend = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureAutoSend }, [])
+  phone.autoSend(true); phone.set('Recording question · live', '')
+  expect(document.querySelector('[data-action="ask"]')?.textContent).toBe('Stop talking · send')
+  document.querySelector<HTMLInputElement>('#auto-send')?.click()
+  expect(configureAutoSend).toHaveBeenCalledWith(false)
+  phone.autoSend(false); phone.set('Recording question', '')
+  expect(document.querySelector('[data-action="ask"]')?.textContent).toBe('Stop talking · review')
+  phone.set('Ready', '')
+  expect(document.querySelector('[data-action="ask"]')?.textContent).toBe('Talk')
+})
 function fixture() {
   const selectAnswer = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), selectAnswer }, [])

@@ -6,6 +6,7 @@ async function fixture() {
   const store = new OpenAGIStore({ get: () => Promise.resolve(null), set: () => Promise.resolve(), remove: () => Promise.resolve() })
   await store.update({ nodeToken: 'test-scoped-token-1234', connectionMode: 'direct', agentOrigin: 'https://main.example.com', conversationId: crypto.randomUUID() })
   let receive: (pcm: Uint8Array) => void = () => {}
+  await store.update({ autoSend: false })
   const ask = vi.fn(() => Promise.resolve({ question: 'Hello', reply: 'Hi' }))
   const listen = vi.fn(() => Promise.resolve({ question: 'Hello', triggered: false, armed: false }))
   const set = vi.fn()
@@ -13,7 +14,7 @@ async function fixture() {
   const renderer = { home: vi.fn(), recent: vi.fn(), review: vi.fn(), confirmCancel: vi.fn(), listening: vi.fn(), thinking: vi.fn(), message: vi.fn(), answer: vi.fn(), progress: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(
-    { askText: ask, listen } as unknown as Args[0], store,
+    { ask, askText: ask, listen } as unknown as Args[0], store,
     audio,
     renderer as unknown as Args[3],
     { set, paired: vi.fn(), ambient: vi.fn() } as unknown as Args[4], [],
@@ -31,6 +32,37 @@ it('starts buffered follow-up on tap without deleting the saved answer', async (
   expect(store.snapshot().history[0].reply).toBe('# Answer\n**Plain** text')
   expect(renderer.answer).toHaveBeenLastCalledWith('Answer Plain text', 0, 1)
   await app.systemExit()
+})
+
+it('auto-send uploads buffered audio once without a separate transcription request', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureAutoSend(true)
+    await f.app.startAsk(); f.receive(new Uint8Array(32000))
+    await f.app.configureAutoSend(false) // Must not change an active recording.
+    expect(f.store.snapshot().autoSend).toBe(true)
+    await f.app.finishAsk()
+    expect(f.listen).not.toHaveBeenCalled()
+    expect(f.ask).toHaveBeenCalledWith(expect.any(Blob), expect.any(String), expect.any(Function), expect.any(AbortSignal))
+    expect(f.ask).toHaveBeenCalledOnce()
+    await f.app.sendDraft(); expect(f.ask).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit() }
+})
+
+it('defaults older pairings to auto-send and persists explicit confirmation preference', async () => {
+  let saved: string | null = null
+  const storage = { get: async () => saved, set: async (_key: string, value: string) => { saved = value }, remove: async () => {} }
+  const store = new OpenAGIStore(storage)
+  await store.update({ nodeToken: 'test-scoped-token-1234' })
+  const legacy = JSON.parse(saved!); delete legacy.autoSend; saved = JSON.stringify(legacy)
+  const reopened = new OpenAGIStore(storage)
+  expect((await reopened.load()).autoSend).toBe(true)
+  await reopened.update({ autoSend: false })
+  const again = new OpenAGIStore(storage)
+  expect((await again.load()).autoSend).toBe(false)
+  expect(again.snapshot().nodeToken).toBe('test-scoped-token-1234')
+  await again.clearCredential()
+  expect(again.snapshot().autoSend).toBe(false)
 })
 
 it('returns from an answer to Ask and browses Recent on glasses without changing the conversation', async () => {

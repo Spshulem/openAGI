@@ -6,11 +6,13 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ### Version 0.4.3: review before send and glasses activity
 
-Manual questions: tap to record, tap to stop, review the transcript, then tap
-to send. Swipe through longer transcripts; double-tap discards without sending.
+Manual questions: tap to record, tap to stop and send by default. Turn off
+"Send automatically when I stop talking" to review the transcript, then tap
+to send. The preference survives reopening and disconnecting. Swipe through longer transcripts; double-tap discards without sending.
 The phone also offers Send, Re-record and Discard. Deepgram streams speech live;
 OpenAI buffered mode transcribes after Stop, using the existing transcribe-only
-listen route. Both wait for confirmation before starting agent work. Optional
+listen route when confirmation is enabled. With auto-send on, buffered audio
+uses a single ask request and live speech sends finalized text. Optional
 wake listening keeps its explicitly enabled automatic-trigger behavior.
 
 While working, Thinking and a bounded timestamped tool/stage trail replace the
