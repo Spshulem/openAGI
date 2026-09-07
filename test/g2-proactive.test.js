@@ -98,6 +98,29 @@ test("settings validate categories/timezones/retention and stale consent-off can
   assert.throws(() => f.call({ op: "execute" }));
 });
 
+test("selected coding watches reach G2 with exact review targets and existing notification guards", t => {
+  const f = fixture(t);
+  const sourceRef = { kind: "coding-watch", id: "local:codex:fixture-session", nodeId: "local", provider: "codex", sessionId: "fixture-session" };
+  f.runtime.codingSupervisor = { configured: true, state: { watches: { [sourceRef.id]: {} } } };
+  f.outreach.push({ id: "coding-alert", sourceRef, status: "unseen", createdAt: new Date(f.now()).toISOString(), title: "Codex: response ready", summary: "Untrusted output", needsDecision: false });
+  assert.equal(f.call({ op: "feed" }).items.length, 0);
+  f.call({ op: "configure", settings: { enabled: true } });
+  const item = f.call({ op: "feed" }).items[0];
+  assert.equal(item.important, true); assert.equal(item.category, "discoveries");
+  assert.deepEqual(item.codingTarget, { provider: "codex", sessionId: "fixture-session" });
+  assert.equal(item.action, "review-on-main");
+  assert.equal(f.call({ op: "notify", id: item.id }).notify, true);
+  assert.equal(f.call({ op: "notify", id: item.id }).notify, false);
+  f.call({ op: "configure", settings: { categories: ["approvals"] } });
+  assert.equal(f.call({ op: "feed" }).items.length, 0);
+  f.call({ op: "configure", settings: { categories: ["discoveries"] } });
+  f.runtime.codingSupervisor.remoteNodeId = "another-node";
+  assert.equal(f.call({ op: "feed" }).items.length, 0);
+  f.runtime.codingSupervisor.remoteNodeId = null;
+  delete f.runtime.codingSupervisor.state.watches[sourceRef.id];
+  assert.equal(f.call({ op: "feed" }).items.length, 0);
+});
+
 test("HTTP scope rejects unauthenticated, non-G2, owner-token and cross-node access; owner handoff remains protected", async t => {
   const f = fixture(t);
   const prior = process.env.OPENAGI_AUTH_TOKEN; process.env.OPENAGI_AUTH_TOKEN = "test-owner-g2-inbox";

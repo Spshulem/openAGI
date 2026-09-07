@@ -21,6 +21,10 @@ export async function codingSupervisorRoute(runtime, method, pathname, url, read
   }
   if (!supervisor?.configured) return { status: 503, body: { error: "Coding supervisor is not configured. See the coding-supervisor setup guide." } };
   try {
+    if (method === "POST" && pathname === "/coding-agents/watch") {
+      const body = await readBody();
+      return { status: 200, body: await supervisor.setWatch({ provider: body.provider, sessionId: body.sessionId, enabled: body.enabled }) };
+    }
     if (method === "POST" && pathname === "/coding-agents/reconcile" && (!supervisor.external || supervisor.remote)) {
       const body = await readBody();
       if (supervisor.remote) return { status: 200, body: await supervisor.request({ operation: "reconcile", provider: body.provider, sessionId: body.sessionId, confirmedStopped: body.confirmedStopped }) };

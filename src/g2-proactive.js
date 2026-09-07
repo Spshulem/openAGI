@@ -142,10 +142,15 @@ export class G2Proactive {
       for (const i of (this.runtime?.outreach?.list?.() ?? []).slice(0, 200)) {
         if (!["unseen", "seen"].includes(i.status) || Date.parse(i.createdAt) < this.now() - 7 * DAY) continue;
         const kind = i.sourceRef?.kind;
+        const coding = kind === "coding-watch";
+        const supervisor = this.runtime?.codingSupervisor;
+        if (coding && (!supervisor?.configured || !supervisor.state.watches?.[i.sourceRef.id]
+          || i.sourceRef.nodeId !== (supervisor.remoteNodeId || "local"))) continue;
         const category = /email|mail/.test(kind) ? "email" : /calendar/.test(kind) ? "calendar"
           : i.needsDecision ? "approvals" : /task/.test(kind) ? "tasks" : "discoveries";
-        if (selected.has(category)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary), category,
-          important: i.needsDecision === true, at: Date.parse(i.createdAt) || this.now(), action: "review-on-main" });
+        if (selected.has(category)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary, coding ? 1000 : 400), category,
+          important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: "review-on-main",
+          ...(coding ? { codingTarget: { provider: i.sourceRef.provider, sessionId: i.sourceRef.sessionId } } : {}) });
       }
       if (selected.has("tasks")) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: 100 }) ?? []) {
         const due = Date.parse(t.dueDate);
