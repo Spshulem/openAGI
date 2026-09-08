@@ -13,7 +13,11 @@ supervisor remains an optional compatibility adapter.
    A CLI being found does not prove authentication; the first approved run does.
 2. Open **More → Coding Agents → Setup and provider requirements**. Enter the
    absolute paths of existing Git project folders, one per line, then choose
-   **Save folders and enable**. Saving replaces the selected folder list.
+   **Replace folders and enable**. Entering paths replaces the entire selected
+   folder list. The editor intentionally does not reveal saved absolute paths:
+   saved project names and short IDs are shown instead. Leave it blank and choose
+   **Keep saved folders and enable** to reuse the saved selection, including after
+   disabling and re-enabling the feature. An empty new setup cannot be enabled.
    Home directories, filesystem roots, duplicates and non-Git folders are rejected.
 3. Select a provider, workspace, optional model ID and reasoning effort. Enter
    an instruction and choose **Review start approval**. The complete instruction,
@@ -21,6 +25,23 @@ supervisor remains an optional compatibility adapter.
    the floating panel. Nothing starts before approval.
 4. Inspect the result in Coding Agents. **Stop managed run** stops only a process
    OpenAGI launched. It does not stop pre-existing terminal or desktop writers.
+
+The setup panel links directly to this public guide. If no CLI is found, it shows
+installation/sign-in guidance instead of an unusable start form. Install and
+authenticate the CLI under the same operating-system account that runs the
+supervisor, then choose **Refresh**. On a remote coding node, both the CLI and
+project folders must be on that node, not on the computer displaying the dashboard.
+OpenAGI does not download executables, log in, or start a model as a side effect
+of saving setup. Users supply their own accounts, project folders and optional
+node enrollment; no machine names or private infrastructure are required.
+
+For a first test, use a disposable Git project and request a read-only summary.
+Confirm that no session starts before approval, the approval names the exact
+project/provider, the result is visible in **Inspect / reply**, and a follow-up
+also requires approval. CLI discovery alone does not prove authentication or
+successful work. If a run fails, check provider sign-in, CLI compatibility and
+usage limits on the supervisor computer. This does not grant computer-control
+permissions or configure email/iMessage accounts.
 
 The initial built-in execution profile is deliberately restricted: Codex runs
 read-only with user execution configuration ignored; Claude keeps manual
