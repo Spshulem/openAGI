@@ -210,6 +210,88 @@ it('safely discards buffered Stop when backgrounding clears the recording', asyn
   } finally { await f.app.systemExit() }
 })
 
+async function lifelogHoldFixture() {
+  const f = await fixture()
+  Object.assign(f.api, { proactive: vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] }) })
+  await f.app.configureMemory(true, true); await f.app.configureLifelogTalkMode('hold')
+  return f
+}
+
+it.each([true, false])('hold ignores quick taps and release respects auto-send=%s', async autoSend => {
+  const f = await lifelogHoldFixture()
+  try {
+    await f.app.configureAutoSend(autoSend)
+    f.audio.start.mockClear(); f.app.tap(); await Promise.resolve()
+    expect(f.audio.start).not.toHaveBeenCalled()
+    await f.app.holdStart(); f.app.tap()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    await f.app.holdRelease()
+    expect(f.api.askText).toHaveBeenCalledTimes(autoSend ? 1 : 0)
+    if (!autoSend) { await f.app.sendDraft(); expect(f.api.askText).toHaveBeenCalledOnce() }
+    await f.app.holdRelease(); expect(f.api.askText).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(true)
+  } finally { await f.app.systemExit() }
+})
+
+it('release during microphone setup cancels instead of sending later', async () => {
+  const f = await lifelogHoldFixture()
+  let opened!: () => void
+  try {
+    await f.app.configureAutoSend(true)
+    f.speech.open.mockImplementationOnce(() => new Promise<void>(resolve => { opened = resolve }))
+    const starting = f.app.holdStart()
+    await vi.waitFor(() => expect(opened).toBeTypeOf('function'))
+    await f.app.holdRelease(); opened(); await starting
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.speech.finish).not.toHaveBeenCalled()
+    expect(f.app.proactive.memoryActive).toBe(true)
+    await f.app.holdStart(); await f.app.holdRelease()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit() }
+})
+
+it('hold release also sends buffered audio once', async () => {
+  const f = await lifelogHoldFixture()
+  try {
+    await f.app.configureSpeech('openai-buffered'); await f.app.configureMemory(true, true)
+    await f.app.configureAutoSend(true)
+    f.api.ask.mockResolvedValue({ question: 'Buffered question', reply: 'Answer' })
+    await f.app.holdStart(); f.receive(new Uint8Array(6400))
+    expect(f.api.ask).not.toHaveBeenCalled()
+    await f.app.holdRelease(); await f.app.holdRelease()
+    expect(f.api.ask).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(true)
+  } finally { await f.app.systemExit() }
+})
+
+it('missing release times out without sending and foreground loss never sends', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    await f.app.configureAutoSend(true); await f.app.holdStart()
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(f.api.askText).not.toHaveBeenCalled()
+    await f.app.holdRelease(); expect(f.api.askText).not.toHaveBeenCalled()
+    await f.app.holdStart(); f.app.setForeground(false); await f.app.holdRelease()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    expect(f.app.proactive.memoryActive).toBe(false)
+    f.app.setForeground(true); await f.app.configureMemory(true, true)
+    await f.app.holdStart(); await f.app.holdRelease()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('lifelog hold preference persists and does not reset pairing', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureLifelogTalkMode('hold')
+    const saved = f.storage.set.mock.calls.at(-1) as unknown as [string, string]
+    const reloaded = new OpenAGIStore({ get: async () => saved[1], set: async () => {}, remove: async () => {} })
+    const state = await reloaded.load()
+    expect(state.lifelogTalkMode).toBe('hold'); expect(state.nodeToken).toBe(f.store.snapshot().nodeToken)
+    await reloaded.clearCredential(); expect(reloaded.snapshot().lifelogTalkMode).toBe('hold')
+  } finally { await f.app.systemExit() }
+})
+
 it('renders paired home when boot happens while hidden without starting capture', async () => {
   const hidden = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
   const f = await fixture({ ambientEnabled: true })

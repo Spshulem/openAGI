@@ -4,6 +4,23 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.10: optional hold-to-talk during lifelog
+
+In Listen → Talk, speech and activity settings, select **Hold to talk / release
+to finish**. The preference survives reopening and leaves auto-send unchanged.
+While lifelog is active, quick taps no longer start a question (the optional
+tap-to-mark-moment action still works). Hold until Listening appears, speak,
+then release to send or review according to the auto-send setting. The same
+hold gesture starts a follow-up from an answer while lifelog remains active.
+
+Requires hold/release events from the Even app/firmware, using pinned SDK
+0.0.15. Releases are matched to their input source. Missing source information
+is ignored; early release, cancellation, backgrounding and a 30-second missing
+release timeout never auto-send the held question. Tap mode and explicit phone
+Ask remain available if the hardware does not deliver these gestures. Physical
+testing is required on glasses and ring; SDK declarations alone are not proof
+of firmware support. No main-server update is required.
+
 ### Version 0.4.9: quiet lifelog and resume
 
 Quiet lifelog shows only `●` while the microphone and retention session are

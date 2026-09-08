@@ -3,6 +3,15 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('offers a separate persisted lifelog hold mode without changing auto-send', () => {
+  const configureLifelogTalkMode = vi.fn(), configureAutoSend = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureLifelogTalkMode, configureAutoSend }, [])
+  const select = document.querySelector<HTMLSelectElement>('#lifelog-talk-mode')!
+  phone.lifelogTalkMode('hold'); expect(select.value).toBe('hold')
+  select.dispatchEvent(new Event('change'))
+  expect(configureLifelogTalkMode).toHaveBeenCalledWith('hold'); expect(configureAutoSend).not.toHaveBeenCalled()
+})
+
 it('resumes lifelog with current explicit consent and disables duplicate requests while starting', () => {
   const returnToLifelog = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), returnToLifelog }, [])

@@ -30,6 +30,7 @@ export interface OpenAGIPhoneActions {
   inboxAction?(op: InboxOperation, id?: string, extra?: Record<string, unknown>): void
   markMoment?(): void
   configureIdleTap?(action: 'talk' | 'highlight'): void
+  configureLifelogTalkMode?(mode: 'tap' | 'hold'): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -94,11 +95,12 @@ export class OpenAGIPhoneCompanion {
             </details>
           </section>
           <details class="ambient" data-page="listen"><summary>Talk, speech and activity settings</summary><h2>Talk controls</h2>
-            <label>Tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (default)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down while listening for Talk / Mark moment controls. Swipe up for Inbox. Double-tap pauses. Holding is not supported.</p>
-            <p>On glasses: tap Talk, speak, then tap Stop talking.</p>
+            <label>Talk while lifelog is on<select id="lifelog-talk-mode"><option value="tap">Tap to start / tap to stop</option><option value="hold">Hold to talk / release to finish</option></select></label>
+            <p>Hold mode ignores quick taps for Talk. Wait for Listening before speaking; releasing during microphone setup cancels. Requires an Even app and firmware that deliver hold/release gestures. If holding does nothing, use tap mode or Ask on the phone.</p>
+            <label>Quick tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (ignored in hold mode)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down for explicit Talk / Mark moment controls. Swipe up for Inbox. Double-tap pauses. During a held question, double-tap cancels without sending.</p>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
             <p>Turn off to review the transcript and confirm Send first. Passive listening resumes after a manual question; optional wake responses are controlled separately.</p>
-            <p>Hold to talk / release to finish is unavailable on G2: the current Even SDK does not provide press and release events.</p>
+            <p>Hold mode stops without sending if no release arrives within 30 seconds. Lifelog remains foreground-only.</p>
             <h2>Speech recognition</h2><label for="speech-model">Speech model (not the agent's reasoning model)</label>
             <select id="speech-model"><option value="openai-buffered">OpenAI · buffered recording</option><option value="nova-3">Deepgram Nova 3 · live</option><option value="nova-2">Deepgram Nova 2 · live</option></select>
             <label for="speech-transport">Live speech connection</label>
@@ -173,6 +175,7 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#open-inbox')?.addEventListener('click', () => actions.openInbox?.())
     root.querySelector('#memory-enabled')?.addEventListener('change', () => actions.memoryConsent?.(root.querySelector<HTMLInputElement>('#memory-enabled')?.checked === true, root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
     root.querySelector('#memory-resume')?.addEventListener('click', () => actions.returnToLifelog?.(root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
+    root.querySelector('#lifelog-talk-mode')?.addEventListener('change', () => actions.configureLifelogTalkMode?.(requiredSelect(root, '#lifelog-talk-mode').value === 'hold' ? 'hold' : 'tap'))
     root.querySelector('#recording-consent')?.addEventListener('change', () => {
       if (root.querySelector<HTMLInputElement>('#recording-consent')?.checked !== true) actions.memoryConsent?.(false, false)
     })
@@ -270,6 +273,7 @@ export class OpenAGIPhoneCompanion {
   }
   saveStatus(text: string): void { const p = this.actionsSection.querySelector('#save-status'); if (p) p.textContent = text }
   idleTapAction(action: 'talk' | 'highlight'): void { requiredSelect(this.actionsSection, '#idle-tap').value = action }
+  lifelogTalkMode(mode: 'tap' | 'hold'): void { requiredSelect(this.actionsSection, '#lifelog-talk-mode').value = mode }
   memoryPending(pending: boolean): void {
     const resume = this.actionsSection.querySelector<HTMLButtonElement>('#memory-resume'); if (resume) resume.disabled = pending
     const input = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled')
