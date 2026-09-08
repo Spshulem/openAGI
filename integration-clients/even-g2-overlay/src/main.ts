@@ -11,6 +11,7 @@ import { loadOpenAGIConfig, safeOpenAGIError } from './openagi/config'
 import { OpenAGIStore } from './openagi/store'
 import { SerializedAudioSource } from './openagi/audio-source'
 import { AgentsInputController } from './openagi/input-controller'
+import { AgentsDisplayController } from './openagi/display-controller'
 import { EvenKeyValueStorage } from './openagi/persistent-storage'
 import { BrowserKeyValueStorage, RecoveryStore } from './storage/recovery-store'
 import { GlassesRenderer } from './ui/glasses-renderer'
@@ -24,7 +25,7 @@ else await launchBuildBetter(bridge)
 
 async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
   const config = loadOpenAGIConfig()
-  const display = new EvenDisplayController(bridge)
+  const display = new AgentsDisplayController(bridge)
   await display.initialize('OpenAGI\n\nStarting…')
   const renderer = new OpenAGIGlassesRenderer(display)
   const store = new OpenAGIStore(new EvenKeyValueStorage(bridge, new BrowserKeyValueStorage()))

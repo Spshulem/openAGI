@@ -5,13 +5,13 @@ it('keeps retained quiet listening minimal while preserving sleep and wake contr
   const surface = { show: vi.fn() }
   const renderer = new OpenAGIGlassesRenderer(surface as never)
   renderer.inboxCount(80); renderer.passive(true, false, 'Peri')
-  expect(surface.show).toHaveBeenLastCalledWith('●', false)
+  expect(surface.show).toHaveBeenLastCalledWith('●', false, true)
   renderer.notice('Action identified', 'Send proposal')
   expect(surface.show).toHaveBeenLastCalledWith('Action identified\n\nSend proposal', false)
   renderer.sleep(true); renderer.passive(true, false, 'Peri')
   expect(surface.show).toHaveBeenLastCalledWith(' ', false)
   renderer.sleep(false)
-  expect(surface.show).toHaveBeenLastCalledWith('●', false)
+  expect(surface.show).toHaveBeenLastCalledWith('●', false, true)
 })
 
 it('never shows a recording dot for paused or non-retained listening', () => {

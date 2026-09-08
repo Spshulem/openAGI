@@ -4,6 +4,18 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.13: upper-right recording dot
+
+Quiet lifelog places its recording dot in a separate 32 × 32 display container
+at (540, 4), near the upper-right corner. The existing full-screen container
+remains the sole gesture owner; tap, hold/release, double-tap and swipe behavior
+is unchanged. Pause, answers, notices and display sleep clear the indicator;
+returning to active quiet lifelog restores it. Display updates are serialized
+so an older update cannot leave the recording dot on after pause/sleep.
+This layout change needs only a G2 update. The included 0.4.12 consent restoration
+still requires the corresponding main update. Physical position, readability
+and gestures must be checked on glasses after installing.
+
 ### Version 0.4.12: remember enabled lifelog across reopening
 
 **Keep lifelog on** saves the user's preference and the current consent ID and

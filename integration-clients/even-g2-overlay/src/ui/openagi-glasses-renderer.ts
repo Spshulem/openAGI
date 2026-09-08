@@ -1,4 +1,4 @@
-import type { DisplaySurface } from '../even/display-controller'
+import type { AgentsDisplaySurface } from '../openagi/display-controller'
 
 export class OpenAGIGlassesRenderer {
   private sleeping = false
@@ -13,7 +13,8 @@ export class OpenAGIGlassesRenderer {
   private stopHint(): string { return this.holding ? this.sendOnStop ? 'Release: send' : 'Release: review' : this.sendOnStop ? 'Tap: stop and send' : 'Tap: stop and review' }
   passive(retaining: boolean, wake: boolean, phrase: string): void {
     const dots = '.'.repeat(this.pulse++ % 3 + 1)
-    this.show(retaining && !wake ? '●' : `Listening ${dots}\n\n${wake ? `Say “${phrase}” or tap to ask` : 'Tap to ask'}`, false)
+    if (retaining && !wake) this.show('●', false, true)
+    else this.show(`Listening ${dots}\n\n${wake ? `Say “${phrase}” or tap to ask` : 'Tap to ask'}`, false)
   }
   paused(lifelog: boolean, confirm = false): void {
     this.show(confirm
@@ -23,11 +24,11 @@ export class OpenAGIGlassesRenderer {
   inboxCount(count: number): void { this.pendingInbox = count }
   memory(active: boolean): void { this.memoryActive = active }
   autoSend(enabled: boolean): void { this.sendOnStop = enabled }
-  private latest: [string, boolean] = ['', false]
-  constructor(private readonly surface: DisplaySurface) {}
-  private show(text: string, reset: boolean): void {
-    this.latest = [text, reset]
-    if (!this.sleeping) this.surface.show(text, reset)
+  private latest: [string, boolean, boolean?] = ['', false]
+  constructor(private readonly surface: AgentsDisplaySurface) {}
+  private show(text: string, reset: boolean, recording?: boolean): void {
+    this.latest = recording ? [text, reset, true] : [text, reset]
+    if (!this.sleeping) this.surface.show(...this.latest)
   }
   sleep(value: boolean): void {
     this.sleeping = value
