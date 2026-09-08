@@ -2,6 +2,7 @@ import { expect, it, vi } from 'vitest'
 import { OpenAGIG2App } from '../../app/openagi-g2-app'
 import { OpenAGIStore } from '../store'
 import type { LiveSpeech, SpeechCallbacks } from '../live-speech'
+import { SpeechStreamError } from '../live-speech'
 
 it('auto-sends finalized live text once after Stop when enabled', async () => {
   const f = await fixture()
@@ -31,7 +32,7 @@ async function fixture(initial: { ambientEnabled?: boolean } = {}) {
   const renderer = { paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
   const phone = { set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
-  const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return speech as unknown as LiveSpeech })
+  const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return { ...speech } as unknown as LiveSpeech })
   await app.boot()
   return { app, api, audio, renderer, phone, speech, store, storage, receive: (pcm: Uint8Array) => receive(pcm), callbacks: () => callbacks }
 }
@@ -216,6 +217,81 @@ async function lifelogHoldFixture() {
   await f.app.configureMemory(true, true); await f.app.configureLifelogTalkMode('hold')
   return f
 }
+
+it('recovers lifelog with fresh speech and existing consent, without replaying a question', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    const old = f.callbacks(), enable = vi.spyOn(f.app.proactive, 'enableMemory')
+    old.error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(f.audio.start).toHaveBeenCalledTimes(2); expect(enable).not.toHaveBeenCalled()
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.phone.activity).toHaveBeenCalledWith(expect.stringContaining('Audio gap'))
+    old.utterance('Peri send an email'); expect(f.api.askText).not.toHaveBeenCalled()
+    f.callbacks().utterance('Peri incomplete tail'); expect(f.api.askText).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it.each(['pause', 'background', 'consent', 'expiry'])('cancels lifelog recovery on %s', async action => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    if (action === 'expiry') await vi.advanceTimersByTimeAsync(59500)
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(0)
+    if (action === 'pause') f.app.doubleTap()
+    if (action === 'background') f.app.setForeground(false)
+    if (action === 'consent') await f.app.configureMemory(false, false)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('stops after three recovery attempts per minute', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    for (const delay of [1000, 2000, 4000]) {
+      f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+      await vi.advanceTimersByTimeAsync(delay)
+    }
+    expect(f.audio.start).toHaveBeenCalledTimes(4)
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(f.audio.start).toHaveBeenCalledTimes(4); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('pause while a recovery connection is opening cannot restart the microphone later', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  let opened!: () => void
+  try {
+    f.speech.open.mockImplementationOnce(() => new Promise<void>(resolve => { opened = resolve }))
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(opened).toBeTypeOf('function')
+    await f.app.configureAmbient(false, 'Peri', false)
+    opened(); await vi.advanceTimersByTimeAsync(5000)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    expect(f.store.snapshot().ambientEnabled).toBe(false); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('never retries malformed audio or auto-sends an interrupted manual question', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    f.callbacks().error(new SpeechStreamError('Invalid PCM', 'invalid_pcm'))
+    await vi.advanceTimersByTimeAsync(5000); expect(f.audio.start).toHaveBeenCalledOnce()
+    await f.app.configureAutoSend(true); await f.app.startAsk()
+    f.callbacks().transcript('A partial question', false, 0)
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(5000); await f.app.finishAsk()
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
 
 it.each([true, false])('hold ignores quick taps and release respects auto-send=%s', async autoSend => {
   const f = await lifelogHoldFixture()

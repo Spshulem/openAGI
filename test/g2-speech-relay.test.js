@@ -20,8 +20,9 @@ async function fixture(t, onUpstream = () => {}) {
   const requested = [];
   const channel = { deepgramApiKey: "server-only-deepgram-key" };
   const relay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channel, upstreamFactory: (url, options) => {
-    requested.push({ url, options });
-    return new WebSocket(`ws://127.0.0.1:${provider.address().port}`, options);
+    const upstream = new WebSocket(`ws://127.0.0.1:${provider.address().port}`, options);
+    requested.push({ url, options, upstream });
+    return upstream;
   } });
   const peers = [];
   provider.on("connection", (socket, req) => { peers.push(socket); onUpstream(socket, req); });
@@ -112,7 +113,7 @@ test("provider error bodies never leak and invalid PCM never reaches Deepgram", 
   const invalid = connect(f.origin); t.after(() => invalid.ws.terminate()); await invalid.next();
   const closed = once(invalid.ws, "close");
   invalid.ws.send(Buffer.alloc(3));
-  assert.match((await invalid.next()).message, /PCM/);
+  const pcmError = await invalid.next(); assert.match(pcmError.message, /PCM/); assert.equal(pcmError.code, "invalid_pcm");
   assert.equal((await closed)[0], 1008);
 });
 
@@ -121,4 +122,15 @@ test("shutting down the relay closes both sides of an active speech connection",
   const client = connect(f.origin); t.after(() => client.ws.terminate()); await client.next();
   const closed = once(client.ws, "close"); const providerClosed = once(f.peers[0], "close");
   f.relay.close(); await closed; await providerClosed;
+});
+
+test("relay distinguishes rate overflow from provider backlog without relaxing either limit", { timeout: 3000 }, async t => {
+  const f = await fixture(t);
+  const fast = connect(f.origin); t.after(() => fast.ws.terminate()); await fast.next();
+  const closed = once(fast.ws, "close");
+  fast.ws.send(Buffer.alloc(64000)); fast.ws.send(Buffer.alloc(64000));
+  assert.equal((await fast.next()).code, "audio_rate"); await closed;
+  const slow = connect(f.origin); t.after(() => slow.ws.terminate()); await slow.next();
+  Object.defineProperty(f.requested[1].upstream, "bufferedAmount", { get: () => 64000 });
+  slow.ws.send(Buffer.alloc(640)); assert.equal((await slow.next()).code, "upstream_backlog");
 });

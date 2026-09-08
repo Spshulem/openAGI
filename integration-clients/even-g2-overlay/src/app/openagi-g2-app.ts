@@ -6,13 +6,13 @@ import { AgentOriginSchema, OpenAGIApiError, safeOpenAGIError } from '../openagi
 import { AmbientAudioSegmenter } from '../openagi/ambient-listener'
 import { progressDetail, progressLabel } from '../openagi/progress'
 import { plainAnswer } from '../openagi/answer-format'
-import { LiveSpeech, speechTrigger, type SpeechModel, type SpeechCallbacks } from '../openagi/live-speech'
+import { LiveSpeech, SpeechStreamError, speechTrigger, type SpeechModel, type SpeechCallbacks } from '../openagi/live-speech'
 import type { OpenAGIStore } from '../openagi/store'
 import type { OpenAGIGlassesRenderer } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
 import { G2ProactiveClient, type InboxItem } from '../openagi/proactive'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'paused' | 'resume-consent' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'paused' | 'resume-consent' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 
 export class OpenAGIG2App {
   readonly proactive: G2ProactiveClient
@@ -38,6 +38,13 @@ export class OpenAGIG2App {
   private memoryRequest = 0
   private pausedLifelog = false
   private heldQuestion: { ready: boolean; cancelled: boolean; released: boolean } | null = null
+  private recoveringSpeech = false
+  private recoveryEpoch = 0
+  private recoveryTimer: ReturnType<typeof setTimeout> | undefined
+  private recoveryAttempts: number[] = []
+  private recoveryFailure: Error | null = null
+  private discardRecoveryUtterance = false
+  private cancelSpeechRecovery(): void { this.recoveryEpoch++; clearTimeout(this.recoveryTimer); this.recoveryTimer = undefined; this.recoveringSpeech = false }
   private resumeAfterAsk = false
   private lastListeningPulse = 0
   private foregroundActive = true
@@ -199,6 +206,7 @@ export class OpenAGIG2App {
   async configureMemory(enabled: boolean, consent: boolean): Promise<void> {
     const request = ++this.memoryRequest
     if (!enabled || !consent) {
+      if (this.recoveringSpeech) { this.cancelSpeechRecovery(); await this.stopAmbient(); this.showPaused() }
       this.phone.memoryPending?.(false); this.proactive.pauseMemory()
       if (enabled) this.phone.memoryStatus?.(false, 'Confirm participant consent above, then tap Return / resume lifelog.')
       return
@@ -297,6 +305,7 @@ export class OpenAGIG2App {
     this.showUnpaired()
   }
   tap(): void {
+    if (this.recoveringSpeech) return
     if (this.heldQuestion && !this.heldQuestion.released) return
     if (this.displaySleeping) return
     if (this.exited || this.navigationBusy || this.microphoneOpening || Date.now() - this.lastTapAt < 400) return
@@ -370,6 +379,7 @@ export class OpenAGIG2App {
   private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length) }
   async recentAnswer(): Promise<void> { await this.selectAnswer(this.store.snapshot().history.length - 1) }
   doubleTap(): void {
+    if (this.recoveringSpeech) { void this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions); return }
     if (this.heldQuestion && !this.heldQuestion.released) { void this.cancelHold(); return }
     if (this.displaySleeping) { this.toggleDisplay(); return }
     void this.navigateBack().catch(error => this.fail(error))
@@ -419,6 +429,7 @@ export class OpenAGIG2App {
     this.renderer.recent?.(plainAnswer(history[this.recentIndex].question), history.length - this.recentIndex, history.length)
   }
   async systemExit(): Promise<void> {
+    this.cancelSpeechRecovery()
     this.clearNotice()
     document.removeEventListener('visibilitychange', this.onVisibility)
     this.memoryRequest++; this.resumeAfterAsk = false
@@ -539,6 +550,11 @@ export class OpenAGIG2App {
   }
   private async applyAmbientConfiguration(enabled: boolean, wakePhrase: string, answerQuestions: boolean): Promise<void> {
     if (this.exited) return
+    if (!enabled && this.recoveringSpeech) {
+      this.pausedLifelog = this.proactive.memoryActive
+      await this.stopAmbient(); await this.store.update({ ambientEnabled: false })
+      this.phone.ambient(false, wakePhrase, answerQuestions); this.showPaused(); return
+    }
     if (!enabled && this.requestController) {
       this.resumeAfterAsk = false
       await this.store.update({ ambientEnabled: false })
@@ -569,6 +585,7 @@ export class OpenAGIG2App {
     }
   }
   async startAsk(fromHold = false): Promise<void> {
+    if (this.recoveringSpeech) return
     if (this.heldQuestion && !fromHold) return
     if (this.exited || !this.foregroundActive || this.navigationBusy || this.microphoneOpening || this.requestController) return
     if (this.mode === 'review') { await this.sendDraft(); return }
@@ -802,6 +819,7 @@ export class OpenAGIG2App {
     } finally { this.microphoneOpening = false }
   }
   private async stopAmbient(preserveMemory = false): Promise<void> {
+    if (!preserveMemory) this.cancelSpeechRecovery()
     if (!preserveMemory) this.resumeAfterAsk = false
     this.ambientEpoch++
     if (!preserveMemory) this.proactive.pauseMemory()
@@ -873,6 +891,7 @@ export class OpenAGIG2App {
       },
       utterance: text => {
         if (!ambient || !this.ambientRunning || this.liveSpeech !== speech || this.exited) return
+        if (this.discardRecoveryUtterance) { this.discardRecoveryUtterance = false; this.phone.activity?.('First utterance after the gap was not used to trigger an agent question.'); return }
         if (this.requestController) { this.ambientArmedUntil = 0; return }
         const preferences = this.store.snapshot()
         if (preferences.listeningMode === 'passive') return
@@ -889,7 +908,8 @@ export class OpenAGIG2App {
       },
       error: error => {
         if (this.liveSpeech !== speech || this.exited) return
-        if (ambient) void this.pauseAmbientWithError(error)
+        if (ambient && this.recoveringSpeech) { this.recoveryFailure = error; return }
+        if (ambient) void this.recoverAmbientSpeech(error)
         else { this.stopLiveSpeech(); void this.audio.stop().catch(() => undefined); this.fail(error) }
       },
     })
@@ -994,6 +1014,52 @@ export class OpenAGIG2App {
     const detail = `${safeOpenAGIError(error)} Listening is paused, not recording. Your preference is saved. Use Retry listening on the phone.`
     this.renderer.message('Listening paused', detail)
     this.phone.set('Listening paused', detail)
+  }
+  private async recoverAmbientSpeech(error: Error): Promise<void> {
+    if (this.recoveringSpeech) return // The in-flight attempt owns its failure.
+    if (!(error instanceof SpeechStreamError) || !error.recoverable || !this.ambientRunning || !this.proactive.memoryActive || !this.foregroundActive || this.exited || this.requestController) {
+      await this.pauseAmbientWithError(error); return
+    }
+    this.recoveringSpeech = true
+    const epoch = ++this.recoveryEpoch, state = this.store.snapshot(), consentRequest = this.memoryRequest
+    const stillAllowed = (): boolean => epoch === this.recoveryEpoch && !this.exited && this.foregroundActive && document.visibilityState !== 'hidden'
+      && this.proactive.memoryActive && consentRequest === this.memoryRequest && this.store.snapshot().ambientEnabled
+      && state.nodeToken === this.store.snapshot().nodeToken && state.agentOrigin === this.store.snapshot().agentOrigin
+    const previous = this.mode, page = this.page
+    await this.stopAmbient(true)
+    if (!stillAllowed()) { if (epoch === this.recoveryEpoch) await this.pauseAmbientWithError(new Error('Lifelog recovery cancelled. Confirm consent before resuming.')); return }
+    this.discardRecoveryUtterance = true
+    // A new LiveSpeech has a new stream id and no old partial utterance or audio.
+    this.phone.activity?.(`Audio gap: ${error.message} Unfinalized words were discarded; previously finalized text is retained.`)
+    this.phone.saveStatus?.('Audio gap · reconnecting with fresh audio. No old audio will be replayed.')
+    const schedule = (): void => {
+      this.recoveryAttempts = this.recoveryAttempts.filter(at => Date.now() - at < 60_000)
+      if (this.recoveryAttempts.length >= 3) { void this.pauseAmbientWithError(new Error('Live speech recovery stopped after three attempts in one minute. Check Activity and retry lifelog on the phone.')); return }
+      if (['ambient', 'home', 'reconnecting'].includes(this.mode)) { this.mode = 'reconnecting'; this.renderer.notice?.('Audio gap · reconnecting', 'Microphone off · Double-tap: stop') }
+      this.phone.set('Lifelog reconnecting', 'Microphone off. Some words may be missing. Double-tap to stop recovery.')
+      this.recoveryTimer = setTimeout(() => { void attempt() }, 1000 * 2 ** this.recoveryAttempts.length)
+    }
+    const attempt = async (): Promise<void> => {
+      this.recoveryTimer = undefined
+      if (!stillAllowed()) { if (epoch === this.recoveryEpoch) await this.pauseAmbientWithError(new Error('Lifelog consent or foreground session ended. Resume explicitly.')); return }
+      this.recoveryAttempts.push(Date.now())
+      try {
+        this.recoveryFailure = null
+        await this.startAmbient()
+        if (this.recoveryFailure) throw this.recoveryFailure
+        if (!stillAllowed()) { if (epoch === this.recoveryEpoch) await this.stopAmbient(); return }
+        this.recoveringSpeech = false
+        this.phone.activity?.('Lifelog reconnected. New transcript stream started after the audio gap.')
+        if (previous === 'answer') this.showAnswer(page)
+      } catch (retryError) {
+        if (epoch !== this.recoveryEpoch) return
+        await this.stopAmbient(true)
+        // Authentication, provider setup and malformed audio are never retried.
+        if (retryError instanceof SpeechStreamError && retryError.recoverable && stillAllowed()) schedule()
+        else await this.pauseAmbientWithError(retryError)
+      }
+    }
+    schedule()
   }
   private async heartbeatWithoutLosingEnrollment(name?: string): Promise<void> {
     try { await this.api.heartbeat(name) }

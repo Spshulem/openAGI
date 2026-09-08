@@ -3,6 +3,7 @@ import { z } from 'zod'
 const SpeechEvent = z.object({
   type: z.string(), is_final: z.boolean().optional(), speech_final: z.boolean().optional(),
   message: z.string().max(250).optional(),
+  code: z.string().max(60).optional(),
   start: z.number().nonnegative().optional(), duration: z.number().nonnegative().optional(),
   channel: z.object({ alternatives: z.array(z.object({ transcript: z.string().max(8000).optional(), words: z.array(z.object({ word: z.string().max(100), punctuated_word: z.string().max(100).optional(), start: z.number().nonnegative(), end: z.number().nonnegative(), speaker: z.number().int().min(0).max(99).optional() })).max(2000).optional() })).max(10).optional() }).optional(),
 })
@@ -15,6 +16,10 @@ export interface SpeechCallbacks {
 }
 type SocketFactory = (url: string, protocols: string[]) => WebSocket
 
+export class SpeechStreamError extends Error {
+  constructor(message: string, readonly code: string, readonly recoverable = false) { super(message); this.name = 'SpeechStreamError' }
+}
+
 // Raw PCM streams through the paired main by default; direct Deepgram is optional.
 // Only a G2-scoped credential or ephemeral voice token enters this object.
 export class LiveSpeech {
@@ -22,6 +27,12 @@ export class LiveSpeech {
   private closed = false
   private ready = false
   private bytes = 0
+  private queue: { pcm: Uint8Array; offset: number; at: number }[] = []
+  private queuedBytes = 0
+  private audioCredit = 640
+  private creditAt = Date.now()
+  private drainTimer: ReturnType<typeof setTimeout> | undefined
+  private closeSent = false
   private stable = ''
   private full = ''
   private lastFinalEnd = -1
@@ -45,7 +56,7 @@ export class LiveSpeech {
       this.rejectOpen = error => { clearTimeout(timer); reject(error) }
       const markReady = (): void => {
         if (this.closed || this.ready) return
-        clearTimeout(timer); this.rejectOpen = undefined; this.ready = true
+        clearTimeout(timer); this.rejectOpen = undefined; this.ready = true; this.creditAt = Date.now()
         this.keepalive = setInterval(() => { if (ws.readyState === 1 && !this.finishResolve) ws.send(JSON.stringify({ type: 'KeepAlive' })) }, 4000)
         resolve()
       }
@@ -57,35 +68,62 @@ export class LiveSpeech {
         }
         this.receive(event.data)
       }
-      ws.onerror = () => this.failure('Live speech connection failed. Check Deepgram access and your network. No audio was retried.')
+      ws.onerror = () => this.failure('Live speech connection failed. Check Deepgram access and your network. No audio was retried.', 'connection_failed')
       ws.onclose = event => {
         if (this.closed) return
         // CloseStream drains final results before closing. Other closes are failures.
-        if (this.finishResolve && event.code === 1000) {
+        if (this.finishResolve && this.closeSent && event.code === 1000) {
           const resolveFinish = this.finishResolve; this.finishResolve = undefined; this.finishReject = undefined
           const text = this.full.trim(); this.close(); resolveFinish(text)
-        } else this.failure('Live speech disconnected. Listening is paused; tap Retry listening to reconnect.')
+        } else this.failure('Live speech disconnected.', event.code === 1006 || event.code === 1011 ? 'stream_disconnected' : 'stream_closed')
       }
     })
   }
 
   push(pcm: Uint8Array): void {
-    if (this.closed) return
+    if (this.closed || this.finishResolve) return
     if (!this.ready || !this.socket || this.socket.readyState !== 1) { this.failure('Live speech is not connected. Please retry.'); return }
-    // Stop instead of building seconds of latency or silently dropping words.
-    if (this.socket.bufferedAmount + pcm.byteLength > 64_000) { this.failure('Speech upload fell more than two seconds behind. Listening paused; check the connection.'); return }
-    if (this.bytes === 0) this.streamAt = Date.now()
-    this.bytes += pcm.byteLength
-    this.socket.send(pcm)
+    if (!pcm.byteLength || pcm.byteLength % 2) { this.failure('Invalid PCM frame: expected non-empty 16-bit mono audio.', 'invalid_pcm'); return }
+    if (this.queuedBytes + this.socket.bufferedAmount + pcm.byteLength > 64_000) { this.failure('Audio queue exceeded two seconds. Some audio was not transcribed.', 'audio_backlog'); return }
+    if (this.bytes === 0 && !this.queue.length) this.streamAt = Date.now()
+    this.queue.push({ pcm: pcm.slice(), offset: 0, at: Date.now() }); this.queuedBytes += pcm.byteLength
+    this.drain()
+  }
+
+  private drain(): void {
+    clearTimeout(this.drainTimer); this.drainTimer = undefined
+    if (this.closed || !this.socket || this.socket.readyState !== 1) return
+    const now = Date.now(), frame = this.queue[0]
+    if (frame && now - frame.at >= 2000) { this.failure('Audio became stale in the two-second queue. Some audio was not transcribed.', 'audio_backlog'); return }
+    // Never catch up by dumping a burst after the event loop or BLE stalls.
+    this.audioCredit = Math.min(3200, this.audioCredit + Math.max(0, now - this.creditAt) * 32); this.creditAt = now
+    while (this.queue.length && this.socket.bufferedAmount < 6400 && this.audioCredit >= 2) {
+      const frame = this.queue[0]
+      const length = Math.min(frame.pcm.length - frame.offset, Math.floor(this.audioCredit / 2) * 2, 640)
+      if (length > 0) {
+        try { this.socket.send(frame.pcm.subarray(frame.offset, frame.offset + length)) }
+        catch { this.failure('Speech upload interrupted.', 'stream_disconnected'); return }
+        frame.offset += length; this.audioCredit -= length; this.queuedBytes -= length; this.bytes += length
+        if (frame.offset === frame.pcm.length) this.queue.shift()
+      }
+    }
+    if (this.queue.length) this.drainTimer = setTimeout(() => this.drain(), 20)
+    else if (this.finishResolve && !this.closeSent) {
+      this.closeSent = true
+      clearTimeout(this.finishTimer)
+      this.finishTimer = setTimeout(() => this.failure('Speech finalization took too long. The question was not sent.'), 5000)
+      try { this.socket.send(JSON.stringify({ type: 'CloseStream' })) }
+      catch { this.failure('Speech finalization connection failed.', 'stream_disconnected') }
+    }
   }
 
   finish(): Promise<string> {
     if (this.closed || !this.ready || !this.socket || this.finishResolve) return Promise.reject(new Error('Live speech is not ready to finish. Please retry.'))
     return new Promise((resolve, reject) => {
       this.finishResolve = resolve; this.finishReject = reject
-      this.finishTimer = setTimeout(() => this.failure('Speech finalization took too long. Your transcript remains visible; the question was not sent.'), 5000)
-      // Deepgram flushes all remaining transcription, then closes the connection.
-      this.socket?.send(JSON.stringify({ type: 'CloseStream' }))
+      this.finishTimer = setTimeout(() => this.failure('Speech finalization took too long. Your transcript remains visible; the question was not sent.'), 7000)
+      // Drain the bounded PCM queue in order before requesting final words.
+      this.drain()
     })
   }
 
@@ -93,6 +131,7 @@ export class LiveSpeech {
     if (this.closed) return
     this.closed = true; this.ready = false
     clearInterval(this.keepalive); clearTimeout(this.finishTimer)
+    clearTimeout(this.drainTimer); this.queue = []; this.queuedBytes = 0
     this.rejectOpen?.(reason); this.rejectOpen = undefined
     this.finishReject?.(reason); this.finishResolve = undefined; this.finishReject = undefined
     if (this.socket) {
@@ -101,16 +140,20 @@ export class LiveSpeech {
     }
   }
 
-  private failure(message: string): void {
+  private failure(message: string, code = 'speech_error'): void {
     if (this.closed) return
-    const error = new Error(message)
+    const error = new SpeechStreamError(message, code, ['audio_backlog', 'audio_rate', 'upstream_backlog', 'stream_disconnected'].includes(code))
     this.close(error); this.callbacks.error(error)
   }
   private receive(data: unknown): void {
     if (typeof data !== 'string' || data.length > 128_000) return
     let event: z.infer<typeof SpeechEvent>
     try { event = SpeechEvent.parse(JSON.parse(data)) } catch { return }
-    if (event.type === 'Error') { this.failure(event.message ?? 'Deepgram reported a speech error. Check your speech model and account configuration.'); return }
+    if (event.type === 'Error') {
+      // Legacy mains used one error for rate and backlog failures. Retries remain bounded.
+      const code = event.code ?? (event.message === 'Speech upload fell behind or exceeded real-time PCM limits. Listening paused.' ? 'audio_backlog' : 'speech_error')
+      this.failure(event.message ?? 'Deepgram reported a speech error. Check your speech model and account configuration.', code); return
+    }
     if (event.type === 'UtteranceEnd') { this.endUtterance(); return }
     if (event.type !== 'Results') return
     const text = event.channel?.alternatives?.[0]?.transcript?.trim() ?? ''

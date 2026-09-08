@@ -4,6 +4,31 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.11: paced live speech and bounded lifelog recovery
+
+Live PCM is split into at most 640-byte chunks and paced at 32 KB/s, with at
+most 100 ms of catch-up credit and a two-second combined audio backlog limit.
+Stop drains queued PCM before requesting final words. Invalid frames and stale
+queues fail explicitly; incomplete manual questions never auto-send or replay.
+
+A recoverable speech backlog/disconnection during consented lifelog pauses the
+microphone, shows **Audio gap · reconnecting**, and starts a fresh stream after
+1/2/4-second delays, capped at three reconnect attempts per minute. Activity
+records the gap; finalized text already queued for main is preserved, not replayed.
+The gap notice is local Activity, not a new durable server gap record. New stream
+IDs prevent client-side transcript coalescing across the gap. The first utterance
+after recovery is not used for a wake/question trigger because it may be clipped.
+
+Recovery never renews retention consent. Pause, background, exit, consent expiry
+or withdrawal, and main/credential changes cancel it. Authentication, malformed
+PCM and provider-configuration errors remain explicit failures. Recovery applies
+to lifelog, not interrupted manual questions or unconsented wake listening.
+
+The client handles the older main's combined PCM error. The matching optional
+main update distinguishes invalid PCM, incoming rate overflow, and provider upload
+backlog with machine-readable codes, without weakening limits or authentication.
+Physical sustained-listening and network-interruption tests remain required.
+
 ### Version 0.4.10: optional hold-to-talk during lifelog
 
 In Listen → Talk, speech and activity settings, select **Hold to talk / release
