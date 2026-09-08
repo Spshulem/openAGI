@@ -19,8 +19,8 @@ it('auto-sends finalized live text once after Stop when enabled', async () => {
   } finally { await f.app.systemExit() }
 })
 
-async function fixture(initial: { ambientEnabled?: boolean } = {}) {
-  const storage = { get: vi.fn(() => Promise.resolve(null as string | null)), set: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve()) }
+async function fixture(initial: { ambientEnabled?: boolean } = {}, restored?: { saved: string; proactive: (body: { op: string }) => Promise<unknown> }) {
+  const storage = { get: vi.fn(() => Promise.resolve(restored?.saved ?? null as string | null)), set: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve()) }
   const store = new OpenAGIStore(storage)
   await store.update({ autoSend: false, ...initial })
   await store.update({ nodeToken: 'saved-scoped-token-123', connectionMode: 'direct', agentOrigin: 'https://main.example.com', conversationId: crypto.randomUUID(), speechModel: 'nova-3' })
@@ -29,6 +29,7 @@ async function fixture(initial: { ambientEnabled?: boolean } = {}) {
   const audio = { active: true, start: vi.fn((cb: typeof receive) => { receive = cb; return Promise.resolve() }), stop: vi.fn(() => Promise.resolve()) }
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon' })), ask: vi.fn(), listen: vi.fn() }
+  if (restored) Object.assign(api, { proactive: restored.proactive })
   const renderer = { paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
   const phone = { set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
@@ -183,13 +184,13 @@ it('phone return to active lifelog leaves the consent and microphone intact', as
   } finally { await f.app.systemExit() }
 })
 
-it('does not revive retention after backgrounding without a new confirmation', async () => {
+it('does not revive retention when main cannot verify the saved consent', async () => {
   const f = await fixture()
   Object.assign(f.api, { proactive: vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] }) })
   try {
     await f.app.configureMemory(true, true)
     f.app.setForeground(false); await Promise.resolve(); f.app.setForeground(true)
-    expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
+    await vi.waitFor(() => expect(f.renderer.paused).toHaveBeenLastCalledWith(true))
     await f.app.configureMemory(true, false)
     expect(f.app.proactive.memoryActive).toBe(false)
     expect(f.audio.start).toHaveBeenCalledOnce()
@@ -208,6 +209,97 @@ it('safely discards buffered Stop when backgrounding clears the recording', asyn
     expect(f.api.listen).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
     f.app.setForeground(true); await f.app.startAsk()
     expect(f.audio.start).toHaveBeenCalledTimes(2)
+  } finally { await f.app.systemExit() }
+})
+
+it('resumes on foreground return and fresh app boot without generating another consent', async () => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: Date.now() + 60000 }
+  const proactive = vi.fn(async (body: { op: string }) => ['consent', 'settings'].includes(body.op) ? { consent: grant } : { items: [] })
+  Object.assign(f.api, { proactive })
+  let reopened: Awaited<ReturnType<typeof fixture>> | undefined
+  try {
+    await f.app.configureMemory(true, true)
+    const saved = JSON.stringify(f.store.snapshot())
+    f.app.setForeground(false); await Promise.resolve(); f.app.setForeground(true)
+    await vi.waitFor(() => expect(f.audio.start).toHaveBeenCalledTimes(2))
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(proactive.mock.calls.filter(([b]) => b.op === 'consent')).toHaveLength(1)
+    await f.app.systemExit()
+    reopened = await fixture({}, { saved, proactive })
+    expect(reopened.audio.start).toHaveBeenCalledOnce()
+    expect(reopened.app.proactive.memoryActive).toBe(true)
+    expect(proactive.mock.calls.filter(([b]) => b.op === 'consent')).toHaveLength(1)
+  } finally { await f.app.systemExit(); await reopened?.app.systemExit() }
+})
+
+it.each(['expired', 'revoked', 'different', 'offline', 'off'])('does not auto-record after reopening when consent is %s', async reason => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: reason === 'expired' ? Date.now() - 1 : Date.now() + 60000 }
+  let reopened: Awaited<ReturnType<typeof fixture>> | undefined
+  const proactive = vi.fn(async (body: { op: string }) => {
+    if (body.op !== 'settings') return { items: [] }
+    if (reason === 'offline') throw new Error('Main offline')
+    return { consent: reason === 'revoked' ? null : reason === 'different' ? { ...grant, id: 'replacement' } : grant }
+  })
+  try {
+    const saved = JSON.stringify({ ...f.store.snapshot(), ambientEnabled: reason !== 'off', lifelogEnabled: reason !== 'off', lifelogConsent: grant })
+    reopened = await fixture({}, { saved, proactive })
+    expect(reopened.audio.start).not.toHaveBeenCalled()
+    expect(reopened.app.proactive.memoryActive).toBe(false)
+    expect(proactive.mock.calls.some(([b]) => b.op === 'consent')).toBe(false)
+  } finally { await f.app.systemExit(); await reopened?.app.systemExit() }
+})
+
+it('retries consent verification after rapid background and foreground switching', async () => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: Date.now() + 60000 }
+  let finish!: (value: unknown) => void
+  let checks = 0
+  Object.assign(f.api, { proactive: vi.fn(async (body: { op: string }) => {
+    if (body.op === 'consent') return { consent: grant }
+    if (body.op === 'settings') {
+      if (++checks === 1) return new Promise(resolve => { finish = resolve })
+      return { consent: grant }
+    }
+    return { items: [] }
+  }) })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.setForeground(false); f.app.setForeground(true)
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    f.app.setForeground(false); f.app.setForeground(true)
+    finish({ consent: grant })
+    await vi.waitFor(() => expect(f.audio.start).toHaveBeenCalledTimes(2))
+    expect(checks).toBe(2); expect(f.app.proactive.memoryActive).toBe(true)
+  } finally { await f.app.systemExit() }
+})
+
+it('explicit Off during consent verification wins and prevents microphone startup', async () => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: Date.now() + 60000 }
+  let finish!: (value: unknown) => void
+  Object.assign(f.api, { proactive: vi.fn(async (body: { op: string }) => body.op === 'consent' ? { consent: grant } : body.op === 'settings' ? new Promise(resolve => { finish = resolve }) : { items: [] }) })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.setForeground(false); await Promise.resolve(); f.app.setForeground(true)
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    await f.app.configureMemory(false, false); finish({ consent: grant })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.store.snapshot().lifelogEnabled).toBe(false)
+    expect(f.store.snapshot().lifelogConsent).toBeNull(); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit() }
+})
+
+it('clears saved lifelog consent when pairing credentials or main change', async () => {
+  const f = await fixture()
+  try {
+    await f.store.update({ lifelogEnabled: true, lifelogConsent: { id: 'saved', until: Date.now() + 60000 } })
+    await f.store.update({ agentOrigin: 'https://other.example.com' })
+    expect(f.store.snapshot().lifelogEnabled).toBe(false); expect(f.store.snapshot().lifelogConsent).toBeNull()
+    await f.store.update({ lifelogEnabled: true, lifelogConsent: { id: 'new', until: Date.now() + 60000 } })
+    await f.store.clearCredential()
+    expect(f.store.snapshot().lifelogEnabled).toBe(false); expect(f.store.snapshot().lifelogConsent).toBeNull()
   } finally { await f.app.systemExit() }
 })
 
@@ -470,7 +562,7 @@ it('buffered quiet listening ignores trigger results while still capturing final
   } finally { await f.app.systemExit() }
 })
 
-it('start lifelog opens the microphone automatically and foreground exit revokes retention', async () => {
+it('start lifelog persists its preference and foreground exit suspends without revoking consent', async () => {
   const f = await fixture()
   const proactive = vi.fn(async (body: { op: string; enabled?: boolean }) => body.op === 'consent' && body.enabled ? { consent: { id: 'fixture-consent', until: Date.now() + 60000 } } : { items: [] })
   Object.assign(f.api, { proactive })
@@ -479,7 +571,9 @@ it('start lifelog opens the microphone automatically and foreground exit revokes
     expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(true)
     f.app.setForeground(false); await Promise.resolve()
     expect(f.app.proactive.memoryActive).toBe(false); expect(f.speech.close).toHaveBeenCalled()
-    expect(proactive).toHaveBeenCalledWith(expect.objectContaining({ op: 'consent', enabled: false, consentId: 'fixture-consent' }))
+    expect(proactive).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'consent', enabled: false, consentId: 'fixture-consent' }))
+    expect(f.store.snapshot().lifelogEnabled).toBe(true)
+    expect(f.store.snapshot().lifelogConsent?.id).toBe('fixture-consent')
     f.app.setForeground(true); await Promise.resolve()
     expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(false)
   } finally { await f.app.systemExit() }

@@ -66,7 +66,7 @@ export class G2Proactive {
       return result;
     }
     switch (body.op) {
-      case "settings": return { settings: n.settings, consentActive: Boolean(n.consent) };
+      case "settings": return { settings: n.settings, consentActive: Boolean(n.consent), consent: n.consent ? { ...n.consent } : null };
       case "configure": {
         const p = body.settings;
         if (!p || typeof p !== "object" || Array.isArray(p) || Object.keys(p).some(k => !Object.keys(defaults()).includes(k))) reject("Unsupported settings");

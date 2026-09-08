@@ -87,10 +87,10 @@ export class OpenAGIPhoneCompanion {
           </section>
           <section class="ambient" data-page="listen"><h2>Lifelog</h2><p id="save-status" role="status">No text saved this session yet.</p><button id="mark-moment">Mark moment</button>
             <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
-            <label><input id="memory-enabled" type="checkbox"> Start lifelog · listen and save final transcripts</label>
-            <p id="memory-status">Off. Give consent, then Start lifelog. Listening starts automatically; no separate switch is required. Switch off to stop retaining text.</p>
+            <label><input id="memory-enabled" type="checkbox"> Keep lifelog on · resume when this app opens</label>
+            <p id="memory-status">Off. Give consent, then enable Keep lifelog on. It resumes when the app opens while that consent is valid. Switch off to stop recording and automatic resumption.</p>
             <button id="memory-resume">Return / resume lifelog</button>
-            <details><summary>Privacy and retention</summary><p>Final text is batched to your main, not raw audio. Speakers are unverified. Suggestions need your confirmation. Retention stops on pause, app hiding or exit, and expires after 4 hours.</p>
+            <details><summary>Privacy and retention</summary><p>Final text is batched to your main, not raw audio. Speakers are unverified. Suggestions need your confirmation. Backgrounding stops the microphone; reopening resumes with the same consent, including after a crash. Consent expires after 4 hours and is never renewed automatically. Turn lifelog off to stop automatic resumption. Reconfirm consent if participants change. Unsent text is not replayed after exit.</p>
             <button id="delete-memory">Stop memory & delete retained transcripts</button>
             </details>
           </section>
@@ -271,6 +271,7 @@ export class OpenAGIPhoneCompanion {
     const p = this.actionsSection.querySelector('#memory-status'); if (p) p.textContent = detail
     if (!active) this.saveStatus(detail)
   }
+  lifelogEnabled(enabled: boolean): void { const input = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled'); if (input) input.checked = enabled }
   saveStatus(text: string): void { const p = this.actionsSection.querySelector('#save-status'); if (p) p.textContent = text }
   idleTapAction(action: 'talk' | 'highlight'): void { requiredSelect(this.actionsSection, '#idle-tap').value = action }
   lifelogTalkMode(mode: 'tap' | 'hold'): void { requiredSelect(this.actionsSection, '#lifelog-talk-mode').value = mode }
