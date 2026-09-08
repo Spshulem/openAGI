@@ -31,6 +31,7 @@ export interface OpenAGIPhoneActions {
   markMoment?(): void
   configureIdleTap?(action: 'talk' | 'highlight'): void
   configureLifelogTalkMode?(mode: 'tap' | 'hold'): void
+  configureBackgroundListening?(enabled: boolean): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -88,9 +89,12 @@ export class OpenAGIPhoneCompanion {
           <section class="ambient" data-page="listen"><h2>Lifelog</h2><p id="save-status" role="status">No text saved this session yet.</p><button id="mark-moment">Mark moment</button>
             <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
             <label><input id="memory-enabled" type="checkbox"> Keep lifelog on · resume when this app opens</label>
+            <label><input id="background-listening" type="checkbox"> Keep listening when phone is locked · experimental</label>
+            <p>Opt-in continuation of live, quiet lifelog when switching phone apps or locking the screen. Audio continues to your speech provider and final text to main under the same consent. Requires live speech, not buffered mode. Even must remain running; phone suspension can interrupt recording. Unlock to ask questions or recover after a gap.</p>
+            <p id="background-status" role="status">Lock-screen listening off.</p>
             <p id="memory-status">Off. Give consent, then enable Keep lifelog on. It resumes when the app opens while that consent is valid. Switch off to stop recording and automatic resumption.</p>
             <button id="memory-resume">Return / resume lifelog</button>
-            <details><summary>Privacy and retention</summary><p>Final text is batched to your main, not raw audio. Speakers are unverified. Suggestions need your confirmation. Backgrounding stops the microphone; reopening resumes with the same consent, including after a crash. Consent expires after 4 hours and is never renewed automatically. Turn lifelog off to stop automatic resumption. Reconfirm consent if participants change. Unsent text is not replayed after exit.</p>
+            <details><summary>Privacy and retention</summary><p>Final text is batched to your main, not raw audio. Speakers are unverified. Suggestions need your confirmation. Backgrounding stops the microphone unless experimental lock-screen listening is enabled for active live lifelog. Reopening resumes with the same consent, including after a crash. Consent expires after 4 hours and is never renewed automatically. Turn lifelog off to stop automatic resumption. Reconfirm consent if participants change. Unsent text is not replayed after exit.</p>
             <button id="delete-memory">Stop memory & delete retained transcripts</button>
             </details>
           </section>
@@ -176,6 +180,7 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#memory-enabled')?.addEventListener('change', () => actions.memoryConsent?.(root.querySelector<HTMLInputElement>('#memory-enabled')?.checked === true, root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
     root.querySelector('#memory-resume')?.addEventListener('click', () => actions.returnToLifelog?.(root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
     root.querySelector('#lifelog-talk-mode')?.addEventListener('change', () => actions.configureLifelogTalkMode?.(requiredSelect(root, '#lifelog-talk-mode').value === 'hold' ? 'hold' : 'tap'))
+    root.querySelector('#background-listening')?.addEventListener('change', () => actions.configureBackgroundListening?.(root.querySelector<HTMLInputElement>('#background-listening')!.checked))
     root.querySelector('#recording-consent')?.addEventListener('change', () => {
       if (root.querySelector<HTMLInputElement>('#recording-consent')?.checked !== true) actions.memoryConsent?.(false, false)
     })
@@ -275,6 +280,8 @@ export class OpenAGIPhoneCompanion {
   saveStatus(text: string): void { const p = this.actionsSection.querySelector('#save-status'); if (p) p.textContent = text }
   idleTapAction(action: 'talk' | 'highlight'): void { requiredSelect(this.actionsSection, '#idle-tap').value = action }
   lifelogTalkMode(mode: 'tap' | 'hold'): void { requiredSelect(this.actionsSection, '#lifelog-talk-mode').value = mode }
+  backgroundListening(enabled: boolean): void { const input = this.actionsSection.querySelector<HTMLInputElement>('#background-listening'); if (input) input.checked = enabled }
+  backgroundStatus(text: string): void { const element = this.actionsSection.querySelector('#background-status'); if (element) element.textContent = text }
   memoryPending(pending: boolean): void {
     const resume = this.actionsSection.querySelector<HTMLButtonElement>('#memory-resume'); if (resume) resume.disabled = pending
     const input = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled')

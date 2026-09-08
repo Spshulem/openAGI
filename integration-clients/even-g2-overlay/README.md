@@ -4,6 +4,33 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.14: experimental lock-screen lifelog
+
+Under Listen, enable **Keep listening when phone is locked · experimental**,
+select live speech (Nova, not buffered), Quiet listening, and start consented
+lifelog while the phone is visible. The separate preference defaults off and
+survives reopening; changing main or credentials clears it. Only an already-running
+live, quiet session can continue when the phone WebView becomes hidden. No hidden
+cold starts, consent renewal, wake-triggered agent calls, or new notifications.
+Native G2 background/exit still stops capture: this does not keep the plugin alive
+after it is closed or force-quit, and does not bypass OS suspension.
+
+The same speech provider receives audio and the same main receives final text.
+Consent expiry, explicit Off, native app exit, a broken speech connection, or eight
+seconds without PCM stops capture and clears the recording dot. Checks run before
+accepting returning audio as well as on a timer: a suspended timer is not evidence
+of recording. Late audio is discarded, not uploaded as a catch-up burst. Unlock
+to validate saved consent and resume with a fresh stream. The phone shows audio
+received while hidden separately from **Saved on main** transcript acknowledgments.
+
+Hardware acceptance (not yet verified): record a baseline phrase, lock the phone
+for five minutes and speak a distinct phrase each minute, then switch to another
+phone app. Unlock and verify all phrases in saved lifelog on main, not just a dot.
+Also check Off, consent expiry, Bluetooth/network interruption, and force-quit.
+No claim of uninterrupted background support: Even's background guide and FAQ
+disagree about suspension/network behavior. No main update is needed for this
+setting; saved-consent restoration still requires the 0.4.12 main-side change.
+
 ### Version 0.4.13: upper-right recording dot
 
 Quiet lifelog places its recording dot in a separate 32 × 32 display container

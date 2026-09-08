@@ -3,6 +3,19 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('offers explicit background opt-in without granting retention consent', () => {
+  const configureBackgroundListening = vi.fn(), memoryConsent = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureBackgroundListening, memoryConsent }, [])
+  const checkbox = document.querySelector<HTMLInputElement>('#background-listening')!
+  expect(checkbox.checked).toBe(false)
+  checkbox.click()
+  expect(configureBackgroundListening).toHaveBeenCalledWith(true)
+  expect(memoryConsent).not.toHaveBeenCalled()
+  phone.backgroundListening(false); expect(checkbox.checked).toBe(false)
+  phone.backgroundStatus('Audio gap · unlock to resume')
+  expect(document.querySelector('#background-status')!.textContent).toBe('Audio gap · unlock to resume')
+})
+
 it('offers a separate persisted lifelog hold mode without changing auto-send', () => {
   const configureLifelogTalkMode = vi.fn(), configureAutoSend = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureLifelogTalkMode, configureAutoSend }, [])
