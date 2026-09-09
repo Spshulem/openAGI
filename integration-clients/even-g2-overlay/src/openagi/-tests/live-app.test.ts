@@ -368,6 +368,46 @@ it.each(['gap', 'suspended-callback', 'expired', 'off', 'native-exit', 'socket']
   } finally { visibility.mockRestore(); await f.app.systemExit(); vi.useRealTimers() }
 })
 
+it.each(['retry', 'return'])('restores saved lifelog consent after a stream error using %s without creating a new grant', async action => {
+  const f = await fixture()
+  const grant = { id: 'retry-consent', until: Date.now() + 60000 }
+  const proactive = vi.fn(async (body: { op: string }) => ['consent', 'settings'].includes(body.op) ? { consent: grant } : { items: [] })
+  Object.assign(f.api, { proactive })
+  try {
+    await f.app.configureMemory(true, true)
+    f.callbacks().error(new Error('Speech disconnected'))
+    await vi.waitFor(() => expect(f.app.proactive.memoryActive).toBe(false))
+    f.renderer.home.mockClear()
+    if (action === 'retry') await f.app.retryListening()
+    else await f.app.returnToLifelog(false)
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.audio.start).toHaveBeenCalledTimes(2)
+    expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, expect.any(String))
+    expect(f.renderer.home).not.toHaveBeenCalled()
+    await f.app.proactive.refresh()
+    expect(f.renderer.home).not.toHaveBeenCalled()
+    expect(proactive.mock.calls.filter(([b]) => b.op === 'consent')).toHaveLength(1)
+  } finally { await f.app.systemExit() }
+})
+
+it.each(['expired', 'unverified', 'native-background'])('Retry preserves paused lifelog instead of falling back home when %s', async reason => {
+  const f = await lifelogHoldFixture()
+  try {
+    f.callbacks().error(new Error('Speech disconnected'))
+    await vi.waitFor(() => expect(f.app.proactive.memoryActive).toBe(false))
+    if (reason === 'expired') await f.store.update({ lifelogConsent: { id: 'expired', until: Date.now() - 1 } })
+    if (reason === 'native-background') f.app.setForeground(false)
+    f.renderer.home.mockClear()
+    await f.app.retryListening()
+    await f.app.proactive.refresh()
+    expect(f.renderer.home).not.toHaveBeenCalled()
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(false)
+    expect(f.store.snapshot().lifelogEnabled).toBe(true)
+    expect(f.phone.set).toHaveBeenLastCalledWith(expect.stringContaining('paused'), expect.any(String))
+  } finally { await f.app.systemExit() }
+})
+
 async function lifelogHoldFixture() {
   const f = await fixture()
   Object.assign(f.api, { proactive: vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] }) })
@@ -525,10 +565,10 @@ it('lifelog hold preference persists and does not reset pairing', async () => {
   } finally { await f.app.systemExit() }
 })
 
-it('renders paired home when boot happens while hidden without starting capture', async () => {
+it('renders paired pause when boot happens while hidden without starting capture', async () => {
   const hidden = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
   const f = await fixture({ ambientEnabled: true })
-  try { expect(f.renderer.home).toHaveBeenCalled(); expect(f.phone.paired).toHaveBeenCalledWith(true); expect(f.audio.start).not.toHaveBeenCalled() }
+  try { expect(f.renderer.paused).toHaveBeenCalled(); expect(f.phone.paired).toHaveBeenCalledWith(true); expect(f.audio.start).not.toHaveBeenCalled() }
   finally { hidden.mockRestore(); await f.app.systemExit() }
 })
 

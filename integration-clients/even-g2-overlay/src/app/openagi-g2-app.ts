@@ -175,7 +175,11 @@ export class OpenAGIG2App {
       proactiveSettings: settings => phone.proactiveSettings?.(settings),
       inbox: items => {
         phone.inbox?.(items); renderer.inboxCount?.(items.length)
-        if (this.mode === 'home' && !this.noticeTimer) renderer.home(this.store.snapshot().node?.name)
+        if (this.mode === 'home' && !this.noticeTimer) {
+          if (this.store.snapshot().lifelogEnabled && !this.ambientRunning) { this.pausedLifelog = true; this.showPaused() }
+          else if (this.ambientRunning) this.showHome()
+          else renderer.home(this.store.snapshot().node?.name)
+        }
         // Browsing keeps a stable snapshot. Reopen to see arrivals; main
         // revalidates the exact target before accepting any action.
       },
@@ -268,6 +272,7 @@ export class OpenAGIG2App {
     }
   }
   async returnToLifelog(consent: boolean): Promise<void> {
+    if (this.store.snapshot().lifelogEnabled && !consent) { await this.retryListening(); return }
     if (this.exited || !this.foregroundActive || document.visibilityState === 'hidden' || this.navigationBusy || this.requestController || this.microphoneOpening || ['review', 'listening', 'pairing'].includes(this.mode)) return
     if (this.proactive.memoryActive && this.ambientRunning) { this.showHome(); return }
     await this.configureMemory(true, consent)
@@ -628,6 +633,31 @@ export class OpenAGIG2App {
     this.ambientConfiguration = next.catch(() => undefined)
     return next
   }
+  async retryListening(): Promise<void> {
+    if (this.exited) return
+    const visible = (): boolean => this.nativeForeground && document.visibilityState !== 'hidden' && !this.exited
+    if (!visible()) {
+      this.pausedLifelog = this.store.snapshot().lifelogEnabled
+      this.showPaused()
+      this.phone.set('Listening paused', 'Open Agents on the glasses and bring the Even app to the foreground, then retry. G2 has not reported an active foreground session.')
+      return
+    }
+    if (this.requestController || this.microphoneOpening || this.navigationBusy || ['listening', 'review', 'pairing'].includes(this.mode)) {
+      this.phone.set('Listening busy', 'Finish the current question or microphone operation, then retry lifelog.'); return
+    }
+    await this.foregroundTransition
+    if (!visible()) return
+    this.foregroundActive = true; this.proactive.setForeground(true)
+    this.cancelSpeechRecovery()
+    const state = this.store.snapshot()
+    if (state.lifelogEnabled) {
+      if (this.ambientRunning && this.proactive.memoryActive) { this.showHome(); return }
+      // A retry must restore retention, not merely turn the microphone on.
+      await this.stopAmbient(true)
+      this.proactive.suspendMemory()
+      await this.restoreLifelog()
+    } else await this.configureAmbient(true, state.wakePhrase, state.answerQuestions)
+  }
   private async applyAmbientConfiguration(enabled: boolean, wakePhrase: string, answerQuestions: boolean): Promise<void> {
     if (this.exited) return
     if (!enabled) { this.memoryRequest++; await this.disableSavedLifelog(); this.phone.lifelogEnabled?.(false) }
@@ -851,6 +881,7 @@ export class OpenAGIG2App {
   }
   private showUnpaired(): void { this.proactive.stop(); this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
   private showPaused(): void {
+    this.phone.paired(Boolean(this.store.snapshot().nodeToken))
     this.mode = 'paused'; this.renderer.paused?.(this.pausedLifelog)
     this.phone.set(this.pausedLifelog ? 'Lifelog paused' : 'Listening paused', 'Microphone off. Tap on glasses to resume, or use Return / resume lifelog on the phone.')
   }
@@ -870,7 +901,11 @@ export class OpenAGIG2App {
   private fail(error: unknown): void { this.voiceTarget = null; this.clearNotice(); this.mode = 'message'; const message = safeOpenAGIError(error); this.renderer.message('Could not ask agent', message); this.phone.set('Ask failed', message) }
   private async startAmbient(): Promise<void> {
     if (this.exited) return
-    if (!this.foregroundActive || document.visibilityState === 'hidden') { this.showHome(); return }
+    if (!this.foregroundActive || document.visibilityState === 'hidden') {
+      this.pausedLifelog = this.store.snapshot().lifelogEnabled; this.showPaused()
+      this.phone.set('Listening paused', 'Microphone was not started: open Agents on the glasses and the Even app on your phone, then retry.')
+      return
+    }
     if (this.ambientRunning) { this.showHome(); return }
     if (this.microphoneOpening) return
     if (this.store.snapshot().speechModel !== 'openai-buffered') { await this.startLiveAmbient(); return }
@@ -1128,7 +1163,11 @@ export class OpenAGIG2App {
       if (!this.store.snapshot().lifelogEnabled || request !== this.memoryRequest || !this.foregroundActive || this.exited) return
       if (!valid) {
         this.pausedLifelog = true; this.showPaused()
-        this.phone.memoryStatus?.(false, 'Lifelog is enabled, but consent expired, was revoked, or could not be verified. Confirm current participant consent to resume. Main must support consent restoration.')
+        const detail = !state.lifelogConsent || state.lifelogConsent.until <= Date.now()
+          ? 'Lifelog consent expired or is missing. Confirm current participant consent, then use Return / resume lifelog.'
+          : 'Main could not verify the saved lifelog consent. It may be revoked or main needs the consent-restoration update. Check main before resuming.'
+        this.phone.set('Lifelog paused', detail)
+        this.phone.memoryStatus?.(false, detail)
         this.phone.lifelogEnabled?.(true); return
       }
       await this.startAmbient()

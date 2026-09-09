@@ -3,6 +3,14 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('routes Retry listening through lifelog-aware recovery rather than the ambient toggle', () => {
+  const retryListening = vi.fn(), configureAmbient = vi.fn()
+  new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient, retryListening }, [])
+  document.querySelector<HTMLButtonElement>('#ambient-retry')!.click()
+  expect(retryListening).toHaveBeenCalledOnce()
+  expect(configureAmbient).not.toHaveBeenCalled()
+})
+
 it('offers explicit background opt-in without granting retention consent', () => {
   const configureBackgroundListening = vi.fn(), memoryConsent = vi.fn()
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureBackgroundListening, memoryConsent }, [])

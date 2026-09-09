@@ -4,6 +4,20 @@ This workspace contains the implemented phone-hosted Even Realities G2 plugin. I
 
 ## Agents voice mode
 
+### Version 0.4.15: lifelog-aware retry
+
+Retry listening now restores the saved lifelog consent before restarting the
+microphone when lifelog is enabled. Previously it only enabled ordinary ambient
+listening, leaving retention suspended after an error. Return / resume lifelog
+also reuses saved consent when no new participant confirmation is supplied.
+It never creates a new grant without confirmation. Expired or unverifiable grants
+stay paused with a specific phone status; native G2 background and hidden-phone
+startup remain blocked. A blocked start renders Paused, not the Ready home screen,
+and inbox refresh does not overwrite the stopped-lifelog state with Tap to ask.
+Physical repro still required: trigger a speech interruption, Retry, then verify
+the recording dot and a newly saved transcript on main. The initial device-side
+interruption reported by the user has not been diagnosed from device logs.
+
 ### Version 0.4.14: experimental lock-screen lifelog
 
 Under Listen, enable **Keep listening when phone is locked · experimental**,

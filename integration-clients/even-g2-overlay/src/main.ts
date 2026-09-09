@@ -41,6 +41,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     pair: (code, origin) => { void app.pair(code, origin) },
     ask: () => { void app.startAsk() },
     configureBackgroundListening: enabled => { void app.configureBackgroundListening(enabled) },
+    retryListening: () => { void app.retryListening() },
     configureSpeech: (model, transport) => { void app.configureSpeech(model, transport) },
     toggleDisplay: () => app.toggleDisplay(),
     newConversation: () => { void app.newConversation() },

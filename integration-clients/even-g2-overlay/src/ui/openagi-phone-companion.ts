@@ -32,6 +32,7 @@ export interface OpenAGIPhoneActions {
   configureIdleTap?(action: 'talk' | 'highlight'): void
   configureLifelogTalkMode?(mode: 'tap' | 'hold'): void
   configureBackgroundListening?(enabled: boolean): void
+  retryListening?(): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -218,7 +219,7 @@ export class OpenAGIPhoneCompanion {
     })
     const configure = (): void => actions.configureAmbient(ambient?.checked === true, wakePhrase?.value.trim() || 'open agi', answerQuestions?.checked === true)
     ambient?.addEventListener('change', configure)
-    root.querySelector('#ambient-retry')?.addEventListener('click', () => actions.configureAmbient(true, wakePhrase?.value.trim() || 'open agi', answerQuestions?.checked === true))
+    root.querySelector('#ambient-retry')?.addEventListener('click', () => actions.retryListening?.())
     wakePhrase?.addEventListener('change', configure)
     answerQuestions?.addEventListener('change', configure)
     injectStyles()
