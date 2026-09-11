@@ -36,6 +36,15 @@ test("retention is opt-in, consent is scoped/expiring, passive text never invoke
   assert.throws(() => f.capture(id), /consent/);
 });
 
+test("settings verifies existing consent without renewing it or exposing another node's grant", t => {
+  const f = fixture(t), id = f.consent();
+  const original = f.call({ op: "settings" }).consent;
+  assert.equal(original.id, id);
+  assert.equal(f.call({ op: "settings" }, "two").consent, null);
+  f.advance(1000); assert.deepEqual(f.call({ op: "settings" }).consent, original);
+  f.advance(4 * 3600_000); assert.equal(f.call({ op: "settings" }).consent, null);
+});
+
 test("reminder proposals resolve tomorrow in main timezone and need confirmed time", t => {
   const f = fixture(t);
   f.call({ op: "configure", settings: { timeZone: "Pacific/Honolulu" } });

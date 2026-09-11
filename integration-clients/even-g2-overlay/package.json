@@ -29,7 +29,7 @@
     "check": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run build && pnpm run check:bundle && pnpm run check:secrets"
   },
   "dependencies": {
-    "@evenrealities/even_hub_sdk": "0.0.13",
+    "@evenrealities/even_hub_sdk": "0.0.15",
     "zod": "4.4.3"
   },
   "devDependencies": {

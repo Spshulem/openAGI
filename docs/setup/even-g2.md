@@ -177,8 +177,11 @@ Interim transcripts update the phone and glasses. Final segments accumulate;
 only completed utterances can trigger agent work. Extra triggers during an
 active agent request are discarded, not queued. Push-to-talk drains final words
 before sending text, with a bounded five-second finalization wait. A network
-backlog over two seconds pauses speech instead of silently losing words. Retry
-is explicit; there is no automatic WAV fallback or request replay. Activity
+backlog over two seconds discards stale audio with an explicit gap notice. G2
+0.4.11 paces short PCM chunks and can reconnect consented foreground lifelog up to
+three times per minute without renewing consent; pause, app hiding or consent
+expiry cancels recovery. Manual questions and non-recoverable failures still
+require explicit retry. There is no automatic WAV fallback or question replay. Activity
 shows speech setup/finalization time and first-answer-text time separately.
 
 Always listening remains opt-in and foreground-only. Deepgram receives all

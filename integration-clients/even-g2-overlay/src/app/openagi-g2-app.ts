@@ -6,13 +6,13 @@ import { AgentOriginSchema, OpenAGIApiError, safeOpenAGIError } from '../openagi
 import { AmbientAudioSegmenter } from '../openagi/ambient-listener'
 import { progressDetail, progressLabel } from '../openagi/progress'
 import { plainAnswer } from '../openagi/answer-format'
-import { LiveSpeech, speechTrigger, type SpeechModel, type SpeechCallbacks } from '../openagi/live-speech'
+import { LiveSpeech, SpeechStreamError, speechTrigger, type SpeechModel, type SpeechCallbacks } from '../openagi/live-speech'
 import type { OpenAGIStore } from '../openagi/store'
 import type { OpenAGIGlassesRenderer } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
 import { G2ProactiveClient, type InboxItem } from '../openagi/proactive'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'paused' | 'resume-consent' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 
 export class OpenAGIG2App {
   readonly proactive: G2ProactiveClient
@@ -36,22 +36,106 @@ export class OpenAGIG2App {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private ambientRunning = false
   private memoryRequest = 0
+  private pausedLifelog = false
+  private foregroundTransition: Promise<void> = Promise.resolve()
+  private restoringLifelog = false
+  private heldQuestion: { ready: boolean; cancelled: boolean; released: boolean } | null = null
+  private recoveringSpeech = false
+  private recoveryEpoch = 0
+  private recoveryTimer: ReturnType<typeof setTimeout> | undefined
+  private recoveryAttempts: number[] = []
+  private recoveryFailure: Error | null = null
+  private discardRecoveryUtterance = false
+  private cancelSpeechRecovery(): void { this.recoveryEpoch++; clearTimeout(this.recoveryTimer); this.recoveryTimer = undefined; this.recoveringSpeech = false }
   private resumeAfterAsk = false
   private lastListeningPulse = 0
   private foregroundActive = true
+  private nativeForeground = true
+  private backgroundCapture = false
+  private backgroundTimer: ReturnType<typeof setInterval> | null = null
+  private lastAudioAt = 0
+  private backgroundAudioBytes = 0
+  private lastBackgroundStatusAt = 0
   private lifelogRequest = 0
-  private onVisibility = (): void => { this.setForeground(document.visibilityState !== 'hidden') }
-  setForeground(active: boolean): void {
+  private onVisibility = (): void => {
+    const hidden = document.visibilityState === 'hidden'
+    if (hidden && this.canContinueInBackground()) {
+      if (this.backgroundCapture) return
+      this.backgroundCapture = true; this.backgroundAudioBytes = 0
+      this.clearNotice(); this.ambientArmedUntil = 0
+      this.proactive.setForeground(true)
+      this.phone.activity?.('Phone hidden: continuing consented live lifelog. No background agent questions. Actual audio delivery is being checked.')
+      this.phone.backgroundStatus?.('Phone hidden · checking live audio delivery')
+      this.backgroundTimer = setInterval(() => { this.checkBackgroundAudio() }, 2000)
+      this.checkBackgroundAudio()
+      return
+    }
+    if (!hidden && this.backgroundCapture) {
+      this.checkBackgroundAudio()
+      if (this.backgroundCapture) {
+        this.phone.backgroundStatus?.(`Phone visible · ${(this.backgroundAudioBytes / 32000).toFixed(1)}s of audio received while hidden. Check Saved on main for text delivery.`)
+        this.stopBackgroundWatch()
+        this.proactive.setForeground(this.nativeForeground)
+        return
+      }
+    }
+    this.setForeground(!hidden && this.nativeForeground, false)
+  }
+  async configureBackgroundListening(enabled: boolean): Promise<void> {
+    // Enabling capture in a new context requires a visible user action.
+    if (enabled && (!this.nativeForeground || document.visibilityState === 'hidden' || this.exited)) return
+    await this.store.update({ backgroundListening: enabled })
+    this.phone.backgroundListening?.(enabled)
+    this.phone.backgroundStatus?.(enabled ? 'Enabled · start live, quiet lifelog before locking. Background continuity is not guaranteed.' : 'Lock-screen listening off.')
+    if (!enabled && this.backgroundCapture) this.setForeground(false, false)
+  }
+  private canContinueInBackground(): boolean {
+    const state = this.store.snapshot()
+    return !this.exited && this.nativeForeground && this.foregroundActive && state.backgroundListening && state.lifelogEnabled
+      && state.ambientEnabled && state.listeningMode === 'passive' && state.speechModel !== 'openai-buffered'
+      && this.proactive.memoryActive && this.ambientRunning && Boolean(this.liveSpeech)
+      && !this.microphoneOpening && !this.requestController && !this.heldQuestion && !this.recoveringSpeech
+  }
+  private stopBackgroundWatch(): void {
+    this.backgroundCapture = false
+    if (this.backgroundTimer) clearInterval(this.backgroundTimer)
+    this.backgroundTimer = null
+  }
+  private checkBackgroundAudio(): boolean {
+    if (!this.backgroundCapture) return true
+    if (!this.canContinueInBackground() || Date.now() - this.lastAudioAt > 8000) {
+      const detail = 'Background audio gap or consent ended. Microphone paused; unsent audio is not replayed. Unlock to resume.'
+      this.phone.activity?.(detail); this.phone.backgroundStatus?.(detail)
+      // Stop synchronously before a delayed PCM callback can upload stale audio.
+      this.setForeground(false, false)
+      return false
+    }
+    return true
+  }
+  setForeground(active: boolean, nativeEvent = true): void {
+    if (nativeEvent) this.nativeForeground = active
+    // A native G2 app exit/background is distinct from the phone WebView hiding.
+    if (active && document.visibilityState === 'hidden') { this.onVisibility(); return }
+    if (!active) this.stopBackgroundWatch()
+    if (!active && this.proactive.memoryActive) this.pausedLifelog = true
     this.foregroundActive = active; this.proactive.setForeground(active)
+    if (active && this.store.snapshot().lifelogEnabled && !this.ambientRunning) void this.restoreLifelog()
+    else if (active && this.pausedLifelog && this.mode === 'home') this.showPaused()
     if (!active) {
+      if (this.heldQuestion) {
+        this.heldQuestion.cancelled = true
+        if (this.heldQuestion.ready) { this.heldQuestion = null; this.renderer.holdToTalk?.(false) }
+      }
       this.clearNotice()
-      this.renderer.message('Listening paused', 'App is not in the foreground. Resume on phone.')
+      this.renderer.message('Listening paused', 'Microphone off while app is in the background.')
       this.memoryRequest++; this.resumeAfterAsk = false; this.lifelogRequest++; this.voiceTarget = null
       this.audioBuffer = null
       if (this.preparingDraft) this.cancelRequest()
-      this.stopLiveSpeech(); void this.stopAmbient()
-      if (this.mode === 'ambient' || this.mode === 'listening') this.mode = 'home'
-      this.phone.memoryStatus?.(false, 'Lifelog stopped when the app left the foreground. Start it again with current participant consent.')
+      this.stopLiveSpeech(); this.cancelSpeechRecovery()
+      this.foregroundTransition = this.stopAmbient(this.store.snapshot().lifelogEnabled)
+      if (this.mode === 'ambient' || this.mode === 'listening' || (this.mode === 'thinking' && !this.requestController)) this.mode = 'home'
+      this.phone.memoryStatus?.(false, 'Microphone off in background. Enabled lifelog resumes on return while consent is valid.')
+      this.phone.lifelogEnabled?.(this.store.snapshot().lifelogEnabled)
     }
   }
   private ambientEpoch = 0
@@ -91,16 +175,20 @@ export class OpenAGIG2App {
       proactiveSettings: settings => phone.proactiveSettings?.(settings),
       inbox: items => {
         phone.inbox?.(items); renderer.inboxCount?.(items.length)
-        if (this.mode === 'home' && !this.noticeTimer) renderer.home(this.store.snapshot().node?.name)
+        if (this.mode === 'home' && !this.noticeTimer) {
+          if (this.store.snapshot().lifelogEnabled && !this.ambientRunning) { this.pausedLifelog = true; this.showPaused() }
+          else if (this.ambientRunning) this.showHome()
+          else renderer.home(this.store.snapshot().node?.name)
+        }
         // Browsing keeps a stable snapshot. Reopen to see arrivals; main
         // revalidates the exact target before accepting any action.
       },
       activity: text => phone.activity?.(text),
       saveStatus: text => phone.saveStatus?.(text),
-      memoryStatus: (active, detail) => { phone.memoryStatus?.(active, detail); renderer.memory?.(active); this.listeningPulse(true) },
+      memoryStatus: (active, detail) => { phone.memoryStatus?.(active, detail); phone.lifelogEnabled?.(this.store.snapshot().lifelogEnabled); renderer.memory?.(active); this.listeningPulse(true) },
     },
-      () => (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.noticeTimer && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.displaySleeping && !this.requestController,
-      item => this.showNotice(item))
+      () => document.visibilityState !== 'hidden' && (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.noticeTimer && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.displaySleeping && !this.requestController,
+      item => this.showNotice(item), () => this.store.snapshot().lifelogEnabled, () => this.backgroundCapture)
   }
   openInbox(id?: string): void {
     if (this.exited || this.navigationBusy || this.microphoneOpening || this.requestController || this.displaySleeping || ['listening', 'review', 'pairing'].includes(this.mode)) return
@@ -147,13 +235,63 @@ export class OpenAGIG2App {
   async configureIdleTap(action: 'talk' | 'highlight'): Promise<void> {
     await this.store.update({ idleTapAction: action }); this.phone.idleTapAction?.(action)
   }
+  async configureLifelogTalkMode(mode: 'tap' | 'hold'): Promise<void> {
+    if (this.heldQuestion || this.microphoneOpening || this.requestController || ['listening', 'review'].includes(this.mode)) { this.phone.lifelogTalkMode?.(this.store.snapshot().lifelogTalkMode); return }
+    await this.store.update({ lifelogTalkMode: mode }); this.phone.lifelogTalkMode?.(mode)
+  }
+  async holdStart(): Promise<void> {
+    if (this.heldQuestion || this.store.snapshot().lifelogTalkMode !== 'hold' || !this.proactive.memoryActive || !this.ambientRunning || !['ambient', 'answer'].includes(this.mode) || this.exited || !this.foregroundActive || this.displaySleeping || this.navigationBusy || this.microphoneOpening || this.requestController) return
+    const held = { ready: false, cancelled: false, released: false }
+    this.heldQuestion = held; this.renderer.holdToTalk?.(true)
+    try {
+      await this.startAsk(true)
+      if (this.mode !== 'listening' || held.cancelled || this.exited || !this.foregroundActive) { await this.cancelHold(true); return }
+      held.ready = true
+      clearTimeout(this.liveCaptureTimer)
+      this.liveCaptureTimer = setTimeout(() => { void this.cancelHold() }, 30_000)
+    } catch (error) { await this.cancelHold(true); if (!this.exited) this.fail(error) }
+  }
+  async holdRelease(): Promise<void> {
+    const held = this.heldQuestion
+    if (!held || held.released) return
+    // Letting go during setup cancels, rather than recording after release.
+    if (!held.ready) { held.cancelled = true; return }
+    held.released = true
+    try { await this.finishAsk() }
+    finally { if (this.heldQuestion === held) this.heldQuestion = null; this.renderer.holdToTalk?.(false) }
+  }
+  async cancelHold(startupSettled = false): Promise<void> {
+    const held = this.heldQuestion; if (!held) return
+    held.cancelled = true
+    if ((!held.ready && !startupSettled) || this.microphoneOpening) return // Startup owns cleanup once it settles.
+    this.heldQuestion = null; this.renderer.holdToTalk?.(false)
+    clearTimeout(this.liveCaptureTimer)
+    if (this.mode === 'listening') {
+      this.stopLiveSpeech(); await this.audio.stop().catch(() => undefined); this.audioBuffer = null
+      if (!this.exited && this.foregroundActive) { this.showHome(); await this.resumeListening(); this.phone.set('Question not sent', 'Hold ended before capture was ready, was cancelled, or reached the 30-second limit. Lifelog resumes when available.') }
+    }
+  }
+  async returnToLifelog(consent: boolean): Promise<void> {
+    if (this.store.snapshot().lifelogEnabled && !consent) { await this.retryListening(); return }
+    if (this.exited || !this.foregroundActive || document.visibilityState === 'hidden' || this.navigationBusy || this.requestController || this.microphoneOpening || ['review', 'listening', 'pairing'].includes(this.mode)) return
+    if (this.proactive.memoryActive && this.ambientRunning) { this.showHome(); return }
+    await this.configureMemory(true, consent)
+  }
   async configureMemory(enabled: boolean, consent: boolean): Promise<void> {
     const request = ++this.memoryRequest
-    if (!enabled || !consent) { this.phone.memoryPending?.(false); this.proactive.pauseMemory(); return }
+    if (!enabled || !consent) {
+      await this.disableSavedLifelog()
+      if (this.recoveringSpeech) { this.cancelSpeechRecovery(); await this.stopAmbient(); this.showPaused() }
+      this.phone.memoryPending?.(false); this.proactive.pauseMemory()
+      if (this.ambientRunning) await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
+      if (enabled) this.phone.memoryStatus?.(false, 'Confirm participant consent above, then tap Return / resume lifelog.')
+      return
+    }
     if (!this.foregroundActive || document.visibilityState === 'hidden') { this.proactive.pauseMemory(); return }
     if (this.navigationBusy || this.requestController || this.microphoneOpening || ['review', 'listening', 'pairing'].includes(this.mode)) {
       this.phone.memoryStatus?.(false, 'Finish the current microphone operation, then start lifelog.'); return
     }
+    if (this.proactive.memoryActive && this.ambientRunning) { this.showHome(); return }
     this.phone.memoryPending?.(true)
     this.phone.memoryStatus?.(false, 'Starting lifelog… opening the microphone, then requesting retention consent.')
     try {
@@ -164,12 +302,16 @@ export class OpenAGIG2App {
         return
       }
       if (!this.ambientRunning) { this.phone.memoryStatus?.(false, 'Lifelog could not start: microphone unavailable. Check the connection, then retry.'); return }
-      await this.proactive.enableMemory(true)
+      if (!this.proactive.memoryActive) await this.proactive.enableMemory(true)
+      if (request === this.memoryRequest && this.proactive.memoryActive && this.foregroundActive && !this.exited) {
+        await this.store.update({ lifelogEnabled: true, lifelogConsent: this.proactive.consentSnapshot() })
+        this.phone.lifelogEnabled?.(true)
+      }
       if (startedHere && !this.proactive.memoryActive) {
         await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
         this.phone.memoryStatus?.(false, 'Lifelog did not start. Microphone stopped because retention consent was not granted. Retry Start lifelog.')
       }
-      this.listeningPulse(true)
+      if (this.proactive.memoryActive && this.ambientRunning && this.foregroundActive && !this.exited) { this.pausedLifelog = false; this.showHome() }
     } catch (error) { this.proactive.pauseMemory(`Could not start lifelog: ${safeOpenAGIError(error)}`) }
     finally { this.phone.memoryPending?.(false) }
   }
@@ -212,10 +354,14 @@ export class OpenAGIG2App {
     const stored = await this.store.load()
     this.phone.listeningMode?.(stored.listeningMode)
     this.phone.idleTapAction?.(stored.idleTapAction)
+    this.phone.lifelogTalkMode?.(stored.lifelogTalkMode)
     this.phone.speechModel?.(stored.speechModel)
     this.phone.speechTransport?.(stored.speechTransport)
     this.phone.autoSend?.(stored.autoSend)
     this.renderer.autoSend?.(stored.autoSend)
+    this.phone.lifelogEnabled?.(stored.lifelogEnabled)
+    this.phone.backgroundListening?.(stored.backgroundListening)
+    this.phone.backgroundStatus?.(stored.backgroundListening ? 'Lock-screen listening enabled · requires active live, quiet lifelog.' : 'Lock-screen listening off.')
     if (stored.nodeToken) {
       try {
         if (stored.connectionMode === 'enrollment') {
@@ -223,7 +369,8 @@ export class OpenAGIG2App {
           this.startHeartbeat()
         }
         this.phone.ambient(stored.ambientEnabled, stored.wakePhrase, stored.answerQuestions)
-        if (stored.ambientEnabled) {
+        if (stored.lifelogEnabled) { this.showHome(); await this.restoreLifelog() }
+        else if (stored.ambientEnabled) {
           try { await this.startAmbient() }
           catch (error) { this.showHome(); this.phone.set('Always listening unavailable', safeOpenAGIError(error)) }
         } else {
@@ -242,6 +389,8 @@ export class OpenAGIG2App {
     this.showUnpaired()
   }
   tap(): void {
+    if (this.recoveringSpeech) return
+    if (this.heldQuestion && !this.heldQuestion.released) return
     if (this.displaySleeping) return
     if (this.exited || this.navigationBusy || this.microphoneOpening || Date.now() - this.lastTapAt < 400) return
     this.lastTapAt = Date.now()
@@ -251,14 +400,19 @@ export class OpenAGIG2App {
       else if (!this.preparingDraft) { this.activityView = !this.activityView; this.renderActiveProgress?.() }
       return
     }
-    if (this.mode === 'review') void this.sendDraft()
+    if (this.mode === 'paused') {
+      if (this.pausedLifelog) { this.mode = 'resume-consent'; this.renderer.paused?.(true, true) }
+      else void this.configureAmbient(true, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
+    }
+    else if (this.mode === 'resume-consent') void this.configureMemory(true, true)
+    else if (this.mode === 'review') void this.sendDraft()
     else if (this.mode === 'inbox') { this.mode = 'inbox-detail'; this.showInboxPage(); void this.proactive.action('seen', this.inboxItems[this.inboxIndex]?.id) }
     else if (this.mode === 'inbox-detail') { this.actionTarget = { ...this.inboxItems[this.inboxIndex] }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
     else if (this.mode === 'inbox-action' || this.mode === 'inbox-confirm') void this.chooseInboxAction()
     else if (this.mode === 'home') void this.startAsk()
     else if (this.mode === 'listening') void this.finishAsk()
-    else if (this.mode === 'ambient') { if (this.proactive.memoryActive && this.store.snapshot().idleTapAction === 'highlight') void this.markMoment(); else void this.startAsk() }
-    else if (this.mode === 'answer') void this.startAsk()
+    else if (this.mode === 'ambient') { if (this.proactive.memoryActive && this.store.snapshot().idleTapAction === 'highlight') void this.markMoment(); else if (!(this.proactive.memoryActive && this.store.snapshot().lifelogTalkMode === 'hold')) void this.startAsk() }
+    else if (this.mode === 'answer') { if (!(this.proactive.memoryActive && this.ambientRunning && this.store.snapshot().lifelogTalkMode === 'hold')) void this.startAsk() }
     else if (this.mode === 'recent') void this.selectAnswer(this.recentIndex).catch(error => this.fail(error))
     else if (this.mode === 'message') this.showHome()
     else if (this.mode === 'unpaired') this.renderer.pairing()
@@ -309,6 +463,8 @@ export class OpenAGIG2App {
   private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length) }
   async recentAnswer(): Promise<void> { await this.selectAnswer(this.store.snapshot().history.length - 1) }
   doubleTap(): void {
+    if (this.recoveringSpeech) { void this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions); return }
+    if (this.heldQuestion && !this.heldQuestion.released) { void this.cancelHold(); return }
     if (this.displaySleeping) { this.toggleDisplay(); return }
     void this.navigateBack().catch(error => this.fail(error))
   }
@@ -329,11 +485,18 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'review') { await this.discardDraft(); return }
+    if (this.mode === 'resume-consent') { this.showPaused(); return }
+    if (this.mode === 'paused') { this.showHome(); return }
     if (this.mode === 'inbox-confirm') { this.mode = 'inbox-action'; this.showInboxAction(); await this.resumeListening(); return }
     if (this.mode === 'inbox-action') { if (!this.actionTarget?.id) this.showHome(); else { this.mode = 'inbox-detail'; this.showInboxPage() }; return }
     if (this.mode === 'inbox-detail') { this.showInboxItem(); return }
     if (this.mode === 'inbox') { this.showHome(); return }
-    if (this.mode === 'ambient') { await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions); this.mode = 'message'; this.renderer.message('Listening paused', 'Microphone off. Resume on phone.'); return }
+    if (this.mode === 'ambient') {
+      this.pausedLifelog = this.proactive.memoryActive
+      await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
+      if (!this.exited && this.foregroundActive && !this.ambientRunning) this.showPaused()
+      return
+    }
     if (this.mode === 'home') { this.showRecent(this.store.snapshot().history.length - 1); return }
     this.navigationBusy = true
     try {
@@ -350,10 +513,12 @@ export class OpenAGIG2App {
     this.renderer.recent?.(plainAnswer(history[this.recentIndex].question), history.length - this.recentIndex, history.length)
   }
   async systemExit(): Promise<void> {
+    this.stopBackgroundWatch()
+    this.cancelSpeechRecovery()
     this.clearNotice()
     document.removeEventListener('visibilitychange', this.onVisibility)
     this.memoryRequest++; this.resumeAfterAsk = false
-    this.proactive.stop()
+    this.proactive.stop(this.store.snapshot().lifelogEnabled)
     this.exited = true
     this.stopLiveSpeech()
     this.cancelRequest()
@@ -468,8 +633,39 @@ export class OpenAGIG2App {
     this.ambientConfiguration = next.catch(() => undefined)
     return next
   }
+  async retryListening(): Promise<void> {
+    if (this.exited) return
+    const visible = (): boolean => this.nativeForeground && document.visibilityState !== 'hidden' && !this.exited
+    if (!visible()) {
+      this.pausedLifelog = this.store.snapshot().lifelogEnabled
+      this.showPaused()
+      this.phone.set('Listening paused', 'Open Agents on the glasses and bring the Even app to the foreground, then retry. G2 has not reported an active foreground session.')
+      return
+    }
+    if (this.requestController || this.microphoneOpening || this.navigationBusy || ['listening', 'review', 'pairing'].includes(this.mode)) {
+      this.phone.set('Listening busy', 'Finish the current question or microphone operation, then retry lifelog.'); return
+    }
+    await this.foregroundTransition
+    if (!visible()) return
+    this.foregroundActive = true; this.proactive.setForeground(true)
+    this.cancelSpeechRecovery()
+    const state = this.store.snapshot()
+    if (state.lifelogEnabled) {
+      if (this.ambientRunning && this.proactive.memoryActive) { this.showHome(); return }
+      // A retry must restore retention, not merely turn the microphone on.
+      await this.stopAmbient(true)
+      this.proactive.suspendMemory()
+      await this.restoreLifelog()
+    } else await this.configureAmbient(true, state.wakePhrase, state.answerQuestions)
+  }
   private async applyAmbientConfiguration(enabled: boolean, wakePhrase: string, answerQuestions: boolean): Promise<void> {
     if (this.exited) return
+    if (!enabled) { this.memoryRequest++; await this.disableSavedLifelog(); this.phone.lifelogEnabled?.(false) }
+    if (!enabled && this.recoveringSpeech) {
+      this.pausedLifelog = this.proactive.memoryActive
+      await this.stopAmbient(); await this.store.update({ ambientEnabled: false })
+      this.phone.ambient(false, wakePhrase, answerQuestions); this.showPaused(); return
+    }
     if (!enabled && this.requestController) {
       this.resumeAfterAsk = false
       await this.store.update({ ambientEnabled: false })
@@ -499,13 +695,16 @@ export class OpenAGIG2App {
       await this.pauseAmbientWithError(error)
     }
   }
-  async startAsk(): Promise<void> {
+  async startAsk(fromHold = false): Promise<void> {
+    if (document.visibilityState === 'hidden') { this.phone.activity?.('Unlock the phone to ask; background mode only retains lifelog.'); return }
+    if (this.recoveringSpeech) return
+    if (this.heldQuestion && !fromHold) return
     if (this.exited || !this.foregroundActive || this.navigationBusy || this.microphoneOpening || this.requestController) return
     if (this.mode === 'review') { await this.sendDraft(); return }
     if (this.mode === 'listening') { await this.finishAsk(); return }
     this.clearNotice()
     if (this.mode.startsWith('inbox')) { const selected = this.mode === 'inbox-action' || this.mode === 'inbox-confirm' ? this.actionTarget : this.inboxItems[this.inboxIndex]; this.voiceTarget = selected?.id ? { ...selected } : null; this.showHome() }
-    if (this.mode === 'message' || this.mode === 'answer' || this.mode === 'recent') this.showHome()
+    if (this.mode === 'message' || this.mode === 'answer' || this.mode === 'recent' || this.mode === 'paused' || this.mode === 'resume-consent') this.showHome()
     if (this.ambientRunning) {
       this.resumeAfterAsk = true
       await this.stopAmbient(true)
@@ -513,7 +712,7 @@ export class OpenAGIG2App {
     }
     if (this.mode !== 'home' || !this.store.snapshot().nodeToken) return
     if (this.store.snapshot().speechModel !== 'openai-buffered') { await this.startLiveAsk(); return }
-    this.mode = 'listening'; this.audioBuffer = new QuestionAudioBuffer(); this.renderer.listening(); this.phone.set('Opening microphone…', 'Waiting for audio from your glasses. Keep the Even app open.')
+    this.mode = 'listening'; this.audioBuffer = new QuestionAudioBuffer(); this.renderer.progress?.('Opening microphone', this.heldQuestion ? 'Keep holding' : 'Please wait'); this.phone.set('Opening microphone…', 'Waiting for audio from your glasses. Keep the Even app open.')
     let displayedSecond = -1
     this.microphoneOpening = true
     try { await this.audio.start(pcm => {
@@ -526,12 +725,16 @@ export class OpenAGIG2App {
           this.phone.set('Recording question', `${duration.toFixed(1)} seconds received from G2. ${this.stopInstruction()}`)
         }
       } catch (error) { void this.audio.stop(); this.fail(error) }
-    }) }
+    });
+      if (this.exited || !this.foregroundActive) { await this.audio.stop(); this.audioBuffer = null }
+      else if (this.mode === 'listening') this.renderer.listening()
+    }
     catch (error) { this.fail(error) }
     finally { this.microphoneOpening = false }
     if (['message'].includes(this.mode)) await this.resumeListening()
   }
   async finishAsk(): Promise<void> {
+    if (this.heldQuestion && !this.heldQuestion.released) { await this.cancelHold(); return }
     if (!this.microphoneOpening && this.mode === 'listening' && this.liveSpeech) {
       const speech = this.liveSpeech
       this.mode = 'thinking'; clearTimeout(this.liveCaptureTimer)
@@ -556,7 +759,7 @@ export class OpenAGIG2App {
     }
     if (this.microphoneOpening || this.mode !== 'listening' || !this.audioBuffer) return
     this.mode = 'thinking'; await this.audio.stop().catch(() => undefined)
-    if (this.exited) return
+    if (this.exited || !this.foregroundActive || !this.audioBuffer) return
     const audio = this.audioBuffer; this.audioBuffer = null
     if (audio.durationSeconds < 0.1) {
       this.fail(new Error(audio.durationSeconds === 0 ? 'No microphone audio arrived from G2. Check the glasses connection, then try Ask again.' : 'The recording was too short. Speak your question before sending.'))
@@ -583,7 +786,7 @@ export class OpenAGIG2App {
     if (controller.signal.aborted && !this.exited) { this.showHome(); await this.resumeListening() }
     else if (this.mode === 'message') await this.resumeListening()
   }
-  private stopInstruction(): string { return this.store.snapshot().autoSend ? 'Tap Stop talking to send automatically.' : 'Tap Stop talking to review before sending.' }
+  private stopInstruction(): string { const action = this.heldQuestion ? 'Release' : 'Tap Stop talking'; return this.store.snapshot().autoSend ? `${action} to send automatically.` : `${action} to review before sending.` }
   async configureAutoSend(enabled: boolean): Promise<void> {
     if (this.exited || this.microphoneOpening || this.navigationBusy || this.requestController || ['listening', 'thinking', 'review', 'pairing'].includes(this.mode)) {
       this.phone.autoSend?.(this.store.snapshot().autoSend)
@@ -677,6 +880,11 @@ export class OpenAGIG2App {
     } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false); await this.resumeListening() }
   }
   private showUnpaired(): void { this.proactive.stop(); this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
+  private showPaused(): void {
+    this.phone.paired(Boolean(this.store.snapshot().nodeToken))
+    this.mode = 'paused'; this.renderer.paused?.(this.pausedLifelog)
+    this.phone.set(this.pausedLifelog ? 'Lifelog paused' : 'Listening paused', 'Microphone off. Tap on glasses to resume, or use Return / resume lifelog on the phone.')
+  }
   private showHome(): void {
     this.phone.history?.(this.store.snapshot().history)
     const state = this.store.snapshot(); if (!state.nodeToken) { this.showUnpaired(); return }
@@ -689,11 +897,15 @@ export class OpenAGIG2App {
     }
     this.mode = 'home'; this.phone.paired(true); this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined)); this.phone.set('Ready', 'Tap to ask in this conversation. Swipe or double-tap for recent answers. Exit is separate on the phone.')
   }
-  private showAnswer(page: number): void { this.mode = 'answer'; this.page = page; this.renderer.answer(this.pages[page] ?? '', page, this.pages.length) }
+  private showAnswer(page: number): void { this.mode = 'answer'; this.page = page; this.renderer.followupHold?.(this.proactive.memoryActive && this.ambientRunning && this.store.snapshot().lifelogTalkMode === 'hold'); this.renderer.answer(this.pages[page] ?? '', page, this.pages.length) }
   private fail(error: unknown): void { this.voiceTarget = null; this.clearNotice(); this.mode = 'message'; const message = safeOpenAGIError(error); this.renderer.message('Could not ask agent', message); this.phone.set('Ask failed', message) }
   private async startAmbient(): Promise<void> {
     if (this.exited) return
-    if (!this.foregroundActive || document.visibilityState === 'hidden') { this.showHome(); return }
+    if (!this.foregroundActive || document.visibilityState === 'hidden') {
+      this.pausedLifelog = this.store.snapshot().lifelogEnabled; this.showPaused()
+      this.phone.set('Listening paused', 'Microphone was not started: open Agents on the glasses and the Even app on your phone, then retry.')
+      return
+    }
     if (this.ambientRunning) { this.showHome(); return }
     if (this.microphoneOpening) return
     if (this.store.snapshot().speechModel !== 'openai-buffered') { await this.startLiveAmbient(); return }
@@ -724,6 +936,8 @@ export class OpenAGIG2App {
     } finally { this.microphoneOpening = false }
   }
   private async stopAmbient(preserveMemory = false): Promise<void> {
+    this.stopBackgroundWatch()
+    if (!preserveMemory) this.cancelSpeechRecovery()
     if (!preserveMemory) this.resumeAfterAsk = false
     this.ambientEpoch++
     if (!preserveMemory) this.proactive.pauseMemory()
@@ -791,10 +1005,12 @@ export class OpenAGIG2App {
         }
       },
       segment: (text, metadata) => {
-        if (ambient && this.ambientRunning && this.liveSpeech === speech && !this.exited) this.proactive.capture(text, metadata)
+        if (ambient && this.checkBackgroundAudio() && this.ambientRunning && this.liveSpeech === speech && !this.exited) this.proactive.capture(text, metadata)
       },
       utterance: text => {
         if (!ambient || !this.ambientRunning || this.liveSpeech !== speech || this.exited) return
+        if (document.visibilityState === 'hidden') return
+        if (this.discardRecoveryUtterance) { this.discardRecoveryUtterance = false; this.phone.activity?.('First utterance after the gap was not used to trigger an agent question.'); return }
         if (this.requestController) { this.ambientArmedUntil = 0; return }
         const preferences = this.store.snapshot()
         if (preferences.listeningMode === 'passive') return
@@ -811,7 +1027,8 @@ export class OpenAGIG2App {
       },
       error: error => {
         if (this.liveSpeech !== speech || this.exited) return
-        if (ambient) void this.pauseAmbientWithError(error)
+        if (ambient && this.recoveringSpeech) { this.recoveryFailure = error; return }
+        if (ambient) void this.recoverAmbientSpeech(error)
         else { this.stopLiveSpeech(); void this.audio.stop().catch(() => undefined); this.fail(error) }
       },
     })
@@ -836,9 +1053,9 @@ export class OpenAGIG2App {
     try {
       const speech = await this.openLiveSpeech(false)
       if (this.exited || !this.foregroundActive || this.liveSpeech !== speech) { speech.close(); return }
-      this.renderer.listening()
       await this.audio.start(pcm => { if (this.mode === 'listening') speech.push(pcm) })
       if (this.exited || !this.foregroundActive || this.liveSpeech !== speech) { await this.audio.stop(); return }
+      this.renderer.listening()
       this.phone.set('Recording question · live', `Words appear while you speak. ${this.stopInstruction()} Audio streams ${this.store.snapshot().speechTransport === 'relay' ? 'through your main to' : 'directly to'} Deepgram.`)
       this.liveCaptureTimer = setTimeout(() => { void this.finishAsk() }, 30_000)
     } catch (error) { this.stopLiveSpeech(); if (!this.exited) this.fail(error) }
@@ -850,7 +1067,19 @@ export class OpenAGIG2App {
     try {
       const speech = await this.openLiveSpeech(true)
       if (this.exited || !this.foregroundActive || this.liveSpeech !== speech) { speech.close(); return }
-      await this.audio.start(pcm => { speech.push(pcm); this.listeningPulse() })
+      this.lastAudioAt = Date.now()
+      await this.audio.start(pcm => {
+        if (this.liveSpeech !== speech || this.exited || !this.checkBackgroundAudio()) return
+        if (pcm.byteLength) this.lastAudioAt = Date.now()
+        if (this.backgroundCapture) {
+          this.backgroundAudioBytes += pcm.byteLength
+          if (Date.now() - this.lastBackgroundStatusAt >= 2000) {
+            this.lastBackgroundStatusAt = Date.now()
+            this.phone.backgroundStatus?.(`Phone hidden · ${(this.backgroundAudioBytes / 32000).toFixed(1)}s audio received · last packet ${new Date(this.lastAudioAt).toLocaleTimeString()}`)
+          }
+        }
+        speech.push(pcm); this.listeningPulse()
+      })
       if (this.exited || !this.foregroundActive || this.liveSpeech !== speech) { await this.audio.stop(); return }
       this.ambientRunning = true; this.ambientArmedUntil = 0
       this.showHome()
@@ -908,7 +1137,10 @@ export class OpenAGIG2App {
     }
   }
   private async pauseAmbientWithError(error: unknown): Promise<void> {
-    await this.stopAmbient()
+    this.cancelSpeechRecovery()
+    const keepLifelog = this.store.snapshot().lifelogEnabled
+    await this.stopAmbient(keepLifelog)
+    if (keepLifelog) this.proactive.suspendMemory()
     const state = this.store.snapshot()
     this.phone.ambient(state.ambientEnabled, state.wakePhrase, state.answerQuestions)
     if (this.requestController) { this.phone.transcript?.(`Microphone paused: ${safeOpenAGIError(error)}. Agent request continues separately.`); return }
@@ -916,6 +1148,94 @@ export class OpenAGIG2App {
     const detail = `${safeOpenAGIError(error)} Listening is paused, not recording. Your preference is saved. Use Retry listening on the phone.`
     this.renderer.message('Listening paused', detail)
     this.phone.set('Listening paused', detail)
+  }
+  private async restoreLifelog(): Promise<void> {
+    if (this.restoringLifelog || this.exited || !this.foregroundActive || document.visibilityState === 'hidden') return
+    this.restoringLifelog = true
+    const request = this.memoryRequest
+    try {
+      await this.foregroundTransition
+      const state = this.store.snapshot()
+      if (!state.lifelogEnabled || !state.nodeToken || !this.foregroundActive || this.exited || request !== this.memoryRequest) return
+      if (this.requestController || this.microphoneOpening || ['listening', 'review'].includes(this.mode)) return
+      this.proactive.start()
+      const valid = state.lifelogConsent && await this.proactive.restoreMemory(state.lifelogConsent)
+      if (!this.store.snapshot().lifelogEnabled || request !== this.memoryRequest || !this.foregroundActive || this.exited) return
+      if (!valid) {
+        this.pausedLifelog = true; this.showPaused()
+        const detail = !state.lifelogConsent || state.lifelogConsent.until <= Date.now()
+          ? 'Lifelog consent expired or is missing. Confirm current participant consent, then use Return / resume lifelog.'
+          : 'Main could not verify the saved lifelog consent. It may be revoked or main needs the consent-restoration update. Check main before resuming.'
+        this.phone.set('Lifelog paused', detail)
+        this.phone.memoryStatus?.(false, detail)
+        this.phone.lifelogEnabled?.(true); return
+      }
+      await this.startAmbient()
+      if (!this.store.snapshot().lifelogEnabled || request !== this.memoryRequest || !this.foregroundActive || this.exited) { await this.stopAmbient(true); this.proactive.suspendMemory(); return }
+      this.pausedLifelog = false; this.phone.lifelogEnabled?.(true)
+    } catch (error) { await this.pauseAmbientWithError(error) }
+    finally {
+      this.restoringLifelog = false
+      // A second foreground entry may arrive while an older check is settling.
+      if (request !== this.memoryRequest && this.foregroundActive && !this.exited && this.store.snapshot().lifelogEnabled) void this.restoreLifelog()
+    }
+  }
+  private async disableSavedLifelog(): Promise<void> {
+    const saved = this.store.snapshot().lifelogConsent
+    await this.store.update({ lifelogEnabled: false, lifelogConsent: null })
+    if (saved && !this.proactive.memoryActive) void this.api.proactive({ op: 'consent', enabled: false, consentId: saved.id }).catch(() => {})
+  }
+  private async recoverAmbientSpeech(error: Error): Promise<void> {
+    if (this.backgroundCapture) {
+      this.phone.activity?.('Background speech connection interrupted. Unlock to resume; no audio replay.')
+      this.phone.backgroundStatus?.('Background connection interrupted · unlock to resume')
+      this.setForeground(false, false)
+      return
+    }
+    if (this.recoveringSpeech) return // The in-flight attempt owns its failure.
+    if (!(error instanceof SpeechStreamError) || !error.recoverable || !this.ambientRunning || !this.proactive.memoryActive || !this.foregroundActive || this.exited || this.requestController) {
+      await this.pauseAmbientWithError(error); return
+    }
+    this.recoveringSpeech = true
+    const epoch = ++this.recoveryEpoch, state = this.store.snapshot(), consentRequest = this.memoryRequest
+    const stillAllowed = (): boolean => epoch === this.recoveryEpoch && !this.exited && this.foregroundActive && document.visibilityState !== 'hidden'
+      && this.proactive.memoryActive && consentRequest === this.memoryRequest && this.store.snapshot().ambientEnabled
+      && state.nodeToken === this.store.snapshot().nodeToken && state.agentOrigin === this.store.snapshot().agentOrigin
+    const previous = this.mode, page = this.page
+    await this.stopAmbient(true)
+    if (!stillAllowed()) { if (epoch === this.recoveryEpoch) await this.pauseAmbientWithError(new Error('Lifelog recovery cancelled. Confirm consent before resuming.')); return }
+    this.discardRecoveryUtterance = true
+    // A new LiveSpeech has a new stream id and no old partial utterance or audio.
+    this.phone.activity?.(`Audio gap: ${error.message} Unfinalized words were discarded; previously finalized text is retained.`)
+    this.phone.saveStatus?.('Audio gap · reconnecting with fresh audio. No old audio will be replayed.')
+    const schedule = (): void => {
+      this.recoveryAttempts = this.recoveryAttempts.filter(at => Date.now() - at < 60_000)
+      if (this.recoveryAttempts.length >= 3) { void this.pauseAmbientWithError(new Error('Live speech recovery stopped after three attempts in one minute. Check Activity and retry lifelog on the phone.')); return }
+      if (['ambient', 'home', 'reconnecting'].includes(this.mode)) { this.mode = 'reconnecting'; this.renderer.notice?.('Audio gap · reconnecting', 'Microphone off · Double-tap: stop') }
+      this.phone.set('Lifelog reconnecting', 'Microphone off. Some words may be missing. Double-tap to stop recovery.')
+      this.recoveryTimer = setTimeout(() => { void attempt() }, 1000 * 2 ** this.recoveryAttempts.length)
+    }
+    const attempt = async (): Promise<void> => {
+      this.recoveryTimer = undefined
+      if (!stillAllowed()) { if (epoch === this.recoveryEpoch) await this.pauseAmbientWithError(new Error('Lifelog consent or foreground session ended. Resume explicitly.')); return }
+      this.recoveryAttempts.push(Date.now())
+      try {
+        this.recoveryFailure = null
+        await this.startAmbient()
+        if (this.recoveryFailure) throw this.recoveryFailure
+        if (!stillAllowed()) { if (epoch === this.recoveryEpoch) await this.stopAmbient(); return }
+        this.recoveringSpeech = false
+        this.phone.activity?.('Lifelog reconnected. New transcript stream started after the audio gap.')
+        if (previous === 'answer') this.showAnswer(page)
+      } catch (retryError) {
+        if (epoch !== this.recoveryEpoch) return
+        await this.stopAmbient(true)
+        // Authentication, provider setup and malformed audio are never retried.
+        if (retryError instanceof SpeechStreamError && retryError.recoverable && stillAllowed()) schedule()
+        else await this.pauseAmbientWithError(retryError)
+      }
+    }
+    schedule()
   }
   private async heartbeatWithoutLosingEnrollment(name?: string): Promise<void> {
     try { await this.api.heartbeat(name) }

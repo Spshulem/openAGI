@@ -61,19 +61,19 @@ export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstream
     let closeTimer;
     let heartbeat;
 
-    const cleanup = (code = 1011, message = "Live speech disconnected. Retry listening.", normal = false) => {
+    const cleanup = (code = 1011, message = "Live speech disconnected. Retry listening.", normal = false, errorCode = "speech_error") => {
       if (done) return;
       done = true;
       clearTimeout(openTimer); clearTimeout(drainTimer); clearInterval(heartbeat);
       // Retain the active slot until the peer closes, bounded by a kill timer.
       if (upstream && upstream.readyState !== WebSocket.CLOSED) upstream.terminate();
       if (client.readyState === WebSocket.OPEN) {
-        if (!normal) client.send(JSON.stringify({ type: "Error", message }));
+        if (!normal) client.send(JSON.stringify({ type: "Error", message, code: errorCode }));
         client.close(code, normal ? "Speech finished" : "Speech paused");
         closeTimer = setTimeout(() => client.terminate(), 1000); closeTimer.unref();
       } else { client.terminate(); active.delete(nodeId); }
     };
-    const fail = (message, code = 1011) => cleanup(code, message);
+    const fail = (message, code = 1011, errorCode = "speech_error") => cleanup(code, message, false, errorCode);
     const sendClient = text => {
       if (client.readyState !== WebSocket.OPEN || client.bufferedAmount + Buffer.byteLength(text) > 128_000) {
         fail("Transcript delivery fell behind. Listening paused."); return;
@@ -90,9 +90,9 @@ export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstream
       if (binary) {
         const now = Date.now();
         audioBudget = Math.min(MAX_AUDIO_BACKLOG, audioBudget + Math.max(0, now - budgetAt) * 32); budgetAt = now;
-        if (!data.length || data.length % 2 || data.length > audioBudget || upstream.bufferedAmount + data.length > MAX_AUDIO_BACKLOG) {
-          fail("Speech upload fell behind or exceeded real-time PCM limits. Listening paused.", 1008); return;
-        }
+        if (!data.length || data.length % 2) { fail("Invalid PCM frame: expected non-empty 16-bit mono audio.", 1008, "invalid_pcm"); return; }
+        if (data.length > audioBudget) { fail("Audio arrived faster than real time. Check client pacing and sample rate.", 1008, "audio_rate"); return; }
+        if (upstream.bufferedAmount + data.length > MAX_AUDIO_BACKLOG) { fail("Speech provider upload backed up by more than two seconds.", 1011, "upstream_backlog"); return; }
         audioBudget -= data.length;
         upstream.send(data, { binary: true }, error => { if (error) fail("Speech upload interrupted."); });
       } else {

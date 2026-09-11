@@ -11,6 +11,7 @@ import { loadOpenAGIConfig, safeOpenAGIError } from './openagi/config'
 import { OpenAGIStore } from './openagi/store'
 import { SerializedAudioSource } from './openagi/audio-source'
 import { AgentsInputController } from './openagi/input-controller'
+import { AgentsDisplayController } from './openagi/display-controller'
 import { EvenKeyValueStorage } from './openagi/persistent-storage'
 import { BrowserKeyValueStorage, RecoveryStore } from './storage/recovery-store'
 import { GlassesRenderer } from './ui/glasses-renderer'
@@ -24,7 +25,7 @@ else await launchBuildBetter(bridge)
 
 async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
   const config = loadOpenAGIConfig()
-  const display = new EvenDisplayController(bridge)
+  const display = new AgentsDisplayController(bridge)
   await display.initialize('OpenAGI\n\nStarting…')
   const renderer = new OpenAGIGlassesRenderer(display)
   const store = new OpenAGIStore(new EvenKeyValueStorage(bridge, new BrowserKeyValueStorage()))
@@ -39,6 +40,8 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
   const phone = new OpenAGIPhoneCompanion({
     pair: (code, origin) => { void app.pair(code, origin) },
     ask: () => { void app.startAsk() },
+    configureBackgroundListening: enabled => { void app.configureBackgroundListening(enabled) },
+    retryListening: () => { void app.retryListening() },
     configureSpeech: (model, transport) => { void app.configureSpeech(model, transport) },
     toggleDisplay: () => app.toggleDisplay(),
     newConversation: () => { void app.newConversation() },
@@ -52,11 +55,13 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     refreshInbox: () => { void app.proactive.refresh() },
     openInbox: () => app.openInbox(),
     memoryConsent: (enabled, consent) => { void app.configureMemory(enabled, consent) },
+    returnToLifelog: consent => { void app.returnToLifelog(consent) },
     configureListeningMode: mode => { void app.configureListeningMode(mode) },
     readLifelog: (query, offset) => { void app.readLifelog(query, offset) },
     inboxAction: (op, id, extra) => { void app.proactive.action(op, id, extra) },
     markMoment: () => { void app.markMoment() },
     configureIdleTap: action => { void app.configureIdleTap(action) },
+    configureLifelogTalkMode: mode => { void app.configureLifelogTalkMode(mode) },
     previousPage: () => app.scrollUp(),
     nextPage: () => app.scrollDown(),
     recentAnswer: () => { void app.recentAnswer() },
@@ -66,7 +71,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     configureAmbient: (enabled, wakePhrase, answerQuestions) => { void app.configureAmbient(enabled, wakePhrase, answerQuestions) },
   }, config.allowedOrigins)
   app = new OpenAGIG2App(api, store, new SerializedAudioSource(bridge), renderer, phone, config.allowedOrigins)
-  const input = new AgentsInputController(bridge, { tap: () => app.tap(), scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), foreground: active => app.setForeground(active), systemExit: () => { void app.systemExit() } })
+  const input = new AgentsInputController(bridge, { tap: () => app.tap(), holdStart: () => { void app.holdStart() }, holdRelease: () => { void app.holdRelease() }, holdCancel: () => { void app.cancelHold() }, scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), foreground: active => app.setForeground(active), systemExit: () => { void app.systemExit() } })
   input.start()
   try { await app.boot() }
   catch (error) { renderer.message('OpenAGI could not start', safeOpenAGIError(error)); phone.set('Startup failed', safeOpenAGIError(error)) }

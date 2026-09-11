@@ -2,6 +2,7 @@ import { expect, it, vi } from 'vitest'
 import { OpenAGIG2App } from '../../app/openagi-g2-app'
 import { OpenAGIStore } from '../store'
 import type { LiveSpeech, SpeechCallbacks } from '../live-speech'
+import { SpeechStreamError } from '../live-speech'
 
 it('auto-sends finalized live text once after Stop when enabled', async () => {
   const f = await fixture()
@@ -18,8 +19,8 @@ it('auto-sends finalized live text once after Stop when enabled', async () => {
   } finally { await f.app.systemExit() }
 })
 
-async function fixture(initial: { ambientEnabled?: boolean } = {}) {
-  const storage = { get: vi.fn(() => Promise.resolve(null as string | null)), set: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve()) }
+async function fixture(initial: { ambientEnabled?: boolean } = {}, restored?: { saved: string; proactive: (body: { op: string }) => Promise<unknown> }) {
+  const storage = { get: vi.fn(() => Promise.resolve(restored?.saved ?? null as string | null)), set: vi.fn(() => Promise.resolve()), remove: vi.fn(() => Promise.resolve()) }
   const store = new OpenAGIStore(storage)
   await store.update({ autoSend: false, ...initial })
   await store.update({ nodeToken: 'saved-scoped-token-123', connectionMode: 'direct', agentOrigin: 'https://main.example.com', conversationId: crypto.randomUUID(), speechModel: 'nova-3' })
@@ -28,10 +29,11 @@ async function fixture(initial: { ambientEnabled?: boolean } = {}) {
   const audio = { active: true, start: vi.fn((cb: typeof receive) => { receive = cb; return Promise.resolve() }), stop: vi.fn(() => Promise.resolve()) }
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon' })), ask: vi.fn(), listen: vi.fn() }
-  const renderer = { inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
+  if (restored) Object.assign(api, { proactive: restored.proactive })
+  const renderer = { paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
   const phone = { set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
-  const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return speech as unknown as LiveSpeech })
+  const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return { ...speech } as unknown as LiveSpeech })
   await app.boot()
   return { app, api, audio, renderer, phone, speech, store, storage, receive: (pcm: Uint8Array) => receive(pcm), callbacks: () => callbacks }
 }
@@ -144,10 +146,429 @@ it('opening a recent answer preserves active lifelog consent and microphone', as
   } finally { await f.app.systemExit() }
 })
 
-it('renders paired home when boot happens while hidden without starting capture', async () => {
+it('resumes paused lifelog on glasses only after explicit participant consent', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  const proactive = vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] })
+  Object.assign(f.api, { proactive })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.doubleTap(); await vi.advanceTimersByTimeAsync(500)
+    expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
+    expect(f.app.proactive.memoryActive).toBe(false)
+    f.audio.start.mockClear(); proactive.mockClear()
+    f.app.tap()
+    expect(f.renderer.paused).toHaveBeenLastCalledWith(true, true)
+    expect(f.audio.start).not.toHaveBeenCalled()
+    f.app.doubleTap(); await vi.advanceTimersByTimeAsync(500)
+    expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
+    expect(proactive.mock.calls.some(([b]) => b.op === 'consent' && b.enabled)).toBe(false)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, 'open agi')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('phone return to active lifelog leaves the consent and microphone intact', async () => {
+  const f = await fixture()
+  const proactive = vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] })
+  Object.assign(f.api, { proactive })
+  try {
+    await f.store.remember('Earlier question', 'Earlier answer'); await f.app.configureMemory(true, true)
+    await f.app.selectAnswer(0); f.audio.start.mockClear(); proactive.mockClear()
+    await f.app.returnToLifelog(false)
+    expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, 'open agi')
+    expect(f.audio.start).not.toHaveBeenCalled()
+    expect(proactive.mock.calls.some(([b]) => b.op === 'consent')).toBe(false)
+  } finally { await f.app.systemExit() }
+})
+
+it('does not revive retention when main cannot verify the saved consent', async () => {
+  const f = await fixture()
+  Object.assign(f.api, { proactive: vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] }) })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.setForeground(false); await Promise.resolve(); f.app.setForeground(true)
+    await vi.waitFor(() => expect(f.renderer.paused).toHaveBeenLastCalledWith(true))
+    await f.app.configureMemory(true, false)
+    expect(f.app.proactive.memoryActive).toBe(false)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit() }
+})
+
+it('safely discards buffered Stop when backgrounding clears the recording', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureSpeech('openai-buffered'); await f.app.startAsk()
+    f.receive(new Uint8Array(6400))
+    let stopped!: () => void
+    f.audio.stop.mockImplementationOnce(() => new Promise<void>(resolve => { stopped = resolve }))
+    const finishing = f.app.finishAsk()
+    f.app.setForeground(false); stopped(); await expect(finishing).resolves.toBeUndefined()
+    expect(f.api.listen).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
+    f.app.setForeground(true); await f.app.startAsk()
+    expect(f.audio.start).toHaveBeenCalledTimes(2)
+  } finally { await f.app.systemExit() }
+})
+
+it('resumes on foreground return and fresh app boot without generating another consent', async () => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: Date.now() + 60000 }
+  const proactive = vi.fn(async (body: { op: string }) => ['consent', 'settings'].includes(body.op) ? { consent: grant } : { items: [] })
+  Object.assign(f.api, { proactive })
+  let reopened: Awaited<ReturnType<typeof fixture>> | undefined
+  try {
+    await f.app.configureMemory(true, true)
+    const saved = JSON.stringify(f.store.snapshot())
+    f.app.setForeground(false); await Promise.resolve(); f.app.setForeground(true)
+    await vi.waitFor(() => expect(f.audio.start).toHaveBeenCalledTimes(2))
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(proactive.mock.calls.filter(([b]) => b.op === 'consent')).toHaveLength(1)
+    await f.app.systemExit()
+    reopened = await fixture({}, { saved, proactive })
+    expect(reopened.audio.start).toHaveBeenCalledOnce()
+    expect(reopened.app.proactive.memoryActive).toBe(true)
+    expect(proactive.mock.calls.filter(([b]) => b.op === 'consent')).toHaveLength(1)
+  } finally { await f.app.systemExit(); await reopened?.app.systemExit() }
+})
+
+it.each(['expired', 'revoked', 'different', 'offline', 'off'])('does not auto-record after reopening when consent is %s', async reason => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: reason === 'expired' ? Date.now() - 1 : Date.now() + 60000 }
+  let reopened: Awaited<ReturnType<typeof fixture>> | undefined
+  const proactive = vi.fn(async (body: { op: string }) => {
+    if (body.op !== 'settings') return { items: [] }
+    if (reason === 'offline') throw new Error('Main offline')
+    return { consent: reason === 'revoked' ? null : reason === 'different' ? { ...grant, id: 'replacement' } : grant }
+  })
+  try {
+    const saved = JSON.stringify({ ...f.store.snapshot(), ambientEnabled: reason !== 'off', lifelogEnabled: reason !== 'off', lifelogConsent: grant })
+    reopened = await fixture({}, { saved, proactive })
+    expect(reopened.audio.start).not.toHaveBeenCalled()
+    expect(reopened.app.proactive.memoryActive).toBe(false)
+    expect(proactive.mock.calls.some(([b]) => b.op === 'consent')).toBe(false)
+  } finally { await f.app.systemExit(); await reopened?.app.systemExit() }
+})
+
+it('retries consent verification after rapid background and foreground switching', async () => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: Date.now() + 60000 }
+  let finish!: (value: unknown) => void
+  let checks = 0
+  Object.assign(f.api, { proactive: vi.fn(async (body: { op: string }) => {
+    if (body.op === 'consent') return { consent: grant }
+    if (body.op === 'settings') {
+      if (++checks === 1) return new Promise(resolve => { finish = resolve })
+      return { consent: grant }
+    }
+    return { items: [] }
+  }) })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.setForeground(false); f.app.setForeground(true)
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    f.app.setForeground(false); f.app.setForeground(true)
+    finish({ consent: grant })
+    await vi.waitFor(() => expect(f.audio.start).toHaveBeenCalledTimes(2))
+    expect(checks).toBe(2); expect(f.app.proactive.memoryActive).toBe(true)
+  } finally { await f.app.systemExit() }
+})
+
+it('explicit Off during consent verification wins and prevents microphone startup', async () => {
+  const f = await fixture()
+  const grant = { id: 'saved-consent', until: Date.now() + 60000 }
+  let finish!: (value: unknown) => void
+  Object.assign(f.api, { proactive: vi.fn(async (body: { op: string }) => body.op === 'consent' ? { consent: grant } : body.op === 'settings' ? new Promise(resolve => { finish = resolve }) : { items: [] }) })
+  try {
+    await f.app.configureMemory(true, true)
+    f.app.setForeground(false); await Promise.resolve(); f.app.setForeground(true)
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'))
+    await f.app.configureMemory(false, false); finish({ consent: grant })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.store.snapshot().lifelogEnabled).toBe(false)
+    expect(f.store.snapshot().lifelogConsent).toBeNull(); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit() }
+})
+
+it('clears saved lifelog consent when pairing credentials or main change', async () => {
+  const f = await fixture()
+  try {
+    await f.store.update({ lifelogEnabled: true, lifelogConsent: { id: 'saved', until: Date.now() + 60000 } })
+    await f.store.update({ agentOrigin: 'https://other.example.com' })
+    expect(f.store.snapshot().lifelogEnabled).toBe(false); expect(f.store.snapshot().lifelogConsent).toBeNull()
+    await f.store.update({ lifelogEnabled: true, lifelogConsent: { id: 'new', until: Date.now() + 60000 } })
+    await f.store.clearCredential()
+    expect(f.store.snapshot().lifelogEnabled).toBe(false); expect(f.store.snapshot().lifelogConsent).toBeNull()
+  } finally { await f.app.systemExit() }
+})
+
+it('continues opted-in live lifelog through phone hiding, saves finals, and returns without reopening the mic', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  const grant = { id: 'background-consent', until: Date.now() + 60000 }
+  const proactive = vi.fn(async (body: { op: string }) => ['consent', 'settings'].includes(body.op) ? { consent: grant } : { items: [] })
+  Object.assign(f.api, { proactive })
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+  try {
+    expect(f.store.snapshot().backgroundListening).toBe(false)
+    await f.app.configureBackgroundListening(true)
+    await f.app.configureMemory(true, true)
+    f.receive(new Uint8Array(640)); const stops = f.audio.stop.mock.calls.length
+    visibility.mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange'))
+    f.callbacks().segment!('Remember to buy milk', { at: Date.now(), endAt: Date.now(), streamId: 'live-test', speaker: null })
+    for (let n = 0; n < 32; n++) { await vi.advanceTimersByTimeAsync(1000); f.receive(new Uint8Array(640)) }
+    expect(proactive).toHaveBeenCalledWith(expect.objectContaining({ op: 'capture', consentId: grant.id, texts: ['Remember to buy milk'] }), expect.anything())
+    expect(f.audio.stop).toHaveBeenCalledTimes(stops)
+    f.callbacks().utterance('Peri, do something'); expect(f.api.askText).not.toHaveBeenCalled()
+    visibility.mockReturnValue('visible'); document.dispatchEvent(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.store.snapshot().backgroundListening).toBe(true)
+  } finally { visibility.mockRestore(); await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it.each(['default-off', 'wake', 'buffered'])('does not continue background capture for %s', async reason => {
+  const f = await lifelogHoldFixture()
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+  try {
+    if (reason !== 'default-off') await f.app.configureBackgroundListening(true)
+    if (reason === 'wake') await f.store.update({ listeningMode: 'wake' })
+    if (reason === 'buffered') await f.store.update({ speechModel: 'openai-buffered' })
+    const stops = f.audio.stop.mock.calls.length
+    visibility.mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange'))
+    await Promise.resolve()
+    expect(f.audio.stop.mock.calls.length).toBeGreaterThan(stops)
+    expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { visibility.mockRestore(); await f.app.systemExit() }
+})
+
+it.each(['gap', 'suspended-callback', 'expired', 'off', 'native-exit', 'socket'])('stops background capture on %s without replay', async reason => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+  try {
+    await f.app.configureBackgroundListening(true); f.receive(new Uint8Array(640))
+    visibility.mockReturnValue('hidden'); document.dispatchEvent(new Event('visibilitychange'))
+    const pushes = f.speech.push.mock.calls.length, stops = f.audio.stop.mock.calls.length
+    if (reason === 'gap') await vi.advanceTimersByTimeAsync(10000)
+    if (reason === 'suspended-callback' || reason === 'expired') {
+      vi.setSystemTime(Date.now() + (reason === 'expired' ? 61000 : 10000))
+      f.receive(new Uint8Array(640))
+    }
+    if (reason === 'off') await f.app.configureBackgroundListening(false)
+    if (reason === 'native-exit') f.app.setForeground(false)
+    if (reason === 'socket') f.callbacks().error(new SpeechStreamError('Disconnected', 'network', true))
+    await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.stop.mock.calls.length).toBeGreaterThan(stops)
+    expect(f.app.proactive.memoryActive).toBe(false)
+    expect(f.speech.push).toHaveBeenCalledTimes(pushes)
+    expect(f.store.snapshot().lifelogEnabled).toBe(true)
+    expect(f.phone.activity).toHaveBeenCalled()
+  } finally { visibility.mockRestore(); await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it.each(['retry', 'return'])('restores saved lifelog consent after a stream error using %s without creating a new grant', async action => {
+  const f = await fixture()
+  const grant = { id: 'retry-consent', until: Date.now() + 60000 }
+  const proactive = vi.fn(async (body: { op: string }) => ['consent', 'settings'].includes(body.op) ? { consent: grant } : { items: [] })
+  Object.assign(f.api, { proactive })
+  try {
+    await f.app.configureMemory(true, true)
+    f.callbacks().error(new Error('Speech disconnected'))
+    await vi.waitFor(() => expect(f.app.proactive.memoryActive).toBe(false))
+    f.renderer.home.mockClear()
+    if (action === 'retry') await f.app.retryListening()
+    else await f.app.returnToLifelog(false)
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.audio.start).toHaveBeenCalledTimes(2)
+    expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, expect.any(String))
+    expect(f.renderer.home).not.toHaveBeenCalled()
+    await f.app.proactive.refresh()
+    expect(f.renderer.home).not.toHaveBeenCalled()
+    expect(proactive.mock.calls.filter(([b]) => b.op === 'consent')).toHaveLength(1)
+  } finally { await f.app.systemExit() }
+})
+
+it.each(['expired', 'unverified', 'native-background'])('Retry preserves paused lifelog instead of falling back home when %s', async reason => {
+  const f = await lifelogHoldFixture()
+  try {
+    f.callbacks().error(new Error('Speech disconnected'))
+    await vi.waitFor(() => expect(f.app.proactive.memoryActive).toBe(false))
+    if (reason === 'expired') await f.store.update({ lifelogConsent: { id: 'expired', until: Date.now() - 1 } })
+    if (reason === 'native-background') f.app.setForeground(false)
+    f.renderer.home.mockClear()
+    await f.app.retryListening()
+    await f.app.proactive.refresh()
+    expect(f.renderer.home).not.toHaveBeenCalled()
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(false)
+    expect(f.store.snapshot().lifelogEnabled).toBe(true)
+    expect(f.phone.set).toHaveBeenLastCalledWith(expect.stringContaining('paused'), expect.any(String))
+  } finally { await f.app.systemExit() }
+})
+
+async function lifelogHoldFixture() {
+  const f = await fixture()
+  Object.assign(f.api, { proactive: vi.fn(async (b: { op: string; enabled?: boolean }) => b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] }) })
+  await f.app.configureMemory(true, true); await f.app.configureLifelogTalkMode('hold')
+  return f
+}
+
+it('recovers lifelog with fresh speech and existing consent, without replaying a question', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    const old = f.callbacks(), enable = vi.spyOn(f.app.proactive, 'enableMemory')
+    old.error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(f.audio.start).toHaveBeenCalledTimes(2); expect(enable).not.toHaveBeenCalled()
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.phone.activity).toHaveBeenCalledWith(expect.stringContaining('Audio gap'))
+    old.utterance('Peri send an email'); expect(f.api.askText).not.toHaveBeenCalled()
+    f.callbacks().utterance('Peri incomplete tail'); expect(f.api.askText).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it.each(['pause', 'background', 'consent', 'expiry'])('cancels lifelog recovery on %s', async action => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    if (action === 'expiry') await vi.advanceTimersByTimeAsync(59500)
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(0)
+    if (action === 'pause') f.app.doubleTap()
+    if (action === 'background') f.app.setForeground(false)
+    if (action === 'consent') await f.app.configureMemory(false, false)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('stops after three recovery attempts per minute', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    for (const delay of [1000, 2000, 4000]) {
+      f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+      await vi.advanceTimersByTimeAsync(delay)
+    }
+    expect(f.audio.start).toHaveBeenCalledTimes(4)
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(f.audio.start).toHaveBeenCalledTimes(4); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('pause while a recovery connection is opening cannot restart the microphone later', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  let opened!: () => void
+  try {
+    f.speech.open.mockImplementationOnce(() => new Promise<void>(resolve => { opened = resolve }))
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(opened).toBeTypeOf('function')
+    await f.app.configureAmbient(false, 'Peri', false)
+    opened(); await vi.advanceTimersByTimeAsync(5000)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    expect(f.store.snapshot().ambientEnabled).toBe(false); expect(f.app.proactive.memoryActive).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('never retries malformed audio or auto-sends an interrupted manual question', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    f.callbacks().error(new SpeechStreamError('Invalid PCM', 'invalid_pcm'))
+    await vi.advanceTimersByTimeAsync(5000); expect(f.audio.start).toHaveBeenCalledOnce()
+    await f.app.configureAutoSend(true); await f.app.startAsk()
+    f.callbacks().transcript('A partial question', false, 0)
+    f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
+    await vi.advanceTimersByTimeAsync(5000); await f.app.finishAsk()
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.api.ask).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it.each([true, false])('hold ignores quick taps and release respects auto-send=%s', async autoSend => {
+  const f = await lifelogHoldFixture()
+  try {
+    await f.app.configureAutoSend(autoSend)
+    f.audio.start.mockClear(); f.app.tap(); await Promise.resolve()
+    expect(f.audio.start).not.toHaveBeenCalled()
+    await f.app.holdStart(); f.app.tap()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    await f.app.holdRelease()
+    expect(f.api.askText).toHaveBeenCalledTimes(autoSend ? 1 : 0)
+    if (!autoSend) { await f.app.sendDraft(); expect(f.api.askText).toHaveBeenCalledOnce() }
+    await f.app.holdRelease(); expect(f.api.askText).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(true)
+  } finally { await f.app.systemExit() }
+})
+
+it('release during microphone setup cancels instead of sending later', async () => {
+  const f = await lifelogHoldFixture()
+  let opened!: () => void
+  try {
+    await f.app.configureAutoSend(true)
+    f.speech.open.mockImplementationOnce(() => new Promise<void>(resolve => { opened = resolve }))
+    const starting = f.app.holdStart()
+    await vi.waitFor(() => expect(opened).toBeTypeOf('function'))
+    await f.app.holdRelease(); opened(); await starting
+    expect(f.api.askText).not.toHaveBeenCalled(); expect(f.speech.finish).not.toHaveBeenCalled()
+    expect(f.app.proactive.memoryActive).toBe(true)
+    await f.app.holdStart(); await f.app.holdRelease()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit() }
+})
+
+it('hold release also sends buffered audio once', async () => {
+  const f = await lifelogHoldFixture()
+  try {
+    await f.app.configureSpeech('openai-buffered'); await f.app.configureMemory(true, true)
+    await f.app.configureAutoSend(true)
+    f.api.ask.mockResolvedValue({ question: 'Buffered question', reply: 'Answer' })
+    await f.app.holdStart(); f.receive(new Uint8Array(6400))
+    expect(f.api.ask).not.toHaveBeenCalled()
+    await f.app.holdRelease(); await f.app.holdRelease()
+    expect(f.api.ask).toHaveBeenCalledOnce()
+    expect(f.app.proactive.memoryActive).toBe(true)
+  } finally { await f.app.systemExit() }
+})
+
+it('missing release times out without sending and foreground loss never sends', async () => {
+  vi.useFakeTimers()
+  const f = await lifelogHoldFixture()
+  try {
+    await f.app.configureAutoSend(true); await f.app.holdStart()
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(f.api.askText).not.toHaveBeenCalled()
+    await f.app.holdRelease(); expect(f.api.askText).not.toHaveBeenCalled()
+    await f.app.holdStart(); f.app.setForeground(false); await f.app.holdRelease()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    expect(f.app.proactive.memoryActive).toBe(false)
+    f.app.setForeground(true); await f.app.configureMemory(true, true)
+    await f.app.holdStart(); await f.app.holdRelease()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('lifelog hold preference persists and does not reset pairing', async () => {
+  const f = await fixture()
+  try {
+    await f.app.configureLifelogTalkMode('hold')
+    const saved = f.storage.set.mock.calls.at(-1) as unknown as [string, string]
+    const reloaded = new OpenAGIStore({ get: async () => saved[1], set: async () => {}, remove: async () => {} })
+    const state = await reloaded.load()
+    expect(state.lifelogTalkMode).toBe('hold'); expect(state.nodeToken).toBe(f.store.snapshot().nodeToken)
+    await reloaded.clearCredential(); expect(reloaded.snapshot().lifelogTalkMode).toBe('hold')
+  } finally { await f.app.systemExit() }
+})
+
+it('renders paired pause when boot happens while hidden without starting capture', async () => {
   const hidden = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
   const f = await fixture({ ambientEnabled: true })
-  try { expect(f.renderer.home).toHaveBeenCalled(); expect(f.phone.paired).toHaveBeenCalledWith(true); expect(f.audio.start).not.toHaveBeenCalled() }
+  try { expect(f.renderer.paused).toHaveBeenCalled(); expect(f.phone.paired).toHaveBeenCalledWith(true); expect(f.audio.start).not.toHaveBeenCalled() }
   finally { hidden.mockRestore(); await f.app.systemExit() }
 })
 
@@ -246,7 +667,7 @@ it('buffered quiet listening ignores trigger results while still capturing final
   } finally { await f.app.systemExit() }
 })
 
-it('start lifelog opens the microphone automatically and foreground exit revokes retention', async () => {
+it('start lifelog persists its preference and foreground exit suspends without revoking consent', async () => {
   const f = await fixture()
   const proactive = vi.fn(async (body: { op: string; enabled?: boolean }) => body.op === 'consent' && body.enabled ? { consent: { id: 'fixture-consent', until: Date.now() + 60000 } } : { items: [] })
   Object.assign(f.api, { proactive })
@@ -255,7 +676,9 @@ it('start lifelog opens the microphone automatically and foreground exit revokes
     expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(true)
     f.app.setForeground(false); await Promise.resolve()
     expect(f.app.proactive.memoryActive).toBe(false); expect(f.speech.close).toHaveBeenCalled()
-    expect(proactive).toHaveBeenCalledWith(expect.objectContaining({ op: 'consent', enabled: false, consentId: 'fixture-consent' }))
+    expect(proactive).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'consent', enabled: false, consentId: 'fixture-consent' }))
+    expect(f.store.snapshot().lifelogEnabled).toBe(true)
+    expect(f.store.snapshot().lifelogConsent?.id).toBe('fixture-consent')
     f.app.setForeground(true); await Promise.resolve()
     expect(f.audio.start).toHaveBeenCalledOnce(); expect(f.app.proactive.memoryActive).toBe(false)
   } finally { await f.app.systemExit() }
