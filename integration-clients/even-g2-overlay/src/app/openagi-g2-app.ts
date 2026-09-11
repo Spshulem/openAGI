@@ -104,15 +104,17 @@ export class OpenAGIG2App {
   private checkBackgroundAudio(): boolean {
     if (!this.backgroundCapture) return true
     if (!this.canContinueInBackground() || Date.now() - this.lastAudioAt > 8000) {
-      const detail = 'Background audio gap or consent ended. Microphone paused; unsent audio is not replayed. Unlock to resume.'
+      const detail = Date.now() - this.lastAudioAt > 8000
+        ? 'No microphone packets reached the app for 8 seconds while the phone was hidden. Even or the phone may have suspended audio. Unlock to resume; smaller upload chunks cannot restore missing microphone packets.'
+        : 'Lock-screen lifelog conditions changed (consent, listening mode, or connection). Microphone paused; unlock to resume.'
       this.phone.activity?.(detail); this.phone.backgroundStatus?.(detail)
       // Stop synchronously before a delayed PCM callback can upload stale audio.
-      this.setForeground(false, false)
+      this.setForeground(false, false, detail)
       return false
     }
     return true
   }
-  setForeground(active: boolean, nativeEvent = true): void {
+  setForeground(active: boolean, nativeEvent = true, pauseReason?: string): void {
     if (nativeEvent) this.nativeForeground = active
     // A native G2 app exit/background is distinct from the phone WebView hiding.
     if (active && document.visibilityState === 'hidden') { this.onVisibility(); return }
@@ -122,6 +124,10 @@ export class OpenAGIG2App {
     if (active && this.store.snapshot().lifelogEnabled && !this.ambientRunning) void this.restoreLifelog()
     else if (active && this.pausedLifelog && this.mode === 'home') this.showPaused()
     if (!active) {
+      const reason = pauseReason ?? (nativeEvent
+        ? 'Even reported that Agents left the glasses foreground. Capture must stop. Lock-screen continuation cannot override this native event; reopen Agents to resume.'
+        : 'Phone hidden without an eligible active live, quiet lifelog session. Open Even to resume. Lock-screen continuation requires its experimental switch and live speech.')
+      this.phone.activity?.(reason); this.phone.backgroundStatus?.(reason)
       if (this.heldQuestion) {
         this.heldQuestion.cancelled = true
         if (this.heldQuestion.ready) { this.heldQuestion = null; this.renderer.holdToTalk?.(false) }
@@ -136,6 +142,7 @@ export class OpenAGIG2App {
       if (this.mode === 'ambient' || this.mode === 'listening' || (this.mode === 'thinking' && !this.requestController)) this.mode = 'home'
       this.phone.memoryStatus?.(false, 'Microphone off in background. Enabled lifelog resumes on return while consent is valid.')
       this.phone.lifelogEnabled?.(this.store.snapshot().lifelogEnabled)
+      this.phone.set('Listening paused', reason)
     }
   }
   private ambientEpoch = 0
@@ -157,6 +164,7 @@ export class OpenAGIG2App {
   private liveCaptureTimer: ReturnType<typeof setTimeout> | undefined
   private displaySleeping = false
   private draft = ''
+  private draftRecovery: 'speech' | 'delivery' | undefined
   private preparingDraft = false
   private cancelConfirmation = false
   private activityView = false
@@ -450,17 +458,26 @@ export class OpenAGIG2App {
     const text = this.draft; this.draft = ''; this.phone.draft?.(null)
     await this.runQuestion(text)
   }
-  private reviewDraft(text: string): void {
+  private reviewDraft(text: string, recovery?: 'speech' | 'delivery'): void {
     const clean = text.trim()
     if (!clean) throw new Error('No speech was recognized. Nothing was sent; please retry.')
     if (clean.length > 4000) throw new Error('Question is too long. Nothing was sent; please record a shorter question.')
-    this.draft = clean; this.mode = 'review'; this.pages = paginateText(plainAnswer(clean), 220); this.page = 0
-    if (this.store.snapshot().autoSend) { this.phone.transcript?.(clean); return }
-    this.phone.transcript?.(clean); this.phone.draft?.(clean)
+    this.draft = clean; this.draftRecovery = recovery; this.mode = 'review'; this.pages = paginateText(plainAnswer(clean), 220); this.page = 0
+    if (this.store.snapshot().autoSend && !recovery) { this.phone.transcript?.(clean); return }
+    this.phone.transcript?.(clean); this.phone.draft?.(clean, recovery)
     this.phone.set('Review question · not sent', 'Tap to send. Double-tap to discard. Swipe to read the whole transcript, or re-record on the phone.')
     this.showDraftPage()
   }
-  private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length) }
+  private recoverQuestion(text: string, error: unknown, recovery: 'speech' | 'delivery'): void {
+    if (!text.trim() || text.length > 4000) { this.fail(error); return }
+    this.reviewDraft(text, recovery)
+    const detail = recovery === 'speech'
+      ? 'Text may be incomplete. Review, then Send or Re-record. Nothing was sent to the agent.'
+      : 'Main may already have received this question. Check its chat before sending again; actions could run twice.'
+    this.phone.set(recovery === 'speech' ? 'Transcript recovered · not sent' : 'Delivery uncertain · question retained', `${safeOpenAGIError(error)} ${detail}`)
+    this.phone.activity?.(`${recovery === 'speech' ? 'Speech finalization failed' : 'Agent delivery failed'}: ${safeOpenAGIError(error)} ${detail}`)
+  }
+  private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length, this.draftRecovery) }
   async recentAnswer(): Promise<void> { await this.selectAnswer(this.store.snapshot().history.length - 1) }
   doubleTap(): void {
     if (this.recoveringSpeech) { void this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions); return }
@@ -739,6 +756,7 @@ export class OpenAGIG2App {
       const speech = this.liveSpeech
       this.mode = 'thinking'; clearTimeout(this.liveCaptureTimer)
       const controller = new AbortController(); this.requestController = controller; this.preparingDraft = true
+      let finalized = false
       this.phone.requestActive?.(true)
       this.renderActiveProgress = () => { if (!this.cancelConfirmation) this.renderer.progress?.('Finishing transcript', 'Not sent to agent') }
       this.renderActiveProgress()
@@ -752,9 +770,14 @@ export class OpenAGIG2App {
         if (!text) throw new Error('No speech was recognized. Your question was not sent; please retry.')
         this.phone.activity?.(`Speech finalized in ${Date.now() - started}ms`)
         this.reviewDraft(text)
-      } catch (error) { this.stopLiveSpeech(); if (!this.exited && !controller.signal.aborted) this.fail(error) }
+        finalized = true
+      } catch (error) {
+        const text = speech.snapshotText?.() ?? ''
+        this.stopLiveSpeech()
+        if (!this.exited && !controller.signal.aborted) this.recoverQuestion(text, error, 'speech')
+      }
       finally { await this.finishDraftPreparation(controller) }
-      if (!controller.signal.aborted && !this.exited && this.store.snapshot().autoSend) await this.sendDraft()
+      if (finalized && !controller.signal.aborted && !this.exited && this.store.snapshot().autoSend) await this.sendDraft()
       return
     }
     if (this.microphoneOpening || this.mode !== 'listening' || !this.audioBuffer) return
@@ -876,7 +899,8 @@ export class OpenAGIG2App {
       } else if (controller.signal.aborted) {
         this.mode = 'message'; this.renderer.message('Request stopped', 'No automatic retry. Completed actions cannot be undone. Your recent answers are still saved.')
       } else this.fail(error)
-      this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
+      if (!controller.signal.aborted && !this.exited && typeof input === 'string') this.recoverQuestion(input, error, 'delivery')
+      else this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
     } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false); await this.resumeListening() }
   }
   private showUnpaired(): void { this.proactive.stop(); this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
@@ -950,6 +974,7 @@ export class OpenAGIG2App {
     if (this.audio.active) await this.audio.stop().catch(() => undefined)
   }
   private async resumeListening(): Promise<void> {
+    if (this.mode === 'review') return // Keep recovery text visible until Send or Discard.
     if (!this.resumeAfterAsk || this.exited || !this.foregroundActive || !this.store.snapshot().ambientEnabled) return
     this.resumeAfterAsk = false
     const previous = this.mode, page = this.page
@@ -1029,7 +1054,11 @@ export class OpenAGIG2App {
         if (this.liveSpeech !== speech || this.exited) return
         if (ambient && this.recoveringSpeech) { this.recoveryFailure = error; return }
         if (ambient) void this.recoverAmbientSpeech(error)
-        else { this.stopLiveSpeech(); void this.audio.stop().catch(() => undefined); this.fail(error) }
+        else if (!this.preparingDraft) {
+          const text = speech.snapshotText?.() ?? ''
+          this.stopLiveSpeech(); void this.audio.stop().catch(() => undefined)
+          this.recoverQuestion(text, error, 'speech')
+        }
       },
     })
     this.liveSpeech = speech
@@ -1189,7 +1218,7 @@ export class OpenAGIG2App {
     if (this.backgroundCapture) {
       this.phone.activity?.('Background speech connection interrupted. Unlock to resume; no audio replay.')
       this.phone.backgroundStatus?.('Background connection interrupted · unlock to resume')
-      this.setForeground(false, false)
+      this.setForeground(false, false, `Background speech connection interrupted: ${safeOpenAGIError(error)} Unlock to resume; no audio replay.`)
       return
     }
     if (this.recoveringSpeech) return // The in-flight attempt owns its failure.

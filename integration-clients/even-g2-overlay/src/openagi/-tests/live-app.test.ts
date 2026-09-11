@@ -4,6 +4,56 @@ import { OpenAGIStore } from '../store'
 import type { LiveSpeech, SpeechCallbacks } from '../live-speech'
 import { SpeechStreamError } from '../live-speech'
 
+it('retains failed finalization for explicit review even with auto-send and ambient resume enabled', async () => {
+  const f = await fixture({ ambientEnabled: true })
+  try {
+    await f.app.configureAutoSend(true); await f.app.startAsk()
+    f.speech.snapshotText.mockReturnValue('Please keep these words')
+    const error = new SpeechStreamError('Finalization timed out', 'finalization_timeout')
+    f.speech.finish.mockImplementationOnce(async () => { f.callbacks().error(error); throw error })
+    await f.app.finishAsk()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    expect(f.phone.draft).toHaveBeenLastCalledWith('Please keep these words', 'speech')
+    expect(f.renderer.review).toHaveBeenLastCalledWith('Please keep these words', 0, 1, 'speech')
+    expect(f.audio.start).toHaveBeenCalledTimes(2) // ambient + manual, no resume over review
+    await f.app.sendDraft()
+    expect(f.api.askText).toHaveBeenCalledExactlyOnceWith('Please keep these words', expect.any(String), expect.any(Function), expect.any(AbortSignal))
+  } finally { await f.app.systemExit() }
+})
+
+it('retains text when native microphone release fails, and discarding never sends it', async () => {
+  const f = await fixture()
+  try {
+    await f.app.startAsk(); f.speech.snapshotText.mockReturnValue('Already transcribed')
+    f.audio.stop.mockRejectedValueOnce(new Error('Microphone release failed'))
+    await f.app.finishAsk()
+    expect(f.phone.draft).toHaveBeenLastCalledWith('Already transcribed', 'speech')
+    await f.app.discardDraft(); expect(f.api.askText).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
+})
+
+it('keeps a failed text send with a duplicate-action warning and never retries automatically', async () => {
+  const f = await fixture({ ambientEnabled: true })
+  try {
+    await f.app.configureAutoSend(true); await f.app.startAsk()
+    f.api.askText.mockRejectedValueOnce(new Error('Failed to fetch'))
+    await f.app.finishAsk()
+    expect(f.api.askText).toHaveBeenCalledOnce()
+    expect(f.phone.draft).toHaveBeenLastCalledWith('What time is it?', 'delivery')
+    expect(f.phone.set).toHaveBeenLastCalledWith('Delivery uncertain · question retained', expect.stringContaining('actions could run twice'))
+    await f.app.sendDraft(); expect(f.api.askText).toHaveBeenCalledTimes(2)
+  } finally { await f.app.systemExit() }
+})
+
+it('distinguishes an Even native foreground exit from a speech upload timeout', async () => {
+  const f = await fixture()
+  try {
+    f.app.setForeground(false)
+    expect(f.phone.activity).toHaveBeenCalledWith(expect.stringContaining('Even reported'))
+    expect(f.phone.set).toHaveBeenLastCalledWith('Listening paused', expect.stringContaining('native event'))
+  } finally { await f.app.systemExit() }
+})
+
 it('auto-sends finalized live text once after Stop when enabled', async () => {
   const f = await fixture()
   try {
@@ -27,11 +77,11 @@ async function fixture(initial: { ambientEnabled?: boolean } = {}, restored?: { 
   let receive: (pcm: Uint8Array) => void = () => {}
   let callbacks!: SpeechCallbacks
   const audio = { active: true, start: vi.fn((cb: typeof receive) => { receive = cb; return Promise.resolve() }), stop: vi.fn(() => Promise.resolve()) }
-  const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), finish: vi.fn(() => Promise.resolve('What time is it?')) }
+  const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), snapshotText: vi.fn(() => ''), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon' })), ask: vi.fn(), listen: vi.fn() }
   if (restored) Object.assign(api, { proactive: restored.proactive })
-  const renderer = { paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
-  const phone = { set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
+  const renderer = { review: vi.fn(), paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
+  const phone = { draft: vi.fn(), set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return { ...speech } as unknown as LiveSpeech })
   await app.boot()

@@ -35,6 +35,8 @@ export class LiveSpeech {
   private closeSent = false
   private stable = ''
   private full = ''
+  private interim = ''
+  private relayed = false
   private lastFinalEnd = -1
   private streamId = crypto.randomUUID()
   private streamAt = Date.now()
@@ -45,8 +47,18 @@ export class LiveSpeech {
   private finishTimer: ReturnType<typeof setTimeout> | undefined
   constructor(private readonly callbacks: SpeechCallbacks, private readonly factory: SocketFactory = (url, protocols) => new WebSocket(url, protocols)) {}
 
+  // Recovery text can contain unfinished words. It must be reviewed, never auto-sent.
+  snapshotText(): string { return `${this.full} ${this.interim}`.trim().slice(-4000) }
+  private complete(): void {
+    if (!this.finishResolve || !this.closeSent) return
+    const resolve = this.finishResolve, text = this.full.trim()
+    this.finishResolve = undefined; this.finishReject = undefined
+    this.close(); resolve(text)
+  }
+
   async open(token: string, model: Exclude<SpeechModel, 'openai-buffered'>, wakePhrase: string, relayUrl?: string): Promise<void> {
     if (this.closed) throw new Error('Speech start cancelled.')
+    this.relayed = Boolean(relayUrl)
     const params = new URLSearchParams({ model, encoding: 'linear16', sample_rate: '16000', channels: '1', language: 'en', interim_results: 'true', endpointing: '500', utterance_end_ms: '1000', vad_events: 'true', smart_format: 'true', mip_opt_out: 'true', diarize: 'true' })
     if (model === 'nova-3' && wakePhrase.trim()) params.set('keyterm', wakePhrase.trim().slice(0, 40))
     const ws = this.factory(relayUrl ?? `wss://api.deepgram.com/v1/listen?${params}`, [relayUrl ? 'openagi-g2-speech' : 'bearer', token])
@@ -73,8 +85,7 @@ export class LiveSpeech {
         if (this.closed) return
         // CloseStream drains final results before closing. Other closes are failures.
         if (this.finishResolve && this.closeSent && event.code === 1000) {
-          const resolveFinish = this.finishResolve; this.finishResolve = undefined; this.finishReject = undefined
-          const text = this.full.trim(); this.close(); resolveFinish(text)
+          this.complete()
         } else this.failure('Live speech disconnected.', event.code === 1006 || event.code === 1011 ? 'stream_disconnected' : 'stream_closed')
       }
     })
@@ -111,7 +122,7 @@ export class LiveSpeech {
     else if (this.finishResolve && !this.closeSent) {
       this.closeSent = true
       clearTimeout(this.finishTimer)
-      this.finishTimer = setTimeout(() => this.failure('Speech finalization took too long. The question was not sent.'), 5000)
+      this.finishTimer = setTimeout(() => this.failure('Speech finalization timed out. Review the recovered text before sending.', 'finalization_timeout'), 12_000)
       try { this.socket.send(JSON.stringify({ type: 'CloseStream' })) }
       catch { this.failure('Speech finalization connection failed.', 'stream_disconnected') }
     }
@@ -121,7 +132,7 @@ export class LiveSpeech {
     if (this.closed || !this.ready || !this.socket || this.finishResolve) return Promise.reject(new Error('Live speech is not ready to finish. Please retry.'))
     return new Promise((resolve, reject) => {
       this.finishResolve = resolve; this.finishReject = reject
-      this.finishTimer = setTimeout(() => this.failure('Speech finalization took too long. Your transcript remains visible; the question was not sent.'), 7000)
+      this.finishTimer = setTimeout(() => this.failure('Speech finalization timed out. Review the recovered text before sending.', 'finalization_timeout'), 14_000)
       // Drain the bounded PCM queue in order before requesting final words.
       this.drain()
     })
@@ -149,6 +160,9 @@ export class LiveSpeech {
     if (typeof data !== 'string' || data.length > 128_000) return
     let event: z.infer<typeof SpeechEvent>
     try { event = SpeechEvent.parse(JSON.parse(data)) } catch { return }
+    // Deepgram sends its summary after the final Results, before socket teardown.
+    // Main strips that metadata and exposes only a completion marker.
+    if (event.type === (this.relayed ? 'SpeechFinished' : 'Metadata')) { this.complete(); return }
     if (event.type === 'Error') {
       // Legacy mains used one error for rate and backlog failures. Retries remain bounded.
       const code = event.code ?? (event.message === 'Speech upload fell behind or exceeded real-time PCM limits. Listening paused.' ? 'audio_backlog' : 'speech_error')
@@ -157,6 +171,7 @@ export class LiveSpeech {
     if (event.type === 'UtteranceEnd') { this.endUtterance(); return }
     if (event.type !== 'Results') return
     const text = event.channel?.alternatives?.[0]?.transcript?.trim() ?? ''
+    this.interim = event.is_final ? '' : text
     const end = (event.start ?? 0) + (event.duration ?? 0)
     if (event.is_final && text && end > this.lastFinalEnd) {
       this.lastFinalEnd = end

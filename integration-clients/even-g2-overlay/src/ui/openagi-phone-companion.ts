@@ -105,7 +105,7 @@ export class OpenAGIPhoneCompanion {
             <label>Quick tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (ignored in hold mode)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down for explicit Talk / Mark moment controls. Swipe up for Inbox. Double-tap pauses. During a held question, double-tap cancels without sending.</p>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
             <p>Turn off to review the transcript and confirm Send first. Passive listening resumes after a manual question; optional wake responses are controlled separately.</p>
-            <p>Hold mode stops without sending if no release arrives within 30 seconds. Lifelog remains foreground-only.</p>
+            <p>Hold mode stops without sending if no release arrives within 30 seconds. Manual questions require the app to stay in the foreground; experimental lock-screen continuation applies only to an already-active lifelog.</p>
             <h2>Speech recognition</h2><label for="speech-model">Speech model (not the agent's reasoning model)</label>
             <select id="speech-model"><option value="openai-buffered">OpenAI · buffered recording</option><option value="nova-3">Deepgram Nova 3 · live</option><option value="nova-2">Deepgram Nova 2 · live</option></select>
             <label for="speech-transport">Live speech connection</label>
@@ -310,16 +310,20 @@ export class OpenAGIPhoneCompanion {
     const input = this.actionsSection.querySelector<HTMLInputElement>('#auto-send')
     if (input) input.checked = enabled
   }
-  draft(text: string | null): void {
+  draft(text: string | null, recovery?: 'speech' | 'delivery'): void {
     const panel = this.actionsSection.querySelector<HTMLElement>('#draft-review')
     if (panel) panel.hidden = text === null
+    const title = panel?.querySelector('h2')
+    if (title) title.textContent = recovery === 'delivery' ? 'Delivery uncertain · sending again may repeat actions' : recovery === 'speech' ? 'Recovered text · may be incomplete · not sent' : 'Review question · not sent'
+    const send = panel?.querySelector('#send-draft')
+    if (send) send.textContent = recovery === 'delivery' ? 'Send again (may repeat actions)' : 'Send question'
     const preview = this.actionsSection.querySelector('#draft-text')
     if (preview) preview.textContent = text ?? ''
   }
   requestActive(active: boolean): void {
     const cancel = this.actionsSection.querySelector<HTMLButtonElement>('#cancel-request')
     if (cancel) cancel.hidden = !active
-    for (const selector of ['[data-action="ask"]', '[data-action="newConversation"]', '[data-action="unlink"]', '#last-answer', '#ambient-retry']) {
+    for (const selector of ['[data-action="ask"]', '[data-action="newConversation"]', '[data-action="unlink"]', '#last-answer', '#ambient-retry', '#send-draft', '#rerecord-draft', '#discard-draft']) {
       const input = this.actionsSection.querySelector<HTMLButtonElement | HTMLInputElement>(selector)
       if (input) input.disabled = active
     }

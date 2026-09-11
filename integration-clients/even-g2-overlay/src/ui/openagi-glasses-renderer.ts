@@ -49,8 +49,9 @@ export class OpenAGIGlassesRenderer {
   ambient(wakePhrase: string): void { this.show(`AGENT · ALWAYS LISTENING${this.memoryActive ? ' · MEMORY ON' : ''}\n\nSay “${wakePhrase}” then ask.\nTap to pause.\n\nForeground only`, true) }
   listening(): void { this.show(`Ask agent\n\nListening…\n\n${this.stopHint()}\nMaximum 30 seconds.`, true) }
   thinking(question?: string): void { this.show(`Ask agent\n\n${question ? tail(question, 300) : 'Transcribing your question…'}\n\nThinking…`, true) }
-  review(text: string, page: number, pages: number): void {
-    this.show(`Review question · not sent\n\n${text}\n\n${page + 1}/${pages} · Swipe to read\nTap: send · Double-tap: discard`, true)
+  review(text: string, page: number, pages: number, recovery?: 'speech' | 'delivery'): void {
+    const title = recovery === 'delivery' ? 'Delivery uncertain · may repeat actions' : recovery === 'speech' ? 'Recovered · check missing words · not sent' : 'Review question · not sent'
+    this.show(`${title}\n\n${text}\n\n${page + 1}/${pages} · Swipe to read\nTap: ${recovery === 'delivery' ? 'send again' : 'send'} · Double-tap: discard`, true)
   }
   confirmCancel(): void {
     this.show('Stop this request?\n\nCompleted actions cannot be undone.\n\nTap: stop request\nDouble-tap: keep waiting', true)

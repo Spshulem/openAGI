@@ -339,3 +339,22 @@ Do not try to make one atomic cross-repository release. The backend contracts la
 ## Generic package verification
 
 The default build starts without an address and declares network permission with an empty whitelist, which the official packager accepts. Runtime access to user-entered HTTPS servers and store acceptance still need verification in Even Hub; packager acceptance alone does not establish either. Do not claim universal server support until this device check passes. No wildcard syntax is assumed.
+# 0.4.16: retain failed questions and finish live speech promptly
+
+Live speech completes on Deepgram's CloseStream summary, without waiting for
+socket teardown. The matching main relay strips provider metadata and emits only
+`SpeechFinished`; an older main still works through normal close handling.
+Finalization remains bounded (12 seconds after draining, at most 14 seconds total).
+Timeouts and microphone-release errors retain available final and interim words
+in an explicit review screen, even with auto-send enabled. Such text may be
+incomplete and is never auto-sent. Failed agent delivery retains the question with
+a warning that main may already have acted; resending is manual and can repeat
+actions. Recovery drafts are held in the current app session, not persisted across
+force-quit. Discard removes them. Cancel does not automatically resend.
+
+Phone Activity now distinguishes native Even foreground exit, missing background
+PCM packets, and speech connection failure. These changes do not make an OS- or
+Even-suspended microphone run in the background. Native exits still stop capture,
+and stale audio is not replayed. Test on the actual phone/glasses and report the
+exact Activity reason after locking; smaller upload chunks do not restore packets
+that never reach the WebView. Participant consent and expiry rules are unchanged.

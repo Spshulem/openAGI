@@ -13,6 +13,38 @@ function fixture() {
 }
 afterEach(() => { vi.useRealTimers() })
 
+it('finishes on provider summary without waiting for the socket close handshake', async () => {
+  const f = fixture(); await f.open()
+  f.result('First sentence.', true, 0, true)
+  f.result('Second sentence.', false, 1)
+  expect(f.speech.snapshotText()).toBe('First sentence. Second sentence.')
+  const finishing = f.speech.finish()
+  f.result('Second sentence.', true, 1)
+  f.emit({ type: 'Metadata', request_id: 'private-provider-id' })
+  expect(await finishing).toBe('First sentence. Second sentence.')
+  expect(f.callbacks.error).not.toHaveBeenCalled()
+})
+
+it('accepts only the sanitized relay completion after CloseStream, not early metadata', async () => {
+  const f = fixture()
+  const opening = f.speech.open('scoped-token', 'nova-3', '', 'wss://main.example/speech')
+  f.emit({ type: 'Ready' }); await opening
+  f.emit({ type: 'SpeechFinished' }); expect(f.socket.close).not.toHaveBeenCalled()
+  f.result('Keep this question', true)
+  const finishing = f.speech.finish()
+  f.emit({ type: 'Metadata' }); expect(f.socket.close).not.toHaveBeenCalled()
+  f.emit({ type: 'SpeechFinished' }); expect(await finishing).toBe('Keep this question')
+})
+
+it('keeps final and interim recovery text after a timeout without treating it as final', async () => {
+  vi.useFakeTimers(); const f = fixture(); await f.open()
+  f.result('First sentence.', true, 0, true); f.result('Unfinished tail', false, 1)
+  const finishing = expect(f.speech.finish()).rejects.toMatchObject({ code: 'finalization_timeout' })
+  await vi.advanceTimersByTimeAsync(12000); await finishing
+  expect(f.speech.snapshotText()).toBe('First sentence. Unfinished tail')
+  expect(vi.getTimerCount()).toBe(0)
+})
+
 it('paces a burst into bounded chunks and drains them before CloseStream', async () => {
   vi.useFakeTimers()
   const f = fixture(); await f.open()
@@ -143,7 +175,7 @@ it('fails boundedly on upload backlog, disconnect and finalization timeout', asy
   expect(slow.callbacks.error).toHaveBeenCalledOnce(); expect(slow.socket.send).not.toHaveBeenCalled()
   const lost = fixture(); await lost.open(); lost.socket.onclose?.({ code: 1006 }); expect(lost.callbacks.error).toHaveBeenCalledOnce()
   const stuck = fixture(); await stuck.open(); const finished = expect(stuck.speech.finish()).rejects.toThrow()
-  await vi.advanceTimersByTimeAsync(5000); await finished
+  await vi.advanceTimersByTimeAsync(12000); await finished
   expect(stuck.callbacks.error).toHaveBeenCalledOnce()
   expect(vi.getTimerCount()).toBe(0)
 })
