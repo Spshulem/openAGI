@@ -36,7 +36,7 @@ Automated verification (Node 24, SDK 0.0.15, Vitest 4.1.10):
   0.4.16 submission assets, with this repository's overlay applied. The older
   dirty checkout and live G2 workspace are unchanged.
 
-### Built candidate
+### Original built candidate (superseded by review cleanup)
 
 - Overlay source commit: `4c28b3b9e31e33a5110e45a1a3e808beefa73f3b`.
 - Built on BuildBot3 in an isolated temporary directory, using Node 22.21.1,
@@ -54,6 +54,30 @@ Automated verification (Node 24, SDK 0.0.15, Vitest 4.1.10):
   `0573223788408ff8f5297f564cba962ae1fac851ea87e08125db8901189f569d`.
   They contain no environment exports or installed dependencies. This preserves
   the compatible base used for the previous submission as well as the overlay.
+
+### PR review cleanup
+
+Live `gh` inspection identifies PR #103 (`codex/g2-preserve-failed-question`) as
+the exit-dialog PR, including source commit `4c28b3b`. The older
+`codex/even-g2-node-integration` branch belongs to already-merged PR #91, not
+#103. The separate open PR #102 is public coding-agent setup recovery.
+
+The three Codex P2 findings and Cursor's medium finding on #103 are addressed:
+
+- A completed API result survives local history errors; it is never offered as
+  an uncertain-delivery resend.
+- A partial streamed answer remains visible, with its incomplete label, instead
+  of being replaced by a resend draft (including when history storage fails).
+- Both live and buffered ambient triggers leave a retained review draft alone.
+- Empty or duplicate final speech results no longer erase interim recovery text.
+
+The updated client passes 192 tests, full assembled-client TypeScript, and lint
+on all four changed source/test files. Existing lint issues within those files
+were corrected without disabling rules. Version stays at the unreleased 0.4.17;
+the original bundle checksum above must not be used for the rebuilt candidate.
+The PR cleanup comment records the exact verified source commit, rebuilt bundle
+SHA-256, build results and GitHub check state. No Even Hub action is authorized
+by this review cleanup; physical acceptance remains unverified.
 
 Physical G2 acceptance remains required; mocked SDK tests cannot prove the
 native modal appears on hardware:

@@ -171,9 +171,11 @@ export class LiveSpeech {
     if (event.type === 'UtteranceEnd') { this.endUtterance(); return }
     if (event.type !== 'Results') return
     const text = event.channel?.alternatives?.[0]?.transcript?.trim() ?? ''
-    this.interim = event.is_final ? '' : text
+    if (!event.is_final) this.interim = text
     const end = (event.start ?? 0) + (event.duration ?? 0)
     if (event.is_final && text && end > this.lastFinalEnd) {
+      // Only an accepted, non-empty final supersedes the recovery words.
+      this.interim = ''
       this.lastFinalEnd = end
       const words = event.channel?.alternatives?.[0]?.words
       if (words?.length) {

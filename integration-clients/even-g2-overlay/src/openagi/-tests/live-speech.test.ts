@@ -1,10 +1,10 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { LiveSpeech, SpeechStreamError, speechTrigger } from '../live-speech'
+import { LiveSpeech, SpeechStreamError, speechTrigger, type SpeechCallbacks } from '../live-speech'
 import { OpenAGIGlassesRenderer } from '../../ui/openagi-glasses-renderer'
 
 function fixture() {
-  const socket = { bufferedAmount: 0, readyState: 1, send: vi.fn(), close: vi.fn(), onopen: null as null | (() => void), onmessage: null as null | ((event: { data: string }) => void), onclose: null as null | ((event: { code: number }) => void), onerror: null as null | (() => void) }
-  const callbacks = { transcript: vi.fn(), utterance: vi.fn(), error: vi.fn(), segment: vi.fn() }
+  const socket = { bufferedAmount: 0, readyState: 1, send: vi.fn<(data: string | Uint8Array) => void>(), close: vi.fn(), onopen: null as null | (() => void), onmessage: null as null | ((event: { data: string }) => void), onclose: null as null | ((event: { code: number }) => void), onerror: null as null | (() => void) }
+  const callbacks = { transcript: vi.fn(), utterance: vi.fn(), error: vi.fn(), segment: vi.fn<NonNullable<SpeechCallbacks['segment']>>() }
   const factory = vi.fn<(url: string, protocols: string[]) => WebSocket>(() => socket as unknown as WebSocket)
   const speech = new LiveSpeech(callbacks, factory)
   const emit = (event: object) => socket.onmessage?.({ data: JSON.stringify(event) })
@@ -45,6 +45,28 @@ it('keeps final and interim recovery text after a timeout without treating it as
   expect(vi.getTimerCount()).toBe(0)
 })
 
+it.each(['empty', 'duplicate'])('retains interim words after a %s final result and timeout', async final => {
+  vi.useFakeTimers(); const f = fixture(); await f.open()
+  f.result('First sentence.', true, 0, true); f.result('Unfinished tail', false, 1)
+  if (final === 'empty') f.result('', true, 1, true)
+  else f.result('First sentence.', true, 0, true)
+  const finishing = expect(f.speech.finish()).rejects.toMatchObject({ code: 'finalization_timeout' })
+  await vi.advanceTimersByTimeAsync(12000); await finishing
+  expect(f.speech.snapshotText()).toBe('First sentence. Unfinished tail')
+  expect(f.callbacks.utterance).toHaveBeenCalledExactlyOnceWith('First sentence.')
+  expect(vi.getTimerCount()).toBe(0)
+})
+
+it('replaces recovery words only when a non-empty new final arrives', async () => {
+  const f = fixture(); await f.open()
+  f.result('Interim words', false); f.result('', true)
+  expect(f.speech.snapshotText()).toBe('Interim words')
+  f.result('Final words.', true)
+  expect(f.speech.snapshotText()).toBe('Final words.')
+  const finishing = f.speech.finish(); f.emit({ type: 'Metadata' })
+  expect(await finishing).toBe('Final words.')
+})
+
 it('paces a burst into bounded chunks and drains them before CloseStream', async () => {
   vi.useFakeTimers()
   const f = fixture(); await f.open()
@@ -52,7 +74,7 @@ it('paces a burst into bounded chunks and drains them before CloseStream', async
   expect(f.socket.send).toHaveBeenCalledOnce()
   const finishing = f.speech.finish()
   await vi.advanceTimersByTimeAsync(980)
-  const frames = f.socket.send.mock.calls.map(([data]) => data).filter(data => data instanceof Uint8Array) as Uint8Array[]
+  const frames = f.socket.send.mock.calls.map(([data]) => data).filter(data => data instanceof Uint8Array)
   expect(frames.reduce((sum, frame) => sum + frame.length, 0)).toBe(32000)
   expect(frames.every(frame => frame.length <= 640 && frame.length % 2 === 0)).toBe(true)
   expect(f.socket.send).toHaveBeenLastCalledWith(JSON.stringify({ type: 'CloseStream' }))
@@ -112,7 +134,8 @@ it('preserves final speaker turns once while interim words never enter memory', 
   f.emit({ ...event, is_final: false }); expect(f.callbacks.segment).not.toHaveBeenCalled()
   f.emit({ ...event, is_final: true }); f.emit({ ...event, is_final: true })
   expect(f.callbacks.segment).toHaveBeenCalledTimes(2)
-  expect(f.callbacks.segment).toHaveBeenNthCalledWith(1, 'Hello.', expect.objectContaining({ speaker: 0, streamId: expect.any(String) }))
+  expect(f.callbacks.segment).toHaveBeenNthCalledWith(1, 'Hello.', expect.objectContaining({ speaker: 0 }))
+  expect(f.callbacks.segment.mock.calls[0]?.[1].streamId).toBeTypeOf('string')
   expect(f.callbacks.segment).toHaveBeenNthCalledWith(2, 'Hi.', expect.objectContaining({ speaker: 1 }))
   expect(f.factory.mock.calls[0]?.[0]).toContain('diarize=true'); f.speech.close()
 })

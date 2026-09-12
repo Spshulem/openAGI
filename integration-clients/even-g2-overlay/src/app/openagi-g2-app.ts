@@ -478,6 +478,7 @@ export class OpenAGIG2App {
   }
   private recoverQuestion(text: string, error: unknown, recovery: 'speech' | 'delivery'): void {
     if (!text.trim() || text.length > 4000) { this.fail(error); return }
+    this.ambientArmedUntil = 0
     this.reviewDraft(text, recovery)
     const detail = recovery === 'speech'
       ? 'Text may be incomplete. Review, then Send or Re-record. Nothing was sent to the agent.'
@@ -871,6 +872,7 @@ export class OpenAGIG2App {
     let lastWork = started
     let streaming = false
     let firstText = false
+    let received: { question: string; reply: string } | undefined
     const renderProgress = (): void => {
       const detail = progressDetail(started, lastEvent, streaming)
       this.phone.set(stage, `${detail}. Last activity ${Math.floor((Date.now() - lastWork) / 1000)}s ago. Cancel stops further work; completed actions cannot be undone.`)
@@ -908,20 +910,31 @@ export class OpenAGIG2App {
       const result = typeof input === 'string'
         ? await this.api.askText(input, conversationId, onProgress, controller.signal)
         : await this.api.ask(input, conversationId, onProgress, controller.signal)
+      received = result
       await this.store.remember(result.question, result.reply)
       this.phone.history?.(this.store.snapshot().history); this.phone.preview?.(plainAnswer(result.reply))
       this.pages = paginateText(plainAnswer(result.reply), 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
       this.phone.set('Answer ready', `${this.pages.length} page${this.pages.length === 1 ? '' : 's'} on G2`)
     } catch (error) {
-      if (partial) {
+      if (received) {
+        // Delivery succeeded. A local persistence/rendering failure must not
+        // discard the completed answer or offer to repeat completed actions.
+        this.phone.preview?.(plainAnswer(received.reply))
+        this.pages = paginateText(plainAnswer(received.reply), 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
+        this.phone.set('Answer received · local update failed', `${safeOpenAGIError(error)} The agent already completed this question. Do not resend to retry saving history.`)
+        this.phone.activity?.(`Answer received; local update failed: ${safeOpenAGIError(error)}`)
+      } else if (partial) {
         await this.store.remember(question, `Incomplete answer:\n${plainAnswer(partial)}`).catch(() => undefined)
         this.phone.history?.(this.store.snapshot().history)
+        this.phone.preview?.(`Incomplete answer:\n${plainAnswer(partial)}`)
         this.pages = paginateText(`Incomplete answer:\n${plainAnswer(partial)}`, 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
       } else if (controller.signal.aborted) {
         this.mode = 'message'; this.renderer.message('Request stopped', 'No automatic retry. Completed actions cannot be undone. Your recent answers are still saved.')
       } else this.fail(error)
-      if (!controller.signal.aborted && !this.exited && typeof input === 'string') this.recoverQuestion(input, error, 'delivery')
-      else this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
+      if (!received) {
+        if (!partial && !controller.signal.aborted && !this.exited && typeof input === 'string') this.recoverQuestion(input, error, 'delivery')
+        else this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
+      }
     } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false); await this.resumeListening() }
   }
   private showUnpaired(): void { this.proactive.stop(); this.mode = 'unpaired'; this.phone.paired(false); this.renderer.unpaired(); this.phone.set('Connect an agent', 'Pair OpenAGI or add an allowed agent URL and scoped token.') }
@@ -1057,7 +1070,7 @@ export class OpenAGIG2App {
         if (!ambient || !this.ambientRunning || this.liveSpeech !== speech || this.exited) return
         if (document.visibilityState === 'hidden') return
         if (this.discardRecoveryUtterance) { this.discardRecoveryUtterance = false; this.phone.activity?.('First utterance after the gap was not used to trigger an agent question.'); return }
-        if (this.requestController) { this.ambientArmedUntil = 0; return }
+        if (this.requestController || this.mode === 'review') { this.ambientArmedUntil = 0; return }
         const preferences = this.store.snapshot()
         if (preferences.listeningMode === 'passive') return
         const trigger = speechTrigger(text, preferences.wakePhrase, preferences.answerQuestions, Date.now() < this.ambientArmedUntil)
@@ -1161,7 +1174,7 @@ export class OpenAGIG2App {
         this.lastAmbientSpeechAt = Date.now()
         this.proactive.capture(result.question)
         if (this.store.snapshot().listeningMode === 'passive') { this.listeningPulse(); continue }
-        if (this.requestController) continue // Transcription stays live; never queue hidden agent actions.
+        if (this.requestController || this.mode === 'review') continue // Transcription stays live; never replace a draft or queue hidden agent actions.
         if (result.armed) {
           this.ambientArmedUntil = Date.now() + 8_000
           this.renderer.message('Agent is listening', 'Ask your question now.')
@@ -1272,7 +1285,9 @@ export class OpenAGIG2App {
       try {
         this.recoveryFailure = null
         await this.startAmbient()
-        if (this.recoveryFailure) throw this.recoveryFailure
+        // Speech callbacks can set this during the awaited connection setup.
+        const recoveryFailure = this.recoveryFailure as Error | null
+        if (recoveryFailure) throw recoveryFailure
         if (!stillAllowed()) { if (epoch === this.recoveryEpoch) await this.stopAmbient(); return }
         this.recoveringSpeech = false
         this.phone.activity?.('Lifelog reconnected. New transcript stream started after the audio gap.')
