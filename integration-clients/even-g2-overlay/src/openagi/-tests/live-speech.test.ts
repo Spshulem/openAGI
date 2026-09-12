@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { LiveSpeech, speechTrigger } from '../live-speech'
+import { LiveSpeech, SpeechStreamError, speechTrigger } from '../live-speech'
 import { OpenAGIGlassesRenderer } from '../../ui/openagi-glasses-renderer'
 
 function fixture() {
@@ -12,6 +12,64 @@ function fixture() {
   return { speech, socket, callbacks, factory, emit, result, open: async () => { const pending = speech.open('ephemeral-token', 'nova-3', 'Peri'); socket.onopen?.(); await pending } }
 }
 afterEach(() => { vi.useRealTimers() })
+
+it('paces a burst into bounded chunks and drains them before CloseStream', async () => {
+  vi.useFakeTimers()
+  const f = fixture(); await f.open()
+  f.speech.push(new Uint8Array(32000))
+  expect(f.socket.send).toHaveBeenCalledOnce()
+  const finishing = f.speech.finish()
+  await vi.advanceTimersByTimeAsync(980)
+  const frames = f.socket.send.mock.calls.map(([data]) => data).filter(data => data instanceof Uint8Array) as Uint8Array[]
+  expect(frames.reduce((sum, frame) => sum + frame.length, 0)).toBe(32000)
+  expect(frames.every(frame => frame.length <= 640 && frame.length % 2 === 0)).toBe(true)
+  expect(f.socket.send).toHaveBeenLastCalledWith(JSON.stringify({ type: 'CloseStream' }))
+  f.result('Complete question', true); f.socket.onclose?.({ code: 1000 })
+  expect(await finishing).toBe('Complete question'); expect(f.callbacks.error).not.toHaveBeenCalled()
+  expect(vi.getTimerCount()).toBe(0)
+})
+
+it('sustains minute-long listening delivered in one-second bursts without accumulating delay', async () => {
+  vi.useFakeTimers()
+  const f = fixture(); await f.open()
+  for (let second = 0; second < 60; second++) {
+    f.speech.push(new Uint8Array(32000)); await vi.advanceTimersByTimeAsync(1000)
+  }
+  const bytes = f.socket.send.mock.calls.reduce((sum, [data]) => sum + (data instanceof Uint8Array ? data.byteLength : 0), 0)
+  expect(bytes).toBe(60 * 32000); expect(f.callbacks.error).not.toHaveBeenCalled()
+  f.speech.close(); expect(vi.getTimerCount()).toBe(0)
+})
+
+it('tolerates a short socket stall but rejects stale audio without returning a partial question', async () => {
+  vi.useFakeTimers()
+  const f = fixture(); await f.open(); f.socket.bufferedAmount = 6400
+  f.speech.push(new Uint8Array(640)); await vi.advanceTimersByTimeAsync(200)
+  expect(f.socket.send).not.toHaveBeenCalled()
+  f.socket.bufferedAmount = 0; await vi.advanceTimersByTimeAsync(20)
+  expect(f.socket.send).toHaveBeenCalledOnce()
+  f.socket.bufferedAmount = 6400; f.speech.push(new Uint8Array(640)); f.result('Partial', true)
+  const finishing = expect(f.speech.finish()).rejects.toBeInstanceOf(SpeechStreamError)
+  await vi.advanceTimersByTimeAsync(2000); await finishing
+  expect(f.callbacks.error).toHaveBeenCalledWith(expect.objectContaining({ code: 'audio_backlog', recoverable: true }))
+  expect(vi.getTimerCount()).toBe(0)
+})
+
+it('rejects malformed PCM and classifies modern and legacy relay diagnostics', async () => {
+  const malformed = fixture(); await malformed.open(); malformed.speech.push(new Uint8Array(3))
+  expect(malformed.callbacks.error).toHaveBeenCalledWith(expect.objectContaining({ code: 'invalid_pcm', recoverable: false }))
+  const modern = fixture(); await modern.open(); modern.emit({ type: 'Error', code: 'audio_rate', message: 'Audio too fast' })
+  expect(modern.callbacks.error).toHaveBeenCalledWith(expect.objectContaining({ recoverable: true }))
+  const legacy = fixture(); await legacy.open(); legacy.emit({ type: 'Error', message: 'Speech upload fell behind or exceeded real-time PCM limits. Listening paused.' })
+  expect(legacy.callbacks.error).toHaveBeenCalledWith(expect.objectContaining({ recoverable: true }))
+})
+
+it('does not accept a normal close before the queued audio was finalized', async () => {
+  vi.useFakeTimers()
+  const f = fixture(); await f.open(); f.speech.push(new Uint8Array(32000)); f.result('Only part', true)
+  const finishing = expect(f.speech.finish()).rejects.toThrow()
+  f.socket.onclose?.({ code: 1000 }); await finishing
+  expect(f.callbacks.error).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0)
+})
 
 it('preserves final speaker turns once while interim words never enter memory', async () => {
   const f = fixture(); await f.open()

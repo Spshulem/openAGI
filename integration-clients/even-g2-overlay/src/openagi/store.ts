@@ -8,8 +8,12 @@ const StateSchema = z.object({
   node: z.object({ id: z.string().uuid(), name: z.string(), platform: z.literal('even_g2'), enrolledAt: z.string() }).nullable(),
   conversationId: z.string().uuid().nullable(),
   ambientEnabled: z.boolean().default(false),
+  lifelogEnabled: z.boolean().default(false),
+  backgroundListening: z.boolean().default(false),
+  lifelogConsent: z.object({ id: z.string().min(1).max(200), until: z.number().finite() }).nullable().default(null),
   listeningMode: z.enum(['passive', 'wake']).default('passive'),
   idleTapAction: z.enum(['talk', 'highlight']).default('talk'),
+  lifelogTalkMode: z.enum(['tap', 'hold']).default('tap'),
   wakePhrase: z.string().trim().min(1).max(40).default('open agi'),
   answerQuestions: z.boolean().default(true),
   speechModel: z.enum(['openai-buffered', 'nova-3', 'nova-2']).default('openai-buffered'),
@@ -22,12 +26,14 @@ const StateSchema = z.object({
 export type OpenAGIState = z.infer<typeof StateSchema>
 const KEY = 'openagi.g2.state.v2'
 
-function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'listeningMode' | 'idleTapAction' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
+function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'listeningMode' | 'idleTapAction' | 'lifelogTalkMode' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
   return {
     version: 2, nodeId, nodeToken: null, node: null, conversationId: null,
+    lifelogEnabled: false, lifelogConsent: null, backgroundListening: false,
     ambientEnabled: preferences?.ambientEnabled ?? false, wakePhrase: preferences?.wakePhrase ?? 'open agi',
     listeningMode: preferences?.listeningMode ?? 'passive',
     idleTapAction: preferences?.idleTapAction ?? 'talk',
+    lifelogTalkMode: preferences?.lifelogTalkMode ?? 'tap',
     answerQuestions: preferences?.answerQuestions ?? true,
     speechModel: preferences?.speechModel ?? 'openai-buffered',
     speechTransport: preferences?.speechTransport ?? 'relay',
@@ -52,7 +58,8 @@ export class OpenAGIStore {
   }
   async update(patch: Partial<Omit<OpenAGIState, 'version'>>): Promise<OpenAGIState> {
     const changedMain = patch.agentOrigin !== undefined && patch.agentOrigin !== this.state.agentOrigin
-    const next = StateSchema.parse({ ...this.state, ...patch, ...(changedMain ? { history: [] } : {}), version: 2 })
+    const changedCredential = patch.nodeToken !== undefined && patch.nodeToken !== this.state.nodeToken
+    const next = StateSchema.parse({ ...this.state, ...patch, ...(changedMain ? { history: [] } : {}), ...(changedMain || changedCredential ? { lifelogEnabled: false, lifelogConsent: null, backgroundListening: false } : {}), version: 2 })
     await this.storage.set(KEY, JSON.stringify(next))
     this.state = next
     return this.snapshot()

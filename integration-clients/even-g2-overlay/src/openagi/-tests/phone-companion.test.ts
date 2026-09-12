@@ -3,6 +3,48 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('routes Retry listening through lifelog-aware recovery rather than the ambient toggle', () => {
+  const retryListening = vi.fn(), configureAmbient = vi.fn()
+  new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient, retryListening }, [])
+  document.querySelector<HTMLButtonElement>('#ambient-retry')!.click()
+  expect(retryListening).toHaveBeenCalledOnce()
+  expect(configureAmbient).not.toHaveBeenCalled()
+})
+
+it('offers explicit background opt-in without granting retention consent', () => {
+  const configureBackgroundListening = vi.fn(), memoryConsent = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureBackgroundListening, memoryConsent }, [])
+  const checkbox = document.querySelector<HTMLInputElement>('#background-listening')!
+  expect(checkbox.checked).toBe(false)
+  checkbox.click()
+  expect(configureBackgroundListening).toHaveBeenCalledWith(true)
+  expect(memoryConsent).not.toHaveBeenCalled()
+  phone.backgroundListening(false); expect(checkbox.checked).toBe(false)
+  phone.backgroundStatus('Audio gap · unlock to resume')
+  expect(document.querySelector('#background-status')!.textContent).toBe('Audio gap · unlock to resume')
+})
+
+it('offers a separate persisted lifelog hold mode without changing auto-send', () => {
+  const configureLifelogTalkMode = vi.fn(), configureAutoSend = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), configureLifelogTalkMode, configureAutoSend }, [])
+  const select = document.querySelector<HTMLSelectElement>('#lifelog-talk-mode')!
+  phone.lifelogTalkMode('hold'); expect(select.value).toBe('hold')
+  select.dispatchEvent(new Event('change'))
+  expect(configureLifelogTalkMode).toHaveBeenCalledWith('hold'); expect(configureAutoSend).not.toHaveBeenCalled()
+})
+
+it('resumes lifelog with current explicit consent and disables duplicate requests while starting', () => {
+  const returnToLifelog = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn(), returnToLifelog }, [])
+  const resume = document.querySelector<HTMLButtonElement>('#memory-resume')!
+  resume.click(); expect(returnToLifelog).toHaveBeenLastCalledWith(false)
+  document.querySelector<HTMLInputElement>('#recording-consent')!.click()
+  resume.click(); expect(returnToLifelog).toHaveBeenLastCalledWith(true)
+  returnToLifelog.mockClear(); phone.memoryPending(true); resume.click()
+  expect(returnToLifelog).not.toHaveBeenCalled()
+  phone.memoryPending(false); resume.click(); expect(returnToLifelog).toHaveBeenCalledOnce()
+})
+
 it('provides peer pages and bounded, collapsed inbox details without hiding lifelog behind tasks', () => {
   const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn() }, [])
   phone.paired(true)

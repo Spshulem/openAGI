@@ -28,13 +28,28 @@ export class G2ProactiveClient {
   private running = false
   private consentChanging = false
   private foreground = true
-  private hidden(): boolean { return !this.foreground || document.visibilityState === 'hidden' }
+  private phoneHidden(): boolean { return document.visibilityState === 'hidden' }
+  private hidden(): boolean { return !this.foreground || (document.visibilityState === 'hidden' && !this.allowBackground()) }
   setForeground(active: boolean): void { this.foreground = active; this.visibility() }
   private visibility = (): void => {
-    if (this.hidden()) { this.pauseMemory(); this.controller.abort(); this.controller = new AbortController() }
+    if (this.hidden()) { if (this.keepOnReopen()) this.suspendMemory(); else this.pauseMemory(); this.controller.abort(); this.controller = new AbortController() }
     else if (this.running) void this.refresh()
   }
-  constructor(private readonly api: OpenAGIApiClient, private readonly view: ProactiveView, private readonly canNotify: () => boolean, private readonly notify: (item: InboxItem) => void) {}
+  constructor(private readonly api: OpenAGIApiClient, private readonly view: ProactiveView, private readonly canNotify: () => boolean, private readonly notify: (item: InboxItem) => void, private readonly keepOnReopen: () => boolean = () => false, private readonly allowBackground: () => boolean = () => false) {}
+  consentSnapshot(): { id: string; until: number } | null { return this.consent ? { ...this.consent } : null }
+  suspendMemory(): void {
+    this.generation++; this.consent = null; this.queue = []
+    if (this.flushTimer) clearTimeout(this.flushTimer)
+    this.flushTimer = null
+    this.view.memoryStatus?.(false, 'Lifelog enabled · temporarily paused. Microphone off; resumes when the app is open and consent is valid. Unsent text is not replayed.')
+  }
+  async restoreMemory(saved: { id: string; until: number }): Promise<boolean> {
+    if (!this.running || this.hidden() || saved.until <= Date.now()) return false
+    const generation = this.generation, signal = this.controller.signal
+    const result = await this.api.proactive({ op: 'settings' }, signal)
+    if (signal.aborted || generation !== this.generation || this.hidden() || !this.running || result.consent?.id !== saved.id || result.consent.until !== saved.until || saved.until <= Date.now()) return false
+    this.consent = { ...saved }; this.view.memoryStatus?.(true, 'Lifelog resumed with existing consent.'); return true
+  }
   start(): void {
     if (this.running || typeof this.api.proactive !== 'function') return
     this.running = true; this.controller = new AbortController()
@@ -42,8 +57,8 @@ export class G2ProactiveClient {
     void this.refresh()
     this.timer = setInterval(() => { if (!this.hidden()) void this.refresh() }, 60_000)
   }
-  stop(): void {
-    this.running = false; this.pauseMemory(); this.controller.abort()
+  stop(preserveConsent = false): void {
+    this.running = false; if (preserveConsent) this.suspendMemory(); else this.pauseMemory(); this.controller.abort()
     if (this.timer) clearInterval(this.timer)
     this.timer = null; document.removeEventListener('visibilitychange', this.visibility)
     this.items = []; this.view.inbox?.([])
@@ -76,12 +91,12 @@ export class G2ProactiveClient {
     catch (error) { this.view.activity?.(`Could not save inbox settings: ${String(error)}`) }
   }
   async enableMemory(recordingConsent: boolean): Promise<void> {
-    if (!this.running || this.consentChanging || this.hidden()) return
+    if (!this.running || this.consentChanging || this.hidden() || this.phoneHidden()) return
     this.consentChanging = true
     const generation = this.generation
     try {
       const result = await this.api.proactive({ op: 'consent', enabled: true, recordingConsent }, this.controller.signal)
-      if (generation !== this.generation || !this.running || this.hidden()) {
+      if (generation !== this.generation || !this.running || this.hidden() || this.phoneHidden()) {
         if (result.consent) void this.api.proactive({ op: 'consent', enabled: false, consentId: result.consent.id }).catch(() => {})
         return
       }
@@ -117,6 +132,7 @@ export class G2ProactiveClient {
   }
   private async flush(): Promise<void> {
     if (!this.consent || !this.queue.length || this.uploading || !this.running) return
+    if (this.hidden() || this.consent.until <= Date.now()) { this.suspendMemory(); return }
     this.uploading = true
     const segments = this.queue.splice(0, 10), texts = segments.map(s => s.text), generation = this.generation
     try {
