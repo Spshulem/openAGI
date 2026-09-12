@@ -36,6 +36,25 @@ Automated verification (Node 24, SDK 0.0.15, Vitest 4.1.10):
   0.4.16 submission assets, with this repository's overlay applied. The older
   dirty checkout and live G2 workspace are unchanged.
 
+### Built candidate
+
+- Overlay source commit: `4c28b3b9e31e33a5110e45a1a3e808beefa73f3b`.
+- Built on BuildBot3 in an isolated temporary directory, using Node 22.21.1,
+  pnpm 10.24.0 and the frozen assembly lockfile. No containers or live services
+  were started or changed.
+- `pnpm package:agents` passed (TypeScript, Vite production build and Even Hub
+  packaging). `pnpm check:bundle` and `pnpm check:secrets` passed.
+- Artifact: `OpenAGI-Agent-0.4.17.ehpk`, 89,570 bytes, package ID
+  `sh.agents.even.g2`, version `0.4.17`. Generic build: no default main URL or
+  scoped credentials; users supply their own connection.
+- Artifact SHA-256:
+  `f27cc4d4c3ecc8f22d3ba67f276c490c96d4442837c59164143b42b69d994986`.
+- The assembled source/configuration/lockfile inputs are retained alongside the
+  bundle as `OpenAGI-Agent-0.4.17-build-input.tar.gz`, SHA-256
+  `0573223788408ff8f5297f564cba962ae1fac851ea87e08125db8901189f569d`.
+  They contain no environment exports or installed dependencies. This preserves
+  the compatible base used for the previous submission as well as the overlay.
+
 Physical G2 acceptance remains required; mocked SDK tests cannot prove the
 native modal appears on hardware:
 
