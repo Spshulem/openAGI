@@ -105,7 +105,7 @@ export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstream
         if (!control || Object.keys(control).length !== 1 || !["KeepAlive", "CloseStream"].includes(control.type)) { fail("Invalid speech control.", 1008); return; }
         if (control.type === "CloseStream") {
           draining = true;
-          drainTimer = setTimeout(() => fail("Speech finalization took too long. Question was not sent."), 5000);
+          drainTimer = setTimeout(() => fail("Speech finalization timed out. Review the recovered text before sending.", 1011, "finalization_timeout"), 12000);
         }
         upstream.send(JSON.stringify(control), error => { if (error) fail("Speech control interrupted."); });
       }
@@ -132,6 +132,12 @@ export function attachG2SpeechRelay(server, { nodeRegistry, getChannel, upstream
       let event;
       try { event = JSON.parse(data.toString()); } catch { fail("Invalid speech provider response."); return; }
       if (event?.type === "Error") { fail("Deepgram rejected the speech stream. Check the main's key, model and credit."); return; }
+      if (event?.type === "Metadata" && draining) {
+        // CloseStream summary follows all final Results. Never forward provider metadata.
+        sendClient(JSON.stringify({ type: "SpeechFinished" }));
+        cleanup(1000, "Speech finished", true);
+        return;
+      }
       if (event?.type === "Results") {
         const transcript = event.channel?.alternatives?.[0]?.transcript;
         if (typeof transcript !== "string" || transcript.length > 8000 || !Number.isFinite(event.start) || !Number.isFinite(event.duration)) { fail("Invalid speech provider response."); return; }

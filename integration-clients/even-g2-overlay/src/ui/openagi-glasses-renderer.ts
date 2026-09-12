@@ -26,6 +26,7 @@ export class OpenAGIGlassesRenderer {
   autoSend(enabled: boolean): void { this.sendOnStop = enabled }
   private latest: [string, boolean, boolean?] = ['', false]
   constructor(private readonly surface: AgentsDisplaySurface) {}
+  requestExit(): Promise<boolean> { return this.surface.requestExit() }
   private show(text: string, reset: boolean, recording?: boolean): void {
     this.latest = recording ? [text, reset, true] : [text, reset]
     if (!this.sleeping) this.surface.show(...this.latest)
@@ -35,10 +36,10 @@ export class OpenAGIGlassesRenderer {
     // Retain the native page and its gestures; this is not hardware power-off.
     this.surface.show(...(value ? [' ', false] as [string, boolean] : this.latest))
   }
-  transcript(text: string, ambient: boolean): void { this.show(`LIVE SPEECH${ambient ? this.memoryActive ? ' · memory ON' : ' · wake listening' : ''}\n\n${tail(text, 260)}\n\n${ambient ? 'Double-tap: pause listening' : this.stopHint()}`, false) }
-  unpaired(): void { this.show('Agents\n\nPair or add an agent\nfrom the phone screen.', true) }
+  transcript(text: string, ambient: boolean): void { this.show(`LIVE SPEECH${ambient ? this.memoryActive ? ' · memory ON' : ' · wake listening' : ''}\n\n${tail(text, 260)}\n\n${ambient ? 'Double-tap: exit · Swipe down: controls' : this.stopHint()}`, false) }
+  unpaired(): void { this.show('Agents\n\nPair or add an agent\nfrom the phone screen.\n\nDouble-tap: exit', true) }
   pairing(): void { this.show('Agents\n\nPair OpenAGI or add\nan agent URL + token\non the phone screen.', true) }
-  home(device?: string): void { this.show(`Agent${device ? ` · ${device}` : ''}\n\nTap to ask / follow up\nin this conversation.\n\n${this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})\nSwipe down / double-tap: Recent` : 'Swipe or double-tap: Recent'}`, true) }
+  home(device?: string): void { this.show(`Agent${device ? ` · ${device}` : ''}\n\nTap to ask / follow up\nin this conversation.\n\n${this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})\nSwipe down: Recent` : 'Swipe: Recent'}\nDouble-tap: exit`, true) }
   recent(question: string, position: number, total: number): void { this.show(`Recent answers · ${position}/${total}\n\n${question.slice(0, 220)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true) }
   inbox(text: string, item: number, total: number, page: number, pages: number): void {
     this.show(`Inbox ${item}/${total}\n\n${text}\n\nPage ${page}/${pages} · Swipe: read\nTap: actions · Double-tap: list`, true)
@@ -46,11 +47,12 @@ export class OpenAGIGlassesRenderer {
   inboxList(title: string, item: number, total: number): void { this.show(`Inbox ${item}/${total}\n\n${title.slice(0, 180)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true) }
   notice(label: string, title: string): void { this.show(`${label}\n\n${title.slice(0, 150)}`, false) }
   inboxAction(label: string, title: string, confirming = false): void { this.show(`${confirming ? 'Confirm: ' : ''}${label}\n\n${title.slice(0, 160)}\n\n${confirming ? 'Tap: confirm · Double-tap: cancel' : 'Swipe: choose action · Tap: select\nDouble-tap: details'}`, true) }
-  ambient(wakePhrase: string): void { this.show(`AGENT · ALWAYS LISTENING${this.memoryActive ? ' · MEMORY ON' : ''}\n\nSay “${wakePhrase}” then ask.\nTap to pause.\n\nForeground only`, true) }
+  ambient(wakePhrase: string): void { this.show(`AGENT · ALWAYS LISTENING${this.memoryActive ? ' · MEMORY ON' : ''}\n\nSay “${wakePhrase}” then ask.\nSwipe down: pause controls.\nDouble-tap: exit`, true) }
   listening(): void { this.show(`Ask agent\n\nListening…\n\n${this.stopHint()}\nMaximum 30 seconds.`, true) }
   thinking(question?: string): void { this.show(`Ask agent\n\n${question ? tail(question, 300) : 'Transcribing your question…'}\n\nThinking…`, true) }
-  review(text: string, page: number, pages: number): void {
-    this.show(`Review question · not sent\n\n${text}\n\n${page + 1}/${pages} · Swipe to read\nTap: send · Double-tap: discard`, true)
+  review(text: string, page: number, pages: number, recovery?: 'speech' | 'delivery'): void {
+    const title = recovery === 'delivery' ? 'Delivery uncertain · may repeat actions' : recovery === 'speech' ? 'Recovered · check missing words · not sent' : 'Review question · not sent'
+    this.show(`${title}\n\n${text}\n\n${page + 1}/${pages} · Swipe to read\nTap: ${recovery === 'delivery' ? 'send again' : 'send'} · Double-tap: discard`, true)
   }
   confirmCancel(): void {
     this.show('Stop this request?\n\nCompleted actions cannot be undone.\n\nTap: stop request\nDouble-tap: keep waiting', true)

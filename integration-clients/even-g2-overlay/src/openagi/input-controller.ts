@@ -1,7 +1,7 @@
 import { OsEventTypeList, type EvenAppBridge } from '@evenrealities/even_hub_sdk'
 import { eventTypeOf, type InputHandlers } from '../even/input-controller'
 
-/** Agents owns navigation. A double tap must not destroy its native page. */
+/** The app routes double-tap: native exit confirmation at root, Back elsewhere. */
 export class AgentsInputController {
   private unsubscribe: (() => void) | null = null
   private pendingTap: ReturnType<typeof setTimeout> | null = null

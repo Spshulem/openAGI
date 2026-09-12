@@ -11,7 +11,7 @@ it('distinguishes tool work from thinking and transcription', () => {
 
 it('shows thinking and retained tool activity instead of an empty-answer placeholder', () => {
   const show = vi.fn()
-  const renderer = new OpenAGIGlassesRenderer({ show, initialize: () => Promise.resolve() })
+  const renderer = new OpenAGIGlassesRenderer({ show, initialize: () => Promise.resolve(), requestExit: () => Promise.resolve(true) })
   renderer.progress('Thinking', '12s elapsed', '', '5s Tool: computer_list_apps\n9s Thinking')
   expect(show.mock.calls[0][0]).toContain('\nThinking\n')
   expect(show.mock.calls[0][0]).toContain('computer_list_apps')
@@ -28,7 +28,7 @@ it('distinguishes connected progress from silence and no streaming response', ()
 
 it('shows partial output without a misleading tap-to-continue instruction', () => {
   const show = vi.fn()
-  const renderer = new OpenAGIGlassesRenderer({ show, initialize: () => Promise.resolve() })
+  const renderer = new OpenAGIGlassesRenderer({ show, initialize: () => Promise.resolve(), requestExit: () => Promise.resolve(true) })
   renderer.progress('Answer arriving', '12s elapsed', 'The answer so far')
   expect(show).toHaveBeenCalledWith(expect.stringContaining('The answer so far'), false)
   expect(show.mock.calls[0][0]).toContain('Cancel on phone')
