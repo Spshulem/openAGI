@@ -126,7 +126,7 @@ export class OpenAGIPhoneCompanion {
           <button class="secondary" data-action="unlink">Disconnect agent</button>
           <button class="secondary" id="exit-agents">Exit Agents (keep pairing)</button>
         </section>
-        <footer>Foreground listening · double-tap glasses to pause</footer>
+        <footer>Double-tap at home: exit dialog · Swipe down while listening: pause controls</footer>
       </main>`
     this.status = required(root.querySelector('#status'))
     this.detail = required(root.querySelector('#detail'))

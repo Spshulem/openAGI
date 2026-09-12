@@ -80,7 +80,7 @@ async function fixture(initial: { ambientEnabled?: boolean } = {}, restored?: { 
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), snapshotText: vi.fn(() => ''), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon' })), ask: vi.fn(), listen: vi.fn() }
   if (restored) Object.assign(api, { proactive: restored.proactive })
-  const renderer = { review: vi.fn(), paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
+  const renderer = { requestExit: vi.fn(() => Promise.resolve(true)), review: vi.fn(), paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
   const phone = { draft: vi.fn(), set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return { ...speech } as unknown as LiveSpeech })
@@ -203,7 +203,7 @@ it('resumes paused lifelog on glasses only after explicit participant consent', 
   Object.assign(f.api, { proactive })
   try {
     await f.app.configureMemory(true, true)
-    f.app.doubleTap(); await vi.advanceTimersByTimeAsync(500)
+    f.app.scrollDown(); f.app.tap(); await vi.advanceTimersByTimeAsync(500)
     expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
     expect(f.app.proactive.memoryActive).toBe(false)
     f.audio.start.mockClear(); proactive.mockClear()
@@ -218,6 +218,21 @@ it('resumes paused lifelog on glasses only after explicit participant consent', 
     expect(f.app.proactive.memoryActive).toBe(true)
     expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, 'open agi')
   } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('uses native exit confirmation at the quiet lifelog root without revoking consent before exit', async () => {
+  const f = await fixture()
+  Object.assign(f.api, { proactive: vi.fn((b: { op: string; enabled?: boolean }) => Promise.resolve(b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] })) })
+  try {
+    await f.app.configureMemory(true, true)
+    const before = f.store.snapshot()
+    f.audio.stop.mockClear()
+    f.app.doubleTap(); await Promise.resolve()
+    expect(f.renderer.requestExit).toHaveBeenCalledOnce()
+    expect(f.audio.stop).not.toHaveBeenCalled()
+    expect(f.app.proactive.memoryActive).toBe(true)
+    expect(f.store.snapshot()).toEqual(before)
+  } finally { await f.app.systemExit() }
 })
 
 it('phone return to active lifelog leaves the consent and microphone intact', async () => {
@@ -487,7 +502,7 @@ it.each(['pause', 'background', 'consent', 'expiry'])('cancels lifelog recovery 
     if (action === 'expiry') await vi.advanceTimersByTimeAsync(59500)
     f.callbacks().error(new SpeechStreamError('Queue stale', 'audio_backlog', true))
     await vi.advanceTimersByTimeAsync(0)
-    if (action === 'pause') f.app.doubleTap()
+    if (action === 'pause') await f.app.configureAmbient(false, 'Peri', false)
     if (action === 'background') f.app.setForeground(false)
     if (action === 'consent') await f.app.configureMemory(false, false)
     await vi.advanceTimersByTimeAsync(5000)
@@ -766,6 +781,7 @@ it('discards live capture on Back and wakes a blank display without exiting or c
   expect(f.speech.close).toHaveBeenCalled(); expect(f.api.askText).not.toHaveBeenCalled()
   f.app.toggleDisplay(); f.app.tap(); f.app.doubleTap()
   expect(f.renderer.sleep.mock.calls).toEqual([[true], [false]])
+  expect(f.renderer.requestExit).toHaveBeenCalledOnce()
   expect(f.store.snapshot().nodeToken).toBe('saved-scoped-token-123')
   await f.app.systemExit()
 })

@@ -158,6 +158,7 @@ export class OpenAGIG2App {
   private renderActiveProgress: (() => void) | null = null
   private recentIndex = 0
   private navigationBusy = false
+  private exitDialogOpening = false
   private exited = false
   private liveSpeech: LiveSpeech | null = null
   private speechStart: AbortController | null = null
@@ -212,9 +213,10 @@ export class OpenAGIG2App {
   private showInboxPage(): void {
     this.renderer.inbox?.(this.pages[this.page] ?? '', this.inboxIndex + 1, this.inboxItems.length, this.page + 1, this.pages.length)
   }
-  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' }[] {
+  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' }[] {
     const item = this.actionTarget
-    return [{ label: 'Talk about this item', op: 'talk' },
+    return [...(!item?.id && this.ambientRunning ? [{ label: 'Pause listening', op: 'pause' as const }] : []),
+      { label: 'Talk about this item', op: 'talk' },
       ...(item?.action === 'complete-task' ? [{ label: 'Complete task on main', op: 'complete-task' as const }] : []),
       ...(item?.action === 'accept-task' && !item.reminder ? [{ label: 'Add as my task', op: 'accept-task' as const }] : []),
       ...(item?.id ? [{ label: 'Dismiss alert only', op: 'dismiss' as const }, { label: 'Snooze alert 1 hour', op: 'snooze' as const }] : []),
@@ -225,6 +227,12 @@ export class OpenAGIG2App {
   }
   private async chooseInboxAction(): Promise<void> {
     const target = this.actionTarget, action = this.inboxActions()[this.actionIndex]; if (!target || !action) return
+    if (action.op === 'pause') {
+      this.pausedLifelog = this.proactive.memoryActive
+      await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
+      if (!this.exited && this.foregroundActive && !this.ambientRunning) this.showPaused()
+      return
+    }
     if (action.op === 'talk') { this.voiceTarget = target.id ? { ...target } : null; this.showHome(); await this.startAsk(); return }
     if (action.op === 'mark') { await this.markMoment(); return }
     if (this.mode !== 'inbox-confirm') { this.mode = 'inbox-confirm'; this.showInboxAction(); return }
@@ -400,7 +408,7 @@ export class OpenAGIG2App {
     if (this.recoveringSpeech) return
     if (this.heldQuestion && !this.heldQuestion.released) return
     if (this.displaySleeping) return
-    if (this.exited || this.navigationBusy || this.microphoneOpening || Date.now() - this.lastTapAt < 400) return
+    if (this.exited || this.exitDialogOpening || this.navigationBusy || this.microphoneOpening || Date.now() - this.lastTapAt < 400) return
     this.lastTapAt = Date.now()
     this.clearNotice()
     if (this.requestController) {
@@ -480,10 +488,30 @@ export class OpenAGIG2App {
   private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length, this.draftRecovery) }
   async recentAnswer(): Promise<void> { await this.selectAnswer(this.store.snapshot().history.length - 1) }
   doubleTap(): void {
+    if (this.exited) return
+    // These are the same root screen in different connection/listening states.
+    // Do not tear down on dialog-open: only SYSTEM_EXIT/ABNORMAL_EXIT confirms exit.
+    if (['home', 'unpaired', 'ambient', 'reconnecting'].includes(this.mode) && !this.requestController && !this.heldQuestion) {
+      if (this.displaySleeping) this.toggleDisplay()
+      void this.requestExit(); return
+    }
     if (this.recoveringSpeech) { void this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions); return }
     if (this.heldQuestion && !this.heldQuestion.released) { void this.cancelHold(); return }
     if (this.displaySleeping) { this.toggleDisplay(); return }
     void this.navigateBack().catch(error => this.fail(error))
+  }
+  async requestExit(): Promise<void> {
+    if (this.exited || this.exitDialogOpening) return
+    this.exitDialogOpening = true
+    this.lastTapAt = Date.now()
+    this.clearNotice()
+    try {
+      if (!await this.renderer.requestExit() && !this.exited) {
+        this.phone.set('Exit dialog unavailable', 'Even could not open its exit confirmation. Try double-tap again or use Exit on the phone.')
+      }
+    } catch (error) {
+      if (!this.exited) this.phone.set('Exit dialog unavailable', `${safeOpenAGIError(error)} Try double-tap again or use Exit on the phone.`)
+    } finally { this.exitDialogOpening = false }
   }
   toggleDisplay(): void {
     if (this.exited) return
@@ -508,13 +536,6 @@ export class OpenAGIG2App {
     if (this.mode === 'inbox-action') { if (!this.actionTarget?.id) this.showHome(); else { this.mode = 'inbox-detail'; this.showInboxPage() }; return }
     if (this.mode === 'inbox-detail') { this.showInboxItem(); return }
     if (this.mode === 'inbox') { this.showHome(); return }
-    if (this.mode === 'ambient') {
-      this.pausedLifelog = this.proactive.memoryActive
-      await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
-      if (!this.exited && this.foregroundActive && !this.ambientRunning) this.showPaused()
-      return
-    }
-    if (this.mode === 'home') { this.showRecent(this.store.snapshot().history.length - 1); return }
     this.navigationBusy = true
     try {
       if (this.mode === 'listening') { this.stopLiveSpeech(); await this.audio.stop(); this.audioBuffer = null }
@@ -919,7 +940,7 @@ export class OpenAGIG2App {
       this.phone.set('Listening quietly', state.listeningMode === 'passive' ? 'Tap Talk to ask. Overheard questions do not start the agent. Lifelog retention has separate consent.' : `Wake responses enabled: say “${state.wakePhrase}”. Tap Talk to ask explicitly.`)
       return
     }
-    this.mode = 'home'; this.phone.paired(true); this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined)); this.phone.set('Ready', 'Tap to ask in this conversation. Swipe or double-tap for recent answers. Exit is separate on the phone.')
+    this.mode = 'home'; this.phone.paired(true); this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined)); this.phone.set('Ready', 'Tap to ask in this conversation. Swipe for recent answers. Double-tap at home opens Even’s exit confirmation.')
   }
   private showAnswer(page: number): void { this.mode = 'answer'; this.page = page; this.renderer.followupHold?.(this.proactive.memoryActive && this.ambientRunning && this.store.snapshot().lifelogTalkMode === 'hold'); this.renderer.answer(this.pages[page] ?? '', page, this.pages.length) }
   private fail(error: unknown): void { this.voiceTarget = null; this.clearNotice(); this.mode = 'message'; const message = safeOpenAGIError(error); this.renderer.message('Could not ask agent', message); this.phone.set('Ask failed', message) }
@@ -1240,8 +1261,8 @@ export class OpenAGIG2App {
     const schedule = (): void => {
       this.recoveryAttempts = this.recoveryAttempts.filter(at => Date.now() - at < 60_000)
       if (this.recoveryAttempts.length >= 3) { void this.pauseAmbientWithError(new Error('Live speech recovery stopped after three attempts in one minute. Check Activity and retry lifelog on the phone.')); return }
-      if (['ambient', 'home', 'reconnecting'].includes(this.mode)) { this.mode = 'reconnecting'; this.renderer.notice?.('Audio gap · reconnecting', 'Microphone off · Double-tap: stop') }
-      this.phone.set('Lifelog reconnecting', 'Microphone off. Some words may be missing. Double-tap to stop recovery.')
+      if (['ambient', 'home', 'reconnecting'].includes(this.mode)) { this.mode = 'reconnecting'; this.renderer.notice?.('Audio gap · reconnecting', 'Microphone off · Double-tap: exit') }
+      this.phone.set('Lifelog reconnecting', 'Microphone off. Some words may be missing. Turn listening off to stop recovery, or double-tap for Even’s exit confirmation.')
       this.recoveryTimer = setTimeout(() => { void attempt() }, 1000 * 2 ** this.recoveryAttempts.length)
     }
     const attempt = async (): Promise<void> => {

@@ -1,0 +1,59 @@
+# G2 0.4.17 resubmission: root exit dialog
+
+## Rejection evidence
+
+The user supplied this reviewer feedback verbatim on September 12, 2026:
+
+> Other: Please ensure double tapping can invoke exit dialogue at the root page to follow the normal app feature UX logic. See shutDownPageContainer(1) at [https://hub.evenrealities.com/docs/guides/page-lifecycle#methods](https://hub.evenrealities.com/docs/guides/page-lifecycle#methods) for more information.
+
+This is the one supplied review item, not a claim that other portal/email
+feedback was retrieved. The linked guide has moved to
+<https://hub.evenrealities.com/docs/build/page-lifecycle#methods>. The live guide
+states: "Pass 1 for the system exit-confirmation dialog (required on the root
+page); pass 0 for immediate exit (internal pages only)."
+
+## Change
+
+- Home, unpaired home, quiet-listening and reconnecting root double-taps invoke
+  the native SDK call with argument `1`; no custom confirmation or mode-0 exit.
+- Native exit events, not opening the dialog, stop input, speech, audio and
+  ongoing requests. The phone Exit button uses the same confirmation path.
+- Recent remains on swipe. Child screens retain Back/discard/cancel semantics.
+- Listening can still be paused on glasses: swipe down, then tap Pause listening.
+- The package version advances once from the rejected 0.4.16 to 0.4.17. No main
+  server update is required for this gesture fix.
+
+## Verification and resubmission gate
+
+Automated verification (Node 24, SDK 0.0.15, Vitest 4.1.10):
+
+- 18 OpenAGI test files, **184 tests passed**.
+- Full assembled-client `tsc --noEmit`: passed.
+- Targeted lint for the native-exit wiring, renderer, controller and new tests:
+  passed. Broader lint still reports pre-existing errors in the existing
+  app/live-speech tests and recovery code; this is not a whole-repository lint pass.
+- The test assembly uses the same compatible G2 base source retained with the
+  0.4.16 submission assets, with this repository's overlay applied. The older
+  dirty checkout and live G2 workspace are unchanged.
+
+Physical G2 acceptance remains required; mocked SDK tests cannot prove the
+native modal appears on hardware:
+
+1. Install 0.4.17. At unpaired home, double-tap: the **Even system exit dialog**
+   appears. Cancel: pairing UI remains usable.
+2. Pair, ask a question, return home. Double-tap: the same native dialog appears,
+   not Recent. Cancel, tap Ask, and verify pairing/history remain intact.
+3. Start consented quiet lifelog. Double-tap: native exit dialog. Cancel: verify
+   microphone status and newly saved text. Swipe down and tap Pause listening:
+   microphone off, with explicit consent required for resume as before.
+4. From an answer, Recent, inbox/detail, draft, and active request, double-tap
+   performs Back/discard/request-cancellation confirmation, not app exit.
+5. Confirm Exit: return to Even's launcher and verify capture stops. Reopen:
+   pairing persists; any saved lifelog preference still validates consent.
+
+Suggested reviewer response after device acceptance: "Root-page double-tap now
+calls shutDownPageContainer(1) to display Even's native exit confirmation. Child
+pages retain Back navigation. Cancelling the dialog leaves the app usable;
+resources are cleaned up only when Even emits the system-exit event."
+
+Not resubmitted automatically.

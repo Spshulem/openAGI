@@ -190,8 +190,11 @@ does not save raw audio; provider retention terms still apply. The client opts
 out of Deepgram's model improvement program. This is not a zero-retention claim.
 
 **Blank glasses display** on the phone hides text while retaining the app page.
-Double-tap wakes it; the phone's Wake button is a fallback. While awake,
-double-tap still means Back and home → Recent. Display blanking is not hardware
+Double-tap wakes it; at the root it also opens Even's native exit confirmation.
+The phone's Wake button wakes without requesting exit. While awake, double-tap
+means Back on child screens and native exit confirmation at the root, including
+quiet listening. Swipe at home for Recent; swipe down while listening and tap
+Pause listening to pause without exiting. Display blanking is not hardware
 sleep and does not stop recording or cancel an agent request. Gesture delivery
 while blank and battery behavior require testing on actual glasses.
 
