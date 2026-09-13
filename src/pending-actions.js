@@ -342,6 +342,8 @@ function serializableContext(ctx) {
   if (!ctx) return null;
   return {
     sessionId: ctx.sessionId ?? null,
+    ...(typeof ctx.requestId === "string" ? { requestId: ctx.requestId.slice(0, 200) } : {}),
+    ...(typeof ctx.sourceNodeId === "string" ? { sourceNodeId: ctx.sourceNodeId.slice(0, 200) } : {}),
     agentId: ctx.agentId ?? null,
     channel: ctx.channel ?? null,
     from: ctx.from ?? null,

@@ -165,6 +165,7 @@ export class ToolRegistry {
   }
 
   async invoke(name, args, context = {}) {
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     const tool = this.tools.get(name);
     if (!tool) {
       return { ok: false, error: `Unknown tool: ${name}` };
@@ -214,6 +215,7 @@ export class ToolRegistry {
       }
     }
     const toolConfirm = tool.needsConfirmation && safeConfirmationRequired(tool.confirmationRequired, invocationArgs, context);
+    if (context?.signal?.aborted) return { ok: false, error: "Request cancelled; tool was not run." };
     const scrutinyConfirm = context?.__scrutinyPolicy === "confirm"
       && tool.sideEffects
       && safeConfirmationRequired(tool.scrutinyConfirmationRequired, invocationArgs, context);

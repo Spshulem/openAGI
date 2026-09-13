@@ -142,7 +142,13 @@ export class G2Channel {
   async answer(question, wav, conversationId, nodeId, enrollment, options = {}) {
     const nodeNamespace = createHash("sha256").update(nodeId, "utf8").digest("base64url");
     const conversationNamespace = createHash("sha256").update(conversationId, "utf8").digest("base64url");
-    const sessionId = `node:${nodeNamespace}:${conversationNamespace}:main`;
+    const sessionId = options.continuation ? this.sessionIdFor(nodeId, conversationId, options.continuation)
+      : `node:${nodeNamespace}:${conversationNamespace}:main`;
+    const store = this.agentHost.store;
+    if (store?.saveSession) {
+      const session = store.getSession(sessionId);
+      store.saveSession({ ...session, metadata: { ...session.metadata, g2NodeId: nodeId } });
+    }
     const turn = await this.agentHost.handleMessage({
       channel: "g2",
       from: `node:${nodeId}:${conversationNamespace}`,
@@ -151,6 +157,7 @@ export class G2Channel {
       text: question,
       metadata: {
         sourceNodeId: nodeId,
+        ...(options.requestId ? { requestId: options.requestId } : {}),
         nodePlatform: EVEN_G2_PLATFORM,
         nodeName: enrollment.name ?? "Even G2",
         audioDurationSeconds: Number(((wav.length - 44) / 32_000).toFixed(3))
@@ -160,6 +167,49 @@ export class G2Channel {
       at: nowIso(), op: "ask", nodeId, sessionId: turn.session?.id ?? sessionId, audioBytes: wav.length
     });
     return { question, reply: turn.reply, sessionId: turn.session?.id ?? sessionId };
+  }
+
+  sessionIdFor(nodeId, conversationId, continuation) {
+    this.assertEnrolled(nodeId);
+    const prefix = g2SessionPrefix(nodeId);
+    if (continuation !== undefined) {
+      const sessionId = typeof continuation === "string" && continuation.startsWith("g2:") ? continuation.slice(3) : "";
+      if (!sessionId.startsWith(prefix) || !/^[\w-]{43}:main$/.test(sessionId.slice(prefix.length)))
+        throw new G2ChannelError("invalid_conversation", 403, "That conversation does not belong to this G2.");
+      const session = this.agentHost.store?.getSession(sessionId);
+      if (!isG2Session(session, nodeId)) throw new G2ChannelError("invalid_conversation", 404, "This G2 conversation was not found.");
+      return sessionId;
+    }
+    return `${prefix}${createHash("sha256").update(conversationId, "utf8").digest("base64url")}:main`;
+  }
+
+  history(nodeId, { continuation, offset = 0, query = "" } = {}) {
+    this.assertEnrolled(nodeId);
+    const store = this.agentHost.store;
+    if (!store?.listSessions) throw new G2ChannelError("history_unavailable", 503, "Main history is not configured.");
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1000 || typeof query !== "string" || query.length > 200)
+      throw new G2ChannelError("invalid_history", 400, "Invalid history page.");
+    if (continuation) {
+      const id = this.sessionIdFor(nodeId, "", continuation), session = store.getSession(id);
+      const publicMessages = session.messages.filter(m => ["user", "assistant"].includes(m.role) && m.channel === "g2" && typeof m.content === "string");
+      const end = Math.max(0, publicMessages.length - offset), start = Math.max(0, end - 30);
+      return { continuation, messages: publicMessages.slice(start, end).map(m => ({ id: m.id, role: m.role, text: m.content.slice(0, 16000), at: m.createdAt })),
+        nextOffset: start > 0 ? offset + 30 : null, archivedOnMain: session.metadata?.historyArchived === true };
+    }
+    const matches = [], prefix = g2SessionPrefix(nodeId);
+    for (const summary of store.listSessions({ prefix, limit: 200 })) {
+      if (!summary.id.startsWith(prefix) || summary.recoveryNeeded) continue;
+      // Project one bounded session at a time; never retain hundreds of full
+      // conversation files just to build a twenty-row history page.
+      const s = store.getSession(summary.id);
+      if (!isG2Session(s, nodeId)) continue;
+      const messages = s.messages.filter(m => ["user", "assistant"].includes(m.role) && m.channel === "g2" && typeof m.content === "string");
+      const item = { continuation: `g2:${s.id}`, title: (messages.find(m => m.role === "user")?.content ?? "Conversation").slice(0, 160),
+        preview: (messages.at(-1)?.content ?? "").slice(0, 240), at: s.updatedAt };
+      if (`${item.title} ${item.preview}`.toLowerCase().includes(query.toLowerCase())) matches.push(item);
+    }
+    return { conversations: matches.slice(offset, offset + 20), nextOffset: matches.length > offset + 20 ? offset + 20 : null,
+      searchScope: "Question and reply previews from this G2’s 200 most recently updated active conversations; full archives remain on main." };
   }
 
   async transcribe(wav, language, signal) {
@@ -186,6 +236,12 @@ export class G2Channel {
     if (!text) throw new G2ChannelError("empty_transcription", 422, "I did not hear a question. Try again a little closer to the microphone.");
     return text;
   }
+}
+
+function g2SessionPrefix(nodeId) { return `node:${createHash("sha256").update(nodeId, "utf8").digest("base64url")}:`; }
+function isG2Session(session, nodeId) {
+  return session?.id?.startsWith(g2SessionPrefix(nodeId)) && (session.metadata?.g2NodeId === nodeId
+    || session.messages?.some(m => m.channel === "g2" && m.role === "user" && m.metadata?.sourceNodeId === nodeId));
 }
 
 function normalizedWords(value) {

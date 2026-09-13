@@ -32,10 +32,10 @@ it('coalesces rapid final events from one speaker without losing stream metadata
   f.client.stop()
 })
 function fixture() {
-  const api = { proactive: vi.fn(async (body: { op: string }) => body.op === 'consent' ? { consent: { id: 'session-consent', until: Date.now() + 3600_000 } } : ['notify', 'can-notify'].includes(body.op) ? { notify: true } : {
+  const api = { proactive: vi.fn((body: { op: string }) => Promise.resolve(body.op === 'consent' ? { consent: { id: 'session-consent', until: Date.now() + 3600_000 } } : ['notify', 'can-notify'].includes(body.op) ? { notify: true } : {
     settings: { enabled: true, categories: ['approvals'], retentionDays: 1, quietStart: 22, quietEnd: 8, timeZone: 'UTC', maxPerHour: 3 },
     quiet: false, items: [{ id: 'approval', title: 'Review needed', summary: 'Open main', important: true, seen: false, action: 'review-on-main', category: 'approvals' }],
-  }) }
+  })) }
   const view = { activity: vi.fn(), memoryStatus: vi.fn(), inbox: vi.fn(), proactiveSettings: vi.fn() }, notify = vi.fn(), idle = vi.fn(() => false)
   const client = new G2ProactiveClient(api as unknown as ConstructorParameters<typeof G2ProactiveClient>[0], view, idle, notify)
   return { api, view, client, notify, idle }
@@ -81,7 +81,7 @@ it('delivers an idle alert only after server permission and releases timers on e
 
 it('failed capture pauses memory without replaying audio or text', async () => {
   vi.useFakeTimers(); const f = fixture(); f.client.start(); await f.client.enableMemory(true)
-  f.api.proactive.mockImplementation(async body => { if (body.op === 'capture') throw new Error('offline'); return { items: [] } as never })
+  f.api.proactive.mockImplementation(body => body.op === 'capture' ? Promise.reject(new Error('offline')) : Promise.resolve({ items: [] } as never))
   f.client.capture('Remember to call the team'); await vi.advanceTimersByTimeAsync(120000)
   expect(f.api.proactive.mock.calls.filter(([b]) => b.op === 'capture')).toHaveLength(1)
   expect(f.view.memoryStatus).toHaveBeenLastCalledWith(false, expect.stringContaining('upload failed')); f.client.stop()

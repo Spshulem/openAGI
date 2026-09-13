@@ -395,7 +395,8 @@ test("helper runner writes payload to stdin, bounds output, and never places it 
 
 test("helper cancellation requests cooperative cleanup before any hard kill", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-helper-cancel-"));
-  const helper = path.join(dir, "helper.js");
+  // Explicit CommonJS: a shared temp parent may itself declare type: module.
+  const helper = path.join(dir, "helper.cjs");
   const marker = path.join(dir, "cleanup-complete");
   const ready = path.join(dir, "ready");
   fs.writeFileSync(helper, `#!/usr/bin/env node\nconst fs=require('node:fs');process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(marker)},'yes');setTimeout(()=>process.exit(2),20)});fs.writeFileSync(${JSON.stringify(ready)},'yes');process.stdin.resume();setInterval(()=>{},1000);\n`, { mode: 0o700 });

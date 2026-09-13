@@ -1,5 +1,10 @@
 import type { SpeechModel } from '../openagi/live-speech'
 import type { InboxItem, InboxOperation, ProactiveSettings } from '../openagi/proactive'
+import { PhoneExperience, experienceStyles } from './phone-experience'
+import { parseConnectionCard } from '../openagi/connection-card'
+import type { G2Capabilities, G2History } from '../openagi/experience-client'
+
+export type PhoneInteraction = 'idle' | 'recording' | 'review' | 'working' | 'unavailable'
 
 export interface OpenAGIPhoneActions {
   pair(code: string, origin: string): void
@@ -33,6 +38,12 @@ export interface OpenAGIPhoneActions {
   configureLifelogTalkMode?(mode: 'tap' | 'hold'): void
   configureBackgroundListening?(enabled: boolean): void
   retryListening?(): void
+  configureInterface?(style: 'focused' | 'classic'): void
+  pauseLifelog?(): void
+  resumeRequest?(): void
+  dismissRequest?(): void
+  readHistory?(continuation?: string, offset?: number, query?: string): void
+  continueHistory?(continuation: string): void
 }
 
 export class OpenAGIPhoneCompanion {
@@ -44,6 +55,11 @@ export class OpenAGIPhoneCompanion {
   private lifelogNext: number | null = null
   private lifelogOffset = 0
   private lifelogQuery = ''
+  private experience: PhoneExperience
+  private interactionState: PhoneInteraction = 'unavailable'
+  private requestInProgress = false
+  private historyContinuation: string | undefined
+  private historyNext: number | null = null
 
   constructor(actions: OpenAGIPhoneActions, allowedOrigins: string[]) {
     const root = document.querySelector<HTMLDivElement>('#app')
@@ -51,9 +67,13 @@ export class OpenAGIPhoneCompanion {
     root.innerHTML = `
       <main class="shell">
         <header><div class="brand">Agents</div><div class="eyebrow">Even G2</div></header>
+        <label class="interface-switch">Interface<select id="interface-style"><option value="focused">Focused · new</option><option value="classic">Classic</option></select></label>
         <section class="card" role="status" aria-live="polite"><h1 id="status">Starting…</h1><p id="detail">Connecting to your agent.</p></section>
         <section id="pair" class="pair">
           <h2>Connect to your OpenAGI main</h2>
+          <p>Already have OpenAGI? On your main computer, open <strong>Connect glasses</strong> at /g2/connect. Paste its connection card below.</p>
+          <label for="connection-card">Connection card</label><textarea id="connection-card" autocomplete="off" placeholder="Paste your connection card"></textarea><button id="read-connection-card">Review connection</button><p id="card-status" role="status"></p>
+          <details><summary>New to OpenAGI?</summary><p>Install OpenAGI on a computer, select your model, then connect these glasses. Your computer stays in control; G2 does not need a separate agent subscription.</p><a href="https://github.com/Spshulem/openAGI#readme" target="_blank" rel="noopener noreferrer">Computer installation guide</a><p>You can preview the layout below without a microphone or agent connection.</p><button id="preview-interface">Preview interface · no recording</button></details>
           <label for="agent-origin">Main server URL</label>
           <input id="agent-origin" type="url" autocomplete="off" placeholder="https://your-main.example.com" value="${escapeHtml(allowedOrigins[0] ?? '')}">
           <p>Use the machine that hosts your main, not another node. G2 will connect as a node. Choose ONE method below.</p>
@@ -71,6 +91,7 @@ export class OpenAGIPhoneCompanion {
           <nav class="page-nav" aria-label="Agent pages"><button data-page-link="listen" aria-pressed="true">Listen</button><button id="read-lifelog" data-page-link="lifelog">Lifelog</button><button data-page-link="inbox">Inbox</button><button data-page-link="recent">Recent</button></nav>
           <button data-action="ask">Ask agent</button><button data-action="newConversation">New conversation</button>
           <button id="cancel-request" hidden>Cancel request</button>
+          <section id="pending-question" class="ambient" hidden><h2>Saved question</h2><p id="pending-detail">Check the same request without starting it twice.</p><button id="resume-request">Check / send saved question</button><button id="dismiss-request">Clear after checking History</button></section>
           <section id="draft-review" class="ambient" hidden><h2>Review question · not sent</h2><p id="draft-text"></p><button id="send-draft">Send question</button><button id="rerecord-draft">Re-record</button><button id="discard-draft">Discard</button></section>
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
@@ -95,6 +116,7 @@ export class OpenAGIPhoneCompanion {
             <p id="background-status" role="status">Lock-screen listening off.</p>
             <p id="memory-status">Off. Give consent, then enable Keep lifelog on. It resumes when the app opens while that consent is valid. Switch off to stop recording and automatic resumption.</p>
             <button id="memory-resume">Return / resume lifelog</button>
+            <button id="pause-lifelog">Pause lifelog</button>
             <details><summary>Privacy and retention</summary><p>Final text is batched to your main, not raw audio. Speakers are unverified. Suggestions need your confirmation. Backgrounding stops the microphone unless experimental lock-screen listening is enabled for active live lifelog. Reopening resumes with the same consent, including after a crash. Consent expires after 4 hours and is never renewed automatically. Turn lifelog off to stop automatic resumption. Reconfirm consent if participants change. Unsent text is not replayed after exit.</p>
             <button id="delete-memory">Stop memory & delete retained transcripts</button>
             </details>
@@ -102,7 +124,7 @@ export class OpenAGIPhoneCompanion {
           <details class="ambient" data-page="listen"><summary>Talk, speech and activity settings</summary><h2>Talk controls</h2>
             <label>Talk while lifelog is on<select id="lifelog-talk-mode"><option value="tap">Tap to start / tap to stop</option><option value="hold">Hold to talk / release to finish</option></select></label>
             <p>Hold mode ignores quick taps for Talk. Wait for Listening before speaking; releasing during microphone setup cancels. Requires an Even app and firmware that deliver hold/release gestures. If holding does nothing, use tap mode or Ask on the phone.</p>
-            <label>Quick tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (ignored in hold mode)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down for explicit Talk / Mark moment controls. Swipe up for Inbox. Double-tap pauses. During a held question, double-tap cancels without sending.</p>
+            <label>Quick tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (ignored in hold mode)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down for Talk / Mark moment / Pause. Swipe up for Inbox. At home, double-tap opens Even’s exit dialog. During a held question, double-tap cancels without sending.</p>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
             <p>Turn off to review the transcript and confirm Send first. Passive listening resumes after a manual question; optional wake responses are controlled separately.</p>
             <p>Hold mode stops without sending if no release arrives within 30 seconds. Manual questions require the app to stay in the foreground; experimental lock-screen continuation applies only to an already-active lifelog.</p>
@@ -113,6 +135,8 @@ export class OpenAGIPhoneCompanion {
             <p>Through main works with a regular Deepgram speech key. Audio is forwarded live, not saved or uploaded as a whole recording. Direct mode skips that network hop but needs permission to create temporary tokens. Neither mode stores your permanent Deepgram key on the phone.</p>
             <details><summary>Live transcript · optional phone preview</summary><p id="live-transcript">Waiting for speech.</p><p id="speech-timing">Select Deepgram for live words, or OpenAI for transcription after recording.</p></details><h2>Activity</h2><ol id="activity-log"></ol></details>
           <section class="ambient" data-page="recent"><h2>Recent answers</h2><p>Select an answer to resume its conversation. Stored on this phone; disconnect clears history.</p><div id="recent-answers"></div><p id="answer-preview"></p></section>
+          <section class="ambient" data-page="recent"><div id="history-controls"><h2>Conversations on main</h2><label>Search recent conversation previews<input type="search" id="history-query" maxlength="200"></label><button id="refresh-history">Search / refresh</button><button id="older-history" hidden>Older</button><button id="continue-history" hidden>Continue this conversation</button><p id="history-status" role="status"></p></div><div id="main-history"></div></section>
+          <p id="connection-readiness" role="status">Connection has not been checked.</p>
           <section class="ambient" data-page="listen">
             <h2>Listening controls</h2><label><input id="ambient-enabled" type="checkbox"> Keep microphone listening while this app is open</label>
             <label>What should listening do?<select id="listening-mode"><option value="passive">Quiet listening · tap Talk for answers</option><option value="wake">Wake responses · answer when triggered</option></select></label>
@@ -137,6 +161,32 @@ export class OpenAGIPhoneCompanion {
       for (const panel of root.querySelectorAll<HTMLElement>('[data-page]')) panel.hidden = panel.dataset.page !== page
       for (const button of root.querySelectorAll<HTMLElement>('[data-page-link]')) button.setAttribute('aria-pressed', String(button.dataset.pageLink === page))
     }
+    this.experience = new PhoneExperience(root, showPage)
+    root.querySelector('#interface-style')?.addEventListener('change', () => actions.configureInterface?.(requiredSelect(root, '#interface-style').value === 'classic' ? 'classic' : 'focused'))
+    root.querySelector('#read-connection-card')?.addEventListener('click', () => {
+      const status = root.querySelector<HTMLElement>('#card-status')!
+      try {
+        const card = parseConnectionCard(root.querySelector<HTMLTextAreaElement>('#connection-card')!.value)
+        if (allowedOrigins.length && !allowedOrigins.includes(card.origin)) throw new Error('This installed package does not allow that main URL.')
+        root.querySelector<HTMLInputElement>('#agent-origin')!.value = card.origin
+        root.querySelector<HTMLInputElement>('#pair-code')!.value = card.code
+        status.textContent = `Ready to connect to ${card.origin}. Check this is your main, then tap Pair G2 below.`
+      } catch (error) { status.textContent = error instanceof Error ? error.message : 'Invalid connection card.' }
+    })
+    root.querySelector('#preview-interface')?.addEventListener('click', () => {
+      this.actionsSection.hidden = false; this.interaction('unavailable')
+      this.set('Interface preview', 'No microphone, pairing, or model is active. Connect above when you are ready.')
+    })
+    root.querySelector('#pause-lifelog')?.addEventListener('click', () => actions.pauseLifelog?.())
+    root.querySelector('#resume-request')?.addEventListener('click', () => actions.resumeRequest?.())
+    root.querySelector('#dismiss-request')?.addEventListener('click', () => { if (window.confirm('Have you checked History? Clearing this local reminder does not cancel main work or undo completed actions.')) actions.dismissRequest?.() })
+    root.querySelector('#refresh-history')?.addEventListener('click', () => { this.historyContinuation = undefined; actions.readHistory?.(undefined, 0, root.querySelector<HTMLInputElement>('#history-query')!.value) })
+    root.querySelector('#older-history')?.addEventListener('click', () => { if (this.historyNext !== null) actions.readHistory?.(this.historyContinuation, this.historyNext, root.querySelector<HTMLInputElement>('#history-query')!.value) })
+    root.querySelector('#continue-history')?.addEventListener('click', () => { if (this.historyContinuation) { actions.continueHistory?.(this.historyContinuation); showPage(root.dataset.experience === 'focused' ? 'talk' : 'recent') } })
+    root.querySelector('#main-history')?.addEventListener('click', event => {
+      const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('[data-continuation]') : null
+      if (button?.dataset.continuation) { this.historyContinuation = button.dataset.continuation; actions.readHistory?.(this.historyContinuation) }
+    })
     for (const button of root.querySelectorAll<HTMLElement>('[data-page-link]')) button.addEventListener('click', () => showPage(button.dataset.pageLink!))
     showPage('listen')
     root.querySelector('#mark-moment')?.addEventListener('click', () => actions.markMoment?.())
@@ -158,7 +208,7 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#lifelog-search')?.addEventListener('click', () => readHistory(0, true))
     root.querySelector('#lifelog-next')?.addEventListener('click', () => { if (this.lifelogNext !== null) readHistory(this.lifelogNext) })
     root.querySelector('#lifelog-previous')?.addEventListener('click', () => readHistory(Math.max(0, this.lifelogOffset - 25)))
-    root.querySelector('#lifelog-close')?.addEventListener('click', () => showPage('listen'))
+    root.querySelector('#lifelog-close')?.addEventListener('click', () => showPage(root.dataset.experience === 'focused' ? 'history' : 'listen'))
     root.querySelector('#pair-button')?.addEventListener('click', () => actions.pair(input?.value.trim() ?? '', agentOrigin?.value.trim() ?? ''))
     root.querySelector('#agent-connect')?.addEventListener('click', () => {
       actions.connectAgent(agentOrigin?.value ?? '', agentToken?.value ?? '')
@@ -215,7 +265,7 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#speech-transport')?.addEventListener('change', configureSpeech)
     root.querySelector('#recent-answers')?.addEventListener('click', event => {
       const target = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-answer]') : null
-      if (target?.dataset.answer !== undefined) actions.selectAnswer?.(Number(target.dataset.answer))
+      if (target?.dataset.answer !== undefined) { actions.selectAnswer?.(Number(target.dataset.answer)); showPage(root.dataset.experience === 'focused' ? 'talk' : 'recent') }
     })
     const configure = (): void => actions.configureAmbient(ambient?.checked === true, wakePhrase?.value.trim() || 'open agi', answerQuestions?.checked === true)
     ambient?.addEventListener('change', configure)
@@ -223,13 +273,39 @@ export class OpenAGIPhoneCompanion {
     wakePhrase?.addEventListener('change', configure)
     answerQuestions?.addEventListener('change', configure)
     injectStyles()
+    this.interfaceStyle('focused')
   }
   set(status: string, detail: string): void {
     this.status.textContent = status; this.detail.textContent = detail
-    const ask = this.actionsSection.querySelector<HTMLButtonElement>('[data-action="ask"]')
-    if (ask) ask.textContent = /Opening microphone|Recording question/.test(status) ? (this.sendOnStop ? 'Stop talking · send' : 'Stop talking · review') : status.startsWith('Review question') ? 'Send question' : 'Talk'
-    if (/failed|could not|check|not allowed/i.test(status)) this.status.scrollIntoView?.({ block: 'center' })
   }
+  interfaceStyle(style: 'focused' | 'classic'): void { this.experience.set(style); requiredSelect(document.querySelector('#app')!, '#interface-style').value = style }
+  interaction(state: PhoneInteraction): void {
+    this.interactionState = state
+    const ask = this.actionsSection.querySelector<HTMLButtonElement>('[data-action="ask"]')
+    if (ask) {
+      ask.textContent = state === 'recording' ? (this.sendOnStop ? 'Stop & send' : 'Stop & review') : state === 'review' ? 'Send question' : state === 'working' ? 'Working…' : 'Talk'
+      ask.disabled = this.requestInProgress || state === 'working' || state === 'unavailable'
+    }
+  }
+  pendingQuestion(text: string | null): void {
+    this.actionsSection.querySelector<HTMLElement>('#pending-question')!.hidden = text === null
+    this.actionsSection.querySelector<HTMLElement>('#pending-detail')!.textContent = text ?? ''
+  }
+  readiness(capabilities: G2Capabilities | null, problem?: string): void {
+    const element = this.actionsSection.querySelector<HTMLElement>('#connection-readiness')!
+    element.textContent = problem ?? (!capabilities ? 'Classic main · update OpenAGI for reconnectable questions and main history.'
+      : `${capabilities.mainRole === 'main' ? 'Connected to main' : 'Connected to a node — use your main instead'} · saved request recovery ready\nSpeech: ${capabilities.speech.liveTranscriptionConfigured ? 'live speech configured' : capabilities.speech.transcriptionConfigured ? 'buffered speech configured' : 'configure speech on main'}\nComputer and coding actions require connected hosts and approval on main.`)
+  }
+  mainHistory(page: G2History, continuation?: string): void {
+    this.historyContinuation = continuation; this.historyNext = page.nextOffset ?? null
+    const root = this.actionsSection.querySelector<HTMLElement>('#main-history')!; root.replaceChildren()
+    for (const item of page.conversations ?? []) { const b = document.createElement('button'); b.dataset.continuation = item.continuation; b.textContent = `${item.title}\n${item.preview}`; root.append(b) }
+    for (const message of page.messages ?? []) { const p = document.createElement('p'); const label = document.createElement('strong'); label.textContent = message.role === 'user' ? 'You: ' : 'OpenAGI: '; p.append(label, document.createTextNode(message.text)); root.append(p) }
+    this.actionsSection.querySelector<HTMLElement>('#older-history')!.hidden = this.historyNext === null
+    this.actionsSection.querySelector<HTMLElement>('#continue-history')!.hidden = !continuation
+    this.historyStatus(page.archivedOnMain ? 'Earlier archived messages remain on main.' : root.childElementCount ? 'Saved on your main · only this G2’s conversations' : 'No conversations found on main.')
+  }
+  historyStatus(text: string): void { this.actionsSection.querySelector<HTMLElement>('#history-status')!.textContent = text }
   paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value; if (!value) this.lifelogStatus('') }
   listeningMode(mode: 'passive' | 'wake'): void {
     requiredSelect(this.actionsSection, '#listening-mode').value = mode
@@ -276,6 +352,9 @@ export class OpenAGIPhoneCompanion {
     const i = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled'); if (i) i.checked = active
     const p = this.actionsSection.querySelector('#memory-status'); if (p) p.textContent = detail
     if (!active) this.saveStatus(detail)
+    for (const id of ['pause-lifelog', 'mark-moment']) {
+      const button = this.actionsSection.querySelector<HTMLButtonElement>(`#${id}`); if (button) button.disabled = !active
+    }
   }
   lifelogEnabled(enabled: boolean): void { const input = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled'); if (input) input.checked = enabled }
   saveStatus(text: string): void { const p = this.actionsSection.querySelector('#save-status'); if (p) p.textContent = text }
@@ -309,6 +388,7 @@ export class OpenAGIPhoneCompanion {
     this.sendOnStop = enabled
     const input = this.actionsSection.querySelector<HTMLInputElement>('#auto-send')
     if (input) input.checked = enabled
+    this.interaction(this.interactionState)
   }
   draft(text: string | null, recovery?: 'speech' | 'delivery'): void {
     const panel = this.actionsSection.querySelector<HTMLElement>('#draft-review')
@@ -321,12 +401,14 @@ export class OpenAGIPhoneCompanion {
     if (preview) preview.textContent = text ?? ''
   }
   requestActive(active: boolean): void {
+    this.requestInProgress = active
     const cancel = this.actionsSection.querySelector<HTMLButtonElement>('#cancel-request')
     if (cancel) cancel.hidden = !active
     for (const selector of ['[data-action="ask"]', '[data-action="newConversation"]', '[data-action="unlink"]', '#last-answer', '#ambient-retry', '#send-draft', '#rerecord-draft', '#discard-draft']) {
       const input = this.actionsSection.querySelector<HTMLButtonElement | HTMLInputElement>(selector)
       if (input) input.disabled = active
     }
+    this.interaction(this.interactionState)
   }
   transcript(text: string): void { const node = this.actionsSection.querySelector('#live-transcript'); if (node) node.textContent = text }
   speechModel(model: SpeechModel): void { const select = this.actionsSection.querySelector<HTMLSelectElement>('#speech-model'); if (select) select.value = model }
@@ -402,5 +484,6 @@ function injectStyles(): void {
     #answer-preview:not(:empty){border-top:1px solid #364d3e;padding-top:18px;margin-top:4px;font-size:14px;line-height:1.65;white-space:pre-wrap}#answer-preview:empty{display:none}
     @media(max-width:360px){.shell{padding:20px 14px}.ambient{padding:16px}button{padding:12px;font-size:14px}}
     button.secondary{grid-column:1/-1;background:transparent;color:#dde5e0;border-color:#41564b}footer{font-size:12px;text-align:center;padding:10px 24px}code{word-break:break-all;color:#d9eee2}`
+  style.textContent += experienceStyles
   document.head.appendChild(style)
 }

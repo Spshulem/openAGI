@@ -6,8 +6,8 @@ afterEach(() => vi.useRealTimers())
 
 async function fixture() {
   const bridge = {
-    createStartUpPageContainer: vi.fn(async () => StartUpPageCreateResult.success),
-    textContainerUpgrade: vi.fn(async (_value: unknown) => true),
+    createStartUpPageContainer: vi.fn(() => Promise.resolve(StartUpPageCreateResult.success)),
+    textContainerUpgrade: vi.fn((value: unknown) => { void value; return Promise.resolve(true) }),
   }
   const display = new AgentsDisplayController(bridge as never)
   await display.initialize('Starting')
@@ -63,7 +63,7 @@ it('clears an in-flight dot before sleeping and restores it on the next active r
   display.show(' ', true)
   finish(true)
   await vi.waitFor(() => expect(bridge.textContainerUpgrade).toHaveBeenLastCalledWith(expect.objectContaining({ containerID: 2, content: ' ' })))
-  bridge.textContainerUpgrade.mockImplementation(async () => true)
+  bridge.textContainerUpgrade.mockImplementation(() => Promise.resolve(true))
   display.show('●', true, true)
   await vi.waitFor(() => expect(bridge.textContainerUpgrade).toHaveBeenLastCalledWith(expect.objectContaining({ containerID: 2, content: '●' })))
 })
