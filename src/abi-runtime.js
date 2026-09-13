@@ -1,6 +1,7 @@
 import path from "node:path";
 import { resolveDataDir } from "./data-dir.js";
 import { AgentHost } from "./agent-host.js";
+import { CodingSupervisor, registerCodingSupervisorTools } from "./coding-supervisor.js";
 import { FileBackedAgentStore } from "./agent-store.js";
 import { CronScheduler, createDailyAdaptationReviewJob } from "./cron-scheduler.js";
 import { DirectionalAdaptiveScrutiny } from "./directional-adaptive-scrutiny.js";
@@ -233,6 +234,9 @@ export class AbiRuntime {
     this.outreach = options.outreach ?? new OutreachStore({
       dir: options.dataDir ? path.join(options.dataDir, "outreach") : undefined,
       runtime: this
+    });
+    this.codingSupervisor = options.codingSupervisor ?? new CodingSupervisor({
+      ...options.codingSupervisorOptions, dataDir: options.dataDir, runtime: this
     });
     if (this.outreachConfig.enabled) {
       this.outreachMapper = new OutreachMapper({ store: this.outreach, events: this.events });
@@ -533,6 +537,7 @@ export class AbiRuntime {
         intervalMs: 60 * 60 * 1000
       });
       registerCoreTools(this.tools, this);
+      registerCodingSupervisorTools(this.tools, this.codingSupervisor);
       // Computer-use tools register only when explicitly opted-in via env
       // (OPENAGI_COMPUTER_USE=1). Default install doesn't expose them so
       // an LLM can't accidentally try to drive the user's screen. The

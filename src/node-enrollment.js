@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-export const NODE_ENROLLMENT_CODE_TTL_MS = 10 * 60 * 1000;
+export const NODE_ENROLLMENT_CODE_TTL_MS = 30 * 60 * 1000;
 export const NODE_ENROLLMENT_MAX_ATTEMPTS = 5;
 export const NODE_ENROLLMENT_LOCKOUT_MS = 15 * 60 * 1000;
 
@@ -33,7 +33,9 @@ export class NodeEnrollmentCodes {
   consume(code, platform, { now = Date.now() } = {}) {
     if (!this.platforms.has(platform)) return this._fail(now, "unsupported-platform");
     if (now < this.lockedUntil) return { ok: false, reason: "locked" };
-    if (!this.active) return this._fail(now, "no-active-code");
+    // Requests made before the owner has issued a code reveal nothing and
+    // must not let an internet caller pre-lock the next legitimate pairing.
+    if (!this.active) return { ok: false, reason: "no-active-code" };
     if (now - this.active.createdAt > NODE_ENROLLMENT_CODE_TTL_MS) {
       this.active = null;
       return this._fail(now, "expired");

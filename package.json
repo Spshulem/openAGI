@@ -28,6 +28,9 @@
   "engines": {
     "node": ">=22"
   },
+  "dependencies": {
+    "ws": "8.21.3"
+  },
   "bin": {
     "openagi": "bin/openagi.js"
   }

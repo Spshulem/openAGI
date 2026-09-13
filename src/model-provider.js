@@ -182,6 +182,7 @@ export class OpenAIResponsesProvider {
       }
 
       for (const call of calls) {
+        context.signal?.throwIfAborted();
         notifyProgress(onProgress, { stage: "tool", provider: "openai", model, hop: hop + 1, tool: call.name });
         const parsedArgs = safeParseJson(call.arguments) ?? {};
         const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
@@ -266,7 +267,7 @@ export class OpenAIResponsesProvider {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/responses`, {
         method: "POST",
-        signal: controller.signal,
+        signal: context.signal ? AbortSignal.any([context.signal, controller.signal]) : controller.signal,
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${this.apiKey}`
@@ -294,7 +295,7 @@ export class OpenAIResponsesProvider {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/responses`, {
         method: "POST",
-        signal: idle.signal,
+        signal: context.signal ? AbortSignal.any([context.signal, idle.signal]) : idle.signal,
         headers: {
           "content-type": "application/json",
           accept: "text/event-stream",
@@ -453,6 +454,7 @@ export class AnthropicProvider {
 
       const toolResults = [];
       for (const use of toolUses) {
+        context.signal?.throwIfAborted();
         notifyProgress(onProgress, { stage: "tool", provider: "anthropic", model, hop: hop + 1, tool: use.name });
         const invocation = await (toolRegistry?.invoke?.(use.name, use.input ?? {}, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: use.name, arguments: use.input, result: invocation });
@@ -534,7 +536,7 @@ export class AnthropicProvider {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/messages`, {
         method: "POST",
-        signal: controller.signal,
+        signal: context.signal ? AbortSignal.any([context.signal, controller.signal]) : controller.signal,
         headers: {
           "content-type": "application/json",
           "x-api-key": this.apiKey,
@@ -563,7 +565,7 @@ export class AnthropicProvider {
     try {
       const response = await this.fetchImpl(`${this.baseUrl}/messages`, {
         method: "POST",
-        signal: idle.signal,
+        signal: context.signal ? AbortSignal.any([context.signal, idle.signal]) : idle.signal,
         headers: {
           "content-type": "application/json",
           accept: "text/event-stream",

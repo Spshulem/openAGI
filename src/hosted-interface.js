@@ -2,11 +2,14 @@ import http from "node:http";
 import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
+import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
+import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
+import { codingSupervisorUi } from "./coding-supervisor-ui.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
 import {
@@ -224,6 +227,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("computer-use", (data) => broadcast("computer-use", data));
   events.on("outreach", (data) => broadcast("outreach", data));
   events.on("outreach-resolved", (data) => broadcast("outreach-resolved", data));
+  events.on("coding-agents", (data) => broadcast("coding-agents", data));
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -680,19 +684,29 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
-        "/nodes/capture-memory", "/nodes/g2/ask"
+        "/nodes/capture-memory", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"
       ].includes(pathname);
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message");
-      const requestNodeId = typeof req.headers["x-openagi-node-id"] === "string"
+      const headerNodeId = typeof req.headers["x-openagi-node-id"] === "string"
         ? req.headers["x-openagi-node-id"]
         : null;
       const scopedBearer = String(req.headers.authorization ?? "").startsWith("Bearer ")
         ? String(req.headers.authorization).slice(7)
         : null;
-      const requestEnrollment = requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null;
+      // Generic Even agent clients may be configured with only an agent URL
+      // and scoped token. Resolve the bound node id from that token ONLY for
+      // the G2 voice routes; all generic node/control routes still require
+      // the explicit X-OpenAGI-Node-ID header.
+      const tokenOnlyG2Enrollment = !headerNodeId
+        && ["/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"].includes(pathname)
+        ? nodeRegistry.enrollmentForToken(scopedBearer)
+        : null;
+      const requestNodeId = headerNodeId ?? tokenOnlyG2Enrollment?.nodeId ?? null;
+      const requestEnrollment = tokenOnlyG2Enrollment
+        ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
-        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask"].includes(pathname);
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"].includes(pathname);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
@@ -701,11 +715,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         : false;
       // Even Hub runs the G2 client in a phone webview whose Origin is not the
       // daemon's origin. Bypass only the browser-origin check, and only after
-      // the request has proven its G2 node id + scoped bearer credential. The
+      // the request has proven its G2 scoped bearer credential (and, when
+      // supplied, its matching node id). The
       // normal auth gate below still runs; this does not make the route public.
       const authenticatedG2CrossOrigin = requestEnrollment?.platform === EVEN_G2_PLATFORM
         && nodeScopedAuth
-        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask"].includes(pathname);
+        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"].includes(pathname);
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -963,21 +978,64 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: `platform must be ${EVEN_G2_PLATFORM}` });
         }
         const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM);
-        console.log(`[openagi] Even G2 node enrollment code ${issued.code} (valid 10 min, single use)`);
+        console.log(`[openagi] Even G2 node enrollment code ${issued.code} (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
           transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
         });
       }
+      if (method === "POST" && pathname === "/nodes/g2/direct-token") {
+        if (readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, { error: "Even G2 agents must be added on the main OpenAGI" });
+        }
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
+        if (!body || typeof body !== "object" || Array.isArray(body)
+            || Object.keys(body).some((key) => key !== "name")) {
+          return sendJson(res, 400, { error: "Only an optional agent name is supported" });
+        }
+        let agentUrl;
+        try {
+          const configured = new URL(getPublicUrl());
+          if (configured.protocol !== "https:" || configured.username || configured.password
+              || configured.pathname !== "/" || configured.search || configured.hash) throw new Error("invalid");
+          agentUrl = configured.origin;
+        } catch {
+          return sendJson(res, 409, {
+            error: "Set OPENAGI_PUBLIC_URL to the exact public HTTPS origin before creating a G2 agent token"
+          });
+        }
+        const nodeId = randomUUID();
+        const nodeToken = randomBytes(32).toString("base64url");
+        const name = boundedG2NodeName(body.name || "Even G2 agent");
+        nodeRegistry.enroll(nodeId, nodeToken, {
+          platform: EVEN_G2_PLATFORM,
+          name,
+          capabilities: EVEN_G2_CAPABILITIES
+        });
+        const enrollment = nodeRegistry.enrollment(nodeId);
+        res.setHeader("cache-control", "no-store");
+        return sendJson(res, 201, {
+          agentUrl,
+          token: nodeToken,
+          node: {
+            id: nodeId,
+            name,
+            platform: EVEN_G2_PLATFORM,
+            enrolledAt: enrollment.createdAt
+          },
+          capabilities: EVEN_G2_CAPABILITIES
+        });
+      }
       if (method === "POST" && pathname === "/nodes/enroll/exchange") {
         const body = await readJsonLimited(req, 16 * 1024).catch(() => ({}));
         const keys = Object.keys(body ?? {});
-        if (keys.some((key) => !["code", "platform", "nodeId", "name"].includes(key))) {
+        if (keys.some((key) => !["code", "platform", "nodeId", "nodeToken", "name"].includes(key))) {
           return sendG2NodeJson(res, 400, { error: "enrollment contains unsupported fields" });
         }
         const code = typeof body.code === "string" ? body.code.trim() : "";
         const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
+        const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken : "";
         const name = boundedG2NodeName(body.name);
         if (!/^\d{6}$/.test(code)) {
           return sendG2NodeJson(res, 400, { error: "invalid_enrollment_code", message: "Enter the 6-digit code shown by OpenAGI." });
@@ -988,7 +1046,19 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (!/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
           return sendG2NodeJson(res, 400, { error: "invalid_node_id", message: "The G2 node identity is malformed." });
         }
+        if (!/^[a-zA-Z0-9_-]{43}$/.test(nodeToken)) {
+          return sendG2NodeJson(res, 400, { error: "invalid_node_token", message: "The G2 credential is malformed." });
+        }
         if (nodeRegistry.isEnrolled(nodeId)) {
+          const enrollment = nodeRegistry.enrollment(nodeId);
+          if (enrollment?.platform === EVEN_G2_PLATFORM && nodeRegistry.authenticate(nodeId, nodeToken)) {
+            return sendG2NodeJson(res, 200, {
+              node: { id: nodeId, name: enrollment.name ?? name, platform: EVEN_G2_PLATFORM, enrolledAt: enrollment.createdAt },
+              nodeToken,
+              capabilities: EVEN_G2_CAPABILITIES,
+              recovered: true
+            });
+          }
           return sendG2NodeJson(res, 409, { error: "node_already_enrolled", message: "Remove this G2 node in OpenAGI before pairing it again." });
         }
         const consumed = nodeEnrollment.consume(code, EVEN_G2_PLATFORM);
@@ -1001,7 +1071,6 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               : "That enrollment code is invalid or expired. Generate a new one in OpenAGI."
           });
         }
-        const nodeToken = randomBytes(32).toString("base64url");
         nodeRegistry.enroll(nodeId, nodeToken, {
           platform: EVEN_G2_PLATFORM,
           name,
@@ -1281,7 +1350,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const localCapabilities = await localCapabilitiesPromise;
 
         if (!pairing?.remote) {
-          const others = nodeRegistry.list({ now })
+          const registered = nodeRegistry.list({ now });
+          const activeIds = new Set(registered.map((entry) => entry.nodeId));
+          const waiting = nodeRegistry.listEnrollments()
+            .filter((entry) => !activeIds.has(entry.nodeId))
+            .map((entry) => ({ ...entry, role: "node", lastSeenAt: null }));
+          const others = [...registered, ...waiting]
             .map((e) => row(e, { status: statusFor(e.lastSeenAt, now), statusAsOf: nowIso }));
           return respond([selfRow("main"), ...others], {
             pairedTo: null, stale: false, cachedAt: null, unreachableReason: null,
@@ -1442,10 +1516,63 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         try {
           const body = await readJsonLimited(req, 1536 * 1024);
           if (!body || typeof body !== "object" || Array.isArray(body)
-              || Object.keys(body).some((key) => !["audioBase64", "conversationId", "language"].includes(key))) {
+              || Object.keys(body).some((key) => !["audioBase64", "text", "conversationId", "language"].includes(key))) {
             return sendG2NodeJson(res, 400, { error: "G2 request contains unsupported fields" });
           }
+          if (String(req.headers.accept ?? "").includes("application/x-ndjson")) {
+            res.writeHead(200, { "Content-Type": "application/x-ndjson", "Cache-Control": "no-store", "X-Accel-Buffering": "no", "Access-Control-Allow-Origin": "*" });
+            const emit = (event) => {
+              if (res.writableLength > 1024 * 1024) { res.destroy(); return; }
+              if (!res.destroyed && !res.writableEnded) res.write(JSON.stringify(event) + "\n");
+            };
+            const keepalive = setInterval(() => emit({ type: "heartbeat" }), 10_000);
+            const controller = new AbortController();
+            const cleanup = () => clearInterval(keepalive);
+            res.once("close", () => { cleanup(); if (!res.writableEnded) controller.abort(); });
+            try {
+              const result = await channels.g2.ask(body, requestNodeId, {
+                signal: controller.signal,
+                onProgress: (progress) => emit({ type: "progress", stage: progress.stage, ...(typeof progress.tool === "string" ? { tool: progress.tool.slice(0, 100) } : {}), ...(progress.question ? { question: progress.question } : {}) }),
+                onTextDelta: (delta) => emit({ type: "delta", text: delta.text ?? "", reset: delta.reset === true })
+              });
+              emit({ type: "result", ...result });
+            } catch (error) {
+              emit({ type: "error", message: error instanceof G2ChannelError ? error.message : "The agent could not complete this question." });
+            } finally { cleanup(); res.end(); }
+            return;
+          }
           const result = await channels.g2.ask(body, requestNodeId);
+          return sendG2NodeJson(res, 200, result);
+        } catch (error) {
+          return sendG2NodeError(res, error);
+        }
+      }
+
+      if (method === "POST" && pathname === "/nodes/g2/speech-token") {
+        res.setHeader("Cache-Control", "no-store");
+        // Require node auth even on an unauthenticated local main or with an owner token.
+        if (!nodeScopedAuth || requestEnrollment?.platform !== EVEN_G2_PLATFORM) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
+        if (!channels?.g2) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const body = await readJsonLimited(req, 1024);
+          if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => key !== "model")) {
+            return sendG2NodeJson(res, 400, { error: "unsupported_speech_fields" });
+          }
+          return sendG2NodeJson(res, 200, await channels.g2.speechToken(body, requestNodeId));
+        } catch (error) { return sendG2NodeError(res, error); }
+      }
+
+      if (method === "POST" && pathname === "/nodes/g2/listen") {
+        if (!channels?.g2) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const body = await readJsonLimited(req, 1536 * 1024);
+          if (!body || typeof body !== "object" || Array.isArray(body)
+              || Object.keys(body).some((key) => ![
+                "audioBase64", "conversationId", "language", "wakePhrase", "triggerMode", "forceAnswer", "transcribeOnly"
+              ].includes(key))) {
+            return sendG2NodeJson(res, 400, { error: "G2 listening request contains unsupported fields" });
+          }
+          const result = await channels.g2.listen(body, requestNodeId);
           return sendG2NodeJson(res, 200, result);
         } catch (error) {
           return sendG2NodeError(res, error);
@@ -1921,6 +2048,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, {
           actions: runtime.pendingActions?.list({ status }) ?? []
         });
+      }
+      if (pathname === "/coding-agents" || pathname.startsWith("/coding-agents/")) {
+        const result = await codingSupervisorRoute(runtime, method, pathname, url, () => readJsonLimited(req, 24 * 1024));
+        return sendJson(res, result.status, result.body);
       }
       if (method === "GET" && pathname === "/outreach/feed") {
         const since = Number(url.searchParams.get("since") ?? 0);
@@ -3018,6 +3149,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     }
   });
 
+  const speechRelay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channels?.g2 });
   const app = {
     runtime,
     channels,
@@ -3033,6 +3165,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve) => {
         server.listen(port, host, () => {
           channels?.start();
+          runtime.codingSupervisor?.start();
           if (tickerMs > 0) {
             tickerHandle = setInterval(() => {
               runtime.tick().catch(() => { /* swallow */ });
@@ -3114,6 +3247,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     },
     close() {
       return new Promise((resolve, reject) => {
+        speechRelay.close();
         approvalContinuationsClosing = true;
         for (const timer of approvalContinuationTimers) clearTimeout(timer);
         approvalContinuationTimers.clear();
@@ -3122,6 +3256,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
         sseClients.clear();
         channels?.stop?.();
+        runtime.codingSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
@@ -3416,7 +3551,9 @@ function isG2NodeCorsRoute(pathname) {
     "/nodes/enroll/exchange",
     "/nodes/heartbeat",
     "/nodes/revoke",
-    "/nodes/g2/ask"
+    "/nodes/g2/ask",
+    "/nodes/g2/listen",
+    "/nodes/g2/speech-token"
   ].includes(pathname);
 }
 
@@ -3573,6 +3710,9 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (action === "do") {
         let a = runtime.pendingActions?.get(ref.id);
         if (!a) throw new Error("pending action gone");
+        if (["reply_to_coding_agent", "start_coding_agent"].includes(a.toolName)) {
+          throw outreachActionConflict("Open Approvals to review the complete coding instruction before sending.");
+        }
         if (a.status !== "pending") {
           throw outreachActionConflict(`pending action already ${a.status}`);
         }
@@ -3883,7 +4023,10 @@ function renderApp() {
     .nav-more-panel button.active { background: var(--accent-bg); color: var(--accent-foreground); }
 
     .body { display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
-    .body.no-sidebar { grid-template-columns: 1fr; }
+    .body.no-sidebar { grid-template-columns: minmax(0, 1fr); }
+    main, .pane, .card { min-width: 0; overflow-wrap: anywhere; }
+    #codingDetail pre { overflow-wrap: anywhere; }
+    #codingList ~ section, #codingList { min-width: 0; }
     .sidebar {
       background: var(--panel);
       border-right: 1px solid var(--line);
@@ -4423,6 +4566,7 @@ function renderApp() {
             <button data-tab="cron" title="Scheduled prompts + the agent's autopilot pulse cron jobs.">Cron</button>
             <button data-tab="channels" title="Telegram / webhook channels the agent can deliver through.">Channels</button>
             <button data-tab="agents" title="Specialists the propagation controller has spawned for repeated tasks.">Agents</button>
+            <button data-tab="coding-agents" title="Inspect and coordinate Claude Code and Codex sessions through your local supervisor.">Coding Agents</button>
             <button data-tab="nodes" title="Which machines are paired, which one is main, and who's online right now.">Nodes</button>
           </div>
           <div class="nav-more-section">
@@ -4940,6 +5084,9 @@ async function switchTab(tab) {
   } else if (tab === "agents") {
     showSidebar(false);
     await renderAgents();
+  } else if (tab === "coding-agents") {
+    showSidebar(false);
+    await renderCodingAgents();
   } else if (tab === "memory") {
     showSidebar(false);
     await renderMemory();
@@ -6373,6 +6520,8 @@ function openMcpComposer() {
   });
 }
 
+${codingSupervisorUi}
+
 async function renderAgents() {
   const agents = await fetchJson("/agents");
   main.innerHTML = '<div class="pane"><h2>Agents</h2><div class="grid" id="agentList"></div></div>';
@@ -6790,8 +6939,12 @@ async function renderNodesOnce({ showLoading = true } = {}) {
       <div class="card">
         <div class="name">Add an Even Realities G2 node</div>
         <div class="desc">The glasses receive their own revocable node identity with voice-input and text-display capabilities only.</div>
-        <button class="ui-btn ui-btn-sm" id="g2NodeEnrollBtn" style="margin-top:10px;">Generate enrollment code</button>
+        <div class="row" style="margin-top:10px; gap:8px;">
+          <button class="ui-btn ui-btn-sm" id="g2NodeEnrollBtn">Generate pairing code</button>
+          <button class="ui-btn ui-btn-sm" id="g2DirectTokenBtn">Generate agent URL + token</button>
+        </div>
         <div class="desc" id="g2NodeEnrollOut" style="margin-top:8px;"></div>
+        <div class="desc" id="g2DirectTokenOut" style="margin-top:8px;"></div>
       </div>\`;
 
   main.innerHTML = \`
@@ -6856,6 +7009,36 @@ async function renderNodesOnce({ showLoading = true } = {}) {
         + (enrollment.transcriptionConfigured ? "" : \` <span class="warn">Set <code>OPENAI_API_KEY</code> before asking by voice.</span>\`);
     } catch (error) {
       if (out) out.textContent = error.message || "Could not create an enrollment code.";
+    }
+  });
+  document.getElementById("g2DirectTokenBtn")?.addEventListener("click", async () => {
+    const out = document.getElementById("g2DirectTokenOut");
+    const button = document.getElementById("g2DirectTokenBtn");
+    if (button) button.disabled = true;
+    try {
+      const response = await fetch("/nodes/g2/direct-token", {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "Even G2 agent" })
+      });
+      const credential = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(credential.error || \`HTTP \${response.status}\`);
+      if (out) out.innerHTML = \`Paste these into the <b>Agents</b> phone companion. The token is shown only now.<br>\`
+        + \`Agent URL: <code>\${escapeHtml(credential.agentUrl)}</code> <button class="ui-btn ui-btn-sm" id="g2CopyDirectUrl">Copy URL</button><br>\`
+        + \`Token: <code>\${escapeHtml(credential.token)}</code> <button class="ui-btn ui-btn-sm" id="g2CopyDirectToken">Copy token</button><br>\`
+        + \`<span class="warn">Store it now. OpenAGI keeps only its hash; if it is lost, remove this node and generate another.</span>\`;
+      document.getElementById("g2CopyDirectUrl")?.addEventListener("click", () => {
+        void navigator.clipboard.writeText(credential.agentUrl).then(() => showToast("Agent URL copied.", true));
+      });
+      document.getElementById("g2CopyDirectToken")?.addEventListener("click", () => {
+        void navigator.clipboard.writeText(credential.token).then(() => showToast("Agent token copied.", true));
+      });
+      showToast("G2 agent token created. It is shown only once.", true);
+    } catch (error) {
+      if (out) out.textContent = error.message || "Could not create an agent token.";
+    } finally {
+      if (button) button.disabled = false;
     }
   });
   main.querySelectorAll("[data-revoke-node]").forEach((button) => {
@@ -7174,6 +7357,15 @@ async function renderHealth() {
 }
 
 function pendingActionCardHtml(action) {
+  const coding = ['reply_to_coding_agent', 'start_coding_agent'].includes(action.toolName);
+  const details = coding
+    ? '<p>' + escapeHtml(action.args?.provider || '') + ' · ' + escapeHtml(action.args?.project || 'Coding session')
+      + '<br>Session: ' + escapeHtml(action.args?.sessionId || '')
+      + (action.toolName === 'start_coding_agent' ? '<br>Model: ' + escapeHtml(action.args?.model || 'Provider default') + ' · Effort: ' + escapeHtml(action.args?.effort || 'Provider default') + '<br>Codex: read-only. Claude: manual permissions. No automatic permission approvals.' : '')
+      + '</p><pre style="white-space:pre-wrap; overflow-wrap:anywhere;">'
+      + escapeHtml(action.args?.message || '') + '</pre><p class="muted">Provider usage may be charged. CLI usage is not capped by the OpenAGI chat budget. Later provider permission requests need a separate decision.</p>'
+    : '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px; white-space:pre-wrap; overflow-wrap:anywhere;">'
+      + escapeHtml(JSON.stringify(action.args, null, 2)) + '</pre></details>';
   return '<div class="card" style="padding:14px; margin-bottom:10px;" data-pending-id="' + escapeHtml(action.id) + '">'
     + '<div style="display:flex; gap:8px; align-items:center;">'
     + '<span style="font-size:18px;">🤖</span>'
@@ -7181,9 +7373,7 @@ function pendingActionCardHtml(action) {
     + '<span class="badge">' + escapeHtml(action.toolName) + '</span>'
     + '</div>'
     + (action.reason ? '<div class="muted" style="margin-top:6px; font-size:12px;">' + escapeHtml(action.reason) + '</div>' : '')
-    + '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px;">'
-    + escapeHtml(JSON.stringify(action.args, null, 2))
-    + '</pre></details>'
+    + details
     + '<div class="muted" style="margin-top:4px; font-size:11px;">queued ' + escapeHtml(new Date(action.createdAt).toLocaleString()) + '</div>'
     + '<div class="row" style="gap:8px; margin-top:10px;">'
     + '<button data-pending-action="approve">Approve & run</button>'
@@ -9313,6 +9503,10 @@ function refreshApprovalSurfaces() {
 }
 evt.addEventListener("pending-action", refreshApprovalSurfaces);
 evt.addEventListener("pending-action-resolved", refreshApprovalSurfaces);
+evt.addEventListener("coding-agents", () => {
+  // Do not redraw while someone is composing a reply.
+  if (state.tab === "coding-agents" && $("codingRefresh")) $("codingRefresh").textContent = "Refresh status";
+});
 
 // New skill candidate proposed by the pattern miner or session miner.
 // Refresh the Skills tab if the user is on it; otherwise show a browser
@@ -9462,7 +9656,7 @@ setInterval(() => {
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");
