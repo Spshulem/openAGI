@@ -136,7 +136,7 @@ export class G2ProactiveClient {
     this.uploading = true
     const segments = this.queue.splice(0, 10), texts = segments.map(s => s.text), generation = this.generation
     try {
-      await this.api.proactive({ op: 'capture', consentId: this.consent.id, batchId: crypto.randomUUID(), texts, segments: segments.map(({ text: _text, ...metadata }) => metadata) }, this.controller.signal)
+      await this.api.proactive({ op: 'capture', consentId: this.consent.id, batchId: crypto.randomUUID(), texts, segments: segments.map(s => ({ at: s.at, endAt: s.endAt, streamId: s.streamId, speaker: s.speaker })) }, this.controller.signal)
       if (generation === this.generation) {
         this.view.activity?.(`Saved ${texts.length} final transcript segment(s) to main; checking explicit commitments.`)
         this.view.saveStatus?.(`Saved on main at ${new Date().toLocaleTimeString()}`)

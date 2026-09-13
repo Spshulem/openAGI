@@ -52,7 +52,7 @@ export class OpenAGIGlassesRenderer {
   thinking(question?: string): void { this.show(`Ask agent\n\n${question ? tail(question, 300) : 'Transcribing your question…'}\n\nThinking…`, true) }
   review(text: string, page: number, pages: number, recovery?: 'speech' | 'delivery'): void {
     const title = recovery === 'delivery' ? 'Delivery uncertain · may repeat actions' : recovery === 'speech' ? 'Recovered · check missing words · not sent' : 'Review question · not sent'
-    this.show(`${title}\n\n${text}\n\n${page + 1}/${pages} · Swipe to read\nTap: ${recovery === 'delivery' ? 'send again' : 'send'} · Double-tap: discard`, true)
+    this.show(`${title}\n\n${text}\n\n${page + 1}/${pages} · Swipe to read\nTap: ${recovery === 'delivery' ? 'send again' : 'send'} · Double-tap: back (keeps draft)`, true)
   }
   confirmCancel(): void {
     this.show('Stop this request?\n\nCompleted actions cannot be undone.\n\nTap: stop request\nDouble-tap: keep waiting', true)

@@ -29,7 +29,55 @@ export class OpenAGIG2App {
     this.renderer.notice?.(label, plainAnswer(item.title))
     this.noticeTimer = setTimeout(() => { this.noticeTimer = null; if (['home', 'ambient'].includes(this.mode) && this.foregroundActive && !this.exited) this.showHome() }, 4500)
   }
-  private mode: Mode = 'unpaired'
+  private currentMode: Mode = 'unpaired'
+  private get mode(): Mode { return this.currentMode }
+  private set mode(value: Mode) {
+    this.currentMode = value
+    this.phone?.interaction?.(value === 'unpaired' || value === 'pairing' ? 'unavailable' : value === 'thinking' ? 'working' : value === 'listening' ? 'recording' : value === 'review' ? 'review' : 'idle')
+  }
+  async configureInterface(style: 'focused' | 'classic'): Promise<void> {
+    await this.store.update({ interfaceStyle: style }); this.phone.interfaceStyle?.(style)
+  }
+  private async checkExperience(): Promise<void> {
+    try { this.phone.readiness?.(await this.api.configureExperience?.(this.store) ?? null) }
+    catch (error) { this.phone.readiness?.(null, `Main readiness could not be checked: ${safeOpenAGIError(error)}`) }
+  }
+  async readHistory(continuation?: string, offset = 0, query = ''): Promise<void> {
+    this.phone.historyStatus?.('Loading from main…')
+    try { this.phone.mainHistory?.(await this.api.readHistory(continuation, offset, query), continuation) }
+    catch (error) { this.phone.historyStatus?.(`Could not load main history: ${safeOpenAGIError(error)} Local recent answers remain below.`) }
+  }
+  async continueHistory(continuation: string): Promise<void> {
+    if (this.requestController || this.microphoneOpening || this.store.snapshot().pendingRequest || this.store.snapshot().savedDraft || ['listening', 'review', 'pairing'].includes(this.mode)) {
+      this.phone.set('Keep your current question', 'Finish or clear the saved question before switching conversations.'); return
+    }
+    try {
+      const history = await this.api.readHistory(continuation)
+      const answer = history.messages?.filter(m => m.role === 'assistant').at(-1)?.text
+      await this.store.update({ continuation, conversationId: crypto.randomUUID() })
+      if (answer) { this.pages = paginateText(plainAnswer(answer), 260); this.phone.preview?.(plainAnswer(answer)); this.showAnswer(0) } else this.showHome()
+      this.phone.set('Conversation resumed', 'Your next question continues this exact chat on main.')
+    } catch (error) { this.phone.set('Could not resume conversation', safeOpenAGIError(error)) }
+  }
+  async resumeRequest(allowSubmit = true): Promise<void> {
+    if (this.requestController || this.exited || !this.foregroundActive || this.microphoneOpening) return
+    const pending = this.store.snapshot().pendingRequest
+    if (!pending) return
+    await this.stopAmbient(true)
+    await this.store.update({ conversationId: pending.conversationId, continuation: pending.continuation })
+    await this.runQuestion(pending.text ?? '', { resume: true, allowSubmit })
+  }
+  async dismissRequest(): Promise<void> {
+    if (this.requestController) return
+    await this.store.update({ pendingRequest: null }); this.phone.pendingQuestion?.(null); this.showHome()
+  }
+  async pauseLifelog(): Promise<void> {
+    if (this.requestController || this.microphoneOpening || this.mode === 'listening') return
+    await this.store.update({ lifelogPaused: true })
+    this.memoryRequest++; this.resumeAfterAsk = false; this.pausedLifelog = this.store.snapshot().lifelogEnabled
+    await this.stopAmbient(true); this.proactive.suspendMemory(); this.showPaused()
+    this.phone.set('Lifelog paused by you', 'Microphone off. Reopening will keep it paused until you choose Resume.')
+  }
   private audioBuffer: QuestionAudioBuffer | null = null
   private pages: string[] = []
   private page = 0
@@ -228,8 +276,7 @@ export class OpenAGIG2App {
   private async chooseInboxAction(): Promise<void> {
     const target = this.actionTarget, action = this.inboxActions()[this.actionIndex]; if (!target || !action) return
     if (action.op === 'pause') {
-      this.pausedLifelog = this.proactive.memoryActive
-      await this.configureAmbient(false, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
+      await this.pauseLifelog()
       if (!this.exited && this.foregroundActive && !this.ambientRunning) this.showPaused()
       return
     }
@@ -309,6 +356,7 @@ export class OpenAGIG2App {
     }
     if (this.proactive.memoryActive && this.ambientRunning) { this.showHome(); return }
     this.phone.memoryPending?.(true)
+    await this.store.update({ lifelogPaused: false })
     this.phone.memoryStatus?.(false, 'Starting lifelog… opening the microphone, then requesting retention consent.')
     try {
       const startedHere = !this.ambientRunning
@@ -368,6 +416,7 @@ export class OpenAGIG2App {
   async boot(): Promise<void> {
     document.addEventListener('visibilitychange', this.onVisibility)
     const stored = await this.store.load()
+    this.phone.interfaceStyle?.(stored.interfaceStyle)
     this.phone.listeningMode?.(stored.listeningMode)
     this.phone.idleTapAction?.(stored.idleTapAction)
     this.phone.lifelogTalkMode?.(stored.lifelogTalkMode)
@@ -385,7 +434,11 @@ export class OpenAGIG2App {
           this.startHeartbeat()
         }
         this.phone.ambient(stored.ambientEnabled, stored.wakePhrase, stored.answerQuestions)
-        if (stored.lifelogEnabled) { this.showHome(); await this.restoreLifelog() }
+        await this.checkExperience()
+        if (stored.pendingRequest) { this.showHome(); await this.resumeRequest(false); return }
+        if (stored.savedDraft) { this.showHome(); this.reviewDraft(stored.savedDraft, 'speech'); return }
+        if (stored.lifelogPaused) { this.pausedLifelog = stored.lifelogEnabled; this.showPaused() }
+        else if (stored.lifelogEnabled) { this.showHome(); await this.restoreLifelog() }
         else if (stored.ambientEnabled) {
           try { await this.startAmbient() }
           catch (error) { this.showHome(); this.phone.set('Always listening unavailable', safeOpenAGIError(error)) }
@@ -417,7 +470,8 @@ export class OpenAGIG2App {
       return
     }
     if (this.mode === 'paused') {
-      if (this.pausedLifelog) { this.mode = 'resume-consent'; this.renderer.paused?.(true, true) }
+      if (this.pausedLifelog && this.store.snapshot().lifelogPaused) void this.retryListening()
+      else if (this.pausedLifelog) { this.mode = 'resume-consent'; this.renderer.paused?.(true, true) }
       else void this.configureAmbient(true, this.store.snapshot().wakePhrase, this.store.snapshot().answerQuestions)
     }
     else if (this.mode === 'resume-consent') void this.configureMemory(true, true)
@@ -455,9 +509,14 @@ export class OpenAGIG2App {
     }
     else if (this.mode === 'recent') this.showRecent(this.recentIndex - direction)
   }
-  cancelRequest(): void { this.cancelConfirmation = false; this.requestController?.abort(); if (this.preparingDraft) this.stopLiveSpeech() }
+  cancelRequest(): void {
+    this.cancelConfirmation = false; this.requestController?.abort(); if (this.preparingDraft) this.stopLiveSpeech()
+    if (this.store.snapshot().pendingRequest) void this.api.cancelPending?.().then(() => this.phone.pendingQuestion?.(this.store.snapshot().pendingRequest ? 'Main already finished. Check the saved result.' : null))
+      .catch(error => { this.phone.pendingQuestion?.(`Cancel could not be confirmed: ${safeOpenAGIError(error)} Check the saved request.`) })
+  }
   async discardDraft(): Promise<void> {
     if (this.mode !== 'review') return
+    await this.store.update({ savedDraft: '' })
     this.voiceTarget = null; this.draft = ''; this.phone.draft?.(null); this.showHome(); await this.resumeListening()
   }
   async rerecordDraft(): Promise<void> { if (this.mode !== 'review') return; await this.discardDraft(); await this.startAsk() }
@@ -471,9 +530,10 @@ export class OpenAGIG2App {
     if (!clean) throw new Error('No speech was recognized. Nothing was sent; please retry.')
     if (clean.length > 4000) throw new Error('Question is too long. Nothing was sent; please record a shorter question.')
     this.draft = clean; this.draftRecovery = recovery; this.mode = 'review'; this.pages = paginateText(plainAnswer(clean), 220); this.page = 0
+    void this.store.update({ savedDraft: clean }).catch(error => this.phone.set('Draft is only on screen', `Could not save it for reopening: ${safeOpenAGIError(error)}`))
     if (this.store.snapshot().autoSend && !recovery) { this.phone.transcript?.(clean); return }
     this.phone.transcript?.(clean); this.phone.draft?.(clean, recovery)
-    this.phone.set('Review question · not sent', 'Tap to send. Double-tap to discard. Swipe to read the whole transcript, or re-record on the phone.')
+    this.phone.set('Review question · not sent', 'Tap to send. Double-tap goes back and keeps the draft. Swipe to read, or explicitly Discard on the phone.')
     this.showDraftPage()
   }
   private recoverQuestion(text: string, error: unknown, recovery: 'speech' | 'delivery'): void {
@@ -530,7 +590,7 @@ export class OpenAGIG2App {
       else this.renderActiveProgress?.()
       return
     }
-    if (this.mode === 'review') { await this.discardDraft(); return }
+    if (this.mode === 'review') { this.showHome(); this.phone.set('Draft kept', 'Tap Talk to return to your question. Discard on the phone to delete it.'); return }
     if (this.mode === 'resume-consent') { this.showPaused(); return }
     if (this.mode === 'paused') { this.showHome(); return }
     if (this.mode === 'inbox-confirm') { this.mode = 'inbox-action'; this.showInboxAction(); await this.resumeListening(); return }
@@ -560,7 +620,8 @@ export class OpenAGIG2App {
     this.proactive.stop(this.store.snapshot().lifelogEnabled)
     this.exited = true
     this.stopLiveSpeech()
-    this.cancelRequest()
+    // Closing the observer is not cancellation of main-owned accepted work.
+    this.requestController?.abort()
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     this.heartbeatTimer = null
     this.ambientRunning = false
@@ -604,6 +665,7 @@ export class OpenAGIG2App {
       await this.heartbeatWithoutLosingEnrollment(enrolled.node.name)
       this.startHeartbeat()
       this.showHome()
+      await this.checkExperience()
     }
     catch (error) {
       // Preserve pending credentials across failed attempts: a prior response
@@ -629,16 +691,18 @@ export class OpenAGIG2App {
     await this.store.clearCredential(); this.showUnpaired()
   }
   async newConversation(): Promise<void> {
+    if (this.store.snapshot().pendingRequest || this.store.snapshot().savedDraft) { this.phone.set('Keep your current question', 'Finish or clear your saved question before starting a new chat.'); return }
     if (this.mode === 'review') return
     if (this.mode === 'thinking' || this.mode === 'listening' || this.mode === 'pairing' || this.ambientProcessing) return
-    await this.store.update({ conversationId: crypto.randomUUID() }); this.pages = []; this.phone.preview?.(''); this.showHome(); this.phone.set('New conversation', 'Your next question starts a fresh agent chat.')
+    await this.store.update({ conversationId: crypto.randomUUID(), continuation: null }); this.pages = []; this.phone.preview?.(''); this.showHome(); this.phone.set('New conversation', 'Your next question starts a fresh agent chat.')
   }
   async selectAnswer(index: number): Promise<void> {
+    if (this.store.snapshot().pendingRequest || this.store.snapshot().savedDraft) return
     if (this.mode === 'review') return
     if (this.mode === 'thinking' || this.mode === 'listening' || this.mode === 'pairing' || this.ambientProcessing) return
     const entry = this.store.snapshot().history[index]
     if (!entry) return
-    await this.store.update({ conversationId: entry.conversationId })
+    await this.store.update({ conversationId: entry.conversationId, continuation: entry.continuation })
     this.pages = paginateText(plainAnswer(entry.reply), 260); this.phone.paired(true); this.showAnswer(0)
     this.phone.history?.(this.store.snapshot().history); this.phone.preview?.(entry.reply)
     this.phone.set('Conversation resumed', `${entry.question} — Tap the glasses to ask a follow-up, or use Ask on the phone.`)
@@ -666,6 +730,7 @@ export class OpenAGIG2App {
     this.heartbeatTimer = null
     this.showHome()
     this.phone.set('Agent connected', `G2 will use ${normalizedOrigin}. The token stays in this app's local storage.`)
+    await this.checkExperience()
   }
   async configureAmbient(enabled: boolean, wakePhrase: string, answerQuestions: boolean): Promise<void> {
     const next = this.ambientConfiguration.then(() => this.applyAmbientConfiguration(enabled, wakePhrase, answerQuestions))
@@ -688,6 +753,7 @@ export class OpenAGIG2App {
     if (!visible()) return
     this.foregroundActive = true; this.proactive.setForeground(true)
     this.cancelSpeechRecovery()
+    await this.store.update({ lifelogPaused: false })
     const state = this.store.snapshot()
     if (state.lifelogEnabled) {
       if (this.ambientRunning && this.proactive.memoryActive) { this.showHome(); return }
@@ -735,6 +801,8 @@ export class OpenAGIG2App {
     }
   }
   async startAsk(fromHold = false): Promise<void> {
+    if (this.store.snapshot().pendingRequest) { this.phone.pendingQuestion?.('Check your saved question before asking another. Reconnecting will not submit it twice.'); return }
+    if (this.mode !== 'review' && this.store.snapshot().savedDraft) { this.reviewDraft(this.store.snapshot().savedDraft, 'speech'); return }
     if (document.visibilityState === 'hidden') { this.phone.activity?.('Unlock the phone to ask; background mode only retains lifelog.'); return }
     if (this.recoveringSpeech) return
     if (this.heldQuestion && !fromHold) return
@@ -846,8 +914,11 @@ export class OpenAGIG2App {
     } catch (error) { this.phone.autoSend?.(this.store.snapshot().autoSend); this.phone.set('Could not save preference', safeOpenAGIError(error)) }
     finally { this.navigationBusy = false }
   }
-  private async runQuestion(input: Blob | string): Promise<void> {
+  private async runQuestion(input: Blob | string, recovery?: { resume: boolean; allowSubmit: boolean }): Promise<void> {
     if (this.requestController) return
+    try { await this.store.update({ savedDraft: '' }) }
+    catch (error) { this.phone.set('Question not sent', `Could not save delivery state: ${safeOpenAGIError(error)}`); return }
+    if (this.requestController || this.exited) return
     const target = this.voiceTarget; this.voiceTarget = null
     if (target && typeof input === 'string') {
       if (/^(?:(?:please )?mark )?(?:this (?:one|task)|it)(?:['’]s| is)? (?:as )?(?:done|complete|completed)[.!]?$/i.test(input.trim())) {
@@ -907,10 +978,12 @@ export class OpenAGIG2App {
           renderProgress()
         }
       }
-      const result = typeof input === 'string'
+      const result = recovery?.resume ? await this.api.resumePending(onProgress, controller.signal, recovery.allowSubmit) : typeof input === 'string'
         ? await this.api.askText(input, conversationId, onProgress, controller.signal)
         : await this.api.ask(input, conversationId, onProgress, controller.signal)
       received = result
+      await this.store.update({ savedDraft: '' })
+      this.phone.pendingQuestion?.(null); this.phone.draft?.(null)
       await this.store.remember(result.question, result.reply)
       this.phone.history?.(this.store.snapshot().history); this.phone.preview?.(plainAnswer(result.reply))
       this.pages = paginateText(plainAnswer(result.reply), 260); this.showAnswer(Math.min(this.page, this.pages.length - 1))
@@ -931,7 +1004,11 @@ export class OpenAGIG2App {
       } else if (controller.signal.aborted) {
         this.mode = 'message'; this.renderer.message('Request stopped', 'No automatic retry. Completed actions cannot be undone. Your recent answers are still saved.')
       } else this.fail(error)
-      if (!received) {
+      if (!received && this.store.snapshot().pendingRequest) {
+        this.phone.pendingQuestion?.(`${safeOpenAGIError(error)} Your question is saved. Check the same request, or review History before clearing it.`)
+        this.mode = 'message'; this.renderer.message('Question saved', 'Connection interrupted. Check saved request on phone; it will not send twice.')
+        this.phone.set('Question saved · needs attention', safeOpenAGIError(error))
+      } else if (!received) {
         if (!partial && !controller.signal.aborted && !this.exited && typeof input === 'string') this.recoverQuestion(input, error, 'delivery')
         else this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
       }
@@ -959,6 +1036,7 @@ export class OpenAGIG2App {
   private fail(error: unknown): void { this.voiceTarget = null; this.clearNotice(); this.mode = 'message'; const message = safeOpenAGIError(error); this.renderer.message('Could not ask agent', message); this.phone.set('Ask failed', message) }
   private async startAmbient(): Promise<void> {
     if (this.exited) return
+    if (this.store.snapshot().lifelogPaused) { this.showPaused(); return }
     if (!this.foregroundActive || document.visibilityState === 'hidden') {
       this.pausedLifelog = this.store.snapshot().lifelogEnabled; this.showPaused()
       this.phone.set('Listening paused', 'Microphone was not started: open Agents on the glasses and the Even app on your phone, then retry.')
@@ -1008,6 +1086,7 @@ export class OpenAGIG2App {
     if (this.audio.active) await this.audio.stop().catch(() => undefined)
   }
   private async resumeListening(): Promise<void> {
+    if (this.store.snapshot().lifelogPaused) return
     if (this.mode === 'review') return // Keep recovery text visible until Send or Discard.
     if (!this.resumeAfterAsk || this.exited || !this.foregroundActive || !this.store.snapshot().ambientEnabled) return
     this.resumeAfterAsk = false
@@ -1219,6 +1298,7 @@ export class OpenAGIG2App {
     try {
       await this.foregroundTransition
       const state = this.store.snapshot()
+      if (state.lifelogPaused) { this.pausedLifelog = state.lifelogEnabled; this.showPaused(); return }
       if (!state.lifelogEnabled || !state.nodeToken || !this.foregroundActive || this.exited || request !== this.memoryRequest) return
       if (this.requestController || this.microphoneOpening || ['listening', 'review'].includes(this.mode)) return
       this.proactive.start()

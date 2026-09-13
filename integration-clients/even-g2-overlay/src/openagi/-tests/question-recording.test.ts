@@ -51,10 +51,10 @@ it('auto-send uploads buffered audio once without a separate transcription reque
 
 it('defaults older pairings to auto-send and persists explicit confirmation preference', async () => {
   let saved: string | null = null
-  const storage = { get: async () => saved, set: async (_key: string, value: string) => { saved = value }, remove: async () => {} }
+  const storage = { get: () => Promise.resolve(saved), set: (_key: string, value: string) => { saved = value; return Promise.resolve() }, remove: () => Promise.resolve() }
   const store = new OpenAGIStore(storage)
   await store.update({ nodeToken: 'test-scoped-token-1234' })
-  const legacy = JSON.parse(saved!); delete legacy.autoSend; saved = JSON.stringify(legacy)
+  const legacy = JSON.parse(saved!) as Record<string, unknown>; delete legacy.autoSend; saved = JSON.stringify(legacy)
   const reopened = new OpenAGIStore(storage)
   expect((await reopened.load()).autoSend).toBe(true)
   await reopened.update({ autoSend: false })
@@ -239,6 +239,7 @@ it('streams tool history without stealing answer pages and confirms cancellation
   try {
     await app.startAsk(); receive(new Uint8Array(32000)); await app.finishAsk()
     const request = app.sendDraft()
+    await vi.advanceTimersByTimeAsync(0) // Persist delivery state before sending.
     progress({ type: 'progress', stage: 'tool', tool: 'computer_list_apps' })
     progress({ type: 'progress', stage: 'model' })
     expect(renderer.progress).toHaveBeenLastCalledWith('Thinking', expect.any(String), '', expect.stringContaining('Tool: computer_list_apps'))

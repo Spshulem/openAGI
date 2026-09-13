@@ -1,0 +1,17 @@
+// Owner-gated by hosted-interface. Cards contain a single-use code, no bearer.
+export const g2ConnectPage = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect glasses · OpenAGI</title>
+<style>body{font:17px system-ui;line-height:1.6;max-width:640px;margin:64px auto;padding:24px;color:#1b2329;background:#f7f8fa}h1{letter-spacing:-.04em}button{min-height:44px;padding:12px 20px;border:0;border-radius:12px;background:#172c37;color:white;font:inherit;cursor:pointer}textarea{box-sizing:border-box;width:100%;min-height:130px;border:1px solid #bdc7ce;border-radius:12px;padding:16px}section{margin:32px 0}</style>
+<a href="/">‹ OpenAGI</a><h1>Connect your glasses.</h1><p>Your computer is home. G2 is a companion, with its own revocable connection.</p>
+<ol><li>Run OpenAGI on the computer you want as main. Finish <a href="/setup">computer setup</a>.</li><li>Configure its exact HTTPS public URL. For private remote use, keep your phone and main on the same Tailscale network and use HTTPS Serve.</li><li>Open Agents in Even. Choose Connect, then paste the connection card below.</li></ol>
+<section><button id="generate">Create connection card</button> <button id="copy" hidden>Copy card</button><p id="status" role="status">Creates a code valid for 30 minutes and one pairing. Do not share it publicly.</p><textarea id="card" readonly aria-label="Connection card" hidden></textarea></section>
+<section><h2>Ready when you are.</h2><p>Choose live speech for words as you speak, or buffered speech for transcription after Stop. Your model and keys stay on main.</p><p>First try a read-only question. Lifelog is optional and needs participant consent. Computer actions need separate approval; readable coding sessions are not automatically controllable.</p><p><a href="/g2/proactive">Notifications</a> · <a href="/g2/lifelog">Lifelog privacy</a> · <a href="/setup">Models and budget</a></p></section>
+<script>
+const statusText=document.querySelector('#status'), card=document.querySelector('#card'), generate=document.querySelector('#generate'), copy=document.querySelector('#copy');
+generate.onclick=async()=>{generate.disabled=true;card.hidden=true;copy.hidden=true;card.value='';try{
+ const r=await fetch('/nodes/enrollment-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({platform:'even_g2'})}); const data=await r.json();
+ if(!r.ok)throw new Error(data.error||'Could not create code');
+ const url=new URL(data.publicUrl);if(url.protocol!=='https:'||url.username||url.password||url.pathname!=='/'||url.search||url.hash)throw new Error('Set OPENAGI_PUBLIC_URL to an exact HTTPS origin in main setup, then try again.');
+ card.value=JSON.stringify({format:'openagi-g2',version:1,origin:url.origin,code:data.code,expiresAt:data.expiresAt});card.hidden=false;copy.hidden=false;statusText.textContent='Paste into Agents on your phone. Expires '+new Date(data.expiresAt).toLocaleTimeString()+'.';
+}catch(e){statusText.textContent=e.message==='Invalid URL'?'Set your main HTTPS public URL in setup first.':e.message;}finally{generate.disabled=false;}};
+copy.onclick=async()=>{try{await navigator.clipboard.writeText(card.value);statusText.textContent='Copied. Paste the card into Agents.';}catch{card.focus();card.select();statusText.textContent='Select and copy the card manually.';}};
+</script></html>`;

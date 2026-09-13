@@ -1,6 +1,8 @@
 import type { OpenAGIConfig } from './config'
 import { OpenAGIApiError } from './config'
 import type { InboxItem, ProactiveSettings } from './proactive'
+import type { OpenAGIStore } from './store'
+import { G2ExperienceClient, type G2Capabilities, type G2History } from './experience-client'
 
 type Fetch = typeof fetch
 export interface OpenAGINode {
@@ -21,6 +23,21 @@ const CAPABILITIES = [
 ]
 
 export class OpenAGIApiClient {
+  private experienceClient: G2ExperienceClient | null = null
+  async configureExperience(store: OpenAGIStore): Promise<G2Capabilities | null> {
+    this.experienceClient = new G2ExperienceClient(store, (body, signal) => this.json('/nodes/g2/experience', {
+      method: 'POST', body: JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(12_000)]) : AbortSignal.timeout(6000),
+    }), () => this.validatedOrigin())
+    return this.experienceClient.probe()
+  }
+  resumePending(progress: (event: AskProgress) => void, signal: AbortSignal, allowSubmit = false): Promise<OpenAGIAskResult> {
+    if (!this.experienceClient) throw new OpenAGIApiError('recovery_unavailable', 503, 'Reconnect to main to check this saved question.')
+    return this.experienceClient.resume(progress, signal, allowSubmit)
+  }
+  async cancelPending(): Promise<void> { await this.experienceClient?.cancel() }
+  readHistory(continuation?: string, offset = 0, query = ''): Promise<G2History> {
+    return this.json('/nodes/g2/experience', { method: 'POST', body: JSON.stringify({ op: 'history', ...(continuation ? { continuation } : {}), offset, query }), signal: AbortSignal.timeout(10_000) })
+  }
   proactive(body: object, signal?: AbortSignal): Promise<G2LifelogPage & { items?: InboxItem[]; settings?: ProactiveSettings; consent?: { id: string; until: number }; quiet?: boolean; notify?: boolean }> {
     return this.json('/nodes/g2/proactive', { method: 'POST', body: JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) })
   }
@@ -62,6 +79,7 @@ export class OpenAGIApiClient {
     return this.json('/nodes/revoke', { method: 'POST', body: JSON.stringify({ nodeId: credential.nodeId }) })
   }
   async ask(wav: Blob, conversationId: string, progress?: (event: AskProgress) => void, signal?: AbortSignal): Promise<OpenAGIAskResult> {
+    if (this.experienceClient?.capabilities?.recovery) return this.experienceClient.submit({ audioBase64: await blobToBase64(wav), conversationId }, progress, signal)
     return this.json('/nodes/g2/ask', {
       method: 'POST',
       signal,
@@ -85,6 +103,7 @@ export class OpenAGIApiClient {
     return origin
   }
   askText(text: string, conversationId: string, progress: (event: AskProgress) => void, signal: AbortSignal): Promise<OpenAGIAskResult> {
+    if (this.experienceClient?.capabilities?.recovery) return this.experienceClient.submit({ text, conversationId }, progress, signal)
     return this.json('/nodes/g2/ask', { method: 'POST', signal, body: JSON.stringify({ text, conversationId }) }, true, progress)
   }
   async listen(wav: Blob, conversationId: string, options: { wakePhrase: string; answerQuestions: boolean; forceAnswer?: boolean }, signal?: AbortSignal): Promise<OpenAGIListenResult> {
