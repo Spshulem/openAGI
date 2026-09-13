@@ -4,7 +4,7 @@
 
 - [x] T001 Preserve current working trees and reviewed source before redesign; record commits in `/Users/shooby/Dev/openagi-pr101-rollout/docs/scopes/g2-next/quickstart.md`.
 - [x] T002 Define scoped additive contracts, data model and rollback in `/Users/shooby/Dev/openagi-pr101-rollout/docs/scopes/g2-next/`.
-- [ ] T003 Establish a pinned reproducible OpenAGI client build in `/Users/shooby/Dev/openagi-pr101-rollout/integration-clients/even-g2-overlay/`.
+- [x] T003 Establish a pinned reproducible OpenAGI client build in `/Users/shooby/Dev/openagi-pr101-rollout/integration-clients/even-g2-overlay/`.
 
 ## US1 — Request recovery
 
@@ -28,8 +28,8 @@
 
 ## Verification and delivery
 
-- [ ] T015 Expand client/auth/fault tests; run focused backend files twice and G2 tests/typecheck/lint with isolated data.
-- [ ] T016 Review exact changes, secret-scan and commit; produce one 0.4.18 artifact on BuildBot3 and record checksum/inputs in `/Users/shooby/Dev/openagi-pr101-rollout/docs/verification/2026-09-12-g2-experience.md`.
+- [x] T015 Expand client/auth/fault tests; run focused backend files twice and G2 tests/typecheck/lint with isolated data.
+- [x] T016 Review exact changes, secret-scan and commit; produce one 0.4.18 artifact on BuildBot3 and record checksum/inputs in `/Users/shooby/Dev/openagi-pr101-rollout/docs/verification/2026-09-12-g2-experience.md`.
 - [ ] T017 Compare remote heads, normal fast-forward push and open the scoped PR; check external status once, with no merge/deploy/Hub submission.
 - [ ] T018 Physical acceptance: clean pairing, speech, follow-up, Classic switch, pause/reopen, network/Bluetooth recovery, native Exit and lock-screen capture. Requires user hardware; not an automated pass.
 

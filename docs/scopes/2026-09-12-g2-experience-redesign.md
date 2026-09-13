@@ -1,6 +1,6 @@
 # OpenAGI + G2: a simpler, dependable everyday experience
 
-Date: 2026-09-12. Status: proposed product and engineering scope, not implemented.
+Date: 2026-09-12. Status: full product and engineering scope. A bounded, reversible 0.4.18 candidate is implemented; see [candidate verification](../verification/2026-09-12-g2-experience.md) for delivered scope, exclusions and outstanding physical acceptance. The source audit below describes the pre-redesign baseline.
 
 ## Recommendation
 
