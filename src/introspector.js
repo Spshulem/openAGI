@@ -12,12 +12,13 @@ export class Introspector {
 
   audit() {
     const r = this.runtime;
+    const now = Date.now();
     const specialists = r.propagation?.list?.({ includeRetired: true }) ?? [];
     const active = specialists.filter((s) => s.status !== "retired");
     const retired = specialists.filter((s) => s.status === "retired");
     const dormant = active.filter((s) => {
       const last = s.lastActivatedAt ? new Date(s.lastActivatedAt).getTime() : 0;
-      return Date.now() - last > 14 * 86400 * 1000;
+      return now - last > 14 * 86400 * 1000;
     });
     const lowQuality = active.filter((s) => (s.outcomeSamples ?? 0) >= 5 && (s.meanOutcomeQuality ?? 1) < 0.4);
 
@@ -44,6 +45,7 @@ export class Introspector {
 
     const channels = r.channels?.status?.() ?? null;
     const mcp = (r.mcp?.listServers?.() ?? []).map((s) => ({ name: s.name, connected: s.connected, tools: (s.tools ?? []).length }));
+    const observations = observationFreshness(r.observations, now);
 
     const findings = [];
     if (memSaturation.short > 0.85) findings.push({ severity: "warn", area: "memory", note: "short tier > 85% — older items will start dropping." });
@@ -66,11 +68,16 @@ export class Introspector {
         note: `Only ${Math.round((outcomeAgg30.userSignalCoverage ?? 0) * 100)}% of recent outcomes have user feedback — quality scores are mostly inferred until rating/follow-up hooks are used.`
       });
     }
+    if (observations?.latestAgeMinutes != null && observations.latestAgeMinutes > 30) {
+      findings.push({ severity: "warn", area: "observations", note: `latest screen/activity observation is ${formatAge(observations.latestAgeMinutes)} old — capture may be paused, permission-blocked, or pointed at another daemon.` });
+    } else if (observations && observations.latestAt === null) {
+      findings.push({ severity: "info", area: "observations", note: "no screen/activity observations have been recorded yet." });
+    }
 
     // Stale today-bucket tasks. If a task has been in 'today' >3 days
     // pending, it almost certainly belongs in this_week or someday now.
     const tasks = r.tasks?.list?.({ queue: "user", bucket: "today", status: "pending", limit: 200 }) ?? [];
-    const staleCutoff = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const staleCutoff = now - 3 * 24 * 60 * 60 * 1000;
     const stale = tasks.filter((t) => Date.parse(t.createdAt ?? "") < staleCutoff);
     if (stale.length > 0) {
       findings.push({
@@ -80,7 +87,7 @@ export class Introspector {
       });
     }
     const overdue = (r.tasks?.list?.({ status: "pending", limit: 200 }) ?? [])
-      .filter((t) => t.dueDate && Date.parse(t.dueDate) < Date.now() - 24 * 60 * 60 * 1000);
+      .filter((t) => t.dueDate && Date.parse(t.dueDate) < now - 24 * 60 * 60 * 1000);
     if (overdue.length > 0) {
       findings.push({
         severity: "warn",
@@ -101,9 +108,39 @@ export class Introspector {
       cron: { total: cron.length, enabled: enabledCron.length, upcoming },
       budget,
       outcomes: { last7Days: outcomeAgg7, last30Days: outcomeAgg30 },
+      observations,
       channels,
       mcp,
       findings
     };
   }
+}
+
+function observationFreshness(observations, now) {
+  const db = observations?.db;
+  if (!db?.prepare) return null;
+  try {
+    const row = db.prepare(`
+      SELECT MAX(at) AS latestAt FROM (
+        SELECT MAX(at) AS at FROM activity
+        UNION ALL
+        SELECT MAX(captured_at) AS at FROM frames
+      )
+    `).get();
+    const latestAt = typeof row?.latestAt === "string" && row.latestAt ? row.latestAt : null;
+    const latestMs = Date.parse(latestAt ?? "");
+    return {
+      latestAt,
+      latestAgeMinutes: Number.isFinite(latestMs) ? Math.max(0, Math.round((now - latestMs) / 60000)) : null
+    };
+  } catch {
+    return null;
+  }
+}
+
+function formatAge(minutes) {
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
 }

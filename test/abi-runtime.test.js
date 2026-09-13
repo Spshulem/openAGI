@@ -895,6 +895,34 @@ test("introspector audit flags memory pressure and low outcome feedback coverage
   assert.ok(audit.findings.some((f) => f.area === "outcomes" && /2%/.test(f.note) && /user feedback/.test(f.note)));
 });
 
+test("introspector reports stale observation capture without exposing content", () => {
+  const runtime = createDefaultRuntime();
+  const oldNow = Date.now;
+  Date.now = () => Date.parse("2026-09-13T15:00:00.000Z");
+  runtime.observations = {
+    db: {
+      prepare: (sql) => {
+        assert.match(sql, /MAX\(at\)/);
+        return { get: () => ({ latestAt: "2026-09-13T12:00:00.000Z" }) };
+      }
+    }
+  };
+  try {
+    const audit = runtime.introspector.audit();
+    assert.deepEqual(audit.observations, {
+      latestAt: "2026-09-13T12:00:00.000Z",
+      latestAgeMinutes: 180
+    });
+    const finding = audit.findings.find((entry) => entry.area === "observations");
+    assert.ok(finding);
+    assert.equal(finding.severity, "warn");
+    assert.match(finding.note, /latest screen\/activity observation is 3h old/);
+    assert.doesNotMatch(JSON.stringify(audit), /window title|ocr text|private/i);
+  } finally {
+    Date.now = oldNow;
+  }
+});
+
 test("setup wizard saves env atomically and is detected as first-run before keys exist", async () => {
   const { saveEnv, isFirstRun } = await import("../src/setup-wizard.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-wizard-"));
