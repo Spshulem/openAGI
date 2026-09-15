@@ -18,6 +18,7 @@ import { registerIMessagePoller } from "./integrations/imessage-poller.js";
 import { registerBuildBetterTaskSource } from "./integrations/buildbetter-tasks.js";
 import { registerCalendarIntegration } from "./integrations/calendar.js";
 import { registerWebSearchTools } from "./integrations/web-search.js";
+import { VocaleoClient, registerVocaleoTools } from "./integrations/vocaleo.js";
 import { registerImessageSearchTool } from "./integrations/imessage-search-tool.js";
 import { createEmbedder } from "./embeddings.js";
 import { McpRegistry } from "./mcp-registry.js";
@@ -557,6 +558,8 @@ export class AbiRuntime {
     }
 
     if (options.integrations !== false) {
+      this.vocaleo = options.vocaleoClient ?? new VocaleoClient({ dataDir: options.dataDir });
+      registerVocaleoTools(this, this.vocaleo);
       registerRizeIntegration(this);
       // Calendar via secret ICS feed — env-gated on CALENDAR_ICS_URL.
       // Feeds reconciliation ("did the meeting happen?") + daily planner.
