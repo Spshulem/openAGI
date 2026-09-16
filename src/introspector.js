@@ -47,6 +47,7 @@ export class Introspector {
 
     const findings = [];
     if (memSaturation.short > 0.85) findings.push({ severity: "warn", area: "memory", note: "short tier > 85% — older items will start dropping." });
+    if (memSaturation.medium > 0.85) findings.push({ severity: "warn", area: "memory", note: "medium tier > 85% — fresh working memories are under eviction pressure." });
     if (memSaturation.long > 0.85) findings.push({ severity: "warn", area: "memory", note: "long tier > 85% — consider raising limit or curating principles." });
     if (memQuality?.active >= 50 && memQuality.recallCoverage < 0.2) {
       findings.push({ severity: "info", area: "memory", note: `Only ${Math.round(memQuality.recallCoverage * 100)}% of active memories have been recalled — improve retrieval or retire low-value rows.` });
@@ -58,6 +59,13 @@ export class Introspector {
     if (lowQuality.length > 0) findings.push({ severity: "warn", area: "specialists", note: `${lowQuality.length} specialist(s) under-performing (<0.4 mean quality).` });
     if (budget && budget.spentUsd / Math.max(budget.dailyUsdLimit, 0.0001) > 0.7) findings.push({ severity: "warn", area: "budget", note: `today's spend > 70% of daily cap.` });
     if (outcomeAgg7 && outcomeAgg7.avgQuality !== null && outcomeAgg7.avgQuality < 0.45) findings.push({ severity: "warn", area: "outcomes", note: `7-day avg outcome quality is ${outcomeAgg7.avgQuality}.` });
+    if (outcomeAgg30?.resolved >= 50 && (outcomeAgg30.userSignalCoverage ?? 0) < 0.05) {
+      findings.push({
+        severity: "info",
+        area: "outcomes",
+        note: `Only ${Math.round((outcomeAgg30.userSignalCoverage ?? 0) * 100)}% of recent outcomes have user feedback — quality scores are mostly inferred until rating/follow-up hooks are used.`
+      });
+    }
 
     // Stale today-bucket tasks. If a task has been in 'today' >3 days
     // pending, it almost certainly belongs in this_week or someday now.

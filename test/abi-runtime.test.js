@@ -877,6 +877,24 @@ test("introspector audit returns structural findings", () => {
   assert.ok(Array.isArray(audit.findings));
 });
 
+test("introspector audit flags memory pressure and low outcome feedback coverage", () => {
+  const runtime = createDefaultRuntime();
+  for (let i = 0; i < 86; i += 1) {
+    runtime.memory.remember({ content: `Audit pressure fixture ${i}` }, { tier: "medium" });
+  }
+  runtime.memory.limits.medium = 100;
+  runtime.outcomes = {
+    aggregate(days) {
+      return days === 30
+        ? { windowDays: 30, resolved: 100, avgQuality: 0.7, userSignalCoverage: 0.02 }
+        : { windowDays: 7, resolved: 20, avgQuality: 0.7, userSignalCoverage: 0.1 };
+    }
+  };
+  const audit = runtime.introspector.audit();
+  assert.ok(audit.findings.some((f) => f.area === "memory" && /medium tier/.test(f.note)));
+  assert.ok(audit.findings.some((f) => f.area === "outcomes" && /2%/.test(f.note) && /user feedback/.test(f.note)));
+});
+
 test("setup wizard saves env atomically and is detected as first-run before keys exist", async () => {
   const { saveEnv, isFirstRun } = await import("../src/setup-wizard.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-wizard-"));
