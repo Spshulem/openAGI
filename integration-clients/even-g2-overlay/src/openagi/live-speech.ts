@@ -51,6 +51,10 @@ export class LiveSpeech {
   snapshotText(): string { return `${this.full} ${this.interim}`.trim().slice(-4000) }
   private complete(): void {
     if (!this.finishResolve || !this.closeSent) return
+    if (this.interim.trim()) {
+      this.failure('Speech ended with unfinished words. Review the recovered text before sending.', 'incomplete_transcript')
+      return
+    }
     const resolve = this.finishResolve, text = this.full.trim()
     this.finishResolve = undefined; this.finishReject = undefined
     this.close(); resolve(text)

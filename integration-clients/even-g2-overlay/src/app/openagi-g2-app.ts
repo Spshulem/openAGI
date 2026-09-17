@@ -919,6 +919,7 @@ export class OpenAGIG2App {
     try { await this.store.update({ savedDraft: '' }) }
     catch (error) { this.phone.set('Question not sent', `Could not save delivery state: ${safeOpenAGIError(error)}`); return }
     if (this.requestController || this.exited) return
+    const originalInput = input
     const target = this.voiceTarget; this.voiceTarget = null
     if (target && typeof input === 'string') {
       if (/^(?:(?:please )?mark )?(?:this (?:one|task)|it)(?:['’]s| is)? (?:as )?(?:done|complete|completed)[.!]?$/i.test(input.trim())) {
@@ -1009,7 +1010,10 @@ export class OpenAGIG2App {
         this.mode = 'message'; this.renderer.message('Question saved', 'Connection interrupted. Check saved request on phone; it will not send twice.')
         this.phone.set('Question saved · needs attention', safeOpenAGIError(error))
       } else if (!received) {
-        if (!partial && !controller.signal.aborted && !this.exited && typeof input === 'string') this.recoverQuestion(input, error, 'delivery')
+        if (!partial && !controller.signal.aborted && !this.exited && typeof originalInput === 'string') {
+          this.voiceTarget = target
+          this.recoverQuestion(originalInput, error, 'delivery')
+        }
         else this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
       }
     } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false); await this.resumeListening() }

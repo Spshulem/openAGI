@@ -46,6 +46,27 @@ it('keeps a failed text send with a duplicate-action warning and never retries a
   } finally { await f.app.systemExit() }
 })
 
+it('recovers the original long inbox question and preserves its target on explicit retry', async () => {
+  const f = await fixture()
+  try {
+    const target = { id: 'task:original', title: 'Original item', summary: '', category: 'tasks', action: '', seen: false, important: true }
+    f.app.proactive.items = [target]; f.app.openInbox()
+    await f.app.configureAutoSend(true); await f.app.startAsk()
+    const question = 'q'.repeat(4000)
+    f.speech.finish.mockResolvedValueOnce(question)
+    f.api.askText.mockRejectedValueOnce(new Error('Failed to fetch'))
+    await f.app.finishAsk()
+    expect(f.phone.draft).toHaveBeenLastCalledWith(question, 'delivery')
+    f.app.proactive.items = [{ ...target, id: 'task:other', title: 'Other item' }]
+    await f.app.sendDraft()
+    expect(f.api.askText).toHaveBeenCalledTimes(2)
+    const first = f.api.askText.mock.calls[0]![0]
+    expect(first).toContain('task:original')
+    expect(first).toContain(question)
+    expect(f.api.askText.mock.calls[1]![0]).toBe(first)
+  } finally { await f.app.systemExit() }
+})
+
 it('keeps the completed answer when local history fails, without offering a resend', async () => {
   const f = await fixture()
   try {

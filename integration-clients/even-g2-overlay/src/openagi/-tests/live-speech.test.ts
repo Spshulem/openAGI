@@ -13,6 +13,22 @@ function fixture() {
 }
 afterEach(() => { vi.useRealTimers() })
 
+it.each(['Metadata', 'SpeechFinished', 'close'])('requires review for retained interim words on %s completion', async completion => {
+  const f = fixture()
+  if (completion === 'SpeechFinished') {
+    const opening = f.speech.open('scoped-token', 'nova-3', '', 'wss://main.example/speech')
+    f.emit({ type: 'Ready' }); await opening
+  } else await f.open()
+  f.result('Final prefix.', true, 0)
+  f.result('Unfinished tail', false, 1); f.result('', true, 1)
+  const finishing = expect(f.speech.finish()).rejects.toMatchObject({ code: 'incomplete_transcript' })
+  if (completion === 'close') f.socket.onclose?.({ code: 1000 })
+  else f.emit({ type: completion })
+  await finishing
+  expect(f.speech.snapshotText()).toBe('Final prefix. Unfinished tail')
+  expect(f.callbacks.error).toHaveBeenCalledOnce()
+})
+
 it('finishes on provider summary without waiting for the socket close handshake', async () => {
   const f = fixture(); await f.open()
   f.result('First sentence.', true, 0, true)
