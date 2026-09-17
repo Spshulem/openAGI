@@ -591,4 +591,10 @@ You can use, fork, run, and modify OpenAGI freely for personal, research, hobby,
 
 ---
 
+## Optional phone calls
+
+Connect your own Vocaleo account from **Integrations → Vocaleo** using your phone
+number and an SMS code, or an existing API key. OpenAGI can then make approved
+calls and retrieve their results. See [Vocaleo setup](docs/vocaleo.md) for details.
+
 [openagi.sh](https://openagi.sh) · [Issues](https://github.com/Spshulem/openAGI/issues) · [Docs](https://github.com/Spshulem/openAGI/tree/main/docs)

@@ -68,8 +68,10 @@ export class BuiltinCodingSupervisor {
 
   configure({ enabled, workspaces }) {
     if (this.children.size) throw new Error("Stop managed sessions before changing configuration.");
-    if (enabled === false && workspaces === undefined) workspaces = this.config.workspaces.map(w => w.path);
+    // Omission keeps the owner's saved selection; an explicit list replaces it.
+    if (workspaces === undefined) workspaces = this.config.workspaces.map(w => w.path);
     if (typeof enabled !== "boolean" || !Array.isArray(workspaces) || workspaces.length > 20) throw new Error("Choose up to 20 workspace folders.");
+    if (enabled && workspaces.length === 0) throw new Error("Choose at least one Git project folder before enabling.");
     const selected = workspaces.map(value => {
       if (typeof value !== "string" || !path.isAbsolute(value)) throw new Error("Workspace folders must be absolute paths.");
       const real = fs.realpathSync(value);

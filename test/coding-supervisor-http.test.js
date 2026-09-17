@@ -28,6 +28,8 @@ test("fresh owner setup → start approval → provider process → terminal sta
   assert.equal((await fetch(url + "/coding-agents/setup")).status, 401);
   assert.equal((await fetch(url + "/coding-agents/configure", { method: "POST", headers: { ...headers, Origin: "https://example.com" }, body: "{}" })).status, 403);
   assert.equal((await json("/coding-agents/setup")).body.enabled, false);
+  assert.equal((await json("/coding-agents/configure", { enabled: true, workspaces: [] })).status, 400);
+  assert.equal((await json("/coding-agents/setup")).body.enabled, false);
   const configured = await json("/coding-agents/configure", { enabled: true, workspaces: [project] });
   assert.equal(configured.status, 200);
   const workspaceId = configured.body.workspaces[0].id;
@@ -48,6 +50,12 @@ test("fresh owner setup → start approval → provider process → terminal sta
   assert.equal(runtime.tools.has("start_coding_agent"), false);
   assert.equal((await json("/coding-agents/start", { provider: "codex", workspaceId, message: "Must not run" })).status, 503);
   assert.equal(children.length, 1);
+  const enabledAgain = await json("/coding-agents/configure", { enabled: true });
+  assert.equal(enabledAgain.status, 200);
+  assert.equal(enabledAgain.body.workspaces[0].id, workspaceId);
+  assert.equal(JSON.stringify(enabledAgain.body).includes(fs.realpathSync(project)), false);
+  assert.equal(children.length, 1, "enabling does not start a provider");
+  assert.equal((await json("/coding-agents/configure", { enabled: false })).status, 200);
 });
 
 test("authenticated dashboard → exact-session inspection → approval → one delivery → receipt", async (t) => {

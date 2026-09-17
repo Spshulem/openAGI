@@ -91,26 +91,43 @@ async function renderCodingSetup(panel) {
   try {
     const setup = await fetchJson('/coding-agents/setup');
     if (!panel.isConnected) return;
-    if (setup.external) { panel.textContent = 'Using the optional external supervisor adapter. See the setup guide to switch to the built-in supervisor.'; return; }
+    const guide = document.createElement('a');
+    guide.href = 'https://github.com/Spshulem/openAGI/blob/main/docs/setup/coding-supervisor.md';
+    guide.target = '_blank'; guide.rel = 'noopener noreferrer'; guide.textContent = 'Open coding-agent setup guide';
+    panel.append(guide);
+    if (setup.external) { const note = document.createElement('p'); note.textContent = 'Using the optional external supervisor adapter. See the setup guide to switch to the built-in supervisor.'; panel.append(note); return; }
     const details = document.createElement('details'); details.open = !setup.enabled;
     const summary = document.createElement('summary'); summary.textContent = 'Setup and provider requirements'; details.append(summary);
     const requirements = document.createElement('p');
     requirements.textContent = (setup.providers || []).map(p => p.provider + ': ' + (p.installed ? 'CLI found; sign-in not yet verified' : 'install the official CLI first') + ' · ' + p.loginCommand).join(' — ');
     const limits = document.createElement('p'); limits.textContent = setup.limitation;
-    const label = document.createElement('label'); label.textContent = 'Git project folders (absolute paths, one per line; replaces the selected list)';
+    const saved = setup.workspaces || [];
+    const current = document.createElement('p');
+    current.textContent = saved.length ? 'Saved projects: ' + saved.map(w => w.label + ' (' + w.id.slice(0, 8) + ')').join(', ') : 'No projects selected yet.';
+    const location = document.createElement('p'); location.textContent = 'Install and sign in to a provider CLI on the computer running the supervisor, under the same operating-system account. For a remote coding node, use project paths on that node, not this browser’s computer. No G2 hardware or private supervisor is required.';
+    const label = document.createElement('label'); label.textContent = 'Git project folders (absolute paths, one per line; entering paths replaces the entire saved list; leave blank to keep saved projects)';
     const folders = document.createElement('textarea'); folders.rows = 3; folders.style.width = '100%'; label.append(folders);
-    const save = document.createElement('button'); save.textContent = 'Save folders and enable';
+    const save = document.createElement('button');
+    const updateSave = () => { save.textContent = folders.value.trim() ? 'Replace folders and enable' : saved.length ? 'Keep saved folders and enable' : 'Save folders and enable'; };
+    folders.oninput = updateSave; updateSave();
     const status = document.createElement('p'); status.setAttribute('role', 'status');
     save.onclick = async () => {
+      const paths = folders.value.split('\n').map(x => x.trim()).filter(Boolean);
+      if (!paths.length && !saved.length) { status.textContent = 'Choose at least one existing Git project folder first.'; return; }
       save.disabled = true;
-      try { await postJson('/coding-agents/configure', { enabled: true, workspaces: folders.value.split('\n').map(x => x.trim()).filter(Boolean) }); await renderCodingAgents(); }
+      try { await postJson('/coding-agents/configure', { enabled: true, ...(paths.length ? { workspaces: paths } : {}) }); await renderCodingAgents(); }
       catch { status.textContent = 'Could not save setup. Choose existing absolute Git project paths and stop managed runs first.'; save.disabled = false; }
     };
-    details.append(requirements, limits, label, save, status); panel.append(details);
+    details.append(location, requirements, limits, current, label, save, status); panel.append(details);
     if (!setup.enabled) return;
     const off = document.createElement('button'); off.textContent = 'Disable built-in supervisor';
     off.onclick = async () => { try { await postJson('/coding-agents/configure', { enabled: false }); await renderCodingAgents(); } catch { status.textContent = 'Stop managed runs before disabling.'; } };
     details.append(off);
+    if (!(setup.providers || []).some(p => p.installed) || !saved.length) {
+      const blocked = document.createElement('p'); blocked.setAttribute('role', 'status');
+      blocked.textContent = !saved.length ? 'Choose a Git project folder before starting an agent.' : 'No provider CLI found. Install Claude Code or Codex, sign in on the supervisor computer, then Refresh. No agent can start yet.';
+      panel.append(blocked); return;
+    }
     const form = document.createElement('section');
     const addSelect = (title, options) => {
       const label = document.createElement('label'); label.textContent = title + ' ';
@@ -119,7 +136,7 @@ async function renderCodingSetup(panel) {
       label.append(select); form.append(label); return select;
     };
     const provider = addSelect('Provider', (setup.providers || []).filter(p => p.installed).map(p => ({ value: p.provider, label: p.provider })));
-    const workspace = addSelect('Workspace', setup.workspaces.map(w => ({ value: w.id, label: w.label })));
+    const workspace = addSelect('Workspace', saved.map(w => ({ value: w.id, label: w.label + ' (' + w.id.slice(0, 8) + ')' })));
     const effort = addSelect('Reasoning effort', ['low', 'medium', 'high'].map(x => ({ value: x, label: x }))); effort.value = 'medium';
     const modelLabel = document.createElement('label'); modelLabel.textContent = 'Model (optional provider model ID)';
     const model = document.createElement('input'); model.maxLength = 100; modelLabel.append(model); form.append(modelLabel);

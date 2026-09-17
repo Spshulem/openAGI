@@ -41,6 +41,25 @@ test("fresh install requires explicit workspace setup and exposes no credentials
   assert.deepEqual(codingChildEnv({ HOME: "/fixture", OPENAI_API_KEY: "private", OPENAGI_AUTH_TOKEN: "private", ANTHROPIC_API_KEY: "private" }), { HOME: "/fixture" });
 });
 
+test("empty setup cannot enable and saved folders can be re-enabled without exposing paths", t => {
+  const f = fixture(t);
+  const saved = f.supervisor.setup().workspaces;
+  f.supervisor.configure({ enabled: false });
+  const before = fs.readFileSync(f.supervisor.configFile, "utf8");
+  assert.throws(() => f.supervisor.configure({ enabled: true, workspaces: [] }), /at least one/);
+  assert.equal(fs.readFileSync(f.supervisor.configFile, "utf8"), before);
+  const restarted = new BuiltinCodingSupervisor({ dataDir: f.dataDir, findExecutable: () => null });
+  const setup = restarted.configure({ enabled: true });
+  assert.deepEqual(setup.workspaces, saved);
+  assert.ok(setup.providers.every(p => !p.installed));
+  assert.equal(JSON.stringify(setup).includes(f.project), false);
+  assert.throws(() => restarted.prepare({ provider: "codex", workspaceId: saved[0].id, message: "Test" }), /Install and sign in/);
+  restarted.configure({ enabled: false, workspaces: [] });
+  assert.throws(() => restarted.configure({ enabled: true }), /at least one/);
+  assert.equal(restarted.setup().enabled, false);
+  assert.equal(f.launches.length, 0);
+});
+
 test("fixed provider arguments preserve permission gates and reject injection", () => {
   const codex = codingArguments("codex", { model: "test-model", effort: "high", nativeId });
   assert.equal(codex[codex.indexOf("--sandbox") + 1], "read-only");

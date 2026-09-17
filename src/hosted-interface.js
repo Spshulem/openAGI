@@ -9,6 +9,9 @@ import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
 import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
 import { codingSupervisorUi } from "./coding-supervisor-ui.js";
+import { VocaleoClient } from "./integrations/vocaleo.js";
+import { createVocaleoRoute } from "./vocaleo-routes.js";
+import { vocaleoUi } from "./vocaleo-ui.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
@@ -76,6 +79,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // process (a main + a node) would otherwise silently collide on the same
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
+  const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodeEnrollment = options.nodeEnrollment
     ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM] });
@@ -2102,6 +2106,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (pathname === "/coding-agents" || pathname.startsWith("/coding-agents/")) {
         const result = await codingSupervisorRoute(runtime, method, pathname, url, () => readJsonLimited(req, 24 * 1024));
+        return sendJson(res, result.status, result.body);
+      }
+      if (pathname.startsWith("/integrations/vocaleo/")) {
+        res.setHeader("Cache-Control", "no-store");
+        const result = await vocaleoRoute(method, pathname, () => readJsonLimited(req, 4 * 1024));
         return sendJson(res, result.status, result.body);
       }
       if (method === "GET" && pathname === "/outreach/feed") {
@@ -6575,6 +6584,7 @@ function openMcpComposer() {
 }
 
 ${codingSupervisorUi}
+${vocaleoUi}
 
 async function renderAgents() {
   const agents = await fetchJson("/agents");
@@ -7838,6 +7848,7 @@ async function renderIntegrations() {
   main.innerHTML = \`
     <div class="pane">
       <h2>Integrations</h2>
+      <section id="vocaleo-setup" aria-label="Vocaleo phone call setup"></section>
       <p class="muted">Every source, channel, and MCP in one place. Each row shows all the paths you can use — direct API, MCP, or file-drop. Click "+ Connect this MCP" to register one with one click, or set credentials in <a href="/setup">/setup</a> step 5 / <code>.openagi/.env</code>.</p>
 
       \${integrations.map((it) => \`
@@ -7872,6 +7883,7 @@ async function renderIntegrations() {
     </div>
   \`;
 
+  void renderVocaleoSetup(document.getElementById("vocaleo-setup"));
   document.querySelectorAll(".add-mcp-btn").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const catalogId = btn.dataset.catalogId;

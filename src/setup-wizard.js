@@ -16,6 +16,7 @@ const WIZARD_FIELDS = [
   "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT",
   "OPENAGI_AUTH_TOKEN",
   "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
+  "VOCALEO_API_KEY", "VOCALEO_ACCOUNT_ID", "VOCALEO_PHONE_NUMBER",
   "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_POLLING",
   "RIZE_API_KEY",
   "CALENDAR_ICS_URL",
@@ -367,6 +368,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
     <div class="step">
       <h2>6 / 8 · MCPs <span class="sub">optional, but easy to add later</span></h2>
       <h3>Connect tools the agent can use</h3>
+      <p><strong>Vocaleo phone calls · optional.</strong> After saving setup, open <a href="/?tab=integrations">Integrations → Vocaleo</a> to verify your phone number or connect your existing account. Each call uses your Vocaleo credit and asks for approval.</p>
       <p class="sub">MCP servers give the agent extra tools (read your Linear issues, search Stripe customers, query PostHog, etc). Check the ones you want and we'll register them when you save. OAuth handshakes will run once you visit the dashboard.</p>
       ${renderMcpCatalogStep()}
     </div>
