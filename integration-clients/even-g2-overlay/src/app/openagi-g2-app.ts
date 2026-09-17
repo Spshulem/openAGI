@@ -848,6 +848,7 @@ export class OpenAGIG2App {
   }
   private async runQuestion(input: Blob | string): Promise<void> {
     if (this.requestController) return
+    const originalInput = input
     const target = this.voiceTarget; this.voiceTarget = null
     if (target && typeof input === 'string') {
       if (/^(?:(?:please )?mark )?(?:this (?:one|task)|it)(?:['’]s| is)? (?:as )?(?:done|complete|completed)[.!]?$/i.test(input.trim())) {
@@ -932,7 +933,10 @@ export class OpenAGIG2App {
         this.mode = 'message'; this.renderer.message('Request stopped', 'No automatic retry. Completed actions cannot be undone. Your recent answers are still saved.')
       } else this.fail(error)
       if (!received) {
-        if (!partial && !controller.signal.aborted && !this.exited && typeof input === 'string') this.recoverQuestion(input, error, 'delivery')
+        if (!partial && !controller.signal.aborted && !this.exited && typeof originalInput === 'string') {
+          this.voiceTarget = target
+          this.recoverQuestion(originalInput, error, 'delivery')
+        }
         else this.phone.set(controller.signal.aborted ? 'Request interrupted' : 'Connection interrupted', `${safeOpenAGIError(error)} No automatic retry. Recent answers remain available.`)
       }
     } finally { clearInterval(timer); this.cancelConfirmation = false; this.renderActiveProgress = null; this.requestController = null; this.phone.requestActive?.(false); await this.resumeListening() }
