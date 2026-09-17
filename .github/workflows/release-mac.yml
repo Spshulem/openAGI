@@ -26,6 +26,42 @@ permissions:
   contents: write   # so we can upload release assets
 
 jobs:
+  build-g2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - run: npm install --global pnpm@10.24.0
+      - run: pnpm install --frozen-lockfile
+        working-directory: integration-clients/even-g2-overlay
+      - run: pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run package:agents && pnpm run check:bundle && pnpm run check:secrets
+        working-directory: integration-clients/even-g2-overlay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openagi-g2-${{ github.sha }}
+          path: integration-clients/even-g2-overlay/**/*.ehpk
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-g2:
+    needs: [build-g2, build-and-publish]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openagi-g2-${{ github.sha }}
+          path: g2
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: g2/**/*.ehpk
+          fail_on_unmatched_files: true
+
   build-and-publish:
     runs-on: macos-14   # Apple Silicon, Xcode preinstalled
     timeout-minutes: 45
