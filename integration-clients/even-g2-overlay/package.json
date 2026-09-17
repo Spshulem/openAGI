@@ -1,6 +1,6 @@
 {
-  "name": "@buildbetter/even-g2",
-  "version": "0.1.1",
+  "name": "@openagi/even-g2",
+  "version": "0.4.18",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.24.0",

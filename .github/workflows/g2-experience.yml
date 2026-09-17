@@ -1,0 +1,31 @@
+name: G2 experience
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'integration-clients/even-g2-overlay/**'
+      - '.github/workflows/g2-experience.yml'
+      - 'package*.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - run: npm install --global pnpm@10.24.0
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: pnpm install --frozen-lockfile
+        working-directory: integration-clients/even-g2-overlay
+      - run: pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run package:agents && pnpm run check:bundle && pnpm run check:secrets
+        working-directory: integration-clients/even-g2-overlay

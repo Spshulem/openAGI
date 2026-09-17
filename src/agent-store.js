@@ -72,8 +72,9 @@ export class InMemoryAgentStore {
     return this.getSession(sessionId);
   }
 
-  listSessions() {
+  listSessions({ prefix = "", limit = Infinity } = {}) {
     return [...this.sessions.values()]
+      .filter(session => session.id.startsWith(prefix))
       .map((session) => ({
         id: session.id,
         createdAt: session.createdAt,
@@ -81,7 +82,7 @@ export class InMemoryAgentStore {
         messageCount: session.messages?.length ?? 0,
         lastMessage: session.messages?.at(-1)?.content ?? ""
       }))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, limit);
   }
 }
 
@@ -218,10 +219,14 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
     return this.getSession(sessionId);
   }
 
-  listSessions() {
+  listSessions({ prefix = "", limit = Infinity } = {}) {
     const entries = [];
-    for (const entry of readDirSafe(this.sessionsDir)) {
-      if (!entry.endsWith(".json")) continue;
+    let candidates = readDirSafe(this.sessionsDir).filter(entry => entry.endsWith(".json") && (!prefix || entry.startsWith(safeFilename(prefix))));
+    // Bound active-session reads for scoped history, newest writes first. Do
+    // not let filesystem enumeration order hide recently updated conversations.
+    if (Number.isFinite(limit)) candidates = candidates.map(entry => ({ entry, modified: fs.statSync(path.join(this.sessionsDir, entry)).mtimeMs }))
+      .sort((a, b) => b.modified - a.modified).slice(0, limit).map(item => item.entry);
+    for (const entry of candidates) {
       const filePath = path.join(this.sessionsDir, entry);
       try { this.assertSessionSize(filePath); } catch (error) {
         if (error.code !== "SESSION_TOO_LARGE") throw error;
