@@ -38,15 +38,16 @@ test("a paired instance heartbeats immediately on listen instead of waiting for 
 
   try {
     // The main's roster now includes the main itself, so a bare count can't
-    // tell "the node checked in" apart from "only the main is listed" — poll
-    // for the row that is not this main, and identify it by nodeId.
+    // tell "the node checked in" apart from "only the main is listed". Also,
+    // enrollment creates an "unknown" row before the eager heartbeat arrives;
+    // wait for online rather than racing that intermediate registration row.
     let arrival = null;
     for (let attempt = 0; attempt < 20 && !arrival; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 25));
       const json = await (await fetch(`${mainBase}/nodes`, {
         headers: { authorization: `Bearer ${oneTimePairingCredential}` }
       })).json();
-      arrival = json.nodes.find((n) => !n.self) ?? null;
+      arrival = json.nodes.find((n) => !n.self && n.status === "online") ?? null;
     }
     assert.ok(arrival, "the node's heartbeat reached the main");
     assert.equal(arrival.role, "node");

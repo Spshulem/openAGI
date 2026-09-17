@@ -15,6 +15,10 @@
 .openagi/*
 !.openagi/mcp.json.example
 node_modules/
+integration-clients/even-g2-overlay/node_modules
+integration-clients/even-g2-overlay/dist/
+integration-clients/even-g2-overlay/out.ehpk
+integration-clients/even-g2-overlay/coverage/
 npm-debug.log*
 .DS_Store
 logs/

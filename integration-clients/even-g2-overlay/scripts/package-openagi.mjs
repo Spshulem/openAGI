@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
+const { version } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
 const rawOrigins = process.argv.slice(2).filter(argument => argument !== '--')
 const origins = [...new Set(rawOrigins.map(normalizeOrigin))]
 if (origins.length > 16) fail('Agents packages support at most 16 exact origins.')
@@ -20,7 +21,7 @@ const manifestDir = path.join(root, 'build', 'openagi-g2')
 fs.mkdirSync(manifestDir, { recursive: true })
 const manifestPath = path.join(manifestDir, 'app.json')
 fs.writeFileSync(manifestPath, JSON.stringify({
-  package_id: 'sh.agents.even.g2', edition: '202601', name: 'Agents', version: '0.4.17', min_app_version: '2.2.6', min_sdk_version: '0.0.15', entrypoint: 'index.html',
+  package_id: 'sh.agents.even.g2', edition: '202601', name: 'Agents', version, min_app_version: '2.2.6', min_sdk_version: '0.0.15', entrypoint: 'index.html',
   permissions: [
     { name: 'g2-microphone', desc: 'Listen after Ask or consented lifelog. Optional lock-screen listening continues live lifelog while Even remains running.' },
     { name: 'network', desc: 'Connect to your selected agent. Optional live speech streams through your main or directly to Deepgram.', whitelist: networkOrigins },
