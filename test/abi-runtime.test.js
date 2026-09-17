@@ -877,6 +877,52 @@ test("introspector audit returns structural findings", () => {
   assert.ok(Array.isArray(audit.findings));
 });
 
+test("introspector audit flags memory pressure and low outcome feedback coverage", () => {
+  const runtime = createDefaultRuntime();
+  for (let i = 0; i < 86; i += 1) {
+    runtime.memory.remember({ content: `Audit pressure fixture ${i}` }, { tier: "medium" });
+  }
+  runtime.memory.limits.medium = 100;
+  runtime.outcomes = {
+    aggregate(days) {
+      return days === 30
+        ? { windowDays: 30, resolved: 100, avgQuality: 0.7, userSignalCoverage: 0.02 }
+        : { windowDays: 7, resolved: 20, avgQuality: 0.7, userSignalCoverage: 0.1 };
+    }
+  };
+  const audit = runtime.introspector.audit();
+  assert.ok(audit.findings.some((f) => f.area === "memory" && /medium tier/.test(f.note)));
+  assert.ok(audit.findings.some((f) => f.area === "outcomes" && /2%/.test(f.note) && /user feedback/.test(f.note)));
+});
+
+test("introspector reports stale observation capture without exposing content", () => {
+  const runtime = createDefaultRuntime();
+  const oldNow = Date.now;
+  Date.now = () => Date.parse("2026-09-13T15:00:00.000Z");
+  runtime.observations = {
+    db: {
+      prepare: (sql) => {
+        assert.match(sql, /MAX\(at\)/);
+        return { get: () => ({ latestAt: "2026-09-13T12:00:00.000Z" }) };
+      }
+    }
+  };
+  try {
+    const audit = runtime.introspector.audit();
+    assert.deepEqual(audit.observations, {
+      latestAt: "2026-09-13T12:00:00.000Z",
+      latestAgeMinutes: 180
+    });
+    const finding = audit.findings.find((entry) => entry.area === "observations");
+    assert.ok(finding);
+    assert.equal(finding.severity, "warn");
+    assert.match(finding.note, /latest screen\/activity observation is 3h old/);
+    assert.doesNotMatch(JSON.stringify(audit), /window title|ocr text|private/i);
+  } finally {
+    Date.now = oldNow;
+  }
+});
+
 test("setup wizard saves env atomically and is detected as first-run before keys exist", async () => {
   const { saveEnv, isFirstRun } = await import("../src/setup-wizard.js");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-wizard-"));
