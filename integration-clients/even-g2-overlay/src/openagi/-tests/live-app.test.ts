@@ -60,10 +60,10 @@ it('recovers the original long inbox question and preserves its target on explic
     f.app.proactive.items = [{ ...target, id: 'task:other', title: 'Other item' }]
     await f.app.sendDraft()
     expect(f.api.askText).toHaveBeenCalledTimes(2)
-    const first = f.api.askText.mock.calls[0]![0]
+    const first = f.api.askText.mock.calls[0][0]
     expect(first).toContain('task:original')
     expect(first).toContain(question)
-    expect(f.api.askText.mock.calls[1]![0]).toBe(first)
+    expect(f.api.askText.mock.calls[1][0]).toBe(first)
   } finally { await f.app.systemExit() }
 })
 
