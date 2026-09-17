@@ -24,3 +24,17 @@ it('never shows a recording dot for paused or non-retained listening', () => {
   renderer.paused(true, true)
   expect(surface.show.mock.calls.at(-1)?.[0]).toContain('including from other participants')
 })
+
+it('describes native exit at home and keeps the Recent gesture on swipe', () => {
+  const surface = { show: vi.fn<(content: string, immediate?: boolean, recording?: boolean) => void>() }
+  const renderer = new OpenAGIGlassesRenderer(surface as never)
+  for (const count of [0, 80]) {
+    renderer.inboxCount(count); renderer.home()
+    const content = surface.show.mock.calls.at(-1)?.[0]
+    expect(content).toContain('Double-tap: exit')
+    expect(content).toContain('Recent')
+    expect(content).not.toContain('double-tap: Recent')
+  }
+  renderer.unpaired()
+  expect(surface.show.mock.calls.at(-1)?.[0]).toContain('Double-tap: exit')
+})

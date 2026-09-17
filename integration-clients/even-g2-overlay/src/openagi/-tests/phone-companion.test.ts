@@ -3,6 +3,18 @@ import { OpenAGIPhoneCompanion } from '../../ui/openagi-phone-companion'
 
 beforeEach(() => { document.body.innerHTML = '<div id="app"></div>'; document.head.innerHTML = '' })
 
+it('labels recovered drafts honestly and disables all review actions during a send', () => {
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn() }, [])
+  phone.draft('Saved question', 'delivery')
+  expect(document.querySelector('#draft-review h2')!.textContent).toContain('Delivery uncertain')
+  expect(document.querySelector('#send-draft')!.textContent).toContain('may repeat actions')
+  phone.requestActive(true)
+  for (const id of ['send-draft', 'discard-draft', 'rerecord-draft']) expect(document.querySelector<HTMLButtonElement>(`#${id}`)!.disabled).toBe(true)
+  phone.requestActive(false); phone.draft('Partial words', 'speech')
+  expect(document.querySelector('#draft-review h2')!.textContent).toContain('may be incomplete')
+  phone.draft('Normal text'); expect(document.querySelector('#draft-review h2')!.textContent).toBe('Review question · not sent')
+})
+
 it('routes Retry listening through lifelog-aware recovery rather than the ambient toggle', () => {
   const retryListening = vi.fn(), configureAmbient = vi.fn()
   new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient, retryListening }, [])

@@ -65,7 +65,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     previousPage: () => app.scrollUp(),
     nextPage: () => app.scrollDown(),
     recentAnswer: () => { void app.recentAnswer() },
-    exit: () => { void app.systemExit().then(() => bridge.shutDownPageContainer(1)).catch(error => phone.set('Exit failed', safeOpenAGIError(error))) },
+    exit: () => { void app.requestExit() },
     unlink: () => { void app.unlink() },
     connectAgent: (origin, token) => { void app.connectAgent(origin, token) },
     configureAmbient: (enabled, wakePhrase, answerQuestions) => { void app.configureAmbient(enabled, wakePhrase, answerQuestions) },

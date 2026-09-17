@@ -102,10 +102,10 @@ export class OpenAGIPhoneCompanion {
           <details class="ambient" data-page="listen"><summary>Talk, speech and activity settings</summary><h2>Talk controls</h2>
             <label>Talk while lifelog is on<select id="lifelog-talk-mode"><option value="tap">Tap to start / tap to stop</option><option value="hold">Hold to talk / release to finish</option></select></label>
             <p>Hold mode ignores quick taps for Talk. Wait for Listening before speaking; releasing during microphone setup cancels. Requires an Even app and firmware that deliver hold/release gestures. If holding does nothing, use tap mode or Ask on the phone.</p>
-            <label>Quick tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (ignored in hold mode)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down for explicit Talk / Mark moment controls. Swipe up for Inbox. Double-tap pauses. During a held question, double-tap cancels without sending.</p>
+            <label>Quick tap while lifelog is listening<select id="idle-tap"><option value="talk">Talk (ignored in hold mode)</option><option value="highlight">Mark moment</option></select></label><p>Swipe down for Talk / Mark moment / Pause listening controls. Swipe up for Inbox. Double-tap at the listening root opens the exit confirmation. During a held question, double-tap cancels without sending.</p>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
             <p>Turn off to review the transcript and confirm Send first. Passive listening resumes after a manual question; optional wake responses are controlled separately.</p>
-            <p>Hold mode stops without sending if no release arrives within 30 seconds. Lifelog remains foreground-only.</p>
+            <p>Hold mode stops without sending if no release arrives within 30 seconds. Manual questions require the app to stay in the foreground; experimental lock-screen continuation applies only to an already-active lifelog.</p>
             <h2>Speech recognition</h2><label for="speech-model">Speech model (not the agent's reasoning model)</label>
             <select id="speech-model"><option value="openai-buffered">OpenAI · buffered recording</option><option value="nova-3">Deepgram Nova 3 · live</option><option value="nova-2">Deepgram Nova 2 · live</option></select>
             <label for="speech-transport">Live speech connection</label>
@@ -126,7 +126,7 @@ export class OpenAGIPhoneCompanion {
           <button class="secondary" data-action="unlink">Disconnect agent</button>
           <button class="secondary" id="exit-agents">Exit Agents (keep pairing)</button>
         </section>
-        <footer>Foreground listening · double-tap glasses to pause</footer>
+        <footer>Double-tap at home: exit dialog · Swipe down while listening: pause controls</footer>
       </main>`
     this.status = required(root.querySelector('#status'))
     this.detail = required(root.querySelector('#detail'))
@@ -310,16 +310,20 @@ export class OpenAGIPhoneCompanion {
     const input = this.actionsSection.querySelector<HTMLInputElement>('#auto-send')
     if (input) input.checked = enabled
   }
-  draft(text: string | null): void {
+  draft(text: string | null, recovery?: 'speech' | 'delivery'): void {
     const panel = this.actionsSection.querySelector<HTMLElement>('#draft-review')
     if (panel) panel.hidden = text === null
+    const title = panel?.querySelector('h2')
+    if (title) title.textContent = recovery === 'delivery' ? 'Delivery uncertain · sending again may repeat actions' : recovery === 'speech' ? 'Recovered text · may be incomplete · not sent' : 'Review question · not sent'
+    const send = panel?.querySelector('#send-draft')
+    if (send) send.textContent = recovery === 'delivery' ? 'Send again (may repeat actions)' : 'Send question'
     const preview = this.actionsSection.querySelector('#draft-text')
     if (preview) preview.textContent = text ?? ''
   }
   requestActive(active: boolean): void {
     const cancel = this.actionsSection.querySelector<HTMLButtonElement>('#cancel-request')
     if (cancel) cancel.hidden = !active
-    for (const selector of ['[data-action="ask"]', '[data-action="newConversation"]', '[data-action="unlink"]', '#last-answer', '#ambient-retry']) {
+    for (const selector of ['[data-action="ask"]', '[data-action="newConversation"]', '[data-action="unlink"]', '#last-answer', '#ambient-retry', '#send-draft', '#rerecord-draft', '#discard-draft']) {
       const input = this.actionsSection.querySelector<HTMLButtonElement | HTMLInputElement>(selector)
       if (input) input.disabled = active
     }

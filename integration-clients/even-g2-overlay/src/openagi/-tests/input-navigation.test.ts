@@ -55,7 +55,7 @@ it('recovers the gesture controller after a missing release', async () => {
   } finally { input.stop(); vi.useRealTimers() }
 })
 
-it('double-tap navigates without closing the page or firing a pending single tap', async () => {
+it('delegates double-tap to app navigation without firing a pending single tap or exiting directly', async () => {
   vi.useFakeTimers()
   const { input, actions, shutDownPageContainer, emit } = setup()
   try {

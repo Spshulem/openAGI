@@ -6,6 +6,24 @@ import WebSocket, { WebSocketServer } from "ws";
 import { attachG2SpeechRelay } from "../src/integrations/g2-speech-relay.js";
 
 const TOKEN = "t".repeat(43);
+
+test("CloseStream summary completes immediately and exposes no provider metadata", { timeout: 3000 }, async t => {
+  const f = await fixture(t, socket => {
+    socket.on("message", (data, binary) => {
+      if (!binary && JSON.parse(data.toString()).type === "CloseStream") {
+        socket.send(result("Final question", true));
+        socket.send(JSON.stringify({ type: "Metadata", request_id: "private-provider-id", account: "private-account" }));
+        // Deliberately do not close: completion must not depend on socket teardown.
+      }
+    });
+  });
+  const client = connect(f.origin); t.after(() => client.ws.terminate()); await client.next();
+  const closed = once(client.ws, "close");
+  client.ws.send(JSON.stringify({ type: "CloseStream" }));
+  assert.equal((await client.next()).channel.alternatives[0].transcript, "Final question");
+  assert.deepEqual(await client.next(), { type: "SpeechFinished" });
+  assert.equal((await closed)[0], 1000);
+});
 const PROTOCOL = "openagi-g2-speech";
 
 async function fixture(t, onUpstream = () => {}) {

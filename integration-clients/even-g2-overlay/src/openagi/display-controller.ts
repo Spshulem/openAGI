@@ -3,6 +3,7 @@ import type { DisplaySurface } from '../even/display-controller'
 
 export interface AgentsDisplaySurface extends DisplaySurface {
   show(content: string, immediate?: boolean, recording?: boolean): void
+  requestExit(): Promise<boolean>
 }
 
 // Keep the original full-screen gesture owner. The indicator never captures input.
@@ -15,6 +16,11 @@ export class AgentsDisplayController implements AgentsDisplaySurface {
   private rendering = false
 
   constructor(private readonly bridge: EvenAppBridge, private readonly debounceMs = 160) {}
+
+  requestExit(): Promise<boolean> {
+    // Mode 1 asks Even to show its native exit confirmation, not an immediate exit.
+    return this.bridge.shutDownPageContainer(1)
+  }
 
   async initialize(content: string): Promise<void> {
     const result = await this.bridge.createStartUpPageContainer(new CreateStartUpPageContainer({
