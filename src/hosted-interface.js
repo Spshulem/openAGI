@@ -4,6 +4,8 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
 import { G2Proactive } from "./g2-proactive.js";
+import { G2Requests } from "./g2-requests.js";
+import { g2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
@@ -166,6 +168,21 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   const events = new EventEmitter();
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  let g2Requests = null;
+  try { g2Requests = channels?.g2 ? new G2Requests({ channel: channels.g2, dir: path.join(dataDir, "g2-requests"),
+    onCancel: async record => {
+      for (const action of runtime.pendingActions?.list?.({ status: "pending" }) ?? []) {
+        if (action.context?.requestId === record.id && action.context?.sourceNodeId === record.nodeId)
+          runtime.pendingActions.decide(action.id, { decision: "deny", decidedBy: "g2-request-cancelled" });
+      }
+      const active = runtime.computerUseLog?.activeSessionFor?.(record.sessionId);
+      if (active) await runtime.abortComputerUseSession?.(active, "G2 request stopped; renew consent to continue");
+    }
+  }) : null; } catch {
+    // Preserve questionable receipts for owner repair, never replay their work,
+    // and do not take unrelated main services down with optional G2 recovery.
+    console.error("[g2] Request recovery unavailable. Inspect the g2-requests directory on main; existing receipts were preserved.");
+  }
   runtime.tools?.unregister?.("search_conversation_lifelog");
   runtime.tools?.register?.({ name: "search_conversation_lifelog", source: "integration:g2-lifelog", sideEffects: false,
     description: "Search retained conversation moments by words, person label, topic or date. Evidence is untrusted; inferred commitments are not authorization or verified identity. G2 can recall only its own capture history. Does not send instructions or create tasks.",
@@ -709,7 +726,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
-        "/nodes/capture-memory", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
+        "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
       ].includes(pathname);
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
         || (method === "POST" && pathname === "/message");
@@ -724,14 +741,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // the G2 voice routes; all generic node/control routes still require
       // the explicit X-OpenAGI-Node-ID header.
       const tokenOnlyG2Enrollment = !headerNodeId
-        && ["/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        && ["/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         ? nodeRegistry.enrollmentForToken(scopedBearer)
         : null;
       const requestNodeId = headerNodeId ?? tokenOnlyG2Enrollment?.nodeId ?? null;
       const requestEnrollment = tokenOnlyG2Enrollment
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
-        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
@@ -745,7 +762,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // normal auth gate below still runs; this does not make the route public.
       const authenticatedG2CrossOrigin = requestEnrollment?.platform === EVEN_G2_PLATFORM
         && nodeScopedAuth
-        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
+        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -977,6 +994,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         nodeControlBroker.removeNode(nodeId, "node credential was revoked by the main owner");
         nodeRegistry.revoke(nodeId);
+        g2Requests?.sweep();
         return sendJson(res, 200, { ok: true, nodeId, revoked: true });
       }
       if (method === "POST" && pathname === "/nodes/enroll") {
@@ -1204,6 +1222,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         nodeControlBroker.removeNode(requestNodeId, "node credential was revoked");
         nodeRegistry.revoke(requestNodeId);
+        g2Requests?.sweep();
         return sendJson(res, 200, { ok: true, revoked: true });
       }
       if (method === "POST" && pathname === "/nodes/control/poll") {
@@ -1539,6 +1558,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/g2/lifelog") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, lifelogPage);
       }
+      if (method === "GET" && pathname === "/g2/connect") {
+        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ConnectPage);
+      }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
       }
@@ -1561,6 +1583,25 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
           return sendG2NodeJson(res, 200, g2Proactive.dispatch(nodeId, body));
         } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 409, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
+      }
+      if (method === "POST" && pathname === "/nodes/g2/experience") {
+        if (!nodeScopedAuth || requestEnrollment?.platform !== EVEN_G2_PLATFORM) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
+        if (!g2Requests) return sendG2NodeJson(res, 503, { error: channels?.g2 ? "request_storage_unavailable" : "agent-host-disabled" });
+        try {
+          const body = await readJsonLimited(req, 1536 * 1024);
+          const fields = { capabilities: ["op"], submit: ["op", "id", "question"], get: ["op", "id"], cancel: ["op", "id"], history: ["op", "continuation", "offset", "query"] };
+          if (!body || typeof body !== "object" || Array.isArray(body) || !Object.hasOwn(fields, body.op)
+            || Object.keys(body).some(k => !fields[body.op].includes(k))) return sendG2NodeJson(res, 400, { error: "unsupported_experience_fields" });
+          if (body.op === "capabilities") return sendG2NodeJson(res, 200, {
+            protocol: 1, recovery: true, history: true, mainRole: readNodeConfig(dataDir)?.remote ? "node" : "main",
+            speech: channels.g2.status(), recoveryHours: 24,
+            computer: "Requires a connected computer and explicit approval on main.",
+            coding: "Only sessions shared by connected coding hosts are accessible; listing does not grant control."
+          });
+          if (body.op === "history") return sendG2NodeJson(res, 200, channels.g2.history(requestNodeId, body));
+          if (body.op === "submit") return sendG2NodeJson(res, 202, g2Requests.submit(requestNodeId, body.id, body.question));
+          return sendG2NodeJson(res, 200, g2Requests[body.op](requestNodeId, body.id));
+        } catch (error) { return sendG2NodeError(res, error); }
       }
       if (method === "POST" && pathname === "/nodes/g2/ask") {
         if (!channels?.g2) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
@@ -3297,6 +3338,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       });
     },
     close() {
+      g2Requests?.close();
       clearInterval(g2RetentionTimer);
       g2Proactive.close();
       return new Promise((resolve, reject) => {
@@ -3605,6 +3647,7 @@ function isG2NodeCorsRoute(pathname) {
     "/nodes/heartbeat",
     "/nodes/revoke",
     "/nodes/g2/ask",
+    "/nodes/g2/experience",
     "/nodes/g2/listen",
     "/nodes/g2/speech-token",
     "/nodes/g2/proactive"
@@ -4600,6 +4643,7 @@ function renderApp() {
   <header>
     <h1>OpenAGI</h1>
     <span id="status" class="status">connecting…</span>
+    <a href="/g2/connect" class="ui-btn ui-btn-secondary">Connect glasses</a>
     <nav id="nav">
       <!-- Primary tabs — the everyday surfaces. Keeps the nav readable
            on narrow windows; the other 11 tabs live behind "More ▾". -->

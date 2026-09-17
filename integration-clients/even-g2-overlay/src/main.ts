@@ -40,6 +40,12 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
   const phone = new OpenAGIPhoneCompanion({
     pair: (code, origin) => { void app.pair(code, origin) },
     ask: () => { void app.startAsk() },
+    configureInterface: style => { void app.configureInterface(style) },
+    pauseLifelog: () => { void app.pauseLifelog() },
+    resumeRequest: () => { void app.resumeRequest() },
+    dismissRequest: () => { void app.dismissRequest() },
+    readHistory: (continuation, offset, query) => { void app.readHistory(continuation, offset, query) },
+    continueHistory: continuation => { void app.continueHistory(continuation) },
     configureBackgroundListening: enabled => { void app.configureBackgroundListening(enabled) },
     retryListening: () => { void app.retryListening() },
     configureSpeech: (model, transport) => { void app.configureSpeech(model, transport) },

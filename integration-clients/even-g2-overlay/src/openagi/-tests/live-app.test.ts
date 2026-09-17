@@ -60,10 +60,10 @@ it('recovers the original long inbox question and preserves its target on explic
     f.app.proactive.items = [{ ...target, id: 'task:other', title: 'Other item' }]
     await f.app.sendDraft()
     expect(f.api.askText).toHaveBeenCalledTimes(2)
-    const first = f.api.askText.mock.calls[0]![0]
+    const first = f.api.askText.mock.calls[0][0]
     expect(first).toContain('task:original')
     expect(first).toContain(question)
-    expect(f.api.askText.mock.calls[1]![0]).toBe(first)
+    expect(f.api.askText.mock.calls[1][0]).toBe(first)
   } finally { await f.app.systemExit() }
 })
 
@@ -286,24 +286,22 @@ it('opening a recent answer preserves active lifelog consent and microphone', as
   } finally { await f.app.systemExit() }
 })
 
-it('resumes paused lifelog on glasses only after explicit participant consent', async () => {
+it('keeps an explicit pause until Resume and reuses only main-validated consent', async () => {
   vi.useFakeTimers()
   const f = await fixture()
-  const proactive = vi.fn((b: { op: string; enabled?: boolean }) => Promise.resolve(b.op === 'consent' && b.enabled ? { consent: { id: 'retention', until: Date.now() + 60000 } } : { items: [] }))
+  const consent = { id: 'retention', until: Date.now() + 60000 }
+  const proactive = vi.fn((b: { op: string; enabled?: boolean }) => Promise.resolve((b.op === 'consent' && b.enabled) || b.op === 'settings' ? { consent } : { items: [] }))
   Object.assign(f.api, { proactive })
   try {
     await f.app.configureMemory(true, true)
     f.app.scrollDown(); f.app.tap(); await vi.advanceTimersByTimeAsync(500)
     expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
     expect(f.app.proactive.memoryActive).toBe(false)
+    expect(f.store.snapshot().lifelogPaused).toBe(true)
     f.audio.start.mockClear(); proactive.mockClear()
-    f.app.tap()
-    expect(f.renderer.paused).toHaveBeenLastCalledWith(true, true)
-    expect(f.audio.start).not.toHaveBeenCalled()
-    f.app.doubleTap(); await vi.advanceTimersByTimeAsync(500)
-    expect(f.renderer.paused).toHaveBeenLastCalledWith(true)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(500)
     expect(proactive.mock.calls.some(([b]) => b.op === 'consent' && b.enabled)).toBe(false)
-    f.app.tap(); await vi.advanceTimersByTimeAsync(500); f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(proactive.mock.calls.some(([b]) => b.op === 'settings')).toBe(true)
     expect(f.audio.start).toHaveBeenCalledOnce()
     expect(f.app.proactive.memoryActive).toBe(true)
     expect(f.renderer.passive).toHaveBeenLastCalledWith(true, false, 'open agi')
@@ -780,7 +778,7 @@ it('triggers once from finalized wake speech, keeps interim words live during ag
   f.callbacks().transcript('Peri what time', false, 50)
   expect(f.api.askText).not.toHaveBeenCalled()
   f.callbacks().utterance('Peri'); f.callbacks().utterance('What time is it?')
-  expect(f.api.askText).toHaveBeenCalledOnce()
+  await vi.waitFor(() => expect(f.api.askText).toHaveBeenCalledOnce())
   f.callbacks().transcript('More speech', false, 30); f.callbacks().utterance('Peri do another thing')
   expect(f.phone.transcript).toHaveBeenLastCalledWith('More speech')
   expect(f.api.askText).toHaveBeenCalledOnce()

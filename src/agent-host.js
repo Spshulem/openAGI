@@ -83,6 +83,7 @@ export class AgentHost {
       }
     }
 
+    options.signal?.throwIfAborted();
     const agent = this.store.getAgent(agentId);
     const sessionId = this.store.sessionKey({ channel, from, agentId, sessionId: input.sessionId });
 
@@ -245,6 +246,7 @@ export class AgentHost {
       }),
       context: {
         signal: options.signal,
+        ...(requestId ? { requestId } : {}),
         channel,
         ...(channel === "g2" ? { sourceNodeId: metadata.sourceNodeId } : {}),
         from,

@@ -210,6 +210,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
       <p>OpenAGI is an always-on local agent: chat, scheduled prompts, MCP tools, SMS/Telegram channels, automatic task tracking from your calls/issues/notes.<br>
       Everything runs on this machine. State stays in <code>${escapeHtml(envFilePath().replace(/\\/g, "/"))}</code>.</p>
       <p>This wizard takes ~3 minutes. You can change anything later by re-running <code>/setup</code> or via the <code>Integrations</code> tab.</p>
+      <p><strong>Using Even G2?</strong> Finish setup on your main computer, then open <a href="/g2/connect" target="_blank" rel="noopener">Connect glasses</a> for a single-use connection card and speech-readiness guidance. Your glasses never need your owner token.</p>
     </div>
 
     <div class="step">
