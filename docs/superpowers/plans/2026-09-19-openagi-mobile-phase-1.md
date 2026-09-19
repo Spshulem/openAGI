@@ -60,7 +60,7 @@
 - `.../sync/` — `RefreshCoordinator.kt` (`RefreshOutcome`), `RefreshWorker.kt` (15-minute periodic), `DrainWorker.kt` (one-shot, fired by a widget tap).
 - `.../ui/` — `PairingScreen.kt`, `TodayScreen.kt`, `SettingsScreen.kt`; `MainActivity.kt` at the package root.
 - `.../widget/` — `WidgetState.kt`, `TodayWidget.kt`, `TodayWidgetReceiver.kt`, `CompleteTaskAction.kt`.
-- `app/src/main/res/xml/` — `network_security_config.xml`, `today_widget_info.xml`.
+- `app/src/main/res/xml/today_widget_info.xml`, `app/src/main/res/values/strings.xml`.
 - `app/src/test/kotlin/sh/openagi/mobile/` — mirror of the iOS unit tests against the same fixtures.
 
 **Docs:**
@@ -1290,9 +1290,6 @@ targets:
     platform: iOS
     sources:
       - path: Sources
-    resources:
-      - path: ../fixtures
-        buildPhase: none
     info:
       path: Sources/Info.plist
       properties:
@@ -2459,22 +2456,36 @@ git commit -m "feat(ios): pair, store credentials in the keychain, and refresh"
 ## Task 10: The iOS widget
 
 **Files:**
+- Create: `mobile/ios/Sources/Store/WidgetState.swift` (in `Sources/`, not `Widget/`, so both the app and the widget extension compile it and the test target can reach it)
 - Create: `mobile/ios/Widget/TodayWidgetBundle.swift`, `mobile/ios/Widget/TodayTimelineProvider.swift`, `mobile/ios/Widget/TodayWidget.swift`, `mobile/ios/Widget/CompleteTaskIntent.swift`, `mobile/ios/Widget/WidgetViews.swift`, `mobile/ios/Widget/Info.plist`, `mobile/ios/Widget/OpenAGIWidget.entitlements`
 - Modify: `mobile/ios/project.yml` (widget extension target and its dependency on the app)
 - Create: `mobile/ios/Tests/WidgetEntryTests.swift`
 
 **Interfaces:**
-- Consumes: `SnapshotStore`, `OutboundQueue` (Task 8), `Credentials`, `RefreshCoordinator` (Task 9).
-- Produces: `struct TodayEntry: TimelineEntry` — `date: Date`, `state: WidgetState`; `enum WidgetState { case unpaired, empty(headline: String), tasks([TaskItem], counts: MobileSummary.Counts, ageMinutes: Int), stale(Int) }`.
+- Consumes: `Snapshot`, `SnapshotStore`, `OutboundQueue` (Task 8), `Credentials` (Task 9).
+- Produces:
+  - `enum WidgetState: Equatable { case unpaired; case empty(headline: String); case tasks([TaskItem], counts: MobileSummary.Counts, ageMinutes: Int); case stale(Int) }`
+  - `static func from(snapshot: Snapshot?, paired: Bool, now: Date = Date()) -> WidgetState` and `static let staleAfterMinutes = 60` on `WidgetState`
+  - `struct TodayEntry: TimelineEntry` — `date: Date`, `state: WidgetState`
 
 - [ ] **Step 1: Write the failing test**
 
-Create `mobile/ios/Tests/WidgetEntryTests.swift`, asserting the state machine
-that decides what the widget draws — this is the part worth testing, because it
-is where a stale widget silently lies:
+`WidgetState.from` is a pure function taking `paired: Bool` — deliberately not
+reading the Keychain itself, because a unit-test bundle cannot arrange Keychain
+state, and because this makes it the literal twin of Android's
+`WidgetState.from` in Task 15. The timeline provider is what supplies
+`paired: Credentials.load() != nil`.
 
-1. No credentials in the Keychain → `.unpaired`.
-2. Credentials but no snapshot → `.empty` with a "pull to refresh" headline.
+It must match Android's rules exactly: not paired → `.unpaired`; no snapshot →
+`.empty`; age > `staleAfterMinutes` (60) → `.stale(age)`; no visible tasks →
+`.empty` with the brief headline; otherwise `.tasks(visibleToday, visibleCounts, age)`.
+
+Create `mobile/ios/Tests/WidgetEntryTests.swift` with these five cases as real
+XCTest methods, following the shape of `SnapshotStoreTests` (a private helper
+that builds a `Snapshot` from titles and an age in minutes, and a fixed `now`):
+
+1. `paired: false` → `.unpaired`, whatever the snapshot holds.
+2. `paired: true`, `snapshot: nil` → `.empty` with a non-empty headline.
 3. Snapshot with two visible tasks, fetched 3 minutes ago → `.tasks` with both
    titles and `ageMinutes == 3`.
 4. Snapshot fetched 61 minutes ago → `.stale(61)` — past an hour the widget
@@ -2783,7 +2794,7 @@ Create `mobile/android/app/src/main/AndroidManifest.xml`:
         android:label="OpenAGI"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.DayNight"
-        android:networkSecurityConfig="@xml/network_security_config">
+        android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -2803,35 +2814,18 @@ Create `mobile/android/app/src/main/AndroidManifest.xml`:
 </manifest>
 ```
 
-Create `mobile/android/app/src/main/res/xml/network_security_config.xml`. Android
-blocks cleartext by default from API 28 on; this is the file that permits it for
-exactly the hosts `HostAllowlist` permits in Task 12, and nowhere else:
+Note the `android:usesCleartextTraffic="true"` attribute above, and the absence
+of a `network-security-config`. That is deliberate. Android blocks cleartext by
+default from API 28 on, and a `network-security-config` is the usual way to
+re-permit it per host — but that file cannot express `100.64.0.0/10` or the
+RFC1918 ranges, only literal domains. A config whose `base-config` denies
+cleartext would therefore block every Tailscale-IP and LAN-IP origin this app
+exists to reach, and it silently overrides `usesCleartextTraffic` on API 28+.
 
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-    <domain-config cleartextTrafficPermitted="true">
-        <!-- Tailscale MagicDNS names. The tailnet is the transport boundary. -->
-        <domain includeSubdomains="true">ts.net</domain>
-    </domain-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <!-- Literal private addresses, for LAN-only setups without MagicDNS.
-             Android cannot express a CIDR here, so the runtime allowlist in
-             HostAllowlist is the real check; this only unblocks the platform. -->
-        <domain includeSubdomains="false">localhost</domain>
-    </domain-config>
-</network-security-config>
-```
-
-Because a `network-security-config` cannot express `100.64.0.0/10` or RFC1918
-ranges, also set `android:usesCleartextTraffic="true"` on `<application>` and
-rely on `HostAllowlist` — which is unit-tested — as the enforcing check. Add the
-attribute now:
-
-```xml
-        android:usesCleartextTraffic="true"
-```
+So the platform gate is opened wide and the real check is `HostAllowlist` in
+Task 12: a pure, unit-tested function with an explicit table of the three host
+families that may be reached over `http`. One enforcing check that is tested
+beats two where the outer one cannot express the policy.
 
 - [ ] **Step 3: Write the failing test**
 
@@ -4080,7 +4074,6 @@ class RefreshCoordinator(
 package sh.openagi.mobile.sync
 
 import android.content.Context
-import androidx.glance.appwidget.updateAll
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -4092,7 +4085,6 @@ import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.transport.DaemonClient
-import sh.openagi.mobile.widget.TodayWidget
 import java.util.concurrent.TimeUnit
 
 class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -4103,14 +4095,14 @@ class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorke
             SnapshotStore(applicationContext.filesDir),
             OutboundQueue(applicationContext.filesDir),
         )
-        val outcome = coordinator.refresh()
-        TodayWidget().updateAll(applicationContext)
-        return when (outcome) {
-            // An offline phone is the normal case off the tailnet, not a failure
-            // worth exponential backoff on a 15-minute schedule.
-            is RefreshOutcome.Offline -> Result.success()
-            else -> Result.success()
-        }
+        coordinator.refresh()
+        // Task 15 adds the TodayWidget().updateAll(applicationContext) call here,
+        // once the widget and the Glance dependency exist. There is nothing to
+        // repaint until then, and a forward reference would not compile.
+        // An offline phone is the normal case off the tailnet, not a failure
+        // worth exponential backoff on a 15-minute schedule, so every outcome
+        // is success.
+        return Result.success()
     }
 
     companion object {
@@ -4144,8 +4136,9 @@ allowlist's message already tells the user exactly what to change.
 
 `TodayScreen` renders `SnapshotStore(filesDir).load()?.visibleToday` with a
 completion button per row that calls `applyOptimisticCompletion`, enqueues
-`PendingOp.completeTask(id)`, calls `TodayWidget().updateAll(context)`, and kicks
-`RefreshCoordinator.drainQueue()`. It shows the staleness line
+`PendingOp.completeTask(id)`, and kicks `RefreshCoordinator.drainQueue()`. (Task
+15 adds the widget repaint here too; the widget does not exist yet.) It shows
+the staleness line
 ("updated 14m ago" / "can't reach OpenAGI") from `Snapshot.ageInMinutes()`.
 
 `SettingsScreen` shows the paired server and node id, a Refresh button, and a
@@ -4178,9 +4171,12 @@ the widget owns rendering, and the widget never performs network I/O.
 
 **Files:**
 - Create: `mobile/android/app/src/main/kotlin/sh/openagi/mobile/widget/TodayWidget.kt`, `.../widget/TodayWidgetReceiver.kt`, `.../widget/WidgetState.kt`, `.../widget/CompleteTaskAction.kt`
-- Create: `mobile/android/app/src/main/res/xml/today_widget_info.xml`
+- Create: `mobile/android/app/src/main/kotlin/sh/openagi/mobile/sync/DrainWorker.kt`
+- Create: `mobile/android/app/src/main/res/xml/today_widget_info.xml`, `mobile/android/app/src/main/res/values/strings.xml`
 - Modify: `mobile/android/app/src/main/AndroidManifest.xml` (the receiver)
 - Modify: `mobile/android/app/build.gradle.kts` (Glance)
+- Modify: `mobile/android/app/src/main/kotlin/sh/openagi/mobile/sync/RefreshWorker.kt` (add the `TodayWidget().updateAll(applicationContext)` call Task 14 deliberately left out)
+- Modify: `mobile/android/app/src/main/kotlin/sh/openagi/mobile/ui/TodayScreen.kt` (repaint the widget after an optimistic completion)
 - Create: `mobile/android/app/src/test/kotlin/sh/openagi/mobile/widget/WidgetStateTest.kt`
 
 **Interfaces:**
