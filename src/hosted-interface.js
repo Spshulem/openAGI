@@ -60,7 +60,7 @@ import {
   G2ChannelError
 } from "./integrations/g2-channel.js";
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
-import { MOBILE_PLATFORM, isMobileRouteAllowed } from "./mobile-node.js";
+import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -981,20 +981,28 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: error.message });
         }
       }
+      const ENROLLABLE_PLATFORMS = new Set([EVEN_G2_PLATFORM, MOBILE_PLATFORM]);
+      const capabilitiesForPlatform = (platform) =>
+        platform === MOBILE_PLATFORM ? MOBILE_CAPABILITIES : EVEN_G2_CAPABILITIES;
+      const nodeNameForPlatform = (platform, value) =>
+        platform === MOBILE_PLATFORM ? boundedMobileNodeName(value) : boundedG2NodeName(value);
       if (method === "POST" && pathname === "/nodes/enrollment-code") {
         if (readNodeConfig(dataDir)?.remote) {
-          return sendJson(res, 409, { error: "Even G2 nodes must be enrolled on the main OpenAGI" });
+          return sendJson(res, 409, { error: "nodes must be enrolled on the main OpenAGI" });
         }
         const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
-        if (body.platform !== EVEN_G2_PLATFORM) {
-          return sendJson(res, 400, { error: `platform must be ${EVEN_G2_PLATFORM}` });
+        const platform = body.platform;
+        if (!ENROLLABLE_PLATFORMS.has(platform)) {
+          return sendJson(res, 400, { error: `platform must be one of ${[...ENROLLABLE_PLATFORMS].join(", ")}` });
         }
-        const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM);
-        console.log(`[openagi] Even G2 node enrollment code ${issued.code} (valid 30 min, single use)`);
+        const issued = nodeEnrollment.issue(platform);
+        console.log(`[openagi] ${platform} node enrollment code ${issued.code} (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
-          transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
+          ...(platform === EVEN_G2_PLATFORM
+            ? { transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true }
+            : {})
         });
       }
       if (method === "POST" && pathname === "/nodes/g2/direct-token") {
@@ -1048,12 +1056,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const code = typeof body.code === "string" ? body.code.trim() : "";
         const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
         const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken : "";
-        const name = boundedG2NodeName(body.name);
+        const platform = body.platform;
+        const name = nodeNameForPlatform(platform, body.name);
         if (!/^\d{6}$/.test(code)) {
           return sendG2NodeJson(res, 400, { error: "invalid_enrollment_code", message: "Enter the 6-digit code shown by OpenAGI." });
         }
-        if (body.platform !== EVEN_G2_PLATFORM) {
-          return sendG2NodeJson(res, 400, { error: "invalid_platform", message: "This enrollment code is for an Even G2 node." });
+        if (!ENROLLABLE_PLATFORMS.has(platform)) {
+          return sendG2NodeJson(res, 400, { error: "invalid_platform", message: "This enrollment code is for a different device." });
         }
         if (!/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
           return sendG2NodeJson(res, 400, { error: "invalid_node_id", message: "The G2 node identity is malformed." });
@@ -1063,17 +1072,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         if (nodeRegistry.isEnrolled(nodeId)) {
           const enrollment = nodeRegistry.enrollment(nodeId);
-          if (enrollment?.platform === EVEN_G2_PLATFORM && nodeRegistry.authenticate(nodeId, nodeToken)) {
+          if (enrollment?.platform === platform && nodeRegistry.authenticate(nodeId, nodeToken)) {
             return sendG2NodeJson(res, 200, {
-              node: { id: nodeId, name: enrollment.name ?? name, platform: EVEN_G2_PLATFORM, enrolledAt: enrollment.createdAt },
+              node: { id: nodeId, name: enrollment.name ?? name, platform, enrolledAt: enrollment.createdAt },
               nodeToken,
-              capabilities: EVEN_G2_CAPABILITIES,
+              capabilities: capabilitiesForPlatform(platform),
               recovered: true
             });
           }
           return sendG2NodeJson(res, 409, { error: "node_already_enrolled", message: "Remove this G2 node in OpenAGI before pairing it again." });
         }
-        const consumed = nodeEnrollment.consume(code, EVEN_G2_PLATFORM);
+        const consumed = nodeEnrollment.consume(code, platform);
         if (!consumed.ok) {
           const locked = consumed.reason === "locked";
           return sendG2NodeJson(res, locked ? 429 : 401, {
@@ -1084,20 +1093,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           });
         }
         nodeRegistry.enroll(nodeId, nodeToken, {
-          platform: EVEN_G2_PLATFORM,
+          platform,
           name,
-          capabilities: EVEN_G2_CAPABILITIES
+          capabilities: capabilitiesForPlatform(platform)
         });
         const enrollment = nodeRegistry.enrollment(nodeId);
         return sendG2NodeJson(res, 200, {
           node: {
             id: nodeId,
             name,
-            platform: EVEN_G2_PLATFORM,
+            platform,
             enrolledAt: enrollment.createdAt
           },
           nodeToken,
-          capabilities: EVEN_G2_CAPABILITIES
+          capabilities: capabilitiesForPlatform(platform)
         });
       }
       if (method === "POST" && pathname === "/nodes/heartbeat") {
