@@ -60,7 +60,7 @@ import {
   G2ChannelError
 } from "./integrations/g2-channel.js";
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
-import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, isMobileRouteAllowed, boundedMobileNodeName } from "./mobile-node.js";
+import { MOBILE_PLATFORM, isMobileRouteAllowed } from "./mobile-node.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
