@@ -26,7 +26,20 @@ final class DragHandleView: NSView {
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
   override var mouseDownCanMoveWindow: Bool { true }
 
-  func performClick() { onClick?() }
+  func performClick() {
+    guard let onClick else { return }
+    window?.makeKey()
+    onClick()
+  }
+
+  override func isAccessibilityElement() -> Bool { onClick != nil }
+  override func accessibilityRole() -> NSAccessibility.Role? { .button }
+  override func accessibilityLabel() -> String? { "Quick Ask" }
+  override func accessibilityPerformPress() -> Bool {
+    guard onClick != nil else { return false }
+    performClick()
+    return true
+  }
 
   override func resetCursorRects() {
     addCursorRect(bounds, cursor: .openHand)

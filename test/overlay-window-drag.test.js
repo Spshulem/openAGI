@@ -12,7 +12,7 @@ test("Mac Quick Ask exposes draggable pill and header surfaces", () => {
   assert.match(overlay, /private var pill:[\s\S]{0,1200}WindowDragHandle\(onClick:/);
   assert.match(overlay, /Text\("Ask OpenAGI"\)[\s\S]{0,250}WindowDragHandle\(\)/);
   assert.match(dragHandle, /override var mouseDownCanMoveWindow: Bool \{ true \}/);
-  assert.match(dragHandle, /func performClick\(\) \{ onClick\?\(\) \}/);
+  assert.match(dragHandle, /func performClick\(\)[\s\S]*window\?\.makeKey\(\)[\s\S]*onClick\(\)/);
   assert.match(controller, /override func sendEvent[\s\S]{0,1300}nextEvent\(matching: \[\.leftMouseDragged, \.leftMouseUp\]\)/);
   assert.match(controller, /if didDrag \{ OverlayController\.shared\.persistPosition\(\) \}/);
   assert.match(controller, /private func dragTarget[\s\S]{0,500}view as\? DragHandleView/);

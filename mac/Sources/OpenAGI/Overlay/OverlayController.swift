@@ -240,16 +240,24 @@ final class KeyableOverlayPanel: NSPanel {
   }
 
   private func moveFrom(startOrigin: NSPoint, cursorStart: NSPoint, cursorNow current: NSPoint) {
-    var proposed = NSPoint(
+    let proposed = NSPoint(
       x: startOrigin.x + current.x - cursorStart.x,
       y: startOrigin.y + current.y - cursorStart.y
     )
     let targetScreen = NSScreen.screens.first { $0.frame.contains(current) } ?? screen
     if let visible = targetScreen?.visibleFrame {
-      proposed.x = min(max(visible.minX, proposed.x), visible.maxX - frame.width)
-      proposed.y = min(max(visible.minY, proposed.y), visible.maxY - frame.height)
+      setFrame(Self.fittedDragFrame(NSRect(origin: proposed, size: frame.size), in: visible), display: true)
+      return
     }
     setFrameOrigin(proposed)
+  }
+
+  static func fittedDragFrame(_ proposed: NSRect, in visible: NSRect) -> NSRect {
+    let size = NSSize(width: min(proposed.width, visible.width), height: min(proposed.height, visible.height))
+    return NSRect(
+      x: min(max(visible.minX, proposed.minX), visible.maxX - size.width),
+      y: min(max(visible.minY, proposed.minY), visible.maxY - size.height),
+      width: size.width, height: size.height)
   }
 
   // Esc anywhere in the panel collapses back to the pill instead of beeping.
