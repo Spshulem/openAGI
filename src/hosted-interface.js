@@ -60,6 +60,7 @@ import {
   G2ChannelError
 } from "./integrations/g2-channel.js";
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
+import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, isMobileRouteAllowed, boundedMobileNodeName } from "./mobile-node.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -79,7 +80,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodeEnrollment = options.nodeEnrollment
-    ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM] });
+    ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM, MOBILE_PLATFORM] });
   let channels =
     options.channels ??
     (runtime.agentHost
@@ -711,11 +712,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
         || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token"].includes(pathname);
+      // A mobile credential is accepted on its enumerated allowlist and
+      // nowhere else. Same shape as g2NodeRouteAllowed: platforms other than
+      // "mobile" are unaffected, so this can only ever narrow a phone token.
+      const mobileRouteAllowed = requestEnrollment?.platform !== MOBILE_PLATFORM
+        || isMobileRouteAllowed(method, pathname);
+      const mobileNodeRoute = requestEnrollment?.platform === MOBILE_PLATFORM
+        && isMobileRouteAllowed(method, pathname);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
-      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute)
-        ? g2NodeRouteAllowed && nodeRegistry.authenticate(requestNodeId, scopedBearer)
+      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute || mobileNodeRoute)
+        ? g2NodeRouteAllowed && mobileRouteAllowed && nodeRegistry.authenticate(requestNodeId, scopedBearer)
         : false;
       // Even Hub runs the G2 client in a phone webview whose Origin is not the
       // daemon's origin. Bypass only the browser-origin check, and only after
@@ -760,7 +768,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
-          : nodeClientRoute && requestNodeId
+          : (nodeClientRoute || mobileNodeRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
