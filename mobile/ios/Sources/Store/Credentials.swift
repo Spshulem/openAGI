@@ -28,7 +28,27 @@ public struct Credentials: Sendable, Equatable {
 
     private static let service = "sh.openagi.mobile.node"
     private static let account = "primary"
-    private static let accessGroup = "sh.openagi.mobile"
+
+    // Both entitlements files (Sources/OpenAGI.entitlements and
+    // Widget/OpenAGIWidget.entitlements) declare exactly one, identical
+    // keychain-access-groups entry: "$(AppIdentifierPrefix)sh.openagi.mobile".
+    // $(AppIdentifierPrefix) is an Xcode build-setting substitution that only
+    // ever gets resolved into the .entitlements *file* at codesigning time —
+    // there is no API that hands the resolved, team-prefixed string back to
+    // Swift source. A literal, unprefixed kSecAttrAccessGroup ("sh.openagi.mobile")
+    // therefore never matches the app's real entitled group on any signed
+    // build, and on this project's own unsigned `CODE_SIGNING_ALLOWED: NO`
+    // build it has zero entitled groups to match at all — both fail with
+    // errSecMissingEntitlement / "Could not save credentials to the keychain",
+    // which is exactly what a live simulator pairing run reproduced.
+    //
+    // Deliberately omit kSecAttrAccessGroup instead. Per Apple's documented
+    // Keychain Services behavior, a process entitled to exactly one
+    // keychain-access-group is placed in that group automatically when the
+    // key is left out of the query. The app and the widget extension each
+    // declare exactly one (matching) group, so both land in the same shared
+    // group without either one needing to name it explicitly — which is also
+    // what let this work, untested, before the explicit group was added.
 
     public init(server: URL, nodeID: String, token: String) {
         self.server = server
@@ -43,8 +63,7 @@ public struct Credentials: Sendable, Equatable {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Self.service,
-            kSecAttrAccount as String: Self.account,
-            kSecAttrAccessGroup as String: Self.accessGroup
+            kSecAttrAccount as String: Self.account
         ]
         SecItemDelete(query as CFDictionary)
         query[kSecValueData as String] = payload
@@ -58,7 +77,6 @@ public struct Credentials: Sendable, Equatable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecAttrAccessGroup as String: accessGroup,
             kSecReturnData as String: true
         ]
         var item: CFTypeRef?
@@ -75,8 +93,7 @@ public struct Credentials: Sendable, Equatable {
         SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecAttrAccessGroup as String: accessGroup
+            kSecAttrAccount as String: account
         ] as CFDictionary)
     }
 }

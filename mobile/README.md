@@ -73,7 +73,7 @@ DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer \
   -destination 'id=<simulator-udid>' -derivedDataPath /tmp/openagi-ios build
 ```
 
-Swap the trailing `build` for `test` to run the unit test suite (52 tests
+Swap the trailing `build` for `test` to run the unit test suite (54 tests
 as of Phase 1) on the same destination. `DEVELOPER_DIR` is not optional —
 without it, `xcodebuild` silently resolves against whatever Xcode is
 currently the system default, which on a machine with more than one Xcode
@@ -139,40 +139,78 @@ a shipped phone. If you change anything about a request or response this
 document describes, regenerate the fixtures and re-run both native
 clients' unit tests before assuming your change is safe.
 
-## Known issue and manual verification checklist
+## A defect this pass found, and fixed
 
-An in-process, LAN-bound daemon plus `xcrun simctl openurl` / `adb shell
-am start -a android.intent.action.VIEW` make almost all of the above
-scriptable without ever hand-typing into a phone. Android's full happy
-path — pair, see seeded tasks, tap-to-complete, go offline, complete
-again, come back online and watch the queued completion land with
+An in-process, LAN-bound daemon plus `xcrun simctl openurl` / `adb shell am
+start -a android.intent.action.VIEW` make almost all of the manual pass
+below scriptable, without ever hand-typing into a phone. Both platforms'
+full happy path — pair, see seeded tasks, tap-to-complete, go offline,
+complete again, come back online and watch the queued completion land with
 `completedVia: "mobile"` — passes this way end-to-end.
 
-**iOS pairing currently fails on a real run.** The daemon-side exchange
-succeeds (a `mobile` node is created), but the app's own
-`Credentials.save()` call throws `errSecMissingEntitlement` (-34018) when
-writing to the shared Keychain access group, because this project builds
-with `CODE_SIGNING_ALLOWED: NO` (`mobile/ios/project.yml`) — entitlements
-are only ever embedded as part of a real code signature, so an unsigned
-build carries none at all, on Simulator or (since a real device refuses to
-install an unsigned app in the first place) on hardware either. As of this
-writing that fix is in progress but not yet landed and verified; check
-`mobile/ios/Tests/CredentialsTests.swift` and `git log` on
-`mobile/ios/project.yml` / `Sources/Store/Credentials.swift` before relying
-on iOS pairing, and until it's resolved, treat the iOS half of the pass
-below as manual:
+Getting there on iOS surfaced a real bug, not a test artifact: the first
+live pairing runs against a real device all failed. The daemon-side
+exchange succeeded every time (a `mobile` node was created), but the app's
+own `Credentials.save()` call threw `errSecMissingEntitlement` (-34018)
+writing to the Keychain, leaving the phone stuck on the pairing screen
+having burned its one-time code. Two things were wrong together, and
+either alone was not enough to fix it:
 
-- [ ] Build and install the iOS app on a simulator or a real, signed device.
-- [ ] Mint a code (`openagi pair-phone --platform ios`) and pair.
-- [ ] Confirm the phone's task list matches `openagi tasks --bucket today`.
-- [ ] Add the widget to the home screen; confirm it shows the same tasks
-      and a "can't reach OpenAGI" state when the daemon is unreachable.
-- [ ] Tap a task's check on the widget with the app killed; confirm the
-      row disappears and, on the desktop, the task is `completed` with
-      `completedVia: "mobile"`.
+1. `Credentials.swift` asked for `kSecAttrAccessGroup: "sh.openagi.mobile"`
+   — a literal string with no Team ID prefix. Both entitlements files
+   declare `$(AppIdentifierPrefix)sh.openagi.mobile`, and `$(...)` is an
+   Xcode build-setting substitution that only ever resolves inside the
+   `.entitlements` file at signing time; there is no API that hands the
+   resolved, prefixed string back to Swift source. The fix: stop asking
+   for an explicit access group at all. A process entitled to exactly one
+   keychain-access-group (true here, on both the app and the widget
+   extension) is placed in that group automatically when the key is
+   omitted — the standard, documented pattern for this exact situation.
+2. `mobile/ios/project.yml` built with `CODE_SIGNING_ALLOWED: "NO"`.
+   Entitlements are only ever embedded as part of an actual code
+   signature — an unsigned build carries **zero** entitlements no matter
+   what the `.entitlements` file declares, so even the fixed, unqualified
+   Keychain call above still failed with the same error. The fix: sign
+   with the ad-hoc identity `CODE_SIGN_IDENTITY: "-"` instead of disabling
+   signing. That identity needs no Apple Developer Team, certificate, or
+   provisioning profile — it works on any Mac, including headless CI — and
+   Simulator does not validate entitlements against an Apple-issued
+   provisioning profile the way a real device does, so ad-hoc signing is
+   enough to make a merely-signed process eligible for its own default
+   Keychain scope.
+
+Regression coverage: `mobile/ios/Tests/CredentialsTests.swift` calls the
+real `Credentials.save()`/`load()` against the real Simulator Keychain
+under this project's actual, committed signing configuration — not a
+mock — so a future change that reintroduces either half of this bug fails
+a fast unit test instead of surfacing only on a live phone.
+
+## Manual verification checklist
+
+What the automated pass above does not cover, because it needs a literal
+finger on a literal home screen:
+
+- [ ] Add the widget to the home screen on a real device; confirm it shows
+      the same tasks as the app and a "can't reach OpenAGI" state when the
+      daemon is unreachable.
+- [ ] Tap a task's check **on the widget itself** (not the in-app list)
+      with the app killed; confirm the row disappears and, on the desktop,
+      the task is `completed` with `completedVia: "mobile"`. (The pass
+      above verified the in-app button, which calls the identical
+      `SnapshotStore`/`OutboundQueue` path the widget's `AppIntent` /
+      Glance action uses — same code, not yet the same pixels.)
 - [ ] Turn networking off on the phone, tap a check, confirm the row still
       disappears locally; turn it back on, open the app, confirm the
-      completion lands.
+      completion lands. (Verified live on Android via `adb`; not yet
+      re-run on iOS, where Simulator has no equivalent single-command
+      network kill switch.)
 - [ ] From `openagi nodes`, revoke the phone; confirm it can no longer
       complete tasks and returns to the pairing screen without wiping its
       local snapshot.
+- [ ] Pair a real device with a real, portal-registered Apple Developer
+      Team (not ad-hoc Simulator signing). App Groups and Keychain sharing
+      are both capabilities a real device validates against an
+      Apple-issued provisioning profile, which ad-hoc/Simulator signing
+      never exercises — a from-scratch pairing on real hardware, with a
+      real Team ID, is the one check this whole automated pass cannot
+      stand in for.
