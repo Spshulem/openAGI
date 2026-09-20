@@ -61,7 +61,10 @@ Two kinds of thing need you, and they belong together.
 - Approve or deny, each with an optional note.
 
 **Clarifications** — questions the agent has asked you.
-- The question, the task it belongs to, and a free-text answer.
+- The question, the task it belongs to, and the answer. The daemon accepts one
+  of four fixed values, not free text — present them as four choices, because a
+  text field that rejects most of what you type into it is a worse interface
+  than four buttons.
 
 Routes: `GET /pending-actions`, `POST /pending-actions/{id}/approve`,
 `POST /pending-actions/{id}/deny`, `GET /tasks/clarifications`,
@@ -73,10 +76,12 @@ The one that makes the phone genuinely useful away from the desk.
 
 - A conversation view: your message, then OpenAGI's reply.
 - Send with `POST /message`.
-- **Stream the reply over SSE** (`GET /events`), rendering tokens as they
-  arrive rather than waiting for the whole answer. A reply that takes 20 seconds
-  must show progress within one.
-- The stream also carries the events the rest of the app cares about —
+- **The reply streams from `POST /message` itself**, not from `GET /events` —
+  `/events` is the daemon's ambient event feed, not the chat transport. Render
+  tokens as they arrive rather than waiting for the whole answer; a reply that
+  takes 20 seconds must show progress within one.
+- `GET /events` runs separately and carries the events the rest of the app
+  cares about —
   `task-updated`, `task-reminder`, `task-auto-changed`, `pending-action`,
   `pending-action-resolved`, `clarification-created`. When one arrives, refresh
   the affected surface and update the Inbox badge. This is what makes the app
