@@ -2,6 +2,15 @@ import Foundation
 import Observation
 import WidgetKit
 
+// RootTabView's five destinations. A plain enum (not the `Tab` views
+// themselves) so any screen behind the tab bar can request a switch --
+// e.g. Today's "N waiting on you" row jumping to Inbox, per DESIGN.md's
+// "Screens must not be mostly empty" section -- without needing a callback
+// threaded down through every intermediate view.
+enum AppTab: Hashable {
+    case today, tasks, inbox, chat, settings
+}
+
 // The one piece of shared state behind the tab bar: the paired credential,
 // the daemon client built from it, the locally-cached snapshot, and the
 // Inbox badge count. Every tab reads this rather than each building its own
@@ -18,6 +27,10 @@ final class AppModel {
     private(set) var snapshot: Snapshot?
     private(set) var lastOutcome: RefreshOutcome?
     private(set) var isRefreshingToday = false
+
+    // Plain UI state, not persisted -- which tab RootTabView's `TabView` is
+    // showing. Any view behind the tab bar can set this directly.
+    var selectedTab: AppTab = .today
 
     private(set) var pendingActionsCount = 0
     private(set) var clarificationsCount = 0
