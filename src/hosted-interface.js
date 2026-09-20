@@ -61,6 +61,7 @@ import {
 } from "./integrations/g2-channel.js";
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
+import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -1464,6 +1465,22 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             )
           });
         }
+      }
+      if (method === "GET" && pathname === "/mobile/summary") {
+        if (!runtime.tasks?.list) return sendJson(res, 503, { error: "no task store" });
+        const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+        const payload = buildMobileSummary(runtime, {
+          now: new Date(),
+          taskLimit: Number.isFinite(rawLimit) ? rawLimit : undefined
+        });
+        const etag = summaryETag(payload);
+        res.setHeader("cache-control", "no-store");
+        res.setHeader("etag", etag);
+        if (req.headers["if-none-match"] === etag) {
+          res.writeHead(304);
+          return res.end();
+        }
+        return sendJson(res, 200, payload);
       }
       if (method === "GET" && pathname === "/brief/today") {
         const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "5", 10);
