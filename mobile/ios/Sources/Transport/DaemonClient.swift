@@ -205,7 +205,7 @@ public actor DaemonClient {
             let pump = Task {
                 var parser = SSEFrameParser()
                 do {
-                    for try await line in bytes.lines {
+                    for try await line in Self.lines(of: bytes) {
                         if Task.isCancelled { break }
                         if let frame = parser.feed(line), let chatEvent = ChatEvent.decode(frame) {
                             continuation.yield(chatEvent)
@@ -236,7 +236,7 @@ public actor DaemonClient {
             let pump = Task {
                 var parser = SSEFrameParser()
                 do {
-                    for try await line in bytes.lines {
+                    for try await line in Self.lines(of: bytes) {
                         if Task.isCancelled { break }
                         if let event = parser.feed(line) {
                             continuation.yield(DaemonEvent.from(name: event.name))
@@ -316,6 +316,39 @@ public actor DaemonClient {
             throw error
         } catch {
             throw DaemonError.transport(error)
+        }
+    }
+
+    // `URLSession.AsyncBytes.lines` never yielded a single line against
+    // either this SDK's stubbed *or* real streaming responses in this
+    // project's testing (verified live: the raw byte sequence underneath it
+    // delivers every byte correctly -- `for try await _ in bytes` counted
+    // the full response -- but `.lines` produced nothing). Splitting the
+    // byte sequence into lines by hand sidesteps whatever that gap is, and
+    // is simple enough to trust: accumulate until `\n`, drop a trailing
+    // `\r`, decode as UTF-8, repeat.
+    private static func lines(of bytes: URLSession.AsyncBytes) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                var buffer: [UInt8] = []
+                do {
+                    for try await byte in bytes {
+                        if Task.isCancelled { break }
+                        if byte == 0x0A {
+                            if buffer.last == 0x0D { buffer.removeLast() }
+                            continuation.yield(String(decoding: buffer, as: UTF8.self))
+                            buffer.removeAll(keepingCapacity: true)
+                        } else {
+                            buffer.append(byte)
+                        }
+                    }
+                    if !buffer.isEmpty { continuation.yield(String(decoding: buffer, as: UTF8.self)) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
