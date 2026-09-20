@@ -1061,13 +1061,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
         const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken : "";
         const platform = body.platform;
-        const name = nodeNameForPlatform(platform, body.name);
         if (!/^\d{6}$/.test(code)) {
           return sendG2NodeJson(res, 400, { error: "invalid_enrollment_code", message: "Enter the 6-digit code shown by OpenAGI." });
         }
         if (!ENROLLABLE_PLATFORMS.has(platform)) {
           return sendG2NodeJson(res, 400, { error: "invalid_platform", message: "This enrollment code is for a different device." });
         }
+        // Bound the name only once the platform is known to be one we enroll,
+        // so the bound applied is always the one that platform asked for.
+        const name = nodeNameForPlatform(platform, body.name);
         if (!/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
           return sendG2NodeJson(res, 400, { error: "invalid_node_id", message: "The G2 node identity is malformed." });
         }

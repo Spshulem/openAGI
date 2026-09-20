@@ -169,8 +169,8 @@ test("the remote 409 keeps the G2's original wording and gives the phone its own
     assert.equal(phone.status, 409);
     assert.equal(phone.body.error, "phones must be enrolled on the main OpenAGI");
 
-    // An unknown platform reached this 409 before any platform was inspected,
-    // so it still must, with the original text.
+    // Only a mobile caller gets the new sentence. An unknown platform is not
+    // MOBILE_PLATFORM, so it keeps the G2 text it returned before phones.
     const unknown = await askFor("toaster");
     assert.equal(unknown.status, 409);
     assert.equal(unknown.body.error, "Even G2 nodes must be enrolled on the main OpenAGI");
