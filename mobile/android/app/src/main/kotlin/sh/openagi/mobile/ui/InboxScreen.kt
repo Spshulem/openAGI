@@ -83,9 +83,13 @@ fun InboxScreen(
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(
             title = "Inbox",
+            // A failed refresh must win over a stale "last good" timestamp —
+            // otherwise a phone that synced once and then lost the daemon
+            // keeps reading "live, just now" forever, which is exactly the
+            // always-visible honesty DESIGN.md's connection line exists for.
             connection = when {
+                lastLoadFullyFailed -> ConnectionState.Failed(credentials.server, lastSyncedAgo)
                 lastSyncedAgo != null -> ConnectionState.Synced(credentials.server, lastSyncedAgo!!)
-                lastLoadFullyFailed -> ConnectionState.Failed(credentials.server, null)
                 else -> ConnectionState.NeverSynced(credentials.server)
             },
         )
