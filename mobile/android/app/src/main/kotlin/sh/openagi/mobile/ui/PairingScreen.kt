@@ -7,8 +7,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -20,6 +18,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.PairingPayload
@@ -31,6 +30,9 @@ import sh.openagi.mobile.sync.RefreshCoordinator
 import sh.openagi.mobile.sync.RefreshWorker
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
+import sh.openagi.mobile.ui.components.PrimaryButton
+import sh.openagi.mobile.ui.theme.OpenAGIType
+import sh.openagi.mobile.util.ErrorCopy
 
 // Shown before the phone has any Credentials. A person gets here one of two
 // ways: they typed the six-digit code `openagi pair-phone` printed, or they
@@ -46,39 +48,55 @@ fun PairingScreen(
     var serverText by remember(prefill) { mutableStateOf(prefill?.serverUrl ?: "") }
     var codeText by remember(prefill) { mutableStateOf(prefill?.code ?: "") }
     var isPairing by remember { mutableStateOf(false) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var error by remember { mutableStateOf<ErrorCopy.Message?>(null) }
     val scope = rememberCoroutineScope()
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+        modifier = Modifier.fillMaxSize().padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        Text("Pair with OpenAGI", style = MaterialTheme.typography.headlineSmall)
-        OutlinedTextField(
-            value = serverText,
-            onValueChange = { serverText = it },
-            label = { Text("Daemon address") },
-            placeholder = { Text("http://mac.tail1234.ts.net:43210") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = codeText,
-            onValueChange = { if (it.length <= 6) codeText = it },
-            label = { Text("6-digit code") },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        errorMessage?.let { message ->
-            // Rendered verbatim: DaemonException's own message (including the
-            // host allowlist's refusal, e.g. for 127.0.0.1) already tells the
-            // user exactly what to change. No extra mapping layer here.
-            Text(message, color = MaterialTheme.colorScheme.error)
+        Text("Pair with OpenAGI", style = OpenAGIType.screenTitle, color = MaterialTheme.colorScheme.onBackground)
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Daemon address", style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            OutlinedTextField(
+                value = serverText,
+                onValueChange = { serverText = it },
+                placeholder = { Text("http://mac.tail1234.ts.net:43210") },
+                singleLine = true,
+                textStyle = OpenAGIType.dataMono,
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
-        Button(
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("6-digit code", style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // DESIGN.md: nothing is centred except the empty state and this
+            // field. Code entry gets its own reserved type role (28 medium
+            // mono, tracked +2) — never reused for anything else.
+            OutlinedTextField(
+                value = codeText,
+                onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) codeText = it },
+                singleLine = true,
+                textStyle = OpenAGIType.codeEntry.copy(textAlign = TextAlign.Center),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+
+        error?.let { message ->
+            Column {
+                Text(message.headline, style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
+                Text(message.detail, style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+
+        PrimaryButton(
+            text = "Pair",
+            loading = isPairing,
+            enabled = !isPairing && serverText.isNotBlank() && codeText.length == 6,
             onClick = {
-                errorMessage = null
+                error = null
                 isPairing = true
                 scope.launch {
                     try {
@@ -96,7 +114,13 @@ fun PairingScreen(
                             nodeId = enrollment.node.id,
                             token = enrollment.nodeToken,
                         )
-                        Credentials.save(context, credentials)
+                        if (!Credentials.save(context, credentials)) {
+                            error = ErrorCopy.Message(
+                                "Couldn't save the credential on this device.",
+                                "Try pairing again — if this keeps happening, restart the app.",
+                            )
+                            return@launch
+                        }
                         RefreshWorker.schedule(context)
                         // Kick the first refresh so the day's tasks are already on
                         // disk by the time TodayScreen appears; failure here is
@@ -109,23 +133,15 @@ fun PairingScreen(
                             OutboundQueue(context.filesDir),
                         ).refresh()
                         onPaired()
-                    } catch (error: DaemonException) {
-                        errorMessage = error.message
-                    } catch (error: Exception) {
-                        errorMessage = "Could not pair: ${error.message}"
+                    } catch (daemonError: DaemonException) {
+                        error = ErrorCopy.forPairing(daemonError, serverText)
+                    } catch (unexpected: Exception) {
+                        error = ErrorCopy.Message("Pairing failed.", "Try again, or run `openagi pair-phone` for a new code.")
                     } finally {
                         isPairing = false
                     }
                 }
             },
-            enabled = !isPairing && serverText.isNotBlank() && codeText.length == 6,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            if (isPairing) {
-                CircularProgressIndicator()
-            } else {
-                Text("Pair")
-            }
-        }
+        )
     }
 }
