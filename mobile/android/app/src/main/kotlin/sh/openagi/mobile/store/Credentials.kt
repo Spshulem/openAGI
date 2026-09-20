@@ -11,6 +11,12 @@ import java.util.UUID
 // EncryptedSharedPreferences under a Keystore-held master key, never in the
 // snapshot file, and never in logs.
 data class Credentials(val server: String, val nodeId: String, val token: String) {
+    // A data class prints every property, so the generated toString() would put
+    // the token into any log line, crash report or debugger frame that touched
+    // a Credentials. "Never logged" should be a property of the type, not of
+    // everyone who handles it remembering.
+    override fun toString(): String = "Credentials(server=$server, nodeId=$nodeId, token=<redacted>)"
+
     companion object {
         private const val FILE = "sh.openagi.mobile.credentials"
 

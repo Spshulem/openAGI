@@ -39,11 +39,18 @@ data class Snapshot(
 
 class SnapshotStore(directory: File) {
     private val file = File(directory, "snapshot.json")
-    private val lock = Any()
+
+    // The lock is keyed by the file's path, NOT per instance. Seven call sites
+    // build their own SnapshotStore — the widget's action, the Glance provider,
+    // two workers and three screens — and a per-instance lock would mean the
+    // two writers that genuinely race, a WorkManager refresh and a widget tap,
+    // synchronize on different objects and so not at all. Keying by path also
+    // keeps unit tests in separate temp directories from contending.
+    private val lock = lockFor(file)
 
     fun load(): Snapshot? = synchronized(lock) { loadLocked() }
 
-    // Deleting under the same lock every writer holds, so a refresh or an
+    // Deleting under the lock every writer for this file holds, so a refresh or an
     // optimistic completion racing a revoke cannot recreate the file with the
     // just-revoked account's tasks after it has gone.
     fun delete() {
@@ -98,5 +105,13 @@ class SnapshotStore(directory: File) {
         val snapshot = Snapshot(summary, now, etag, stillPending)
         saveLocked(snapshot)
         snapshot
+    }
+
+    companion object {
+        private val locks = java.util.concurrent.ConcurrentHashMap<String, Any>()
+
+        // Shared by every store pointing at the same file, whoever built it.
+        internal fun lockFor(file: File): Any =
+            locks.computeIfAbsent(file.absolutePath) { Any() }
     }
 }
