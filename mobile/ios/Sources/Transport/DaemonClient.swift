@@ -105,7 +105,11 @@ public actor DaemonClient {
         guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
         switch http.statusCode {
         case 200: return try decodeJSON(Enrollment.self, from: data)
-        case 401, 429: throw DaemonError.unauthorized
+        // 403 belongs here for the same reason it does on every other route: it
+        // means the node id and credential disagree, not that the server broke.
+        // This switch omitted it while `validate` included it, so an enrolling
+        // phone reported a 403 as a server fault. Android maps all three.
+        case 401, 403, 429: throw DaemonError.unauthorized
         case 409: throw DaemonError.conflict
         default: throw DaemonError.server(http.statusCode)
         }
