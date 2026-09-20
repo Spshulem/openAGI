@@ -157,6 +157,60 @@ and should not look like the primary path.
 **Empty state.** Centred, a single line of `ink` plus a line of `muted`. No
 illustration, no icon larger than 28pt.
 
+## Chat
+
+A conversation, not a transcript. The first build of this screen put a "You" /
+"OpenAGI" caption above each message and left every line full-width and left
+aligned, which reads as a log file. **Alignment carries the speaker** — that is
+what makes a chat feel like a chat on both platforms, and it means no speaker
+labels at all.
+
+- **You:** right aligned, max 78% width, `live` at 12% opacity as the bubble
+  fill, `ink` text, radius 18 with the bottom-trailing corner at 4.
+- **OpenAGI:** left aligned, max 85% width, `surface` fill, `ink` text, radius
+  18 with the bottom-leading corner at 4.
+- Consecutive messages from the same speaker tighten to 2pt apart; a change of
+  speaker opens to 12. No timestamp unless more than 15 minutes passed, and then
+  it is a centred `caption` in `muted` between the two groups.
+- **Assistant replies render Markdown** — bold, inline code, fenced code blocks,
+  bullet and numbered lists, links. A reply full of raw `**asterisks**` is the
+  clearest possible sign the app does not understand its own content. Fenced
+  code uses the mono face on a subtly darker fill, scrolls horizontally rather
+  than wrapping, and is long-press copyable.
+- **Streaming is the point.** Before the first token, show a three-dot resting
+  indicator inside an assistant bubble — not a full-screen spinner. As `delta`
+  frames arrive, append into that same bubble so it grows. The list stays pinned
+  to the bottom while the user has not scrolled away; if they have scrolled up,
+  do not yank them back — show a "jump to latest" affordance instead.
+- The composer sits above the keyboard, never behind it, and keeps the safe area
+  on a home-indicator device. It grows to 5 lines then scrolls. Send is disabled
+  and `muted` until there is non-whitespace text.
+- A failed send stays in place in `alert` with a "Try again" directly under it.
+  It is never silently dropped and never a modal.
+- Long-press any message to copy it.
+
+The connection line on this screen reads `live` while the event stream is
+attached and `reconnecting` when it is not — the one screen where that
+distinction is worth the words.
+
+## Screens must not be mostly empty
+
+Several screens shipped as a title, a short list, and a large blank rectangle.
+A screen with nothing below the fold should either earn the space or not take
+it. Where a surface has little to show, it carries the next most useful thing
+rather than whitespace:
+
+- **Today** — under the task list: the day's shape in one sentence, then, when
+  something is waiting, a single row linking to Inbox ("2 waiting on you"). When
+  there are no tasks at all, the empty state is the whole screen, centred.
+- **Inbox** — approvals and clarifications are two sections of one list. **If
+  one of the two fails to load, the other still renders**, and the failure is a
+  single inline row in that section, not an error that replaces the screen. A
+  badge promising two items above a blank screen is worse than either alone.
+- **Tasks** — bucket sections are always present in order; an empty bucket shows
+  a one-line `muted` "Nothing here" rather than vanishing, so the structure of
+  the week is legible even when parts of it are empty.
+
 ## Widget
 
 The widget is the reason this project exists. It is not a shrunken app screen.
