@@ -1822,7 +1822,10 @@ public actor DaemonClient {
 
     public func heartbeat() async throws {
         var request = try authorizedRequest(path: "/nodes/heartbeat", method: "POST")
-        request.httpBody = try ProtocolDecoder.jsonEncoder.encode(["nodeId": nodeID])
+        // role is required and must be exactly "node". The name is deliberately
+        // omitted: the daemon stores the name this node enrolled with and ignores
+        // anything the wire claims, so sending one could only ever disagree.
+        request.httpBody = try ProtocolDecoder.jsonEncoder.encode(["nodeId": nodeID, "role": "node"])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         _ = try validate(try await session.data(for: request).1)
     }
@@ -3375,7 +3378,10 @@ class DaemonClient(
 
     suspend fun complete(taskId: String) = post("/tasks/$taskId/complete", """{"completedVia":"mobile"}""")
 
-    suspend fun heartbeat() = post("/nodes/heartbeat", """{"nodeId":"$nodeId"}""")
+    // role is required and must be exactly "node". The name is deliberately
+    // omitted: the daemon stores the name this node enrolled with and ignores
+    // anything the wire claims, so sending one could only ever disagree.
+    suspend fun heartbeat() = post("/nodes/heartbeat", """{"nodeId":"$nodeId","role":"node"}""")
 
     suspend fun revoke() = post("/nodes/revoke", """{"nodeId":"$nodeId"}""")
 
