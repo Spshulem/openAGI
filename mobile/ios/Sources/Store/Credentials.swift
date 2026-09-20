@@ -97,3 +97,13 @@ public struct Credentials: Sendable, Equatable {
         ] as CFDictionary)
     }
 }
+
+// Without this, `String(describing:)` (interpolation, `print`, a crash
+// report's default struct dump) reflects the raw token into any log line
+// that touches a `Credentials` value — the one thing this whole app promises
+// never happens. Android's equivalent type already redacts; this matches it.
+extension Credentials: CustomStringConvertible {
+    public var description: String {
+        "Credentials(server: \(server), nodeID: \(nodeID), token: <redacted>)"
+    }
+}

@@ -48,4 +48,15 @@ final class CredentialsTests: XCTestCase {
         Credentials.clear()
         XCTAssertNil(Credentials.load())
     }
+
+    // Whole-branch review finding: a plain struct reflects its stored
+    // properties into `String(describing:)` — a log line, a crash report, an
+    // interpolated debug print — which would put the raw node token
+    // somewhere this app promises it never goes.
+    func testDescriptionNeverContainsTheRawToken() {
+        let credentials = Credentials(server: URL(string: "http://192.168.1.110:43299")!,
+                                      nodeID: "mobile:test-node", token: "super-secret-token-value")
+        XCTAssertFalse(String(describing: credentials).contains("super-secret-token-value"))
+        XCTAssertTrue(String(describing: credentials).contains("<redacted>"))
+    }
 }

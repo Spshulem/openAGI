@@ -4,12 +4,31 @@ import XCTest
 final class HostAllowlistTests: XCTestCase {
     func testTailnetAndLanCleartextAreAllowed() throws {
         for raw in ["http://mac.tail1234.ts.net:43210",
-                    "http://100.101.102.103:43210",
                     "http://192.168.1.20:43210",
                     "http://10.0.0.5:43210",
                     "http://172.16.4.4:43210"] {
             XCTAssertNoThrow(try HostAllowlist.validate(URL(string: raw)!), raw)
         }
+    }
+
+    // Whole-branch review finding: iOS's ATS exception for cleartext
+    // (`NSAllowsLocalNetworking`) covers RFC 1918 private ranges but not
+    // Tailscale's 100.64.0.0/10 CGNAT range (RFC 6598 shared address
+    // space), and `NSExceptionDomains` cannot name a /10 of raw IPs. A
+    // cleartext request to a bare 100.x address never reaches this app's
+    // networking code — URLSession fails it at the OS level with -1022
+    // before a socket opens. mobile/PROTOCOL.md §10 promises this range is
+    // reachable (it is, on the daemon side, and on Android, which has no
+    // domain-scoped cleartext policy the way ATS does) — refusing it here
+    // trades a mysterious platform timeout for a legible, actionable
+    // refusal. This is the one place iOS and Android's tables intentionally
+    // diverge, and only on iOS.
+    func testCGNATCleartextIsRefusedOnIOSDueToAppTransportSecurity() {
+        for raw in ["http://100.64.0.1:43210", "http://100.101.102.103:43210", "http://100.127.255.255:43210"] {
+            XCTAssertThrowsError(try HostAllowlist.validate(URL(string: raw)!), raw)
+        }
+        XCTAssertTrue(HostAllowlist.isBlockedByAppTransportSecurity("100.101.102.103"))
+        XCTAssertFalse(HostAllowlist.isBlockedByAppTransportSecurity("192.168.1.20"))
     }
 
     func testPublicCleartextIsRefused() {

@@ -5,12 +5,25 @@ public struct Snapshot: Codable, Sendable, Equatable {
     public var fetchedAt: Date
     public var etag: String?
     public var locallyCompleted: Set<String>
+    // Set when the most recent refresh attempt could not reach the daemon at
+    // all (RefreshCoordinator's `.offline` outcome); cleared on the next
+    // successful fetch (200 or 304). Whole-branch review finding: without
+    // this, `RefreshOutcome.offline` never reached the snapshot, so a
+    // widget reading only `fetchedAt`'s age rendered a daemon that had been
+    // down for hours identically to a healthy one, right up until the
+    // 60-minute staleness threshold. This is `Optional` (rather than a
+    // non-optional `Bool`) so an on-disk snapshot written before this field
+    // existed still decodes: a missing key becomes `nil`, not a decode
+    // failure.
+    public var lastRefreshFailedAt: Date?
 
-    public init(summary: MobileSummary, fetchedAt: Date, etag: String?, locallyCompleted: Set<String>) {
+    public init(summary: MobileSummary, fetchedAt: Date, etag: String?, locallyCompleted: Set<String>,
+                lastRefreshFailedAt: Date? = nil) {
         self.summary = summary
         self.fetchedAt = fetchedAt
         self.etag = etag
         self.locallyCompleted = locallyCompleted
+        self.lastRefreshFailedAt = lastRefreshFailedAt
     }
 
     // What the UI and widget actually draw: the server's list minus anything
@@ -87,8 +100,12 @@ public struct SnapshotStore: Sendable {
                 previous = []
             }
             let stillOpen = Set(summary.today.map(\.id))
+            // A fetch that reached the daemon at all -- 200 or 304 -- proves
+            // it is reachable right now, so any previously recorded failure
+            // is cleared here.
             let snapshot = Snapshot(summary: summary, fetchedAt: now, etag: etag,
-                                    locallyCompleted: previous.intersection(stillOpen))
+                                    locallyCompleted: previous.intersection(stillOpen),
+                                    lastRefreshFailedAt: nil)
             try ProtocolDecoder.jsonEncoder.encode(snapshot).write(to: url, options: .atomic)
             return snapshot
         }
@@ -112,6 +129,28 @@ public struct SnapshotStore: Sendable {
                 return nil
             }
             snapshot.fetchedAt = now
+            // A 304 also proves the daemon is reachable right now.
+            snapshot.lastRefreshFailedAt = nil
+            try ProtocolDecoder.jsonEncoder.encode(snapshot).write(to: url, options: .atomic)
+            return snapshot
+        }
+    }
+
+    // Records that the most recent refresh attempt could not reach the
+    // daemon at all, so the widget (which never fetches itself and only
+    // reads what this file already says) can render DESIGN.md's "Can't
+    // reach OpenAGI" state instead of silently treating old data as current.
+    // A read-modify-write, coordinated like every other mutator here.
+    // No-ops (returns nil) if there is no snapshot on disk yet -- an
+    // unpaired-or-never-synced phone has nothing for this flag to qualify.
+    @discardableResult
+    public func recordRefreshFailure(now: Date = Date()) throws -> Snapshot? {
+        try CoordinatedFile.write(file) { url -> Snapshot? in
+            guard let data = try? Data(contentsOf: url),
+                  var snapshot = try? ProtocolDecoder.json.decode(Snapshot.self, from: data) else {
+                return nil
+            }
+            snapshot.lastRefreshFailedAt = now
             try ProtocolDecoder.jsonEncoder.encode(snapshot).write(to: url, options: .atomic)
             return snapshot
         }

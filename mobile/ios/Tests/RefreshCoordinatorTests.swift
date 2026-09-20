@@ -166,6 +166,50 @@ final class RefreshCoordinatorTests: XCTestCase {
                        "the cached snapshot must still be visible while the user re-pairs")
     }
 
+    // Whole-branch review finding: `heartbeat()` was implemented and tested
+    // in isolation but never actually called from anywhere -- not this
+    // coordinator, not the app, not a view -- so a paired phone's `lastSeen`
+    // never advanced past enrollment. `refresh()` is the one place that
+    // covers foreground, pull-to-refresh, and background refresh, so this
+    // pins that it fires from there with the exact method/path the daemon
+    // requires.
+    func testRefreshSendsAHeartbeat() async throws {
+        let fixture = try populatedFixture()
+        let seenRequests = OSAllocatedUnfairLock(initialState: [URLRequest]())
+        StubProtocol.handler = { request in
+            seenRequests.withLock { $0.append(request) }
+            if request.url?.path == "/nodes/heartbeat" {
+                return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"ok":true}"#.utf8))
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: ["ETag": "\"abc\""])!, fixture)
+        }
+        let coordinator = RefreshCoordinator(client: makeClient(), store: SnapshotStore(directory: dir), queue: OutboundQueue(directory: dir))
+
+        _ = await coordinator.refresh()
+
+        let heartbeats = seenRequests.withLock { $0 }.filter { $0.url?.path == "/nodes/heartbeat" }
+        XCTAssertEqual(heartbeats.count, 1, "refresh() must send exactly one heartbeat so the daemon's node roster shows this phone as recently seen")
+        XCTAssertEqual(heartbeats.first?.httpMethod, "POST")
+    }
+
+    // Whole-branch review finding: `RefreshOutcome.offline` never reached the
+    // snapshot, so the widget -- which only reads what's on disk -- had no
+    // way to distinguish "the daemon has been down for hours" from "healthy,
+    // just polled recently" short of the unrelated 60-minute staleness
+    // threshold.
+    func testAnOfflineRefreshRecordsTheFailureOnTheSnapshotForTheWidget() async throws {
+        let store = SnapshotStore(directory: dir)
+        try store.save(Snapshot(summary: summary(ids: ["task_0"]), fetchedAt: Date(), etag: nil, locallyCompleted: []))
+        StubProtocol.failure = URLError(.notConnectedToInternet)
+        defer { StubProtocol.failure = nil }
+        let coordinator = RefreshCoordinator(client: makeClient(), store: store, queue: OutboundQueue(directory: dir))
+
+        let outcome = await coordinator.refresh()
+
+        guard case .offline = outcome else { return XCTFail("expected .offline, got \(outcome)") }
+        XCTAssertNotNil(store.load()?.lastRefreshFailedAt, "an offline refresh must record the failure so the widget can render it")
+    }
+
     // Not enumerated by name in the brief, but the brief's design note says
     // the coordinator drains BEFORE fetching "or a fetch overwrites the
     // snapshot with server state that predates the user's queued
