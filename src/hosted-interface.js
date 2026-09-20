@@ -2591,6 +2591,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 200, task);
         } catch (error) { return sendJson(res, 400, { error: error.message }); }
       }
+      // Literal sub-resources of /tasks must be matched before the `:id`
+      // pattern below, or the pattern claims them first and answers "unknown
+      // task" for a route that exists. /tasks/clarifications was reachable
+      // from the allowlist and from the CLI, and 404d for every caller —
+      // the mobile Inbox surfaced it as "this item is gone".
+      if (method === "GET" && pathname === "/tasks/clarifications") {
+        if (!runtime.clarifications?.list) return sendJson(res, 503, { error: "no clarification store" });
+        const status = url.searchParams.get("status");
+        return sendJson(res, 200, runtime.clarifications.list({ status: status === "null" ? null : (status ?? "pending") }));
+      }
       if (method === "GET" && pathname.match(/^\/tasks\/[^/]+$/)) {
         if (!runtime.tasks?.get) return sendJson(res, 503, { error: "no task store" });
         const id = decodeURIComponent(pathname.split("/")[2]);
@@ -2653,11 +2663,6 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const { buildReconciliationCalibration } = await import("./reconciliation-calibration.js");
         const outcomes = runtime.outcomes?.recent?.(200, "clarification-answered") ?? [];
         return sendJson(res, 200, buildReconciliationCalibration(outcomes).summary);
-      }
-      if (method === "GET" && pathname === "/tasks/clarifications") {
-        if (!runtime.clarifications?.list) return sendJson(res, 503, { error: "no clarification store" });
-        const status = url.searchParams.get("status");
-        return sendJson(res, 200, runtime.clarifications.list({ status: status === "null" ? null : (status ?? "pending") }));
       }
       if (method === "POST" && pathname.match(/^\/tasks\/clarifications\/[^/]+\/answer$/)) {
         if (!runtime.clarifications?.answer) return sendJson(res, 503, { error: "no clarification store" });
