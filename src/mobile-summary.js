@@ -41,7 +41,7 @@ export function buildMobileSummary(runtime, { now = new Date(), taskLimit = MOBI
       id: a.id,
       summary: typeof a.summary === "string" && a.summary
         ? a.summary
-        : [a.tool, a.server].filter(Boolean).join(" · ") || "Pending action",
+        : a.toolName ? `Run ${a.toolName}` : "Pending action",
       createdAt: a.createdAt ?? null
     })),
     brief: { headline: headlineFor(today.length, open.filter(isOverdue).length, actions.length) }
