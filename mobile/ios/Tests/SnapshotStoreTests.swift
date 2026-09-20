@@ -1,4 +1,5 @@
 import XCTest
+import os
 @testable import OpenAGI
 
 final class SnapshotStoreTests: XCTestCase {
@@ -115,6 +116,133 @@ final class SnapshotStoreTests: XCTestCase {
             _ = try? store.applyOptimisticCompletion(taskID: ids[index])
         }
         XCTAssertEqual(try XCTUnwrap(store.load()).locallyCompleted, Set(ids))
+    }
+
+    // Finding 1 (Task 9 review): RefreshCoordinator's `.unchanged` path used
+    // to be `if var snapshot = store.load() { snapshot.fetchedAt = Date();
+    // try? store.save(snapshot) }` -- a load and a save as two independently
+    // coordinated transactions, not one atomic merge. A concurrent
+    // `applyOptimisticCompletion` landing between them would be silently
+    // overwritten by the stale copy the load returned. `touchFetchedAt` is
+    // the fix: one `CoordinatedFile.write` closure that re-reads current
+    // disk contents before writing. This races many `applyOptimisticCompletion`
+    // calls against several `touchFetchedAt` calls on the same file, in the
+    // style of `testConcurrentOptimisticCompletionsDoNotLoseAnUpdate` above --
+    // it proves the coordinated block serializes this in-process race so no
+    // completion is lost to a concurrent fetchedAt bump; it does NOT prove
+    // cross-process behavior (a unit test bundle can't host two real
+    // processes), and it is probabilistic, not a deterministic reproduction
+    // of the old bug -- see the fix report for the run that demonstrates it
+    // fails reliably under the old two-transaction shape.
+    func testConcurrentTouchFetchedAtDoesNotLoseAConcurrentCompletion() throws {
+        let store = SnapshotStore(directory: dir)
+        let ids = (0..<12).map { "task_\($0)" }
+        try store.save(Snapshot(summary: try summary(ids: ids), fetchedAt: Date().addingTimeInterval(-600),
+                                etag: nil, locallyCompleted: []))
+
+        DispatchQueue.concurrentPerform(iterations: ids.count + 4) { index in
+            if index < ids.count {
+                _ = try? store.applyOptimisticCompletion(taskID: ids[index])
+            } else {
+                _ = try? store.touchFetchedAt()
+            }
+        }
+
+        XCTAssertEqual(try XCTUnwrap(store.load()).locallyCompleted, Set(ids),
+                       "a concurrent touchFetchedAt must not drop a completion")
+    }
+
+    func testTouchFetchedAtBumpsTheTimestampWithoutTouchingAnythingElse() throws {
+        let store = SnapshotStore(directory: dir)
+        let old = Date().addingTimeInterval(-600)
+        try store.save(Snapshot(summary: try summary(ids: ["task_0"]), fetchedAt: old, etag: "\"abc\"",
+                                locallyCompleted: ["task_0"]))
+        let touched = try XCTUnwrap(store.touchFetchedAt())
+        XCTAssertGreaterThan(touched.fetchedAt, old)
+        XCTAssertEqual(touched.etag, "\"abc\"")
+        XCTAssertEqual(touched.locallyCompleted, ["task_0"])
+    }
+
+    func testTouchFetchedAtIsANoOpWhenThereIsNoSnapshot() throws {
+        let store = SnapshotStore(directory: dir)
+        XCTAssertNil(try store.touchFetchedAt())
+        XCTAssertNil(store.load())
+    }
+
+    // Finding 3 (Task 9 review): `SettingsView.revoke()` used to delete
+    // `snapshot.json` with a plain `FileManager.removeItem`, outside the
+    // coordination domain every other writer here participates in.
+    func testDeleteRemovesTheSnapshotFile() throws {
+        let store = SnapshotStore(directory: dir)
+        try store.save(Snapshot(summary: try summary(titles: ["A"]), fetchedAt: Date(), etag: nil, locallyCompleted: []))
+        XCTAssertNotNil(store.load())
+        try store.delete()
+        XCTAssertNil(store.load())
+    }
+
+    func testDeleteOnAMissingFileIsANoOp() throws {
+        let store = SnapshotStore(directory: dir)
+        XCTAssertNil(store.load())
+        try store.delete()
+        XCTAssertNil(store.load())
+    }
+
+    // The race Finding 3 is about, proved deterministically rather than by
+    // firing a thread race and hoping it lands (a first attempt at exactly
+    // that -- racing many concurrent applyOptimisticCompletion calls against
+    // one delete via DispatchQueue.concurrentPerform -- passed 4/4 runs
+    // against the *old, uncoordinated* delete too, because NSFileCoordinator
+    // fully serializes the completions against each other, so the single
+    // uncoordinated delete rarely lands inside one of their already-tiny
+    // critical sections; it is not a reliable reproduction and was discarded
+    // -- see the fix report).
+    //
+    // Instead: hold a coordinated write open on this file from one queue
+    // (simulating an in-flight applyOptimisticCompletion/storeFresh/save
+    // that has started but not yet finished), then call store.delete() from
+    // another queue while that write is still holding the coordinator's
+    // lock. A coordinated delete must block until the writer releases --
+    // that is the whole mutual-exclusion guarantee this fix buys. The old
+    // uncoordinated `FileManager.removeItem` has no such wait: it returns
+    // immediately regardless of what else is mid-write on the same file,
+    // which is exactly what let it interleave with and be undone by a
+    // concurrent writer's later atomic rename.
+    func testDeleteWaitsForAnInFlightCoordinatedWriteRatherThanRacingIt() throws {
+        let store = SnapshotStore(directory: dir)
+        try store.save(Snapshot(summary: try summary(titles: ["A"]), fetchedAt: Date(), etag: nil, locallyCompleted: []))
+        let file = dir.appending(path: "snapshot.json")
+
+        let writerIsHoldingTheLock = DispatchSemaphore(value: 0)
+        let releaseTheWriter = DispatchSemaphore(value: 0)
+        let deleteFinished = DispatchSemaphore(value: 0)
+        let deleteReturnedWhileWriterStillHeldTheLock = OSAllocatedUnfairLock(initialState: false)
+
+        DispatchQueue.global().async {
+            try? CoordinatedFile.write(file) { _ -> Void in
+                writerIsHoldingTheLock.signal()
+                _ = releaseTheWriter.wait(timeout: .now() + 2)
+            }
+        }
+        XCTAssertEqual(writerIsHoldingTheLock.wait(timeout: .now() + 1), .success,
+                       "the writer must have entered its coordinated block before delete() is attempted")
+
+        DispatchQueue.global().async {
+            try? store.delete()
+            deleteFinished.signal()
+        }
+
+        // The writer is still holding the coordination lock open at this
+        // point. If delete() has already returned, it did not wait for the
+        // writer -- the exact race the old uncoordinated implementation had.
+        if deleteFinished.wait(timeout: .now() + 0.3) == .success {
+            deleteReturnedWhileWriterStillHeldTheLock.withLock { $0 = true }
+        }
+
+        releaseTheWriter.signal()
+        XCTAssertEqual(deleteFinished.wait(timeout: .now() + 1), .success,
+                       "delete must complete once the writer releases the coordinator's lock")
+        XCTAssertFalse(deleteReturnedWhileWriterStillHeldTheLock.withLock { $0 },
+                       "delete must wait for an in-flight coordinated write to finish, not race it")
     }
 
     func testCorruptFileIsTreatedAsNoSnapshotRatherThanCrashing() throws {

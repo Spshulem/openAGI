@@ -127,6 +127,29 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertTrue(queue.all().isEmpty, "a 409 means the server already considers this done")
     }
 
+    // Finding 2 (Task 9 review): drainQueue's `catch DaemonError.notFound,
+    // DaemonError.conflict` branch retires an op (tested above by 4 and this
+    // 409 test); every other error falls to the generic `catch` and calls
+    // `queue.recordAttempt` instead. Nothing before this exercised that
+    // second branch through the coordinator's own dispatch --
+    // OutboundQueueTests only calls `recordAttempt` directly, never through
+    // `drainQueue()`. A mutation collapsing both catch clauses into "remove
+    // on any error" passes the rest of the suite (nothing else distinguishes
+    // them) but must fail this one.
+    func testA500DuringDrainRecordsAnAttemptRatherThanRetiringTheOp() async throws {
+        let queue = OutboundQueue(directory: dir)
+        let op = PendingOp(kind: .completeTask("task_0"))
+        try queue.enqueue(op)
+        StubProtocol.handler = response(500)
+        let coordinator = RefreshCoordinator(client: makeClient(), store: SnapshotStore(directory: dir), queue: queue)
+
+        await coordinator.drainQueue()
+
+        let remaining = try XCTUnwrap(queue.all().first)
+        XCTAssertEqual(remaining.id, op.id, "a 500 is not the server saying it's done -- the op must still be queued")
+        XCTAssertEqual(remaining.attempts, 1, "the failed attempt must be recorded so the cap eventually retires it")
+    }
+
     // 5. Respond 401: `.unauthorized`, and the cached snapshot still loads
     // so the user sees their tasks while they re-pair.
     func testAnUnauthorizedRefreshReportsUnauthorizedAndKeepsTheSnapshot() async throws {

@@ -26,10 +26,7 @@ public actor RefreshCoordinator {
         do {
             switch try await client.summary(ifNoneMatch: store.load()?.etag) {
             case .unchanged:
-                if var snapshot = store.load() {
-                    snapshot.fetchedAt = Date()
-                    try? store.save(snapshot)
-                }
+                try? store.touchFetchedAt()
                 reloadWidgets()
                 return .unchanged
             case let .fresh(summary, etag):

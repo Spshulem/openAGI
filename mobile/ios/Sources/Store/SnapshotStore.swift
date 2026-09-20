@@ -93,4 +93,44 @@ public struct SnapshotStore: Sendable {
             return snapshot
         }
     }
+
+    // Bumps `fetchedAt` only, for RefreshCoordinator's `.unchanged` (304)
+    // path: the server said nothing changed, but the local "how stale is
+    // this" clock should still reset. This has to be one read-modify-write,
+    // coordinated like every other mutator here, not a `load()` then a
+    // `save()`: those are two independently coordinated transactions, and a
+    // concurrent `applyOptimisticCompletion` (a tap in TodayView, or the
+    // widget's AppIntent, in a different process) landing between them would
+    // be silently overwritten by the stale copy the first transaction
+    // loaded. Returns nil (no-op) if there is no snapshot on disk yet, same
+    // as the other read-modify-write mutators.
+    @discardableResult
+    public func touchFetchedAt(now: Date = Date()) throws -> Snapshot? {
+        try CoordinatedFile.write(file) { url -> Snapshot? in
+            guard let data = try? Data(contentsOf: url),
+                  var snapshot = try? ProtocolDecoder.json.decode(Snapshot.self, from: data) else {
+                return nil
+            }
+            snapshot.fetchedAt = now
+            try ProtocolDecoder.jsonEncoder.encode(snapshot).write(to: url, options: .atomic)
+            return snapshot
+        }
+    }
+
+    // Removes the snapshot file, coordinated like every other writer here.
+    // Used on account revoke: a plain `FileManager.removeItem` bypasses this
+    // file's whole coordination domain, so it is not mutually exclusive with
+    // an overlapping `applyOptimisticCompletion`/`storeFresh`/`save` call —
+    // it can land in the middle of one of those read-modify-write bodies and
+    // be silently undone by that body's later atomic write. Routing the
+    // removal through `CoordinatedFile.write` puts it in the same
+    // NSFileCoordinator domain as every other accessor, so it can never be
+    // interleaved mid-transaction with one of them.
+    public func delete() throws {
+        try CoordinatedFile.write(file) { url in
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+        }
+    }
 }
