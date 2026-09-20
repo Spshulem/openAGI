@@ -33,6 +33,11 @@ targets:
         NSLocalNetworkUsageDescription: OpenAGI talks to the daemon on your own machine.
         BGTaskSchedulerPermittedIdentifiers: [sh.openagi.refresh]
         UIBackgroundModes: [fetch]
+    entitlements:
+      path: Sources/OpenAGI.entitlements
+      properties:
+        com.apple.security.application-groups: [group.sh.openagi.mobile]
+        keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
   OpenAGITests:
     type: bundle.unit-test
     platform: iOS
