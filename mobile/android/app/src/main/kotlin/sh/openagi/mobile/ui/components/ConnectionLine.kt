@@ -26,6 +26,14 @@ sealed class ConnectionState {
     data class Synced(val host: String, val ageMinutes: Int) : ConnectionState()
     data class Failed(val host: String, val ageMinutes: Int?) : ConnectionState()
     data class NeverSynced(val host: String) : ConnectionState()
+
+    // Chat only. DESIGN.md: "The connection line on this screen reads `live`
+    // while the event stream is attached and `reconnecting` when it is not —
+    // the one screen where that distinction is worth the words." Every other
+    // screen's connection line answers "how stale is the last sync"; this
+    // one answers "is a reply actively streaming right now."
+    data class Live(val host: String) : ConnectionState()
+    data class Reconnecting(val host: String) : ConnectionState()
 }
 
 @Composable
@@ -37,11 +45,15 @@ fun ConnectionLine(state: ConnectionState, modifier: Modifier = Modifier) {
         is ConnectionState.Synced -> if (state.ageMinutes < 60) colors.live to true else muted to false
         is ConnectionState.Failed -> colors.alert to true
         is ConnectionState.NeverSynced -> muted to false
+        is ConnectionState.Live -> colors.live to true
+        is ConnectionState.Reconnecting -> muted to false
     }
     val (host, caption) = when (state) {
         is ConnectionState.Synced -> state.host to RelativeTime.short(state.ageMinutes)
         is ConnectionState.Failed -> state.host to "can't reach"
         is ConnectionState.NeverSynced -> state.host to "not synced yet"
+        is ConnectionState.Live -> state.host to "live"
+        is ConnectionState.Reconnecting -> state.host to "reconnecting"
     }
 
     Row(modifier = modifier) {
