@@ -1,22 +1,17 @@
 package sh.openagi.mobile.ui
 
 import android.content.Context
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -24,126 +19,124 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.glance.appwidget.updateAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.TaskItem
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.PendingOp
+import sh.openagi.mobile.store.Snapshot
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.sync.RefreshCoordinator
 import sh.openagi.mobile.sync.RefreshOutcome
 import sh.openagi.mobile.transport.DaemonClient
+import sh.openagi.mobile.ui.components.ConnectionState
+import sh.openagi.mobile.ui.components.EmptyState
+import sh.openagi.mobile.ui.components.RowGroup
+import sh.openagi.mobile.ui.components.ScreenHeader
+import sh.openagi.mobile.ui.components.TaskRow
+import sh.openagi.mobile.ui.theme.OpenAGIType
+import sh.openagi.mobile.util.rememberReducedMotion
 import sh.openagi.mobile.widget.TodayWidget
 
 // The main screen once a phone is paired: today's tasks, tappable to
-// complete, with a line showing how stale the data is. An optimistic
-// completion also repaints the home-screen widget immediately, the same way
-// CompleteTaskAction does for a tap made from the widget itself.
-@OptIn(ExperimentalMaterial3Api::class)
+// complete, matching the widget exactly. DESIGN.md: offline is a normal
+// state, not an error — this always renders the last snapshot and lets the
+// connection line (in ScreenHeader) say whether it's current.
 @Composable
 fun TodayScreen(
     context: Context,
     credentials: Credentials,
-    onOpenSettings: () -> Unit,
-    // Bumped by MainActivity.onResume(). A LaunchedEffect keyed on Unit alone
-    // fires only once for the lifetime of this composable, so without this
-    // key a background/foreground cycle would leave the status line and task
-    // list stale even though MainActivity asked for a refresh.
+    // Bumped by MainActivity.onResume() and by any live SSE event that could
+    // affect today's list. A LaunchedEffect keyed on Unit alone fires only
+    // once for this composable's lifetime, so without this key a
+    // background/foreground cycle — or a task-updated event — would leave
+    // the list stale even though a refresh was warranted.
     resumeSignal: Int = 0,
 ) {
     val store = remember { SnapshotStore(context.filesDir) }
     val queue = remember { OutboundQueue(context.filesDir) }
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
-    val coordinator = remember { RefreshCoordinator(client, store, queue) }
+    val coordinator = remember {
+        RefreshCoordinator(client, store, queue, onSnapshotChanged = { runCatching { TodayWidget().updateAll(context) } })
+    }
     var snapshot by remember { mutableStateOf(store.load()) }
-    var statusLine by remember { mutableStateOf("Not synced yet") }
+    var completingIds by remember { mutableStateOf(setOf<String>()) }
+    val reducedMotion = rememberReducedMotion()
     val scope = rememberCoroutineScope()
 
-    suspend fun refreshAndUpdateStatus() {
-        val outcome = coordinator.refresh()
+    fun connectionState(current: Snapshot?): ConnectionState = when {
+        current == null -> ConnectionState.NeverSynced(credentials.server)
+        current.lastRefreshFailed -> ConnectionState.Failed(credentials.server, current.ageInMinutes())
+        else -> ConnectionState.Synced(credentials.server, current.ageInMinutes())
+    }
+
+    LaunchedEffect(resumeSignal) {
+        coordinator.refresh()
         snapshot = store.load()
-        statusLine = when (outcome) {
-            is RefreshOutcome.Unauthorized -> "Needs re-pairing — revoke and pair again in Settings"
-            is RefreshOutcome.Offline -> "Can't reach OpenAGI"
-            else -> {
-                val age = snapshot?.ageInMinutes()
-                when {
-                    age == null -> "Not synced yet"
-                    age == 0 -> "Updated just now"
-                    else -> "Updated ${age}m ago"
-                }
-            }
+    }
+
+    fun completeTask(task: TaskItem) {
+        completingIds = completingIds + task.id
+        scope.launch {
+            if (!reducedMotion) delay(180)
+            // Optimistic: hide the row, queue the completion for the daemon,
+            // then try to send it right away without waiting for the next
+            // scheduled refresh.
+            snapshot = store.applyOptimisticCompletion(task.id)
+            queue.enqueue(PendingOp.completeTask(task.id))
+            runCatching { TodayWidget().updateAll(context) }
+            coordinator.drainQueue()
+            snapshot = store.load()
+            completingIds = completingIds - task.id
         }
     }
 
-    LaunchedEffect(resumeSignal) { refreshAndUpdateStatus() }
+    Column(modifier = Modifier.fillMaxSize()) {
+        ScreenHeader(title = "Today", connection = connectionState(snapshot))
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Today") },
-                actions = { TextButton(onClick = onOpenSettings) { Text("Settings") } },
-            )
-        },
-    ) { padding ->
-        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-            Text(
-                statusLine,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            )
-            val visible = snapshot?.visibleToday ?: emptyList()
+        val current = snapshot
+        if (current == null) {
+            EmptyState("Nothing left today.", "New tasks appear here when OpenAGI or you add them.")
+            return@Column
+        }
+
+        val visible = current.visibleToday
+        Column(
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            if (current.summary.brief.headline.isNotBlank()) {
+                Text(current.summary.brief.headline, style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
+            }
+
             if (visible.isEmpty()) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("Nothing due today.")
-                }
+                EmptyState("Nothing left today.", "New tasks appear here when OpenAGI or you add them.")
             } else {
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(visible, key = { it.id }) { task ->
+                RowGroup(modifier = Modifier.animateContentSize(tween(if (reducedMotion) 0 else 260))) {
+                    visible.forEachIndexed { index, task ->
                         TaskRow(
-                            task = task,
-                            onComplete = {
-                                scope.launch {
-                                    // Optimistic: hide the row immediately, queue
-                                    // the completion for the daemon, then try to
-                                    // send it right away without waiting for the
-                                    // next scheduled refresh.
-                                    snapshot = store.applyOptimisticCompletion(task.id)
-                                    queue.enqueue(PendingOp.completeTask(task.id))
-                                    TodayWidget().updateAll(context)
-                                    coordinator.drainQueue()
-                                    snapshot = store.load()
-                                }
-                            },
+                            title = task.title,
+                            subtitle = if (task.overdue) "Overdue" else null,
+                            subtitleIsAlert = task.overdue,
+                            isCompleting = task.id in completingIds,
+                            reducedMotion = reducedMotion,
+                            onComplete = { completeTask(task) },
                         )
+                        if (index != visible.lastIndex) Hairline()
                     }
                 }
-            }
-        }
-    }
-}
 
-@Composable
-private fun TaskRow(task: TaskItem, onComplete: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        Column {
-            Text(task.title)
-            if (task.overdue) {
+                val counts = current.visibleCounts
                 Text(
-                    "Overdue",
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.labelSmall,
+                    "${counts.today} left today, ${counts.thisWeek} this week",
+                    style = OpenAGIType.secondary,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
-        Button(onClick = onComplete) { Text("Done") }
     }
 }

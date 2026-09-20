@@ -35,6 +35,11 @@ android {
 
     buildFeatures {
         compose = true
+        // Settings screen shows the build version per FEATURES.md ("so a bug
+        // report can name one") — AGP 8 no longer generates BuildConfig by
+        // default, so this is opted back in rather than hardcoding the
+        // version string a second place.
+        buildConfig = true
     }
 
     sourceSets {
