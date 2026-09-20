@@ -22,6 +22,7 @@ import {
   readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider
 } from "../src/cli-client.js";
 import { pinnedRemoteOrigin } from "../src/node-control.js";
+import { buildPairingUrl, assertPhoneReachable } from "../src/pair-phone.js";
 
 const RESET = "\x1b[0m", DIM = "\x1b[2m", BOLD = "\x1b[1m", GREEN = "\x1b[32m", RED = "\x1b[31m", YELLOW = "\x1b[33m";
 const tty = process.stdout.isTTY;
@@ -37,6 +38,8 @@ function parseArgs(argv) {
     else if (a === "--token") flags.token = argv[++i];
     else if (a === "--host") flags.host = argv[++i];
     else if (a === "--port") flags.port = argv[++i];
+    else if (a === "--platform") flags.platform = argv[++i];
+    else if (a === "--url") flags.url = argv[++i];
     else if (a === "--allow") flags.allow = argv[++i];
     else if (a === "--allow-chat") flags.allowChat = argv[++i];
     else if (a === "--check") flags.check = true;
@@ -205,6 +208,53 @@ async function cmdPair(positional, flags) {
     return 1;
   }
   if (!alreadyConfirmed && !pairingToken) console.log(c(YELLOW, "No OPENAGI_REMOTE_TOKEN was set. An authenticated main cannot enroll this node until it is provided for the first handshake."));
+  return 0;
+}
+
+async function cmdPairPhone(flags) {
+  const platform = flags.platform ?? "ios";
+  if (platform !== "ios" && platform !== "android") {
+    console.error(c(RED, "usage: openagi pair-phone --platform ios|android [--url https://host:port]"));
+    return 1;
+  }
+  const local = normalizeBase(flags.url ?? process.env.OPENAGI_URL ?? "http://127.0.0.1:43210");
+  const headers = { "content-type": "application/json" };
+  const ownerToken = process.env.OPENAGI_AUTH_TOKEN ?? null;
+  if (ownerToken) headers.authorization = `Bearer ${ownerToken}`;
+  let issued;
+  try {
+    const res = await fetch(`${local}/nodes/enrollment-code`, {
+      method: "POST", headers, body: JSON.stringify({ platform: "mobile" })
+    });
+    if (!res.ok) {
+      console.error(c(RED, `x the daemon refused to issue a code (${res.status})`));
+      if (res.status === 401) console.error(c(DIM, "  set OPENAGI_AUTH_TOKEN in this shell and try again."));
+      return 1;
+    }
+    issued = await res.json();
+  } catch (error) {
+    console.error(c(RED, `x could not reach OpenAGI at ${local}: ${error.message}`));
+    return 1;
+  }
+  // The phone must be told an address IT can reach, which is rarely the one
+  // the CLI just used. OPENAGI_PUBLIC_URL is that address when it is set.
+  const reachableCandidate = issued.publicUrl || flags.url || local;
+  let origin;
+  try {
+    origin = assertPhoneReachable(reachableCandidate);
+    buildPairingUrl({ baseUrl: origin, code: issued.code, platform });
+  } catch (error) {
+    console.error(c(RED, `x ${error.message}`));
+    console.error(c(DIM, "  pass the phone-reachable address explicitly: openagi pair-phone --url http://<tailnet-host>:43210"));
+    return 1;
+  }
+  console.log("");
+  console.log(`  In the OpenAGI app on your ${platform === "ios" ? "iPhone" : "Android phone"}, tap Pair and enter:`);
+  console.log("");
+  console.log(`    server: ${c(GREEN, origin)}`);
+  console.log(`    code:   ${c(GREEN, issued.code)}`);
+  console.log("");
+  console.log(c(DIM, `  single use, expires ${issued.expiresAt}`));
   return 0;
 }
 
@@ -479,6 +529,7 @@ ${c(BOLD, "Turn this device into a node of a remote main:")}
   OPENAGI_REMOTE_TOKEN=… openagi pair <https-main-url>
                                          enroll once, then retain only a
                                          revocable node-scoped credential
+  openagi pair-phone --platform ios|android   pair a phone as a mobile node
   openagi unpair [--force]               revoke its scoped credential, then forget it
   openagi imessage-bridge [opts]         (macOS) relay incoming iMessages to the
                                          main and text its replies back. Opts:
@@ -514,6 +565,7 @@ async function main() {
       case "doctor": return await cmdDoctor(flags);
       case "setup": return await cmdSetup(flags);
       case "pair": return await cmdPair(positional, flags);
+      case "pair-phone": return await cmdPairPhone(flags);
       case "unpair": return await cmdUnpair(flags);
       case "update": return await cmdUpdate(positional, flags);
       case "migrate": return await cmdMigrate(positional, flags);
