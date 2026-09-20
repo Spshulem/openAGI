@@ -52,6 +52,7 @@ struct ChatView: View {
                             withAnimation(nil) { proxy.scrollTo(last, anchor: .bottom) }
                         }
                     }
+                    .scrollDismissesKeyboard(.immediately)
                 }
                 inputBar
             }

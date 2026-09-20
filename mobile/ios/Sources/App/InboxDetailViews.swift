@@ -153,12 +153,29 @@ struct ClarificationDetailView: View {
                 }
 
                 if clarification.status == "pending" {
-                    VStack(spacing: Theme.Spacing.x2) {
-                        ForEach(ClarificationAnswer.allCases) { answer in
-                            PrimaryButton(title: answer.label, isLoading: false) {
-                                Task { await respond(answer) }
+                    // DESIGN.md spends its one bold moment on completion --
+                    // four identical filled buttons here would be louder
+                    // than that. "Yes" (the common case) gets the primary
+                    // treatment; the other three are quiet rows instead.
+                    VStack(spacing: Theme.Spacing.x4) {
+                        PrimaryButton(title: ClarificationAnswer.yes.label, isLoading: false) {
+                            Task { await respond(.yes) }
+                        }
+                        RowGroup {
+                            let rest = ClarificationAnswer.allCases.filter { $0 != .yes }
+                            ForEach(Array(rest.enumerated()), id: \.element) { index, answer in
+                                Button {
+                                    Task { await respond(answer) }
+                                } label: {
+                                    Text(answer.label)
+                                        .font(Theme.Typography.body)
+                                        .foregroundStyle(Theme.ink)
+                                        .frame(maxWidth: .infinity, minHeight: Theme.rowMinHeight, alignment: .leading)
+                                        .padding(.horizontal, Theme.Spacing.x4)
+                                }
+                                .buttonStyle(.plain)
+                                if index < rest.count - 1 { RowHairline() }
                             }
-                            .opacity(answer == .yes ? 1 : 0.85)
                         }
                     }
                     .disabled(isWorking)
