@@ -8,11 +8,20 @@ public enum HostAllowlist {
         guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else {
             throw DaemonError.unreachableHost(url.absoluteString)
         }
+        // A phone can never reach the daemon's own loopback address, over any
+        // scheme — refused unconditionally, per mobile/PROTOCOL.md §10. This must
+        // run before the https branch below, or https://127.0.0.1 would sail
+        // through on "https is always allowed" alone.
+        if isLoopback(host) { throw DaemonError.unreachableHost(host) }
         if scheme == "https" { return url }
         guard scheme == "http" else { throw DaemonError.unreachableHost(url.absoluteString) }
         if host.hasSuffix(".ts.net") { return url }
         if isPrivateOrTailscale(host) { return url }
         throw DaemonError.unreachableHost(host)
+    }
+
+    private static func isLoopback(_ host: String) -> Bool {
+        host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
     }
 
     private static func isPrivateOrTailscale(_ host: String) -> Bool {

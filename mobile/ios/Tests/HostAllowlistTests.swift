@@ -42,4 +42,13 @@ final class HostAllowlistTests: XCTestCase {
         XCTAssertThrowsError(try HostAllowlist.validate(URL(string: "http://192.167.1.1:43210")!))
         XCTAssertThrowsError(try HostAllowlist.validate(URL(string: "http://192.169.1.1:43210")!))
     }
+
+    // Review fix: mobile/PROTOCOL.md §10 refuses loopback unconditionally,
+    // regardless of scheme — a phone can never reach its own loopback
+    // address, so https://127.0.0.1 must not sail through on "https is
+    // always allowed" alone.
+    func testLoopbackIsRefusedEvenOverHTTPS() {
+        XCTAssertThrowsError(try HostAllowlist.validate(URL(string: "https://127.0.0.1:43210")!))
+        XCTAssertThrowsError(try HostAllowlist.validate(URL(string: "https://localhost:43210")!))
+    }
 }
