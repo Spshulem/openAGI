@@ -76,6 +76,7 @@ targets:
       - path: Widget
       - path: Sources/Protocol
       - path: Sources/Store
+      - path: Sources/UI
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: sh.openagi.OpenAGI.OpenAGIWidget
