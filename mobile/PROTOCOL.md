@@ -114,16 +114,45 @@ Response (`src/hosted-interface.js:1102-1118`, pinned by
     "id": "mobile:fixture-node",
     "name": "Fixture Phone",
     "platform": "mobile",
-    "enrolledAt": "2026-09-20T02:06:59.841Z"
+    "enrolledAt": "2026-09-20T04:15:13.836Z"
   },
   "nodeToken": "FIXTURE-SYNTHETIC-NODE-TOKEN-NOT-REAL-00000",
   "capabilities": [
-    "mobile-task-client",
-    "mobile-approval-client",
-    "mobile-chat-client"
+    {
+      "id": "mobile-task-client",
+      "ready": true,
+      "operations": ["list", "create", "update", "delete", "complete"],
+      "detail": "Reads, creates, edits, completes, and deletes tasks in the user queue from the phone."
+    },
+    {
+      "id": "mobile-approval-client",
+      "ready": true,
+      "operations": ["approve", "deny"],
+      "detail": "Approves or denies queued agent actions from the phone."
+    },
+    {
+      "id": "mobile-chat-client",
+      "ready": true,
+      "operations": ["send"],
+      "detail": "Sends chat messages to the agent from the phone."
+    }
   ]
 }
 ```
+
+`capabilities` entries are objects, not bare strings — `sanitizeNodeCapabilities`
+(`src/node-control.js:31-61`) only ever keeps capability objects carrying an
+`.id`, the same shape `EVEN_G2_CAPABILITIES` uses
+(`src/integrations/g2-channel.js:11-24`). `MOBILE_CAPABILITIES`
+(`src/mobile-node.js`) declares exactly the three objects above. Note this
+route's response returns them **unsanitized** (`capabilitiesForPlatform`,
+`src/hosted-interface.js:3666-3668`, called directly), so they don't carry a
+`checkedAt` field here — but every other place capabilities are read back out
+of the node registry (§8's heartbeat response, `GET /nodes`) passes them
+through `sanitizeNodeCapabilities` first, which adds `"checkedAt": null` to
+each object. Don't assume the shape here and the shape in §8 are
+byte-identical — the fields are the same set members, but §8's response has
+one more key.
 
 `nodeToken` in the response is an exact echo of what the phone sent — the
 daemon does not mint a different one. If the same `nodeId` calls exchange
@@ -315,7 +344,7 @@ X-OpenAGI-Node-ID: <nodeId>
 is how the daemon (and anything reading task history later) distinguishes a
 completion made from the phone from one made by the CLI, the dashboard, or
 the agent (`"manual"` is the default if `completedVia` is omitted —
-`src/hosted-interface.js:2591-2596`).
+`src/hosted-interface.js:2607-2612`).
 
 Response is the full updated task, verified live against the daemon:
 
@@ -414,7 +443,7 @@ and returns that tool's own invocation result — `{"ok": true, "result": ...}`
 on success or `{"ok": false, "error": "..."}` on failure — optionally with a
 `continuation` field if another step follows. This shape varies by which tool
 was approved; there is no single fixed schema beyond the `ok`/`error`
-envelope (`src/hosted-interface.js:2181-2224`).
+envelope (`src/hosted-interface.js:2197-2241`).
 
 **Deny:**
 
@@ -428,7 +457,7 @@ X-OpenAGI-Node-ID: <nodeId>
 ```
 
 `reason` is optional (defaults to `"denied by user"`). Response is exactly
-(`src/hosted-interface.js:2226-2241`, verified live):
+(`src/hosted-interface.js:2242-2257`, verified live):
 
 ```json
 { "id": "act_840d87422622443a", "status": "denied" }
@@ -446,7 +475,7 @@ Authorization: Bearer <nodeToken>
 X-OpenAGI-Node-ID: <nodeId>
 ```
 
-Long-lived connection. Frame format (`handleSse`, `src/hosted-interface.js:3327-3342`):
+Long-lived connection. Frame format (`handleSse`, `src/hosted-interface.js:3343-3358`):
 
 ```
 event: <name>
@@ -486,10 +515,6 @@ While foregrounded, the phone should call this roughly every 30 seconds so
 the daemon's node roster shows it as recently seen — the same cadence the
 existing node clients use.
 
-**The full request the daemon actually requires** (verified live against the
-daemon — a body of only `{"nodeId": "..."}` gets `400 {"error":"nodeId and
-name are required and must be non-empty strings"}`):
-
 ```
 POST /nodes/heartbeat
 Content-Type: application/json
@@ -498,26 +523,58 @@ X-OpenAGI-Node-ID: <nodeId>
 
 {
   "nodeId": "mobile:D3B1F6C2-...",
-  "name": "Sean's iPhone",
-  "role": "node",
-  "url": null,
-  "version": "1.0.0",
-  "build": null,
-  "buildSource": null,
-  "capabilities": []
+  "role": "node"
 }
 ```
 
-Required fields: `nodeId` (must equal the `X-OpenAGI-Node-ID` header, or the
-daemon returns `403`), a non-empty string `name`, and `role` which must be
-the exact literal `"node"`. `url`, `version`, `build`, `buildSource` are
-optional strings (or `null`); `capabilities` is an optional array.
-(`src/hosted-interface.js:1119-1165`.)
+That minimal body is enough for an already-enrolled phone. Since commit
+`187ba76`, the daemon treats **any enrolled node's identity as
+registry-authoritative**, not just the G2's: for a `nodeId` that has
+completed §1.3, the daemon already knows its `name`, `platform`, and
+`capabilities` from enrollment, and uses those — not the request body — when
+updating the roster and building the response.
 
-Response, verified live:
+- `nodeId` is always required and must equal the `X-OpenAGI-Node-ID` header,
+  or the daemon returns `403`.
+- `role` is always required and must be the exact literal `"node"`, or `400
+  {"error":"role must be \"node\""}`.
+- `name` is required **only** for a caller with no enrollment on file (i.e.
+  not a real phone, which cannot reach this route before completing §1.3). An
+  already-enrolled phone may omit `name` entirely. **If an enrolled phone
+  sends `name` anyway, the daemon accepts the request (still type-checks it
+  as a non-empty string if present) but silently ignores the value** — the
+  roster keeps the name the phone enrolled with. Do not build client logic
+  that expects a `name` sent here to ever change what the dashboard shows;
+  it can't. (Only a caller enrolled with no platform at all — the bare
+  `/nodes/enroll` flow no phone uses — has its body-supplied `name` and
+  `capabilities` actually stored.)
+- `url`, `version`, `build`, `buildSource` are optional strings (or `null`)
+  and are always stored as sent, regardless of enrollment.
+- `capabilities`, if sent, must be an array — but for an enrolled phone the
+  daemon ignores its contents the same way it ignores `name`; the roster and
+  the response both use the phone's enrolled capability set (§1.3), not
+  whatever the body claims. A phone cannot self-declare a capability it
+  didn't enroll with.
+
+Verified live against the current handler (`src/hosted-interface.js:1119-1181`):
+an enrolled mobile node posting exactly `{"nodeId": "...", "role": "node"}`
+gets `200 {"ok": true, "capabilities": [...]}` — no `name` required, no 400.
+Sending a `name` on top of that is also accepted (`200`) and has no visible
+effect on the stored roster entry.
+
+Response, captured live (note `checkedAt` — present here because this
+response is built from `sanitizeNodeCapabilities`, unlike §1.3's raw
+`capabilities`; see the note at the end of §1.3):
 
 ```json
-{ "ok": true, "capabilities": [] }
+{
+  "ok": true,
+  "capabilities": [
+    { "id": "mobile-task-client", "ready": true, "operations": ["list", "create", "update", "delete", "complete"], "detail": "Reads, creates, edits, completes, and deletes tasks in the user queue from the phone.", "checkedAt": null },
+    { "id": "mobile-approval-client", "ready": true, "operations": ["approve", "deny"], "detail": "Approves or denies queued agent actions from the phone.", "checkedAt": null },
+    { "id": "mobile-chat-client", "ready": true, "operations": ["send"], "detail": "Sends chat messages to the agent from the phone.", "checkedAt": null }
+  ]
+}
 ```
 
 ## 9. Revocation
@@ -535,7 +592,7 @@ X-OpenAGI-Node-ID: <nodeId>
 
 `nodeId` in the body must equal the header's node id or the daemon returns
 `403`. Response: `{"ok": true, "revoked": true}`
-(`src/hosted-interface.js:1203-1211`). After this call the daemon's stored
+(`src/hosted-interface.js:1219-1226`). After this call the daemon's stored
 credential for that node is gone; the phone should delete its own stored
 `nodeToken`/`nodeId` at the same time and treat itself as unpaired.
 
@@ -594,11 +651,15 @@ request's `nodeToken` rather than a fresh random one, specifically so nothing
 token-shaped-and-real ever lands in this repo. It still exercises the same
 43-char/`[a-zA-Z0-9_-]` validation and echo-back behavior a real token would.
 
-`test/mobile-fixtures-current.test.js` boots a real daemon, adds the same
-task, and asserts the **key sets** of the live `/mobile/summary` response
-match the committed fixture's key sets (top level, `counts`, one `today`
-item, `brief`). It intentionally checks shape (key names), not exact values
-like timestamps/ids, which differ on every run by design. If this test fails,
-the daemon's response shape changed — regenerate the fixtures and re-run both
+`test/mobile-fixtures-current.test.js` boots a real daemon and, in one test
+per fixture file, re-derives the same live call each fixture came from and
+asserts the **key sets** match the committed fixture's key sets (top level,
+plus the relevant nested objects — `counts`/`brief`/one `today` item for the
+summaries, `tasks[0]`/`stats.user`/`stats.agent` for the task list, `node`
+for the exchange). All five fixtures are covered, not just the populated
+summary — a fixture nothing re-derives is a fixture that can silently rot.
+The test intentionally checks shape (key names), not exact values like
+timestamps/ids, which differ on every run by design. If this test fails, the
+daemon's response shape changed — regenerate the fixtures and re-run both
 native clients' unit tests before assuming the fixture, rather than the
 daemon, is stale.

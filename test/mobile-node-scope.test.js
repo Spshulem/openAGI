@@ -10,10 +10,28 @@ import {
 
 test("the platform string and capabilities are the documented ones", () => {
   assert.equal(MOBILE_PLATFORM, "mobile");
+  // Capability objects, not bare strings: sanitizeNodeCapabilities() only
+  // keeps entries carrying an .id, so a phone's declared capabilities must
+  // already be shaped like this to survive being stored and echoed back.
   assert.deepEqual(MOBILE_CAPABILITIES, [
-    "mobile-task-client",
-    "mobile-approval-client",
-    "mobile-chat-client"
+    {
+      id: "mobile-task-client",
+      ready: true,
+      operations: ["list", "create", "update", "delete", "complete"],
+      detail: "Reads, creates, edits, completes, and deletes tasks in the user queue from the phone."
+    },
+    {
+      id: "mobile-approval-client",
+      ready: true,
+      operations: ["approve", "deny"],
+      detail: "Approves or denies queued agent actions from the phone."
+    },
+    {
+      id: "mobile-chat-client",
+      ready: true,
+      operations: ["send"],
+      detail: "Sends chat messages to the agent from the phone."
+    }
   ]);
 });
 
