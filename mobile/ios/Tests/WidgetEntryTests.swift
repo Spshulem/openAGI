@@ -62,6 +62,36 @@ final class WidgetEntryTests: XCTestCase {
         XCTAssertEqual(WidgetState.staleAfterMinutes, 60)
     }
 
+    // Whole-branch review finding: nothing pinned the exact boundary, so a
+    // `>` to `>=` slip in `WidgetState.from`'s staleness check would pass
+    // every other test in this file. At exactly `staleAfterMinutes` (60),
+    // the snapshot must still be treated as fresh, not stale.
+    func testAtExactlySixtyMinutesTheSnapshotIsStillFreshNotStale() {
+        let state = WidgetState.from(snapshot: snapshot(titles: ["A"], ageMinutes: 60), paired: true, now: now)
+        guard case let .tasks(tasks, _, ageMinutes) = state else { return XCTFail("expected .tasks at exactly 60 minutes, got \(state)") }
+        XCTAssertEqual(tasks.map(\.title), ["A"])
+        XCTAssertEqual(ageMinutes, 60)
+    }
+
+    // Whole-branch review finding: `RefreshOutcome.offline` never reached the
+    // snapshot, so the widget had no state for "the daemon is known
+    // unreachable" distinct from mere staleness.
+    func testAFailedRefreshIsUnreachableEvenWhenTheSnapshotIsOtherwiseFresh() {
+        var seeded = snapshot(titles: ["A"], ageMinutes: 3)
+        seeded.lastRefreshFailedAt = now
+        let state = WidgetState.from(snapshot: seeded, paired: true, now: now)
+        XCTAssertEqual(state, .unreachable(3))
+    }
+
+    // A known failure takes precedence over mere staleness -- it is the more
+    // specific, more actionable signal DESIGN.md's copy rules distinguish.
+    func testAFailedRefreshTakesPrecedenceOverStaleness() {
+        var seeded = snapshot(titles: ["A"], ageMinutes: 120)
+        seeded.lastRefreshFailedAt = now
+        let state = WidgetState.from(snapshot: seeded, paired: true, now: now)
+        XCTAssertEqual(state, .unreachable(120))
+    }
+
     // 5. Snapshot whose only task was optimistically completed -> `.empty`.
     func testSnapshotWithOnlyOptimisticallyCompletedTaskIsEmpty() {
         let state = WidgetState.from(snapshot: snapshot(titles: ["A"], ageMinutes: 3, locallyCompleted: ["task_0"]),

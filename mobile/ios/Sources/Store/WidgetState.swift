@@ -23,6 +23,14 @@ public enum WidgetState: Equatable, Sendable {
     case empty(headline: String)
     case tasks([TaskItem], counts: MobileSummary.Counts, ageMinutes: Int)
     case stale(Int)
+    // Whole-branch review finding: the widget previously had no way to say
+    // "the daemon is known to be unreachable" as distinct from "this is just
+    // old" -- `RefreshOutcome.offline` never reached the snapshot, so a
+    // daemon that had been down the whole time rendered identically to a
+    // healthy one for up to 60 minutes. The carried `Int` is minutes since
+    // the last snapshot that DID succeed (`Snapshot.fetchedAt`, which
+    // `recordRefreshFailure` never touches), matching `.stale`'s shape.
+    case unreachable(Int)
 
     // Past this many minutes, the widget must say the data is stale rather
     // than present old rows as though they were current.
@@ -32,6 +40,11 @@ public enum WidgetState: Equatable, Sendable {
         guard paired else { return .unpaired }
         guard let snapshot else { return .empty(headline: "Nothing synced yet.") }
         let age = snapshot.ageInMinutes(now: now)
+        // A known-failed refresh is a stronger, more specific signal than
+        // mere staleness -- DESIGN.md's copy rules draw the same distinction
+        // between "Can't reach OpenAGI" (an error) and "Last synced 3h ago"
+        // (a fact stated with no claim about why).
+        if snapshot.lastRefreshFailedAt != nil { return .unreachable(age) }
         if age > staleAfterMinutes { return .stale(age) }
         let visible = snapshot.visibleToday
         if visible.isEmpty { return .empty(headline: snapshot.summary.brief.headline) }

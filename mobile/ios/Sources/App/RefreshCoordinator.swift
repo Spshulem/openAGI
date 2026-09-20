@@ -23,6 +23,13 @@ public actor RefreshCoordinator {
     // or a refresh will hand back the state their tap was meant to change.
     public func refresh() async -> RefreshOutcome {
         await drainQueue()
+        // Whole-branch review finding: `heartbeat()` existed, was tested, and
+        // was never called by anything, so a paired phone's `lastSeen` never
+        // advanced past enrollment. This is the one place that covers
+        // foreground refresh, pull-to-refresh, and background refresh with a
+        // single call. Best-effort: the daemon's node roster is a
+        // convenience, never something a refresh should fail over.
+        _ = try? await client.heartbeat()
         do {
             switch try await client.summary(ifNoneMatch: store.load()?.etag) {
             case .unchanged:
@@ -37,6 +44,13 @@ public actor RefreshCoordinator {
         } catch DaemonError.unauthorized {
             return .unauthorized
         } catch {
+            // Whole-branch review finding: this outcome never reached the
+            // snapshot, so the widget (which only reads what's on disk) had
+            // no way to tell "daemon has been down for hours" from "healthy,
+            // just polled recently" until the unrelated 60-minute staleness
+            // threshold happened to also trip.
+            try? store.recordRefreshFailure()
+            reloadWidgets()
             return .offline
         }
     }
