@@ -90,6 +90,167 @@ public actor DaemonClient {
         _ = try await perform(request)
     }
 
+    // MARK: - Tasks (mobile/PROTOCOL.md §5, mobile/FEATURES.md's Tasks tab)
+
+    public func tasks(queue: String = "user", bucket: String? = nil, status: String? = nil, limit: Int? = nil) async throws -> [TaskRecord] {
+        var items = [URLQueryItem(name: "queue", value: queue)]
+        if let bucket { items.append(URLQueryItem(name: "bucket", value: bucket)) }
+        if let status { items.append(URLQueryItem(name: "status", value: status)) }
+        if let limit { items.append(URLQueryItem(name: "limit", value: String(limit))) }
+        let request = try authorizedRequest(path: "/tasks", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(TasksListResponse.self, from: data).tasks
+    }
+
+    public func task(id: String) async throws -> TaskRecord {
+        let request = try authorizedRequest(path: "/tasks/\(id)", method: "GET")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(TaskRecord.self, from: data)
+    }
+
+    public func createTask(_ input: NewTaskInput) async throws -> TaskRecord {
+        var request = try authorizedRequest(path: "/tasks", method: "POST")
+        var body: [String: Any] = ["title": input.title, "bucket": input.bucket.rawValue]
+        if let priority = input.priority { body["priority"] = priority }
+        if let dueDate = input.dueDate { body["dueDate"] = Self.isoString(dueDate) }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(TaskRecord.self, from: data)
+    }
+
+    // Only fields the caller actually set are sent -- `TaskPatch`'s
+    // properties are all optional so a screen editing just the title, say,
+    // never overwrites bucket/priority/status with stale local values.
+    public func updateTask(id: String, patch: TaskPatch) async throws -> TaskRecord {
+        var request = try authorizedRequest(path: "/tasks/\(id)", method: "PATCH")
+        var body: [String: Any] = [:]
+        if let title = patch.title { body["title"] = title }
+        if let bucket = patch.bucket { body["bucket"] = bucket.rawValue }
+        if let priority = patch.priority { body["priority"] = priority }
+        if let dueDate = patch.dueDate { body["dueDate"] = dueDate.map(Self.isoString) ?? NSNull() }
+        if let status = patch.status { body["status"] = status.rawValue }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(TaskRecord.self, from: data)
+    }
+
+    public func deleteTask(id: String) async throws {
+        let request = try authorizedRequest(path: "/tasks/\(id)", method: "DELETE")
+        _ = try await perform(request)
+    }
+
+    // MARK: - Clarifications
+
+    public func clarifications(status: String? = "pending") async throws -> [Clarification] {
+        let items = status.map { [URLQueryItem(name: "status", value: $0)] } ?? []
+        let request = try authorizedRequest(path: "/tasks/clarifications", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON([Clarification].self, from: data)
+    }
+
+    // The daemon accepts exactly one of four fixed values here -- see
+    // `ClarificationAnswer`'s doc comment -- never free text.
+    public func answerClarification(id: String, answer: ClarificationAnswer) async throws -> ClarificationAnswerResponse {
+        var request = try authorizedRequest(path: "/tasks/clarifications/\(id)/answer", method: "POST")
+        request.httpBody = Data(#"{"answer":"\#(answer.rawValue)"}"#.utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(ClarificationAnswerResponse.self, from: data)
+    }
+
+    // MARK: - Pending actions (mobile/PROTOCOL.md §6)
+
+    public func pendingActions(status: String? = "pending") async throws -> [PendingAction] {
+        let items = status.map { [URLQueryItem(name: "status", value: $0)] } ?? []
+        let request = try authorizedRequest(path: "/pending-actions", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(PendingActionsResponse.self, from: data).actions
+    }
+
+    public func approvePendingAction(id: String) async throws -> ApprovalOutcome {
+        let request = try authorizedRequest(path: "/pending-actions/\(id)/approve", method: "POST")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(ApprovalOutcome.self, from: data)
+    }
+
+    public func denyPendingAction(id: String, reason: String?) async throws -> DenyOutcome {
+        var request = try authorizedRequest(path: "/pending-actions/\(id)/deny", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: reason.map { ["reason": $0] } ?? [:])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(DenyOutcome.self, from: data)
+    }
+
+    // MARK: - Chat (mobile/FEATURES.md's Chat tab)
+
+    // `POST /message` with `Accept: text/event-stream` streams its own
+    // reply directly on this response -- a different mechanism from the
+    // always-on `GET /events` broadcast below. See ChatEvent's doc comment.
+    // Throws before returning a stream if the request itself can't even be
+    // sent (bad host, non-2xx status); streaming failures thereafter surface
+    // through the returned stream's `AsyncThrowingStream` itself.
+    public func sendMessageStreaming(text: String) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+        var request = try authorizedRequest(path: "/message", method: "POST")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["text": text])
+        // A chat turn can run a tool loop; the daemon sends a heartbeat
+        // frame every 15s specifically so this doesn't need to be short.
+        request.timeoutInterval = 120
+        let (bytes, response) = try await Self.bytesCall(request, session: session)
+        _ = try validate(response)
+        return AsyncThrowingStream { continuation in
+            let pump = Task {
+                var parser = SSEFrameParser()
+                do {
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        if let frame = parser.feed(line), let chatEvent = ChatEvent.decode(frame) {
+                            continuation.yield(chatEvent)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: DaemonError.transport(error))
+                }
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
+    }
+
+    // `GET /events` -- the long-lived broadcast connection (mobile/PROTOCOL.md
+    // §7). Reconnect-with-backoff is the caller's job (see
+    // `EventStreamController`): this returns one connection's worth of
+    // events and finishes (or throws) when that connection ends.
+    public func eventStream() async throws -> AsyncThrowingStream<DaemonEvent, Error> {
+        var request = try authorizedRequest(path: "/events", method: "GET")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        // Long-lived by design; the daemon pings every 15s specifically so
+        // intermediaries (and this timeout) don't treat silence as dead.
+        request.timeoutInterval = 3600
+        let (bytes, response) = try await Self.bytesCall(request, session: session)
+        _ = try validate(response)
+        return AsyncThrowingStream { continuation in
+            let pump = Task {
+                var parser = SSEFrameParser()
+                do {
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        if let event = parser.feed(line) {
+                            continuation.yield(DaemonEvent.from(name: event.name))
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: DaemonError.transport(error))
+                }
+            }
+            continuation.onTermination = { _ in pump.cancel() }
+        }
+    }
+
     // Enrollment happens before any credential exists, so it is static and
     // carries only the one-time code.
     public static func enroll(server: URL, code: String, nodeID: String, nodeToken: String,
@@ -115,9 +276,23 @@ public actor DaemonClient {
         }
     }
 
-    private func authorizedRequest(path: String, method: String) throws -> URLRequest {
+    // `URL.appending(path:)` percent-encodes its argument as a single path
+    // component -- a literal "?status=pending" passed as `path` becomes the
+    // literal characters "%3Fstatus=pending" in the URL's path, never a real
+    // query string. `queryItems` goes through `URLComponents` instead, which
+    // is the only way to get an actual `?a=b&c=d` on the request.
+    private func authorizedRequest(path: String, method: String, queryItems: [URLQueryItem] = []) throws -> URLRequest {
         let base = try HostAllowlist.validate(server)
-        var request = URLRequest(url: base.appending(path: path))
+        var url = base.appending(path: path)
+        if !queryItems.isEmpty {
+            guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+                throw DaemonError.malformedResponse
+            }
+            components.queryItems = queryItems
+            guard let composed = components.url else { throw DaemonError.malformedResponse }
+            url = composed
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(nodeID, forHTTPHeaderField: "X-OpenAGI-Node-ID")
@@ -142,6 +317,29 @@ public actor DaemonClient {
         } catch {
             throw DaemonError.transport(error)
         }
+    }
+
+    // A dropped connection, timeout, DNS failure, or TLS error throws a raw
+    // URLError here too -- same contract as `networkCall` above, just for
+    // the streaming bytes API instead of `data(for:)`.
+    private static func bytesCall(_ request: URLRequest, session: URLSession) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        do {
+            return try await session.bytes(for: request)
+        } catch let error as DaemonError {
+            throw error
+        } catch {
+            throw DaemonError.transport(error)
+        }
+    }
+
+    // The daemon's own dates round-trip through fractional-second ISO-8601
+    // (see ProtocolDecoder); this is the encode-side counterpart for the
+    // `[String: Any]` request bodies this file builds by hand, which
+    // JSONEncoder's `.iso8601` strategy can't reach into.
+    private static func isoString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
     }
 
     private static func decodeJSON<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
