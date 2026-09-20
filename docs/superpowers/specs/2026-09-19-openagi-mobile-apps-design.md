@@ -193,10 +193,19 @@ voice preferences).
 
 ## Phases
 
-**Phase 1 — pairing + widget.** Transport, protocol, store, pairing,
+**Phase 1 — pairing + widget. Shipped.** Transport, protocol, store, pairing,
 `mobile` platform scope server-side, `GET /mobile/summary`, widget on both
 platforms with tap-to-complete, background refresh, offline queue. Minimal
 host app: pair, view today, settings.
+
+One deliberate divergence from this document as written: `pair-phone` never
+grew a QR encoder. The CLI prints a manual server-address-plus-six-digit-code
+pair and an `openagi://pair` deep link (openable via a saved note, a message
+to yourself, or `xcrun simctl openurl` on a simulator); a hand-rolled QR
+encoder was not worth several hundred lines of code against a two-field,
+once-per-phone flow. Everything else in this document matches what shipped —
+see `mobile/README.md` for how to build, pair, and verify it, and
+`mobile/PROTOCOL.md` for the exact wire contract.
 
 **Phase 2 — full app.** Task management, approvals, clarifications, streaming
 text chat, SSE-driven live refresh.
