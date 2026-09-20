@@ -13,7 +13,12 @@ import java.time.Instant
 class WidgetStateTest {
     private val now: Instant = Instant.parse("2026-09-19T12:00:00Z")
 
-    private fun snapshot(titles: List<String>, minutesAgo: Long, completed: Set<String> = emptySet()): Snapshot {
+    private fun snapshot(
+        titles: List<String>,
+        minutesAgo: Long,
+        completed: Set<String> = emptySet(),
+        refreshFailed: Boolean = false,
+    ): Snapshot {
         val today = titles.mapIndexed { index, title ->
             TaskItem("task_$index", title, "today", "pending", 50, null, false)
         }
@@ -28,6 +33,7 @@ class WidgetStateTest {
             fetchedAt = now.minusSeconds(minutesAgo * 60),
             etag = null,
             locallyCompleted = completed,
+            lastRefreshFailed = refreshFailed,
         )
     }
 
@@ -76,5 +82,26 @@ class WidgetStateTest {
         val state = WidgetState.from(snapshot(listOf("A", "B"), 60), paired = true, now = now)
         assertTrue(state is WidgetState.Tasks)
         assertEquals(60, (state as WidgetState.Tasks).ageMinutes)
+    }
+
+    // The gap the whole-branch review caught: a daemon down the whole time
+    // rendered identically to a healthy one for up to an hour, because age
+    // alone can't distinguish "nothing changed" from "nobody answered."
+    @Test
+    fun aFailedRefreshIsUnreachableEvenWellInsideTheStaleWindow() {
+        val state = WidgetState.from(snapshot(listOf("A", "B"), 3, refreshFailed = true), paired = true, now = now)
+        assertTrue(state is WidgetState.Unreachable)
+        assertEquals(listOf("A", "B"), (state as WidgetState.Unreachable).items.map { it.title })
+        assertEquals(3, state.ageMinutes)
+    }
+
+    @Test
+    fun aFailedRefreshStillShowsWhicheverTasksAreLeftAfterOptimisticCompletion() {
+        val state = WidgetState.from(
+            snapshot(listOf("A", "B"), 3, completed = setOf("task_0"), refreshFailed = true),
+            paired = true,
+            now = now,
+        ) as WidgetState.Unreachable
+        assertEquals(listOf("B"), state.items.map { it.title })
     }
 }

@@ -7,7 +7,6 @@ import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SummaryResponse
-import java.time.Instant
 
 sealed class RefreshOutcome {
     data class Updated(val snapshot: Snapshot) : RefreshOutcome()
@@ -20,15 +19,25 @@ class RefreshCoordinator(
     private val client: DaemonClient,
     private val store: SnapshotStore,
     private val queue: OutboundQueue,
+    // Fired whenever this refresh wrote a new snapshot to disk — the one place
+    // that repaints the widget, rather than each call site (TodayScreen,
+    // Settings' "Refresh now", Pairing's first refresh) remembering to do it
+    // itself and inevitably missing one. Defaults to a no-op so JVM unit tests
+    // that construct this with three positional args keep compiling, and so
+    // this class stays free of any Glance/Android dependency.
+    private val onSnapshotChanged: suspend () -> Unit = {},
 ) {
     // Order matters: send what the user already did before asking what is true,
     // or a refresh will hand back the state their tap was meant to change.
     suspend fun refresh(): RefreshOutcome {
         drainQueue()
-        return try {
+        val outcome = try {
             when (val response = client.summary(store.load()?.etag)) {
                 is SummaryResponse.Unchanged -> {
-                    store.load()?.let { store.save(it.copy(fetchedAt = Instant.now())) }
+                    // A single locked read-modify-write, not a load() and a
+                    // separate save(): see SnapshotStore.touchFetchedAt's own
+                    // comment for the lost-update race this closes.
+                    store.touchFetchedAt()
                     RefreshOutcome.Unchanged
                 }
                 is SummaryResponse.Fresh ->
@@ -37,8 +46,22 @@ class RefreshCoordinator(
         } catch (error: DaemonException.Unauthorized) {
             RefreshOutcome.Unauthorized
         } catch (error: Exception) {
+            store.markRefreshFailed()
             RefreshOutcome.Offline
         }
+        if (outcome is RefreshOutcome.Updated || outcome is RefreshOutcome.Unchanged || outcome is RefreshOutcome.Offline) {
+            onSnapshotChanged()
+        }
+        // Best-effort: keeps the daemon's node roster showing this phone as
+        // recently seen (PROTOCOL.md §8). A phone that can't be reached has
+        // nothing to keep alive either, so failures here are swallowed the
+        // same way an offline summary fetch already is above.
+        try {
+            client.heartbeat()
+        } catch (error: Exception) {
+            // Ignored — heartbeat is advisory, never load-bearing for this call.
+        }
+        return outcome
     }
 
     suspend fun drainQueue() {

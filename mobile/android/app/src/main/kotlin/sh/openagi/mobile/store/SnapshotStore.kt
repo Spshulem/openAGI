@@ -16,6 +16,14 @@ data class Snapshot(
     @Serializable(with = InstantSerializer::class) val fetchedAt: Instant,
     val etag: String? = null,
     val locallyCompleted: Set<String> = emptySet(),
+    // Set when the most recent refresh attempt could not reach the daemon —
+    // distinct from `fetchedAt`'s age, which only says how old the last GOOD
+    // fetch was. Without this, a daemon that has been down the whole time
+    // renders identically to a healthy one for up to an hour: age alone
+    // cannot tell "quiet because nothing changed" from "quiet because nobody
+    // is answering." Cleared by touchFetchedAt/storeFresh, the two paths that
+    // mean a request just succeeded.
+    val lastRefreshFailed: Boolean = false,
 ) {
     // What the UI and widget actually draw: the server's list minus anything
     // completed here that the server has not caught up with yet.
@@ -49,6 +57,33 @@ class SnapshotStore(directory: File) {
     private val lock = lockFor(file)
 
     fun load(): Snapshot? = synchronized(lock) { loadLocked() }
+
+    // A 304 response means the summary didn't change, but the phone still just
+    // confirmed it's current — the age shown to the user should reset to zero.
+    // The naive way to do that, `store.load()?.let { store.save(it.copy(...)) }`,
+    // is two independently-locked transactions: a widget tap or an in-app
+    // completion landing between the load and the save is blind-overwritten
+    // with the pre-tap `locallyCompleted`, so the row the user just ticked
+    // flickers back. This does the read and the write inside one lock instead,
+    // the same fix iOS was required to make.
+    fun touchFetchedAt(now: Instant = Instant.now()): Snapshot? = synchronized(lock) {
+        val current = loadLocked() ?: return@synchronized null
+        val touched = current.copy(fetchedAt = now, lastRefreshFailed = false)
+        saveLocked(touched)
+        touched
+    }
+
+    // A refresh attempt reached no daemon at all — there is no fresher summary
+    // to store, but the widget and every screen's connection line still need
+    // to know the last attempt did not succeed. No-ops when there is nothing
+    // on disk yet: an unpaired or never-synced phone has no snapshot to mark.
+    fun markRefreshFailed(): Snapshot? = synchronized(lock) {
+        val current = loadLocked() ?: return@synchronized null
+        if (current.lastRefreshFailed) return@synchronized current
+        val marked = current.copy(lastRefreshFailed = true)
+        saveLocked(marked)
+        marked
+    }
 
     // Deleting under the lock every writer for this file holds, so a refresh or an
     // optimistic completion racing a revoke cannot recreate the file with the
@@ -102,7 +137,7 @@ class SnapshotStore(directory: File) {
         val previouslyCompleted = previous?.locallyCompleted ?: emptySet()
         val stillOpen = summary.today.mapTo(mutableSetOf()) { it.id }
         val stillPending = previouslyCompleted.intersect(stillOpen).toMutableSet()
-        val snapshot = Snapshot(summary, now, etag, stillPending)
+        val snapshot = Snapshot(summary, now, etag, stillPending, lastRefreshFailed = false)
         saveLocked(snapshot)
         snapshot
     }
