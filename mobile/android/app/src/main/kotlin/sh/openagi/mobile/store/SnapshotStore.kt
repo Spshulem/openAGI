@@ -43,6 +43,13 @@ class SnapshotStore(directory: File) {
 
     fun load(): Snapshot? = synchronized(lock) { loadLocked() }
 
+    // Deleting under the same lock every writer holds, so a refresh or an
+    // optimistic completion racing a revoke cannot recreate the file with the
+    // just-revoked account's tasks after it has gone.
+    fun delete() {
+        synchronized(lock) { file.delete() }
+    }
+
     private fun loadLocked(): Snapshot? {
         if (!file.exists()) return null
         return try {

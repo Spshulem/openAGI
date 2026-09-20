@@ -25,7 +25,6 @@ import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.sync.RefreshCoordinator
 import sh.openagi.mobile.sync.RefreshWorker
 import sh.openagi.mobile.transport.DaemonClient
-import java.io.File
 
 // Shows what this phone is paired to and lets a person force a refresh or
 // unpair entirely. Never renders the token: only the server and node id are
@@ -81,7 +80,13 @@ fun SettingsScreen(
                     }
                     Credentials.clear(context)
                     RefreshWorker.cancel(context)
-                    File(context.filesDir, "snapshot.json").delete()
+                    // Both go through the stores rather than deleting the file
+                    // directly, so the delete holds the same lock every writer
+                    // holds. Clearing the outbox matters as much as the
+                    // snapshot: a queued completion left behind would replay
+                    // against whatever account pairs next. iOS does both.
+                    SnapshotStore(context.filesDir).delete()
+                    OutboundQueue(context.filesDir).clear()
                     isWorking = false
                     onRevoked()
                 }
