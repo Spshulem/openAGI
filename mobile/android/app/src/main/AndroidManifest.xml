@@ -7,7 +7,7 @@
         android:allowBackup="false"
         android:label="OpenAGI"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault.DayNight"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
