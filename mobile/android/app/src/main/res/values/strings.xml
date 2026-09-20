@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">OpenAGI</string>
+    <string name="widget_description">Today from OpenAGI, with one-tap completion.</string>
+</resources>
