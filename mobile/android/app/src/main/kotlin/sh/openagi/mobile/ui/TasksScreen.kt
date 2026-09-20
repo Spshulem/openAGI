@@ -142,7 +142,13 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
                         verticalArrangement = Arrangement.spacedBy(20.dp),
                     ) {
                         BucketFormat.ORDER.forEach { bucket ->
-                            val bucketTasks = byBucket[bucket] ?: return@forEach
+                            // DESIGN.md: "bucket sections are always present in
+                            // order; an empty bucket shows a one-line muted
+                            // 'Nothing here' rather than vanishing, so the
+                            // structure of the week is legible even when parts
+                            // of it are empty." An empty list here is a real,
+                            // still-rendered section, not a skipped one.
+                            val bucketTasks = byBucket[bucket].orEmpty()
                             val collapsed = bucket in collapsedBuckets
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Row(
@@ -158,7 +164,14 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
-                                if (!collapsed) {
+                                if (!collapsed && bucketTasks.isEmpty()) {
+                                    Text(
+                                        "Nothing here",
+                                        style = OpenAGIType.secondary,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(horizontal = 4.dp),
+                                    )
+                                } else if (!collapsed) {
                                     RowGroup {
                                         bucketTasks.forEachIndexed { index, task ->
                                             TaskRow(
