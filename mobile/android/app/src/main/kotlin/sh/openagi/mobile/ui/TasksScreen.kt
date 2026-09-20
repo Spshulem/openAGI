@@ -79,14 +79,22 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
     var editingTask by remember { mutableStateOf<Task?>(null) }
     var showCreate by remember { mutableStateOf(false) }
     var lastSyncedMinutesAgo by remember { mutableStateOf<Int?>(null) }
+    // Tracked separately from `error`, because the connection line has to keep
+    // saying the last attempt failed after the user dismisses or scrolls past
+    // the error row. Without it this screen could only ever say Synced or
+    // NeverSynced, so a dead daemon still showed a healthy green dot — the one
+    // thing the connection line exists to never do.
+    var lastLoadFailed by remember { mutableStateOf(false) }
 
     suspend fun load() {
         try {
             tasks = client.tasks(queue = queue)
             error = null
             lastSyncedMinutesAgo = 0
+            lastLoadFailed = false
         } catch (daemonError: DaemonException) {
             error = ErrorCopy.forDaemon(daemonError, credentials.server)
+            lastLoadFailed = true
         }
     }
 
@@ -117,8 +125,11 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             ScreenHeader(
                 title = "Tasks",
-                connection = lastSyncedMinutesAgo?.let { ConnectionState.Synced(credentials.server, it) }
-                    ?: ConnectionState.NeverSynced(credentials.server),
+                connection = when {
+                    lastLoadFailed -> ConnectionState.Failed(credentials.server, lastSyncedMinutesAgo ?: 0)
+                    lastSyncedMinutesAgo != null -> ConnectionState.Synced(credentials.server, lastSyncedMinutesAgo!!)
+                    else -> ConnectionState.NeverSynced(credentials.server)
+                },
             )
 
             Row(
