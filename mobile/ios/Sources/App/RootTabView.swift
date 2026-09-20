@@ -13,21 +13,28 @@ struct RootTabView: View {
     }
 
     var body: some View {
-        TabView {
-            Tab("Today", systemImage: "sun.max") {
+        // Declaring `@Bindable` locally (rather than storing the model as
+        // `@Bindable` itself) is the documented way to get a two-way
+        // `Binding` out of an `@Observable` reference type held in `@State`
+        // -- needed so Today's "N waiting on you" row (DESIGN.md's "Screens
+        // must not be mostly empty" section) can switch this tab bar to
+        // Inbox by setting `model.selectedTab` from anywhere behind it.
+        @Bindable var model = model
+        TabView(selection: $model.selectedTab) {
+            Tab("Today", systemImage: "sun.max", value: AppTab.today) {
                 TodayView()
             }
-            Tab("Tasks", systemImage: "checklist") {
+            Tab("Tasks", systemImage: "checklist", value: AppTab.tasks) {
                 TasksView()
             }
-            Tab("Inbox", systemImage: "tray") {
+            Tab("Inbox", systemImage: "tray", value: AppTab.inbox) {
                 InboxView()
             }
             .badge(model.inboxBadgeCount)
-            Tab("Chat", systemImage: "bubble.left.and.bubble.right") {
+            Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) {
                 ChatView()
             }
-            Tab("Settings", systemImage: "gearshape") {
+            Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
                 SettingsView(onRevoked: onRevoked)
             }
         }

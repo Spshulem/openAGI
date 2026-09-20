@@ -43,18 +43,17 @@ struct TasksView: View {
                         .listRowSeparator(.hidden)
                 }
 
-                if allTasks.isEmpty && !isLoading && errorHeadline == nil {
-                    EmptyStateView(headline: "No tasks yet.",
-                                  detail: "Add one with the button above, or wait for OpenAGI to add one.")
-                        .listRowInsets(EdgeInsets(top: 0, leading: Theme.gutter, bottom: 0, trailing: Theme.gutter))
-                        .listRowBackground(Theme.canvas)
-                        .listRowSeparator(.hidden)
-                }
-
+                // DESIGN.md's "Screens must not be mostly empty" section:
+                // "bucket sections are always present in order; an empty
+                // bucket shows a one-line `muted` 'Nothing here' rather than
+                // vanishing, so the structure of the week is legible even
+                // when parts of it are empty." That replaces the single
+                // whole-screen "No tasks yet" empty state this used to show
+                // when every bucket was empty -- seven visible buckets, each
+                // legibly empty, is exactly what that section asks for
+                // instead of one centred sentence over a blank screen.
                 ForEach(TaskBucket.allCases) { bucket in
-                    if let tasks = tasksByBucket[bucket], !tasks.isEmpty {
-                        bucketSection(bucket, tasks: tasks)
-                    }
+                    bucketSection(bucket, tasks: tasksByBucket[bucket] ?? [])
                 }
             }
             .listStyle(.plain)
@@ -84,34 +83,43 @@ struct TasksView: View {
         }
     }
 
-    private var allTasks: [TaskRecord] { tasksByBucket.values.flatMap { $0 } }
-
     private func bucketSection(_ bucket: TaskBucket, tasks: [TaskRecord]) -> some View {
         let isCollapsed = collapsedBuckets.contains(bucket.rawValue)
         return Section {
             if !isCollapsed {
-                RowGroup {
-                    ForEach(Array(tasks.enumerated()), id: \.element.id) { index, task in
-                        NavigationLink {
-                            TaskDetailView(task: task, onChanged: {
-                                await load()
-                                model.bumpTasksGeneration()
-                            })
-                        } label: {
-                            TaskRow(title: task.title,
-                                   secondaryText: secondaryText(for: task, in: bucket),
-                                   secondaryIsAlert: isOverdue(task),
-                                   isBusy: isLoading,
-                                   onComplete: task.status == "completed" ? nil : { Task { await complete(task) } })
+                if tasks.isEmpty {
+                    Text("Nothing here")
+                        .font(Theme.Typography.secondary)
+                        .foregroundStyle(Theme.muted)
+                        .padding(.horizontal, Theme.gutter + Theme.Spacing.x4)
+                        .padding(.bottom, Theme.Spacing.x2)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
+                } else {
+                    RowGroup {
+                        ForEach(Array(tasks.enumerated()), id: \.element.id) { index, task in
+                            NavigationLink {
+                                TaskDetailView(task: task, onChanged: {
+                                    await load()
+                                    model.bumpTasksGeneration()
+                                })
+                            } label: {
+                                TaskRow(title: task.title,
+                                       secondaryText: secondaryText(for: task, in: bucket),
+                                       secondaryIsAlert: isOverdue(task),
+                                       isBusy: isLoading,
+                                       onComplete: task.status == "completed" ? nil : { Task { await complete(task) } })
+                            }
+                            .buttonStyle(.plain)
+                            if index < tasks.count - 1 { RowHairline() }
                         }
-                        .buttonStyle(.plain)
-                        if index < tasks.count - 1 { RowHairline() }
                     }
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
                 }
-                .padding(.horizontal, Theme.gutter)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Theme.canvas)
-                .listRowSeparator(.hidden)
             }
         } header: {
             Button {
