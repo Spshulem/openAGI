@@ -1,6 +1,7 @@
 package sh.openagi.mobile.sync
 
 import android.content.Context
+import androidx.glance.appwidget.updateAll
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -12,6 +13,7 @@ import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.transport.DaemonClient
+import sh.openagi.mobile.widget.TodayWidget
 import java.util.concurrent.TimeUnit
 
 class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -23,9 +25,7 @@ class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorke
             OutboundQueue(applicationContext.filesDir),
         )
         coordinator.refresh()
-        // Task 15 adds the TodayWidget().updateAll(applicationContext) call here,
-        // once the widget and the Glance dependency exist. There is nothing to
-        // repaint until then, and a forward reference would not compile.
+        TodayWidget().updateAll(applicationContext)
         // An offline phone is the normal case off the tailnet, not a failure
         // worth exponential backoff on a 15-minute schedule, so every outcome
         // is success.

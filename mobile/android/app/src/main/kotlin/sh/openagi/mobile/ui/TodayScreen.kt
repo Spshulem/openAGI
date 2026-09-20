@@ -27,6 +27,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.glance.appwidget.updateAll
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.TaskItem
 import sh.openagi.mobile.store.Credentials
@@ -36,11 +37,12 @@ import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.sync.RefreshCoordinator
 import sh.openagi.mobile.sync.RefreshOutcome
 import sh.openagi.mobile.transport.DaemonClient
+import sh.openagi.mobile.widget.TodayWidget
 
 // The main screen once a phone is paired: today's tasks, tappable to
-// complete, with a line showing how stale the data is. Task 15 adds a widget
-// repaint alongside the drainQueue() call below; the widget does not exist
-// yet in this task.
+// complete, with a line showing how stale the data is. An optimistic
+// completion also repaints the home-screen widget immediately, the same way
+// CompleteTaskAction does for a tap made from the widget itself.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TodayScreen(
@@ -112,6 +114,7 @@ fun TodayScreen(
                                     // next scheduled refresh.
                                     snapshot = store.applyOptimisticCompletion(task.id)
                                     queue.enqueue(PendingOp.completeTask(task.id))
+                                    TodayWidget().updateAll(context)
                                     coordinator.drainQueue()
                                     snapshot = store.load()
                                 }
