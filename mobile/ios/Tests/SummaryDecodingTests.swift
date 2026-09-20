@@ -19,6 +19,8 @@ final class SummaryDecodingTests: XCTestCase {
         XCTAssertEqual(summary.counts.overdue, 1)
         XCTAssertTrue(summary.today.contains { $0.overdue })
         XCTAssertFalse(summary.brief.headline.isEmpty)
+        XCTAssertEqual(summary.pendingActions.count, 1)
+        XCTAssertTrue(!summary.pendingActions[0].id.isEmpty && !summary.pendingActions[0].summary.isEmpty && summary.pendingActions[0].createdAt != nil)
     }
 
     func testDecodesEmptySummary() throws {
