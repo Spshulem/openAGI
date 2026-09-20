@@ -1,0 +1,33 @@
+{
+  "generatedAt": "2026-09-20T01:37:38.286Z",
+  "today": [
+    {
+      "id": "task_c13cbf7f968e4ed6",
+      "title": "Ship the widget",
+      "bucket": "today",
+      "status": "pending",
+      "priority": 80,
+      "dueDate": null,
+      "overdue": false
+    },
+    {
+      "id": "task_6ad2707d37fb4ff1",
+      "title": "Renew the domain",
+      "bucket": "today",
+      "status": "pending",
+      "priority": 40,
+      "dueDate": "2020-01-01T00:00:00.000Z",
+      "overdue": true
+    }
+  ],
+  "counts": {
+    "today": 2,
+    "this_week": 1,
+    "overdue": 1,
+    "pendingActions": 0
+  },
+  "pendingActions": [],
+  "brief": {
+    "headline": "2 things today, 1 overdue"
+  }
+}
