@@ -1230,7 +1230,8 @@ the completion call (`POST /tasks/:id/complete` with `{"completedVia":"mobile"}`
 the approval calls, the SSE event names the client reacts to
 (`task-updated`, `task-reminder`, `task-auto-changed`, `pending-action`,
 `pending-action-resolved`, `clarification-created`), the heartbeat
-(`POST /nodes/heartbeat` with `{"nodeId":"..."}` every 30s while foregrounded),
+(`POST /nodes/heartbeat` with `{"nodeId":"...","role":"node"}` every 30s while
+foregrounded — `role` is required and must be exactly `"node"`),
 revocation, and the host allowlist rule (cleartext `http://` only for `*.ts.net`,
 `100.64.0.0/10`, and RFC1918; `https://` otherwise). State explicitly that both
 clients implement this document and that `mobile/fixtures/` is the machine-checked
@@ -3073,7 +3074,7 @@ test tables here are deliberately identical to the Swift ones.
   - `object HostAllowlist { fun validate(raw: String): HttpUrl }` — throws `DaemonException.UnreachableHost`
   - `class DaemonClient(server: String, nodeId: String, token: String, client: OkHttpClient = defaultClient)` with `suspend fun summary(ifNoneMatch: String?): SummaryResponse`, `suspend fun complete(taskId: String)`, `suspend fun heartbeat()`, `suspend fun revoke()`, and `companion object { suspend fun enroll(server: String, code: String, nodeId: String, nodeToken: String, name: String, client: OkHttpClient = defaultClient): Enrollment }`
   - `sealed class SummaryResponse { object Unchanged; data class Fresh(val summary: MobileSummary, val etag: String?) }`
-  - `sealed class DaemonException(message: String) : Exception(message)` with subclasses `UnreachableHost(host: String)`, `Unauthorized()`, `NotFound()`, `Conflict()`, `Server(val code: Int)`, `Malformed()` — all classes, so each carries a message and can be caught by type
+  - `sealed class DaemonException(message: String) : Exception(message)` with subclasses `UnreachableHost(host: String)`, `Unauthorized()`, `NotFound()`, `Conflict()`, `Server(val code: Int)`, `Malformed()`, `Transport(val cause: java.io.IOException)` — all classes, so each carries a message and can be caught by type. `Transport` exists because an OkHttp `IOException` would otherwise escape past `DaemonException` entirely, which is the single most common failure on a phone.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3138,6 +3139,45 @@ class HostAllowlistTest {
             "http://mac.ts.net:43210/",
             HostAllowlist.validate("http://mac.ts.net:43210/setup").toString()
         )
+    }
+
+    @Test
+    fun loopbackIsRefusedWhateverTheScheme() {
+        // https must be refused too. A loopback address is the daemon's own
+        // default bind, so it is the single likeliest thing to be pasted into
+        // pairing by mistake, and a phone can never reach it.
+        listOf(
+            "http://127.0.0.1:43210",
+            "https://127.0.0.1:43210",
+            "http://localhost:43210",
+            "https://localhost:43210",
+        ).forEach { raw ->
+            try {
+                HostAllowlist.validate(raw)
+                fail("expected a refusal for $raw")
+            } catch (expected: DaemonException.UnreachableHost) {
+            }
+        }
+    }
+
+    @Test
+    fun cidrBoundaryNearMissesAreRefused() {
+        // Each of these is one octet away from a permitted range. They exist so a
+        // sloppy `a == 172` or `a == 100` check cannot pass this suite.
+        listOf(
+            "http://172.15.0.1:43210",
+            "http://172.32.0.1:43210",
+            "http://100.63.0.1:43210",
+            "http://100.128.0.1:43210",
+            "http://192.167.1.1:43210",
+            "http://192.169.1.1:43210",
+        ).forEach { raw ->
+            try {
+                HostAllowlist.validate(raw)
+                fail("expected a refusal for $raw")
+            } catch (expected: DaemonException.UnreachableHost) {
+            }
+        }
     }
 }
 ```
@@ -3212,6 +3252,34 @@ class DaemonClientTest {
         assertEquals("POST", request.method)
         assertEquals("/tasks/task_abc/complete", request.path)
         assertEquals("""{"completedVia":"mobile"}""", request.body.readUtf8())
+    }
+
+    @Test
+    fun heartbeatSendsRoleNode() = runBlocking {
+        // The daemon rejects a heartbeat whose role is not exactly "node" with a
+        // 400. Nothing else in this suite would notice if role were dropped or
+        // misspelled, and the plan's own first draft omitted it — so assert the
+        // body bytes, not merely that the call succeeded.
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"ok":true}"""))
+        client().heartbeat()
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/nodes/heartbeat", request.path)
+        assertEquals("""{"nodeId":"mobile:abc","role":"node"}""", request.body.readUtf8())
+    }
+
+    @Test
+    fun aTransportFailureArrivesAsDaemonException() = runBlocking {
+        // A dropped connection must not escape as a bare IOException, or every
+        // caller that catches DaemonException misses the commonest failure there
+        // is on a phone.
+        server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START))
+        try {
+            client().heartbeat()
+            fail("expected a transport failure")
+        } catch (expected: DaemonException.Transport) {
+        }
+        Unit
     }
 
     @Test
@@ -3297,6 +3365,14 @@ object HostAllowlist {
             .host(url.host)
             .port(url.port)
             .build()
+        // Loopback is refused whatever the scheme, per PROTOCOL.md §10: a phone
+        // cannot reach its own loopback, so accepting one turns a pairing typo
+        // into a silent hang instead of an immediate, legible refusal. This check
+        // precedes the scheme branch deliberately — putting it after would let
+        // https://127.0.0.1 through, which is the gap iOS shipped and had to fix.
+        if (url.host.lowercase() in setOf("127.0.0.1", "localhost", "::1")) {
+            throw DaemonException.UnreachableHost(url.host)
+        }
         if (url.scheme == "https") return origin
         if (url.scheme != "http") throw DaemonException.UnreachableHost(raw)
         val host = url.host.lowercase()
@@ -3346,6 +3422,10 @@ sealed class DaemonException(message: String) : Exception(message) {
     class Conflict : DaemonException("the daemon has already moved on")
     class Server(val code: Int) : DaemonException("the daemon returned $code")
     class Malformed : DaemonException("the daemon returned something unreadable")
+    // The network itself failed: no connection, a timeout, DNS, TLS. Carries the
+    // cause for diagnosis, and never the token — DaemonException's message is
+    // built from the host and status only.
+    class Transport(val cause: java.io.IOException) : DaemonException("the daemon could not be reached: ${cause.message}")
 }
 
 sealed class SummaryResponse {
@@ -3387,7 +3467,16 @@ class DaemonClient(
 
     private suspend fun post(path: String, json: String) = withContext(Dispatchers.IO) {
         val request = authorized(path).post(json.toRequestBody(JSON)).build()
-        client.newCall(request).execute().use { ensureOk(it) }
+        // An IOException here is a dropped connection, a timeout, a DNS failure —
+        // on a phone, the most likely failure of all. It must arrive as a
+        // DaemonException like every other, or callers that catch DaemonException
+        // miss precisely the case that happens most. iOS shipped this gap first
+        // and had to add a transport case for the same reason.
+        try {
+            client.newCall(request).execute().use { ensureOk(it) }
+        } catch (io: java.io.IOException) {
+            throw DaemonException.Transport(io)
+        }
         Unit
     }
 
