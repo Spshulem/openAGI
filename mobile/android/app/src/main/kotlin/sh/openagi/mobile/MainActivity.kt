@@ -6,17 +6,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.PairingPayload
 import sh.openagi.mobile.store.Credentials
-import sh.openagi.mobile.store.OutboundQueue
-import sh.openagi.mobile.store.SnapshotStore
-import sh.openagi.mobile.sync.RefreshCoordinator
-import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.ui.PairingScreen
 import sh.openagi.mobile.ui.SettingsScreen
 import sh.openagi.mobile.ui.TodayScreen
@@ -29,6 +24,12 @@ class MainActivity : ComponentActivity() {
     private val credentialsState = mutableStateOf<Credentials?>(null)
     private val pendingPairingState = mutableStateOf<PairingPayload?>(null)
 
+    // Bumped in onResume and threaded into TodayScreen as resumeSignal: a
+    // LaunchedEffect keyed on Unit alone would only ever refresh once for
+    // this composable's lifetime, leaving the screen stale after the user
+    // backgrounds the app and comes back to an already-composed TodayScreen.
+    private val resumeSignalState = mutableIntStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         credentialsState.value = Credentials.load(this)
@@ -38,6 +39,7 @@ class MainActivity : ComponentActivity() {
             var showSettings by remember { mutableStateOf(false) }
             val credentials = credentialsState.value
             val pendingPairing = pendingPairingState.value
+            val resumeSignal = resumeSignalState.intValue
 
             MaterialTheme {
                 when {
@@ -58,6 +60,7 @@ class MainActivity : ComponentActivity() {
                         context = this,
                         credentials = credentials,
                         onOpenSettings = { showSettings = true },
+                        resumeSignal = resumeSignal,
                     )
                 }
             }
@@ -74,9 +77,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        val credentials = Credentials.load(this) ?: return
-        val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
-        val coordinator = RefreshCoordinator(client, SnapshotStore(filesDir), OutboundQueue(filesDir))
-        lifecycleScope.launch { coordinator.refresh() }
+        resumeSignalState.intValue += 1
     }
 }

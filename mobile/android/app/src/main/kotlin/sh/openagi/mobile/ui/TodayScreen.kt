@@ -47,6 +47,11 @@ fun TodayScreen(
     context: Context,
     credentials: Credentials,
     onOpenSettings: () -> Unit,
+    // Bumped by MainActivity.onResume(). A LaunchedEffect keyed on Unit alone
+    // fires only once for the lifetime of this composable, so without this
+    // key a background/foreground cycle would leave the status line and task
+    // list stale even though MainActivity asked for a refresh.
+    resumeSignal: Int = 0,
 ) {
     val store = remember { SnapshotStore(context.filesDir) }
     val queue = remember { OutboundQueue(context.filesDir) }
@@ -73,7 +78,7 @@ fun TodayScreen(
         }
     }
 
-    LaunchedEffect(Unit) { refreshAndUpdateStatus() }
+    LaunchedEffect(resumeSignal) { refreshAndUpdateStatus() }
 
     Scaffold(
         topBar = {
