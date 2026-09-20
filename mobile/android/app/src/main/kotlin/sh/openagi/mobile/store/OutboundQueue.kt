@@ -29,7 +29,11 @@ data class PendingOp(
 
 class OutboundQueue(directory: File) {
     private val file = File(directory, "outbox.json")
-    private val lock = Any()
+
+    // Keyed by path, not per instance — see SnapshotStore.lockFor. A widget tap
+    // and a background drain build separate OutboundQueue objects over the same
+    // outbox, so a per-instance lock would serialize nothing.
+    private val lock = SnapshotStore.lockFor(file)
 
     fun all(): List<PendingOp> = synchronized(lock) { allLocked() }
 
