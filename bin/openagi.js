@@ -240,9 +240,10 @@ async function cmdPairPhone(flags) {
   // the CLI just used. OPENAGI_PUBLIC_URL is that address when it is set.
   const reachableCandidate = issued.publicUrl || flags.url || local;
   let origin;
+  let pairingUrl;
   try {
     origin = assertPhoneReachable(reachableCandidate);
-    buildPairingUrl({ baseUrl: origin, code: issued.code, platform });
+    pairingUrl = buildPairingUrl({ baseUrl: origin, code: issued.code, platform });
   } catch (error) {
     console.error(c(RED, `x ${error.message}`));
     console.error(c(DIM, "  pass the phone-reachable address explicitly: openagi pair-phone --url http://<tailnet-host>:43210"));
@@ -253,6 +254,9 @@ async function cmdPairPhone(flags) {
   console.log("");
   console.log(`    server: ${c(GREEN, origin)}`);
   console.log(`    code:   ${c(GREEN, issued.code)}`);
+  console.log("");
+  console.log(c(DIM, "  or open this link on the phone instead of typing anything:"));
+  console.log(`    ${c(DIM, pairingUrl)}`);
   console.log("");
   console.log(c(DIM, `  single use, expires ${issued.expiresAt}`));
   return 0;
