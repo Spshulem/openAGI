@@ -1,0 +1,4 @@
+OpenAGI.xcodeproj/
+*.xcworkspace/
+DerivedData/
+build/

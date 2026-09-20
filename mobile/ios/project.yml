@@ -1,0 +1,54 @@
+name: OpenAGI
+options:
+  bundleIdPrefix: sh.openagi
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGNING_ALLOWED: "NO"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+targets:
+  OpenAGI:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: OpenAGI
+        UILaunchScreen: {}
+        CFBundleURLTypes:
+          - CFBundleURLName: sh.openagi.pair
+            CFBundleURLSchemes: [openagi]
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true
+        NSLocalNetworkUsageDescription: OpenAGI talks to the daemon on your own machine.
+        BGTaskSchedulerPermittedIdentifiers: [sh.openagi.refresh]
+        UIBackgroundModes: [fetch]
+  OpenAGITests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: OpenAGI
+    settings:
+      base:
+        BUNDLE_LOADER: $(TEST_HOST)
+    info:
+      path: Tests/Info.plist
+schemes:
+  OpenAGI:
+    build:
+      targets:
+        OpenAGI: all
+    test:
+      targets: [OpenAGITests]
