@@ -78,23 +78,16 @@ class SnapshotStore(directory: File) {
     // suppressed once the server agrees it is done (dropped here), and an id
     // the server still reports open must stay suppressed (kept here).
     //
-    // A plain id-set intersection is not enough: it only asks "is this id
-    // still present in the new fetch", and cannot tell apart "the same task
-    // is still open" from "this id now happens to label an unrelated task".
-    // Real daemon ids never get reassigned to a different task, so this only
-    // bites in a coincidence, but the cost of getting it wrong is a task that
-    // never reappears — so we also require the title to still match before
-    // continuing to suppress an id.
+    // This is a plain id-set intersection, identical to the iOS implementation.
+    // Matching on anything else — a title, say — would mean a task renamed on
+    // the daemon between two fetches loses its suppression and flickers back
+    // under the user's finger, which is the exact bug this function exists to
+    // prevent. Task ids are the daemon's stable identity; titles are not.
     fun storeFresh(summary: MobileSummary, etag: String?, now: Instant = Instant.now()): Snapshot = synchronized(lock) {
         val previous = loadLocked()
         val previouslyCompleted = previous?.locallyCompleted ?: emptySet()
-        val previousById = previous?.summary?.today?.associateBy { it.id } ?: emptyMap()
-        val newById = summary.today.associateBy { it.id }
-        val stillPending = previouslyCompleted.filterTo(mutableSetOf()) { id ->
-            val newItem = newById[id] ?: return@filterTo false
-            val oldItem = previousById[id]
-            oldItem == null || oldItem.title == newItem.title
-        }
+        val stillOpen = summary.today.mapTo(mutableSetOf()) { it.id }
+        val stillPending = previouslyCompleted.intersect(stillOpen).toMutableSet()
         val snapshot = Snapshot(summary, now, etag, stillPending)
         saveLocked(snapshot)
         snapshot

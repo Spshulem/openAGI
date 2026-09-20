@@ -16,9 +16,14 @@ import java.time.Instant
 class SnapshotStoreTest {
     @get:Rule val folder = TemporaryFolder()
 
+    // The id is derived from the title, not from the position in the list. A
+    // positional id makes summary("A","B") and summary("B") both call their
+    // first item task_0, so "the server dropped A" is indistinguishable from
+    // "the server renamed task_0 to B" — an artifact of the helper that a real
+    // daemon never produces, since its ids are stable per task.
     private fun summary(vararg titles: String): MobileSummary {
-        val today = titles.mapIndexed { index, title ->
-            TaskItem(id = "task_$index", title = title, bucket = "today", status = "pending",
+        val today = titles.map { title ->
+            TaskItem(id = "task_${title.lowercase()}", title = title, bucket = "today", status = "pending",
                      priority = 50, dueDate = null, overdue = false)
         }
         return MobileSummary(
@@ -45,7 +50,7 @@ class SnapshotStoreTest {
     @Test
     fun optimisticCompletionHidesTheTaskImmediately() {
         store().save(Snapshot(summary("A", "B"), Instant.now(), null, emptySet()))
-        val updated = store().applyOptimisticCompletion("task_0")!!
+        val updated = store().applyOptimisticCompletion("task_a")!!
         assertEquals(listOf("B"), updated.visibleToday.map { it.title })
         assertEquals(1, updated.visibleCounts.today)
         // And it survives a reload, because the widget may read from a cold start.
@@ -55,11 +60,11 @@ class SnapshotStoreTest {
     @Test
     fun aFreshFetchDropsOptimisticIdsTheServerNoLongerLists() {
         store().save(Snapshot(summary("A", "B"), Instant.now(), null, emptySet()))
-        store().applyOptimisticCompletion("task_0")
-        // Server still lists task_0: keep hiding it, the completion is in flight.
+        store().applyOptimisticCompletion("task_a")
+        // Server still lists task_a: keep hiding it, the completion is in flight.
         store().storeFresh(summary("A", "B"), null)
         assertEquals(listOf("B"), store().load()!!.visibleToday.map { it.title })
-        assertEquals(setOf("task_0"), store().load()!!.locallyCompleted)
+        assertEquals(setOf("task_a"), store().load()!!.locallyCompleted)
         // Server has caught up: the optimistic set must not grow forever.
         store().storeFresh(summary("B"), null)
         assertEquals(emptySet<String>(), store().load()!!.locallyCompleted)
