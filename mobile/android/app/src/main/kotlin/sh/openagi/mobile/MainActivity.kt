@@ -98,7 +98,12 @@ class MainActivity : ComponentActivity() {
                     ) { padding ->
                         Box(modifier = Modifier.padding(padding)) {
                             when (selectedTab) {
-                                AppTab.TODAY -> TodayScreen(context = this@MainActivity, credentials = credentials, resumeSignal = resumeSignal)
+                                AppTab.TODAY -> TodayScreen(
+                                    context = this@MainActivity,
+                                    credentials = credentials,
+                                    resumeSignal = resumeSignal,
+                                    onOpenInbox = { selectedTab = AppTab.INBOX },
+                                )
                                 AppTab.TASKS -> TasksScreen(context = this@MainActivity, credentials = credentials, resumeSignal = resumeSignal)
                                 AppTab.INBOX -> InboxScreen(
                                     context = this@MainActivity,

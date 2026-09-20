@@ -3,8 +3,10 @@ package sh.openagi.mobile.ui
 import android.content.Context
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -56,6 +58,11 @@ fun TodayScreen(
     // background/foreground cycle — or a task-updated event — would leave
     // the list stale even though a refresh was warranted.
     resumeSignal: Int = 0,
+    // DESIGN.md's "Screens must not be mostly empty": "under the task list:
+    // the day's shape in one sentence, then, when something is waiting, a
+    // single row linking to Inbox." Defaulted so existing callers/tests that
+    // don't care about navigation keep compiling.
+    onOpenInbox: () -> Unit = {},
 ) {
     val store = remember { SnapshotStore(context.filesDir) }
     val queue = remember { OutboundQueue(context.filesDir) }
@@ -136,7 +143,30 @@ fun TodayScreen(
                     style = OpenAGIType.secondary,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+
+                if (counts.pendingActions > 0) {
+                    WaitingOnYouRow(count = counts.pendingActions, onClick = onOpenInbox)
+                }
             }
+        }
+    }
+}
+
+// DESIGN.md: "when something is waiting, a single row linking to Inbox
+// ('2 waiting on you')." One row, not a card — the same RowGroup treatment
+// every other row in this app gets, so it reads as part of the list rather
+// than a banner bolted on top of it.
+@Composable
+private fun WaitingOnYouRow(count: Int, onClick: () -> Unit) {
+    RowGroup {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("$count waiting on you", style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
         }
     }
 }
