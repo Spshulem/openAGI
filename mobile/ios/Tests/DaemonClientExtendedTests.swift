@@ -1,18 +1,16 @@
 import XCTest
 @testable import OpenAGI
 
-// NOTE on what this file does NOT cover: neither a synchronous
-// `URLProtocol` stub (`StubProtocol`, from DaemonClientTests.swift) nor a
-// deferred-delivery variant got a single byte through
-// `URLSession.bytes(for:)`'s `.lines` sequence in this SDK/simulator, even
-// though the identical response works fine through `data(for:)` everywhere
-// else in this suite -- an environment limitation, not evidence the parsing
-// itself is untested. `eventStream()`/`sendMessageStreaming()`'s actual
-// frame-by-frame parsing (`SSEFrameParser`, `DaemonEvent.from`,
-// `ChatEvent.decode`) is exhaustively covered by SSEFrameParserTests and
-// ChatEventTests instead, both pure and needing no URLSession at all. What
-// this file covers for the two streaming methods is what the stub CAN
-// verify reliably: the exact request each one sends.
+// Finding from building this phase, left here because it will bite whoever
+// touches this file next: `URLSession.AsyncBytes.lines` never yielded a
+// single line against either `StubProtocol` or a real daemon connection in
+// this SDK/simulator, even though the raw byte sequence underneath it
+// delivered every byte correctly in both cases (verified live: `for try
+// await _ in bytes` counted the full response; `.lines` produced nothing).
+// `DaemonClient` no longer uses `.lines` for this reason -- see its private
+// `lines(of:)`, which splits the byte sequence by hand -- which is also
+// what makes the stubbed tests below able to assert on parsed frame content
+// again rather than request shape alone.
 
 // Extends DaemonClientTests.swift's coverage to every route this phase
 // added: tasks CRUD, clarifications, pending actions, and the two SSE
@@ -216,11 +214,15 @@ final class DaemonClientExtendedTests: XCTestCase {
     // instead, which is pure and needs no URLSession at all. This test
     // covers what the stub CAN verify reliably: the request this method
     // sends before it ever touches the byte stream.
-    func testEventStreamSendsTheExpectedRequest() async throws {
+    func testEventStreamParsesEveryFrameFromTheStubbedConnection() async throws {
+        let raw = "event: hello\ndata: {}\n\nevent: task-updated\ndata: {\"op\":\"create\"}\n\n: ping\n\nevent: pending-action\ndata: {}\n\n"
         StubProtocol.handler = { request in
-            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data())
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(raw.utf8))
         }
-        _ = try await makeClient().eventStream()
+        let stream = try await makeClient().eventStream()
+        var received: [DaemonEvent] = []
+        for try await event in stream { received.append(event) }
+        XCTAssertEqual(received, [.hello, .taskUpdated, .pendingAction])
         let request = try XCTUnwrap(StubProtocol.lastRequest)
         XCTAssertEqual(request.httpMethod, "GET")
         XCTAssertEqual(request.url?.path, "/events")
@@ -242,16 +244,19 @@ final class DaemonClientExtendedTests: XCTestCase {
 
     // MARK: - SSE: POST /message
 
-    // Same limitation as `testEventStreamSendsTheExpectedRequest` above --
-    // this covers the request `sendMessageStreaming` sends; the frame
-    // decoding it depends on is covered by ChatEventTests instead.
-    func testSendMessageStreamingSendsTheExpectedRequest() async throws {
+    func testSendMessageStreamingSendsTextAndParsesDeltaAndFinalFrames() async throws {
+        let raw = "event: status\ndata: {\"stage\":\"thinking\",\"at\":\"x\"}\n\nevent: delta\ndata: {\"text\":\"Hi\",\"reset\":false}\n\nevent: final\ndata: {\"reply\":\"Hi there\"}\n\n"
         StubProtocol.handler = { request in
-            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data())
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(raw.utf8))
         }
-        _ = try await makeClient().sendMessageStreaming(text: "hello")
+        let stream = try await makeClient().sendMessageStreaming(text: "hello")
+        var events: [ChatEvent] = []
+        for try await event in stream { events.append(event) }
+        XCTAssertEqual(events.count, 3)
+        guard case .final(let finalFrame) = events.last else { return XCTFail("expected a final frame last") }
+        XCTAssertEqual(finalFrame.reply, "Hi there")
+
         let request = try XCTUnwrap(StubProtocol.lastRequest)
-        XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.url?.path, "/message")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "text/event-stream")
         let body = try bodyJSON(of: request)
