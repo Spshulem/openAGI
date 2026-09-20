@@ -32,6 +32,17 @@ try {
   runtime.tasks.add({ queue: "user", title: "Renew the domain", bucket: "today", priority: 40, dueDate: "2020-01-01T00:00:00.000Z" });
   runtime.tasks.add({ queue: "user", title: "Read the whitepaper", bucket: "this_week", priority: 20 });
 
+  // A pending action, so the embedded {id, summary, createdAt} projection in
+  // /mobile/summary is exercised by both clients' decoders. Without one, both
+  // fixtures carry "pendingActions": [], and neither the Swift nor the Kotlin
+  // model would decode that shape until it met a live daemon.
+  runtime.pendingActions.enqueue({
+    toolName: "send_email",
+    args: { to: "team@example.com", subject: "Weekly digest" },
+    summary: "Send the weekly digest to the team",
+    reason: "Drafted from your Friday routine"
+  });
+
   write("summary-populated.json", await (await fetch(`${base}/mobile/summary`)).json());
   write("tasks-list.json", await (await fetch(`${base}/tasks?queue=user`)).json());
   write("pending-actions.json", await (await fetch(`${base}/pending-actions`)).json());
