@@ -1,8 +1,8 @@
 {
-  "generatedAt": "2026-09-20T04:15:28.172Z",
+  "generatedAt": "2026-09-20T04:48:28.150Z",
   "today": [
     {
-      "id": "task_ad80580639e0445c",
+      "id": "task_ed003662bb1444da",
       "title": "Ship the widget",
       "bucket": "today",
       "status": "pending",
@@ -11,7 +11,7 @@
       "overdue": false
     },
     {
-      "id": "task_114a02d9cd9e465e",
+      "id": "task_4629ffb7958540e1",
       "title": "Renew the domain",
       "bucket": "today",
       "status": "pending",
@@ -24,10 +24,16 @@
     "today": 2,
     "this_week": 1,
     "overdue": 1,
-    "pendingActions": 0
+    "pendingActions": 1
   },
-  "pendingActions": [],
+  "pendingActions": [
+    {
+      "id": "act_70a84480ee7e4623",
+      "summary": "Send the weekly digest to the team",
+      "createdAt": "2026-09-20T04:48:28.140Z"
+    }
+  ],
   "brief": {
-    "headline": "2 things today, 1 overdue"
+    "headline": "2 things today, 1 overdue, 1 waiting on you"
   }
 }

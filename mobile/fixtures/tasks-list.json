@@ -1,7 +1,7 @@
 {
   "tasks": [
     {
-      "id": "task_ad80580639e0445c",
+      "id": "task_ed003662bb1444da",
       "queue": "user",
       "title": "Ship the widget",
       "description": "",
@@ -18,13 +18,13 @@
       "scheduledFor": null,
       "parentGoalId": null,
       "dependsOn": [],
-      "createdAt": "2026-09-20T04:15:28.136Z",
-      "updatedAt": "2026-09-20T04:15:28.136Z",
+      "createdAt": "2026-09-20T04:48:28.116Z",
+      "updatedAt": "2026-09-20T04:48:28.116Z",
       "completedAt": null,
       "completedVia": null
     },
     {
-      "id": "task_114a02d9cd9e465e",
+      "id": "task_4629ffb7958540e1",
       "queue": "user",
       "title": "Renew the domain",
       "description": "",
@@ -41,13 +41,13 @@
       "scheduledFor": null,
       "parentGoalId": null,
       "dependsOn": [],
-      "createdAt": "2026-09-20T04:15:28.145Z",
-      "updatedAt": "2026-09-20T04:15:28.145Z",
+      "createdAt": "2026-09-20T04:48:28.124Z",
+      "updatedAt": "2026-09-20T04:48:28.124Z",
       "completedAt": null,
       "completedVia": null
     },
     {
-      "id": "task_ced52377e0e74cbb",
+      "id": "task_9e79997ab98248f9",
       "queue": "user",
       "title": "Read the whitepaper",
       "description": "",
@@ -64,8 +64,8 @@
       "scheduledFor": null,
       "parentGoalId": null,
       "dependsOn": [],
-      "createdAt": "2026-09-20T04:15:28.154Z",
-      "updatedAt": "2026-09-20T04:15:28.154Z",
+      "createdAt": "2026-09-20T04:48:28.133Z",
+      "updatedAt": "2026-09-20T04:48:28.133Z",
       "completedAt": null,
       "completedVia": null
     }
