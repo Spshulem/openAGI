@@ -215,6 +215,7 @@ For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the O
 | **Cron prompts** | The agent can call `schedule_message({prompt, delaySeconds | intervalSeconds | dailyAt, channel, target})`. When the job fires, the daemon runs the prompt and routes the reply to the originating channel (Telegram, local). |
 | **Telegram** | Webhook (`/channels/telegram/webhook`) or long polling (`TELEGRAM_POLLING=1`). |
 | **Even Realities G2 node** | Enroll from the Nodes tab, speak through the glasses microphone, and read OpenAGI's answer on the display. G2 gets a constrained, revocable node credential; question audio is transcribed transiently and is not saved. [Setup guide](docs/setup/even-g2.md). |
+| **Mobile apps (iOS + Android)** | Pair a phone as a node and get today's tasks on a home-screen widget with tap-to-complete — local/Tailscale only, no cloud relay. [`mobile/README.md`](mobile/README.md). |
 | **Persistent state** | All under `.openagi/`: memory (JSONL audit + atomic snapshot), cron jobs, agent/session store, specialist workspaces, MCP logs. |
 
 ### Credits
