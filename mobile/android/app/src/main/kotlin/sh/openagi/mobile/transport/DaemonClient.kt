@@ -2,6 +2,7 @@ package sh.openagi.mobile.transport
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -13,6 +14,21 @@ import sh.openagi.mobile.protocol.Enrollment
 import sh.openagi.mobile.protocol.MobileSummary
 import sh.openagi.mobile.protocol.ProtocolJson
 import java.util.concurrent.TimeUnit
+
+// nodeId is validated upstream against ^[a-zA-Z0-9:_-]{1,240}$ and cannot carry
+// a quote or backslash, but `name` is a free-text device name the user typed —
+// hand-interpolating it into a JSON string literal would let a name like
+// `","platform":"x` smuggle a duplicate key into the request. Routing it
+// through the serializer instead means it is escaped the same way any other
+// string field is.
+@Serializable
+private data class EnrollRequest(
+    val code: String,
+    val platform: String = "mobile",
+    val nodeId: String,
+    val nodeToken: String,
+    val name: String,
+)
 
 sealed class DaemonException(message: String) : Exception(message) {
     class UnreachableHost(host: String) : DaemonException("a phone cannot reach $host")
@@ -116,7 +132,10 @@ class DaemonClient(
         ): Enrollment = withContext(Dispatchers.IO) {
             val origin = if (enforceAllowlist) HostAllowlist.validate(server)
             else server.toHttpUrlOrNull() ?: throw DaemonException.UnreachableHost(server)
-            val body = """{"code":"$code","platform":"mobile","nodeId":"$nodeId","nodeToken":"$nodeToken","name":"$name"}"""
+            val body = ProtocolJson.json.encodeToString(
+                EnrollRequest.serializer(),
+                EnrollRequest(code = code, nodeId = nodeId, nodeToken = nodeToken, name = name),
+            )
             val request = Request.Builder()
                 .url(origin.newBuilder().encodedPath("/nodes/enroll/exchange").build())
                 .post(body.toRequestBody(JSON))
