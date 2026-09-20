@@ -2741,10 +2741,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
     }
@@ -2756,6 +2752,18 @@ android {
 
     testOptions {
         unitTests.isReturnDefaultValues = true
+    }
+}
+
+// `kotlinOptions { jvmTarget = "17" }` is a HARD COMPILE ERROR under Kotlin
+// 2.3.21's Gradle plugin: "Using 'jvmTarget: String' is an error. Please
+// migrate to the compilerOptions DSL." This is the equivalent form — same
+// Java 17 bytecode, and still no jvmToolchain() call, so nothing tries to
+// auto-provision a JDK that does not exist on this machine.
+// Requires `import org.jetbrains.kotlin.gradle.dsl.JvmTarget` at the top.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
     }
 }
 
