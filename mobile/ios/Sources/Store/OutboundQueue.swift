@@ -66,6 +66,21 @@ public struct OutboundQueue: Sendable {
         }
     }
 
+    // Removes the outbox file, coordinated like every other mutator here.
+    // Used on account revoke, for the same reason SnapshotStore.delete()
+    // exists: a queued completion for a revoked account must not survive to
+    // replay against the next paired account, and a plain
+    // `FileManager.removeItem` here would be just as exposed to a
+    // concurrent enqueue/recordAttempt race as an uncoordinated snapshot
+    // delete would be.
+    public func clear() throws {
+        try CoordinatedFile.write(file) { url in
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+
     private static func readOps(at url: URL) -> [PendingOp] {
         guard let data = try? Data(contentsOf: url) else { return [] }
         return (try? ProtocolDecoder.json.decode([PendingOp].self, from: data)) ?? []

@@ -51,15 +51,14 @@ struct SettingsView: View {
         // able to forget its own credential and stop working locally.
         try? await client.revoke()
         Credentials.clear()
-        deleteSnapshot()
+        // Both go through their stores' coordinated delete, not a plain
+        // FileManager removal: an in-flight refresh() or the widget's
+        // AppIntent writing from another process must not be able to
+        // silently recreate either file with the just-revoked account's
+        // data after this. A queued completion left in the outbox would
+        // otherwise survive to replay against whatever account pairs next.
+        try? SnapshotStore().delete()
+        try? OutboundQueue().clear()
         onRevoked()
-    }
-
-    // SnapshotStore (Task 8) exposes load/save/applyOptimisticCompletion/
-    // storeFresh but no delete, and this task's file list does not include
-    // modifying it — so this removes the same file SnapshotStore writes to,
-    // directly, by the filename SnapshotStore itself uses.
-    private func deleteSnapshot() {
-        try? FileManager.default.removeItem(at: SharedContainer.url.appending(path: "snapshot.json"))
     }
 }

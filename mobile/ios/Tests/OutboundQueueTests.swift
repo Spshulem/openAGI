@@ -45,6 +45,25 @@ final class OutboundQueueTests: XCTestCase {
         XCTAssertTrue(queue.all().isEmpty, "an op that keeps failing must be dropped on its 5th attempt")
     }
 
+    // Finding 3 (Task 9 review): a queued completion for a revoked account
+    // must not survive account revoke and replay against whatever account
+    // pairs next.
+    func testClearEmptiesTheQueue() throws {
+        let queue = OutboundQueue(directory: dir)
+        try queue.enqueue(PendingOp(kind: .completeTask("task_1")))
+        try queue.enqueue(PendingOp(kind: .completeTask("task_2")))
+        XCTAssertEqual(queue.all().count, 2)
+        try queue.clear()
+        XCTAssertTrue(queue.all().isEmpty)
+    }
+
+    func testClearOnAnEmptyQueueIsANoOp() throws {
+        let queue = OutboundQueue(directory: dir)
+        XCTAssertTrue(queue.all().isEmpty)
+        try queue.clear()
+        XCTAssertTrue(queue.all().isEmpty)
+    }
+
     func testConcurrentEnqueuesAgainstTheSameFileDoNotLoseUpdates() throws {
         // A true two-process test isn't possible inside an XCTest bundle. This
         // races many threads through the exact read-modify-write sequence
