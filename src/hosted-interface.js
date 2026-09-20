@@ -1121,13 +1121,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (body.nodeId !== requestNodeId) {
           return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
         }
+        // Any node enrolled with a platform (Even G2, mobile, or a future one)
+        // already has a name, platform and capability set on file from
+        // enrollment, so those win over whatever the body claims — see below.
+        // A node enrolled through the bare /nodes/enroll pairing flow carries
+        // no platform, so it has none of that on file and keeps using the
+        // body's own values below, exactly as before this was generalized
+        // from a G2-only check.
+        const enrolledIdentity = requestEnrollment?.platform ? requestEnrollment : null;
         // Type-checked, not just truthy: a non-string name/nodeId previously
         // persisted and crashed NodeRegistry.list()'s name.localeCompare sort
         // with a TypeError, taking down GET /nodes with a 500 until the
-        // poisoned entry aged out. role is restricted to exactly "node" —
-        // only this instance's own self-entry may ever claim role "main";
-        // nothing arriving over the wire should be able to.
-        if (typeof body.nodeId !== "string" || !body.nodeId || typeof body.name !== "string" || !body.name) {
+        // poisoned entry aged out. An enrolled node's name is already on file
+        // and is used regardless of what the body sends (see below), so the
+        // body may omit "name" — but a name it DOES send still has to pass
+        // this same check, and a caller with no enrolled name must supply a
+        // valid one. role is restricted to exactly "node" — only this
+        // instance's own self-entry may ever claim role "main"; nothing
+        // arriving over the wire should be able to.
+        if (typeof body.nodeId !== "string" || !body.nodeId) {
+          return sendJson(res, 400, { error: "nodeId and name are required and must be non-empty strings" });
+        }
+        if (body.name !== undefined) {
+          if (typeof body.name !== "string" || !body.name) {
+            return sendJson(res, 400, { error: "nodeId and name are required and must be non-empty strings" });
+          }
+        } else if (!enrolledIdentity?.name) {
           return sendJson(res, 400, { error: "nodeId and name are required and must be non-empty strings" });
         }
         if (body.role !== "node") {
@@ -1144,23 +1163,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (body.capabilities !== undefined && !Array.isArray(body.capabilities)) {
           return sendJson(res, 400, { error: "capabilities must be an array" });
         }
-        const g2Enrollment = requestEnrollment?.platform === EVEN_G2_PLATFORM
-          ? requestEnrollment
-          : null;
         nodeRegistry.upsert({
-          nodeId: body.nodeId, name: g2Enrollment?.name ?? body.name, role: body.role,
+          nodeId: body.nodeId, name: enrolledIdentity?.name ?? body.name, role: body.role,
           url: body.url ?? null, version: body.version ?? null,
           // A node reports its own build identity (git SHA or bundle build
           // number). Without it a roster can only show package.json versions,
           // which have drifted behind the release tags and so cannot answer
           // "is this node up to date" — the whole point of the column.
           build: body.build ?? null, buildSource: body.buildSource ?? null,
-          platform: g2Enrollment?.platform ?? null,
-          capabilities: g2Enrollment?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
+          platform: enrolledIdentity?.platform ?? null,
+          capabilities: enrolledIdentity?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
         });
         return sendJson(res, 200, {
           ok: true,
-          capabilities: g2Enrollment?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
+          capabilities: enrolledIdentity?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
         });
       }
       if (method === "POST" && pathname === "/nodes/capture-memory") {
