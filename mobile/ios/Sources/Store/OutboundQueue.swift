@@ -27,34 +27,51 @@ public struct OutboundQueue: Sendable {
     }
 
     public func all() -> [PendingOp] {
-        guard let data = try? Data(contentsOf: file) else { return [] }
-        return (try? ProtocolDecoder.json.decode([PendingOp].self, from: data)) ?? []
+        CoordinatedFile.read(file) { url in
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return try? ProtocolDecoder.json.decode([PendingOp].self, from: data)
+        } ?? []
     }
 
+    // Every mutator here is a read-modify-write, coordinated: the widget's
+    // AppIntent and the app's refresh coordinator both mutate this file from
+    // different processes, so read-then-write must be one uninterruptible
+    // unit or a concurrent enqueue/attempt from the other side can be lost.
     public func enqueue(_ op: PendingOp) throws {
-        var ops = all()
-        // Tapping the same row twice is one intent, not two.
-        guard !ops.contains(where: { $0.kind == op.kind }) else { return }
-        ops.append(op)
-        try write(ops)
+        try CoordinatedFile.write(file) { url in
+            var ops = Self.readOps(at: url)
+            // Tapping the same row twice is one intent, not two.
+            guard !ops.contains(where: { $0.kind == op.kind }) else { return }
+            ops.append(op)
+            try Self.writeOps(ops, to: url)
+        }
     }
 
     public func remove(id: UUID) throws {
-        try write(all().filter { $0.id != id })
+        try CoordinatedFile.write(file) { url in
+            try Self.writeOps(Self.readOps(at: url).filter { $0.id != id }, to: url)
+        }
     }
 
     public func recordAttempt(id: UUID) throws {
-        var ops = all()
-        guard let index = ops.firstIndex(where: { $0.id == id }) else { return }
-        ops[index].attempts += 1
-        // An op that has failed this many times is not going to start working.
-        // Dropping it is better than a queue that retries forever on every
-        // background wake.
-        if ops[index].attempts >= Self.maxAttempts { ops.remove(at: index) }
-        try write(ops)
+        try CoordinatedFile.write(file) { url in
+            var ops = Self.readOps(at: url)
+            guard let index = ops.firstIndex(where: { $0.id == id }) else { return }
+            ops[index].attempts += 1
+            // An op that has failed this many times is not going to start working.
+            // Dropping it is better than a queue that retries forever on every
+            // background wake.
+            if ops[index].attempts >= Self.maxAttempts { ops.remove(at: index) }
+            try Self.writeOps(ops, to: url)
+        }
     }
 
-    private func write(_ ops: [PendingOp]) throws {
-        try ProtocolDecoder.jsonEncoder.encode(ops).write(to: file, options: .atomic)
+    private static func readOps(at url: URL) -> [PendingOp] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        return (try? ProtocolDecoder.json.decode([PendingOp].self, from: data)) ?? []
+    }
+
+    private static func writeOps(_ ops: [PendingOp], to url: URL) throws {
+        try ProtocolDecoder.jsonEncoder.encode(ops).write(to: url, options: .atomic)
     }
 }

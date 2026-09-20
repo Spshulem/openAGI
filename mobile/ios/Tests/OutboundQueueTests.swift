@@ -33,10 +33,31 @@ final class OutboundQueueTests: XCTestCase {
     }
 
     func testAttemptsAreCountedAndCapped() throws {
+        // Hardcode the cap (5) rather than reading OutboundQueue.maxAttempts:
+        // the implementation checks against that same symbol, so looping on
+        // it would pass for any cap value, including a regression.
         let queue = OutboundQueue(directory: dir)
         let op = PendingOp(kind: .completeTask("task_4"))
         try queue.enqueue(op)
-        for _ in 0..<OutboundQueue.maxAttempts { try queue.recordAttempt(id: op.id) }
-        XCTAssertTrue(queue.all().isEmpty, "an op that keeps failing must eventually be dropped")
+        for _ in 0..<4 { try queue.recordAttempt(id: op.id) }
+        XCTAssertEqual(queue.all().count, 1, "an op must survive short of the cap (4 attempts)")
+        try queue.recordAttempt(id: op.id)
+        XCTAssertTrue(queue.all().isEmpty, "an op that keeps failing must be dropped on its 5th attempt")
+    }
+
+    func testConcurrentEnqueuesAgainstTheSameFileDoNotLoseUpdates() throws {
+        // A true two-process test isn't possible inside an XCTest bundle. This
+        // races many threads through the exact read-modify-write sequence
+        // (read the outbox, append one op, write it back) that the widget's
+        // AppIntent and the app's refresh coordinator perform from different
+        // processes on the same file. It proves the coordinated block
+        // serializes this in-process race so no enqueue is lost; it does NOT
+        // prove cross-process behavior, which a unit test bundle cannot host.
+        let queue = OutboundQueue(directory: dir)
+        let iterations = 25
+        DispatchQueue.concurrentPerform(iterations: iterations) { index in
+            try? queue.enqueue(PendingOp(kind: .completeTask("task_\(index)")))
+        }
+        XCTAssertEqual(queue.all().count, iterations, "a concurrent read-modify-write must not drop an enqueue")
     }
 }
