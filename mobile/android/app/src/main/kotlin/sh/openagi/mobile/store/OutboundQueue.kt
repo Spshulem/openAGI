@@ -33,6 +33,13 @@ class OutboundQueue(directory: File) {
 
     fun all(): List<PendingOp> = synchronized(lock) { allLocked() }
 
+    // Revoking must empty the outbox, not just forget the credential. A queued
+    // completion left behind would otherwise replay against whatever account
+    // pairs next, completing a task that account's owner never touched.
+    fun clear() {
+        synchronized(lock) { file.delete() }
+    }
+
     private fun allLocked(): List<PendingOp> {
         if (!file.exists()) return emptyList()
         return try {
