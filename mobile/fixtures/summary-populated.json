@@ -1,8 +1,8 @@
 {
-  "generatedAt": "2026-09-20T01:37:38.286Z",
+  "generatedAt": "2026-09-20T04:15:28.172Z",
   "today": [
     {
-      "id": "task_c13cbf7f968e4ed6",
+      "id": "task_ad80580639e0445c",
       "title": "Ship the widget",
       "bucket": "today",
       "status": "pending",
@@ -11,7 +11,7 @@
       "overdue": false
     },
     {
-      "id": "task_6ad2707d37fb4ff1",
+      "id": "task_114a02d9cd9e465e",
       "title": "Renew the domain",
       "bucket": "today",
       "status": "pending",

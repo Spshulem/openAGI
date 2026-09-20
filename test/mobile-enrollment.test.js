@@ -8,6 +8,7 @@ import crypto from "node:crypto";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { writeNodeConfig } from "../src/cli-client.js";
 import { EVEN_G2_CAPABILITIES, EVEN_G2_PLATFORM } from "../src/integrations/g2-channel.js";
+import { MOBILE_CAPABILITIES } from "../src/mobile-node.js";
 
 async function bootApp(dataDir) {
   const runtime = createDurableRuntime({ dataDir });
@@ -47,7 +48,7 @@ test("a phone can get a code and exchange it for a mobile-scoped credential", as
     assert.equal(json.node.platform, "mobile");
     assert.equal(json.node.name, "Sean's iPhone");
     assert.ok(json.node.enrolledAt);
-    assert.deepEqual(json.capabilities, ["mobile-task-client", "mobile-approval-client", "mobile-chat-client"]);
+    assert.deepEqual(json.capabilities, MOBILE_CAPABILITIES);
   } finally { await app.close(); }
 });
 

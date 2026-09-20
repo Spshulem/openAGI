@@ -4,11 +4,33 @@
 // so the gate in hosted-interface.js has nothing to get creative about.
 export const MOBILE_PLATFORM = "mobile";
 
-export const MOBILE_CAPABILITIES = [
-  "mobile-task-client",
-  "mobile-approval-client",
-  "mobile-chat-client"
-];
+// Capability objects, not bare strings — sanitizeNodeCapabilities()
+// (src/node-control.js) only keeps entries shaped like these, the same
+// { id, ready, operations, detail } shape EVEN_G2_CAPABILITIES uses
+// (src/integrations/g2-channel.js). A bare-string array here would be
+// stripped to [] the moment it passed through that sanitizer, which is
+// exactly what was happening: a phone's stored capabilities were always
+// empty and GET /nodes could never say what a phone actually does.
+export const MOBILE_CAPABILITIES = Object.freeze([
+  Object.freeze({
+    id: "mobile-task-client",
+    ready: true,
+    operations: Object.freeze(["list", "create", "update", "delete", "complete"]),
+    detail: "Reads, creates, edits, completes, and deletes tasks in the user queue from the phone."
+  }),
+  Object.freeze({
+    id: "mobile-approval-client",
+    ready: true,
+    operations: Object.freeze(["approve", "deny"]),
+    detail: "Approves or denies queued agent actions from the phone."
+  }),
+  Object.freeze({
+    id: "mobile-chat-client",
+    ready: true,
+    operations: Object.freeze(["send"]),
+    detail: "Sends chat messages to the agent from the phone."
+  })
+]);
 
 export const MOBILE_NODE_NAME_MAX = 60;
 
