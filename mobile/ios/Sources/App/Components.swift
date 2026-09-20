@@ -121,6 +121,25 @@ struct DestructiveTextButton: View {
     }
 }
 
+// Same idea as `DestructiveTextButton` but for a quiet non-destructive
+// secondary action -- a screen with a Save/Complete/Delete stack should
+// still only spend one bold filled button, per DESIGN.md's "spend the
+// boldness in one place."
+struct SecondaryTextButton: View {
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(Theme.Typography.body.weight(.medium))
+                .foregroundStyle(Theme.live)
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+        }
+    }
+}
+
 // Every screen's title + connection line, per DESIGN.md's layout: "Screen
 // title / connection line" as the fixed header shape, left-aligned, never
 // inside a card.

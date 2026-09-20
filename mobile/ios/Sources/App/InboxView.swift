@@ -123,6 +123,8 @@ struct InboxView: View {
             pendingActions = a
             clarifications = c
             errorHeadline = nil
+        } catch let error as DaemonError {
+            errorHeadline = ApprovalError.message(for: error)
         } catch {
             errorHeadline = "Can't reach OpenAGI."
         }
