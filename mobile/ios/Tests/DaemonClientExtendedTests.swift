@@ -262,4 +262,38 @@ final class DaemonClientExtendedTests: XCTestCase {
         let body = try bodyJSON(of: request)
         XCTAssertEqual(body["text"] as? String, "hello")
     }
+
+    // A bare test daemon (no agent host configured) 503s `POST /message`
+    // BEFORE any SSE stream starts -- src/hosted-interface.js's `if
+    // (!channels) return sendJson(res, 503, { error: "agent-host-disabled"
+    // })`. This must surface as its own typed error, not the generic
+    // `.server(503)` that used to reach ChatView as "Can't reach OpenAGI" --
+    // indistinguishable from an actually-down daemon.
+    func testSendMessageStreamingSurfacesAgentHostDisabledFrom503Body() async {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 503, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"error":"agent-host-disabled"}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().sendMessageStreaming(text: "hello")
+            XCTFail("expected a throw")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .agentHostDisabled)
+        } catch { XCTFail("unexpected \(error)") }
+    }
+
+    // A 503 for any other reason (an actual server fault) must not be
+    // misreported as "no agent host" -- only the specific body maps there.
+    func testSendMessageStreamingTreatsOtherServiceUnavailableBodiesGenerically() async {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 503, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"error":"database-unavailable"}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().sendMessageStreaming(text: "hello")
+            XCTFail("expected a throw")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .server(503))
+        } catch { XCTFail("unexpected \(error)") }
+    }
 }

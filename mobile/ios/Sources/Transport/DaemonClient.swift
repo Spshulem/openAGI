@@ -8,6 +8,12 @@ public enum DaemonError: Error {
     case server(Int)
     case malformedResponse
     case transport(Error)
+    // `POST /message` (and `/setup/test`) 503 with `{"error":"agent-host-
+    // disabled"}` when the daemon has no model provider configured yet
+    // (src/hosted-interface.js). A bare test daemon looks exactly like this,
+    // and it is not "the server broke" -- it is a legible, expected state
+    // chat's UI must say plainly rather than showing a generic server error.
+    case agentHostDisabled
 }
 
 // `Error` doesn't conform to `Equatable`, so adding `.transport(Error)` above
@@ -25,6 +31,7 @@ extension DaemonError: Equatable {
         case let (.server(a), .server(b)): return a == b
         case (.malformedResponse, .malformedResponse): return true
         case (.transport, .transport): return true
+        case (.agentHostDisabled, .agentHostDisabled): return true
         default: return false
         }
     }
@@ -200,7 +207,21 @@ public actor DaemonClient {
         // frame every 15s specifically so this doesn't need to be short.
         request.timeoutInterval = 120
         let (bytes, response) = try await Self.bytesCall(request, session: session)
-        _ = try validate(response)
+        guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
+        if !(200...299).contains(http.statusCode) {
+            // A non-2xx status here is a plain JSON error body, not an SSE
+            // stream -- `validate(_:)` alone would report it as a bare
+            // `.server(503)`, which is exactly what shipped as "Can't reach
+            // OpenAGI" for the single most common test-daemon state (no
+            // agent host configured). Read a short bounded prefix of the
+            // same byte sequence to tell that case apart before falling
+            // back to the generic status-code mapping.
+            if http.statusCode == 503 {
+                let body = (try? await Self.collectText(bytes, byteLimit: 4096)) ?? ""
+                if body.contains("agent-host-disabled") { throw DaemonError.agentHostDisabled }
+            }
+            _ = try validate(response)
+        }
         return AsyncThrowingStream { continuation in
             let pump = Task {
                 var parser = SSEFrameParser()
@@ -350,6 +371,20 @@ public actor DaemonClient {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    // A bounded read of a byte sequence into a `String` -- used only to peek
+    // at a non-2xx response's small JSON error body before deciding which
+    // `DaemonError` it maps to. Never used on a 2xx stream, which can run
+    // for minutes and must not be buffered into memory like this.
+    private static func collectText(_ bytes: URLSession.AsyncBytes, byteLimit: Int) async throws -> String {
+        var buffer: [UInt8] = []
+        buffer.reserveCapacity(byteLimit)
+        for try await byte in bytes {
+            buffer.append(byte)
+            if buffer.count >= byteLimit { break }
+        }
+        return String(decoding: buffer, as: UTF8.self)
     }
 
     // A dropped connection, timeout, DNS failure, or TLS error throws a raw
