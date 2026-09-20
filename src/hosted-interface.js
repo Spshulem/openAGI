@@ -981,22 +981,26 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: error.message });
         }
       }
-      const ENROLLABLE_PLATFORMS = new Set([EVEN_G2_PLATFORM, MOBILE_PLATFORM]);
-      const capabilitiesForPlatform = (platform) =>
-        platform === MOBILE_PLATFORM ? MOBILE_CAPABILITIES : EVEN_G2_CAPABILITIES;
-      const nodeNameForPlatform = (platform, value) =>
-        platform === MOBILE_PLATFORM ? boundedMobileNodeName(value) : boundedG2NodeName(value);
       if (method === "POST" && pathname === "/nodes/enrollment-code") {
-        if (readNodeConfig(dataDir)?.remote) {
-          return sendJson(res, 409, { error: "nodes must be enrolled on the main OpenAGI" });
-        }
+        // The body is read before the remote check so the 409 can speak the
+        // caller's language. Only a mobile caller sees new wording: every other
+        // platform value — including an unknown one, which reached this 409
+        // before the platform was ever inspected — keeps the G2 string a
+        // shipped wearable already depends on.
         const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
         const platform = body.platform;
+        if (readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, {
+            error: platform === MOBILE_PLATFORM
+              ? "phones must be enrolled on the main OpenAGI"
+              : "Even G2 nodes must be enrolled on the main OpenAGI"
+          });
+        }
         if (!ENROLLABLE_PLATFORMS.has(platform)) {
           return sendJson(res, 400, { error: `platform must be one of ${[...ENROLLABLE_PLATFORMS].join(", ")}` });
         }
         const issued = nodeEnrollment.issue(platform);
-        console.log(`[openagi] ${platform} node enrollment code ${issued.code} (valid 30 min, single use)`);
+        console.log(`[openagi] ${platformLabel(platform)} node enrollment code ${issued.code} (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
@@ -3615,6 +3619,24 @@ function boundedG2NodeName(value) {
     : "";
   return name || "Even G2";
 }
+
+// Cross-platform enrollment dispatch. This lives at the router rather than in
+// mobile-node.js on purpose: it answers "which platform's rule applies", so
+// putting it in the mobile module would make that module import the G2's
+// platform, capabilities and name bound — G2 logic in the file that exists to
+// hold mobile logic. Module scope, not per-request: every value closed over is
+// a static import.
+const ENROLLABLE_PLATFORMS = new Set([EVEN_G2_PLATFORM, MOBILE_PLATFORM]);
+
+const capabilitiesForPlatform = (platform) =>
+  platform === MOBILE_PLATFORM ? MOBILE_CAPABILITIES : EVEN_G2_CAPABILITIES;
+
+const nodeNameForPlatform = (platform, value) =>
+  platform === MOBILE_PLATFORM ? boundedMobileNodeName(value) : boundedG2NodeName(value);
+
+// Operator-facing display form. The G2's log line read "Even G2" before phones
+// existed and still must.
+const platformLabel = (platform) => (platform === MOBILE_PLATFORM ? "Phone" : "Even G2");
 
 // Task statuses a "stop asking" may retire FROM. Mirrors the allowlist in
 // daily-brief.js, and the reason both exist is the "completed" case: flipping a
