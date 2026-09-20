@@ -8,7 +8,35 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     DEVELOPMENT_TEAM: ""
-    CODE_SIGNING_ALLOWED: "NO"
+    # Ad-hoc signing ("-" needs no Apple Developer Team, certificate, or
+    # provisioning profile — it works on any Mac, headless or not) rather
+    # than disabling signing outright. A live Task 16 end-to-end pairing run
+    # found that CODE_SIGNING_ALLOWED: NO makes the installed app carry an
+    # EMPTY entitlements dictionary (entitlements are only embedded as part
+    # of a code signature), so Credentials.save()'s SecItemAdd unconditionally
+    # failed with errSecMissingEntitlement (-34018) — pairing could never
+    # complete, on Simulator or (since real devices require signing to
+    # install at all) on real hardware either.
+    #
+    # Ad-hoc signing does NOT actually get the declared keychain-access-groups
+    # / application-groups entries embedded either — `codesign -d
+    # --entitlements` on the built app still shows an empty dict, even signed
+    # this way, without a real Team ID. What ad-hoc signing DOES do is make
+    # the process merely *signed*, which is enough to satisfy Keychain's
+    # baseline requirement for a plain, ungrouped item — see the accompanying
+    # fix in Sources/Store/Credentials.swift, which stopped asking for an
+    # explicit access group. The two fixes only work together. App Group
+    # (Sources/Store/SharedContainer.swift) resolution was separately
+    # confirmed to still work on Simulator regardless of this signing change
+    # — Simulator does not enforce that entitlement the way a real device
+    # does — but that is Simulator leniency, not evidence the App Group
+    # entitlement is genuinely wired; a real device with a real Apple
+    # Developer Team is the only environment that actually proves it. See
+    # mobile/ios/Tests/CredentialsTests.swift and mobile/README.md's manual
+    # checklist.
+    CODE_SIGNING_ALLOWED: "YES"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: "YES"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 targets:
   OpenAGI:
