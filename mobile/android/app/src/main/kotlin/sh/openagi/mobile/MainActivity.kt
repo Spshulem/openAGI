@@ -5,7 +5,9 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -95,6 +97,18 @@ class MainActivity : ComponentActivity() {
                         bottomBar = {
                             AppNavigationBar(selected = selectedTab, inboxBadgeCount = inboxBadge, onSelect = { selectedTab = it })
                         },
+                        // Scaffold's default contentWindowInsets is safeDrawing,
+                        // which bundles the IME inset in with status/navigation
+                        // bars. Chat's own composer already calls imePadding()
+                        // precisely where it's needed (DESIGN.md names that
+                        // modifier explicitly); leaving Scaffold's default in
+                        // place double-consumes the keyboard's height here,
+                        // which was verified on-device to push the screen
+                        // header and even the bottom nav bar off-screen when
+                        // the keyboard opened. Only the status bar inset is
+                        // reserved here — the bottomBar already insets itself
+                        // for the navigation bar, and now each screen owns IME.
+                        contentWindowInsets = WindowInsets.statusBars,
                     ) { padding ->
                         Box(modifier = Modifier.padding(padding)) {
                             when (selectedTab) {
