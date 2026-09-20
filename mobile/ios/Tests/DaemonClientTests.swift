@@ -5,12 +5,20 @@ import XCTest
 // exact request the daemon would receive is asserted.
 final class StubProtocol: URLProtocol {
     nonisolated(unsafe) static var handler: ((URLRequest) -> (HTTPURLResponse, Data))?
+    // Set to simulate a transport-level failure (dropped connection, DNS,
+    // TLS, etc.) instead of returning a response. Tests that set this must
+    // reset it to nil afterward so it doesn't leak into later tests.
+    nonisolated(unsafe) static var failure: Error?
     nonisolated(unsafe) static var lastRequest: URLRequest?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.lastRequest = request
+        if let failure = Self.failure {
+            client?.urlProtocol(self, didFailWithError: failure)
+            return
+        }
         let (response, data) = Self.handler!(request)
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
@@ -29,6 +37,22 @@ final class DaemonClientTests: XCTestCase {
             token: String(repeating: "a", count: 43),
             session: URLSession(configuration: config)
         )
+    }
+
+    // URLSession hands an intercepted request's body to URLProtocol as a
+    // stream, not as `httpBody` directly — this drains it so a test can
+    // assert on the exact serialized bytes.
+    private func bodyData(of request: URLRequest) throws -> Data {
+        try XCTUnwrap(request.httpBodyStream.map { stream -> Data in
+            stream.open(); defer { stream.close() }
+            var data = Data(); var buffer = [UInt8](repeating: 0, count: 1024)
+            while stream.hasBytesAvailable {
+                let read = stream.read(&buffer, maxLength: buffer.count)
+                if read <= 0 { break }
+                data.append(buffer, count: read)
+            }
+            return data
+        })
     }
 
     func testSummarySendsCredentialsAndDecodes() async throws {
@@ -66,17 +90,23 @@ final class DaemonClientTests: XCTestCase {
         let request = try XCTUnwrap(StubProtocol.lastRequest)
         XCTAssertEqual(request.httpMethod, "POST")
         XCTAssertEqual(request.url?.path, "/tasks/task_abc/complete")
-        let body = try XCTUnwrap(request.httpBodyStream.map { stream -> Data in
-            stream.open(); defer { stream.close() }
-            var data = Data(); var buffer = [UInt8](repeating: 0, count: 1024)
-            while stream.hasBytesAvailable {
-                let read = stream.read(&buffer, maxLength: buffer.count)
-                if read <= 0 { break }
-                data.append(buffer, count: read)
-            }
-            return data
-        })
+        let body = try bodyData(of: request)
         XCTAssertEqual(String(decoding: body, as: UTF8.self), #"{"completedVia":"mobile"}"#)
+    }
+
+    func testHeartbeatSendsRoleNode() async throws {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{\"ok\":true}".utf8))
+        }
+        try await makeClient().heartbeat()
+        let request = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/nodes/heartbeat")
+        let body = try bodyData(of: request)
+        // Dropping or misspelling "role" here compiles fine and 400s against a
+        // real daemon (POST /nodes/heartbeat requires role to be exactly "node")
+        // — that regression already shipped once in this plan's own text.
+        XCTAssertEqual(String(decoding: body, as: UTF8.self), #"{"nodeId":"mobile:abc","role":"node"}"#)
     }
 
     func testStatusCodesMapToTypedErrors() async {
@@ -101,6 +131,18 @@ final class DaemonClientTests: XCTestCase {
             XCTFail("expected a refusal")
         } catch let error as DaemonError {
             guard case .unreachableHost = error else { return XCTFail("wrong error \(error)") }
+        } catch { XCTFail("unexpected \(error)") }
+    }
+
+    func testTransportFailureSurfacesAsTransportError() async {
+        struct StubNetworkFailure: Error {}
+        StubProtocol.failure = StubNetworkFailure()
+        defer { StubProtocol.failure = nil }
+        do {
+            _ = try await makeClient().summary(ifNoneMatch: nil)
+            XCTFail("expected a throw")
+        } catch let error as DaemonError {
+            guard case .transport = error else { return XCTFail("wrong error \(error)") }
         } catch { XCTFail("unexpected \(error)") }
     }
 }
