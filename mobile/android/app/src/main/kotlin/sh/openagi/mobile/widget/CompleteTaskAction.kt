@@ -1,6 +1,7 @@
 package sh.openagi.mobile.widget
 
 import android.content.Context
+import android.util.Log
 import androidx.glance.GlanceId
 import androidx.glance.action.ActionParameters
 import androidx.glance.appwidget.action.ActionCallback
@@ -16,11 +17,28 @@ class CompleteTaskAction : ActionCallback {
     override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
         val taskId = parameters[taskIdKey] ?: return
         // Hide it now, send it when we can. A tap that visibly does nothing for
-        // fifteen minutes is worse than no widget at all.
-        SnapshotStore(context.filesDir).applyOptimisticCompletion(taskId)
-        OutboundQueue(context.filesDir).enqueue(PendingOp.completeTask(taskId))
-        TodayWidget().updateAll(context)
-        WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<DrainWorker>().build())
+        // fifteen minutes is worse than no widget at all — but a widget host
+        // that crashes gets deprioritized by the OS, which silently kills the
+        // feature entirely. applyOptimisticCompletion/enqueue both reach
+        // File.writeText, which throws IOException on a full or read-only
+        // filesystem, so every write here is best-effort, same as iOS's
+        // `try?` on the equivalent path.
+        try {
+            SnapshotStore(context.filesDir).applyOptimisticCompletion(taskId)
+            OutboundQueue(context.filesDir).enqueue(PendingOp.completeTask(taskId))
+        } catch (error: Exception) {
+            Log.w("CompleteTaskAction", "optimistic completion write failed: ${error.javaClass.simpleName}")
+        }
+        try {
+            TodayWidget().updateAll(context)
+        } catch (error: Exception) {
+            Log.w("CompleteTaskAction", "widget repaint failed: ${error.javaClass.simpleName}")
+        }
+        try {
+            WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<DrainWorker>().build())
+        } catch (error: Exception) {
+            Log.w("CompleteTaskAction", "drain enqueue failed: ${error.javaClass.simpleName}")
+        }
     }
 
     companion object {

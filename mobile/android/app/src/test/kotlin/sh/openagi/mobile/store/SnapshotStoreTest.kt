@@ -82,4 +82,40 @@ class SnapshotStoreTest {
         store().save(Snapshot(summary("A"), old, null, emptySet()))
         assertEquals(15, store().load()!!.ageInMinutes(now = old.plusSeconds(900)))
     }
+
+    @Test
+    fun touchFetchedAtResetsAgeWithoutTouchingOtherFields() {
+        val old = Instant.now().minusSeconds(900)
+        store().save(Snapshot(summary("A", "B"), old, "\"e1\"", setOf("task_a")))
+        val touched = store().touchFetchedAt(Instant.now())!!
+        assertEquals(0, touched.ageInMinutes())
+        assertEquals("\"e1\"", touched.etag)
+        assertEquals(setOf("task_a"), touched.locallyCompleted)
+    }
+
+    @Test
+    fun touchFetchedAtOnAMissingSnapshotIsNullNotAThrow() {
+        assertNull(store().touchFetchedAt())
+    }
+
+    // The bug this guards against: a 304 handler that does
+    // `store.load()?.let { store.save(it.copy(fetchedAt = now)) } }` is two
+    // independently-locked transactions, so a completion landing in the gap
+    // between them is silently overwritten with the pre-completion
+    // `locallyCompleted` set — the row the user just ticked flickers back.
+    // touchFetchedAt does the read and the write under one lock instead, so
+    // hammering it concurrently with real completions must never lose one.
+    @Test
+    fun touchFetchedAtNeverLosesAConcurrentCompletion() {
+        store().save(Snapshot(summary("A", "B"), Instant.now(), null, emptySet()))
+        val touchers = List(8) {
+            Thread {
+                repeat(200) { store().touchFetchedAt() }
+            }
+        }
+        val completer = Thread { store().applyOptimisticCompletion("task_a") }
+        (touchers + completer).forEach { it.start() }
+        (touchers + completer).forEach { it.join() }
+        assertEquals(setOf("task_a"), store().load()!!.locallyCompleted)
+    }
 }

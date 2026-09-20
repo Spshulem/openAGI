@@ -28,6 +28,7 @@ import androidx.work.WorkManager
 import sh.openagi.mobile.MainActivity
 import sh.openagi.mobile.protocol.TaskItem
 import sh.openagi.mobile.store.Credentials
+import sh.openagi.mobile.util.RelativeTime
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.sync.RefreshWorker
 
@@ -62,6 +63,7 @@ private fun WidgetContent(state: WidgetState) {
             is WidgetState.Empty -> EmptyContent(state)
             is WidgetState.Tasks -> TasksContent(state)
             is WidgetState.Stale -> StaleContent(state)
+            is WidgetState.Unreachable -> UnreachableContent(state)
         }
     }
 }
@@ -121,9 +123,27 @@ private fun TaskRow(item: TaskItem) {
 @Composable
 private fun StaleContent(state: WidgetState.Stale) {
     Text(
-        text = "Last synced ${state.ageMinutes}m ago — tap to refresh",
+        text = RelativeTime.lastSynced(state.ageMinutes) + " — tap to refresh",
         style = TextStyle(color = GlanceTheme.colors.error, fontWeight = FontWeight.Bold),
         modifier = GlanceModifier.fillMaxSize().clickable(actionRunCallback<RequestRefreshAction>()),
+    )
+}
+
+// The last refresh attempt failed, but there is still a last-known snapshot
+// worth showing — DESIGN.md: every screen (and by extension the widget)
+// renders from the last snapshot when the daemon is unreachable. State the
+// fact plainly rather than either hiding the tasks or pretending they're
+// current; do not say "offline" when a failed refresh is all that's known.
+@Composable
+private fun UnreachableContent(state: WidgetState.Unreachable) {
+    Text(
+        text = "Can't reach OpenAGI",
+        style = TextStyle(color = GlanceTheme.colors.error, fontWeight = FontWeight.Bold),
+    )
+    state.items.take(3).forEach { item -> TaskRow(item) }
+    Text(
+        text = countsLine(state.counts.today, state.counts.overdue),
+        style = TextStyle(color = GlanceTheme.colors.onSurfaceVariant),
     )
 }
 
