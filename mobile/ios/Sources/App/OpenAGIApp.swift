@@ -24,7 +24,7 @@ struct OpenAGIApp: App {
         WindowGroup {
             Group {
                 if let credentials {
-                    TodayView(credentials: credentials, onRevoked: { self.credentials = nil })
+                    RootTabView(credentials: credentials, onRevoked: { self.credentials = nil })
                 } else {
                     // `.id` forces a fresh PairingView (and fresh @State) whenever a
                     // new deep link arrives; SwiftUI would otherwise keep the

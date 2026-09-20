@@ -1,111 +1,77 @@
 import SwiftUI
 
-// The main screen once a phone is paired: today's tasks, tappable to
-// complete, with a line showing how stale the data is.
+// mobile/FEATURES.md's Today tab: today's tasks (matching the widget
+// exactly), the brief headline above the list, pull to refresh, and "the
+// day's shape in one sentence" below it.
 struct TodayView: View {
-    let credentials: Credentials
-    let onRevoked: () -> Void
-
-    @State private var snapshot: Snapshot?
-    @State private var isBusy = false
-    @State private var lastOutcome: RefreshOutcome?
-
-    private let store = SnapshotStore()
-    private let queue = OutboundQueue()
-
-    private var client: DaemonClient {
-        DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
-    }
-
-    private var coordinator: RefreshCoordinator {
-        RefreshCoordinator(client: client, store: store, queue: queue)
-    }
+    @Environment(AppModel.self) private var model
 
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    Text(statusLine)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                ScreenHeader(title: "Today", host: model.credentials.server.host ?? "",
+                            ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
+
+                if let headline = model.snapshot?.summary.brief.headline, !headline.isEmpty {
+                    Text(headline)
+                        .font(Theme.Typography.section)
+                        .foregroundStyle(Theme.ink)
+                        .padding(.horizontal, Theme.gutter)
+                        .padding(.bottom, Theme.Spacing.x2)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
                 }
-                Section("Today") {
-                    let visible = snapshot?.visibleToday ?? []
-                    if visible.isEmpty {
-                        Text("Nothing due today.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(visible) { task in
-                            row(for: task)
+
+                let visible = model.snapshot?.visibleToday ?? []
+                if visible.isEmpty {
+                    EmptyStateView(headline: "Nothing left today.",
+                                  detail: "New tasks appear here when OpenAGI or you add them.")
+                        .listRowInsets(EdgeInsets(top: 0, leading: Theme.gutter, bottom: 0, trailing: Theme.gutter))
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
+                } else {
+                    RowGroup {
+                        ForEach(Array(visible.enumerated()), id: \.element.id) { index, task in
+                            TaskRow(title: task.title,
+                                   secondaryText: task.overdue ? "Overdue" : nil,
+                                   secondaryIsAlert: task.overdue,
+                                   isBusy: model.isRefreshingToday) {
+                                Task { await model.completeToday(taskID: task.id) }
+                            }
+                            if index < visible.count - 1 { RowHairline() }
                         }
                     }
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
+                }
+
+                if let counts = model.snapshot?.visibleCounts {
+                    Text(dayShape(counts))
+                        .font(Theme.Typography.secondary)
+                        .foregroundStyle(Theme.muted)
+                        .padding(.horizontal, Theme.gutter)
+                        .padding(.top, Theme.Spacing.x3)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
                 }
             }
-            .navigationTitle("Today")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink("Settings") {
-                        SettingsView(credentials: credentials, onRevoked: onRevoked)
-                    }
-                }
-            }
-            .refreshable { await refresh() }
-            .task {
-                snapshot = store.load()
-                await refresh()
-            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .background(Theme.canvas)
+            .refreshable { await model.refreshToday() }
+            .task { await model.refreshToday() }
         }
     }
 
-    private func row(for task: TaskItem) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(task.title)
-                if task.overdue {
-                    Text("Overdue")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-            }
-            Spacer()
-            Button {
-                Task { await complete(task) }
-            } label: {
-                Image(systemName: "checkmark.circle")
-                    .imageScale(.large)
-            }
-            .buttonStyle(.borderless)
-            .disabled(isBusy)
-        }
-    }
-
-    private var statusLine: String {
-        if case .unauthorized = lastOutcome {
-            return "Needs re-pairing — revoke and pair again in Settings"
-        }
-        if case .offline = lastOutcome {
-            return "Can't reach OpenAGI"
-        }
-        guard let snapshot else { return "Not synced yet" }
-        let age = snapshot.ageInMinutes()
-        return age == 0 ? "Updated just now" : "Updated \(age)m ago"
-    }
-
-    private func refresh() async {
-        isBusy = true
-        defer { isBusy = false }
-        lastOutcome = await coordinator.refresh()
-        snapshot = store.load()
-    }
-
-    // Optimistic: hide the row immediately, queue the completion for the
-    // daemon, then try to send it right away without waiting for the next
-    // scheduled refresh.
-    private func complete(_ task: TaskItem) async {
-        isBusy = true
-        defer { isBusy = false }
-        snapshot = try? store.applyOptimisticCompletion(taskID: task.id)
-        try? queue.enqueue(PendingOp(kind: .completeTask(task.id)))
-        await coordinator.drainQueue()
+    // DESIGN.md's mock: "2 left today, 1 this week".
+    private func dayShape(_ counts: MobileSummary.Counts) -> String {
+        var parts: [String] = []
+        parts.append("\(counts.today) left today")
+        if counts.thisWeek > 0 { parts.append("\(counts.thisWeek) this week") }
+        return parts.joined(separator: ", ")
     }
 }
