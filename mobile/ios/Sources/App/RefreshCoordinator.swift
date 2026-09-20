@@ -62,6 +62,6 @@ public actor RefreshCoordinator {
     }
 
     private func reloadWidgets() {
-        WidgetCenter.shared.reloadTimelines(ofKind: "TodayWidget")
+        WidgetCenter.shared.reloadTimelines(ofKind: TodayWidgetKind.value)
     }
 }

@@ -38,6 +38,30 @@ targets:
       properties:
         com.apple.security.application-groups: [group.sh.openagi.mobile]
         keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
+    dependencies:
+      - target: OpenAGIWidget
+        embed: true
+  OpenAGIWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Widget
+      - path: Sources/Protocol
+      - path: Sources/Store
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: sh.openagi.OpenAGI.OpenAGIWidget
+    info:
+      path: Widget/Info.plist
+      properties:
+        CFBundleDisplayName: OpenAGI Today
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: Widget/OpenAGIWidget.entitlements
+      properties:
+        com.apple.security.application-groups: [group.sh.openagi.mobile]
+        keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
   OpenAGITests:
     type: bundle.unit-test
     platform: iOS
