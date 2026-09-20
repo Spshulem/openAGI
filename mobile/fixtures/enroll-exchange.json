@@ -1,0 +1,14 @@
+{
+  "node": {
+    "id": "mobile:fixture-node",
+    "name": "Fixture Phone",
+    "platform": "mobile",
+    "enrolledAt": "2026-09-20T01:37:38.292Z"
+  },
+  "nodeToken": "FIXTURE-SYNTHETIC-NODE-TOKEN-NOT-REAL-00000",
+  "capabilities": [
+    "mobile-task-client",
+    "mobile-approval-client",
+    "mobile-chat-client"
+  ]
+}
