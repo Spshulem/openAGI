@@ -33,7 +33,6 @@ import sh.openagi.mobile.protocol.PendingAction
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.sync.fetchInboxBadgeCount
 import sh.openagi.mobile.transport.DaemonClient
-import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.ui.components.ConnectionState
 import sh.openagi.mobile.ui.components.DestructiveTextButton
 import sh.openagi.mobile.ui.components.EmptyState
@@ -42,7 +41,6 @@ import sh.openagi.mobile.ui.components.RowGroup
 import sh.openagi.mobile.ui.components.ScreenHeader
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
-import sh.openagi.mobile.util.ErrorCopy
 import sh.openagi.mobile.util.RelativeTime
 import java.time.Instant
 
@@ -65,76 +63,66 @@ fun InboxScreen(
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
 
-    var actions by remember { mutableStateOf<List<PendingAction>?>(null) }
-    var clarifications by remember { mutableStateOf<List<Clarification>?>(null) }
-    var error by remember { mutableStateOf<ErrorCopy.Message?>(null) }
+    var load by remember { mutableStateOf<InboxLoadResult?>(null) }
     var openAction by remember { mutableStateOf<PendingAction?>(null) }
     var openClarification by remember { mutableStateOf<Clarification?>(null) }
     var lastSyncedAgo by remember { mutableStateOf<Int?>(null) }
+    var lastLoadFullyFailed by remember { mutableStateOf(false) }
 
-    suspend fun load() {
-        try {
-            actions = client.pendingActions()
-            clarifications = client.clarifications()
-            error = null
-            lastSyncedAgo = 0
-            onBadgeCountChanged((actions?.size ?: 0) + (clarifications?.size ?: 0))
-        } catch (daemonError: DaemonException) {
-            error = ErrorCopy.forDaemon(daemonError, credentials.server)
-        }
+    suspend fun refresh() {
+        val result = loadInbox(client, credentials.server)
+        load = result
+        val anySucceeded = result.actions.error == null || result.clarifications.error == null
+        lastLoadFullyFailed = !anySucceeded
+        if (anySucceeded) lastSyncedAgo = 0
+        onBadgeCountChanged((result.actions.items?.size ?: 0) + (result.clarifications.items?.size ?: 0))
     }
 
-    LaunchedEffect(resumeSignal) { load() }
+    LaunchedEffect(resumeSignal) { refresh() }
 
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(
             title = "Inbox",
-            connection = lastSyncedAgo?.let { ConnectionState.Synced(credentials.server, it) }
-                ?: ConnectionState.NeverSynced(credentials.server),
+            connection = when {
+                lastSyncedAgo != null -> ConnectionState.Synced(credentials.server, lastSyncedAgo!!)
+                lastLoadFullyFailed -> ConnectionState.Failed(credentials.server, null)
+                else -> ConnectionState.NeverSynced(credentials.server)
+            },
         )
 
-        val pendingActions = actions
-        val pendingClarifications = clarifications
-        if (pendingActions == null && pendingClarifications == null) {
-            error?.let { EmptyState(it.headline, it.detail) } ?: EmptyState("Loading…")
-        } else if (pendingActions.orEmpty().isEmpty() && pendingClarifications.orEmpty().isEmpty()) {
-            EmptyState("Nothing waiting on you.", "Approvals and questions from OpenAGI show up here.")
+        val current = load
+        if (current == null) {
+            EmptyState("Loading…")
         } else {
             Column(
                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(24.dp),
             ) {
-                if (!pendingActions.isNullOrEmpty()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Approvals", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
-                        RowGroup {
-                            pendingActions.forEachIndexed { index, action ->
-                                InboxRow(
-                                    title = action.summary.ifBlank { action.toolName },
-                                    subtitle = action.createdAt?.let { "Raised " + RelativeTime.short(minutesAgo(it)) + " ago" },
-                                    onClick = { openAction = action },
-                                )
-                                if (index != pendingActions.lastIndex) Hairline()
-                            }
-                        }
-                    }
-                }
+                InboxSection(
+                    title = "Approvals",
+                    state = current.actions,
+                    emptyLabel = "No approvals waiting.",
+                    rowFor = { action ->
+                        InboxRowData(
+                            title = action.summary.ifBlank { action.toolName },
+                            subtitle = action.createdAt?.let { "Raised " + RelativeTime.short(minutesAgo(it)) + " ago" },
+                            onClick = { openAction = action },
+                        )
+                    },
+                )
 
-                if (!pendingClarifications.isNullOrEmpty()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Clarifications", style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
-                        RowGroup {
-                            pendingClarifications.forEachIndexed { index, clarification ->
-                                InboxRow(
-                                    title = clarification.question,
-                                    subtitle = clarification.createdAt?.let { "Asked " + RelativeTime.short(minutesAgo(it)) + " ago" },
-                                    onClick = { openClarification = clarification },
-                                )
-                                if (index != pendingClarifications.lastIndex) Hairline()
-                            }
-                        }
-                    }
-                }
+                InboxSection(
+                    title = "Clarifications",
+                    state = current.clarifications,
+                    emptyLabel = "No questions waiting.",
+                    rowFor = { clarification ->
+                        InboxRowData(
+                            title = clarification.question,
+                            subtitle = clarification.createdAt?.let { "Asked " + RelativeTime.short(minutesAgo(it)) + " ago" },
+                            onClick = { openClarification = clarification },
+                        )
+                    },
+                )
             }
         }
     }
@@ -154,7 +142,7 @@ fun InboxScreen(
                         // still show it as pending on the next load.
                     }
                     openAction = null
-                    load()
+                    refresh()
                 }
             },
             onDeny = { reason ->
@@ -164,7 +152,7 @@ fun InboxScreen(
                     } catch (error: Exception) {
                     }
                     openAction = null
-                    load()
+                    refresh()
                 }
             },
         )
@@ -181,7 +169,7 @@ fun InboxScreen(
                     } catch (error: Exception) {
                     }
                     openClarification = null
-                    load()
+                    refresh()
                 }
             },
         )
@@ -201,6 +189,49 @@ private fun InboxRow(title: String, subtitle: String?, onClick: () -> Unit) {
             Text(subtitle, style = OpenAGIType.caption, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
+}
+
+private data class InboxRowData(val title: String, val subtitle: String?, val onClick: () -> Unit)
+
+// DESIGN.md: "approvals and clarifications are two sections of one list. If
+// one of the two fails to load, the other still renders, and the failure is
+// a single inline row in that section, not an error that replaces the
+// screen." The section header is always present — a badge promising an item
+// above a section that silently vanished is worse than either alone.
+@Composable
+private fun <T> InboxSection(
+    title: String,
+    state: InboxSectionState<T>,
+    emptyLabel: String,
+    rowFor: (T) -> InboxRowData,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, style = OpenAGIType.section, color = MaterialTheme.colorScheme.onBackground)
+        RowGroup {
+            val error = state.error
+            val items = state.items
+            when {
+                error != null -> InboxInlineMessage(error.headline, isAlert = true)
+                items == null -> InboxInlineMessage("Loading…", isAlert = false)
+                items.isEmpty() -> InboxInlineMessage(emptyLabel, isAlert = false)
+                else -> items.map(rowFor).forEachIndexed { index, row ->
+                    InboxRow(title = row.title, subtitle = row.subtitle, onClick = row.onClick)
+                    if (index != items.lastIndex) Hairline()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InboxInlineMessage(text: String, isAlert: Boolean) {
+    val colors = LocalOpenAGIColors.current
+    Text(
+        text,
+        style = OpenAGIType.caption,
+        color = if (isAlert) colors.alert else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp),
+    )
 }
 
 @Composable
