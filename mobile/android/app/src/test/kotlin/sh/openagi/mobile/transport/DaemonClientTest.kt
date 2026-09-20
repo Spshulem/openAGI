@@ -1,6 +1,8 @@
 package sh.openagi.mobile.transport
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -9,6 +11,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
+import sh.openagi.mobile.protocol.ProtocolJson
 import java.io.File
 
 class DaemonClientTest {
@@ -169,5 +172,55 @@ class DaemonClientTest {
         val request = server.takeRequest()
         assertEquals("/nodes/enroll/exchange", request.path)
         assertTrue(request.body.readUtf8().contains("\"platform\":\"mobile\""))
+    }
+
+    @Test
+    fun enrollNameContainingAQuoteRoundTrips() = runBlocking {
+        // name is free-text the user typed, unlike nodeId which is pattern-
+        // constrained. Hand-interpolating it into a JSON literal would let a
+        // quote either break the JSON or, worse, smuggle a sibling key in. The
+        // body must be built by a real encoder, so a quote in the name must
+        // come back out exactly as it went in.
+        val nameWithQuote = """My "Pixel" Phone"""
+        server.enqueue(MockResponse().setResponseCode(200).setBody(fixture("enroll-exchange")))
+        DaemonClient.enroll(
+            server = server.url("/").toString(),
+            code = "004221",
+            nodeId = "mobile:abc",
+            nodeToken = "b".repeat(43),
+            name = nameWithQuote,
+            enforceAllowlist = false,
+        )
+        val request = server.takeRequest()
+        val bodyJson = ProtocolJson.json.parseToJsonElement(request.body.readUtf8()).jsonObject
+        assertEquals(nameWithQuote, bodyJson["name"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun enrollStatusCodesMapToTypedErrors() = runBlocking {
+        val cases = listOf(
+            401 to DaemonException.Unauthorized::class,
+            403 to DaemonException.Unauthorized::class,
+            429 to DaemonException.Unauthorized::class,
+            409 to DaemonException.Conflict::class,
+            500 to DaemonException.Server::class,
+        )
+        cases.forEach { (code, type) ->
+            server.enqueue(MockResponse().setResponseCode(code))
+            try {
+                DaemonClient.enroll(
+                    server = server.url("/").toString(),
+                    code = "004221",
+                    nodeId = "mobile:abc",
+                    nodeToken = "b".repeat(43),
+                    name = "iPhone",
+                    enforceAllowlist = false,
+                )
+                fail("expected a throw for $code")
+            } catch (error: DaemonException) {
+                assertEquals(type, error::class)
+                if (error is DaemonException.Server) assertEquals(code, error.code)
+            }
+        }
     }
 }
