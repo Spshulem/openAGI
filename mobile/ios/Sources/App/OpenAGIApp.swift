@@ -24,7 +24,12 @@ struct OpenAGIApp: App {
         WindowGroup {
             Group {
                 if let credentials {
-                    RootTabView(credentials: credentials, onRevoked: { self.credentials = nil })
+                    RootTabView(
+                        credentials: credentials,
+                        incomingPairing: pendingPairing,
+                        onDismissIncomingPairing: { pendingPairing = nil },
+                        onRevoked: { self.credentials = nil }
+                    )
                 } else {
                     // `.id` forces a fresh PairingView (and fresh @State) whenever a
                     // new deep link arrives; SwiftUI would otherwise keep the
@@ -32,7 +37,13 @@ struct OpenAGIApp: App {
                     PairingView(
                         prefillServer: pendingPairing?.serverURL,
                         prefillCode: pendingPairing?.code,
-                        onPaired: { self.credentials = Credentials.load() }
+                        onPaired: {
+                            self.credentials = Credentials.load()
+                            // Spent. Left set, it would reach RootTabView as an
+                            // "incoming" link and immediately ask to switch away
+                            // from the pairing it just made.
+                            pendingPairing = nil
+                        }
                     )
                     .id(pendingPairing?.code ?? "")
                 }

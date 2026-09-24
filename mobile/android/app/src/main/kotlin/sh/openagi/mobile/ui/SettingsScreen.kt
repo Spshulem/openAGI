@@ -23,7 +23,7 @@ import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.sync.RefreshCoordinator
-import sh.openagi.mobile.sync.RefreshWorker
+import sh.openagi.mobile.sync.forgetPairing
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.ui.components.DestructiveTextButton
 import sh.openagi.mobile.ui.components.PrimaryButton
@@ -115,24 +115,7 @@ fun SettingsScreen(
                     onClick = {
                         isWorking = true
                         scope.launch {
-                            // Best-effort: tell the daemon first so it can drop the node
-                            // immediately, but a phone that can't reach the daemon must
-                            // still be able to forget its own credential and stop
-                            // working locally.
-                            try {
-                                client.revoke()
-                            } catch (error: Exception) {
-                                // Ignored: the local revoke below still proceeds.
-                            }
-                            Credentials.clear(context)
-                            RefreshWorker.cancel(context)
-                            // Both go through the stores rather than deleting the file
-                            // directly, so the delete holds the same lock every writer
-                            // holds. Clearing the outbox matters as much as the
-                            // snapshot: a queued completion left behind would replay
-                            // against whatever account pairs next.
-                            store.delete()
-                            OutboundQueue(context.filesDir).clear()
+                            forgetPairing(context, credentials)
                             isWorking = false
                             onRevoked()
                         }

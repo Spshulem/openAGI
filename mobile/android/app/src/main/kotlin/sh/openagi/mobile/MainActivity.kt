@@ -27,6 +27,10 @@ import sh.openagi.mobile.ui.PairingScreen
 import sh.openagi.mobile.ui.SettingsScreen
 import sh.openagi.mobile.ui.TasksScreen
 import sh.openagi.mobile.ui.TodayScreen
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import sh.openagi.mobile.sync.forgetPairing
+import sh.openagi.mobile.ui.components.SwitchDaemonDialog
 import sh.openagi.mobile.ui.components.AppNavigationBar
 import sh.openagi.mobile.ui.components.AppTab
 import sh.openagi.mobile.ui.theme.OpenAGITheme
@@ -67,13 +71,23 @@ class MainActivity : ComponentActivity() {
             val pendingPairing = pendingPairingState.value
             val resumeSignal = resumeSignalState.intValue
             val inboxBadge = inboxBadgeState.intValue
+            // Outlives the paired branch on purpose: the switch tears that
+            // branch down mid-flight, and a scope tied to it would be
+            // cancelled before the forget finished.
+            val switchScope = rememberCoroutineScope()
 
             OpenAGITheme {
                 if (credentials == null) {
                     PairingScreen(
                         context = this,
                         prefill = pendingPairing,
-                        onPaired = { credentialsState.value = Credentials.load(this) },
+                        onPaired = {
+                            credentialsState.value = Credentials.load(this)
+                            // Spent. Left set, it would reach the paired branch
+                            // below as an incoming link and immediately offer to
+                            // switch away from the pairing it just made.
+                            pendingPairingState.value = null
+                        },
                     )
                 } else {
                     // One background SSE connection for the life of this
@@ -133,6 +147,28 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                         }
+                    }
+
+                    // A pairing link that arrives while already paired used to
+                    // be dropped silently: the phone stayed on the old daemon,
+                    // the new code went unspent, and the app looked "connected
+                    // but empty" — which is exactly how a phone paired to a
+                    // scratch daemon could never be moved to the real one. Ask,
+                    // naming both machines. Switching leaves the link set, so
+                    // the pairing screen that follows is already filled in and
+                    // the person still reviews the address and taps Pair.
+                    if (pendingPairing != null) {
+                        SwitchDaemonDialog(
+                            currentServer = credentials.server,
+                            incomingServer = pendingPairing.serverUrl,
+                            onSwitch = {
+                                switchScope.launch {
+                                    forgetPairing(this@MainActivity, credentials)
+                                    credentialsState.value = null
+                                }
+                            },
+                            onCancel = { pendingPairingState.value = null },
+                        )
                     }
                 }
             }
