@@ -25,13 +25,13 @@ data class Task(
     val sourceUrl: String? = null,
     val sourceMeta: JsonElement? = null,
     val status: String,
-    @Serializable(with = InstantSerializer::class) val dueDate: Instant? = null,
-    @Serializable(with = InstantSerializer::class) val scheduledFor: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val dueDate: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val scheduledFor: Instant? = null,
     val parentGoalId: String? = null,
     val dependsOn: List<String> = emptyList(),
-    @Serializable(with = InstantSerializer::class) val createdAt: Instant? = null,
-    @Serializable(with = InstantSerializer::class) val updatedAt: Instant? = null,
-    @Serializable(with = InstantSerializer::class) val completedAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val createdAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val updatedAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val completedAt: Instant? = null,
     val completedVia: String? = null,
 )
 
@@ -49,7 +49,7 @@ data class CreateTaskRequest(
     val title: String,
     val bucket: String,
     val priority: Int = 50,
-    @Serializable(with = InstantSerializer::class) val dueDate: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val dueDate: Instant? = null,
 )
 
 // Body for PATCH /tasks/:id. Every field is optional and omitted-when-null:
@@ -62,7 +62,7 @@ data class UpdateTaskRequest(
     val bucket: String? = null,
     val priority: Int? = null,
     val status: String? = null,
-    @Serializable(with = InstantSerializer::class) val dueDate: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val dueDate: Instant? = null,
 )
 
 // Body for POST /tasks/:id/complete. completedVia is never anything but

@@ -11,7 +11,7 @@ data class TaskItem(
     val bucket: String,
     val status: String,
     val priority: Int = 50,
-    @Serializable(with = InstantSerializer::class) val dueDate: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val dueDate: Instant? = null,
     val overdue: Boolean = false,
 )
 
@@ -27,7 +27,7 @@ data class Counts(
 data class PendingActionSummary(
     val id: String,
     val summary: String,
-    @Serializable(with = InstantSerializer::class) val createdAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val createdAt: Instant? = null,
 )
 
 @Serializable

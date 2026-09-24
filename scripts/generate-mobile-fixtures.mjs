@@ -30,6 +30,15 @@ try {
 
   runtime.tasks.add({ queue: "user", title: "Ship the widget", bucket: "today", priority: 80 });
   runtime.tasks.add({ queue: "user", title: "Renew the domain", bucket: "today", priority: 40, dueDate: "2020-01-01T00:00:00.000Z" });
+  // A bare calendar date, the way real tasks actually carry one. Both clients'
+  // date decoders once accepted only full timestamps; every fixture used full
+  // timestamps, so both passed every test and then failed the whole summary
+  // against a real daemon. This row is what keeps that from coming back.
+  runtime.tasks.add({ queue: "user", title: "File the quarterly taxes", bucket: "today", priority: 60, dueDate: "2020-04-15" });
+  // A cleared due date, stored as "" — also how real tasks carry it. /tasks
+  // returns it raw (/mobile/summary normalizes it to null). Kept out of the
+  // today bucket so it lands in tasks-list.json without moving summary counts.
+  runtime.tasks.add({ queue: "user", title: "Call the accountant back", bucket: "this_month", priority: 30, dueDate: "" });
   runtime.tasks.add({ queue: "user", title: "Read the whitepaper", bucket: "this_week", priority: 20 });
 
   // A pending action, so the embedded {id, summary, createdAt} projection in

@@ -11,12 +11,26 @@ final class SummaryDecodingTests: XCTestCase {
         return try Data(contentsOf: root.appending(path: "fixtures/\(name).json"))
     }
 
+    // Real tasks carry a bare calendar date as their dueDate. The decoder once
+    // accepted only full timestamps and failed the entire summary on a real
+    // daemon, while every fixture-based test passed. The fixture now carries
+    // one; this asserts it decodes to the start of that day in UTC.
+    func testABareCalendarDueDateDecodesToStartOfDayUTC() throws {
+        let summary = try ProtocolDecoder.json.decode(MobileSummary.self, from: fixture("summary-populated"))
+        let taxes = try XCTUnwrap(summary.today.first { $0.title == "File the quarterly taxes" })
+        let due = try XCTUnwrap(taxes.dueDate)
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let parts = utc.dateComponents([.year, .month, .day, .hour, .minute], from: due)
+        XCTAssertEqual([parts.year, parts.month, parts.day, parts.hour, parts.minute], [2020, 4, 15, 0, 0])
+    }
+
     func testDecodesPopulatedSummary() throws {
         let summary = try ProtocolDecoder.json.decode(MobileSummary.self, from: fixture("summary-populated"))
-        XCTAssertEqual(summary.today.count, 2)
+        XCTAssertEqual(summary.today.count, 3)
         XCTAssertEqual(summary.today.first?.title, "Ship the widget")
-        XCTAssertEqual(summary.counts.today, 2)
-        XCTAssertEqual(summary.counts.overdue, 1)
+        XCTAssertEqual(summary.counts.today, 3)
+        XCTAssertEqual(summary.counts.overdue, 2)
         XCTAssertTrue(summary.today.contains { $0.overdue })
         XCTAssertFalse(summary.brief.headline.isEmpty)
         XCTAssertEqual(summary.pendingActions.count, 1)

@@ -28,7 +28,11 @@ export function buildMobileSummary(runtime, { now = new Date(), taskLimit = MOBI
       bucket: t.bucket,
       status: t.status,
       priority: t.priority ?? 0,
-      dueDate: t.dueDate ?? null,
+      // The contract is a date or null. The task store holds "" for a cleared
+      // due date, and `??` passes an empty string straight through — which
+      // both phone decoders rejected, failing the whole summary on a real
+      // brain and showing "Nothing left today" over fifty open tasks.
+      dueDate: t.dueDate || null,
       overdue: isOverdue(t)
     })),
     counts: {

@@ -240,7 +240,7 @@ class DaemonClientTest {
     fun tasksListsWithTheQueueParameterAlwaysSet() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(200).setBody(fixture("tasks-list")))
         val tasks = client().tasks()
-        assertEquals(3, tasks.size)
+        assertEquals(5, tasks.size)
         assertEquals("Ship the widget", tasks.first().title)
         val request = server.takeRequest()
         assertEquals("/tasks?queue=user", request.path)

@@ -1,8 +1,8 @@
 {
-  "generatedAt": "2026-09-20T04:48:28.150Z",
+  "generatedAt": "2026-09-24T05:31:34.844Z",
   "today": [
     {
-      "id": "task_ed003662bb1444da",
+      "id": "task_2a4168babb5b483d",
       "title": "Ship the widget",
       "bucket": "today",
       "status": "pending",
@@ -11,7 +11,16 @@
       "overdue": false
     },
     {
-      "id": "task_4629ffb7958540e1",
+      "id": "task_d736413480614ea7",
+      "title": "File the quarterly taxes",
+      "bucket": "today",
+      "status": "pending",
+      "priority": 60,
+      "dueDate": "2020-04-15",
+      "overdue": true
+    },
+    {
+      "id": "task_fae45a0dec2245ce",
       "title": "Renew the domain",
       "bucket": "today",
       "status": "pending",
@@ -21,19 +30,19 @@
     }
   ],
   "counts": {
-    "today": 2,
+    "today": 3,
     "this_week": 1,
-    "overdue": 1,
+    "overdue": 2,
     "pendingActions": 1
   },
   "pendingActions": [
     {
-      "id": "act_70a84480ee7e4623",
+      "id": "act_61a7da752d5d4eca",
       "summary": "Send the weekly digest to the team",
-      "createdAt": "2026-09-20T04:48:28.140Z"
+      "createdAt": "2026-09-24T05:31:34.834Z"
     }
   ],
   "brief": {
-    "headline": "2 things today, 1 overdue, 1 waiting on you"
+    "headline": "3 things today, 2 overdue, 1 waiting on you"
   }
 }
