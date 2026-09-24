@@ -72,4 +72,26 @@ class EventStreamTest {
         job.cancel()
         assertTrue("expected multiple reconnect attempts, got $calls", calls > 1)
     }
+
+    @Test
+    fun reportsAttachedOnTheFirstFrameAndDetachedWhenTheConnectionDrops() = runTest {
+        val changes = mutableListOf<Boolean>()
+        var attempts = 0
+        val stream = EventStream(onAttachedChange = { changes += it }) {
+            attempts++
+            when (attempts) {
+                1 -> flow<SseFrame> {
+                    emit(SseFrame("hello", "{}"))
+                    emit(SseFrame("message", "{}"))
+                    throw DaemonException.Transport(IOException("dropped"))
+                }
+                else -> flowOf(SseFrame("hello", "{}"))
+            }
+        }
+        stream.connect().take(3).toList()
+        // Attached once for two frames (not once per frame), detached on the
+        // drop, attached again on the redial, and detached when the collector
+        // goes away -- a cancelled stream must not keep reading "live".
+        assertEquals(listOf(true, false, true, false), changes)
+    }
 }
