@@ -6,6 +6,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.material3.Scaffold
@@ -125,7 +126,14 @@ class MainActivity : ComponentActivity() {
                         // for the navigation bar, and now each screen owns IME.
                         contentWindowInsets = WindowInsets.statusBars,
                     ) { padding ->
-                        Box(modifier = Modifier.padding(padding)) {
+                        // consumeWindowInsets: the bottom bar already sits under
+                        // the keyboard's lower edge, so Chat's imePadding() must
+                        // add only the part of the keyboard above it. Without
+                        // this it added the bar's height again, and the pan
+                        // the missing adjustResize allowed stacked on top: the
+                        // composer jumped to the top of the screen over a
+                        // gap, with the header pushed off.
+                        Box(modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {
                             when (selectedTab) {
                                 AppTab.TODAY -> TodayScreen(
                                     context = this@MainActivity,
