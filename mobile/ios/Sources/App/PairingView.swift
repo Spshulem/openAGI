@@ -153,7 +153,7 @@ struct PairingView: View {
             return ("That address can't be reached from a phone.",
                     "Plain http works only on a tailnet or your home network. Loopback never works — the phone isn't the machine.")
         case .unauthorized:
-            return ("That code didn't work.", "Codes last 30 minutes and work once. Run `openagi pair-phone` for a new one.")
+            return ("That code didn't work.", "Codes last 30 minutes and work once. Run openagi pair-phone for a new one.")
         case .conflict:
             return ("This phone is already paired.", "Revoke it from Settings first, then pair again.")
         case .transport:

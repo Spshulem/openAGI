@@ -49,7 +49,9 @@ fun PairingScreen(
     var serverText by remember(prefill) { mutableStateOf(prefill?.serverUrl ?: "") }
     var codeText by remember(prefill) { mutableStateOf(prefill?.code ?: "") }
     var isPairing by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<ErrorCopy.Message?>(null) }
+    // Keyed on prefill like the fields: a fresh link is a fresh attempt, and
+    // the last code's "That code didn't work" must not sit under a new one.
+    var error by remember(prefill) { mutableStateOf<ErrorCopy.Message?>(null) }
     val scope = rememberCoroutineScope()
 
     Column(
@@ -137,7 +139,7 @@ fun PairingScreen(
                     } catch (daemonError: DaemonException) {
                         error = ErrorCopy.forPairing(daemonError, serverText)
                     } catch (unexpected: Exception) {
-                        error = ErrorCopy.Message("Pairing failed.", "Try again, or run `openagi pair-phone` for a new code.")
+                        error = ErrorCopy.Message("Pairing failed.", "Try again, or run openagi pair-phone for a new code.")
                     } finally {
                         isPairing = false
                     }

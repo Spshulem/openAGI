@@ -53,6 +53,14 @@ private fun lightScheme(dynamic: androidx.compose.material3.ColorScheme?) = ligh
     onSurfaceVariant = OpenAGIColors.mutedLight,
     outline = OpenAGIColors.edgeLight,
     outlineVariant = OpenAGIColors.edgeLight,
+    // Dialogs, menus and sheets draw from the surfaceContainer family. Left
+    // unset it falls back to Material's baseline lavender, which put every
+    // dialog in a hue that exists nowhere else in the app.
+    surfaceContainerLowest = OpenAGIColors.surfaceLight,
+    surfaceContainerLow = OpenAGIColors.surfaceLight,
+    surfaceContainer = OpenAGIColors.surfaceLight,
+    surfaceContainerHigh = OpenAGIColors.surfaceLight,
+    surfaceContainerHighest = OpenAGIColors.surfaceLight,
 )
 
 private fun darkScheme(dynamic: androidx.compose.material3.ColorScheme?) = darkColorScheme(
@@ -76,6 +84,14 @@ private fun darkScheme(dynamic: androidx.compose.material3.ColorScheme?) = darkC
     onSurfaceVariant = OpenAGIColors.mutedDark,
     outline = OpenAGIColors.edgeDark,
     outlineVariant = OpenAGIColors.edgeDark,
+    // Dialogs, menus and sheets draw from the surfaceContainer family. Left
+    // unset it falls back to Material's baseline lavender, which put every
+    // dialog in a hue that exists nowhere else in the app.
+    surfaceContainerLowest = OpenAGIColors.surfaceDark,
+    surfaceContainerLow = OpenAGIColors.surfaceDark,
+    surfaceContainer = OpenAGIColors.surfaceDark,
+    surfaceContainerHigh = OpenAGIColors.surfaceDark,
+    surfaceContainerHighest = OpenAGIColors.surfaceDark,
 )
 
 @Composable

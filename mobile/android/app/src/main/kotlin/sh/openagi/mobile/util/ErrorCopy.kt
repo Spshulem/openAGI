@@ -19,11 +19,11 @@ object ErrorCopy {
         )
         is DaemonException.Unauthorized -> Message(
             "That code didn't work.",
-            "Codes last 30 minutes and work once. Run `openagi pair-phone` for a new one.",
+            "Codes last 30 minutes and work once. Run openagi pair-phone for a new one.",
         )
         is DaemonException.Conflict -> Message(
             "That code was already used.",
-            "Run `openagi pair-phone` for a new one.",
+            "Run openagi pair-phone for a new one.",
         )
         is DaemonException.Transport -> Message(
             "Can't reach OpenAGI.",
@@ -31,7 +31,7 @@ object ErrorCopy {
         )
         is DaemonException.NotFound, is DaemonException.Malformed, is DaemonException.Server -> Message(
             "Pairing failed.",
-            "Try again, or run `openagi pair-phone` for a new code.",
+            "Try again, or run openagi pair-phone for a new code.",
         )
     }
 
