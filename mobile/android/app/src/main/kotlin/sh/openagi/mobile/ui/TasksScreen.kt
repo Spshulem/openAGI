@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -116,6 +117,10 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
     }
 
     Scaffold(
+        // The app-level Scaffold already reserved the status bar. This one's
+        // default (safeDrawing) reserved it a second time, which is why the
+        // Tasks title sat lower than every other tab's.
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         floatingActionButton = {
             FloatingActionButton(onClick = { showCreate = true }, containerColor = MaterialTheme.colorScheme.primary) {
                 Text("+", style = OpenAGIType.section, color = androidx.compose.ui.graphics.Color.White)
@@ -149,7 +154,11 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
                 else -> {
                     val byBucket = list.groupBy { it.bucket }
                     Column(
-                        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
+                        // Bottom padding clears the + button: without it the last
+                        // rows' completion circles sat underneath it with no
+                        // way to scroll them out.
+                        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                            .padding(horizontal = 20.dp).padding(bottom = 96.dp),
                         verticalArrangement = Arrangement.spacedBy(20.dp),
                     ) {
                         BucketFormat.ORDER.forEach { bucket ->
