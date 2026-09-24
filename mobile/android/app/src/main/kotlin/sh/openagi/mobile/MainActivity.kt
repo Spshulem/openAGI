@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
     // ever refresh once for a composable's lifetime.
     private val resumeSignalState = mutableIntStateOf(0)
     private val inboxBadgeState = mutableIntStateOf(0)
+    private val streamAttachedState = mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -97,7 +98,7 @@ class MainActivity : ComponentActivity() {
                     LaunchedEffect(credentials) {
                         val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
                         inboxBadgeState.intValue = runCatching { fetchInboxBadgeCount(client) }.getOrDefault(inboxBadgeState.intValue)
-                        EventStream(client).connect().collect { frame ->
+                        EventStream(client, onAttachedChange = { streamAttachedState.value = it }).connect().collect { frame ->
                             if (frame.event in REFRESH_TRIGGERING_EVENTS) {
                                 resumeSignalState.intValue += 1
                             }
@@ -139,7 +140,7 @@ class MainActivity : ComponentActivity() {
                                     resumeSignal = resumeSignal,
                                     onBadgeCountChanged = { inboxBadgeState.intValue = it },
                                 )
-                                AppTab.CHAT -> ChatScreen(context = this@MainActivity, credentials = credentials)
+                                AppTab.CHAT -> ChatScreen(context = this@MainActivity, credentials = credentials, streamAttached = streamAttachedState.value)
                                 AppTab.SETTINGS -> SettingsScreen(
                                     context = this@MainActivity,
                                     credentials = credentials,

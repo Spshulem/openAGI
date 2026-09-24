@@ -101,7 +101,7 @@ private sealed interface ChatEntry {
 }
 
 @Composable
-fun ChatScreen(context: Context, credentials: Credentials) {
+fun ChatScreen(context: Context, credentials: Credentials, streamAttached: Boolean) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
@@ -213,7 +213,7 @@ fun ChatScreen(context: Context, credentials: Credentials) {
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(
             title = "Chat",
-            connection = if (isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
+            connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
         )
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
