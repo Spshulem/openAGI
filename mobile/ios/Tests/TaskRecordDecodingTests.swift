@@ -30,6 +30,25 @@ final class TaskRecordDecodingTests: XCTestCase {
         XCTAssertNotNil(overdue.dueDate)
     }
 
+    // The task store holds "" for a cleared due date and /tasks returns it raw.
+    // One such task used to fail the entire list; it must decode as "no date".
+    func testACleredDueDateDecodesAsNilRatherThanFailingTheList() throws {
+        let response = try ProtocolDecoder.json.decode(TasksListResponse.self, from: fixture("tasks-list"))
+        XCTAssertEqual(response.tasks.count, 5)
+        let cleared = try XCTUnwrap(response.tasks.first { $0.title == "Call the accountant back" })
+        XCTAssertNil(cleared.dueDate)
+    }
+
+    // An optional date that is present but malformed is the same situation:
+    // no usable date, not a reason to drop every other task on the screen.
+    func testAMalformedOptionalDateDoesNotFailTheSummary() throws {
+        let raw = String(decoding: try fixture("summary-populated"), as: UTF8.self)
+            .replacingOccurrences(of: "\"2020-04-15\"", with: "\"not a date\"")
+        let summary = try ProtocolDecoder.json.decode(MobileSummary.self, from: Data(raw.utf8))
+        XCTAssertEqual(summary.today.count, 3)
+        XCTAssertNil(summary.today.first { $0.title == "File the quarterly taxes" }?.dueDate)
+    }
+
     // A daemon that grows a field (this fixture doesn't carry `sourceMeta`
     // as a modelled property at all) must not brick every installed phone.
     func testUnknownFieldsDoNotBreakDecoding() throws {

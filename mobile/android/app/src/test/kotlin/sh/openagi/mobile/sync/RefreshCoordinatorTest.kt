@@ -55,7 +55,7 @@ class RefreshCoordinatorTest {
         enqueueHeartbeat()
         val outcome = coordinator().refresh()
         assertTrue(outcome is RefreshOutcome.Updated)
-        assertEquals(2, SnapshotStore(folder.root).load()!!.summary.today.size)
+        assertEquals(3, SnapshotStore(folder.root).load()!!.summary.today.size)
         assertEquals("\"e1\"", SnapshotStore(folder.root).load()!!.etag)
     }
 
@@ -68,7 +68,7 @@ class RefreshCoordinatorTest {
         enqueueHeartbeat()
         assertTrue(coordinator().refresh() is RefreshOutcome.Unchanged)
         val snapshot = SnapshotStore(folder.root).load()!!
-        assertEquals(2, snapshot.summary.today.size)
+        assertEquals(3, snapshot.summary.today.size)
         // The first fetch had nothing cached yet; the second must carry the
         // ETag the first one returned.
         assertEquals(null, takeRequestFor("/mobile/summary").getHeader("If-None-Match"))

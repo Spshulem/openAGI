@@ -18,9 +18,9 @@ data class PendingAction(
     val reason: String? = null,
     val dedupeKey: String? = null,
     val status: String = "pending",
-    @Serializable(with = InstantSerializer::class) val createdAt: Instant? = null,
-    @Serializable(with = InstantSerializer::class) val expiresAt: Instant? = null,
-    @Serializable(with = InstantSerializer::class) val decidedAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val createdAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val expiresAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val decidedAt: Instant? = null,
     val decidedBy: String? = null,
     val result: JsonElement? = null,
     val error: String? = null,
@@ -57,8 +57,8 @@ data class Clarification(
     val sources: List<String> = emptyList(),
     val status: String = "pending",
     val answer: String? = null,
-    @Serializable(with = InstantSerializer::class) val answeredAt: Instant? = null,
-    @Serializable(with = InstantSerializer::class) val createdAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val answeredAt: Instant? = null,
+    @Serializable(with = OptionalInstantSerializer::class) val createdAt: Instant? = null,
 )
 
 // The daemon's clarification-store only accepts one of these four literal

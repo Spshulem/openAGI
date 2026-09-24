@@ -63,7 +63,7 @@ final class RefreshCoordinatorTests: XCTestCase {
         let outcome = await coordinator.refresh()
 
         guard case .updated = outcome else { return XCTFail("expected .updated, got \(outcome)") }
-        XCTAssertEqual(store.load()?.summary.today.count, 2)
+        XCTAssertEqual(store.load()?.summary.today.count, 3)
     }
 
     // 2. Seed a snapshot, respond 304: the stored `fetchedAt` is refreshed

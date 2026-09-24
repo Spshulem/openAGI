@@ -1,7 +1,7 @@
 {
   "actions": [
     {
-      "id": "act_70a84480ee7e4623",
+      "id": "act_61a7da752d5d4eca",
       "toolName": "send_email",
       "args": {
         "to": "team@example.com",
@@ -12,7 +12,7 @@
       "reason": "Drafted from your Friday routine",
       "dedupeKey": null,
       "status": "pending",
-      "createdAt": "2026-09-20T04:48:28.140Z",
+      "createdAt": "2026-09-24T05:31:34.834Z",
       "expiresAt": null,
       "decidedAt": null,
       "decidedBy": null,

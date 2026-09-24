@@ -48,6 +48,22 @@ test("today's tasks are returned newest-priority-first with overdue flagged", as
   } finally { await app.close(); }
 });
 
+// The task store holds "" for a cleared due date. The wire contract is a date
+// or null, and both phone decoders reject an empty string — so one such task
+// failed the entire summary against a real brain.
+test("an empty-string due date reaches the phone as null, never as \"\"", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-mobsum-emptydue-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    runtime.tasks.add({ queue: "user", title: "Cleared due date", bucket: "today", priority: 50, dueDate: "" });
+    const json = await (await fetch(`${base}/mobile/summary`)).json();
+    const task = json.today.find((t) => t.title === "Cleared due date");
+    assert.ok(task, "the task is present");
+    assert.equal(task.dueDate, null);
+    assert.equal(task.overdue, false);
+  } finally { await app.close(); fs.rmSync(dataDir, { recursive: true, force: true }); }
+});
+
 test("completed tasks leave the widget payload", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-mobsum3-"));
   const { runtime, app, base } = await bootApp(dataDir);
