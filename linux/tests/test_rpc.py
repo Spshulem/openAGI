@@ -8,6 +8,7 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -132,12 +133,108 @@ class RpcTests(unittest.TestCase):
 
         close_thread = threading.Thread(target=self.server.close)
         close_thread.start()
-        self.assertTrue(self.server._closed.wait(timeout=1))
+        self.assertTrue(self.server._closing.wait(timeout=1))
         release_accept.set()
         close_thread.join(timeout=2)
 
         self.assertFalse(close_thread.is_alive())
         self.assertFalse(handler_started.is_set())
+        self.assertEqual(self.server._connections, set())
+        self.assertEqual(self.server._workers, set())
+
+    def test_shutdown_linearizes_before_a_registered_worker_starts(self):
+        worker_at_start = threading.Event()
+        release_worker = threading.Event()
+        handler_started = threading.Event()
+        handler_observed_closed = []
+        original_start = threading.Thread.start
+
+        def handler(_request, _context):
+            handler_observed_closed.append(self.server._closed.is_set())
+            handler_started.set()
+            return {"ok": True}
+
+        def pausing_start(thread):
+            if thread.name == "openagi-rpc-client":
+                worker_at_start.set()
+                if not release_worker.wait(timeout=2):
+                    raise TimeoutError("test did not release RPC worker start")
+            return original_start(thread)
+
+        self.server.close()
+        self.server = RpcServer(self.socket_path, handler=handler)
+        with mock.patch.object(threading.Thread, "start", new=pausing_start):
+            self.server.start()
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(client.close)
+            client.connect(str(self.socket_path))
+            client.sendall(
+                json.dumps(
+                    {
+                        "action": "status",
+                        "payload": {},
+                        "meta": {
+                            "actionId": str(uuid.uuid4()),
+                            "deadlineMs": int(time.time() * 1000) + 5_000,
+                            "authorization": None,
+                        },
+                    }
+                ).encode("utf-8")
+                + b"\n"
+            )
+            self.assertTrue(worker_at_start.wait(timeout=1))
+
+            close_thread = threading.Thread(target=self.server.close)
+            close_thread.start()
+            time.sleep(0.05)
+            closed_while_start_paused = self.server._closed.is_set()
+            release_worker.set()
+            close_thread.join(timeout=2)
+
+        self.assertFalse(close_thread.is_alive())
+        self.assertFalse(closed_while_start_paused)
+        self.assertNotIn(True, handler_observed_closed)
+        self.assertEqual(handler_started.is_set(), bool(handler_observed_closed))
+        self.assertEqual(self.server._connections, set())
+        self.assertEqual(self.server._workers, set())
+
+    def test_shutdown_synchronously_cancels_an_active_handler(self):
+        entered = threading.Event()
+        cancelled = threading.Event()
+
+        def handler(_request, context):
+            entered.set()
+            if context.cancelled.wait(timeout=1):
+                cancelled.set()
+            return {"ok": True}
+
+        self.server.close()
+        self.server = RpcServer(self.socket_path, handler=handler)
+        self.server.start()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(str(self.socket_path))
+        client.sendall(
+            json.dumps(
+                {
+                    "action": "status",
+                    "payload": {},
+                    "meta": {
+                        "actionId": str(uuid.uuid4()),
+                        "deadlineMs": int(time.time() * 1000) + 5_000,
+                        "authorization": None,
+                    },
+                }
+            ).encode("utf-8")
+            + b"\n"
+        )
+        self.assertTrue(entered.wait(timeout=1))
+
+        self.server.close()
+
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(self.server._closed.is_set())
+        self.assertEqual(self.server._cancellations, set())
         self.assertEqual(self.server._connections, set())
         self.assertEqual(self.server._workers, set())
 

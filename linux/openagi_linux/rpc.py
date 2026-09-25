@@ -73,15 +73,18 @@ class RpcServer:
         self.peer_authorizer = peer_authorizer
         self.request_read_timeout_seconds = float(request_read_timeout_seconds)
         self.max_concurrent_clients = max_concurrent_clients
+        self._closing = threading.Event()
         self._closed = threading.Event()
         self._ready = threading.Event()
         self._error: BaseException | None = None
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._client_slots = threading.BoundedSemaphore(max_concurrent_clients)
+        self._close_lock = threading.Lock()
         self._worker_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
         self._workers: set[threading.Thread] = set()
+        self._cancellations: set[threading.Event] = set()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -94,7 +97,17 @@ class RpcServer:
             raise RuntimeError("RPC server could not start") from self._error
 
     def close(self) -> None:
-        self._closed.set()
+        with self._close_lock:
+            self._close_once()
+
+    def _close_once(self) -> None:
+        if self._closed.is_set():
+            return
+        with self._worker_lock:
+            self._closing.set()
+            cancellations = tuple(self._cancellations)
+            for cancelled in cancellations:
+                cancelled.set()
         sock = self._socket
         if sock is not None:
             try:
@@ -131,6 +144,8 @@ class RpcServer:
                 connection.close()
             except OSError:
                 pass
+        with self._worker_lock:
+            self._closed.set()
         self._thread = None
         self._socket = None
         try:
@@ -155,14 +170,14 @@ class RpcServer:
             self._ready.set()
             return
         self._ready.set()
-        while not self._closed.is_set():
+        while not self._closing.is_set():
             try:
                 connection, _ = sock.accept()
             except TimeoutError:
                 continue
             except OSError:
                 break
-            if self._closed.is_set():
+            if self._closing.is_set():
                 connection.close()
                 break
             if not self._client_slots.acquire(blocking=False):
@@ -180,7 +195,7 @@ class RpcServer:
             )
             worker_started = False
             with self._worker_lock:
-                if not self._closed.is_set():
+                if not self._closing.is_set():
                     self._connections.add(connection)
                     self._workers.add(worker)
                     try:
@@ -190,7 +205,7 @@ class RpcServer:
                         self._connections.discard(connection)
                         self._workers.discard(worker)
             if not worker_started:
-                should_stop = self._closed.is_set()
+                should_stop = self._closing.is_set()
                 self._client_slots.release()
                 connection.close()
                 if should_stop:
@@ -238,6 +253,10 @@ class RpcServer:
                 if deadline_ms > authorization["expiresAtMs"]:
                     return _error("invalid_request", "RPC deadline exceeds the node lease")
             cancelled = threading.Event()
+            with self._worker_lock:
+                if self._closing.is_set():
+                    raise RequestCancelled("RPC server is closing")
+                self._cancellations.add(cancelled)
             context = RpcContext(
                 action_id=meta["actionId"],
                 deadline_epoch_ms=deadline_ms,
@@ -245,24 +264,28 @@ class RpcServer:
                 cancelled=cancelled,
                 authorization=authorization,
             )
-            monitor_stop = threading.Event()
-            monitor = threading.Thread(
-                target=_watch_peer_disconnect,
-                args=(connection, cancelled, monitor_stop),
-                name="openagi-rpc-peer",
-                daemon=True,
-            )
-            monitor.start()
             try:
-                context.check_active()
-                response = self.handler(
-                    {"action": wire["action"], "payload": wire["payload"]},
-                    context,
+                monitor_stop = threading.Event()
+                monitor = threading.Thread(
+                    target=_watch_peer_disconnect,
+                    args=(connection, cancelled, monitor_stop),
+                    name="openagi-rpc-peer",
+                    daemon=True,
                 )
-                context.check_active()
+                monitor.start()
+                try:
+                    context.check_active()
+                    response = self.handler(
+                        {"action": wire["action"], "payload": wire["payload"]},
+                        context,
+                    )
+                    context.check_active()
+                finally:
+                    monitor_stop.set()
+                    monitor.join(timeout=1)
             finally:
-                monitor_stop.set()
-                monitor.join(timeout=1)
+                with self._worker_lock:
+                    self._cancellations.discard(cancelled)
             if not isinstance(response, dict):
                 raise TypeError("handler response is not an object")
             return response
