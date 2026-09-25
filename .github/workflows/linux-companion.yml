@@ -1,0 +1,97 @@
+name: Linux companion
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-companion.yml"
+      - "linux/**"
+      - "src/hosted-interface.js"
+      - "src/integrations/computer-server.js"
+      - "src/integrations/computer-use.js"
+      - "src/integrations/cua-computer-executor.js"
+      - "test/computer-server.test.js"
+      - "test/computer-use-approval.test.js"
+      - "test/cua-computer-executor.test.js"
+      - "test/linux-companion-contract.test.js"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/linux-companion.yml"
+      - "linux/**"
+      - "src/hosted-interface.js"
+      - "src/integrations/computer-server.js"
+      - "src/integrations/computer-use.js"
+      - "src/integrations/cua-computer-executor.js"
+      - "test/computer-server.test.js"
+      - "test/computer-use-approval.test.js"
+      - "test/cua-computer-executor.test.js"
+      - "test/linux-companion-contract.test.js"
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  companion-headless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENAGI_LINUX_TESSERACT: /usr/bin/tesseract
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONWARNINGS: error::ResourceWarning
+      QT_QPA_PLATFORM: offscreen
+      XDG_SESSION_TYPE: wayland
+      WAYLAND_DISPLAY: wayland-0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: linux/pyproject.toml
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr
+      - run: python -m pip install --disable-pip-version-check ./linux
+      - name: Run headless companion tests
+        run: |
+          export PYTHONPATH="$PWD/linux:$PWD/linux/tests"
+          python - <<'PY'
+          import pathlib
+          import unittest
+
+          excluded = {
+              "test_app_doctor",
+              "test_app_smoke",
+              "test_desktop_bridge",
+              "test_portal_backend_live",
+          }
+          modules = [
+              path.stem
+              for path in sorted(pathlib.Path("linux/tests").glob("test_*.py"))
+              if path.stem not in excluded
+          ]
+          modules.append("test_portal_backend_live.PortalBackendLifecycleTests")
+          suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+      - run: bash -n linux/install-user.sh
+      - name: Parse Python sources
+        run: |
+          python - <<'PY'
+          import ast
+          import pathlib
+
+          for path in pathlib.Path("linux").rglob("*.py"):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          PY
