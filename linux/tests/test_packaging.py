@@ -243,7 +243,8 @@ class PackagingTests(unittest.TestCase):
             releases = install_root / "releases"
             self.assertEqual(list(releases.iterdir()) if releases.exists() else [], [])
 
-    def test_activation_failure_rolls_back_release_entrypoints_and_service_files(self):
+    def _assert_activation_failure_rolls_back_release_entrypoints_and_service_files(self, failure_mode):
+        self.assertIn(failure_mode, {"activation", "health"})
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as fake_temp:
             home = Path(temp)
             fake_bin = Path(fake_temp)
@@ -259,6 +260,7 @@ class PackagingTests(unittest.TestCase):
             unit = systemd_dir / "openagi-linux-companion.service"
             desktop = data_home / "applications" / "sh.openagi.LinuxCompanion.desktop"
             kwin = data_home / "kwin" / "scripts" / "openagi-linux-companion"
+            kwin_config = config_home / "kwinrc"
             for directory in (old_bin, command_dir, dropin.parent, desktop.parent, kwin / "contents" / "code"):
                 directory.mkdir(parents=True, exist_ok=True)
             for name in ("openagi-linux-companion", "openagi-linux-helper"):
@@ -270,6 +272,7 @@ class PackagingTests(unittest.TestCase):
             unit.write_text("old unit\n", encoding="utf-8")
             dropin.write_text("old dropin\n", encoding="utf-8")
             desktop.write_text("old desktop\n", encoding="utf-8")
+            kwin_config.write_text("old kwin config\n", encoding="utf-8")
             (kwin / "metadata.json").write_text("old metadata\n", encoding="utf-8")
             (kwin / "contents" / "code" / "main.js").write_text("old script\n", encoding="utf-8")
 
@@ -284,7 +287,7 @@ class PackagingTests(unittest.TestCase):
                 "if [[ \"${1:-}\" == '-m' && \"${2:-}\" == 'pip' ]]; then\n"
                 "  bindir=\"$(dirname \"$0\")\"\n"
                 "  printf '#!/bin/sh\\n[ \"$1\" = --version ] && echo 0.1.0\\nexit 0\\n' >\"${bindir}/openagi-linux-companion\"\n"
-                "  printf '#!/bin/sh\\nexit 0\\n' >\"${bindir}/openagi-linux-helper\"\n"
+                f"  printf '#!/bin/sh\\nexit {72 if failure_mode == 'health' else 0}\\n' >\"${{bindir}}/openagi-linux-helper\"\n"
                 "  chmod 0700 \"${bindir}/openagi-linux-companion\" \"${bindir}/openagi-linux-helper\"\n"
                 "fi\n"
                 "exit 0\n"
@@ -298,19 +301,46 @@ class PackagingTests(unittest.TestCase):
             python3.chmod(0o700)
             systemctl = fake_bin / "systemctl"
             failure_marker = fake_bin / "failed-once"
+            enabled_state = fake_bin / "companion-enabled"
+            companion_state = fake_bin / "companion-active"
+            core_state = fake_bin / "core-active"
+            systemctl_log = fake_bin / "systemctl.log"
+            for state_file in (enabled_state, companion_state, core_state):
+                state_file.write_text("1\n", encoding="utf-8")
+            activation_failure = ""
+            if failure_mode == "activation":
+                activation_failure = (
+                    "if [[ \"${args}\" == *'restart openagi-linux-companion.service'* && ! -e "
+                    f"{failure_marker!s}" " ]]; then\n"
+                    f"  printf '0\\n' >{companion_state!s}\n"
+                    f"  touch {failure_marker!s}\n"
+                    "  exit 71\n"
+                    "fi\n"
+                )
             systemctl.write_text(
                 "#!/usr/bin/env bash\n"
                 "args=\"$*\"\n"
-                "if [[ \"${args}\" == *'restart openagi-linux-companion.service'* && ! -e "
-                f"{failure_marker!s}" " ]]; then\n"
-                f"  touch {failure_marker!s}\n"
-                "  exit 71\n"
-                "fi\n"
+                f"printf '%s\\n' \"${{args}}\" >>{systemctl_log!s}\n"
+                f"if [[ \"${{args}}\" == *'is-enabled openagi-linux-companion.service'* ]]; then [[ \"$(cat {enabled_state!s})\" == 1 ]]; exit; fi\n"
+                f"if [[ \"${{args}}\" == *'is-active'* && \"${{args}}\" == *'openagi-linux-companion.service'* ]]; then [[ \"$(cat {companion_state!s})\" == 1 ]]; exit; fi\n"
+                f"if [[ \"${{args}}\" == *'is-active'* && \"${{args}}\" == *'openagi.service'* ]]; then [[ \"$(cat {core_state!s})\" == 1 ]]; exit; fi\n"
+                f"if [[ \"${{args}}\" == *'stop openagi-linux-companion.service'* ]]; then printf '0\\n' >{companion_state!s}; exit 0; fi\n"
+                f"if [[ \"${{args}}\" == *'enable openagi-linux-companion.service'* ]]; then printf '1\\n' >{enabled_state!s}; exit 0; fi\n"
+                f"if [[ \"${{args}}\" == *'disable openagi-linux-companion.service'* ]]; then printf '0\\n' >{enabled_state!s}; exit 0; fi\n"
+                + activation_failure
+                + f"if [[ \"${{args}}\" == *'restart openagi-linux-companion.service'* || \"${{args}}\" == *'start openagi-linux-companion.service'* ]]; then printf '1\\n' >{companion_state!s}; exit 0; fi\n"
+                f"if [[ \"${{args}}\" == *'restart openagi.service'* ]]; then printf '1\\n' >{core_state!s}; exit 0; fi\n"
                 "exit 0\n",
                 encoding="utf-8",
             )
             systemctl.chmod(0o700)
-            for command in ("kwriteconfig6", "kreadconfig6", "qdbus6", "busctl"):
+            kwriteconfig = fake_bin / "kwriteconfig6"
+            kwriteconfig.write_text(
+                "#!/bin/sh\nprintf 'mutated kwin config\\n' >\"${XDG_CONFIG_HOME}/kwinrc\"\nexit 0\n",
+                encoding="utf-8",
+            )
+            kwriteconfig.chmod(0o700)
+            for command in ("kreadconfig6", "qdbus6", "busctl", "sleep"):
                 executable = fake_bin / command
                 executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
                 executable.chmod(0o700)
@@ -333,12 +363,17 @@ class PackagingTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 71, (result.stdout, result.stderr))
+            self.assertEqual(
+                result.returncode,
+                71 if failure_mode == "activation" else 1,
+                (result.stdout, result.stderr),
+            )
             self.assertEqual(os.readlink(install_root / "current"), "releases/release.old")
             self.assertEqual(sorted(path.name for path in releases.iterdir()), ["release.old"])
             self.assertEqual(unit.read_text(encoding="utf-8"), "old unit\n")
             self.assertEqual(dropin.read_text(encoding="utf-8"), "old dropin\n")
             self.assertEqual(desktop.read_text(encoding="utf-8"), "old desktop\n")
+            self.assertEqual(kwin_config.read_text(encoding="utf-8"), "old kwin config\n")
             self.assertEqual((kwin / "metadata.json").read_text(encoding="utf-8"), "old metadata\n")
             self.assertEqual((kwin / "contents" / "code" / "main.js").read_text(encoding="utf-8"), "old script\n")
             for name in ("openagi-linux-companion", "openagi-linux-helper"):
@@ -346,6 +381,20 @@ class PackagingTests(unittest.TestCase):
                     os.readlink(command_dir / name),
                     str(install_root / "current" / "venv" / "bin" / name),
                 )
+            self.assertEqual(enabled_state.read_text(encoding="utf-8"), "1\n")
+            self.assertEqual(companion_state.read_text(encoding="utf-8"), "1\n")
+            self.assertEqual(core_state.read_text(encoding="utf-8"), "1\n")
+            systemctl_calls = systemctl_log.read_text(encoding="utf-8")
+            self.assertIn("stop openagi-linux-companion.service", systemctl_calls)
+            self.assertIn("enable openagi-linux-companion.service", systemctl_calls)
+            self.assertIn("start openagi-linux-companion.service", systemctl_calls)
+            self.assertIn("restart openagi.service", systemctl_calls)
+
+    def test_activation_failure_rolls_back_release_entrypoints_and_service_files(self):
+        self._assert_activation_failure_rolls_back_release_entrypoints_and_service_files("activation")
+
+    def test_health_failure_rolls_back_release_entrypoints_and_service_files(self):
+        self._assert_activation_failure_rolls_back_release_entrypoints_and_service_files("health")
 
     def test_activation_refuses_missing_core_service_before_mutating_home(self):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as fake_temp:

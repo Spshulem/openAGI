@@ -14,14 +14,29 @@ LINUX = ROOT / "linux"
 
 class AppSmokeTests(unittest.TestCase):
     def test_daemon_serves_helper_status_and_shuts_down_cleanly_on_sigterm(self):
+        session_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or (
+            f"unix:path={os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/bus"
+        )
+        bus_env = {**os.environ, "DBUS_SESSION_BUS_ADDRESS": session_bus}
+        try:
+            owner = subprocess.run(
+                ["busctl", "--user", "status", "org.openagi.LinuxCompanion"],
+                env=bus_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            owner = None
+        if owner is not None and owner.returncode == 0:
+            self.skipTest("an installed OpenAGI Linux companion already owns the session D-Bus name")
+
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             runtime_dir = root / "run"
             runtime_dir.mkdir(mode=0o700)
-            session_bus = os.environ.get(
-                "DBUS_SESSION_BUS_ADDRESS",
-                f"unix:path={os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/bus",
-            )
             env = {
                 **os.environ,
                 "PYTHONPATH": str(LINUX),
