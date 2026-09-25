@@ -1,0 +1,19 @@
+{
+  "KPlugin": {
+    "Name": "OpenAGI Linux Companion",
+    "Description": "Reports the active KWin window to the local OpenAGI companion and exposes Quick Ask.",
+    "Icon": "applications-education",
+    "Authors": [
+      {
+        "Name": "OpenAGI contributors"
+      }
+    ],
+    "Id": "openagi-linux-companion",
+    "Version": "0.1.0",
+    "License": "PolyForm-Noncommercial-1.0.0",
+    "Website": "https://github.com/Spshulem/openAGI"
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js",
+  "KPackageStructure": "KWin/Script"
+}
