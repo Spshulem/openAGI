@@ -18,6 +18,7 @@ MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_DEADLINE_AHEAD_MS = 60_000
 DEFAULT_REQUEST_READ_TIMEOUT_SECONDS = 1.0
+DEFAULT_MAX_CONCURRENT_CLIENTS = 16
 
 
 class RequestCancelled(RuntimeError):
@@ -51,6 +52,7 @@ class RpcServer:
         handler: Callable[[dict, RpcContext], dict],
         peer_authorizer: Callable[[int], bool] | None = None,
         request_read_timeout_seconds: float = DEFAULT_REQUEST_READ_TIMEOUT_SECONDS,
+        max_concurrent_clients: int = DEFAULT_MAX_CONCURRENT_CLIENTS,
     ) -> None:
         if (
             isinstance(request_read_timeout_seconds, bool)
@@ -59,15 +61,27 @@ class RpcServer:
             or request_read_timeout_seconds > 10
         ):
             raise ValueError("RPC request read timeout is invalid")
+        if (
+            isinstance(max_concurrent_clients, bool)
+            or not isinstance(max_concurrent_clients, int)
+            or max_concurrent_clients < 2
+            or max_concurrent_clients > 64
+        ):
+            raise ValueError("RPC concurrent client limit is invalid")
         self.path = Path(path)
         self.handler = handler
         self.peer_authorizer = peer_authorizer
         self.request_read_timeout_seconds = float(request_read_timeout_seconds)
+        self.max_concurrent_clients = max_concurrent_clients
         self._closed = threading.Event()
         self._ready = threading.Event()
         self._error: BaseException | None = None
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._client_slots = threading.BoundedSemaphore(max_concurrent_clients)
+        self._worker_lock = threading.Lock()
+        self._connections: set[socket.socket] = set()
+        self._workers: set[threading.Thread] = set()
 
     def start(self) -> None:
         if self._thread is not None:
@@ -87,9 +101,25 @@ class RpcServer:
                 sock.close()
             except OSError:
                 pass
+        with self._worker_lock:
+            connections = tuple(self._connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
+        with self._worker_lock:
+            workers = tuple(self._workers)
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join(timeout=5)
         self._thread = None
         self._socket = None
         try:
@@ -121,13 +151,48 @@ class RpcServer:
                 continue
             except OSError:
                 break
+            if self._closed.is_set():
+                connection.close()
+                break
+            if not self._client_slots.acquire(blocking=False):
+                with connection:
+                    try:
+                        connection.sendall(_encode_response(_error("server_busy", "RPC server is busy")))
+                    except OSError:
+                        pass
+                continue
+            worker = threading.Thread(
+                target=self._serve_connection,
+                args=(connection,),
+                name="openagi-rpc-client",
+                daemon=True,
+            )
+            with self._worker_lock:
+                self._connections.add(connection)
+                self._workers.add(worker)
+            try:
+                worker.start()
+            except BaseException:
+                with self._worker_lock:
+                    self._connections.discard(connection)
+                    self._workers.discard(worker)
+                self._client_slots.release()
+                connection.close()
+                raise
+
+    def _serve_connection(self, connection: socket.socket) -> None:
+        try:
             with connection:
                 response = self._handle_connection(connection)
                 try:
-                    encoded = _encode_response(response)
-                    connection.sendall(encoded)
+                    connection.sendall(_encode_response(response))
                 except OSError:
                     pass
+        finally:
+            with self._worker_lock:
+                self._connections.discard(connection)
+                self._workers.discard(threading.current_thread())
+            self._client_slots.release()
 
     def _handle_connection(self, connection: socket.socket) -> dict:
         try:

@@ -48,19 +48,46 @@ class RpcTests(unittest.TestCase):
         self.server = RpcServer(
             self.socket_path,
             handler=lambda _request, _context: {"ok": True},
-            request_read_timeout_seconds=0.05,
+            request_read_timeout_seconds=1.0,
         )
         self.server.start()
-        idle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.addCleanup(idle.close)
-        idle.connect(str(self.socket_path))
-        time.sleep(0.1)
+        idle_clients = [socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(4)]
+        for idle in idle_clients:
+            self.addCleanup(idle.close)
+            idle.connect(str(self.socket_path))
+        time.sleep(0.05)
 
+        started = time.monotonic()
         response = RpcClient(self.socket_path, timeout_seconds=0.5).call(
             {"action": "status", "payload": {}}
         )
 
         self.assertTrue(response["ok"])
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_concurrent_client_limit_rejects_excess_connections_promptly(self):
+        self.server.close()
+        self.server = RpcServer(
+            self.socket_path,
+            handler=lambda _request, _context: {"ok": True},
+            request_read_timeout_seconds=1.0,
+            max_concurrent_clients=2,
+        )
+        self.server.start()
+        idle_clients = [socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(2)]
+        for idle in idle_clients:
+            self.addCleanup(idle.close)
+            idle.connect(str(self.socket_path))
+        time.sleep(0.05)
+
+        started = time.monotonic()
+        response = RpcClient(self.socket_path, timeout_seconds=0.5).call(
+            {"action": "status", "payload": {}}
+        )
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error"]["code"], "server_busy")
+        self.assertLess(time.monotonic() - started, 0.5)
 
     def test_request_contract_rejects_unknown_fields_and_oversized_values(self):
         client = RpcClient(self.socket_path)
