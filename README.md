@@ -125,9 +125,9 @@ Open `http://127.0.0.1:43210/`. Drop in an OpenAI or Anthropic key in the wizard
 | Right away | Chat UI, MCP tab, Skills tab, Memory tab, Activity tab. Tools like `remember`, `recall`, `schedule_message` already work. |
 | After 1 chat | The agent remembers. Ask it later "what did we decide about X" — it knows. |
 | First night _(03:30 UTC)_ | **Session miner** runs across your chat history, clusters recurring intents, drafts skills you might want, drops them in the Suggested tab. |
-| First hour | If you've enabled Mac screen capture, the **workflow miner** checks action sequences and can surface an already-repeated routine without waiting overnight. |
+| First hour | If you've enabled desktop screen capture, the **workflow miner** checks action sequences and can surface an already-repeated routine without waiting overnight. |
 | First night _(02:30 local)_ | The deep pass rechecks day/week cadence and longer-running workflows, then drafts any newly supported skills. |
-| Each Mac notification | "OpenAGI learned a new skill" — click to review, accept with one click, and it's saved as a real `SKILL.md` the agent can run. |
+| Each desktop notification | "OpenAGI learned a new skill" — click to review, accept with one click, and it's saved as a real `SKILL.md` the agent can run. |
 | Ongoing | Schedule a prompt with `schedule_message` and OpenAGI texts/Telegrams you when it fires. |
 
 The whole point is you don't sit there typing prompts. You install it, you go back to work, and it tells you what's worth doing.
@@ -180,6 +180,21 @@ SIGN_IDENTITY="Developer ID Application: ..." \
 ```
 
 Output: `build/OpenAGI.app` (+ optional `.dmg`). See [`mac/README.md`](mac/README.md) for Sparkle key setup, hardened-runtime entitlements, and release signing.
+
+### Linux desktop companion (KDE Plasma / Wayland)
+
+The independent Linux companion adds opt-in XDG Portal screen capture, local
+Tesseract OCR, routine observations, Quick Ask, a Plasma tray, and
+approval-gated RemoteDesktop input without changing the Node daemon contracts.
+Capture and control are separate permissions and both remain off at startup.
+
+```bash
+./linux/install-user.sh --dry-run
+./linux/install-user.sh
+```
+
+See the [Linux companion documentation](linux/README.md) for Fedora runtime
+requirements, privacy exclusions, staging, diagnostics, and uninstall steps.
 
 ### Docker / Linux SBC (Raspberry Pi, Jetson, x86)
 
