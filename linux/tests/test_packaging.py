@@ -38,6 +38,34 @@ class PackagingTests(unittest.TestCase):
             "openagi_linux.helper:main",
         )
 
+    def test_headless_ci_provisions_native_gstreamer_dependencies(self):
+        workflow = (ROOT / ".github" / "workflows" / "linux-companion.yml").read_text(encoding="utf-8")
+        installer = (LINUX / "install-user.sh").read_text(encoding="utf-8")
+
+        self.assertIn("runs-on: ubuntu-24.04", workflow)
+        for package in (
+            "python3-venv",
+            "python3-gi",
+            "python3-gst-1.0",
+            "gir1.2-gst-plugins-base-1.0",
+            "gstreamer1.0-plugins-base",
+            "libdbus-1-3",
+            "libxkbcommon0",
+            "tesseract-ocr",
+        ):
+            self.assertIn(package, workflow)
+        self.assertIn("python3 -m venv --system-site-packages .venv", workflow)
+        self.assertIn('cp -a linux "$RUNNER_TEMP/openagi-linux-source"', workflow)
+        self.assertIn(
+            '.venv/bin/python -m pip install --disable-pip-version-check "$RUNNER_TEMP/openagi-linux-source"',
+            workflow,
+        )
+        self.assertNotIn("pip install --disable-pip-version-check ./linux", workflow)
+        self.assertIn(".venv/bin/python - <<'PY'", workflow)
+        self.assertNotIn("actions/setup-python", workflow)
+        self.assertNotIn("--no-deps", installer)
+        self.assertIn('"${STAGING_VENV}/bin/python" - <<\'PY\'', installer)
+
     def test_linux_readme_documents_consent_privacy_and_configuration_contract(self):
         readme = (LINUX / "README.md").read_text(encoding="utf-8")
         root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -154,6 +182,66 @@ class PackagingTests(unittest.TestCase):
             dropin = (home / ".config" / "systemd" / "user" / "openagi.service.d" / "20-linux-companion.conf").read_text(encoding="utf-8")
             self.assertIn("[Unit]\nAfter=graphical-session.target", dropin)
             self.assertEqual(sorted(LINUX.glob("*.egg-info")), source_artifacts_before)
+
+    def test_failed_upgrade_preserves_existing_environment_and_entrypoints(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as fake_temp:
+            home = Path(temp)
+            fake_bin = Path(fake_temp)
+            install_root = home / ".local" / "share" / "openagi-linux-companion"
+            old_bin = install_root / "venv" / "bin"
+            command_dir = home / ".local" / "bin"
+            old_bin.mkdir(parents=True)
+            command_dir.mkdir(parents=True)
+            old_companion = old_bin / "openagi-linux-companion"
+            old_helper = old_bin / "openagi-linux-helper"
+            old_companion.write_text("old companion\n", encoding="utf-8")
+            old_helper.write_text("old helper\n", encoding="utf-8")
+            companion_link = command_dir / "openagi-linux-companion"
+            helper_link = command_dir / "openagi-linux-helper"
+            companion_link.symlink_to(old_companion)
+            helper_link.symlink_to(old_helper)
+            old_targets = (os.readlink(companion_link), os.readlink(helper_link))
+
+            python3 = fake_bin / "python3"
+            python3.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == '-m' && \"${2:-}\" == 'venv' ]]; then\n"
+                "  target=\"${@: -1}\"\n"
+                "  rm -rf -- \"${target}\"\n"
+                "  mkdir -p -- \"${target}/bin\"\n"
+                "  printf '#!/usr/bin/env bash\\nexit 73\\n' >\"${target}/bin/python\"\n"
+                "  chmod 0700 \"${target}/bin/python\"\n"
+                "  exit 0\n"
+                "fi\n"
+                f"exec {sys.executable!s} \"$@\"\n",
+                encoding="utf-8",
+            )
+            python3.chmod(0o700)
+            env = {
+                **os.environ,
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(home / ".config"),
+                "XDG_DATA_HOME": str(home / ".local" / "share"),
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            }
+
+            result = subprocess.run(
+                ["bash", str(LINUX / "install-user.sh"), "--stage-only"],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(old_companion.read_text(encoding="utf-8"), "old companion\n")
+            self.assertEqual(old_helper.read_text(encoding="utf-8"), "old helper\n")
+            self.assertEqual((os.readlink(companion_link), os.readlink(helper_link)), old_targets)
+            releases = install_root / "releases"
+            self.assertEqual(list(releases.iterdir()) if releases.exists() else [], [])
 
     def test_activation_refuses_missing_core_service_before_mutating_home(self):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as fake_temp:

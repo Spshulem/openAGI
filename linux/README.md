@@ -48,7 +48,9 @@ The supported path expects:
 - KDE Plasma/KWin 6 on Wayland;
 - a user systemd manager.
 
-The installer does not install or elevate privileges for system packages. Its preflight fails if required commands or Python modules are absent.
+The installer never elevates privileges or installs system packages. Its preflight fails if the native commands, PyGObject, or GStreamer bindings are absent. It installs the Python dependencies declared in `pyproject.toml` into a private, versioned virtual environment; this can use already installed packages or download wheels from the configured Python package index.
+
+Upgrades are failure-atomic for the companion runtime: a candidate environment is built and checked before an atomic `current` symlink switch. If dependency installation or validation fails, the existing runtime and command entry points remain in place.
 
 ## Install for the current user
 
