@@ -1,0 +1,25 @@
+[Unit]
+Description=OpenAGI Linux desktop companion
+Documentation=https://github.com/Spshulem/openAGI
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/openagi-linux-companion
+EnvironmentFile=-%h/.config/openagi/linux-companion.env
+Environment=XDG_STATE_HOME=%h/.local/state
+Environment=XDG_CONFIG_HOME=%h/.local/state/openagi/linux-companion/config
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/openagi/linux-companion %t
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

@@ -31,6 +31,12 @@ mac/.swiftpm/
 # Mac app bundle output
 build/
 
+# Python package and bytecode artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.cache/
+
 # Temporary files
 *.tmp
 *.swp
