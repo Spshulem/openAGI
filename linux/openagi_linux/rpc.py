@@ -101,8 +101,12 @@ class RpcServer:
                 sock.close()
             except OSError:
                 pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
         with self._worker_lock:
             connections = tuple(self._connections)
+            workers = tuple(self._workers)
         for connection in connections:
             try:
                 connection.shutdown(socket.SHUT_RDWR)
@@ -112,14 +116,21 @@ class RpcServer:
                 connection.close()
             except OSError:
                 pass
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=5)
-        with self._worker_lock:
-            workers = tuple(self._workers)
+        join_deadline = time.monotonic() + 5
         for worker in workers:
             if worker is not threading.current_thread():
-                worker.join(timeout=5)
+                worker.join(timeout=max(0, join_deadline - time.monotonic()))
+        with self._worker_lock:
+            remaining_connections = tuple(self._connections)
+        for connection in remaining_connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
         self._thread = None
         self._socket = None
         try:
@@ -167,18 +178,23 @@ class RpcServer:
                 name="openagi-rpc-client",
                 daemon=True,
             )
+            worker_started = False
             with self._worker_lock:
-                self._connections.add(connection)
-                self._workers.add(worker)
-            try:
-                worker.start()
-            except BaseException:
-                with self._worker_lock:
-                    self._connections.discard(connection)
-                    self._workers.discard(worker)
+                if not self._closed.is_set():
+                    self._connections.add(connection)
+                    self._workers.add(worker)
+                    try:
+                        worker.start()
+                        worker_started = True
+                    except BaseException:
+                        self._connections.discard(connection)
+                        self._workers.discard(worker)
+            if not worker_started:
+                should_stop = self._closed.is_set()
                 self._client_slots.release()
                 connection.close()
-                raise
+                if should_stop:
+                    break
 
     def _serve_connection(self, connection: socket.socket) -> None:
         try:

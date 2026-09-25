@@ -89,6 +89,58 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(response["error"]["code"], "server_busy")
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_shutdown_cannot_start_a_client_accepted_during_close(self):
+        accepted = threading.Event()
+        release_accept = threading.Event()
+        handler_started = threading.Event()
+
+        class PausingSlots:
+            def acquire(self, *, blocking):
+                self.assert_blocking = blocking
+                accepted.set()
+                self.released = release_accept.wait(timeout=2)
+                return self.released
+
+            def release(self):
+                return None
+
+        self.server.close()
+        self.server = RpcServer(
+            self.socket_path,
+            handler=lambda _request, _context: handler_started.set() or {"ok": True},
+        )
+        setattr(self.server, "_client_slots", PausingSlots())
+        self.server.start()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(str(self.socket_path))
+        client.sendall(
+            json.dumps(
+                {
+                    "action": "status",
+                    "payload": {},
+                    "meta": {
+                        "actionId": str(uuid.uuid4()),
+                        "deadlineMs": int(time.time() * 1000) + 5_000,
+                        "authorization": None,
+                    },
+                }
+            ).encode("utf-8")
+            + b"\n"
+        )
+        self.assertTrue(accepted.wait(timeout=1))
+
+        close_thread = threading.Thread(target=self.server.close)
+        close_thread.start()
+        self.assertTrue(self.server._closed.wait(timeout=1))
+        release_accept.set()
+        close_thread.join(timeout=2)
+
+        self.assertFalse(close_thread.is_alive())
+        self.assertFalse(handler_started.is_set())
+        self.assertEqual(self.server._connections, set())
+        self.assertEqual(self.server._workers, set())
+
     def test_request_contract_rejects_unknown_fields_and_oversized_values(self):
         client = RpcClient(self.socket_path)
         with self.assertRaisesRegex(ValueError, "fields"):
