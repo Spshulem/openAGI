@@ -64,6 +64,26 @@ class CapturePipelineTests(unittest.TestCase):
         self.assertEqual(ocr.calls, [])
         self.assertEqual(self.outbox.pending_count(), 0)
 
+    def test_sensitive_browser_titles_are_excluded_before_capture(self):
+        policy = PrivacyPolicy()
+
+        for title in (
+            "WhatsApp — Google Chrome",
+            "Vaults | 1Password — Mozilla Firefox",
+            "Accounts — Chase — Google Chrome",
+        ):
+            with self.subTest(title=title):
+                browser = FocusSnapshot(
+                    **{
+                        **self.focus.__dict__,
+                        "app_id": "google-chrome",
+                        "app_name": "Google Chrome",
+                        "title": title,
+                    }
+                )
+
+                self.assertEqual(policy.reason(browser), "privacy-excluded")
+
     def test_unknown_focus_fails_closed(self):
         ocr = FakeOcr()
         pipeline = CapturePipeline(

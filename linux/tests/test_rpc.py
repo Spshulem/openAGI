@@ -43,6 +43,25 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(self.requests, [{"action": "status", "payload": {}}])
         self.assertEqual(os.stat(self.socket_path).st_mode & 0o777, 0o600)
 
+    def test_idle_same_uid_client_cannot_block_later_requests(self):
+        self.server.close()
+        self.server = RpcServer(
+            self.socket_path,
+            handler=lambda _request, _context: {"ok": True},
+            request_read_timeout_seconds=0.05,
+        )
+        self.server.start()
+        idle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(idle.close)
+        idle.connect(str(self.socket_path))
+        time.sleep(0.1)
+
+        response = RpcClient(self.socket_path, timeout_seconds=0.5).call(
+            {"action": "status", "payload": {}}
+        )
+
+        self.assertTrue(response["ok"])
+
     def test_request_contract_rejects_unknown_fields_and_oversized_values(self):
         client = RpcClient(self.socket_path)
         with self.assertRaisesRegex(ValueError, "fields"):

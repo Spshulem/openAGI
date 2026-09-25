@@ -55,7 +55,7 @@ class PrivacyPolicy:
         r"\b(2fa|otp|authenticator)\b",
         r"\b(recovery|seed) phrase\b",
         r"\bapi[ _-]?keys?\b",
-        r"\b(card number|online banking)\b",
+        r"\b(card number|accounts?|bank(?:ing)?|wallets?|payments?)\b",
     )
 
     def __init__(self, excluded_apps=None, title_patterns=None) -> None:
@@ -74,8 +74,9 @@ class PrivacyPolicy:
             or focus.height < 32
         ):
             return "focus-unverified"
-        app = focus.app_id.casefold()
-        if any(marker in app for marker in self.excluded_apps):
+        app = f"{focus.app_id}\n{focus.app_name}".casefold()
+        title = focus.title.casefold()
+        if any(marker in app or marker in title for marker in self.excluded_apps):
             return "privacy-excluded"
         if any(pattern.search(focus.title) for pattern in self.title_patterns):
             return "privacy-excluded"

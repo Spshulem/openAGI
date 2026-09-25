@@ -17,6 +17,7 @@ from typing import Callable
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_DEADLINE_AHEAD_MS = 60_000
+DEFAULT_REQUEST_READ_TIMEOUT_SECONDS = 1.0
 
 
 class RequestCancelled(RuntimeError):
@@ -49,10 +50,19 @@ class RpcServer:
         *,
         handler: Callable[[dict, RpcContext], dict],
         peer_authorizer: Callable[[int], bool] | None = None,
+        request_read_timeout_seconds: float = DEFAULT_REQUEST_READ_TIMEOUT_SECONDS,
     ) -> None:
+        if (
+            isinstance(request_read_timeout_seconds, bool)
+            or not isinstance(request_read_timeout_seconds, (int, float))
+            or request_read_timeout_seconds <= 0
+            or request_read_timeout_seconds > 10
+        ):
+            raise ValueError("RPC request read timeout is invalid")
         self.path = Path(path)
         self.handler = handler
         self.peer_authorizer = peer_authorizer
+        self.request_read_timeout_seconds = float(request_read_timeout_seconds)
         self._closed = threading.Event()
         self._ready = threading.Event()
         self._error: BaseException | None = None
@@ -125,6 +135,7 @@ class RpcServer:
             pid, uid, _gid = struct.unpack("3i", credentials)
             if uid != os.getuid():
                 return _error("access_denied", "RPC peer does not own the companion session")
+            connection.settimeout(self.request_read_timeout_seconds)
             raw = _read_bounded(connection, MAX_REQUEST_BYTES)
             wire = json.loads(raw)
             _validate_wire_request(wire)
@@ -178,6 +189,8 @@ class RpcServer:
             return _error("request_cancelled", "RPC request was cancelled")
         except RequestExpired:
             return _error("request_expired", "RPC request deadline expired")
+        except TimeoutError:
+            return _error("invalid_request", "RPC request timed out")
         except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
             return _error("invalid_request", "RPC request is invalid")
         except BaseException:
