@@ -96,3 +96,17 @@ class CompanionRuntime:
                 component.close()
             except BaseException:
                 pass
+        for qt_object in (*self.owned_objects, self.tray):
+            close = getattr(qt_object, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except BaseException:
+                    pass
+            delete_later = getattr(qt_object, "deleteLater", None)
+            if callable(delete_later):
+                try:
+                    delete_later()
+                except BaseException:
+                    pass
+        self.owned_objects = ()

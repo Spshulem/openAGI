@@ -43,6 +43,14 @@ class Tray(Component):
         self.calls.append((self.name, "message", title, message))
 
 
+class QtObject(Component):
+    def hide(self):
+        self.calls.append((self.name, "hide"))
+
+    def deleteLater(self):
+        self.calls.append((self.name, "deleteLater"))
+
+
 class RuntimeTests(unittest.TestCase):
     def test_start_never_opens_portal_sessions_and_user_toggles_are_explicit(self):
         calls = []
@@ -90,6 +98,29 @@ class RuntimeTests(unittest.TestCase):
         for name in ("observer", "rpc", "bridge", "capture", "control", "portal", "outbox"):
             self.assertIn((name, "close"), calls)
         self.assertIn(("tray", "hide"), calls)
+
+    def test_close_disposes_owned_qt_objects_before_interpreter_shutdown(self):
+        calls = []
+        tray = QtObject("tray", calls)
+        window = QtObject("window", calls)
+        signals = QtObject("signals", calls)
+        runtime = CompanionRuntime(
+            observer_loop=Component("observer", calls),
+            rpc_server=Component("rpc", calls),
+            desktop_bridge=Component("bridge", calls),
+            capture_session=Component("capture", calls),
+            control_session=Component("control", calls),
+            portal=Component("portal", calls),
+            outbox=Component("outbox", calls),
+            tray=tray,
+            owned_objects=(window, signals),
+        )
+
+        runtime.close()
+
+        for name in ("window", "signals", "tray"):
+            self.assertIn((name, "close"), calls)
+            self.assertIn((name, "deleteLater"), calls)
 
     def test_portal_revocation_updates_tray_state_and_warns_user(self):
         calls = []
