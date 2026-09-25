@@ -107,7 +107,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         : localCapabilityCache;
       const local = localCapabilities.length ? [{
         nodeId: localIdentity.nodeId,
-        name: localIdentity.name || "This Mac",
+        name: localIdentity.name || "This computer",
         capabilities: localCapabilities,
         local: true,
         seenAt: new Date().toISOString()

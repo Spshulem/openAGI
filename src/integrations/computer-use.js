@@ -14,8 +14,7 @@
 //                               with a stated goal. Subsequent actions
 //                               within that session don't re-prompt.
 //   computer_screenshot       — current screen state (returns OCR snippet,
-//                               since real screenshot transport needs the
-//                               Mac app).
+//                               when no desktop companion is connected).
 //   computer_click            — click at (x, y).
 //   computer_drag             — drag between two points.
 //   computer_type             — type a string.
@@ -132,7 +131,7 @@ export async function computerUseReadiness({
     nodeReachable = true;
     // Do not copy arbitrary node-provided errors into status. No command is
     // dispatched and neither capture nor input is enabled by this fallback.
-    detail = "A connected computer node reports that control prerequisites are not met. Check its Screen Recording, Accessibility, unlocked screen, and Secure Input status in Nodes.";
+    detail = "A connected computer node reports that control prerequisites are not met. Check its capture and input permissions, unlocked screen, and current privacy exclusions in Nodes.";
   }
   if (needsSelection) detail = "Multiple computer nodes are connected. Select a node and check its current permissions in Nodes.";
   const mode = !enabled
@@ -159,7 +158,7 @@ export async function computerUseReadiness({
   };
 }
 
-/// A configured computer-use node (a Mac running `openagi computer-server`)
+/// A configured computer-use node (a supported desktop running `openagi computer-server`)
 /// turns the stub into real execution: screenshots + input synthesis run on
 /// that node. Without it, input is logged and refused (no fake success).
 function explicitComputerNode(env = process.env) {
@@ -283,35 +282,55 @@ async function callNode(node, operation, body, fetchImpl, timeoutMs = 30_000, op
   const path = NODE_PATHS[operation];
   if (!path) throw new Error("unsupported computer node operation");
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onParentAbort = () => controller.abort(
+    opts.signal?.reason instanceof Error
+      ? opts.signal.reason
+      : new Error("computer node request was aborted")
+  );
+  opts.signal?.addEventListener?.("abort", onParentAbort, { once: true });
+  if (opts.signal?.aborted) onParentAbort();
+  const timer = setTimeout(
+    () => controller.abort(new Error("computer node request timed out")),
+    timeoutMs
+  );
   timer.unref?.();
-  let res;
   try {
-    res = await fetchImpl(`${node.url}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...(node.token ? { authorization: `Bearer ${node.token}` } : {}) },
+    const res = await fetchImpl(`${node.url}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(node.token ? { authorization: `Bearer ${node.token}` } : {}) },
       body: JSON.stringify(body ?? {}),
       redirect: "manual",
       signal: controller.signal
     });
-  } finally { clearTimeout(timer); }
-  const json = await readNodeJsonLimited(
-    res,
-    operation === "screenshot" ? 16 * 1024 * 1024 : 256 * 1024
-  ).catch(() => ({}));
-  if (!res.ok) {
-    const publicError = typeof json?.error === "string" ? json.error.slice(0, 300) : `computer node HTTP ${res.status}`;
-    const error = new Error(publicError);
-    error.nodeAcknowledged = true;
-    // Current nodes state this explicitly. Older compatible node services used
-    // 5xx for executor failures after entering a lease, so retain that legacy
-    // default only for 5xx. Redirects/auth/route failures never prove that the
-    // action reached the lease and must not advance its sequence.
-    error.nodeSequenceConsumed = json?.sequenceConsumed === true
-      || (json?.sequenceConsumed !== false && res.status >= 500);
-    throw error;
+    let json;
+    try {
+      json = await readNodeJsonLimited(
+        res,
+        operation === "screenshot" ? 16 * 1024 * 1024 : 256 * 1024
+      );
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw controller.signal.reason instanceof Error ? controller.signal.reason : error;
+      }
+      json = {};
+    }
+    if (!res.ok) {
+      const publicError = typeof json?.error === "string" ? json.error.slice(0, 300) : `computer node HTTP ${res.status}`;
+      const error = new Error(publicError);
+      error.nodeAcknowledged = true;
+      // Current nodes state this explicitly. Older compatible node services used
+      // 5xx for executor failures after entering a lease, so retain that legacy
+      // default only for 5xx. Redirects/auth/route failures never prove that the
+      // action reached the lease and must not advance its sequence.
+      error.nodeSequenceConsumed = json?.sequenceConsumed === true
+        || (json?.sequenceConsumed !== false && res.status >= 500);
+      throw error;
+    }
+    return json;
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener?.("abort", onParentAbort);
   }
-  return json;
 }
 
 /// Remove all computer-use tools from the registry. Caller is expected
@@ -328,8 +347,15 @@ export function unregisterComputerUseTools(registry) {
   return count;
 }
 
-export function registerComputerUseTools(registry, runtime, { fetchImpl = globalThis.fetch } = {}) {
+export function registerComputerUseTools(
+  registry,
+  runtime,
+  { fetchImpl = globalThis.fetch, nodeRequestTimeoutMs = 30_000 } = {}
+) {
   if (!runtime.computerUseLog) return { registered: false, reason: "no computer-use log bound" };
+  const requestTimeoutMs = Number.isSafeInteger(nodeRequestTimeoutMs)
+    ? Math.max(1, Math.min(30_000, nodeRequestTimeoutMs))
+    : 30_000;
 
   const requireActiveSession = (context = {}) => {
     const sourceSessionId = context.sessionId;
@@ -370,7 +396,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
           ...(advertised.includes("screenshot") ? ["screenshot"] : []),
           ...negotiatedInput
         ]
-      }, fetchImpl);
+      }, fetchImpl, requestTimeoutMs);
       const lease = {
         nodeId: node.id,
         leaseId: opened.leaseId,
@@ -416,7 +442,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         leaseId: lease.leaseId,
         actionId: action.id,
         sequence
-      }, fetchImpl, 30_000, { sessionId: session.id });
+      }, fetchImpl, requestTimeoutMs, { sessionId: session.id, signal });
       if (lease.nextSequence === sequence) lease.nextSequence += 1;
       return result;
     } catch (error) {
@@ -535,7 +561,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       type: "object",
       properties: {
         goal: { type: "string", description: "What the user is trying to accomplish, in one sentence. Will be shown verbatim in the approval card." },
-        node: { type: "string", description: "Optional node name or id. Use a value returned by computer_use_status when the user names a specific Mac." },
+        node: { type: "string", description: "Optional node name or id. Use a value returned by computer_use_status when the user names a specific computer." },
         nodeId: { type: "string", description: "Immutable node id resolved before approval. Do not invent this value." },
         nodeName: { type: "string", description: "Display name resolved before approval. Do not invent this value." }
       },
@@ -779,7 +805,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     });
   }
 
-  registerAction("computer_list_apps", "list_apps", "List safe applications available on the selected Mac, returning names, bundle identifiers, and running state.", {
+  registerAction("computer_list_apps", "list_apps", "List safe applications available on the selected computer, returning names, application identifiers, and running state.", {
   }, () => ({}), [], {}, true, true, false);
   registerAction("computer_activate_app", "activate_app", "Launch or bring a safe application to the foreground by bundle identifier. Take a fresh computer_screenshot after activation.", {
     bundleIdentifier: { type: "string", description: "Bundle identifier returned by computer_list_apps." }

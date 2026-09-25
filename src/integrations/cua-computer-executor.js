@@ -10,7 +10,10 @@ const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0
 
 export function createConfiguredComputerExecutor({ env = process.env, ...options } = {}) {
   const backend = String(env.OPENAGI_COMPUTER_BACKEND ?? "native").trim().toLowerCase();
-  if (backend === "native" || backend === "openagi") return createComputerExecutor(options);
+  if (backend === "native" || backend === "openagi") return createComputerExecutor({
+    helperPath: env.OPENAGI_COMPUTER_HELPER,
+    ...options
+  });
   if (backend === "open-computer-use") return createOpenComputerUseExecutor({
     binaryPath: env.OPENAGI_OCU_PATH, helperPath: env.OPENAGI_COMPUTER_HELPER, ...options
   });
@@ -39,6 +42,7 @@ export function createCuaComputerExecutor({
   ...executorOptions
 } = {}) {
   const binary = validBinaryPath(binaryPath) ? binaryPath : null;
+  let driverPlatform = "darwin";
   const call = async (args, payload = null, options = {}) => {
     if (!binary || !binaryReady(binary)) throw new Error("the configured Cua Driver executable is unavailable");
     return await run(binary, args, payload, options);
@@ -67,7 +71,37 @@ export function createCuaComputerExecutor({
           : "Cua Driver needs Screen Recording and Accessibility permission"
       };
     } catch {
-      return { screenshotReady: false, inputReady: false, operations: [], detail: "Cua Driver is not reachable" };
+      try {
+        const result = await call(["call", "health_report"], {}, {
+          timeoutMs: 5_000,
+          maxStdoutBytes: 256 * 1024,
+          maxStderrBytes: 32 * 1024
+        });
+        const status = parseJson(result.stdout, "Cua Driver health report");
+        const checks = new Map(Array.isArray(status?.checks)
+          ? status.checks.map((check) => [check?.name, check?.status])
+          : []);
+        const platform = ["darwin", "linux", "win32"].includes(status?.platform) ? status.platform : null;
+        const coreReady = status?.schema_version === "1"
+          && platform !== null
+          && checks.get("binary_version") === "pass"
+          && checks.get("platform_supported") === "pass"
+          && checks.get("session_active") === "pass";
+        const screenshotReady = coreReady && checks.get("screen_capture_capability") === "pass";
+        const inputReady = coreReady && checks.get("ax_capability") === "pass";
+        if (platform) driverPlatform = platform;
+        const platformName = platform === "linux" ? "Linux" : platform === "win32" ? "Windows" : "macOS";
+        return {
+          screenshotReady,
+          inputReady,
+          operations: inputReady ? [...INPUT_OPERATIONS] : [],
+          detail: screenshotReady && inputReady
+            ? `${platformName} Cua Driver coordinate actions are available, but semantic element and app actions are not`
+            : `${platformName} Cua Driver health checks are incomplete`
+        };
+      } catch {
+        return { screenshotReady: false, inputReady: false, operations: [], detail: "Cua Driver is not reachable" };
+      }
     }
   };
 
@@ -129,7 +163,7 @@ export function createCuaComputerExecutor({
   };
 
   const helperRun = async (_helperPath, operation, payload, options = {}) => {
-    const { tool, args } = cuaAction(operation, payload);
+    const { tool, args } = cuaAction(operation, payload, driverPlatform);
     const result = await call(["call", tool], args, {
       timeoutMs: options.timeoutMs ?? 10_000,
       maxStdoutBytes: 256 * 1024,
@@ -155,7 +189,7 @@ export function createCuaComputerExecutor({
   });
 }
 
-function cuaAction(operation, payload = {}) {
+function cuaAction(operation, payload = {}, platform = "darwin") {
   const focus = payload?.focus;
   const pid = Number(focus?.processIdentifier);
   const windowId = Number(focus?.windowID);
@@ -179,7 +213,7 @@ function cuaAction(operation, payload = {}) {
   if (operation === "move") return { tool: "move_cursor", args: { ...base, x: payload.x, y: payload.y } };
   if (operation === "type") return { tool: "type_text", args: { ...base, text: payload.text } };
   if (operation === "key") {
-    const keys = String(payload.chord ?? "").split("+").map(normalizeKey).filter(Boolean);
+    const keys = String(payload.chord ?? "").split("+").map((key) => normalizeKey(key, platform)).filter(Boolean);
     return keys.length === 1
       ? { tool: "press_key", args: { ...base, key: keys[0] } }
       : { tool: "hotkey", args: { ...base, keys } };
@@ -196,8 +230,14 @@ function cuaAction(operation, payload = {}) {
   throw new Error("unsupported Cua Driver computer operation");
 }
 
-function normalizeKey(value) {
-  return ({ cmd: "command", ctrl: "control", alt: "option", opt: "option", return: "enter", esc: "escape" })[value] ?? value;
+function normalizeKey(value, platform = "darwin") {
+  const key = String(value ?? "").trim().toLowerCase();
+  const common = { ctrl: "control", return: "enter", esc: "escape" };
+  if (common[key]) return common[key];
+  if (platform === "darwin") {
+    return ({ cmd: "command", meta: "command", alt: "option", opt: "option" })[key] ?? key;
+  }
+  return ({ cmd: "super", command: "super", meta: "super", opt: "alt", option: "alt" })[key] ?? key;
 }
 
 function validBinaryPath(value) {
