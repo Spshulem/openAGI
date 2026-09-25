@@ -243,6 +243,110 @@ class PackagingTests(unittest.TestCase):
             releases = install_root / "releases"
             self.assertEqual(list(releases.iterdir()) if releases.exists() else [], [])
 
+    def test_activation_failure_rolls_back_release_entrypoints_and_service_files(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as fake_temp:
+            home = Path(temp)
+            fake_bin = Path(fake_temp)
+            data_home = home / ".local" / "share"
+            config_home = home / ".config"
+            install_root = data_home / "openagi-linux-companion"
+            releases = install_root / "releases"
+            old_release = releases / "release.old"
+            old_bin = old_release / "venv" / "bin"
+            command_dir = home / ".local" / "bin"
+            systemd_dir = config_home / "systemd" / "user"
+            dropin = systemd_dir / "openagi.service.d" / "20-linux-companion.conf"
+            unit = systemd_dir / "openagi-linux-companion.service"
+            desktop = data_home / "applications" / "sh.openagi.LinuxCompanion.desktop"
+            kwin = data_home / "kwin" / "scripts" / "openagi-linux-companion"
+            for directory in (old_bin, command_dir, dropin.parent, desktop.parent, kwin / "contents" / "code"):
+                directory.mkdir(parents=True, exist_ok=True)
+            for name in ("openagi-linux-companion", "openagi-linux-helper"):
+                executable = old_bin / name
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+                (command_dir / name).symlink_to(install_root / "current" / "venv" / "bin" / name)
+            (install_root / "current").symlink_to("releases/release.old")
+            unit.write_text("old unit\n", encoding="utf-8")
+            dropin.write_text("old dropin\n", encoding="utf-8")
+            desktop.write_text("old desktop\n", encoding="utf-8")
+            (kwin / "metadata.json").write_text("old metadata\n", encoding="utf-8")
+            (kwin / "contents" / "code" / "main.js").write_text("old script\n", encoding="utf-8")
+
+            python3 = fake_bin / "python3"
+            python3.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == '-m' && \"${2:-}\" == 'venv' ]]; then\n"
+                "  target=\"${@: -1}\"\n"
+                "  mkdir -p -- \"${target}/bin\"\n"
+                "  cat >\"${target}/bin/python\" <<'PY'\n"
+                "#!/usr/bin/env bash\n"
+                "if [[ \"${1:-}\" == '-m' && \"${2:-}\" == 'pip' ]]; then\n"
+                "  bindir=\"$(dirname \"$0\")\"\n"
+                "  printf '#!/bin/sh\\n[ \"$1\" = --version ] && echo 0.1.0\\nexit 0\\n' >\"${bindir}/openagi-linux-companion\"\n"
+                "  printf '#!/bin/sh\\nexit 0\\n' >\"${bindir}/openagi-linux-helper\"\n"
+                "  chmod 0700 \"${bindir}/openagi-linux-companion\" \"${bindir}/openagi-linux-helper\"\n"
+                "fi\n"
+                "exit 0\n"
+                "PY\n"
+                "  chmod 0700 \"${target}/bin/python\"\n"
+                "  exit 0\n"
+                "fi\n"
+                f"exec {sys.executable!s} \"$@\"\n",
+                encoding="utf-8",
+            )
+            python3.chmod(0o700)
+            systemctl = fake_bin / "systemctl"
+            failure_marker = fake_bin / "failed-once"
+            systemctl.write_text(
+                "#!/usr/bin/env bash\n"
+                "args=\"$*\"\n"
+                "if [[ \"${args}\" == *'restart openagi-linux-companion.service'* && ! -e "
+                f"{failure_marker!s}" " ]]; then\n"
+                f"  touch {failure_marker!s}\n"
+                "  exit 71\n"
+                "fi\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            systemctl.chmod(0o700)
+            for command in ("kwriteconfig6", "kreadconfig6", "qdbus6", "busctl"):
+                executable = fake_bin / command
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+            env = {
+                **os.environ,
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(config_home),
+                "XDG_DATA_HOME": str(data_home),
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            }
+
+            result = subprocess.run(
+                ["bash", str(LINUX / "install-user.sh")],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 71, (result.stdout, result.stderr))
+            self.assertEqual(os.readlink(install_root / "current"), "releases/release.old")
+            self.assertEqual(sorted(path.name for path in releases.iterdir()), ["release.old"])
+            self.assertEqual(unit.read_text(encoding="utf-8"), "old unit\n")
+            self.assertEqual(dropin.read_text(encoding="utf-8"), "old dropin\n")
+            self.assertEqual(desktop.read_text(encoding="utf-8"), "old desktop\n")
+            self.assertEqual((kwin / "metadata.json").read_text(encoding="utf-8"), "old metadata\n")
+            self.assertEqual((kwin / "contents" / "code" / "main.js").read_text(encoding="utf-8"), "old script\n")
+            for name in ("openagi-linux-companion", "openagi-linux-helper"):
+                self.assertEqual(
+                    os.readlink(command_dir / name),
+                    str(install_root / "current" / "venv" / "bin" / name),
+                )
+
     def test_activation_refuses_missing_core_service_before_mutating_home(self):
         with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as fake_temp:
             home = Path(temp)

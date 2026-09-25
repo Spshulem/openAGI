@@ -13,6 +13,7 @@ SYSTEMD_DIR="${CONFIG_HOME}/systemd/user"
 KWIN_DIR="${DATA_HOME}/kwin/scripts/openagi-linux-companion"
 DESKTOP_FILE="${DATA_HOME}/applications/sh.openagi.LinuxCompanion.desktop"
 OPENAGI_DROPIN="${SYSTEMD_DIR}/openagi.service.d/20-linux-companion.conf"
+KWIN_CONFIG="${CONFIG_HOME}/kwinrc"
 MODE="${1:-install}"
 
 reconfigure_kwin() {
@@ -97,16 +98,90 @@ install -d -m 0700 "${BUILD_BASE}"
 BUILD_ROOT="$(mktemp -d "${BUILD_BASE%/}/openagi-linux-build.XXXXXX")"
 STAGING_ROOT="$(mktemp -d "${RELEASES_DIR}/release.XXXXXX")"
 CURRENT_CANDIDATE=""
+ROLLBACK_ROOT=""
+PUBLISHED_RELEASE=""
+TRANSACTION_ARMED=0
+COMPANION_WAS_ENABLED=0
+COMPANION_WAS_ACTIVE=0
+CORE_WAS_ACTIVE=0
+
+backup_path() {
+  local source_path="$1"
+  local backup_name="$2"
+  if [[ -e "${source_path}" || -L "${source_path}" ]]; then
+    : >"${ROLLBACK_ROOT}/${backup_name}.present"
+    cp -a -- "${source_path}" "${ROLLBACK_ROOT}/${backup_name}"
+  fi
+}
+
+restore_path() {
+  local destination="$1"
+  local backup_name="$2"
+  rm -rf -- "${destination}"
+  if [[ -f "${ROLLBACK_ROOT}/${backup_name}.present" ]]; then
+    cp -a -- "${ROLLBACK_ROOT}/${backup_name}" "${destination}"
+  fi
+}
+
 cleanup_install_artifacts() {
-  rm -rf -- "${BUILD_ROOT}"
+  if [[ -n "${BUILD_ROOT}" ]]; then
+    rm -rf -- "${BUILD_ROOT}"
+  fi
   if [[ -n "${STAGING_ROOT}" ]]; then
     rm -rf -- "${STAGING_ROOT}"
   fi
   if [[ -n "${CURRENT_CANDIDATE}" ]]; then
     rm -f -- "${CURRENT_CANDIDATE}"
   fi
+  if [[ -n "${ROLLBACK_ROOT}" ]]; then
+    rm -rf -- "${ROLLBACK_ROOT}"
+  fi
 }
-trap cleanup_install_artifacts EXIT
+
+rollback_installation() {
+  set +e
+  if [[ "${ACTIVATE}" == "1" ]]; then
+    systemctl --user stop openagi-linux-companion.service >/dev/null 2>&1
+  fi
+  restore_path "${CURRENT_LINK}" current
+  restore_path "${BIN_DIR}/openagi-linux-companion" companion-bin
+  restore_path "${BIN_DIR}/openagi-linux-helper" helper-bin
+  restore_path "${SYSTEMD_DIR}/openagi-linux-companion.service" companion-unit
+  restore_path "${OPENAGI_DROPIN}" openagi-dropin
+  restore_path "${DESKTOP_FILE}" desktop-file
+  restore_path "${KWIN_DIR}" kwin-script
+  restore_path "${KWIN_CONFIG}" kwin-config
+  if [[ -n "${PUBLISHED_RELEASE}" ]]; then
+    rm -rf -- "${PUBLISHED_RELEASE}"
+  fi
+  if [[ "${ACTIVATE}" == "1" ]]; then
+    systemctl --user daemon-reload >/dev/null 2>&1
+    if [[ "${COMPANION_WAS_ENABLED}" == "1" ]]; then
+      systemctl --user enable openagi-linux-companion.service >/dev/null 2>&1
+    else
+      systemctl --user disable openagi-linux-companion.service >/dev/null 2>&1
+    fi
+    if [[ "${COMPANION_WAS_ACTIVE}" == "1" ]]; then
+      systemctl --user start openagi-linux-companion.service >/dev/null 2>&1
+    fi
+    if [[ "${CORE_WAS_ACTIVE}" == "1" ]]; then
+      systemctl --user restart openagi.service >/dev/null 2>&1
+    fi
+    reconfigure_kwin
+  fi
+}
+
+finish_install() {
+  local status=$?
+  trap - EXIT
+  if [[ "${status}" != "0" && "${TRANSACTION_ARMED}" == "1" ]]; then
+    printf '%s\n' "Activation failed; restoring the previous OpenAGI Linux companion release." >&2
+    rollback_installation
+  fi
+  cleanup_install_artifacts
+  exit "${status}"
+}
+trap finish_install EXIT
 install -m 0644 "${LINUX_DIR}/pyproject.toml" "${BUILD_ROOT}/pyproject.toml"
 install -d -m 0755 "${BUILD_ROOT}/openagi_linux"
 for source_file in "${LINUX_DIR}"/openagi_linux/*.py; do
@@ -129,6 +204,28 @@ PY
 if [[ "${ACTIVATE}" == "1" ]]; then
   "${STAGING_VENV}/bin/openagi-linux-companion" --doctor
 fi
+
+ROLLBACK_ROOT="$(mktemp -d "${INSTALL_ROOT}/.rollback.XXXXXX")"
+backup_path "${CURRENT_LINK}" current
+backup_path "${BIN_DIR}/openagi-linux-companion" companion-bin
+backup_path "${BIN_DIR}/openagi-linux-helper" helper-bin
+backup_path "${SYSTEMD_DIR}/openagi-linux-companion.service" companion-unit
+backup_path "${OPENAGI_DROPIN}" openagi-dropin
+backup_path "${DESKTOP_FILE}" desktop-file
+backup_path "${KWIN_DIR}" kwin-script
+backup_path "${KWIN_CONFIG}" kwin-config
+if [[ "${ACTIVATE}" == "1" ]]; then
+  if systemctl --user is-enabled openagi-linux-companion.service >/dev/null 2>&1; then
+    COMPANION_WAS_ENABLED=1
+  fi
+  if systemctl --user is-active openagi-linux-companion.service >/dev/null 2>&1; then
+    COMPANION_WAS_ACTIVE=1
+  fi
+  if systemctl --user is-active openagi.service >/dev/null 2>&1; then
+    CORE_WAS_ACTIVE=1
+  fi
+fi
+TRANSACTION_ARMED=1
 
 install -m 0644 "${LINUX_DIR}/systemd/openagi-linux-companion.service" "${SYSTEMD_DIR}/openagi-linux-companion.service"
 install -m 0644 "${LINUX_DIR}/sh.openagi.LinuxCompanion.desktop" "${DESKTOP_FILE}"
@@ -153,6 +250,7 @@ CURRENT_CANDIDATE="${INSTALL_ROOT}/.current.$$"
 ln -s "releases/${RELEASE_NAME}" "${CURRENT_CANDIDATE}"
 mv -Tf -- "${CURRENT_CANDIDATE}" "${CURRENT_LINK}"
 CURRENT_CANDIDATE=""
+PUBLISHED_RELEASE="${RELEASE_ROOT}"
 STAGING_ROOT=""
 ln -sfn "${CURRENT_LINK}/venv/bin/openagi-linux-companion" "${BIN_DIR}/openagi-linux-companion"
 ln -sfn "${CURRENT_LINK}/venv/bin/openagi-linux-helper" "${BIN_DIR}/openagi-linux-helper"
@@ -175,8 +273,22 @@ if systemctl --user is-active openagi-linux-companion.service >/dev/null 2>&1; t
 else
   systemctl --user start openagi-linux-companion.service
 fi
+systemctl --user is-active --quiet openagi-linux-companion.service
+companion_healthy=0
+for _attempt in $(seq 1 20); do
+  if "${BIN_DIR}/openagi-linux-helper" status >/dev/null 2>&1; then
+    companion_healthy=1
+    break
+  fi
+  sleep 0.25
+done
+if [[ "${companion_healthy}" != "1" ]]; then
+  printf '%s\n' "OpenAGI Linux companion health check failed after activation." >&2
+  exit 1
+fi
 if systemctl --user is-active openagi.service >/dev/null 2>&1; then
   systemctl --user restart openagi.service
+  systemctl --user is-active --quiet openagi.service
 fi
 
 show_plan
