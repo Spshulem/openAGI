@@ -15,6 +15,20 @@ The companion provides:
 
 The Linux companion does not implement iMessage. That integration remains specific to the Apple ecosystem.
 
+## Support status
+
+The production-validated target is Fedora 44 on x86-64 with KDE Plasma 6,
+KWin, Wayland, and the KDE XDG Desktop Portal. The companion is designed to use
+portable portal and PipeWire interfaces, but other distributions, desktop
+environments, and portal implementations remain beta until they receive the
+same live acceptance coverage. There is no silent X11 input or capture
+fallback.
+
+The native companion is additive: the Node daemon and web dashboard remain the
+canonical core. Linux-specific code adapts desktop capture, focus, tray, Quick
+Ask, and approved input to the existing HTTP and Computer Use contracts rather
+than introducing a second agent runtime.
+
 ## Consent and privacy
 
 Screen capture and remote control are disabled at startup. Opening the dashboard or starting the service does not create a portal session. The user must select **Enable screen context** or **Enable computer control** from the tray before the corresponding KDE portal request is made.
@@ -141,10 +155,12 @@ The shortcut is registered by KWin as `OpenAGI Quick Ask`. If `Ctrl+Alt+Space` c
 
 ## Development verification
 
-Run the Linux suite without opening portal sessions:
+On a machine with the runtime requirements installed, run the Linux suite
+without opening new portal sessions:
 
 ```bash
-QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s linux/tests -p 'test_*.py' -v
+PYTHONDONTWRITEBYTECODE=1 QT_QPA_PLATFORM=offscreen \
+  python3 -m unittest discover -s linux/tests -p 'test_*.py' -v
 ```
 
 Run the existing Node suite with:
@@ -152,5 +168,26 @@ Run the existing Node suite with:
 ```bash
 npm test
 ```
+
+Static checks used by the Linux lane are:
+
+```bash
+bash -n linux/install-user.sh
+node --check linux/kwin/contents/code/main.js
+python3 - <<'PY'
+import ast
+from pathlib import Path
+
+for path in Path("linux").rglob("*.py"):
+    ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+PY
+```
+
+The pull-request workflow provisions Python, PyGObject, GStreamer, Qt runtime
+libraries, and Tesseract on Ubuntu 24.04 before running its headless subset.
+It deliberately excludes tests that require a live logged-in desktop or the
+installed D-Bus name. See the dated
+[acceptance record](../docs/verification/2026-09-25-linux-companion.md) for the
+live Fedora KDE/Wayland boundary.
 
 The live portal property test reads advertised source, cursor, and device types only. A real ScreenCast or RemoteDesktop end-to-end test requires an explicit user interaction with KDE's portal dialog and is therefore not part of unattended test execution.

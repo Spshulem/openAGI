@@ -542,7 +542,16 @@ Set `BUILDBETTER_API_KEY`, `BUILDBETTER_USER_EMAIL`, and `BUILDBETTER_USER_NAME`
 
 ```bash
 npm test
+
+# Linux companion (requires its native Python/Qt/GStreamer dependencies)
+QT_QPA_PLATFORM=offscreen \
+  python3 -m unittest discover -s linux/tests -p 'test_*.py' -v
 ```
+
+The Linux workflow also checks the companion in a clean Ubuntu 24.04 runner.
+See [`linux/README.md`](linux/README.md#development-verification) for the native
+dependency boundary and [`docs/verification/2026-09-25-linux-companion.md`](docs/verification/2026-09-25-linux-companion.md)
+for the Fedora KDE/Wayland acceptance evidence.
 
 ## Project layout
 
@@ -577,6 +586,12 @@ mac/Sources/OpenAGI/
   AppState.swift              SSE client + dashboard window
   Capture/                    ScreenCaptureKit + Vision OCR pipeline
   Replay/                     SSE-driven action executor + confirmation modal
+linux/
+  openagi_linux/              PySide6 companion, portals, OCR, and private RPC
+  kwin/                       focus bridge and Quick Ask shortcut
+  systemd/                    sandboxed user service
+  tests/                      privacy, lifecycle, packaging, and portal tests
+  install-user.sh             rootless staged installer with rollback
 examples/
   hosted-server.js            entrypoint for `npm run serve`
   abi-demo.js                 deterministic ABI signal demo
