@@ -178,14 +178,14 @@ function infraIntent(ctx) {
     return {
       type: "ask", reason: "logged out",
       question: question(ctx, `${who} logged out. Run /login?`, `${ctx.facts.label} stopped: ${who} is not logged in.`,
-        ["retry", "later"], `logged-out:${who.toLowerCase()}`, "infra")
+        ["retry", "later"], `logged-out:${thread.key}`, "infra")
     };
   }
   if (kind === "disk-full") {
     return {
       type: "ask", reason: "disk full",
       question: question(ctx, "Disk full. Free space?", `${ctx.facts.label} stopped: no space left on device.`,
-        ["retry", "later"], "disk-full", "infra")
+        ["retry", "later"], `disk-full:${thread.key}`, "infra")
     };
   }
   return { type: "none", reason: classified.reason };
@@ -228,6 +228,7 @@ function waitingIntent(ctx) {
   }
   // The agent ended its turn to wait and nothing will wake it but us.
   if (ciDone) return nudge("ci-finished", "CI finished on head");
+  if (pr?.state === "OPEN" && !ci.state && age >= limits.waitingTaskMaxMs) return nudge("merge-ready", "no CI on head after waiting");
   if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
   return { type: "wait", reason: pr ? "CI still running" : wait.reason ?? "waiting" };
 }
@@ -269,7 +270,7 @@ function agentAskIntent(ctx) {
     };
   }
   const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
-  const options = ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
+  const options = ask.structured ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   const excerpt = ownerExcerpt(ask.text || thread.lastAgentText, ctx.limits.bodyMax);
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
@@ -714,7 +715,7 @@ function clampQuestion(q, limits) {
   return {
     title: clampText(q.title, limits.titleMax),
     body: clampText(q.body, limits.bodyMax),
-    options: q.options.map((option) => clampText(option, 20)),
+    options: q.options.map((option) => clampText(option, 40)),
     dedupeKey: q.dedupeKey,
     kind: q.kind
   };

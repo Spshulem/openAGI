@@ -204,6 +204,13 @@ export class FleetStore {
     return this._closeQuestion(id, "answered", text);
   }
 
+  markQuestionDelivered(id, threadKey) {
+    const question = this.state.questions.find((q) => q.id === id && q.status === "open");
+    if (!question) return;
+    question.deliveredThreadKeys = [...new Set([...(question.deliveredThreadKeys ?? []), threadKey])];
+    this._save();
+  }
+
   dismissQuestion(id) {
     return this._closeQuestion(id, "dismissed", null);
   }

@@ -107,7 +107,12 @@ function questionTitle(args) {
   try {
     const parsed = typeof args === "string" ? JSON.parse(args) : args;
     const first = parsed?.questions?.[0];
-    return String(first?.title ?? first?.question ?? "").trim() || null;
+    const text = String(first?.title ?? first?.question ?? "").trim();
+    if (!text) return null;
+    const options = (first.options ?? []).map((option) => typeof option === "string" ? option : option?.label).filter(Boolean);
+    // Multiple prompts and free text need the original thread's input surface.
+    const supported = parsed.questions.length === 1 && options.length > 0 && options.length <= 4 && options.every((option) => option.length <= 40);
+    return { text, options: supported ? options : ["open thread"] };
   } catch {
     return null;
   }

@@ -103,3 +103,15 @@ Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max at
 - Codex threads held open by Codex Desktop (writer lock): blocked. Close the thread in Desktop, or send by hand.
 - Not mirrored to the Distiller main: Mac banners and G2 do not show fleet questions yet.
   The data lives only on this Mac's daemon.
+
+## Question delivery
+
+Structured Codex questions keep their original choices (up to four labels of
+40 characters). Free-text or multiple prompts offer **open thread** so you can
+answer in Codex. Failed or unreachable deliveries stay open for another attempt.
+Account-cap recovery remembers successful deliveries when part of a group is
+unreachable, so retrying the group does not resend to those threads.
+
+Switching away from **Propose** invalidates pending Send buttons. The scan CLI
+copies persisted state into a temporary directory when given `--data-dir`; it
+never writes the daemon's state or sends messages.

@@ -451,3 +451,74 @@ test("fleet-scan --data-dir reads a copy and never writes the source store", asy
   fs.writeFileSync(path.join(scratch, "fleet", "state.json"), "{}");
   assert.equal(fs.readFileSync(path.join(source, "fleet", "state.json"), "utf8"), original);
 });
+
+test("unreachable and failed owner answers stay open until delivered", async (t) => {
+  const thread = makeThread({ writerLocked: true, meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] } } });
+  const { supervisor, delivered } = fixture(t, { threads: [thread] });
+  await supervisor.tick();
+  const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  assert.deepEqual(question.options, ["Starter", "Business annual (recommended)"]);
+  assert.equal((await supervisor.answerQuestion(question.id, question.options[1])).question.status, "open");
+  assert.equal(delivered.length, 0);
+  thread.writerLocked = false;
+  await supervisor.tick();
+  assert.equal((await supervisor.answerQuestion(question.id, question.options[1])).question.status, "answered");
+  assert.match(delivered[0].message, /Business annual \(recommended\)/);
+
+  const failed = fixture(t, { threads: [thread], deliverStatus: "failed" });
+  await failed.supervisor.tick();
+  const q = failed.supervisor.getState().questions[0];
+  assert.equal((await failed.supervisor.answerQuestion(q.id, q.options[0])).question.status, "open");
+});
+
+test("partial grouped recovery retains unanswered threads without resending successful ones", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id, writerLocked: id === "b" }));
+  const { supervisor, delivered } = fixture(t, { threads });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["added"], threadKeys: threads.map((x) => x.key) });
+  assert.equal((await supervisor.answerQuestion(q.id, "added")).question.status, "open");
+  supervisor.lastThreads.get("codex:b").writerLocked = false;
+  assert.equal((await supervisor.answerQuestion(q.id, "added")).question.status, "answered");
+  assert.deepEqual(delivered.map((x) => x.thread.key), ["codex:a", "codex:b"]);
+});
+
+test("observe mode invalidates proposed sends", async (t) => {
+  const { supervisor, delivered } = fixture(t, { mode: "propose" });
+  await supervisor.tick();
+  const action = supervisor.getState().actions.find((x) => x.status === "proposed");
+  supervisor.setMode("observe");
+  assert.equal(await supervisor.sendProposed(action.id), null);
+  assert.equal(delivered.length, 0);
+  assert.equal(supervisor.store.action(action.id).status, "stale");
+});
+
+test("login recovery keeps a retry for each stopped thread", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id, agentStatus: "error", error: { kind: "logged-out" } }));
+  const { supervisor, delivered } = fixture(t, { threads });
+  await supervisor.tick();
+  const questions = supervisor.getState().questions.filter((q) => q.options.includes("retry"));
+  assert.equal(questions.length, 2);
+  for (const q of questions) await supervisor.answerQuestion(q.id, "retry");
+  assert.equal(delivered.length, 2);
+});
+
+test("branch discovery reaches new branches before refreshing expired negative lookups", async (t) => {
+  let now = NOW;
+  const lookedUp = [];
+  const { supervisor } = fixture(t, { now: () => now, deps: { findPrForBranch: async (_, branch) => { lookedUp.push(branch); return null; } } });
+  const threads = Array.from({ length: 65 }, (_, i) => makeThread({ branch: `branch-${i}`, prRefs: [] }));
+  for (let i = 0; i < 9; i++) {
+    await supervisor.resolvePrRefs(threads, new Map(), supervisor.config, null, {});
+    now += 5 * MIN;
+  }
+  assert.equal(new Set(lookedUp).size, 65);
+});
+
+test("free text questions send no invented answer", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [makeThread({ meta: { pendingQuestion: { text: "What should it be called?", options: ["open thread"] } } })] });
+  await supervisor.tick();
+  const q = supervisor.getState().questions[0];
+  assert.deepEqual(q.options, ["open thread"]);
+  assert.equal((await supervisor.answerQuestion(q.id, "open thread")).question.status, "open");
+  assert.equal(delivered.length, 0);
+});

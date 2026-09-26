@@ -317,3 +317,9 @@ test("PR #112 round 2: structured Codex questions, earlier force-push context, u
   assert.ok(unknown.blockers.includes("mergeability unknown"));
   assert.equal(unknown.ready, false);
 });
+
+test("matching PR head proves pushed commits even when upstream is main", () => {
+  const readiness = prReadiness(makePr(), { ...cleanGit, upstream: "origin/main", ahead: 12 });
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.blockers, []);
+});

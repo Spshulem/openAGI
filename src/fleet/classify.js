@@ -152,7 +152,7 @@ export function prReadiness(pr, localGit) {
   const blockers = [];
   // A worktree on another branch says nothing about this PR's head.
   const sameBranch = !local.branch || !pr.headRef || local.branch === pr.headRef;
-  if (sameBranch && Number(local.ahead) > 0) blockers.push("unpushed commits");
+  if (sameBranch && local.head !== pr.headOid && Number(local.ahead) > 0) blockers.push("unpushed commits");
   else if (sameBranch && local.head && pr.headOid && local.head !== pr.headOid) blockers.push("local head differs");
 
   const ci = pr.ci ?? {};
@@ -196,7 +196,8 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
   // Codex request_user_input: the real question is structured, not in the text.
   if (thread.meta?.pendingQuestion) {
-    return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", text: String(thread.meta.pendingQuestion), options: ["yes", "no"] } });
+    const pending = thread.meta.pendingQuestion;
+    return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"] } });
   }
 
   // Once the owner replied, the agent's last words are stale.

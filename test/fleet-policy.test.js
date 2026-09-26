@@ -601,3 +601,10 @@ test("PR #112 round 2: fresh upstream-unavailable LB errors mean down; unknown m
   const { decision } = run(makeThread(), { pr: makePr({ mergeable: "UNKNOWN", mergeState: "UNKNOWN" }) });
   assert.equal(decision.action, "wait", "GitHub is still computing mergeability; nudging the agent does nothing");
 });
+
+test("a stopped CI waiter with no checks on head resumes after the wait threshold", () => {
+  const thread = makeThread({ lastAgentText: "Waiting for CI.", lastActivityAt: ago(60 * MIN), lastAgentAt: ago(60 * MIN), lastUserAt: ago(120 * MIN) });
+  const { decision } = run(thread, { pr: makePr({ ci: { state: null, pending: [], failing: [] } }) });
+  assert.equal(decision.action, "nudge");
+  assert.equal(decision.playbook, "merge-ready");
+});

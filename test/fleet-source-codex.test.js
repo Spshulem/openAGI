@@ -308,7 +308,7 @@ test("listCodexThreads reports unknown when the rollout file is gone", async (t)
 test("parseRolloutTail tracks a pending structured question until the owner replies", () => {
   const text = (rows) => rows.map((row) => JSON.stringify(row)).join("\n");
   const pending = parseRolloutTail(text([ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")]));
-  assert.equal(pending.pendingQuestion, "Reuse the branch?");
+  assert.deepEqual(pending.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"] });
   const answered = parseRolloutTail(text([
     ev.ask("Reuse the branch?", 9 * MIN),
     ev.user("<send_user_message_question_reply> [{\"answer\":\"Reuse the branch (recommended)\"}]", 5 * MIN)
@@ -445,4 +445,11 @@ test("listCodexThreads exposes when an aborted turn was stopped", async (t) => {
   assert.equal(map["t-stopped"].lastActivityAt, iso(30 * MIN));
   assert.equal(map["t-stopped"].lastUserAt, iso(30 * MIN + 29_000));
   assert.equal(map["t-done"].meta.abortedAt, null);
+});
+
+test("structured questions preserve string and labeled options", () => {
+  for (const options of [["Starter", "Business annual (recommended)"], [{ label: "Starter", description: "Basic" }, { label: "Business annual (recommended)" }]]) {
+    const row = { type: "response_item", payload: { type: "function_call", name: "request_user_input_async", arguments: JSON.stringify({ questions: [{ title: "Which plan?", options }] }) } };
+    assert.deepEqual(parseRolloutTail(JSON.stringify(row)).pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] });
+  }
 });

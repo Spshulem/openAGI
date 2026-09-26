@@ -107,8 +107,9 @@ export function groupQuestions(asks, byKey) {
     const match = GROUPED_KINDS[kind]?.match;
     const sameChoices = !match || JSON.stringify(decision.question.options) === JSON.stringify(match);
     if (groups[kind] && sameChoices) { groups[kind].push(decision); continue; }
-    if (titles.has(decision.question.title)) continue;
-    titles.add(decision.question.title);
+    const titleKey = kind === "infra" && decision.question.options?.includes("retry") ? `${decision.threadKey}:${decision.question.title}` : decision.question.title;
+    if (titles.has(titleKey)) continue;
+    titles.add(titleKey);
     out.push(single(decision));
   }
   for (const [kind, list] of Object.entries(groups)) {
@@ -172,6 +173,7 @@ export class FleetSupervisor {
     this.lastError = null;
     this.lastThreads = new Map();
     this.branchLookups = new Map();
+    this.answering = new Set();
   }
 
   now() {
@@ -269,6 +271,11 @@ export class FleetSupervisor {
 
   setMode(mode) {
     if (!MODES.includes(mode)) return null;
+    if (mode !== "propose") {
+      for (const action of this.store.actions(this.config.limits.maxActionsKept)) {
+        if (action.status === "proposed") this.store.updateAction(action.id, { status: "stale", detail: "mode changed" });
+      }
+    }
     return this.store.setMode(mode);
   }
 
@@ -292,48 +299,60 @@ export class FleetSupervisor {
     let sent = 0;
     let blocked = 0;
     for (const key of keys) {
+      if (question.deliveredThreadKeys?.includes(key)) { sent += 1; continue; }
       const thread = this.lastThreads.get(key);
       const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
       if (!thread || !route) { blocked += 1; continue; }
       const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
-      if (delivery.status === "sent") sent += 1;
+      if (delivery.status === "sent") {
+        sent += 1;
+        this.store.markQuestionDelivered(question.id, key);
+      }
       else blocked += 1;
     }
-    return { status: sent ? "sent" : "blocked", route: null, detail: `${sent} resumed, ${blocked} not reachable` };
+    return { status: blocked || !sent ? "blocked" : "sent", route: null, detail: `${sent} resumed, ${blocked} not reachable; open the thread and retry if needed` };
   }
 
   async answerQuestion(id, answer) {
+    if (this.answering.has(id)) return null;
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
     if (answer === "dismiss") return { question: this.dismissQuestion(id), delivery: null };
     // Every surface (page, outreach, future callers) gets the same check:
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
-    const answered = this.store.answerQuestion(id, answer);
-    if (!answered) return null;
-    this.resolveOutreach(question, answer, "acted");
-    this.applyOverride(question, answer);
-    let delivery = null;
-    if (question.kind === "limit" && answer === "added") {
-      return { question: this.store.question(id) ?? answered, delivery: await this.resumeAll(question, ADDED_DELIVERY) };
-    }
-    // An owner answer to the agent's own question, or "retry" after the owner
-    // fixed a login/disk blocker, is an explicit instruction: every mode.
-    const retry = question.kind === "infra" && answer === "retry";
-    if ((question.kind === "agent-ask" || retry) && question.threadKey) {
-      const thread = this.lastThreads.get(question.threadKey);
-      const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
-      if (!thread || !route) {
-        delivery = { status: "blocked", route: null, detail: thread ? "no live route: open the thread to answer" : "thread not seen since restart: scan first" };
-      } else {
-        const message = retry ? RETRY_DELIVERY : ownerDelivery(answered.answer);
-        delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
-        // Starts the cooldown but does not spend the no-progress nudge budget.
-        this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    this.answering.add(id);
+    try {
+      let delivery = null;
+      if (question.kind === "limit" && answer === "added") {
+        delivery = await this.resumeAll(question, ADDED_DELIVERY);
       }
+      // An owner answer to the agent's own question, or "retry" after the owner
+      // fixed a login/disk blocker, is an explicit instruction: every mode.
+      const retry = question.kind === "infra" && answer === "retry";
+      if ((question.kind === "agent-ask" || retry) && question.threadKey && answer !== "open thread") {
+        const thread = this.lastThreads.get(question.threadKey);
+        const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
+        if (!thread || !route) {
+          delivery = { status: "blocked", route: null, detail: thread ? "no live route: open the thread to answer" : "thread not seen since restart: scan first" };
+        } else {
+          const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
+          delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+          // Starts the cooldown but does not spend the no-progress nudge budget.
+          this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+        }
+      }
+      // A failed or unreachable delivery remains actionable on every surface.
+      if (delivery && delivery.status !== "sent") return { question: this.store.question(id), delivery };
+      if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
+      const answered = this.store.answerQuestion(id, answer);
+      this.resolveOutreach(question, answer, "acted");
+      this.applyOverride(question, answer);
+      return { question: answered, delivery };
+    } finally {
+      this.answering.delete(id);
     }
-    return { question: this.store.question(id) ?? answered, delivery };
   }
 
   applyOverride(question, answer) {
@@ -347,6 +366,7 @@ export class FleetSupervisor {
   }
 
   async sendProposed(actionId) {
+    if (this.mode !== "propose") return null;
     const action = this.store.action(actionId);
     if (!action || action.status !== "proposed") return null;
     const thread = this.lastThreads.get(action.targetKey);
@@ -497,7 +517,9 @@ export class FleetSupervisor {
     const find = this.deps.findPrForBranch ?? github.findPrForBranch;
     const now = this.now();
     let lookups = 0;
-    for (const thread of inScope) {
+    // Unseen branches precede expired negative results, then oldest first.
+    const candidates = [...inScope].sort((a, b) => (this.branchLookups.get(`${a.repo}:${a.branch}`)?.at ?? -Infinity) - (this.branchLookups.get(`${b.repo}:${b.branch}`)?.at ?? -Infinity));
+    for (const thread of candidates) {
       if (thread.prRefs?.length || !thread.repo || !thread.branch || TRUNK_BRANCHES.has(thread.branch)) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       const cached = this.branchLookups.get(cacheKey);

@@ -353,3 +353,9 @@ test("a background send that fails to run gives its nudge attempt back", async (
   await executor.whenIdle();
   assert.equal(store.ledgerFor("codex:t1").attemptsWithoutProgress, 0);
 });
+
+test("relay only accepts the exact DONE acknowledgement", async (t) => {
+  const { cwd, executor } = setup(t, { results: [{ stdout: "NOT DONE — peer unavailable" }, { stdout: "I could not send it; DONE is required" }] });
+  const thread = claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 4242, status: "idle" } });
+  for (let i = 0; i < 2; i++) assert.equal((await executor.deliver({ thread, message: "continue", route: "peer-relay" })).status, "failed");
+});

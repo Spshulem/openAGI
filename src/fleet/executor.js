@@ -274,7 +274,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     } else {
       const refusal = summariseRelayFailure(stdout, step.cwd);
       if (refusal) detail = `relay failed: ${refusal}`;
-      else if (!/\bDONE\b/i.test(stdout)) detail = `relay did not confirm delivery: ${detailText(stdout) || "(no output)"}`;
+      else if (stdout !== "DONE") detail = `relay did not confirm delivery: ${detailText(stdout) || "(no output)"}`;
     }
     const status = detail ? "failed" : "sent";
     const finalDetail = detail ? detailText(detail) : `relayed to ${thread.live.peerName}`;
