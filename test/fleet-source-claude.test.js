@@ -391,6 +391,15 @@ test("lookback and maxThreads keep only the newest recent transcripts", async (t
   assert.deepEqual(capped.map((thread) => thread.id), ["new-1", "new-2"]);
 });
 
+test("excluded transcripts do not use up the maxThreads budget", async (t) => {
+  const home = makeHome(t);
+  const ages = { "tmp-1": [5 * MIN, "/tmp/scratch"], "tmp-2": [10 * MIN, "/tmp/scratch"], "real-1": [60 * MIN, "/Users/x/Dev/repo"], "real-2": [70 * MIN, "/Users/x/Dev/repo"], "real-3": [80 * MIN, "/Users/x/Dev/repo"] };
+  for (const [id, [ago, cwd]] of Object.entries(ages)) writeTranscript(home, cwd, id, rowsFor(id, cwd).history(ago + 20 * MIN), NOW - ago);
+  const threads = await listClaudeThreads(makeConfig(home, { limits: { maxThreads: 2 } }), { now: NOW, isPidAlive: () => false });
+  assert.deepEqual(threads.map((thread) => thread.id), ["tmp-1", "tmp-2", "real-1", "real-2"]);
+  assert.deepEqual(threads.filter((thread) => thread.excluded).map((thread) => thread.excluded), ["tmp", "tmp"]);
+});
+
 test("only the tail is read and agent text is redacted and clamped", async (t) => {
   const home = makeHome(t);
   const cwd = "/Users/x/Dev/repo";

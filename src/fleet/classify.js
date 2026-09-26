@@ -154,6 +154,8 @@ export function prReadiness(pr, localGit) {
   const sameBranch = !local.branch || !pr.headRef || local.branch === pr.headRef;
   if (sameBranch && local.head !== pr.headOid && Number(local.ahead) > 0) blockers.push("unpushed commits");
   else if (sameBranch && local.head && pr.headOid && local.head !== pr.headOid) blockers.push("local head differs");
+  // Unpushed work cannot be ruled out when git did not answer.
+  else if (local.unreadable) blockers.push("local git unknown");
 
   const ci = pr.ci ?? {};
   if (CI_RED.has(ci.state) || ci.failing?.length) blockers.push(`CI red: ${ciNames(ci.failing)}`);

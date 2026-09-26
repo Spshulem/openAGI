@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import {
   buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStates, findPrForBranch, normalizePr, readLocalGit
@@ -285,11 +288,25 @@ test("findPrForBranch prefers an open PR, then the newest", async () => {
   assert.equal(await findPrForBranch(BBAPP, "feature/ai-chat-inline-connect", config(), { run }), `${BBAPP}#6878`);
   assert.equal(calls[0].cmd, "/fake/gh");
   assert.deepEqual(calls[0].args, [
-    "pr", "list", "--repo", BBAPP, "--head", "feature/ai-chat-inline-connect", "--state", "all", "--json", "number,state,updatedAt"
+    "pr", "list", "--repo", BBAPP, "--head", "feature/ai-chat-inline-connect", "--state", "all", "--json", "number,state,updatedAt,headRefOid"
   ]);
 
   const closedOnly = fakeRun(() => ok([rows[0], rows[2]]));
   assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: closedOnly.run }), `${BBAPP}#6801`);
+});
+
+test("findPrForBranch skips a closed PR whose head is not the local head", async () => {
+  const rows = [
+    { number: 6801, state: "MERGED", updatedAt: "2026-09-26T08:00:00Z", headRefOid: "aaa" },
+    { number: 6700, state: "CLOSED", updatedAt: "2026-09-20T00:00:00Z", headRefOid: "bbb" }
+  ];
+  const { run } = fakeRun(() => ok(rows));
+  // A reused branch with new local work has no PR yet.
+  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run, head: "ccc" }), null);
+  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run, head: "bbb" }), `${BBAPP}#6700`);
+  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run }), `${BBAPP}#6801`);
+  const open = fakeRun(() => ok([...rows, { number: 6900, state: "OPEN", updatedAt: "2026-09-26T09:00:00Z", headRefOid: "ddd" }]));
+  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: open.run, head: "ccc" }), `${BBAPP}#6900`);
 });
 
 test("findPrForBranch returns null for bad input, no PRs, or failures", async () => {
@@ -346,6 +363,23 @@ test("readLocalGit returns all null for a missing dir or a throwing runner", asy
   assert.equal(calls.length, 1);
   assert.deepEqual(await readLocalGit(null, config(), { run }), empty);
   assert.deepEqual(await readLocalGit("/x", config(), { run: async () => { throw new Error("EPERM"); } }), empty);
+});
+
+test("readLocalGit marks a failed read inside a repo as unreadable", async (t) => {
+  const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null };
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-git-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.mkdirSync(path.join(root, "plain"));
+  const failing = async () => ({ code: 128, stdout: "", stderr: "fatal" });
+  // Git did not answer inside a repo: unpushed work cannot be ruled out.
+  assert.deepEqual(await readLocalGit(repo, config(), { run: failing }), { ...empty, unreadable: true });
+  assert.deepEqual(await readLocalGit(path.join(repo, "src"), config(), { run: failing }), { ...empty, unreadable: true });
+  // A non-repo cwd or a deleted worktree has no local head to protect.
+  assert.deepEqual(await readLocalGit(path.join(root, "plain"), config(), { run: failing }), empty);
+  assert.deepEqual(await readLocalGit(path.join(root, "gone"), config(), { run: failing }), empty);
 });
 
 test("a file list cut at 100 never waives UI QA", () => {

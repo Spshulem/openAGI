@@ -287,14 +287,15 @@ test("listCodexThreads ignores supervisor nudges and injected context when track
   assert.equal(thread.meta.lastSupervisorAt, iso(20 * MIN));
 });
 
-test("listCodexThreads degrades to [] when the state database is missing or broken", async (t) => {
+test("listCodexThreads returns [] without a state database and throws when it is broken", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-codex-empty-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const config = resolveFleetConfig({}, { home });
   assert.deepEqual(await listCodexThreads(config, { now: NOW }), []);
   fs.mkdirSync(path.join(home, ".codex"));
   fs.writeFileSync(path.join(home, ".codex", "state_5.sqlite"), "not a database");
-  assert.deepEqual(await listCodexThreads(config, { now: NOW }), []);
+  // Unreadable is unknown, not empty: the supervisor records a source error.
+  await assert.rejects(listCodexThreads(config, { now: NOW }));
 });
 
 test("listCodexThreads reports unknown when the rollout file is gone", async (t) => {
@@ -316,6 +317,17 @@ test("parseRolloutTail tracks a pending structured question until the owner repl
   assert.equal(answered.pendingQuestion, null);
   assert.equal(parseRolloutTail("").lifecycle, null);
   assert.equal(parseRolloutTail("{bad json\n").lifecycle, null);
+});
+
+test("listCodexThreads keeps a structured question's text and options", async (t) => {
+  const ctx = makeHome(t);
+  const ask = ev.ask("unused", 9 * MIN);
+  ask.payload.arguments = JSON.stringify({ questions: [{ title: "Which plan?", options: [{ label: "Starter" }, { label: "Business annual (recommended)" }] }] });
+  addThread(ctx, { id: "t-ask", lines: [ev.started("q", 10 * MIN), ask, ev.complete("q", 8 * MIN, "asked")] });
+  addThread(ctx, { id: "t-free", lines: [ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.deepEqual(map["t-ask"].meta.pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] });
+  assert.deepEqual(map["t-free"].meta.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"] });
 });
 
 test("cleanCodexUserText strips Codex Desktop wrappers", () => {

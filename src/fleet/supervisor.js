@@ -294,7 +294,7 @@ export class FleetSupervisor {
     try { this.runtime?.outreach?.resolve?.(question.outreachId, decision, { status }); } catch { /* best-effort */ }
   }
 
-  async resumeAll(question, message) {
+  async resumeAll(question, message, settling = []) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
     let sent = 0;
     let blocked = 0;
@@ -308,6 +308,7 @@ export class FleetSupervisor {
       if (delivery.status === "sent") {
         sent += 1;
         this.store.markQuestionDelivered(question.id, key);
+        if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : key)));
       }
       else blocked += 1;
     }
@@ -325,8 +326,9 @@ export class FleetSupervisor {
     this.answering.add(id);
     try {
       let delivery = null;
+      const settling = [];
       if (question.kind === "limit" && answer === "added") {
-        delivery = await this.resumeAll(question, ADDED_DELIVERY);
+        delivery = await this.resumeAll(question, ADDED_DELIVERY, settling);
       }
       // An owner answer to the agent's own question, or "retry" after the owner
       // fixed a login/disk blocker, is an explicit instruction: every mode.
@@ -339,20 +341,37 @@ export class FleetSupervisor {
         } else {
           const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
           delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+          if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
           // Starts the cooldown but does not spend the no-progress nudge budget.
           this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
         }
       }
       // A failed or unreachable delivery remains actionable on every surface.
-      if (delivery && delivery.status !== "sent") return { question: this.store.question(id), delivery };
+      if (delivery && delivery.status !== "sent") {
+        this.reopenIfUndelivered(id, settling);
+        return { question: this.store.question(id), delivery };
+      }
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
       this.resolveOutreach(question, answer, "acted");
       this.applyOverride(question, answer);
+      this.reopenIfUndelivered(id, settling);
       return { question: answered, delivery };
     } finally {
       this.answering.delete(id);
     }
+  }
+
+  // A background resume reports its exit only later. Attached after the
+  // answer was recorded, so even an instant failure finds the final state.
+  reopenIfUndelivered(id, settling) {
+    if (!settling.length) return;
+    Promise.all(settling)
+      .then((keys) => {
+        const failed = keys.filter(Boolean);
+        if (failed.length) this.store.reopenQuestion(id, failed);
+      })
+      .catch(() => { /* best-effort */ });
   }
 
   applyOverride(question, answer) {
@@ -437,7 +456,8 @@ export class FleetSupervisor {
     const items = [];
     for (const thread of inScope) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
-      const git = localGit.get(thread.cwd) ?? null;
+      // No result for a worktree means git timed out or threw: unknown, not clean.
+      const git = localGit.get(thread.cwd) ?? (thread.cwd ? { unreadable: true } : null);
       let classified;
       try {
         classified = classifyThread(thread, { pr, localGit: git, infra, now: started, config });
@@ -468,7 +488,10 @@ export class FleetSupervisor {
     if (manager) byKey.set(manager.key, manager);
     this.lastThreads = byKey;
 
-    await this.act(decisions, { mode, byKey, manager, started, config, items });
+    // A thread source that failed this tick is unknown, not empty: its
+    // actions and questions wait for a tick that can see it.
+    const unknownKinds = new Set(["codex", "claude", "conductor"].filter((kind) => sourceErrors[kind]));
+    await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds });
 
     const finished = this.now();
     const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager });
@@ -530,7 +553,10 @@ export class FleetSupervisor {
       if (lookups >= MAX_BRANCH_LOOKUPS) continue;
       lookups += 1;
       try {
-        const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run })), 20_000, "pr lookup");
+        // The local head tells a reused branch's new work from its old closed PR.
+        const git = localGit.get(thread.cwd);
+        const head = git?.branch === thread.branch ? git.head : null;
+        const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head })), 20_000, "pr lookup");
         this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now });
         if (ref) thread.prRefs = [ref];
       } catch (error) {
@@ -552,8 +578,9 @@ export class FleetSupervisor {
     }
   }
 
-  async act(decisions, { mode, byKey, manager, started, config }) {
+  async act(decisions, { mode, byKey, manager, started, config, unknownKinds = new Set() }) {
     const store = this.store;
+    const unknown = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     const at = new Date(started).toISOString();
     const asked = new Set();
     const openActions = store.actions(config.limits.maxActionsKept).filter((action) => OPEN_ACTION.has(action.status));
@@ -597,12 +624,13 @@ export class FleetSupervisor {
 
     // A planned/proposed action the policy no longer wants is stale.
     for (const action of openActions) {
-      if (!seenActions.has(action.id)) store.updateAction(action.id, { status: "stale" });
+      if (!seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
     }
     // A question whose condition is gone closes itself once its thread was
     // decided again this tick without asking.
     for (const question of store.openQuestions()) {
       if (asked.has(question.dedupeKey)) continue;
+      if (unknown(question.threadKeys ?? [question.threadKey])) continue;
       const decided = question.threadKey ? decisions.some((decision) => decision.threadKey === question.threadKey) : false;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
       if (decided || supervisorOwned) {

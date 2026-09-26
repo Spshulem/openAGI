@@ -209,6 +209,24 @@ test("outreach answers and dismissals on fleet items reach the supervisor", asyn
   assert.equal(late.body.item.status, "error");
 });
 
+test("an outreach answer the agent never got keeps the item actionable", async (t) => {
+  const { json, fleet, runtime } = await boot(t);
+  fleet.answerQuestion = async (id, answer) => {
+    fleet.calls.push(["answerQuestion", id, answer]);
+    return { question: { id, status: "open" }, delivery: { status: "blocked", route: null, detail: "no live route: open the thread to answer" } };
+  };
+  const ask = runtime.outreach.append({
+    type: "fleet-question", sourceRef: { kind: "fleet", id: "fq_answer" }, title: "Merge #1?", summary: "",
+    needsDecision: true, actions: ["yes", "no", "dismiss"], dedupeOpen: true
+  });
+  const blocked = await json("/outreach/" + ask.id + "/act", { action: "yes" });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.body.error, /no live route/);
+  assert.equal(runtime.outreach.get(ask.id).status, "unseen");
+  assert.equal((await json("/outreach/" + ask.id + "/act", { action: "yes" })).status, 409);
+  assert.equal(fleet.calls.filter(([name]) => name === "answerQuestion").length, 2);
+});
+
 test("fleet events reach SSE clients", async (t) => {
   const { url, runtime } = await boot(t);
   const controller = new AbortController();

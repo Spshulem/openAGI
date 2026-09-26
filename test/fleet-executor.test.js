@@ -345,6 +345,31 @@ test("spawnWithTail keeps only the output tail and never throws", async () => {
   assert.equal(slow.timedOut, true);
 });
 
+test("spawnWithTail settles after a timeout even if SIGTERM is ignored or a descendant holds the pipes", async (t) => {
+  const within = (promise) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error("never settled")), 5000))]);
+  const stubborn = await within(spawnWithTail(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { timeoutMs: 100, killGraceMs: 200 }));
+  assert.equal(stubborn.timedOut, true);
+  const parent = "const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' }); process.stdout.write(c.pid + '\\n'); setInterval(() => {}, 1000)";
+  const held = await within(spawnWithTail(process.execPath, ["-e", parent], { timeoutMs: 300, killGraceMs: 200 }));
+  assert.equal(held.timedOut, true);
+  const grandchild = Number(held.tail.trim().split("\n")[0]);
+  t.after(() => { try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ } });
+  assert.ok(grandchild > 0);
+});
+
+test("a background send reports later whether it reached the agent", async (t) => {
+  const failed = setup(t, { results: [{ code: 1, stderr: "error: thread has an active writer" }] });
+  const sent = await failed.executor.deliver({ thread: codexThread(failed.cwd), message: "Owner answer: Starter.", route: "codex-exec" });
+  assert.equal(sent.status, "sent");
+  assert.equal(await sent.done, false);
+  // The outcome stays off the JSON the routes return.
+  assert.equal(JSON.stringify(sent).includes("done"), false);
+  const timedOut = setup(t, { results: [{ code: null, timedOut: true }] });
+  assert.equal(await (await timedOut.executor.deliver({ thread: codexThread(timedOut.cwd), message: "hi", route: "codex-exec" })).done, true);
+  const okay = setup(t, { results: [{ code: 0, stdout: "done" }] });
+  assert.equal(await (await okay.executor.deliver({ thread: codexThread(okay.cwd), message: "hi", route: "codex-exec" })).done, true);
+});
+
 test("a background send that fails to run gives its nudge attempt back", async (t) => {
   const { cwd, store, executor } = setup(t, { results: [{ code: 1, stderr: "boom" }] });
   store.recordNudge("codex:t1", { playbook: "merge-ready", route: "codex-exec", status: "sent" }, { head: "h", unresolved: 1 });

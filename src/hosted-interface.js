@@ -3874,6 +3874,9 @@ async function applyOutreachAction(runtime, item, action, note) {
     case "fleet": {
       const r = await runtime.fleetSupervisor?.answerQuestion(ref.id, action);
       if (!r) throw new Error("fleet question not answerable");
+      // Blocked, failed, or "open thread": the agent has no answer yet, so
+      // the item stays actionable.
+      if (r.question?.status === "open") throw outreachActionConflict(r.delivery?.detail ?? "fleet answer not delivered; the question is still open");
       return;
     }
     case "skill-candidate": {

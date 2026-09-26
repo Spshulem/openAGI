@@ -352,18 +352,25 @@ export async function listClaudeThreads(config, options = {}) {
   try {
     const { now = Date.now(), isPidAlive = defaultIsPidAlive, tailBytes = DEFAULT_TAIL_BYTES } = options;
     const cutoff = now - config.lookbackHours * 3_600_000;
+    // Excluded transcripts (tmp, relay, too short) do not count toward the
+    // cap, so read extra and stop once enough in-scope threads are found.
     const files = recentTranscripts(path.join(config.paths.claudeHome, "projects"), cutoff)
       .sort((a, b) => b.mtimeMs - a.mtimeMs || a.id.localeCompare(b.id))
-      .slice(0, config.limits.maxThreads);
+      .slice(0, config.limits.maxThreads * 5);
     if (!files.length) return [];
     const peers = options.peers ?? readLivePeers(config, { isPidAlive });
     const threads = [];
+    let inScope = 0;
     for (const entry of files) {
+      if (inScope >= config.limits.maxThreads) break;
       try {
         const summary = summarizeTranscript(parseJsonLines(readTail(entry.file, tailBytes)));
         const thread = buildThread(entry, summary, { config, now, peers });
         // The mtime pre-filter lets metadata-only writes through; the last turn decides.
-        if (!(Date.parse(thread.lastActivityAt ?? "") < cutoff)) threads.push(thread);
+        if (!(Date.parse(thread.lastActivityAt ?? "") < cutoff)) {
+          threads.push(thread);
+          if (!thread.excluded) inScope += 1;
+        }
       } catch {
         // One unreadable transcript never hides the rest.
       }

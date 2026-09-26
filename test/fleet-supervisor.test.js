@@ -522,3 +522,101 @@ test("free text questions send no invented answer", async (t) => {
   assert.equal((await supervisor.answerQuestion(q.id, "open thread")).question.status, "open");
   assert.equal(delivered.length, 0);
 });
+
+// A fake background send: "sent" now, whether it reached the agent later.
+function backgroundExecutor(reachedFor) {
+  const delivered = [];
+  return {
+    delivered,
+    deliver: async (args) => {
+      delivered.push(args);
+      const sent = { status: "sent", route: args.route, detail: "started in background", actionId: null };
+      Object.defineProperty(sent, "done", { value: Promise.resolve(reachedFor(args.thread.key)) });
+      return sent;
+    },
+    inFlight: () => [],
+    whenIdle: async () => {}
+  };
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test("an owner answer reopens when its background send fails after launch", async (t) => {
+  const thread = makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] } } });
+  const failing = backgroundExecutor(() => false);
+  const { supervisor } = fixture(t, { threads: [thread], deps: { executor: failing } });
+  await supervisor.tick();
+  const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  supervisor.store.markQuestionNotified(question.id, { outreachId: "out_1" });
+  const result = await supervisor.answerQuestion(question.id, "Starter");
+  assert.equal(result.question.status, "answered");
+  await settle();
+  const reopened = supervisor.store.question(question.id);
+  assert.equal(reopened.status, "open");
+  // The overlay copy was resolved as acted, so the notifier posts it again.
+  assert.equal(reopened.outreachId, null);
+  await supervisor.tick();
+  assert.ok(supervisor.getState().questions.some((q) => q.id === question.id));
+
+  const reaching = fixture(t, { threads: [thread], deps: { executor: backgroundExecutor(() => true) } });
+  await reaching.supervisor.tick();
+  const q = reaching.supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await reaching.supervisor.answerQuestion(q.id, "Starter");
+  await settle();
+  assert.equal(reaching.supervisor.store.question(q.id).status, "answered");
+});
+
+test("a grouped resume retries only the threads whose background send failed", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id }));
+  const executor = backgroundExecutor((key) => key !== "codex:b");
+  const { supervisor } = fixture(t, { threads, deps: { executor } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["added"], threadKeys: threads.map((x) => x.key) });
+  assert.equal((await supervisor.answerQuestion(q.id, "added")).question.status, "answered");
+  await settle();
+  const reopened = supervisor.store.question(q.id);
+  assert.equal(reopened.status, "open");
+  assert.deepEqual(reopened.deliveredThreadKeys, ["codex:a"]);
+  executor.delivered.length = 0;
+  await supervisor.answerQuestion(q.id, "added");
+  assert.deepEqual(executor.delivered.map((x) => x.thread.key), ["codex:b"]);
+});
+
+test("a failed Codex source keeps its proposals and grouped questions open", async (t) => {
+  let broken = false;
+  const thread = makeThread();
+  const { supervisor } = fixture(t, {
+    mode: "propose",
+    threads: [thread],
+    deps: { listCodexThreads: async () => { if (broken) throw new Error("database is locked"); return [thread]; } }
+  });
+  await supervisor.tick();
+  const proposed = supervisor.getState().actions.find((a) => a.status === "proposed");
+  assert.ok(proposed);
+  const group = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "limit:group", title: "2 threads capped", options: ["wait", "added"], threadKeys: [thread.key, "codex:t2"] });
+  broken = true;
+  const snapshot = await supervisor.tick();
+  assert.match(snapshot.sourceErrors.codex, /locked/);
+  assert.equal(supervisor.store.action(proposed.id).status, "proposed");
+  assert.equal(supervisor.store.question(group.id).status, "open");
+  broken = false;
+  await supervisor.tick();
+  assert.equal(supervisor.store.action(proposed.id).status, "proposed");
+});
+
+test("a worktree whose git read failed is never offered as ready to merge", async (t) => {
+  const green = makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  const { supervisor } = fixture(t, { prs: new Map([["acme/app#7", green]]), deps: { readLocalGit: async () => { throw new Error("git timed out"); } } });
+  const snapshot = await supervisor.tick();
+  assert.equal(snapshot.threads[0].state, "pr-not-ready");
+  assert.deepEqual(snapshot.threads[0].blockers, ["local git unknown"]);
+  assert.equal(supervisor.getState().questions.length, 0);
+});
+
+test("branch discovery passes the local head so a reused branch skips its old PR", async (t) => {
+  const seen = [];
+  const thread = makeThread({ prRefs: [] });
+  const { supervisor } = fixture(t, { threads: [thread], deps: { findPrForBranch: async (repo, branch, config, opts) => { seen.push(opts.head); return null; } } });
+  await supervisor.tick();
+  assert.deepEqual(seen, [HEAD]);
+});

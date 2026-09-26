@@ -276,8 +276,9 @@ function applyRollout(thread, row, context) {
   thread.meta.abortReason = aborted ? (summary.lifecycle.payload.reason ?? null) : null;
   thread.meta.abortedAt = aborted ? summary.lifecycle.at : null;
   thread.meta.lastSupervisorAt = summary.lastSupervisorAt;
-  thread.meta.pendingQuestion = summary.pendingQuestion
-    ? clampText(redactSecrets(summary.pendingQuestion), limits.bodyMax)
+  const pending = summary.pendingQuestion;
+  thread.meta.pendingQuestion = pending
+    ? { text: clampText(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)) }
     : null;
   // A Codex heartbeat automation already drives this thread; nudging it too
   // would double up.
@@ -448,30 +449,30 @@ export async function listCodexThreads(config, options = {}) {
   const run = options.run ?? runCommand;
   const isPidAlive = options.isPidAlive ?? defaultIsPidAlive;
   const limits = config.limits;
+  const file = path.join(config.paths.codexHome, "state_5.sqlite");
+  // No Codex install is an empty catalog. An unreadable one throws, so the
+  // supervisor records a source error instead of seeing zero threads.
+  if (!fs.existsSync(file)) return [];
+  const db = await openReadOnlyDb(file);
+  if (!db) throw new Error("Codex state database unavailable");
+  let rows;
+  let attachments;
   try {
-    const db = await openReadOnlyDb(path.join(config.paths.codexHome, "state_5.sqlite"));
-    if (!db) return [];
-    let rows;
-    let attachments;
-    try {
-      // Guardian reviews dominate the catalog; fetch extra so the cap below
-      // never drops a real thread in favour of an excluded one.
-      rows = readThreadRows(db, now - config.lookbackHours * HOUR, limits.maxThreads * 5);
-      attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
-    } finally {
-      try { db.close(); } catch { /* already closed */ }
-    }
-    const context = { config, now, attachments, tailBytes: options.tailBytes ?? TAIL_BYTES };
-    // The catalog query lets settings-only writes through; the last turn decides.
-    const cutoff = now - config.lookbackHours * HOUR;
-    const built = rows.map((row) => buildThread(row, context)).filter((thread) => !(Date.parse(thread.lastActivityAt ?? "") < cutoff));
-    const threads = capThreads(built, limits.maxThreads);
-    const locked = await readWriterLocks(config, threads.map((thread) => thread.id), { run, isPidAlive });
-    for (const thread of threads) thread.writerLocked = locked.has(thread.id);
-    return threads;
-  } catch {
-    return [];
+    // Guardian reviews dominate the catalog; fetch extra so the cap below
+    // never drops a real thread in favour of an excluded one.
+    rows = readThreadRows(db, now - config.lookbackHours * HOUR, limits.maxThreads * 5);
+    attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
+  } finally {
+    try { db.close(); } catch { /* already closed */ }
   }
+  const context = { config, now, attachments, tailBytes: options.tailBytes ?? TAIL_BYTES };
+  // The catalog query lets settings-only writes through; the last turn decides.
+  const cutoff = now - config.lookbackHours * HOUR;
+  const built = rows.map((row) => buildThread(row, context)).filter((thread) => !(Date.parse(thread.lastActivityAt ?? "") < cutoff));
+  const threads = capThreads(built, limits.maxThreads);
+  const locked = await readWriterLocks(config, threads.map((thread) => thread.id), { run, isPidAlive });
+  for (const thread of threads) thread.writerLocked = locked.has(thread.id);
+  return threads;
 }
 
 // ---------- LB retry errors ----------

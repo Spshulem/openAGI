@@ -608,3 +608,11 @@ test("a stopped CI waiter with no checks on head resumes after the wait threshol
   assert.equal(decision.action, "nudge");
   assert.equal(decision.playbook, "merge-ready");
 });
+
+test("local git the supervisor could not read waits instead of asking to merge or nudging", () => {
+  const { decision } = run(makeThread(), { localGit: { unreadable: true } });
+  assert.equal(decision.action, "wait");
+  assert.equal(decision.question ?? null, null);
+  assert.equal(decision.playbook ?? null, null);
+  assert.match(decision.reason, /local git unknown/);
+});

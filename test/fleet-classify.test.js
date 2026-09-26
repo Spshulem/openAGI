@@ -318,6 +318,18 @@ test("PR #112 round 2: structured Codex questions, earlier force-push context, u
   assert.equal(unknown.ready, false);
 });
 
+test("local git that could not be read blocks readiness", () => {
+  const unreadable = { head: null, branch: null, upstream: null, ahead: null, remote: null, unreadable: true };
+  const readiness = prReadiness(makePr(), unreadable);
+  assert.equal(readiness.ready, false);
+  assert.deepEqual(readiness.blockers, ["local git unknown"]);
+  // No worktree read at all (no cwd) keeps the GitHub-only answer.
+  assert.equal(prReadiness(makePr(), null).ready, true);
+  const classified = classifyThread(makeThread(), { pr: makePr(), localGit: unreadable, now: NOW, config });
+  assert.equal(classified.state, "pr-not-ready");
+  assert.deepEqual(classified.blockers, ["local git unknown"]);
+});
+
 test("matching PR head proves pushed commits even when upstream is main", () => {
   const readiness = prReadiness(makePr(), { ...cleanGit, upstream: "origin/main", ahead: 12 });
   assert.equal(readiness.ready, true);

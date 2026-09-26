@@ -215,6 +215,20 @@ export class FleetStore {
     return this._closeQuestion(id, "dismissed", null);
   }
 
+  // A background send that never reached the agent puts the owner's answer
+  // back in front of them instead of suppressing the question for a day,
+  // and a retry sends to those threads again.
+  reopenQuestion(id, undeliveredKeys = []) {
+    const question = this._findQuestion(id);
+    if (!question || !["open", "answered"].includes(question.status)) return null;
+    if (question.status === "answered") {
+      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, updatedAt: iso(this.now()) });
+    }
+    if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));
+    this._save();
+    return { ...question };
+  }
+
   // The supervisor closes a question itself once the condition behind it is gone.
   resolveQuestion(id) {
     return this._closeQuestion(id, "resolved", null);

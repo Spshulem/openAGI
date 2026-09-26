@@ -16,6 +16,8 @@ const RELAY_TIMEOUT_MS = 180_000;
 // A resumed turn can run for an hour (CI waits, bb-quick). Only the child we
 // spawned is ever killed, and only after this ceiling.
 const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+// After the ceiling, SIGTERM gets this long before SIGKILL settles the send.
+const KILL_GRACE_MS = 10_000;
 // Codex exec echoes everything it runs (logs reached 168 MB), so only the
 // tail is kept in memory and on disk.
 const TAIL_CHARS = 64 * 1024;
@@ -115,7 +117,7 @@ function withPrefix(message) {
 }
 
 // Spawns a long-running child without holding its whole output. Never throws.
-export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND_TIMEOUT_MS } = {}) {
+export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND_TIMEOUT_MS, killGraceMs = KILL_GRACE_MS } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -127,6 +129,7 @@ export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND
     let tail = "";
     let timedOut = false;
     let settled = false;
+    let killTimer = null;
     const keep = (chunk) => {
       tail += chunk.toString("utf8");
       if (tail.length > TAIL_CHARS * 2) tail = tail.slice(-TAIL_CHARS);
@@ -135,11 +138,20 @@ export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(killTimer);
       resolve({ ...result, tail: tail.slice(-TAIL_CHARS) });
     };
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill("SIGTERM"); } catch { /* already gone */ }
+      // A child that ignores SIGTERM, or a descendant still holding the
+      // pipes, must not leave the thread "in flight" forever.
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish({ code: null, timedOut: true, error: null });
+      }, killGraceMs);
     }, timeoutMs);
     child.stdout.on("data", keep);
     child.stderr.on("data", keep);
@@ -284,6 +296,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
 
   const launch = (thread, step, base, actionId, env) => {
     const id = journal(actionId, { ...base, status: "sent", running: true, detail: "started", startedAt: new Date().toISOString() });
+    let reached = true;
     const task = Promise.resolve()
       .then(() => background(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs: BACKGROUND_TIMEOUT_MS }))
       .catch((error) => ({ code: null, timedOut: false, error: error?.message ?? String(error) }))
@@ -292,6 +305,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
         // Spawn errors and non-zero exits never reached the agent, so they
         // must not count toward "N nudges without progress". A timeout did.
         if (!ok && !result?.timedOut) {
+          reached = false;
           try { store?.undoAttempt?.(thread.key); } catch { /* best-effort */ }
         }
         if (!id) return;
@@ -314,7 +328,11 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
         pending.delete(task);
       });
     pending.add(task);
-    return { status: "sent", route: base.route, detail: "started in background", actionId: id };
+    const sent = { status: "sent", route: base.route, detail: "started in background", actionId: id };
+    // Resolves to whether the child reached the agent. Not enumerable, so the
+    // delivery JSON the routes return stays the same.
+    Object.defineProperty(sent, "done", { value: task.then(() => reached) });
+    return sent;
   };
 
   async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null } = {}) {

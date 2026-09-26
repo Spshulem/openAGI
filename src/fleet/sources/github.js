@@ -3,6 +3,8 @@
 // is a gh/git query. Nothing here throws; failures leave refs out of the map
 // or return nulls.
 
+import fs from "node:fs";
+import path from "node:path";
 import { clampText, parsePrRef, prRefKey, repoFromRemote, runCommand } from "../contracts.js";
 
 const BATCH_SIZE = 20;
@@ -187,13 +189,13 @@ export async function fetchPrStates(refs, config, { run = runCommand } = {}) {
   return out;
 }
 
-export async function findPrForBranch(repo, branch, config, { run = runCommand } = {}) {
+export async function findPrForBranch(repo, branch, config, { run = runCommand, head = null } = {}) {
   const name = String(branch ?? "").trim();
   if (!REPO_PATTERN.test(String(repo ?? "")) || !name || name.startsWith("-") || NON_PR_BRANCHES.has(name)) return null;
   let result;
   try {
     result = await run(config.bins.gh, [
-      "pr", "list", "--repo", repo, "--head", name, "--state", "all", "--json", "number,state,updatedAt"
+      "pr", "list", "--repo", repo, "--head", name, "--state", "all", "--json", "number,state,updatedAt,headRefOid"
     ], { timeoutMs: GH_TIMEOUT_MS });
   } catch {
     return null;
@@ -204,7 +206,11 @@ export async function findPrForBranch(repo, branch, config, { run = runCommand }
   if (!candidates.length) return null;
   const newestFirst = (a, b) => (Date.parse(b.updatedAt ?? "") || 0) - (Date.parse(a.updatedAt ?? "") || 0);
   const open = candidates.filter((row) => row.state === "OPEN").sort(newestFirst);
-  const pick = open[0] ?? candidates.sort(newestFirst)[0];
+  // A reused branch name: a closed PR only counts if it holds the local head,
+  // or the new work would read as already done.
+  const closed = candidates.filter((row) => !head || !row.headRefOid || row.headRefOid === head).sort(newestFirst);
+  const pick = open[0] ?? closed[0];
+  if (!pick) return null;
   return prRefKey(repo, pick.number);
 }
 
@@ -221,12 +227,27 @@ async function gitLine(run, config, cwd, args) {
   }
 }
 
+// A .git at or above dir means a failed read is git not answering, not
+// "no repo here".
+function insideRepo(dir) {
+  try {
+    if (!fs.statSync(dir).isDirectory()) return false;
+    for (let current = path.resolve(dir); ; current = path.dirname(current)) {
+      if (fs.existsSync(path.join(current, ".git"))) return true;
+      if (path.dirname(current) === current) return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
 export async function readLocalGit(cwd, config, { run = runCommand } = {}) {
   const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null };
   if (!cwd) return empty;
   // A missing dir, a denied volume, or a non-repo all fail here; skip the rest.
+  // Inside a repo the failure is unknown local state, which blocks readiness.
   const head = await gitLine(run, config, cwd, ["rev-parse", "HEAD"]);
-  if (!head) return empty;
+  if (!head) return insideRepo(cwd) ? { ...empty, unreadable: true } : empty;
   const [branch, upstream, remoteUrl] = await Promise.all([
     gitLine(run, config, cwd, ["rev-parse", "--abbrev-ref", "HEAD"]),
     gitLine(run, config, cwd, ["rev-parse", "--abbrev-ref", "@{u}"]),
