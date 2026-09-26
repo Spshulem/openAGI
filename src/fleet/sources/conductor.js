@@ -142,7 +142,9 @@ function statusAndError(sessionStatus, lastEnd, now, excerptMax) {
     return { agentStatus: "aborted", error: null, abortReason: "aborted by user" };
   }
   if (lastEnd?.isError) {
-    const classified = classifyErrorText(lastEnd.text, new Date(now)) ?? { kind: "other", resetAt: null };
+    // "resets 12am" is relative to when the error was written, not to now.
+    const at = Date.parse(lastEnd.at ?? "");
+    const classified = classifyErrorText(lastEnd.text, new Date(Number.isFinite(at) ? at : now)) ?? { kind: "other", resetAt: null };
     const error = { kind: classified.kind, text: clampText(redactSecrets(lastEnd.text), excerptMax), resetAt: classified.resetAt };
     return { agentStatus: "error", error, abortReason: null };
   }

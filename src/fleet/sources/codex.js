@@ -220,7 +220,9 @@ function errorFor(lifecycle, now, limits) {
   if (!source) return null;
   const message = typeof source === "string" ? source : String(source.message ?? "");
   const code = typeof source === "string" ? null : errorCode(source.codex_error_info ?? source.codexErrorInfo);
-  const classified = classifyCodexErrorCode(code, message, new Date(now)) ?? { kind: "other", resetAt: null };
+  // "Try again at 1:11 AM" is relative to when the error was written, not to now.
+  const at = Date.parse(lifecycle.at ?? "");
+  const classified = classifyCodexErrorCode(code, message, new Date(Number.isFinite(at) ? at : now)) ?? { kind: "other", resetAt: null };
   return { kind: classified.kind, text: clampText(redactSecrets(message), limits.excerptMax), resetAt: classified.resetAt ?? null };
 }
 

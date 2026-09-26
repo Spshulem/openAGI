@@ -31,7 +31,8 @@ function emptyState() {
     actions: [],
     escalations: {},
     infraDown: {},
-    pushes: []
+    pushes: [],
+    muted: {}
   };
 }
 
@@ -146,7 +147,7 @@ export class FleetStore {
 
   // ─── needs-you questions ────────────────────────────────────────────────
 
-  upsertQuestion({ dedupeKey, threadKey = null, prRef = null, title, body = "", options = [], playbook = null } = {}) {
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     const fields = {
@@ -155,7 +156,10 @@ export class FleetStore {
       title: clampText(redactSecrets(title), this.limits.titleMax) || "(untitled)",
       body: clampText(redactSecrets(body), this.limits.bodyMax),
       options: normalizeOptions(options),
-      playbook: playbook ?? null
+      playbook: playbook ?? null,
+      kind: kind ?? null,
+      // Grouped questions ("5 threads capped") cover several threads.
+      threadKeys: Array.isArray(threadKeys) && threadKeys.length ? threadKeys.slice(0, 50) : null
     };
     const key = String(dedupeKey ?? "").trim() || `${fields.threadKey ?? "fleet"}:${fields.title}`;
     const existing = this.state.questions.find((q) => q.status === "open" && q.dedupeKey === key);
@@ -194,6 +198,11 @@ export class FleetStore {
 
   dismissQuestion(id) {
     return this._closeQuestion(id, "dismissed", null);
+  }
+
+  // The supervisor closes a question itself once the condition behind it is gone.
+  resolveQuestion(id) {
+    return this._closeQuestion(id, "resolved", null);
   }
 
   // Records how the notifier reached the owner so a later tick neither
@@ -302,6 +311,30 @@ export class FleetStore {
     return this.state.pushes.filter((p) => toMs(p, 0) >= since).length;
   }
 
+  // ─── owner overrides ────────────────────────────────────────────────────
+
+  // "keep going" on a stuck question gives the thread a fresh nudge budget.
+  resetAttempts(key) {
+    const ledger = this.state.ledger[key];
+    if (!ledger) return null;
+    ledger.attemptsWithoutProgress = 0;
+    this._save();
+    return structuredClone(ledger);
+  }
+
+  // "stop" / "skip" silences a thread until the given time.
+  mute(key, until) {
+    if (!key) return null;
+    this.state.muted[key] = iso(toMs(until, this.now()));
+    this._save();
+    return this.state.muted[key];
+  }
+
+  mutedUntil(key) {
+    const until = this.state.muted[key];
+    return until && toMs(until, 0) > this.now() ? until : null;
+  }
+
   // ─── internals ──────────────────────────────────────────────────────────
 
   _findQuestion(id) {
@@ -361,7 +394,8 @@ export class FleetStore {
       actions: Array.isArray(raw.actions) ? raw.actions.filter(isObject) : [],
       escalations: isObject(raw.escalations) ? raw.escalations : {},
       infraDown: isObject(raw.infraDown) ? raw.infraDown : {},
-      pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : []
+      pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
+      muted: isObject(raw.muted) ? raw.muted : {}
     };
   }
 

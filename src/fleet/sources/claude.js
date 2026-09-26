@@ -170,7 +170,7 @@ function onAssistant(summary, row) {
   // and are not real agent output.
   if (row.isApiErrorMessage) {
     summary.phase = "api-error";
-    summary.apiError = { text: text || String(row.error ?? "API error") };
+    summary.apiError = { text: text || String(row.error ?? "API error"), at: row.timestamp ?? null };
     return;
   }
   summary.apiError = null;
@@ -205,7 +205,7 @@ function summarizeTranscript(rows) {
     if (row.type === "user") onUser(summary, row);
     else if (row.type === "assistant") onAssistant(summary, row);
     else if (row.type === "system" && row.subtype === "api_error") {
-      summary.retryError = { text: String(row.error?.formatted ?? row.error?.message ?? "API error") };
+      summary.retryError = { text: String(row.error?.formatted ?? row.error?.message ?? "API error"), at: row.timestamp ?? null };
     } else if (row.type === "queue-operation") {
       closeNotifiedTasks(summary, row.content);
     } else if (row.type === "attachment" && row.attachment?.type === "queued_command") {
@@ -247,7 +247,9 @@ function agentStatusFor(summary, { recent, peer, openTasks }) {
 
 function threadError(source, now, excerptMax) {
   if (!source) return null;
-  const classified = classifyErrorText(source.text, new Date(now)) ?? { kind: "other", resetAt: null };
+  // "resets 12am" is relative to when the error was written, not to now.
+  const at = Date.parse(source.at ?? "");
+  const classified = classifyErrorText(source.text, new Date(Number.isFinite(at) ? at : now)) ?? { kind: "other", resetAt: null };
   return { kind: classified.kind, text: clampText(redactSecrets(source.text), excerptMax), resetAt: classified.resetAt };
 }
 
