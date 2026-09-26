@@ -14,6 +14,8 @@ import { codingSupervisorUi } from "./coding-supervisor-ui.js";
 import { VocaleoClient } from "./integrations/vocaleo.js";
 import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
+import { createFleetRoute } from "./fleet/routes.js";
+import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
@@ -82,6 +84,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
+  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodeEnrollment = options.nodeEnrollment
     ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM] });
@@ -274,6 +277,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("outreach", (data) => broadcast("outreach", data));
   events.on("outreach-resolved", (data) => broadcast("outreach-resolved", data));
   events.on("coding-agents", (data) => broadcast("coding-agents", data));
+  events.on("fleet", (data) => broadcast("fleet", data));
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -2149,6 +2153,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const result = await codingSupervisorRoute(runtime, method, pathname, url, () => readJsonLimited(req, 24 * 1024));
         return sendJson(res, result.status, result.body);
       }
+      if (method === "GET" && pathname === "/fleet") {
+        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage);
+      }
+      if (pathname.startsWith("/fleet/api/")) {
+        res.setHeader("Cache-Control", "no-store");
+        const result = await fleetRoute(method, pathname, url, () => readJsonLimited(req, 8 * 1024));
+        return sendJson(res, result.status, result.body);
+      }
       if (pathname.startsWith("/integrations/vocaleo/")) {
         res.setHeader("Cache-Control", "no-store");
         const result = await vocaleoRoute(method, pathname, () => readJsonLimited(req, 4 * 1024));
@@ -3267,6 +3279,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         server.listen(port, host, () => {
           channels?.start();
           runtime.codingSupervisor?.start();
+          runtime.fleetSupervisor?.start();
           if (tickerMs > 0) {
             tickerHandle = setInterval(() => {
               runtime.tick().catch(() => { /* swallow */ });
@@ -3361,6 +3374,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         sseClients.clear();
         channels?.stop?.();
         runtime.codingSupervisor?.stop();
+        runtime.fleetSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
@@ -3798,7 +3812,10 @@ function recordRetirementOutcome(runtime, task, { draftId, by, reason }) {
 // Map an outreach action to the real action on the underlying source. Throws
 // on a failed delegation so the route can mark the item status:"error".
 async function applyOutreachAction(runtime, item, action, note) {
-  if (action === "dismiss") return;
+  if (action === "dismiss") {
+    if (item.sourceRef?.kind === "fleet") runtime.fleetSupervisor?.dismissQuestion(item.sourceRef.id);
+    return;
+  }
   if (action === "up" || action === "down") return applyOutreachFeedback(runtime, item, action, note);
   const ref = item.sourceRef ?? {};
   switch (ref.kind) {
@@ -3853,6 +3870,11 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (!runtime.clarifications?.answer) throw new Error("no clarification store");
       if (!runtime.clarifications.answer(ref.id, action)) throw new Error("clarification not answerable");
       return;
+    case "fleet": {
+      const r = await runtime.fleetSupervisor?.answerQuestion(ref.id, action);
+      if (!r) throw new Error("fleet question not answerable");
+      return;
+    }
     case "skill-candidate": {
       if (action !== "accept") throw new Error(`unsupported skill-candidate action: ${action}`);
       const { findSuggestion, resolveSuggestion } = await import("./suggestion-feed.js");
@@ -4653,6 +4675,7 @@ function renderApp() {
     <h1>OpenAGI</h1>
     <span id="status" class="status">connecting…</span>
     <a href="/g2/connect" class="ui-btn ui-btn-secondary">Connect glasses</a>
+    <a href="/fleet" class="ui-btn ui-btn-secondary">Fleet</a>
     <nav id="nav">
       <!-- Primary tabs — the everyday surfaces. Keeps the nav readable
            on narrow windows; the other 11 tabs live behind "More ▾". -->
