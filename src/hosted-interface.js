@@ -2154,7 +2154,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, result.status, result.body);
       }
       if (method === "GET" && pathname === "/fleet") {
-        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage);
+        // Pass extraCookies so /fleet?token= signs in like the dashboard does.
+        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage, extraCookies);
       }
       if (pathname.startsWith("/fleet/api/")) {
         res.setHeader("Cache-Control", "no-store");
