@@ -338,6 +338,17 @@ export class FleetStore {
 
   // ─── owner overrides ────────────────────────────────────────────────────
 
+  // A counted send that failed in the background gives its attempt back.
+  undoAttempt(key) {
+    const ledger = this.state.ledger[key];
+    if (!ledger || !(ledger.attemptsWithoutProgress > 0)) return null;
+    ledger.attemptsWithoutProgress -= 1;
+    const last = ledger.nudges.at(-1);
+    if (last?.status === "sent") last.status = "failed";
+    this._save();
+    return structuredClone(ledger);
+  }
+
   // "keep going" on a stuck question gives the thread a fresh nudge budget.
   resetAttempts(key) {
     const ledger = this.state.ledger[key];

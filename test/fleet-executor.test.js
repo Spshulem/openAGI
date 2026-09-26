@@ -344,3 +344,12 @@ test("spawnWithTail keeps only the output tail and never throws", async () => {
   const slow = await spawnWithTail(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { timeoutMs: 100 });
   assert.equal(slow.timedOut, true);
 });
+
+test("a background send that fails to run gives its nudge attempt back", async (t) => {
+  const { cwd, store, executor } = setup(t, { results: [{ code: 1, stderr: "boom" }] });
+  store.recordNudge("codex:t1", { playbook: "merge-ready", route: "codex-exec", status: "sent" }, { head: "h", unresolved: 1 });
+  const result = await executor.deliver({ thread: codexThread(cwd), message: "Ready to merge?", route: "codex-exec", playbook: "merge-ready" });
+  assert.equal(result.status, "sent");
+  await executor.whenIdle();
+  assert.equal(store.ledgerFor("codex:t1").attemptsWithoutProgress, 0);
+});

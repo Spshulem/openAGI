@@ -169,7 +169,7 @@ test("groupQuestions collapses limit and unreachable bursts and duplicate titles
     ["b", makeThread({ key: "b", workspace: "apia", prRefs: ["acme/app#2"], error: { kind: "session-limit", resetAt: "2026-09-27T07:00:00.000Z" } })],
     ["c", makeThread({ key: "c", workspace: "milan", prRefs: [] })]
   ]);
-  const ask = (threadKey, kind, title) => ({ threadKey, playbook: null, question: { title, body: "x", options: ["yes", "no"], dedupeKey: `${kind}:${threadKey}`, kind } });
+  const ask = (threadKey, kind, title, options = kind === "limit" ? ["wait", "added"] : ["yes", "no"]) => ({ threadKey, playbook: null, question: { title, body: "x", options, dedupeKey: `${kind}:${threadKey}`, kind } });
   const grouped = groupQuestions([
     ask("a", "limit", "cairo capped"), ask("b", "limit", "apia capped"), ask("c", "open", "milan stuck"),
     ask("infra:bb3", "infra", "BB3 jammed. Manager offline."), ask("a", "infra", "BB3 jammed. Manager offline.")
@@ -406,4 +406,48 @@ test("retry on a logged-out question resumes the thread, and owner answers never
   assert.equal(ledger.attemptsWithoutProgress, 0);
   assert.ok(ledger.lastNudgeAt, "the answer still starts the cooldown");
   assert.ok(dataDir);
+});
+
+test("model-limit questions keep their own buttons instead of joining the account-cap group", () => {
+  const byKey = new Map([
+    ["a", makeThread({ key: "a", workspace: "cairo" })],
+    ["b", makeThread({ key: "b", workspace: "apia" })]
+  ]);
+  const model = (key) => ({ threadKey: key, playbook: null, question: { title: `${key}: Fable capped. Switch model?`, body: "x", options: ["switched", "wait"], dedupeKey: `limit:${key}:model`, kind: "limit" } });
+  const grouped = groupQuestions([model("a"), model("b")], byKey);
+  assert.equal(grouped.length, 2);
+  assert.ok(grouped.every((q) => q.options.includes("switched")));
+});
+
+test("added on a grouped cap question resumes every reachable thread and closes the outreach item", async (t) => {
+  const resolved = [];
+  const capped = ["t1", "t2"].map((id) => makeThread({
+    key: `codex:${id}`, id, cwd: `/work/${id}`, agentStatus: "error",
+    error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() }
+  }));
+  const { supervisor, delivered } = fixture(t, { threads: capped });
+  supervisor.runtime = { outreach: { resolve: (id, decision, opts) => resolved.push([id, decision, opts.status]) } };
+  await supervisor.tick({ reason: "test" });
+  const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
+  assert.ok(group, "grouped cap question");
+  supervisor.store.markQuestionNotified(group.id, { outreachId: "out_1" });
+  const result = await supervisor.answerQuestion(group.id, "added");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.length, 2);
+  assert.ok(delivered.every((d) => /added account capacity/.test(d.message)));
+  assert.deepEqual(resolved, [["out_1", "added", "acted"]]);
+});
+
+test("fleet-scan --data-dir reads a copy and never writes the source store", async (t) => {
+  const { scratchCopy } = await import("../scripts/fleet-scan.mjs");
+  const source = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-scan-src-"));
+  t.after(() => fs.rmSync(source, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(source, "fleet"));
+  const original = JSON.stringify({ version: 1, mode: "auto", questions: [] });
+  fs.writeFileSync(path.join(source, "fleet", "state.json"), original);
+  const scratch = scratchCopy(source);
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+  assert.notEqual(scratch, source);
+  fs.writeFileSync(path.join(scratch, "fleet", "state.json"), "{}");
+  assert.equal(fs.readFileSync(path.join(source, "fleet", "state.json"), "utf8"), original);
 });

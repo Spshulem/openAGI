@@ -354,3 +354,12 @@ test("readLocalWatchState reads the Mac watch files", () => {
   files["/fake/state"] = "  \n";
   assert.deepEqual(readLocalWatchState(config(), { readFile }), { bb3State: null, gateState: null });
 });
+
+test("an SSH probe cut off after the first marker is unknown, never reachable", async () => {
+  const run = async () => ({ code: 255, stdout: "@@ps\n", stderr: "Connection closed by remote host", timedOut: false, error: null });
+  const previous = { gate: { state: "blocked", reason: "slot held", since: "2026-09-26T07:00:00.000Z" } };
+  const bb3 = await probeBuildBot3(config(), { run, now: NOW, previous });
+  assert.equal(bb3.reachable, null);
+  assert.equal(bb3.gate.state, "blocked", "the last known gate state carries over");
+  assert.ok(bb3.error);
+});

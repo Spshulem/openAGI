@@ -23,8 +23,9 @@ const MANAGER_DOWN_KINDS = new Set(["session-limit", "usage-limit", "model-limit
 const RESUME_STATUSES = new Set(["aborted", "stalled", "error"]);
 const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
-const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head"]);
-const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection"]);
+// Blockers only GitHub can clear; nudging the agent does nothing for them.
+const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown"]);
+const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
 // Thread-level and infra-level escalations of one incident share a cooldown.
 const ESCALATION_KEYS = { "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" };
@@ -280,8 +281,8 @@ function agentAskIntent(ctx) {
 function prIntent(ctx) {
   const { classified, thread } = ctx;
   const blockers = classified.blockers ?? [];
-  if (blockers.includes("CI running") && blockers.every((blocker) => PASSIVE_BLOCKERS.has(blocker))) {
-    return { type: "wait", reason: "CI running on head" };
+  if (blockers.length && blockers.every((blocker) => PASSIVE_BLOCKERS.has(blocker))) {
+    return { type: "wait", reason: blockers.includes("CI running") ? "CI running on head" : `waiting on GitHub: ${blockers.join("; ")}` };
   }
   const playbook = RESUME_STATUSES.has(thread.agentStatus) ? "resume" : "merge-ready";
   return nudge(playbook, `not ready: ${blockers.join("; ")}`);

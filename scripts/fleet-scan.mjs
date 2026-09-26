@@ -7,9 +7,11 @@
 // Needs Node >= 22 (node:sqlite). Without --data-dir it uses a throwaway temp
 // dir, so needs-you questions and the nudge ledger start empty each run.
 //
-// Three locks keep it read-only, even with --data-dir pointed at the daemon's
+// Four locks keep it read-only, even with --data-dir pointed at the daemon's
 // state after the owner picked Auto there, and even with OPENAGI_FLEET_PUSH
 // exported in the shell:
+//   - --data-dir is only read: its fleet state.json is copied into a temp
+//     dir and the scan writes there, so the daemon's store is never touched,
 //   - forceMode "observe" overrides the saved mode,
 //   - phone push is off (config.push null),
 //   - the executor is a stub whose deliver() only ever returns "dry-run".
@@ -125,16 +127,29 @@ async function main() {
     console.log("usage: node scripts/fleet-scan.mjs [--json] [--no-bb3] [--no-github] [--data-dir <dir>]");
     return;
   }
-  const temp = !args.dataDir;
-  const dataDir = args.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fleet-scan-"));
+  const dataDir = scratchCopy(args.dataDir);
   const supervisor = buildScanSupervisor({ dataDir, noBb3: args.noBb3, noGithub: args.noGithub });
   try {
     await supervisor.tick({ reason: "cli" });
     const state = supervisor.getState();
     console.log(args.json ? JSON.stringify(state, null, 2) : report(state, Date.now()));
   } finally {
-    if (temp) fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
+}
+
+// A throwaway data dir, seeded with a read-only copy of the source dir's
+// fleet state so questions and the nudge ledger look like the daemon's.
+export function scratchCopy(sourceDir) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fleet-scan-"));
+  if (sourceDir) {
+    const from = path.join(sourceDir, "fleet", "state.json");
+    if (fs.existsSync(from)) {
+      fs.mkdirSync(path.join(dir, "fleet"), { recursive: true, mode: 0o700 });
+      fs.copyFileSync(from, path.join(dir, "fleet", "state.json"));
+    }
+  }
+  return dir;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

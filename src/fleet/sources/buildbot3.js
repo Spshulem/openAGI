@@ -248,6 +248,11 @@ export async function probeBuildBot3(config, { run = runCommand, now = Date.now(
   if (result?.timedOut) return emptyBb3(now, "ssh probe timed out");
   const parsed = parseBb3Probe(result?.stdout, now);
   if (!parsed.reachable) return emptyBb3(now, result?.code === 0 ? parsed.error : sshError(result));
+  // A probe cut off mid-way (ssh dropped after the first marker) proves
+  // nothing: report unknown so an outage is never marked recovered by it.
+  if (parsed.error || result?.code !== 0) {
+    return { ...emptyBb3(now, parsed.error ?? sshError(result)), reachable: null, gate: previous?.gate ?? { state: null, reason: null, since: null } };
+  }
   return withGateSince(parsed, previous);
 }
 

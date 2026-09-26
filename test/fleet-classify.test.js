@@ -306,3 +306,14 @@ test("PR review comments on #112: truncated threads, requested changes, and shor
   const asked = classify(makeThread({ lastAgentText: "CI is green. Should I merge #42?" }));
   assert.equal(asked.state, "needs-human", "a merge of any PR number is the owner's call");
 });
+
+test("PR #112 round 2: structured Codex questions, earlier force-push context, unknown mergeability", () => {
+  const structured = classify(makeThread({ lastAgentText: "asked", meta: { pendingQuestion: "Which billing plan should the migration target?" } }));
+  assert.equal(structured.state, "needs-human");
+  assert.match(structured.ask.text, /billing plan/);
+  const forcePush = classify(makeThread({ lastAgentText: "I can force-push the rewritten branch. Tests pass. Should I push?" }));
+  assert.equal(forcePush.state, "needs-human", "a force-push named earlier keeps the push ask with the owner");
+  const unknown = prReadiness(makePr({ mergeable: "UNKNOWN", mergeState: "UNKNOWN" }), cleanGit);
+  assert.ok(unknown.blockers.includes("mergeability unknown"));
+  assert.equal(unknown.ready, false);
+});

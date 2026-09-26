@@ -73,7 +73,7 @@ function emptyBb3() {
 // thread at once), so they collapse into one line each. Identical titles
 // (the same BuildBot3 problem seen by a thread and by infra) collapse too.
 const GROUPED_KINDS = Object.freeze({
-  limit: { dedupeKey: "limit:group", options: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
+  limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
   open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` }
 });
 
@@ -102,7 +102,11 @@ export function groupQuestions(asks, byKey) {
   });
   for (const decision of asks) {
     const kind = decision.question.kind;
-    if (groups[kind]) { groups[kind].push(decision); continue; }
+    // Only questions with the group's exact choices merge; a model-limit
+    // question ("switched" / "wait") keeps its own wording and buttons.
+    const match = GROUPED_KINDS[kind]?.match;
+    const sameChoices = !match || JSON.stringify(decision.question.options) === JSON.stringify(match);
+    if (groups[kind] && sameChoices) { groups[kind].push(decision); continue; }
     if (titles.has(decision.question.title)) continue;
     titles.add(decision.question.title);
     out.push(single(decision));
@@ -145,6 +149,8 @@ function ownerDelivery(answer) {
 
 // "retry" on a logged-out / disk-full question means the owner fixed it.
 const RETRY_DELIVERY = "Owner fixed the blocker (login or disk). Retry: continue where you stopped.";
+// "added" on an account-cap question means new capacity: resume now.
+const ADDED_DELIVERY = "Owner added account capacity. Continue where you stopped.";
 
 export class FleetSupervisor {
   // forceMode pins the mode over the owner's saved choice (the dry-run CLI).
@@ -270,7 +276,31 @@ export class FleetSupervisor {
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
     this.applyOverride(question, "dismiss");
+    this.resolveOutreach(question, "dismiss", "dismissed");
     return this.store.dismissQuestion(id);
+  }
+
+  // The outreach copy (Mac overlay, G2) must not keep asking after the
+  // question closed on /fleet or by itself.
+  resolveOutreach(question, decision, status) {
+    if (!question?.outreachId) return;
+    try { this.runtime?.outreach?.resolve?.(question.outreachId, decision, { status }); } catch { /* best-effort */ }
+  }
+
+  async resumeAll(question, message) {
+    const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
+    let sent = 0;
+    let blocked = 0;
+    for (const key of keys) {
+      const thread = this.lastThreads.get(key);
+      const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
+      if (!thread || !route) { blocked += 1; continue; }
+      const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+      if (delivery.status === "sent") sent += 1;
+      else blocked += 1;
+    }
+    return { status: sent ? "sent" : "blocked", route: null, detail: `${sent} resumed, ${blocked} not reachable` };
   }
 
   async answerQuestion(id, answer) {
@@ -282,8 +312,12 @@ export class FleetSupervisor {
     if (!(question.options ?? []).includes(answer)) return null;
     const answered = this.store.answerQuestion(id, answer);
     if (!answered) return null;
+    this.resolveOutreach(question, answer, "acted");
     this.applyOverride(question, answer);
     let delivery = null;
+    if (question.kind === "limit" && answer === "added") {
+      return { question: this.store.question(id) ?? answered, delivery: await this.resumeAll(question, ADDED_DELIVERY) };
+    }
     // An owner answer to the agent's own question, or "retry" after the owner
     // fixed a login/disk blocker, is an explicit instruction: every mode.
     const retry = question.kind === "infra" && answer === "retry";
@@ -549,7 +583,10 @@ export class FleetSupervisor {
       if (asked.has(question.dedupeKey)) continue;
       const decided = question.threadKey ? decisions.some((decision) => decision.threadKey === question.threadKey) : false;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
-      if (decided || supervisorOwned) store.resolveQuestion(question.id);
+      if (decided || supervisorOwned) {
+        store.resolveQuestion(question.id);
+        this.resolveOutreach(question, "resolved", "dismissed");
+      }
     }
   }
 

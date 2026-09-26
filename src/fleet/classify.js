@@ -165,6 +165,8 @@ export function prReadiness(pr, localGit) {
   // Requested changes are work for the agent, not an approval for the owner.
   if (pr.reviewDecision === "CHANGES_REQUESTED") blockers.push("changes requested");
   if (pr.mergeState === "DIRTY" || pr.mergeable === "CONFLICTING") blockers.push("merge conflicts");
+  // GitHub computes mergeability lazily; unknown is never "ready".
+  else if (!pr.mergeable || pr.mergeable === "UNKNOWN" || !pr.mergeState || pr.mergeState === "UNKNOWN") blockers.push("mergeability unknown");
   if (pr.codexReview?.reviewedHead === false) blockers.push("Codex review not on head");
   if (pr.qa?.required === true && pr.qa?.freshOnHead !== true) blockers.push("UI QA missing");
   if (pr.isDraft) blockers.push("draft");
@@ -192,6 +194,10 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // A live session on a permission prompt or dialog waits on the owner's
   // click. A nudge cannot clear it.
   if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
+  // Codex request_user_input: the real question is structured, not in the text.
+  if (thread.meta?.pendingQuestion) {
+    return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", text: String(thread.meta.pendingQuestion), options: ["yes", "no"] } });
+  }
 
   // Once the owner replied, the agent's last words are stale.
   const text = agentSpokeLast(thread) ? String(thread.lastAgentText ?? "") : "";
@@ -312,8 +318,10 @@ function detectAsk(text) {
   const recommended = /\(recommended\)/i.test(text);
   // The risky step is often named just before the ask ("--admin merges now.
   // Which?") or in the options after it, so both count. Earlier recap does not.
+  // Any risky step anywhere in the closing message (a force-push named two
+  // sentences before "Should I push?") keeps the ask with the owner.
   const region = askRegion(sentences, askIndexes);
-  const hit = OUT_OF_SCOPE_PATTERNS.find(({ pattern }) => pattern.test(region));
+  const hit = OUT_OF_SCOPE_PATTERNS.find(({ pattern }) => pattern.test(region) || pattern.test(text));
   if (hit) return { kind: "needs-human", topic: hit.topic, options, text: askText };
   const isChoice = options.length >= 2 && CHOICE_WORDS.test(askText);
   // The agent already picked one: taking "(recommended)" is in scope only

@@ -592,3 +592,12 @@ test("F16: a thread blocked on a permission prompt gets one owner question, neve
   });
   assert.equal(decisions.filter((d) => d.action === "nudge").length, 0);
 });
+
+test("PR #112 round 2: fresh upstream-unavailable LB errors mean down; unknown mergeability waits", () => {
+  const lb = { ...lbOk, recentErrors: [{ kind: "unavailable", count: 4, lastAt: ago(2 * MIN), threadIds: [] }] };
+  const health = infraHealth({ bb3: bb3Base, lb }, { config, now: NOW });
+  assert.equal(health.lb.down, true);
+  assert.equal(health.lb.up, false);
+  const { decision } = run(makeThread(), { pr: makePr({ mergeable: "UNKNOWN", mergeState: "UNKNOWN" }) });
+  assert.equal(decision.action, "wait", "GitHub is still computing mergeability; nudging the agent does nothing");
+});
