@@ -143,6 +143,9 @@ function ownerDelivery(answer) {
   return `Owner answer: ${answer}. Continue with that.`;
 }
 
+// "retry" on a logged-out / disk-full question means the owner fixed it.
+const RETRY_DELIVERY = "Owner fixed the blocker (login or disk). Retry: continue where you stopped.";
+
 export class FleetSupervisor {
   // forceMode pins the mode over the owner's saved choice (the dry-run CLI).
   constructor({ dataDir, runtime = null, config = null, deps = {}, skip = {}, forceMode = null } = {}) {
@@ -281,16 +284,19 @@ export class FleetSupervisor {
     if (!answered) return null;
     this.applyOverride(question, answer);
     let delivery = null;
-    // An owner answer to the agent's own question is an explicit instruction,
-    // so it is delivered in every mode.
-    if (question.kind === "agent-ask" && question.threadKey) {
+    // An owner answer to the agent's own question, or "retry" after the owner
+    // fixed a login/disk blocker, is an explicit instruction: every mode.
+    const retry = question.kind === "infra" && answer === "retry";
+    if ((question.kind === "agent-ask" || retry) && question.threadKey) {
       const thread = this.lastThreads.get(question.threadKey);
       const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
       if (!thread || !route) {
         delivery = { status: "blocked", route: null, detail: thread ? "no live route: open the thread to answer" : "thread not seen since restart: scan first" };
       } else {
-        delivery = await this.executor.deliver({ thread, message: ownerDelivery(answered.answer), route, playbook: "owner-answer" });
-        this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status });
+        const message = retry ? RETRY_DELIVERY : ownerDelivery(answered.answer);
+        delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+        // Starts the cooldown but does not spend the no-progress nudge budget.
+        this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
       }
     }
     return { question: this.store.question(id) ?? answered, delivery };

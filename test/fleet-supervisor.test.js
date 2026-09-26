@@ -391,3 +391,19 @@ test("fleet-scan CLI can never send or push, whatever the saved mode or env", as
   const delivery = await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "codex-exec", playbook: "resume" });
   assert.equal(delivery.status, "dry-run");
 });
+
+test("retry on a logged-out question resumes the thread, and owner answers never spend the nudge budget", async (t) => {
+  const loggedOut = makeThread({ agentStatus: "error", error: { kind: "logged-out", text: "Not logged in · Please run /login", resetAt: null } });
+  const { supervisor, delivered, dataDir } = fixture(t, { threads: [loggedOut] });
+  await supervisor.tick({ reason: "test" });
+  const question = supervisor.getState().questions.find((q) => q.kind === "infra" && q.options.includes("retry"));
+  assert.ok(question, "logged-out question raised");
+  const result = await supervisor.answerQuestion(question.id, "retry");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  assert.match(delivered[0].message, /Retry: continue where you stopped/);
+  const ledger = supervisor.store.ledgerFor(loggedOut.key);
+  assert.equal(ledger.attemptsWithoutProgress, 0);
+  assert.ok(ledger.lastNudgeAt, "the answer still starts the cooldown");
+  assert.ok(dataDir);
+});

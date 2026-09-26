@@ -43,8 +43,10 @@ export function parseResetAt(text, now = new Date()) {
     h, minute ? Number(minute) : 0, 0, 0
   );
   if (Number.isNaN(date.getTime())) return null;
-  // A bare time ("resets 12am") that already passed today means tomorrow.
+  // A bare time ("resets 12am") that already passed today means tomorrow;
+  // a yearless date that already passed ("resets Jan 2" on Dec 30) means next year.
   if (!month && date.getTime() <= now.getTime()) date.setDate(date.getDate() + 1);
+  else if (month && !year && date.getTime() <= now.getTime()) date.setFullYear(date.getFullYear() + 1);
   return date.toISOString();
 }
 

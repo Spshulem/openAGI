@@ -43,3 +43,8 @@ test("classifyCodexErrorCode maps codes and falls back to text", () => {
   assert.equal(classifyCodexErrorCode("other", "weird thing", now).kind, "other");
   assert.equal(classifyCodexErrorCode(null, "", now), null);
 });
+
+test("a yearless reset date that already passed rolls into next year", () => {
+  const dec30 = new Date(2026, 11, 30, 10, 0, 0);
+  assert.equal(parseResetAt("resets Jan 2 at 9am (America/Los_Angeles)", dec30), new Date(2027, 0, 2, 9, 0).toISOString());
+});

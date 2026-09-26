@@ -37,7 +37,7 @@ export const OUT_OF_SCOPE_PATTERNS = Object.freeze([
   { topic: "approval", pattern: /\bapprov(?:e|al|als|ing)\b/i },
   // Any mention of prod: releases, prod databases, prod migrations.
   { topic: "production", pattern: /\bprod(?:uction)?\b|\blive (?:site|db|database|env(?:ironment)?)\b/i },
-  { topic: "merge", pattern: /\b(?:merge|land)\s+(?:it|this|them|both|all|these|those|the (?:PRs?|stack|branch))\b|\bmerge\s+#?\d{3,}\b|\bmerge (?:to|into) main\b|\bmerge (?:as|when) (?:they|it|each)\b/i },
+  { topic: "merge", pattern: /\b(?:merge|land)\s+(?:it|this|them|both|all|these|those|the (?:PRs?|stack|branch))\b|\bmerge\s+(?:PR\s*)?#?\d+\b|\bmerge (?:to|into) main\b|\bmerge (?:as|when) (?:they|it|each)\b/i },
   { topic: "credentials", pattern: /\bpassword\b|\bcredentials?\b|\bAUP\b|\bOAuth\b|\bre-?auth\w*\b|\/login\b|\b2FA\b|\bAPI key\b|\byour click\b|\bsecrets?\b|\b(?:access|auth|secret|private|signing|deploy|service)[- ](?:keys?|tokens?)\b|\b(?:rotate|regenerate|revoke|roll|reissue)\b[^.?!\n]{0,40}\b(?:keys?|tokens?|creds|certs?|certificates?)\b/i },
   { topic: "money", pattern: /\bcredits\b|\btop[- ]?up\b|\bupgrade (?:the |your )?plan\b|\bbilling\b|\bpurchase\b|\$\d/i },
   { topic: "delete", pattern: /\b(?:delete|remove|stop|kill|reap|shut ?down|tear ?down|clean ?up)\b[^.?!\n]{0,50}\b(?:other|others'?|another|their|someone else's)\b|\b(?:stop|delete|remove|tear ?down|shut ?down)\s+(?!(?:my|our|its) own\b)[^.?!\n]{0,40}\bpreviews?\b|\btake (?:it|this|that|them|these|those) down\b|\breclaim\b|\bprune\b|\bwipe\b/i },
@@ -161,6 +161,9 @@ export function prReadiness(pr, localGit) {
   else if (!ci.state) blockers.push("no CI on head");
 
   if (Number(pr.unresolvedThreads) > 0) blockers.push(`${pr.unresolvedThreads} open threads`);
+  else if (pr.threadsTruncated) blockers.push("100+ threads, not all read");
+  // Requested changes are work for the agent, not an approval for the owner.
+  if (pr.reviewDecision === "CHANGES_REQUESTED") blockers.push("changes requested");
   if (pr.mergeState === "DIRTY" || pr.mergeable === "CONFLICTING") blockers.push("merge conflicts");
   if (pr.codexReview?.reviewedHead === false) blockers.push("Codex review not on head");
   if (pr.qa?.required === true && pr.qa?.freshOnHead !== true) blockers.push("UI QA missing");

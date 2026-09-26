@@ -296,3 +296,13 @@ test("classifyThread: a session blocked on a permission prompt needs the owner",
   // Only the source's flag counts.
   assert.equal(classify({ ...prompt, meta: { waitingFor: "permission prompt" } }).state, "waiting-ci");
 });
+
+test("PR review comments on #112: truncated threads, requested changes, and short PR merges", () => {
+  const truncated = prReadiness(makePr({ unresolvedThreads: 0, threadsTruncated: true }), cleanGit);
+  assert.ok(truncated.blockers.includes("100+ threads, not all read"), "unread thread pages are never treated as resolved");
+  const changes = prReadiness(makePr({ reviewDecision: "CHANGES_REQUESTED" }), cleanGit);
+  assert.ok(changes.blockers.includes("changes requested"));
+  assert.equal(changes.onlyHumanLeft, false);
+  const asked = classify(makeThread({ lastAgentText: "CI is green. Should I merge #42?" }));
+  assert.equal(asked.state, "needs-human", "a merge of any PR number is the owner's call");
+});

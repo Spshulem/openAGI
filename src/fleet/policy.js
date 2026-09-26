@@ -290,7 +290,7 @@ function prIntent(ctx) {
 function readyIntent(ctx) {
   const { pr, facts } = ctx;
   if (!pr) return { type: "none", reason: ctx.classified.reason };
-  const needsApprove = pr.reviewDecision === "REVIEW_REQUIRED" || pr.reviewDecision === "CHANGES_REQUESTED";
+  const needsApprove = pr.reviewDecision === "REVIEW_REQUIRED";
   const title = needsApprove ? `#${pr.number} ready. Needs approve.` : `#${pr.number} ready. Merge?`;
   const body = `${facts.prRef} at ${facts.head}: CI green, 0 open threads${needsApprove ? ", review required" : ""}.`;
   return {

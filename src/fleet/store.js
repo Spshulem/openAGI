@@ -22,7 +22,7 @@ const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 // starts the cooldown so a broken route is not retried every tick; dry-runs,
 // proposals, and blocked attempts are history only.
 const ATTEMPT_STATUSES = new Set(["sent"]);
-const COOLDOWN_STATUSES = new Set(["sent", "failed"]);
+const COOLDOWN_STATUSES = new Set(["sent", "failed", "owner-answer"]);
 
 function emptyState() {
   return {

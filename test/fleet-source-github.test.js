@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import {
-  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStates, findPrForBranch, readLocalGit
+  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStates, findPrForBranch, normalizePr, readLocalGit
 } from "../src/fleet/sources/github.js";
 
 const BBAPP = "buildbetter-app/buildbetter";
@@ -119,7 +119,8 @@ test("buildPrQuery batches refs by repository with safe aliases", () => {
   assert.match(query, /r0: repository\(owner:"buildbetter-app",name:"buildbetter"\)\{ p6878: pullRequest\(number:6878\)\{\.\.\.P\} p6849: pullRequest\(number:6849\)\{\.\.\.P\} \}/);
   assert.match(query, /r1: repository\(owner:"Spshulem",name:"openAGI"\)\{ p108: pullRequest\(number:108\)\{\.\.\.P\} \}/);
   assert.match(query, /comments\(last:30\)\{nodes\{author\{login\} body createdAt\}\}/);
-  assert.match(query, /files\(first:100\)\{nodes\{path\}\}/);
+  assert.match(query, /files\(first:100\)\{pageInfo\{hasNextPage\} nodes\{path\}\}/);
+  assert.match(query, /reviewThreads\(first:100\)\{totalCount pageInfo\{hasNextPage\}/);
   assert.match(query, /statusCheckRollup\{state contexts\(first:30\)/);
   assert.match(query, /reviewThreads\(first:100\)/);
 });
@@ -345,4 +346,16 @@ test("readLocalGit returns all null for a missing dir or a throwing runner", asy
   assert.equal(calls.length, 1);
   assert.deepEqual(await readLocalGit(null, config(), { run }), empty);
   assert.deepEqual(await readLocalGit("/x", config(), { run: async () => { throw new Error("EPERM"); } }), empty);
+});
+
+test("a file list cut at 100 never waives UI QA", () => {
+  const node = {
+    number: 9, headRefOid: "c".repeat(40), state: "OPEN",
+    reviewThreads: { totalCount: 150, pageInfo: { hasNextPage: true }, nodes: [] },
+    files: { pageInfo: { hasNextPage: true }, nodes: [{ path: "docs/readme.md" }] },
+    comments: { nodes: [] }
+  };
+  const pr = normalizePr(BBAPP, node, config());
+  assert.equal(pr.qa.required, true);
+  assert.equal(pr.threadsTruncated, true);
 });

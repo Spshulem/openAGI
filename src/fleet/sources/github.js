@@ -29,9 +29,9 @@ const PR_FRAGMENT = [
   "fragment P on PullRequest { number url title state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision updatedAt",
   " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:30){nodes{__typename",
   " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state}}}}}}}",
-  " reviewThreads(first:100){totalCount nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
+  " reviewThreads(first:100){totalCount pageInfo{hasNextPage} nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
   " comments(last:30){nodes{author{login} body createdAt}}",
-  " files(first:100){nodes{path}} }"
+  " files(first:100){pageInfo{hasNextPage} nodes{path}} }"
 ].join("");
 
 // refs: [{repo, number}] already validated by parsePrRef, so owner and name
@@ -106,8 +106,9 @@ function codexReviewFor(comments, headOid) {
   return { reviewedHead: onHead, sha };
 }
 
-function qaFor(number, headOid, comments, files, prefixes) {
-  const required = prefixes ? files.some((file) => prefixes.some((prefix) => file.startsWith(prefix))) : null;
+function qaFor(number, headOid, comments, files, prefixes, filesTruncated = false) {
+  // A file list cut at 100 can hide a UI path, so a truncated list never waives QA.
+  const required = prefixes ? (filesTruncated || files.some((file) => prefixes.some((prefix) => file.startsWith(prefix)))) : null;
   let sha = null;
   for (const comment of comments) {
     const body = String(comment?.body ?? "");
@@ -144,8 +145,10 @@ export function normalizePr(repo, node, config) {
     reviewDecision: node.reviewDecision ?? null,
     ci: summarizeChecks(node.commits?.nodes?.[0]?.commit ?? null, headOid),
     unresolvedThreads: (node.reviewThreads?.nodes ?? []).filter((thread) => thread && !thread.isResolved).length,
+    // More than 100 threads: unread pages may hold unresolved ones.
+    threadsTruncated: node.reviewThreads?.pageInfo?.hasNextPage === true,
     codexReview: codexReviewFor(comments, headOid),
-    qa: qaFor(number, headOid, comments, files, uiPrefixesFor(repo, config)),
+    qa: qaFor(number, headOid, comments, files, uiPrefixesFor(repo, config), node.files?.pageInfo?.hasNextPage === true),
     updatedAt: node.updatedAt ?? null
   };
 }
