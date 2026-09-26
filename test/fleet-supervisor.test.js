@@ -620,3 +620,128 @@ test("branch discovery passes the local head so a reused branch skips its old PR
   await supervisor.tick();
   assert.deepEqual(seen, [HEAD]);
 });
+
+// Background sends whose outcome the test settles by hand, per thread.
+function heldExecutor() {
+  const delivered = [];
+  const outcomes = new Map();
+  return {
+    delivered,
+    settle: (key, reached) => outcomes.get(key)(reached),
+    deliver: async (args) => {
+      delivered.push(args);
+      const sent = { status: "sent", route: args.route, detail: "started in background", actionId: null };
+      Object.defineProperty(sent, "done", { value: new Promise((resolve) => outcomes.set(args.thread.key, resolve)) });
+      return sent;
+    },
+    inFlight: () => [],
+    whenIdle: async () => {}
+  };
+}
+
+test("one fast failure reopens a grouped resume without waiting for the slow threads", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id }));
+  const executor = heldExecutor();
+  const { supervisor } = fixture(t, { threads, deps: { executor } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["wait", "added"], threadKeys: threads.map((x) => x.key) });
+  assert.equal((await supervisor.answerQuestion(q.id, "added")).question.status, "answered");
+  executor.settle("codex:b", false);
+  await settle();
+  assert.equal(supervisor.store.question(q.id).status, "open");
+  assert.deepEqual(supervisor.store.question(q.id).deliveredThreadKeys, ["codex:a"]);
+  executor.settle("codex:a", true);
+});
+
+test("a late send failure never undoes a newer, different owner answer", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id, writerLocked: id === "b" }));
+  const executor = heldExecutor();
+  const { supervisor } = fixture(t, { threads, deps: { executor } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["wait", "added"], threadKeys: threads.map((x) => x.key) });
+  assert.equal((await supervisor.answerQuestion(q.id, "added")).question.status, "open");
+  assert.equal((await supervisor.answerQuestion(q.id, "wait")).question.status, "answered");
+  executor.settle("codex:a", false);
+  await settle();
+  const stored = supervisor.store.question(q.id);
+  assert.equal(stored.status, "answered");
+  assert.equal(stored.answer, "wait");
+  assert.deepEqual(stored.deliveredThreadKeys, []);
+});
+
+test("a grouped retry does not close while an earlier resume failed mid-send", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id, writerLocked: id === "b" }));
+  const executor = heldExecutor();
+  const { supervisor } = fixture(t, { threads, deps: { executor } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["wait", "added"], threadKeys: threads.map((x) => x.key) });
+  await supervisor.answerQuestion(q.id, "added");
+  supervisor.lastThreads.get("codex:b").writerLocked = false;
+  const deliver = executor.deliver;
+  // codex:a's first resume fails while codex:b is being sent.
+  executor.deliver = async (args) => { executor.settle("codex:a", false); await settle(); return deliver(args); };
+  const retry = await supervisor.answerQuestion(q.id, "added");
+  assert.equal(retry.question.status, "open");
+  assert.equal(retry.delivery.status, "blocked");
+  executor.deliver = deliver;
+  executor.delivered.length = 0;
+  await supervisor.answerQuestion(q.id, "added");
+  assert.deepEqual(executor.delivered.map((x) => x.thread.key), ["codex:a"]);
+});
+
+test("a failed source keeps its threads in an open grouped question", async (t) => {
+  let broken = false;
+  const capped = (id, kind = "codex") => makeThread({ key: `${kind}:${id}`, kind, id, cwd: `/work/${id}`, agentStatus: "error", error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() } });
+  const threads = [capped("a"), capped("b", "claude"), capped("c", "claude")];
+  const { supervisor } = fixture(t, {
+    threads,
+    deps: { listCodexThreads: async () => { if (broken) throw new Error("database is locked"); return threads.filter((x) => x.kind === "codex"); } }
+  });
+  await supervisor.tick();
+  const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
+  assert.deepEqual(group.threadKeys, ["codex:a", "claude:b", "claude:c"]);
+  broken = true;
+  await supervisor.tick();
+  const kept = supervisor.store.question(group.id);
+  assert.equal(kept.status, "open");
+  assert.deepEqual(kept.threadKeys, ["codex:a", "claude:b", "claude:c"]);
+});
+
+test("a one-tick git failure keeps an open ready question instead of closing and re-asking it", async (t) => {
+  let gitBroken = false;
+  const green = makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  const { supervisor } = fixture(t, {
+    prs: new Map([["acme/app#7", green]]),
+    deps: { readLocalGit: async () => { if (gitBroken) throw new Error("git timed out"); return { head: HEAD, branch: "spencer/fix", upstream: "origin/spencer/fix", ahead: 0, remote: "acme/app" }; } }
+  });
+  await supervisor.tick();
+  const [ready] = supervisor.getState().questions;
+  assert.ok(ready);
+  gitBroken = true;
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(ready.id).status, "open");
+  gitBroken = false;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.id), [ready.id]);
+});
+
+test("a new local head is a new PR lookup, not a cached answer", async (t) => {
+  let head = HEAD;
+  const seen = [];
+  const thread = makeThread({ prRefs: [] });
+  const { supervisor } = fixture(t, {
+    threads: [thread],
+    deps: {
+      readLocalGit: async () => ({ head, branch: "spencer/fix", upstream: "origin/spencer/fix", ahead: 0, remote: "acme/app" }),
+      findPrForBranch: async (repo, branch, config, opts) => { seen.push(opts.head); return null; }
+    }
+  });
+  await supervisor.tick();
+  thread.prRefs = [];
+  await supervisor.tick();
+  assert.deepEqual(seen, [HEAD]);
+  head = "f".repeat(40);
+  thread.prRefs = [];
+  await supervisor.tick();
+  assert.deepEqual(seen, [HEAD, "f".repeat(40)]);
+});

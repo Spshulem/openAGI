@@ -309,6 +309,19 @@ test("findPrForBranch skips a closed PR whose head is not the local head", async
   assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: open.run, head: "ccc" }), `${BBAPP}#6900`);
 });
 
+test("findPrForBranch keeps a closed PR whose later commits came from GitHub", async () => {
+  const rows = [{ number: 6801, state: "MERGED", updatedAt: "2026-09-26T08:00:00Z", headRefOid: "aaa" }];
+  const answering = (code) => fakeRun((cmd, args) => (cmd === "/fake/gh" ? ok(rows) : { code, stdout: "", stderr: "" }));
+  // Local head is an ancestor of the PR head ("Update branch" on GitHub).
+  const inside = answering(0);
+  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: inside.run, head: "old", cwd: "/work/tree" }), `${BBAPP}#6801`);
+  assert.deepEqual(inside.calls[1].args, ["-C", "/work/tree", "merge-base", "--is-ancestor", "old", "aaa"]);
+  // Local head has work the PR lacks: a reused branch.
+  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: answering(1).run, head: "new", cwd: "/work/tree" }), null);
+  // Ancestry unknown (PR head not fetched): keep the PR.
+  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: answering(128).run, head: "new", cwd: "/work/tree" }), `${BBAPP}#6801`);
+});
+
 test("findPrForBranch returns null for bad input, no PRs, or failures", async () => {
   const { run, calls } = fakeRun(() => ok([]));
   assert.equal(await findPrForBranch(BBAPP, "feature/x", config(), { run }), null);

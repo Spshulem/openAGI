@@ -189,7 +189,22 @@ export async function fetchPrStates(refs, config, { run = runCommand } = {}) {
   return out;
 }
 
-export async function findPrForBranch(repo, branch, config, { run = runCommand, head = null } = {}) {
+// Exit 0: the local head is inside the PR (later commits came from GitHub).
+// Exit 1: the local head has work the PR lacks. Anything else is unknown.
+async function headInPr(run, config, cwd, head, prHead) {
+  try {
+    const result = await run(config.bins.git, ["-C", cwd, "merge-base", "--is-ancestor", head, prHead], {
+      timeoutMs: GIT_TIMEOUT_MS,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }
+    });
+    if (result?.code === 0) return true;
+    return result?.code === 1 ? false : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function findPrForBranch(repo, branch, config, { run = runCommand, head = null, cwd = null } = {}) {
   const name = String(branch ?? "").trim();
   if (!REPO_PATTERN.test(String(repo ?? "")) || !name || name.startsWith("-") || NON_PR_BRANCHES.has(name)) return null;
   let result;
@@ -206,12 +221,15 @@ export async function findPrForBranch(repo, branch, config, { run = runCommand, 
   if (!candidates.length) return null;
   const newestFirst = (a, b) => (Date.parse(b.updatedAt ?? "") || 0) - (Date.parse(a.updatedAt ?? "") || 0);
   const open = candidates.filter((row) => row.state === "OPEN").sort(newestFirst);
-  // A reused branch name: a closed PR only counts if it holds the local head,
-  // or the new work would read as already done.
-  const closed = candidates.filter((row) => !head || !row.headRefOid || row.headRefOid === head).sort(newestFirst);
-  const pick = open[0] ?? closed[0];
-  if (!pick) return null;
-  return prRefKey(repo, pick.number);
+  if (open[0]) return prRefKey(repo, open[0].number);
+  // A reused branch name: a closed PR counts only if the local head has no
+  // work beyond it, or the new work would read as already done. Unknown
+  // ancestry keeps the PR.
+  for (const row of candidates.sort(newestFirst)) {
+    if (!head || !row.headRefOid || row.headRefOid === head) return prRefKey(repo, row.number);
+    if (cwd && (await headInPr(run, config, cwd, head, row.headRefOid)) !== false) return prRefKey(repo, row.number);
+  }
+  return null;
 }
 
 async function gitLine(run, config, cwd, args) {

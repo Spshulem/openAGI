@@ -218,12 +218,13 @@ test("maxThreads keeps the newest sessions", async (t) => {
   assert.deepEqual(threads.map((thread) => thread.id), ["s-run", "s-self"]);
 });
 
-test("missing database degrades to an empty list", async (t) => {
+test("a missing database is an empty list; a broken one throws", async (t) => {
   const home = makeHome(t);
   assert.deepEqual(await listConductorThreads(makeConfig(home), { now: NOW }), []);
   const bad = path.join(home, "bad.db");
   fs.writeFileSync(bad, "not a database");
-  assert.deepEqual(await listConductorThreads(makeConfig(home, { paths: { conductorDb: bad } }), { now: NOW }), []);
+  // Unreadable is unknown, not empty: the supervisor records a source error.
+  await assert.rejects(listConductorThreads(makeConfig(home, { paths: { conductorDb: bad } }), { now: NOW }));
   assert.deepEqual(await listConductorThreads(null), []);
 });
 

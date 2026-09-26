@@ -217,11 +217,12 @@ export class FleetStore {
 
   // A background send that never reached the agent puts the owner's answer
   // back in front of them instead of suppressing the question for a day,
-  // and a retry sends to those threads again.
-  reopenQuestion(id, undeliveredKeys = []) {
+  // and a retry sends to those threads again. A different, later answer
+  // from the owner is not undone.
+  reopenQuestion(id, undeliveredKeys = [], { answer = null } = {}) {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
-    if (question.status === "answered") {
+    if (question.status === "answered" && (answer === null || question.answer === answer)) {
       Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, updatedAt: iso(this.now()) });
     }
     if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));

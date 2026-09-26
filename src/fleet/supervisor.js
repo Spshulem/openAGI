@@ -299,7 +299,9 @@ export class FleetSupervisor {
     let sent = 0;
     let blocked = 0;
     for (const key of keys) {
-      if (question.deliveredThreadKeys?.includes(key)) { sent += 1; continue; }
+      // Read the store each time: a background resume that failed meanwhile
+      // took its key back out, so that thread is sent again.
+      if (this.store.question(question.id)?.deliveredThreadKeys?.includes(key)) { sent += 1; continue; }
       const thread = this.lastThreads.get(key);
       const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
       if (!thread || !route) { blocked += 1; continue; }
@@ -346,32 +348,39 @@ export class FleetSupervisor {
           this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
         }
       }
+      // A background resume can fail while the others are still sending;
+      // the group closes only once every thread has it.
+      if (delivery?.status === "sent" && question.kind === "limit" && answer === "added") {
+        const delivered = this.store.question(id)?.deliveredThreadKeys ?? [];
+        if ((question.threadKeys ?? []).some((key) => !delivered.includes(key))) {
+          delivery = { ...delivery, status: "blocked", detail: "a resume failed before it reached its thread; answer again to retry" };
+        }
+      }
       // A failed or unreachable delivery remains actionable on every surface.
       if (delivery && delivery.status !== "sent") {
-        this.reopenIfUndelivered(id, settling);
+        this.reopenIfUndelivered(id, settling, answer);
         return { question: this.store.question(id), delivery };
       }
       if (answer === "open thread") return { question, delivery: { status: "blocked", route: null, detail: "Answer in the original thread, then scan again." } };
       const answered = this.store.answerQuestion(id, answer);
       this.resolveOutreach(question, answer, "acted");
       this.applyOverride(question, answer);
-      this.reopenIfUndelivered(id, settling);
+      this.reopenIfUndelivered(id, settling, answer);
       return { question: answered, delivery };
     } finally {
       this.answering.delete(id);
     }
   }
 
-  // A background resume reports its exit only later. Attached after the
-  // answer was recorded, so even an instant failure finds the final state.
-  reopenIfUndelivered(id, settling) {
-    if (!settling.length) return;
-    Promise.all(settling)
-      .then((keys) => {
-        const failed = keys.filter(Boolean);
-        if (failed.length) this.store.reopenQuestion(id, failed);
-      })
-      .catch(() => { /* best-effort */ });
+  // A background resume reports its exit only later, one thread at a time.
+  // Attached after the answer was recorded, so even an instant failure finds
+  // the final state; a newer, different answer from the owner stands.
+  reopenIfUndelivered(id, settling, answer) {
+    for (const outcome of settling) {
+      outcome
+        .then((key) => { if (key) this.store.reopenQuestion(id, [key], { answer }); })
+        .catch(() => { /* best-effort */ });
+    }
   }
 
   applyOverride(question, answer) {
@@ -545,19 +554,20 @@ export class FleetSupervisor {
     for (const thread of candidates) {
       if (thread.prRefs?.length || !thread.repo || !thread.branch || TRUNK_BRANCHES.has(thread.branch)) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
+      // The local head tells a reused branch's new work from its old closed
+      // PR, so a new head is a new lookup.
+      const git = localGit.get(thread.cwd);
+      const head = git?.branch === thread.branch ? (git.head ?? null) : null;
       const cached = this.branchLookups.get(cacheKey);
-      if (cached && now - cached.at < BRANCH_LOOKUP_TTL_MS) {
+      if (cached && cached.head === head && now - cached.at < BRANCH_LOOKUP_TTL_MS) {
         if (cached.ref) thread.prRefs = [cached.ref];
         continue;
       }
       if (lookups >= MAX_BRANCH_LOOKUPS) continue;
       lookups += 1;
       try {
-        // The local head tells a reused branch's new work from its old closed PR.
-        const git = localGit.get(thread.cwd);
-        const head = git?.branch === thread.branch ? git.head : null;
-        const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head })), 20_000, "pr lookup");
-        this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now });
+        const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head, cwd: head ? thread.cwd : null })), 20_000, "pr lookup");
+        this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now, head });
         if (ref) thread.prRefs = [ref];
       } catch (error) {
         sourceErrors.prLookup = clampText(error?.message, 200);
@@ -578,9 +588,13 @@ export class FleetSupervisor {
     }
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, unknownKinds = new Set() }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set() }) {
     const store = this.store;
-    const unknown = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
+    const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
+    // A thread whose git read failed this tick is unknown too: its PR question
+    // must not close now and come back as a new push on the next good tick.
+    const gitUnknown = new Set(items.filter(({ classified }) => (classified.blockers ?? []).includes("local git unknown")).map(({ thread }) => thread.key));
+    const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key));
     const at = new Date(started).toISOString();
     const asked = new Set();
     const openActions = store.actions(config.limits.maxActionsKept).filter((action) => OPEN_ACTION.has(action.status));
@@ -589,6 +603,10 @@ export class FleetSupervisor {
 
     const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
     for (const fields of groupQuestions(asks, byKey)) {
+      // Rebuilt without a failed source's threads, a group would drop them;
+      // the open one stays as it is until that source reads again.
+      const open = fields.threadKeys && unknownKinds.size ? store.openQuestions().find((q) => q.dedupeKey === fields.dedupeKey) : null;
+      if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       const question = store.upsertQuestion(fields);
       asked.add(question.dedupeKey);
       // The owner already answered or dismissed this one; stay quiet.

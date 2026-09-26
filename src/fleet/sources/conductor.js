@@ -2,6 +2,7 @@
 // session_messages hold one Claude Agent SDK stream event as JSON; user rows
 // hold the plain text the owner typed.
 
+import fs from "node:fs";
 import { classifyErrorText } from "../errors.js";
 import {
   SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
@@ -226,11 +227,14 @@ function matchesRef(ref, { id, claudeSessionId, workspace }) {
 }
 
 export async function listConductorThreads(config, options = {}) {
-  let db = null;
+  const file = config?.paths?.conductorDb;
+  // No Conductor install is an empty list. An unreadable database throws, so
+  // the supervisor records a source error instead of seeing zero threads.
+  if (!file || !fs.existsSync(file)) return [];
+  const db = await openReadOnlyDb(file);
+  if (!db) throw new Error("Conductor database unavailable");
   try {
     const { now = Date.now(), isPidAlive = defaultIsPidAlive } = options;
-    db = await openReadOnlyDb(config.paths.conductorDb);
-    if (!db) return [];
     const cutoff = now - config.lookbackHours * 3_600_000;
     const sinceIso = new Date(cutoff).toISOString();
     const ref = String(config.managerRef ?? "").trim();
@@ -256,10 +260,8 @@ export async function listConductorThreads(config, options = {}) {
       }
     }
     return threads;
-  } catch {
-    return [];
   } finally {
-    if (db) try { db.close(); } catch { /* ignore */ }
+    try { db.close(); } catch { /* ignore */ }
   }
 }
 
