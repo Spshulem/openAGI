@@ -2,6 +2,7 @@ import path from "node:path";
 import { resolveDataDir } from "./data-dir.js";
 import { AgentHost } from "./agent-host.js";
 import { CodingSupervisor, registerCodingSupervisorTools } from "./coding-supervisor.js";
+import { FleetSupervisor } from "./fleet/supervisor.js";
 import { FileBackedAgentStore } from "./agent-store.js";
 import { CronScheduler, createDailyAdaptationReviewJob } from "./cron-scheduler.js";
 import { DirectionalAdaptiveScrutiny } from "./directional-adaptive-scrutiny.js";
@@ -238,6 +239,11 @@ export class AbiRuntime {
     });
     this.codingSupervisor = options.codingSupervisor ?? new CodingSupervisor({
       ...options.codingSupervisorOptions, dataDir: options.dataDir, runtime: this
+    });
+    // Watches every recent Codex/Claude/Conductor coding thread. The
+    // constructor has no side effects; hosted-interface starts it on listen.
+    this.fleetSupervisor = options.fleetSupervisor ?? new FleetSupervisor({
+      ...options.fleetSupervisorOptions, dataDir: options.dataDir, runtime: this
     });
     if (this.outreachConfig.enabled) {
       this.outreachMapper = new OutreachMapper({ store: this.outreach, events: this.events });
