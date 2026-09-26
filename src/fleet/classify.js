@@ -19,7 +19,8 @@ export const WAITING_PATTERNS = Object.freeze([
   /\bqueued (?:with|behind) \d+/i
 ]);
 
-// Permission phrasing. With no out-of-scope topic, the answer is "yes".
+// Permission phrasing. The answer is "yes" only when the step asked about is
+// on IN_SCOPE_STEP_PATTERNS and no out-of-scope topic is near it.
 export const IN_SCOPE_ASK_PATTERNS = Object.freeze([
   /\b(?:do you )?want me to\b/i,
   /\bwould you like me to\b/i,
@@ -34,12 +35,46 @@ export const IN_SCOPE_ASK_PATTERNS = Object.freeze([
 export const OUT_OF_SCOPE_PATTERNS = Object.freeze([
   { topic: "admin", pattern: /--admin\b|\badmin[- ]merge\b|\bbypass\w*\b[^.?!\n]{0,30}\b(?:protection|rules?|policy)\b/i },
   { topic: "approval", pattern: /\bapprov(?:e|al|als|ing)\b/i },
-  { topic: "production", pattern: /\b(?:release|deploy|ship|promote|cut)\w*\b[^.?!\n]{0,40}\bprod(?:uction)?\b|\bprod(?:uction)?\b[^.?!\n]{0,20}\b(?:release|deploy|push)\w*/i },
+  // Any mention of prod: releases, prod databases, prod migrations.
+  { topic: "production", pattern: /\bprod(?:uction)?\b|\blive (?:site|db|database|env(?:ironment)?)\b/i },
   { topic: "merge", pattern: /\b(?:merge|land)\s+(?:it|this|them|both|all|these|those|the (?:PRs?|stack|branch))\b|\bmerge\s+#?\d{3,}\b|\bmerge (?:to|into) main\b|\bmerge (?:as|when) (?:they|it|each)\b/i },
-  { topic: "credentials", pattern: /\bpassword\b|\bcredentials?\b|\bAUP\b|\bOAuth\b|\bre-?auth\w*\b|\/login\b|\b2FA\b|\bAPI key\b|\byour click\b/i },
+  { topic: "credentials", pattern: /\bpassword\b|\bcredentials?\b|\bAUP\b|\bOAuth\b|\bre-?auth\w*\b|\/login\b|\b2FA\b|\bAPI key\b|\byour click\b|\bsecrets?\b|\b(?:access|auth|secret|private|signing|deploy|service)[- ](?:keys?|tokens?)\b|\b(?:rotate|regenerate|revoke|roll|reissue)\b[^.?!\n]{0,40}\b(?:keys?|tokens?|creds|certs?|certificates?)\b/i },
   { topic: "money", pattern: /\bcredits\b|\btop[- ]?up\b|\bupgrade (?:the |your )?plan\b|\bbilling\b|\bpurchase\b|\$\d/i },
-  { topic: "delete", pattern: /\b(?:delete|remove|stop|kill|reap|shut ?down|tear ?down|clean ?up)\b[^.?!\n]{0,50}\b(?:other|others'?|another|their|someone else's)\b|\b(?:stop|delete|remove|tear ?down|shut ?down)\s+(?!(?:my|our|its) own\b)[^.?!\n]{0,40}\bpreviews?\b|\btake (?:it|this|that|them|these|those) down\b|\breclaim\b|\bprune\b|\bwipe\b/i }
+  { topic: "delete", pattern: /\b(?:delete|remove|stop|kill|reap|shut ?down|tear ?down|clean ?up)\b[^.?!\n]{0,50}\b(?:other|others'?|another|their|someone else's)\b|\b(?:stop|delete|remove|tear ?down|shut ?down)\s+(?!(?:my|our|its) own\b)[^.?!\n]{0,40}\bpreviews?\b|\btake (?:it|this|that|them|these|those) down\b|\breclaim\b|\bprune\b|\bwipe\b/i },
+  { topic: "reboot", pattern: /\breboot\w*|\bpower[- ]?cycle\b|\b(?:restart|bounce|shut ?down|stop)\b[^.?!\n]{0,40}\b(?:buildbot ?3|bb3|100\.99\.3\.113|docker\w*|colima|orbstack|daemons?|the (?:box|host|machine|vm))\b|\b(?:buildbot ?3|bb3|docker\w*)\b[^.?!\n]{0,30}\b(?:restart|bounce)\w*/i },
+  { topic: "cancel", pattern: /\b(?:cancel|kill|stop|abort|terminate|pkill)\w*\b(?!\s+(?:my|our|its)\b)[^.?!\n]{0,25}\b(?:runs?|jobs?|verif\w*|bb-(?:quick|verify)|builds?|previews?|containers?|workflows?|processes|queue)\b/i },
+  { topic: "history", pattern: /\bforce[- ]?push\w*|\bpush\b[^.?!\n]{0,40}(?:--force\b|\s-f\b)|\breset\s+--hard\b|\brewrit\w*\b[^.?!\n]{0,20}\bhistory\b/i },
+  { topic: "main", pattern: /\bpush\w*\s+(?:[\w-]+\s+){0,2}(?:to|into|onto|on|over)\s+(?:origin[ /])?(?:main|master)\b|\bpush\w*\s+(?:origin\s+)?(?:HEAD:)?(?:main|master)\b|\b(?:straight|directly|right)\s+(?:to|into|onto|on)\s+(?:origin[ /])?(?:main|master)\b|\bcommit\w*\s+(?:directly\s+|straight\s+)?(?:to|on|into)\s+(?:main|master)\b/i },
+  { topic: "database", pattern: /\b(?:drop|truncate)\b[^.?!\n]{0,40}\b(?:tables?|databases?|db|schemas?|collections?|indexes)\b|\bdelete\b[^.?!\n]{0,30}\b(?:rows?|records?|tables?)\b|\bDELETE FROM\b|\b(?:run|apply|execute|roll ?back)\b[^.?!\n]{0,30}\bmigrations?\b|\bmigrat\w*\b[^.?!\n]{0,40}\b(?:db|database|shared|staging)\b|\breseed\b/i }
 ]);
+
+// The only asks answered "yes" without the owner: routine steps on the
+// agent's own PR. Anything else, however it is phrased, goes to the owner.
+export const IN_SCOPE_STEP_PATTERNS = Object.freeze([
+  // bb-quick / bb-verify on BuildBot3 for its own PR.
+  /\bbb-(?:quick|verify)\b/i,
+  /\bverif\w*\b[^.?!\n]{0,30}\bon (?:buildbot ?3|bb3)\b/i,
+  // Push its own branch. Force-push and push to main are caught above.
+  /\bpush(?:ed|ing)?\b(?![^.?!\n]{0,30}\b(?:tags?|releases?)\b)(?=\s*(?:[.?!,;]|$)|\s+(?:it|this|that|them|these|those|now|again|up|and|then|everything|the (?:fix(?:es)?|changes?|commits?|branch|update|head)|my (?:fix(?:es)?|changes?|commits?|branch)|(?:up )?to (?:origin|the remote|the PR|the branch|my branch|this branch|remote)\b))/i,
+  // Resolve or reply to review threads.
+  /\b(?:resolve|reply(?: to)?|respond to|address|answer|fix)\b[^.?!\n]{0,40}\b(?:threads?|comments?|reviews?|nits?|feedback)\b/i,
+  // Merge or rebase main into its own branch. "Merge into main" is caught above.
+  /\b(?:merg(?:e|ed|ing)|pull(?:ed|ing)?)\s+(?:in\s+)?(?:the latest\s+)?(?:origin\/)?(?:main|master)\b/i,
+  /\brebas(?:e|ed|ing)\b[^.?!\n]{0,30}\b(?:main|master)\b/i,
+  // Rerun CI.
+  /\b(?:re-?run|re-?trigger|retry|restart|kick)\b[^.?!\n]{0,30}\b(?:CI|checks?|jobs?|workflows?|tests?|builds?)\b/i,
+  // Open or update its own PR.
+  /\b(?:open|create|raise|file|update|edit|draft|put up)\b[^.?!\n]{0,30}\b(?:PR|pull request)\b/i,
+  /\bfollow-?up PR\b/i,
+  // Retake screenshots or start its own BuildBot3 preview.
+  /\b(?:re-?take|take|capture|grab|attach|add|redo)\b[^.?!\n]{0,20}\bscreenshots?\b/i,
+  /\b(?:start|spin up|bring up|launch|create|rebuild|refresh)\b(?![^.?!\n]{0,40}\b(?:other|others'?|another|their|someone)\b)[^.?!\n]{0,30}\bpreview\b/i,
+  // Clean up its own worktree.
+  /\b(?:clean ?up|remove|delete)\s+(?:my|our|its|this|the)\s+(?:own\s+)?(?:worktree|workspace)\b/i
+]);
+
+// "Say go." or "Proceed?" names no step: the sentence before it does.
+const BARE_ASK = /^(?:(?:ok(?:ay)?|so)[,.]?\s+)?(?:say (?:go|the word)|(?:(?:shall|should|can|may) I\s+|(?:do you )?want me to\s+|ok(?:ay)? to\s+)?(?:proceed|go ahead|continue|do (?:it|this|that|so))(?:\s+now)?|(?:do you )?want me to|(?:should|shall) I)\W*$/i;
 
 // The agent wants a decision, not permission.
 const NEED_YOU_PATTERNS = [
@@ -61,6 +96,8 @@ const BB3_DOWN_PATTERNS = [
   /\b(?:buildbot ?3|bb3|100\.99\.3\.113)\b[^.?!\n]{0,60}\b(?:down|unreachable|not reachable|unavailable|frozen|rebooting|jammed)\b/i,
   /\bblocked on (?:buildbot ?3|bb3)\b/i
 ];
+
+const BLOCKED_ON_OWNER_ASK = Object.freeze({ topic: "approval", text: "Blocked on a permission prompt or dialog.", options: Object.freeze(["opened", "later"]) });
 
 const STOPPED = new Set(["aborted", "stalled", "error"]);
 const PR_DONE = new Set(["MERGED", "CLOSED"]);
@@ -149,6 +186,9 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   const excluded = exclusionReason(thread, { pr, localGit, config });
   if (excluded) return result("excluded", excluded);
   if (isRunning(thread, now, limits)) return result("running", "turn in progress");
+  // A live session on a permission prompt or dialog waits on the owner's
+  // click. A nudge cannot clear it.
+  if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
 
   // Once the owner replied, the agent's last words are stale.
   const text = agentSpokeLast(thread) ? String(thread.lastAgentText ?? "") : "";
@@ -273,13 +313,34 @@ function detectAsk(text) {
   const hit = OUT_OF_SCOPE_PATTERNS.find(({ pattern }) => pattern.test(region));
   if (hit) return { kind: "needs-human", topic: hit.topic, options, text: askText };
   const isChoice = options.length >= 2 && CHOICE_WORDS.test(askText);
-  if (isChoice && !recommended) return { kind: "needs-human", topic: "choice", options, text: askText };
-  // The agent already picked one: taking "(recommended)" is in scope.
-  if (isChoice) return { kind: "in-scope", topic: "in-scope", options, text: askText };
+  // The agent already picked one: taking "(recommended)" is in scope only
+  // when that option is itself a routine PR step.
+  if (isChoice) {
+    const pick = sentences.find((sentence) => /\(recommended\)/i.test(sentence));
+    const routine = recommended && pick && isRoutineStep(pick);
+    return { kind: routine ? "in-scope" : "needs-human", topic: routine ? "in-scope" : "choice", options, text: askText };
+  }
   if (NEED_YOU_PATTERNS.some((p) => p.test(askText))) return { kind: "needs-human", topic: "decision", options, text: askText };
-  if (IN_SCOPE_ASK_PATTERNS.some((p) => p.test(askText))) return { kind: "in-scope", topic: "in-scope", options, text: askText };
   // A bare question with no permission phrasing: let the PR state decide.
-  return null;
+  const permission = askIndexes.filter((index) => IN_SCOPE_ASK_PATTERNS.some((p) => p.test(sentences[index])));
+  if (!permission.length) return null;
+  // Every permission ask must name a routine PR step; the default is the owner.
+  if (permission.every((index) => isRoutineStep(stepText(sentences, index)))) return { kind: "in-scope", topic: "in-scope", options, text: askText };
+  return { kind: "needs-human", topic: "permission", options, text: askText };
+}
+
+function isRoutineStep(text) {
+  return IN_SCOPE_STEP_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+// "I'd do this as a follow-up PR. Say go." -> the step is the stated plan.
+const PLAN_WORDS = /\b(?:I'd|I would|I'll|I will|I can|I could|I'm going to|I plan to|next(?: step)?:|plan:)/i;
+
+function stepText(sentences, index) {
+  const sentence = sentences[index];
+  if (!BARE_ASK.test(sentence) || index === 0) return sentence;
+  const before = sentences[index - 1];
+  return PLAN_WORDS.test(before) ? `${before} ${sentence}` : sentence;
 }
 
 function isAsk(sentence) {

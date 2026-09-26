@@ -405,3 +405,190 @@ test("infra: recovery resumes every thread blocked on it, once", () => {
   const merged = dedupeDecisions([...decisions, perThread]);
   assert.equal(merged.filter((d) => d.threadKey === "codex:x1" && d.action === "nudge").length, 1);
 });
+
+// --- Review fixes -----------------------------------------------------------
+
+test("F8: auto mode never says yes to a risky or unlisted ask", () => {
+  const asks = [
+    "Should I run it against the production database now?",
+    "Want me to force-push over origin/main?",
+    "Do you want me to drop the prod users table and reseed it?",
+    "Should I rotate the Stripe secret key in Vercel?",
+    "Should I push this straight to main?",
+    "Want me to run the migration on prod?",
+    "Should I git reset --hard to origin?",
+    "Should I email the customer about the outage?"
+  ];
+  for (const text of asks) {
+    const { decision } = run(makeThread({ lastAgentText: text }));
+    assert.equal(decision.action, "ask-user", text);
+    assert.equal(decision.message, null, text);
+    assert.notEqual(decision.playbook, "in-scope-yes", text);
+  }
+  const permission = run(makeThread({ lastAgentText: "Should I email the customer about the outage?" })).decision;
+  assert.equal(permission.question.title, "madrid #6522: asks permission. OK?");
+});
+
+test("F1: the manager never gets an automatic yes", () => {
+  const mgrThread = { ...manager, lastAgentText: "Want me to push the branch?", lastAgentAt: ago(30 * MIN) };
+  const own = run(mgrThread, { pr: null }).decision;
+  assert.equal(own.action, "ask-user");
+  assert.equal(own.message, null);
+  for (const text of ["Want me to cancel runs #6522 and #6530 and reboot BuildBot3?", "Should I restart the docker daemon on BuildBot3? It will drop every running preview."]) {
+    const { decision } = run({ ...mgrThread, lastAgentText: text }, { pr: null });
+    assert.equal(decision.action, "ask-user", text);
+    assert.equal(decision.message, null, text);
+  }
+  // Any other thread still gets the yes for the same routine ask.
+  assert.equal(run(makeThread({ lastAgentText: "Want me to push the branch?" })).decision.playbook, "in-scope-yes");
+});
+
+test("F3/F9: thread and infra BuildBot3 escalations share one cooldown and one send per tick", () => {
+  const quick = { id: "t1", description: "Run bb-quick on fixed candidate", kind: "local_bash", startedAt: ago(20 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [quick] });
+  const classified = classifyThread(thread, { pr: makePr(), localGit: cleanGit, infra: null, now: NOW, config });
+  const escalationLedger = { lastEscalation: (key) => (key === "infra:bb3" ? ago(20 * MIN) : null) };
+  const cooling = decideThread(classified, thread, { ledger: {}, escalationLedger, playbooks, config, now: NOW, pr: makePr(), mode: "auto", manager });
+  assert.equal(cooling.action, "wait");
+  assert.equal(cooling.notBefore, ago(-40 * MIN));
+  const fresh = decideThread(classified, thread, { ledger: {}, escalationLedger: { lastEscalation: () => null }, playbooks, config, now: NOW, pr: makePr(), mode: "auto", manager });
+  assert.equal(fresh.action, "escalate-manager");
+
+  // Three slow threads plus the infra incident: one manager message per tick.
+  const bb3 = { ...bb3Base, runs: [{ pid: 1, kind: "quick", pr: 6522, head: "aaaaaaaaaa", ageSec: 1200, owner: "madrid" }] };
+  const infra = { bb3, lb: lbOk, localVerify: [] };
+  const items = ["s1", "s2", "s3"].map((id) => {
+    const t = makeThread({ key: `conductor:${id}`, id, workspace: `ws-${id}`, agentStatus: "waiting", openTasks: [quick] });
+    const c = classifyThread(t, { pr: makePr(), localGit: cleanGit, infra, now: NOW, config });
+    return { thread: t, classified: c, pr: makePr(), ledger: {}, decision: decideThread(c, t, { ledger: {}, playbooks, config, now: NOW, pr: makePr(), mode: "auto", infra, manager }) };
+  });
+  const nudge = { threadKey: "codex:t9", action: "nudge", playbook: "merge-ready", targetKey: "codex:t9" };
+  const infraDecisions = decideInfra(infra, { ledger: {}, playbooks, config, now: NOW, threads: items, manager, mode: "auto" });
+  const merged = dedupeDecisions([...infraDecisions, ...items.map((item) => item.decision), nudge]);
+  const escalations = merged.filter((d) => d.action === "escalate-manager");
+  assert.equal(escalations.length, 1);
+  assert.equal(escalations[0].threadKey, "infra:bb3");
+  // The winning message still names every waiting thread.
+  for (const id of ["s1", "s2", "s3"]) assert.match(escalations[0].message, new RegExp(`agent ws-${id}`));
+  assert.ok(merged.includes(nudge));
+});
+
+test("F5: stale LB log rows do not keep the LB down", () => {
+  const stale = { healthy: true, detail: "200", watchLine: null, recentErrors: [{ kind: "no-accounts", count: 4, lastAt: ago(50 * MIN), threadIds: ["x1"] }] };
+  const staleHealth = infraHealth({ bb3: bb3Base, lb: stale }, { config, now: NOW });
+  assert.equal(staleHealth.lb.down, false);
+  assert.equal(staleHealth.lb.up, true);
+  assert.deepEqual(staleHealth.lb.problems, []);
+  const recent = { ...stale, recentErrors: [{ ...stale.recentErrors[0], lastAt: ago(5 * MIN) }] };
+  assert.equal(infraHealth({ bb3: bb3Base, lb: recent }, { config, now: NOW }).lb.down, true);
+  // The window is a limit; a config without it uses 15 min.
+  const tight = { ...config, limits: { ...config.limits, lbErrorFreshMs: 2 * MIN } };
+  assert.equal(infraHealth({ bb3: bb3Base, lb: recent }, { config: tight, now: NOW }).lb.down, false);
+  const { lbErrorFreshMs, ...noFresh } = config.limits;
+  assert.equal(infraHealth({ bb3: bb3Base, lb: recent }, { config: { limits: noFresh }, now: NOW }).lb.down, true);
+  assert.equal(infraHealth({ bb3: bb3Base, lb: stale }, { config: { limits: noFresh }, now: NOW }).lb.down, false);
+});
+
+test("F5: recovery resumes threads remembered as blocked after their log rows expire", () => {
+  // The aborted turn has no error; its only lb signal (the log row) is gone.
+  const aborted = makeThread({ key: "codex:x1", kind: "codex", id: "x1", live: null, agentStatus: "aborted", prRefs: [], error: null, lastUserAt: ago(3 * 60 * MIN) });
+  const infra = { bb3: bb3Base, lb: lbOk, localVerify: [] };
+  const classified = classifyThread(aborted, { pr: null, localGit: cleanGit, infra, now: NOW, config });
+  assert.equal(classified.state, "idle-no-pr");
+  const items = [{ thread: aborted, classified, pr: null, ledger: {} }];
+  const ledger = { infraDown: { lb: true, bb3: false } };
+  const forgotten = decideInfra(infra, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto" });
+  assert.equal(forgotten.filter((d) => d.action === "nudge").length, 0);
+  const remembered = decideInfra(infra, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto", blockedKeys: { lb: ["codex:x1"], bb3: [] } });
+  const nudges = remembered.filter((d) => d.action === "nudge");
+  assert.deepEqual(nudges.map((d) => d.threadKey), ["codex:x1"]);
+  assert.equal(nudges[0].playbook, "infra-recovered");
+  // Remembered for the other infra does not count.
+  const other = decideInfra(infra, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto", blockedKeys: { bb3: ["codex:x1"], lb: [] } });
+  assert.equal(other.filter((d) => d.action === "nudge").length, 0);
+});
+
+test("F2: muted threads get no recovery nudge and no decision", () => {
+  const blocked = makeThread({ key: "codex:x1", kind: "codex", id: "x1", live: null, agentStatus: "stalled", error: { kind: "lb", text: "Connection failed", resetAt: null } });
+  const infra = { bb3: bb3Base, lb: lbOk, localVerify: [] };
+  const classified = classifyThread(blocked, { pr: makePr(), localGit: cleanGit, infra, now: NOW, config });
+  const items = [{ thread: blocked, classified, pr: makePr(), ledger: {} }];
+  const ledger = { infraDown: { lb: true, bb3: false } };
+  const muted = decideInfra(infra, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto", mutedKeys: new Set(["codex:x1"]) });
+  assert.equal(muted.filter((d) => d.action === "nudge").length, 0);
+  const remembered = decideInfra(infra, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto", mutedKeys: new Set(["codex:x1"]), blockedKeys: { lb: ["codex:x1"] } });
+  assert.equal(remembered.filter((d) => d.action === "nudge").length, 0);
+  const own = decideThread(classified, blocked, { ledger: {}, playbooks, config, now: NOW, pr: makePr(), mode: "auto", infra, mutedKeys: new Set(["codex:x1"]) });
+  assert.equal(own.action, "none");
+  assert.equal(own.reason, "muted by owner");
+});
+
+test("F6: the manager is not escalated to while the owner talks to it or mid-turn", () => {
+  const bb3 = { ...bb3Base, gate: { state: "blocked", reason: "slot held", since: ago(40 * MIN) } };
+  const infra = { bb3, lb: lbOk, localVerify: [] };
+  const chatting = { ...manager, lastUserAt: ago(2 * MIN), lastUserText: "check the lb timers" };
+  const [owner] = decideInfra(infra, { ledger: {}, playbooks, config, now: NOW, threads: [], manager: chatting, mode: "auto" });
+  assert.equal(owner.action, "wait");
+  assert.equal(owner.notBefore, ago(-8 * MIN));
+  const busy = { ...manager, agentStatus: "running" };
+  const [running] = decideInfra(infra, { ledger: {}, playbooks, config, now: NOW, threads: [], manager: busy, mode: "auto" });
+  assert.equal(running.action, "wait");
+  // The supervisor's own last message is not the owner talking.
+  const ours = { ...manager, lastUserAt: ago(2 * MIN), lastUserText: "[OpenAGI supervisor] BuildBot3 needs a look" };
+  assert.equal(decideInfra(infra, { ledger: {}, playbooks, config, now: NOW, threads: [], manager: ours, mode: "auto" })[0].action, "escalate-manager");
+  // Thread-level escalations follow the same rule.
+  const quick = { id: "t1", description: "Run bb-quick on fixed candidate", kind: "local_bash", startedAt: ago(20 * MIN) };
+  const waiting = run(makeThread({ agentStatus: "waiting", openTasks: [quick] }), { mgr: chatting }).decision;
+  assert.equal(waiting.action, "wait");
+  assert.equal(waiting.notBefore, ago(-8 * MIN));
+});
+
+test("F17: a limit error whose reset has passed does not mark the manager offline", () => {
+  const quick = { id: "t1", description: "Run bb-quick on fixed candidate", kind: "local_bash", startedAt: ago(20 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [quick] });
+  const past = { ...manager, agentStatus: "error", error: { kind: "session-limit", text: "x", resetAt: ago(10 * 60 * MIN) } };
+  const recovered = run(thread, { mgr: past }).decision;
+  assert.equal(recovered.action, "escalate-manager");
+  assert.equal(recovered.route, "peer-relay");
+  const future = { ...past, error: { ...past.error, resetAt: ago(-60 * MIN) } };
+  assert.equal(run(thread, { mgr: future }).decision.action, "ask-user");
+  const usage = { ...past, error: { kind: "usage-limit", text: "x", resetAt: ago(MIN) } };
+  assert.equal(run(thread, { mgr: usage }).decision.action, "escalate-manager");
+});
+
+test("F15: the deliberate-stop check uses the real abort time", () => {
+  const pr = makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } });
+  const userAt = ago(5 * 60 * MIN);
+  const stopped = makeThread({
+    agentStatus: "aborted", lastUserAt: userAt, lastUserText: "no wait", lastAgentAt: ago(5 * 60 * MIN - 29_000),
+    lastActivityAt: ago(45 * MIN), meta: { abortedAt: new Date(Date.parse(userAt) + 29_000).toISOString() }
+  });
+  const { decision } = run(stopped, { pr });
+  assert.equal(decision.action, "none");
+  assert.equal(decision.reason, "owner stopped this turn");
+  // Without abortedAt the bumped activity time is all there is.
+  const bumped = { ...stopped, meta: {} };
+  assert.equal(run(bumped, { pr }).decision.action, "nudge");
+});
+
+test("F16: a thread blocked on a permission prompt gets one owner question, never a nudge", () => {
+  const pr = makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } });
+  const prompt = makeThread({
+    kind: "claude", key: "claude:c7", id: "c7", agentStatus: "waiting", lastAgentAt: ago(24 * 60 * MIN), lastActivityAt: ago(24 * 60 * MIN),
+    live: { peerName: "p7", pid: 7, status: "waiting" }, meta: { blockedOnOwner: true, waitingFor: "permission prompt" }
+  });
+  const { classified, decision } = run(prompt, { pr });
+  assert.equal(classified.state, "needs-human");
+  assert.equal(decision.action, "ask-user");
+  assert.equal(decision.message, null);
+  assert.equal(decision.question.title, "madrid #6522: waiting on a prompt. Open it?");
+  assert.deepEqual(decision.question.options, ["opened", "later"]);
+  assert.equal(decision.question.kind, "prompt");
+  // Recovery never nudges it either.
+  const infra = { bb3: bb3Base, lb: lbOk, localVerify: [] };
+  const decisions = decideInfra(infra, {
+    ledger: { infraDown: { lb: true } }, playbooks, config, now: NOW, manager, mode: "auto",
+    threads: [{ thread: prompt, classified, pr, ledger: {} }], blockedKeys: { lb: ["claude:c7"] }
+  });
+  assert.equal(decisions.filter((d) => d.action === "nudge").length, 0);
+});

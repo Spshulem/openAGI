@@ -253,3 +253,45 @@ test("findManagerSession matches id, Claude session id, or workspace name", () =
   assert.equal(findManagerSession(null, threads), null);
   assert.equal(findManagerSession(resolveFleetConfig({}, { home: "/h", managerRef: "a" }), null), null);
 });
+
+test("open tasks count only while their Claude process is alive and started after them", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  // Started before the current process: killed with the old one, never notified.
+  addMessage(db, "s-wait", "assistant", sdk.taskStarted("s-wait", "dead-1", "bb-verify --full"), iso(50 * MIN));
+  db.close();
+  // ps lstart (UTC) says the process restarted 30 min ago.
+  writePeer(home, {
+    pid: 601, sessionId: "claude-wait", name: "sydney-6a", status: "idle", entrypoint: "sdk-ts", updatedAt: NOW,
+    startedAt: NOW - 30 * MIN + 3000, procStart: "Sat Sep 26 07:30:00 2026"
+  });
+  const live = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: (pid) => pid === 601 }));
+  assert.deepEqual(live["s-wait"].openTasks.map((task) => task.id), ["open-1"]);
+
+  // No live process: no background task can still be running.
+  const dead = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
+  assert.deepEqual(dead["s-wait"].openTasks, []);
+  assert.equal(dead["s-wait"].agentStatus, "waiting");
+});
+
+test("an aborted session exposes when the owner stopped it", async (t) => {
+  const home = makeHome(t);
+  seed(home);
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
+  assert.equal(threads["s-abort"].meta.abortedAt, iso(45 * MIN));
+  assert.equal(threads["s-idle"].meta.abortedAt, null);
+});
+
+test("a live peer on a permission prompt is waiting on the owner", async (t) => {
+  const home = makeHome(t);
+  seed(home);
+  writePeer(home, { pid: 701, sessionId: "s-run", name: "madrid-7a", status: "waiting", waitingFor: "permission prompt", entrypoint: "sdk-ts", updatedAt: NOW });
+  writePeer(home, { pid: 702, sessionId: "s-idle", name: "cairo-7b", status: "idle", entrypoint: "sdk-ts", updatedAt: NOW });
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: (pid) => pid > 700 }));
+  assert.equal(threads["s-run"].agentStatus, "waiting");
+  assert.equal(threads["s-run"].meta.blockedOnOwner, true);
+  assert.equal(threads["s-run"].meta.waitingFor, "permission prompt");
+  assert.equal(threads["s-idle"].agentStatus, "idle");
+  assert.equal(threads["s-idle"].meta.blockedOnOwner, false);
+});

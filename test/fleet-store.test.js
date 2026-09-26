@@ -128,12 +128,73 @@ test("questions dedupe by key, clamp text, and answer once", (t) => {
   assert.equal(store.answerQuestion("fq_missing", "yes"), null);
   assert.deepEqual(store.openQuestions(), []);
 
-  const second = store.upsertQuestion({ dedupeKey: "model-limit:codex:a", title: "capped again" });
+  const second = store.upsertQuestion({ dedupeKey: "model-limit:codex:b", title: "capped again" });
   assert.notEqual(second.id, first.id);
   const dismissed = store.dismissQuestion(second.id);
   assert.equal(dismissed.status, "dismissed");
   assert.equal(store.dismissQuestion(second.id), null);
   assert.equal(store.question(first.id).answer, "yes");
+});
+
+test("a question the owner answered or dismissed stays closed for its TTL", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const asked = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?", options: ["merged", "later"] });
+  store.answerQuestion(asked.id, "later");
+
+  // The condition still holds next tick: same question back, not reopened.
+  now.advance(5 * 60 * 1000);
+  const again = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge? (new)", options: ["merged", "later"] });
+  assert.equal(again.id, asked.id);
+  assert.equal(again.suppressed, true);
+  assert.equal(again.status, "answered");
+  assert.equal(again.title, "#7 ready. Merge?");
+  assert.deepEqual(store.openQuestions(), []);
+  assert.equal(store.question(asked.id).suppressed, undefined, "the flag is never persisted");
+
+  const other = store.upsertQuestion({ dedupeKey: "logged-out:codex", title: "Codex logged out. Run /login?" });
+  store.dismissQuestion(other.id);
+  const otherAgain = store.upsertQuestion({ dedupeKey: "logged-out:codex", title: "Codex logged out. Run /login?" });
+  assert.equal(otherAgain.id, other.id);
+  assert.equal(otherAgain.suppressed, true);
+
+  // A question the supervisor resolved itself comes back when the condition does.
+  const resolved = store.upsertQuestion({ dedupeKey: "disk-full", title: "Disk full. Free space?" });
+  store.resolveQuestion(resolved.id);
+  const reopened = store.upsertQuestion({ dedupeKey: "disk-full", title: "Disk full. Free space?" });
+  assert.notEqual(reopened.id, resolved.id);
+  assert.equal(reopened.suppressed, undefined);
+
+  // Past the TTL the owner is asked again.
+  now.advance(24 * HOUR);
+  const fresh = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" });
+  assert.notEqual(fresh.id, asked.id);
+  assert.equal(fresh.status, "open");
+  assert.equal(fresh.suppressed, undefined);
+});
+
+test("infra-blocked keys persist per kind, dedupe, and clear", (t) => {
+  const dir = tempDir(t);
+  const store = new FleetStore({ dir });
+  assert.deepEqual(store.infraBlocked("lb"), []);
+  store.setInfraBlocked("lb", ["codex:a", "codex:b", "codex:a", "", null]);
+  assert.deepEqual(store.infraBlocked("lb"), ["codex:a", "codex:b"]);
+  assert.deepEqual(store.infraBlocked("bb3"), []);
+  const copy = store.infraBlocked("lb");
+  copy.push("codex:z");
+  assert.deepEqual(new FleetStore({ dir }).infraBlocked("lb"), ["codex:a", "codex:b"]);
+  store.setInfraBlocked("lb", []);
+  assert.deepEqual(new FleetStore({ dir }).infraBlocked("lb"), []);
+});
+
+test("mutedKeys lists only threads still muted", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  store.mute("codex:a", T0 + HOUR);
+  store.mute("codex:b", T0 + 3 * HOUR);
+  assert.deepEqual([...store.mutedKeys()].sort(), ["codex:a", "codex:b"]);
+  now.advance(2 * HOUR);
+  assert.deepEqual([...store.mutedKeys()], ["codex:b"]);
 });
 
 test("question text is redacted before storage", (t) => {

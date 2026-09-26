@@ -163,6 +163,8 @@ test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) 
   const expectedPrompt = buildRelayPrompt("cairo-1f", `${MESSAGE_PREFIX}CI finished on abc1234: green.`);
   assert.deepEqual(call.args, [
     "-p", expectedPrompt,
+    "--tools", "SendMessage",
+    "--strict-mcp-config",
     "--allowedTools", "SendMessage",
     "--permission-mode", "bypassPermissions",
     "--model", "claude-haiku-4-5-20251001"
@@ -215,6 +217,95 @@ test("claude-resume runs claude -p --resume in the thread cwd without the LB key
   assert.equal(calls[0].env?.CODEX_LB_API_KEY, undefined);
   await executor.whenIdle();
   assert.equal(store.action(result.actionId).status, "done");
+});
+
+const SEEDED_SECRETS = {
+  ANTHROPIC_API_KEY: "sk-ant-seeded",
+  OPENAI_API_KEY: "sk-openai-seeded",
+  OPENAGI_AUTH_TOKEN: "openagi-seeded",
+  OPENAGI_FLEET_MODE: "auto",
+  TELEGRAM_BOT_TOKEN: "telegram-seeded",
+  TWILIO_AUTH_TOKEN: "twilio-seeded",
+  TWILIO_ACCOUNT_SID: "twilio-sid-seeded",
+  BUILDBETTER_API_KEY: "bb-seeded",
+  BUILDBETTER_URL: "bb-url-seeded",
+  GH_TOKEN: "gh-seeded",
+  STRIPE_SECRET: "stripe-seeded",
+  AWS_SECRET_ACCESS_KEY: "aws-seeded",
+  LC_PRIVATE_KEY: "lc-seeded"
+};
+const SECRET_NAME = /^(?:ANTHROPIC|OPENAI|OPENAGI|TELEGRAM|TWILIO|BUILDBETTER)_|_(?:TOKEN|SECRET|KEY)$/;
+
+function seedEnv(t, values) {
+  const saved = {};
+  for (const [key, value] of Object.entries(values)) {
+    saved[key] = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  t.after(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+}
+
+test("every route gets an allowlisted child env with no daemon secrets", async (t) => {
+  seedEnv(t, { ...SEEDED_SECRETS, CODEX_LB_API_KEY: undefined, LC_ALL: "en_US.UTF-8", PATH: "/usr/bin:/bin" });
+  const { cwd, calls, executor } = setup(t, { results: [{ code: 0 }, { code: 0, stdout: "DONE" }, { code: 0 }] });
+  await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec" });
+  await executor.deliver({ thread: claudeThread(cwd, { key: "claude:s2", live: { peerName: "cairo-1f", pid: 1, status: "idle" } }), message: "hi", route: "peer-relay" });
+  await executor.deliver({ thread: claudeThread(cwd), message: "continue", route: "claude-resume" });
+  await executor.whenIdle();
+  assert.equal(calls.length, 3);
+  const [codex, relay, resume] = calls.map((call) => call.env);
+  for (const [name, env] of [["codex-exec", codex], ["peer-relay", relay], ["claude-resume", resume]]) {
+    assert.ok(env && typeof env === "object", `${name} passes an explicit env`);
+    const leaked = Object.keys(env).filter((key) => SECRET_NAME.test(key) && key !== "CODEX_LB_API_KEY");
+    assert.deepEqual(leaked, [], `${name} leaks ${leaked.join(", ")}`);
+    for (const value of Object.values(SEEDED_SECRETS)) assert.ok(!JSON.stringify(env).includes(value), `${name} carries ${value}`);
+    assert.equal(env.HOME, process.env.HOME);
+    assert.equal(env.LC_ALL, "en_US.UTF-8");
+    const dirs = env.PATH.split(path.delimiter);
+    assert.deepEqual(dirs.slice(0, 2), ["/usr/bin", "/bin"]);
+    assert.ok(dirs.includes("/abs"), `${name} PATH includes the configured bin dirs`);
+    assert.ok(dirs.includes(path.dirname(process.execPath)), `${name} PATH includes the node dir`);
+  }
+  assert.equal(codex.CODEX_LB_API_KEY, "lb-secret-123");
+  assert.equal("CODEX_LB_API_KEY" in relay, false);
+  assert.equal("CODEX_LB_API_KEY" in resume, false);
+});
+
+test("codex-exec takes only CODEX_LB_API_KEY from the LB env file", async (t) => {
+  seedEnv(t, { CODEX_LB_API_KEY: undefined });
+  const { home, cwd, calls, executor } = setup(t, { results: [{ code: 0 }] });
+  fs.writeFileSync(path.join(home, ".codex", "codex-lb.env"), "OPENAI_API_KEY=sk-from-file\nCODEX_LB_API_KEY=lb-file\nEXTRA=1\n");
+  await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec" });
+  await executor.whenIdle();
+  assert.equal(calls[0].env.CODEX_LB_API_KEY, "lb-file");
+  assert.equal("OPENAI_API_KEY" in calls[0].env, false);
+  assert.equal("EXTRA" in calls[0].env, false);
+});
+
+test("codex-exec falls back to the daemon's own CODEX_LB_API_KEY when the file is missing", async (t) => {
+  seedEnv(t, { CODEX_LB_API_KEY: "lb-daemon" });
+  const { home, cwd, calls, executor } = setup(t, { results: [{ code: 0 }, { code: 0 }] });
+  fs.rmSync(path.join(home, ".codex", "codex-lb.env"));
+  await executor.deliver({ thread: codexThread(cwd), message: "continue", route: "codex-exec" });
+  await executor.deliver({ thread: claudeThread(cwd), message: "continue", route: "claude-resume" });
+  await executor.whenIdle();
+  assert.equal(calls[0].env.CODEX_LB_API_KEY, "lb-daemon");
+  assert.equal("CODEX_LB_API_KEY" in calls[1].env, false);
+});
+
+test("the peer relay can only use SendMessage", async (t) => {
+  const { cwd, calls, executor } = setup(t, { results: [{ code: 0, stdout: "DONE" }] });
+  await executor.deliver({ thread: claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 1, status: "idle" } }), message: "hi", route: "peer-relay" });
+  const args = calls[0].args;
+  assert.equal(args[args.indexOf("--tools") + 1], "SendMessage");
+  assert.ok(args.includes("--strict-mcp-config"), "no MCP servers load in the relay");
+  assert.equal(args[args.indexOf("--allowedTools") + 1], "SendMessage");
 });
 
 test("an existing proposed action is updated instead of duplicated", async (t) => {

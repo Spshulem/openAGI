@@ -18,6 +18,8 @@ const PR_URL_PATTERN = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\
 const WRAPPER_TAGS = [
   "environment_context", "in-app-browser-context", "user_instructions", "user_shell_command", "turn_aborted", "subagent_notification"
 ];
+// Codex Desktop writes these when it reopens a thread; no turn runs.
+const METADATA_EVENTS = new Set(["thread_settings_applied"]);
 const THREAD_COLUMNS = [
   "id", "rollout_path", "updated_at", "updated_at_ms", "source", "model_provider", "cwd", "title", "name",
   "archived", "git_branch", "git_origin_url", "model", "thread_source"
@@ -52,9 +54,10 @@ function atMs(at) {
   return Number.isFinite(ms) ? ms : 0;
 }
 
-function addPrRefs(summary, text, at) {
+// source "attachment" = the agent attached the PR; "owner" = a link in text the owner typed.
+function addPrRefs(summary, text, at, source) {
   for (const match of String(text ?? "").matchAll(PR_URL_PATTERN)) {
-    summary.prRefs.push({ ref: prRefKey(`${match[1]}/${match[2]}`, Number(match[3])), at: atMs(at) });
+    summary.prRefs.push({ ref: prRefKey(`${match[1]}/${match[2]}`, Number(match[3])), at: atMs(at), source, headBranch: null });
   }
 }
 
@@ -64,7 +67,7 @@ function addAttachRefs(summary, text, at) {
   const source = String(text ?? "");
   for (let index = source.indexOf("attach_artifact"); index >= 0; index = source.indexOf("attach_artifact", index + 1)) {
     const match = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/.exec(source.slice(index, index + 600));
-    if (match) summary.prRefs.push({ ref: prRefKey(`${match[1]}/${match[2]}`, Number(match[3])), at: atMs(at) });
+    if (match) summary.prRefs.push({ ref: prRefKey(`${match[1]}/${match[2]}`, Number(match[3])), at: atMs(at), source: "attachment", headBranch: null });
   }
 }
 
@@ -94,8 +97,9 @@ function readUserInput(summary, raw, at) {
     return;
   }
   summary.lastInputHeartbeat = false;
-  addPrRefs(summary, text, at);
+  // Links inside the browser/IDE wrappers are ambient context, not the owner's words.
   const cleaned = cleanCodexUserText(text);
+  addPrRefs(summary, cleaned, at, "owner");
   if (cleaned) summary.lastUser = { text: cleaned, at };
 }
 
@@ -113,7 +117,7 @@ function readItem(summary, item, at) {
   if (!item || typeof item !== "object") return;
   if (item.type === "AgentMessage") setAgent(summary, contentText(item.content, ["Text", "text"]), at);
   else if (item.type === "UserMessage") readUserInput(summary, contentText(item.content, ["text", "Text"]), at);
-  else if (item.type === "McpToolCall" && item.tool === "attach_artifact") addPrRefs(summary, item.arguments?.url, at);
+  else if (item.type === "McpToolCall" && item.tool === "attach_artifact") addPrRefs(summary, item.arguments?.url, at, "attachment");
 }
 
 function readEvent(summary, payload, at) {
@@ -152,7 +156,7 @@ function readResponseItem(summary, payload, at) {
   } else if (payload.type === "function_call") {
     const name = String(payload.name ?? "");
     if (name === "request_user_input_async") summary.pendingQuestion = questionTitle(payload.arguments) ?? summary.pendingQuestion;
-    else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at);
+    else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
   } else if (payload.type === "custom_tool_call" && String(payload.input ?? "").includes("attach_artifact")) {
     addAttachRefs(summary, payload.input, at);
   }
@@ -161,7 +165,7 @@ function readResponseItem(summary, payload, at) {
 export function parseRolloutTail(text) {
   const summary = {
     events: 0, lifecycle: null, turnStartedAt: null, lastAgent: null, lastUser: null,
-    lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: []
+    lastInputHeartbeat: false, lastSupervisorAt: null, pendingQuestion: null, prRefs: [], lastTurnAt: null
   };
   for (const row of parseJsonLines(text)) {
     const payload = row?.payload;
@@ -170,9 +174,11 @@ export function parseRolloutTail(text) {
     if (row.type === "event_msg") {
       summary.events += 1;
       readEvent(summary, payload, at);
+      if (at && !METADATA_EVENTS.has(payload.type)) summary.lastTurnAt = at;
     } else if (row.type === "response_item") {
       summary.events += 1;
       readResponseItem(summary, payload, at);
+      if (at) summary.lastTurnAt = at;
     }
   }
   return summary;
@@ -247,7 +253,9 @@ function applyRollout(thread, row, context) {
   }
   const summary = parseRolloutTail(readTail(row.rollout_path, tailBytes));
   const updatedMs = Date.parse(thread.lastActivityAt ?? "");
-  thread.lastActivityAt = toIso(Math.max(mtimeMs, Number.isFinite(updatedMs) ? updatedMs : 0));
+  // Settings writes bump the file and catalog times without a turn, so
+  // those are only a fallback when the tail holds no turn row.
+  thread.lastActivityAt = summary.lastTurnAt ?? toIso(Math.max(mtimeMs, Number.isFinite(updatedMs) ? updatedMs : 0));
   thread.agentStatus = statusFor(summary, mtimeMs, now, limits);
   thread.error = errorFor(summary.lifecycle, now, limits);
   if (summary.lastAgent) {
@@ -259,7 +267,9 @@ function applyRollout(thread, row, context) {
     thread.lastUserAt = summary.lastUser.at;
   }
   thread.meta.turnStartedAt = summary.turnStartedAt;
-  thread.meta.abortReason = summary.lifecycle?.type === "turn_aborted" ? (summary.lifecycle.payload.reason ?? null) : null;
+  const aborted = summary.lifecycle?.type === "turn_aborted";
+  thread.meta.abortReason = aborted ? (summary.lifecycle.payload.reason ?? null) : null;
+  thread.meta.abortedAt = aborted ? summary.lifecycle.at : null;
   thread.meta.lastSupervisorAt = summary.lastSupervisorAt;
   thread.meta.pendingQuestion = summary.pendingQuestion
     ? clampText(redactSecrets(summary.pendingQuestion), limits.bodyMax)
@@ -273,9 +283,19 @@ function applyRollout(thread, row, context) {
   return summary.prRefs;
 }
 
-function orderPrRefs(entries) {
-  const sorted = [...entries].sort((a, b) => b.at - a.at);
-  return [...new Set(sorted.map((entry) => entry.ref))];
+// An attachment whose head is the thread's branch comes first, then other
+// attachments (unknown head before a different head), then links the owner
+// typed. Newest first within a tier; same-second ties go to the higher PR.
+function refTier(entry, branch) {
+  if (entry.source !== "attachment") return 3;
+  if (!entry.headBranch || !branch) return 1;
+  return entry.headBranch === branch ? 0 : 2;
+}
+
+function orderPrRefs(entries, branch) {
+  const ranked = entries.map((entry) => ({ ...entry, tier: refTier(entry, branch), number: parsePrRef(entry.ref)?.number ?? 0 }));
+  ranked.sort((a, b) => a.tier - b.tier || b.at - a.at || b.number - a.number || a.ref.localeCompare(b.ref));
+  return [...new Set(ranked.map((entry) => entry.ref))];
 }
 
 function buildThread(row, context) {
@@ -313,6 +333,7 @@ function buildThread(row, context) {
       file: row.rollout_path || null,
       turnStartedAt: null,
       abortReason: null,
+      abortedAt: null,
       lastSupervisorAt: null,
       pendingQuestion: null,
       heartbeat: false
@@ -320,7 +341,7 @@ function buildThread(row, context) {
   };
   // Excluded-by-metadata threads (mostly guardian reviews) skip the tail read.
   const rolloutRefs = thread.excluded ? [] : applyRollout(thread, row, context);
-  thread.prRefs = orderPrRefs([...(attachments.get(id) ?? []), ...rolloutRefs]);
+  thread.prRefs = orderPrRefs([...(attachments.get(id) ?? []), ...rolloutRefs], thread.branch);
   if (!thread.repo && thread.prRefs.length > 0) thread.repo = parsePrRef(thread.prRefs[0])?.repo ?? null;
   if (!thread.excluded) thread.excluded = scopeExclusion(thread);
   return thread;
@@ -333,6 +354,15 @@ function readThreadRows(db, sinceMs, limit) {
   select.push(present.has("first_user_message") ? "substr(first_user_message, 1, 400) AS first_user_head" : "NULL AS first_user_head");
   return db.prepare(`SELECT ${select.join(", ")} FROM threads WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT ?`)
     .all(Math.floor(sinceMs / 1000), limit);
+}
+
+function headBranchOf(row) {
+  try {
+    const head = JSON.parse(row.payload)?.headBranch;
+    return typeof head === "string" && head ? head : null;
+  } catch {
+    return null;
+  }
 }
 
 function prRefFromAttachment(row) {
@@ -360,7 +390,7 @@ function readPrAttachments(db, ids) {
       const ref = prRefFromAttachment(row);
       if (!ref) continue;
       if (!out.has(row.thread_id)) out.set(row.thread_id, []);
-      out.get(row.thread_id).push({ ref, at: Number(row.created_at) * 1000 || 0 });
+      out.get(row.thread_id).push({ ref, at: Number(row.created_at) * 1000 || 0, source: "attachment", headBranch: headBranchOf(row) });
     }
   } catch { /* older Codex without the attachments table */ }
   return out;
@@ -427,7 +457,10 @@ export async function listCodexThreads(config, options = {}) {
       try { db.close(); } catch { /* already closed */ }
     }
     const context = { config, now, attachments, tailBytes: options.tailBytes ?? TAIL_BYTES };
-    const threads = capThreads(rows.map((row) => buildThread(row, context)), limits.maxThreads);
+    // The catalog query lets settings-only writes through; the last turn decides.
+    const cutoff = now - config.lookbackHours * HOUR;
+    const built = rows.map((row) => buildThread(row, context)).filter((thread) => !(Date.parse(thread.lastActivityAt ?? "") < cutoff));
+    const threads = capThreads(built, limits.maxThreads);
     const locked = await readWriterLocks(config, threads.map((thread) => thread.id), { run, isPidAlive });
     for (const thread of threads) thread.writerLocked = locked.has(thread.id);
     return threads;

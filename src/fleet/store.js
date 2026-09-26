@@ -14,6 +14,9 @@ const NUDGES_KEPT = 20;
 const CLOSED_QUESTIONS_KEPT = 200;
 const OPTIONS_MAX = 4;
 const OPTION_MAX_CHARS = 40;
+const INFRA_BLOCKED_KEPT = 200;
+// The owner closed these; the same ask stays quiet until its TTL passes.
+const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 
 // Only a delivered nudge spends the no-progress budget. A failed send still
 // starts the cooldown so a broken route is not retried every tick; dry-runs,
@@ -31,6 +34,7 @@ function emptyState() {
     actions: [],
     escalations: {},
     infraDown: {},
+    infraBlocked: {},
     pushes: [],
     muted: {}
   };
@@ -171,6 +175,10 @@ export class FleetStore {
       }
       return { ...existing };
     }
+    // An answer or dismissal holds while the condition does, so the next
+    // tick neither reopens it with a new id nor pushes the phone again.
+    const closed = this._ownerClosed(key, now);
+    if (closed) return { ...closed, suppressed: true };
     const question = {
       id: makeId("fq"),
       dedupeKey: key,
@@ -297,6 +305,23 @@ export class FleetStore {
     return this.state.infraDown[kind] ?? null;
   }
 
+  // Threads seen blocked on an outage, so the recovery tick can resume them
+  // even after the error rows that flagged them have aged out.
+  setInfraBlocked(kind, keys) {
+    const list = [...new Set((Array.isArray(keys) ? keys : []).filter((key) => typeof key === "string" && key))].slice(-INFRA_BLOCKED_KEPT);
+    const current = this.state.infraBlocked[kind] ?? [];
+    if (JSON.stringify(current) === JSON.stringify(list)) return this.infraBlocked(kind);
+    if (list.length) this.state.infraBlocked[kind] = list;
+    else delete this.state.infraBlocked[kind];
+    this._save();
+    return this.infraBlocked(kind);
+  }
+
+  infraBlocked(kind) {
+    const list = this.state.infraBlocked[kind];
+    return Array.isArray(list) ? [...list] : [];
+  }
+
   // ─── phone pushes (times only; never the endpoint) ──────────────────────
 
   recordPush(at) {
@@ -335,10 +360,25 @@ export class FleetStore {
     return until && toMs(until, 0) > this.now() ? until : null;
   }
 
+  mutedKeys() {
+    return new Set(Object.keys(this.state.muted).filter((key) => this.mutedUntil(key)));
+  }
+
   // ─── internals ──────────────────────────────────────────────────────────
 
   _findQuestion(id) {
     return this.state.questions.find((q) => q.id === id) ?? null;
+  }
+
+  _ownerClosed(key, now) {
+    let latest = null;
+    for (const question of this.state.questions) {
+      if (question.dedupeKey !== key || !OWNER_CLOSED.has(question.status)) continue;
+      const closedAt = toMs(question.answeredAt, null);
+      if (closedAt === null || now - closedAt >= QUESTION_TTL_MS) continue;
+      if (!latest || closedAt > toMs(latest.answeredAt, 0)) latest = question;
+    }
+    return latest;
   }
 
   _closeQuestion(id, status, answer) {
@@ -394,6 +434,7 @@ export class FleetStore {
       actions: Array.isArray(raw.actions) ? raw.actions.filter(isObject) : [],
       escalations: isObject(raw.escalations) ? raw.escalations : {},
       infraDown: isObject(raw.infraDown) ? raw.infraDown : {},
+      infraBlocked: isObject(raw.infraBlocked) ? raw.infraBlocked : {},
       pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
       muted: isObject(raw.muted) ? raw.muted : {}
     };

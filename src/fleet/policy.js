@@ -14,6 +14,8 @@ const UNREACHABLE_ASK_MS = 90 * MIN;
 const LONG_DOWN_MS = HOUR;
 // An abort within a minute of the owner's message is the owner hitting stop.
 const DELIBERATE_STOP_MS = MIN;
+// LB log rows older than this say nothing about the LB now.
+const LB_ERROR_FRESH_MS = 15 * MIN;
 
 const LIMIT_KINDS = new Set(["session-limit", "usage-limit"]);
 const BACKOFF_KINDS = new Set(["overloaded", "network"]);
@@ -24,17 +26,26 @@ const CI_FAILING = new Set(["FAILURE", "ERROR"]);
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head"]);
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection"]);
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
+// Thread-level and infra-level escalations of one incident share a cooldown.
+const ESCALATION_KEYS = { "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" };
 
 const TOPIC_TITLES = {
   approval: "needs an approval. OK?",
   admin: "wants an --admin merge. OK?",
   merge: "wants to merge. OK?",
-  production: "wants a prod release. OK?",
+  production: "wants a prod step. OK?",
   credentials: "needs a login or creds. Do it?",
   money: "wants to spend credits. OK?",
   delete: "wants to delete shared stuff. OK?",
   choice: "needs a pick. Which?",
-  decision: "needs your call. Answer?"
+  decision: "needs your call. Answer?",
+  permission: "asks permission. OK?",
+  "in-scope": "asks to go ahead. OK?",
+  reboot: "wants to reboot shared infra. OK?",
+  cancel: "wants to cancel runs. OK?",
+  history: "wants to rewrite git history. OK?",
+  main: "wants to push to main. OK?",
+  database: "wants to change a shared DB. OK?"
 };
 
 // ---------------------------------------------------------------------------
@@ -51,26 +62,56 @@ export function chooseRoute(thread, mode) {
   return null;
 }
 
-function managerRoute(manager, mode) {
+// Null while the owner is talking to the manager, while it is mid-turn, or
+// while it is down. Callers check managerBusy first to wait instead of asking.
+function managerRoute(manager, mode, limits, now) {
   if (!manager) return null;
-  if (manager.error && MANAGER_DOWN_KINDS.has(manager.error.kind)) return null;
+  if (managerBusy(manager, limits, now)) return null;
+  if (managerDown(manager, now)) return null;
   return chooseRoute(manager, mode);
+}
+
+function managerBusy(manager, limits, now) {
+  if (!manager) return null;
+  const ownerUntil = ownerActiveUntil(manager, limits, now);
+  if (ownerUntil) return { reason: "owner active in manager thread", notBefore: ownerUntil };
+  if (manager.agentStatus === "running") return { reason: "manager mid-turn", notBefore: null };
+  return null;
+}
+
+// A limit error stays on the thread until its next turn; once the reset has
+// passed it no longer means the manager is down.
+function managerDown(manager, now) {
+  const kind = manager.error?.kind;
+  if (!MANAGER_DOWN_KINDS.has(kind)) return false;
+  const resetAt = Date.parse(manager.error?.resetAt ?? "");
+  return !(LIMIT_KINDS.has(kind) && Number.isFinite(resetAt) && resetAt <= now);
+}
+
+function isManager(ctx) {
+  const { manager, thread } = ctx;
+  if (!manager || !thread) return false;
+  return manager.key === thread.key || (Boolean(thread.meta?.claudeKey) && manager.key === thread.meta.claudeKey);
 }
 
 // ---------------------------------------------------------------------------
 // Per-thread decisions
 
+// options.escalationLedger: lastEscalation(key) for shared incident keys
+// ("infra:bb3", "infra:lb"). options.mutedKeys: thread keys the owner muted.
 export function decideThread(classified, thread, options = {}) {
   const ctx = makeContext(classified, thread, options);
+  if (ctx.mutedKeys.has(thread?.key)) return { ...baseDecision(ctx), reason: "muted by owner" };
   return resolveIntent(ctx, intentFor(ctx));
 }
 
 function makeContext(classified, thread, options) {
-  const { ledger = null, playbooks = new Map(), config = null, now = Date.now(), pr = null, infra = null, manager = null } = options;
+  const { ledger = null, playbooks = new Map(), config = null, now = Date.now(), pr = null, infra = null, manager = null, escalationLedger = null } = options;
   const mode = options.mode ?? config?.mode ?? "observe";
   const limits = limitsOf(config);
   return {
-    classified, thread, pr, infra, manager, playbooks, limits, now, mode,
+    classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger,
+    mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
     progressMark: classified.readiness?.progressMark ?? { head: null, unresolved: null },
     facts: factsFor(thread, pr, classified)
@@ -84,7 +125,8 @@ function intentFor(ctx) {
     case "waiting-ci": return waitingIntent(ctx);
     case "local-verify": return nudge("no-local-verify", "heavy verification on the laptop", { immediate: true });
     case "needs-human": return agentAskIntent(ctx);
-    case "asked-in-scope": return nudge("in-scope-yes", "agent asked to do an in-scope step");
+    // The manager's asks are about shared infra: the owner answers them.
+    case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
     default: return { type: "none", reason: classified.reason };
@@ -194,14 +236,37 @@ function escalateIntent(ctx, what, age) {
   const vars = {
     ...bb3Vars(ctx.infra?.bb3, [], ctx.limits),
     problems: `${facts.label} waits on ${what} ${minutes(age)}m`,
-    waiting: `Waiting: ${facts.prRef || "no PR"} head ${facts.head || "?"}, ${what} ${minutes(age)}m (agent ${facts.thread}).`
+    waiting: waitingLine(facts, what, age)
   };
   return { type: "escalate", playbook: "manager-bb3", reason: `${what} ${minutes(age)}m`, vars };
+}
+
+function waitingLine(facts, what, age) {
+  return `Waiting: ${facts.prRef || "no PR"} head ${facts.head || "?"}, ${what} ${minutes(age)}m (agent ${facts.thread}).`;
+}
+
+// The verify wait waitingIntent escalates to the manager, or null.
+function escalatedWait(classified, pr, limits) {
+  if (classified?.state !== "waiting-ci") return null;
+  const wait = classified.wait ?? {};
+  const age = wait.ageMs ?? 0;
+  const ciFailing = Boolean(pr) && (CI_FAILING.has(pr.ci?.state) || Boolean(pr.ci?.failing?.length));
+  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs && ciFailing) return { what: "bb-verify --full", age };
+  if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) return { what: "bb-quick", age };
+  return null;
 }
 
 function agentAskIntent(ctx) {
   const { classified, thread } = ctx;
   const ask = classified.ask ?? {};
+  if (thread.meta?.blockedOnOwner === true) {
+    // Only a click in the session clears it, so the answer is not relayed.
+    return {
+      type: "ask", reason: "blocked on a permission prompt",
+      question: question(ctx, `${ctx.facts.label}: waiting on a prompt. Open it?`, `${ctx.facts.label}: ${ask.text ?? "Blocked on a permission prompt or dialog."}`,
+        ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["opened", "later"], `prompt:${thread.key}`, "prompt")
+    };
+  }
   const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
   const options = ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   const excerpt = ownerExcerpt(ask.text || thread.lastAgentText, ctx.limits.bodyMax);
@@ -241,7 +306,7 @@ function resolveIntent(ctx, intent) {
   if (intent.type === "wait") return { ...base, action: "wait", reason: intent.reason, notBefore: intent.notBefore ?? null };
   if (intent.type === "escalate") return resolveEscalation(ctx, intent, base);
   // The owner typing into this thread outranks anything that touches it.
-  const ownerUntil = ownerActiveUntil(ctx);
+  const ownerUntil = ownerActiveUntil(ctx.thread, ctx.limits, ctx.now);
   if (ownerUntil) return { ...base, action: "wait", reason: "owner active in thread", notBefore: ownerUntil };
   if (intent.type === "ask") {
     return { ...base, action: "ask-user", reason: intent.reason, question: intent.question, notBefore: intent.notBefore ?? null };
@@ -300,10 +365,16 @@ function resolveEscalation(ctx, intent, base) {
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
   const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.managerEscalationCooldownMs;
-  const cooledAt = addMs(lastPlaybookAt(ctx.ledger, intent.playbook), cooldownMs);
+  // One incident, one cooldown: the infra-level escalation of the same
+  // incident counts, not just this thread's own sends.
+  const incidentKey = ESCALATION_KEYS[intent.playbook];
+  const lastAt = latest(lastPlaybookAt(ctx.ledger, intent.playbook), incidentKey ? readLedger(ctx.escalationLedger, "lastEscalation", incidentKey) : null);
+  const cooledAt = addMs(lastAt, cooldownMs);
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: `escalated; ${intent.reason}`, notBefore: cooledAt };
+  const busy = managerBusy(ctx.manager, limits, now);
+  if (busy) return { ...decision, action: "wait", reason: `${busy.reason}; ${intent.reason}`, notBefore: busy.notBefore };
   const vars = { ...ctx.facts, ...intent.vars };
-  const route = managerRoute(ctx.manager, ctx.mode);
+  const route = managerRoute(ctx.manager, ctx.mode, limits, now);
   if (!route) {
     return {
       ...decision, action: "ask-user",
@@ -323,8 +394,7 @@ function baseDecision(ctx) {
   };
 }
 
-function ownerActiveUntil(ctx) {
-  const { thread, limits, now } = ctx;
+function ownerActiveUntil(thread, limits, now) {
   if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return null;
   const at = Date.parse(thread.lastUserAt ?? "");
   if (!Number.isFinite(at)) return null;
@@ -336,7 +406,8 @@ function deliberateStop(thread) {
   if (thread.agentStatus !== "aborted") return false;
   if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
   const userAt = Date.parse(thread.lastUserAt ?? "");
-  const abortAt = Date.parse(thread.lastActivityAt ?? "");
+  // Later metadata writes bump lastActivityAt; the source's abort time does not move.
+  const abortAt = Date.parse(thread.meta?.abortedAt ?? thread.lastActivityAt ?? "");
   if (!Number.isFinite(userAt) || !Number.isFinite(abortAt)) return false;
   const gap = abortAt - userAt;
   return gap >= 0 && gap <= DELIBERATE_STOP_MS;
@@ -380,7 +451,10 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
   if (slow.quick.length) bb3Problems.push(`${slow.quick.length} bb-quick >${minutes(limits.quickVerifyEscalateMs)}m`);
   if (bb3?.timersDead?.length) bb3Problems.push(`timers dead: ${bb3.timersDead.map((name) => fact(name, 40)).join(", ")}`);
 
-  const lbErrors = (lb?.recentErrors ?? []).filter((entry) => LB_ALARM_KINDS.has(entry.kind) && Number(entry.count) > 0);
+  // The log window is an hour; only recent rows say the LB is down now.
+  const freshMs = limits.lbErrorFreshMs ?? LB_ERROR_FRESH_MS;
+  const lbErrors = (lb?.recentErrors ?? []).filter((entry) => LB_ALARM_KINDS.has(entry.kind) && Number(entry.count) > 0
+    && isFresh(entry.lastAt, freshMs, now));
   const lbProblems = [];
   if (lb?.healthy === false) lbProblems.push(`LB unhealthy${lb.detail ? ` (${fact(lb.detail, 80)})` : ""}`);
   for (const entry of lbErrors) lbProblems.push(`${Number(entry.count)}x ${entry.kind}`);
@@ -403,10 +477,13 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
 // threads: [{ thread, classified, ledger?, pr? }] from this tick.
 // ledger: the FleetStore (lastEscalation(key), infraDown(kind), optional
 // infraDownSince(kind)) or plain maps with the same names.
+// blockedKeys: { bb3: [], lb: [] } thread keys seen blocked while it was down.
+// mutedKeys: thread keys the owner muted; they get no recovery nudge.
 export function decideInfra(infra, options = {}) {
-  const { ledger = {}, playbooks = new Map(), config = null, now = Date.now(), threads = [], manager = null } = options;
+  const { ledger = {}, playbooks = new Map(), config = null, now = Date.now(), threads = [], manager = null, blockedKeys = null } = options;
   const mode = options.mode ?? config?.mode ?? "observe";
   const limits = limitsOf(config);
+  const mutedKeys = keySet(options.mutedKeys);
   const health = infraHealth(infra, { config, now });
   const decisions = [];
   for (const kind of ["bb3", "lb"]) {
@@ -415,7 +492,8 @@ export function decideInfra(infra, options = {}) {
     const wasDown = readLedger(ledger, "infraDown", kind) === true;
     if (wasDown && state.up) {
       decisions.push(infraDecision(key, { reason: `${INFRA_NAMES[kind]} recovered` }));
-      decisions.push(...recoveryNudges(kind, { threads, playbooks, config, now, mode, infra }));
+      const remembered = keySet(blockedKeys?.[kind]);
+      decisions.push(...recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, remembered, mutedKeys }));
       continue;
     }
     if (!state.problems.length) continue;
@@ -425,7 +503,7 @@ export function decideInfra(infra, options = {}) {
       decisions.push(infraDecision(key, { action: "wait", reason: "BuildBot3 SSH failed once", blockers: state.problems }));
       continue;
     }
-    decisions.push(escalateInfra(kind, state.problems, { infra, ledger, playbooks, limits, now, manager, mode }));
+    decisions.push(escalateInfra(kind, state.problems, { infra, ledger, playbooks, limits, now, manager, mode, threads }));
     const downSince = readLedger(ledger, "infraDownSince", kind);
     const downMs = msSince(downSince, now);
     if (state.down && downMs !== null && downMs >= LONG_DOWN_MS) {
@@ -439,7 +517,7 @@ export function decideInfra(infra, options = {}) {
   return decisions;
 }
 
-function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, manager, mode }) {
+function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, manager, mode, threads }) {
   const key = `infra:${kind}`;
   const playbookId = kind === "bb3" ? "manager-bb3" : "manager-lb";
   const base = infraDecision(key, { playbook: playbookId, reason: problems.join("; "), blockers: problems, targetKey: manager?.key ?? null });
@@ -448,8 +526,10 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.managerEscalationCooldownMs;
   const cooledAt = addMs(readLedger(ledger, "lastEscalation", key), cooldownMs);
   if (cooledAt && Date.parse(cooledAt) > now) return { ...base, action: "wait", reason: `escalated; ${base.reason}`, notBefore: cooledAt };
-  const vars = kind === "bb3" ? bb3Vars(infra?.bb3, problems, limits) : lbVars(infra?.lb, problems);
-  const route = managerRoute(manager, mode);
+  const busy = managerBusy(manager, limits, now);
+  if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
+  const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
+  const route = managerRoute(manager, mode, limits, now);
   if (!route) {
     return {
       ...base, action: "ask-user",
@@ -462,13 +542,25 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   return { ...base, action: "escalate-manager", route, message: renderTemplate(playbook.body, vars) };
 }
 
-function recoveryNudges(kind, { threads, playbooks, config, now, mode, infra }) {
+// Only one escalation per manager per tick carries the news, so it names
+// every thread whose verify wait would have escalated on its own.
+function waitingLines(threads, limits) {
+  const lines = [];
+  for (const item of threads ?? []) {
+    const slow = item?.thread && escalatedWait(item.classified, item.pr ?? null, limits);
+    if (slow) lines.push(waitingLine(factsFor(item.thread, item.pr ?? null, item.classified), slow.what, slow.age));
+  }
+  const extra = lines.length > 4 ? ` +${lines.length - 4} more waiting.` : "";
+  return `${lines.slice(0, 4).join(" ")}${extra}`;
+}
+
+function recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, remembered = new Set(), mutedKeys = new Set() }) {
   const out = [];
   for (const item of threads ?? []) {
     const thread = item?.thread;
     const classified = item?.classified;
-    if (!thread || classified?.infraKind !== kind) continue;
-    if (classified.state !== "infra-blocked" && classified.state !== "waiting-ci") continue;
+    if (!thread || !classified || mutedKeys.has(thread.key)) continue;
+    if (!recoverable(kind, classified, remembered.has(thread.key))) continue;
     // A thread still inside a turn or a background wait will notice by itself.
     if (thread.agentStatus === "running" || thread.agentStatus === "waiting") continue;
     const ctx = makeContext(classified, thread, { ledger: item.ledger, playbooks, config, now, pr: item.pr ?? null, mode, infra });
@@ -476,6 +568,17 @@ function recoveryNudges(kind, { threads, playbooks, config, now, mode, infra }) 
     if (decision.action !== "none") out.push(decision);
   }
   return out;
+}
+
+// Blocked on this infra now, or remembered as blocked while it was down (the
+// log rows that marked it may have aged out). Remembered threads that now ask
+// the owner, wait on the owner, or are done are left alone.
+function recoverable(kind, classified, remembered) {
+  const { state, infraKind } = classified;
+  if ((state === "infra-blocked" || state === "waiting-ci") && infraKind === kind) return true;
+  if (!remembered) return false;
+  if (state === "pr-not-ready" || state === "idle-no-pr") return true;
+  return state === "waiting-ci" && !infraKind;
 }
 
 function infraDecision(key, patch) {
@@ -520,10 +623,19 @@ function lbVars(lb, problems) {
 }
 
 // Keep one sending decision per thread per tick (infra recovery and the
-// thread's own decision can both pick the same nudge). Earlier entries win.
+// thread's own decision can both pick the same nudge), and one escalation
+// per manager and playbook (the infra incident and every slow thread can all
+// escalate the same jam). Earlier entries win; infra decisions come first.
 export function dedupeDecisions(decisions) {
   const sent = new Set();
+  const escalated = new Set();
   return (decisions ?? []).filter((decision) => {
+    if (decision?.action === "escalate-manager") {
+      const key = `${decision.targetKey ?? ""}\u0000${decision.playbook ?? ""}`;
+      if (escalated.has(key)) return false;
+      escalated.add(key);
+      return true;
+    }
     if (decision?.action !== "nudge") return true;
     if (sent.has(decision.threadKey)) return false;
     sent.add(decision.threadKey);
@@ -637,6 +749,19 @@ function latest(...values) {
     if (Number.isFinite(at) && (best === null || at > Date.parse(best))) best = value;
   }
   return best;
+}
+
+function isFresh(iso, maxAgeMs, now) {
+  // A row with no time cannot be aged out, so it still counts.
+  const at = Date.parse(iso ?? "");
+  return !Number.isFinite(at) || now - at <= maxAgeMs;
+}
+
+function keySet(value) {
+  if (value instanceof Set) return value;
+  if (Array.isArray(value)) return new Set(value);
+  if (typeof value?.has === "function") return value;
+  return new Set();
 }
 
 function readLedger(ledger, name, key) {

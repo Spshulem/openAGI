@@ -55,7 +55,9 @@ const ev = {
   aborted: (turn, msAgo) => ({ timestamp: iso(msAgo), type: "event_msg", payload: { type: "turn_aborted", turn_id: turn, reason: "interrupted", started_at: sec(msAgo + MIN), completed_at: sec(msAgo) } }),
   attachMcp: (url, msAgo) => ({ timestamp: iso(msAgo), type: "event_msg", payload: { type: "item_completed", item: { type: "McpToolCall", server: "codex_app", tool: "attach_artifact", arguments: { artifact_type: "pull_request", url }, status: "completed" } } }),
   attachExec: (url, msAgo) => ({ timestamp: iso(msAgo), type: "response_item", payload: { type: "custom_tool_call", name: "exec", call_id: "c1", input: `const r = await tools.mcp__codex_app__attach_artifact({artifact_type:"pull_request",url:"${url}"});` } }),
-  ask: (title, msAgo) => ({ timestamp: iso(msAgo), type: "response_item", payload: { type: "function_call", name: "request_user_input_async", call_id: "q1", arguments: JSON.stringify({ questions: [{ title }] }) } })
+  ask: (title, msAgo) => ({ timestamp: iso(msAgo), type: "response_item", payload: { type: "function_call", name: "request_user_input_async", call_id: "q1", arguments: JSON.stringify({ questions: [{ title }] }) } }),
+  // Codex Desktop writes this when it reopens a thread; no turn runs.
+  settings: (msAgo) => ({ timestamp: iso(msAgo), type: "event_msg", payload: { type: "thread_settings_applied", thread_id: "x", thread_settings: { model: "gpt-6-sol" } } })
 };
 
 function makeHome(t) {
@@ -164,7 +166,7 @@ test("listCodexThreads classifies running, stalled, aborted, error, and idle thr
   assert.equal(idle.lastActivityAt, new Date(NOW - 25 * MIN).toISOString());
 });
 
-test("listCodexThreads collects PR refs newest first from attachments, attach_artifact calls, and user messages", async (t) => {
+test("listCodexThreads collects PR refs newest first from attachments and attach_artifact calls, not browser context", async (t) => {
   const ctx = makeHome(t);
   addThread(ctx, { id: "t-pr", mtimeAgo: 25 * MIN, lines: [
     ev.user("<in-app-browser-context source=\"ambient-ui-state\"> Current URL: https://github.com/buildbetter-app/buildbetter/pull/6001 </in-app-browser-context>\n## My request for Codex:\nplease fix CI", 60 * MIN),
@@ -182,7 +184,6 @@ test("listCodexThreads collects PR refs newest first from attachments, attach_ar
   assert.deepEqual(thread.prRefs, [
     "buildbetter-app/buildbetter#6003",
     "buildbetter-app/buildbetter#6002",
-    "buildbetter-app/buildbetter#6001",
     "buildbetter-app/bb-recorder#283"
   ]);
   assert.equal(thread.lastUserText, "please fix CI");
@@ -375,4 +376,73 @@ test("classifyLbError maps real retry strings to kinds", () => {
   assert.equal(classifyLbError("error=request timed out"), "connection");
   assert.equal(classifyLbError("error=unexpected status 502 Bad Gateway: Previous response owner account is unavailable"), "unavailable");
   assert.equal(classifyLbError("error=Transport error: timeout"), "connection");
+});
+
+function attach(ctx, threadId, number, { at, headBranch = null, repo = "buildbetter-app/buildbetter" }) {
+  const [owner, name] = repo.split("/");
+  ctx.db.prepare("INSERT INTO thread_attachments VALUES (?, ?, 'pull_request', ?, ?, ?)")
+    .run(`${threadId}-${number}`, threadId, JSON.stringify(["github.com", owner, name, number]),
+      JSON.stringify({ url: `https://github.com/${repo}/pull/${number}`, root: null, headBranch }), at);
+}
+
+test("listCodexThreads ranks the thread's own attached PR first and owner links last", async (t) => {
+  const ctx = makeHome(t);
+  const idle = (turn) => [ev.started(turn, 30 * MIN), ev.complete(turn, 25 * MIN, "ok")];
+  addThread(ctx, { id: "t-own", branch: "feature/jiminny-import-guardrails", lines: [
+    ev.userItem("<in-app-browser-context> Current URL: https://github.com/buildbetter-app/buildbetter/pull/6500 </in-app-browser-context>\n## My request for Codex:\nfix the import", 60 * MIN),
+    ev.user("also see https://github.com/buildbetter-app/buildbetter/pull/6376", 40 * MIN),
+    ...idle("o1")
+  ] });
+  attach(ctx, "t-own", 6630, { at: sec(300 * MIN), headBranch: "feature/jiminny-import-guardrails" });
+  attach(ctx, "t-own", 6100, { at: sec(200 * MIN), headBranch: "bugfix/other" });
+  attach(ctx, "t-own", 6200, { at: sec(250 * MIN) });
+
+  // Three PRs attached in the same second, the lowest number inserted first.
+  addThread(ctx, { id: "t-tie", lines: idle("t1") });
+  for (const number of [4811, 6237, 6453]) attach(ctx, "t-tie", number, { at: sec(100 * MIN) });
+
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.deepEqual(map["t-own"].prRefs, [
+    "buildbetter-app/buildbetter#6630",
+    "buildbetter-app/buildbetter#6200",
+    "buildbetter-app/buildbetter#6100",
+    "buildbetter-app/buildbetter#6376"
+  ], "own-branch attachment, unknown-head attachment, other-branch attachment, owner link; no browser-context URL");
+  assert.deepEqual(map["t-tie"].prRefs, [
+    "buildbetter-app/buildbetter#6453",
+    "buildbetter-app/buildbetter#6237",
+    "buildbetter-app/buildbetter#4811"
+  ]);
+});
+
+test("listCodexThreads dates activity from the last turn row, not settings writes", async (t) => {
+  const ctx = makeHome(t);
+  addThread(ctx, { id: "t-dormant", mtimeAgo: 5 * MIN, lines: [
+    ev.started("d1", 27 * 24 * 60 * MIN + MIN), ev.complete("d1", 27 * 24 * 60 * MIN, "done"), ev.settings(5 * MIN)
+  ] });
+  addThread(ctx, { id: "t-reopened", mtimeAgo: 5 * MIN, lines: [
+    ev.started("r1", 3 * 60 * MIN + MIN), ev.complete("r1", 3 * 60 * MIN, "done"), ev.settings(5 * MIN)
+  ] });
+  // A rollout with no turn row in its tail falls back to the file and catalog times.
+  addThread(ctx, { id: "t-bare", mtimeAgo: 7 * MIN, updatedAgo: 9 * MIN, lines: [ev.settings(7 * MIN)] });
+
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.equal(map["t-dormant"], undefined, "a thread whose last turn was 27 days ago is outside the lookback");
+  assert.equal(map["t-reopened"].lastActivityAt, iso(3 * 60 * MIN));
+  assert.equal(map["t-reopened"].agentStatus, "idle");
+  assert.equal(map["t-bare"].lastActivityAt, iso(7 * MIN));
+});
+
+test("listCodexThreads exposes when an aborted turn was stopped", async (t) => {
+  const ctx = makeHome(t);
+  addThread(ctx, { id: "t-stopped", mtimeAgo: MIN, lines: [
+    ev.user("rebase onto main", 30 * MIN + 29_000), ev.started("s1", 30 * MIN + 28_000), ev.aborted("s1", 30 * MIN), ev.settings(MIN)
+  ] });
+  addThread(ctx, { id: "t-done", lines: [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.equal(map["t-stopped"].agentStatus, "aborted");
+  assert.equal(map["t-stopped"].meta.abortedAt, iso(30 * MIN));
+  assert.equal(map["t-stopped"].lastActivityAt, iso(30 * MIN));
+  assert.equal(map["t-stopped"].lastUserAt, iso(30 * MIN + 29_000));
+  assert.equal(map["t-done"].meta.abortedAt, null);
 });

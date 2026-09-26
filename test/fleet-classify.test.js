@@ -180,7 +180,9 @@ test("classifyThread: out-of-scope asks need a human, in-scope asks do not", () 
     ["Want me to merge main into this and push?", "asked-in-scope", "in-scope"],
     ["Blocker: no tasks box on main's homepage. I'd do this as a follow-up PR after #6549 merges. Say go.", "asked-in-scope", "in-scope"],
     ["Should I open a PR with the fix?", "asked-in-scope", "in-scope"],
-    ["Which do you want:\n1. Execute with plain gh (recommended)\n2. Wait for the fix", "asked-in-scope", "in-scope"]
+    // F8: a recommended option is taken only when it is a routine PR step.
+    ["Which do you want:\n1. Execute with plain gh (recommended)\n2. Wait for the fix", "needs-human", "choice"],
+    ["Which do you want:\n1. Merge main into the branch (recommended)\n2. Wait for the fix", "asked-in-scope", "in-scope"]
   ];
   for (const [text, state, topic] of cases) {
     const result = classify(makeThread({ lastAgentText: text }));
@@ -220,4 +222,77 @@ test("exported pattern lists match the owner's real phrases", () => {
   assert.ok(any(IN_SCOPE_ASK_PATTERNS, "May I stop my own preview?"));
   assert.ok(!any(IN_SCOPE_ASK_PATTERNS, "Pushed and resolved all threads."));
   assert.ok(OUT_OF_SCOPE_PATTERNS.every((entry) => typeof entry.topic === "string" && entry.pattern instanceof RegExp));
+});
+
+// F8: only routine PR steps get an automatic yes. Everything else asks the owner.
+test("classifyThread: risky asks need a human even without an old out-of-scope word", () => {
+  const cases = [
+    ["Should I run it against the production database now?", "production"],
+    ["Want me to force-push over origin/main?", "history"],
+    ["Do you want me to drop the prod users table and reseed it?", "production"],
+    ["Should I rotate the Stripe secret key in Vercel?", "credentials"],
+    ["Should I push this straight to main?", "main"],
+    ["Want me to run the migration on prod?", "production"],
+    ["Should I git reset --hard to origin?", "history"],
+    ["Should I run the migration against the shared staging DB?", "database"],
+    ["Want me to truncate the events table?", "database"],
+    ["Should I cancel the queued runs?", "cancel"],
+    ["Should I restart the docker daemon on BuildBot3? It will drop every running preview.", "reboot"],
+    ["Want me to cancel runs #6522 and #6530 and reboot BuildBot3?", null],
+    // Not a known risk, and not a routine PR step either: the owner decides.
+    ["Should I email the customer about the outage?", "permission"],
+    ["Want me to do it on this branch right now?", "permission"],
+    // One routine ask does not carry a second, unlisted one.
+    ["Want me to push the fix? Also, should I email the customer?", "permission"],
+    // A bare "Proceed?" after a recap names no step.
+    ["Pushed the fix. Proceed?", "permission"]
+  ];
+  for (const [text, topic] of cases) {
+    const result = classify(makeThread({ lastAgentText: text }));
+    assert.equal(result.state, "needs-human", text);
+    if (topic) assert.equal(result.ask.topic, topic, text);
+  }
+});
+
+test("classifyThread: routine PR steps on the allowlist are in scope", () => {
+  const cases = [
+    "Want me to run bb-quick on BuildBot3 for this PR?",
+    "Should I push the branch?",
+    "Want me to resolve the 3 open review threads?",
+    "Should I rebase onto main?",
+    "Want me to rerun the failed CI job?",
+    "Should I update the PR description?",
+    "Want me to retake the screenshots on the BuildBot3 preview?",
+    "Want me to start my own BuildBot3 preview?",
+    "Should I clean up my worktree?",
+    "Let me know if you want me to push the branch.",
+    "Next: merge main into the branch and push. Proceed?"
+  ];
+  for (const text of cases) {
+    const result = classify(makeThread({ lastAgentText: text }));
+    assert.equal(result.state, "asked-in-scope", text);
+  }
+  // A recommended option is taken only when that option is itself routine.
+  const routine = classify(makeThread({ lastAgentText: "Which do you want:\n1. Rerun CI on the head (recommended)\n2. Wait" }));
+  assert.equal(routine.state, "asked-in-scope");
+  const unknown = classify(makeThread({ lastAgentText: "Which do you want:\n1. Execute with plain gh (recommended)\n2. Wait for the fix" }));
+  assert.equal(unknown.state, "needs-human");
+  assert.equal(unknown.ask.topic, "choice");
+});
+
+// F16: a live session stuck on a permission prompt is the owner's, not ours.
+test("classifyThread: a session blocked on a permission prompt needs the owner", () => {
+  const expected = { topic: "approval", text: "Blocked on a permission prompt or dialog.", options: ["opened", "later"] };
+  const prompt = makeThread({
+    kind: "claude", key: "claude:c7", agentStatus: "waiting", live: { peerName: "p", pid: 7, status: "waiting" },
+    meta: { blockedOnOwner: true, waitingFor: "permission prompt" }, lastAgentText: "Want me to push the branch?"
+  });
+  const result = classify(prompt, { pr: makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } }) });
+  assert.equal(result.state, "needs-human");
+  assert.deepEqual(result.ask, expected);
+  // It beats a background-task wait too.
+  const task = { id: "t1", description: "Run bb-quick", kind: "local_bash", startedAt: ago(20 * MIN) };
+  assert.equal(classify({ ...prompt, openTasks: [task] }).state, "needs-human");
+  // Only the source's flag counts.
+  assert.equal(classify({ ...prompt, meta: { waitingFor: "permission prompt" } }).state, "waiting-ci");
 });

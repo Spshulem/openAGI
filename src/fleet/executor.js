@@ -21,6 +21,32 @@ const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const TAIL_CHARS = 64 * 1024;
 const DETAIL_MAX = 200;
 
+// Children run agents under bypassPermissions, so they get an allowlisted env
+// (same rule as codingChildEnv in builtin-coding-supervisor.js), never the
+// daemon's .env: API keys, the OpenAGI auth token, and messaging tokens.
+const CHILD_ENV_KEYS = ["HOME", "USER", "LOGNAME", "PATH", "SHELL", "LANG", "TMPDIR", "TERM", "CODEX_HOME", "CCODEX_HOME", "CLAUDE_CONFIG_DIR"];
+const SECRET_ENV_NAME = /^(?:ANTHROPIC|OPENAI|OPENAGI|TELEGRAM|TWILIO|BUILDBETTER)_|_(?:TOKEN|SECRET|KEY)$/i;
+// A launchd daemon's PATH can be bare; the ccodex shim and hooks need node.
+const BASE_PATH_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+function childPath(envPath, bins) {
+  const binDirs = Object.values(bins ?? {})
+    .filter((bin) => typeof bin === "string" && path.isAbsolute(bin))
+    .map((bin) => path.dirname(bin));
+  const dirs = [...String(envPath ?? "").split(path.delimiter), ...binDirs, path.dirname(process.execPath), ...BASE_PATH_DIRS];
+  return [...new Set(dirs.filter(Boolean))].join(path.delimiter);
+}
+
+export function fleetChildEnv(env = process.env, { bins } = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (value === undefined || SECRET_ENV_NAME.test(key)) continue;
+    if (CHILD_ENV_KEYS.includes(key) || key.startsWith("LC_")) out[key] = String(value);
+  }
+  out.PATH = childPath(env?.PATH, bins);
+  return out;
+}
+
 // Mirrors relayToPeer in g2 scripts/agent-supervisor/attach.mjs so the relay
 // model sees the same, already-proven instruction.
 export function buildRelayPrompt(peerName, text) {
@@ -168,11 +194,14 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     }
   };
 
-  const codexEnv = () => {
-    // The daemon's env lacks CODEX_LB_API_KEY; it goes to the codex child only.
+  const childEnv = (route) => {
+    const env = fleetChildEnv(process.env, { bins });
+    if (route !== "codex-exec") return env;
+    // CODEX_LB_API_KEY goes to the codex child only, and nothing else from the file.
     let text = "";
     try { text = fs.readFileSync(paths.codexLbEnvFile, "utf8"); } catch { /* no LB env on this machine */ }
-    return { ...process.env, ...parseEnvText(text) };
+    const lbKey = parseEnvText(text).CODEX_LB_API_KEY ?? process.env.CODEX_LB_API_KEY;
+    return lbKey ? { ...env, CODEX_LB_API_KEY: lbKey } : env;
   };
 
   const plan = (thread, route, text) => {
@@ -200,6 +229,10 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       cmd: bins.claude ?? "claude",
       args: [
         "-p", buildRelayPrompt(peerName, text),
+        // bypassPermissions ignores --allowedTools as a limit, so --tools and
+        // --strict-mcp-config leave SendMessage as the only tool.
+        "--tools", "SendMessage",
+        "--strict-mcp-config",
         "--allowedTools", "SendMessage",
         "--permission-mode", "bypassPermissions",
         "--model", config?.relayModel ?? DEFAULT_RELAY_MODEL
@@ -223,11 +256,11 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     }
   };
 
-  const relay = async (thread, step, base, actionId) => {
+  const relay = async (thread, step, base, actionId, env) => {
     try { ensureDir(step.cwd); } catch { /* the runner surfaces a real failure */ }
     let result;
     try {
-      result = await runner(step.cmd, step.args, { cwd: step.cwd, timeoutMs: RELAY_TIMEOUT_MS });
+      result = await runner(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs: RELAY_TIMEOUT_MS });
     } catch (error) {
       result = { code: null, stdout: "", stderr: "", timedOut: false, error: error?.message ?? String(error) };
     }
@@ -293,12 +326,10 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
 
     const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text) };
     active.add(thread.key);
-    if (step.background) {
-      const env = route === "codex-exec" ? codexEnv() : undefined;
-      return launch(thread, step, base, actionId, env);
-    }
+    const env = childEnv(route);
+    if (step.background) return launch(thread, step, base, actionId, env);
     try {
-      return await relay(thread, step, base, actionId);
+      return await relay(thread, step, base, actionId, env);
     } finally {
       active.delete(thread.key);
     }

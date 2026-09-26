@@ -31,13 +31,13 @@ function makePr(overrides = {}) {
   };
 }
 
-function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", deps = {}, now = () => NOW, limits = {} } = {}) {
+function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", deps = {}, now = () => NOW, limits = {}, deliverStatus = "sent", manager = null } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-supervisor-"));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const delivered = [];
   const notified = [];
   const executor = {
-    deliver: async (args) => { delivered.push(args); return { status: "sent", route: args.route, detail: "ok", actionId: args.actionId ?? null }; },
+    deliver: async (args) => { delivered.push(args); return { status: deliverStatus, route: args.route, detail: "ok", actionId: args.actionId ?? null }; },
     inFlight: () => [],
     whenIdle: async () => {}
   };
@@ -62,6 +62,7 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
       fetchPrStates: async () => prMap,
       probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: "ok", reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
       checkLb: async () => ({ healthy: true, detail: "200", watchLine: null }),
+      findManagerSession: () => manager,
       ...deps
     }
   });
@@ -192,4 +193,201 @@ test("skip on a grouped unreachable question mutes every thread in it", async (t
   const snapshot = await supervisor.tick({ reason: "test" });
   assert.ok(snapshot.threads.every((row) => row.decision.reason === "muted by owner"));
   assert.equal(supervisor.getState().questions.some((q) => q.dedupeKey === "open:group"), false);
+});
+
+const READY_PR = () => makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+
+function makeManager(overrides = {}) {
+  return makeThread({
+    key: "conductor:mgr", kind: "conductor", id: "mgr", title: "Remote dev setup", workspace: "remote-dev", cwd: "/work/mgr",
+    prRefs: [], live: { peerName: "remote-dev", pid: 4242 }, excluded: "manager", ...overrides
+  });
+}
+
+function blockedGate() {
+  return async () => ({
+    reachable: true, checkedAt: ago(0), gate: { state: "blocked", reason: "10 full verifies queued", since: ago(40 * MIN) },
+    fullQueue: 10, quickQueue: 0, load: [9, 9, 9], runs: [], timersDead: [], error: null
+  });
+}
+
+for (const close of ["later", "dismiss"]) {
+  test(`a question closed with '${close}' is not re-asked or re-pushed while its condition holds`, async (t) => {
+    let now = NOW;
+    const { supervisor, notified } = fixture(t, { prs: new Map([["acme/app#7", READY_PR()]]), now: () => now });
+    await supervisor.tick({ reason: "test" });
+    const first = supervisor.getState().questions.find((q) => q.kind === "ready");
+    assert.ok(first, "ready question raised");
+    assert.equal(notified.length, 1);
+    await supervisor.answerQuestion(first.id, close);
+    for (let i = 0; i < 2; i += 1) {
+      now += 5 * MIN;
+      await supervisor.tick({ reason: "test" });
+    }
+    assert.deepEqual(supervisor.getState().questions, []);
+    assert.equal(notified.length, 1);
+    assert.equal(supervisor.store.question(first.id).status, close === "dismiss" ? "dismissed" : "answered");
+  });
+}
+
+test("answerQuestion accepts only the question's own options or dismiss", async (t) => {
+  const asking = makeThread({ lastAgentText: "Ready. Want me to merge with --admin or wait for Nikhil's approval?", prRefs: [] });
+  const { supervisor, delivered } = fixture(t, { threads: [asking], prs: new Map() });
+  await supervisor.tick({ reason: "test" });
+  const question = supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  assert.ok(question, "agent question raised");
+  assert.equal(await supervisor.answerQuestion(question.id, "merge with --admin now and skip CI"), null);
+  assert.equal(await supervisor.answerQuestion(question.id, ""), null);
+  assert.equal(delivered.length, 0);
+  assert.equal(supervisor.store.question(question.id).status, "open");
+  const dismissed = await supervisor.answerQuestion(question.id, "dismiss");
+  assert.equal(dismissed.question.status, "dismissed");
+  assert.equal(delivered.length, 0);
+});
+
+test("a muted thread gets no infra-recovered nudge when the LB comes back", async (t) => {
+  const blocked = makeThread({ agentStatus: "aborted", error: { kind: "lb" }, prRefs: [] });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [blocked], prs: new Map() });
+  supervisor.store.setInfraDown("lb", true);
+  supervisor.store.mute("codex:t1", NOW + 60 * MIN);
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0);
+  assert.equal(snapshot.threads[0].decision.action, "none");
+  assert.equal(snapshot.threads[0].decision.reason, "muted by owner");
+  assert.equal(snapshot.counts.actions, 0);
+});
+
+test("threads blocked while the LB is down are remembered until the recovery tick", async (t) => {
+  let now = NOW;
+  let healthy = false;
+  const threads = [makeThread({ agentStatus: "aborted", error: { kind: "lb" }, prRefs: [] })];
+  const { supervisor } = fixture(t, { threads, prs: new Map(), now: () => now, deps: { checkLb: async () => ({ healthy, detail: healthy ? "200" : "503", watchLine: null }) } });
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), ["codex:t1"]);
+  assert.deepEqual(supervisor.store.infraBlocked("bb3"), []);
+
+  // The first thread's error row aged out; a second one hit the outage.
+  threads[0] = makeThread({ agentStatus: "aborted", error: null, prRefs: [] });
+  threads.push(makeThread({ key: "codex:t2", id: "t2", cwd: "/work/t2", agentStatus: "aborted", error: { kind: "lb" }, prRefs: [] }));
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(supervisor.store.infraBlocked("lb").sort(), ["codex:t1", "codex:t2"]);
+
+  healthy = true;
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), []);
+});
+
+test("LB recovery resumes a remembered thread even after its error rows aged out", async (t) => {
+  // Needs policy.recoveryNudges to honor blockedKeys (shared interface I4).
+  const stalled = makeThread({ agentStatus: "aborted", error: null, prRefs: [] });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [stalled], prs: new Map() });
+  supervisor.store.setInfraDown("lb", true);
+  supervisor.store.setInfraBlocked("lb", ["codex:t1"]);
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].playbook, "infra-recovered");
+  assert.equal(snapshot.threads[0].state, "idle-no-pr");
+  assert.equal(snapshot.threads[0].decision.action, "nudge");
+  assert.equal(snapshot.threads[0].decision.playbook, "infra-recovered");
+});
+
+test("snapshot rows show the decision that acts, not a trailing none or wait", async (t) => {
+  const { supervisor } = fixture(t);
+  const thread = makeThread();
+  const classified = { state: "idle-no-pr", reason: "no PR", blockers: [] };
+  const base = { threadKey: thread.key, state: "idle-no-pr", playbook: null, message: null, blockers: [], question: null, route: null, notBefore: null };
+  const decisions = [
+    { ...base, action: "nudge", playbook: "infra-recovered", reason: "Codex LB is up", route: "codex-exec", message: "go" },
+    { ...base, action: "none", reason: "no PR" }
+  ];
+  const snapshot = supervisor.buildSnapshot({
+    reason: "test", started: NOW, finished: NOW, mode: "auto", threads: [thread], inScope: [thread],
+    items: [{ thread, classified, pr: null }], decisions, infra: {}, sourceErrors: {}, manager: null
+  });
+  assert.equal(snapshot.threads[0].decision.action, "nudge");
+  assert.equal(snapshot.threads[0].decision.playbook, "infra-recovered");
+  const waitOnly = supervisor.buildSnapshot({
+    reason: "test", started: NOW, finished: NOW, mode: "auto", threads: [thread], inScope: [thread],
+    items: [{ thread, classified, pr: null }], decisions: [{ ...base, action: "wait", reason: "cooldown" }, { ...base, action: "none", reason: "no PR" }],
+    infra: {}, sourceErrors: {}, manager: null
+  });
+  assert.equal(waitOnly.threads[0].decision.action, "wait");
+});
+
+test("a failed infra escalation starts the cooldown under its incident key", async (t) => {
+  let now = NOW;
+  const manager = makeManager();
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", threads: [], prs: new Map(), now: () => now, deliverStatus: "failed", manager,
+    deps: { probeBuildBot3: blockedGate() }
+  });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].thread.key, "conductor:mgr");
+  assert.equal(supervisor.store.lastEscalation("infra:bb3"), new Date(NOW).toISOString());
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1, "no retry every tick");
+});
+
+test("thread-level manager escalations record the shared incident key", async (t) => {
+  const waiting = makeThread({
+    key: "conductor:w1", kind: "conductor", id: "w1", workspace: "apia", cwd: "/work/w1", agentStatus: "waiting",
+    lastAgentText: "bb-quick is running.", openTasks: [{ id: "task1", description: "bb-quick on BuildBot3", startedAt: ago(20 * MIN) }]
+  });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [waiting], manager: makeManager() });
+  await supervisor.tick({ reason: "test" });
+  const escalation = delivered.find((d) => d.playbook === "manager-bb3");
+  assert.ok(escalation, "bb-quick escalation sent");
+  assert.equal(escalation.thread.key, "conductor:mgr");
+  assert.equal(supervisor.store.lastEscalation("infra:bb3"), new Date(NOW).toISOString());
+
+  const at = new Date(NOW).toISOString();
+  supervisor.recordSend({ threadKey: "codex:x", kind: "escalate-manager", playbook: "manager-lb", route: "peer-relay" }, { status: "failed" });
+  assert.equal(supervisor.store.lastEscalation("infra:lb"), at);
+  supervisor.recordSend({ threadKey: "codex:y", kind: "nudge", playbook: "merge-ready", route: "codex-exec" }, { status: "failed" });
+  supervisor.recordSend({ threadKey: "infra:bb3", kind: "escalate-manager", playbook: "manager-bb3", route: "peer-relay" }, { status: "blocked" });
+  assert.equal(supervisor.store.lastEscalation("codex:y"), null);
+  assert.equal(supervisor.store.lastEscalation("infra:bb3"), at);
+});
+
+test("a recent infra escalation holds back a thread-level one to the same manager", async (t) => {
+  // Needs decideThread to read escalationLedger (shared interface I3).
+  const waiting = makeThread({
+    key: "conductor:w1", kind: "conductor", id: "w1", workspace: "apia", cwd: "/work/w1", agentStatus: "waiting",
+    lastAgentText: "bb-quick is running.", openTasks: [{ id: "task1", description: "bb-quick on BuildBot3", startedAt: ago(20 * MIN) }]
+  });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [waiting], manager: makeManager() });
+  supervisor.store.recordEscalation("infra:bb3", ago(5 * MIN));
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.filter((d) => d.playbook === "manager-bb3").length, 0);
+});
+
+test("forceMode overrides the mode the owner persisted", async (t) => {
+  const { supervisor, delivered, dataDir } = fixture(t, { mode: "auto" });
+  supervisor.store.setMode("auto");
+  const forced = new FleetSupervisor({ dataDir, config: supervisor.config, deps: supervisor.deps, forceMode: "observe" });
+  assert.equal(forced.mode, "observe");
+  assert.equal(forced.getState().mode, "observe");
+  await forced.tick({ reason: "test" });
+  assert.equal(delivered.length, 0);
+  assert.equal(forced.getState().actions.filter((a) => a.status === "planned").length, 1);
+  assert.equal(new FleetSupervisor({ dataDir, config: supervisor.config, forceMode: "yolo" }).mode, "auto");
+});
+
+test("fleet-scan CLI can never send or push, whatever the saved mode or env", async (t) => {
+  const { buildScanSupervisor } = await import("../scripts/fleet-scan.mjs");
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-scan-cli-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dataDir, "fleet"), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, "fleet", "state.json"), JSON.stringify({ mode: "auto" }));
+  const supervisor = buildScanSupervisor({ dataDir, env: { OPENAGI_FLEET_PUSH: "buzzkit", OPENAGI_FLEET_MODE: "auto" } });
+  assert.equal(supervisor.store.mode, "auto");
+  assert.equal(supervisor.mode, "observe");
+  assert.equal(supervisor.config.push, null);
+  assert.equal(supervisor.config.enabled, false);
+  const delivery = await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "codex-exec", playbook: "resume" });
+  assert.equal(delivery.status, "dry-run");
 });

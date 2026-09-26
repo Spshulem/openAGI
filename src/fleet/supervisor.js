@@ -32,6 +32,16 @@ const MUTE_MS = 24 * 60 * MIN;
 const SENDING = new Set(["nudge", "escalate-manager"]);
 const OPEN_ACTION = new Set(["planned", "proposed"]);
 const TRUNK_BRANCHES = new Set(["main", "master", "HEAD", "develop", "staging"]);
+const INFRA_KINDS = ["bb3", "lb"];
+const BLOCKED_STATES = new Set(["infra-blocked", "waiting-ci"]);
+// A manager escalation shares one cooldown per incident, whichever thread
+// or infra check raised it (same keys decideInfra uses).
+const INCIDENT_KEYS = Object.freeze({ "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" });
+// A delivered or failed escalation starts the cooldown; a failed route must
+// not be retried every tick (same rule as the nudge ledger).
+const ESCALATION_STATUSES = new Set(["sent", "failed"]);
+// The snapshot row shows the decision that acts when a thread got two.
+const DECISION_RANK = Object.freeze({ nudge: 3, "escalate-manager": 3, "ask-user": 2, wait: 1, none: 0 });
 
 function withTimeout(promise, ms, name) {
   let timer;
@@ -113,14 +123,31 @@ export function groupQuestions(asks, byKey) {
   return out;
 }
 
+function incidentKey(action) {
+  const key = String(action?.threadKey ?? "");
+  if (key.startsWith("infra:")) return key;
+  return action?.kind === "escalate-manager" ? (INCIDENT_KEYS[action.playbook] ?? null) : null;
+}
+
+function effectiveDecisions(decisions) {
+  const out = new Map();
+  for (const decision of decisions) {
+    const current = out.get(decision.threadKey);
+    if (!current || (DECISION_RANK[decision.action] ?? 0) >= (DECISION_RANK[current.action] ?? 0)) out.set(decision.threadKey, decision);
+  }
+  return out;
+}
+
 function ownerDelivery(answer) {
   // Options are fixed strings chosen by policy, never agent text.
   return `Owner answer: ${answer}. Continue with that.`;
 }
 
 export class FleetSupervisor {
-  constructor({ dataDir, runtime = null, config = null, deps = {}, skip = {} } = {}) {
+  // forceMode pins the mode over the owner's saved choice (the dry-run CLI).
+  constructor({ dataDir, runtime = null, config = null, deps = {}, skip = {}, forceMode = null } = {}) {
     this.dataDirOption = dataDir ?? null;
+    this.forceMode = MODES.includes(forceMode) ? forceMode : null;
     this.runtime = runtime;
     this.deps = deps ?? {};
     this.skip = { bb3: false, github: false, ...skip };
@@ -156,7 +183,7 @@ export class FleetSupervisor {
   }
 
   get mode() {
-    return this.store.mode ?? this.config.mode;
+    return this.forceMode ?? this.store.mode ?? this.config.mode;
   }
 
   get executor() {
@@ -247,6 +274,9 @@ export class FleetSupervisor {
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
     if (answer === "dismiss") return { question: this.dismissQuestion(id), delivery: null };
+    // Every surface (page, outreach, future callers) gets the same check:
+    // only the fixed options policy offered can reach an agent.
+    if (!(question.options ?? []).includes(answer)) return null;
     const answered = this.store.answerQuestion(id, answer);
     if (!answered) return null;
     this.applyOverride(question, answer);
@@ -291,10 +321,9 @@ export class FleetSupervisor {
 
   recordSend(action, delivery) {
     const at = new Date(this.now()).toISOString();
-    if (String(action.threadKey ?? "").startsWith("infra:")) {
-      if (delivery.status === "sent") this.store.recordEscalation(action.threadKey, at);
-      return;
-    }
+    const incident = incidentKey(action);
+    if (incident && ESCALATION_STATUSES.has(delivery.status)) this.store.recordEscalation(incident, at);
+    if (String(action.threadKey ?? "").startsWith("infra:")) return;
     this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status: delivery.status }, action.progressMark);
   }
 
@@ -344,6 +373,7 @@ export class FleetSupervisor {
 
     const playbooks = this.playbooks();
     const store = this.store;
+    const mutedKeys = store.mutedKeys();
     const items = [];
     for (const thread of inScope) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
@@ -355,21 +385,25 @@ export class FleetSupervisor {
         classified = { state: "idle-no-pr", reason: `classify failed: ${clampText(error?.message, 80)}`, blockers: [], readiness: null };
       }
       let decision;
-      const mutedUntil = store.mutedUntil(thread.key);
-      if (mutedUntil) {
-        decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: mutedUntil, targetKey: thread.key, progressMark: null };
+      if (mutedKeys.has(thread.key)) {
+        decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), playbooks, config, now: started, pr, mode, infra, manager });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision });
     }
 
-    const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode });
+    const blockedKeys = { bb3: store.infraBlocked("bb3"), lb: store.infraBlocked("lb") };
+    const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys });
     const health = infraHealth(infra, { config, now: started });
+    this.trackInfraBlocked(health, items, blockedKeys);
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
     if (lb) store.setInfraDown("lb", health.lb.down);
 
-    const decisions = dedupeDecisions([...infraDecisions, ...items.map((item) => item.decision)]);
+    // A muted thread keeps only its "muted by owner" line: nothing that
+    // infra recovery or any other path decided for it may send or ask.
+    const decisions = dedupeDecisions([...infraDecisions, ...items.map((item) => item.decision)])
+      .filter((decision) => !mutedKeys.has(decision.threadKey) || decision.action === "none");
     const byKey = new Map(threads.map((thread) => [thread.key, thread]));
     if (manager) byKey.set(manager.key, manager);
     this.lastThreads = byKey;
@@ -382,6 +416,21 @@ export class FleetSupervisor {
     this.lastTickAt = snapshot.at;
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
     return snapshot;
+  }
+
+  // While an outage lasts, remember every thread blocked on it; the recovery
+  // tick resumes them (policy reads blockedKeys) and then the list is cleared.
+  trackInfraBlocked(health, items, previous) {
+    for (const kind of INFRA_KINDS) {
+      if (health[kind].down) {
+        const current = items
+          .filter(({ classified }) => classified.infraKind === kind && BLOCKED_STATES.has(classified.state))
+          .map(({ thread }) => thread.key);
+        this.store.setInfraBlocked(kind, [...previous[kind], ...current]);
+      } else if (health[kind].up) {
+        this.store.setInfraBlocked(kind, []);
+      }
+    }
   }
 
   async readGit(inScope, config, run, sourceErrors) {
@@ -453,6 +502,8 @@ export class FleetSupervisor {
     for (const fields of groupQuestions(asks, byKey)) {
       const question = store.upsertQuestion(fields);
       asked.add(question.dedupeKey);
+      // The owner already answered or dismissed this one; stay quiet.
+      if (question.suppressed) continue;
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
@@ -498,7 +549,7 @@ export class FleetSupervisor {
 
   buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager }) {
     const byState = {};
-    const decisionFor = new Map(decisions.map((decision) => [decision.threadKey, decision]));
+    const decisionFor = effectiveDecisions(decisions);
     const rows = items.map(({ thread, classified, pr }) => {
       byState[classified.state] = (byState[classified.state] ?? 0) + 1;
       const decision = decisionFor.get(thread.key) ?? null;

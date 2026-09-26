@@ -49,6 +49,7 @@ export const DEFAULTS = Object.freeze({
   quickVerifyEscalateMs: 15 * MIN,
   waitingTaskMaxMs: 45 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
+  lbErrorFreshMs: 15 * MIN,
   managerEscalationCooldownMs: 60 * MIN,
   // An idle thread with no delivery route waits this long before the owner
   // is asked to open it.

@@ -433,7 +433,117 @@ test("readLivePeers keeps alive pids, skips key files, newest entry wins", (t) =
 
   const peers = readLivePeers(makeConfig(home), { isPidAlive: (pid) => pid !== 12 });
   assert.deepEqual([...peers.keys()].sort(), ["s-1", "s-3"]);
-  assert.deepEqual(peers.get("s-1"), { peerName: "a-11", pid: 11, status: "busy", cwd: "/a", entrypoint: "sdk-ts", waitingFor: null });
+  assert.deepEqual(peers.get("s-1"), { peerName: "a-11", pid: 11, status: "busy", cwd: "/a", entrypoint: "sdk-ts", waitingFor: null, startedAt: null });
   assert.equal(peers.get("s-3").waitingFor, "permission prompt");
   assert.equal(readLivePeers(makeConfig(makeHome(t))).size, 0);
+});
+
+// Rows Claude appends on session load or exit, after the last real turn.
+const metadataTail = (id, at) => [
+  { type: "last-prompt", lastPrompt: "ship it", sessionId: id },
+  { type: "cost-state", sessionId: id, costUsd: 1.5 },
+  { type: "queue-operation", operation: "remove", timestamp: at, sessionId: id },
+  { type: "attachment", timestamp: at, sessionId: id, attachment: { type: "deferred_tools_delta" } }
+];
+
+test("activity and the lookback come from the last turn row, not metadata writes", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/repo";
+  const dormant = rowsFor("dormant-1", cwd);
+  writeTranscript(home, cwd, "dormant-1", [...dormant.history(15 * 24 * 60 * MIN), ...metadataTail("dormant-1", iso(5 * MIN))], NOW - 5 * MIN);
+  const recent = rowsFor("recent-1", cwd);
+  writeTranscript(home, cwd, "recent-1", [...recent.history(3 * 60 * MIN), ...metadataTail("recent-1", iso(5 * MIN))], NOW - 5 * MIN);
+  // No timestamped turn row in the tail: the file time is all there is.
+  writeTranscript(home, cwd, "bare-1", metadataTail("bare-1", undefined), NOW - 7 * MIN);
+
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
+  assert.equal(threads["dormant-1"], undefined, "a thread idle for 15 days is outside the 48 h lookback");
+  assert.equal(threads["recent-1"].lastActivityAt, iso(3 * 60 * MIN - 9000));
+  assert.equal(threads["bare-1"].lastActivityAt, iso(7 * MIN));
+});
+
+test("an interrupted turn exposes when the owner stopped it", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/repo";
+  const r = rowsFor("stop-1", cwd);
+  writeTranscript(home, cwd, "stop-1", [
+    ...r.history(90 * MIN),
+    r.prompt("run the tests", iso(30 * MIN)),
+    r.tool("Bash", "t1", { command: "npm test" }, iso(29 * MIN)),
+    r.prompt("[Request interrupted by user for tool use]", iso(29 * MIN - 20_000), { origin: undefined }),
+    ...metadataTail("stop-1", iso(MIN))
+  ], NOW - MIN);
+  const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(thread.agentStatus, "aborted");
+  assert.equal(thread.meta.abortedAt, iso(29 * MIN - 20_000));
+  assert.equal(thread.lastActivityAt, iso(29 * MIN - 20_000));
+
+  const r2 = rowsFor("go-1", cwd);
+  writeTranscript(home, cwd, "go-1", [...r2.history(90 * MIN)], NOW - 80 * MIN);
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
+  assert.equal(threads["go-1"].meta.abortedAt, null);
+});
+
+test("a live peer on a permission prompt is waiting on the owner, not stalled", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/repo";
+  for (const [id, pid, status, waitingFor] of [["prompt-1", 301, "waiting", "permission prompt"], ["dialog-1", 302, "idle", "dialog"], ["plain-1", 303, "idle", null]]) {
+    const r = rowsFor(id, cwd);
+    writeTranscript(home, cwd, id, [
+      ...r.history(26 * 60 * MIN),
+      r.prompt("deploy the fix", iso(24 * 60 * MIN + MIN)),
+      r.tool("Bash", "t1", { command: "rm -rf build" }, iso(24 * 60 * MIN))
+    ], NOW - 24 * 60 * MIN);
+    writePeer(home, { pid, sessionId: id, cwd, name: `${id}-p`, status, entrypoint: "cli", updatedAt: NOW, ...(waitingFor ? { waitingFor } : {}) });
+  }
+  const threads = byId(await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: (pid) => pid > 300 }));
+  assert.equal(threads["prompt-1"].agentStatus, "waiting");
+  assert.equal(threads["prompt-1"].meta.blockedOnOwner, true);
+  assert.equal(threads["prompt-1"].meta.waitingFor, "permission prompt");
+  assert.equal(threads["prompt-1"].error, null);
+  assert.equal(threads["dialog-1"].agentStatus, "waiting");
+  assert.equal(threads["dialog-1"].meta.blockedOnOwner, true);
+  assert.equal(threads["plain-1"].agentStatus, "stalled");
+  assert.equal(threads["plain-1"].meta.blockedOnOwner, false);
+});
+
+test("background tasks started before the live process are dead", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/repo";
+  const r = rowsFor("restart-1", cwd);
+  const started = (n, at) => [
+    r.tool("Bash", `t${n}`, { command: "x", description: `task ${n}`, run_in_background: true }, at),
+    r.result(`t${n}`, `Command running in background with ID: bg${n}.`, at, { backgroundTaskId: `bg${n}` })
+  ];
+  writeTranscript(home, cwd, "restart-1", [
+    ...r.history(90 * MIN),
+    r.prompt("run the full verify", iso(50 * MIN)),
+    ...started(1, iso(49 * MIN)),
+    r.text("Full verify running.", iso(48 * MIN)),
+    r.prompt("continue", iso(25 * MIN)),
+    ...started(2, iso(24 * MIN)),
+    r.text("Full verify restarted.", iso(23 * MIN))
+  ], NOW - 23 * MIN);
+  // The process restarted 30 min ago; ps lstart is written in UTC.
+  writePeer(home, {
+    pid: 91, sessionId: "restart-1", cwd, name: "repo-91", status: "idle", entrypoint: "cli", updatedAt: NOW,
+    startedAt: NOW - 30 * MIN + 4000, procStart: "Sat Sep 26 07:30:00 2026"
+  });
+  const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: (pid) => pid === 91 });
+  assert.deepEqual(thread.openTasks.map((task) => task.id), ["bg2"]);
+  assert.equal(thread.agentStatus, "waiting");
+});
+
+test("readLivePeers reports the process start time", (t) => {
+  const home = makeHome(t);
+  writePeer(home, { pid: 21, sessionId: "a", status: "idle", startedAt: NOW - 30 * MIN + 4000, procStart: "Sat Sep 26 07:30:00 2026" });
+  // A procStart that disagrees with startedAt (another time zone) is ignored.
+  writePeer(home, { pid: 22, sessionId: "b", status: "idle", startedAt: NOW - 30 * MIN + 4000, procStart: "Sat Sep 26 00:30:00 2026" });
+  writePeer(home, { pid: 23, sessionId: "c", status: "idle", startedAt: NOW - 30 * MIN });
+  writePeer(home, { pid: 24, sessionId: "d", status: "idle" });
+  const peers = readLivePeers(makeConfig(home), { isPidAlive: () => true });
+  assert.equal(peers.get("a").startedAt, iso(30 * MIN));
+  assert.equal(peers.get("b").startedAt, iso(30 * MIN - 4000));
+  assert.equal(peers.get("c").startedAt, iso(30 * MIN));
+  assert.equal(peers.get("d").startedAt, null);
 });

@@ -7,7 +7,7 @@ import {
   SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
   threadKey, toIso
 } from "../contracts.js";
-import { readLivePeers } from "./claude.js";
+import { liveTasks, peerBlockedOnOwner, readLivePeers } from "./claude.js";
 
 const STATUS_MAP = Object.freeze({ working: "running", waiting: "waiting", idle: "idle", error: "error" });
 const TAIL_ROWS = 400;
@@ -139,7 +139,7 @@ function statusAndError(sessionStatus, lastEnd, now, excerptMax) {
   const agentStatus = STATUS_MAP[sessionStatus] ?? "unknown";
   if (agentStatus !== "idle" && agentStatus !== "error") return { agentStatus, error: null, abortReason: null };
   if (lastEnd?.isError && /^aborted by user$/i.test(lastEnd.text.trim())) {
-    return { agentStatus: "aborted", error: null, abortReason: "aborted by user" };
+    return { agentStatus: "aborted", error: null, abortReason: "aborted by user", abortedAt: lastEnd.at ?? null };
   }
   if (lastEnd?.isError) {
     // "resets 12am" is relative to when the error was written, not to now.
@@ -155,11 +155,19 @@ function statusAndError(sessionStatus, lastEnd, now, excerptMax) {
 function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
   const { limits } = config;
   const summary = summarizeTail(readRecentMessages(db, row.id));
-  const { agentStatus, error, abortReason } = statusAndError(row.status, summary.lastEnd, now, limits.excerptMax);
-  // Only running or waiting sessions still own live background tasks.
-  const openTasks = agentStatus === "waiting" || agentStatus === "running" ? readOpenTasks(db, row.id, sinceIso) : [];
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
+  // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
+  const blockedOnOwner = peerBlockedOnOwner(peer);
+  const { agentStatus, error, abortReason, abortedAt = null } = blockedOnOwner
+    ? { agentStatus: "waiting", error: null, abortReason: null }
+    : statusAndError(row.status, summary.lastEnd, now, limits.excerptMax);
+  // Only running or waiting sessions still own background tasks, and only
+  // those started by the live process: conductor.db never records the ones
+  // killed with an earlier process.
+  const openTasks = agentStatus === "waiting" || agentStatus === "running"
+    ? liveTasks(readOpenTasks(db, row.id, sinceIso), peer)
+    : [];
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const title = row.title && row.title !== "Untitled" ? row.title : row.pr_title || row.directory_name || row.id;
   const selfIds = config.selfSessionIds ?? [];
@@ -197,6 +205,9 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
       file: null,
       turnStartedAt: summary.turnStartedAt ?? summary.lastUserAt,
       abortReason,
+      abortedAt,
+      blockedOnOwner,
+      waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,
       unreadCount: Number(row.unread_count) || 0,

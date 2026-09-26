@@ -19,6 +19,8 @@ const NON_OWNER_ORIGINS = new Set(["task-notification", "peer"]);
 const NON_OWNER_TURNS = new Set(["task_notification", "peer", "system", "scheduled"]);
 const STOP_TOOLS = new Set(["TaskStop", "KillShell", "KillBash"]);
 const PR_URL = /github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/;
+// ps lstart can trail the registry's startedAt by a few seconds, never by more.
+const PROC_START_SKEW_MS = 10 * 60_000;
 
 function safeAlive(isPidAlive, pid) {
   try { return Boolean(isPidAlive(pid)); } catch { return false; }
@@ -26,6 +28,37 @@ function safeAlive(isPidAlive, pid) {
 
 function isUnder(dir, root) {
   return Boolean(dir && root) && (dir === root || dir.startsWith(`${root.replace(/\/+$/, "")}/`));
+}
+
+function laterIso(current, next) {
+  if (!next) return current;
+  return !current || Date.parse(next) > Date.parse(current) ? next : current;
+}
+
+// When the peer's process started. The registry's startedAt (ms) is written a
+// few seconds after launch; procStart (ps lstart in UTC, 1 s precision) is
+// exact, so it wins when the two agree.
+function processStartIso(entry) {
+  const registered = Number(entry.startedAt);
+  if (!Number.isFinite(registered) || registered <= 0) return null;
+  const lstart = typeof entry.procStart === "string" ? Date.parse(`${entry.procStart} UTC`) : NaN;
+  const exact = Number.isFinite(lstart) && lstart <= registered && registered - lstart <= PROC_START_SKEW_MS;
+  return toIso(exact ? lstart : registered);
+}
+
+// A registry "waiting" status or waitingFor means the process sits on a
+// permission prompt or dialog that only the owner can answer.
+export function peerBlockedOnOwner(peer) {
+  return Boolean(peer) && (peer.status === "waiting" || Boolean(peer.waitingFor));
+}
+
+// Background tasks die with their Claude process: none without a live peer,
+// and none that started before the current process did.
+export function liveTasks(tasks, peer) {
+  if (!peer) return [];
+  const since = Date.parse(peer.startedAt ?? "");
+  if (!Number.isFinite(since)) return [...tasks];
+  return tasks.filter((task) => !(Date.parse(task.startedAt ?? "") < since));
 }
 
 // Live Claude processes keyed by session id. Only <pid>.json is read: the
@@ -52,7 +85,8 @@ export function readLivePeers(config, { isPidAlive = defaultIsPidAlive } = {}) {
         status: typeof entry.status === "string" ? entry.status : "unknown",
         cwd: typeof entry.cwd === "string" ? entry.cwd : null,
         entrypoint: typeof entry.entrypoint === "string" ? entry.entrypoint : null,
-        waitingFor: typeof entry.waitingFor === "string" ? entry.waitingFor : null
+        waitingFor: typeof entry.waitingFor === "string" ? entry.waitingFor : null,
+        startedAt: processStartIso(entry)
       });
     }
   } catch {
@@ -116,7 +150,7 @@ function emptySummary() {
     customTitle: null, aiTitle: null, agentName: null,
     prRefs: [], textTurns: 0, phase: null, model: null,
     lastAgentText: "", lastAgentAt: null, lastUserText: "", lastUserAt: null, turnStartedAt: null,
-    apiError: null, retryError: null,
+    lastTurnAt: null, abortedAt: null, apiError: null, retryError: null,
     toolDescriptions: new Map(), tasks: new Map()
   };
 }
@@ -150,6 +184,7 @@ function onUser(summary, row) {
   closeNotifiedTasks(summary, text);
   if (text.startsWith("[Request interrupted")) {
     summary.phase = "interrupted";
+    summary.abortedAt = toIso(row.timestamp);
     return;
   }
   // Local slash commands (/login, /model) never start a model turn.
@@ -194,10 +229,17 @@ function onAssistant(summary, row) {
   summary.phase = TURN_END_STOPS.has(message.stop_reason) && !usesTool ? "turn-end" : "in-progress";
 }
 
+// Claude appends cost-state, last-prompt, queue-operation and attachment rows
+// on session load or exit; only turn rows say the agent or owner did work.
+function isTurnRow(row) {
+  return row.type === "user" || row.type === "assistant" || (row.type === "system" && row.subtype === "api_error");
+}
+
 function summarizeTranscript(rows) {
   const summary = emptySummary();
   for (const row of rows) {
     if (!row || typeof row !== "object") continue;
+    if (isTurnRow(row)) summary.lastTurnAt = laterIso(summary.lastTurnAt, toIso(row.timestamp));
     if (typeof row.cwd === "string" && row.cwd) summary.cwd = row.cwd;
     if (typeof row.gitBranch === "string") summary.branch = row.gitBranch || null;
     if (typeof row.entrypoint === "string") summary.entrypoint = row.entrypoint;
@@ -256,9 +298,11 @@ function threadError(source, now, excerptMax) {
 function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
   const { limits } = config;
   const peer = peers.get(id) ?? null;
-  // Background tasks die with their process, so they only count while live.
-  const openTasks = peer ? [...summary.tasks.values()] : [];
-  const agentStatus = agentStatusFor(summary, { recent: now - mtimeMs <= limits.runningWindowMs, peer, openTasks });
+  const openTasks = liveTasks([...summary.tasks.values()], peer);
+  const blockedOnOwner = peerBlockedOnOwner(peer);
+  const agentStatus = blockedOnOwner
+    ? "waiting"
+    : agentStatusFor(summary, { recent: now - mtimeMs <= limits.runningWindowMs, peer, openTasks });
   const errorSource = agentStatus === "error" ? summary.apiError : agentStatus === "stalled" ? summary.retryError : null;
   const prRefs = newestFirstUnique(summary.prRefs);
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
@@ -275,7 +319,8 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     workspace: null,
     claudeSessionId: id,
     agentStatus,
-    lastActivityAt: toIso(mtimeMs),
+    // The file time is only a fallback: metadata rows bump it without a turn.
+    lastActivityAt: summary.lastTurnAt ?? toIso(mtimeMs),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
@@ -291,12 +336,14 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
       model: summary.model,
       file,
       turnStartedAt: summary.turnStartedAt,
-      abortReason: summary.phase === "interrupted" ? "interrupted" : null,
+      abortReason: agentStatus === "aborted" ? "interrupted" : null,
+      abortedAt: agentStatus === "aborted" ? summary.abortedAt : null,
       entrypoint: summary.entrypoint,
       conductorHosted: Boolean(cwd && (cwd.includes("/conductor/workspaces/") || cwd.includes("/.conductor/")))
         || summary.entrypoint === "sdk-ts",
       peerStatus: peer?.status ?? null,
-      waitingFor: peer?.waitingFor ?? null
+      waitingFor: peer?.waitingFor ?? null,
+      blockedOnOwner
     }
   };
 }
@@ -314,7 +361,9 @@ export async function listClaudeThreads(config, options = {}) {
     for (const entry of files) {
       try {
         const summary = summarizeTranscript(parseJsonLines(readTail(entry.file, tailBytes)));
-        threads.push(buildThread(entry, summary, { config, now, peers }));
+        const thread = buildThread(entry, summary, { config, now, peers });
+        // The mtime pre-filter lets metadata-only writes through; the last turn decides.
+        if (!(Date.parse(thread.lastActivityAt ?? "") < cutoff)) threads.push(thread);
       } catch {
         // One unreadable transcript never hides the rest.
       }

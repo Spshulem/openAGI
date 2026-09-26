@@ -6,11 +6,37 @@
 //
 // Needs Node >= 22 (node:sqlite). Without --data-dir it uses a throwaway temp
 // dir, so needs-you questions and the nudge ledger start empty each run.
+//
+// Three locks keep it read-only, even with --data-dir pointed at the daemon's
+// state after the owner picked Auto there, and even with OPENAGI_FLEET_PUSH
+// exported in the shell:
+//   - forceMode "observe" overrides the saved mode,
+//   - phone push is off (config.push null),
+//   - the executor is a stub whose deliver() only ever returns "dry-run".
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
+
+const DRY_RUN_EXECUTOR = Object.freeze({
+  deliver: async ({ route = null, actionId = null } = {}) => ({ status: "dry-run", route, detail: "fleet-scan never sends", actionId }),
+  inFlight: () => [],
+  whenIdle: async () => {}
+});
+
+export function buildScanSupervisor({ dataDir, noBb3 = false, noGithub = false, env = process.env } = {}) {
+  const config = { ...resolveFleetConfig(env, { mode: "observe", enabled: false }), push: null };
+  return new FleetSupervisor({
+    dataDir,
+    config,
+    forceMode: "observe",
+    deps: { executor: DRY_RUN_EXECUTOR },
+    skip: { bb3: noBb3, github: noGithub }
+  });
+}
 
 function parseArgs(argv) {
   const args = { json: false, noBb3: false, noGithub: false, dataDir: null };
@@ -42,6 +68,7 @@ function report(state, now) {
   const counts = snap.counts;
   const src = counts.sources ?? {};
   out.push(`FLEET ${new Date(snap.at).toLocaleTimeString()} · ${Math.round(snap.durationMs / 100) / 10}s · codex ${src.codex ?? 0} · claude ${src.claude ?? 0} · conductor ${src.conductor ?? 0} → ${counts.inScope} in scope`);
+  out.push("DRY RUN observe mode: sends nothing to any agent, no phone push");
   out.push("");
   out.push(`NEEDS YOU (${state.questions.length})`);
   if (!state.questions.length) out.push("  nothing");
@@ -100,11 +127,7 @@ async function main() {
   }
   const temp = !args.dataDir;
   const dataDir = args.dataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fleet-scan-"));
-  const supervisor = new FleetSupervisor({
-    dataDir,
-    config: { mode: "observe", enabled: false },
-    skip: { bb3: args.noBb3, github: args.noGithub }
-  });
+  const supervisor = buildScanSupervisor({ dataDir, noBb3: args.noBb3, noGithub: args.noGithub });
   try {
     await supervisor.tick({ reason: "cli" });
     const state = supervisor.getState();
@@ -114,7 +137,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(`fleet-scan failed: ${error?.message ?? error}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(`fleet-scan failed: ${error?.message ?? error}`);
+    process.exitCode = 1;
+  });
+}
