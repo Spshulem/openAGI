@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  clampText, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
+  clampTail, clampText, isPidAlive, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
   resolveFleetConfig, runCommand, toIso
 } from "../src/fleet/contracts.js";
 
@@ -30,6 +30,9 @@ test("resolveFleetConfig reads env and lets overrides win", () => {
 test("text helpers clamp, redact, and parse refs", () => {
   assert.equal(clampText("a   b\n c", 100), "a b c");
   assert.equal(clampText("abcdefghij", 5), "abcd…");
+  assert.equal(clampTail("long preamble. Want me to merge?", 18), "…Want me to merge?");
+  assert.equal(isPidAlive(process.pid), true);
+  assert.equal(isPidAlive(0), false);
   const redacted = redactSecrets("key sk-ant-abcdefghijklmnop and CODEX_LB_API_KEY=supersecret and https://ping.buzzkit.dev/abc123/x");
   assert.doesNotMatch(redacted, /abcdefghijklmnop|supersecret|abc123/);
   assert.match(redacted, /CODEX_LB_API_KEY=\[redacted\]/);

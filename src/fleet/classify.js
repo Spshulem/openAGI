@@ -2,11 +2,10 @@
 // No I/O. Agent text is only matched against patterns here; nothing from it
 // is copied into anything another agent will read.
 
-import { DEFAULTS, ERROR_KINDS, msSince } from "./contracts.js";
+import { DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, msSince } from "./contracts.js";
 
-// The executor prefixes every message with this, so a Codex rollout that
-// records our nudge as a "user" message is not mistaken for the owner typing.
-export const SUPERVISOR_PREFIX = "[OpenAGI supervisor]";
+// Re-exported for callers that already import it from here.
+export { SUPERVISOR_PREFIX };
 
 // The agent ended its turn to wait on CI, a verify, or a deploy.
 export const WAITING_PATTERNS = Object.freeze([

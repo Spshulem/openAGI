@@ -28,6 +28,10 @@ export const ACTIONS = Object.freeze(["none", "wait", "nudge", "escalate-manager
 export const MODES = Object.freeze(["observe", "propose", "auto"]);
 export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume"]);
 
+// The executor prefixes every message with this. Sources and policy use it
+// to tell the supervisor's own sends apart from the owner typing.
+export const SUPERVISOR_PREFIX = "[OpenAGI supervisor]";
+
 const MIN = 60_000;
 
 export const DEFAULTS = Object.freeze({
@@ -46,6 +50,9 @@ export const DEFAULTS = Object.freeze({
   waitingTaskMaxMs: 45 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
   managerEscalationCooldownMs: 60 * MIN,
+  // An idle thread with no delivery route waits this long before the owner
+  // is asked to open it.
+  unreachableAskMs: 90 * MIN,
   sessionLimitGraceMs: 2 * MIN,
   overloadBackoffMs: Object.freeze([5 * MIN, 15 * MIN, 30 * MIN]),
   quietHours: Object.freeze({ start: 22, end: 8 }),
@@ -122,6 +129,9 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     relayModel: overrides.relayModel ?? (String(env.OPENAGI_FLEET_RELAY_MODEL ?? "").trim() || DEFAULT_RELAY_MODEL),
     publicUrl: overrides.publicUrl ?? (String(env.OPENAGI_PUBLIC_URL ?? "").trim() || null),
     selfSessionIds,
+    // repo -> UI path prefixes that make visual QA required; github.js has
+    // a built-in default for buildbetter-app/buildbetter.
+    uiPathPrefixes: overrides.uiPathPrefixes ?? {},
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
     bins: { ...defaultBinaries(home), ...(overrides.bins ?? {}) }
@@ -178,6 +188,24 @@ const SECRET_PATTERNS = [
   [/(https:\/\/ping\.buzzkit\.dev\/)[^\s"')]+/g, "$1[redacted]"],
   [/\b([A-Z0-9_]*(?:API_KEY|TOKEN|SECRET)=)\S+/g, "$1[redacted]"]
 ];
+
+// Keeps the END of a message: agents put their question or wait notice last.
+export function clampTail(value, max) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!max || text.length <= max) return text;
+  return `…${text.slice(text.length - Math.max(0, max - 1)).trimStart()}`;
+}
+
+export function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the pid exists but belongs to another user.
+    return error?.code === "EPERM";
+  }
+}
 
 // Best-effort scrub before untrusted transcript text is stored or shown.
 export function redactSecrets(value) {
@@ -304,7 +332,9 @@ export async function openReadOnlyDb(filePath) {
  * @property {boolean} writerLocked
  * @property {boolean} archived
  * @property {string|null} excluded       reason, or null when in scope
- * @property {{model?: string|null, file?: string|null, turnStartedAt?: string|null, abortReason?: string|null}} meta
+ * @property {Object} meta               source extras: model, file, turnStartedAt, abortReason, heartbeat,
+ *   lastSupervisorAt, pendingQuestion, provider, threadSource, conductorHosted, entrypoint, waitingFor,
+ *   peerStatus, derivedStatus, dbRemote
  */
 
 /**
@@ -352,13 +382,16 @@ export async function openReadOnlyDb(filePath) {
 /**
  * @typedef {Object} FleetDecision
  * @property {string} threadKey           thread key, or "infra:bb3" / "infra:lb"
+ * @property {string|null} targetKey      thread that receives the message (the manager for escalate-manager)
+ * @property {{head: string|null, unresolved: number|null}|null} progressMark
  * @property {string} state               one of STATES (or "infra")
  * @property {string} action              one of ACTIONS
  * @property {string|null} playbook       playbook id
  * @property {string|null} message        rendered text to send (nudge / escalate-manager)
  * @property {string} reason              short human-readable why
  * @property {string[]} blockers          short readiness blockers
- * @property {{title: string, body: string, options: string[], dedupeKey: string}|null} question
+ * @property {{title: string, body: string, options: string[], dedupeKey: string,
+ *   kind: "agent-ask"|"ready"|"stuck"|"limit"|"infra"|"open"}|null} question
  * @property {string|null} route          one of ROUTES, or null when undeliverable
  * @property {string|null} notBefore      ISO; do not act before this time
  */

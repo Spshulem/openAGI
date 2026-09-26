@@ -4,8 +4,7 @@
 // untrusted and may carry instructions, so it never goes into a message
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
-import { DEFAULTS, clampText, msSince, redactSecrets, shortHash } from "./contracts.js";
-import { SUPERVISOR_PREFIX } from "./classify.js";
+import { DEFAULTS, SUPERVISOR_PREFIX, clampText, msSince, redactSecrets, shortHash } from "./contracts.js";
 import { renderTemplate } from "./playbooks.js";
 
 const MIN = 60_000;

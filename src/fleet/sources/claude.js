@@ -6,7 +6,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { classifyErrorText } from "../errors.js";
-import { clampText, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, threadKey, toIso } from "../contracts.js";
+import {
+  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, parseJsonLines, parsePrRef, prRefKey, readTail,
+  redactSecrets, threadKey, toIso
+} from "../contracts.js";
 
 const DEFAULT_TAIL_BYTES = 2 * 1024 * 1024;
 const MIN_TEXT_TURNS = 5;
@@ -15,19 +18,7 @@ const TMP_ROOTS = ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders
 const NON_OWNER_ORIGINS = new Set(["task-notification", "peer"]);
 const NON_OWNER_TURNS = new Set(["task_notification", "peer", "system", "scheduled"]);
 const STOP_TOOLS = new Set(["TaskStop", "KillShell", "KillBash"]);
-// The executor prefixes every message; the supervisor's own sends are not the owner typing.
-export const SUPERVISOR_PREFIX = "[OpenAGI supervisor]";
 const PR_URL = /github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/;
-
-export function defaultIsPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM means the pid exists but belongs to another user.
-    return error?.code === "EPERM";
-  }
-}
 
 function safeAlive(isPidAlive, pid) {
   try { return Boolean(isPidAlive(pid)); } catch { return false; }
@@ -283,7 +274,7 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     claudeSessionId: id,
     agentStatus,
     lastActivityAt: toIso(mtimeMs),
-    lastAgentText: excerpt(summary.lastAgentText),
+    lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,

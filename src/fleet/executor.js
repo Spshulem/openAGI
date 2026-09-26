@@ -7,10 +7,10 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { DEFAULT_RELAY_MODEL, ROUTES, clampText, parseEnvText, redactSecrets, runCommand, shortHash } from "./contracts.js";
+import { DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, parseEnvText, redactSecrets, runCommand, shortHash } from "./contracts.js";
 import { classifyErrorText } from "./errors.js";
 
-export const MESSAGE_PREFIX = "[OpenAGI supervisor] ";
+export const MESSAGE_PREFIX = `${SUPERVISOR_PREFIX} `;
 
 const RELAY_TIMEOUT_MS = 180_000;
 // A resumed turn can run for an hour (CI waits, bb-quick). Only the child we

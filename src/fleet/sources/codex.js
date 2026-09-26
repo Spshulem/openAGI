@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  clampText, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
+  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
   runCommand, threadKey, toIso
 } from "../contracts.js";
 import { classifyCodexErrorCode } from "../errors.js";
@@ -14,7 +14,6 @@ const HOUR = 3_600_000;
 const TAIL_BYTES = 1024 * 1024;
 const AUTOMATION_SOURCES = new Set(["guardian_review", "subagent", "automation"]);
 const HEARTBEAT_PATTERN = /<heartbeat>|<automation_id>/;
-const SUPERVISOR_PREFIX = "[OpenAGI supervisor]";
 const PR_URL_PATTERN = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
 const WRAPPER_TAGS = [
   "environment_context", "in-app-browser-context", "user_instructions", "user_shell_command", "turn_aborted", "subagent_notification"
@@ -33,15 +32,6 @@ const LB_RULES = [
   ["unavailable", /\b50[0234]\b|Service Unavailable|Bad Gateway|Gateway Timeout|draining|cooling down|degraded mode|upstream_unavailable/i],
   ["connection", /Connection failed|error sending request|stream disconnected|timed out|timeout|Connection (?:reset|closed)|Transport error|network error|os error/i]
 ];
-
-function defaultIsPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
-  }
-}
 
 // ---------- rollout tail parsing ----------
 
@@ -259,7 +249,7 @@ function applyRollout(thread, row, context) {
   thread.agentStatus = statusFor(summary, mtimeMs, now, limits);
   thread.error = errorFor(summary.lifecycle, now, limits);
   if (summary.lastAgent) {
-    thread.lastAgentText = clampText(redactSecrets(summary.lastAgent.text), limits.excerptMax);
+    thread.lastAgentText = clampTail(redactSecrets(summary.lastAgent.text), limits.excerptMax);
     thread.lastAgentAt = summary.lastAgent.at;
   }
   if (summary.lastUser) {

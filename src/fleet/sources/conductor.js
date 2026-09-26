@@ -3,8 +3,11 @@
 // hold the plain text the owner typed.
 
 import { classifyErrorText } from "../errors.js";
-import { clampText, openReadOnlyDb, redactSecrets, repoFromRemote, threadKey, toIso } from "../contracts.js";
-import { SUPERVISOR_PREFIX, defaultIsPidAlive, readLivePeers } from "./claude.js";
+import {
+  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, redactSecrets, repoFromRemote,
+  threadKey, toIso
+} from "../contracts.js";
+import { readLivePeers } from "./claude.js";
 
 const STATUS_MAP = Object.freeze({ working: "running", waiting: "waiting", idle: "idle", error: "error" });
 const TAIL_ROWS = 400;
@@ -176,7 +179,7 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
     claudeSessionId,
     agentStatus,
     lastActivityAt: latestIso(dbTimeToIso(row.updated_at), summary.lastAt),
-    lastAgentText: excerpt(summary.lastAgentText),
+    lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,
