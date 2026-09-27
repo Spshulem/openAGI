@@ -7,6 +7,9 @@ struct ChatMessage: Identifiable, Equatable {
     var text: String
     var isStreaming: Bool
     var isFailed: Bool = false
+    // A dropped stream can hide a committed turn. Never offer a blind resend
+    // when the daemon may still be running it or may already have finished.
+    var retrySafe: Bool = true
     let timestamp: Date
 
     init(role: Role, text: String, isStreaming: Bool = false, timestamp: Date = Date()) {
@@ -146,10 +149,9 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity, alignment: .center)
             }
             MessageBubbleRow(message: item.message, maxContainerWidth: width)
-            // DESIGN.md: "A failed send stays in place in `alert` with a
-            // 'Try again' directly under it. It is never silently dropped
-            // and never a modal."
-            if item.message.isFailed {
+            // Offer a resend only when the daemon definitely rejected the
+            // turn. A lost stream may hide a committed reply or tool action.
+            if item.message.isFailed && item.message.retrySafe {
                 Button("Try again") {
                     Task { await retry(item.message) }
                 }
@@ -222,6 +224,7 @@ struct ChatView: View {
     }
 
     private func streamReply(text: String, replyID: UUID) async {
+        var receivedTerminal = false
         do {
             let stream = try await model.client.sendMessageStreaming(text: text)
             for try await event in stream {
@@ -234,32 +237,46 @@ struct ChatView: View {
                         messages[index].text += frame.text
                     }
                 case .final(let frame):
+                    receivedTerminal = true
                     if let reply = frame.reply, !reply.isEmpty {
                         messages[index].text = reply
                     }
                     messages[index].isStreaming = false
                 case .failure(let frame):
-                    messages[index].text = frame.error ?? "OpenAGI couldn't reply. Try again."
+                    receivedTerminal = true
+                    messages[index].text = (frame.error ?? "OpenAGI couldn't finish.") + " Check the conversation before sending again."
                     messages[index].isStreaming = false
                     messages[index].isFailed = true
+                    messages[index].retrySafe = false
                 case .status, .session:
                     break
                 }
             }
             if let index = messages.firstIndex(where: { $0.id == replyID }) {
                 messages[index].isStreaming = false
+                if !receivedTerminal {
+                    messages[index].text = "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again."
+                    messages[index].isFailed = true
+                    messages[index].retrySafe = false
+                }
             }
         } catch let error as DaemonError {
+            if receivedTerminal { return } // Keep a final reply or failure received before teardown.
             if let index = messages.firstIndex(where: { $0.id == replyID }) {
-                messages[index].text = ChatErrorCopy.message(for: error)
+                messages[index].text = error == .agentHostDisabled || error == .unauthorized
+                    ? ChatErrorCopy.message(for: error)
+                    : "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again."
                 messages[index].isStreaming = false
                 messages[index].isFailed = true
+                messages[index].retrySafe = error == .agentHostDisabled
             }
         } catch {
+            if receivedTerminal { return }
             if let index = messages.firstIndex(where: { $0.id == replyID }) {
-                messages[index].text = "Can't reach OpenAGI. Check your connection and try again."
+                messages[index].text = "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again."
                 messages[index].isStreaming = false
                 messages[index].isFailed = true
+                messages[index].retrySafe = false
             }
         }
     }
@@ -274,6 +291,7 @@ enum ChatRetry {
     static func target(failedID: UUID, in messages: [ChatMessage], isSending: Bool) -> (index: Int, userText: String)? {
         guard !isSending,
               let index = messages.firstIndex(where: { $0.id == failedID }),
+              messages[index].isFailed && messages[index].retrySafe,
               let userText = messages[..<index].last(where: { $0.role == .user })?.text
         else { return nil }
         return (index, userText)

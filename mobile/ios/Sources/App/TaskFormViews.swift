@@ -151,7 +151,7 @@ struct TaskDetailView: View {
 
                 VStack(spacing: Theme.Spacing.x2) {
                     PrimaryButton(title: "Save", isLoading: isSaving) { Task { await save() } }
-                    if task.status != "completed" {
+                    if task.status != "completed" && task.status != "cancelled" {
                         SecondaryTextButton(title: "Complete") { Task { await complete() } }
                     }
                     DestructiveTextButton(title: "Delete") { showingDeleteConfirmation = true }

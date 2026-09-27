@@ -2251,6 +2251,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         const body = await readJson(req).catch(() => ({}));
         const action = String(body.action ?? "");
+        const fleetDismissId = action === "dismiss" && item.sourceRef?.kind === "fleet" ? item.sourceRef.id : null;
+        if (fleetDismissId) runtime.fleetSupervisor?.beginOutreachDecision?.(fleetDismissId);
         try {
           const applied = await applyOutreachAction(runtime, item, action, body.note);
           if (applied?.pendingAction) {
@@ -2263,8 +2265,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (error?.code === "OUTREACH_ACTION_CONFLICT") {
             return sendJson(res, 409, { item: runtime.outreach.get(id), error: error.message });
           }
+          if (action === "dismiss" && item.sourceRef?.kind === "fleet") {
+            // The selected computer did not confirm dismissal. Keep the
+            // question actionable in outreach and the G2 approvals feed.
+            return sendJson(res, 503, { item: runtime.outreach.get(id), error: error.message });
+          }
           const updated = runtime.outreach.resolve(id, { action, by: "user" }, { status: "error", error: error.message });
           return sendJson(res, 400, { item: updated, error: error.message });
+        } finally {
+          if (fleetDismissId) runtime.fleetSupervisor?.finishOutreachDecision?.(fleetDismissId);
         }
       }
       if (method === "POST" && pathname.startsWith("/outreach/") && pathname.endsWith("/feedback")) {
@@ -3897,7 +3906,10 @@ function recordRetirementOutcome(runtime, task, { draftId, by, reason }) {
 // on a failed delegation so the route can mark the item status:"error".
 async function applyOutreachAction(runtime, item, action, note) {
   if (action === "dismiss") {
-    if (item.sourceRef?.kind === "fleet") runtime.fleetSupervisor?.dismissQuestion(item.sourceRef.id);
+    if (item.sourceRef?.kind === "fleet") {
+      if (!runtime.fleetSupervisor) throw new Error("Fleet supervisor unavailable");
+      await runtime.fleetSupervisor.dismissQuestion(item.sourceRef.id);
+    }
     return;
   }
   if (action === "up" || action === "down") return applyOutreachFeedback(runtime, item, action, note);
