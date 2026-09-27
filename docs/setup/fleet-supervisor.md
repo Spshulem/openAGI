@@ -69,6 +69,8 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_LB_URL` | `http://100.99.3.113:2455` | codex-lb base URL; `/health` is checked |
 | `OPENAGI_FLEET_BB3_MANAGER` | Remote dev setup session | Conductor session id or workspace name that gets BuildBot3 / LB escalations |
 | `OPENAGI_FLEET_RELAY_MODEL` | `claude-haiku-4-5-20251001` | Model for the `claude -p` relay to live Claude/Conductor sessions |
+| `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
+| `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
 
 `OPENAGI_PUBLIC_URL`, when set, makes phone pushes deep-link to `/fleet?q=<id>`.
 
@@ -115,10 +117,82 @@ colour, needs-you questions with buttons, mode, and **Scan now**.
   `fleet_thread` (one thread's row, decision, PR, and questions). They read the
   last scan only; they never scan, send, answer, or change the mode.
 
-## Known gaps
+## Computer-use delivery
 
-- Non-live Conductor sessions: no delivery route yet. You get "open it" after 90 min stuck.
-- Codex threads held open by Codex Desktop (writer lock): blocked. Close the thread in Desktop, or send by hand.
+Types each supervisor message into the app that shows the thread, then presses
+Send. No `codex exec` and no `claude -p`. Covers nudges, owner answers,
+**retry**, grouped **added** resumes, and manager escalations.
+
+| `OPENAGI_FLEET_DELIVERY` | Does |
+|---|---|
+| `cli` (default) | The CLI routes above. Nothing changes. |
+| `computer-use` | App UI only, never a CLI. Not ready: the send waits. No app shows the thread (plain terminal `claude`): the usual "open it?" question. |
+| `computer-use-first` | App UI when ready, otherwise the CLI routes. |
+
+Which app:
+
+- Conductor sessions: `conductor://workspace?id=<workspace>&session=<session>`.
+- Codex threads: the Codex app, `codex://threads/<id>` (never `?prompt=`).
+- Codex threads Conductor started (`originator=codex_sdk_ts`): their Conductor
+  tab. No Conductor row: no route.
+
+Setup on the coding Mac:
+
+1. `npm install -g open-computer-use` (0.3.5 on the owner's Mac). The fleet runs the
+   bundled `Open Computer Use.app` engine through its app agent, so macOS checks
+   that app's permissions, not the daemon's node.
+2. Grant **Open Computer Use** Accessibility and Screen Recording in System
+   Settings > Privacy & Security. `open-computer-use doctor` shows both.
+3. Keep `OPENAGI_COMPUTER_USE=1`. Turning it off in the dashboard stops
+   computer-use delivery too.
+4. Check what a delivery would see, read-only (no clicks, no typing):
+
+   ```sh
+   open-computer-use snapshot com.conductor.app | node scripts/fleet-ui-probe.mjs --expect <workspace>
+   ```
+
+   It should find one composer, the Send button, and the open workspace.
+5. Add `OPENAGI_FLEET_DELIVERY=computer-use` to `~/.openagi/.env`, start with
+   `OPENAGI_FLEET_MODE=propose`, and restart OpenAGI. Set
+   `OPENAGI_FLEET_OCU_PATH` if the launchd `PATH` cannot find the binary.
+
+Each send, in order. Any failed check stops before typing:
+
+- Ready: permissions granted, screen unlocked, secure input off, no OpenAGI
+  computer-use session running.
+- The app is already running (never launched) and you are not using it: it is
+  frontmost and you touched the keyboard or mouse in the last 2 min means
+  "owner using <App>".
+- Opens the thread. While you are away it opens the deep link with `open -g`.
+  While you are active it only uses background accessibility clicks.
+- Proves the right thread is open: workspace name, plus the tab title when the
+  workspace has more than one tab (Codex: thread title). Shared or missing
+  names block as "ambiguous".
+- Blocks on a running turn (Stop visible) or a permission prompt.
+- The composer must be empty. A draft is never overwritten.
+- Types the message as one line (newlines become spaces), checks the composer
+  holds exactly that text, checks the thread again, then clicks Send (or
+  Return).
+- Confirms the message shows in the thread within 8 s. Otherwise the result is
+  **failed** and *unconfirmed*: check the thread before retrying.
+
+Safety rules:
+
+- One app delivery at a time. 10 s per UI step, 45 s per delivery.
+- Only Conductor (`com.conductor.app`) and the Codex app (`com.openai.codex`).
+  No clipboard, no paste, no app launch, no pointer moves.
+- Text typed before a failed check is cleared only when it is provably ours.
+- Before and after screenshots go to `<dataDir>/fleet/logs/ui/` (0600, newest
+  200 kept). Their paths are on the action record.
+- Blocked means nothing was typed: no attempt spent, retried next scan.
+
+
+- Non-live Conductor sessions: no CLI delivery route. You get "open it" after
+  90 min stuck, unless computer-use delivery is on.
+- Codex threads held open by Codex Desktop (writer lock): blocked on the CLI
+  route. Close the thread in Desktop, send by hand, or use computer-use delivery.
+- Computer-use delivery reads the apps' accessibility trees. An app update can
+  change them; a thread it cannot verify is blocked, never guessed.
 - Main mirroring requires an explicitly selected enrolled coding Mac; without
   `OPENAGI_FLEET_NODE`, Fleet remains local to that daemon.
 

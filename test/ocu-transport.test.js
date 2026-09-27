@@ -104,3 +104,24 @@ test("late output from a killed dispatcher cannot close its replacement", async 
   assert.equal(client.proc, children[1]);
   await client.call("get_app_state", {});
 });
+test("the fleet's app-agent opt-in keeps pointer fallback off and only lifts the proxy block", async t => {
+  const child = new EventEmitter(); let spawnArgs;
+  child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kill = () => {};
+  child.stdin = new Writable({ write(chunk, _encoding, done) {
+    const request = JSON.parse(String(chunk));
+    if (request.id) queueMicrotask(() => child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id,
+      result: request.method === "initialize" ? { serverInfo: { name: "fixture" } } : { isError: false, content: [] } }) + "\n"));
+    done();
+  } });
+  const client = new OcuTransport("/native/OpenComputerUse", { timeoutMs: 30, appAgentProxy: true, spawnImpl: (...args) => { spawnArgs = args; return child; } });
+  t.after(() => client.close());
+  await client.call("get_app_state", { app: "com.conductor.app" });
+  assert.equal(spawnArgs[2].env.OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY, undefined);
+  assert.equal(spawnArgs[2].env.OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS, "0");
+  assert.equal(spawnArgs[2].env.OPENAI_API_KEY, undefined);
+  await readOcuPermissions("/native/OpenComputerUse", (_file, _args, options, callback) => {
+    assert.equal(options.env.OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY, undefined);
+    assert.equal(options.timeout, 10_000);
+    callback(null, "Permissions: accessibility=granted, screenRecording=granted");
+  }, { appAgentProxy: true, timeoutMs: 10_000 });
+});

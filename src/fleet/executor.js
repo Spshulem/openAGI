@@ -1,14 +1,16 @@
-// Delivers supervisor text to one agent thread through the three routes in
-// the spec: codex exec resume, a claude -p SendMessage relay to a live peer,
-// and claude -p --resume. This is the only fleet unit that writes to other
-// processes, so it re-checks every precondition instead of trusting policy.
+// Delivers supervisor text to one agent thread through the routes in the
+// spec: codex exec resume, a claude -p SendMessage relay to a live peer,
+// claude -p --resume, and computer-use (typed into the app that shows the
+// thread, see ui-delivery.js). This is the only fleet unit that writes to
+// other processes, so it re-checks every precondition instead of trusting policy.
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, parseEnvText, redactSecrets, runCommand, shortHash } from "./contracts.js";
+import { DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { classifyErrorText } from "./errors.js";
+import { UI_LOCK, flattenMessage, uiIdentity } from "./ui-delivery.js";
 
 export const MESSAGE_PREFIX = `${SUPERVISOR_PREFIX} `;
 
@@ -171,6 +173,16 @@ function checkPreconditions(thread, route, message, config) {
   if (!String(message ?? "").trim()) return "empty message";
   if (isSelf(thread, config)) return "the supervisor's own session";
   if (thread.archived) return "archived";
+  // On a computer-use-only Mac no send ever runs a CLI, whatever an older
+  // proposal or caller asked for.
+  if (config?.delivery === "computer-use" && route !== "computer-use") return "computer-use delivery only: CLI routes are off";
+  if (route === "computer-use") {
+    // A Codex writer lock held by the desktop app is expected here; a running
+    // turn is not. The UI re-checks for a Stop button before typing.
+    if (!uiTargetFor(thread)) return "no app shows this thread: open it";
+    if (thread.agentStatus === "running") return "turn running";
+    if (thread.meta?.blockedOnOwner === true) return "waiting on a permission prompt: open it";
+  }
   if (route === "codex-exec") {
     if (thread.kind !== "codex") return "codex-exec needs a codex thread";
     if (thread.writerLocked) return "writer-locked: the thread is open in another Codex writer";
@@ -187,15 +199,20 @@ function checkPreconditions(thread, route, message, config) {
   return null;
 }
 
-export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null } = {}) {
+// ui: createUiDriver() result ({ deliver }); knownThreads: () => every thread
+// the supervisor saw, to spot shared titles; uiLock: one UI send at a time.
+export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK } = {}) {
   const runner = run ?? runCommand;
   // An injected run (tests, dry harnesses) also serves the background routes.
   const background = spawnBackground ?? (run ? run : spawnWithTail);
   const logsDir = logDir ?? (store?.dir ? path.join(store.dir, "logs") : null);
   const bins = config?.bins ?? {};
   const paths = config?.paths ?? {};
+  const limits = { ...DEFAULTS, ...(config?.limits ?? {}) };
   const active = new Set();
   const pending = new Set();
+  // targetKey -> messageHash of the last UI send that could not be confirmed.
+  const unconfirmed = new Map();
 
   const journal = (actionId, fields) => {
     try {
@@ -217,6 +234,11 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   };
 
   const plan = (thread, route, text) => {
+    if (route === "computer-use") {
+      const target = uiTargetFor(thread);
+      const where = target.app === "conductor" ? (target.workspace ?? thread.workspace ?? thread.id) : clampText(target.title ?? thread.id, 60);
+      return { ui: true, target, describe: `type into ${target.name}: ${where}` };
+    }
     if (route === "codex-exec") {
       return {
         cmd: bins.codex ?? "codex",
@@ -294,6 +316,39 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     return { status, route: base.route, detail: finalDetail, actionId: id };
   };
 
+  // Synchronous: the result is final when this returns, so there is no done
+  // promise and nothing for reopenIfUndelivered to wait on.
+  const typeInApp = async (thread, step, base, actionId, text) => {
+    const target = step.target;
+    const evidenceName = actionId ?? `${thread.kind}-${String(thread.id).slice(0, 8)}-${Date.now()}`;
+    let result;
+    const locked = await uiLock.run(async () => {
+      let threads = [];
+      try { threads = knownThreads() ?? []; } catch { threads = []; }
+      const identity = uiIdentity(thread, target, threads);
+      const previousUnconfirmed = unconfirmed.get(target.targetKey) === base.messageHash;
+      try {
+        return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName });
+      } catch (error) {
+        return { status: "failed", detail: `computer use failed: ${detailText(error?.message ?? error)}; nothing confirmed` };
+      }
+    }, { waitMs: limits.uiDeliveryTimeoutMs });
+    if (locked.busy) result = { status: "blocked", detail: "busy: another app delivery is running; retry" };
+    else result = locked.value ?? { status: "failed", detail: "computer use returned nothing" };
+    const status = ["sent", "failed", "blocked"].includes(result.status) ? result.status : "failed";
+    const detail = detailText(result.detail || status);
+    if (status === "sent") unconfirmed.delete(target.targetKey);
+    else if (result.unconfirmed) unconfirmed.set(target.targetKey, base.messageHash);
+    const extra = {};
+    if (Array.isArray(result.evidence) && result.evidence.length) extra.evidence = result.evidence;
+    if (result.unconfirmed) extra.unconfirmed = true;
+    // A blocked UI send typed nothing: journal it only against an existing
+    // action, like every other blocked delivery.
+    let id = actionId;
+    if (status !== "blocked" || actionId) id = journal(actionId, { ...base, status, detail, ...extra, finishedAt: new Date().toISOString() });
+    return { status, route: base.route, detail, actionId: id ?? null, ...extra };
+  };
+
   const launch = (thread, step, base, actionId, env) => {
     const id = journal(actionId, { ...base, status: "sent", running: true, detail: "started", startedAt: new Date().toISOString() });
     let reached = true;
@@ -348,11 +403,26 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       if ([thread.id, thread.claudeSessionId].some((id) => id && peers.has(id))) return blocked("live session: use peer-relay");
     }
     if (active.has(thread.key)) return blocked("in flight: a send to this thread has not finished");
-    const text = withPrefix(message);
+    // The composer takes one line; the journaled hash is of what is typed.
+    const text = route === "computer-use" ? flattenMessage(withPrefix(message)) : withPrefix(message);
     const step = plan(thread, route, text);
-    if (dryRun) return { status: "dry-run", route, detail: `would run ${step.describe}`, actionId };
+    if (dryRun) return { status: "dry-run", route, detail: step.ui ? `would ${step.describe}` : `would run ${step.describe}`, actionId };
 
     const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text) };
+    if (step.ui) {
+      if (!ui?.deliver) return blocked("computer use unavailable on this Mac");
+      // One Conductor session can be reached through two fleet threads (its
+      // own row and the Codex thread it hosts).
+      if (active.has(step.target.targetKey)) return blocked("in flight: a send to this thread has not finished");
+      active.add(thread.key);
+      active.add(step.target.targetKey);
+      try {
+        return await typeInApp(thread, step, base, actionId, text);
+      } finally {
+        active.delete(thread.key);
+        active.delete(step.target.targetKey);
+      }
+    }
     active.add(thread.key);
     const env = childEnv(route);
     if (step.background) return launch(thread, step, base, actionId, env);
@@ -365,7 +435,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
 
   return {
     deliver,
-    inFlight: () => [...active],
+    inFlight: () => [...active].filter((key) => !/^(conductor-session|codex-thread):/.test(key)),
     // Resolves once every background send has finished and been journaled.
     whenIdle: async () => {
       while (pending.size) await Promise.allSettled([...pending]);

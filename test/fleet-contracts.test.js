@@ -4,8 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  clampTail, clampText, isPidAlive, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  resolveFleetConfig, runCommand, toIso
+  ROUTES, UI_APPS, clampTail, clampText, isPidAlive, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
 test("resolveFleetConfig defaults to observe and disabled", () => {
@@ -81,4 +81,56 @@ test("runCommand settles after a timeout even if SIGTERM is ignored or a descend
   const grandchild = Number(held.stdout.trim().split("\n")[0]);
   t.after(() => { try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ } });
   assert.ok(grandchild > 0);
+});
+
+test("OPENAGI_FLEET_DELIVERY picks cli, computer-use, or computer-use-first; anything else is cli", () => {
+  assert.ok(ROUTES.includes("computer-use"));
+  assert.equal(resolveFleetConfig({}, { home: "/h" }).delivery, "cli");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: "computer-use" }, { home: "/h" }).delivery, "computer-use");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: " Computer-Use-First " }, { home: "/h" }).delivery, "computer-use-first");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: "ui" }, { home: "/h" }).delivery, "cli");
+  assert.equal(resolveFleetConfig({ OPENAGI_FLEET_DELIVERY: "computer-use" }, { home: "/h", delivery: "cli" }).delivery, "cli");
+  assert.equal(parseDeliveryMode(undefined), "cli");
+  const limits = resolveFleetConfig({}, { home: "/h" }).limits;
+  assert.equal(limits.uiOwnerIdleMs, 120_000);
+  assert.equal(limits.uiStepTimeoutMs, 10_000);
+  assert.equal(limits.uiDeliveryTimeoutMs, 45_000);
+});
+
+test("resolveOcuPath: explicit path, else open-computer-use on PATH, preferring the bundled native engine", () => {
+  const launcher = "/nvm/lib/node_modules/open-computer-use/bin/open-computer-use";
+  const native = "/nvm/lib/node_modules/open-computer-use/dist/Open Computer Use.app/Contents/MacOS/OpenComputerUse";
+  const files = new Set(["/nvm/bin/open-computer-use", launcher, native, "/opt/ocu/custom"]);
+  const exists = (file) => files.has(file);
+  const realpath = (file) => (file === "/nvm/bin/open-computer-use" ? launcher : file);
+  const options = { exists, realpath, execPath: "/nowhere/node" };
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin:/nvm/bin" }, options), native);
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin", OPENAGI_FLEET_OCU_PATH: "/opt/ocu/custom" }, options), "/opt/ocu/custom");
+  // An explicit path that does not exist is kept, so readiness names it as missing.
+  assert.equal(resolveOcuPath({ OPENAGI_FLEET_OCU_PATH: "/missing/ocu" }, options), "/missing/ocu");
+  // A launchd PATH without nvm still finds the engine next to the daemon's node.
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, { ...options, execPath: "/nvm/bin/node" }), native);
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, options), null);
+  // Without the bundled app, the resolved launcher itself.
+  files.delete(native);
+  assert.equal(resolveOcuPath({ PATH: "/nvm/bin" }, options), launcher);
+});
+
+test("uiTargetFor maps threads to the app that shows them, or none", () => {
+  const conductor = {
+    key: "conductor:s1", kind: "conductor", id: "s1", workspace: "madrid", title: "Fix billing",
+    meta: { conductorWorkspaceId: "w 1", conductorSessionId: "s1", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 3 }
+  };
+  const target = uiTargetFor(conductor);
+  assert.equal(target.bundleId, UI_APPS.conductor.bundleId);
+  assert.equal(target.deepLink, "conductor://workspace?id=w%201&session=s1");
+  assert.equal(target.sessionCount, 3);
+  assert.equal(uiTargetFor({ ...conductor, meta: {} }), null, "no workspace id: no deep link, no route");
+  assert.equal(uiTargetFor({ ...conductor, archived: true }), null);
+  const codex = uiTargetFor({ key: "codex:t1", kind: "codex", id: "t1", title: "Fix uploads", meta: { originator: "Codex Desktop" } });
+  assert.equal(codex.bundleId, "com.openai.codex");
+  assert.equal(codex.deepLink, "codex://threads/t1");
+  assert.equal(uiTargetFor({ key: "codex:t2", kind: "codex", id: "t2", meta: { originator: "codex_sdk_ts" } }), null);
+  assert.equal(uiTargetFor({ key: "claude:c1", kind: "claude", id: "c1", meta: { entrypoint: "cli" } }), null, "terminal Claude: no app");
+  assert.equal(uiTargetFor(null), null);
 });

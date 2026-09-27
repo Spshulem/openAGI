@@ -26,7 +26,11 @@ export const STATES = Object.freeze([
 
 export const ACTIONS = Object.freeze(["none", "wait", "nudge", "escalate-manager", "ask-user"]);
 export const MODES = Object.freeze(["observe", "propose", "auto"]);
-export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume"]);
+export const ROUTES = Object.freeze(["codex-exec", "peer-relay", "claude-resume", "computer-use"]);
+// How supervisor text reaches a thread. "cli" is the original set of routes;
+// "computer-use" types into the app that shows the thread and never runs a
+// CLI; "computer-use-first" types when computer use is ready, else falls back.
+export const DELIVERY_MODES = Object.freeze(["cli", "computer-use", "computer-use-first"]);
 
 // The executor prefixes every message with this. Sources and policy use it
 // to tell the supervisor's own sends apart from the owner typing.
@@ -62,7 +66,15 @@ export const DEFAULTS = Object.freeze({
   bodyMax: 220,
   excerptMax: 600,
   maxThreads: 150,
-  maxActionsKept: 300
+  maxActionsKept: 300,
+  // Computer-use delivery: the owner counts as away after this much input
+  // idle time; each Open Computer Use call and each whole delivery is capped.
+  uiOwnerIdleMs: 2 * MIN,
+  uiStepTimeoutMs: 10_000,
+  uiDeliveryTimeoutMs: 45_000,
+  uiNavigateMs: 5_000,
+  uiConfirmMs: 8_000,
+  uiPollMs: 500
 });
 
 export const DEFAULT_BB3_HOST = "dev@100.99.3.113";
@@ -96,8 +108,39 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     ssh: pick(["/usr/bin/ssh"], "ssh"),
     git: pick(["/usr/bin/git", "/opt/homebrew/bin/git"], "git"),
     ps: pick(["/bin/ps"], "ps"),
-    lsof: pick(["/usr/sbin/lsof"], "lsof")
+    lsof: pick(["/usr/sbin/lsof"], "lsof"),
+    lsappinfo: pick(["/usr/bin/lsappinfo"], "lsappinfo"),
+    ioreg: pick(["/usr/sbin/ioreg"], "ioreg"),
+    open: pick(["/usr/bin/open"], "open")
   };
+}
+
+const OCU_NAME = "open-computer-use";
+const OCU_NATIVE = ["dist", "Open Computer Use.app", "Contents", "MacOS", "OpenComputerUse"];
+
+// The standalone Open Computer Use binary the fleet drives apps with. The npm
+// "open-computer-use" command is a node launcher: a launchd PATH may lack
+// node, and killing the launcher would orphan the engine, so the bundled
+// native executable next to it is used instead when present.
+export function resolveOcuPath(env = process.env, { exists = fs.existsSync, realpath = fs.realpathSync, execPath = process.execPath } = {}) {
+  const explicit = String(env?.OPENAGI_FLEET_OCU_PATH ?? "").trim();
+  const candidates = explicit ? [explicit] : [
+    ...String(env?.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, OCU_NAME)),
+    path.join(path.dirname(execPath), OCU_NAME),
+    `/opt/homebrew/bin/${OCU_NAME}`,
+    `/usr/local/bin/${OCU_NAME}`
+  ];
+  const found = candidates.find((candidate) => path.isAbsolute(candidate) && exists(candidate));
+  if (!found) return explicit || null;
+  let real = found;
+  try { real = realpath(found); } catch { /* keep the path as given */ }
+  const native = path.join(path.dirname(real), "..", ...OCU_NATIVE);
+  return exists(native) ? path.normalize(native) : real;
+}
+
+export function parseDeliveryMode(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  return DELIVERY_MODES.includes(text) ? text : "cli";
 }
 
 function envFlag(value) {
@@ -133,10 +176,100 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // repo -> UI path prefixes that make visual QA required; github.js has
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},
+    delivery: DELIVERY_MODES.includes(overrides.delivery) ? overrides.delivery : parseDeliveryMode(env.OPENAGI_FLEET_DELIVERY),
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
-    bins: { ...defaultBinaries(home), ...(overrides.bins ?? {}) }
+    bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env), ...(overrides.bins ?? {}) }
   };
+}
+
+// ---------------------------------------------------------------------------
+// Computer-use delivery targets. Pure: policy asks "which app shows this
+// thread?" without I/O. Only these bundle ids are ever driven.
+
+export const UI_APPS = Object.freeze({
+  conductor: Object.freeze({ app: "conductor", name: "Conductor", bundleId: "com.conductor.app" }),
+  codex: Object.freeze({ app: "codex", name: "Codex", bundleId: "com.openai.codex" })
+});
+
+// Codex threads started by Conductor's Codex agent carry this originator;
+// they show in Conductor, not in the Codex app.
+export const CONDUCTOR_CODEX_ORIGINATOR = "codex_sdk_ts";
+
+// sessionTitle: the Conductor tab title (null when untitled); sessionCount:
+// visible sessions in the workspace; titleShared: another tab there has the
+// same title. They decide whether the workspace name alone proves the tab.
+function conductorTarget({ workspaceId, sessionId, workspace = null, title = null, sessionCount = null, titleShared = false }) {
+  const id = String(workspaceId);
+  const session = String(sessionId);
+  return {
+    ...UI_APPS.conductor,
+    targetKey: `conductor-session:${session}`,
+    deepLink: `conductor://workspace?id=${encodeURIComponent(id)}&session=${encodeURIComponent(session)}`,
+    workspaceId: id,
+    sessionId: session,
+    workspace: workspace ?? null,
+    title: title ?? null,
+    sessionCount: Number.isInteger(sessionCount) ? sessionCount : null,
+    titleShared: titleShared === true
+  };
+}
+
+function conductorFields(thread) {
+  const meta = thread.meta ?? {};
+  return {
+    workspaceId: meta.conductorWorkspaceId,
+    sessionId: meta.conductorSessionId,
+    workspace: thread.workspace ?? null,
+    // The source's own tab title when it read one; older rows fall back to the thread title.
+    title: Object.hasOwn(meta, "conductorSessionTitle") ? meta.conductorSessionTitle : (thread.title ?? null),
+    sessionCount: meta.conductorWorkspaceSessions ?? null,
+    titleShared: meta.conductorTitleShared === true
+  };
+}
+
+// The app that shows this thread, or null (loose Claude terminal sessions,
+// Conductor-hosted Codex threads without a Conductor row, archived threads).
+export function uiTargetFor(thread) {
+  if (!thread || thread.archived) return null;
+  const meta = thread.meta ?? {};
+  if (thread.kind === "conductor") {
+    if (!meta.conductorWorkspaceId || !meta.conductorSessionId) return null;
+    return conductorTarget(conductorFields(thread));
+  }
+  if (thread.kind === "codex" && thread.id) {
+    if (meta.originator === CONDUCTOR_CODEX_ORIGINATOR) {
+      const host = meta.conductorHost;
+      return host?.workspaceId && host?.sessionId ? conductorTarget(host) : null;
+    }
+    return {
+      ...UI_APPS.codex,
+      targetKey: `codex-thread:${thread.id}`,
+      deepLink: `codex://threads/${encodeURIComponent(thread.id)}`,
+      threadId: String(thread.id),
+      title: thread.title ?? null
+    };
+  }
+  return null;
+}
+
+// Links each Conductor-hosted Codex thread to the Conductor session that
+// runs it (Conductor stores the Codex thread id as claude_session_id).
+// Returns new thread objects; the inputs are left untouched.
+export function linkUiHosts(threads) {
+  const list = Array.isArray(threads) ? threads : [];
+  const hosts = new Map();
+  for (const thread of list) {
+    if (thread?.kind === "conductor" && !thread.archived && thread.claudeSessionId && thread.meta?.conductorWorkspaceId && thread.meta?.conductorSessionId) {
+      hosts.set(thread.claudeSessionId, thread);
+    }
+  }
+  return list.map((thread) => {
+    if (thread?.kind !== "codex" || thread.meta?.originator !== CONDUCTOR_CODEX_ORIGINATOR) return thread;
+    const host = hosts.get(thread.id);
+    const conductorHost = host ? { ...conductorFields(host), key: host.key } : null;
+    return { ...thread, meta: { ...(thread.meta ?? {}), conductorHost } };
+  });
 }
 
 // Runs a child process and never throws. Timeouts kill only the child this

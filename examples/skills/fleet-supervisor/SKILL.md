@@ -72,6 +72,9 @@ Readiness blockers: `CI red: <names>`, `CI running`, `no CI on head`, `unpushed 
 | Claude or Conductor, live | `peer-relay`: `claude -p` SendMessage relay to its peer name; success = DONE | peer pid alive |
 | Claude CLI, not live | `claude-resume`: `claude -p --resume <id> --permission-mode bypassPermissions <msg>` | `auto` mode only; never Conductor |
 | Conductor not live, Codex writer-locked | none | ask owner "open it" only if stuck 90 min+ |
+| Conductor tab or Codex app thread, `OPENAGI_FLEET_DELIVERY=computer-use` or `computer-use-first` | `computer-use`: open the thread in Conductor / the Codex app, type one line into the empty composer, press Send, confirm it shows | Open Computer Use permissions, screen unlocked, owner not using that app, thread verified by name, no running turn, no draft |
+
+With `OPENAGI_FLEET_DELIVERY=computer-use` no CLI route is ever used; threads no app shows (terminal `claude`) get the "open it" question.
 
 Every message starts with `[OpenAGI supervisor]`. Every send is journaled.
 
