@@ -155,17 +155,25 @@ export function normalizePr(repo, node, config) {
   };
 }
 
-async function fetchBatch(batch, config, run, out) {
+// unread (optional) collects refs GitHub could not answer this call: a
+// failed or unparseable batch, or a malformed node. A PR GitHub reports as
+// missing is an answer, not unread.
+async function fetchBatch(batch, config, run, out, unread) {
+  const miss = (refs) => { for (const ref of refs) unread?.add(prRefKey(ref.repo, ref.number)); };
   let result;
   try {
     result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrQuery(batch)}`], { timeoutMs: GH_TIMEOUT_MS });
   } catch {
+    miss(batch);
     return;
   }
   // gh exits non-zero on partial GraphQL errors (an unknown PR) but still
   // prints the body, so parse stdout regardless of the exit code.
   const data = parseJson(result?.stdout)?.data;
-  if (!data || typeof data !== "object") return;
+  if (!data || typeof data !== "object") {
+    miss(batch);
+    return;
+  }
   const aliases = new Map();
   for (const ref of batch) if (!aliases.has(ref.repo)) aliases.set(ref.repo, `r${aliases.size}`);
   for (const ref of batch) {
@@ -176,15 +184,16 @@ async function fetchBatch(batch, config, run, out) {
       out.set(pr.ref, pr);
     } catch {
       // A malformed node leaves this ref unknown for the tick.
+      miss([ref]);
     }
   }
 }
 
-export async function fetchPrStates(refs, config, { run = runCommand } = {}) {
+export async function fetchPrStates(refs, config, { run = runCommand, unread = null } = {}) {
   const out = new Map();
   const parsed = uniqueRefs(refs);
   for (let index = 0; index < parsed.length; index += BATCH_SIZE) {
-    await fetchBatch(parsed.slice(index, index + BATCH_SIZE), config, run, out);
+    await fetchBatch(parsed.slice(index, index + BATCH_SIZE), config, run, out, unread);
   }
   return out;
 }

@@ -35,6 +35,7 @@ function emptyState() {
     escalations: {},
     infraDown: {},
     infraBlocked: {},
+    infraUp: {},
     pushes: [],
     muted: {}
   };
@@ -313,8 +314,10 @@ export class FleetStore {
   setInfraDown(kind, down) {
     const current = this.state.infraDown[kind] ?? null;
     if (down && !current) this.state.infraDown[kind] = iso(this.now());
-    else if (!down && current) delete this.state.infraDown[kind];
-    else return this.infraDown(kind);
+    else if (!down && current) {
+      delete this.state.infraDown[kind];
+      this.state.infraUp[kind] = iso(this.now());
+    } else return this.infraDown(kind);
     this._save();
     return this.infraDown(kind);
   }
@@ -325,6 +328,11 @@ export class FleetStore {
 
   infraDownSince(kind) {
     return this.state.infraDown[kind] ?? null;
+  }
+
+  // When the last outage of this kind ended.
+  infraUpSince(kind) {
+    return this.state.infraUp[kind] ?? null;
   }
 
   // Threads seen blocked on an outage, so the recovery tick can resume them
@@ -468,6 +476,7 @@ export class FleetStore {
       escalations: isObject(raw.escalations) ? raw.escalations : {},
       infraDown: isObject(raw.infraDown) ? raw.infraDown : {},
       infraBlocked: isObject(raw.infraBlocked) ? raw.infraBlocked : {},
+      infraUp: isObject(raw.infraUp) ? raw.infraUp : {},
       pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
       muted: isObject(raw.muted) ? raw.muted : {}
     };

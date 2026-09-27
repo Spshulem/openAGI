@@ -34,6 +34,8 @@ const OPEN_ACTION = new Set(["planned", "proposed"]);
 const TRUNK_BRANCHES = new Set(["main", "master", "HEAD", "develop", "staging"]);
 const INFRA_KINDS = ["bb3", "lb"];
 const BLOCKED_STATES = new Set(["infra-blocked", "waiting-ci"]);
+// How long a remembered outage thread hidden by a failed source waits for it.
+const RECOVERY_HOLD_MS = 60 * MIN;
 // A manager escalation shares one cooldown per incident, whichever thread
 // or infra check raised it (same keys decideInfra uses).
 const INCIDENT_KEYS = Object.freeze({ "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" });
@@ -455,7 +457,8 @@ export class FleetSupervisor {
 
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
-    const prs = await this.fetchPrs(inScope, config, run, sourceErrors);
+    const unreadPrs = new Set();
+    const prs = await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs);
 
     const infra = {
       bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
@@ -472,8 +475,8 @@ export class FleetSupervisor {
       // No result for a worktree means git timed out or threw: unknown, not clean.
       const git = localGit.get(thread.cwd) ?? (thread.cwd ? { unreadable: true } : null);
       const gitUnreadable = Boolean(git?.unreadable);
-      // A linked PR GitHub did not return (gh failed or timed out) is unknown, not gone.
-      const prUnreadable = !pr && !this.skip.github && Boolean(parsePrRef(thread.prRefs?.[0]));
+      // A linked PR GitHub could not answer (gh failed or timed out) is unknown, not gone.
+      const prUnreadable = !pr && unreadPrs.has(thread.prRefs?.[0]);
       let classified;
       try {
         classified = classifyThread(thread, { pr, localGit: git, infra, now: started, config });
@@ -489,7 +492,8 @@ export class FleetSupervisor {
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
 
-    const blockedKeys = { bb3: store.infraBlocked("bb3"), lb: store.infraBlocked("lb") };
+    const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
+    const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys });
     const health = infraHealth(infra, { config, now: started });
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
@@ -507,7 +511,7 @@ export class FleetSupervisor {
     // actions and questions wait for a tick that can see it.
     const unknownKinds = new Set(["codex", "claude", "conductor"].filter((kind) => sourceErrors[kind]));
     const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds });
-    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode });
+    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
     const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager });
@@ -517,11 +521,25 @@ export class FleetSupervisor {
     return snapshot;
   }
 
+  // Remembered outage threads, minus any that moved on by themselves after
+  // the infra came back (owner or agent active since): a late resume is stale.
+  rememberedBlocked(kind, byItem) {
+    const keys = this.store.infraBlocked(kind);
+    const upAt = this.store.infraDown(kind) ? NaN : Date.parse(this.store.infraUpSince(kind) ?? "");
+    if (!Number.isFinite(upAt)) return keys;
+    const activeSince = (at) => Date.parse(at ?? "") > upAt;
+    return keys.filter((key) => {
+      const thread = byItem.get(key);
+      return !thread || !(activeSince(thread.lastUserAt) || activeSince(thread.lastAgentAt));
+    });
+  }
+
   // While an outage lasts, remember every thread blocked on it; once it is up,
-  // policy resumes them (it reads blockedKeys). A thread stays remembered
-  // until its resume was tried: one past the send cap, cooling down, or in a
-  // source that failed this tick waits for the next tick.
-  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe" } = {}) {
+  // policy resumes them (it reads blockedKeys). Only a resume the send cap
+  // held back is retried next tick; a wait means the owner or a recent nudge
+  // already has the thread. A thread hidden by a failed source waits up to
+  // RECOVERY_HOLD_MS for that source.
+  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe", now = this.now() } = {}) {
     for (const kind of INFRA_KINDS) {
       if (health[kind].down) {
         const current = items
@@ -531,9 +549,11 @@ export class FleetSupervisor {
       } else if (health[kind].up) {
         const pending = new Set(recovering
           .filter((decision) => !decision.threadKey.startsWith("infra:") && !attempted.has(decision.threadKey)
-            && (decision.action === "wait" || (decision.action === "nudge" && mode === "auto" && decision.route)))
+            && decision.action === "nudge" && mode === "auto" && decision.route)
           .map((decision) => decision.threadKey));
-        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || unknownKinds.has(key.split(":")[0])));
+        const upAt = Date.parse(this.store.infraUpSince(kind) ?? "");
+        const holdHidden = Number.isFinite(upAt) && now - upAt < RECOVERY_HOLD_MS;
+        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || (holdHidden && unknownKinds.has(key.split(":")[0]))));
       }
     }
   }
@@ -591,15 +611,16 @@ export class FleetSupervisor {
     }
   }
 
-  async fetchPrs(inScope, config, run, sourceErrors) {
+  async fetchPrs(inScope, config, run, sourceErrors, unread = new Set()) {
     if (this.skip.github) return new Map();
     const refs = [...new Set(inScope.map((thread) => thread.prRefs?.[0]).filter((ref) => parsePrRef(ref)))];
     if (!refs.length) return new Map();
     try {
       const fetch = this.deps.fetchPrStates ?? github.fetchPrStates;
-      return (await withTimeout(Promise.resolve(fetch(refs, config, { run })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
+      return (await withTimeout(Promise.resolve(fetch(refs, config, { run, unread })), SOURCE_TIMEOUT_MS, "github")) ?? new Map();
     } catch (error) {
       sourceErrors.github = clampText(error?.message, 200);
+      for (const ref of refs) unread.add(ref);
       return new Map();
     }
   }

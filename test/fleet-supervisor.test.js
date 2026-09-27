@@ -849,8 +849,10 @@ test("manager escalations from a thread never spend that thread's nudge budget",
 test("a GitHub outage keeps a ready question and proposals open", async (t) => {
   let down = null;
   const green = makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
-  const fetchPrStates = (pr) => async () => {
+  const fetchPrStates = (pr) => async (refs, config, opts) => {
     if (down === "throw") throw new Error("gh: 502");
+    // "empty": the gh call failed, so GitHub could not answer these refs.
+    if (down === "empty") for (const ref of refs) opts.unread.add(ref);
     return down ? new Map() : new Map([["acme/app#7", pr]]);
   };
   const { supervisor } = fixture(t, { deps: { fetchPrStates: fetchPrStates(green) } });
@@ -876,6 +878,11 @@ test("a GitHub outage keeps a ready question and proposals open", async (t) => {
   down = null;
   await proposing.supervisor.tick();
   assert.deepEqual(proposing.supervisor.getState().actions.filter((a) => a.status === "proposed").map((a) => a.id), [proposed.id]);
+
+  // GitHub answered "no such PR": a real answer, so the question closes.
+  down = "notfound";
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(ready.id).status, "resolved");
 });
 
 test("remembered threads past the send cap or in a failed source resume on a later tick", async (t) => {
@@ -902,4 +909,41 @@ test("remembered threads past the send cap or in a failed source resume on a lat
   assert.deepEqual(delivered.map((d) => d.thread.key), ["codex:t1", "codex:t2", "codex:t3"]);
   assert.equal(delivered[2].playbook, "infra-recovered");
   assert.deepEqual(supervisor.store.infraBlocked("lb"), []);
+});
+
+test("a remembered thread the owner or agent picked up after recovery gets no late resume", async (t) => {
+  let now = NOW;
+  const at = (ms) => new Date(ms).toISOString();
+  // The owner typed "LB is back, continue" two minutes before recovery.
+  const thread = makeThread({ agentStatus: "aborted", error: null, prRefs: [], lastUserAt: at(NOW - 2 * MIN), lastAgentAt: at(NOW - MIN), lastActivityAt: at(NOW - MIN) });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(), now: () => now });
+  supervisor.store.setInfraDown("lb", true);
+  supervisor.store.setInfraBlocked("lb", ["codex:t1"]);
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0, "owner active: wait");
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), []);
+  now += 15 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0, "no stale resume once the owner window closes");
+});
+
+test("a thread hidden by a failed source is remembered for an hour at most", async (t) => {
+  let now = NOW;
+  let codexFails = true;
+  const thread = makeThread({ agentStatus: "aborted", error: null, prRefs: [] });
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", threads: [thread], prs: new Map(), now: () => now,
+    deps: { listCodexThreads: async () => { if (codexFails) throw new Error("database is locked"); return [thread]; } }
+  });
+  supervisor.store.setInfraDown("lb", true);
+  supervisor.store.setInfraBlocked("lb", ["codex:t1"]);
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), ["codex:t1"]);
+  now += 61 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), []);
+  codexFails = false;
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 0);
 });

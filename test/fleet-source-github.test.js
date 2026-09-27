@@ -193,6 +193,19 @@ test("fetchPrStates keeps known PRs when GraphQL reports an unknown ref", async 
   assert.equal(prs.has(`${BBAPP}#999999`), false);
 });
 
+test("fetchPrStates reports refs GitHub could not answer, not refs it says are missing", async () => {
+  const refs = [`${BBAPP}#6878`, `${BBAPP}#999999`];
+  const failed = new Set();
+  await fetchPrStates(refs, config(), { run: async () => { throw new Error("gh: 502"); }, unread: failed });
+  assert.deepEqual([...failed].sort(), refs.slice().sort());
+  const garbled = new Set();
+  await fetchPrStates(refs, config(), { run: async () => ({ code: 1, stdout: "<html>502</html>", stderr: "" }), unread: garbled });
+  assert.deepEqual([...garbled].sort(), refs.slice().sort());
+  const missing = new Set();
+  await fetchPrStates([`${BBAPP}#999999`], config(), { run: async () => ({ code: 1, stdout: JSON.stringify({ data: { r0: { p999999: null } } }), stderr: "" }), unread: missing });
+  assert.deepEqual([...missing], []);
+});
+
 test("fetchPrStates degrades to an empty map on failures", async () => {
   const refs = [`${BBAPP}#6878`];
   for (const result of [
