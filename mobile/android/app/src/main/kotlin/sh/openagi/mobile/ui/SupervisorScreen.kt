@@ -114,6 +114,9 @@ fun SupervisorScreen(
     var questionNote by remember { mutableStateOf<Pair<String, SupervisorFormat.Note>?>(null) }
     var busyActionId by remember { mutableStateOf<String?>(null) }
     var actionNote by remember { mutableStateOf<Pair<String, SupervisorFormat.Note>?>(null) }
+    // The thread whose sheet started the send: the sheet can be closed and
+    // another thread opened while a nudge relays, and the result is not theirs.
+    var actionNoteThread by remember { mutableStateOf<String?>(null) }
     var openThread by remember { mutableStateOf<FleetThread?>(null) }
     var chatOpen by remember { mutableStateOf(false) }
 
@@ -213,6 +216,7 @@ fun SupervisorScreen(
         if (busyActionId != null) return
         busyActionId = action.id
         actionNote = null
+        actionNoteThread = openThread?.key
         scope.launch {
             try {
                 val result = client.fleetSendAction(action.id)
@@ -311,7 +315,8 @@ fun SupervisorScreen(
                                 modeNote = modeNote,
                                 scanning = scanning || current.running,
                                 scanNote = scanNote,
-                                onMode = { mode -> if (mode == FleetMode.AUTO) confirmAuto = true else setMode(mode) },
+                                // Tapping Auto while already in Auto must not ask to turn it on.
+                                onMode = { mode -> if (mode == FleetMode.AUTO && current.mode != FleetMode.AUTO) confirmAuto = true else setMode(mode) },
                                 onScan = { scan() },
                                 onAsk = { chatOpen = true },
                             )
@@ -373,7 +378,7 @@ fun SupervisorScreen(
             thread = thread,
             proposed = if (current?.mode == FleetMode.PROPOSE) SupervisorFormat.proposedFor(thread, current.actions) else emptyList(),
             busyActionId = busyActionId,
-            actionNote = actionNote,
+            actionNote = actionNote?.takeIf { actionNoteThread == thread.key },
             onSend = { send(it) },
             onDismiss = { openThread = null },
         )
