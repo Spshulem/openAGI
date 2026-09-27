@@ -8,11 +8,12 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
 
-// FEATURES.md's five destinations. Sentence case labels, no icon library —
+// FEATURES.md's six destinations. Sentence case labels, no icon library —
 // NavIconGlyph hand-draws each one at a fixed size, tinted to match
 // selection state exactly the way TaskRow's completion control is tinted.
 enum class AppTab(val label: String, val icon: NavIcon) {
@@ -20,6 +21,7 @@ enum class AppTab(val label: String, val icon: NavIcon) {
     TASKS("Tasks", NavIcon.TASKS),
     INBOX("Inbox", NavIcon.INBOX),
     CHAT("Chat", NavIcon.CHAT),
+    SUPERVISOR("Supervisor", NavIcon.SUPERVISOR),
     SETTINGS("Settings", NavIcon.SETTINGS),
 }
 
@@ -42,7 +44,9 @@ fun AppNavigationBar(selected: AppTab, inboxBadgeCount: Int, onSelect: (AppTab) 
                         NavIconGlyph(tab.icon, tint)
                     }
                 },
-                label = { Text(tab.label, style = OpenAGIType.caption) },
+                // One line, always: six items leave "Supervisor" little room,
+                // and a label broken mid-word reads worse than a clipped one.
+                label = { Text(tab.label, style = OpenAGIType.caption, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 colors = NavigationBarItemDefaults.colors(
                     selectedIconColor = colors.live,
                     selectedTextColor = colors.live,

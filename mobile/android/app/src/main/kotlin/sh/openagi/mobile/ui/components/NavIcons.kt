@@ -12,11 +12,11 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 
-// Five small hand-drawn glyphs for the bottom NavigationBar, one per
+// Six small hand-drawn glyphs for the bottom NavigationBar, one per
 // FEATURES.md destination. No icon library dependency: each is a handful of
 // Canvas primitives at a fixed 22dp, tinted by the caller (selected/muted)
 // rather than baking colour in — the same approach TaskRow's checkmark uses.
-enum class NavIcon { TODAY, TASKS, INBOX, CHAT, SETTINGS }
+enum class NavIcon { TODAY, TASKS, INBOX, CHAT, SUPERVISOR, SETTINGS }
 
 @Composable
 fun NavIconGlyph(icon: NavIcon, tint: Color, modifier: Modifier = Modifier) {
@@ -71,6 +71,19 @@ fun NavIconGlyph(icon: NavIcon, tint: Color, modifier: Modifier = Modifier) {
                     lineTo(size.width * 0.48f, size.height * 0.68f)
                 }
                 drawPath(tail, color = tint, style = stroke)
+            }
+            NavIcon.SUPERVISOR -> {
+                // A pulse line: flat, one beat, flat — a monitor watching
+                // the health of every thread, distinct from the list glyph.
+                val path = Path().apply {
+                    moveTo(size.width * 0.1f, size.height * 0.55f)
+                    lineTo(size.width * 0.34f, size.height * 0.55f)
+                    lineTo(size.width * 0.44f, size.height * 0.25f)
+                    lineTo(size.width * 0.57f, size.height * 0.8f)
+                    lineTo(size.width * 0.67f, size.height * 0.55f)
+                    lineTo(size.width * 0.9f, size.height * 0.55f)
+                }
+                drawPath(path, color = tint, style = stroke)
             }
             NavIcon.SETTINGS -> {
                 // A gear: a ring with four short radial ticks.

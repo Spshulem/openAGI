@@ -20,6 +20,13 @@ import sh.openagi.mobile.protocol.CreateTaskRequest
 import sh.openagi.mobile.protocol.DenyRequest
 import sh.openagi.mobile.protocol.DenyResult
 import sh.openagi.mobile.protocol.Enrollment
+import sh.openagi.mobile.protocol.FleetActionResult
+import sh.openagi.mobile.protocol.FleetAnswerRequest
+import sh.openagi.mobile.protocol.FleetDismissRequest
+import sh.openagi.mobile.protocol.FleetJson
+import sh.openagi.mobile.protocol.FleetModeRequest
+import sh.openagi.mobile.protocol.FleetQuestionResult
+import sh.openagi.mobile.protocol.FleetState
 import sh.openagi.mobile.protocol.MobileSummary
 import sh.openagi.mobile.protocol.PendingAction
 import sh.openagi.mobile.protocol.PendingActionsResponse
@@ -53,6 +60,10 @@ sealed class DaemonException(message: String) : Exception(message) {
     class Conflict : DaemonException("the daemon has already moved on")
     class Server(val code: Int) : DaemonException("the daemon returned $code")
     class Malformed : DaemonException("the daemon returned something unreadable")
+    // The fleet supervisor's routes are missing (an older daemon: 404) or the
+    // daemon runs without a supervisor (503). Not a failure of the call so
+    // much as a feature this daemon does not have.
+    class Unavailable : DaemonException("the daemon has no fleet supervisor")
     // The network itself failed: no connection, a timeout, DNS, TLS. Carries the
     // cause for diagnosis, and never the token — DaemonException's message is
     // built from the host and status only. `cause` overrides Throwable.cause
@@ -81,6 +92,16 @@ class DaemonClient(
     // calls below use this; every other method keeps `client` unchanged.
     private val streamingClient: OkHttpClient by lazy {
         client.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+    }
+
+    // A fleet scan walks every coding thread and PR (up to ~100s), and an
+    // answer or a proposed nudge can wait on a live relay to the agent (up to
+    // ~190s). Only those calls use these; the 12s default stays for the rest.
+    private val scanClient: OkHttpClient by lazy {
+        client.newBuilder().readTimeout(120, TimeUnit.SECONDS).build()
+    }
+    private val relayClient: OkHttpClient by lazy {
+        client.newBuilder().readTimeout(200, TimeUnit.SECONDS).build()
     }
 
     suspend fun summary(ifNoneMatch: String?): SummaryResponse = withContext(Dispatchers.IO) {
@@ -218,6 +239,67 @@ class DaemonClient(
             .post(body.toRequestBody(JSON))
             .build()
         return streamingClient.streamSse(request)
+    }
+
+    // ─── Fleet supervisor (FEATURES.md "Supervisor": /fleet/api/*) ───────────
+
+    suspend fun fleetState(): FleetState =
+        fleetCall(authorized("/fleet/api/state").get().build(), client, FleetState.serializer(), missingMeansUnavailable = true)
+
+    // No body: the route reads none, and an empty POST matches approveAction.
+    suspend fun fleetScan(): FleetState =
+        fleetCall(authorized("/fleet/api/scan").post("".toRequestBody(JSON)).build(), scanClient, FleetState.serializer(), missingMeansUnavailable = true)
+
+    suspend fun fleetSetMode(mode: String): FleetState {
+        val body = ProtocolJson.json.encodeToString(FleetModeRequest.serializer(), FleetModeRequest(mode))
+        val request = authorized("/fleet/api/mode").post(body.toRequestBody(JSON)).build()
+        return fleetCall(request, client, FleetState.serializer(), missingMeansUnavailable = true)
+    }
+
+    // The answer must be one of the question's own options; 409 means it was
+    // already closed elsewhere, 404 that it is gone.
+    suspend fun fleetAnswer(id: String, answer: String): FleetQuestionResult {
+        val body = ProtocolJson.json.encodeToString(FleetAnswerRequest.serializer(), FleetAnswerRequest(answer))
+        val request = authorized("/fleet/api/questions/$id").post(body.toRequestBody(JSON)).build()
+        return fleetCall(request, relayClient, FleetQuestionResult.serializer(), missingMeansUnavailable = false)
+    }
+
+    suspend fun fleetDismiss(id: String): FleetQuestionResult {
+        val body = ProtocolJson.json.encodeToString(FleetDismissRequest.serializer(), FleetDismissRequest())
+        val request = authorized("/fleet/api/questions/$id").post(body.toRequestBody(JSON)).build()
+        return fleetCall(request, client, FleetQuestionResult.serializer(), missingMeansUnavailable = false)
+    }
+
+    // Propose mode only; the daemon answers 409 for anything not "proposed".
+    suspend fun fleetSendAction(id: String): FleetActionResult =
+        fleetCall(authorized("/fleet/api/actions/$id/send").post("".toRequestBody(JSON)).build(), relayClient, FleetActionResult.serializer(), missingMeansUnavailable = false)
+
+    // 503 is always "no supervisor on this daemon". 404 means the same on the
+    // routes every daemon with a supervisor has (state, scan, mode), but on a
+    // question or action it means that one item is gone, so it stays NotFound.
+    private suspend fun <T> fleetCall(
+        request: Request,
+        http: OkHttpClient,
+        serializer: KSerializer<T>,
+        missingMeansUnavailable: Boolean,
+    ): T = withContext(Dispatchers.IO) {
+        val body = try {
+            http.newCall(request).execute().use { response ->
+                when (response.code) {
+                    503 -> throw DaemonException.Unavailable()
+                    404 -> throw if (missingMeansUnavailable) DaemonException.Unavailable() else DaemonException.NotFound()
+                    else -> ensureOk(response)
+                }
+                response.body?.string() ?: throw DaemonException.Malformed()
+            }
+        } catch (io: java.io.IOException) {
+            throw DaemonException.Transport(io)
+        }
+        try {
+            FleetJson.json.decodeFromString(serializer, body)
+        } catch (error: Exception) {
+            throw DaemonException.Malformed()
+        }
     }
 
     // ─── Background events (PROTOCOL.md §7: GET /events) ─────────────────────

@@ -10,7 +10,7 @@ list, that is a design question to raise, not an allowlist entry to add.
 
 ## Navigation
 
-Five destinations. On iOS a `TabView`; on Android a `NavigationBar`.
+Six destinations. On iOS a `TabView`; on Android a `NavigationBar`.
 
 | Tab | Purpose |
 |---|---|
@@ -18,6 +18,7 @@ Five destinations. On iOS a `TabView`; on Android a `NavigationBar`.
 | Tasks | Everything, by bucket, with full editing |
 | Inbox | Approvals and clarifications — anything waiting on you |
 | Chat | Talk to OpenAGI |
+| Supervisor | Every coding thread the fleet supervisor watches, worst first |
 | Settings | Connection, refresh, revoke |
 
 The Inbox tab carries a badge with the count of items waiting. That count is the
@@ -91,6 +92,62 @@ The one that makes the phone genuinely useful away from the desk.
 - Reconnect with backoff when the stream drops. Never silently stay dead.
 
 Routes: `POST /message`, `GET /events`.
+
+## Supervisor
+
+The fleet supervisor (`src/fleet/`) watches every Codex, Claude and Conductor
+coding thread and says which ones need you. This tab is its phone view.
+
+- **Header:** a mode control — Observe / Propose / Auto. Switching to Auto
+  asks first, because Auto sends preset nudges to agents by itself. Under it,
+  the mode's one-line meaning, "Scanned 3m ago · Auto-scan on", and a single
+  `alert` line when the last scan failed or a source could not be read. Two
+  buttons: **Scan now** (a scan can take up to ~100s) and **Ask supervisor**.
+- **Needs you:** each open question with its title, body, the thread and PR
+  it is about, and one button per option plus Dismiss. The result shows
+  inline: "Sent to the agent.", or "Saved. Couldn't reach the agent: …" when
+  the answer was kept but the relay failed. An answer can take up to ~190s.
+- **Threads:** a count line ("3 red · 5 yellow · 12 green"), then every
+  thread sorted red, yellow, green, gray, most recent first within a colour.
+  A row is a health dot plus the colour named in words (colour is never the
+  only signal), the name (workspace, else title), the state in plain words,
+  a one-line reason, a PR chip (`#112 · CI failing`) and the last activity.
+- **Thread detail** (a sheet): repo and branch in mono, health, reason,
+  blockers, the PR (tap to open it in the browser), the supervisor's next
+  step and why, any error, the last agent message in mono, and — in Propose
+  mode — each proposed nudge for that thread with a Send button.
+- **Ask supervisor** opens the Chat screen titled "Supervisor", on its own
+  conversation, with three starters: "What's running?", "What needs me?",
+  "Which threads are red?". It sends `sessionId` and `from` both as
+  `"mobile-supervisor"`: for a phone credential the daemon ignores
+  `sessionId` and keys the conversation on `from`, so `from` is what keeps it
+  apart from Chat. The agent has two read-only tools for it, `fleet_status`
+  and `fleet_thread`.
+- Pull to refresh; refreshes every 30s while on screen (every 5s while a scan
+  runs). Nothing is optimistic — a mode, answer or send shows once the daemon
+  confirms it.
+- A daemon without a supervisor (a 404 or 503 on these routes) shows
+  "Supervisor isn't running on this daemon." instead of an error.
+
+Health is a field on every thread. When a daemon does not send it, the phone
+derives the same thing from `state`:
+
+| Health | States |
+|---|---|
+| green | `running`, `waiting-ci`, `local-verify`, `asked-in-scope`, `done` |
+| yellow | `pr-not-ready`, `idle-no-pr`, `ready-needs-human` |
+| red | `needs-human`, `infra-blocked`, or any other known state but `running` when the thread has an `error` |
+| gray | `excluded`, or a state the phone does not know (even with an `error`) |
+
+Yellow is drawn in one added colour token, `caution`: `#8A5A00` light,
+`#E8B64C` dark — fixed like `live` and `alert`, 4.5:1 on `surface` in both.
+
+Routes: `GET /fleet/api/state`, `POST /fleet/api/scan`,
+`POST /fleet/api/mode` (`{mode}`), `POST /fleet/api/questions/{id}`
+(`{answer}` or `{dismiss: true}`), `POST /fleet/api/actions/{id}/send`,
+`POST /message` (`from` and `sessionId`: `"mobile-supervisor"`). The `/fleet/api/*` routes
+join the mobile allowlist for this tab; they read and steer the supervisor
+and nothing else.
 
 ## Settings
 

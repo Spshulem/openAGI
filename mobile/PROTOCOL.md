@@ -135,6 +135,12 @@ Response (`src/hosted-interface.js:1102-1118`, pinned by
       "ready": true,
       "operations": ["send"],
       "detail": "Sends chat messages to the agent from the phone."
+    },
+    {
+      "id": "mobile-fleet-client",
+      "ready": true,
+      "operations": ["read", "answer", "mode", "send", "scan"],
+      "detail": "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone."
     }
   ]
 }
@@ -144,7 +150,9 @@ Response (`src/hosted-interface.js:1102-1118`, pinned by
 (`src/node-control.js:31-61`) only ever keeps capability objects carrying an
 `.id`, the same shape `EVEN_G2_CAPABILITIES` uses
 (`src/integrations/g2-channel.js:11-24`). `MOBILE_CAPABILITIES`
-(`src/mobile-node.js`) declares exactly the three objects above. Note this
+(`src/mobile-node.js`) declares exactly the four objects above
+(`mobile/fixtures/enroll-exchange.json` predates `mobile-fleet-client` and
+still lists three until it is regenerated). Note this
 route's response returns them **unsanitized** (`capabilitiesForPlatform`,
 `src/hosted-interface.js:3666-3668`, called directly), so they don't carry a
 `checkedAt` field here — but every other place capabilities are read back out
@@ -219,6 +227,11 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | POST | `/nodes/heartbeat` | §8 |
 | POST | `/nodes/revoke` | §9 |
 | POST | `/nodes/speech-token` | **allowlisted but not yet implemented — see below** |
+| GET | `/fleet/api/state` | fleet supervisor state, see "Fleet supervisor routes" below |
+| POST | `/fleet/api/scan` | no body; runs a scan and returns state (can take ~100s) |
+| POST | `/fleet/api/mode` | body `{"mode": "observe"\|"propose"\|"auto"}`; returns state |
+| POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}` or `{"dismiss": true}` |
+| POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
 
 `:id` above means a task/action id as minted by `createId()`:
 `[a-zA-Z0-9_-]{1,120}`, deliberately excluding `.` and `/` so no id can carry
@@ -227,6 +240,36 @@ a path segment. `..` and `//` anywhere in the path are refused outright
 `/skills`, `/computer-use/log`, `/control/restart`, `/nodes/g2/*`, etc. — is
 refused for a mobile-scoped token even though it may be reachable to the
 daemon owner or to a G2 node's own token.
+
+### Fleet supervisor routes
+
+Only the `/fleet/api/` JSON routes above open to a phone token. `GET /fleet`
+(the owner's page), any other `/fleet/api/` path, and a wrong method on a
+listed path are refused with `401`. Shapes are the daemon's
+`src/fleet/routes.js` and `FleetSupervisor.getState()`; see
+`docs/setup/fleet-supervisor.md`.
+
+- `GET /fleet/api/state` → `{mode, enabled, running, lastTickAt, lastError,
+  snapshot, questions, actions, settings}`. `snapshot` is `null` before the
+  first scan. Each `snapshot.threads[]` row carries `health`:
+  `"green" | "yellow" | "red" | "gray"`.
+- `POST /fleet/api/questions/:id` → `{question, delivery, state}` for an
+  answer, `{question, state}` for a dismiss. A question that is no longer open
+  is `404` (`409` only when it closed during the request): treat both as
+  "already closed" and refresh. An answer that relays to a live session can
+  take up to ~190s.
+- `POST /fleet/api/actions/:id/send` → `{action, delivery, state}`; `409` when
+  the action is not a proposed one (for example after leaving propose mode),
+  `404` when the id is unknown.
+- Question and action ids are checked again by the route (`[A-Za-z0-9_-]{1,80}`)
+  and a longer id is `400`.
+
+Supervisor chat is the ordinary `POST /message`. For a node credential the
+daemon ignores `sessionId` and keys the session on `from` (see
+`bindScopedNodeMessage` in `src/hosted-interface.js`), so a separate
+supervisor conversation must send its own `from`, e.g.
+`{"text": "...", "from": "mobile-supervisor"}`. The agent has two read-only
+tools for it, `fleet_status` and `fleet_thread`.
 
 > **Known gap:** `POST /nodes/speech-token` is present in the allowlist but
 > the daemon has no route handler for that exact path (only
@@ -572,10 +615,16 @@ response is built from `sanitizeNodeCapabilities`, unlike §1.3's raw
   "capabilities": [
     { "id": "mobile-task-client", "ready": true, "operations": ["list", "create", "update", "delete", "complete"], "detail": "Reads, creates, edits, completes, and deletes tasks in the user queue from the phone.", "checkedAt": null },
     { "id": "mobile-approval-client", "ready": true, "operations": ["approve", "deny"], "detail": "Approves or denies queued agent actions from the phone.", "checkedAt": null },
-    { "id": "mobile-chat-client", "ready": true, "operations": ["send"], "detail": "Sends chat messages to the agent from the phone.", "checkedAt": null }
+    { "id": "mobile-chat-client", "ready": true, "operations": ["send"], "detail": "Sends chat messages to the agent from the phone.", "checkedAt": null },
+    { "id": "mobile-fleet-client", "ready": true, "operations": ["read", "answer", "mode", "send", "scan"], "detail": "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone.", "checkedAt": null }
   ]
 }
 ```
+
+These are the capabilities stored at enrollment. A phone paired before
+`mobile-fleet-client` existed keeps reporting three here until it re-pairs;
+the fleet routes in §3 are open to it either way, so do not gate the
+Supervisor tab on this list.
 
 ## 9. Revocation
 

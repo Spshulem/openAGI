@@ -15,6 +15,7 @@ import { VocaleoClient } from "./integrations/vocaleo.js";
 import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
 import { createFleetRoute } from "./fleet/routes.js";
+import { createFleetCapability } from "./fleet/remote.js";
 import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
@@ -593,6 +594,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
+    if (process.env.OPENAGI_FLEET_SUPERVISOR === "1" && !process.env.OPENAGI_FLEET_NODE && runtime.fleetSupervisor) {
+      providers.set("fleet-supervisor", createFleetCapability(runtime.fleetSupervisor));
+    }
     if (computerUseEnabledHere()) {
       computerExecutor ??= options.computerExecutor ?? createConfiguredComputerExecutor();
       providers.set("computer-use", computerExecutor);

@@ -104,6 +104,23 @@ const PR_DONE = new Set(["MERGED", "CLOSED"]);
 const CI_RED = new Set(["FAILURE", "ERROR"]);
 const CI_RUNNING = new Set(["PENDING", "EXPECTED"]);
 
+// One colour per thread for the phone and chat tools. Red: the owner or an
+// outage has it stuck. Yellow: it will stall without a push. Green: moving,
+// or finished. Gray: out of scope or a state this build does not know.
+const HEALTH_BY_STATE = Object.freeze({
+  running: "green", "waiting-ci": "green", "local-verify": "green", "asked-in-scope": "green", done: "green",
+  "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow",
+  "needs-human": "red", "infra-blocked": "red"
+});
+
+// error is the row's error (any non-null value). A turn that ended on an
+// error is red whatever the PR says, unless the agent is running again.
+export function threadHealth(state, error = null) {
+  if (state === "excluded" || !Object.hasOwn(HEALTH_BY_STATE, state)) return "gray";
+  if (state !== "running" && error != null) return "red";
+  return HEALTH_BY_STATE[state];
+}
+
 // A Claude transcript and a Conductor session are the same agent when the
 // Conductor row points at the transcript's session id. Conductor owns status.
 export function mergeThreads({ codex = [], claude = [], conductor = [] } = {}) {

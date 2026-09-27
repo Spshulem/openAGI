@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, classifyThread, mergeThreads, prReadiness
+  IN_SCOPE_ASK_PATTERNS, OUT_OF_SCOPE_PATTERNS, WAITING_PATTERNS, classifyThread, mergeThreads, prReadiness, threadHealth
 } from "../src/fleet/classify.js";
-import { DEFAULTS } from "../src/fleet/contracts.js";
+import { DEFAULTS, STATES } from "../src/fleet/contracts.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -334,4 +334,29 @@ test("matching PR head proves pushed commits even when upstream is main", () => 
   const readiness = prReadiness(makePr(), { ...cleanGit, upstream: "origin/main", ahead: 12 });
   assert.equal(readiness.ready, true);
   assert.deepEqual(readiness.blockers, []);
+});
+
+test("threadHealth maps every state to one colour", () => {
+  const expected = {
+    running: "green", "waiting-ci": "green", "local-verify": "green", "asked-in-scope": "green", done: "green",
+    "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow",
+    "needs-human": "red", "infra-blocked": "red",
+    excluded: "gray"
+  };
+  // A new state must pick a colour here, not fall through to gray unnoticed.
+  assert.deepEqual(Object.keys(expected).sort(), [...STATES].sort());
+  for (const [state, health] of Object.entries(expected)) assert.equal(threadHealth(state, null), health, state);
+  assert.equal(threadHealth("something-new", null), "gray");
+  assert.equal(threadHealth(undefined), "gray");
+});
+
+test("threadHealth turns an errored thread red unless it is running again", () => {
+  const error = { kind: "usage-limit", resetAt: null };
+  for (const state of ["waiting-ci", "done", "idle-no-pr", "pr-not-ready", "ready-needs-human", "needs-human"]) {
+    assert.equal(threadHealth(state, error), "red", state);
+  }
+  // Any non-null error counts, even one with no known kind.
+  assert.equal(threadHealth("idle-no-pr", {}), "red");
+  assert.equal(threadHealth("running", error), "green");
+  assert.equal(threadHealth("excluded", error), "gray");
 });

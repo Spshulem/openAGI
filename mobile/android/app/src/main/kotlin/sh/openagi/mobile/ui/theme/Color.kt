@@ -6,6 +6,10 @@ import androidx.compose.ui.graphics.Color
 // belongs in this file: DESIGN.md is explicit that there are six values per
 // mode and nothing more, and that `live`/`alert` never change hue with the
 // wallpaper, so they are not sourced from dynamic colour.
+//
+// One exception: `caution`, the Supervisor's yellow health dot, which needs a
+// third status hue between `live` and `alert`. Amber dark enough to hold 4.5:1
+// on `surface` in both modes, and fixed like them (FEATURES.md "Supervisor").
 object OpenAGIColors {
     // Light
     val canvasLight = Color(0xFFF1F3F2)
@@ -15,6 +19,7 @@ object OpenAGIColors {
     val liveLight = Color(0xFF0E6F4E)
     val alertLight = Color(0xFFA32C22)
     val edgeLight = Color(0xFFE2E6E4)
+    val cautionLight = Color(0xFF8A5A00)
 
     // Dark
     val canvasDark = Color(0xFF0E1211)
@@ -24,6 +29,7 @@ object OpenAGIColors {
     val liveDark = Color(0xFF4BC48D)
     val alertDark = Color(0xFFF08A7E)
     val edgeDark = Color(0xFF262D2A)
+    val cautionDark = Color(0xFFE8B64C)
 
     val white = Color(0xFFFFFFFF)
 }

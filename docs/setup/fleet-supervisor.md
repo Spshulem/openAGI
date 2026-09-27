@@ -97,12 +97,30 @@ Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max at
 - Never kills processes, merges PRs, changes permissions, or answers out-of-scope questions.
 - Agent text is untrusted: shown as plain text, never forwarded to other agents.
 
+## Phone app
+
+The OpenAGI phone app's **Supervisor** tab shows the same fleet: threads by
+colour, needs-you questions with buttons, mode, and **Scan now**.
+
+- Colour is `threads[].health` in the snapshot. Red: `needs-human`,
+  `infra-blocked`, or any thread with an error that is not running. Yellow: `pr-not-ready`,
+  `idle-no-pr`, `ready-needs-human`. Green: `running`, `waiting-ci`,
+  `local-verify`, `asked-in-scope`, `done`. Gray: `excluded` or unknown.
+- The paired phone credential (`mobile-fleet-client`) may call only
+  `GET /fleet/api/state`, `POST /fleet/api/scan`, `POST /fleet/api/mode`,
+  `POST /fleet/api/questions/:id`, and `POST /fleet/api/actions/:id/send`.
+  The `/fleet` page and every other route stay owner-only.
+- Supervisor chat uses the normal chat route with two read-only tools:
+  `fleet_status` (mode, counts, open questions, threads red first) and
+  `fleet_thread` (one thread's row, decision, PR, and questions). They read the
+  last scan only; they never scan, send, answer, or change the mode.
+
 ## Known gaps
 
 - Non-live Conductor sessions: no delivery route yet. You get "open it" after 90 min stuck.
 - Codex threads held open by Codex Desktop (writer lock): blocked. Close the thread in Desktop, or send by hand.
-- Not mirrored to the Distiller main: Mac banners and G2 do not show fleet questions yet.
-  The data lives only on this Mac's daemon.
+- Main mirroring requires an explicitly selected enrolled coding Mac; without
+  `OPENAGI_FLEET_NODE`, Fleet remains local to that daemon.
 
 ## Question delivery
 
@@ -115,3 +133,18 @@ unreachable, so retrying the group does not resend to those threads.
 Switching away from **Propose** invalidates pending Send buttons. The scan CLI
 copies persisted state into a temporary directory when given `--data-dir`; it
 never writes the daemon's state or sends messages.
+
+## One supervisor shared by main, Android and G2
+
+Run the scanner on the coding Mac with `OPENAGI_FLEET_SUPERVISOR=1` and
+`OPENAGI_FLEET_MODE=observe`. Its existing enrolled-node connection advertises
+the `fleet-supervisor` capability. On main set `OPENAGI_FLEET_NODE` to that
+Mac's node id and restart. Main then forwards Fleet requests over the authenticated
+node-control channel and mirrors open questions into its outreach feed.
+
+The Android **Supervisor** tab reads main's Fleet API with the existing phone
+pairing. Existing Agents G2 clients can show mirrored questions in their
+proactive inbox when Approvals notifications are enabled; this requires the
+backend update, not a glasses firmware update. Answering remains on the phone
+or main dashboard. Offline Macs retain their last snapshot with an unavailable
+status; no successful delivery is inferred from cached data.

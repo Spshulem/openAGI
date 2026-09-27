@@ -31,6 +31,12 @@ test("the platform string and capabilities are the documented ones", () => {
       ready: true,
       operations: ["send"],
       detail: "Sends chat messages to the agent from the phone."
+    },
+    {
+      id: "mobile-fleet-client",
+      ready: true,
+      operations: ["read", "answer", "mode", "send", "scan"],
+      detail: "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone."
     }
   ]);
 });
@@ -58,7 +64,12 @@ test("every route the phone app needs is allowed", () => {
     ["GET", "/outreach/digest"],
     ["POST", "/nodes/heartbeat"],
     ["POST", "/nodes/revoke"],
-    ["POST", "/nodes/speech-token"]
+    ["POST", "/nodes/speech-token"],
+    ["GET", "/fleet/api/state"],
+    ["POST", "/fleet/api/scan"],
+    ["POST", "/fleet/api/mode"],
+    ["POST", "/fleet/api/questions/fq_abc-1"],
+    ["POST", "/fleet/api/actions/fa_abc-1/send"]
   ];
   for (const [method, pathname] of allowed) {
     assert.equal(isMobileRouteAllowed(method, pathname), true, `${method} ${pathname} should be allowed`);
@@ -88,7 +99,8 @@ test("one representative route from every excluded family is refused", () => {
     ["GET", "/budget/ledger"],
     ["GET", "/observations"],
     ["GET", "/sessions"],
-    ["POST", "/tick"]
+    ["POST", "/tick"],
+    ["GET", "/outreach/feed"]
   ];
   for (const [method, pathname] of refused) {
     assert.equal(isMobileRouteAllowed(method, pathname), false, `${method} ${pathname} must be refused`);
@@ -101,12 +113,47 @@ test("the method matters, not just the path", () => {
   assert.equal(isMobileRouteAllowed("POST", "/mobile/summary"), false);
 });
 
+test("only the fleet JSON API opens to the phone, never the page or other fleet paths", () => {
+  const refused = [
+    ["GET", "/fleet"],
+    ["GET", "/fleet/"],
+    ["GET", "/fleet/api"],
+    ["GET", "/fleet/api/"],
+    ["GET", "/fleet/api/unknown"],
+    ["POST", "/fleet/api/unknown"],
+    ["POST", "/fleet/api/state"],
+    ["GET", "/fleet/api/scan"],
+    ["GET", "/fleet/api/mode"],
+    ["GET", "/fleet/api/questions/fq_1"],
+    ["DELETE", "/fleet/api/questions/fq_1"],
+    ["POST", "/fleet/api/questions"],
+    ["POST", "/fleet/api/questions/"],
+    ["POST", "/fleet/api/questions/fq_1/answer"],
+    ["POST", "/fleet/api/actions/fa_1"],
+    ["GET", "/fleet/api/actions/fa_1/send"],
+    ["POST", "/fleet/api/actions/fa_1/cancel"],
+    ["POST", "/fleet/api/state/extra"]
+  ];
+  for (const [method, pathname] of refused) {
+    assert.equal(isMobileRouteAllowed(method, pathname), false, `${method} ${pathname} must be refused`);
+  }
+});
+
 test("path traversal and lookalike ids cannot widen the scope", () => {
   assert.equal(isMobileRouteAllowed("POST", "/tasks/../control/restart"), false);
   assert.equal(isMobileRouteAllowed("POST", "/tasks/a/b/complete"), false);
   assert.equal(isMobileRouteAllowed("POST", "/tasks//complete"), false);
   assert.equal(isMobileRouteAllowed("POST", "/pending-actions/pa 1/approve"), false);
   assert.equal(isMobileRouteAllowed("GET", "/tasks/clarifications/extra"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/questions/../mode"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/questions/../../control/restart"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/actions/../../nodes/enroll/send"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/actions//send"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/actions/a/b/send"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/questions/fq 1"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet/api/questions/fq.1"), false);
+  assert.equal(isMobileRouteAllowed("POST", "/fleet//api/state"), false);
+  assert.equal(isMobileRouteAllowed("POST", `/fleet/api/questions/${"a".repeat(121)}`), false);
 });
 
 test("node names are bounded and never empty", () => {

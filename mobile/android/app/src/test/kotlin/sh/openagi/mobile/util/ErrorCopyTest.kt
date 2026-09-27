@@ -36,6 +36,13 @@ class ErrorCopyTest {
     }
 
     @Test
+    fun aDaemonWithoutASupervisorSaysSoAndHowToGetOne() {
+        val message = ErrorCopy.forDaemon(DaemonException.Unavailable(), "mac.ts.net")
+        assertEquals("Supervisor isn't running on this daemon.", message.headline)
+        assertTrue(message.detail.contains("Update OpenAGI"))
+    }
+
+    @Test
     fun noMessageEverReadsLikeAGenericApology() {
         val banned = listOf("oops", "something went wrong", "please try again later")
         val allDaemonMessages = listOf(
@@ -53,6 +60,7 @@ class ErrorCopyTest {
             ErrorCopy.forDaemon(DaemonException.Conflict(), "h"),
             ErrorCopy.forDaemon(DaemonException.Malformed(), "h"),
             ErrorCopy.forDaemon(DaemonException.Server(500), "h"),
+            ErrorCopy.forDaemon(DaemonException.Unavailable(), "h"),
         )
         allDaemonMessages.forEach { message ->
             val text = (message.headline + " " + message.detail).lowercase()

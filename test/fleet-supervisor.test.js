@@ -316,6 +316,24 @@ test("snapshot rows show the decision that acts, not a trailing none or wait", a
   assert.equal(waitOnly.threads[0].decision.action, "wait");
 });
 
+test("snapshot rows carry a health colour, and an older saved snapshot gets one on read", async (t) => {
+  const { supervisor } = fixture(t);
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(snapshot.threads[0].state, "pr-not-ready");
+  assert.equal(snapshot.threads[0].health, "yellow");
+  const errored = makeThread({ agentStatus: "aborted", error: { kind: "usage-limit", resetAt: null } });
+  const erroredSnapshot = supervisor.buildSnapshot({
+    reason: "test", started: NOW, finished: NOW, mode: "observe", threads: [errored], inScope: [errored],
+    items: [{ thread: errored, classified: { state: "idle-no-pr", reason: "no PR", blockers: [] }, pr: null }],
+    decisions: [], infra: {}, sourceErrors: {}, manager: null
+  });
+  assert.equal(erroredSnapshot.threads[0].health, "red");
+  // Saved by a build without health: the phone still gets a colour.
+  supervisor.store.recordSnapshot({ at: ago(0), threads: [{ key: "codex:old", state: "needs-human", error: null }, { key: "codex:new", state: "done", health: "green" }] });
+  assert.deepEqual(supervisor.getState().snapshot.threads.map((row) => row.health), ["red", "green"]);
+  assert.equal(supervisor.store.snapshot.threads[0].health, undefined, "the stored snapshot is not rewritten");
+});
+
 test("a failed infra escalation starts the cooldown under its incident key", async (t) => {
   let now = NOW;
   const manager = makeManager();

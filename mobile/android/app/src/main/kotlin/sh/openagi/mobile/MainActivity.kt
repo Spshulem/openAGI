@@ -26,6 +26,7 @@ import sh.openagi.mobile.ui.ChatScreen
 import sh.openagi.mobile.ui.InboxScreen
 import sh.openagi.mobile.ui.PairingScreen
 import sh.openagi.mobile.ui.SettingsScreen
+import sh.openagi.mobile.ui.SupervisorScreen
 import sh.openagi.mobile.ui.TasksScreen
 import sh.openagi.mobile.ui.TodayScreen
 import androidx.compose.runtime.rememberCoroutineScope
@@ -153,6 +154,12 @@ class MainActivity : ComponentActivity() {
                                     onBadgeCountChanged = { inboxBadgeState.intValue = it },
                                 )
                                 AppTab.CHAT -> ChatScreen(context = this@MainActivity, credentials = credentials, streamAttached = streamAttachedState.value)
+                                AppTab.SUPERVISOR -> SupervisorScreen(
+                                    context = this@MainActivity,
+                                    credentials = credentials,
+                                    resumeSignal = resumeSignal,
+                                    streamAttached = streamAttachedState.value,
+                                )
                                 AppTab.SETTINGS -> SettingsScreen(
                                     context = this@MainActivity,
                                     credentials = credentials,

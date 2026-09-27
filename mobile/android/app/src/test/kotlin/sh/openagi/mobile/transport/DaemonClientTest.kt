@@ -438,6 +438,147 @@ class DaemonClientTest {
         assertEquals("""{"text":"hello"}""", request.body.readUtf8())
     }
 
+    // ─── Fleet supervisor ─────────────────────────────────────────────────
+
+    private val fleetStateJson = """{"mode":"observe","enabled":true,"running":false,"snapshot":{"threads":[{"key":"codex:abc","state":"running"}]}}"""
+
+    @Test
+    fun fleetStateGetsWithTheNodeCredential() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody(fleetStateJson))
+        val state = client().fleetState()
+        assertEquals("observe", state.mode)
+        assertEquals("codex:abc", state.snapshot!!.threads.single().key)
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/fleet/api/state", request.path)
+        assertEquals("Bearer $token", request.getHeader("Authorization"))
+        assertEquals("mobile:abc", request.getHeader("X-OpenAGI-Node-ID"))
+    }
+
+    @Test
+    fun fleetScanPostsWithNoBody() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody(fleetStateJson))
+        client().fleetScan()
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/fleet/api/scan", request.path)
+        assertEquals("", request.body.readUtf8())
+    }
+
+    @Test
+    fun fleetSetModePostsTheMode() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody(fleetStateJson))
+        client().fleetSetMode("propose")
+        val request = server.takeRequest()
+        assertEquals("/fleet/api/mode", request.path)
+        assertEquals("""{"mode":"propose"}""", request.body.readUtf8())
+    }
+
+    @Test
+    fun fleetAnswerPostsTheChosenOption() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"question":{"id":"fq_1"},"delivery":{"status":"blocked","route":null,"detail":"no live route"},"state":$fleetStateJson}""",
+            ),
+        )
+        val result = client().fleetAnswer("fq_1", "open thread")
+        assertEquals("blocked", result.delivery!!.status)
+        assertEquals("observe", result.state!!.mode)
+        val request = server.takeRequest()
+        assertEquals("/fleet/api/questions/fq_1", request.path)
+        assertEquals("""{"answer":"open thread"}""", request.body.readUtf8())
+    }
+
+    @Test
+    fun fleetDismissPostsDismissTrue() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"question":{"id":"fq_1"},"state":$fleetStateJson}"""))
+        val result = client().fleetDismiss("fq_1")
+        assertEquals(null, result.delivery)
+        val request = server.takeRequest()
+        assertEquals("/fleet/api/questions/fq_1", request.path)
+        assertEquals("""{"dismiss":true}""", request.body.readUtf8())
+    }
+
+    @Test
+    fun fleetSendActionPostsToTheSendRoute() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"action":{"id":"fa_1","status":"sent"},"delivery":{"status":"sent"},"state":$fleetStateJson}"""))
+        val result = client().fleetSendAction("fa_1")
+        assertEquals("sent", result.delivery!!.status)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/fleet/api/actions/fa_1/send", request.path)
+    }
+
+    // An older daemon has no /fleet/api routes (404); a daemon without a
+    // supervisor answers 503. Both are "not on this daemon", not a failure.
+    @Test
+    fun aMissingSupervisorIsUnavailableNotAnError() = runBlocking {
+        listOf(404, 503).forEach { code ->
+            server.enqueue(MockResponse().setResponseCode(code).setBody("""{"error":"Fleet supervisor is not available."}"""))
+            try {
+                client().fleetState()
+                fail("expected a throw for $code")
+            } catch (expected: DaemonException.Unavailable) {
+            }
+        }
+    }
+
+    // On a question, 404 means that one question is gone, and 409 that it
+    // was already closed elsewhere.
+    @Test
+    fun aGoneOrClosedQuestionKeepsItsOwnMeaning() = runBlocking {
+        val cases = listOf(404 to DaemonException.NotFound::class, 409 to DaemonException.Conflict::class, 503 to DaemonException.Unavailable::class)
+        cases.forEach { (code, type) ->
+            server.enqueue(MockResponse().setResponseCode(code))
+            try {
+                client().fleetAnswer("fq_1", "merged")
+                fail("expected a throw for $code")
+            } catch (error: DaemonException) {
+                assertEquals(type, error::class)
+            }
+        }
+    }
+
+    @Test
+    fun anUnreadableFleetStateIsMalformed() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("<html>not json</html>"))
+        try {
+            client().fleetState()
+            fail("expected a throw")
+        } catch (expected: DaemonException.Malformed) {
+        }
+    }
+
+    @Test
+    fun aTransportFailureDuringAFleetCallArrivesAsDaemonException() = runBlocking {
+        server.enqueue(MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START))
+        try {
+            client().fleetScan()
+            fail("expected a transport failure")
+        } catch (expected: DaemonException.Transport) {
+        }
+        Unit
+    }
+
+    // The Supervisor chat's own conversation. A phone's sessionId is ignored
+    // by the daemon, so `from` must travel too or it lands in Chat's thread.
+    @Test
+    fun supervisorChatSendsItsOwnFromAndSessionId() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(200)
+                .setChunkedBody("event: final\ndata: {\"reply\":\"3 running\"}\n\n", 1024)
+                .setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.KEEP_OPEN),
+        )
+        kotlinx.coroutines.withTimeout(5_000) {
+            client().sendMessageStream("What's running?", from = "mobile-supervisor", sessionId = "mobile-supervisor").take(1).toList()
+        }
+        assertEquals(
+            """{"text":"What's running?","from":"mobile-supervisor","sessionId":"mobile-supervisor"}""",
+            server.takeRequest().body.readUtf8(),
+        )
+    }
+
     @Test
     fun eventsStatusCodesArriveAsTypedErrorsNotSilentEmptyStreams() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(401))

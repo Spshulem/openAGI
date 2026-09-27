@@ -29,6 +29,12 @@ export const MOBILE_CAPABILITIES = Object.freeze([
     ready: true,
     operations: Object.freeze(["send"]),
     detail: "Sends chat messages to the agent from the phone."
+  }),
+  Object.freeze({
+    id: "mobile-fleet-client",
+    ready: true,
+    operations: Object.freeze(["read", "answer", "mode", "send", "scan"]),
+    detail: "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone."
   })
 ]);
 
@@ -53,7 +59,12 @@ const EXACT = new Set([
   "GET /outreach/digest",
   "POST /nodes/heartbeat",
   "POST /nodes/revoke",
-  "POST /nodes/speech-token"
+  "POST /nodes/speech-token",
+  // The /fleet supervisor's JSON API only. The /fleet page itself and any
+  // other /fleet/api/ path stay owner-only.
+  "GET /fleet/api/state",
+  "POST /fleet/api/scan",
+  "POST /fleet/api/mode"
 ]);
 
 const PATTERNS = [
@@ -63,7 +74,9 @@ const PATTERNS = [
   { method: "POST", re: new RegExp(`^/tasks/${ID}/complete$`) },
   { method: "POST", re: new RegExp(`^/tasks/clarifications/${ID}/answer$`) },
   { method: "POST", re: new RegExp(`^/pending-actions/${ID}/approve$`) },
-  { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) }
+  { method: "POST", re: new RegExp(`^/pending-actions/${ID}/deny$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/questions/${ID}$`) },
+  { method: "POST", re: new RegExp(`^/fleet/api/actions/${ID}/send$`) }
 ];
 
 export function isMobileRouteAllowed(method, pathname) {

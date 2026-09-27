@@ -29,7 +29,7 @@ object ErrorCopy {
             "Can't reach OpenAGI.",
             "Nothing is listening at $host. Is the daemon running?",
         )
-        is DaemonException.NotFound, is DaemonException.Malformed, is DaemonException.Server -> Message(
+        is DaemonException.NotFound, is DaemonException.Malformed, is DaemonException.Server, is DaemonException.Unavailable -> Message(
             "Pairing failed.",
             "Try again, or run openagi pair-phone for a new code.",
         )
@@ -65,6 +65,10 @@ object ErrorCopy {
         is DaemonException.Server -> Message(
             "OpenAGI had a problem.",
             "Try again in a moment.",
+        )
+        is DaemonException.Unavailable -> Message(
+            "Supervisor isn't running on this daemon.",
+            "Update OpenAGI on that machine, then pull to refresh.",
         )
     }
 }

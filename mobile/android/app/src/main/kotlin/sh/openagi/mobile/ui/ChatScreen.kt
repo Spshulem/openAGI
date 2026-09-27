@@ -3,6 +3,7 @@
 package sh.openagi.mobile.ui
 
 import android.content.Context
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -10,6 +11,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,6 +30,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SuggestionChip
+import androidx.compose.material3.SuggestionChipDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -100,8 +104,22 @@ private sealed interface ChatEntry {
     ) : ChatEntry
 }
 
+// The Supervisor's "Ask supervisor" reuses this whole screen: the same
+// bubbles and transport, its own title, its own conversation, and a few
+// starter questions while it is empty. For a phone credential the daemon
+// ignores sessionId and keys the conversation on `from`
+// (bindScopedNodeMessage), so a separate conversation needs its own `from`.
+// The Chat tab passes none of these and sends exactly what it always has.
 @Composable
-fun ChatScreen(context: Context, credentials: Credentials, streamAttached: Boolean) {
+fun ChatScreen(
+    context: Context,
+    credentials: Credentials,
+    streamAttached: Boolean,
+    title: String = "Chat",
+    sessionId: String? = null,
+    from: String? = null,
+    starters: List<String> = emptyList(),
+) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
@@ -166,7 +184,7 @@ fun ChatScreen(context: Context, credentials: Credentials, streamAttached: Boole
     suspend fun runExchange(assistantId: Long, text: String) {
         isStreaming = true
         try {
-            client.sendMessageStream(text).collect { frame -> decodeFrame(assistantId, frame) }
+            client.sendMessageStream(text, from = from, sessionId = sessionId).collect { frame -> decodeFrame(assistantId, frame) }
         } catch (error: DaemonException) {
             applyFailure(assistantId, chatErrorCopy(error, credentials.server))
         } catch (error: Exception) {
@@ -179,16 +197,21 @@ fun ChatScreen(context: Context, credentials: Credentials, streamAttached: Boole
         }
     }
 
-    fun send() {
-        val text = inputText.trim()
+    fun start(text: String) {
         if (text.isEmpty() || isStreaming) return
-        inputText = ""
         val userId = newId()
         val assistantId = newId()
         val now = Instant.now()
         messages = messages + ChatEntry.User(userId, now, text) +
             ChatEntry.Assistant(assistantId, now, "", streaming = true, retryText = text)
         scope.launch { runExchange(assistantId, text) }
+    }
+
+    fun send() {
+        val text = inputText.trim()
+        if (text.isEmpty() || isStreaming) return
+        inputText = ""
+        start(text)
     }
 
     fun retry(entry: ChatEntry.Assistant) {
@@ -212,7 +235,7 @@ fun ChatScreen(context: Context, credentials: Credentials, streamAttached: Boole
 
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(
-            title = "Chat",
+            title = title,
             connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
         )
 
@@ -243,6 +266,14 @@ fun ChatScreen(context: Context, credentials: Credentials, streamAttached: Boole
                         ChatBubble(entry, clipboard = clipboard, onRetry = { failed -> retry(failed) })
                     }
                 }
+            }
+
+            if (messages.isEmpty() && starters.isNotEmpty()) {
+                StarterChips(
+                    starters = starters,
+                    onPick = { start(it) },
+                    modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = 20.dp, vertical = 12.dp),
+                )
             }
 
             if (!stickToBottom && messages.isNotEmpty()) {
@@ -410,6 +441,29 @@ private fun CodeBlockView(code: String) {
                 .padding(10.dp),
         ) {
             Text(code, style = OpenAGIType.dataMono, color = MaterialTheme.colorScheme.onSurface)
+        }
+    }
+}
+
+// Tapping a starter sends it as-is, exactly as if it had been typed.
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+private fun StarterChips(starters: List<String>, onPick: (String) -> Unit, modifier: Modifier = Modifier) {
+    FlowRow(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        starters.forEach { starter ->
+            SuggestionChip(
+                onClick = { onPick(starter) },
+                label = { Text(starter, style = OpenAGIType.secondary) },
+                border = BorderStroke(1.dp, LocalOpenAGIColors.current.edge),
+                colors = SuggestionChipDefaults.suggestionChipColors(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    labelColor = MaterialTheme.colorScheme.onSurface,
+                ),
+            )
         }
     }
 }

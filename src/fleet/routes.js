@@ -60,7 +60,9 @@ export function createFleetRoute({ supervisor } = {}) {
     const parts = pathname.slice(PREFIX.length).split("/");
     try {
       if (parts.length === 1 && parts[0] === "state") {
-        return method === "GET" ? ok(state()) : fail(405, "Use GET.");
+        if (method !== "GET") return fail(405, "Use GET.");
+        await supervisor.refresh?.();
+        return ok(state());
       }
       if (parts.length === 1 && parts[0] === "scan") {
         if (method !== "POST") return fail(405, "Use POST.");
@@ -75,7 +77,7 @@ export function createFleetRoute({ supervisor } = {}) {
         if (method !== "POST") return fail(405, "Use POST.");
         const body = await readObject(readBody);
         const mode = typeof body?.mode === "string" ? body.mode : "";
-        if (!MODES.includes(mode) || supervisor.setMode(mode) === null) {
+        if (!MODES.includes(mode) || await supervisor.setMode(mode) === null) {
           return fail(400, "Mode must be one of: " + MODES.join(", ") + ".");
         }
         return ok(state());

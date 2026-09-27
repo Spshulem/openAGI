@@ -9,7 +9,7 @@
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
 import { MODES, clampTail, clampText, parsePrRef, resolveFleetConfig, runCommand } from "./contracts.js";
-import { classifyThread, mergeThreads } from "./classify.js";
+import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
@@ -145,6 +145,12 @@ function effectiveDecisions(decisions) {
   return out;
 }
 
+// A snapshot saved before rows carried health still gives the phone one.
+function withHealth(snapshot) {
+  if (!Array.isArray(snapshot?.threads) || snapshot.threads.every((row) => row?.health)) return snapshot;
+  return { ...snapshot, threads: snapshot.threads.map((row) => (row?.health ? row : { ...row, health: threadHealth(row?.state, row?.error ?? null) })) };
+}
+
 function ownerDelivery(answer) {
   // Options are fixed strings chosen by policy, never agent text.
   return `Owner answer: ${answer}. Continue with that.`;
@@ -258,7 +264,7 @@ export class FleetSupervisor {
       running: Boolean(this.running),
       lastTickAt: this.lastTickAt ?? store.snapshot?.at ?? null,
       lastError: this.lastError,
-      snapshot: store.snapshot,
+      snapshot: withHealth(store.snapshot),
       questions: store.openQuestions(),
       actions: store.actions(50),
       settings: {
@@ -720,6 +726,7 @@ export class FleetSupervisor {
         branch: thread.branch ?? null,
         agentStatus: thread.agentStatus,
         state: classified.state,
+        health: threadHealth(classified.state, thread.error ?? null),
         reason: clampText(classified.reason, 160),
         blockers: (classified.blockers ?? []).slice(0, 6),
         pr: pr
