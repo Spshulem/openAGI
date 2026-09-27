@@ -66,6 +66,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         credentialsState.value = Credentials.load(this)
         pendingPairingState.value = intent?.data?.let { PairingPayload.from(it) }
+        // A pair link is single-use. Left on the Activity's intent, singleTask
+        // hands it back on every later relaunch from the launcher or recents,
+        // re-raising the switch prompt for a code the daemon already spent.
+        intent?.data = null
 
         setContent {
             var selectedTab by remember { mutableStateOf(AppTab.TODAY) }
@@ -166,7 +170,12 @@ class MainActivity : ComponentActivity() {
                     // naming both machines. Switching leaves the link set, so
                     // the pairing screen that follows is already filled in and
                     // the person still reviews the address and taps Pair.
-                    if (pendingPairing != null) {
+                    val alreadyOnThisDaemon = pendingPairing != null &&
+                        PairingPayload.namesSameDaemon(credentials.server, pendingPairing.serverUrl)
+                    LaunchedEffect(alreadyOnThisDaemon) {
+                        if (alreadyOnThisDaemon) pendingPairingState.value = null
+                    }
+                    if (pendingPairing != null && !alreadyOnThisDaemon) {
                         SwitchDaemonDialog(
                             currentServer = credentials.server,
                             incomingServer = pendingPairing.serverUrl,
@@ -190,6 +199,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         pendingPairingState.value = intent.data?.let { PairingPayload.from(it) }
+        intent.data = null
     }
 
     override fun onResume() {

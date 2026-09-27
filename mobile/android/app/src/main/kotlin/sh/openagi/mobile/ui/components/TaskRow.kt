@@ -10,7 +10,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.Canvas
@@ -27,6 +27,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -53,13 +54,25 @@ fun TaskRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .height(60.dp)
-            .padding(horizontal = 20.dp),
+            // heightIn, not height: a fixed 60dp clipped every real task whose
+            // title ran past two lines -- the daemon's tasks are whole
+            // sentences, and the third line was sliced through the middle by
+            // the next row's separator. Short rows still land on exactly 60.
+            .heightIn(min = 60.dp)
+            .padding(horizontal = 20.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Column(modifier = Modifier.weight(1f).alpha(textAlpha)) {
-            Text(title, style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
+            Text(
+                title,
+                style = OpenAGIType.body,
+                color = MaterialTheme.colorScheme.onSurface,
+                // A cap, not a crop: a pathologically long title stops at four
+                // lines with an ellipsis instead of pushing the list apart.
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis,
+            )
             if (subtitle != null) {
                 Text(
                     subtitle,

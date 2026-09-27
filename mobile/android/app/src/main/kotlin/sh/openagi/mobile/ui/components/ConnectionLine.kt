@@ -13,6 +13,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
@@ -67,9 +68,20 @@ fun ConnectionLine(state: ConnectionState, modifier: Modifier = Modifier) {
             androidx.compose.foundation.layout.Box(dotModifier.border(1.dp, dotColor, CircleShape))
         }
         CompositionLocalProvider(LocalContentColor provides muted) {
-            Text(text = host, style = OpenAGIType.dataMono)
-            Text(text = "  ·  ", style = OpenAGIType.caption)
-            Text(text = caption, style = OpenAGIType.caption)
+            // The status word is the part that must survive. Unweighted, it is
+            // measured first and keeps its full width; the host takes what is
+            // left and ellipsizes. Without this the Row handed the host every
+            // pixel it asked for and wrapped "reconnecting" down the right
+            // edge one letter per line on a narrow (folded) screen.
+            Text(
+                text = host,
+                style = OpenAGIType.dataMono,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            Text(text = "  ·  ", style = OpenAGIType.caption, maxLines = 1, softWrap = false)
+            Text(text = caption, style = OpenAGIType.caption, maxLines = 1, softWrap = false)
         }
     }
 }

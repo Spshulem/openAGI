@@ -73,15 +73,24 @@ public struct ConnectionLineView: View {
         let state = ConnectionDotState.derive(ageMinutes: ageMinutes, refreshFailed: refreshFailed)
         HStack(spacing: Theme.Spacing.x1) {
             ConnectionDot(state: state)
+            // The status is the part that must survive a narrow screen. It
+            // keeps its intrinsic width and the highest priority; the host
+            // truncates into whatever is left. Without this the HStack split
+            // the width evenly and wrapped the status down the right edge.
             Text(host)
                 .font(Theme.Typography.dataMono)
                 .foregroundStyle(Theme.muted)
+                .lineLimit(1)
+                .truncationMode(.tail)
             Text("·")
                 .font(Theme.Typography.caption)
                 .foregroundStyle(Theme.muted)
+                .fixedSize()
             Text(refreshFailed ? "Can't reach OpenAGI" : RelativeTime.compact(minutes: ageMinutes))
                 .font(Theme.Typography.caption)
                 .foregroundStyle(refreshFailed ? Theme.alert : Theme.muted)
+                .fixedSize()
+                .layoutPriority(1)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
