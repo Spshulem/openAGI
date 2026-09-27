@@ -89,7 +89,7 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
 
     suspend fun load() {
         try {
-            tasks = client.tasks(queue = queue)
+            tasks = client.tasks(queue = queue, limit = Int.MAX_VALUE)
             error = null
             lastSyncedMinutesAgo = 0
             lastLoadFailed = false
@@ -203,7 +203,11 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
                                                 },
                                                 isCompleting = task.id in completingIds,
                                                 reducedMotion = reducedMotion,
-                                                onComplete = { completeTask(task) },
+                                                onComplete = if (BucketFormat.canComplete(task.status)) {
+                                                    { completeTask(task) }
+                                                } else {
+                                                    null
+                                                },
                                                 modifier = Modifier.clickable { editingTask = task },
                                             )
                                             if (index != bucketTasks.lastIndex) Hairline()
@@ -225,7 +229,7 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
             onSave = { title, bucket, priority, dueDate, _ ->
                 scope.launch {
                     try {
-                        client.createTask(CreateTaskRequest(title = title, bucket = bucket, priority = priority, dueDate = dueDate))
+                        client.createTask(CreateTaskRequest(title = title, bucket = bucket, priority = priority, dueDate = dueDate, queue = queue))
                         showCreate = false
                         load()
                     } catch (daemonError: DaemonException) {
@@ -247,7 +251,10 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
                     try {
                         client.updateTask(
                             task.id,
-                            UpdateTaskRequest(title = title, bucket = bucket, priority = priority, status = status, dueDate = dueDate),
+                            UpdateTaskRequest(
+                                title = title, bucket = bucket, priority = priority, status = status, dueDate = dueDate,
+                                clearDueDate = dueDate == null && task.dueDate != null,
+                            ),
                         )
                         editingTask = null
                         load()

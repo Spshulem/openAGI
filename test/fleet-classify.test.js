@@ -87,6 +87,16 @@ test("prReadiness reports exact blocker strings", () => {
   assert.deepEqual(blockersOf({ isDraft: true }), ["draft"]);
 });
 
+test("a green, mergeable PR that GitHub reports BEHIND is not ready", () => {
+  const behind = prReadiness(makePr({ mergeState: "BEHIND", mergeable: "MERGEABLE" }), cleanGit);
+  assert.equal(behind.ready, false);
+  assert.equal(behind.onlyHumanLeft, false);
+  assert.deepEqual(behind.blockers, ["branch behind base"]);
+  assert.equal(classify(makeThread(), { pr: makePr({ mergeState: "BEHIND" }) }).state, "pr-not-ready");
+  // A conflict already names the work; behind is not listed twice.
+  assert.deepEqual(prReadiness(makePr({ mergeState: "DIRTY", mergeable: "CONFLICTING" }), cleanGit).blockers, ["merge conflicts"]);
+});
+
 test("prReadiness separates ready, only-human-left, and progress marks", () => {
   const ready = prReadiness(makePr(), cleanGit);
   assert.equal(ready.ready, true);

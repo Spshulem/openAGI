@@ -104,4 +104,15 @@ class WidgetStateTest {
         ) as WidgetState.Unreachable
         assertEquals(listOf("B"), state.items.map { it.title })
     }
+
+    // At the declared 110dp minimum, three rows plus the two status lines
+    // overran the content height and clipped the counts and age lines.
+    @Test
+    fun rowCountFollowsTheHeightTheLauncherGave() {
+        assertEquals(1, WidgetState.rowsThatFit(110f))
+        assertEquals(2, WidgetState.rowsThatFit(140f))
+        assertEquals(3, WidgetState.rowsThatFit(180f))
+        assertEquals(3, WidgetState.rowsThatFit(400f))
+        assertEquals("never zero rows, even below the minimum", 1, WidgetState.rowsThatFit(60f))
+    }
 }

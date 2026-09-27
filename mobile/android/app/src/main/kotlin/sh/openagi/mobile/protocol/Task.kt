@@ -1,7 +1,11 @@
 package sh.openagi.mobile.protocol
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import java.time.Instant
 
 // The full task shape, as returned by GET /tasks, GET /tasks/:id, POST
@@ -50,6 +54,9 @@ data class CreateTaskRequest(
     val bucket: String,
     val priority: Int = 50,
     @Serializable(with = OptionalInstantSerializer::class) val dueDate: Instant? = null,
+    // The queue the Tasks screen is showing. Left out, the daemon files the
+    // task under "user" and it vanishes from the agent queue it was added to.
+    val queue: String = "user",
 )
 
 // Body for PATCH /tasks/:id. Every field is optional and omitted-when-null:
@@ -63,7 +70,16 @@ data class UpdateTaskRequest(
     val priority: Int? = null,
     val status: String? = null,
     @Serializable(with = OptionalInstantSerializer::class) val dueDate: Instant? = null,
-)
+    // The one field the editor must be able to remove. Omitting dueDate means
+    // "leave it" to the daemon, so a cleared date needs an explicit JSON null,
+    // which explicitNulls = false never writes. patchBody() adds it.
+    @Transient val clearDueDate: Boolean = false,
+) {
+    fun patchBody(): JsonObject {
+        val body = ProtocolJson.json.encodeToJsonElement(serializer(), this).jsonObject
+        return if (clearDueDate) JsonObject(body + ("dueDate" to JsonNull)) else body
+    }
+}
 
 // Body for POST /tasks/:id/complete. completedVia is never anything but
 // "mobile" from this client — PROTOCOL.md §5 and FEATURES.md are both

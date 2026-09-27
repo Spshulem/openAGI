@@ -13,9 +13,10 @@ public enum HostAllowlist {
         // run before the https branch below, or https://127.0.0.1 would sail
         // through on "https is always allowed" alone.
         if isLoopback(host) { throw DaemonError.unreachableHost(host) }
-        if scheme == "https" { return url }
+        let origin = try Self.origin(of: url)
+        if scheme == "https" { return origin }
         guard scheme == "http" else { throw DaemonError.unreachableHost(url.absoluteString) }
-        if host.hasSuffix(".ts.net") { return url }
+        if host.hasSuffix(".ts.net") { return origin }
         // iOS's own ATS exception for cleartext (`NSAllowsLocalNetworking` in
         // project.yml's Info.plist) only covers RFC 1918 private ranges and
         // `.local`/unqualified hostnames — it does NOT cover Tailscale's
@@ -34,8 +35,25 @@ public enum HostAllowlist {
         // not domain-scoped the way ATS is) — this is the one place the two
         // clients' tables intentionally diverge, and only on iOS.
         if isCGNAT(host) { throw DaemonError.unreachableHost(host) }
-        if isPrivateOrTailscale(host) { return url }
+        if isPrivateOrTailscale(host) { return origin }
         throw DaemonError.unreachableHost(host)
+    }
+
+    // Scheme, host, and port only. A pasted page address like
+    // `https://host/setup` otherwise reached DaemonClient path and all, which
+    // appended every route beneath it (`/setup/nodes/enroll/exchange`) and
+    // 404'd pairing. Android's allowlist and the pairing CLI already strip it.
+    private static func origin(of url: URL) throws -> URL {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            throw DaemonError.unreachableHost(url.absoluteString)
+        }
+        components.user = nil
+        components.password = nil
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        guard let origin = components.url else { throw DaemonError.unreachableHost(url.absoluteString) }
+        return origin
     }
 
     // Exposed so UI copy can distinguish this specific refusal (which has a

@@ -42,7 +42,10 @@ final class OutboundQueueTests: XCTestCase {
         for _ in 0..<4 { try queue.recordAttempt(id: op.id) }
         XCTAssertEqual(queue.all().count, 1, "an op must survive short of the cap (4 attempts)")
         try queue.recordAttempt(id: op.id)
-        XCTAssertTrue(queue.all().isEmpty, "an op that keeps failing must be dropped on its 5th attempt")
+        XCTAssertEqual(queue.all().count, 1, "an undelivered completion must survive retry exhaustion")
+        XCTAssertEqual(queue.all().first?.attempts, 5)
+        try queue.recordAttempt(id: op.id)
+        XCTAssertEqual(OutboundQueue(directory: dir).all().first?.attempts, 5)
     }
 
     // Finding 3 (Task 9 review): a queued completion for a revoked account

@@ -211,6 +211,11 @@ test("row: pr-not-ready gets a merge-readiness nudge listing the exact failing i
   assert.equal(running.action, "wait");
   // An aborted turn gets the resume wording.
   assert.equal(run(makeThread({ agentStatus: "aborted" }), { pr }).decision.playbook, "resume");
+  // A branch behind its base is agent work (update it), never a merge ask.
+  const behind = run(makeThread(), { pr: makePr({ mergeState: "BEHIND" }) }).decision;
+  assert.equal(behind.action, "nudge");
+  assert.equal(behind.playbook, "merge-ready");
+  assert.match(behind.message, /branch behind base/);
 });
 
 test("row: ready-needs-human pings the owner once per head", () => {

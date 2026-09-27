@@ -30,9 +30,18 @@ struct RootTabView: View {
 
     private var switchAlertShown: Binding<Bool> {
         Binding(
-            get: { incomingPairing != nil },
+            get: { incomingPairing != nil && !incomingMatchesCurrent },
             set: { if !$0 { onDismissIncomingPairing() } }
         )
+    }
+
+    // A link for the daemon this phone is already paired with is not a
+    // switch: offering one revoked the working credential before learning the
+    // link's one-time code was spent, leaving the phone unpaired. Android
+    // drops these the same way.
+    private var incomingMatchesCurrent: Bool {
+        guard let incomingPairing else { return false }
+        return PairingPayload.namesSameDaemon(model.credentials.server, incomingPairing.serverURL)
     }
 
     var body: some View {
@@ -88,6 +97,11 @@ struct RootTabView: View {
             model.startEventStream()
             await model.refreshInboxCounts()
         }
+        .task(id: incomingPairing?.serverURL) {
+            if incomingMatchesCurrent { onDismissIncomingPairing() }
+        }
+        // Cancelled with the view, so it stops once this pairing is revoked.
+        .task { await RefreshCoordinator.sendHeartbeats(client: model.client) }
         .onDisappear { model.stopEventStream() }
     }
 }

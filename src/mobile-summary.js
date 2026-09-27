@@ -9,7 +9,7 @@ export const MOBILE_SUMMARY_MAX_ACTIONS = 5;
 export function buildMobileSummary(runtime, { now = new Date(), taskLimit = MOBILE_SUMMARY_MAX_TASKS } = {}) {
   const limit = Math.max(1, Math.min(MOBILE_SUMMARY_MAX_TASKS, Number.isFinite(taskLimit) ? taskLimit : MOBILE_SUMMARY_MAX_TASKS));
   const openStatuses = new Set(["pending", "in_progress", "blocked"]);
-  const all = runtime.tasks?.list ? runtime.tasks.list({ queue: "user" }) : [];
+  const all = runtime.tasks?.list ? runtime.tasks.list({ queue: "user", limit: Infinity }) : [];
   const open = all.filter((t) => openStatuses.has(t.status));
   const today = open.filter((t) => t.bucket === "today");
   const nowMs = now.getTime();

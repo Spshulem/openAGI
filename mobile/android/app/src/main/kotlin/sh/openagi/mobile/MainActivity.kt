@@ -23,6 +23,7 @@ import sh.openagi.mobile.sync.fetchInboxBadgeCount
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.EventStream
 import sh.openagi.mobile.ui.ChatScreen
+import sh.openagi.mobile.ui.ChatConversationState
 import sh.openagi.mobile.ui.InboxScreen
 import sh.openagi.mobile.ui.PairingScreen
 import sh.openagi.mobile.ui.SettingsScreen
@@ -31,6 +32,7 @@ import sh.openagi.mobile.ui.TasksScreen
 import sh.openagi.mobile.ui.TodayScreen
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import sh.openagi.mobile.sync.forgetPairing
 import sh.openagi.mobile.ui.components.SwitchDaemonDialog
 import sh.openagi.mobile.ui.components.AppNavigationBar
@@ -39,14 +41,18 @@ import sh.openagi.mobile.ui.theme.OpenAGITheme
 
 // Events on GET /events that mean "a surface other than Chat might now be
 // stale" — PROTOCOL.md §7's table of what a mobile client reacts to.
-private val REFRESH_TRIGGERING_EVENTS = setOf(
+// clarification-resolved is the only event a "No" or a dismiss from another
+// client produces; without it the answered question stays actionable here.
+internal val REFRESH_TRIGGERING_EVENTS = setOf(
     "task-updated",
     "task-auto-changed",
     "pending-action",
     "pending-action-resolved",
     "clarification-created",
+    "clarification-resolved",
 )
-private val INBOX_AFFECTING_EVENTS = setOf("pending-action", "pending-action-resolved", "clarification-created")
+internal val INBOX_AFFECTING_EVENTS =
+    setOf("pending-action", "pending-action-resolved", "clarification-created", "clarification-resolved")
 
 class MainActivity : ComponentActivity() {
     // Plain mutableStateOf held on the Activity, not inside setContent's
@@ -97,6 +103,9 @@ class MainActivity : ComponentActivity() {
                         },
                     )
                 } else {
+                    val conversationScope = rememberCoroutineScope()
+                    val chatConversation = remember(credentials) { ChatConversationState(conversationScope) }
+                    val supervisorConversation = remember(credentials) { ChatConversationState(conversationScope) }
                     // One background SSE connection for the life of this
                     // pairing, reconnected with backoff by EventStream. This
                     // is what makes Inbox's badge and the other tabs feel
@@ -111,6 +120,13 @@ class MainActivity : ComponentActivity() {
                             if (frame.event in INBOX_AFFECTING_EVENTS) {
                                 inboxBadgeState.intValue = runCatching { fetchInboxBadgeCount(client) }.getOrDefault(inboxBadgeState.intValue)
                             }
+                        }
+                    }
+                    LaunchedEffect(credentials) {
+                        val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
+                        while (true) {
+                            runCatching { client.heartbeat() }
+                            delay(30_000L)
                         }
                     }
 
@@ -153,12 +169,13 @@ class MainActivity : ComponentActivity() {
                                     resumeSignal = resumeSignal,
                                     onBadgeCountChanged = { inboxBadgeState.intValue = it },
                                 )
-                                AppTab.CHAT -> ChatScreen(context = this@MainActivity, credentials = credentials, streamAttached = streamAttachedState.value)
+                                AppTab.CHAT -> ChatScreen(context = this@MainActivity, credentials = credentials, streamAttached = streamAttachedState.value, conversationState = chatConversation)
                                 AppTab.SUPERVISOR -> SupervisorScreen(
                                     context = this@MainActivity,
                                     credentials = credentials,
                                     resumeSignal = resumeSignal,
                                     streamAttached = streamAttachedState.value,
+                                    chatConversationState = supervisorConversation,
                                 )
                                 AppTab.SETTINGS -> SettingsScreen(
                                     context = this@MainActivity,

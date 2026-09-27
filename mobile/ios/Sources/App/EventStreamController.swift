@@ -1,10 +1,15 @@
 import Foundation
+import Observation
 
 // Owns the one long-lived `GET /events` connection and reconnects with
 // exponential backoff (capped at 30s) whenever it drops -- mobile/FEATURES.md:
 // "Reconnect with backoff when the stream drops. Never silently stay dead."
 // `AppModel` is the only caller; kept as its own type so the reconnect loop
 // is a single, readable place rather than tangled into the model itself.
+// `@Observable` so `isConnected` flips reach SwiftUI: Chat's header reads it
+// through `AppModel.isStreamConnected`, and a plain property here left the
+// header stuck on "live" or "reconnecting" until some unrelated re-render.
+@Observable
 @MainActor
 public final class EventStreamController {
     private let client: DaemonClient

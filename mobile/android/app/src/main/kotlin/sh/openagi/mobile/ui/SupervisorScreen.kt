@@ -95,6 +95,7 @@ fun SupervisorScreen(
     credentials: Credentials,
     resumeSignal: Int = 0,
     streamAttached: Boolean = false,
+    chatConversationState: ChatConversationState,
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
@@ -264,6 +265,7 @@ fun SupervisorScreen(
                     sessionId = SupervisorFormat.SESSION_ID,
                     from = SupervisorFormat.SESSION_ID,
                     starters = SupervisorFormat.STARTERS,
+                    conversationState = chatConversationState,
                 )
             }
         }

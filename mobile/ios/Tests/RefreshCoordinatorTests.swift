@@ -147,7 +147,7 @@ final class RefreshCoordinatorTests: XCTestCase {
 
         let remaining = try XCTUnwrap(queue.all().first)
         XCTAssertEqual(remaining.id, op.id, "a 500 is not the server saying it's done -- the op must still be queued")
-        XCTAssertEqual(remaining.attempts, 1, "the failed attempt must be recorded so the cap eventually retires it")
+        XCTAssertEqual(remaining.attempts, 1, "the failed attempt must be recorded")
     }
 
     // 5. Respond 401: `.unauthorized`, and the cached snapshot still loads
@@ -190,6 +190,30 @@ final class RefreshCoordinatorTests: XCTestCase {
         let heartbeats = seenRequests.withLock { $0 }.filter { $0.url?.path == "/nodes/heartbeat" }
         XCTAssertEqual(heartbeats.count, 1, "refresh() must send exactly one heartbeat so the daemon's node roster shows this phone as recently seen")
         XCTAssertEqual(heartbeats.first?.httpMethod, "POST")
+    }
+
+    // The daemon marks a node offline 90s after its last heartbeat and does
+    // not count an open `GET /events` stream, so an idle foreground phone
+    // must keep heartbeating on its own cadence, not only on refresh.
+    func testSendHeartbeatsRepeatsUntilCancelled() async throws {
+        let heartbeats = OSAllocatedUnfairLock(initialState: 0)
+        StubProtocol.handler = { request in
+            if request.url?.path == "/nodes/heartbeat" { heartbeats.withLock { $0 += 1 } }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"ok":true}"#.utf8))
+        }
+        XCTAssertEqual(RefreshCoordinator.heartbeatInterval, .seconds(30))
+        let client = makeClient()
+        let loop = Task { await RefreshCoordinator.sendHeartbeats(client: client, every: .milliseconds(20)) }
+        let deadline = Date().addingTimeInterval(5)
+        while heartbeats.withLock({ $0 }) < 3 && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        loop.cancel()
+        await loop.value
+        let sent = heartbeats.withLock { $0 }
+        XCTAssertGreaterThanOrEqual(sent, 3, "an idle foreground phone must keep heartbeating, not just once per refresh")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(heartbeats.withLock { $0 }, sent, "cancelling the task must stop the loop")
     }
 
     // Whole-branch review finding: `RefreshOutcome.offline` never reached the

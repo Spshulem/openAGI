@@ -343,7 +343,7 @@ test("findPrForBranch keeps a closed PR whose later commits came from GitHub", a
   assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: answering(128).run, head: "new", cwd: "/work/tree" }), `${BBAPP}#6801`);
 });
 
-test("findPrForBranch returns null for bad input, no PRs, or failures", async () => {
+test("findPrForBranch returns null for bad input or no PRs, and throws when GitHub cannot answer", async () => {
   const { run, calls } = fakeRun(() => ok([]));
   assert.equal(await findPrForBranch(BBAPP, "feature/x", config(), { run }), null);
   assert.equal(await findPrForBranch("not a repo", "feature/x", config(), { run }), null);
@@ -352,8 +352,13 @@ test("findPrForBranch returns null for bad input, no PRs, or failures", async ()
   assert.equal(await findPrForBranch(BBAPP, "-x", config(), { run }), null);
   assert.equal(await findPrForBranch(BBAPP, "", config(), { run }), null);
   assert.equal(calls.length, 1);
-  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: async () => ({ code: 1, stdout: "", stderr: "x" }) }), null);
-  assert.equal(await findPrForBranch(BBAPP, "b", config(), { run: async () => { throw new Error("boom"); } }), null);
+  // A failed lookup is unknown, not "no PR": the supervisor keeps its last answer.
+  await assert.rejects(findPrForBranch(BBAPP, "b", config(), { run: async () => ({ code: 1, stdout: "", stderr: "x" }) }), /unavailable/);
+  await assert.rejects(findPrForBranch(BBAPP, "b", config(), { run: async () => { throw new Error("boom"); } }), /unavailable: boom/);
+  await assert.rejects(findPrForBranch(BBAPP, "b", config(), { run: async () => ok("not json") }), /unavailable/);
+  await assert.rejects(findPrForBranch(BBAPP, "b", config(), { run: async () => ok({ number: 1 }) }), /unavailable/);
+  // gh exits non-zero with valid-looking output: still not an answer.
+  await assert.rejects(findPrForBranch(BBAPP, "b", config(), { run: async () => ({ code: 1, stdout: "[]", stderr: "x" }) }), /unavailable/);
 });
 
 function gitRunner(table) {
@@ -369,11 +374,12 @@ test("readLocalGit reads head, branch, upstream, ahead, and remote", async () =>
     "rev-parse --abbrev-ref HEAD": "feature/ai-chat-inline-connect",
     "rev-parse --abbrev-ref @{u}": "origin/feature/ai-chat-inline-connect",
     "rev-list --count @{u}..HEAD": "2",
-    "remote get-url origin": "https://github.com/buildbetter-app/buildbetter.git"
+    "remote get-url origin": "https://github.com/buildbetter-app/buildbetter.git",
+    "status --porcelain --untracked-files=normal": ""
   });
   const git = await readLocalGit("/work/tree", config(), { run });
   assert.deepEqual(git, {
-    head: HEAD_6878, branch: "feature/ai-chat-inline-connect", upstream: "origin/feature/ai-chat-inline-connect", ahead: 2, remote: BBAPP
+    head: HEAD_6878, branch: "feature/ai-chat-inline-connect", upstream: "origin/feature/ai-chat-inline-connect", ahead: 2, remote: BBAPP, dirty: false
   });
   assert.equal(calls[0].cmd, "/fake/git");
   assert.deepEqual(calls[0].args.slice(0, 2), ["-C", "/work/tree"]);
@@ -383,15 +389,38 @@ test("readLocalGit handles detached heads and missing upstreams", async () => {
   const { run } = gitRunner({
     "rev-parse HEAD": HEAD_6878,
     "rev-parse --abbrev-ref HEAD": "HEAD",
-    "remote get-url origin": "git@github.com:Spshulem/openAGI.git"
+    "remote get-url origin": "git@github.com:Spshulem/openAGI.git",
+    "status --porcelain --untracked-files=normal": ""
   });
   assert.deepEqual(await readLocalGit("/work/tree", config(), { run }), {
-    head: HEAD_6878, branch: null, upstream: null, ahead: null, remote: "Spshulem/openAGI"
+    head: HEAD_6878, branch: null, upstream: null, ahead: null, remote: "Spshulem/openAGI", dirty: false
   });
 });
 
+test("readLocalGit reports uncommitted work, and unknown when git status fails", async () => {
+  const base = {
+    "rev-parse HEAD": HEAD_6878,
+    "rev-parse --abbrev-ref HEAD": "feature/ai-chat-inline-connect",
+    "remote get-url origin": "https://github.com/buildbetter-app/buildbetter.git"
+  };
+  // Staged, unstaged, and untracked changes all count; the head alone hides them.
+  for (const status of [" M src/a.js", "A  src/b.js", "?? notes/new.md"]) {
+    const { run } = gitRunner({ ...base, "status --porcelain --untracked-files=normal": status });
+    assert.equal((await readLocalGit("/work/tree", config(), { run })).dirty, true, status);
+  }
+  const clean = gitRunner({ ...base, "status --porcelain --untracked-files=normal": "" });
+  const git = await readLocalGit("/work/tree", config(), { run: clean.run });
+  assert.equal(git.dirty, false);
+  const statusCall = clean.calls.find((call) => call.args.includes("status"));
+  assert.deepEqual(statusCall.args, ["-C", "/work/tree", "status", "--porcelain", "--untracked-files=normal"]);
+  assert.equal(statusCall.options.env.GIT_OPTIONAL_LOCKS, "0");
+  // git status did not answer: the worktree is unknown, not clean.
+  const failing = gitRunner(base);
+  assert.equal((await readLocalGit("/work/tree", config(), { run: failing.run })).dirty, null);
+});
+
 test("readLocalGit returns all null for a missing dir or a throwing runner", async () => {
-  const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null };
+  const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null, dirty: null };
   const { run, calls } = gitRunner({});
   assert.deepEqual(await readLocalGit("/gone", config(), { run }), empty);
   assert.equal(calls.length, 1);
@@ -400,7 +429,7 @@ test("readLocalGit returns all null for a missing dir or a throwing runner", asy
 });
 
 test("readLocalGit marks a failed read inside a repo as unreadable", async (t) => {
-  const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null };
+  const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null, dirty: null };
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-git-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const repo = path.join(root, "repo");

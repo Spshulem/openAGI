@@ -58,10 +58,9 @@ public struct OutboundQueue: Sendable {
             var ops = Self.readOps(at: url)
             guard let index = ops.firstIndex(where: { $0.id == id }) else { return }
             ops[index].attempts += 1
-            // An op that has failed this many times is not going to start working.
-            // Dropping it is better than a queue that retries forever on every
-            // background wake.
-            if ops[index].attempts >= Self.maxAttempts { ops.remove(at: index) }
+            // Keep the completion until the server accepts it or confirms it
+            // is already gone. Dropping it leaves the optimistic row hidden.
+            ops[index].attempts = min(ops[index].attempts, Self.maxAttempts)
             try Self.writeOps(ops, to: url)
         }
     }

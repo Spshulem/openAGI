@@ -110,14 +110,13 @@ function summarizeTail(rowsNewestFirst) {
 }
 
 function readRecentMessages(db, sessionId) {
-  try { return db.prepare(TAIL_SQL).all(sessionId, TAIL_ROWS); } catch { return []; }
+  return db.prepare(TAIL_SQL).all(sessionId, TAIL_ROWS);
 }
 
 // Background tasks = task_started with no matching task_notification.
 function readOpenTasks(db, sessionId, sinceIso) {
   const open = new Map();
-  let rows = [];
-  try { rows = db.prepare(TASKS_SQL).all(sessionId, sinceIso); } catch { return []; }
+  const rows = db.prepare(TASKS_SQL).all(sessionId, sinceIso);
   for (const row of rows) {
     const event = parseEvent(row.content);
     const taskId = event?.task_id ? String(event.task_id) : "";
@@ -252,11 +251,9 @@ export async function listConductorThreads(config, options = {}) {
     const threads = [];
     for (const [list, stale] of [[recent, false], [manager, true]]) {
       for (const { row } of list) {
-        try {
-          threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale }));
-        } catch {
-          // One odd session never hides the rest.
-        }
+        // A query failure means the source is unknown this tick. Returning a
+        // partial catalog would close questions from sessions we failed to read.
+        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale }));
       }
     }
     return threads;

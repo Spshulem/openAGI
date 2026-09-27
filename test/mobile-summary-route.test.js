@@ -90,6 +90,20 @@ test("the task limit is bounded so a widget cannot ask for the whole store", asy
   } finally { await app.close(); }
 });
 
+test("counts cover every user task, not the task store's default first 50", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-mobsum7-"));
+  const { runtime, app, base } = await bootApp(dataDir);
+  try {
+    for (let i = 0; i < 55; i += 1) runtime.tasks.add({ queue: "user", title: `T${i}`, bucket: "today" });
+    runtime.tasks.add({ queue: "user", title: "Week", bucket: "this_week" });
+    runtime.tasks.add({ queue: "user", title: "Late", bucket: "this_week", dueDate: "2020-01-01T00:00:00.000Z" });
+    const json = await (await fetch(`${base}/mobile/summary`)).json();
+    assert.equal(json.counts.today, 55);
+    assert.equal(json.counts.this_week, 2);
+    assert.equal(json.counts.overdue, 1);
+  } finally { await app.close(); }
+});
+
 test("an unchanged summary is a 304", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-mobsum5-"));
   const { runtime, app, base } = await bootApp(dataDir);

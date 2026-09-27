@@ -176,9 +176,19 @@ public actor DaemonClient {
         return try Self.decodeJSON(PendingActionsResponse.self, from: data).actions
     }
 
+    // Not routed through `perform()`: the daemon answers 400 (not just 200)
+    // with a real `{ok:false, error:"..."}` body when the approved tool ran
+    // and failed -- src/hosted-interface.js's approve handler returns
+    // `invokeResult.ok ? 200 : 400`. Rejecting that status before decoding
+    // made the Inbox's `!outcome.ok` branch unreachable and reported a failed
+    // tool as "Can't reach OpenAGI". Android's `approveAction` does the same.
     public func approvePendingAction(id: String) async throws -> ApprovalOutcome {
         let request = try authorizedRequest(path: "/pending-actions/\(id)/approve", method: "POST")
-        let (data, _) = try await perform(request)
+        let (data, response) = try await Self.networkCall(request, session: session)
+        if (response as? HTTPURLResponse)?.statusCode == 400 {
+            return try Self.decodeJSON(ApprovalOutcome.self, from: data)
+        }
+        _ = try validate(response)
         return try Self.decodeJSON(ApprovalOutcome.self, from: data)
     }
 

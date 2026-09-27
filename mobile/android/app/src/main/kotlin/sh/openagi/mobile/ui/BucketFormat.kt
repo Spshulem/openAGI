@@ -27,4 +27,8 @@ object BucketFormat {
     }
 
     val STATUSES = listOf("pending", "in_progress", "blocked", "completed", "cancelled")
+
+    // A completed row gets no completion control, same as iOS. Completing it
+    // again makes the daemon record a second task-completed outcome.
+    fun canComplete(status: String): Boolean = status != "completed"
 }

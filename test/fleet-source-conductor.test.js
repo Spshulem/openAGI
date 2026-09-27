@@ -141,6 +141,15 @@ function makeConfig(home, overrides = {}) {
 
 const byId = (threads) => Object.fromEntries(threads.map((thread) => [thread.id, thread]));
 
+test("a failed message query makes the Conductor source unknown", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  db.exec("ALTER TABLE session_messages RENAME COLUMN sender_api_key_name TO older_schema_name");
+  db.close();
+  await assert.rejects(listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }), /sender_api_key_name/);
+});
+
 test("lists in-scope Conductor sessions with normalized status and context", async (t) => {
   const home = makeHome(t);
   seed(home);

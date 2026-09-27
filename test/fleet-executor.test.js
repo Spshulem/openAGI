@@ -370,13 +370,18 @@ test("a background send reports later whether it reached the agent", async (t) =
   assert.equal(await (await okay.executor.deliver({ thread: codexThread(okay.cwd), message: "hi", route: "codex-exec" })).done, true);
 });
 
-test("a background send that fails to run gives its nudge attempt back", async (t) => {
+test("a background send that fails to run reports it and leaves earlier counted nudges alone", async (t) => {
   const { cwd, store, executor } = setup(t, { results: [{ code: 1, stderr: "boom" }] });
+  // An earlier nudge the target already counted; this send (an owner answer
+  // or an escalation) recorded none, so its failure must not undo that one.
   store.recordNudge("codex:t1", { playbook: "merge-ready", route: "codex-exec", status: "sent" }, { head: "h", unresolved: 1 });
-  const result = await executor.deliver({ thread: codexThread(cwd), message: "Ready to merge?", route: "codex-exec", playbook: "merge-ready" });
+  const result = await executor.deliver({ thread: codexThread(cwd), message: "Owner answer: Starter.", route: "codex-exec", playbook: "owner-answer" });
   assert.equal(result.status, "sent");
+  assert.equal(await result.done, false);
   await executor.whenIdle();
-  assert.equal(store.ledgerFor("codex:t1").attemptsWithoutProgress, 0);
+  const ledger = store.ledgerFor("codex:t1");
+  assert.equal(ledger.attemptsWithoutProgress, 1);
+  assert.equal(ledger.nudges.at(-1).status, "sent");
 });
 
 test("relay only accepts the exact DONE acknowledgement", async (t) => {

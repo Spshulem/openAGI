@@ -44,7 +44,8 @@ fun TaskRow(
     subtitleIsAlert: Boolean = false,
     isCompleting: Boolean,
     reducedMotion: Boolean,
-    onComplete: () -> Unit,
+    // Null draws no control at all, for a row with nothing left to complete.
+    onComplete: (() -> Unit)?,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalOpenAGIColors.current
@@ -81,12 +82,14 @@ fun TaskRow(
                 )
             }
         }
-        CompletionControl(
-            title = title,
-            isCompleting = isCompleting,
-            reducedMotion = reducedMotion,
-            onTap = onComplete,
-        )
+        if (onComplete != null) {
+            CompletionControl(
+                title = title,
+                isCompleting = isCompleting,
+                reducedMotion = reducedMotion,
+                onTap = onComplete,
+            )
+        }
     }
 }
 

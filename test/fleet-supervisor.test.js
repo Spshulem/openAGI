@@ -183,6 +183,16 @@ test("groupQuestions collapses limit and unreachable bursts and duplicate titles
   assert.equal(grouped.find((q) => q.kind === "open").threadKey, "c");
 });
 
+test("groupQuestions keeps distinct agent questions sharing a display title", () => {
+  const asks = ["a", "b"].map((threadKey) => ({
+    threadKey, playbook: null,
+    question: { kind: "agent-ask", title: "madrid asks", body: `Answer ${threadKey}?`, options: ["yes", "no"], dedupeKey: `agent-ask:${threadKey}` }
+  }));
+  const grouped = groupQuestions(asks, new Map());
+  assert.equal(grouped.length, 2);
+  assert.deepEqual(grouped.map((q) => q.body), ["Answer a?", "Answer b?"]);
+});
+
 test("skip on a grouped unreachable question mutes every thread in it", async (t) => {
   const threads = ["t1", "t2"].map((id) => makeThread({ key: `conductor:${id}`, kind: "conductor", id, workspace: id, live: null, lastActivityAt: ago(300 * MIN), lastAgentAt: ago(300 * MIN), agentStatus: "idle" }));
   const { supervisor } = fixture(t, { threads });
@@ -600,6 +610,59 @@ test("a grouped resume retries only the threads whose background send failed", a
   assert.deepEqual(executor.delivered.map((x) => x.thread.key), ["codex:b"]);
 });
 
+// The real executor over a runner whose background child exits non-zero.
+function failingRunDeps() {
+  return { executor: null, run: async () => ({ code: 1, stdout: "", stderr: "boom", timedOut: false, error: null }) };
+}
+
+test("a counted nudge that fails in the background gives back its own attempt", async (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-undo-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const { supervisor } = fixture(t, { mode: "auto", threads: [makeThread({ cwd })], deps: failingRunDeps() });
+  await supervisor.tick();
+  await supervisor.executor.whenIdle();
+  await settle();
+  const ledger = supervisor.store.ledgerFor("codex:t1");
+  assert.equal(ledger.nudges.length, 1);
+  assert.equal(ledger.nudges[0].status, "failed");
+  assert.equal(ledger.attemptsWithoutProgress, 0);
+  assert.ok(ledger.lastNudgeAt, "a failed send still starts the cooldown");
+});
+
+test("an owner answer or escalation that fails in the background leaves earlier counted nudges alone", async (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-undo-"));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  const counted = (store, key, n) => { for (let i = 0; i < n; i++) store.recordNudge(key, { playbook: "merge-ready", route: "codex-exec", status: "sent" }); };
+
+  // Owner answers are recorded as "owner-answer" and count nothing.
+  const asking = makeThread({ cwd, meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
+  const answered = fixture(t, { threads: [asking], deps: failingRunDeps() });
+  counted(answered.supervisor.store, "codex:t1", 2);
+  await answered.supervisor.tick();
+  const question = answered.supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  assert.equal((await answered.supervisor.answerQuestion(question.id, "Starter")).delivery.status, "sent");
+  await answered.supervisor.executor.whenIdle();
+  await settle();
+  assert.equal(answered.supervisor.store.ledgerFor("codex:t1").attemptsWithoutProgress, 2);
+  assert.equal(answered.supervisor.store.question(question.id).status, "open", "the failed answer is still reopened");
+
+  // An escalation is recorded on the thread that raised it, not on the
+  // manager it was delivered to, so the manager's own nudges stay counted.
+  const waiting = makeThread({
+    key: "conductor:w1", kind: "conductor", id: "w1", workspace: "apia", cwd: "/work/w1", agentStatus: "waiting",
+    lastAgentText: "bb-quick is running.", openTasks: [{ id: "task1", description: "bb-quick on BuildBot3", startedAt: ago(20 * MIN) }]
+  });
+  const manager = makeManager({ key: "codex:mgr", kind: "codex", cwd, live: null });
+  const escalated = fixture(t, { mode: "auto", threads: [waiting], manager, deps: failingRunDeps() });
+  counted(escalated.supervisor.store, manager.key, 1);
+  await escalated.supervisor.tick();
+  assert.equal(escalated.supervisor.store.ledgerFor(waiting.key).nudges.at(-1).status, "escalated");
+  await escalated.supervisor.executor.whenIdle();
+  await settle();
+  assert.equal(escalated.supervisor.store.ledgerFor(manager.key).attemptsWithoutProgress, 1);
+  assert.equal(escalated.supervisor.store.ledgerFor(manager.key).nudges.at(-1).status, "sent");
+});
+
 test("a failed Codex source keeps its proposals and grouped questions open", async (t) => {
   let broken = false;
   const thread = makeThread();
@@ -990,4 +1053,3 @@ test("a group widened while added is sending stays open for the new thread", asy
   assert.equal(result.question.status, "open");
   assert.equal(result.delivery.status, "blocked");
 });
-

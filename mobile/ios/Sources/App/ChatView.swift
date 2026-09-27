@@ -153,6 +153,7 @@ struct ChatView: View {
                 Button("Try again") {
                     Task { await retry(item.message) }
                 }
+                .disabled(isSending)
                 .font(Theme.Typography.secondary)
                 .foregroundStyle(Theme.alert)
             }
@@ -211,12 +212,13 @@ struct ChatView: View {
     // just that failed bubble in place rather than appending a new one --
     // "stays in place", per DESIGN.md, not a fresh row at the bottom.
     private func retry(_ failedMessage: ChatMessage) async {
-        guard let failedIndex = messages.firstIndex(where: { $0.id == failedMessage.id }) else { return }
-        guard let userText = messages[..<failedIndex].last(where: { $0.role == .user })?.text else { return }
+        guard let target = ChatRetry.target(failedID: failedMessage.id, in: messages, isSending: isSending) else { return }
+        isSending = true
+        defer { isSending = false }
         let fresh = ChatMessage(role: .assistant, text: "", isStreaming: true)
-        messages[failedIndex] = fresh
+        messages[target.index] = fresh
         isPinnedToBottom = true
-        await streamReply(text: userText, replyID: fresh.id)
+        await streamReply(text: target.userText, replyID: fresh.id)
     }
 
     private func streamReply(text: String, replyID: UUID) async {
@@ -260,6 +262,21 @@ struct ChatView: View {
                 messages[index].isFailed = true
             }
         }
+    }
+}
+
+// Which failed reply a "Try again" tap re-sends, and with what text -- or nil
+// when it must not run. Retries used to skip `isSending`, so repeated taps, or
+// a retry racing the composer, fired concurrent `POST /message` calls for the
+// same node session: duplicated user turns, repeated tool side effects, and
+// two streams writing one bubble. Now they share `send()`'s single-flight gate.
+enum ChatRetry {
+    static func target(failedID: UUID, in messages: [ChatMessage], isSending: Bool) -> (index: Int, userText: String)? {
+        guard !isSending,
+              let index = messages.firstIndex(where: { $0.id == failedID }),
+              let userText = messages[..<index].last(where: { $0.role == .user })?.text
+        else { return nil }
+        return (index, userText)
     }
 }
 

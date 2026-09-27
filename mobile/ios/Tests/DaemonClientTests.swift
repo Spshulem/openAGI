@@ -134,6 +134,21 @@ final class DaemonClientTests: XCTestCase {
         } catch { XCTFail("unexpected \(error)") }
     }
 
+    // A daemon page URL typed into pairing must not become a path prefix.
+    func testEnrollPostsToTheOriginWhenGivenAPagePath() async throws {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"node":{"id":"mobile:abc","name":"Phone","platform":"mobile"},"nodeToken":"t"}"#.utf8))
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubProtocol.self]
+        _ = try await DaemonClient.enroll(server: URL(string: "http://mac.tail1234.ts.net:43210/setup")!,
+                                          code: "004221", nodeID: "mobile:abc", nodeToken: "t", name: "Phone",
+                                          session: URLSession(configuration: config))
+        XCTAssertEqual(StubProtocol.lastRequest?.url?.absoluteString,
+                       "http://mac.tail1234.ts.net:43210/nodes/enroll/exchange")
+    }
+
     func testTransportFailureSurfacesAsTransportError() async {
         struct StubNetworkFailure: Error {}
         StubProtocol.failure = StubNetworkFailure()

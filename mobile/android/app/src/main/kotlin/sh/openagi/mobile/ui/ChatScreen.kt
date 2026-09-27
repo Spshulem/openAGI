@@ -59,6 +59,7 @@ import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.ChatDeltaPayload
 import sh.openagi.mobile.protocol.ChatFailurePayload
@@ -84,7 +85,7 @@ import sh.openagi.mobile.util.ErrorCopy
 // over POST /message with Accept: text/event-stream and renders frames as
 // they arrive; see DaemonClient.sendMessageStream's own comment for why that
 // isn't GET /events.
-private sealed interface ChatEntry {
+internal sealed interface ChatEntry {
     val id: Long
     val timestamp: Instant
 
@@ -104,6 +105,17 @@ private sealed interface ChatEntry {
     ) : ChatEntry
 }
 
+// Kept by the Activity so switching tabs does not discard a conversation
+// while the daemon keeps the same node session alive. Replies stream in
+// `scope`, the Activity's, so leaving the tab mid-reply does not cancel the
+// stream and leave a false "Can't reach OpenAGI" in the kept history.
+class ChatConversationState(internal val scope: CoroutineScope) {
+    internal val messages = mutableStateOf<List<ChatEntry>>(emptyList())
+    internal val inputText = mutableStateOf("")
+    internal val isStreaming = mutableStateOf(false)
+    internal val nextId = mutableStateOf(0L)
+}
+
 // The Supervisor's "Ask supervisor" reuses this whole screen: the same
 // bubbles and transport, its own title, its own conversation, and a few
 // starter questions while it is empty. For a phone credential the daemon
@@ -119,16 +131,17 @@ fun ChatScreen(
     sessionId: String? = null,
     from: String? = null,
     starters: List<String> = emptyList(),
+    conversationState: ChatConversationState,
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     val clipboard = LocalClipboardManager.current
 
-    var messages by remember { mutableStateOf(listOf<ChatEntry>()) }
-    var inputText by remember { mutableStateOf("") }
-    var isStreaming by remember { mutableStateOf(false) }
-    var nextId by remember { mutableStateOf(0L) }
+    var messages by conversationState.messages
+    var inputText by conversationState.inputText
+    var isStreaming by conversationState.isStreaming
+    var nextId by conversationState.nextId
 
     // DESIGN.md: "the list stays pinned to the bottom while the user has not
     // scrolled away; if they have scrolled up, do not yank them back." Once
@@ -204,7 +217,7 @@ fun ChatScreen(
         val now = Instant.now()
         messages = messages + ChatEntry.User(userId, now, text) +
             ChatEntry.Assistant(assistantId, now, "", streaming = true, retryText = text)
-        scope.launch { runExchange(assistantId, text) }
+        conversationState.scope.launch { runExchange(assistantId, text) }
     }
 
     fun send() {
@@ -224,7 +237,7 @@ fun ChatScreen(
                 current
             }
         }
-        scope.launch { runExchange(entry.id, text) }
+        conversationState.scope.launch { runExchange(entry.id, text) }
     }
 
     LaunchedEffect(messages) {

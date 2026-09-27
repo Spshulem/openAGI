@@ -29,4 +29,14 @@ class BucketFormatTest {
         assertEquals("In progress", BucketFormat.statusLabel("in_progress"))
         assertEquals("Pending", BucketFormat.statusLabel("pending"))
     }
+
+    // Re-completing a completed task records a second task-completed outcome
+    // on the daemon, so its row must not offer the control at all.
+    @Test
+    fun onlyACompletedTaskHasNothingLeftToComplete() {
+        assertEquals(false, BucketFormat.canComplete("completed"))
+        listOf("pending", "in_progress", "blocked", "cancelled").forEach { status ->
+            assertEquals(status, true, BucketFormat.canComplete(status))
+        }
+    }
 }

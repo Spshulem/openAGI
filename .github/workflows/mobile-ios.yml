@@ -1,0 +1,30 @@
+name: iOS mobile
+
+on:
+  pull_request:
+    paths:
+      - "mobile/ios/**"
+      - ".github/workflows/mobile-ios.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null; then brew install xcodegen; fi
+      - name: Generate iOS project
+        working-directory: mobile/ios
+        run: xcodegen generate
+      - name: Build and test iOS app
+        working-directory: mobile/ios
+        run: |
+          xcodebuild test \
+            -project OpenAGI.xcodeproj \
+            -scheme OpenAGI \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=YES

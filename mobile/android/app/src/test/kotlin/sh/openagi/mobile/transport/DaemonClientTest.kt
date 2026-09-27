@@ -256,6 +256,23 @@ class DaemonClientTest {
         assertTrue(path.contains("limit=5"))
     }
 
+    // Omitting limit lets the daemon's TaskStore.list() cap the Tasks screen at
+    // 50 rows, which blanked the later buckets (usually all of Done).
+    @Test
+    fun theTasksScreensUncappedLimitReachesTheDaemonIntact() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"tasks":[]}"""))
+        client().tasks(queue = "user", limit = Int.MAX_VALUE)
+        assertEquals("/tasks?queue=user&limit=2147483647", server.takeRequest().path)
+    }
+
+    @Test
+    fun createTaskSendsTheSelectedQueue() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody(taskJson))
+        client().createTask(sh.openagi.mobile.protocol.CreateTaskRequest(title = "Triage inbox", bucket = "today", queue = "agent"))
+        val body = ProtocolJson.json.parseToJsonElement(server.takeRequest().body.readUtf8()).jsonObject
+        assertEquals("agent", body["queue"]!!.jsonPrimitive.content)
+    }
+
     @Test
     fun createTaskPostsAndDecodesTheCreatedTask() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(200).setBody(taskJson))
@@ -281,6 +298,15 @@ class DaemonClientTest {
         assertEquals("PATCH", request.method)
         val body = request.body.readUtf8()
         assertEquals("""{"status":"in_progress"}""", body)
+    }
+
+    // The daemon keeps dueDate unless the key is present, so Clear must send
+    // an explicit null even though every other null field is dropped.
+    @Test
+    fun clearingTheDueDateSendsAnExplicitNull() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody(taskJson))
+        client().updateTask("task_1", sh.openagi.mobile.protocol.UpdateTaskRequest(title = "Ship it", clearDueDate = true))
+        assertEquals("""{"title":"Ship it","dueDate":null}""", server.takeRequest().body.readUtf8())
     }
 
     @Test

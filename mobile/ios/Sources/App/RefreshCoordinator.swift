@@ -55,6 +55,21 @@ public actor RefreshCoordinator {
         }
     }
 
+    // The daemon marks a node offline 90s after its last heartbeat
+    // (src/node-registry.js's ONLINE_WINDOW_MS, 3x a 30s send interval), and
+    // it never counts an attached `GET /events` stream as liveness. `refresh()`
+    // alone left an open-but-idle phone showing offline after 90s, since the
+    // next refresh could be a 15-minute background wake away. RootTabView runs
+    // this for as long as the paired UI is up; cancelling the task ends it.
+    public static let heartbeatInterval: Duration = .seconds(30)
+
+    public static func sendHeartbeats(client: DaemonClient, every interval: Duration = heartbeatInterval) async {
+        while !Task.isCancelled {
+            _ = try? await client.heartbeat()
+            try? await Task.sleep(for: interval)
+        }
+    }
+
     public func drainQueue() async {
         for op in queue.all() {
             switch op.kind {

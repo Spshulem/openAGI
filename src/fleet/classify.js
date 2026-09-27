@@ -173,6 +173,8 @@ export function prReadiness(pr, localGit) {
   else if (sameBranch && local.head && pr.headOid && local.head !== pr.headOid) blockers.push("local head differs");
   // Unpushed work cannot be ruled out when git did not answer.
   else if (local.unreadable) blockers.push("local git unknown");
+  if (sameBranch && local.head === pr.headOid && local.dirty === true) blockers.push("uncommitted work");
+  else if (sameBranch && local.head === pr.headOid && Object.hasOwn(local, "dirty") && local.dirty === null) blockers.push("local worktree status unknown");
 
   const ci = pr.ci ?? {};
   if (CI_RED.has(ci.state) || ci.failing?.length) blockers.push(`CI red: ${ciNames(ci.failing)}`);
@@ -184,6 +186,7 @@ export function prReadiness(pr, localGit) {
   // Requested changes are work for the agent, not an approval for the owner.
   if (pr.reviewDecision === "CHANGES_REQUESTED") blockers.push("changes requested");
   if (pr.mergeState === "DIRTY" || pr.mergeable === "CONFLICTING") blockers.push("merge conflicts");
+  else if (pr.mergeState === "BEHIND") blockers.push("branch behind base");
   // GitHub computes mergeability lazily; unknown is never "ready".
   else if (!pr.mergeable || pr.mergeable === "UNKNOWN" || !pr.mergeState || pr.mergeState === "UNKNOWN") blockers.push("mergeability unknown");
   if (pr.codexReview?.reviewedHead === false) blockers.push("Codex review not on head");

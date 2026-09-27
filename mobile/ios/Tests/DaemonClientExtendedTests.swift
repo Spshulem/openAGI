@@ -182,6 +182,35 @@ final class DaemonClientExtendedTests: XCTestCase {
         XCTAssertEqual(request.url?.path, "/pending-actions/act_1/approve")
     }
 
+    // The daemon answers 400 with the tool's own `{ok:false, error}` when an
+    // approved action ran and failed. That body is the result, not a
+    // transport error: rejecting it made the Inbox say "Can't reach OpenAGI".
+    func testApprovePendingActionDecodesAFailedToolOutcomeFrom400() async throws {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"ok":false,"error":"smtp rejected the message"}"#.utf8))
+        }
+        let outcome = try await makeClient().approvePendingAction(id: "act_1")
+        XCTAssertFalse(outcome.ok)
+        XCTAssertEqual(outcome.error, "smtp rejected the message")
+    }
+
+    // Every other status still maps through the shared table.
+    func testApprovePendingActionKeepsTypedErrorsForOtherStatuses() async {
+        for (code, expected) in [(401, DaemonError.unauthorized), (404, .notFound), (409, .conflict), (410, .server(410))] {
+            StubProtocol.handler = { request in
+                (HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: nil, headerFields: nil)!,
+                 Data(#"{"error":"nope"}"#.utf8))
+            }
+            do {
+                _ = try await makeClient().approvePendingAction(id: "act_1")
+                XCTFail("expected a throw for \(code)")
+            } catch let error as DaemonError {
+                XCTAssertEqual(error, expected, "status \(code)")
+            } catch { XCTFail("unexpected \(error)") }
+        }
+    }
+
     func testDenyPendingActionSendsTheOptionalReason() async throws {
         StubProtocol.handler = { request in
             (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"id":"act_1","status":"denied"}"#.utf8))

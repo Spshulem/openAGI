@@ -2,10 +2,13 @@ package sh.openagi.mobile.widget
 
 import android.content.Context
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.glance.GlanceId
 import androidx.glance.GlanceModifier
 import androidx.glance.GlanceTheme
+import androidx.glance.LocalSize
+import androidx.glance.appwidget.SizeMode
 import androidx.glance.action.ActionParameters
 import androidx.glance.action.actionParametersOf
 import androidx.glance.action.actionStartActivity
@@ -38,6 +41,12 @@ import sh.openagi.mobile.sync.RefreshWorker
 // to it and whether a credential currently exists -- both cheap, synchronous,
 // on-device reads.
 class TodayWidget : GlanceAppWidget() {
+    // One layout per height band, so LocalSize reports the space the launcher
+    // actually gave rather than the 110dp minimum SizeMode.Single always does.
+    override val sizeMode = SizeMode.Responsive(
+        setOf(DpSize(180.dp, 110.dp), DpSize(180.dp, 140.dp), DpSize(180.dp, 180.dp)),
+    )
+
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         // SnapshotStore.load() already turns a missing or corrupt file into
         // null rather than throwing, and Credentials.load() returns null
@@ -87,8 +96,9 @@ private fun EmptyContent(state: WidgetState.Empty) {
 
 @Composable
 private fun TasksContent(state: WidgetState.Tasks) {
-    // Home-screen real estate is small; three rows is a widget, not the app.
-    state.items.take(3).forEach { item -> TaskRow(item) }
+    // Home-screen real estate is small; three rows is a widget, not the app,
+    // and fewer when the widget is sized too short to hold three.
+    state.items.take(WidgetState.rowsThatFit(LocalSize.current.height.value)).forEach { item -> TaskRow(item) }
     Text(
         text = countsLine(state.counts.today, state.counts.overdue),
         style = TextStyle(color = GlanceTheme.colors.onSurfaceVariant),
@@ -116,7 +126,8 @@ private fun TaskRow(item: TaskItem) {
                     ),
                 ),
         )
-        Text(text = item.title, style = TextStyle(color = GlanceTheme.colors.onBackground))
+        // One line, so a long title cannot undo rowsThatFit's arithmetic.
+        Text(text = item.title, style = TextStyle(color = GlanceTheme.colors.onBackground), maxLines = 1)
     }
 }
 
@@ -140,7 +151,7 @@ private fun UnreachableContent(state: WidgetState.Unreachable) {
         text = "Can't reach OpenAGI",
         style = TextStyle(color = GlanceTheme.colors.error, fontWeight = FontWeight.Bold),
     )
-    state.items.take(3).forEach { item -> TaskRow(item) }
+    state.items.take(WidgetState.rowsThatFit(LocalSize.current.height.value)).forEach { item -> TaskRow(item) }
     Text(
         text = countsLine(state.counts.today, state.counts.overdue),
         style = TextStyle(color = GlanceTheme.colors.onSurfaceVariant),

@@ -1,7 +1,7 @@
 // GitHub readiness for the PRs linked to fleet threads, plus the local git
 // facts needed to judge "CI green on the exact head". Read-only: every call
-// is a gh/git query. Nothing here throws; failures leave refs out of the map
-// or return nulls.
+// is a gh/git query. Failed branch lookups throw so a confirmed absence is
+// never confused with an unavailable GitHub response.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -224,11 +224,11 @@ export async function findPrForBranch(repo, branch, config, { run = runCommand, 
     result = await run(config.bins.gh, [
       "pr", "list", "--repo", repo, "--head", name, "--state", "all", "--json", "number,state,updatedAt,headRefOid"
     ], { timeoutMs: GH_TIMEOUT_MS });
-  } catch {
-    return null;
+  } catch (error) {
+    throw new Error(`PR branch lookup unavailable: ${error?.message ?? error}`);
   }
   const rows = result?.code === 0 ? parseJson(result.stdout) : null;
-  if (!Array.isArray(rows)) return null;
+  if (!Array.isArray(rows)) throw new Error("PR branch lookup unavailable");
   const candidates = rows.filter((row) => Number.isInteger(row?.number));
   if (!candidates.length) return null;
   const newestFirst = (a, b) => (Date.parse(b.updatedAt ?? "") || 0) - (Date.parse(a.updatedAt ?? "") || 0);
@@ -257,6 +257,18 @@ async function gitLine(run, config, cwd, args) {
   }
 }
 
+async function gitDirty(run, config, cwd) {
+  try {
+    const result = await run(config.bins.git, ["-C", cwd, "status", "--porcelain", "--untracked-files=normal"], {
+      timeoutMs: GIT_TIMEOUT_MS,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }
+    });
+    return result?.code === 0 ? Boolean(String(result.stdout ?? "").trim()) : null;
+  } catch {
+    return null;
+  }
+}
+
 // A .git at or above dir means a failed read is git not answering, not
 // "no repo here".
 function insideRepo(dir) {
@@ -272,7 +284,7 @@ function insideRepo(dir) {
 }
 
 export async function readLocalGit(cwd, config, { run = runCommand } = {}) {
-  const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null };
+  const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null, dirty: null };
   if (!cwd) return empty;
   // A missing dir, a denied volume, or a non-repo all fail here; skip the rest.
   // Inside a repo the failure is unknown local state, which blocks readiness.
@@ -285,11 +297,13 @@ export async function readLocalGit(cwd, config, { run = runCommand } = {}) {
   ]);
   const aheadText = upstream ? await gitLine(run, config, cwd, ["rev-list", "--count", "@{u}..HEAD"]) : null;
   const ahead = aheadText !== null && /^\d+$/.test(aheadText) ? Number(aheadText) : null;
+  const dirty = await gitDirty(run, config, cwd);
   return {
     head,
     branch: branch && branch !== "HEAD" ? branch : null,
     upstream,
     ahead,
-    remote: repoFromRemote(remoteUrl)
+    remote: repoFromRemote(remoteUrl),
+    dirty
   };
 }

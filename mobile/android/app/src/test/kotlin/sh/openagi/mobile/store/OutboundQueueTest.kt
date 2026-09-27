@@ -36,26 +36,28 @@ class OutboundQueueTest {
     }
 
     @Test
-    fun attemptsAreCountedAndCapped() {
+    fun failuresKeepTheCompletionQueued() {
         val queue = OutboundQueue(folder.root)
         val op = PendingOp.completeTask("task_4")
         queue.enqueue(op)
         repeat(OutboundQueue.MAX_ATTEMPTS) { queue.recordAttempt(op.id) }
-        assertTrue("an op that keeps failing must eventually be dropped", queue.all().isEmpty())
+        assertEquals(1, queue.all().size)
+        assertEquals(OutboundQueue.MAX_ATTEMPTS, queue.all().single().attempts)
     }
 
-    // The test above loops to OutboundQueue.MAX_ATTEMPTS itself, so it would
-    // pass for any cap value the implementation happens to check against —
-    // it is self-referential and proves nothing about the cap actually being
-    // 5. Pin the real number here instead.
+    // After five failures the op remains durable, including across a fresh
+    // queue instance, so reconnection can still deliver the completion.
     @Test
-    fun theCapIsExactlyFiveAttempts() {
+    fun exhaustionDoesNotHideAnUndeliveredTaskForever() {
         val queue = OutboundQueue(folder.root)
         val op = PendingOp.completeTask("task_5")
         queue.enqueue(op)
         repeat(4) { queue.recordAttempt(op.id) }
         assertEquals("must survive 4 failed attempts", 1, queue.all().size)
         queue.recordAttempt(op.id)
-        assertTrue("must be dropped after the 5th failed attempt", queue.all().isEmpty())
+        assertEquals(1, OutboundQueue(folder.root).all().size)
+        assertEquals(5, queue.all().single().attempts)
+        queue.recordAttempt(op.id)
+        assertEquals(5, queue.all().single().attempts)
     }
 }

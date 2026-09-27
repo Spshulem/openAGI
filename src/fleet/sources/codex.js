@@ -353,13 +353,17 @@ function buildThread(row, context) {
   return thread;
 }
 
-function readThreadRows(db, sinceMs, limit) {
+// One page, newest first. after is the last row of the previous page.
+function readThreadRows(db, sinceMs, limit, after = null) {
   const present = new Set(db.prepare("PRAGMA table_info(threads)").all().map((column) => column.name));
   if (!present.has("id") || !present.has("updated_at")) return [];
   const select = THREAD_COLUMNS.map((name) => (present.has(name) ? name : `NULL AS ${name}`));
   select.push(present.has("first_user_message") ? "substr(first_user_message, 1, 400) AS first_user_head" : "NULL AS first_user_head");
-  return db.prepare(`SELECT ${select.join(", ")} FROM threads WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT ?`)
-    .all(Math.floor(sinceMs / 1000), limit);
+  const since = Math.floor(sinceMs / 1000);
+  const page = after ? " AND (updated_at < ? OR (updated_at = ? AND id < ?))" : "";
+  const params = after ? [since, after.updated_at, after.updated_at, after.id, limit] : [since, limit];
+  return db.prepare(`SELECT ${select.join(", ")} FROM threads WHERE updated_at >= ?${page} ORDER BY updated_at DESC, id DESC LIMIT ?`)
+    .all(...params);
 }
 
 function headBranchOf(row) {
@@ -455,20 +459,30 @@ export async function listCodexThreads(config, options = {}) {
   if (!fs.existsSync(file)) return [];
   const db = await openReadOnlyDb(file);
   if (!db) throw new Error("Codex state database unavailable");
-  let rows;
-  let attachments;
+  const cutoff = now - config.lookbackHours * HOUR;
+  const pageSize = limits.maxThreads * 5;
+  const built = [];
   try {
-    // Guardian reviews dominate the catalog; fetch extra so the cap below
-    // never drops a real thread in favour of an excluded one.
-    rows = readThreadRows(db, now - config.lookbackHours * HOUR, limits.maxThreads * 5);
-    attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
+    // Guardian reviews, automation, and settings-only rows fill pages too,
+    // so read on until maxThreads in-scope threads are found or the
+    // lookback window runs out; no fixed row cap hides an older real thread.
+    for (let after = null, inScope = 0; inScope < limits.maxThreads;) {
+      const rows = readThreadRows(db, cutoff, pageSize, after);
+      const attachments = readPrAttachments(db, rows.map((row) => String(row.id)));
+      const context = { config, now, attachments, tailBytes: options.tailBytes ?? TAIL_BYTES };
+      for (const row of rows) {
+        const thread = buildThread(row, context);
+        // The catalog query lets settings-only writes through; the last turn decides.
+        if (Date.parse(thread.lastActivityAt ?? "") < cutoff) continue;
+        built.push(thread);
+        if (!thread.excluded) inScope += 1;
+      }
+      if (rows.length < pageSize) break;
+      after = rows.at(-1);
+    }
   } finally {
     try { db.close(); } catch { /* already closed */ }
   }
-  const context = { config, now, attachments, tailBytes: options.tailBytes ?? TAIL_BYTES };
-  // The catalog query lets settings-only writes through; the last turn decides.
-  const cutoff = now - config.lookbackHours * HOUR;
-  const built = rows.map((row) => buildThread(row, context)).filter((thread) => !(Date.parse(thread.lastActivityAt ?? "") < cutoff));
   const threads = capThreads(built, limits.maxThreads);
   const locked = await readWriterLocks(config, threads.map((thread) => thread.id), { run, isPidAlive });
   for (const thread of threads) thread.writerLocked = locked.has(thread.id);

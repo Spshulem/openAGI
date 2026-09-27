@@ -26,6 +26,15 @@ sealed class WidgetState {
         // Past this, old rows stop being information and start being a lie.
         const val STALE_AFTER_MINUTES = 60
 
+        // Both task layouts draw two single-line status lines around the rows,
+        // inside 12dp of padding. Glance's default text sits on about a 20dp
+        // line and a row adds 4dp above and below it. At the 110dp minimum
+        // only one row fits; three need roughly 150dp.
+        const val MAX_ROWS = 3
+
+        fun rowsThatFit(heightDp: Float): Int =
+            ((heightDp - 2 * 12f - 2 * 20f) / 28f).toInt().coerceIn(1, MAX_ROWS)
+
         fun from(snapshot: Snapshot?, paired: Boolean, now: Instant = Instant.now()): WidgetState {
             if (!paired) return Unpaired
             if (snapshot == null) return Empty("Open OpenAGI to sync")

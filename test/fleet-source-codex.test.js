@@ -445,6 +445,27 @@ test("listCodexThreads dates activity from the last turn row, not settings write
   assert.equal(map["t-bare"].lastActivityAt, iso(7 * MIN));
 });
 
+test("listCodexThreads reads past excluded rows until it has maxThreads in-scope threads", async (t) => {
+  const ctx = makeHome(t);
+  // maxThreads 2 reads pages of 10 rows.
+  const config = resolveFleetConfig({}, { home: ctx.home, bins: { lsof: "/fake/lsof" }, limits: { maxThreads: 2 } });
+  const idleLines = [ev.started("x", 45 * MIN), ev.complete("x", 40 * MIN, "ok")];
+  // Newer guardian reviews, all in one second so a page boundary splits the tie.
+  for (let i = 0; i < 12; i += 1) addThread(ctx, { id: `t-guardian-${String(i).padStart(2, "0")}`, threadSource: "guardian_review", updatedAgo: 2 * MIN });
+  // A settings-only reopen: a recent catalog row whose last turn is outside the lookback.
+  addThread(ctx, { id: "t-dormant", mtimeAgo: 3 * MIN, lines: [
+    ev.started("d1", 27 * 24 * 60 * MIN + MIN), ev.complete("d1", 27 * 24 * 60 * MIN, "done"), ev.settings(3 * MIN)
+  ] });
+  addThread(ctx, { id: "t-real-1", updatedAgo: 40 * MIN, mtimeAgo: 40 * MIN, lines: idleLines });
+  addThread(ctx, { id: "t-real-2", updatedAgo: 50 * MIN, mtimeAgo: 50 * MIN, lines: idleLines });
+  addThread(ctx, { id: "t-real-3", updatedAgo: 60 * MIN, mtimeAgo: 60 * MIN, lines: idleLines });
+
+  const threads = await listCodexThreads(config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) });
+  assert.deepEqual(threads.filter((thread) => !thread.excluded).map((thread) => thread.id), ["t-real-1", "t-real-2"]);
+  assert.equal(new Set(threads.map((thread) => thread.id)).size, threads.length, "no row is read twice across pages");
+  assert.equal(threads.some((thread) => thread.id === "t-dormant"), false);
+});
+
 test("listCodexThreads exposes when an aborted turn was stopped", async (t) => {
   const ctx = makeHome(t);
   addThread(ctx, { id: "t-stopped", mtimeAgo: MIN, lines: [

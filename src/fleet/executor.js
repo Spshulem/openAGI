@@ -302,12 +302,10 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       .catch((error) => ({ code: null, timedOut: false, error: error?.message ?? String(error) }))
       .then((result) => {
         const ok = !result?.error && !result?.timedOut && result?.code === 0;
-        // Spawn errors and non-zero exits never reached the agent, so they
-        // must not count toward "N nudges without progress". A timeout did.
-        if (!ok && !result?.timedOut) {
-          reached = false;
-          try { store?.undoAttempt?.(thread.key); } catch { /* best-effort */ }
-        }
+        // Spawn errors and non-zero exits never reached the agent; a timeout
+        // did. Only the caller knows whether this send was a counted nudge,
+        // so it gives the attempt back from done, not the executor.
+        if (!ok && !result?.timedOut) reached = false;
         if (!id) return;
         const output = result?.tail ?? `${result?.stdout ?? ""}\n${result?.stderr ?? ""}`;
         const detail = ok

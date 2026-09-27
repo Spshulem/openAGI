@@ -67,4 +67,17 @@ final class SummaryDecodingTests: XCTestCase {
         XCTAssertEqual(payload.serverURL.absoluteString, "http://mac.ts.net:43210")
         XCTAssertEqual(payload.code, "004221")
     }
+
+    // A replayed link for the daemon this phone already uses must not offer
+    // "Switch" (which revokes the working pairing), so comparison is by origin.
+    func testNamesSameDaemonComparesOrigins() {
+        let current = URL(string: "http://mac.ts.net:43210")!
+        XCTAssertTrue(PairingPayload.namesSameDaemon(current, URL(string: "http://MAC.ts.net:43210/")!))
+        XCTAssertTrue(PairingPayload.namesSameDaemon(current, URL(string: "HTTP://mac.ts.net:43210/setup")!))
+        XCTAssertTrue(PairingPayload.namesSameDaemon(URL(string: "https://openagi.example.com")!,
+                                                     URL(string: "https://openagi.example.com:443/")!))
+        XCTAssertFalse(PairingPayload.namesSameDaemon(current, URL(string: "http://mac.ts.net:43211")!))
+        XCTAssertFalse(PairingPayload.namesSameDaemon(current, URL(string: "https://mac.ts.net:43210")!))
+        XCTAssertFalse(PairingPayload.namesSameDaemon(current, URL(string: "http://other.ts.net:43210")!))
+    }
 }

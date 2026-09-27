@@ -115,6 +115,24 @@ class RefreshCoordinatorTest {
         assertEquals(1, OutboundQueue(folder.root).all().single().attempts)
     }
 
+    // The optimistic snapshot keeps hiding the row until the server stops
+    // listing it. Dropping the op after five offline drains left that row
+    // hidden with nothing left to deliver it; it must still go out on reconnect.
+    @Test
+    fun aCompletionThatOutlivesFiveFailedDrainsIsStillDeliveredOnReconnect() = runBlocking {
+        OutboundQueue(folder.root).enqueue(PendingOp.completeTask("task_1"))
+        repeat(OutboundQueue.MAX_ATTEMPTS + 1) {
+            server.enqueue(MockResponse().setResponseCode(503))
+            coordinator().drainQueue()
+        }
+        assertEquals(1, OutboundQueue(folder.root).all().size)
+
+        server.enqueue(MockResponse().setResponseCode(200).setBody("{}"))
+        coordinator().drainQueue()
+        assertTrue(OutboundQueue(folder.root).all().isEmpty())
+        repeat(OutboundQueue.MAX_ATTEMPTS + 2) { assertEquals("/tasks/task_1/complete", server.takeRequest().path) }
+    }
+
     @Test
     fun anUnauthorizedRefreshKeepsTheCachedSnapshot() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(200).setBody(fixture("summary-populated")))

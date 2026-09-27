@@ -36,6 +36,7 @@ import sh.openagi.mobile.protocol.Task
 import sh.openagi.mobile.protocol.TasksListResponse
 import sh.openagi.mobile.protocol.UpdateTaskRequest
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.TimeUnit
 
 // nodeId is validated upstream against ^[a-zA-Z0-9:_-]{1,240}$ and cannot carry
@@ -144,7 +145,7 @@ class DaemonClient(
     suspend fun getTask(id: String): Task = getJson("/tasks/$id", emptyMap(), Task.serializer())
 
     suspend fun updateTask(id: String, request: UpdateTaskRequest): Task =
-        patchJson("/tasks/$id", UpdateTaskRequest.serializer(), request, Task.serializer())
+        patchJson("/tasks/$id", JsonObject.serializer(), request.patchBody(), Task.serializer())
 
     // Completing via /tasks/:id/complete returns the full updated task, unlike
     // the bare complete() above (kept as-is: RefreshCoordinator's outbound

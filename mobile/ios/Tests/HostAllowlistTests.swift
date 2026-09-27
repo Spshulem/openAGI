@@ -62,6 +62,21 @@ final class HostAllowlistTests: XCTestCase {
         XCTAssertThrowsError(try HostAllowlist.validate(URL(string: "http://192.169.1.1:43210")!))
     }
 
+    // A pasted page URL must come back as its origin, or DaemonClient
+    // appends routes beneath the path (`/setup/nodes/enroll/exchange`).
+    func testValidateReturnsOnlyTheOrigin() throws {
+        let cases = [
+            ("https://openagi.example.com/setup", "https://openagi.example.com"),
+            ("https://openagi.example.com:8443/setup/?x=1#top", "https://openagi.example.com:8443"),
+            ("http://mac.tail1234.ts.net:43210/setup", "http://mac.tail1234.ts.net:43210"),
+            ("http://192.168.1.20:43210/", "http://192.168.1.20:43210"),
+            ("http://mac.tail1234.ts.net:43210", "http://mac.tail1234.ts.net:43210"),
+        ]
+        for (raw, expected) in cases {
+            XCTAssertEqual(try HostAllowlist.validate(URL(string: raw)!).absoluteString, expected, raw)
+        }
+    }
+
     // Review fix: mobile/PROTOCOL.md §10 refuses loopback unconditionally,
     // regardless of scheme — a phone can never reach its own loopback
     // address, so https://127.0.0.1 must not sail through on "https is

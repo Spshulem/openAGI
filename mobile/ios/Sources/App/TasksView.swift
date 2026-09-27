@@ -177,7 +177,7 @@ struct TasksView: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            let tasks = try await model.client.tasks(queue: queue.rawValue)
+            let tasks = try await model.client.tasks(queue: queue.rawValue, limit: Int.max)
             var grouped: [TaskBucket: [TaskRecord]] = [:]
             for task in tasks {
                 let bucket = TaskBucket(rawValue: task.bucket) ?? .someday

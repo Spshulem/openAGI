@@ -109,7 +109,9 @@ export function groupQuestions(asks, byKey) {
     const match = GROUPED_KINDS[kind]?.match;
     const sameChoices = !match || JSON.stringify(decision.question.options) === JSON.stringify(match);
     if (groups[kind] && sameChoices) { groups[kind].push(decision); continue; }
-    const titleKey = kind === "infra" && decision.question.options?.includes("retry") ? `${decision.threadKey}:${decision.question.title}` : decision.question.title;
+    const titleKey = kind === "infra" && !decision.question.options?.includes("retry")
+      ? `infra:${decision.question.title}`
+      : decision.question.dedupeKey ?? `${decision.threadKey}:${decision.question.title}:${decision.question.body}`;
     if (titles.has(titleKey)) continue;
     titles.add(titleKey);
     out.push(single(decision));
@@ -425,6 +427,11 @@ export class FleetSupervisor {
     // spends neither the thread's nudge budget nor its cooldown.
     const status = action.kind === "escalate-manager" && delivery.status === "sent" ? "escalated" : delivery.status;
     this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status }, action.progressMark);
+    // A counted nudge whose background child never reached the agent gives
+    // back that one attempt. Owner answers and escalations counted none.
+    if (status === "sent" && delivery.done) {
+      delivery.done.then((reached) => { if (!reached) this.store.undoAttempt(action.threadKey); }).catch(() => { /* best-effort */ });
+    }
   }
 
   async _tick(reason) {
@@ -613,6 +620,7 @@ export class FleetSupervisor {
         if (ref) thread.prRefs = [ref];
       } catch (error) {
         sourceErrors.prLookup = clampText(error?.message, 200);
+        if (cached?.ref) thread.prRefs = [cached.ref];
       }
     }
   }

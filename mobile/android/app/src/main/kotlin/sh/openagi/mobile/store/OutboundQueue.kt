@@ -72,10 +72,9 @@ class OutboundQueue(directory: File) {
             val index = ops.indexOfFirst { it.id == id }
             if (index < 0) return
             val bumped = ops[index].copy(attempts = ops[index].attempts + 1)
-            // An op that has failed this many times is not going to start working.
-            // Dropping it is better than a queue that retries forever on every
-            // background wake.
-            if (bumped.attempts >= MAX_ATTEMPTS) ops.removeAt(index) else ops[index] = bumped
+            // Keep the completion until the server accepts it or confirms it
+            // is already gone. Dropping it leaves the optimistic row hidden.
+            ops[index] = bumped.copy(attempts = minOf(bumped.attempts, MAX_ATTEMPTS))
             writeLocked(ops)
         }
     }
