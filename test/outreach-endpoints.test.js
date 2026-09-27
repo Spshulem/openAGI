@@ -63,6 +63,20 @@ test("POST /outreach/:id/act approves a draft via delegation and is idempotent",
   await app.close?.();
 });
 
+test("fleet dismissal waits for the selected computer before closing outreach", async () => {
+  const { runtime, app, base } = await bootApp();
+  const item = runtime.outreach.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: "fq_remote", nodeId: "selected-mac" },
+    title: "Remote question", needsDecision: true, actions: ["dismiss"] });
+  runtime.fleetSupervisor = { dismissQuestion: async () => { throw new Error("remote computer offline"); }, stop() {} };
+  const response = await fetch(`${base}/outreach/${item.id}/act`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "dismiss" })
+  });
+  assert.equal(response.status, 503);
+  assert.equal(runtime.outreach.get(item.id).status, "unseen");
+  assert.match((await response.json()).error, /remote computer offline/);
+  await app.close?.();
+});
+
 // Code-review finding: an unhandled sourceRef.kind (or a typo'd action)
 // silently fell through applyOutreachAction's switch default and was
 // recorded as a successful "acted" item instead of erroring — indistinguishable

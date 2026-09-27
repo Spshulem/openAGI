@@ -30,7 +30,9 @@ export class RemoteFleetSupervisor {
   getState() { return structuredClone(this.state); }
   async request(method, path, body) {
     try {
-      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: 120000 });
+      // Peer relays may take 180 seconds on the coding Mac. Leave time for
+      // its result to return before telling the owner that delivery failed.
+      const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: 200000 });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
       this.mirrorQuestions();
@@ -63,8 +65,8 @@ export class RemoteFleetSupervisor {
     if (!outreach) return;
     const openIds = new Set(this.state.questions.map(q => q.id));
     for (const item of outreach.list()) {
-      if (item.sourceRef?.kind === 'fleet' && item.sourceRef.nodeId === this.nodeId
-          && ['unseen', 'seen'].includes(item.status) && !openIds.has(item.sourceRef.id)) {
+      if (item.sourceRef?.kind === 'fleet' && ['unseen', 'seen'].includes(item.status)
+          && (item.sourceRef.nodeId !== this.nodeId || !openIds.has(item.sourceRef.id))) {
         outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
       }
     }

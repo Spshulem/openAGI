@@ -109,7 +109,7 @@ struct TasksView: View {
                                        secondaryText: secondaryText(for: task, in: bucket),
                                        secondaryIsAlert: isOverdue(task),
                                        isBusy: isLoading,
-                                       onComplete: task.status == "completed" ? nil : { Task { await complete(task) } })
+                                       onComplete: ["completed", "cancelled"].contains(task.status) ? nil : { Task { await complete(task) } })
                             }
                             .buttonStyle(.plain)
                             if index < tasks.count - 1 { RowHairline() }

@@ -224,6 +224,7 @@ struct ChatView: View {
     private func streamReply(text: String, replyID: UUID) async {
         do {
             let stream = try await model.client.sendMessageStreaming(text: text)
+            var receivedTerminal = false
             for try await event in stream {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
@@ -234,11 +235,13 @@ struct ChatView: View {
                         messages[index].text += frame.text
                     }
                 case .final(let frame):
+                    receivedTerminal = true
                     if let reply = frame.reply, !reply.isEmpty {
                         messages[index].text = reply
                     }
                     messages[index].isStreaming = false
                 case .failure(let frame):
+                    receivedTerminal = true
                     messages[index].text = frame.error ?? "OpenAGI couldn't reply. Try again."
                     messages[index].isStreaming = false
                     messages[index].isFailed = true
@@ -248,6 +251,10 @@ struct ChatView: View {
             }
             if let index = messages.firstIndex(where: { $0.id == replyID }) {
                 messages[index].isStreaming = false
+                if !receivedTerminal {
+                    messages[index].text = "Connection ended before OpenAGI finished. Try again."
+                    messages[index].isFailed = true
+                }
             }
         } catch let error as DaemonError {
             if let index = messages.firstIndex(where: { $0.id == replyID }) {

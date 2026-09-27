@@ -33,6 +33,7 @@ test('main routes fleet reads and mode changes only to the selected enrolled nod
   assert.equal(result.body.mode, 'propose');
   assert.equal(state.mode, 'propose');
   assert.ok(calls.every(c => c[0] === 'selected-mac' && c[1] === 'fleet-supervisor'));
+  assert.ok(calls.every(c => c[4].timeoutMs > 180_000), 'dispatch outlasts the peer relay timeout');
 });
 
 test('mirrored questions reach the existing G2 feed and close after an owner answer', async t => {
@@ -59,6 +60,15 @@ test('offline node retains last state and cannot falsely confirm an answer', asy
   assert.equal(remote.getState().questions.length, 1);
   assert.equal(runtime.outreach.list()[0].status, 'unseen');
   assert.match(remote.getState().lastError, /unavailable/);
+});
+
+test('successful refresh retires open questions from the previously selected node', async t => {
+  const { remote, runtime } = fixture(t);
+  const old = runtime.outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: 'fq_old', nodeId: 'old-mac' },
+    title: 'Old Mac question', needsDecision: true, actions: ['dismiss'] });
+  await remote.refresh();
+  assert.equal(runtime.outreach.get(old.id).status, 'dismissed');
+  assert.deepEqual(runtime.outreach.list({ status: 'unseen' }).map(item => item.sourceRef.id), ['fq_one']);
 });
 
 test('node capability refuses arbitrary routes, commands, and methods', async t => {
