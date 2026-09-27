@@ -69,3 +69,16 @@ test("runCommand never throws and reports timeouts", async () => {
   const slow = await runCommand(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { timeoutMs: 100 });
   assert.equal(slow.timedOut, true);
 });
+
+test("runCommand settles after a timeout even if SIGTERM is ignored or a descendant holds the pipes", async (t) => {
+  const within = (promise) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error("never settled")), 5000))]);
+  const stubborn = await within(runCommand(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { timeoutMs: 100, killGraceMs: 200 }));
+  assert.equal(stubborn.timedOut, true);
+  assert.equal(stubborn.code, null);
+  const parent = "const c = require('child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' }); process.stdout.write(c.pid + '\\n'); setInterval(() => {}, 1000)";
+  const held = await within(runCommand(process.execPath, ["-e", parent], { timeoutMs: 300, killGraceMs: 200 }));
+  assert.equal(held.timedOut, true);
+  const grandchild = Number(held.stdout.trim().split("\n")[0]);
+  t.after(() => { try { process.kill(grandchild, "SIGKILL"); } catch { /* already gone */ } });
+  assert.ok(grandchild > 0);
+});

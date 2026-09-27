@@ -140,9 +140,10 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
 }
 
 // Runs a child process and never throws. Timeouts kill only the child this
-// call spawned. Output is capped so a chatty command cannot exhaust memory.
+// call spawned (SIGTERM, then SIGKILL after a grace) and always settle.
+// Output is capped so a chatty command cannot exhaust memory.
 export function runCommand(cmd, args = [], options = {}) {
-  const { cwd, env, timeoutMs = 30_000, input, maxBytes = 4 * 1024 * 1024 } = options;
+  const { cwd, env, timeoutMs = 30_000, input, maxBytes = 4 * 1024 * 1024, killGraceMs = 5_000 } = options;
   return new Promise((resolve) => {
     let child;
     try {
@@ -155,15 +156,25 @@ export function runCommand(cmd, args = [], options = {}) {
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    let killTimer = null;
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(killTimer);
       resolve(result);
     };
     const timer = setTimeout(() => {
       timedOut = true;
       try { child.kill("SIGTERM"); } catch { /* already gone */ }
+      // A child that ignores SIGTERM, or a descendant still holding the
+      // pipes, must not keep the caller waiting forever.
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish({ code: null, stdout, stderr, timedOut: true, error: null });
+      }, killGraceMs);
     }, timeoutMs);
     child.stdout.on("data", (chunk) => { if (stdout.length < maxBytes) stdout += chunk.toString("utf8"); });
     child.stderr.on("data", (chunk) => { if (stderr.length < maxBytes) stderr += chunk.toString("utf8"); });

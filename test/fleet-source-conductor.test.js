@@ -276,6 +276,25 @@ test("open tasks count only while their Claude process is alive and started afte
   assert.equal(dead["s-wait"].agentStatus, "waiting");
 });
 
+test("zoneless message times read as UTC on a non-UTC machine", async (t) => {
+  const tz = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  t.after(() => { if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz; });
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  // Older Conductor builds left created_at to datetime('now'): UTC, no zone.
+  db.prepare(`INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run("m-tz-user", "s-idle", "user", "one more thing", sqliteTime(5 * MIN), iso(5 * MIN));
+  db.prepare(`INSERT INTO session_messages (id, session_id, role, content, created_at, sent_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run("m-tz-task", "s-wait", "assistant", JSON.stringify(sdk.taskStarted("s-wait", "tz-1", "bb-quick again")), sqliteTime(4 * MIN), iso(4 * MIN));
+  db.close();
+  writePeer(home, { pid: 701, sessionId: "claude-wait", name: "sydney-7a", status: "idle", entrypoint: "sdk-ts", updatedAt: NOW });
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: (pid) => pid === 701 }));
+  assert.equal(threads["s-idle"].lastUserAt, iso(5 * MIN));
+  assert.equal(threads["s-wait"].openTasks.find((task) => task.id === "tz-1")?.startedAt, iso(4 * MIN));
+});
+
 test("an aborted session exposes when the owner stopped it", async (t) => {
   const home = makeHome(t);
   seed(home);

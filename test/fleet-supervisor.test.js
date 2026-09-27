@@ -823,3 +823,83 @@ test("a grouped resume that the tick resolved mid-send is not reported as failed
   executor.settle("codex:a", true);
   executor.settle("codex:b", true);
 });
+
+test("manager escalations from a thread never spend that thread's nudge budget", async (t) => {
+  let now = NOW;
+  const waiting = makeThread({
+    key: "conductor:w1", kind: "conductor", id: "w1", workspace: "apia", cwd: "/work/w1", agentStatus: "waiting",
+    live: { peerName: "apia", pid: 7 }, lastAgentText: "bb-quick is running.",
+    openTasks: [{ id: "task1", description: "bb-quick on BuildBot3", startedAt: ago(20 * MIN) }]
+  });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [waiting], now: () => now, manager: makeManager() });
+  for (let hour = 0; hour < 3; hour += 1) {
+    await supervisor.tick({ reason: "test" });
+    now += 61 * MIN;
+  }
+  assert.equal(delivered.filter((d) => d.playbook === "manager-bb3").length, 3);
+  assert.equal(supervisor.store.ledgerFor("conductor:w1").attemptsWithoutProgress, 0);
+  // bb-quick ends on the same head: the agent gets its first real nudge.
+  waiting.openTasks = [];
+  waiting.agentStatus = "idle";
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.at(-1).thread.key, "conductor:w1");
+  assert.equal(supervisor.getState().questions.filter((q) => q.kind === "stuck").length, 0);
+});
+
+test("a GitHub outage keeps a ready question and proposals open", async (t) => {
+  let down = null;
+  const green = makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  const fetchPrStates = (pr) => async () => {
+    if (down === "throw") throw new Error("gh: 502");
+    return down ? new Map() : new Map([["acme/app#7", pr]]);
+  };
+  const { supervisor } = fixture(t, { deps: { fetchPrStates: fetchPrStates(green) } });
+  await supervisor.tick();
+  const [ready] = supervisor.getState().questions;
+  assert.ok(ready);
+  for (const mode of ["empty", "throw"]) {
+    down = mode;
+    await supervisor.tick();
+    assert.equal(supervisor.store.question(ready.id).status, "open");
+  }
+  down = null;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.store.openQuestions().map((q) => q.id), [ready.id]);
+
+  const proposing = fixture(t, { mode: "propose", deps: { fetchPrStates: fetchPrStates(makePr()) } });
+  await proposing.supervisor.tick();
+  const proposed = proposing.supervisor.getState().actions.find((a) => a.status === "proposed");
+  assert.ok(proposed);
+  down = "empty";
+  await proposing.supervisor.tick();
+  assert.equal(proposing.supervisor.store.action(proposed.id).status, "proposed");
+  down = null;
+  await proposing.supervisor.tick();
+  assert.deepEqual(proposing.supervisor.getState().actions.filter((a) => a.status === "proposed").map((a) => a.id), [proposed.id]);
+});
+
+test("remembered threads past the send cap or in a failed source resume on a later tick", async (t) => {
+  let now = NOW;
+  let codexFails = false;
+  const threads = ["t1", "t2", "t3"].map((id) => makeThread({ key: `codex:${id}`, id, cwd: `/work/${id}`, agentStatus: "aborted", error: null, prRefs: [] }));
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", threads, prs: new Map(), now: () => now, limits: { maxSendsPerTick: 2 },
+    deps: { listCodexThreads: async () => { if (codexFails) throw new Error("database is locked"); return threads; } }
+  });
+  supervisor.store.setInfraDown("lb", true);
+  supervisor.store.setInfraBlocked("lb", threads.map((x) => x.key));
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(delivered.map((d) => d.thread.key), ["codex:t1", "codex:t2"]);
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), ["codex:t3"]);
+  codexFails = true;
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 2);
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), ["codex:t3"]);
+  codexFails = false;
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.deepEqual(delivered.map((d) => d.thread.key), ["codex:t1", "codex:t2", "codex:t3"]);
+  assert.equal(delivered[2].playbook, "infra-recovered");
+  assert.deepEqual(supervisor.store.infraBlocked("lb"), []);
+});

@@ -70,7 +70,7 @@ function summarizeTail(rowsNewestFirst) {
     lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
-    const at = toIso(row.created_at);
+    const at = dbTimeToIso(row.created_at);
     summary.lastAt = latestIso(summary.lastAt, at);
     if (row.role === "user") {
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
@@ -127,7 +127,7 @@ function readOpenTasks(db, sessionId, sinceIso) {
         id: taskId,
         description: clampText(redactSecrets(event.description ?? ""), 120),
         kind: String(event.task_type ?? "task"),
-        startedAt: toIso(row.created_at)
+        startedAt: dbTimeToIso(row.created_at)
       });
     } else if (event.subtype === "task_notification") {
       open.delete(taskId);

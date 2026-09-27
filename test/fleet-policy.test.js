@@ -503,9 +503,13 @@ test("F5: recovery resumes threads remembered as blocked after their log rows ex
   const nudges = remembered.filter((d) => d.action === "nudge");
   assert.deepEqual(nudges.map((d) => d.threadKey), ["codex:x1"]);
   assert.equal(nudges[0].playbook, "infra-recovered");
-  // Remembered for the other infra does not count.
-  const other = decideInfra(infra, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto", blockedKeys: { bb3: ["codex:x1"], lb: [] } });
+  // Remembered for the other infra (still down) does not count.
+  const bb3Down = { ...infra, bb3: { ...bb3Base, reachable: false } };
+  const other = decideInfra(bb3Down, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto", blockedKeys: { bb3: ["codex:x1"], lb: [] } });
   assert.equal(other.filter((d) => d.action === "nudge").length, 0);
+  // Left over after the recovery tick: the resume is still offered.
+  const leftover = decideInfra(infra, { ledger: { infraDown: { lb: false, bb3: false } }, playbooks, config, now: NOW, threads: items, manager, mode: "auto", blockedKeys: { lb: ["codex:x1"], bb3: [] } });
+  assert.deepEqual(leftover.filter((d) => d.action === "nudge").map((d) => d.threadKey), ["codex:x1"]);
 });
 
 test("F2: muted threads get no recovery nudge and no decision", () => {

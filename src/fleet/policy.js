@@ -493,11 +493,13 @@ export function decideInfra(infra, options = {}) {
     const state = health[kind];
     const key = `infra:${kind}`;
     const wasDown = readLedger(ledger, "infraDown", kind) === true;
-    if (wasDown && state.up) {
-      decisions.push(infraDecision(key, { reason: `${INFRA_NAMES[kind]} recovered` }));
-      const remembered = keySet(blockedKeys?.[kind]);
+    const remembered = keySet(blockedKeys?.[kind]);
+    // Remembered threads left after the recovery tick (send cap, cooldown, a
+    // failed source) keep getting their resume until it was tried.
+    if (state.up && (wasDown || remembered.size)) {
+      if (wasDown) decisions.push(infraDecision(key, { reason: `${INFRA_NAMES[kind]} recovered` }));
       decisions.push(...recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, remembered, mutedKeys }));
-      continue;
+      if (wasDown) continue;
     }
     if (!state.problems.length) continue;
     // One failed SSH is often a blip; act when it fails on a second tick.

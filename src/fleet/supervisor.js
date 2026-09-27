@@ -413,7 +413,10 @@ export class FleetSupervisor {
     const incident = incidentKey(action);
     if (incident && ESCALATION_STATUSES.has(delivery.status)) this.store.recordEscalation(incident, at);
     if (String(action.threadKey ?? "").startsWith("infra:")) return;
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status: delivery.status }, action.progressMark);
+    // An escalation went to the manager, not this thread: history only, so it
+    // spends neither the thread's nudge budget nor its cooldown.
+    const status = action.kind === "escalate-manager" && delivery.status === "sent" ? "escalated" : delivery.status;
+    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status }, action.progressMark);
   }
 
   async _tick(reason) {
@@ -469,6 +472,8 @@ export class FleetSupervisor {
       // No result for a worktree means git timed out or threw: unknown, not clean.
       const git = localGit.get(thread.cwd) ?? (thread.cwd ? { unreadable: true } : null);
       const gitUnreadable = Boolean(git?.unreadable);
+      // A linked PR GitHub did not return (gh failed or timed out) is unknown, not gone.
+      const prUnreadable = !pr && !this.skip.github && Boolean(parsePrRef(thread.prRefs?.[0]));
       let classified;
       try {
         classified = classifyThread(thread, { pr, localGit: git, infra, now: started, config });
@@ -481,13 +486,12 @@ export class FleetSupervisor {
       } else {
         decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager });
       }
-      items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable });
+      items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
 
     const blockedKeys = { bb3: store.infraBlocked("bb3"), lb: store.infraBlocked("lb") };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys });
     const health = infraHealth(infra, { config, now: started });
-    this.trackInfraBlocked(health, items, blockedKeys);
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
     if (lb) store.setInfraDown("lb", health.lb.down);
 
@@ -502,7 +506,8 @@ export class FleetSupervisor {
     // A thread source that failed this tick is unknown, not empty: its
     // actions and questions wait for a tick that can see it.
     const unknownKinds = new Set(["codex", "claude", "conductor"].filter((kind) => sourceErrors[kind]));
-    await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds });
+    this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode });
 
     const finished = this.now();
     const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager });
@@ -512,9 +517,11 @@ export class FleetSupervisor {
     return snapshot;
   }
 
-  // While an outage lasts, remember every thread blocked on it; the recovery
-  // tick resumes them (policy reads blockedKeys) and then the list is cleared.
-  trackInfraBlocked(health, items, previous) {
+  // While an outage lasts, remember every thread blocked on it; once it is up,
+  // policy resumes them (it reads blockedKeys). A thread stays remembered
+  // until its resume was tried: one past the send cap, cooling down, or in a
+  // source that failed this tick waits for the next tick.
+  trackInfraBlocked(health, items, previous, { recovering = [], attempted = new Set(), unknownKinds = new Set(), mode = "observe" } = {}) {
     for (const kind of INFRA_KINDS) {
       if (health[kind].down) {
         const current = items
@@ -522,7 +529,11 @@ export class FleetSupervisor {
           .map(({ thread }) => thread.key);
         this.store.setInfraBlocked(kind, [...previous[kind], ...current]);
       } else if (health[kind].up) {
-        this.store.setInfraBlocked(kind, []);
+        const pending = new Set(recovering
+          .filter((decision) => !decision.threadKey.startsWith("infra:") && !attempted.has(decision.threadKey)
+            && (decision.action === "wait" || (decision.action === "nudge" && mode === "auto" && decision.route)))
+          .map((decision) => decision.threadKey));
+        this.store.setInfraBlocked(kind, previous[kind].filter((key) => pending.has(key) || unknownKinds.has(key.split(":")[0])));
       }
     }
   }
@@ -596,15 +607,17 @@ export class FleetSupervisor {
   async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set() }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
-    // A thread whose git read failed this tick is unknown too: its PR question
-    // must not close now and come back as a new push on the next good tick.
-    const gitUnknown = new Set(items.filter((item) => item.gitUnreadable).map(({ thread }) => thread.key));
+    // A thread whose git read or PR fetch failed this tick is unknown too: its
+    // PR question must not close now and come back as a new push next tick.
+    const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
     const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key));
     const at = new Date(started).toISOString();
     const asked = new Set();
     const openActions = store.actions(config.limits.maxActionsKept).filter((action) => OPEN_ACTION.has(action.status));
     const seenActions = new Set();
     let sends = 0;
+    // Threads a send was tried for this tick, whatever the outcome.
+    const attempted = new Set();
 
     const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
     for (const fields of groupQuestions(asks, byKey)) {
@@ -643,6 +656,7 @@ export class FleetSupervisor {
       }
       if (sends >= config.limits.maxSendsPerTick) continue;
       sends += 1;
+      attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
       else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
@@ -665,6 +679,7 @@ export class FleetSupervisor {
         this.resolveOutreach(question, "resolved", "dismissed");
       }
     }
+    return attempted;
   }
 
   buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager }) {
