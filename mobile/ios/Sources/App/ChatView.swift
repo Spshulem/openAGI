@@ -224,9 +224,9 @@ struct ChatView: View {
     }
 
     private func streamReply(text: String, replyID: UUID) async {
+        var receivedTerminal = false
         do {
             let stream = try await model.client.sendMessageStreaming(text: text)
-            var receivedTerminal = false
             for try await event in stream {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
@@ -261,6 +261,7 @@ struct ChatView: View {
                 }
             }
         } catch let error as DaemonError {
+            if receivedTerminal { return } // Keep a final reply or failure received before teardown.
             if let index = messages.firstIndex(where: { $0.id == replyID }) {
                 messages[index].text = error == .agentHostDisabled || error == .unauthorized
                     ? ChatErrorCopy.message(for: error)
@@ -270,6 +271,7 @@ struct ChatView: View {
                 messages[index].retrySafe = error == .agentHostDisabled
             }
         } catch {
+            if receivedTerminal { return }
             if let index = messages.firstIndex(where: { $0.id == replyID }) {
                 messages[index].text = "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again."
                 messages[index].isStreaming = false
