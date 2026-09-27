@@ -146,7 +146,7 @@ struct InboxView: View {
         await model.refreshInboxCounts()
     }
 
-    private func fetchResult<T>(_ operation: () async throws -> T) async -> Result<T, Error> {
+    private func fetchResult<T: Sendable>(_ operation: () async throws -> T) async -> Result<T, Error> {
         do { return .success(try await operation()) } catch { return .failure(error) }
     }
 }
