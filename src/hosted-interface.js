@@ -2251,6 +2251,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         const body = await readJson(req).catch(() => ({}));
         const action = String(body.action ?? "");
+        const fleetDismissId = action === "dismiss" && item.sourceRef?.kind === "fleet" ? item.sourceRef.id : null;
+        if (fleetDismissId) runtime.fleetSupervisor?.beginOutreachDecision?.(fleetDismissId);
         try {
           const applied = await applyOutreachAction(runtime, item, action, body.note);
           if (applied?.pendingAction) {
@@ -2270,6 +2272,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
           const updated = runtime.outreach.resolve(id, { action, by: "user" }, { status: "error", error: error.message });
           return sendJson(res, 400, { item: updated, error: error.message });
+        } finally {
+          if (fleetDismissId) runtime.fleetSupervisor?.finishOutreachDecision?.(fleetDismissId);
         }
       }
       if (method === "POST" && pathname.startsWith("/outreach/") && pathname.endsWith("/feedback")) {
@@ -3904,7 +3908,7 @@ async function applyOutreachAction(runtime, item, action, note) {
   if (action === "dismiss") {
     if (item.sourceRef?.kind === "fleet") {
       if (!runtime.fleetSupervisor) throw new Error("Fleet supervisor unavailable");
-      await runtime.fleetSupervisor.dismissQuestion(item.sourceRef.id, { preserveOutreachDecision: true });
+      await runtime.fleetSupervisor.dismissQuestion(item.sourceRef.id);
     }
     return;
   }

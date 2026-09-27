@@ -26,16 +26,25 @@ export class RemoteFleetSupervisor {
     this.state = { mode: 'observe', enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
     this.refreshing = null;
     this.timer = null;
+    this.pendingOutreachDecisions = new Map();
   }
   getState() { return structuredClone(this.state); }
-  async request(method, path, body, { preserveOutreachDecisionFor = null } = {}) {
+  beginOutreachDecision(id) {
+    this.pendingOutreachDecisions.set(id, (this.pendingOutreachDecisions.get(id) ?? 0) + 1);
+  }
+  finishOutreachDecision(id) {
+    const count = this.pendingOutreachDecisions.get(id) ?? 0;
+    if (count <= 1) this.pendingOutreachDecisions.delete(id);
+    else this.pendingOutreachDecisions.set(id, count - 1);
+  }
+  async request(method, path, body) {
     try {
       // Peer relays may take 180 seconds on the coding Mac. Leave time for
       // its result to return before telling the owner that delivery failed.
       const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: 200000 });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
-      this.mirrorQuestions({ preserveOutreachDecisionFor });
+      this.mirrorQuestions();
       if (result.response?.status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
       return result.response.body;
     } catch (error) {
@@ -51,10 +60,7 @@ export class RemoteFleetSupervisor {
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
   async answerQuestion(id, answer) { return this.request('POST', `/fleet/api/questions/${id}`, { answer }); }
-  async dismissQuestion(id, { preserveOutreachDecision = false } = {}) {
-    return (await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true },
-      { preserveOutreachDecisionFor: preserveOutreachDecision ? id : null })).question;
-  }
+  async dismissQuestion(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
   start() {
     if (this.timer) return;
@@ -63,14 +69,14 @@ export class RemoteFleetSupervisor {
     this.timer.unref?.();
   }
   stop() { clearInterval(this.timer); this.timer = null; }
-  mirrorQuestions({ preserveOutreachDecisionFor = null } = {}) {
+  mirrorQuestions() {
     const outreach = this.runtime.outreach;
     if (!outreach) return;
     const openIds = new Set(this.state.questions.map(q => q.id));
     for (const item of outreach.list()) {
       if (item.sourceRef?.kind === 'fleet' && ['unseen', 'seen'].includes(item.status)
           && (item.sourceRef.nodeId !== this.nodeId
-            || (!openIds.has(item.sourceRef.id) && item.sourceRef.id !== preserveOutreachDecisionFor))) {
+            || (!openIds.has(item.sourceRef.id) && !this.pendingOutreachDecisions.has(item.sourceRef.id)))) {
         outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
       }
     }

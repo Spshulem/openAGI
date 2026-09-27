@@ -67,9 +67,27 @@ test('an outreach dismissal preserves the owner decision until its route records
   const { remote, runtime } = fixture(t);
   await remote.refresh();
   const item = runtime.outreach.list()[0];
-  await remote.dismissQuestion('fq_one', { preserveOutreachDecision: true });
+  const dispatch = runtime.nodeCapabilities.dispatch;
+  let dismissalReached, releaseDismissal;
+  const reached = new Promise(resolve => { dismissalReached = resolve; });
+  const held = new Promise(resolve => { releaseDismissal = resolve; });
+  runtime.nodeCapabilities.dispatch = async (...args) => {
+    const result = await dispatch(...args);
+    if (args[3].path === '/fleet/api/questions/fq_one') {
+      dismissalReached();
+      await held;
+    }
+    return result;
+  };
+  remote.beginOutreachDecision('fq_one');
+  const dismissal = remote.dismissQuestion('fq_one');
+  await reached; // The computer has dismissed it, but main has not received that reply.
+  await remote.refresh(); // A concurrent refresh sees the now-empty question list.
+  releaseDismissal();
+  await dismissal;
   assert.equal(runtime.outreach.get(item.id).status, 'unseen');
   runtime.outreach.resolve(item.id, { action: 'dismiss', by: 'user', note: 'Use main' }, { status: 'dismissed' });
+  remote.finishOutreachDecision('fq_one');
   assert.deepEqual(runtime.outreach.get(item.id).decision, { action: 'dismiss', by: 'user', note: 'Use main' });
 });
 

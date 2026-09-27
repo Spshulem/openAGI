@@ -74,9 +74,8 @@ test("fleet dismissal waits for the selected computer before closing outreach", 
   assert.equal(response.status, 503);
   assert.equal(runtime.outreach.get(item.id).status, "unseen");
   assert.match((await response.json()).error, /remote computer offline/);
-  runtime.fleetSupervisor = { dismissQuestion: async (id, options) => {
+  runtime.fleetSupervisor = { dismissQuestion: async id => {
     assert.equal(id, "fq_remote");
-    assert.deepEqual(options, { preserveOutreachDecision: true });
     return { id, status: "dismissed" };
   }, stop() {} };
   const success = await fetch(`${base}/outreach/${item.id}/act`, {
