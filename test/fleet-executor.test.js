@@ -384,3 +384,17 @@ test("relay only accepts the exact DONE acknowledgement", async (t) => {
   const thread = claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 4242, status: "idle" } });
   for (let i = 0; i < 2; i++) assert.equal((await executor.deliver({ thread, message: "continue", route: "peer-relay" })).status, "failed");
 });
+
+test("claude-resume re-reads live peers at send time and never forks a live session", async (t) => {
+  const { cwd, config, store, calls, run } = setup(t);
+  const live = createExecutor({ config, run, store, readLivePeers: () => new Map([["s1", { peerName: "cairo-1f" }]]) });
+  const opened = await live.deliver({ thread: claudeThread(cwd), message: `${MESSAGE_PREFIX}continue`, route: "claude-resume" });
+  assert.equal(opened.status, "blocked");
+  assert.match(opened.detail, /live session/);
+  const broken = createExecutor({ config, run, store, readLivePeers: () => { throw new Error("EACCES"); } });
+  assert.equal((await broken.deliver({ thread: claudeThread(cwd), message: `${MESSAGE_PREFIX}continue`, route: "claude-resume" })).status, "blocked");
+  assert.equal(calls.length, 0);
+  const idle = createExecutor({ config, run, store, readLivePeers: () => new Map() });
+  assert.equal((await idle.deliver({ thread: claudeThread(cwd), message: `${MESSAGE_PREFIX}continue`, route: "claude-resume" })).status, "sent");
+  await idle.whenIdle();
+});

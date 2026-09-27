@@ -201,7 +201,7 @@ export class FleetSupervisor {
 
   get executor() {
     if (this.deps.executor) return this.deps.executor;
-    this._executor ??= createExecutor({ config: this.config, run: this.deps.run, store: this.store });
+    this._executor ??= createExecutor({ config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers });
     return this._executor;
   }
 
@@ -355,7 +355,7 @@ export class FleetSupervisor {
       if (delivery?.status === "sent" && question.kind === "limit" && answer === "added") {
         const stored = this.store.question(id);
         // A tick may have resolved the group mid-send; only an open one counts.
-        if (stored?.status === "open" && (question.threadKeys ?? []).some((key) => !(stored.deliveredThreadKeys ?? []).includes(key))) {
+        if (stored?.status === "open" && (stored.threadKeys ?? question.threadKeys ?? []).some((key) => !(stored.deliveredThreadKeys ?? []).includes(key))) {
           delivery = { ...delivery, status: "blocked", detail: "a resume failed before it reached its thread; answer again to retry" };
         }
       }
@@ -462,7 +462,7 @@ export class FleetSupervisor {
 
     const infra = {
       bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
-      lb: { healthy: lb?.healthy ?? null, detail: lb?.detail ?? null, watchLine: lb?.watchLine ?? null, recentErrors: lbErrors ?? [] },
+      lb: { healthy: lb?.healthy ?? null, detail: lb?.detail ?? null, watchLine: lb?.watchLine ?? null, recentErrors: lbErrors ?? [], errorsUnknown: Boolean(sourceErrors.lbErrors) },
       localVerify: (localVerify ?? []).map((row) => ({ ...row, threadKey: processes.matchThreadByCwd(row.cwd, inScope) }))
     };
 
@@ -669,8 +669,10 @@ export class FleetSupervisor {
       const existing = openActions.find((action) => action.threadKey === record.threadKey && action.playbook === record.playbook);
       if (existing) seenActions.add(existing.id);
 
-      if (mode !== "auto" || !target || !decision.route) {
-        const status = mode === "propose" && target && decision.route ? "proposed" : "planned";
+      // The live mode, not the tick's: the owner may have left Auto mid-scan.
+      const liveMode = this.mode;
+      if (liveMode !== "auto" || !target || !decision.route) {
+        const status = liveMode === "propose" && target && decision.route ? "proposed" : "planned";
         if (existing) store.updateAction(existing.id, { ...record, status, at });
         else store.recordAction({ ...record, status, at });
         continue;

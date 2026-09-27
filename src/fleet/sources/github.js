@@ -177,7 +177,10 @@ async function fetchBatch(batch, config, run, out, unread) {
   const aliases = new Map();
   for (const ref of batch) if (!aliases.has(ref.repo)) aliases.set(ref.repo, `r${aliases.size}`);
   for (const ref of batch) {
-    const node = data[aliases.get(ref.repo)]?.[`p${ref.number}`];
+    const repoNode = data[aliases.get(ref.repo)];
+    // A null repository alias is a partial GraphQL failure, not an answer.
+    if (!repoNode || typeof repoNode !== "object") { miss([ref]); continue; }
+    const node = repoNode[`p${ref.number}`];
     if (!node || typeof node !== "object") continue;
     try {
       const pr = normalizePr(ref.repo, node, config);

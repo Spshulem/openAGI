@@ -494,30 +494,30 @@ function retryThreadId(row) {
 export async function readCodexLbErrors(config, options = {}) {
   const now = options.now ?? Date.now();
   const windowMs = options.windowMs ?? LB_WINDOW_MS;
+  const file = path.join(config.paths.codexHome, "logs_2.sqlite");
+  // No log database is no errors; one that exists but cannot be read is
+  // unknown, so the LB is never declared recovered on missing evidence.
+  if (!fs.existsSync(file)) return [];
+  const db = await openReadOnlyDb(file);
+  if (!db) throw new Error("Codex retry log unreadable");
+  let rows;
   try {
-    const db = await openReadOnlyDb(path.join(config.paths.codexHome, "logs_2.sqlite"));
-    if (!db) return [];
-    let rows;
-    try {
-      rows = db.prepare(`SELECT ts, thread_id, feedback_log_body FROM logs
-        WHERE ts >= ? AND target = ? ORDER BY ts DESC LIMIT 5000`).all(Math.floor((now - windowMs) / 1000), LB_TARGET);
-    } finally {
-      try { db.close(); } catch { /* already closed */ }
-    }
-    const groups = new Map();
-    for (const row of rows) {
-      const kind = classifyLbError(row.feedback_log_body);
-      const group = groups.get(kind) ?? { kind, count: 0, lastAtSec: 0, threadIds: new Set() };
-      group.count += 1;
-      group.lastAtSec = Math.max(group.lastAtSec, Number(row.ts) || 0);
-      const id = retryThreadId(row);
-      if (id) group.threadIds.add(id);
-      groups.set(kind, group);
-    }
-    return [...groups.values()]
-      .sort((a, b) => b.count - a.count || b.lastAtSec - a.lastAtSec)
-      .map((group) => ({ kind: group.kind, count: group.count, lastAt: group.lastAtSec ? toIso(group.lastAtSec) : null, threadIds: [...group.threadIds] }));
-  } catch {
-    return [];
+    rows = db.prepare(`SELECT ts, thread_id, feedback_log_body FROM logs
+      WHERE ts >= ? AND target = ? ORDER BY ts DESC LIMIT 5000`).all(Math.floor((now - windowMs) / 1000), LB_TARGET);
+  } finally {
+    try { db.close(); } catch { /* already closed */ }
   }
+  const groups = new Map();
+  for (const row of rows) {
+    const kind = classifyLbError(row.feedback_log_body);
+    const group = groups.get(kind) ?? { kind, count: 0, lastAtSec: 0, threadIds: new Set() };
+    group.count += 1;
+    group.lastAtSec = Math.max(group.lastAtSec, Number(row.ts) || 0);
+    const id = retryThreadId(row);
+    if (id) group.threadIds.add(id);
+    groups.set(kind, group);
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.count - a.count || b.lastAtSec - a.lastAtSec)
+    .map((group) => ({ kind: group.kind, count: group.count, lastAt: group.lastAtSec ? toIso(group.lastAtSec) : null, threadIds: [...group.threadIds] }));
 }

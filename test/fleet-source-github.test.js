@@ -206,6 +206,14 @@ test("fetchPrStates reports refs GitHub could not answer, not refs it says are m
   assert.deepEqual([...missing], []);
 });
 
+test("fetchPrStates marks a null repository alias unread, not missing", async () => {
+  const unread = new Set();
+  const body = { data: { r0: null }, errors: [{ type: "INTERNAL", path: ["r0"], message: "Something went wrong" }] };
+  const prs = await fetchPrStates([`${BBAPP}#6878`], config(), { run: async () => ({ code: 1, stdout: JSON.stringify(body), stderr: "" }), unread });
+  assert.equal(prs.size, 0);
+  assert.deepEqual([...unread], [`${BBAPP}#6878`]);
+});
+
 test("fetchPrStates degrades to an empty map on failures", async () => {
   const refs = [`${BBAPP}#6878`];
   for (const result of [

@@ -187,7 +187,7 @@ function checkPreconditions(thread, route, message, config) {
   return null;
 }
 
-export function createExecutor({ config, run, store = null, logDir, spawnBackground } = {}) {
+export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null } = {}) {
   const runner = run ?? runCommand;
   // An injected run (tests, dry harnesses) also serves the background routes.
   const background = spawnBackground ?? (run ? run : spawnWithTail);
@@ -342,6 +342,13 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     };
     const reason = checkPreconditions(thread, route, message, config);
     if (reason) return blocked(reason);
+    // The scan's liveness is a snapshot; a session opened since then would fork.
+    if (route === "claude-resume" && readLivePeers) {
+      let peers = null;
+      try { peers = readLivePeers(config); } catch { /* unknown below */ }
+      if (!peers) return blocked("live-session check failed: scan again");
+      if ([thread.id, thread.claudeSessionId].some((id) => id && peers.has(id))) return blocked("live session: use peer-relay");
+    }
     if (active.has(thread.key)) return blocked("in flight: a send to this thread has not finished");
     const text = withPrefix(message);
     const step = plan(thread, route, text);

@@ -556,3 +556,24 @@ test("readLivePeers reports the process start time", (t) => {
   assert.equal(peers.get("c").startedAt, iso(30 * MIN));
   assert.equal(peers.get("d").startedAt, null);
 });
+
+test("an unreadable projects dir is a source failure; a missing one is empty", async (t) => {
+  const home = makeHome(t);
+  assert.deepEqual(await listClaudeThreads(makeConfig(home), { now: NOW }), []);
+  // A file where the directory should be makes readdir fail with ENOTDIR.
+  fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "projects"), "");
+  await assert.rejects(listClaudeThreads(makeConfig(home), { now: NOW }));
+});
+
+test("many newer excluded transcripts never hide an older in-scope one", async (t) => {
+  const home = makeHome(t);
+  for (let i = 0; i < 12; i += 1) {
+    const id = `tmp-${i}`;
+    writeTranscript(home, "/tmp/scratch", id, rowsFor(id, "/tmp/scratch").history(i * MIN + 20 * MIN), NOW - i * MIN);
+  }
+  const cwd = "/Users/x/Dev/repo";
+  writeTranscript(home, cwd, "real-old", rowsFor("real-old", cwd).history(120 * MIN), NOW - 100 * MIN);
+  const threads = await listClaudeThreads(makeConfig(home, { limits: { maxThreads: 1 } }), { now: NOW, isPidAlive: () => false });
+  assert.ok(threads.some((thread) => thread.id === "real-old" && !thread.excluded));
+});

@@ -947,3 +947,29 @@ test("a thread hidden by a failed source is remembered for an hour at most", asy
   await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 0);
 });
+
+test("leaving Auto mid-scan stops that tick's sends", async (t) => {
+  let supervisor = null;
+  const prMap = new Map([["acme/app#7", makePr()]]);
+  const built = fixture(t, { mode: "auto", deps: { fetchPrStates: async () => { supervisor.setMode("observe"); return prMap; } } });
+  supervisor = built.supervisor;
+  await supervisor.tick();
+  assert.equal(built.delivered.length, 0);
+  assert.equal(supervisor.getState().actions.filter((a) => a.status === "planned").length, 1);
+});
+
+test("a group widened while added is sending stays open for the new thread", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id }));
+  const { supervisor } = fixture(t, { threads });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["wait", "added"], threadKeys: ["codex:a"] });
+  const deliver = supervisor.executor.deliver;
+  supervisor.executor.deliver = async (args) => {
+    supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["wait", "added"], threadKeys: ["codex:a", "codex:b"] });
+    return deliver(args);
+  };
+  const result = await supervisor.answerQuestion(q.id, "added");
+  assert.equal(result.question.status, "open");
+  assert.equal(result.delivery.status, "blocked");
+});
+

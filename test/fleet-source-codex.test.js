@@ -465,3 +465,13 @@ test("structured questions preserve string and labeled options", () => {
     assert.deepEqual(parseRolloutTail(JSON.stringify(row)).pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] });
   }
 });
+
+test("readCodexLbErrors: no log db is empty, an unreadable one throws", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-codex-logs-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, ".codex"));
+  const config = resolveFleetConfig({}, { home });
+  assert.deepEqual(await readCodexLbErrors(config, { now: NOW }), []);
+  fs.writeFileSync(path.join(home, ".codex", "logs_2.sqlite"), "not a database, just bytes ".repeat(100));
+  await assert.rejects(readCodexLbErrors(config, { now: NOW }));
+});

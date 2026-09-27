@@ -471,7 +471,7 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
     },
     lb: {
       down: lb?.healthy === false || lbErrors.some((entry) => entry.kind !== "auth"),
-      up: lb?.healthy === true && lbErrors.length === 0,
+      up: lb?.healthy === true && lbErrors.length === 0 && lb?.errorsUnknown !== true,
       problems: lbProblems
     }
   };
