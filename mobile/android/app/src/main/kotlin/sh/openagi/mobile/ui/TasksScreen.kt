@@ -1,3 +1,5 @@
+@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+
 package sh.openagi.mobile.ui
 
 import android.content.Context
@@ -6,6 +8,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -249,13 +252,18 @@ fun TasksScreen(context: Context, credentials: Credentials, resumeSignal: Int = 
             onSave = { title, bucket, priority, dueDate, status ->
                 scope.launch {
                     try {
+                        val shouldComplete = status == "completed" && task.status != "completed"
                         client.updateTask(
                             task.id,
                             UpdateTaskRequest(
-                                title = title, bucket = bucket, priority = priority, status = status, dueDate = dueDate,
+                                title = title, bucket = bucket, priority = priority,
+                                status = if (shouldComplete) null else status, dueDate = dueDate,
                                 clearDueDate = dueDate == null && task.dueDate != null,
                             ),
                         )
+                        // PATCH alone skips the task-completed outcome and
+                        // dependent-task unblocking performed by this route.
+                        if (shouldComplete) client.completeTask(task.id)
                         editingTask = null
                         load()
                     } catch (daemonError: DaemonException) {
@@ -300,7 +308,10 @@ private fun TaskEditorDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (initial == null) "New task" else "Edit task", style = OpenAGIType.section) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
                 OutlinedTextField(
                     value = title,
                     onValueChange = { title = it },
@@ -311,7 +322,7 @@ private fun TaskEditorDialog(
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Bucket", style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         BucketFormat.ORDER.filter { it != "done" }.forEach { option ->
                             FilterChip(selected = bucket == option, onClick = { bucket = option }, label = { Text(BucketFormat.label(option)) })
                         }
@@ -321,7 +332,7 @@ private fun TaskEditorDialog(
                 if (initial != null) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("Status", style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             BucketFormat.STATUSES.forEach { option ->
                                 FilterChip(selected = status == option, onClick = { status = option }, label = { Text(BucketFormat.statusLabel(option)) })
                             }

@@ -197,7 +197,14 @@ fun ChatScreen(
     suspend fun runExchange(assistantId: Long, text: String) {
         isStreaming = true
         try {
-            client.sendMessageStream(text, from = from, sessionId = sessionId).collect { frame -> decodeFrame(assistantId, frame) }
+            var receivedTerminal = false
+            client.sendMessageStream(text, from = from, sessionId = sessionId).collect { frame ->
+                if (frame.event == "final" || frame.event == "failure") receivedTerminal = true
+                decodeFrame(assistantId, frame)
+            }
+            if (!receivedTerminal) {
+                applyFailure(assistantId, ErrorCopy.Message("Reply stopped early.", "Try again."))
+            }
         } catch (error: DaemonException) {
             applyFailure(assistantId, chatErrorCopy(error, credentials.server))
         } catch (error: Exception) {

@@ -172,10 +172,17 @@ struct TaskDetailView: View {
     private func save() async {
         isSaving = true
         defer { isSaving = false }
+        let shouldComplete = status == .completed && task.status != "completed"
         let patch = TaskPatch(title: title, bucket: bucket, priority: Int(priority),
-                              dueDate: .some(hasDueDate ? dueDate : nil), status: status)
+                              dueDate: .some(hasDueDate ? dueDate : nil), status: shouldComplete ? nil : status)
         do {
             _ = try await model.client.updateTask(id: task.id, patch: patch)
+            if shouldComplete {
+                // PATCH marks a task terminal but does not record its outcome
+                // or unblock dependents. The completion route does both.
+                try await model.client.complete(taskID: task.id)
+                WidgetReload.reloadToday()
+            }
             await onChanged()
             dismiss()
         } catch {

@@ -626,6 +626,18 @@ test("local git the supervisor could not read waits instead of asking to merge o
   assert.match(decision.reason, /local git unknown/);
 });
 
+test("a failed git status waits, but uncommitted work on the PR head is agent work", () => {
+  const unknown = run(makeThread(), { localGit: { ...cleanGit, dirty: null } }).decision;
+  assert.equal(unknown.action, "wait");
+  assert.equal(unknown.playbook ?? null, null);
+  assert.match(unknown.reason, /local git unknown/);
+  const dirty = run(makeThread(), { localGit: { ...cleanGit, dirty: true } }).decision;
+  assert.equal(dirty.action, "nudge");
+  assert.equal(dirty.playbook, "merge-ready");
+  assert.match(dirty.message, /uncommitted work/);
+  assert.equal(run(makeThread(), { localGit: { ...cleanGit, dirty: false } }).decision.question?.kind, "ready");
+});
+
 test("an unreadable retry log keeps the LB unknown, never recovered", () => {
   const lb = { healthy: true, detail: "200", watchLine: null, recentErrors: [], errorsUnknown: true };
   const health = infraHealth({ bb3: bb3Base, lb }, { config, now: NOW });

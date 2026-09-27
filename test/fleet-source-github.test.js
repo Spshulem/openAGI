@@ -121,7 +121,7 @@ test("buildPrQuery batches refs by repository with safe aliases", () => {
   ]);
   assert.match(query, /r0: repository\(owner:"buildbetter-app",name:"buildbetter"\)\{ p6878: pullRequest\(number:6878\)\{\.\.\.P\} p6849: pullRequest\(number:6849\)\{\.\.\.P\} \}/);
   assert.match(query, /r1: repository\(owner:"Spshulem",name:"openAGI"\)\{ p108: pullRequest\(number:108\)\{\.\.\.P\} \}/);
-  assert.match(query, /comments\(last:30\)\{nodes\{author\{login\} body createdAt\}\}/);
+  assert.match(query, /comments\(last:30\)\{pageInfo\{hasPreviousPage\} nodes\{author\{login\} body createdAt\}\}/);
   assert.match(query, /files\(first:100\)\{pageInfo\{hasNextPage\} nodes\{path\}\}/);
   assert.match(query, /reviewThreads\(first:100\)\{totalCount pageInfo\{hasNextPage\}/);
   assert.match(query, /statusCheckRollup\{state contexts\(first:30\)/);
@@ -269,6 +269,15 @@ test("Codex review on an older commit or still running is not on head", async ()
   body.body = body.body.replace("✅ **Completed**", "👀 **In progress**");
   pr = (await fetchPrStates([`${BBAPP}#6878`], config(), { run: fakeRun(() => ok(running)).run })).get(`${BBAPP}#6878`);
   assert.deepEqual(pr.codexReview, { reviewedHead: false, sha: "95720cc" });
+});
+
+test("a Codex summary outside the last comment page cannot satisfy review readiness", () => {
+  const response = capturedResponse().data.r0.p6878;
+  response.comments.nodes = response.comments.nodes.filter((comment) => !comment.body.includes("codex-pull-request-review-summary"));
+  response.comments.pageInfo = { hasPreviousPage: true };
+  assert.deepEqual(normalizePr(BBAPP, response, config()).codexReview, { reviewedHead: false, sha: null });
+  response.comments.pageInfo.hasPreviousPage = false;
+  assert.deepEqual(normalizePr(BBAPP, response, config()).codexReview, { reviewedHead: null, sha: null });
 });
 
 test("QA evidence comes from the latest screenshots comment for this PR", async () => {

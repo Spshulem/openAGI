@@ -32,7 +32,7 @@ const PR_FRAGMENT = [
   " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:30){nodes{__typename",
   " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state}}}}}}}",
   " reviewThreads(first:100){totalCount pageInfo{hasNextPage} nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
-  " comments(last:30){nodes{author{login} body createdAt}}",
+  " comments(last:30){pageInfo{hasPreviousPage} nodes{author{login} body createdAt}}",
   " files(first:100){pageInfo{hasNextPage} nodes{path}} }"
 ].join("");
 
@@ -98,9 +98,11 @@ function summarizeChecks(commit, headOid) {
 
 // The Codex bot keeps one summary comment per PR and edits it in place:
 // "| 📝 **Code Review** | ✅ **Completed** <time> | `95720cc` | New commits |".
-function codexReviewFor(comments, headOid) {
+function codexReviewFor(comments, headOid, commentsTruncated = false) {
   const summary = comments.filter((comment) => String(comment?.body ?? "").includes(CODEX_SUMMARY_MARKER)).at(-1);
-  if (!summary) return { reviewedHead: null, sha: null };
+  // The bot edits its original summary in place. If that comment fell off
+  // the last page, its absence is not evidence that the head was reviewed.
+  if (!summary) return { reviewedHead: commentsTruncated ? false : null, sha: null };
   const lines = String(summary.body).split("\n");
   const row = lines.find((line) => /Code Review/i.test(line)) ?? lines.find((line) => /`[0-9a-f]{7,40}`/i.test(line)) ?? "";
   const sha = /`([0-9a-f]{7,40})`/i.exec(row)?.[1]?.toLowerCase() ?? null;
@@ -149,7 +151,7 @@ export function normalizePr(repo, node, config) {
     unresolvedThreads: (node.reviewThreads?.nodes ?? []).filter((thread) => thread && !thread.isResolved).length,
     // More than 100 threads: unread pages may hold unresolved ones.
     threadsTruncated: node.reviewThreads?.pageInfo?.hasNextPage === true,
-    codexReview: codexReviewFor(comments, headOid),
+    codexReview: codexReviewFor(comments, headOid, node.comments?.pageInfo?.hasPreviousPage === true),
     qa: qaFor(number, headOid, comments, files, uiPrefixesFor(repo, config), node.files?.pageInfo?.hasNextPage === true),
     updatedAt: node.updatedAt ?? null
   };

@@ -41,6 +41,7 @@ import sh.openagi.mobile.ui.components.RowGroup
 import sh.openagi.mobile.ui.components.ScreenHeader
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
+import sh.openagi.mobile.util.ErrorCopy
 import sh.openagi.mobile.util.RelativeTime
 import java.time.Instant
 
@@ -65,6 +66,8 @@ fun InboxScreen(
 
     var load by remember { mutableStateOf<InboxLoadResult?>(null) }
     var openAction by remember { mutableStateOf<PendingAction?>(null) }
+    var approvalError by remember { mutableStateOf<String?>(null) }
+    var approvalResolved by remember { mutableStateOf(false) }
     var openClarification by remember { mutableStateOf<Clarification?>(null) }
     var lastSyncedAgo by remember { mutableStateOf<Int?>(null) }
     var lastLoadFullyFailed by remember { mutableStateOf(false) }
@@ -110,7 +113,7 @@ fun InboxScreen(
                         InboxRowData(
                             title = action.summary.ifBlank { action.toolName },
                             subtitle = action.createdAt?.let { "Raised " + RelativeTime.short(minutesAgo(it)) + " ago" },
-                            onClick = { openAction = action },
+                            onClick = { approvalError = null; approvalResolved = false; openAction = action },
                         )
                     },
                 )
@@ -134,18 +137,27 @@ fun InboxScreen(
     openAction?.let { action ->
         ApprovalDetailDialog(
             action = action,
-            onDismiss = { openAction = null },
+            error = approvalError,
+            resolved = approvalResolved,
+            onDismiss = { openAction = null; approvalError = null; approvalResolved = false },
             onApprove = {
                 scope.launch {
                     try {
-                        client.approveAction(action.id)
+                        val result = client.approveAction(action.id)
+                        if (!result.ok) {
+                            approvalError = result.error?.takeIf { it.isNotBlank() } ?: "The approved action failed."
+                            approvalResolved = true
+                            refresh()
+                            return@launch
+                        }
                     } catch (error: Exception) {
-                        // The daemon's own approve response already carries the
-                        // failure reason when the tool itself failed; a
-                        // transport/auth failure here just means the list will
-                        // still show it as pending on the next load.
+                        approvalError = if (error is sh.openagi.mobile.transport.DaemonException) {
+                            ErrorCopy.forDaemon(error, credentials.server).headline
+                        } else "Couldn't approve that action. Try again."
+                        return@launch
                     }
                     openAction = null
+                    approvalError = null
                     refresh()
                 }
             },
@@ -239,7 +251,7 @@ private fun InboxInlineMessage(text: String, isAlert: Boolean) {
 }
 
 @Composable
-private fun ApprovalDetailDialog(action: PendingAction, onDismiss: () -> Unit, onApprove: () -> Unit, onDeny: (String) -> Unit) {
+private fun ApprovalDetailDialog(action: PendingAction, error: String?, resolved: Boolean, onDismiss: () -> Unit, onApprove: () -> Unit, onDeny: (String) -> Unit) {
     var denying by remember { mutableStateOf(false) }
     var reason by remember { mutableStateOf("") }
     val colors = LocalOpenAGIColors.current
@@ -253,6 +265,7 @@ private fun ApprovalDetailDialog(action: PendingAction, onDismiss: () -> Unit, o
                     Text(action.summary, style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
                 }
                 action.reason?.let { Text(it, style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                error?.let { Text(it, style = OpenAGIType.secondary, color = colors.alert) }
                 action.args?.let { args ->
                     Text("Arguments", style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(
@@ -273,14 +286,18 @@ private fun ApprovalDetailDialog(action: PendingAction, onDismiss: () -> Unit, o
             }
         },
         confirmButton = {
-            if (denying) {
+            if (resolved) {
+                PrimaryButton(text = "Close", onClick = onDismiss)
+            } else if (denying) {
                 PrimaryButton(text = "Deny", onClick = { onDeny(reason) })
             } else {
                 PrimaryButton(text = "Approve", onClick = onApprove)
             }
         },
         dismissButton = {
-            if (denying) {
+            if (resolved) {
+                // The daemon has consumed this approval. There is no retry.
+            } else if (denying) {
                 TextButton(onClick = { denying = false }) { Text("Back") }
             } else {
                 DestructiveTextButton(text = "Deny", onClick = { denying = true })
