@@ -745,3 +745,81 @@ test("a new local head is a new PR lookup, not a cached answer", async (t) => {
   await supervisor.tick();
   assert.deepEqual(seen, [HEAD, "f".repeat(40)]);
 });
+
+test("cached PR refs survive a git failure and a spent lookup budget", async (t) => {
+  let gitBroken = false;
+  let head = HEAD;
+  const ids = Array.from({ length: 10 }, (_, i) => `t${i}`);
+  const fresh = () => ids.map((id) => makeThread({ key: `codex:${id}`, id, cwd: `/work/${id}`, branch: `spencer/${id}`, prRefs: [] }));
+  const prs = new Map(ids.map((id, i) => [`acme/app#${i + 1}`, makePr({ ref: `acme/app#${i + 1}`, number: i + 1, headRef: `spencer/${id}` })]));
+  const { supervisor } = fixture(t, {
+    prs,
+    deps: {
+      listCodexThreads: async () => fresh(),
+      readLocalGit: async (cwd) => { if (gitBroken) throw new Error("git timed out"); return { head, branch: `spencer/${path.basename(cwd)}`, upstream: null, ahead: 0, remote: "acme/app" }; },
+      findPrForBranch: async (repo, branch) => `acme/app#${Number(branch.slice("spencer/t".length)) + 1}`
+    }
+  });
+  await supervisor.tick();
+  await supervisor.tick();
+  assert.ok((await supervisor.tick()).threads.every((row) => row.pr), "all ten resolved and cached");
+  gitBroken = true;
+  assert.ok((await supervisor.tick()).threads.every((row) => row.pr), "unknown head keeps the cache");
+  gitBroken = false;
+  head = "f".repeat(40);
+  assert.ok((await supervisor.tick()).threads.every((row) => row.pr), "past the lookup budget the cached ref stays");
+});
+
+test("a failed source never splits its open group into a second question", async (t) => {
+  let broken = false;
+  const capped = (id, kind) => makeThread({ key: `${kind}:${id}`, kind, id, cwd: `/work/${id}`, agentStatus: "error", error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() } });
+  const threads = [capped("a", "codex"), capped("b", "claude")];
+  const { supervisor, notified } = fixture(t, {
+    threads,
+    deps: { listCodexThreads: async () => { if (broken) throw new Error("database is locked"); return threads.filter((x) => x.kind === "codex"); } }
+  });
+  await supervisor.tick();
+  const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
+  assert.ok(group);
+  const before = notified.length;
+  broken = true;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.id), [group.id]);
+  assert.equal(notified.slice(before).some((q) => q.id !== group.id), false);
+});
+
+test("a git failure keeps the ready question of a thread whose repo only git knew", async (t) => {
+  let gitBroken = false;
+  const green = makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  const { supervisor } = fixture(t, {
+    prs: new Map([["acme/app#7", green]]),
+    deps: {
+      listCodexThreads: async () => [makeThread({ repo: null, prRefs: [] })],
+      readLocalGit: async () => { if (gitBroken) throw new Error("git timed out"); return { head: HEAD, branch: "spencer/fix", upstream: "origin/spencer/fix", ahead: 0, remote: "acme/app" }; },
+      findPrForBranch: async () => "acme/app#7"
+    }
+  });
+  await supervisor.tick();
+  const [ready] = supervisor.getState().questions;
+  assert.ok(ready);
+  gitBroken = true;
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(ready.id).status, "open");
+});
+
+test("a grouped resume that the tick resolved mid-send is not reported as failed", async (t) => {
+  const threads = ["a", "b"].map((id) => makeThread({ key: `codex:${id}`, id }));
+  const executor = heldExecutor();
+  const { supervisor } = fixture(t, { threads, deps: { executor } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["wait", "added"], threadKeys: threads.map((x) => x.key) });
+  const deliver = executor.deliver;
+  executor.deliver = async (args) => {
+    if (args.thread.key === "codex:b") supervisor.store.resolveQuestion(q.id);
+    return deliver(args);
+  };
+  const result = await supervisor.answerQuestion(q.id, "added");
+  assert.equal(result.delivery.status, "sent");
+  executor.settle("codex:a", true);
+  executor.settle("codex:b", true);
+});

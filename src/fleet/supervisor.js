@@ -351,8 +351,9 @@ export class FleetSupervisor {
       // A background resume can fail while the others are still sending;
       // the group closes only once every thread has it.
       if (delivery?.status === "sent" && question.kind === "limit" && answer === "added") {
-        const delivered = this.store.question(id)?.deliveredThreadKeys ?? [];
-        if ((question.threadKeys ?? []).some((key) => !delivered.includes(key))) {
+        const stored = this.store.question(id);
+        // A tick may have resolved the group mid-send; only an open one counts.
+        if (stored?.status === "open" && (question.threadKeys ?? []).some((key) => !(stored.deliveredThreadKeys ?? []).includes(key))) {
           delivery = { ...delivery, status: "blocked", detail: "a resume failed before it reached its thread; answer again to retry" };
         }
       }
@@ -467,6 +468,7 @@ export class FleetSupervisor {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
       // No result for a worktree means git timed out or threw: unknown, not clean.
       const git = localGit.get(thread.cwd) ?? (thread.cwd ? { unreadable: true } : null);
+      const gitUnreadable = Boolean(git?.unreadable);
       let classified;
       try {
         classified = classifyThread(thread, { pr, localGit: git, infra, now: started, config });
@@ -479,7 +481,7 @@ export class FleetSupervisor {
       } else {
         decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager });
       }
-      items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision });
+      items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable });
     }
 
     const blockedKeys = { bb3: store.infraBlocked("bb3"), lb: store.infraBlocked("lb") };
@@ -559,7 +561,10 @@ export class FleetSupervisor {
       const git = localGit.get(thread.cwd);
       const head = git?.branch === thread.branch ? (git.head ?? null) : null;
       const cached = this.branchLookups.get(cacheKey);
-      if (cached && cached.head === head && now - cached.at < BRANCH_LOOKUP_TTL_MS) {
+      const fresh = cached && now - cached.at < BRANCH_LOOKUP_TTL_MS;
+      // An unknown head (git failed) keeps the cached answer, and so does a
+      // thread past this tick's lookup budget: the last answer beats none.
+      if (fresh && (head === null || cached.head === head || lookups >= MAX_BRANCH_LOOKUPS)) {
         if (cached.ref) thread.prRefs = [cached.ref];
         continue;
       }
@@ -593,7 +598,7 @@ export class FleetSupervisor {
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read failed this tick is unknown too: its PR question
     // must not close now and come back as a new push on the next good tick.
-    const gitUnknown = new Set(items.filter(({ classified }) => (classified.blockers ?? []).includes("local git unknown")).map(({ thread }) => thread.key));
+    const gitUnknown = new Set(items.filter((item) => item.gitUnreadable).map(({ thread }) => thread.key));
     const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key));
     const at = new Date(started).toISOString();
     const asked = new Set();
@@ -603,9 +608,13 @@ export class FleetSupervisor {
 
     const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
     for (const fields of groupQuestions(asks, byKey)) {
-      // Rebuilt without a failed source's threads, a group would drop them;
-      // the open one stays as it is until that source reads again.
-      const open = fields.threadKeys && unknownKinds.size ? store.openQuestions().find((q) => q.dedupeKey === fields.dedupeKey) : null;
+      // Rebuilt without a failed source's threads, a group would drop them,
+      // or shrink to one thread and ask it twice; the open group stays as it
+      // is until that source reads again.
+      const spec = unknownKinds.size ? GROUPED_KINDS[fields.kind] : null;
+      const covers = (q) => (fields.threadKeys ? true : (q.threadKeys ?? []).includes(fields.threadKey));
+      const sameChoices = spec && (fields.threadKeys || JSON.stringify(fields.options) === JSON.stringify(spec.options));
+      const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
       const question = store.upsertQuestion(fields);
       asked.add(question.dedupeKey);
