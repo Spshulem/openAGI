@@ -29,4 +29,10 @@ final class ChatRetryTests: XCTestCase {
         let (messages, _) = conversation()
         XCTAssertNil(ChatRetry.target(failedID: UUID(), in: messages, isSending: false))
     }
+
+    func testInterruptedTurnCannotBeBlindlyResent() {
+        var (messages, failedID) = conversation()
+        messages[3].retrySafe = false
+        XCTAssertNil(ChatRetry.target(failedID: failedID, in: messages, isSending: false))
+    }
 }

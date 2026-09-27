@@ -3904,7 +3904,7 @@ async function applyOutreachAction(runtime, item, action, note) {
   if (action === "dismiss") {
     if (item.sourceRef?.kind === "fleet") {
       if (!runtime.fleetSupervisor) throw new Error("Fleet supervisor unavailable");
-      await runtime.fleetSupervisor.dismissQuestion(item.sourceRef.id);
+      await runtime.fleetSupervisor.dismissQuestion(item.sourceRef.id, { preserveOutreachDecision: true });
     }
     return;
   }

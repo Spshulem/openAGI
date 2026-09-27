@@ -102,7 +102,9 @@ class DaemonClient(
         client.newBuilder().readTimeout(120, TimeUnit.SECONDS).build()
     }
     private val relayClient: OkHttpClient by lazy {
-        client.newBuilder().readTimeout(200, TimeUnit.SECONDS).build()
+        // Main may wait 200s for the coding Mac; leave time for the daemon
+        // to serialize the confirmed result before this phone gives up.
+        client.newBuilder().readTimeout(240, TimeUnit.SECONDS).build()
     }
 
     suspend fun summary(ifNoneMatch: String?): SummaryResponse = withContext(Dispatchers.IO) {

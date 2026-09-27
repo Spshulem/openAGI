@@ -13,7 +13,8 @@ function fixture(t) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const state = { mode: 'observe', enabled: true, lastError: null, snapshot: { threads: [] }, questions: [{ id: 'fq_one', title: 'Which branch?', body: 'Pick a branch', options: ['feature', 'main'] }], actions: [] };
   const supervisor = { getState: () => structuredClone(state), tick: async () => state.snapshot, setMode: mode => (state.mode = mode),
-    answerQuestion: async (id, answer) => { const question = state.questions.find(q => q.id === id); state.questions = []; return { question: { ...question, status: 'answered', answer }, delivery: { status: 'sent' } }; } };
+    answerQuestion: async (id, answer) => { const question = state.questions.find(q => q.id === id); state.questions = []; return { question: { ...question, status: 'answered', answer }, delivery: { status: 'sent' } }; },
+    dismissQuestion: async id => { const question = state.questions.find(q => q.id === id); state.questions = []; return { ...question, status: 'dismissed' }; } };
   const capability = createFleetCapability(supervisor);
   const calls = [];
   const runtime = { outreach: new OutreachStore({ dir: path.join(dir, 'outreach') }), nodeCapabilities: { dispatch: async (...args) => {
@@ -60,6 +61,16 @@ test('offline node retains last state and cannot falsely confirm an answer', asy
   assert.equal(remote.getState().questions.length, 1);
   assert.equal(runtime.outreach.list()[0].status, 'unseen');
   assert.match(remote.getState().lastError, /unavailable/);
+});
+
+test('an outreach dismissal preserves the owner decision until its route records it', async t => {
+  const { remote, runtime } = fixture(t);
+  await remote.refresh();
+  const item = runtime.outreach.list()[0];
+  await remote.dismissQuestion('fq_one', { preserveOutreachDecision: true });
+  assert.equal(runtime.outreach.get(item.id).status, 'unseen');
+  runtime.outreach.resolve(item.id, { action: 'dismiss', by: 'user', note: 'Use main' }, { status: 'dismissed' });
+  assert.deepEqual(runtime.outreach.get(item.id).decision, { action: 'dismiss', by: 'user', note: 'Use main' });
 });
 
 test('successful refresh retires open questions from the previously selected node', async t => {
