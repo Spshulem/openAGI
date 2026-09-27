@@ -1,0 +1,118 @@
+package sh.openagi.mobile.widget
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import sh.openagi.mobile.protocol.Brief
+import sh.openagi.mobile.protocol.Counts
+import sh.openagi.mobile.protocol.MobileSummary
+import sh.openagi.mobile.protocol.TaskItem
+import sh.openagi.mobile.store.Snapshot
+import java.time.Instant
+
+class WidgetStateTest {
+    private val now: Instant = Instant.parse("2026-09-19T12:00:00Z")
+
+    private fun snapshot(
+        titles: List<String>,
+        minutesAgo: Long,
+        completed: Set<String> = emptySet(),
+        refreshFailed: Boolean = false,
+    ): Snapshot {
+        val today = titles.mapIndexed { index, title ->
+            TaskItem("task_$index", title, "today", "pending", 50, null, false)
+        }
+        return Snapshot(
+            summary = MobileSummary(
+                generatedAt = now.minusSeconds(minutesAgo * 60),
+                today = today,
+                counts = Counts(today.size, 0, 0, 0),
+                pendingActions = emptyList(),
+                brief = Brief("${today.size} things today"),
+            ),
+            fetchedAt = now.minusSeconds(minutesAgo * 60),
+            etag = null,
+            locallyCompleted = completed,
+            lastRefreshFailed = refreshFailed,
+        )
+    }
+
+    @Test
+    fun noCredentialsMeansUnpaired() {
+        assertEquals(WidgetState.Unpaired, WidgetState.from(snapshot(listOf("A"), 1), paired = false, now = now))
+    }
+
+    @Test
+    fun pairedWithNoSnapshotMeansEmpty() {
+        val state = WidgetState.from(null, paired = true, now = now)
+        assertTrue(state is WidgetState.Empty)
+        assertTrue((state as WidgetState.Empty).headline.isNotEmpty())
+    }
+
+    @Test
+    fun freshSnapshotRendersTasksWithTheirAge() {
+        val state = WidgetState.from(snapshot(listOf("A", "B"), 3), paired = true, now = now) as WidgetState.Tasks
+        assertEquals(listOf("A", "B"), state.items.map { it.title })
+        assertEquals(3, state.ageMinutes)
+    }
+
+    @Test
+    fun pastAnHourTheWidgetSaysItIsStaleRatherThanLying() {
+        // Past an hour the widget must say so rather than present old rows as current.
+        val state = WidgetState.from(snapshot(listOf("A", "B"), 61), paired = true, now = now)
+        assertEquals(WidgetState.Stale(61), state)
+    }
+
+    @Test
+    fun anOptimisticallyCompletedOnlyTaskLeavesTheWidgetEmpty() {
+        val state = WidgetState.from(snapshot(listOf("A"), 2, completed = setOf("task_0")), paired = true, now = now)
+        assertTrue(state is WidgetState.Empty)
+    }
+
+    // iOS's own review flagged this exact gap: no test at ageMinutes == 60, so a
+    // `>` vs `>=` mutation at the staleness boundary would go uncaught. At
+    // exactly the threshold the data is still current, not stale — only past it
+    // does the widget refuse to show old rows as current.
+    @Test
+    fun atExactlySixtyMinutesTheSnapshotIsStillFreshNotStale() {
+        // The other side of the boundary from pastAnHourTheWidgetSaysItIsStaleRatherThanLying
+        // (61 minutes): at exactly 60 the data is still current, so this must
+        // remain Tasks, not Stale. A `>=` mutation at the threshold would flip
+        // this to Stale and only the >61 test would still pass.
+        val state = WidgetState.from(snapshot(listOf("A", "B"), 60), paired = true, now = now)
+        assertTrue(state is WidgetState.Tasks)
+        assertEquals(60, (state as WidgetState.Tasks).ageMinutes)
+    }
+
+    // The gap the whole-branch review caught: a daemon down the whole time
+    // rendered identically to a healthy one for up to an hour, because age
+    // alone can't distinguish "nothing changed" from "nobody answered."
+    @Test
+    fun aFailedRefreshIsUnreachableEvenWellInsideTheStaleWindow() {
+        val state = WidgetState.from(snapshot(listOf("A", "B"), 3, refreshFailed = true), paired = true, now = now)
+        assertTrue(state is WidgetState.Unreachable)
+        assertEquals(listOf("A", "B"), (state as WidgetState.Unreachable).items.map { it.title })
+        assertEquals(3, state.ageMinutes)
+    }
+
+    @Test
+    fun aFailedRefreshStillShowsWhicheverTasksAreLeftAfterOptimisticCompletion() {
+        val state = WidgetState.from(
+            snapshot(listOf("A", "B"), 3, completed = setOf("task_0"), refreshFailed = true),
+            paired = true,
+            now = now,
+        ) as WidgetState.Unreachable
+        assertEquals(listOf("B"), state.items.map { it.title })
+    }
+
+    // At the declared 110dp minimum, three rows plus the two status lines
+    // overran the content height and clipped the counts and age lines.
+    @Test
+    fun rowCountFollowsTheHeightTheLauncherGave() {
+        assertEquals(1, WidgetState.rowsThatFit(110f))
+        assertEquals(2, WidgetState.rowsThatFit(140f))
+        assertEquals(3, WidgetState.rowsThatFit(180f))
+        assertEquals(3, WidgetState.rowsThatFit(400f))
+        assertEquals("never zero rows, even below the minimum", 1, WidgetState.rowsThatFit(60f))
+    }
+}

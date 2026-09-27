@@ -14,6 +14,9 @@ import { codingSupervisorUi } from "./coding-supervisor-ui.js";
 import { VocaleoClient } from "./integrations/vocaleo.js";
 import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
+import { createFleetRoute } from "./fleet/routes.js";
+import { createFleetCapability } from "./fleet/remote.js";
+import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { createRequire } from "node:module";
@@ -65,6 +68,8 @@ import {
   G2ChannelError
 } from "./integrations/g2-channel.js";
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
+import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
+import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
@@ -82,9 +87,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
+  const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
   const nodeEnrollment = options.nodeEnrollment
-    ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM] });
+    ?? new NodeEnrollmentCodes({ platforms: [EVEN_G2_PLATFORM, MOBILE_PLATFORM] });
   let channels =
     options.channels ??
     (runtime.agentHost
@@ -274,6 +280,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("outreach", (data) => broadcast("outreach", data));
   events.on("outreach-resolved", (data) => broadcast("outreach-resolved", data));
   events.on("coding-agents", (data) => broadcast("coding-agents", data));
+  events.on("fleet", (data) => broadcast("fleet", data));
 
   // Expose the bus to runtime subsystems (pattern miner, session miner) so
   // they can emit "skill-candidate" without holding a reference to this
@@ -587,6 +594,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
+    if (process.env.OPENAGI_FLEET_SUPERVISOR === "1" && !process.env.OPENAGI_FLEET_NODE && runtime.fleetSupervisor) {
+      providers.set("fleet-supervisor", createFleetCapability(runtime.fleetSupervisor));
+    }
     if (computerUseEnabledHere()) {
       computerExecutor ??= options.computerExecutor ?? createConfiguredComputerExecutor();
       providers.set("computer-use", computerExecutor);
@@ -753,11 +763,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
         || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
+      // A mobile credential is accepted on its enumerated allowlist and
+      // nowhere else. Same shape as g2NodeRouteAllowed: platforms other than
+      // "mobile" are unaffected, so this can only ever narrow a phone token.
+      const mobileRouteAllowed = requestEnrollment?.platform !== MOBILE_PLATFORM
+        || isMobileRouteAllowed(method, pathname);
+      const mobileNodeRoute = requestEnrollment?.platform === MOBILE_PLATFORM
+        && isMobileRouteAllowed(method, pathname);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
-      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute)
-        ? g2NodeRouteAllowed && nodeRegistry.authenticate(requestNodeId, scopedBearer)
+      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute || mobileNodeRoute)
+        ? g2NodeRouteAllowed && mobileRouteAllowed && nodeRegistry.authenticate(requestNodeId, scopedBearer)
         : false;
       // Even Hub runs the G2 client in a phone webview whose Origin is not the
       // daemon's origin. Bypass only the browser-origin check, and only after
@@ -802,7 +819,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
-          : nodeClientRoute && requestNodeId
+          : (nodeClientRoute || mobileNodeRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
@@ -1017,19 +1034,31 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
       }
       if (method === "POST" && pathname === "/nodes/enrollment-code") {
-        if (readNodeConfig(dataDir)?.remote) {
-          return sendJson(res, 409, { error: "Even G2 nodes must be enrolled on the main OpenAGI" });
-        }
+        // The body is read before the remote check so the 409 can speak the
+        // caller's language. Only a mobile caller sees new wording: every other
+        // platform value — including an unknown one, which reached this 409
+        // before the platform was ever inspected — keeps the G2 string a
+        // shipped wearable already depends on.
         const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
-        if (body.platform !== EVEN_G2_PLATFORM) {
-          return sendJson(res, 400, { error: `platform must be ${EVEN_G2_PLATFORM}` });
+        const platform = body.platform;
+        if (readNodeConfig(dataDir)?.remote) {
+          return sendJson(res, 409, {
+            error: platform === MOBILE_PLATFORM
+              ? "phones must be enrolled on the main OpenAGI"
+              : "Even G2 nodes must be enrolled on the main OpenAGI"
+          });
         }
-        const issued = nodeEnrollment.issue(EVEN_G2_PLATFORM);
-        console.log(`[openagi] Even G2 node enrollment code ${issued.code} (valid 30 min, single use)`);
+        if (!ENROLLABLE_PLATFORMS.has(platform)) {
+          return sendJson(res, 400, { error: `platform must be one of ${[...ENROLLABLE_PLATFORMS].join(", ")}` });
+        }
+        const issued = nodeEnrollment.issue(platform);
+        console.log(`[openagi] ${platformLabel(platform)} node enrollment code ${issued.code} (valid 30 min, single use)`);
         return sendJson(res, 200, {
           ...issued,
           publicUrl: getPublicUrl(),
-          transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true
+          ...(platform === EVEN_G2_PLATFORM
+            ? { transcriptionConfigured: channels?.g2?.status?.().transcriptionConfigured === true }
+            : {})
         });
       }
       if (method === "POST" && pathname === "/nodes/g2/direct-token") {
@@ -1083,13 +1112,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const code = typeof body.code === "string" ? body.code.trim() : "";
         const nodeId = typeof body.nodeId === "string" ? body.nodeId.trim() : "";
         const nodeToken = typeof body.nodeToken === "string" ? body.nodeToken : "";
-        const name = boundedG2NodeName(body.name);
+        const platform = body.platform;
         if (!/^\d{6}$/.test(code)) {
           return sendG2NodeJson(res, 400, { error: "invalid_enrollment_code", message: "Enter the 6-digit code shown by OpenAGI." });
         }
-        if (body.platform !== EVEN_G2_PLATFORM) {
-          return sendG2NodeJson(res, 400, { error: "invalid_platform", message: "This enrollment code is for an Even G2 node." });
+        if (!ENROLLABLE_PLATFORMS.has(platform)) {
+          return sendG2NodeJson(res, 400, { error: "invalid_platform", message: "This enrollment code is for a different device." });
         }
+        // Bound the name only once the platform is known to be one we enroll,
+        // so the bound applied is always the one that platform asked for.
+        const name = nodeNameForPlatform(platform, body.name);
         if (!/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
           return sendG2NodeJson(res, 400, { error: "invalid_node_id", message: "The G2 node identity is malformed." });
         }
@@ -1098,17 +1130,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         if (nodeRegistry.isEnrolled(nodeId)) {
           const enrollment = nodeRegistry.enrollment(nodeId);
-          if (enrollment?.platform === EVEN_G2_PLATFORM && nodeRegistry.authenticate(nodeId, nodeToken)) {
+          if (enrollment?.platform === platform && nodeRegistry.authenticate(nodeId, nodeToken)) {
             return sendG2NodeJson(res, 200, {
-              node: { id: nodeId, name: enrollment.name ?? name, platform: EVEN_G2_PLATFORM, enrolledAt: enrollment.createdAt },
+              node: { id: nodeId, name: enrollment.name ?? name, platform, enrolledAt: enrollment.createdAt },
               nodeToken,
-              capabilities: EVEN_G2_CAPABILITIES,
+              capabilities: capabilitiesForPlatform(platform),
               recovered: true
             });
           }
           return sendG2NodeJson(res, 409, { error: "node_already_enrolled", message: "Remove this G2 node in OpenAGI before pairing it again." });
         }
-        const consumed = nodeEnrollment.consume(code, EVEN_G2_PLATFORM);
+        const consumed = nodeEnrollment.consume(code, platform);
         if (!consumed.ok) {
           const locked = consumed.reason === "locked";
           return sendG2NodeJson(res, locked ? 429 : 401, {
@@ -1119,20 +1151,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           });
         }
         nodeRegistry.enroll(nodeId, nodeToken, {
-          platform: EVEN_G2_PLATFORM,
+          platform,
           name,
-          capabilities: EVEN_G2_CAPABILITIES
+          capabilities: capabilitiesForPlatform(platform)
         });
         const enrollment = nodeRegistry.enrollment(nodeId);
         return sendG2NodeJson(res, 200, {
           node: {
             id: nodeId,
             name,
-            platform: EVEN_G2_PLATFORM,
+            platform,
             enrolledAt: enrollment.createdAt
           },
           nodeToken,
-          capabilities: EVEN_G2_CAPABILITIES
+          capabilities: capabilitiesForPlatform(platform)
         });
       }
       if (method === "POST" && pathname === "/nodes/heartbeat") {
@@ -1140,13 +1172,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (body.nodeId !== requestNodeId) {
           return sendJson(res, 403, { error: "nodeId does not match scoped credential" });
         }
+        // Any node enrolled with a platform (Even G2, mobile, or a future one)
+        // already has a name, platform and capability set on file from
+        // enrollment, so those win over whatever the body claims — see below.
+        // A node enrolled through the bare /nodes/enroll pairing flow carries
+        // no platform, so it has none of that on file and keeps using the
+        // body's own values below, exactly as before this was generalized
+        // from a G2-only check.
+        const enrolledIdentity = requestEnrollment?.platform ? requestEnrollment : null;
         // Type-checked, not just truthy: a non-string name/nodeId previously
         // persisted and crashed NodeRegistry.list()'s name.localeCompare sort
         // with a TypeError, taking down GET /nodes with a 500 until the
-        // poisoned entry aged out. role is restricted to exactly "node" —
-        // only this instance's own self-entry may ever claim role "main";
-        // nothing arriving over the wire should be able to.
-        if (typeof body.nodeId !== "string" || !body.nodeId || typeof body.name !== "string" || !body.name) {
+        // poisoned entry aged out. An enrolled node's name is already on file
+        // and is used regardless of what the body sends (see below), so the
+        // body may omit "name" — but a name it DOES send still has to pass
+        // this same check, and a caller with no enrolled name must supply a
+        // valid one. role is restricted to exactly "node" — only this
+        // instance's own self-entry may ever claim role "main"; nothing
+        // arriving over the wire should be able to.
+        if (typeof body.nodeId !== "string" || !body.nodeId) {
+          return sendJson(res, 400, { error: "nodeId and name are required and must be non-empty strings" });
+        }
+        if (body.name !== undefined) {
+          if (typeof body.name !== "string" || !body.name) {
+            return sendJson(res, 400, { error: "nodeId and name are required and must be non-empty strings" });
+          }
+        } else if (!enrolledIdentity?.name) {
           return sendJson(res, 400, { error: "nodeId and name are required and must be non-empty strings" });
         }
         if (body.role !== "node") {
@@ -1163,23 +1214,20 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (body.capabilities !== undefined && !Array.isArray(body.capabilities)) {
           return sendJson(res, 400, { error: "capabilities must be an array" });
         }
-        const g2Enrollment = requestEnrollment?.platform === EVEN_G2_PLATFORM
-          ? requestEnrollment
-          : null;
         nodeRegistry.upsert({
-          nodeId: body.nodeId, name: g2Enrollment?.name ?? body.name, role: body.role,
+          nodeId: body.nodeId, name: enrolledIdentity?.name ?? body.name, role: body.role,
           url: body.url ?? null, version: body.version ?? null,
           // A node reports its own build identity (git SHA or bundle build
           // number). Without it a roster can only show package.json versions,
           // which have drifted behind the release tags and so cannot answer
           // "is this node up to date" — the whole point of the column.
           build: body.build ?? null, buildSource: body.buildSource ?? null,
-          platform: g2Enrollment?.platform ?? null,
-          capabilities: g2Enrollment?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
+          platform: enrolledIdentity?.platform ?? null,
+          capabilities: enrolledIdentity?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
         });
         return sendJson(res, 200, {
           ok: true,
-          capabilities: g2Enrollment?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
+          capabilities: enrolledIdentity?.capabilities ?? sanitizeNodeCapabilities(body.capabilities)
         });
       }
       if (method === "POST" && pathname === "/nodes/capture-memory") {
@@ -1485,6 +1533,22 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             )
           });
         }
+      }
+      if (method === "GET" && pathname === "/mobile/summary") {
+        if (!runtime.tasks?.list) return sendJson(res, 503, { error: "no task store" });
+        const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
+        const payload = buildMobileSummary(runtime, {
+          now: new Date(),
+          taskLimit: Number.isFinite(rawLimit) ? rawLimit : undefined
+        });
+        const etag = summaryETag(payload);
+        res.setHeader("cache-control", "no-store");
+        res.setHeader("etag", etag);
+        if (req.headers["if-none-match"] === etag) {
+          res.writeHead(304);
+          return res.end();
+        }
+        return sendJson(res, 200, payload);
       }
       if (method === "GET" && pathname === "/brief/today") {
         const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "5", 10);
@@ -2149,6 +2213,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const result = await codingSupervisorRoute(runtime, method, pathname, url, () => readJsonLimited(req, 24 * 1024));
         return sendJson(res, result.status, result.body);
       }
+      if (method === "GET" && pathname === "/fleet") {
+        // Pass extraCookies so /fleet?token= signs in like the dashboard does.
+        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, fleetPage, extraCookies);
+      }
+      if (pathname.startsWith("/fleet/api/")) {
+        res.setHeader("Cache-Control", "no-store");
+        const result = await fleetRoute(method, pathname, url, () => readJsonLimited(req, 8 * 1024));
+        return sendJson(res, result.status, result.body);
+      }
       if (pathname.startsWith("/integrations/vocaleo/")) {
         res.setHeader("Cache-Control", "no-store");
         const result = await vocaleoRoute(method, pathname, () => readJsonLimited(req, 4 * 1024));
@@ -2627,6 +2700,16 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 200, task);
         } catch (error) { return sendJson(res, 400, { error: error.message }); }
       }
+      // Literal sub-resources of /tasks must be matched before the `:id`
+      // pattern below, or the pattern claims them first and answers "unknown
+      // task" for a route that exists. /tasks/clarifications was reachable
+      // from the allowlist and from the CLI, and 404d for every caller —
+      // the mobile Inbox surfaced it as "this item is gone".
+      if (method === "GET" && pathname === "/tasks/clarifications") {
+        if (!runtime.clarifications?.list) return sendJson(res, 503, { error: "no clarification store" });
+        const status = url.searchParams.get("status");
+        return sendJson(res, 200, runtime.clarifications.list({ status: status === "null" ? null : (status ?? "pending") }));
+      }
       if (method === "GET" && pathname.match(/^\/tasks\/[^/]+$/)) {
         if (!runtime.tasks?.get) return sendJson(res, 503, { error: "no task store" });
         const id = decodeURIComponent(pathname.split("/")[2]);
@@ -2689,11 +2772,6 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const { buildReconciliationCalibration } = await import("./reconciliation-calibration.js");
         const outcomes = runtime.outcomes?.recent?.(200, "clarification-answered") ?? [];
         return sendJson(res, 200, buildReconciliationCalibration(outcomes).summary);
-      }
-      if (method === "GET" && pathname === "/tasks/clarifications") {
-        if (!runtime.clarifications?.list) return sendJson(res, 503, { error: "no clarification store" });
-        const status = url.searchParams.get("status");
-        return sendJson(res, 200, runtime.clarifications.list({ status: status === "null" ? null : (status ?? "pending") }));
       }
       if (method === "POST" && pathname.match(/^\/tasks\/clarifications\/[^/]+\/answer$/)) {
         if (!runtime.clarifications?.answer) return sendJson(res, 503, { error: "no clarification store" });
@@ -3267,6 +3345,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         server.listen(port, host, () => {
           channels?.start();
           runtime.codingSupervisor?.start();
+          runtime.fleetSupervisor?.start();
           if (tickerMs > 0) {
             tickerHandle = setInterval(() => {
               runtime.tick().catch(() => { /* swallow */ });
@@ -3361,6 +3440,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         sseClients.clear();
         channels?.stop?.();
         runtime.codingSupervisor?.stop();
+        runtime.fleetSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
@@ -3696,6 +3776,24 @@ function boundedG2NodeName(value) {
   return name || "Even G2";
 }
 
+// Cross-platform enrollment dispatch. This lives at the router rather than in
+// mobile-node.js on purpose: it answers "which platform's rule applies", so
+// putting it in the mobile module would make that module import the G2's
+// platform, capabilities and name bound — G2 logic in the file that exists to
+// hold mobile logic. Module scope, not per-request: every value closed over is
+// a static import.
+const ENROLLABLE_PLATFORMS = new Set([EVEN_G2_PLATFORM, MOBILE_PLATFORM]);
+
+const capabilitiesForPlatform = (platform) =>
+  platform === MOBILE_PLATFORM ? MOBILE_CAPABILITIES : EVEN_G2_CAPABILITIES;
+
+const nodeNameForPlatform = (platform, value) =>
+  platform === MOBILE_PLATFORM ? boundedMobileNodeName(value) : boundedG2NodeName(value);
+
+// Operator-facing display form. The G2's log line read "Even G2" before phones
+// existed and still must.
+const platformLabel = (platform) => (platform === MOBILE_PLATFORM ? "Phone" : "Even G2");
+
 // Task statuses a "stop asking" may retire FROM. Mirrors the allowlist in
 // daily-brief.js, and the reason both exist is the "completed" case: flipping a
 // completed task to cancelled would erase a real outcome the user earned in
@@ -3798,7 +3896,10 @@ function recordRetirementOutcome(runtime, task, { draftId, by, reason }) {
 // Map an outreach action to the real action on the underlying source. Throws
 // on a failed delegation so the route can mark the item status:"error".
 async function applyOutreachAction(runtime, item, action, note) {
-  if (action === "dismiss") return;
+  if (action === "dismiss") {
+    if (item.sourceRef?.kind === "fleet") runtime.fleetSupervisor?.dismissQuestion(item.sourceRef.id);
+    return;
+  }
   if (action === "up" || action === "down") return applyOutreachFeedback(runtime, item, action, note);
   const ref = item.sourceRef ?? {};
   switch (ref.kind) {
@@ -3853,6 +3954,14 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (!runtime.clarifications?.answer) throw new Error("no clarification store");
       if (!runtime.clarifications.answer(ref.id, action)) throw new Error("clarification not answerable");
       return;
+    case "fleet": {
+      const r = await runtime.fleetSupervisor?.answerQuestion(ref.id, action);
+      if (!r) throw new Error("fleet question not answerable");
+      // Blocked, failed, or "open thread": the agent has no answer yet, so
+      // the item stays actionable.
+      if (r.question?.status === "open") throw outreachActionConflict(r.delivery?.detail ?? "fleet answer not delivered; the question is still open");
+      return;
+    }
     case "skill-candidate": {
       if (action !== "accept") throw new Error(`unsupported skill-candidate action: ${action}`);
       const { findSuggestion, resolveSuggestion } = await import("./suggestion-feed.js");
@@ -4653,6 +4762,7 @@ function renderApp() {
     <h1>OpenAGI</h1>
     <span id="status" class="status">connecting…</span>
     <a href="/g2/connect" class="ui-btn ui-btn-secondary">Connect glasses</a>
+    <a href="/fleet" class="ui-btn ui-btn-secondary">Fleet</a>
     <nav id="nav">
       <!-- Primary tabs — the everyday surfaces. Keeps the nav readable
            on narrow windows; the other 11 tabs live behind "More ▾". -->

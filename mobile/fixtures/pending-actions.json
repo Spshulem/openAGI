@@ -1,0 +1,23 @@
+{
+  "actions": [
+    {
+      "id": "act_61a7da752d5d4eca",
+      "toolName": "send_email",
+      "args": {
+        "to": "team@example.com",
+        "subject": "Weekly digest"
+      },
+      "context": null,
+      "summary": "Send the weekly digest to the team",
+      "reason": "Drafted from your Friday routine",
+      "dedupeKey": null,
+      "status": "pending",
+      "createdAt": "2026-09-24T05:31:34.834Z",
+      "expiresAt": null,
+      "decidedAt": null,
+      "decidedBy": null,
+      "result": null,
+      "error": null
+    }
+  ]
+}

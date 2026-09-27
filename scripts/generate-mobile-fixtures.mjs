@@ -1,0 +1,79 @@
+// Fixtures are generated from a real daemon, never hand-written: a client
+// tested against an imagined response is a client that fails on first contact.
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { fileURLToPath } from "node:url";
+import { createDurableRuntime, createHostedInterface } from "../src/index.js";
+
+// The exchange response echoes back whatever nodeToken it is given, so a
+// fixture that feeds it a real crypto.randomBytes() value would ship a live-
+// shaped credential in the repo. Feed it this obviously synthetic 43-char
+// placeholder instead — it still satisfies the daemon's token-shape regex
+// (/^[a-zA-Z0-9_-]{43}$/) so the fixture still exercises real validation.
+const FIXTURE_NODE_TOKEN = "FIXTURE-SYNTHETIC-NODE-TOKEN-NOT-REAL-00000";
+
+const outDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "mobile", "fixtures");
+fs.mkdirSync(outDir, { recursive: true });
+
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-fixtures-"));
+let app;
+try {
+  const runtime = createDurableRuntime({ dataDir });
+  app = createHostedInterface(runtime, { host: "127.0.0.1", port: 0, tickerMs: 0, dataDir, authToken: null });
+  const listened = await app.listen();
+  const base = listened.url ?? `http://127.0.0.1:${listened.port}`;
+
+  const write = (name, value) => fs.writeFileSync(path.join(outDir, name), JSON.stringify(value, null, 2) + "\n");
+
+  write("summary-empty.json", await (await fetch(`${base}/mobile/summary`)).json());
+
+  runtime.tasks.add({ queue: "user", title: "Ship the widget", bucket: "today", priority: 80 });
+  runtime.tasks.add({ queue: "user", title: "Renew the domain", bucket: "today", priority: 40, dueDate: "2020-01-01T00:00:00.000Z" });
+  // A bare calendar date, the way real tasks actually carry one. Both clients'
+  // date decoders once accepted only full timestamps; every fixture used full
+  // timestamps, so both passed every test and then failed the whole summary
+  // against a real daemon. This row is what keeps that from coming back.
+  runtime.tasks.add({ queue: "user", title: "File the quarterly taxes", bucket: "today", priority: 60, dueDate: "2020-04-15" });
+  // A cleared due date, stored as "" — also how real tasks carry it. /tasks
+  // returns it raw (/mobile/summary normalizes it to null). Kept out of the
+  // today bucket so it lands in tasks-list.json without moving summary counts.
+  runtime.tasks.add({ queue: "user", title: "Call the accountant back", bucket: "this_month", priority: 30, dueDate: "" });
+  runtime.tasks.add({ queue: "user", title: "Read the whitepaper", bucket: "this_week", priority: 20 });
+
+  // A pending action, so the embedded {id, summary, createdAt} projection in
+  // /mobile/summary is exercised by both clients' decoders. Without one, both
+  // fixtures carry "pendingActions": [], and neither the Swift nor the Kotlin
+  // model would decode that shape until it met a live daemon.
+  runtime.pendingActions.enqueue({
+    toolName: "send_email",
+    args: { to: "team@example.com", subject: "Weekly digest" },
+    summary: "Send the weekly digest to the team",
+    reason: "Drafted from your Friday routine"
+  });
+
+  write("summary-populated.json", await (await fetch(`${base}/mobile/summary`)).json());
+  write("tasks-list.json", await (await fetch(`${base}/tasks?queue=user`)).json());
+  write("pending-actions.json", await (await fetch(`${base}/pending-actions`)).json());
+
+  const { code } = await (await fetch(`${base}/nodes/enrollment-code`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ platform: "mobile" })
+  })).json();
+  write("enroll-exchange.json", await (await fetch(`${base}/nodes/enroll/exchange`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      code, platform: "mobile",
+      nodeId: "mobile:fixture-node",
+      nodeToken: FIXTURE_NODE_TOKEN,
+      name: "Fixture Phone"
+    })
+  })).json());
+
+  console.log(`wrote fixtures to ${outDir}`);
+} finally {
+  // A generator that leaves a temp daemon directory behind on every run (and
+  // every failure) fills os.tmpdir() a little more each time it's used.
+  await app?.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+}

@@ -2,6 +2,9 @@ import path from "node:path";
 import { resolveDataDir } from "./data-dir.js";
 import { AgentHost } from "./agent-host.js";
 import { CodingSupervisor, registerCodingSupervisorTools } from "./coding-supervisor.js";
+import { FleetSupervisor } from "./fleet/supervisor.js";
+import { RemoteFleetSupervisor } from "./fleet/remote.js";
+import { registerFleetTools } from "./fleet/tools.js";
 import { FileBackedAgentStore } from "./agent-store.js";
 import { CronScheduler, createDailyAdaptationReviewJob } from "./cron-scheduler.js";
 import { DirectionalAdaptiveScrutiny } from "./directional-adaptive-scrutiny.js";
@@ -239,6 +242,11 @@ export class AbiRuntime {
     this.codingSupervisor = options.codingSupervisor ?? new CodingSupervisor({
       ...options.codingSupervisorOptions, dataDir: options.dataDir, runtime: this
     });
+    // Watches every recent Codex/Claude/Conductor coding thread. The
+    // constructor has no side effects; hosted-interface starts it on listen.
+    this.fleetSupervisor = options.fleetSupervisor ?? (process.env.OPENAGI_FLEET_NODE
+      ? new RemoteFleetSupervisor({ runtime: this, nodeId: process.env.OPENAGI_FLEET_NODE })
+      : new FleetSupervisor({ ...options.fleetSupervisorOptions, dataDir: options.dataDir, runtime: this }));
     if (this.outreachConfig.enabled) {
       this.outreachMapper = new OutreachMapper({ store: this.outreach, events: this.events });
       if (this.events) this.outreachMapper.attach();
@@ -539,6 +547,9 @@ export class AbiRuntime {
       });
       registerCoreTools(this.tools, this);
       registerCodingSupervisorTools(this.tools, this.codingSupervisor);
+      // Read-only fleet_status / fleet_thread. this.fleetSupervisor is
+      // constructed above, before this block runs.
+      registerFleetTools(this.tools, this.fleetSupervisor);
       // Computer-use tools register only when explicitly opted-in via env
       // (OPENAGI_COMPUTER_USE=1). Default install doesn't expose them so
       // an LLM can't accidentally try to drive the user's screen. The
