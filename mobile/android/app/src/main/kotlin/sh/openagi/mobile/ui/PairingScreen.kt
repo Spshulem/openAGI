@@ -48,6 +48,9 @@ fun PairingScreen(
 ) {
     var serverText by remember(prefill) { mutableStateOf(prefill?.serverUrl ?: "") }
     var codeText by remember(prefill) { mutableStateOf(prefill?.code ?: "") }
+    // Enrollment consumes the one-time code before local encrypted storage.
+    // Hold a successful exchange so a storage retry never enrolls a new node.
+    var awaitingSave by remember(prefill) { mutableStateOf<Credentials?>(null) }
     var isPairing by remember { mutableStateOf(false) }
     // Keyed on prefill like the fields: a fresh link is a fresh attempt, and
     // the last code's "That code didn't work" must not sit under a new one.
@@ -64,7 +67,7 @@ fun PairingScreen(
             Text("Daemon address", style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)
             OutlinedTextField(
                 value = serverText,
-                onValueChange = { serverText = it },
+                onValueChange = { serverText = it; awaitingSave = null },
                 placeholder = { Text("http://mac.tail1234.ts.net:43210") },
                 singleLine = true,
                 textStyle = OpenAGIType.dataMono,
@@ -79,7 +82,7 @@ fun PairingScreen(
             // mono, tracked +2) — never reused for anything else.
             OutlinedTextField(
                 value = codeText,
-                onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) codeText = it },
+                onValueChange = { if (it.length <= 6 && it.all(Char::isDigit)) { codeText = it; awaitingSave = null } },
                 singleLine = true,
                 textStyle = OpenAGIType.codeEntry.copy(textAlign = TextAlign.Center),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -95,35 +98,35 @@ fun PairingScreen(
         }
 
         PrimaryButton(
-            text = "Pair",
+            text = if (awaitingSave != null) "Retry save" else "Pair",
             loading = isPairing,
-            enabled = !isPairing && serverText.isNotBlank() && codeText.length == 6,
+            enabled = !isPairing && (awaitingSave != null || (serverText.isNotBlank() && codeText.length == 6)),
             onClick = {
                 error = null
                 isPairing = true
                 scope.launch {
                     try {
-                        val nodeId = MobileNodeIdentity.newNodeId()
-                        val nodeToken = MobileNodeIdentity.newToken()
-                        val enrollment = DaemonClient.enroll(
-                            server = serverText,
-                            code = codeText,
-                            nodeId = nodeId,
-                            nodeToken = nodeToken,
-                            name = "Android",
-                        )
-                        val credentials = Credentials(
-                            server = serverText,
-                            nodeId = enrollment.node.id,
-                            token = enrollment.nodeToken,
-                        )
+                        val credentials = awaitingSave ?: run {
+                            val nodeId = MobileNodeIdentity.newNodeId()
+                            val nodeToken = MobileNodeIdentity.newToken()
+                            val enrollment = DaemonClient.enroll(
+                                server = serverText,
+                                code = codeText,
+                                nodeId = nodeId,
+                                nodeToken = nodeToken,
+                                name = "Android",
+                            )
+                            Credentials(server = serverText, nodeId = enrollment.node.id, token = enrollment.nodeToken)
+                        }
                         if (!Credentials.save(context, credentials)) {
+                            awaitingSave = credentials
                             error = ErrorCopy.Message(
                                 "Couldn't save the credential on this device.",
-                                "Try pairing again — if this keeps happening, restart the app.",
+                                "Tap Retry save after storage is available. This keeps the already enrolled code.",
                             )
                             return@launch
                         }
+                        awaitingSave = null
                         RefreshWorker.schedule(context)
                         // Kick the first refresh so the day's tasks are already on
                         // disk by the time TodayScreen appears; failure here is
