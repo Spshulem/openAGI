@@ -14,10 +14,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import sh.openagi.mobile.protocol.PairingPayload
+import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.sync.fetchInboxBadgeCount
 import sh.openagi.mobile.transport.DaemonClient
@@ -79,7 +81,11 @@ class MainActivity : ComponentActivity() {
         intent?.data = null
 
         setContent {
-            var selectedTab by remember { mutableStateOf(AppTab.TODAY) }
+            // Folding, unfolding, or rotating the phone is handled in place
+            // (configChanges in the manifest); rememberSaveable still keeps
+            // the tab if Android recreates the Activity for another reason.
+            var selectedTab by rememberSaveable { mutableStateOf(AppTab.TODAY) }
+            val supervisorChatOpen = rememberSaveable { mutableStateOf(false) }
             val credentials = credentialsState.value
             val pendingPairing = pendingPairingState.value
             val resumeSignal = resumeSignalState.intValue
@@ -104,8 +110,12 @@ class MainActivity : ComponentActivity() {
                     )
                 } else {
                     val conversationScope = rememberCoroutineScope()
-                    val chatConversation = remember(credentials) { ChatConversationState(conversationScope) }
-                    val supervisorConversation = remember(credentials) { ChatConversationState(conversationScope) }
+                    val chatConversation = remember(credentials) {
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId)
+                    }
+                    val supervisorConversation = remember(credentials) {
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId)
+                    }
                     // One background SSE connection for the life of this
                     // pairing, reconnected with backoff by EventStream. This
                     // is what makes Inbox's badge and the other tabs feel
@@ -176,6 +186,7 @@ class MainActivity : ComponentActivity() {
                                     resumeSignal = resumeSignal,
                                     streamAttached = streamAttachedState.value,
                                     chatConversationState = supervisorConversation,
+                                    chatOpenState = supervisorChatOpen,
                                 )
                                 AppTab.SETTINGS -> SettingsScreen(
                                     context = this@MainActivity,

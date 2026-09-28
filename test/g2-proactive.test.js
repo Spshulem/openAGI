@@ -247,3 +247,63 @@ test("due tasks outside the first page and email drafts retain their categories"
   f.call({ op: "seen", id: due.id }); f.call({ op: "notify", id: due.id });
   assert.equal(f.store.node("one").notifications, 1);
 });
+
+test("supervisor questions carry their choices and Supervisor mode keeps only them", (t) => {
+  const { call, outreach, tasks, now } = fixture(t);
+  const at = new Date(now()).toISOString();
+  outreach.push(
+    { id: "o-fleet", status: "unseen", createdAt: at, sourceRef: { kind: "fleet", id: "fq_1" }, title: "#7 ready. Merge?", summary: "CI green", needsDecision: true, actions: ["merged", "later", "dismiss"] },
+    { id: "o-mail", status: "unseen", createdAt: at, sourceRef: { kind: "email", id: "m1" }, title: "Invoice", summary: "", needsDecision: false, actions: [] }
+  );
+  tasks.push({ id: "t1", title: "Pay rent", status: "pending", dueDate: at });
+  call({ op: "configure", settings: { enabled: true } });
+  const all = call({ op: "feed" }).items;
+  const fleet = all.find(i => i.id === "o-fleet");
+  assert.deepEqual(fleet.options, ["merged", "later"]);
+  assert.equal(fleet.action, "answer-fleet");
+  assert.equal(fleet.supervisor, true);
+  assert.ok(all.some(i => i.id === "o-mail") && all.some(i => i.id.startsWith("due:")));
+  // Supervisor mode: only supervisor items, even with approvals deselected.
+  call({ op: "configure", settings: { supervisorOnly: true, categories: ["email"] } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
+  assert.throws(() => call({ op: "configure", settings: { supervisorOnly: "yes" } }), /Invalid settings/);
+  // Supervisor mode shows its questions before updates are turned on, but
+  // pinging still needs that opt-in.
+  call({ op: "configure", settings: { enabled: false } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
+  assert.equal(call({ op: "can-notify", id: "o-fleet" }).notify, false);
+  call({ op: "configure", settings: { supervisorOnly: false } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
+});
+
+test("answering a supervisor question from the glasses uses its fixed choices", async (t) => {
+  const { store, runtime, call, outreach, now } = fixture(t);
+  outreach.push({ id: "o-fleet", status: "unseen", createdAt: new Date(now()).toISOString(), sourceRef: { kind: "fleet", id: "fq_1" }, title: "Which plan?", summary: "", needsDecision: true, actions: ["Starter", "Business", "dismiss"] });
+  const answered = [];
+  const resolved = [];
+  let open = true;
+  runtime.outreach.get = (id) => outreach.find(i => i.id === id);
+  runtime.outreach.resolve = (id, decision, opts) => resolved.push([id, decision.action, opts.status]);
+  runtime.fleetSupervisor = {
+    answerQuestion: async (id, answer) => { answered.push([id, answer]); return open ? { question: { status: "open" }, delivery: { detail: "owner using Conductor" } } : { question: { status: "answered" }, delivery: { detail: "typed into Conductor" } }; },
+    getState: () => ({ mode: "auto", lastTickAt: null, questions: [{}], snapshot: { threads: [
+      { key: "a", workspace: "apia", health: "red", state: "needs-human", reason: "asks", lastActivityAt: "2" },
+      { key: "b", title: "Fix", health: "green", state: "running", reason: "", lastActivityAt: "3" },
+      { key: "c", workspace: "cairo", health: "yellow", state: "pr-not-ready", reason: "CI red", lastActivityAt: "1" }
+    ] } })
+  };
+  call({ op: "configure", settings: { enabled: true } });
+  await assert.rejects(store.answerFleet("one", { id: "o-fleet", answer: "Enterprise" }), /choices/);
+  // Not delivered yet: the question stays open and on the glasses.
+  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: false, detail: "owner using Conductor" });
+  assert.ok(call({ op: "feed" }).items.some(i => i.id === "o-fleet"));
+  open = false;
+  assert.deepEqual(await store.answerFleet("one", { id: "o-fleet", answer: "Starter" }), { ok: true, detail: "typed into Conductor" });
+  assert.deepEqual(answered, [["fq_1", "Starter"], ["fq_1", "Starter"]]);
+  assert.deepEqual(resolved, [["o-fleet", "Starter", "acted"]]);
+  assert.equal(call({ op: "feed" }).items.some(i => i.id === "o-fleet"), false);
+  const status = store.fleetStatus();
+  assert.deepEqual(status.counts, { red: 1, yellow: 1, green: 1, gray: 0 });
+  assert.deepEqual(status.threads.map(r => r.name), ["apia", "cairo"]);
+  assert.equal(status.needsYou, 1);
+});

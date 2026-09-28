@@ -35,6 +35,7 @@ export interface OpenAGIPhoneActions {
   inboxAction?(op: InboxOperation, id?: string, extra?: Record<string, unknown>): void
   markMoment?(): void
   configureIdleTap?(action: 'talk' | 'highlight'): void
+  configureHomeMode?(mode: 'ask' | 'supervisor'): void
   configureLifelogTalkMode?(mode: 'tap' | 'hold'): void
   configureBackgroundListening?(enabled: boolean): void
   retryListening?(): void
@@ -108,6 +109,7 @@ export class OpenAGIPhoneCompanion {
             <section id="lifelog-panel" hidden><h2>Saved conversations on main</h2><label>Search this G2’s history<input id="lifelog-query" maxlength="200" type="search"></label><button id="lifelog-search">Search / refresh</button><p id="lifelog-status" role="status"></p><div id="lifelog-moments"></div><button id="lifelog-previous" hidden>Previous conversations</button><button id="lifelog-next" hidden>Older conversations</button><button id="lifelog-close">Close history</button></section>
             <details><summary>Advanced owner controls · main sign-in required</summary><p>This G2 pairing can read its own history here. Owner sign-in is still required for analysis models, speaker edits, screen context and other devices. Your owner token is never put in a link.</p><a id="main-inbox" target="_blank" rel="noopener noreferrer" hidden>Main owner inbox</a><a id="main-lifelog" target="_blank" rel="noopener noreferrer" hidden>Owner lifelog settings</a></details><div id="proactive-items"></div>
           </section>
+          <section class="ambient" data-page="listen"><h2>Glasses home</h2><label>Tap on the glasses home<select id="home-mode"><option value="ask">Ask the agent</option><option value="supervisor">Supervisor</option></select></label><p>Supervisor: tap shows the supervisor's questions (answer with one tap), swipe down shows red / yellow / green threads, and the glasses ping you only for supervisor items.</p></section>
           <section class="ambient" data-page="listen"><h2>Lifelog</h2><p id="save-status" role="status">No text saved this session yet.</p><button id="mark-moment">Mark moment</button>
             <label><input id="recording-consent" type="checkbox"> I have consent to retain this conversation, including from other participants</label>
             <label><input id="memory-enabled" type="checkbox"> Keep lifelog on · resume when this app opens</label>
@@ -191,6 +193,7 @@ export class OpenAGIPhoneCompanion {
     showPage('listen')
     root.querySelector('#mark-moment')?.addEventListener('click', () => actions.markMoment?.())
     root.querySelector('#idle-tap')?.addEventListener('change', () => actions.configureIdleTap?.(requiredSelect(root, '#idle-tap').value as 'talk' | 'highlight'))
+    root.querySelector('#home-mode')?.addEventListener('change', () => actions.configureHomeMode?.(requiredSelect(root, '#home-mode').value as 'ask' | 'supervisor'))
     const input = root.querySelector<HTMLInputElement>('#pair-code')
     const agentOrigin = root.querySelector<HTMLInputElement>('#agent-origin')
     const agentToken = root.querySelector<HTMLInputElement>('#agent-token')
@@ -359,6 +362,7 @@ export class OpenAGIPhoneCompanion {
   lifelogEnabled(enabled: boolean): void { const input = this.actionsSection.querySelector<HTMLInputElement>('#memory-enabled'); if (input) input.checked = enabled }
   saveStatus(text: string): void { const p = this.actionsSection.querySelector('#save-status'); if (p) p.textContent = text }
   idleTapAction(action: 'talk' | 'highlight'): void { requiredSelect(this.actionsSection, '#idle-tap').value = action }
+  homeMode(mode: 'ask' | 'supervisor'): void { const select = this.actionsSection.querySelector<HTMLSelectElement>('#home-mode'); if (select) select.value = mode }
   lifelogTalkMode(mode: 'tap' | 'hold'): void { requiredSelect(this.actionsSection, '#lifelog-talk-mode').value = mode }
   backgroundListening(enabled: boolean): void { const input = this.actionsSection.querySelector<HTMLInputElement>('#background-listening'); if (input) input.checked = enabled }
   backgroundStatus(text: string): void { const element = this.actionsSection.querySelector('#background-status'); if (element) element.textContent = text }

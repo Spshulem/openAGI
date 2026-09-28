@@ -325,6 +325,91 @@ test("chooseRoute follows the delivery table", () => {
   assert.equal(chooseRoute(null, "auto"), null);
 });
 
+test("chooseRoute honours OPENAGI_FLEET_DELIVERY: computer-use never picks a CLI route", () => {
+  const ui = { conductorWorkspaceId: "w-madrid", conductorSessionId: "s1", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 1 };
+  const conductorLive = makeThread({ meta: ui });
+  const conductorOffline = makeThread({ live: null, meta: ui });
+  const codexLocked = makeThread({ key: "codex:t1", kind: "codex", id: "t1", live: null, writerLocked: true, meta: {} });
+  const codexFree = { ...codexLocked, writerLocked: false };
+  const terminal = makeThread({ key: "claude:c1", kind: "claude", id: "c1", live: { peerName: "cli-1", pid: 9, status: "idle" }, meta: {} });
+  const hostedCodex = makeThread({ key: "codex:t9", kind: "codex", id: "t9", live: null, meta: { originator: "codex_sdk_ts" } });
+  const strict = { mode: "computer-use", ready: true };
+  for (const mode of ["observe", "propose", "auto"]) {
+    assert.equal(chooseRoute(conductorLive, mode, strict), "computer-use");
+    assert.equal(chooseRoute(conductorOffline, mode, strict), "computer-use");
+    assert.equal(chooseRoute(codexLocked, mode, strict), "computer-use", "the desktop app's writer lock does not block typing");
+    assert.equal(chooseRoute(terminal, mode, strict), null, "no app shows a terminal session: never a relay");
+    assert.equal(chooseRoute(hostedCodex, mode, strict), null, "Conductor-hosted Codex without a Conductor row");
+  }
+  // Not ready: strict mode has no route; -first falls back to the CLI routes.
+  const down = { mode: "computer-use", ready: false, detail: "screen locked" };
+  assert.equal(chooseRoute(conductorLive, "auto", down), null);
+  assert.equal(chooseRoute(codexFree, "auto", down), null);
+  const first = { mode: "computer-use-first", ready: false, detail: "screen locked" };
+  assert.equal(chooseRoute(conductorLive, "auto", first), "peer-relay");
+  assert.equal(chooseRoute(codexFree, "auto", first), "codex-exec");
+  assert.equal(chooseRoute(codexLocked, "auto", first), null);
+  assert.equal(chooseRoute(conductorOffline, "auto", { mode: "computer-use-first", ready: true }), "computer-use");
+  assert.equal(chooseRoute(terminal, "auto", { mode: "computer-use-first", ready: true }), "peer-relay");
+  // -first with the thread's app closed falls back to the CLI; strict waits.
+  const closed = { "com.conductor.app": false, "com.openai.codex": false };
+  assert.equal(chooseRoute(conductorLive, "auto", { mode: "computer-use-first", ready: true, apps: closed }), "peer-relay");
+  assert.equal(chooseRoute(codexFree, "auto", { mode: "computer-use-first", ready: true, apps: closed }), "codex-exec");
+  assert.equal(chooseRoute(codexFree, "auto", { mode: "computer-use-first", ready: true, apps: { "com.openai.codex": null } }), "computer-use");
+  assert.equal(chooseRoute(conductorLive, "auto", { mode: "computer-use", ready: true, apps: closed }), "computer-use");
+  // cli (default) is today's table, and a bare mode string works too.
+  assert.equal(chooseRoute(conductorOffline, "auto", { mode: "cli" }), null);
+  assert.equal(chooseRoute(codexFree, "auto"), "codex-exec");
+  assert.equal(chooseRoute(codexLocked, "auto", "computer-use"), "computer-use");
+});
+
+test("computer-use not ready waits instead of asking; an app-less thread keeps the open-it path", () => {
+  const ui = { conductorWorkspaceId: "w-madrid", conductorSessionId: "s1", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 1 };
+  const pr = makePr({ unresolvedThreads: 1 });
+  const decide = (thread, delivery, extra = {}) => {
+    const classified = classifyThread(thread, { pr, localGit: cleanGit, infra: null, now: NOW, config });
+    return decideThread(classified, thread, { ledger: {}, playbooks, config, now: NOW, pr, mode: extra.mode ?? "auto", infra: null, manager, delivery });
+  };
+  const long = { live: null, lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN) };
+  const ready = decide(makeThread({ ...long, meta: ui }), { mode: "computer-use", ready: true });
+  assert.equal(ready.action, "nudge");
+  assert.equal(ready.route, "computer-use");
+  assert.equal(decide(makeThread({ ...long, meta: ui }), { mode: "computer-use", ready: true }, { mode: "propose" }).route, "computer-use");
+  const waiting = decide(makeThread({ ...long, meta: ui }), { mode: "computer-use", ready: false, detail: "screen locked" });
+  assert.equal(waiting.action, "wait");
+  assert.match(waiting.reason, /computer use not ready: screen locked/);
+  // A terminal Claude session with a live peer: no app, so the owner is asked to open it.
+  const terminal = makeThread({ key: "claude:c1", kind: "claude", id: "c1", ...long, live: { peerName: "cli-1", pid: 9, status: "idle" }, meta: {} });
+  const unreachable = decide(terminal, { mode: "computer-use", ready: true });
+  assert.equal(unreachable.action, "ask-user");
+  assert.equal(unreachable.question.dedupeKey, "open:claude:c1");
+});
+
+test("manager escalations type into the manager's app in computer-use mode", () => {
+  const quick = { id: "t1", description: "Run bb-quick on fixed candidate", kind: "local_bash", startedAt: ago(20 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [quick] });
+  const uiManager = { ...manager, live: null, meta: { conductorWorkspaceId: "w-remote", conductorSessionId: "mgr", conductorSessionTitle: "Remote dev setup", conductorWorkspaceSessions: 1 } };
+  const escalate = (delivery) => {
+    const classified = classifyThread(thread, { pr: makePr(), localGit: cleanGit, infra: null, now: NOW, config });
+    return decideThread(classified, thread, { ledger: {}, playbooks, config, now: NOW, pr: makePr(), mode: "auto", infra: null, manager: uiManager, delivery });
+  };
+  const sent = escalate({ mode: "computer-use", ready: true });
+  assert.equal(sent.action, "escalate-manager");
+  assert.equal(sent.route, "computer-use");
+  assert.equal(sent.targetKey, "conductor:mgr");
+  const waiting = escalate({ mode: "computer-use", ready: false, detail: "Conductor is not running" });
+  assert.equal(waiting.action, "wait");
+  assert.match(waiting.reason, /computer use not ready/);
+  // cli: an offline manager still means the owner is asked.
+  assert.equal(escalate({ mode: "cli" }).action, "ask-user");
+
+  const bb3 = { ...bb3Base, gate: { state: "blocked", reason: "load", since: ago(30 * MIN) }, timersDead: ["bb-gc"] };
+  const infra = decideInfra({ bb3, lb: lbOk }, { ledger: { lastEscalation: () => null, infraDown: () => false }, playbooks, config, now: NOW, manager: uiManager, mode: "auto", delivery: { mode: "computer-use", ready: true } });
+  const escalation = infra.find((decision) => decision.threadKey === "infra:bb3" && decision.action === "escalate-manager");
+  assert.ok(escalation, JSON.stringify(infra));
+  assert.equal(escalation.route, "computer-use");
+});
+
 test("an idle thread with no route asks the owner to open it only when long stuck", () => {
   const pr = makePr({ unresolvedThreads: 1 });
   const offline = makeThread({ live: null });

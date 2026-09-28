@@ -18,6 +18,8 @@ const StateSchema = z.object({
   lifelogConsent: z.object({ id: z.string().min(1).max(200), until: z.number().finite() }).nullable().default(null),
   listeningMode: z.enum(['passive', 'wake']).default('passive'),
   idleTapAction: z.enum(['talk', 'highlight']).default('talk'),
+  // 'supervisor': the glasses home opens the fleet supervisor, not a new question.
+  homeMode: z.enum(['ask', 'supervisor']).default('ask'),
   lifelogTalkMode: z.enum(['tap', 'hold']).default('tap'),
   wakePhrase: z.string().trim().min(1).max(40).default('open agi'),
   answerQuestions: z.boolean().default(true),
@@ -31,7 +33,7 @@ const StateSchema = z.object({
 export type OpenAGIState = z.infer<typeof StateSchema>
 const KEY = 'openagi.g2.state.v2'
 
-function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'listeningMode' | 'idleTapAction' | 'lifelogTalkMode' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
+function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'listeningMode' | 'idleTapAction' | 'homeMode' | 'lifelogTalkMode' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
   return {
     version: 2, nodeId, nodeToken: null, node: null, conversationId: null,
     continuation: null, interfaceStyle: 'focused', lifelogPaused: false, savedDraft: '', pendingRequest: null,
@@ -39,6 +41,7 @@ function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIS
     ambientEnabled: preferences?.ambientEnabled ?? false, wakePhrase: preferences?.wakePhrase ?? 'open agi',
     listeningMode: preferences?.listeningMode ?? 'passive',
     idleTapAction: preferences?.idleTapAction ?? 'talk',
+    homeMode: preferences?.homeMode ?? 'ask',
     lifelogTalkMode: preferences?.lifelogTalkMode ?? 'tap',
     answerQuestions: preferences?.answerQuestions ?? true,
     speechModel: preferences?.speechModel ?? 'openai-buffered',

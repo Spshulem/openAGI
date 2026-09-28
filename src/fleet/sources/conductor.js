@@ -17,7 +17,7 @@ const MIN_REF_PREFIX = 8;
 
 const SESSIONS_SQL = `
   SELECT s.id, s.status, s.claude_session_id, s.title, s.model, s.updated_at, s.unread_count,
-         w.directory_name, w.branch, w.derived_status, w.workspace_path, w.pr_title, w.active_session_id,
+         w.local_id AS workspace_local_id, w.directory_name, w.branch, w.derived_status, w.workspace_path, w.pr_title, w.active_session_id,
          r.remote_url
   FROM sessions s
   JOIN workspaces w ON w.local_id = s.workspace_id
@@ -152,7 +152,28 @@ function statusAndError(sessionStatus, lastEnd, now, excerptMax) {
   return { agentStatus, error: null, abortReason: null };
 }
 
-function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
+// Per workspace: how many visible sessions (tabs) it has, and how many share
+// each tab title. Computer-use delivery needs the tab title to tell tabs apart.
+function sessionTitleKey(title) {
+  const text = String(title ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  return text && text !== "untitled" ? text : null;
+}
+
+function workspaceTabs(rows) {
+  const out = new Map();
+  for (const { row } of rows) {
+    const id = row.workspace_local_id;
+    if (!id) continue;
+    const entry = out.get(id) ?? { count: 0, titles: new Map() };
+    entry.count += 1;
+    const key = sessionTitleKey(row.title);
+    if (key) entry.titles.set(key, (entry.titles.get(key) ?? 0) + 1);
+    out.set(id, entry);
+  }
+  return out;
+}
+
+function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null }) {
   const { limits } = config;
   const summary = summarizeTail(readRecentMessages(db, row.id));
   const claudeSessionId = row.claude_session_id || null;
@@ -214,7 +235,15 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale }) {
       activeTab: row.active_session_id === row.id,
       prTitle: row.pr_title ?? null,
       dbRemote: repoFromRemote(row.remote_url),
-      conductorHosted: true
+      conductorHosted: true,
+      // conductor://workspace?id=<workspace local_id>&session=<sessions.id>
+      conductorWorkspaceId: row.workspace_local_id || null,
+      conductorSessionId: row.id,
+      // The tab's own title (null when untitled) and its siblings, so the
+      // computer-use route can prove which tab is open.
+      conductorSessionTitle: sessionTitleKey(row.title) ? clampText(redactSecrets(row.title), limits.titleMax) : null,
+      conductorWorkspaceSessions: tabs?.count ?? null,
+      conductorTitleShared: Boolean(sessionTitleKey(row.title) && (tabs?.titles.get(sessionTitleKey(row.title)) ?? 0) > 1)
     }
   };
 }
@@ -248,12 +277,13 @@ export async function listConductorThreads(config, options = {}) {
       .sort(newestFirst)
       .slice(0, MAX_STALE_MANAGER_ROWS);
     const peers = options.peers ?? readLivePeers(config, { isPidAlive });
+    const tabs = workspaceTabs(rows);
     const threads = [];
     for (const [list, stale] of [[recent, false], [manager, true]]) {
       for (const { row } of list) {
         // A query failure means the source is unknown this tick. Returning a
         // partial catalog would close questions from sessions we failed to read.
-        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale }));
+        threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null }));
       }
     }
     return threads;

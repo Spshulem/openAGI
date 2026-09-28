@@ -123,7 +123,7 @@ details.thread>summary{padding:0}
   var COLLAPSED = { done: true, excluded: true, 'idle-no-pr': true };
   var ACTION_LABEL = { planned: 'Planned', proposed: 'Proposed', sent: 'Sent', 'dry-run': 'Dry run', blocked: 'Blocked', failed: 'Failed', done: 'Done' };
   var ACTION_TONE = { planned: 'dim', proposed: 'warn', sent: 'good', 'dry-run': 'dim', blocked: 'hot', failed: 'hot', done: 'good' };
-  var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume' };
+  var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume', 'computer-use': 'typed in app' };
   var INFRA_NAME = { 'infra:bb3': 'BuildBot3', 'infra:lb': 'Codex load balancer' };
   var DOING_MAX = 20;
 

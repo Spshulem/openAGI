@@ -31,7 +31,7 @@ function makePr(overrides = {}) {
   };
 }
 
-function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", deps = {}, now = () => NOW, limits = {}, deliverStatus = "sent", manager = null } = {}) {
+function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", deps = {}, now = () => NOW, limits = {}, deliverStatus = "sent", manager = null, delivery = undefined } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-supervisor-"));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const delivered = [];
@@ -42,7 +42,7 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
     whenIdle: async () => {}
   };
   const notifier = { notifyQuestion: async (q) => { notified.push(q); return { outreachId: null, pushed: false, skipped: "push-off" }; } };
-  const config = resolveFleetConfig({}, { home: dataDir, mode, limits: { ...DEFAULTS, ...limits }, managerRef: "none" });
+  const config = resolveFleetConfig({}, { home: dataDir, mode, limits: { ...DEFAULTS, ...limits }, managerRef: "none", ...(delivery ? { delivery } : {}) });
   const prMap = prs ?? new Map([["acme/app#7", makePr()]]);
   const supervisor = new FleetSupervisor({
     dataDir,
@@ -1052,4 +1052,178 @@ test("a group widened while added is sending stays open for the new thread", asy
   const result = await supervisor.answerQuestion(q.id, "added");
   assert.equal(result.question.status, "open");
   assert.equal(result.delivery.status, "blocked");
+});
+
+// --- computer-use delivery (fake executor and readiness; no real app) -------
+
+const uiMeta = (id, extra = {}) => ({ conductorWorkspaceId: `w-${id}`, conductorSessionId: id, conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 1, ...extra });
+const readyDriver = (ready = true, detail = null) => ({ readiness: async () => ({ ready, detail }) });
+
+test("computer-use mode types into the app for a writer-locked Codex thread and never relays to a terminal one", async (t) => {
+  const locked = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop" } });
+  const terminal = makeThread({
+    key: "claude:c1", kind: "claude", id: "c1", cwd: "/work/c1", live: { peerName: "cli-1", pid: 9, status: "idle" },
+    lastAgentAt: ago(3 * 60 * MIN), lastActivityAt: ago(3 * 60 * MIN), meta: {}
+  });
+  const { supervisor, delivered, notified } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [locked, terminal], deps: { uiDriver: readyDriver() } });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.deepEqual(delivered.map((d) => [d.thread.key, d.route]), [["codex:t1", "computer-use"]]);
+  const rows = Object.fromEntries(snapshot.threads.map((row) => [row.key, row]));
+  assert.equal(rows["codex:t1"].route, "computer-use");
+  assert.equal(rows["claude:c1"].route, null);
+  assert.ok(notified.some((q) => q.dedupeKey === "open:claude:c1"), "the terminal thread takes the open-it path");
+  const settings = supervisor.getState().settings;
+  assert.equal(settings.delivery, "computer-use");
+  assert.equal(settings.deliveryReady, true);
+});
+
+test("computer-use not ready: the tick waits and sends nothing; computer-use-first falls back", async (t) => {
+  const thread = makeThread({ meta: { originator: "Codex Desktop" } });
+  const strict = fixture(t, { mode: "auto", delivery: "computer-use", threads: [thread], deps: { uiDriver: readyDriver(false, "screen locked") } });
+  const snapshot = await strict.supervisor.tick({ reason: "test" });
+  assert.equal(strict.delivered.length, 0);
+  assert.equal(snapshot.threads[0].decision.action, "wait");
+  assert.match(snapshot.threads[0].decision.reason, /computer use not ready: screen locked/);
+  assert.equal(strict.supervisor.getState().settings.deliveryDetail, "screen locked");
+  const first = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [thread], deps: { uiDriver: readyDriver(false, "screen locked") } });
+  await first.supervisor.tick({ reason: "test" });
+  assert.deepEqual(first.delivered.map((d) => d.route), ["codex-exec"]);
+});
+
+test("a blocked app send spends no attempt and no cooldown, so the next tick tries again", async (t) => {
+  let now = NOW;
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", deliverStatus: "blocked", now: () => now, deps: { uiDriver: readyDriver() } });
+  await supervisor.tick({ reason: "test" });
+  const ledger = supervisor.store.ledgerFor("codex:t1");
+  assert.equal(ledger.attemptsWithoutProgress ?? 0, 0);
+  assert.equal(ledger.lastNudgeAt ?? null, null);
+  now += MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 2);
+});
+
+test("a Conductor tab and the Codex thread it hosts get one typed message per tick", async (t) => {
+  const tab = makeThread({ key: "conductor:s9", kind: "conductor", id: "s9", claudeSessionId: "t9", workspace: "madrid", cwd: "/work/s9", meta: uiMeta("s9") });
+  const hosted = makeThread({ key: "codex:t9", id: "t9", cwd: "/work/t9", meta: { originator: "codex_sdk_ts" } });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [tab, hosted], deps: { uiDriver: readyDriver() } });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].route, "computer-use");
+  const routes = Object.fromEntries(snapshot.threads.map((row) => [row.key, row.route]));
+  assert.deepEqual(routes, { "conductor:s9": "computer-use", "codex:t9": "computer-use" });
+});
+
+test("a grouped resume types once into a Conductor tab shared by two thread keys", async (t) => {
+  const tab = makeThread({ key: "conductor:s9", kind: "conductor", id: "s9", claudeSessionId: "t9", workspace: "madrid", cwd: "/work/s9", meta: uiMeta("s9") });
+  const hosted = makeThread({ key: "codex:t9", id: "t9", cwd: "/work/t9", meta: { originator: "codex_sdk_ts" } });
+  const { supervisor, delivered } = fixture(t, { mode: "observe", delivery: "computer-use", threads: [tab, hosted], deps: { uiDriver: readyDriver() } });
+  await supervisor.tick();
+  const count = delivered.length;
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["added"], threadKeys: [tab.key, hosted.key] });
+  assert.equal((await supervisor.answerQuestion(q.id, "added")).question.status, "answered");
+  assert.equal(delivered.length - count, 1);
+  assert.deepEqual([...supervisor.store.question(q.id).deliveredThreadKeys].sort(), ["codex:t9", "conductor:s9"]);
+});
+
+test("owner answers are typed into the app; blocked ones stay open with the reason", async (t) => {
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
+  const typed = fixture(t, { delivery: "computer-use", threads: [asking], deps: { uiDriver: readyDriver() } });
+  await typed.supervisor.tick();
+  const question = typed.supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  const answered = await typed.supervisor.answerQuestion(question.id, "Business");
+  assert.equal(answered.question.status, "answered");
+  assert.equal(typed.delivered[0].route, "computer-use");
+  assert.equal(typed.supervisor.store.ledgerFor("codex:t1").nudges.at(-1).status, "owner-answer");
+
+  const blocked = fixture(t, { delivery: "computer-use", threads: [asking], deliverStatus: "blocked", deps: { uiDriver: readyDriver() } });
+  await blocked.supervisor.tick();
+  const open = blocked.supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  const result = await blocked.supervisor.answerQuestion(open.id, "Starter");
+  assert.equal(result.question.status, "open");
+  assert.equal(result.delivery.status, "blocked");
+
+  const notReady = fixture(t, { delivery: "computer-use", threads: [asking], deps: { uiDriver: readyDriver(false, "Codex is not running") } });
+  await notReady.supervisor.tick();
+  const waiting = notReady.supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  const held = await notReady.supervisor.answerQuestion(waiting.id, "Starter");
+  assert.equal(held.question.status, "open");
+  assert.match(held.delivery.detail, /computer use not ready: Codex is not running/);
+  assert.equal(notReady.delivered.length, 0);
+
+  const terminal = makeThread({ key: "claude:c1", kind: "claude", id: "c1", live: { peerName: "cli-1", pid: 9, status: "idle" }, meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
+  const cli = fixture(t, { delivery: "computer-use", threads: [terminal], deps: { uiDriver: readyDriver() } });
+  await cli.supervisor.tick();
+  const ask = cli.supervisor.getState().questions.find((q) => q.kind === "agent-ask");
+  assert.ok(ask, "a terminal thread still gets its question");
+  const none = await cli.supervisor.answerQuestion(ask.id, ask.options[0]);
+  assert.equal(none.question.status, "open");
+  assert.match(none.delivery.detail, /no app shows this thread/);
+  assert.equal(cli.delivered.length, 0);
+});
+
+test("a grouped resume types into one app thread at a time", async (t) => {
+  const capped = ["t1", "t2", "t3"].map((id) => makeThread({
+    key: `codex:${id}`, id, title: `Fix ${id}`, cwd: `/work/${id}`, agentStatus: "error", writerLocked: true, meta: { originator: "Codex Desktop" },
+    error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() }
+  }));
+  let running = 0;
+  let most = 0;
+  const routes = [];
+  const executor = {
+    deliver: async (args) => {
+      running += 1;
+      most = Math.max(most, running);
+      routes.push(args.route);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      running -= 1;
+      return { status: "sent", route: args.route, detail: "typed into Codex", actionId: null };
+    },
+    inFlight: () => [],
+    whenIdle: async () => {}
+  };
+  const { supervisor } = fixture(t, { delivery: "computer-use", threads: capped, deps: { executor, uiDriver: readyDriver() } });
+  await supervisor.tick({ reason: "test" });
+  const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
+  assert.ok(group);
+  const result = await supervisor.answerQuestion(group.id, "added");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(result.question.status, "answered");
+  assert.deepEqual(routes, ["computer-use", "computer-use", "computer-use"]);
+  assert.equal(most, 1);
+});
+
+test("the owner's own message to a thread goes through the supervisor's delivery", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [makeThread()] });
+  await supervisor.tick();
+  const result = await supervisor.sendOwnerMessage("codex:t1", "  Rebase on main.  ");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].message, "Rebase on main.");
+  assert.equal(delivered[0].playbook, "owner-message");
+  assert.equal((await supervisor.sendOwnerMessage("codex:missing", "hi")).delivery.status, "blocked");
+  assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
+});
+
+test("a question whose thread left the scan closes itself", async (t) => {
+  let threads = [makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } })];
+  const { supervisor } = fixture(t, { deps: { listCodexThreads: async () => threads } });
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.ok(question);
+  threads = [];
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "resolved");
+});
+
+test("a question stays open when its thread was only pushed out by the scan cap", async (t) => {
+  const asking = makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
+  const newer = (n) => makeThread({ key: `codex:n${n}`, id: `n${n}`, title: `Newer ${n}`, prRefs: [], lastActivityAt: ago(n) });
+  let threads = [asking];
+  const { supervisor } = fixture(t, { limits: { maxThreads: 2 }, deps: { listCodexThreads: async () => threads } });
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.ok(question);
+  threads = [newer(1), newer(2)];
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "open");
 });

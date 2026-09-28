@@ -3,9 +3,12 @@ package sh.openagi.mobile.ui
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import sh.openagi.mobile.store.ChatHistoryStore
+import java.nio.file.Files
 import java.time.Instant
 
 class ChatConversationStateTest {
@@ -29,5 +32,81 @@ class ChatConversationStateTest {
         // Replies stream in the Activity's scope, not the screen's, so a tab
         // switch mid-reply does not cancel the stream.
         assertSame(scope, chat.scope)
+    }
+
+    // Folding the phone recreates the Activity and a process kill drops
+    // everything in memory; the saved copy brings the conversation back.
+    @Test
+    fun aSavedConversationComesBackInANewHolder() {
+        val dir = Files.createTempDirectory("chat-history").toFile()
+        val scope = CoroutineScope(Dispatchers.Unconfined)
+        val first = ChatConversationState(scope, ChatHistoryStore(dir, "supervisor"), "node-1", Dispatchers.Unconfined)
+        first.messages.value = listOf(
+            ChatEntry.User(0, Instant.EPOCH, "What needs me?"),
+            ChatEntry.Assistant(1, Instant.EPOCH, "Two PRs.", streaming = false),
+            ChatEntry.User(2, Instant.EPOCH, "And now?"),
+            ChatEntry.Assistant(3, Instant.EPOCH, "Half a rep", streaming = true, retryText = "And now?"),
+        )
+        first.persist()
+
+        val second = ChatConversationState(scope, ChatHistoryStore(dir, "supervisor"), "node-1")
+        val restored = second.messages.value
+        assertEquals(4, restored.size)
+        assertEquals("Two PRs.", (restored[1] as ChatEntry.Assistant).text)
+        // A reply still streaming when the app died comes back stopped, with Try again.
+        val stopped = restored[3] as ChatEntry.Assistant
+        assertFalse(stopped.streaming)
+        assertTrue(stopped.failed)
+        assertEquals("And now?", stopped.retryText)
+        assertEquals(4L, second.nextId.value)
+        // The Chat tab's conversation and another pairing's are separate.
+        assertTrue(ChatConversationState(scope, ChatHistoryStore(dir, "chat"), "node-1").messages.value.isEmpty())
+        assertTrue(ChatConversationState(scope, ChatHistoryStore(dir, "supervisor"), "node-2").messages.value.isEmpty())
+    }
+
+    @Test
+    fun onlyTheNewestLinesAreKept() {
+        val dir = Files.createTempDirectory("chat-history-cap").toFile()
+        val store = ChatHistoryStore(dir, "chat")
+        val many = (0 until ChatHistoryStore.MAX_ENTRIES + 25).map {
+            sh.openagi.mobile.store.SavedChatEntry(it.toLong(), "user", Instant.EPOCH, "m$it")
+        }
+        store.save("node-1", many)
+        val kept = store.load("node-1")
+        assertEquals(ChatHistoryStore.MAX_ENTRIES, kept.size)
+        assertEquals("m25", kept.first().text)
+        store.delete()
+        assertTrue(store.load("node-1").isEmpty())
+    }
+
+    // Writes run on IO threads and can reach the file out of order; the
+    // snapshot numbered last wins.
+    @Test
+    fun aLateOlderSnapshotNeverReplacesANewerOne() {
+        val dir = Files.createTempDirectory("chat-history-order").toFile()
+        val store = ChatHistoryStore(dir, "chat")
+        val older = ChatHistoryStore.nextSequence()
+        val newer = ChatHistoryStore.nextSequence()
+        store.save("node-1", listOf(sh.openagi.mobile.store.SavedChatEntry(1, "assistant", Instant.EPOCH, "Done.")), newer)
+        store.save("node-1", listOf(sh.openagi.mobile.store.SavedChatEntry(1, "assistant", Instant.EPOCH, "", failed = true)), older)
+        assertEquals("Done.", store.load("node-1").single().text)
+    }
+
+    // Forgetting a pairing mid-reply: the reply's final write, and any write
+    // already queued, must not bring the deleted conversation back.
+    @Test
+    fun aForgottenPairingsHistoryIsNotRecreated() {
+        val dir = Files.createTempDirectory("chat-history-forget").toFile()
+        val queued = ChatHistoryStore.nextSequence()
+        val state = ChatConversationState(CoroutineScope(Dispatchers.Unconfined), ChatHistoryStore(dir, "chat"), "node-forget", Dispatchers.Unconfined)
+        state.messages.value = listOf(ChatEntry.User(0, Instant.EPOCH, "hi"))
+        state.persist()
+        ChatHistoryStore(dir, "chat").delete(forgetNodeId = "node-forget")
+        ChatHistoryStore(dir, "chat").save("node-forget", listOf(sh.openagi.mobile.store.SavedChatEntry(0, "user", Instant.EPOCH, "hi")), queued)
+        state.persist()
+        assertFalse(java.io.File(dir, "chat-chat.json").exists())
+        // A new pairing writes normally.
+        ChatHistoryStore(dir, "chat").save("node-new", listOf(sh.openagi.mobile.store.SavedChatEntry(0, "user", Instant.EPOCH, "hello")))
+        assertEquals("hello", ChatHistoryStore(dir, "chat").load("node-new").single().text)
     }
 }

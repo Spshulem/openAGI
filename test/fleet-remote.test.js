@@ -67,3 +67,21 @@ test('node capability refuses arbitrary routes, commands, and methods', async t 
     await assert.rejects(capability.invoke(operation,payload), /Unsupported/);
   }
 });
+
+test("the Mac capability forwards the owner's send and validates it", async () => {
+  const { createFleetCapability } = await import("../src/fleet/remote.js");
+  const calls = [];
+  const supervisor = {
+    getState: () => ({ mode: "auto", questions: [], actions: [], snapshot: null, settings: {} }),
+    sendOwnerMessage: async (key, message) => { calls.push([key, message]); return { delivery: { status: "sent", route: "computer-use", detail: "typed" } }; }
+  };
+  const capability = createFleetCapability(supervisor);
+  const ok = await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: "Push it." } });
+  assert.equal(ok.response.status, 200);
+  assert.equal(ok.response.body.delivery.status, "sent");
+  assert.deepEqual(calls, [["codex:abc-1", "Push it."]]);
+  const badKey = await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "../etc", message: "x" } });
+  assert.equal(badKey.response.status, 400);
+  const empty = await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: " " } });
+  assert.equal(empty.response.status, 400);
+});

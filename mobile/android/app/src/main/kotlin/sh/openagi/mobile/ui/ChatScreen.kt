@@ -59,21 +59,24 @@ import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.ChatDeltaPayload
 import sh.openagi.mobile.protocol.ChatFailurePayload
 import sh.openagi.mobile.protocol.ChatFinalPayload
 import sh.openagi.mobile.protocol.ProtocolJson
+import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
+import sh.openagi.mobile.store.SavedChatEntry
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SseFrame
 import sh.openagi.mobile.ui.components.ConnectionState
 import sh.openagi.mobile.ui.components.ScreenHeader
-import sh.openagi.mobile.ui.markdown.InlineSpan
-import sh.openagi.mobile.ui.markdown.Markdown
-import sh.openagi.mobile.ui.markdown.MarkdownBlock
+import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
 import sh.openagi.mobile.util.ErrorCopy
@@ -102,18 +105,85 @@ internal sealed interface ChatEntry {
         // resend it without the user retyping — never sent back to the
         // daemon as anything but a fresh POST /message body.
         val retryText: String? = null,
+        // What the agent is doing right now ("Using fleet_status"), from the
+        // stream's status frames. Shown only while streaming; never saved.
+        val activity: String? = null,
     ) : ChatEntry
+}
+
+// Plain words for a status frame: the tool it is running, else its stage.
+internal fun chatActivityLabel(data: String): String? {
+    val obj = runCatching { ProtocolJson.json.parseToJsonElement(data) as? kotlinx.serialization.json.JsonObject }.getOrNull() ?: return null
+    fun field(name: String) = (obj[name] as? kotlinx.serialization.json.JsonPrimitive)?.takeIf { it.isString }?.content?.trim()?.takeIf { it.isNotEmpty() }
+    val tool = field("tool")
+    if (tool != null) return "Using ${tool.replace('_', ' ')}"
+    return when (field("stage")) {
+        null -> null
+        "routing" -> "Getting started"
+        "thinking" -> "Thinking"
+        "saving" -> "Saving"
+        else -> field("stage")!!.replace('-', ' ').replaceFirstChar { it.uppercase() }
+    }
 }
 
 // Kept by the Activity so switching tabs does not discard a conversation
 // while the daemon keeps the same node session alive. Replies stream in
 // `scope`, the Activity's, so leaving the tab mid-reply does not cancel the
 // stream and leave a false "Can't reach OpenAGI" in the kept history.
-class ChatConversationState(internal val scope: CoroutineScope) {
+//
+// With a store, the conversation is also saved on the phone, so folding the
+// phone (which recreates the Activity), a process kill, or a relaunch keeps
+// it. A reply that was still streaming when the app died comes back as
+// stopped, with "Try again".
+class ChatConversationState(
+    internal val scope: CoroutineScope,
+    private val store: ChatHistoryStore? = null,
+    private val nodeId: String = "",
+    private val io: CoroutineDispatcher = Dispatchers.IO,
+) {
     internal val messages = mutableStateOf<List<ChatEntry>>(emptyList())
     internal val inputText = mutableStateOf("")
     internal val isStreaming = mutableStateOf(false)
     internal val nextId = mutableStateOf(0L)
+
+    init {
+        val restored = store?.load(nodeId).orEmpty().map { it.toEntry() }
+        if (restored.isNotEmpty()) {
+            messages.value = restored
+            nextId.value = restored.maxOf { it.id } + 1
+        }
+    }
+
+    // Called after every change that should outlive the screen: a send, a
+    // finished or failed reply, a retry.
+    internal fun persist() {
+        val entries = messages.value.mapNotNull { it.toSaved() }
+        val target = store ?: return
+        // Numbered now, on the caller's thread, so a write that reaches the
+        // file late never replaces a newer snapshot.
+        val sequence = ChatHistoryStore.nextSequence()
+        // A scope already cancelled (the Activity went away mid-reply) still
+        // gets its last write, on this thread; the file is small.
+        if (scope.isActive) scope.launch(io) { target.save(nodeId, entries, sequence) } else target.save(nodeId, entries, sequence)
+    }
+}
+
+private fun ChatEntry.toSaved(): SavedChatEntry? = when (this) {
+    is ChatEntry.User -> SavedChatEntry(id, "user", timestamp, text)
+    // A still-streaming reply is saved as stopped: if the app dies now, the
+    // next launch must not show a reply that will never finish.
+    is ChatEntry.Assistant -> SavedChatEntry(
+        id, "assistant", timestamp, text,
+        failed = failed || streaming,
+        failureDetail = if (streaming && !failed) "Reply stopped when the app closed." else failureDetail,
+        retryText = retryText,
+    )
+}
+
+private fun SavedChatEntry.toEntry(): ChatEntry = if (role == "user") {
+    ChatEntry.User(id, at, text)
+} else {
+    ChatEntry.Assistant(id, at, text, streaming = false, failed = failed, failureDetail = failureDetail, retryText = retryText)
 }
 
 // The Supervisor's "Ask supervisor" reuses this whole screen: the same
@@ -189,7 +259,11 @@ fun ChatScreen(
             // PROTOCOL.md's every-15s keepalive during a long turn — it must
             // never be mistaken for an empty reply. Anything else is a frame
             // name this client doesn't know yet and is ignored the same way.
-            "status", "session", "heartbeat" -> Unit
+            "status" -> {
+                val label = chatActivityLabel(frame.data)
+                if (label != null) updateAssistant(assistantId) { current -> if (current.streaming) current.copy(activity = label) else current }
+            }
+            "session", "heartbeat" -> Unit
             else -> Unit
         }
     }
@@ -214,6 +288,7 @@ fun ChatScreen(
             )
         } finally {
             isStreaming = false
+            conversationState.persist()
         }
     }
 
@@ -224,6 +299,7 @@ fun ChatScreen(
         val now = Instant.now()
         messages = messages + ChatEntry.User(userId, now, text) +
             ChatEntry.Assistant(assistantId, now, "", streaming = true, retryText = text)
+        conversationState.persist()
         conversationState.scope.launch { runExchange(assistantId, text) }
     }
 
@@ -370,10 +446,13 @@ private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform
                                 .padding(horizontal = 14.dp, vertical = 10.dp),
                         ) {
                             if (entry.streaming && entry.text.isBlank()) {
-                                TypingDots()
+                                Column {
+                                    TypingDots()
+                                    entry.activity?.let { Text("$it…", style = OpenAGIType.caption, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp)) }
+                                }
                             } else {
                                 val textColor = if (entry.failed) colors.alert else MaterialTheme.colorScheme.onBackground
-                                MarkdownBlocksView(Markdown.parse(entry.text), textColor = textColor)
+                                MarkdownView(entry.text, textColor = textColor)
                             }
                         }
                     }
@@ -412,55 +491,6 @@ private fun TypingDots() {
     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         repeat(3) {
             Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(muted))
-        }
-    }
-}
-
-@Composable
-private fun MarkdownBlocksView(blocks: List<MarkdownBlock>, textColor: Color) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        blocks.forEach { block ->
-            when (block) {
-                is MarkdownBlock.Paragraph -> Text(renderInline(block.spans, textColor), style = OpenAGIType.body, color = textColor)
-                is MarkdownBlock.Bullet -> Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("•", style = OpenAGIType.body, color = textColor)
-                    Text(renderInline(block.spans, textColor), style = OpenAGIType.body, color = textColor, modifier = Modifier.weight(1f))
-                }
-                is MarkdownBlock.Numbered -> Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("${block.index}.", style = OpenAGIType.body, color = textColor)
-                    Text(renderInline(block.spans, textColor), style = OpenAGIType.body, color = textColor, modifier = Modifier.weight(1f))
-                }
-                is MarkdownBlock.CodeBlock -> CodeBlockView(block.code)
-            }
-        }
-    }
-}
-
-private fun renderInline(spans: List<InlineSpan>, base: Color): AnnotatedString = buildAnnotatedString {
-    spans.forEach { span ->
-        when (span) {
-            is InlineSpan.Text -> append(span.text)
-            is InlineSpan.Bold -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(span.text) }
-            is InlineSpan.Code -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(span.text) }
-            is InlineSpan.Link -> withStyle(SpanStyle(color = base, textDecoration = TextDecoration.Underline)) { append(span.text) }
-        }
-    }
-}
-
-// DESIGN.md: "Fenced code uses the mono face on a subtly darker fill,
-// scrolls horizontally rather than wrapping, and is long-press copyable."
-@Composable
-private fun CodeBlockView(code: String) {
-    val colors = LocalOpenAGIColors.current
-    val clipboard = LocalClipboardManager.current
-    Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-        Box(
-            modifier = Modifier
-                .horizontalScroll(rememberScrollState())
-                .combinedClickable(onClick = {}, onLongClick = { clipboard.setText(AnnotatedString(code)) })
-                .padding(10.dp),
-        ) {
-            Text(code, style = OpenAGIType.dataMono, color = MaterialTheme.colorScheme.onSurface)
         }
     }
 }

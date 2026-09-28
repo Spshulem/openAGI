@@ -39,6 +39,7 @@ export class OpenAGIGlassesRenderer {
   transcript(text: string, ambient: boolean): void { this.show(`LIVE SPEECH${ambient ? this.memoryActive ? ' · memory ON' : ' · wake listening' : ''}\n\n${tail(text, 260)}\n\n${ambient ? 'Double-tap: exit · Swipe down: controls' : this.stopHint()}`, false) }
   unpaired(): void { this.show('Agents\n\nPair or add an agent\nfrom the phone screen.\n\nDouble-tap: exit', true) }
   pairing(): void { this.show('Agents\n\nPair OpenAGI or add\nan agent URL + token\non the phone screen.', true) }
+  supervisorHome(questions: number): void { this.show(`Supervisor\n\nTap: ${questions ? `${questions} question${questions === 1 ? '' : 's'} for you` : 'no questions now'}\nSwipe down: thread status\n${this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})\n` : ''}Double-tap: exit`, true) }
   home(device?: string): void { this.show(`Agent${device ? ` · ${device}` : ''}\n\nTap to ask / follow up\nin this conversation.\n\n${this.pendingInbox ? `Swipe up: Inbox (${this.pendingInbox})\nSwipe down: Recent` : 'Swipe: Recent'}\nDouble-tap: exit`, true) }
   recent(question: string, position: number, total: number): void { this.show(`Recent answers · ${position}/${total}\n\n${question.slice(0, 220)}\n\nSwipe: choose · Tap: open\nDouble-tap: back`, true) }
   inbox(text: string, item: number, total: number, page: number, pages: number): void {
@@ -61,6 +62,8 @@ export class OpenAGIGlassesRenderer {
     const content = partial || `\n${stage.slice(0, 58)}\n\n${activity || 'Waiting for the next update…'}`
     this.show(`Agent · ${detail.split(' · ')[0]}\n${content}\n\nSwipe: read · Tap: text/activity\nDouble-tap: stop? · Cancel on phone`, false)
   }
+  // Read-only: a tap or double-tap goes back to Supervisor home.
+  fleetStatus(page: string, pageIndex: number, pages: number): void { this.show(`Supervisor status\n\n${page}\n\n${pageIndex + 1}/${pages} · swipe pages\nTap: back`, true) }
   answer(page: string, pageIndex: number, pages: number): void { this.show(`Agent\n\n${page}\n\n${pageIndex + 1}/${pages} · swipe pages\n${this.holdFollowup ? 'Hold' : 'Tap'}: follow up · Double-tap: back`, true) }
   message(title: string, detail: string): void { this.show(`${title}\n\n${tail(detail, 420)}\n\nTap to continue`, true) }
 }

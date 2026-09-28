@@ -1,16 +1,20 @@
 import { spawn, execFile } from "node:child_process";
 
-function engineEnvironment() {
+// appAgentProxy: true lets the engine hand work to the Open Computer Use.app
+// agent, which holds its own Accessibility and Screen Recording grants (the
+// fleet uses this; the daemon's node binary lacks both). The default keeps
+// the engine inside this process tree, under the caller's permissions.
+function engineEnvironment({ appAgentProxy = false } = {}) {
   const env = Object.fromEntries(["HOME", "USER", "PATH", "LANG", "TMPDIR"]
     .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
   env.OPEN_COMPUTER_USE_ALLOW_GLOBAL_POINTER_FALLBACKS = "0";
-  env.OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY = "1";
+  if (!appAgentProxy) env.OPEN_COMPUTER_USE_DISABLE_APP_AGENT_PROXY = "1";
   return env;
 }
 
-export function readOcuPermissions(command, run = execFile) {
+export function readOcuPermissions(command, run = execFile, { appAgentProxy = false, timeoutMs = 3000 } = {}) {
   return new Promise((resolve, reject) => {
-    run(command, ["doctor"], { env: engineEnvironment(), timeout: 3000,
+    run(command, ["doctor"], { env: engineEnvironment({ appAgentProxy }), timeout: timeoutMs,
       maxBuffer: 16 * 1024, killSignal: "SIGKILL", encoding: "utf8" }, (error, stdout) => {
       if (error) reject(new Error("Open Computer Use permission probe failed."));
       else resolve(stdout);
@@ -21,10 +25,11 @@ export function readOcuPermissions(command, run = execFile) {
 // A private stdio connection, not an unrestricted MCP registration. No tool
 // arguments, screenshots, stderr, or provider credentials enter daemon logs.
 export class OcuTransport {
-  constructor(command, { spawnImpl = spawn, timeoutMs = 10_000 } = {}) {
+  constructor(command, { spawnImpl = spawn, timeoutMs = 10_000, appAgentProxy = false } = {}) {
     this.command = command;
     this.spawn = spawnImpl;
     this.timeoutMs = timeoutMs;
+    this.appAgentProxy = appAgentProxy;
     this.nextId = 0;
     this.pending = new Map();
     this.buffer = "";
@@ -35,7 +40,8 @@ export class OcuTransport {
     // v0.3.3 otherwise proxies even the native executable to a shared,
     // LaunchServices-owned app agent. Killing that proxy does NOT cancel the
     // app agent's input. Own the actual dispatcher and its snapshot cache.
-    const env = engineEnvironment();
+    // Callers that opt into the app agent accept that trade for its grants.
+    const env = engineEnvironment({ appAgentProxy: this.appAgentProxy });
     const child = this.spawn(this.command, ["mcp"], { stdio: ["pipe", "pipe", "pipe"], env });
     this.proc = child;
     child.stderr.resume();

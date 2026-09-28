@@ -45,6 +45,7 @@ test("registers two read-only fleet tools and replaces them on re-register", () 
   }
   assert.deepEqual(tools.get("fleet_thread").parameters.required, ["key"]);
   registerFleetTools(tools, fakeSupervisor());
+  // The two sending tools register only for a supervisor that can send.
   assert.equal(tools.list().filter((tool) => tool.name.startsWith("fleet_")).length, 2);
   registerFleetTools(tools, null);
   assert.equal(tools.has("fleet_status"), false);
@@ -152,4 +153,35 @@ test("the runtime registers the fleet tools against its own fleet supervisor", a
   assert.equal(ok, true);
   assert.equal(result.thread.key, "codex:t1");
   assert.equal(runtime.tools.get("fleet_status").sideEffects, false);
+});
+
+test("the send and answer tools need approval and pin the exact target", async () => {
+  const sent = [];
+  const answered = [];
+  const supervisor = {
+    ...fakeSupervisor({
+      snapshot: { at: "2026-09-26T11:00:00.000Z", counts: {}, threads: [row({ workspace: "apia" })], infra: {}, sourceErrors: {} },
+      questions: [{ id: "fq_1", title: "Which plan?", options: ["Starter", "Business", "dismiss"], threadKey: "codex:t1" }]
+    }),
+    sendOwnerMessage: async (key, message) => { sent.push([key, message]); return { delivery: { status: "sent", route: "computer-use", detail: "typed into Codex" } }; },
+    answerQuestion: async (id, answer) => { answered.push([id, answer]); return { question: { status: "answered" }, delivery: { status: "sent", route: "computer-use", detail: "typed into Codex" } }; }
+  };
+  const tools = registry(supervisor);
+  const send = tools.get("fleet_send_message");
+  const answer = tools.get("fleet_answer_question");
+  assert.equal(send.needsConfirmation, true);
+  assert.equal(answer.needsConfirmation, true);
+  const target = send.prepareApprovalArgs({ key: "codex:t1", message: "  Rebase on main and push.  " });
+  assert.deepEqual(target, { key: "codex:t1", message: "Rebase on main and push.", name: "apia" });
+  assert.match(send.summarize(target), /Send to apia \(codex:t1\):\nRebase on main and push\./);
+  assert.throws(() => send.prepareApprovalArgs({ key: "codex:nope", message: "hi" }), /No fleet thread/);
+  await assert.rejects(send.handler(target, {}), /approval/);
+  assert.deepEqual(await send.handler(target, { __confirmed: true }), { status: "sent", route: "computer-use", detail: "typed into Codex" });
+  assert.deepEqual(sent, [["codex:t1", "Rebase on main and push."]]);
+  assert.throws(() => answer.prepareApprovalArgs({ questionId: "fq_1", answer: "Enterprise" }), /one of: Starter, Business/);
+  const pinned = answer.prepareApprovalArgs({ questionId: "fq_1", answer: "Business" });
+  assert.equal((await answer.handler(pinned, { __confirmed: true })).questionStatus, "answered");
+  assert.deepEqual(answered, [["fq_1", "Business"]]);
+  supervisor.sendOwnerMessage = async () => ({ delivery: { status: "blocked", detail: "owner using Codex" } });
+  await assert.rejects(tools.get("fleet_send_message").handler(target, { __confirmed: true }), /Not delivered \(blocked\): owner using Codex/);
 });

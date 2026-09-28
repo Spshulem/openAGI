@@ -4,7 +4,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { resolveFleetConfig } from "../src/fleet/contracts.js";
+import { uiIdentity } from "../src/fleet/ui-delivery.js";
+import { linkUiHosts, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   classifyLbError, cleanCodexUserText, listCodexThreads, parseRolloutTail, readCodexLbErrors
 } from "../src/fleet/sources/codex.js";
@@ -79,7 +80,7 @@ function addThread(ctx, spec) {
   const {
     id, lines = null, mtimeAgo = 30 * MIN, updatedAgo = mtimeAgo, cwd = ctx.repoDir, archived = 0,
     threadSource = "user", source = "vscode", branch = "spencer/feature", origin = "git@github.com:buildbetter-app/buildbetter.git",
-    name = null, title = "Fix the thing", firstUserMessage = "fix it"
+    name = null, title = "Fix the thing", firstUserMessage = "fix it", originator = null
   } = spec;
   const rollout = path.join(ctx.codexHome, "sessions", "2026", "09", "25", `rollout-2026-09-25T10-00-00-${id}.jsonl`);
   if (lines) {
@@ -88,10 +89,10 @@ function addThread(ctx, spec) {
     fs.utimesSync(rollout, at, at);
   }
   ctx.db.prepare(`INSERT INTO threads (id, rollout_path, created_at, updated_at, updated_at_ms, source, model_provider, cwd, title,
-    sandbox_policy, approval_mode, archived, git_branch, git_origin_url, first_user_message, model, thread_source, name)
-    VALUES (?, ?, ?, ?, ?, ?, 'codex-lb', ?, ?, 'danger-full-access', 'never', ?, ?, ?, ?, 'gpt-6-sol', ?, ?)`)
+    sandbox_policy, approval_mode, archived, git_branch, git_origin_url, first_user_message, model, thread_source, name, originator)
+    VALUES (?, ?, ?, ?, ?, ?, 'codex-lb', ?, ?, 'danger-full-access', 'never', ?, ?, ?, ?, 'gpt-6-sol', ?, ?, ?)`)
     .run(id, rollout, sec(5 * 60 * MIN), sec(updatedAgo), NOW - updatedAgo, source, cwd, title, archived, branch, origin,
-      firstUserMessage, threadSource, name);
+      firstUserMessage, threadSource, name, originator);
   return rollout;
 }
 
@@ -495,4 +496,56 @@ test("readCodexLbErrors: no log db is empty, an unreadable one throws", async (t
   assert.deepEqual(await readCodexLbErrors(config, { now: NOW }), []);
   fs.writeFileSync(path.join(home, ".codex", "logs_2.sqlite"), "not a database, just bytes ".repeat(100));
   await assert.rejects(readCodexLbErrors(config, { now: NOW }));
+});
+
+test("listCodexThreads exposes the originator; Conductor-hosted threads type into Conductor, others into the Codex app", async (t) => {
+  const ctx = makeHome(t);
+  const idleLines = [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")];
+  addThread(ctx, { id: "t-desktop", lines: idleLines, name: "Fix uploads", originator: "Codex Desktop" });
+  addThread(ctx, { id: "t-hosted", lines: idleLines, originator: "codex_sdk_ts" });
+  addThread(ctx, { id: "t-orphan", lines: idleLines, originator: "codex_sdk_ts" });
+  const run = async () => ({ code: 1, stdout: "", stderr: "" });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run }));
+  assert.equal(map["t-desktop"].meta.originator, "Codex Desktop");
+  assert.equal(map["t-hosted"].meta.originator, "codex_sdk_ts");
+
+  const desktop = uiTargetFor(map["t-desktop"]);
+  assert.equal(desktop.bundleId, "com.openai.codex");
+  assert.equal(desktop.deepLink, "codex://threads/t-desktop");
+  assert.doesNotMatch(desktop.deepLink, /prompt=/, "never pre-fills the composer");
+  // Conductor-hosted Codex: no Conductor row, no app route.
+  assert.equal(uiTargetFor(map["t-hosted"]), null);
+
+  const host = {
+    key: "conductor:s-host", kind: "conductor", id: "s-host", claudeSessionId: "t-hosted", workspace: "madrid", title: "Fix billing", archived: false,
+    meta: { conductorWorkspaceId: "w-madrid", conductorSessionId: "s-host", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 1 }
+  };
+  const linked = byId(linkUiHosts([map["t-hosted"], map["t-orphan"], map["t-desktop"], host]));
+  const hosted = uiTargetFor(linked["t-hosted"]);
+  assert.equal(hosted.bundleId, "com.conductor.app");
+  assert.equal(hosted.deepLink, "conductor://workspace?id=w-madrid&session=s-host");
+  assert.equal(hosted.targetKey, uiTargetFor(host).targetKey, "same app thread as the Conductor row");
+  assert.equal(uiTargetFor(linked["t-orphan"]), null);
+  assert.equal(linked["t-desktop"], map["t-desktop"], "other threads pass through untouched");
+  assert.equal(map["t-hosted"].meta.conductorHost, undefined, "inputs are not mutated");
+});
+
+test("listCodexThreads flags a title shared with any unarchived Codex thread, even one outside the scan", async (t) => {
+  const ctx = makeHome(t);
+  const idleLines = [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")];
+  addThread(ctx, { id: "t-recent", lines: idleLines, name: "Fix uploads" });
+  addThread(ctx, { id: "t-unique", lines: idleLines, name: "Ship billing" });
+  // Weeks old, so outside the lookback, but still open in the Codex app.
+  addThread(ctx, { id: "t-old", updatedAgo: 60 * 24 * 60 * MIN, name: "Fix uploads" });
+  // Archived and Conductor-hosted copies are not in the Codex sidebar.
+  addThread(ctx, { id: "t-archived", archived: 1, name: "Ship billing" });
+  addThread(ctx, { id: "t-hosted-copy", originator: "codex_sdk_ts", name: "Ship billing" });
+  const run = async () => ({ code: 1, stdout: "", stderr: "" });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run }));
+  assert.equal(map["t-old"], undefined);
+  assert.equal(uiTargetFor(map["t-recent"]).titleShared, true);
+  assert.equal(uiTargetFor(map["t-unique"]).titleShared, false);
+  const identity = uiIdentity(map["t-recent"], uiTargetFor(map["t-recent"]), Object.values(map));
+  assert.equal(identity.ambiguous, true);
+  assert.match(identity.reason, /share this title/);
 });

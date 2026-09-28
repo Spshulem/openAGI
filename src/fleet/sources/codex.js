@@ -6,9 +6,10 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  runCommand, threadKey, toIso
+  CONDUCTOR_CODEX_ORIGINATOR, runCommand, threadKey, toIso
 } from "../contracts.js";
 import { classifyCodexErrorCode } from "../errors.js";
+import { identityToken } from "../ui-delivery.js";
 
 const HOUR = 3_600_000;
 const TAIL_BYTES = 1024 * 1024;
@@ -22,7 +23,7 @@ const WRAPPER_TAGS = [
 const METADATA_EVENTS = new Set(["thread_settings_applied"]);
 const THREAD_COLUMNS = [
   "id", "rollout_path", "updated_at", "updated_at_ms", "source", "model_provider", "cwd", "title", "name",
-  "archived", "git_branch", "git_origin_url", "model", "thread_source"
+  "archived", "git_branch", "git_origin_url", "model", "thread_source", "originator"
 ];
 
 const LB_TARGET = "codex_core::responses_retry";
@@ -304,6 +305,27 @@ function orderPrRefs(entries, branch) {
   return [...new Set(ranked.map((entry) => entry.ref))];
 }
 
+function displayTitle(row, limits) {
+  return clampText(redactSecrets(row.name || row.title || `Codex ${String(row.id).slice(0, 8)}`), limits.titleMax);
+}
+
+// Title tokens shared by two or more unarchived threads the Codex app shows,
+// across the whole catalog: a same-titled thread outside the lookback or the
+// cap can still be the one open on screen.
+function readSharedTitles(db, limits) {
+  const present = new Set(db.prepare("PRAGMA table_info(threads)").all().map((column) => column.name));
+  if (!present.has("id")) return new Set();
+  const pick = (name) => (present.has(name) ? name : `NULL AS ${name}`);
+  const where = present.has("archived") ? " WHERE COALESCE(archived, 0) = 0" : "";
+  const counts = new Map();
+  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("originator")} FROM threads${where}`).all()) {
+    if (row.originator === CONDUCTOR_CODEX_ORIGINATOR) continue;
+    const token = identityToken(displayTitle(row, limits));
+    if (token) counts.set(token, (counts.get(token) ?? 0) + 1);
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([token]) => token));
+}
+
 function buildThread(row, context) {
   const { config, attachments } = context;
   const limits = config.limits;
@@ -313,7 +335,7 @@ function buildThread(row, context) {
     key: threadKey("codex", id),
     kind: "codex",
     id,
-    title: clampText(redactSecrets(row.name || row.title || `Codex ${id.slice(0, 8)}`), limits.titleMax),
+    title: displayTitle(row, limits),
     cwd: row.cwd ? String(row.cwd) : null,
     repo: repoFromRemote(row.git_origin_url),
     branch: row.git_branch || null,
@@ -336,6 +358,8 @@ function buildThread(row, context) {
       model: row.model || null,
       provider: row.model_provider || null,
       threadSource: row.thread_source || null,
+      // "codex_sdk_ts" = started by Conductor's Codex agent, shown in Conductor.
+      originator: row.originator || null,
       file: row.rollout_path || null,
       turnStartedAt: null,
       abortReason: null,
@@ -479,6 +503,13 @@ export async function listCodexThreads(config, options = {}) {
       }
       if (rows.length < pageSize) break;
       after = rows.at(-1);
+    }
+    // A failed title scan marks nothing shared; identity checks still see
+    // every thread the supervisor retained.
+    let shared = new Set();
+    try { shared = readSharedTitles(db, limits); } catch { /* older schema */ }
+    for (const thread of built) {
+      if (shared.has(identityToken(thread.title))) thread.meta.codexTitleShared = true;
     }
   } finally {
     try { db.close(); } catch { /* already closed */ }

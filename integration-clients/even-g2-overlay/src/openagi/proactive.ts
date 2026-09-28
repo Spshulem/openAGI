@@ -1,8 +1,10 @@
 import type { OpenAGIApiClient } from './api-client'
 
-export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string }
+export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[] }
+// The supervisor's glanceable status: counts by colour, red then yellow threads.
+export interface FleetStatus { mode: string | null; lastTickAt: string | null; needsYou: number; counts: { red: number; yellow: number; green: number; gray: number }; threads: { name: string; health: string; state: string; reason: string }[] }
 export type InboxOperation = 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'delete-memory'
-export interface ProactiveSettings { enabled: boolean; categories: string[]; retentionDays: number; quietStart: number; quietEnd: number; timeZone: string; maxPerHour: number }
+export interface ProactiveSettings { enabled: boolean; categories: string[]; retentionDays: number; quietStart: number; quietEnd: number; timeZone: string; maxPerHour: number; supervisorOnly?: boolean }
 export interface ProactiveView {
   proactiveSettings?(settings: ProactiveSettings): void
   inbox?(items: InboxItem[]): void
@@ -24,6 +26,10 @@ export class G2ProactiveClient {
   private generation = 0
   private controller = new AbortController()
   private refreshing = false
+  // A refresh asked for mid-flight runs once the current one ends; bumping
+  // feedGeneration drops the in-flight snapshot (it predates an answer).
+  private refreshQueued = false
+  private feedGeneration = 0
   private uploading = false
   private running = false
   private consentChanging = false
@@ -64,12 +70,14 @@ export class G2ProactiveClient {
     this.items = []; this.view.inbox?.([])
   }
   async refresh(): Promise<void> {
-    if (!this.running || this.refreshing || this.hidden()) return
+    if (!this.running || this.hidden()) return
+    if (this.refreshing) { this.refreshQueued = true; return }
     this.refreshing = true
     const signal = this.controller.signal
+    const feedGeneration = this.feedGeneration
     try {
       const result = await this.api.proactive({ op: 'feed' }, signal)
-      if (!this.running || signal.aborted) return
+      if (!this.running || signal.aborted || feedGeneration !== this.feedGeneration) return
       this.items = result.items ?? []; this.view.inbox?.(this.items)
       if (result.settings) this.view.proactiveSettings?.(result.settings)
       if (this.consent && this.consent.until <= Date.now()) this.pauseMemory('Memory consent expired. Enable again to keep new transcripts.')
@@ -84,7 +92,26 @@ export class G2ProactiveClient {
         }
       }
     } catch (error) { if (!signal.aborted) this.view.activity?.(`Inbox unavailable: ${error instanceof Error ? error.message : 'check main connection'}`) }
-    finally { this.refreshing = false }
+    finally {
+      this.refreshing = false
+      if (this.refreshQueued) { this.refreshQueued = false; void this.refresh() }
+    }
+  }
+  // Answers a supervisor question with one of its fixed choices. ok=false
+  // means main kept the question open (the agent was not reached yet).
+  async answer(id: string, answer: string): Promise<{ ok: boolean; detail: string }> {
+    try {
+      const result = await this.api.proactive({ op: 'answer', id, answer }, this.controller.signal) as unknown as { ok?: boolean; detail?: string }
+      // A feed read that started before the answer must not bring it back.
+      this.feedGeneration++
+      if (result.ok === true) { this.items = this.items.filter(i => i.id !== id); this.view.inbox?.(this.items) }
+      await this.refresh()
+      return { ok: result.ok === true, detail: result.detail ?? '' }
+    } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : 'Main did not answer' } }
+  }
+  async fleetStatus(): Promise<FleetStatus | null> {
+    try { return await this.api.proactive({ op: 'fleet-status' }, this.controller.signal) as unknown as FleetStatus }
+    catch { return null }
   }
   async configure(settings: Partial<ProactiveSettings>): Promise<void> {
     try { await this.api.proactive({ op: 'configure', settings }, this.controller.signal); await this.refresh() }
