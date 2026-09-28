@@ -297,7 +297,7 @@ export function uiIdentity(thread, target, threads = []) {
   }
   const title = identityToken(target.title);
   if (!title || /^codex [0-9a-f-]{8}$/i.test(title)) return blocked("no thread title to verify", false);
-  if (others.some(({ target: t }) => identityToken(t.title) === title)) return blocked("ambiguous: two threads share this title");
+  if (target.titleShared || others.some(({ target: t }) => identityToken(t.title) === title)) return blocked("ambiguous: two threads share this title");
   return { tokens: [title], conflicts: distinct(others.map(({ target: t }) => identityToken(t.title)), [title]), ambiguous: false, reason: null };
 }
 
@@ -530,8 +530,12 @@ export function createUiDriver({
     }
   }
 
+  // An unconfirmed outcome carries how many copies the thread showed before
+  // this attempt, so a retry needs a new copy, not any old one.
   const outcome = (ctx, status, detail, extra = {}) => ({
-    status, detail: detailText(detail), evidence: ctx.evidence.length ? [...ctx.evidence] : undefined, ...extra
+    status, detail: detailText(detail), evidence: ctx.evidence.length ? [...ctx.evidence] : undefined,
+    ...(extra.unconfirmed && Number.isInteger(ctx.priorCount) ? { priorCount: ctx.priorCount } : {}),
+    ...extra
   });
 
   const keep = (ctx, label, state) => {
@@ -666,10 +670,18 @@ export function createUiDriver({
     if (hasStopButton(state)) return outcome(ctx, "blocked", "turn running (Stop is visible)");
     if (hasPermissionPrompt(state)) return outcome(ctx, "blocked", "permission prompt visible: open it");
     const needle = text.slice(0, SUPERVISOR_PREFIX.length + 1 + CONFIRM_CHARS);
-    if (request.previousUnconfirmed && transcriptCount(state, text) > 0) {
-      keep(ctx, "before", state);
-      return outcome(ctx, "sent", "already in thread (the earlier unconfirmed send landed)");
+    const copies = transcriptCount(state, text);
+    if (request.previousUnconfirmed) {
+      const prior = Number.isInteger(request.previousUnconfirmed.priorCount) ? request.previousUnconfirmed.priorCount : 0;
+      if (copies > prior) {
+        keep(ctx, "before", state);
+        return outcome(ctx, "sent", "already in thread (the earlier unconfirmed send landed)");
+      }
+      // Fewer copies than before the uncertain send: the transcript is not
+      // all on screen, so it cannot tell whether that send landed.
+      if (copies < prior) return outcome(ctx, "blocked", "cannot tell whether the earlier unconfirmed send landed; check the thread");
     }
+    ctx.priorCount = copies;
 
     // 4. Composer: exactly one, and empty. Exactly this message left unsent
     // by an earlier attempt is ours: it is sent as is, never retyped.
@@ -778,5 +790,9 @@ export function createUiDriver({
     return outcome(ctx, "failed", `${reason}; not sent; ${cleared ? "cleared our text" : "our text may still be in the composer"}`);
   }
 
-  return { readiness, deliver };
+  // The owner's apps, checked once per tick so computer-use-first can fall
+  // back to the CLI for a thread whose app is closed.
+  const appRunning = (bundleId) => presence.appRunning(bundleId);
+
+  return { readiness, deliver, appRunning };
 }

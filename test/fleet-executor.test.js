@@ -488,7 +488,7 @@ test("computer-use maps blocked and failed results; an unconfirmed send is flagg
   const { cwd, store, executor, requests } = uiSetup(t, {
     results: [
       { status: "blocked", detail: "owner using Conductor", evidence: undefined },
-      { status: "failed", detail: "unconfirmed: may have been sent; check the thread before retrying", unconfirmed: true },
+      { status: "failed", detail: "unconfirmed: may have been sent; check the thread before retrying", unconfirmed: true, priorCount: 2 },
       { status: "sent", detail: "already in thread (the earlier unconfirmed send landed)" }
     ]
   });
@@ -502,11 +502,29 @@ test("computer-use maps blocked and failed results; an unconfirmed send is flagg
   assert.equal(failed.unconfirmed, true);
   assert.equal(store.action(failed.actionId).unconfirmed, true);
   const retried = await executor.deliver({ thread, message: "continue", route: "computer-use" });
-  assert.equal(requests[2].previousUnconfirmed, true);
+  assert.deepEqual(requests[2].previousUnconfirmed, { priorCount: 2 });
   assert.equal(retried.status, "sent");
+  assert.equal(store.action(retried.actionId).unconfirmed, false);
   // A different message is not the unconfirmed one.
   await executor.deliver({ thread, message: "something else", route: "computer-use" });
   assert.equal(requests[3].previousUnconfirmed, false);
+});
+
+test("an unconfirmed UI send stays guarded after the executor is recreated", async (t) => {
+  const { cwd, store, config, executor } = uiSetup(t, {
+    results: [{ status: "failed", detail: "unconfirmed: may have been sent", unconfirmed: true, priorCount: 1 }]
+  });
+  const thread = conductorUiThread(cwd);
+  await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  const requests = [];
+  const ui = { async deliver(request) { requests.push(request); return { status: "sent", detail: "already in thread" }; } };
+  const restarted = createExecutor({ config, run: async () => ({ code: 0 }), store, ui, uiLock: createUiLock() });
+  await restarted.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.deepEqual(requests[0].previousUnconfirmed, { priorCount: 1 });
+  // Once it is confirmed, a later restart no longer carries the guard.
+  const again = createExecutor({ config, run: async () => ({ code: 0 }), store, ui, uiLock: createUiLock() });
+  await again.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.equal(requests[1].previousUnconfirmed, false);
 });
 
 test("computer-use runs one app delivery at a time and one per app thread", async (t) => {

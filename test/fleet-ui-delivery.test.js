@@ -345,10 +345,29 @@ test("an earlier identical message in the transcript does not confirm a new send
 
 test("a retry after an unconfirmed send that did land is not sent twice", async (t) => {
   const f = setup(t, { app: fakeApp({ transcript: ["older", MESSAGE] }) });
-  const result = await f.driver.deliver(f.request({ previousUnconfirmed: true }));
+  const result = await f.driver.deliver(f.request({ previousUnconfirmed: { priorCount: 0 } }));
   assert.equal(result.status, "sent");
   assert.match(result.detail, /already in thread/);
   assert.deepEqual(typed(f.calls()), []);
+});
+
+test("an unconfirmed send reports the copies seen before it; a retry needs a new copy", async (t) => {
+  const first = fakeApp({ transcript: [MESSAGE], onSend: () => { first.composer = ""; } });
+  const f = setup(t, { app: first });
+  const unsure = await f.driver.deliver(f.request());
+  assert.equal(unsure.unconfirmed, true);
+  assert.equal(unsure.priorCount, 1);
+  // The older copy alone does not prove the uncertain attempt landed.
+  const g = setup(t, { app: fakeApp({ transcript: [MESSAGE] }) });
+  const retried = await g.driver.deliver(g.request({ previousUnconfirmed: { priorCount: 1 } }));
+  assert.equal(retried.status, "sent", retried.detail);
+  assert.doesNotMatch(retried.detail, /already in thread/);
+  assert.equal(typed(g.calls()).length, 1);
+  // Fewer copies than before: the transcript is not all visible, so wait.
+  const h = setup(t, { app: fakeApp({ transcript: ["older"] }) });
+  const unsureAgain = await h.driver.deliver(h.request({ previousUnconfirmed: { priorCount: 1 } }));
+  assert.equal(unsureAgain.status, "blocked");
+  assert.deepEqual(typed(h.calls()), []);
 });
 
 test("without a Send button, Return in the focused composer sends", async (t) => {

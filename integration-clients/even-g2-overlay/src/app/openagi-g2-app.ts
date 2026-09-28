@@ -229,7 +229,13 @@ export class OpenAGIG2App {
     private readonly speechFactory: (callbacks: SpeechCallbacks) => LiveSpeech = callbacks => new LiveSpeech(callbacks),
   ) {
     this.proactive = new G2ProactiveClient(api, {
-      proactiveSettings: settings => phone.proactiveSettings?.(settings),
+      proactiveSettings: settings => {
+        phone.proactiveSettings?.(settings)
+        // supervisorOnly lives on main; a new pairing or another main starts
+        // without it, so the saved home mode is reapplied on first read.
+        const supervisorOnly = this.store.snapshot().homeMode === 'supervisor'
+        if (Boolean(settings.supervisorOnly) !== supervisorOnly) void this.proactive.configure({ supervisorOnly })
+      },
       inbox: items => {
         phone.inbox?.(items); renderer.inboxCount?.(items.length)
         if (this.mode === 'home' && !this.noticeTimer) {

@@ -54,14 +54,18 @@ const TOPIC_TITLES = {
 // Routes
 
 // delivery: { mode: "cli" | "computer-use" | "computer-use-first", ready,
-// detail } (a bare mode string also works). ready === false means the last
-// readiness probe failed; null/undefined means not probed, treated as ready.
+// detail, apps } (a bare mode string also works). ready === false means the
+// last readiness probe failed; null/undefined means not probed, treated as
+// ready. apps maps bundleId -> running; false means that app is closed.
 export function chooseRoute(thread, mode, delivery = null) {
   if (!thread || thread.archived) return null;
   const ui = deliveryOf(delivery);
   if (ui.mode !== "cli") {
+    const target = uiTargetFor(thread);
+    // computer-use-first falls back to the CLI while the thread's app is closed.
+    const appClosed = ui.mode === "computer-use-first" && target && ui.apps?.[target.bundleId] === false;
     // Typing into the app has no fork risk, so every mode may use it.
-    if (uiTargetFor(thread) && ui.ready !== false) return "computer-use";
+    if (target && ui.ready !== false && !appClosed) return "computer-use";
     // Computer-use only: never a CLI, whatever the thread offers.
     if (ui.mode === "computer-use") return null;
   }
@@ -75,8 +79,8 @@ export function chooseRoute(thread, mode, delivery = null) {
 }
 
 function deliveryOf(delivery) {
-  if (typeof delivery === "string") return { mode: delivery, ready: null, detail: null };
-  return { mode: delivery?.mode ?? "cli", ready: delivery?.ready ?? null, detail: delivery?.detail ?? null };
+  if (typeof delivery === "string") return { mode: delivery, ready: null, detail: null, apps: null };
+  return { mode: delivery?.mode ?? "cli", ready: delivery?.ready ?? null, detail: delivery?.detail ?? null, apps: delivery?.apps ?? null };
 }
 
 // Computer-use-only mode with an app that could show the thread, but computer

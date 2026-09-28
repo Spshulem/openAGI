@@ -44,7 +44,13 @@ class ChatHistoryStore(directory: File, key: String) {
         }
     }
 
-    fun save(nodeId: String, entries: List<SavedChatEntry>) = synchronized(lock) {
+    // sequence orders writes made on different threads: one older than the
+    // last write (or the last delete) is stale and dropped, so the newest
+    // in-memory history always wins. A nodeId whose history was forgotten
+    // is never written again, even by a reply that ends after the forget.
+    fun save(nodeId: String, entries: List<SavedChatEntry>, sequence: Long = nextSequence()): Unit = synchronized(lock) {
+        if (nodeId in forgotten || sequence <= (written[file.absolutePath] ?: Long.MIN_VALUE)) return@synchronized
+        written[file.absolutePath] = sequence
         try {
             val kept = entries.takeLast(MAX_ENTRIES)
             val tmp = File(file.parentFile, "${file.name}.tmp")
@@ -58,7 +64,10 @@ class ChatHistoryStore(directory: File, key: String) {
         }
     }
 
-    fun delete() = synchronized(lock) {
+    // forgetNodeId: the pairing being forgotten; its late writes are dropped.
+    fun delete(forgetNodeId: String? = null) = synchronized(lock) {
+        if (forgetNodeId != null) synchronized(forgotten) { forgotten.add(forgetNodeId) }
+        written[file.absolutePath] = nextSequence()
         file.delete()
     }
 
@@ -66,7 +75,13 @@ class ChatHistoryStore(directory: File, key: String) {
         const val MAX_ENTRIES = 200
         val KEYS = listOf("chat", "supervisor")
 
+        private val sequences = java.util.concurrent.atomic.AtomicLong()
+        fun nextSequence(): Long = sequences.incrementAndGet()
+
         private val locks = HashMap<String, Any>()
+        // Guarded by each file's lock; keyed by path.
+        private val written = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        private val forgotten: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
 
         private fun lockFor(file: File): Any = synchronized(locks) {
             locks.getOrPut(file.absolutePath) { Any() }

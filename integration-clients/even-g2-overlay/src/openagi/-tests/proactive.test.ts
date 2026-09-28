@@ -86,3 +86,26 @@ it('failed capture pauses memory without replaying audio or text', async () => {
   expect(f.api.proactive.mock.calls.filter(([b]) => b.op === 'capture')).toHaveLength(1)
   expect(f.view.memoryStatus).toHaveBeenLastCalledWith(false, expect.stringContaining('upload failed')); f.client.stop()
 })
+
+it('an answer drops a feed read that started before it and fetches a fresh one', async () => {
+  vi.useFakeTimers(); const f = fixture()
+  const question = { id: 'fleet-q', title: 'Which plan?', summary: '', important: false, seen: true, action: 'answer-fleet', category: 'approvals', supervisor: true, options: ['Starter'] }
+  let answered = false
+  let releaseStale: (() => void) | null = null
+  const proactive = f.api.proactive as unknown as { mockImplementation: (fn: (body: { op: string }) => Promise<unknown>) => void }
+  proactive.mockImplementation((body: { op: string }) => {
+    if (body.op === 'answer') { answered = true; return Promise.resolve({ ok: true, detail: 'typed' }) }
+    const snapshot = { settings: { enabled: false }, quiet: false, items: answered ? [] : [question] }
+    // The first read is slow and returns the pre-answer snapshot.
+    if (!releaseStale && !answered) return new Promise(resolve => { releaseStale = () => resolve(snapshot) })
+    return Promise.resolve(snapshot)
+  })
+  f.client.start(); await vi.advanceTimersByTimeAsync(1)
+  const result = await f.client.answer('fleet-q', 'Starter')
+  expect(result.ok).toBe(true)
+  expect(f.client.items).toEqual([])
+  releaseStale!(); await vi.advanceTimersByTimeAsync(1)
+  expect(f.client.items).toEqual([])
+  expect(f.api.proactive.mock.calls.filter(([b]) => b.op === 'feed').length).toBe(2)
+  f.client.stop()
+})

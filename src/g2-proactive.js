@@ -276,7 +276,9 @@ export class G2Proactive {
   feed(n) {
     const selected = new Set(n.settings.categories);
     const items = [];
-    if (n.settings.enabled) {
+    // Supervisor mode lists supervisor questions even before "Show updates
+    // from my main" is on; pings still need that opt-in (see can-notify).
+    if (n.settings.enabled || n.settings.supervisorOnly) {
       for (const i of (this.runtime?.outreach?.list?.() ?? []).slice(0, 200)) {
         if (!["unseen", "seen"].includes(i.status) || Date.parse(i.createdAt) < this.now() - 7 * DAY) continue;
         const kind = i.sourceRef?.kind === "draft"

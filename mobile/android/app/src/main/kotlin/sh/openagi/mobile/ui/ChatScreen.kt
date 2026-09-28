@@ -159,9 +159,12 @@ class ChatConversationState(
     internal fun persist() {
         val entries = messages.value.mapNotNull { it.toSaved() }
         val target = store ?: return
+        // Numbered now, on the caller's thread, so a write that reaches the
+        // file late never replaces a newer snapshot.
+        val sequence = ChatHistoryStore.nextSequence()
         // A scope already cancelled (the Activity went away mid-reply) still
         // gets its last write, on this thread; the file is small.
-        if (scope.isActive) scope.launch(io) { target.save(nodeId, entries) } else target.save(nodeId, entries)
+        if (scope.isActive) scope.launch(io) { target.save(nodeId, entries, sequence) } else target.save(nodeId, entries, sequence)
     }
 }
 

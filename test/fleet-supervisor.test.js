@@ -1202,3 +1202,16 @@ test("a question whose thread left the scan closes itself", async (t) => {
   await supervisor.tick();
   assert.equal(supervisor.store.question(question.id).status, "resolved");
 });
+
+test("a question stays open when its thread was only pushed out by the scan cap", async (t) => {
+  const asking = makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
+  const newer = (n) => makeThread({ key: `codex:n${n}`, id: `n${n}`, title: `Newer ${n}`, prRefs: [], lastActivityAt: ago(n) });
+  let threads = [asking];
+  const { supervisor } = fixture(t, { limits: { maxThreads: 2 }, deps: { listCodexThreads: async () => threads } });
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.ok(question);
+  threads = [newer(1), newer(2)];
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "open");
+});

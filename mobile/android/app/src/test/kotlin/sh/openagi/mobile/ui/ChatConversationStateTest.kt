@@ -78,4 +78,35 @@ class ChatConversationStateTest {
         store.delete()
         assertTrue(store.load("node-1").isEmpty())
     }
+
+    // Writes run on IO threads and can reach the file out of order; the
+    // snapshot numbered last wins.
+    @Test
+    fun aLateOlderSnapshotNeverReplacesANewerOne() {
+        val dir = Files.createTempDirectory("chat-history-order").toFile()
+        val store = ChatHistoryStore(dir, "chat")
+        val older = ChatHistoryStore.nextSequence()
+        val newer = ChatHistoryStore.nextSequence()
+        store.save("node-1", listOf(sh.openagi.mobile.store.SavedChatEntry(1, "assistant", Instant.EPOCH, "Done.")), newer)
+        store.save("node-1", listOf(sh.openagi.mobile.store.SavedChatEntry(1, "assistant", Instant.EPOCH, "", failed = true)), older)
+        assertEquals("Done.", store.load("node-1").single().text)
+    }
+
+    // Forgetting a pairing mid-reply: the reply's final write, and any write
+    // already queued, must not bring the deleted conversation back.
+    @Test
+    fun aForgottenPairingsHistoryIsNotRecreated() {
+        val dir = Files.createTempDirectory("chat-history-forget").toFile()
+        val queued = ChatHistoryStore.nextSequence()
+        val state = ChatConversationState(CoroutineScope(Dispatchers.Unconfined), ChatHistoryStore(dir, "chat"), "node-forget", Dispatchers.Unconfined)
+        state.messages.value = listOf(ChatEntry.User(0, Instant.EPOCH, "hi"))
+        state.persist()
+        ChatHistoryStore(dir, "chat").delete(forgetNodeId = "node-forget")
+        ChatHistoryStore(dir, "chat").save("node-forget", listOf(sh.openagi.mobile.store.SavedChatEntry(0, "user", Instant.EPOCH, "hi")), queued)
+        state.persist()
+        assertFalse(java.io.File(dir, "chat-chat.json").exists())
+        // A new pairing writes normally.
+        ChatHistoryStore(dir, "chat").save("node-new", listOf(sh.openagi.mobile.store.SavedChatEntry(0, "user", Instant.EPOCH, "hello")))
+        assertEquals("hello", ChatHistoryStore(dir, "chat").load("node-new").single().text)
+    }
 }

@@ -351,6 +351,12 @@ test("chooseRoute honours OPENAGI_FLEET_DELIVERY: computer-use never picks a CLI
   assert.equal(chooseRoute(codexLocked, "auto", first), null);
   assert.equal(chooseRoute(conductorOffline, "auto", { mode: "computer-use-first", ready: true }), "computer-use");
   assert.equal(chooseRoute(terminal, "auto", { mode: "computer-use-first", ready: true }), "peer-relay");
+  // -first with the thread's app closed falls back to the CLI; strict waits.
+  const closed = { "com.conductor.app": false, "com.openai.codex": false };
+  assert.equal(chooseRoute(conductorLive, "auto", { mode: "computer-use-first", ready: true, apps: closed }), "peer-relay");
+  assert.equal(chooseRoute(codexFree, "auto", { mode: "computer-use-first", ready: true, apps: closed }), "codex-exec");
+  assert.equal(chooseRoute(codexFree, "auto", { mode: "computer-use-first", ready: true, apps: { "com.openai.codex": null } }), "computer-use");
+  assert.equal(chooseRoute(conductorLive, "auto", { mode: "computer-use", ready: true, apps: closed }), "computer-use");
   // cli (default) is today's table, and a bare mode string works too.
   assert.equal(chooseRoute(conductorOffline, "auto", { mode: "cli" }), null);
   assert.equal(chooseRoute(codexFree, "auto"), "codex-exec");

@@ -226,6 +226,23 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
+it('reapplies Supervisor mode to a main that does not have it yet', async () => {
+  const f = await fixture()
+  try {
+    const configure = vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    const view = (f.app.proactive as unknown as { view: { proactiveSettings: (s: Record<string, unknown>) => void } }).view
+    const settings = { enabled: false, categories: [], retentionDays: 1, quietStart: 22, quietEnd: 8, timeZone: 'UTC', maxPerHour: 3 }
+    view.proactiveSettings({ ...settings, supervisorOnly: false })
+    expect(configure).not.toHaveBeenCalled()
+    await f.store.update({ homeMode: 'supervisor' })
+    view.proactiveSettings({ ...settings, supervisorOnly: false })
+    expect(configure).toHaveBeenCalledWith({ supervisorOnly: true })
+    configure.mockClear()
+    view.proactiveSettings({ ...settings, supervisorOnly: true })
+    expect(configure).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
+})
+
 it('freezes the selected voice task and requires confirmation even with auto-send', async () => {
   vi.useFakeTimers()
   const f = await fixture()

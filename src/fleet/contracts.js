@@ -247,7 +247,9 @@ export function uiTargetFor(thread) {
       targetKey: `codex-thread:${thread.id}`,
       deepLink: `codex://threads/${encodeURIComponent(thread.id)}`,
       threadId: String(thread.id),
-      title: thread.title ?? null
+      title: thread.title ?? null,
+      // Another unarchived Codex thread anywhere in the catalog has this title.
+      titleShared: meta.codexTitleShared === true
     };
   }
   return null;

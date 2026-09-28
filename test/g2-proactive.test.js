@@ -267,6 +267,13 @@ test("supervisor questions carry their choices and Supervisor mode keeps only th
   call({ op: "configure", settings: { supervisorOnly: true, categories: ["email"] } });
   assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
   assert.throws(() => call({ op: "configure", settings: { supervisorOnly: "yes" } }), /Invalid settings/);
+  // Supervisor mode shows its questions before updates are turned on, but
+  // pinging still needs that opt-in.
+  call({ op: "configure", settings: { enabled: false } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
+  assert.equal(call({ op: "can-notify", id: "o-fleet" }).notify, false);
+  call({ op: "configure", settings: { supervisorOnly: false } });
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
 });
 
 test("answering a supervisor question from the glasses uses its fixed choices", async (t) => {

@@ -211,8 +211,19 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   const limits = { ...DEFAULTS, ...(config?.limits ?? {}) };
   const active = new Set();
   const pending = new Set();
-  // targetKey -> messageHash of the last UI send that could not be confirmed.
+  // targetKey -> { hash, priorCount } of the last UI send that could not be
+  // confirmed. Rebuilt from the action journal so a restart between an
+  // uncertain send and its retry does not type the message twice.
   const unconfirmed = new Map();
+  try {
+    const seen = new Set();
+    for (const action of store?.actions?.(limits.maxActionsKept ?? 500) ?? []) {
+      const key = action.uiTargetKey;
+      if (!key || seen.has(key) || action.route !== "computer-use") continue;
+      seen.add(key);
+      if (action.unconfirmed === true && action.messageHash) unconfirmed.set(key, { hash: action.messageHash, priorCount: Number.isInteger(action.priorCount) ? action.priorCount : null });
+    }
+  } catch { /* an unreadable journal only loses the guard */ }
 
   const journal = (actionId, fields) => {
     try {
@@ -326,7 +337,8 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       let threads = [];
       try { threads = knownThreads() ?? []; } catch { threads = []; }
       const identity = uiIdentity(thread, target, threads);
-      const previousUnconfirmed = unconfirmed.get(target.targetKey) === base.messageHash;
+      const guard = unconfirmed.get(target.targetKey);
+      const previousUnconfirmed = guard?.hash === base.messageHash ? { priorCount: guard.priorCount } : false;
       try {
         return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName });
       } catch (error) {
@@ -337,15 +349,18 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     else result = locked.value ?? { status: "failed", detail: "computer use returned nothing" };
     const status = ["sent", "failed", "blocked"].includes(result.status) ? result.status : "failed";
     const detail = detailText(result.detail || status);
+    const priorCount = Number.isInteger(result.priorCount) ? result.priorCount : null;
     if (status === "sent") unconfirmed.delete(target.targetKey);
-    else if (result.unconfirmed) unconfirmed.set(target.targetKey, base.messageHash);
+    else if (result.unconfirmed) unconfirmed.set(target.targetKey, { hash: base.messageHash, priorCount });
     const extra = {};
     if (Array.isArray(result.evidence) && result.evidence.length) extra.evidence = result.evidence;
     if (result.unconfirmed) extra.unconfirmed = true;
     // A blocked UI send typed nothing: journal it only against an existing
-    // action, like every other blocked delivery.
+    // action, like every other blocked delivery. The target and guard state
+    // are journaled so a restarted executor can rebuild the guard.
     let id = actionId;
-    if (status !== "blocked" || actionId) id = journal(actionId, { ...base, status, detail, ...extra, finishedAt: new Date().toISOString() });
+    const guardFields = { uiTargetKey: target.targetKey, unconfirmed: Boolean(result.unconfirmed), priorCount };
+    if (status !== "blocked" || actionId) id = journal(actionId, { ...base, status, detail, ...extra, ...guardFields, finishedAt: new Date().toISOString() });
     return { status, route: base.route, detail, actionId: id ?? null, ...extra };
   };
 

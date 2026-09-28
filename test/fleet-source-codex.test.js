@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { uiIdentity } from "../src/fleet/ui-delivery.js";
 import { linkUiHosts, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   classifyLbError, cleanCodexUserText, listCodexThreads, parseRolloutTail, readCodexLbErrors
@@ -527,4 +528,24 @@ test("listCodexThreads exposes the originator; Conductor-hosted threads type int
   assert.equal(uiTargetFor(linked["t-orphan"]), null);
   assert.equal(linked["t-desktop"], map["t-desktop"], "other threads pass through untouched");
   assert.equal(map["t-hosted"].meta.conductorHost, undefined, "inputs are not mutated");
+});
+
+test("listCodexThreads flags a title shared with any unarchived Codex thread, even one outside the scan", async (t) => {
+  const ctx = makeHome(t);
+  const idleLines = [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "ok")];
+  addThread(ctx, { id: "t-recent", lines: idleLines, name: "Fix uploads" });
+  addThread(ctx, { id: "t-unique", lines: idleLines, name: "Ship billing" });
+  // Weeks old, so outside the lookback, but still open in the Codex app.
+  addThread(ctx, { id: "t-old", updatedAgo: 60 * 24 * 60 * MIN, name: "Fix uploads" });
+  // Archived and Conductor-hosted copies are not in the Codex sidebar.
+  addThread(ctx, { id: "t-archived", archived: 1, name: "Ship billing" });
+  addThread(ctx, { id: "t-hosted-copy", originator: "codex_sdk_ts", name: "Ship billing" });
+  const run = async () => ({ code: 1, stdout: "", stderr: "" });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run }));
+  assert.equal(map["t-old"], undefined);
+  assert.equal(uiTargetFor(map["t-recent"]).titleShared, true);
+  assert.equal(uiTargetFor(map["t-unique"]).titleShared, false);
+  const identity = uiIdentity(map["t-recent"], uiTargetFor(map["t-recent"]), Object.values(map));
+  assert.equal(identity.ambiguous, true);
+  assert.match(identity.reason, /share this title/);
 });

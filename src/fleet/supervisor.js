@@ -8,7 +8,7 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { MODES, clampTail, clampText, linkUiHosts, parsePrRef, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { MODES, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
@@ -246,12 +246,26 @@ export class FleetSupervisor {
       try {
         const result = await withTimeout(Promise.resolve(driver.readiness()), SOURCE_TIMEOUT_MS, "computer-use readiness");
         state = { mode, ready: result?.ready === true, detail: result?.ready === true ? null : clampText(result?.detail ?? "not ready", 160) };
+        if (state.ready && mode === "computer-use-first" && driver.appRunning) state.apps = await this.probeApps(driver);
       } catch (error) {
         state = { mode, ready: false, detail: clampText(`readiness check failed: ${error?.message ?? error}`, 160) };
       }
     }
     this.lastDelivery = { ...state, checkedAt: new Date(this.now()).toISOString() };
     return state;
+  }
+
+  // bundleId -> running (true/false), or null when it could not be told.
+  async probeApps(driver) {
+    const apps = {};
+    for (const { bundleId } of Object.values(UI_APPS)) {
+      try {
+        apps[bundleId] = await withTimeout(Promise.resolve(driver.appRunning(bundleId)), SOURCE_TIMEOUT_MS, "app presence");
+      } catch {
+        apps[bundleId] = null;
+      }
+    }
+    return apps;
   }
 
   // Why an answer or resume has no route, in the owner's words.
@@ -597,7 +611,10 @@ export class FleetSupervisor {
     // A thread source that failed this tick is unknown, not empty: its
     // actions and questions wait for a tick that can see it.
     const unknownKinds = new Set(["codex", "claude", "conductor"].filter((kind) => sourceErrors[kind]));
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds });
+    // A source that returned a full page may have evicted older live threads,
+    // so a missing thread of that kind is not proof it is gone.
+    const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -713,7 +730,7 @@ export class FleetSupervisor {
     }
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set() }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set() }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -792,8 +809,11 @@ export class FleetSupervisor {
       const decided = question.threadKey ? decisions.some((decision) => decision.threadKey === question.threadKey) : false;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
-      // scope, while its source read fine: nothing is left to answer.
-      const threadGone = Boolean(question.threadKey) && (!byKey.has(question.threadKey) || Boolean(byKey.get(question.threadKey)?.excluded));
+      // scope, while its source read fine: nothing is left to answer. A
+      // source that hit its cap only proves absence for excluded threads.
+      const known = question.threadKey ? byKey.get(question.threadKey) : null;
+      const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]);
+      const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       if (decided || supervisorOwned || threadGone) {
         store.resolveQuestion(question.id);
         this.resolveOutreach(question, "resolved", "dismissed");
