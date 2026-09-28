@@ -1,6 +1,7 @@
 package sh.openagi.mobile.sync
 
 import android.content.Context
+import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.SnapshotStore
@@ -25,4 +26,6 @@ suspend fun forgetPairing(context: Context, credentials: Credentials) {
     // holds the lock every writer for that file holds.
     SnapshotStore(context.filesDir).delete()
     OutboundQueue(context.filesDir).clear()
+    // Saved conversations belong to the pairing being forgotten.
+    ChatHistoryStore.KEYS.forEach { ChatHistoryStore(context.filesDir, it).delete() }
 }

@@ -59,13 +59,18 @@ import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.ChatDeltaPayload
 import sh.openagi.mobile.protocol.ChatFailurePayload
 import sh.openagi.mobile.protocol.ChatFinalPayload
 import sh.openagi.mobile.protocol.ProtocolJson
+import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
+import sh.openagi.mobile.store.SavedChatEntry
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SseFrame
@@ -109,11 +114,57 @@ internal sealed interface ChatEntry {
 // while the daemon keeps the same node session alive. Replies stream in
 // `scope`, the Activity's, so leaving the tab mid-reply does not cancel the
 // stream and leave a false "Can't reach OpenAGI" in the kept history.
-class ChatConversationState(internal val scope: CoroutineScope) {
+//
+// With a store, the conversation is also saved on the phone, so folding the
+// phone (which recreates the Activity), a process kill, or a relaunch keeps
+// it. A reply that was still streaming when the app died comes back as
+// stopped, with "Try again".
+class ChatConversationState(
+    internal val scope: CoroutineScope,
+    private val store: ChatHistoryStore? = null,
+    private val nodeId: String = "",
+    private val io: CoroutineDispatcher = Dispatchers.IO,
+) {
     internal val messages = mutableStateOf<List<ChatEntry>>(emptyList())
     internal val inputText = mutableStateOf("")
     internal val isStreaming = mutableStateOf(false)
     internal val nextId = mutableStateOf(0L)
+
+    init {
+        val restored = store?.load(nodeId).orEmpty().map { it.toEntry() }
+        if (restored.isNotEmpty()) {
+            messages.value = restored
+            nextId.value = restored.maxOf { it.id } + 1
+        }
+    }
+
+    // Called after every change that should outlive the screen: a send, a
+    // finished or failed reply, a retry.
+    internal fun persist() {
+        val entries = messages.value.mapNotNull { it.toSaved() }
+        val target = store ?: return
+        // A scope already cancelled (the Activity went away mid-reply) still
+        // gets its last write, on this thread; the file is small.
+        if (scope.isActive) scope.launch(io) { target.save(nodeId, entries) } else target.save(nodeId, entries)
+    }
+}
+
+private fun ChatEntry.toSaved(): SavedChatEntry? = when (this) {
+    is ChatEntry.User -> SavedChatEntry(id, "user", timestamp, text)
+    // A still-streaming reply is saved as stopped: if the app dies now, the
+    // next launch must not show a reply that will never finish.
+    is ChatEntry.Assistant -> SavedChatEntry(
+        id, "assistant", timestamp, text,
+        failed = failed || streaming,
+        failureDetail = if (streaming && !failed) "Reply stopped when the app closed." else failureDetail,
+        retryText = retryText,
+    )
+}
+
+private fun SavedChatEntry.toEntry(): ChatEntry = if (role == "user") {
+    ChatEntry.User(id, at, text)
+} else {
+    ChatEntry.Assistant(id, at, text, streaming = false, failed = failed, failureDetail = failureDetail, retryText = retryText)
 }
 
 // The Supervisor's "Ask supervisor" reuses this whole screen: the same
@@ -214,6 +265,7 @@ fun ChatScreen(
             )
         } finally {
             isStreaming = false
+            conversationState.persist()
         }
     }
 
@@ -224,6 +276,7 @@ fun ChatScreen(
         val now = Instant.now()
         messages = messages + ChatEntry.User(userId, now, text) +
             ChatEntry.Assistant(assistantId, now, "", streaming = true, retryText = text)
+        conversationState.persist()
         conversationState.scope.launch { runExchange(assistantId, text) }
     }
 

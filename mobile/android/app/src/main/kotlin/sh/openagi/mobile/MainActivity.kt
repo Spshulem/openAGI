@@ -18,6 +18,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import sh.openagi.mobile.protocol.PairingPayload
+import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.sync.fetchInboxBadgeCount
 import sh.openagi.mobile.transport.DaemonClient
@@ -104,8 +105,12 @@ class MainActivity : ComponentActivity() {
                     )
                 } else {
                     val conversationScope = rememberCoroutineScope()
-                    val chatConversation = remember(credentials) { ChatConversationState(conversationScope) }
-                    val supervisorConversation = remember(credentials) { ChatConversationState(conversationScope) }
+                    val chatConversation = remember(credentials) {
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId)
+                    }
+                    val supervisorConversation = remember(credentials) {
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId)
+                    }
                     // One background SSE connection for the life of this
                     // pairing, reconnected with backoff by EventStream. This
                     // is what makes Inbox's badge and the other tabs feel
