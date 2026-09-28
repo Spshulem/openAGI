@@ -1,6 +1,7 @@
 import SwiftUI
 
-// mobile/FEATURES.md's five destinations. The Inbox badge — "the one number
+// mobile/FEATURES.md's destinations, five so none fold into More;
+// Settings opens from Today's toolbar. The Inbox badge — "the one number
 // worth interrupting someone for" — is the only piece of chrome on this bar
 // besides the tab names themselves.
 struct RootTabView: View {
@@ -54,7 +55,7 @@ struct RootTabView: View {
         @Bindable var model = model
         TabView(selection: $model.selectedTab) {
             Tab("Today", systemImage: "sun.max", value: AppTab.today) {
-                TodayView()
+                TodayView(onRevoked: onRevoked)
             }
             Tab("Tasks", systemImage: "checklist", value: AppTab.tasks) {
                 TasksView()
@@ -66,8 +67,8 @@ struct RootTabView: View {
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) {
                 ChatView()
             }
-            Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
-                SettingsView(onRevoked: onRevoked)
+            Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) {
+                SupervisorView()
             }
         }
         // Every control that reaches for a system accent (the tab bar's

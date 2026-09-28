@@ -1,23 +1,5 @@
 import SwiftUI
 
-struct ChatMessage: Identifiable, Equatable {
-    enum Role: Equatable { case user, assistant }
-    let id: UUID
-    var role: Role
-    var text: String
-    var isStreaming: Bool
-    var isFailed: Bool = false
-    let timestamp: Date
-
-    init(role: Role, text: String, isStreaming: Bool = false, timestamp: Date = Date()) {
-        self.id = UUID()
-        self.role = role
-        self.text = text
-        self.isStreaming = isStreaming
-        self.timestamp = timestamp
-    }
-}
-
 // DESIGN.md's Chat section, added after the first build of this screen put
 // a "You"/"OpenAGI" caption above every message and rendered them all
 // full-width and left-aligned: "that reads as a log file... Alignment
@@ -38,30 +20,57 @@ struct ChatMessage: Identifiable, Equatable {
 struct ChatView: View {
     @Environment(AppModel.self) private var model
 
-    @State private var messages: [ChatMessage] = []
-    @State private var draft = ""
-    @State private var isSending = false
-    @State private var isPinnedToBottom = true
-
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                header
-                GeometryReader { geometry in
-                    messageScroll(width: geometry.size.width)
-                }
-                inputBar
+            ChatConversationView(conversation: model.agentChat, title: "Chat")
+                .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+// The conversation screen itself, shared by the Chat tab (thread "agent") and
+// the Supervisor tab's "Ask supervisor" (thread "supervisor"): the same
+// bubbles and transport, its own title, its own conversation, and a few
+// starter questions while it is empty. The conversation lives on AppModel
+// (see `ChatConversation`), so this view only draws it.
+struct ChatConversationView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
+
+    let conversation: ChatConversation
+    var title: String
+    var showsTitle = true
+    var starters: [String] = []
+    var placeholder = "Message OpenAGI"
+    var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
+
+    @State private var draft = ""
+    @State private var isPinnedToBottom = true
+
+    private var messages: [ChatMessage] { conversation.messages }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            GeometryReader { geometry in
+                messageScroll(width: geometry.size.width)
             }
-            .background(Theme.canvas)
-            .navigationBarTitleDisplayMode(.inline)
+            inputBar
+        }
+        .background(Theme.canvas)
+        .task { await conversation.refresh() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { Task { await conversation.refresh() } }
         }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
-            Text("Chat")
-                .font(Theme.Typography.screenTitle)
-                .foregroundStyle(Theme.ink)
+            if showsTitle {
+                Text(title)
+                    .font(Theme.Typography.screenTitle)
+                    .foregroundStyle(Theme.ink)
+            }
             HStack(spacing: Theme.Spacing.x1) {
                 ConnectionDot(state: model.isStreamConnected ? .fresh : .stale)
                 Text(model.credentials.server.host ?? "")
@@ -69,6 +78,13 @@ struct ChatView: View {
                     .foregroundStyle(Theme.muted)
                 Text("·").font(Theme.Typography.caption).foregroundStyle(Theme.muted)
                 Text(model.isStreamConnected ? "live" : "reconnecting")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.muted)
+            }
+            // A main from before shared threads: this phone's own copy still
+            // shows, but the glasses and other phones can't see it.
+            if conversation.historyStatus == .needsUpdate {
+                Text("Update OpenAGI on your main to share this chat with your other devices.")
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
             }
@@ -85,9 +101,9 @@ struct ChatView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         if messages.isEmpty {
-                            EmptyStateView(headline: "Say something.",
-                                          detail: "OpenAGI reads this the same way it reads everything else you tell it.")
+                            EmptyStateView(headline: "Say something.", detail: emptyDetail)
                                 .padding(.top, Theme.Spacing.x8)
+                            if !starters.isEmpty { starterButtons }
                         }
                         ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
                             messageItemView(item, width: width)
@@ -103,6 +119,7 @@ struct ChatView: View {
                 .onChange(of: messages) { _, _ in
                     if isPinnedToBottom { scrollToLatest(proxy) }
                 }
+                .onAppear { scrollToLatest(proxy) }
                 .scrollDismissesKeyboard(.immediately)
 
                 if !isPinnedToBottom && !messages.isEmpty {
@@ -110,6 +127,25 @@ struct ChatView: View {
                 }
             }
         }
+    }
+
+    private var starterButtons: some View {
+        VStack(spacing: Theme.Spacing.x2) {
+            ForEach(starters, id: \.self) { starter in
+                Button {
+                    Task { await conversation.send(starter) }
+                } label: {
+                    Text(starter)
+                        .font(Theme.Typography.secondary)
+                        .foregroundStyle(Theme.live)
+                        .padding(.horizontal, Theme.Spacing.x4)
+                        .padding(.vertical, Theme.Spacing.x2)
+                        .overlay(Capsule().strokeBorder(Theme.live.opacity(0.5), lineWidth: 1))
+                }
+                .disabled(conversation.isSending)
+            }
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private func scrollToLatest(_ proxy: ScrollViewProxy) {
@@ -145,15 +181,22 @@ struct ChatView: View {
                     .foregroundStyle(Theme.muted)
                     .frame(maxWidth: .infinity, alignment: .center)
             }
+            // A shared thread: a question asked on the glasses or another
+            // phone says where it came from. Lines from this phone don't.
+            if isUser, let source = ChatSourceLabel.text(for: item.message, ownNodeID: model.credentials.nodeID) {
+                Text(source)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.muted)
+            }
             MessageBubbleRow(message: item.message, maxContainerWidth: width)
             // DESIGN.md: "A failed send stays in place in `alert` with a
             // 'Try again' directly under it. It is never silently dropped
             // and never a modal."
             if item.message.isFailed {
                 Button("Try again") {
-                    Task { await retry(item.message) }
+                    Task { await conversation.retry(item.message) }
                 }
-                .disabled(isSending)
+                .disabled(conversation.isSending)
                 .font(Theme.Typography.secondary)
                 .foregroundStyle(Theme.alert)
             }
@@ -165,7 +208,7 @@ struct ChatView: View {
 
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: Theme.Spacing.x2) {
-            TextField("Message OpenAGI", text: $draft, axis: .vertical)
+            TextField(placeholder, text: $draft, axis: .vertical)
                 .font(Theme.Typography.body)
                 .lineLimit(1...5)
                 .padding(.horizontal, Theme.Spacing.x3)
@@ -173,7 +216,10 @@ struct ChatView: View {
                 .background(Theme.surface)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.rowGroupRadius, style: .continuous))
             Button {
-                Task { await send() }
+                let text = draft
+                draft = ""
+                isPinnedToBottom = true
+                Task { await conversation.send(text) }
             } label: {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 16, weight: .bold))
@@ -190,78 +236,18 @@ struct ChatView: View {
     }
 
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSending
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !conversation.isSending
     }
+}
 
-    private func send() async {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        draft = ""
-        isSending = true
-        defer { isSending = false }
-
-        messages.append(ChatMessage(role: .user, text: text))
-        let reply = ChatMessage(role: .assistant, text: "", isStreaming: true)
-        messages.append(reply)
-        isPinnedToBottom = true
-
-        await streamReply(text: text, replyID: reply.id)
-    }
-
-    // Re-sends the user message that preceded a failed reply, replacing
-    // just that failed bubble in place rather than appending a new one --
-    // "stays in place", per DESIGN.md, not a fresh row at the bottom.
-    private func retry(_ failedMessage: ChatMessage) async {
-        guard let target = ChatRetry.target(failedID: failedMessage.id, in: messages, isSending: isSending) else { return }
-        isSending = true
-        defer { isSending = false }
-        let fresh = ChatMessage(role: .assistant, text: "", isStreaming: true)
-        messages[target.index] = fresh
-        isPinnedToBottom = true
-        await streamReply(text: target.userText, replyID: fresh.id)
-    }
-
-    private func streamReply(text: String, replyID: UUID) async {
-        do {
-            let stream = try await model.client.sendMessageStreaming(text: text)
-            for try await event in stream {
-                guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
-                switch event {
-                case .delta(let frame):
-                    if frame.reset {
-                        messages[index].text = frame.text
-                    } else {
-                        messages[index].text += frame.text
-                    }
-                case .final(let frame):
-                    if let reply = frame.reply, !reply.isEmpty {
-                        messages[index].text = reply
-                    }
-                    messages[index].isStreaming = false
-                case .failure(let frame):
-                    messages[index].text = frame.error ?? "OpenAGI couldn't reply. Try again."
-                    messages[index].isStreaming = false
-                    messages[index].isFailed = true
-                case .status, .session:
-                    break
-                }
-            }
-            if let index = messages.firstIndex(where: { $0.id == replyID }) {
-                messages[index].isStreaming = false
-            }
-        } catch let error as DaemonError {
-            if let index = messages.firstIndex(where: { $0.id == replyID }) {
-                messages[index].text = ChatErrorCopy.message(for: error)
-                messages[index].isStreaming = false
-                messages[index].isFailed = true
-            }
-        } catch {
-            if let index = messages.firstIndex(where: { $0.id == replyID }) {
-                messages[index].text = "Can't reach OpenAGI. Check your connection and try again."
-                messages[index].isStreaming = false
-                messages[index].isFailed = true
-            }
-        }
+// "From Spencer's G2" above a user line another device sent into the shared
+// thread. Nothing for this phone's own lines, or for lines whose source the
+// daemon did not record.
+enum ChatSourceLabel {
+    static func text(for message: ChatMessage, ownNodeID: String) -> String? {
+        guard message.role == .user, let sourceNodeId = message.sourceNodeId, sourceNodeId != ownNodeID else { return nil }
+        let name = message.sourceName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return name.isEmpty ? "From another device" : "From \(name)"
     }
 }
 

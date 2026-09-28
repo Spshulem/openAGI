@@ -2,13 +2,13 @@ import Foundation
 import Observation
 import WidgetKit
 
-// RootTabView's five destinations. A plain enum (not the `Tab` views
+// RootTabView's six destinations (mobile/FEATURES.md's Navigation). A plain enum (not the `Tab` views
 // themselves) so any screen behind the tab bar can request a switch --
 // e.g. Today's "N waiting on you" row jumping to Inbox, per DESIGN.md's
 // "Screens must not be mostly empty" section -- without needing a callback
 // threaded down through every intermediate view.
 enum AppTab: Hashable {
-    case today, tasks, inbox, chat, settings
+    case today, tasks, inbox, chat, supervisor
 }
 
 // The one piece of shared state behind the tab bar: the paired credential,
@@ -23,6 +23,10 @@ final class AppModel {
     let client: DaemonClient
     let store: SnapshotStore
     let queue: OutboundQueue
+    // The two shared device threads. Owned here, not by a view, so a reply
+    // keeps streaming across tab switches and `/events` can refresh them.
+    let agentChat: ChatConversation
+    let supervisorChat: ChatConversation
 
     private(set) var snapshot: Snapshot?
     private(set) var lastOutcome: RefreshOutcome?
@@ -39,6 +43,8 @@ final class AppModel {
     // should refetch; views observe this rather than polling on a timer.
     private(set) var tasksGeneration = 0
     private(set) var inboxGeneration = 0
+    // Bumped on the daemon's `fleet` event; the Supervisor tab refetches.
+    private(set) var fleetGeneration = 0
 
     private var eventStream: EventStreamController?
 
@@ -50,6 +56,12 @@ final class AppModel {
         self.store = SnapshotStore()
         self.queue = OutboundQueue()
         self.snapshot = store.load()
+        self.agentChat = ChatConversation(thread: .agent, client: client,
+                                          store: ChatHistoryStore(thread: ConversationThread.agent.rawValue),
+                                          nodeID: credentials.nodeID)
+        self.supervisorChat = ChatConversation(thread: .supervisor, client: client,
+                                               store: ChatHistoryStore(thread: ConversationThread.supervisor.rawValue),
+                                               nodeID: credentials.nodeID)
     }
 
     private var coordinator: RefreshCoordinator {
@@ -132,7 +144,17 @@ final class AppModel {
             break
         case .pendingAction, .pendingActionResolved, .clarificationCreated:
             bumpInboxGeneration()
-        case .hello, .unknown:
+        case .conversationUpdated(let thread):
+            // Another device (or this one) stored a turn in a shared thread.
+            if thread == nil || thread == ConversationThread.agent.rawValue { Task { await agentChat.refresh() } }
+            if thread == nil || thread == ConversationThread.supervisor.rawValue { Task { await supervisorChat.refresh() } }
+        case .fleet:
+            fleetGeneration += 1
+        case .hello:
+            // A (re)connected stream may have missed updates while it was down.
+            Task { await agentChat.refresh() }
+            Task { await supervisorChat.refresh() }
+        case .unknown:
             break
         }
     }
@@ -142,6 +164,8 @@ final class AppModel {
     func revoke() async {
         try? await client.revoke()
         stopEventStream()
+        agentChat.forget()
+        supervisorChat.forget()
         Credentials.clear()
         try? SnapshotStore().delete()
         try? OutboundQueue().clear()

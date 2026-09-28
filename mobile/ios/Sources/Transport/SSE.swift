@@ -54,10 +54,20 @@ public enum DaemonEvent: Sendable, Equatable {
     case pendingAction
     case pendingActionResolved
     case clarificationCreated
+    // A turn was stored in a shared device thread ("agent" or
+    // "supervisor"), by this phone or any other device. nil when the frame
+    // did not say which thread, which reloads both.
+    case conversationUpdated(thread: String?)
+    // The fleet supervisor's state changed (a scan, a mode, an answer).
+    case fleet
     case unknown(name: String)
 
-    public static func from(name: String) -> DaemonEvent {
+    public static func from(name: String, data: String = "") -> DaemonEvent {
         switch name {
+        case "conversation.updated":
+            let object = data.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            return .conversationUpdated(thread: object?["thread"] as? String)
+        case "fleet": return .fleet
         case "hello": return .hello
         case "task-updated": return .taskUpdated
         case "task-reminder": return .taskReminder

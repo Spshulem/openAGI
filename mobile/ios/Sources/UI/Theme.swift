@@ -25,6 +25,10 @@ public enum Theme {
     public static let alert = Color(light: 0xA32C22, dark: 0xF08A7E)
     // Row-group separators.
     public static let edge = Color(light: 0xE2E6E4, dark: 0x262D2A)
+    // One exception to the six: the Supervisor's yellow health dot, a third
+    // status hue between `live` and `alert` (mobile/FEATURES.md's
+    // Supervisor section). 4.5:1 on `surface` in both modes, fixed like them.
+    public static let caution = Color(light: 0x8A5A00, dark: 0xE8B64C)
 
     // MARK: - Layout
 

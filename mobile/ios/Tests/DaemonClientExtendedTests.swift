@@ -325,4 +325,60 @@ final class DaemonClientExtendedTests: XCTestCase {
             XCTAssertEqual(error, .server(503))
         } catch { XCTFail("unexpected \(error)") }
     }
+
+    // A main from before shared threads validates a node's `/message` body
+    // against text/from/sessionId only and 400s `thread` before running the
+    // turn. The send must retry once without it (keeping `from`), and the
+    // client must stop sending `thread` for the rest of its life.
+    func testSendMessageStreamingRetriesWithoutThreadWhenAnOlderMainRejectsIt() async throws {
+        final class Bodies: @unchecked Sendable { var items: [[String: Any]] = [] }
+        let bodies = Bodies()
+        let raw = "event: final\ndata: {\"reply\":\"ok\"}\n\n"
+        StubProtocol.handler = { [self] request in
+            let body = (try? self.bodyJSON(of: request)) ?? [:]
+            bodies.items.append(body)
+            if body["thread"] != nil {
+                return (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+                        Data(#"{"error":"node message contains unsupported fields"}"#.utf8))
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(raw.utf8))
+        }
+        let client = makeClient()
+        let stream = try await client.sendMessageStreaming(
+            text: "hello", thread: .supervisor, from: "mobile-supervisor", sessionId: "mobile-supervisor")
+        var events: [ChatEvent] = []
+        for try await event in stream { events.append(event) }
+        guard case .final(let frame) = events.last else { return XCTFail("expected a final frame") }
+        XCTAssertEqual(frame.reply, "ok")
+        XCTAssertEqual(bodies.items.count, 2)
+        XCTAssertEqual(bodies.items[0]["thread"] as? String, "supervisor")
+        XCTAssertNil(bodies.items[1]["thread"])
+        XCTAssertEqual(bodies.items[1]["from"] as? String, "mobile-supervisor")
+        XCTAssertEqual(bodies.items[1]["sessionId"] as? String, "mobile-supervisor")
+
+        // Remembered: the next send goes straight out without `thread`.
+        let second = try await client.sendMessageStreaming(text: "again", thread: .agent)
+        for try await _ in second {}
+        XCTAssertEqual(bodies.items.count, 3)
+        XCTAssertNil(bodies.items[2]["thread"])
+    }
+
+    // Any other 400 (bad text, say) is not a missing-thread-support signal:
+    // no resend, and it surfaces as the plain server error.
+    func testSendMessageStreamingDoesNotRetryOtherBadRequests() async {
+        final class Count: @unchecked Sendable { var value = 0 }
+        let count = Count()
+        StubProtocol.handler = { request in
+            count.value += 1
+            return (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+                    Data(#"{"error":"node message text must be non-empty and at most 64 KiB"}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().sendMessageStreaming(text: "hello", thread: .agent)
+            XCTFail("expected a throw")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .server(400))
+        } catch { XCTFail("unexpected \(error)") }
+        XCTAssertEqual(count.value, 1)
+    }
 }
