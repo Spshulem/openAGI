@@ -7,7 +7,18 @@ export class SerializedAudioSource implements AudioSource {
   private unsubscribe: (() => void) | null = null
   private isActive = false
   private nativeStateUnknown = false
-  constructor(private readonly bridge: Pick<EvenAppBridge, 'audioControl' | 'onEvenHubEvent'>) {}
+  // A native call that never settles must not hold the microphone (and every
+  // later tap) hostage; the next open closes first because state is unknown.
+  constructor(private readonly bridge: Pick<EvenAppBridge, 'audioControl' | 'onEvenHubEvent'>, private readonly timeoutMs = 8000) {}
+  private control(open: boolean): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(open
+        ? 'The glasses microphone did not open within 8 seconds. Tap to try again; if it keeps failing, close and reopen Agents in the Even app.'
+        : 'The Even app did not confirm microphone release within 8 seconds. Tap to try again.')), this.timeoutMs)
+    })
+    return Promise.race([open ? this.bridge.audioControl(true, AudioInputSource.Glasses) : this.bridge.audioControl(false), timeout]).finally(() => clearTimeout(timer))
+  }
   get active(): boolean { return this.isActive || this.nativeStateUnknown }
   private enqueue(operation: () => Promise<void>): Promise<void> {
     const next = this.tail.then(operation)
@@ -22,7 +33,7 @@ export class SerializedAudioSource implements AudioSource {
         if (event.audioEvent?.audioPcm && this.isActive) onPcm(event.audioEvent.audioPcm)
       })
       try {
-        if (!await this.bridge.audioControl(true, AudioInputSource.Glasses)) {
+        if (!await this.control(true)) {
           throw new Error('The Even app could not open the glasses microphone. Close and reopen Agents in the Even app to restore its glasses page, then try once. If it still fails, check the glasses connection and microphone access. No re-pairing needed.')
         }
         this.isActive = true
@@ -43,7 +54,7 @@ export class SerializedAudioSource implements AudioSource {
   }
   private async closeNative(): Promise<void> {
     this.nativeStateUnknown = true
-    if (!await this.bridge.audioControl(false)) throw new Error('The Even app did not confirm microphone release. Close and reopen Agents before trying again; do not keep pressing Retry.')
+    if (!await this.control(false)) throw new Error('The Even app did not confirm microphone release. Close and reopen Agents before trying again; do not keep pressing Retry.')
     this.nativeStateUnknown = false
   }
 }
