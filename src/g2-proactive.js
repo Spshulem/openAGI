@@ -43,7 +43,8 @@ export class G2Proactive {
       const oldCandidates = n.candidates.length;
       n.candidates = n.candidates.filter(c => ids.has(c.segmentId));
       pruneLifelog(n);
-      if (n.consent?.until <= this.now()) { n.consent = null; changed = true; }
+      // Consent persists until revoked. Legacy grants carried a 4-hour until;
+      // they stay valid and are never expired here.
       changed ||= before !== n.segments.length || oldCandidates !== n.candidates.length;
     }
     if (changed) this.save();
@@ -86,7 +87,8 @@ export class G2Proactive {
       case "consent": {
         if (typeof body.enabled !== "boolean" || (body.enabled && body.recordingConsent !== true)) reject("Explicit recording consent is required");
         if (!body.enabled && body.consentId && body.consentId !== n.consent?.id) return { consent: null };
-        n.consent = body.enabled ? { id: randomUUID(), until: this.now() + 4 * 3600_000 } : null;
+        // Only an explicit consent-off (or delete-memory) revokes a grant.
+        n.consent = body.enabled ? { id: randomUUID(), grantedAt: this.now(), until: null } : null;
         this.save(); return { consent: n.consent };
       }
       case "transcripts": return { segments: [...n.segments].reverse(), candidates: n.candidates };
@@ -130,7 +132,10 @@ export class G2Proactive {
         const mark = n.marks[item.id] ?? {};
         if (body.op === "notify" || body.op === "can-notify") {
           const hour = Math.floor(this.now() / 3600_000);
-          if (!n.settings.enabled || this.quiet(n) || !item.important || mark.notified || (mark.seen && body.op === "can-notify")
+          // Supervisor mode pings for its own questions without the general
+          // "updates from my main" opt-in; quiet hours and the hourly cap apply.
+          const allowed = n.settings.enabled || (n.settings.supervisorOnly && item.supervisor === true);
+          if (!allowed || this.quiet(n) || !item.important || mark.notified || (mark.seen && body.op === "can-notify")
             || (n.hour === hour && n.notifications >= n.settings.maxPerHour) || n.settings.maxPerHour === 0) return { notify: false };
           if (body.op === "can-notify") return { notify: true };
           n.notifications = n.hour === hour ? n.notifications + 1 : 1; n.hour = hour; mark.notified = true;
@@ -168,7 +173,7 @@ export class G2Proactive {
     }
   }
   capture(n, body) {
-    if (!n.consent || n.consent.id !== body.consentId || n.consent.until <= this.now()) reject("Conversation memory consent is off or expired", 403);
+    if (!n.consent || n.consent.id !== body.consentId) reject("Conversation memory consent is off or was revoked", 403);
     if (typeof body.batchId !== "string" || !/^[a-zA-Z0-9-]{16,80}$/.test(body.batchId)
       || !Array.isArray(body.texts) || !body.texts.length || body.texts.length > 10
       || body.texts.some(t => typeof t !== "string" || !t.trim() || t.length > 1000)) reject("Invalid transcript batch");
@@ -277,7 +282,7 @@ export class G2Proactive {
     const selected = new Set(n.settings.categories);
     const items = [];
     // Supervisor mode lists supervisor questions even before "Show updates
-    // from my main" is on; pings still need that opt-in (see can-notify).
+    // from my main" is on, and pings for them (see can-notify).
     if (n.settings.enabled || n.settings.supervisorOnly) {
       for (const i of (this.runtime?.outreach?.list?.() ?? []).slice(0, 200)) {
         if (!["unseen", "seen"].includes(i.status) || Date.parse(i.createdAt) < this.now() - 7 * DAY) continue;

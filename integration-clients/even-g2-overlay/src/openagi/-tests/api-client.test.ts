@@ -119,3 +119,22 @@ describe('OpenAGIApiClient', () => {
     expect(fetchImpl).not.toHaveBeenCalled()
   })
 })
+
+describe('shared conversations', () => {
+  const config = { origin: 'https://openagi.example.com', allowedOrigins: ['https://openagi.example.com'] }
+  it('reads a shared thread through G2 history and returns null on a main without threads', async () => {
+    const bodies: unknown[] = []
+    let supported = true
+    const fetchImpl = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(typeof init?.body === 'string' ? init.body : '{}'))
+      return Promise.resolve(supported
+        ? new Response(JSON.stringify({ thread: 'agent', messages: [{ id: 'm', role: 'user', text: 'hi', at: 'now' }], nextBefore: null }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        : new Response(JSON.stringify({ error: 'unsupported_experience_fields' }), { status: 400, headers: { 'Content-Type': 'application/json' } }))
+    }) as unknown as typeof fetch
+    const api = new OpenAGIApiClient(config, () => ({ nodeId: crypto.randomUUID(), nodeToken: 'n'.repeat(43) }), fetchImpl)
+    expect((await api.readThread('agent'))?.messages).toHaveLength(1)
+    expect(bodies[0]).toEqual({ op: 'history', thread: 'agent' })
+    supported = false
+    expect(await api.readThread('agent')).toBeNull()
+  })
+})

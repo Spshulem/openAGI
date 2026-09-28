@@ -1,4 +1,4 @@
-import type { OpenAGIStore } from './store'
+import type { ConversationThread, OpenAGIStore } from './store'
 import type { AskProgress, OpenAGIAskResult } from './api-client'
 import { OpenAGIApiError } from './config'
 
@@ -6,7 +6,18 @@ export interface G2Capabilities { protocol: number; recovery: boolean; history: 
 export interface G2Conversation { continuation: string; title: string; preview: string; at: string }
 export interface G2History { conversations?: G2Conversation[]; messages?: { role: string; text: string; at: string }[]; nextOffset?: number | null; archivedOnMain?: boolean }
 export interface RequestReceipt { id: string; state: 'accepted' | 'working' | 'completed' | 'cancelled' | 'unconfirmed'; revision: number; stage?: string; tool?: string; question?: string; text?: string; message?: string; result?: OpenAGIAskResult; events?: { seq: number; stage: string; tool?: string }[] }
+export interface SharedThreadMessage { id: string; role: 'user' | 'assistant'; text: string; at: string; sourceNodeId?: string | null; sourceName?: string | null }
+export interface SharedThreadPage { thread?: ConversationThread; messages: SharedThreadMessage[]; nextBefore?: string | null }
 type Send = <T>(body: object, signal?: AbortSignal) => Promise<T>
+
+// A main without shared threads rejects the unknown field before it creates
+// any request, so retrying without it cannot run a question twice.
+export function threadsUnsupported(error: unknown): boolean {
+  return error instanceof OpenAGIApiError && error.status === 400 && error.code === 'unsupported_experience_fields'
+}
+export function supervisorUnsupported(): OpenAGIApiError {
+  return new OpenAGIApiError('threads_unsupported', 400, 'Update OpenAGI on your main to talk to the supervisor from the glasses. Nothing was sent.')
+}
 
 export class G2ExperienceClient {
   capabilities: G2Capabilities | null = null
@@ -21,12 +32,34 @@ export class G2ExperienceClient {
     }
     return this.capabilities
   }
-  async submit(payload: { text?: string; audioBase64?: string; conversationId: string }, progress: ((event: AskProgress) => void) | undefined, signal?: AbortSignal): Promise<OpenAGIAskResult> {
+  // null until main answers a threaded submit; false once it rejects threads.
+  private threads: boolean | null = null
+  async submit(payload: { text?: string; audioBase64?: string; conversationId: string }, progress: ((event: AskProgress) => void) | undefined, signal?: AbortSignal, thread?: ConversationThread): Promise<OpenAGIAskResult> {
     if (this.store.snapshot().pendingRequest) throw new OpenAGIApiError('request_pending', 409, 'A saved question needs attention. Check its result before asking again.')
+    if (thread === 'supervisor' && this.threads === false) throw supervisorUnsupported()
     const id = `${Date.now()}_${crypto.randomUUID()}`, continuation = this.store.snapshot().continuation
-    await this.store.update({ pendingRequest: { id, conversationId: payload.conversationId, continuation, text: payload.text ?? null, origin: this.origin() }, savedDraft: '' })
-    const receipt = await this.send<RequestReceipt>({ op: 'submit', id, question: { ...payload, ...(continuation ? { continuation } : {}) } }, signal)
+    const wanted = thread && this.threads !== false ? thread : null
+    await this.store.update({ pendingRequest: { id, conversationId: payload.conversationId, continuation, text: payload.text ?? null, origin: this.origin(), thread: wanted }, savedDraft: '' })
+    const receipt = await this.submitRequest(id, { ...payload, ...(continuation ? { continuation } : {}) }, wanted, signal)
     return this.observe(receipt, progress, signal)
+  }
+  private async submitRequest(id: string, question: object, thread: ConversationThread | null, signal?: AbortSignal): Promise<RequestReceipt> {
+    try {
+      const receipt = await this.send<RequestReceipt>({ op: 'submit', id, ...(thread ? { thread } : {}), question }, signal)
+      if (thread) this.threads = true
+      return receipt
+    } catch (error) {
+      if (!thread || !threadsUnsupported(error)) throw error
+      this.threads = false
+      const pending = this.store.snapshot().pendingRequest
+      if (thread === 'supervisor') {
+        if (pending?.id === id) await this.store.update({ pendingRequest: null })
+        throw supervisorUnsupported()
+      }
+      // Older main: the agent thread falls back to this G2's own conversation.
+      if (pending?.id === id) await this.store.update({ pendingRequest: { ...pending, thread: null } })
+      return this.send<RequestReceipt>({ op: 'submit', id, question }, signal)
+    }
   }
   async resume(progress: ((event: AskProgress) => void) | undefined, signal?: AbortSignal, allowSubmit = false): Promise<OpenAGIAskResult> {
     const pending = this.store.snapshot().pendingRequest
@@ -35,7 +68,7 @@ export class G2ExperienceClient {
     try { receipt = await this.send<RequestReceipt>({ op: 'get', id: pending.id }, signal) }
     catch (error) {
       if (!(error instanceof OpenAGIApiError) || error.code !== 'request_not_found' || !allowSubmit || !pending.text) throw error
-      receipt = await this.send<RequestReceipt>({ op: 'submit', id: pending.id, question: { text: pending.text, conversationId: pending.conversationId, ...(pending.continuation ? { continuation: pending.continuation } : {}) } }, signal)
+      receipt = await this.submitRequest(pending.id, { text: pending.text, conversationId: pending.conversationId, ...(pending.continuation ? { continuation: pending.continuation } : {}) }, pending.thread, signal)
     }
     return this.observe(receipt, progress, signal)
   }

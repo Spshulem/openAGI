@@ -53,3 +53,20 @@ it('requires confirmed release before reopening after a failed close', async () 
   expect(control.mock.calls.map(call => call[0])).toEqual([true, false, false, false, true])
   await audio.stop()
 })
+
+it('times out a native open that never settles, then closes first before reopening', async () => {
+  vi.useFakeTimers()
+  try {
+    const control = vi.fn<(open: boolean) => Promise<boolean>>().mockImplementationOnce(() => new Promise<boolean>(() => {})).mockResolvedValue(true)
+    const audio = new SerializedAudioSource({ audioControl: control, onEvenHubEvent: () => vi.fn() })
+    const start = audio.start(vi.fn())
+    const failed = expect(start).rejects.toThrow('did not open within 8 seconds')
+    await vi.advanceTimersByTimeAsync(8000)
+    await failed
+    // The native state is unknown: the next open releases it first.
+    await audio.start(vi.fn())
+    expect(control.mock.calls.map(call => call[0])).toEqual([true, false, true])
+    expect(audio.active).toBe(true)
+    await audio.stop()
+  } finally { vi.useRealTimers() }
+})

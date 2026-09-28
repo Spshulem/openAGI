@@ -14,7 +14,7 @@ export class PhoneExperience {
     const actions = this.root.querySelector<HTMLElement>('#actions')!
     const focused = document.createElement('div'); focused.id = 'focused-experience'; this.focused = focused
     focused.innerHTML = `<nav class="experience-nav" aria-label="Main navigation"><button data-destination="talk">Talk</button><button data-destination="inbox">Inbox</button><button data-destination="history">History</button><button data-destination="settings" aria-label="Settings">⚙</button></nav>
-      <section data-page="talk" class="talk-page"><div id="talk-primary"></div><div id="talk-result"></div><details id="talk-activity"><summary>Activity</summary></details><section id="lifelog-simple" class="ambient"><h2>Lifelog</h2><p>Keep a quiet record. Ask only when you choose.</p><div id="lifelog-primary"></div></section></section>
+      <section data-page="talk" class="talk-page"><div id="mode-slot"></div><section id="lifelog-simple" class="ambient lifelog-only"><h2>Lifelog</h2><p>Always listening while Agents is open on the glasses. Tap the glasses to talk to the agent.</p><div id="lifelog-primary"></div></section><div id="talk-primary"></div><div id="talk-result"></div><details id="talk-activity"><summary>Activity</summary></details></section>
       <section data-page="history" class="history-page"><h2>History</h2><p>Your conversations and saved moments.</p><div id="history-destinations"></div><div id="history-main"></div><div id="history-local"></div></section>
       <section data-page="settings" class="settings-page"><h2>Settings</h2><div id="settings-content"></div></section>`
     actions.prepend(focused)
@@ -32,8 +32,9 @@ export class PhoneExperience {
     for (const selector of ['[data-action="ask"]', '#cancel-request', '#pending-question', '#draft-review', '[data-action="newConversation"]']) move(selector, '#talk-primary')
     for (const selector of ['#live-transcript', '#speech-timing', '#answer-preview', '#previous-page', '#next-page']) move(selector, '#talk-result')
     move('#activity-log', '#talk-activity')
-    for (const id of ['memory-enabled', 'recording-consent']) moveLabel(id, '#lifelog-primary')
-    for (const selector of ['#memory-status', '#save-status', '#memory-resume', '#pause-lifelog', '#mark-moment']) move(selector, '#lifelog-primary')
+    move('#mode-picker', '#mode-slot')
+    moveLabel('recording-consent', '#lifelog-primary')
+    for (const selector of ['#memory-status', '#save-status', '#pause-lifelog', '#mark-moment']) move(selector, '#lifelog-primary')
     move('#history-controls', '#history-main'); move('#main-history', '#history-main')
     move('#recent-answers', '#history-local'); move('#read-lifelog', '#history-destinations')
     // Advanced cards remain intact, and restore to their exact Classic position.
@@ -74,7 +75,7 @@ export const experienceStyles = `
   #talk-activity{border-top:1px solid #334049;padding:14px 0;font-size:14px}
   #lifelog-primary,#settings-content,#history-main,#main-history,#history-controls{display:grid;gap:14px;min-width:0}
   #lifelog-primary label{display:flex;gap:12px;align-items:center;min-height:44px}
-  [data-experience="focused"] #lifelog-primary:has(#memory-enabled:not(:checked)) #save-status{display:none}
+  [data-experience="focused"] #lifelog-primary:has(#recording-consent:not(:checked)) #save-status{display:none}
   #lifelog-primary input[type=checkbox]{width:22px;height:22px;flex-shrink:0;accent-color:#abc8dc}
   #main-history{max-height:55vh;overflow:auto;overscroll-behavior:contain}
   #main-history button{text-align:left;display:grid;gap:8px}#main-history p{white-space:pre-wrap}

@@ -4,8 +4,9 @@ const noop = (): void => { phone.set('Design preview', 'Sample content only. No 
 let recording = false
 const phone = new OpenAGIPhoneCompanion({
   pair: noop, ask: () => { recording = !recording; phone.interaction(recording ? 'recording' : 'idle'); phone.set(recording ? 'Listening…' : 'Ready', 'Design preview only · no microphone or connection'); phone.transcript(recording ? 'What should I focus on this afternoon?' : '') },
-  newConversation: noop, unlink: noop, connectAgent: noop, configureAmbient: noop,
-  configureInterface: style => phone.interfaceStyle(style), pauseLifelog: noop, returnToLifelog: noop,
+  newConversation: noop, unlink: noop, connectAgent: noop,
+  configureInterface: style => phone.interfaceStyle(style), pauseLifelog: noop, resumeLifelog: noop,
+  configureHomeMode: mode => phone.homeMode(mode),
 }, [])
 phone.paired(true); phone.interaction('idle')
 phone.set('Ready when you are.', 'Design preview · no microphone or connection')

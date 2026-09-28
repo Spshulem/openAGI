@@ -1,4 +1,5 @@
 import type { OpenAGIApiClient } from './api-client'
+import { OpenAGIApiError } from './config'
 
 export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[] }
 // The supervisor's glanceable status: counts by colour, red then yellow threads.
@@ -11,16 +12,26 @@ export interface ProactiveView {
   memoryStatus?(active: boolean, detail: string): void
   activity?(text: string): void
   saveStatus?(text: string): void
+  consentLost?(): void
 }
 
+export interface MainConsent { id: string; grantedAt?: number | null; until?: number | null }
+
 // This timer only reads persisted notifications; it never starts agent work.
-// Ambient uploads are final text only, opt-in, ephemeral and never replayed.
+// Ambient uploads are final text only, opt-in, and never replayed.
+// Consent is persistent: suspendMemory() stops capture locally (app in the
+// background, microphone paused); only revokeMemory() withdraws it on main.
 export class G2ProactiveClient {
   items: InboxItem[] = []
-  get memoryActive(): boolean { return Boolean(this.consent && this.consent.until > Date.now()) }
+  /** Main holds a recording consent for this G2. */
+  get memoryActive(): boolean { return Boolean(this.consent) }
+  /** Final text is being retained right now. */
+  get capturing(): boolean { return Boolean(this.consent) && !this.suspended && this.running && this.foreground }
+  get consentId(): string | null { return this.consent?.id ?? null }
   private timer: ReturnType<typeof setInterval> | null = null
   private flushTimer: ReturnType<typeof setTimeout> | null = null
-  private consent: { id: string; until: number } | null = null
+  private consent: MainConsent | null = null
+  private suspended = true
   private queue: { text: string; at: number; endAt: number; streamId: string; speaker: number | null }[] = []
   private bufferedStreamId = crypto.randomUUID()
   private generation = 0
@@ -32,29 +43,40 @@ export class G2ProactiveClient {
   private feedGeneration = 0
   private uploading = false
   private running = false
-  private consentChanging = false
   private foreground = true
-  private phoneHidden(): boolean { return document.visibilityState === 'hidden' }
-  private hidden(): boolean { return !this.foreground || (document.visibilityState === 'hidden' && !this.allowBackground()) }
-  setForeground(active: boolean): void { this.foreground = active; this.visibility() }
-  private visibility = (): void => {
-    if (this.hidden()) { if (this.keepOnReopen()) this.suspendMemory(); else this.pauseMemory(); this.controller.abort(); this.controller = new AbortController() }
+  private hidden(): boolean { return !this.foreground }
+  setForeground(active: boolean): void {
+    if (this.foreground === active) return
+    this.foreground = active
+    if (!active) { this.suspendMemory(); this.controller.abort(); this.controller = new AbortController() }
     else if (this.running) void this.refresh()
   }
-  constructor(private readonly api: OpenAGIApiClient, private readonly view: ProactiveView, private readonly canNotify: () => boolean, private readonly notify: (item: InboxItem) => void, private readonly keepOnReopen: () => boolean = () => false, private readonly allowBackground: () => boolean = () => false) {}
-  consentSnapshot(): { id: string; until: number } | null { return this.consent ? { ...this.consent } : null }
-  suspendMemory(): void {
-    this.generation++; this.consent = null; this.queue = []
+  // The phone screen does not gate anything; becoming visible just refreshes.
+  private visibility = (): void => { if (document.visibilityState !== 'hidden' && this.running && !this.hidden()) void this.refresh() }
+  constructor(private readonly api: OpenAGIApiClient, private readonly view: ProactiveView, private readonly canNotify: () => boolean, private readonly notify: (item: InboxItem) => void) {}
+  consentSnapshot(): MainConsent | null { return this.consent ? { ...this.consent } : null }
+  /** Stops capture locally and drops unsent text. Consent stays on main. */
+  suspendMemory(detail = 'Lifelog paused on this device. Microphone off; consent stays on. Unsent text is not replayed.'): void {
+    const wasCapturing = !this.suspended
+    this.generation++; this.suspended = true; this.queue = []
     if (this.flushTimer) clearTimeout(this.flushTimer)
     this.flushTimer = null
-    this.view.memoryStatus?.(false, 'Lifelog enabled · temporarily paused. Microphone off; resumes when the app is open and consent is valid. Unsent text is not replayed.')
+    if (wasCapturing) this.view.memoryStatus?.(false, detail)
   }
-  async restoreMemory(saved: { id: string; until: number }): Promise<boolean> {
-    if (!this.running || this.hidden() || saved.until <= Date.now()) return false
-    const generation = this.generation, signal = this.controller.signal
-    const result = await this.api.proactive({ op: 'settings' }, signal)
-    if (signal.aborted || generation !== this.generation || this.hidden() || !this.running || result.consent?.id !== saved.id || result.consent.until !== saved.until || saved.until <= Date.now()) return false
-    this.consent = { ...saved }; this.view.memoryStatus?.(true, 'Lifelog resumed with existing consent.'); return true
+  resumeMemory(): boolean {
+    if (!this.consent || !this.running || this.hidden()) return false
+    if (this.suspended) { this.suspended = false; this.view.memoryStatus?.(true, 'Lifelog on. Final text is saved on your main; speakers are unverified.') }
+    return true
+  }
+  /** Main's current grant for this G2, or null. Throws when main is unreachable. */
+  async readConsent(): Promise<MainConsent | null> {
+    const result = await this.api.proactive({ op: 'settings' }, this.controller.signal)
+    return result.consent?.id ? { ...result.consent } : null
+  }
+  /** Adopts a grant main confirmed. Capture stays suspended until resumeMemory(). */
+  adoptConsent(consent: MainConsent): void {
+    if (this.consent?.id !== consent.id) { this.generation++; this.queue = []; this.suspended = true }
+    this.consent = { ...consent }
   }
   start(): void {
     if (this.running || typeof this.api.proactive !== 'function') return
@@ -63,8 +85,9 @@ export class G2ProactiveClient {
     void this.refresh()
     this.timer = setInterval(() => { if (!this.hidden()) void this.refresh() }, 60_000)
   }
-  stop(preserveConsent = false): void {
-    this.running = false; if (preserveConsent) this.suspendMemory(); else this.pauseMemory(); this.controller.abort()
+  /** Local teardown only: never revokes consent on main. */
+  stop(): void {
+    this.running = false; this.suspendMemory(); this.consent = null; this.controller.abort()
     if (this.timer) clearInterval(this.timer)
     this.timer = null; document.removeEventListener('visibilitychange', this.visibility)
     this.items = []; this.view.inbox?.([])
@@ -80,10 +103,10 @@ export class G2ProactiveClient {
       if (!this.running || signal.aborted || feedGeneration !== this.feedGeneration) return
       this.items = result.items ?? []; this.view.inbox?.(this.items)
       if (result.settings) this.view.proactiveSettings?.(result.settings)
-      if (this.consent && this.consent.until <= Date.now()) this.pauseMemory('Memory consent expired. Enable again to keep new transcripts.')
       // Do not claim a notification until the app says it can show it safely.
-      const item = this.items.find(i => i.important && !i.seen && !i.notified)
-      if (item && !result.quiet && result.settings?.enabled && this.canNotify()) {
+      // Supervisor mode pings for its own questions without the general opt-in.
+      const item = this.items.find(i => i.important && !i.seen && !i.notified && (result.settings?.enabled === true || (result.settings?.supervisorOnly === true && i.supervisor === true)))
+      if (item && !result.quiet && this.canNotify()) {
         const allowed = await this.api.proactive({ op: 'can-notify', id: item.id }, signal)
         if (!signal.aborted && this.running && allowed.notify && this.canNotify()) {
           this.notify(item)
@@ -117,31 +140,28 @@ export class G2ProactiveClient {
     try { await this.api.proactive({ op: 'configure', settings }, this.controller.signal); await this.refresh() }
     catch (error) { this.view.activity?.(`Could not save inbox settings: ${String(error)}`) }
   }
-  async enableMemory(recordingConsent: boolean): Promise<void> {
-    if (!this.running || this.consentChanging || this.hidden() || this.phoneHidden()) return
-    this.consentChanging = true
+  /** Asks main for a new grant after the owner's explicit consent. */
+  async grantMemory(recordingConsent: boolean): Promise<MainConsent | null> {
+    if (!this.running || !recordingConsent) return null
     const generation = this.generation
-    try {
-      const result = await this.api.proactive({ op: 'consent', enabled: true, recordingConsent }, this.controller.signal)
-      if (generation !== this.generation || !this.running || this.hidden() || this.phoneHidden()) {
-        if (result.consent) void this.api.proactive({ op: 'consent', enabled: false, consentId: result.consent.id }).catch(() => {})
-        return
-      }
-      this.consent = result.consent ?? null
-      this.view.memoryStatus?.(Boolean(this.consent), 'Memory armed for this foreground listening session (up to 4 hours). Final transcripts are retained on your main; speakers are unverified.')
-    } catch (error) { this.view.memoryStatus?.(false, `Could not enable memory: ${String(error)}`) }
-    finally { this.consentChanging = false }
+    const result = await this.api.proactive({ op: 'consent', enabled: true, recordingConsent }, this.controller.signal)
+    if (!result.consent?.id) return null
+    if (generation !== this.generation || !this.running) {
+      void this.api.proactive({ op: 'consent', enabled: false, consentId: result.consent.id }).catch(() => {})
+      return null
+    }
+    this.adoptConsent(result.consent)
+    return this.consentSnapshot()
   }
-  pauseMemory(detail = 'Memory off. New ambient transcripts are not retained. Existing transcripts follow your retention setting.'): void {
-    const consent = this.consent
-    this.generation++; this.consent = null; this.queue = []
+  /** Withdraws the grant on main. Only for an explicit owner choice. */
+  revokeMemory(consentId = this.consent?.id, detail = 'Lifelog off. New transcripts are not retained. Existing transcripts follow your retention setting.'): void {
+    this.generation++; this.suspended = true; this.queue = []; this.consent = null
     if (this.flushTimer) clearTimeout(this.flushTimer)
     this.flushTimer = null; this.view.memoryStatus?.(false, detail)
-    if (consent) void this.api.proactive({ op: 'consent', enabled: false, consentId: consent.id }).catch(() => {})
+    if (consentId) void this.api.proactive({ op: 'consent', enabled: false, consentId }).catch(() => {})
   }
   capture(text: string, metadata?: { at: number; endAt: number; streamId: string; speaker: number | null }): void {
-    if (!this.consent || !this.running || this.hidden()) return
-    if (this.consent.until <= Date.now()) { this.pauseMemory('Memory consent expired; enable it again.'); return }
+    if (!this.capturing) return
     const trimmed = text.trim()
     if (!trimmed) return
     const previous = this.queue.at(-1)
@@ -152,35 +172,47 @@ export class G2ProactiveClient {
       && previous.text.length + trimmed.length < 950) {
       previous.text += ` ${trimmed}`; previous.endAt = metadata.endAt; return
     }
-    if (trimmed.length > 1000 || this.queue.length >= 100) { this.pauseMemory('Memory paused: transcript buffer full. No unsent text was saved.'); return }
+    // A full buffer (main unreachable for a long time) drops new text rather
+    // than turning lifelog off; consent is untouched.
+    if (trimmed.length > 1000 || this.queue.length >= 100) { this.view.saveStatus?.('Text not saved: waiting for main. Lifelog stays on.'); return }
     this.queue.push({ text: trimmed, ...(metadata ?? { at: Date.now(), endAt: Date.now(), streamId: this.bufferedStreamId, speaker: null }) })
     this.view.saveStatus?.('Final text waiting to save on main')
     if (!this.flushTimer) this.flushTimer = setTimeout(() => { this.flushTimer = null; void this.flush() }, 30_000)
   }
   private async flush(): Promise<void> {
     if (!this.consent || !this.queue.length || this.uploading || !this.running) return
-    if (this.hidden() || this.consent.until <= Date.now()) { this.suspendMemory(); return }
+    if (!this.capturing) { this.suspendMemory(); return }
     this.uploading = true
-    const segments = this.queue.splice(0, 10), texts = segments.map(s => s.text), generation = this.generation
+    const segments = this.queue.splice(0, 10), texts = segments.map(s => s.text), generation = this.generation, consentId = this.consent.id
     try {
-      await this.api.proactive({ op: 'capture', consentId: this.consent.id, batchId: crypto.randomUUID(), texts, segments: segments.map(s => ({ at: s.at, endAt: s.endAt, streamId: s.streamId, speaker: s.speaker })) }, this.controller.signal)
+      await this.api.proactive({ op: 'capture', consentId, batchId: crypto.randomUUID(), texts, segments: segments.map(s => ({ at: s.at, endAt: s.endAt, streamId: s.streamId, speaker: s.speaker })) }, this.controller.signal)
       if (generation === this.generation) {
         this.view.activity?.(`Saved ${texts.length} final transcript segment(s) to main; checking explicit commitments.`)
         this.view.saveStatus?.(`Saved on main at ${new Date().toLocaleTimeString()}`)
         await this.refresh()
       }
-    } catch { if (generation === this.generation) this.pauseMemory('Memory paused: upload failed. No automatic replay; some submitted text may already be saved on main.') }
-    finally { this.uploading = false; if (this.queue.length && this.consent && this.running && !this.flushTimer) this.flushTimer = setTimeout(() => { this.flushTimer = null; void this.flush() }, 16_000) }
+    } catch (error) {
+      if (generation !== this.generation) return
+      // 403: main no longer holds this grant (revoked on main). Anything else
+      // is a transient failure: drop this batch (no replay) and keep going.
+      if (error instanceof OpenAGIApiError && error.status === 403 && this.consent?.id === consentId) {
+        this.suspendMemory(); this.consent = null
+        this.view.memoryStatus?.(false, 'Main no longer holds your lifelog consent (revoked or deleted on main). Microphone off.')
+        this.view.consentLost?.()
+      } else this.view.saveStatus?.('Upload failed; that text was not saved and is not replayed. Lifelog stays on.')
+    }
+    finally { this.uploading = false; if (this.queue.length && this.capturing && !this.flushTimer) this.flushTimer = setTimeout(() => { this.flushTimer = null; void this.flush() }, 16_000) }
   }
   async markMoment(): Promise<boolean> {
-    if (!this.memoryActive || this.hidden()) { this.view.activity?.('Start consented lifelog before marking a moment.'); return false }
+    if (!this.capturing) { this.view.activity?.('Lifelog must be listening before marking a moment.'); return false }
     try {
       await this.api.proactive({ op: 'mark-moment', consentId: this.consent!.id }, this.controller.signal)
       this.view.activity?.('Moment marked on main, linked to the latest saved words.'); return true
     } catch (error) { this.view.activity?.(`Moment not marked: ${String(error)}`); return false }
   }
   async action(op: InboxOperation, id?: string, extra: Record<string, unknown> = {}): Promise<boolean> {
-    if (op === 'delete-memory') this.pauseMemory()
+    // Main clears its grant with the transcripts.
+    if (op === 'delete-memory') { this.suspendMemory(); this.consent = null }
     try {
       await this.api.proactive({ ...extra, op, id, ...(['accept-task', 'complete-task'].includes(op) ? { confirm: true } : {}) }, this.controller.signal)
       this.view.activity?.(op === 'complete-task' ? 'Task completed on OpenAGI main. External source was not changed.' : op === 'accept-task' ? 'Added to your user tasks on main. No agent action was started.' : op === 'delete-memory' ? 'Retained transcripts and suggestions deleted; accepted tasks remain.' : 'Inbox updated')

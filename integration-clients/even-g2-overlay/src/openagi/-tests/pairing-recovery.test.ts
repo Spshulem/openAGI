@@ -26,7 +26,7 @@ it('reuses pending credentials after lost responses and ignores Pair once enroll
 
 it('hides pairing after connection and shows phone errors', () => {
   document.body.innerHTML = '<div id="app"></div>'
-  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), configureAmbient: vi.fn() }, [])
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn() }, [])
   phone.paired(true)
   expect(getComputedStyle(document.querySelector('#pair')!).display).toBe('none')
   phone.paired(false)

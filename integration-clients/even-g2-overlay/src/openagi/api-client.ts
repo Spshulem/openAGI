@@ -1,8 +1,9 @@
 import type { OpenAGIConfig } from './config'
 import { OpenAGIApiError } from './config'
-import type { InboxItem, ProactiveSettings } from './proactive'
+import type { InboxItem, MainConsent, ProactiveSettings } from './proactive'
+import type { ConversationThread } from './store'
 import type { OpenAGIStore } from './store'
-import { G2ExperienceClient, type G2Capabilities, type G2History } from './experience-client'
+import { G2ExperienceClient, supervisorUnsupported, threadsUnsupported, type G2Capabilities, type G2History, type SharedThreadPage } from './experience-client'
 
 type Fetch = typeof fetch
 export interface OpenAGINode {
@@ -38,7 +39,13 @@ export class OpenAGIApiClient {
   readHistory(continuation?: string, offset = 0, query = ''): Promise<G2History> {
     return this.json('/nodes/g2/experience', { method: 'POST', body: JSON.stringify({ op: 'history', ...(continuation ? { continuation } : {}), offset, query }), signal: AbortSignal.timeout(10_000) })
   }
-  proactive(body: object, signal?: AbortSignal): Promise<G2LifelogPage & { items?: InboxItem[]; settings?: ProactiveSettings; consent?: { id: string; until: number }; quiet?: boolean; notify?: boolean }> {
+  /** The owner's shared conversation (all paired devices). Null when this main predates shared threads. */
+  async readThread(thread: ConversationThread, before?: string): Promise<SharedThreadPage | null> {
+    try {
+      return await this.json<SharedThreadPage>('/nodes/g2/experience', { method: 'POST', body: JSON.stringify({ op: 'history', thread, ...(before ? { before } : {}) }), signal: AbortSignal.timeout(10_000) })
+    } catch (error) { if (threadsUnsupported(error) || (error instanceof OpenAGIApiError && [404, 405].includes(error.status))) return null; throw error }
+  }
+  proactive(body: object, signal?: AbortSignal): Promise<G2LifelogPage & { items?: InboxItem[]; settings?: ProactiveSettings; consent?: MainConsent | null; quiet?: boolean; notify?: boolean }> {
     return this.json('/nodes/g2/proactive', { method: 'POST', body: JSON.stringify(body), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) })
   }
   private readonly fetchImpl: Fetch
@@ -78,8 +85,9 @@ export class OpenAGIApiClient {
     if (!credential.nodeId) throw new OpenAGIApiError('direct_agent', 400, 'Disconnect this direct agent locally.')
     return this.json('/nodes/revoke', { method: 'POST', body: JSON.stringify({ nodeId: credential.nodeId }) })
   }
-  async ask(wav: Blob, conversationId: string, progress?: (event: AskProgress) => void, signal?: AbortSignal): Promise<OpenAGIAskResult> {
-    if (this.experienceClient?.capabilities?.recovery) return this.experienceClient.submit({ audioBase64: await blobToBase64(wav), conversationId }, progress, signal)
+  async ask(wav: Blob, conversationId: string, progress?: (event: AskProgress) => void, signal?: AbortSignal, thread?: ConversationThread): Promise<OpenAGIAskResult> {
+    if (this.experienceClient?.capabilities?.recovery) return this.experienceClient.submit({ audioBase64: await blobToBase64(wav), conversationId }, progress, signal, thread)
+    if (thread === 'supervisor') throw supervisorUnsupported()
     return this.json('/nodes/g2/ask', {
       method: 'POST',
       signal,
@@ -102,8 +110,11 @@ export class OpenAGIApiClient {
     if (new URL(origin).protocol !== 'https:') throw new OpenAGIApiError('invalid_origin', 400, 'Use your main server HTTPS URL.')
     return origin
   }
-  askText(text: string, conversationId: string, progress: (event: AskProgress) => void, signal: AbortSignal): Promise<OpenAGIAskResult> {
-    if (this.experienceClient?.capabilities?.recovery) return this.experienceClient.submit({ text, conversationId }, progress, signal)
+  askText(text: string, conversationId: string, progress: (event: AskProgress) => void, signal: AbortSignal, thread?: ConversationThread): Promise<OpenAGIAskResult> {
+    if (this.experienceClient?.capabilities?.recovery) return this.experienceClient.submit({ text, conversationId }, progress, signal, thread)
+    // Classic mains have no shared threads; the agent thread degrades to this
+    // G2's own conversation, the supervisor has no fallback.
+    if (thread === 'supervisor') return Promise.reject(supervisorUnsupported())
     return this.json('/nodes/g2/ask', { method: 'POST', signal, body: JSON.stringify({ text, conversationId }) }, true, progress)
   }
   async listen(wav: Blob, conversationId: string, options: { wakePhrase: string; answerQuestions: boolean; forceAnswer?: boolean }, signal?: AbortSignal): Promise<OpenAGIListenResult> {

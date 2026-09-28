@@ -6,52 +6,45 @@ function setup() {
   let emit!: Parameters<EvenAppBridge['onEvenHubEvent']>[0]
   const shutDownPageContainer = vi.fn()
   const bridge = { onEvenHubEvent: (callback: typeof emit) => { emit = callback; return vi.fn() }, shutDownPageContainer }
-  const actions = { holdStart: vi.fn(), holdRelease: vi.fn(), holdCancel: vi.fn(), tap: vi.fn(), doubleTap: vi.fn(), scrollUp: vi.fn(), scrollDown: vi.fn(), systemExit: vi.fn() }
+  const actions = { input: vi.fn(), foreground: vi.fn(), tap: vi.fn(), doubleTap: vi.fn(), scrollUp: vi.fn(), scrollDown: vi.fn(), systemExit: vi.fn() }
   const input = new AgentsInputController(bridge, actions)
   input.start()
   return { input, actions, shutDownPageContainer, emit: (type: OsEventTypeList, eventSource?: number) => emit({ sysEvent: { eventType: type, eventSource } } as Parameters<typeof emit>[0]) }
 }
 
-it('matches hold release to its source and suppresses repeat and trailing clicks', async () => {
+it('a press-and-hold acts as one tap; repeats, its release and a trailing click are not extra taps', async () => {
   vi.useFakeTimers()
   const { input, actions, emit } = setup()
   try {
-    emit(OsEventTypeList.CLICK_EVENT)
     emit(OsEventTypeList.LONG_PRESS_EVENT, 1); emit(OsEventTypeList.LONG_PRESS_EVENT, 1)
-    emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 2)
-    expect(actions.holdRelease).not.toHaveBeenCalled()
-    emit(OsEventTypeList.CLICK_EVENT); await vi.advanceTimersByTimeAsync(600)
-    expect(actions.tap).not.toHaveBeenCalled()
-    emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 1)
+    expect(actions.tap).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(2000)
+    emit(OsEventTypeList.LONG_PRESS_EVENT, 1)
+    expect(actions.tap).toHaveBeenCalledOnce()
     emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 1); emit(OsEventTypeList.CLICK_EVENT)
     await vi.advanceTimersByTimeAsync(600)
-    expect(actions.holdStart).toHaveBeenCalledOnce(); expect(actions.holdRelease).toHaveBeenCalledOnce()
-    expect(actions.tap).not.toHaveBeenCalled()
+    expect(actions.tap).toHaveBeenCalledOnce()
+    // The next ordinary tap (stop talking) goes through.
+    emit(OsEventTypeList.CLICK_EVENT); await vi.advanceTimersByTimeAsync(300)
+    expect(actions.tap).toHaveBeenCalledTimes(2)
   } finally { input.stop(); vi.useRealTimers() }
 })
 
-it('ignores unknown hold sources and stale release after foreground exit', () => {
-  const { input, actions, emit } = setup()
-  try {
-    emit(OsEventTypeList.LONG_PRESS_EVENT)
-    expect(actions.holdStart).not.toHaveBeenCalled()
-    emit(OsEventTypeList.LONG_PRESS_EVENT, 1)
-    emit(OsEventTypeList.FOREGROUND_EXIT_EVENT)
-    emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 1)
-    expect(actions.holdRelease).not.toHaveBeenCalled()
-  } finally { input.stop() }
-})
-
-it('recovers the gesture controller after a missing release', async () => {
+it('reports every glasses gesture as glasses input before handling it, but not native foreground events', async () => {
   vi.useFakeTimers()
   const { input, actions, emit } = setup()
   try {
+    emit(OsEventTypeList.FOREGROUND_EXIT_EVENT); emit(OsEventTypeList.FOREGROUND_ENTER_EVENT)
+    expect(actions.input).not.toHaveBeenCalled()
+    expect(actions.foreground.mock.calls).toEqual([[false], [true]])
+    for (const type of [OsEventTypeList.CLICK_EVENT, OsEventTypeList.SCROLL_TOP_EVENT, OsEventTypeList.SCROLL_BOTTOM_EVENT, OsEventTypeList.DOUBLE_CLICK_EVENT]) emit(type)
+    expect(actions.input).toHaveBeenCalledTimes(4)
+    expect(actions.input.mock.invocationCallOrder[1]).toBeLessThan(actions.scrollUp.mock.invocationCallOrder[0])
+    // A press still held when Agents leaves the foreground does not block the next press.
+    emit(OsEventTypeList.LONG_PRESS_EVENT, 1); emit(OsEventTypeList.FOREGROUND_EXIT_EVENT)
+    await vi.advanceTimersByTimeAsync(600)
     emit(OsEventTypeList.LONG_PRESS_EVENT, 1)
-    await vi.advanceTimersByTimeAsync(31000)
-    expect(actions.holdCancel).toHaveBeenCalledOnce()
-    expect(actions.holdRelease).not.toHaveBeenCalled()
-    emit(OsEventTypeList.LONG_PRESS_EVENT, 1)
-    expect(actions.holdStart).toHaveBeenCalledTimes(2)
+    expect(actions.tap).toHaveBeenCalledTimes(2)
   } finally { input.stop(); vi.useRealTimers() }
 })
 

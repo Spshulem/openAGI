@@ -22,7 +22,7 @@ function fixture(t) {
   return { dir, store, runtime, call, consent, capture, tasks, outreach, advance: ms => { now += ms; }, now: () => now };
 }
 
-test("retention is opt-in, consent is scoped/expiring, passive text never invokes an agent", t => {
+test("retention is opt-in, consent is scoped and persists until revoked, passive text never invokes an agent", t => {
   const f = fixture(t);
   assert.equal(f.call({ op: "settings" }).settings.enabled, false);
   assert.throws(() => f.capture("missing"), /consent/);
@@ -32,8 +32,29 @@ test("retention is opt-in, consent is scoped/expiring, passive text never invoke
   assert.equal(f.call({ op: "transcripts" }).segments.length, 1);
   assert.equal(f.call({ op: "transcripts" }, "two").segments.length, 0);
   assert.throws(() => f.call({ op: "capture", consentId: id, texts: ["test"], batchId: crypto.randomUUID() }, "two"), /consent/);
-  f.advance(4 * 3600_000);
+  // No expiry: the same grant keeps working days later.
+  f.advance(3 * 86400_000); f.store.prune();
+  assert.equal(f.capture(id).saved, 1);
+  // Only an explicit consent-off revokes it.
+  f.call({ op: "consent", enabled: false, consentId: id });
   assert.throws(() => f.capture(id), /consent/);
+});
+
+test("new grants have no expiry, legacy expiring grants stay valid, and delete-memory revokes", t => {
+  const f = fixture(t), id = f.consent();
+  const grant = f.call({ op: "settings" }).consent;
+  assert.equal(grant.until, null); assert.equal(grant.grantedAt, f.now());
+  // A grant written by an older main carries a numeric until; it is accepted
+  // and never pruned, even long after that time.
+  const node = Object.values(f.store.nodes)[0];
+  node.consent = { id: "legacy-grant", until: f.now() + 1000 }; f.store.save();
+  f.advance(86400_000);
+  const reopened = new G2Proactive({ dir: f.dir, runtime: f.runtime, now: () => f.now() });
+  assert.equal(reopened.dispatch("one", { op: "settings" }).consent.id, "legacy-grant");
+  assert.equal(reopened.dispatch("one", { op: "capture", consentId: "legacy-grant", texts: ["Legacy words"], batchId: crypto.randomUUID() }).saved, 1);
+  assert.throws(() => reopened.dispatch("one", { op: "capture", consentId: id, texts: ["Stale id"], batchId: crypto.randomUUID() }), /consent/);
+  reopened.dispatch("one", { op: "delete-memory" });
+  assert.equal(reopened.dispatch("one", { op: "settings" }).consent, null);
 });
 
 test("settings verifies existing consent without renewing it or exposing another node's grant", t => {
@@ -42,7 +63,7 @@ test("settings verifies existing consent without renewing it or exposing another
   assert.equal(original.id, id);
   assert.equal(f.call({ op: "settings" }, "two").consent, null);
   f.advance(1000); assert.deepEqual(f.call({ op: "settings" }).consent, original);
-  f.advance(4 * 3600_000); assert.equal(f.call({ op: "settings" }).consent, null);
+  f.advance(4 * 3600_000); assert.deepEqual(f.call({ op: "settings" }).consent, original);
 });
 
 test("reminder proposals resolve tomorrow in main timezone and need confirmed time", t => {
@@ -267,11 +288,11 @@ test("supervisor questions carry their choices and Supervisor mode keeps only th
   call({ op: "configure", settings: { supervisorOnly: true, categories: ["email"] } });
   assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
   assert.throws(() => call({ op: "configure", settings: { supervisorOnly: "yes" } }), /Invalid settings/);
-  // Supervisor mode shows its questions before updates are turned on, but
-  // pinging still needs that opt-in.
+  // Supervisor mode shows and pings its questions before general updates
+  // are turned on.
   call({ op: "configure", settings: { enabled: false } });
   assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), ["o-fleet"]);
-  assert.equal(call({ op: "can-notify", id: "o-fleet" }).notify, false);
+  assert.equal(call({ op: "can-notify", id: "o-fleet" }).notify, true);
   call({ op: "configure", settings: { supervisorOnly: false } });
   assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
 });
