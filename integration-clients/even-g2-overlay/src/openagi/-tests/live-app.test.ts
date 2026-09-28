@@ -192,6 +192,40 @@ it('browses all 80 inbox items with swipes and returns from details to the same 
   } finally { await f.app.systemExit() }
 })
 
+it('supervisor home opens the supervisor questions and answers with a fixed choice', async () => {
+  vi.useFakeTimers()
+  const f = await fixture()
+  try {
+    const answer = vi.spyOn(f.app.proactive, 'answer').mockResolvedValue({ ok: true, detail: 'typed into Conductor' })
+    const configure = vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    Object.assign(f.renderer, { supervisorHome: vi.fn() })
+    const question = { id: 'o-fleet', title: '#7 ready. Merge?', summary: 'CI green', category: 'approvals', action: 'answer-fleet', seen: false, important: true, supervisor: true, options: ['merged', 'later'] }
+    f.app.proactive.items = [{ id: 'mail', title: 'Invoice', summary: '', category: 'email', action: 'review-on-main', seen: false, important: false }, question]
+    // Taps closer than 400 ms apart are ignored as bounces.
+    const tap = async () => { f.app.tap(); await vi.advanceTimersByTimeAsync(500) }
+    await f.app.configureHomeMode('supervisor')
+    expect(configure).toHaveBeenCalledWith({ supervisorOnly: true })
+    expect(f.store.snapshot().homeMode).toBe('supervisor')
+    // Tap at home: only supervisor items, not a new question.
+    await tap()
+    expect(f.renderer.inboxList).toHaveBeenLastCalledWith('#7 ready. Merge?', 1, 1)
+    expect(f.api.askText).not.toHaveBeenCalled()
+    await tap(); await tap()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: merged', '#7 ready. Merge?', false)
+    // Like the inbox list, swipe up moves forward through the choices.
+    f.app.scrollDown()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: merged', '#7 ready. Merge?', false)
+    f.app.scrollUp()
+    expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: later', '#7 ready. Merge?', false)
+    f.app.scrollDown()
+    // Confirm, then send.
+    await tap(); expect(f.renderer.inboxAction).toHaveBeenLastCalledWith('Answer: merged', '#7 ready. Merge?', true)
+    await tap()
+    expect(answer).toHaveBeenCalledWith('o-fleet', 'merged')
+    expect(f.renderer.message).toHaveBeenLastCalledWith('Answered', 'merged. typed into Conductor')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
 it('freezes the selected voice task and requires confirmation even with auto-send', async () => {
   vi.useFakeTimers()
   const f = await fixture()

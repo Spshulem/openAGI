@@ -12,7 +12,7 @@ import type { OpenAGIGlassesRenderer } from '../ui/openagi-glasses-renderer'
 import type { OpenAGIPhoneCompanion } from '../ui/openagi-phone-companion'
 import { G2ProactiveClient, type InboxItem } from '../openagi/proactive'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'paused' | 'resume-consent' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'paused' | 'resume-consent' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 
 export class OpenAGIG2App {
   readonly proactive: G2ProactiveClient
@@ -247,9 +247,10 @@ export class OpenAGIG2App {
       () => document.visibilityState !== 'hidden' && (this.mode === 'home' || (this.mode === 'ambient' && !this.ambientProcessing && Date.now() - this.lastAmbientSpeechAt > 15_000)) && !this.noticeTimer && !this.exited && !this.navigationBusy && !this.microphoneOpening && !this.displaySleeping && !this.requestController,
       item => this.showNotice(item), () => this.store.snapshot().lifelogEnabled, () => this.backgroundCapture)
   }
-  openInbox(id?: string): void {
+  openInbox(id?: string, supervisorOnly = false): void {
     if (this.exited || this.navigationBusy || this.microphoneOpening || this.requestController || this.displaySleeping || ['listening', 'review', 'pairing'].includes(this.mode)) return
-    this.clearNotice(); this.inboxItems = [...this.proactive.items]
+    this.clearNotice(); this.inboxItems = this.proactive.items.filter(i => !supervisorOnly || i.supervisor)
+    if (supervisorOnly && !this.inboxItems.length) { void this.showFleetStatus(); return }
     if (!this.inboxItems.length) { this.phone.set('Inbox empty', 'Enable proactive updates on the phone, then Refresh.'); return }
     this.inboxIndex = Math.max(0, this.inboxItems.findIndex(i => i.id === id)); this.showInboxItem()
   }
@@ -261,9 +262,11 @@ export class OpenAGIG2App {
   private showInboxPage(): void {
     this.renderer.inbox?.(this.pages[this.page] ?? '', this.inboxIndex + 1, this.inboxItems.length, this.page + 1, this.pages.length)
   }
-  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' }[] {
+  private inboxActions(): { label: string; op: 'talk' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'mark' | 'pause' | 'answer'; value?: string }[] {
     const item = this.actionTarget
-    return [...(!item?.id && this.ambientRunning ? [{ label: 'Pause listening', op: 'pause' as const }] : []),
+    // A supervisor question is answered with one of its own fixed choices.
+    const answers = item?.supervisor ? (item.options ?? []).map(value => ({ label: `Answer: ${value}`, op: 'answer' as const, value })) : []
+    return [...answers, ...(!item?.id && this.ambientRunning ? [{ label: 'Pause listening', op: 'pause' as const }] : []),
       { label: 'Talk about this item', op: 'talk' },
       ...(item?.action === 'complete-task' ? [{ label: 'Complete task on main', op: 'complete-task' as const }] : []),
       ...(item?.action === 'accept-task' && !item.reminder ? [{ label: 'Add as my task', op: 'accept-task' as const }] : []),
@@ -284,6 +287,15 @@ export class OpenAGIG2App {
     if (action.op === 'mark') { await this.markMoment(); return }
     if (this.mode !== 'inbox-confirm') { this.mode = 'inbox-confirm'; this.showInboxAction(); return }
     this.navigationBusy = true
+    if (action.op === 'answer') {
+      try {
+        const result = await this.proactive.answer(target.id, action.value ?? '')
+        await this.resumeListening()
+        if (this.exited || !this.foregroundActive) return
+        this.mode = 'message'; this.renderer.message(result.ok ? 'Answered' : 'Not sent yet', result.ok ? `${action.value}. ${result.detail}` : `${result.detail || 'The question stays open.'} Try again later.`)
+      } finally { this.navigationBusy = false }
+      return
+    }
     try {
       const ok = await this.proactive.action(action.op, target.id, { title: target.title, taskId: target.taskId, dueDate: target.dueDate })
       await this.resumeListening()
@@ -294,6 +306,23 @@ export class OpenAGIG2App {
   async markMoment(): Promise<void> {
     const ok = await this.proactive.markMoment()
     if (ok && ['ambient', 'home', 'inbox-action'].includes(this.mode) && this.foregroundActive && !this.exited) { this.showHome(); this.showNotice({ id: '', title: 'Moment marked on main', summary: '', category: 'highlight', action: '', important: false, seen: true }) }
+  }
+  // Supervisor mode: the home tap opens the supervisor's questions, swipe
+  // down shows thread status, and main pings only for supervisor items.
+  async configureHomeMode(mode: 'ask' | 'supervisor'): Promise<void> {
+    await this.store.update({ homeMode: mode }); this.phone.homeMode?.(mode)
+    await this.proactive.configure({ supervisorOnly: mode === 'supervisor' })
+    if (['home', 'status'].includes(this.mode)) this.showHome()
+  }
+  private async showFleetStatus(): Promise<void> {
+    const status = await this.proactive.fleetStatus()
+    if (this.exited || !this.foregroundActive) return
+    if (!status) { this.mode = 'message'; this.renderer.message('Supervisor unavailable', 'Main could not read the supervisor. Check the Mac running it.'); return }
+    const c = status.counts
+    const lines = status.threads.map(t => `${t.health === 'red' ? '●' : '○'} ${t.name}: ${t.reason || t.state}`)
+    const text = `${c.red} red · ${c.yellow} yellow · ${c.green} green\n${status.needsYou} question${status.needsYou === 1 ? '' : 's'} for you · ${status.mode ?? 'mode ?'}\n\n${lines.join('\n') || 'Nothing needs attention.'}`
+    this.pages = paginateText(plainAnswer(text), 220); this.page = 0; this.mode = 'status'
+    this.renderer.answer(this.pages[0] ?? '', 0, this.pages.length)
   }
   async configureIdleTap(action: 'talk' | 'highlight'): Promise<void> {
     await this.store.update({ idleTapAction: action }); this.phone.idleTapAction?.(action)
@@ -419,6 +448,7 @@ export class OpenAGIG2App {
     this.phone.interfaceStyle?.(stored.interfaceStyle)
     this.phone.listeningMode?.(stored.listeningMode)
     this.phone.idleTapAction?.(stored.idleTapAction)
+    this.phone.homeMode?.(stored.homeMode)
     this.phone.lifelogTalkMode?.(stored.lifelogTalkMode)
     this.phone.speechModel?.(stored.speechModel)
     this.phone.speechTransport?.(stored.speechTransport)
@@ -479,7 +509,9 @@ export class OpenAGIG2App {
     else if (this.mode === 'inbox') { this.mode = 'inbox-detail'; this.showInboxPage(); void this.proactive.action('seen', this.inboxItems[this.inboxIndex]?.id) }
     else if (this.mode === 'inbox-detail') { this.actionTarget = { ...this.inboxItems[this.inboxIndex] }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
     else if (this.mode === 'inbox-action' || this.mode === 'inbox-confirm') void this.chooseInboxAction()
+    else if (this.mode === 'home' && this.store.snapshot().homeMode === 'supervisor') this.openInbox(undefined, true)
     else if (this.mode === 'home') void this.startAsk()
+    else if (this.mode === 'status') this.showHome()
     else if (this.mode === 'listening') void this.finishAsk()
     else if (this.mode === 'ambient') { if (this.proactive.memoryActive && this.store.snapshot().idleTapAction === 'highlight') void this.markMoment(); else if (!(this.proactive.memoryActive && this.store.snapshot().lifelogTalkMode === 'hold')) void this.startAsk() }
     else if (this.mode === 'answer') { if (!(this.proactive.memoryActive && this.ambientRunning && this.store.snapshot().lifelogTalkMode === 'hold')) void this.startAsk() }
@@ -502,6 +534,8 @@ export class OpenAGIG2App {
       this.renderActiveProgress?.()
     }
     else if (this.mode === 'answer') this.showAnswer(Math.max(0, Math.min(this.pages.length - 1, this.page + direction)))
+    else if (this.mode === 'status') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.renderer.answer(this.pages[this.page] ?? '', this.page, this.pages.length) }
+    else if (this.mode === 'home' && this.store.snapshot().homeMode === 'supervisor' && direction > 0) void this.showFleetStatus()
     else if (this.mode === 'home' || this.mode === 'ambient') {
       if (direction < 0 && this.proactive.items.length) this.openInbox()
       else if (this.mode === 'ambient' && direction > 0) { this.actionTarget = { id: '', title: 'Listening controls', summary: '', category: '', important: false, seen: true, action: '' }; this.actionIndex = 0; this.mode = 'inbox-action'; this.showInboxAction() }
@@ -596,7 +630,7 @@ export class OpenAGIG2App {
     if (this.mode === 'inbox-confirm') { this.mode = 'inbox-action'; this.showInboxAction(); await this.resumeListening(); return }
     if (this.mode === 'inbox-action') { if (!this.actionTarget?.id) this.showHome(); else { this.mode = 'inbox-detail'; this.showInboxPage() }; return }
     if (this.mode === 'inbox-detail') { this.showInboxItem(); return }
-    if (this.mode === 'inbox') { this.showHome(); return }
+    if (this.mode === 'inbox' || this.mode === 'status') { this.showHome(); return }
     this.navigationBusy = true
     try {
       if (this.mode === 'listening') { this.stopLiveSpeech(); await this.audio.stop(); this.audioBuffer = null }
@@ -1032,6 +1066,11 @@ export class OpenAGIG2App {
     if (this.ambientRunning) {
       this.mode = 'ambient'; this.phone.paired(true); this.listeningPulse(true)
       this.phone.set('Listening quietly', state.listeningMode === 'passive' ? 'Tap Talk to ask. Overheard questions do not start the agent. Lifelog retention has separate consent.' : `Wake responses enabled: say “${state.wakePhrase}”. Tap Talk to ask explicitly.`)
+      return
+    }
+    if (state.homeMode === 'supervisor') {
+      this.mode = 'home'; this.phone.paired(true); this.renderer.supervisorHome(this.proactive.items.filter(i => i.supervisor).length)
+      this.phone.set('Supervisor', 'Tap on the glasses for the supervisor’s questions. Swipe down for thread status. Switch the home back to Ask on this page.')
       return
     }
     this.mode = 'home'; this.phone.paired(true); this.renderer.home(state.node?.name ?? (state.connectionMode === 'direct' ? 'Agent' : undefined)); this.phone.set('Ready', 'Tap to ask in this conversation. Swipe for recent answers. Double-tap at home opens Even’s exit confirmation.')

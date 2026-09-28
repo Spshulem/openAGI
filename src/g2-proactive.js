@@ -6,7 +6,10 @@ import { lifelogState, lifelogDispatch, pruneLifelog, moments, reviewLifelog } f
 
 const DAY = 86400_000;
 const categories = ["approvals", "tasks", "discoveries", "email", "calendar"];
-const defaults = () => ({ enabled: false, categories: [...categories], retentionDays: 1, quietStart: 22, quietEnd: 8, timeZone: "UTC", maxPerHour: 3 });
+// supervisorOnly: the glasses' Supervisor mode. The inbox and its pings carry
+// only fleet supervisor items, whatever categories are selected.
+const defaults = () => ({ enabled: false, categories: [...categories], retentionDays: 1, quietStart: 22, quietEnd: 8, timeZone: "UTC", maxPerHour: 3, supervisorOnly: false });
+const HEALTH_ORDER = ["red", "yellow", "green", "gray"];
 const hash = text => createHash("sha256").update(text).digest("hex");
 const clean = (text, max = 400) => String(text ?? "").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, max);
 function reject(message, status = 400) { throw Object.assign(new Error(message), { status }); }
@@ -70,12 +73,13 @@ export class G2Proactive {
       case "configure": {
         const p = body.settings;
         if (!p || typeof p !== "object" || Array.isArray(p) || Object.keys(p).some(k => !Object.keys(defaults()).includes(k))) reject("Unsupported settings");
-        const s = { ...n.settings, ...p };
+        // Settings saved before supervisorOnly existed read as off.
+        const s = { supervisorOnly: false, ...n.settings, ...p };
         if (typeof s.enabled !== "boolean" || ![1, 7, 30].includes(s.retentionDays)
           || !Array.isArray(s.categories) || s.categories.length > 5 || s.categories.some(c => !categories.includes(c))
           || ![s.quietStart, s.quietEnd].every(h => Number.isInteger(h) && h >= 0 && h <= 23)
           || !Number.isInteger(s.maxPerHour) || s.maxPerHour < 0 || s.maxPerHour > 10
-          || typeof s.timeZone !== "string" || s.timeZone.length > 80) reject("Invalid settings");
+          || typeof s.timeZone !== "string" || s.timeZone.length > 80 || typeof s.supervisorOnly !== "boolean") reject("Invalid settings");
         try { new Intl.DateTimeFormat("en", { timeZone: s.timeZone }).format(); } catch { reject("Invalid time zone"); }
         n.settings = s; this.prune(); this.save(); return { settings: s };
       }
@@ -230,6 +234,40 @@ export class G2Proactive {
     if (n.lifelog !== state || state.generation !== generation || !state.settings.screenContext || !moments(n).some(item => item.id === id)) reject("Screen context consent or moment changed", 403);
     return { items: rows.map(r => ({ at: r.at, app: r.app, text: clean(r.text, 500) })), relation: "nearby-in-time-only" };
   }
+  // Answers a supervisor question from the glasses with one of its fixed
+  // choices. Same path as the owner's outreach action: the question closes
+  // only when the answer reached the agent; otherwise it stays open.
+  async answerFleet(nodeId, body) {
+    if (typeof body?.id !== "string" || typeof body?.answer !== "string") reject("Pick one of the question's choices");
+    this.prune();
+    const n = this.node(nodeId);
+    const item = this.feed(n).find(i => i.id === body.id && i.supervisor);
+    if (!item) reject("Supervisor question not available", 404);
+    if (!item.options.includes(body.answer)) reject("Pick one of the question's choices");
+    const source = this.runtime?.outreach?.get?.(body.id);
+    const supervisor = this.runtime?.fleetSupervisor;
+    if (!source || source.sourceRef?.kind !== "fleet" || !supervisor?.answerQuestion) reject("Supervisor unavailable", 503);
+    const result = await supervisor.answerQuestion(source.sourceRef.id, body.answer);
+    if (!result) reject("Question already closed", 409);
+    if (result.question?.status === "open") return { ok: false, detail: clean(result.delivery?.detail ?? "Not delivered; the question stays open", 200) };
+    try { this.runtime?.outreach?.resolve?.(body.id, { action: body.answer, by: "g2" }, { status: "acted" }); } catch { /* the mirror resolves it on the next refresh */ }
+    n.marks[body.id] = { ...(n.marks[body.id] ?? {}), dismissed: true };
+    this.save();
+    return { ok: true, detail: clean(result.delivery?.detail ?? "Answered", 200) };
+  }
+  // A glanceable read of the supervisor for the glasses: counts by colour and
+  // the red threads first. Read-only; nothing here reaches an agent.
+  fleetStatus() {
+    const state = this.runtime?.fleetSupervisor?.getState?.();
+    if (!state) reject("Supervisor unavailable", 503);
+    const rows = Array.isArray(state.snapshot?.threads) ? state.snapshot.threads : [];
+    const counts = Object.fromEntries(HEALTH_ORDER.map(h => [h, 0]));
+    for (const r of rows) counts[HEALTH_ORDER.includes(r?.health) ? r.health : "gray"] += 1;
+    const threads = rows.filter(r => r?.health === "red" || r?.health === "yellow")
+      .sort((a, b) => HEALTH_ORDER.indexOf(a.health) - HEALTH_ORDER.indexOf(b.health) || String(b.lastActivityAt ?? "").localeCompare(String(a.lastActivityAt ?? "")))
+      .slice(0, 20).map(r => ({ name: clean(r.workspace || r.title || r.key, 60), health: r.health, state: clean(r.state, 30), reason: clean(r.reason, 140) }));
+    return { mode: state.mode ?? null, lastTickAt: state.lastTickAt ?? null, needsYou: Array.isArray(state.questions) ? state.questions.length : 0, counts, threads };
+  }
   quiet(n) {
     const hour = Number(new Intl.DateTimeFormat("en-GB", { timeZone: n.settings.timeZone, hour: "2-digit", hourCycle: "h23" }).format(this.now()));
     const { quietStart: start, quietEnd: end } = n.settings;
@@ -245,24 +283,30 @@ export class G2Proactive {
           ? this.runtime?.drafts?.get?.(i.sourceRef.id)?.kind ?? "draft"
           : i.sourceRef?.kind;
         const coding = kind === "coding-watch";
+        const fleet = kind === "fleet";
+        if (n.settings.supervisorOnly && !fleet) continue;
         const supervisor = this.runtime?.codingSupervisor;
         if (coding && (!supervisor?.configured || !supervisor.state.watches?.[i.sourceRef.id]
           || i.sourceRef.nodeId !== (supervisor.remoteNodeId || "local"))) continue;
         const category = /email|mail/.test(kind) ? "email" : /calendar/.test(kind) ? "calendar"
           : i.needsDecision ? "approvals" : /task/.test(kind) ? "tasks" : "discoveries";
-        if (selected.has(category)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary, coding ? 1000 : 400), category,
-          important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: "review-on-main",
+        // A supervisor question carries its fixed choices so the glasses can
+        // answer it; the answer goes through answerFleet, never free text.
+        const options = fleet ? (Array.isArray(i.actions) ? i.actions : []).filter(a => typeof a === "string" && a && a !== "dismiss").map(a => clean(a, 40)).slice(0, 4) : [];
+        if (selected.has(category) || (fleet && n.settings.supervisorOnly)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary, coding ? 1000 : 400), category,
+          important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: fleet && options.length ? "answer-fleet" : "review-on-main",
+          ...(fleet ? { supervisor: true, options } : {}),
           ...(coding ? { codingTarget: { provider: i.sourceRef.provider, sessionId: i.sourceRef.sessionId } } : {}) });
       }
-      if (selected.has("tasks")) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: Infinity }) ?? []) {
+      if (selected.has("tasks") && !n.settings.supervisorOnly) for (const t of this.runtime?.tasks?.list?.({ queue: "user", limit: Infinity }) ?? []) {
         const due = Date.parse(t.dueDate);
         if (!["pending", "in_progress", "blocked"].includes(t.status) || !Number.isFinite(due) || due > this.now() + 3600_000 || due < this.now() - 7 * DAY) continue;
         items.push({ id: `due:${t.id}:${t.dueDate}`, title: clean(t.title, 160), summary: `Due ${t.dueDate}`, category: "tasks", important: true, at: due, action: "complete-task", taskId: t.id, dueDate: t.dueDate });
       }
     }
-    for (const c of n.candidates) if (!c.taskId) items.push({ id: c.id, title: `${c.reminder ? 'Reminder suggested' : 'Possible task'}: ${c.title}`, summary: c.evidence, category: "memory", important: n.settings.enabled && selected.has("discoveries"), at: c.at, action: "accept-task", speakerVerified: false,
+    if (!n.settings.supervisorOnly) for (const c of n.candidates) if (!c.taskId) items.push({ id: c.id, title: `${c.reminder ? 'Reminder suggested' : 'Possible task'}: ${c.title}`, summary: c.evidence, category: "memory", important: n.settings.enabled && selected.has("discoveries"), at: c.at, action: "accept-task", speakerVerified: false,
       ...(c.reminder ? { reminder: true, suggestedDate: c.suggestedDate, timeZone: c.timeZone } : {}) });
-    if (n.settings.enabled && selected.has("discoveries")) {
+    if (n.settings.enabled && selected.has("discoveries") && !n.settings.supervisorOnly) {
       const l = lifelogState(n);
       for (const m of moments(n)) if (m.review?.claims.length) items.push({ id: `moment-${m.id}-${m.review.fingerprint}`,
         title: m.title, summary: m.review.summary, category: "discoveries", important: true, at: m.endAt, action: "review-lifelog", momentId: m.id });

@@ -1649,6 +1649,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             if (scoped) return sendG2NodeJson(res, 403, { error: "Screen context is owner-only" });
             return sendJson(res, 200, await g2Proactive.screenContext(nodeId, body.id));
           }
+          if (body.op === "answer") return sendG2NodeJson(res, 200, await g2Proactive.answerFleet(nodeId, body));
+          if (body.op === "fleet-status") return sendG2NodeJson(res, 200, g2Proactive.fleetStatus());
           return sendG2NodeJson(res, 200, g2Proactive.dispatch(nodeId, body));
         } catch (error) { return sendG2NodeJson(res, [400, 403, 404, 409, 429, 503].includes(error.status) ? error.status : 500, { error: error.status ? error.message : "Could not update proactive inbox" }); }
       }

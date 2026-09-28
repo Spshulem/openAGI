@@ -59,6 +59,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     inboxAction: (op, id, extra) => { void app.proactive.action(op, id, extra) },
     markMoment: () => { void app.markMoment() },
     configureIdleTap: action => { void app.configureIdleTap(action) },
+    configureHomeMode: mode => { void app.configureHomeMode(mode) },
     configureLifelogTalkMode: mode => { void app.configureLifelogTalkMode(mode) },
     previousPage: () => app.scrollUp(),
     nextPage: () => app.scrollDown(),

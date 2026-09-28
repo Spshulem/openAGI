@@ -1,8 +1,10 @@
 import type { OpenAGIApiClient } from './api-client'
 
-export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string }
+export interface InboxItem { id: string; title: string; summary: string; category: string; important: boolean; seen: boolean; notified?: boolean; action: string; taskId?: string; dueDate?: string; reminder?: boolean; suggestedDate?: string; timeZone?: string; supervisor?: boolean; options?: string[] }
+// The supervisor's glanceable status: counts by colour, red then yellow threads.
+export interface FleetStatus { mode: string | null; lastTickAt: string | null; needsYou: number; counts: { red: number; yellow: number; green: number; gray: number }; threads: { name: string; health: string; state: string; reason: string }[] }
 export type InboxOperation = 'seen' | 'dismiss' | 'snooze' | 'accept-task' | 'complete-task' | 'delete-memory'
-export interface ProactiveSettings { enabled: boolean; categories: string[]; retentionDays: number; quietStart: number; quietEnd: number; timeZone: string; maxPerHour: number }
+export interface ProactiveSettings { enabled: boolean; categories: string[]; retentionDays: number; quietStart: number; quietEnd: number; timeZone: string; maxPerHour: number; supervisorOnly?: boolean }
 export interface ProactiveView {
   proactiveSettings?(settings: ProactiveSettings): void
   inbox?(items: InboxItem[]): void
@@ -85,6 +87,19 @@ export class G2ProactiveClient {
       }
     } catch (error) { if (!signal.aborted) this.view.activity?.(`Inbox unavailable: ${error instanceof Error ? error.message : 'check main connection'}`) }
     finally { this.refreshing = false }
+  }
+  // Answers a supervisor question with one of its fixed choices. ok=false
+  // means main kept the question open (the agent was not reached yet).
+  async answer(id: string, answer: string): Promise<{ ok: boolean; detail: string }> {
+    try {
+      const result = await this.api.proactive({ op: 'answer', id, answer }, this.controller.signal) as unknown as { ok?: boolean; detail?: string }
+      await this.refresh()
+      return { ok: result.ok === true, detail: result.detail ?? '' }
+    } catch (error) { return { ok: false, detail: error instanceof Error ? error.message : 'Main did not answer' } }
+  }
+  async fleetStatus(): Promise<FleetStatus | null> {
+    try { return await this.api.proactive({ op: 'fleet-status' }, this.controller.signal) as unknown as FleetStatus }
+    catch { return null }
   }
   async configure(settings: Partial<ProactiveSettings>): Promise<void> {
     try { await this.api.proactive({ op: 'configure', settings }, this.controller.signal); await this.refresh() }
