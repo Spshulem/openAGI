@@ -98,4 +98,12 @@ final class MarkdownParserTests: XCTestCase {
         XCTAssertEqual(plain, "Run swift build now.")
         XCTAssertFalse(plain.contains("`"))
     }
+
+    func testHeadingsBecomeTheirOwnBlocks() {
+        XCTAssertEqual(MarkdownParser.parse("## Plan\nShip it.\n#no-space stays text"), [
+            .heading(level: 2, text: "Plan"),
+            .paragraph("Ship it. #no-space stays text"),
+        ])
+        XCTAssertEqual(MarkdownParser.parse("### Next ###"), [.heading(level: 3, text: "Next")])
+    }
 }

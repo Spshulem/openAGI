@@ -14,6 +14,9 @@ import SwiftUI
 // bold/code/link spans only.
 public enum MarkdownBlock: Equatable {
     case paragraph(String)
+    // "## Plan" -- models reach for headings to structure longer replies;
+    // shown as bold section text rather than a literal run of #'s.
+    case heading(level: Int, text: String)
     case bulletList([String])
     case numberedList([String])
     case codeBlock(language: String?, code: String)
@@ -64,6 +67,14 @@ public enum MarkdownParser {
                 continue
             }
 
+            if let heading = headingText(line) {
+                flushParagraph()
+                flushList()
+                blocks.append(.heading(level: heading.level, text: heading.text))
+                index += 1
+                continue
+            }
+
             if let item = bulletItemText(line) {
                 flushParagraph()
                 if listIsOrdered { flushList() }
@@ -96,6 +107,16 @@ public enum MarkdownParser {
         flushParagraph()
         flushList()
         return blocks
+    }
+
+    private static func headingText(_ line: String) -> (level: Int, text: String)? {
+        let hashes = line.prefix(while: { $0 == "#" }).count
+        guard (1...6).contains(hashes) else { return nil }
+        let rest = line.dropFirst(hashes)
+        guard rest.first == " " else { return nil }
+        let text = rest.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+            .trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : (hashes, text)
     }
 
     private static func bulletItemText(_ line: String) -> String? {
@@ -169,6 +190,10 @@ struct MarkdownContent: View {
         case .paragraph(let raw):
             Text(MarkdownParser.inline(raw))
                 .font(Theme.Typography.body)
+                .foregroundStyle(Theme.ink)
+        case .heading(let level, let raw):
+            Text(MarkdownParser.inline(raw))
+                .font(level <= 2 ? Theme.Typography.section : Theme.Typography.body.weight(.semibold))
                 .foregroundStyle(Theme.ink)
         case .bulletList(let items):
             VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
