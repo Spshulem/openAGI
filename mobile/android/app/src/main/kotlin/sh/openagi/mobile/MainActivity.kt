@@ -14,6 +14,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -80,7 +81,11 @@ class MainActivity : ComponentActivity() {
         intent?.data = null
 
         setContent {
-            var selectedTab by remember { mutableStateOf(AppTab.TODAY) }
+            // Folding, unfolding, or rotating the phone is handled in place
+            // (configChanges in the manifest); rememberSaveable still keeps
+            // the tab if Android recreates the Activity for another reason.
+            var selectedTab by rememberSaveable { mutableStateOf(AppTab.TODAY) }
+            val supervisorChatOpen = rememberSaveable { mutableStateOf(false) }
             val credentials = credentialsState.value
             val pendingPairing = pendingPairingState.value
             val resumeSignal = resumeSignalState.intValue
@@ -181,6 +186,7 @@ class MainActivity : ComponentActivity() {
                                     resumeSignal = resumeSignal,
                                     streamAttached = streamAttachedState.value,
                                     chatConversationState = supervisorConversation,
+                                    chatOpenState = supervisorChatOpen,
                                 )
                                 AppTab.SETTINGS -> SettingsScreen(
                                     context = this@MainActivity,

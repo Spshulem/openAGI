@@ -38,6 +38,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -96,6 +97,9 @@ fun SupervisorScreen(
     resumeSignal: Int = 0,
     streamAttached: Boolean = false,
     chatConversationState: ChatConversationState,
+    // Held by the Activity so leaving the tab, or the phone folding, returns
+    // to the open supervisor conversation rather than the dashboard.
+    chatOpenState: MutableState<Boolean> = remember { mutableStateOf(false) },
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
@@ -119,7 +123,7 @@ fun SupervisorScreen(
     // another thread opened while a nudge relays, and the result is not theirs.
     var actionNoteThread by remember { mutableStateOf<String?>(null) }
     var openThread by remember { mutableStateOf<FleetThread?>(null) }
-    var chatOpen by remember { mutableStateOf(false) }
+    var chatOpen by chatOpenState
 
     // Responses can land out of order: a 30s poll sent while an answer was
     // relaying may return after it with the state from before. A poll is

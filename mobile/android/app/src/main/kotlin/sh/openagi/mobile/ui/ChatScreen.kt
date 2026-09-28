@@ -107,7 +107,25 @@ internal sealed interface ChatEntry {
         // resend it without the user retyping — never sent back to the
         // daemon as anything but a fresh POST /message body.
         val retryText: String? = null,
+        // What the agent is doing right now ("Using fleet_status"), from the
+        // stream's status frames. Shown only while streaming; never saved.
+        val activity: String? = null,
     ) : ChatEntry
+}
+
+// Plain words for a status frame: the tool it is running, else its stage.
+internal fun chatActivityLabel(data: String): String? {
+    val obj = runCatching { ProtocolJson.json.parseToJsonElement(data) as? kotlinx.serialization.json.JsonObject }.getOrNull() ?: return null
+    fun field(name: String) = (obj[name] as? kotlinx.serialization.json.JsonPrimitive)?.takeIf { it.isString }?.content?.trim()?.takeIf { it.isNotEmpty() }
+    val tool = field("tool")
+    if (tool != null) return "Using ${tool.replace('_', ' ')}"
+    return when (field("stage")) {
+        null -> null
+        "routing" -> "Getting started"
+        "thinking" -> "Thinking"
+        "saving" -> "Saving"
+        else -> field("stage")!!.replace('-', ' ').replaceFirstChar { it.uppercase() }
+    }
 }
 
 // Kept by the Activity so switching tabs does not discard a conversation
@@ -240,7 +258,11 @@ fun ChatScreen(
             // PROTOCOL.md's every-15s keepalive during a long turn — it must
             // never be mistaken for an empty reply. Anything else is a frame
             // name this client doesn't know yet and is ignored the same way.
-            "status", "session", "heartbeat" -> Unit
+            "status" -> {
+                val label = chatActivityLabel(frame.data)
+                if (label != null) updateAssistant(assistantId) { current -> if (current.streaming) current.copy(activity = label) else current }
+            }
+            "session", "heartbeat" -> Unit
             else -> Unit
         }
     }
@@ -423,7 +445,10 @@ private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform
                                 .padding(horizontal = 14.dp, vertical = 10.dp),
                         ) {
                             if (entry.streaming && entry.text.isBlank()) {
-                                TypingDots()
+                                Column {
+                                    TypingDots()
+                                    entry.activity?.let { Text("$it…", style = OpenAGIType.caption, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 6.dp)) }
+                                }
                             } else {
                                 val textColor = if (entry.failed) colors.alert else MaterialTheme.colorScheme.onBackground
                                 MarkdownBlocksView(Markdown.parse(entry.text), textColor = textColor)
