@@ -63,6 +63,8 @@ fun TodayScreen(
     // single row linking to Inbox." Defaulted so existing callers/tests that
     // don't care about navigation keep compiling.
     onOpenInbox: () -> Unit = {},
+    // The read-only G2 lifelog opens from here rather than from a seventh tab.
+    onOpenLifelog: () -> Unit = {},
 ) {
     val store = remember { SnapshotStore(context.filesDir) }
     val queue = remember { OutboundQueue(context.filesDir) }
@@ -107,7 +109,8 @@ fun TodayScreen(
 
         val current = snapshot
         if (current == null) {
-            EmptyState("Nothing left today.", "New tasks appear here when OpenAGI or you add them.")
+            EmptyState("Nothing left today.", "New tasks appear here when OpenAGI or you add them.", modifier = Modifier.weight(1f))
+            Column(modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp)) { LinkRow("Lifelog", onClick = onOpenLifelog) }
             return@Column
         }
 
@@ -148,6 +151,8 @@ fun TodayScreen(
                     WaitingOnYouRow(count = counts.pendingActions, onClick = onOpenInbox)
                 }
             }
+
+            LinkRow("Lifelog", onClick = onOpenLifelog)
         }
     }
 }
@@ -157,7 +162,10 @@ fun TodayScreen(
 // every other row in this app gets, so it reads as part of the list rather
 // than a banner bolted on top of it.
 @Composable
-private fun WaitingOnYouRow(count: Int, onClick: () -> Unit) {
+private fun WaitingOnYouRow(count: Int, onClick: () -> Unit) = LinkRow("$count waiting on you", onClick)
+
+@Composable
+private fun LinkRow(label: String, onClick: () -> Unit) {
     RowGroup {
         Row(
             modifier = Modifier
@@ -166,7 +174,7 @@ private fun WaitingOnYouRow(count: Int, onClick: () -> Unit) {
                 .padding(horizontal = 20.dp, vertical = 14.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Text("$count waiting on you", style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
+            Text(label, style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
         }
     }
 }

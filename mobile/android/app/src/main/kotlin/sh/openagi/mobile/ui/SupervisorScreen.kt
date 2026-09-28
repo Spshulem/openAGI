@@ -267,8 +267,6 @@ fun SupervisorScreen(
                     credentials = credentials,
                     streamAttached = streamAttached,
                     title = "Supervisor",
-                    sessionId = SupervisorFormat.SESSION_ID,
-                    from = SupervisorFormat.SESSION_ID,
                     starters = SupervisorFormat.STARTERS,
                     conversationState = chatConversationState,
                 )

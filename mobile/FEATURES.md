@@ -76,7 +76,12 @@ Routes: `GET /pending-actions`, `POST /pending-actions/{id}/approve`,
 The one that makes the phone genuinely useful away from the desk.
 
 - A conversation view: your message, then OpenAGI's reply.
-- Send with `POST /message`.
+- Send with `POST /message` and `"thread": "agent"`: one shared thread for
+  every paired phone and G2 (PROTOCOL.md §3.1). A message another device sent
+  is labelled with that device's name.
+- Load the thread from `GET /conversations/agent/messages` when the screen
+  opens, after each reply, and on the `conversation.updated` event. The
+  daemon's thread is the history; the phone's copy is an offline cache.
 - **The reply streams from `POST /message` itself**, not from `GET /events` —
   `/events` is the daemon's ambient event feed, not the chat transport. Render
   tokens as they arrive rather than waiting for the whole answer; a reply that
@@ -84,14 +89,15 @@ The one that makes the phone genuinely useful away from the desk.
 - `GET /events` runs separately and carries the events the rest of the app
   cares about —
   `task-updated`, `task-reminder`, `task-auto-changed`, `pending-action`,
-  `pending-action-resolved`, `clarification-created`. When one arrives, refresh
+  `pending-action-resolved`, `clarification-created`, `conversation.updated`.
+  When one arrives, refresh
   the affected surface and update the Inbox badge. This is what makes the app
   feel live rather than polled.
 - The connection line doubles as the stream indicator: filled while the SSE
   stream is attached.
 - Reconnect with backoff when the stream drops. Never silently stay dead.
 
-Routes: `POST /message`, `GET /events`.
+Routes: `POST /message`, `GET /conversations/agent/messages`, `GET /events`.
 
 ## Supervisor
 
@@ -118,11 +124,10 @@ coding thread and says which ones need you. This tab is its phone view.
   mode — each proposed nudge for that thread with a Send button.
 - **Ask supervisor** opens the Chat screen titled "Supervisor", on its own
   conversation, with three starters: "What's running?", "What needs me?",
-  "Which threads are red?". It sends `sessionId` and `from` both as
-  `"mobile-supervisor"`: for a phone credential the daemon ignores
-  `sessionId` and keys the conversation on `from`, so `from` is what keeps it
-  apart from Chat. The agent has two read-only tools for it, `fleet_status`
-  and `fleet_thread`.
+  "Which threads are red?". It sends `"thread": "supervisor"`, the shared
+  supervisor thread every paired device talks in, and loads it like Chat
+  from `GET /conversations/supervisor/messages`. The agent has two read-only
+  tools for it, `fleet_status` and `fleet_thread`.
 - Pull to refresh; refreshes every 30s while on screen (every 5s while a scan
   runs). Nothing is optimistic — a mode, answer or send shows once the daemon
   confirms it.
@@ -145,9 +150,22 @@ Yellow is drawn in one added colour token, `caution`: `#8A5A00` light,
 Routes: `GET /fleet/api/state`, `POST /fleet/api/scan`,
 `POST /fleet/api/mode` (`{mode}`), `POST /fleet/api/questions/{id}`
 (`{answer}` or `{dismiss: true}`), `POST /fleet/api/actions/{id}/send`,
-`POST /message` (`from` and `sessionId`: `"mobile-supervisor"`). The `/fleet/api/*` routes
+`POST /message` (`thread`: `"supervisor"`), `GET /conversations/supervisor/messages`. The `/fleet/api/*` routes
 join the mobile allowlist for this tab; they read and steer the supervisor
 and nothing else.
+
+## Lifelog
+
+A read-only view of what the paired G2s captured with consent, opened from
+Today (Android) — there is no room for a seventh tab.
+
+- Moments by day, newest first: title, time range, device name, the review
+  summary when there is one, and the transcript on tap.
+- Search box (words, speaker labels, topics) and a day picker; "Any day"
+  clears it.
+- Nothing here edits or deletes; that stays on the owner's dashboard.
+
+Routes: `GET /lifelog/moments` (`date`, `query`, `limit`).
 
 ## Settings
 

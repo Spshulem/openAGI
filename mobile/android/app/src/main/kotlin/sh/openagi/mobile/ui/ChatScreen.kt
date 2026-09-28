@@ -62,6 +62,7 @@ import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.ChatDeltaPayload
@@ -91,8 +92,17 @@ import sh.openagi.mobile.util.ErrorCopy
 internal sealed interface ChatEntry {
     val id: Long
     val timestamp: Instant
+    // The daemon's message id once this line is confirmed in the shared thread.
+    val serverId: String?
 
-    data class User(override val id: Long, override val timestamp: Instant, val text: String) : ChatEntry
+    data class User(
+        override val id: Long,
+        override val timestamp: Instant,
+        val text: String,
+        override val serverId: String? = null,
+        // Set only when another paired device (a G2, another phone) sent it.
+        val sourceName: String? = null,
+    ) : ChatEntry
 
     data class Assistant(
         override val id: Long,
@@ -108,6 +118,7 @@ internal sealed interface ChatEntry {
         // What the agent is doing right now ("Using fleet_status"), from the
         // stream's status frames. Shown only while streaming; never saved.
         val activity: String? = null,
+        override val serverId: String? = null,
     ) : ChatEntry
 }
 
@@ -127,19 +138,25 @@ internal fun chatActivityLabel(data: String): String? {
 }
 
 // Kept by the Activity so switching tabs does not discard a conversation
-// while the daemon keeps the same node session alive. Replies stream in
-// `scope`, the Activity's, so leaving the tab mid-reply does not cancel the
-// stream and leave a false "Can't reach OpenAGI" in the kept history.
+// while the daemon keeps the same session alive. Replies stream in `scope`,
+// the Activity's, so leaving the tab mid-reply does not cancel the stream and
+// leave a false "Can't reach OpenAGI" in the kept history.
 //
-// With a store, the conversation is also saved on the phone, so folding the
-// phone (which recreates the Activity), a process kill, or a relaunch keeps
-// it. A reply that was still streaming when the app died comes back as
-// stopped, with "Try again".
+// With a thread ("agent" or "supervisor"), the conversation is the daemon's
+// shared thread that every paired device talks in: it is loaded from the
+// daemon when the screen opens, after each reply, and whenever /events says
+// the thread changed (PROTOCOL.md §3.1).
+//
+// With a store, the conversation is also cached on the phone, so folding the
+// phone (which recreates the Activity), a process kill, a relaunch, or being
+// offline keeps it. A reply that was still streaming when the app died comes
+// back as stopped, with "Try again".
 class ChatConversationState(
     internal val scope: CoroutineScope,
     private val store: ChatHistoryStore? = null,
     private val nodeId: String = "",
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    internal val thread: String? = null,
 ) {
     internal val messages = mutableStateOf<List<ChatEntry>>(emptyList())
     internal val inputText = mutableStateOf("")
@@ -154,8 +171,32 @@ class ChatConversationState(
         }
     }
 
+    private var refreshJob: Job? = null
+    private var refreshAgain = false
+
+    // Loads the thread's newest page and folds it in. Calls that arrive while
+    // one is running collapse into one more run, so a burst of events costs
+    // at most two fetches. A failure keeps the cached conversation as it is.
+    fun requestRefresh(client: DaemonClient) {
+        val name = thread ?: return
+        if (refreshJob?.isActive == true) {
+            refreshAgain = true
+            return
+        }
+        refreshJob = scope.launch {
+            do {
+                refreshAgain = false
+                val page = runCatching { client.conversationMessages(name) }.getOrNull() ?: continue
+                var id = nextId.value
+                messages.value = ChatHistoryMerge.merge(messages.value, page, nodeId) { id++ }
+                nextId.value = id
+                persist()
+            } while (refreshAgain)
+        }
+    }
+
     // Called after every change that should outlive the screen: a send, a
-    // finished or failed reply, a retry.
+    // finished or failed reply, a retry, a refresh.
     internal fun persist() {
         val entries = messages.value.mapNotNull { it.toSaved() }
         val target = store ?: return
@@ -169,7 +210,7 @@ class ChatConversationState(
 }
 
 private fun ChatEntry.toSaved(): SavedChatEntry? = when (this) {
-    is ChatEntry.User -> SavedChatEntry(id, "user", timestamp, text)
+    is ChatEntry.User -> SavedChatEntry(id, "user", timestamp, text, serverId = serverId, sourceName = sourceName)
     // A still-streaming reply is saved as stopped: if the app dies now, the
     // next launch must not show a reply that will never finish.
     is ChatEntry.Assistant -> SavedChatEntry(
@@ -177,21 +218,22 @@ private fun ChatEntry.toSaved(): SavedChatEntry? = when (this) {
         failed = failed || streaming,
         failureDetail = if (streaming && !failed) "Reply stopped when the app closed." else failureDetail,
         retryText = retryText,
+        serverId = serverId,
     )
 }
 
 private fun SavedChatEntry.toEntry(): ChatEntry = if (role == "user") {
-    ChatEntry.User(id, at, text)
+    ChatEntry.User(id, at, text, serverId = serverId, sourceName = sourceName)
 } else {
-    ChatEntry.Assistant(id, at, text, streaming = false, failed = failed, failureDetail = failureDetail, retryText = retryText)
+    ChatEntry.Assistant(id, at, text, streaming = false, failed = failed, failureDetail = failureDetail, retryText = retryText, serverId = serverId)
 }
 
 // The Supervisor's "Ask supervisor" reuses this whole screen: the same
 // bubbles and transport, its own title, its own conversation, and a few
-// starter questions while it is empty. For a phone credential the daemon
-// ignores sessionId and keys the conversation on `from`
-// (bindScopedNodeMessage), so a separate conversation needs its own `from`.
-// The Chat tab passes none of these and sends exactly what it always has.
+// starter questions while it is empty. Each sends its conversation state's
+// thread ("agent" for Chat, "supervisor" for the Supervisor), which the
+// daemon keys on; with no thread, a phone credential's conversation is keyed
+// on `from` instead (bindScopedNodeMessage).
 @Composable
 fun ChatScreen(
     context: Context,
@@ -272,7 +314,7 @@ fun ChatScreen(
         isStreaming = true
         try {
             var receivedTerminal = false
-            client.sendMessageStream(text, from = from, sessionId = sessionId).collect { frame ->
+            client.sendMessageStream(text, from = from, sessionId = sessionId, thread = conversationState.thread).collect { frame ->
                 if (frame.event == "final" || frame.event == "failure") receivedTerminal = true
                 decodeFrame(assistantId, frame)
             }
@@ -289,6 +331,8 @@ fun ChatScreen(
         } finally {
             isStreaming = false
             conversationState.persist()
+            // The daemon's copy of this exchange replaces the local one.
+            conversationState.requestRefresh(client)
         }
     }
 
@@ -321,6 +365,12 @@ fun ChatScreen(
             }
         }
         conversationState.scope.launch { runExchange(entry.id, text) }
+    }
+
+    // Opening the screen shows the shared thread as the daemon has it,
+    // including what other devices said while this one was away.
+    LaunchedEffect(conversationState) {
+        conversationState.requestRefresh(client)
     }
 
     LaunchedEffect(messages) {
@@ -412,6 +462,15 @@ private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform
     val colors = LocalOpenAGIColors.current
     when (entry) {
         is ChatEntry.User -> {
+            entry.sourceName?.let { source ->
+                Text(
+                    "From $source",
+                    style = OpenAGIType.caption,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                )
+            }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 Surface(
                     color = colors.live.copy(alpha = 0.12f),

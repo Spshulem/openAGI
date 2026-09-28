@@ -18,7 +18,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import sh.openagi.mobile.protocol.ConversationUpdated
 import sh.openagi.mobile.protocol.PairingPayload
+import sh.openagi.mobile.protocol.ProtocolJson
 import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.sync.fetchInboxBadgeCount
@@ -27,8 +29,10 @@ import sh.openagi.mobile.transport.EventStream
 import sh.openagi.mobile.ui.ChatScreen
 import sh.openagi.mobile.ui.ChatConversationState
 import sh.openagi.mobile.ui.InboxScreen
+import sh.openagi.mobile.ui.LifelogScreen
 import sh.openagi.mobile.ui.PairingScreen
 import sh.openagi.mobile.ui.SettingsScreen
+import sh.openagi.mobile.ui.SupervisorFormat
 import sh.openagi.mobile.ui.SupervisorScreen
 import sh.openagi.mobile.ui.TasksScreen
 import sh.openagi.mobile.ui.TodayScreen
@@ -55,6 +59,14 @@ internal val REFRESH_TRIGGERING_EVENTS = setOf(
 )
 internal val INBOX_AFFECTING_EVENTS =
     setOf("pending-action", "pending-action-resolved", "clarification-created", "clarification-resolved")
+
+// A shared chat thread has a new stored message (PROTOCOL.md §3.1). Returns
+// which thread, or null for any other frame or an unreadable one.
+internal const val CONVERSATION_UPDATED_EVENT = "conversation.updated"
+internal fun updatedConversationThread(event: String?, data: String): String? {
+    if (event != CONVERSATION_UPDATED_EVENT) return null
+    return runCatching { ProtocolJson.json.decodeFromString(ConversationUpdated.serializer(), data).thread }.getOrNull()
+}
 
 class MainActivity : ComponentActivity() {
     // Plain mutableStateOf held on the Activity, not inside setContent's
@@ -86,6 +98,8 @@ class MainActivity : ComponentActivity() {
             // the tab if Android recreates the Activity for another reason.
             var selectedTab by rememberSaveable { mutableStateOf(AppTab.TODAY) }
             val supervisorChatOpen = rememberSaveable { mutableStateOf(false) }
+            // Lifelog opens from Today; six tabs leave no room for a seventh.
+            var lifelogOpen by rememberSaveable { mutableStateOf(false) }
             val credentials = credentialsState.value
             val pendingPairing = pendingPairingState.value
             val resumeSignal = resumeSignalState.intValue
@@ -110,11 +124,13 @@ class MainActivity : ComponentActivity() {
                     )
                 } else {
                     val conversationScope = rememberCoroutineScope()
+                    // Both are the daemon's shared threads, the same ones every
+                    // paired phone and G2 talks in; the files are offline caches.
                     val chatConversation = remember(credentials) {
-                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId)
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId, thread = "agent")
                     }
                     val supervisorConversation = remember(credentials) {
-                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId)
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId, thread = SupervisorFormat.THREAD)
                     }
                     // One background SSE connection for the life of this
                     // pairing, reconnected with backoff by EventStream. This
@@ -129,6 +145,10 @@ class MainActivity : ComponentActivity() {
                             }
                             if (frame.event in INBOX_AFFECTING_EVENTS) {
                                 inboxBadgeState.intValue = runCatching { fetchInboxBadgeCount(client) }.getOrDefault(inboxBadgeState.intValue)
+                            }
+                            when (updatedConversationThread(frame.event, frame.data)) {
+                                chatConversation.thread -> chatConversation.requestRefresh(client)
+                                supervisorConversation.thread -> supervisorConversation.requestRefresh(client)
                             }
                         }
                     }
@@ -166,12 +186,17 @@ class MainActivity : ComponentActivity() {
                         // gap, with the header pushed off.
                         Box(modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {
                             when (selectedTab) {
-                                AppTab.TODAY -> TodayScreen(
-                                    context = this@MainActivity,
-                                    credentials = credentials,
-                                    resumeSignal = resumeSignal,
-                                    onOpenInbox = { selectedTab = AppTab.INBOX },
-                                )
+                                AppTab.TODAY -> if (lifelogOpen) {
+                                    LifelogScreen(credentials = credentials, onBack = { lifelogOpen = false })
+                                } else {
+                                    TodayScreen(
+                                        context = this@MainActivity,
+                                        credentials = credentials,
+                                        resumeSignal = resumeSignal,
+                                        onOpenInbox = { selectedTab = AppTab.INBOX },
+                                        onOpenLifelog = { lifelogOpen = true },
+                                    )
+                                }
                                 AppTab.TASKS -> TasksScreen(context = this@MainActivity, credentials = credentials, resumeSignal = resumeSignal)
                                 AppTab.INBOX -> InboxScreen(
                                     context = this@MainActivity,
