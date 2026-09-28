@@ -8,7 +8,7 @@ import WidgetKit
 // "Screens must not be mostly empty" section -- without needing a callback
 // threaded down through every intermediate view.
 enum AppTab: Hashable {
-    case today, tasks, inbox, chat, supervisor, settings
+    case today, tasks, inbox, chat, supervisor
 }
 
 // The one piece of shared state behind the tab bar: the paired credential,

@@ -5,6 +5,8 @@ import SwiftUI
 // day's shape in one sentence" below it.
 struct TodayView: View {
     @Environment(AppModel.self) private var model
+    var onRevoked: () -> Void = {}
+    @State private var settingsShown = false
 
     var body: some View {
         NavigationStack {
@@ -89,6 +91,22 @@ struct TodayView: View {
                         Label("Lifelog", systemImage: "waveform")
                     }
                 }
+                // Settings is a sheet, not a tab, so the bar keeps five
+                // tabs and nothing folds into More.
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        settingsShown = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                }
+            }
+            .sheet(isPresented: $settingsShown) {
+                SettingsView(onRevoked: {
+                    settingsShown = false
+                    onRevoked()
+                })
+                .environment(model)
             }
         }
     }
