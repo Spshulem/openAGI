@@ -28,6 +28,7 @@ import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.EventStream
 import sh.openagi.mobile.ui.ChatScreen
 import sh.openagi.mobile.ui.ChatConversationState
+import sh.openagi.mobile.ui.SharedThreadSupport
 import sh.openagi.mobile.ui.InboxScreen
 import sh.openagi.mobile.ui.LifelogScreen
 import sh.openagi.mobile.ui.PairingScreen
@@ -126,11 +127,15 @@ class MainActivity : ComponentActivity() {
                     val conversationScope = rememberCoroutineScope()
                     // Both are the daemon's shared threads, the same ones every
                     // paired phone and G2 talks in; the files are offline caches.
+                    val threadSupport = remember(credentials) { SharedThreadSupport() }
                     val chatConversation = remember(credentials) {
-                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId, thread = "agent")
+                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "chat"), credentials.nodeId, thread = "agent", threadSupport = threadSupport)
                     }
                     val supervisorConversation = remember(credentials) {
-                        ChatConversationState(conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId, thread = SupervisorFormat.THREAD)
+                        ChatConversationState(
+                            conversationScope, ChatHistoryStore(filesDir, "supervisor"), credentials.nodeId, thread = SupervisorFormat.THREAD,
+                            legacySessionKey = SupervisorFormat.LEGACY_SESSION_ID, threadSupport = threadSupport,
+                        )
                     }
                     // One background SSE connection for the life of this
                     // pairing, reconnected with backoff by EventStream. This
@@ -145,6 +150,13 @@ class MainActivity : ComponentActivity() {
                             }
                             if (frame.event in INBOX_AFFECTING_EVENTS) {
                                 inboxBadgeState.intValue = runCatching { fetchInboxBadgeCount(client) }.getOrDefault(inboxBadgeState.intValue)
+                            }
+                            // Every (re)connect opens with hello: reload both
+                            // threads, catching up on anything missed while
+                            // offline or a history load that failed then.
+                            if (frame.event == "hello") {
+                                chatConversation.requestRefresh(client)
+                                supervisorConversation.requestRefresh(client)
                             }
                             when (updatedConversationThread(frame.event, frame.data)) {
                                 chatConversation.thread -> chatConversation.requestRefresh(client)

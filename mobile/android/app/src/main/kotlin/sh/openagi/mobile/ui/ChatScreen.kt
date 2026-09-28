@@ -59,12 +59,18 @@ import androidx.compose.ui.unit.dp
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import sh.openagi.mobile.protocol.ConversationPage
 import sh.openagi.mobile.protocol.ChatDeltaPayload
 import sh.openagi.mobile.protocol.ChatFailurePayload
 import sh.openagi.mobile.protocol.ChatFinalPayload
@@ -151,17 +157,33 @@ internal fun chatActivityLabel(data: String): String? {
 // phone (which recreates the Activity), a process kill, a relaunch, or being
 // offline keeps it. A reply that was still streaming when the app died comes
 // back as stopped, with "Try again".
+//
+// An older daemon answers 400 to a /message body with `thread`. The send is
+// then made again without it, keyed as before shared threads (legacySessionKey
+// as both sessionId and from, which keeps the Supervisor apart from Chat), and
+// `threadSupport`, shared by both conversations of one pairing, remembers it
+// until the app restarts or pairs again.
 class ChatConversationState(
     internal val scope: CoroutineScope,
     private val store: ChatHistoryStore? = null,
     private val nodeId: String = "",
     private val io: CoroutineDispatcher = Dispatchers.IO,
     internal val thread: String? = null,
+    private val legacySessionKey: String? = null,
+    internal val threadSupport: SharedThreadSupport = SharedThreadSupport(),
 ) {
     internal val messages = mutableStateOf<List<ChatEntry>>(emptyList())
     internal val inputText = mutableStateOf("")
     internal val isStreaming = mutableStateOf(false)
     internal val nextId = mutableStateOf(0L)
+    // False until the daemon says there is nothing older than what is shown.
+    internal val olderExhausted = mutableStateOf(false)
+    internal val loadingOlder = mutableStateOf(false)
+    // Waits between retries of a failed history load. A reconnected /events
+    // stream also asks for a refresh, so recovery never depends on these alone.
+    internal var refreshRetryDelaysMs = listOf(2_000L, 5_000L, 15_000L)
+
+    internal val sharedThread: String? get() = thread?.takeIf { threadSupport.supported }
 
     init {
         val restored = store?.load(nodeId).orEmpty().map { it.toEntry() }
@@ -176,9 +198,12 @@ class ChatConversationState(
 
     // Loads the thread's newest page and folds it in. Calls that arrive while
     // one is running collapse into one more run, so a burst of events costs
-    // at most two fetches. A failure keeps the cached conversation as it is.
-    fun requestRefresh(client: DaemonClient) {
-        val name = thread ?: return
+    // at most two fetches. A failure keeps the cached conversation as it is
+    // and is retried a few times with backoff.
+    fun requestRefresh(client: DaemonClient) = requestRefresh { name, before -> client.conversationMessages(name, before) }
+
+    internal fun requestRefresh(fetch: suspend (thread: String, before: String?) -> ConversationPage) {
+        val name = sharedThread ?: return
         if (refreshJob?.isActive == true) {
             refreshAgain = true
             return
@@ -186,12 +211,100 @@ class ChatConversationState(
         refreshJob = scope.launch {
             do {
                 refreshAgain = false
-                val page = runCatching { client.conversationMessages(name) }.getOrNull() ?: continue
+                var page: ConversationPage? = null
+                for (attempt in 0..refreshRetryDelaysMs.size) {
+                    if (attempt > 0) delay(refreshRetryDelaysMs[attempt - 1])
+                    try {
+                        page = fetch(name, null)
+                        break
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (missing: DaemonException.NotFound) {
+                        break
+                    } catch (error: Exception) {
+                        if (refreshAgain) break
+                    }
+                }
+                if (page == null) continue
                 var id = nextId.value
                 messages.value = ChatHistoryMerge.merge(messages.value, page, nodeId) { id++ }
                 nextId.value = id
+                // When the page is the oldest line shown, it alone says whether
+                // anything older exists; older lines kept above it keep theirs.
+                if (messages.value.firstOrNull { it.serverId != null }?.serverId == page.messages.firstOrNull()?.id) {
+                    olderExhausted.value = page.nextBefore == null
+                }
                 persist()
             } while (refreshAgain)
+        }
+    }
+
+    private var olderJob: Job? = null
+
+    // Loads the page just before the oldest line shown ("Load earlier
+    // messages") and puts it on top.
+    fun loadOlder(client: DaemonClient) = loadOlder { name, before -> client.conversationMessages(name, before) }
+
+    internal fun loadOlder(fetch: suspend (thread: String, before: String?) -> ConversationPage) {
+        val name = sharedThread ?: return
+        if (olderJob?.isActive == true || olderExhausted.value) return
+        val before = messages.value.firstOrNull { it.serverId != null }?.serverId ?: return
+        loadingOlder.value = true
+        olderJob = scope.launch {
+            try {
+                val page = try {
+                    fetch(name, before)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (missing: DaemonException.NotFound) {
+                    olderExhausted.value = true
+                    null
+                } catch (error: Exception) {
+                    null
+                } ?: return@launch
+                var id = nextId.value
+                messages.value = ChatHistoryMerge.prependOlder(messages.value, page, nodeId) { id++ }
+                nextId.value = id
+                if (page.nextBefore == null) olderExhausted.value = true
+                persist()
+            } finally {
+                loadingOlder.value = false
+            }
+        }
+    }
+
+    // The reply stream for one send: the shared thread when the daemon has
+    // them, else the pre-thread keying. A 400 before any frame is the older
+    // daemon refusing the `thread` field, so nothing was processed and the
+    // send is made once more without it.
+    internal fun messageStream(
+        text: String,
+        from: String?,
+        sessionId: String?,
+        send: (text: String, from: String?, sessionId: String?, thread: String?) -> Flow<SseFrame>,
+    ): Flow<SseFrame> = flow {
+        val name = sharedThread
+        if (name == null) {
+            emitAll(send(text, legacySessionKey ?: from, legacySessionKey ?: sessionId, null))
+            return@flow
+        }
+        var received = false
+        try {
+            send(text, from, sessionId, name).collect { frame ->
+                received = true
+                emit(frame)
+            }
+            return@flow
+        } catch (error: DaemonException.Server) {
+            if (error.code != 400 || received) throw error
+        }
+        var confirmed = false
+        send(text, legacySessionKey ?: from, legacySessionKey ?: sessionId, null).collect { frame ->
+            if (!confirmed) {
+                confirmed = true
+                threadSupport.supported = false
+            }
+            emit(frame)
         }
     }
 
@@ -207,6 +320,12 @@ class ChatConversationState(
         // gets its last write, on this thread; the file is small.
         if (scope.isActive) scope.launch(io) { target.save(nodeId, entries, sequence) } else target.save(nodeId, entries, sequence)
     }
+}
+
+// Whether this pairing's daemon takes the shared-thread `thread` field. One
+// per pairing, shared by Chat and the Supervisor; reset by restart or pairing.
+class SharedThreadSupport {
+    @Volatile var supported: Boolean = true
 }
 
 private fun ChatEntry.toSaved(): SavedChatEntry? = when (this) {
@@ -314,7 +433,7 @@ fun ChatScreen(
         isStreaming = true
         try {
             var receivedTerminal = false
-            client.sendMessageStream(text, from = from, sessionId = sessionId, thread = conversationState.thread).collect { frame ->
+            conversationState.messageStream(text, from, sessionId) { t, f, s, th -> client.sendMessageStream(t, from = f, sessionId = s, thread = th) }.collect { frame ->
                 if (frame.event == "final" || frame.event == "failure") receivedTerminal = true
                 decodeFrame(assistantId, frame)
             }
@@ -373,9 +492,16 @@ fun ChatScreen(
         conversationState.requestRefresh(client)
     }
 
+    // "Load earlier messages" sits above the oldest line while the shared
+    // thread may have more (PROTOCOL.md §3.1's before cursor).
+    val olderExhausted by conversationState.olderExhausted
+    val loadingOlder by conversationState.loadingOlder
+    val showLoadOlder = conversationState.sharedThread != null && !olderExhausted && messages.any { it.serverId != null }
+    val headerCount = if (showLoadOlder) 1 else 0
+
     LaunchedEffect(messages) {
         if (messages.isNotEmpty() && stickToBottom) {
-            listState.scrollToItem(messages.lastIndex)
+            listState.scrollToItem(messages.lastIndex + headerCount)
         }
     }
 
@@ -390,6 +516,20 @@ fun ChatScreen(
                 state = listState,
                 modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp),
             ) {
+                if (showLoadOlder) {
+                    item(key = "load-older") {
+                        Text(
+                            if (loadingOlder) "Loading earlier messages…" else "Load earlier messages",
+                            style = OpenAGIType.caption,
+                            color = MaterialTheme.colorScheme.primary,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(enabled = !loadingOlder) { conversationState.loadOlder(client) }
+                                .padding(vertical = 12.dp),
+                        )
+                    }
+                }
                 itemsIndexed(messages, key = { _, entry -> entry.id }) { index, entry ->
                     val previous = messages.getOrNull(index - 1)
                     val showDivider = MessageGrouping.needsTimestampDivider(previous?.timestamp?.epochSecond, entry.timestamp.epochSecond)
@@ -424,7 +564,7 @@ fun ChatScreen(
 
             if (!stickToBottom && messages.isNotEmpty()) {
                 JumpToLatestPill(
-                    onClick = { scope.launch { listState.scrollToItem(messages.lastIndex) } },
+                    onClick = { scope.launch { listState.scrollToItem(messages.lastIndex + headerCount) } },
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
                 )
             }

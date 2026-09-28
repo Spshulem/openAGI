@@ -53,6 +53,13 @@ internal object ChatHistoryMerge {
         return older + fromServer + pending
     }
 
+    // An older page ("Load earlier messages") goes above what is shown; lines
+    // already shown are not repeated.
+    fun prependOlder(local: List<ChatEntry>, page: ConversationPage, ownNodeId: String, newId: () -> Long): List<ChatEntry> {
+        val shown = local.mapNotNull { it.serverId }.toSet()
+        return page.messages.filter { it.id !in shown }.map { toEntry(it, newId(), ownNodeId) } + local
+    }
+
     private fun toEntry(message: ConversationMessage, id: Long, ownNodeId: String): ChatEntry =
         if (message.role == "user") {
             // Only another device is named; this phone's own lines need no label.

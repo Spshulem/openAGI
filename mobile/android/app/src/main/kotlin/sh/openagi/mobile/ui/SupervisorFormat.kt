@@ -20,6 +20,10 @@ object SupervisorFormat {
     // The shared supervisor thread every paired device talks in
     // (PROTOCOL.md §3.1); Chat uses "agent".
     const val THREAD = "supervisor"
+    // An older daemon without shared threads keys a phone's conversation on
+    // `from`; sent as both sessionId and from there, as before, so the
+    // Supervisor chat stays apart from Chat.
+    const val LEGACY_SESSION_ID = "mobile-supervisor"
 
     val STARTERS = listOf("What's running?", "What needs me?", "Which threads are red?")
 
