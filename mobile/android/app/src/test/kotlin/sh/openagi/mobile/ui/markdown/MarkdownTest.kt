@@ -115,4 +115,43 @@ class MarkdownTest {
     fun emptyReplyParsesToNoBlocksRatherThanThrowing() {
         assertEquals(emptyList<MarkdownBlock>(), Markdown.parse(""))
     }
+
+    // What agents actually write: headings, tables, quotes, rules, nested and
+    // task lists, italic and strikethrough. None of it may render raw.
+    @Test
+    fun headingsQuotesAndRulesAreBlocksNotRawText() {
+        val blocks = Markdown.parse("## Status\n> Waiting on CI\n---\nDone")
+        assertEquals(MarkdownBlock.Heading(2, listOf(InlineSpan.Text("Status"))), blocks[0])
+        assertEquals(MarkdownBlock.Quote(listOf(InlineSpan.Text("Waiting on CI"))), blocks[1])
+        assertEquals(MarkdownBlock.Rule, blocks[2])
+        assertEquals(MarkdownBlock.Paragraph(listOf(InlineSpan.Text("Done"))), blocks[3])
+    }
+
+    @Test
+    fun aPipeTableBecomesATable() {
+        val table = Markdown.parse("| PR | CI |\n|---|:--:|\n| #7 | **green** |\n| #8 | red |").single() as MarkdownBlock.Table
+        assertEquals(listOf(listOf(InlineSpan.Text("PR")), listOf(InlineSpan.Text("CI"))), table.header)
+        assertEquals(2, table.rows.size)
+        assertEquals(listOf(InlineSpan.Bold("green")), table.rows[0][1])
+    }
+
+    @Test
+    fun nestedAndTaskListsKeepTheirDepthAndState() {
+        val blocks = Markdown.parse("- top\n  - nested\n- [x] done\n- [ ] todo\n1. first\n   2. inner")
+        assertEquals(MarkdownBlock.Bullet(listOf(InlineSpan.Text("top")), 0), blocks[0])
+        assertEquals(MarkdownBlock.Bullet(listOf(InlineSpan.Text("nested")), 1), blocks[1])
+        assertEquals(MarkdownBlock.Bullet(listOf(InlineSpan.Text("done")), 0, true), blocks[2])
+        assertEquals(MarkdownBlock.Bullet(listOf(InlineSpan.Text("todo")), 0, false), blocks[3])
+        assertEquals(1, (blocks[5] as MarkdownBlock.Numbered).depth)
+    }
+
+    @Test
+    fun italicStrikeAndBareLinksParseButSnakeCaseStaysPlain() {
+        val spans = (Markdown.parse("an *important* ~~old~~ note_about_names see https://github.com/x/y/pull/7.").single() as MarkdownBlock.Paragraph).spans
+        assertTrue(spans.contains(InlineSpan.Italic("important")))
+        assertTrue(spans.contains(InlineSpan.Strike("old")))
+        assertTrue(spans.contains(InlineSpan.Link("https://github.com/x/y/pull/7", "https://github.com/x/y/pull/7")))
+        assertTrue(spans.filterIsInstance<InlineSpan.Text>().any { "note_about_names" in it.text })
+        assertTrue(spans.none { it is InlineSpan.Text && ("*" in it.text || "~~" in it.text) })
+    }
 }

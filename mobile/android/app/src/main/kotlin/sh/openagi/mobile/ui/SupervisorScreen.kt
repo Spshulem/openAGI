@@ -76,6 +76,7 @@ import sh.openagi.mobile.ui.components.RowGroup
 import sh.openagi.mobile.ui.components.ScreenHeader
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
+import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.util.ErrorCopy
 import sh.openagi.mobile.util.RelativeTime
 import java.net.SocketTimeoutException
@@ -651,7 +652,7 @@ private fun QuestionRow(
     ) {
         Text(question.title?.takeIf { it.isNotBlank() } ?: "Question", style = OpenAGIType.body, color = MaterialTheme.colorScheme.onSurface)
         if (context.isNotEmpty()) Text(context.joinToString(" · "), style = OpenAGIType.caption, color = muted)
-        question.body?.takeIf { it.isNotBlank() }?.let { Text(it, style = OpenAGIType.secondary, color = muted) }
+        question.body?.takeIf { it.isNotBlank() }?.let { MarkdownView(it, textColor = muted, style = OpenAGIType.secondary) }
         // "dismiss" can arrive as an option; it is the Dismiss button below.
         val options = question.options.filter { it.isNotBlank() && it != "dismiss" }
         FlowRow(
@@ -850,8 +851,8 @@ private fun ThreadDetailSheet(
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("Last agent message (unverified)", style = OpenAGIType.caption, color = muted)
                     Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-                        Box(modifier = Modifier.heightIn(max = 240.dp).verticalScroll(rememberScrollState()).padding(10.dp)) {
-                            Text(text, style = OpenAGIType.dataMono, color = MaterialTheme.colorScheme.onSurface)
+                        Box(modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()).padding(10.dp)) {
+                            MarkdownView(text, textColor = MaterialTheme.colorScheme.onSurface, style = OpenAGIType.secondary)
                         }
                     }
                 }

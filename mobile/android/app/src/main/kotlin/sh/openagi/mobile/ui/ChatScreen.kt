@@ -76,9 +76,7 @@ import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SseFrame
 import sh.openagi.mobile.ui.components.ConnectionState
 import sh.openagi.mobile.ui.components.ScreenHeader
-import sh.openagi.mobile.ui.markdown.InlineSpan
-import sh.openagi.mobile.ui.markdown.Markdown
-import sh.openagi.mobile.ui.markdown.MarkdownBlock
+import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
 import sh.openagi.mobile.util.ErrorCopy
@@ -451,7 +449,7 @@ private fun ChatBubble(entry: ChatEntry, clipboard: androidx.compose.ui.platform
                                 }
                             } else {
                                 val textColor = if (entry.failed) colors.alert else MaterialTheme.colorScheme.onBackground
-                                MarkdownBlocksView(Markdown.parse(entry.text), textColor = textColor)
+                                MarkdownView(entry.text, textColor = textColor)
                             }
                         }
                     }
@@ -490,55 +488,6 @@ private fun TypingDots() {
     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         repeat(3) {
             Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(muted))
-        }
-    }
-}
-
-@Composable
-private fun MarkdownBlocksView(blocks: List<MarkdownBlock>, textColor: Color) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        blocks.forEach { block ->
-            when (block) {
-                is MarkdownBlock.Paragraph -> Text(renderInline(block.spans, textColor), style = OpenAGIType.body, color = textColor)
-                is MarkdownBlock.Bullet -> Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("•", style = OpenAGIType.body, color = textColor)
-                    Text(renderInline(block.spans, textColor), style = OpenAGIType.body, color = textColor, modifier = Modifier.weight(1f))
-                }
-                is MarkdownBlock.Numbered -> Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("${block.index}.", style = OpenAGIType.body, color = textColor)
-                    Text(renderInline(block.spans, textColor), style = OpenAGIType.body, color = textColor, modifier = Modifier.weight(1f))
-                }
-                is MarkdownBlock.CodeBlock -> CodeBlockView(block.code)
-            }
-        }
-    }
-}
-
-private fun renderInline(spans: List<InlineSpan>, base: Color): AnnotatedString = buildAnnotatedString {
-    spans.forEach { span ->
-        when (span) {
-            is InlineSpan.Text -> append(span.text)
-            is InlineSpan.Bold -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(span.text) }
-            is InlineSpan.Code -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(span.text) }
-            is InlineSpan.Link -> withStyle(SpanStyle(color = base, textDecoration = TextDecoration.Underline)) { append(span.text) }
-        }
-    }
-}
-
-// DESIGN.md: "Fenced code uses the mono face on a subtly darker fill,
-// scrolls horizontally rather than wrapping, and is long-press copyable."
-@Composable
-private fun CodeBlockView(code: String) {
-    val colors = LocalOpenAGIColors.current
-    val clipboard = LocalClipboardManager.current
-    Surface(color = colors.edge, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
-        Box(
-            modifier = Modifier
-                .horizontalScroll(rememberScrollState())
-                .combinedClickable(onClick = {}, onLongClick = { clipboard.setText(AnnotatedString(code)) })
-                .padding(10.dp),
-        ) {
-            Text(code, style = OpenAGIType.dataMono, color = MaterialTheme.colorScheme.onSurface)
         }
     }
 }
