@@ -80,6 +80,16 @@ struct TodayView: View {
             .background(Theme.canvas)
             .refreshable { await model.refreshToday() }
             .task { await model.refreshToday() }
+            // What the G2 glasses heard today, one tap from the day's tasks.
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    NavigationLink {
+                        LifelogView()
+                    } label: {
+                        Label("Lifelog", systemImage: "waveform")
+                    }
+                }
+            }
         }
     }
 

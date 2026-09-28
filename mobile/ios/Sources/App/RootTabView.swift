@@ -1,6 +1,7 @@
 import SwiftUI
 
-// mobile/FEATURES.md's five destinations. The Inbox badge — "the one number
+// mobile/FEATURES.md's six destinations. On a phone the system folds the
+// last two into More. The Inbox badge — "the one number
 // worth interrupting someone for" — is the only piece of chrome on this bar
 // besides the tab names themselves.
 struct RootTabView: View {
@@ -65,6 +66,9 @@ struct RootTabView: View {
             .badge(model.inboxBadgeCount)
             Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) {
                 ChatView()
+            }
+            Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) {
+                SupervisorView()
             }
             Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
                 SettingsView(onRevoked: onRevoked)
