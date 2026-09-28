@@ -1113,6 +1113,18 @@ test("a Conductor tab and the Codex thread it hosts get one typed message per ti
   assert.deepEqual(routes, { "conductor:s9": "computer-use", "codex:t9": "computer-use" });
 });
 
+test("a grouped resume types once into a Conductor tab shared by two thread keys", async (t) => {
+  const tab = makeThread({ key: "conductor:s9", kind: "conductor", id: "s9", claudeSessionId: "t9", workspace: "madrid", cwd: "/work/s9", meta: uiMeta("s9") });
+  const hosted = makeThread({ key: "codex:t9", id: "t9", cwd: "/work/t9", meta: { originator: "codex_sdk_ts" } });
+  const { supervisor, delivered } = fixture(t, { mode: "observe", delivery: "computer-use", threads: [tab, hosted], deps: { uiDriver: readyDriver() } });
+  await supervisor.tick();
+  const count = delivered.length;
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Add capacity?", options: ["added"], threadKeys: [tab.key, hosted.key] });
+  assert.equal((await supervisor.answerQuestion(q.id, "added")).question.status, "answered");
+  assert.equal(delivered.length - count, 1);
+  assert.deepEqual([...supervisor.store.question(q.id).deliveredThreadKeys].sort(), ["codex:t9", "conductor:s9"]);
+});
+
 test("owner answers are typed into the app; blocked ones stay open with the reason", async (t) => {
   const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
   const typed = fixture(t, { delivery: "computer-use", threads: [asking], deps: { uiDriver: readyDriver() } });

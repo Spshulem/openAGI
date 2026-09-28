@@ -206,6 +206,7 @@ export class OpenAGIG2App {
   private renderActiveProgress: (() => void) | null = null
   private recentIndex = 0
   private navigationBusy = false
+  private statusRequest = 0
   private exitDialogOpening = false
   private exited = false
   private liveSpeech: LiveSpeech | null = null
@@ -241,6 +242,7 @@ export class OpenAGIG2App {
         if (this.mode === 'home' && !this.noticeTimer) {
           if (this.store.snapshot().lifelogEnabled && !this.ambientRunning) { this.pausedLifelog = true; this.showPaused() }
           else if (this.ambientRunning) this.showHome()
+          else if (this.store.snapshot().homeMode === 'supervisor') renderer.supervisorHome(items.filter(i => i.supervisor).length)
           else renderer.home(this.store.snapshot().node?.name)
         }
         // Browsing keeps a stable snapshot. Reopen to see arrivals; main
@@ -321,14 +323,17 @@ export class OpenAGIG2App {
     if (['home', 'status'].includes(this.mode)) this.showHome()
   }
   private async showFleetStatus(): Promise<void> {
+    // Only the newest request, and only if the user is still where they
+    // asked for it; a slow reply must not replace a question they opened.
+    const request = ++this.statusRequest, from = this.mode
     const status = await this.proactive.fleetStatus()
-    if (this.exited || !this.foregroundActive) return
+    if (this.exited || !this.foregroundActive || request !== this.statusRequest || this.mode !== from) return
     if (!status) { this.mode = 'message'; this.renderer.message('Supervisor unavailable', 'Main could not read the supervisor. Check the Mac running it.'); return }
     const c = status.counts
     const lines = status.threads.map(t => `${t.health === 'red' ? '●' : '○'} ${t.name}: ${t.reason || t.state}`)
     const text = `${c.red} red · ${c.yellow} yellow · ${c.green} green\n${status.needsYou} question${status.needsYou === 1 ? '' : 's'} for you · ${status.mode ?? 'mode ?'}\n\n${lines.join('\n') || 'Nothing needs attention.'}`
     this.pages = paginateText(plainAnswer(text), 220); this.page = 0; this.mode = 'status'
-    this.renderer.answer(this.pages[0] ?? '', 0, this.pages.length)
+    this.renderer.fleetStatus(this.pages[0] ?? '', 0, this.pages.length)
   }
   async configureIdleTap(action: 'talk' | 'highlight'): Promise<void> {
     await this.store.update({ idleTapAction: action }); this.phone.idleTapAction?.(action)
@@ -540,7 +545,7 @@ export class OpenAGIG2App {
       this.renderActiveProgress?.()
     }
     else if (this.mode === 'answer') this.showAnswer(Math.max(0, Math.min(this.pages.length - 1, this.page + direction)))
-    else if (this.mode === 'status') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.renderer.answer(this.pages[this.page] ?? '', this.page, this.pages.length) }
+    else if (this.mode === 'status') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.renderer.fleetStatus(this.pages[this.page] ?? '', this.page, this.pages.length) }
     else if (this.mode === 'home' && this.store.snapshot().homeMode === 'supervisor' && direction > 0) void this.showFleetStatus()
     else if (this.mode === 'home' || this.mode === 'ambient') {
       if (direction < 0 && this.proactive.items.length) this.openInbox()

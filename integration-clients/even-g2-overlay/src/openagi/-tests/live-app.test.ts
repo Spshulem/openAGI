@@ -170,7 +170,7 @@ async function fixture(initial: { ambientEnabled?: boolean } = {}, restored?: { 
   const speech = { open: vi.fn(() => Promise.resolve()), push: vi.fn(), close: vi.fn(), snapshotText: vi.fn(() => ''), finish: vi.fn(() => Promise.resolve('What time is it?')) }
   const api = { speechRelay: vi.fn(() => ({ url: 'wss://main.example.com/nodes/g2/speech?model=nova-3', token: 'saved-scoped-token-123' })), speechToken: vi.fn(() => Promise.resolve({ accessToken: 'short-lived-token', expiresIn: 30 })), askText: vi.fn<OpenAGIApiClient['askText']>(() => Promise.resolve({ question: 'What time is it?', reply: 'Noon', sessionId: 'fixture-session' })), ask: vi.fn(), listen: vi.fn() }
   if (restored) Object.assign(api, { proactive: restored.proactive })
-  const renderer = { requestExit: vi.fn(() => Promise.resolve(true)), review: vi.fn(), paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn() }
+  const renderer = { requestExit: vi.fn(() => Promise.resolve(true)), review: vi.fn(), paused: vi.fn(), inboxList: vi.fn(), inbox: vi.fn(), inboxAction: vi.fn(), notice: vi.fn(), home: vi.fn(), passive: vi.fn(), ambient: vi.fn(), listening: vi.fn(), transcript: vi.fn(), progress: vi.fn(), answer: vi.fn(), message: vi.fn(), sleep: vi.fn(), supervisorHome: vi.fn(), fleetStatus: vi.fn() }
   const phone = { draft: vi.fn(), set: vi.fn(), paired: vi.fn(), ambient: vi.fn(), transcript: vi.fn(), speechModel: vi.fn(), activity: vi.fn() }
   type Args = ConstructorParameters<typeof OpenAGIG2App>
   const app = new OpenAGIG2App(api as unknown as Args[0], store, audio, renderer as unknown as Args[3], phone as unknown as Args[4], [], cb => { callbacks = cb; return { ...speech } as unknown as LiveSpeech })
@@ -224,6 +224,39 @@ it('supervisor home opens the supervisor questions and answers with a fixed choi
     expect(answer).toHaveBeenCalledWith('o-fleet', 'merged')
     expect(f.renderer.message).toHaveBeenLastCalledWith('Answered', 'merged. typed into Conductor')
   } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('keeps Supervisor home through inbox refreshes and shows status on its own page', async () => {
+  const f = await fixture()
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    Object.assign(f.renderer, { supervisorHome: vi.fn(), fleetStatus: vi.fn() })
+    await f.app.configureHomeMode('supervisor')
+    f.renderer.home.mockClear()
+    const view = (f.app.proactive as unknown as { view: { inbox: (items: unknown[]) => void } }).view
+    view.inbox([{ id: 'q', title: 'Merge?', summary: '', category: 'approvals', action: 'answer-fleet', seen: false, important: true, supervisor: true, options: ['yes'] }])
+    expect(f.renderer.home).not.toHaveBeenCalled()
+    expect((f.renderer as unknown as { supervisorHome: ReturnType<typeof vi.fn> }).supervisorHome).toHaveBeenLastCalledWith(1)
+    const status = { mode: 'auto', lastTickAt: null, needsYou: 1, counts: { red: 1, yellow: 0, green: 2, gray: 0 }, threads: [{ name: 'apia', health: 'red', state: 'needs-human', reason: 'asks' }] }
+    // A slow status reply after the user moved on is dropped.
+    let release: (value: typeof status) => void = () => {}
+    vi.spyOn(f.app.proactive, 'fleetStatus').mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+    const showStatus = (f.app as unknown as { showFleetStatus: () => Promise<void> }).showFleetStatus.bind(f.app)
+    const pending = showStatus()
+    f.app.proactive.items = [{ id: 'q', title: 'Merge?', summary: '', category: 'approvals', action: 'answer-fleet', seen: false, important: true, supervisor: true, options: ['yes'] }]
+    f.app.openInbox(undefined, true)
+    release(status); await pending
+    const fleetStatus = (f.renderer as unknown as { fleetStatus: ReturnType<typeof vi.fn> }).fleetStatus
+    expect(fleetStatus).not.toHaveBeenCalled()
+    expect(f.renderer.inboxList).toHaveBeenLastCalledWith('Merge?', 1, 1)
+    // From home it renders on the status page, not the Agent answer page.
+    f.app.doubleTap()
+    vi.spyOn(f.app.proactive, 'fleetStatus').mockResolvedValueOnce(status)
+    f.renderer.answer.mockClear()
+    await showStatus()
+    expect(fleetStatus).toHaveBeenCalledWith(expect.stringContaining('1 red'), 0, 1)
+    expect(f.renderer.answer).not.toHaveBeenCalled()
+  } finally { await f.app.systemExit() }
 })
 
 it('reapplies Supervisor mode to a main that does not have it yet', async () => {

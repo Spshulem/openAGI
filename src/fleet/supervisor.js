@@ -377,6 +377,9 @@ export class FleetSupervisor {
     let sent = 0;
     let blocked = 0;
     const deliveryState = await this.probeDelivery();
+    // A Conductor session and the Codex thread it hosts are one app
+    // conversation: one typed send covers every key that maps to it.
+    const typedInto = new Map();
     for (const key of keys) {
       // Read the store each time: a background resume that failed meanwhile
       // took its key back out, so that thread is sent again.
@@ -384,7 +387,13 @@ export class FleetSupervisor {
       const thread = this.lastThreads.get(key);
       const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
       if (!thread || !route) { blocked += 1; continue; }
+      const uiKey = route === "computer-use" ? uiTargetFor(thread)?.targetKey ?? null : null;
+      if (uiKey && typedInto.has(uiKey)) {
+        if (typedInto.get(uiKey)) { sent += 1; this.store.markQuestionDelivered(question.id, key); } else blocked += 1;
+        continue;
+      }
       const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+      if (uiKey) typedInto.set(uiKey, delivery.status === "sent");
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
       if (delivery.status === "sent") {
         sent += 1;

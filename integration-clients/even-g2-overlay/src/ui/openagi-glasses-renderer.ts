@@ -62,6 +62,8 @@ export class OpenAGIGlassesRenderer {
     const content = partial || `\n${stage.slice(0, 58)}\n\n${activity || 'Waiting for the next update…'}`
     this.show(`Agent · ${detail.split(' · ')[0]}\n${content}\n\nSwipe: read · Tap: text/activity\nDouble-tap: stop? · Cancel on phone`, false)
   }
+  // Read-only: a tap or double-tap goes back to Supervisor home.
+  fleetStatus(page: string, pageIndex: number, pages: number): void { this.show(`Supervisor status\n\n${page}\n\n${pageIndex + 1}/${pages} · swipe pages\nTap: back`, true) }
   answer(page: string, pageIndex: number, pages: number): void { this.show(`Agent\n\n${page}\n\n${pageIndex + 1}/${pages} · swipe pages\n${this.holdFollowup ? 'Hold' : 'Tap'}: follow up · Double-tap: back`, true) }
   message(title: string, detail: string): void { this.show(`${title}\n\n${tail(detail, 420)}\n\nTap to continue`, true) }
 }
