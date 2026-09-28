@@ -88,6 +88,10 @@ enum ChatHistoryMerge {
     static func merge(local: [ChatMessage], server: [ConversationMessage]) -> [ChatMessage] {
         guard let oldest = server.first?.at, let newest = server.last?.at else { return local }
         let serverIDs = Set(server.map(\.id))
+        var serverIndexForID: [String: Int] = [:]
+        for index in server.indices where serverIndexForID[server[index].id] == nil {
+            serverIndexForID[server[index].id] = index
+        }
 
         // Local lines already tied to a server id.
         var uuidForServerID: [String: UUID] = [:]
@@ -143,8 +147,12 @@ enum ChatHistoryMerge {
         for (position, message) in local.enumerated()
         where message.timestamp >= oldest || message.isStreaming || message.isFailed {
             if message.serverID != nil || matchedServerIndex[message.id] != nil { continue }
-            // The user line this one answers, if it is on the daemon's page.
-            let askedAt = precedingUserIndex(position, in: local).flatMap { matchedServerIndex[local[$0].id] }
+            // The user line this one answers, if it is on the daemon's page:
+            // matched just now, or already server-backed (a refresh that
+            // landed mid-stream tied it to its server id).
+            let askedAt = precedingUserIndex(position, in: local).flatMap { index in
+                local[index].serverID.flatMap { serverIndexForID[$0] } ?? matchedServerIndex[local[index].id]
+            }
             if message.isStreaming {
                 result.append((message, .distantFuture))
             } else if message.isFailed {

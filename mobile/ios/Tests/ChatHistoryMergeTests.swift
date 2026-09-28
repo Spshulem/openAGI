@@ -112,6 +112,32 @@ final class ChatHistoryMergeTests: XCTestCase {
         XCTAssertEqual(ChatRetry.target(failedID: failed.id, in: merged, isSending: false)?.userText, "summarize")
     }
 
+    // A refresh that lands mid-stream ties the question to its server id;
+    // when the stream then fails, the final merge must still anchor the
+    // failed reply after that question, not by its own earlier clock --
+    // otherwise it sorts above the question and Try again resends the
+    // previous prompt.
+    func testAFailedReplyStaysAfterAQuestionStoredMidStream() throws {
+        let question = ChatMessage(role: .user, text: "summarize", timestamp: at(100))
+        let streaming = ChatMessage(role: .assistant, text: "", isStreaming: true, timestamp: at(100))
+        let page = [
+            server("m0", .user, "earlier", 0),
+            server("m1", .assistant, "earlier reply", 1),
+            server("m2", .user, "summarize", 101),
+        ]
+        var messages = ChatHistoryMerge.merge(local: [question, streaming], server: page)
+        XCTAssertEqual(messages.first(where: { $0.id == question.id })?.serverID, "m2")
+
+        let index = try XCTUnwrap(messages.firstIndex(where: { $0.id == streaming.id }))
+        messages[index].text = "Reply stopped early. Try again."
+        messages[index].isStreaming = false
+        messages[index].isFailed = true
+
+        let merged = ChatHistoryMerge.merge(local: messages, server: page)
+        XCTAssertEqual(merged.map(\.text), ["earlier", "earlier reply", "summarize", "Reply stopped early. Try again."])
+        XCTAssertEqual(ChatRetry.target(failedID: streaming.id, in: merged, isSending: false)?.userText, "summarize")
+    }
+
     func testAFailedSendMainNeverSawKeepsBothLines() {
         let question = ChatMessage(role: .user, text: "offline ask", timestamp: at(10))
         let failed = ChatMessage(role: .assistant, text: "Can't reach OpenAGI.", isFailed: true, timestamp: at(10))
