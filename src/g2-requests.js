@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { ensureDir, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { G2ChannelError } from "./integrations/g2-channel.js";
+import { isSharedThread, sharedSessionId } from "./shared-conversations.js";
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
 const ACTIVE = new Set(["accepted", "working"]);
@@ -78,7 +79,7 @@ export class G2Requests {
     const own = [...this.records.values()].filter(r => r.nodeId === nodeId);
     if (this.records.size >= 512 || own.length >= 100 || this.running.size >= 16 || own.some(r => ACTIVE.has(r.state)))
       throw fail("request_busy", 429, "Another question is active or the daily recovery limit was reached. Check History first.");
-    const sessionId = this.channel.sessionIdFor(nodeId, payload.conversationId, payload.continuation);
+    const sessionId = payload.thread ? sharedSessionId(payload.thread) : this.channel.sessionIdFor(nodeId, payload.conversationId, payload.continuation);
     const record = { version: 1, id, nodeId, digest, sessionId, state: "accepted", revision: 1,
       createdAt, expiresAt: createdAt + WINDOW_MS, deadline: this.now() + 300_000,
       question: payload.text ?? "", stage: "accepted", tool: "", text: "", events: [], sequence: 0 };
@@ -95,7 +96,7 @@ export class G2Requests {
           if (this.now() - lastSaved >= 750) { this.persist(record); lastSaved = this.now(); }
         };
         const result = await this.channel.ask(payload, nodeId, {
-          requestId: id, continuation: payload.continuation, signal: controller.signal,
+          requestId: id, continuation: payload.continuation, thread: payload.thread, signal: controller.signal,
           onProgress: progress => {
             if (!ACTIVE.has(record.state)) return;
             try {
@@ -176,16 +177,23 @@ export class G2Requests {
 }
 
 function validateRequest(body) {
-  if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(k => !["text", "audioBase64", "conversationId", "continuation", "language"].includes(k)))
+  if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(k => !["text", "audioBase64", "conversationId", "continuation", "language", "thread"].includes(k)))
     throw fail("invalid_question", 400, "Unsupported question fields.");
-  if (typeof body.conversationId !== "string" || !body.conversationId.trim() || body.conversationId.length > 200)
-    throw fail("invalid_conversation", 400, "Choose a conversation first.");
+  // A shared device thread is one fixed session: no G2 conversation id is
+  // needed and a private G2 continuation cannot be combined with it.
+  if (body.thread !== undefined && (!isSharedThread(body.thread) || body.continuation !== undefined))
+    throw fail("invalid_conversation", 400, "Choose the agent or supervisor thread, without a G2 conversation reference.");
+  if (body.thread === undefined || body.conversationId !== undefined) {
+    if (typeof body.conversationId !== "string" || !body.conversationId.trim() || body.conversationId.length > 200)
+      throw fail("invalid_conversation", 400, "Choose a conversation first.");
+  }
   if (body.continuation !== undefined && (typeof body.continuation !== "string" || body.continuation.length > 200))
     throw fail("invalid_conversation", 400, "Invalid conversation reference.");
   const textOnly = typeof body.text === "string";
   if (textOnly ? (!body.text.trim() || body.text.length > 4000 || body.audioBase64 !== undefined)
     : (body.text !== undefined || typeof body.audioBase64 !== "string" || body.audioBase64.length > 1_281_000))
     throw fail("invalid_question", 400, "Send one question of at most 4000 characters or 30 seconds.");
-  return { ...(textOnly ? { text: body.text.trim() } : { audioBase64: body.audioBase64 }), conversationId: body.conversationId,
+  return { ...(textOnly ? { text: body.text.trim() } : { audioBase64: body.audioBase64 }),
+    ...(body.conversationId !== undefined ? { conversationId: body.conversationId } : {}), ...(body.thread ? { thread: body.thread } : {}),
     ...(body.continuation ? { continuation: body.continuation } : {}), ...(typeof body.language === "string" ? { language: body.language.slice(0, 20) } : {}) };
 }

@@ -29,14 +29,20 @@ test("the platform string and capabilities are the documented ones", () => {
     {
       id: "mobile-chat-client",
       ready: true,
-      operations: ["send"],
-      detail: "Sends chat messages to the agent from the phone."
+      operations: ["send", "history"],
+      detail: "Sends chat messages to the agent from the phone and reads the shared device threads."
     },
     {
       id: "mobile-fleet-client",
       ready: true,
       operations: ["read", "answer", "mode", "send", "scan"],
       detail: "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone."
+    },
+    {
+      id: "mobile-lifelog-client",
+      ready: true,
+      operations: ["read"],
+      detail: "Reads and searches retained G2 conversation moments from the phone."
     }
   ]);
 });
@@ -69,7 +75,10 @@ test("every route the phone app needs is allowed", () => {
     ["POST", "/fleet/api/scan"],
     ["POST", "/fleet/api/mode"],
     ["POST", "/fleet/api/questions/fq_abc-1"],
-    ["POST", "/fleet/api/actions/fa_abc-1/send"]
+    ["POST", "/fleet/api/actions/fa_abc-1/send"],
+    ["GET", "/conversations/agent/messages"],
+    ["GET", "/conversations/supervisor/messages"],
+    ["GET", "/lifelog/moments"]
   ];
   for (const [method, pathname] of allowed) {
     assert.equal(isMobileRouteAllowed(method, pathname), true, `${method} ${pathname} should be allowed`);
@@ -100,7 +109,11 @@ test("one representative route from every excluded family is refused", () => {
     ["GET", "/observations"],
     ["GET", "/sessions"],
     ["POST", "/tick"],
-    ["GET", "/outreach/feed"]
+    ["GET", "/outreach/feed"],
+    ["GET", "/conversations/owner/messages"],
+    ["POST", "/conversations/agent/messages"],
+    ["POST", "/lifelog/moments"],
+    ["GET", "/g2/lifelog"]
   ];
   for (const [method, pathname] of refused) {
     assert.equal(isMobileRouteAllowed(method, pathname), false, `${method} ${pathname} must be refused`);
