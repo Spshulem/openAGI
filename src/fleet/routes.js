@@ -7,6 +7,7 @@ import { MODES } from "./contracts.js";
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const ANSWER_MAX = 200;
+const SEND_MAX = 2000;
 
 const ok = (body) => ({ status: 200, body });
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
@@ -86,6 +87,17 @@ export function createFleetRoute({ supervisor } = {}) {
         if (method !== "POST") return fail(405, "Use POST.");
         if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad question id.");
         return await handleQuestion(parts[1], readBody);
+      }
+      if (parts.length === 1 && parts[0] === "send") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
+        const message = typeof body?.message === "string" ? body.message.trim() : "";
+        if (!/^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
+        if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
+        if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
+        const result = await supervisor.sendOwnerMessage(threadKey, message);
+        return ok({ delivery: result?.delivery ?? null, state: state() });
       }
       if (parts.length === 3 && parts[0] === "actions" && parts[2] === "send") {
         if (method !== "POST") return fail(405, "Use POST.");

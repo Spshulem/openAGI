@@ -10,7 +10,7 @@ export function createFleetCapability(supervisor) {
     },
     async invoke(operation, payload) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
-          || !/^\/fleet\/api\/(state|scan|mode|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
+          || !/^\/fleet\/api\/(state|scan|mode|send|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {});
       return { response, state: supervisor.getState() };
@@ -51,6 +51,7 @@ export class RemoteFleetSupervisor {
   async answerQuestion(id, answer) { return this.request('POST', `/fleet/api/questions/${id}`, { answer }); }
   async dismissQuestion(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true })).question; }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
+  async sendOwnerMessage(threadKey, message) { return this.request('POST', '/fleet/api/send', { threadKey, message }); }
   start() {
     if (this.timer) return;
     this.refresh().catch(() => {});

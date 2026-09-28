@@ -1179,3 +1179,26 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   assert.deepEqual(routes, ["computer-use", "computer-use", "computer-use"]);
   assert.equal(most, 1);
 });
+
+test("the owner's own message to a thread goes through the supervisor's delivery", async (t) => {
+  const { supervisor, delivered } = fixture(t, { threads: [makeThread()] });
+  await supervisor.tick();
+  const result = await supervisor.sendOwnerMessage("codex:t1", "  Rebase on main.  ");
+  assert.equal(result.delivery.status, "sent");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].message, "Rebase on main.");
+  assert.equal(delivered[0].playbook, "owner-message");
+  assert.equal((await supervisor.sendOwnerMessage("codex:missing", "hi")).delivery.status, "blocked");
+  assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
+});
+
+test("a question whose thread left the scan closes itself", async (t) => {
+  let threads = [makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } })];
+  const { supervisor } = fixture(t, { deps: { listCodexThreads: async () => threads } });
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.ok(question);
+  threads = [];
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "resolved");
+});

@@ -450,6 +450,21 @@ export class FleetSupervisor {
     }
   }
 
+  // The owner's own words to one thread (the supervisor chat's
+  // fleet_send_message, after approval). Same delivery as an owner answer:
+  // on a computer-use Mac it is typed into the app, never a CLI.
+  async sendOwnerMessage(threadKey, message) {
+    const text = String(message ?? "").trim();
+    if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
+    const thread = this.lastThreads.get(threadKey);
+    const deliveryState = thread ? await this.probeDelivery() : null;
+    const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+    if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message" });
+    this.store.recordNudge(thread.key, { playbook: "owner-message", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null } };
+  }
+
   applyOverride(question, answer) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
     for (const key of keys) {
@@ -776,7 +791,10 @@ export class FleetSupervisor {
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
       const decided = question.threadKey ? decisions.some((decision) => decision.threadKey === question.threadKey) : false;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
-      if (decided || supervisorOwned) {
+      // Its thread left the scan (aged out of the lookback) or is now out of
+      // scope, while its source read fine: nothing is left to answer.
+      const threadGone = Boolean(question.threadKey) && (!byKey.has(question.threadKey) || Boolean(byKey.get(question.threadKey)?.excluded));
+      if (decided || supervisorOwned || threadGone) {
         store.resolveQuestion(question.id);
         this.resolveOutreach(question, "resolved", "dismissed");
       }
