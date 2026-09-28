@@ -27,14 +27,20 @@ export const MOBILE_CAPABILITIES = Object.freeze([
   Object.freeze({
     id: "mobile-chat-client",
     ready: true,
-    operations: Object.freeze(["send"]),
-    detail: "Sends chat messages to the agent from the phone."
+    operations: Object.freeze(["send", "history"]),
+    detail: "Sends chat messages to the agent from the phone and reads the shared device threads."
   }),
   Object.freeze({
     id: "mobile-fleet-client",
     ready: true,
     operations: Object.freeze(["read", "answer", "mode", "send", "scan"]),
     detail: "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone."
+  }),
+  Object.freeze({
+    id: "mobile-lifelog-client",
+    ready: true,
+    operations: Object.freeze(["read"]),
+    detail: "Reads and searches retained G2 conversation moments from the phone."
   })
 ]);
 
@@ -64,7 +70,12 @@ const EXACT = new Set([
   // other /fleet/api/ path stay owner-only.
   "GET /fleet/api/state",
   "POST /fleet/api/scan",
-  "POST /fleet/api/mode"
+  "POST /fleet/api/mode",
+  // Shared device threads and the read-only lifelog. Owner decision: paired
+  // phones may read the lifelog.
+  "GET /conversations/agent/messages",
+  "GET /conversations/supervisor/messages",
+  "GET /lifelog/moments"
 ]);
 
 const PATTERNS = [

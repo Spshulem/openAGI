@@ -17,9 +17,13 @@ import java.time.Instant
 // wording follows the /fleet web page (src/fleet/page.js) so the phone and
 // the dashboard describe the same thread the same way.
 object SupervisorFormat {
-    // Sent as both sessionId and from: the daemon keys a phone's
-    // conversation on `from`, so that is what keeps it apart from Chat.
-    const val SESSION_ID = "mobile-supervisor"
+    // The shared supervisor thread every paired device talks in
+    // (PROTOCOL.md §3.1); Chat uses "agent".
+    const val THREAD = "supervisor"
+    // An older daemon without shared threads keys a phone's conversation on
+    // `from`; sent as both sessionId and from there, as before, so the
+    // Supervisor chat stays apart from Chat.
+    const val LEGACY_SESSION_ID = "mobile-supervisor"
 
     val STARTERS = listOf("What's running?", "What needs me?", "Which threads are red?")
 

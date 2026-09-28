@@ -17,6 +17,10 @@ data class SavedChatEntry(
     val failed: Boolean = false,
     val failureDetail: String? = null,
     val retryText: String? = null,
+    // The daemon's message id once the line is confirmed in the shared
+    // thread, and the device that sent it when that was not this phone.
+    val serverId: String? = null,
+    val sourceName: String? = null,
 )
 
 @Serializable
@@ -26,9 +30,11 @@ private data class SavedConversation(
 )
 
 // A conversation kept on the phone so folding the phone, a process kill, or
-// relaunching the app does not wipe it. One file per conversation ("chat",
-// "supervisor"), bound to the pairing that wrote it: a file from another
-// node id reads as empty. Only the newest MAX_ENTRIES lines are kept.
+// relaunching the app does not wipe it, and so it shows offline. The daemon's
+// shared thread is the real history (PROTOCOL.md §3.1); this is only its
+// cache. One file per conversation ("chat", "supervisor"), bound to the
+// pairing that wrote it: a file from another node id reads as empty. Only the
+// newest MAX_ENTRIES lines are kept.
 class ChatHistoryStore(directory: File, key: String) {
     private val file = File(directory, "chat-$key.json")
     private val lock = lockFor(file)

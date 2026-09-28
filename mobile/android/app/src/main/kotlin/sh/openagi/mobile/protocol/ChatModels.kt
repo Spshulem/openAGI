@@ -1,16 +1,45 @@
 package sh.openagi.mobile.protocol
 
 import kotlinx.serialization.Serializable
+import java.time.Instant
 
 // Body for POST /message. PROTOCOL.md §3 and src/hosted-interface.js's
 // node-message allowlist both limit a node-authenticated caller (a phone is
-// always one) to exactly these three fields — sending anything else 400s.
+// always one) to exactly these four fields — sending anything else 400s.
 @Serializable
 data class SendMessageRequest(
     val text: String,
     val from: String? = null,
     val sessionId: String? = null,
+    // "agent" or "supervisor": the shared thread every paired device talks
+    // in (PROTOCOL.md §3.1). With it the daemon ignores from and sessionId.
+    val thread: String? = null,
 )
+
+// GET /conversations/:thread/messages (PROTOCOL.md §3.1). Oldest first; user
+// and assistant text only. sourceNodeId/sourceName say which paired device
+// sent a user message and are null on replies.
+@Serializable
+data class ConversationMessage(
+    val id: String,
+    val role: String,
+    val text: String,
+    @Serializable(with = InstantSerializer::class) val at: Instant,
+    val sourceNodeId: String? = null,
+    val sourceName: String? = null,
+)
+
+@Serializable
+data class ConversationPage(
+    val thread: String,
+    val messages: List<ConversationMessage> = emptyList(),
+    // The `before` cursor for the next older page; null at the thread's start.
+    val nextBefore: String? = null,
+)
+
+// The /events frame that says a shared thread has a new stored message.
+@Serializable
+data class ConversationUpdated(val thread: String, val messageId: String? = null)
 
 // The frames streamLocalMessage (src/hosted-interface.js) writes when a
 // POST /message call carries `Accept: text/event-stream`. This is the real

@@ -586,10 +586,10 @@ class DaemonClientTest {
         Unit
     }
 
-    // The Supervisor chat's own conversation. A phone's sessionId is ignored
-    // by the daemon, so `from` must travel too or it lands in Chat's thread.
+    // Chat and the Supervisor send their shared thread (PROTOCOL.md §3.1);
+    // nulls are left out, so the body stays inside the daemon's allowlist.
     @Test
-    fun supervisorChatSendsItsOwnFromAndSessionId() = runBlocking {
+    fun sharedThreadChatSendsOnlyTheTextAndThread() = runBlocking {
         server.enqueue(
             MockResponse()
                 .setResponseCode(200)
@@ -597,12 +597,77 @@ class DaemonClientTest {
                 .setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.KEEP_OPEN),
         )
         kotlinx.coroutines.withTimeout(5_000) {
-            client().sendMessageStream("What's running?", from = "mobile-supervisor", sessionId = "mobile-supervisor").take(1).toList()
+            client().sendMessageStream("What's running?", thread = "supervisor").take(1).toList()
         }
         assertEquals(
-            """{"text":"What's running?","from":"mobile-supervisor","sessionId":"mobile-supervisor"}""",
+            """{"text":"What's running?","thread":"supervisor"}""",
             server.takeRequest().body.readUtf8(),
         )
+    }
+
+    @Test
+    fun conversationMessagesPagesAndDecodes() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"thread":"agent","messages":[
+                  {"id":"msg_1","role":"user","text":"From the glasses","at":"2026-09-28T15:04:05.000Z","sourceNodeId":"g2-1","sourceName":"Glasses"},
+                  {"id":"msg_2","role":"assistant","text":"Done.","at":"2026-09-28T15:04:09.120Z","sourceNodeId":null,"sourceName":null}
+                ],"nextBefore":"msg_1","future":true}""",
+            ),
+        )
+        val page = client().conversationMessages("agent", before = "msg_9", limit = 20)
+        assertEquals("agent", page.thread)
+        assertEquals(listOf("msg_1", "msg_2"), page.messages.map { it.id })
+        assertEquals("Glasses", page.messages[0].sourceName)
+        assertEquals(null, page.messages[1].sourceNodeId)
+        assertEquals(java.time.Instant.parse("2026-09-28T15:04:09.120Z"), page.messages[1].at)
+        assertEquals("msg_1", page.nextBefore)
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/conversations/agent/messages?before=msg_9&limit=20", request.path)
+        assertEquals("mobile:abc", request.getHeader("X-OpenAGI-Node-ID"))
+    }
+
+    @Test
+    fun anEmptyThreadDecodesWithNoCursor() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"thread":"supervisor","messages":[],"nextBefore":null}"""))
+        val page = client().conversationMessages("supervisor")
+        assertTrue(page.messages.isEmpty())
+        assertEquals(null, page.nextBefore)
+        assertEquals("/conversations/supervisor/messages", server.takeRequest().path)
+    }
+
+    @Test
+    fun anUnknownThreadIsNeverRequested() = runBlocking {
+        try {
+            client().conversationMessages("../sessions")
+            fail("expected a refusal")
+        } catch (expected: IllegalArgumentException) {
+        }
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun lifelogMomentsSendsFiltersAndDecodes() = runBlocking {
+        server.enqueue(
+            MockResponse().setResponseCode(200).setBody(
+                """{"moments":[{"id":"seg-1","nodeId":"g2-1","deviceName":"Glasses","at":"2026-09-28T14:00:00.000Z",
+                  "endAt":"2026-09-28T14:20:00.000Z","title":"Ship the widget","summary":null,"transcript":"Sam: We decided."}]}""",
+            ),
+        )
+        val moments = client().lifelogMoments(date = java.time.LocalDate.of(2026, 9, 28), query = "  widget ", limit = 100)
+        assertEquals(1, moments.size)
+        assertEquals("Glasses", moments[0].deviceName)
+        assertEquals(null, moments[0].summary)
+        assertEquals(java.time.Instant.parse("2026-09-28T14:20:00Z"), moments[0].endAt)
+        assertEquals("/lifelog/moments?date=2026-09-28&query=widget&limit=100", server.takeRequest().path)
+    }
+
+    @Test
+    fun lifelogWithoutFiltersSendsNone() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(200).setBody("""{"moments":[]}"""))
+        assertTrue(client().lifelogMoments(query = " ").isEmpty())
+        assertEquals("/lifelog/moments", server.takeRequest().path)
     }
 
     @Test

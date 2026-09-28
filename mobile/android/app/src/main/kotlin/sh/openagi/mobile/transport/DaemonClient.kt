@@ -16,6 +16,7 @@ import sh.openagi.mobile.protocol.AnswerClarificationRequest
 import sh.openagi.mobile.protocol.AnswerClarificationResult
 import sh.openagi.mobile.protocol.ApprovalResult
 import sh.openagi.mobile.protocol.Clarification
+import sh.openagi.mobile.protocol.ConversationPage
 import sh.openagi.mobile.protocol.CreateTaskRequest
 import sh.openagi.mobile.protocol.DenyRequest
 import sh.openagi.mobile.protocol.DenyResult
@@ -27,6 +28,8 @@ import sh.openagi.mobile.protocol.FleetJson
 import sh.openagi.mobile.protocol.FleetModeRequest
 import sh.openagi.mobile.protocol.FleetQuestionResult
 import sh.openagi.mobile.protocol.FleetState
+import sh.openagi.mobile.protocol.LifelogMoment
+import sh.openagi.mobile.protocol.LifelogMomentsResponse
 import sh.openagi.mobile.protocol.MobileSummary
 import sh.openagi.mobile.protocol.PendingAction
 import sh.openagi.mobile.protocol.PendingActionsResponse
@@ -233,13 +236,36 @@ class DaemonClient(
     // closes the stream. `Accept: text/event-stream` is what selects this
     // richer streaming reply over the plain single-JSON-object response the
     // same route gives a caller that doesn't ask for it.
-    fun sendMessageStream(text: String, from: String? = null, sessionId: String? = null): Flow<SseFrame> {
-        val body = ProtocolJson.json.encodeToString(SendMessageRequest.serializer(), SendMessageRequest(text, from, sessionId))
+    fun sendMessageStream(text: String, from: String? = null, sessionId: String? = null, thread: String? = null): Flow<SseFrame> {
+        val body = ProtocolJson.json.encodeToString(SendMessageRequest.serializer(), SendMessageRequest(text, from, sessionId, thread))
         val request = authorized("/message")
             .header("Accept", "text/event-stream")
             .post(body.toRequestBody(JSON))
             .build()
         return streamingClient.streamSse(request)
+    }
+
+    // One page of a shared thread, oldest first (PROTOCOL.md §3.1). The
+    // newest page when `before` is null; pass the last page's nextBefore to
+    // walk back. The thread name is one of two fixed words, never user text.
+    suspend fun conversationMessages(thread: String, before: String? = null, limit: Int? = null): ConversationPage {
+        require(thread == "agent" || thread == "supervisor") { "unknown thread" }
+        val query = buildMap {
+            before?.let { put("before", it) }
+            limit?.let { put("limit", it.toString()) }
+        }
+        return getJson("/conversations/$thread/messages", query, ConversationPage.serializer())
+    }
+
+    // ─── Lifelog (PROTOCOL.md §3.2: GET /lifelog/moments, read-only) ─────────
+
+    suspend fun lifelogMoments(date: java.time.LocalDate? = null, query: String? = null, limit: Int? = null): List<LifelogMoment> {
+        val params = buildMap {
+            date?.let { put("date", it.toString()) }
+            query?.trim()?.takeIf { it.isNotEmpty() }?.let { put("query", it) }
+            limit?.let { put("limit", it.toString()) }
+        }
+        return getJson("/lifelog/moments", params, LifelogMomentsResponse.serializer()).moments
     }
 
     // ─── Fleet supervisor (FEATURES.md "Supervisor": /fleet/api/*) ───────────

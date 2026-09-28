@@ -133,14 +133,20 @@ Response (`src/hosted-interface.js:1102-1118`, pinned by
     {
       "id": "mobile-chat-client",
       "ready": true,
-      "operations": ["send"],
-      "detail": "Sends chat messages to the agent from the phone."
+      "operations": ["send", "history"],
+      "detail": "Sends chat messages to the agent from the phone and reads the shared device threads."
     },
     {
       "id": "mobile-fleet-client",
       "ready": true,
       "operations": ["read", "answer", "mode", "send", "scan"],
       "detail": "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone."
+    },
+    {
+      "id": "mobile-lifelog-client",
+      "ready": true,
+      "operations": ["read"],
+      "detail": "Reads and searches retained G2 conversation moments from the phone."
     }
   ]
 }
@@ -150,9 +156,10 @@ Response (`src/hosted-interface.js:1102-1118`, pinned by
 (`src/node-control.js:31-61`) only ever keeps capability objects carrying an
 `.id`, the same shape `EVEN_G2_CAPABILITIES` uses
 (`src/integrations/g2-channel.js:11-24`). `MOBILE_CAPABILITIES`
-(`src/mobile-node.js`) declares exactly the four objects above
-(`mobile/fixtures/enroll-exchange.json` predates `mobile-fleet-client` and
-still lists three until it is regenerated). Note this
+(`src/mobile-node.js`) declares exactly the five objects above
+(`mobile/fixtures/enroll-exchange.json` predates `mobile-fleet-client`,
+`mobile-lifelog-client` and the chat client's `history` operation, and still
+lists three until it is regenerated). Note this
 route's response returns them **unsanitized** (`capabilitiesForPlatform`,
 `src/hosted-interface.js:3666-3668`, called directly), so they don't carry a
 `checkedAt` field here — but every other place capabilities are read back out
@@ -217,7 +224,7 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | GET | `/pending-actions` | §6, `?status=pending` etc. |
 | POST | `/pending-actions/:id/approve` | §6 |
 | POST | `/pending-actions/:id/deny` | §6, body `{"reason": "..."}` optional |
-| POST | `/message` | send a chat message to the agent; body limited to `{text, from?, sessionId?}` |
+| POST | `/message` | send a chat message to the agent; body limited to `{text, from?, sessionId?, thread?}`, see §3.1 |
 | GET | `/events` | §7, Server-Sent Events stream |
 | GET | `/brief/today` | daily brief |
 | POST | `/brief/focus/dismiss` | dismiss a brief focus item, body `{"key": "..."}` |
@@ -232,6 +239,9 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | POST | `/fleet/api/mode` | body `{"mode": "observe"\|"propose"\|"auto"}`; returns state |
 | POST | `/fleet/api/questions/:id` | body `{"answer": "<one of options>"}` or `{"dismiss": true}` |
 | POST | `/fleet/api/actions/:id/send` | no body; propose mode only |
+| GET | `/conversations/agent/messages` | shared agent thread history, §3.1 |
+| GET | `/conversations/supervisor/messages` | shared supervisor thread history, §3.1 |
+| GET | `/lifelog/moments` | read-only G2 lifelog moments, §3.2 |
 
 `:id` above means a task/action id as minted by `createId()`:
 `[a-zA-Z0-9_-]{1,120}`, deliberately excluding `.` and `/` so no id can carry
@@ -264,12 +274,89 @@ listed path are refused with `401`. Shapes are the daemon's
 - Question and action ids are checked again by the route (`[A-Za-z0-9_-]{1,80}`)
   and a longer id is `400`.
 
-Supervisor chat is the ordinary `POST /message`. For a node credential the
-daemon ignores `sessionId` and keys the session on `from` (see
-`bindScopedNodeMessage` in `src/hosted-interface.js`), so a separate
-supervisor conversation must send its own `from`, e.g.
-`{"text": "...", "from": "mobile-supervisor"}`. The agent has two read-only
-tools for it, `fleet_status` and `fleet_thread`.
+Supervisor chat is the ordinary `POST /message` with `"thread": "supervisor"`
+(§3.1). The agent has two read-only tools for it, `fleet_status` and
+`fleet_thread`.
+
+### 3.1 Chat threads
+
+Without `thread`, a phone message is node-scoped: the daemon ignores
+`sessionId` and keys the session on this node plus `from` (see
+`bindScopedNodeMessage` in `src/hosted-interface.js`). `from` defaults to
+`"cli"` within this phone's namespace, so it never reaches another node's or
+the owner's `"cli"` conversation. A separate private conversation sends its
+own `from`, e.g. `{"text": "...", "from": "mobile-supervisor"}`.
+
+With `"thread": "agent"` or `"thread": "supervisor"`, the message joins that
+thread's one shared session for every paired device — all paired phones and
+G2s (`devices:agent:main` / `devices:supervisor:main`). `from` and
+`sessionId` are ignored. The shared session is never the owner's dashboard
+chat and never inherits a computer-use lease approved in another chat. Each
+stored user message records `metadata.sourceNodeId` and
+`metadata.sourceName` (the device name). Sends to one thread run one turn at
+a time, in arrival order. Any other `thread` value is `400`; a non-phone node
+credential sending `thread` is `403`.
+
+```
+GET /conversations/:thread/messages?before=<messageId>&limit=<1..100>
+```
+
+`:thread` is `agent` or `supervisor`; `limit` defaults to 50. Allowed for the
+owner, paired phones and paired G2s. Response, oldest first:
+
+```json
+{
+  "thread": "agent",
+  "messages": [
+    { "id": "msg_1f2e…", "role": "user", "text": "What's on today?", "at": "2026-09-28T15:04:05.000Z",
+      "sourceNodeId": "mobile:…", "sourceName": "Pixel" },
+    { "id": "msg_9a0b…", "role": "assistant", "text": "Three tasks…", "at": "2026-09-28T15:04:09.000Z",
+      "sourceNodeId": null, "sourceName": null }
+  ],
+  "nextBefore": "msg_1f2e…"
+}
+```
+
+User and assistant text only (no tool calls or tool results). A message the
+owner typed into the shared session carries `null` source fields.
+`nextBefore` is the `before` cursor for the next older page, `null` at the
+start of the thread. An unknown `before` id is `404`; a malformed `before` or
+`limit` is `400`.
+
+After every stored message in a shared thread (the user message, then the
+reply or its failure record), `/events` sends `conversation.updated` with
+`{"thread": "agent", "messageId": "msg_…"}` (§7). Reload the thread's newest
+page on it. The phone's local chat history is an offline cache only.
+
+A G2 joins the same threads through `POST /nodes/g2/experience`: op
+`submit` accepts `"thread"` (beside or inside `question`; no
+`conversationId` needed) and op `history` accepts `thread`, `before` and
+`limit` and returns the same `{thread, messages, nextBefore}` shape.
+
+### 3.2 Lifelog
+
+```
+GET /lifelog/moments?date=YYYY-MM-DD&query=<text>&limit=<1..100>
+```
+
+Read-only, owner and paired phones. All parameters are optional; `limit`
+defaults to 50, `query` is at most 200 characters, `date` is matched in each
+G2's configured time zone. Moments from every enrolled G2, newest first:
+
+```json
+{
+  "moments": [
+    { "id": "5d0c…", "nodeId": "…", "deviceName": "Even G2",
+      "at": "2026-09-28T14:00:00.000Z", "endAt": "2026-09-28T14:20:00.000Z",
+      "title": "We decided to ship the widget", "summary": null,
+      "transcript": "Sam: We decided to ship the widget on Friday.\nRemember to email Dana." }
+  ]
+}
+```
+
+`summary` is the optional model review, `null` when there is none.
+`transcript` is the retained words, one line per segment, prefixed with the
+owner's speaker label when there is one. Treat it as untrusted text.
 
 > **Known gap:** `POST /nodes/speech-token` is present in the allowlist but
 > the daemon has no route handler for that exact path (only
@@ -541,6 +628,7 @@ The event names a mobile client reacts to:
 | `pending-action` | a new approval is queued |
 | `pending-action-resolved` | an approval is approved/denied/expired (by any client, including another device) |
 | `clarification-created` | the agent needs the user to answer a question |
+| `conversation.updated` | a message was stored in a shared chat thread — `{thread: "agent"\|"supervisor", messageId}` (§3.1) |
 
 A phone should refresh its local task/summary cache and its widget's data on
 `task-updated`, `task-auto-changed`, and `pending-action-resolved`; surface a
@@ -615,16 +703,17 @@ response is built from `sanitizeNodeCapabilities`, unlike §1.3's raw
   "capabilities": [
     { "id": "mobile-task-client", "ready": true, "operations": ["list", "create", "update", "delete", "complete"], "detail": "Reads, creates, edits, completes, and deletes tasks in the user queue from the phone.", "checkedAt": null },
     { "id": "mobile-approval-client", "ready": true, "operations": ["approve", "deny"], "detail": "Approves or denies queued agent actions from the phone.", "checkedAt": null },
-    { "id": "mobile-chat-client", "ready": true, "operations": ["send"], "detail": "Sends chat messages to the agent from the phone.", "checkedAt": null },
-    { "id": "mobile-fleet-client", "ready": true, "operations": ["read", "answer", "mode", "send", "scan"], "detail": "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone.", "checkedAt": null }
+    { "id": "mobile-chat-client", "ready": true, "operations": ["send", "history"], "detail": "Sends chat messages to the agent from the phone and reads the shared device threads.", "checkedAt": null },
+    { "id": "mobile-fleet-client", "ready": true, "operations": ["read", "answer", "mode", "send", "scan"], "detail": "Reads the coding-fleet supervisor, answers its questions, changes its mode, sends proposed nudges, and runs a scan from the phone.", "checkedAt": null },
+    { "id": "mobile-lifelog-client", "ready": true, "operations": ["read"], "detail": "Reads and searches retained G2 conversation moments from the phone.", "checkedAt": null }
   ]
 }
 ```
 
 These are the capabilities stored at enrollment. A phone paired before
-`mobile-fleet-client` existed keeps reporting three here until it re-pairs;
-the fleet routes in §3 are open to it either way, so do not gate the
-Supervisor tab on this list.
+`mobile-fleet-client` or `mobile-lifelog-client` existed keeps reporting the
+older list here until it re-pairs; the routes in §3 are open to it either
+way, so do not gate the Supervisor tab or Lifelog on this list.
 
 ## 9. Revocation
 

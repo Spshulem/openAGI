@@ -187,7 +187,9 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
     // synchronously on every foreground/background message.
     if (Array.isArray(persisted.messages) && persisted.messages.length > this.maxActiveMessages) {
       const archived = persisted.messages.slice(0, -this.retainedMessages);
-      const chunk = { sessionId: session.id, messages: archived };
+      // startIndex orders chunks for archivedMessages(); a replayed rotation
+      // computes the same value, so content addressing still de-duplicates.
+      const chunk = { sessionId: session.id, startIndex: persisted.metadata?.archivedMessageCount ?? 0, messages: archived };
       const hash = createHash("sha256").update(JSON.stringify(chunk)).digest("hex");
       const archive = path.join(this.archivesDir, `${safeFilename(session.id)}.history`, `${hash}.json`);
       // Archive first: a failed active write leaves the old history intact;
@@ -202,6 +204,32 @@ export class FileBackedAgentStore extends InMemoryAgentStore {
       throw Object.assign(new Error("Session history exceeds the safe size limit. Preserve an archive before repairing it."), { code: "SESSION_TOO_LARGE" });
     }
     writeTextAtomic(this.sessionPath(session.id), serialized);
+  }
+
+  // Messages rotated out of the active file by saveSession, oldest first.
+  // Chunks are content-addressed, so order them by startIndex (older chunks
+  // without one precede it, by first message time); a replayed rotation can
+  // overlap an earlier chunk, so ids are de-duplicated.
+  archivedMessages(sessionId) {
+    const dir = path.join(this.archivesDir, `${safeFilename(sessionId)}.history`);
+    const chunks = [];
+    for (const entry of readDirSafe(dir)) {
+      if (!entry.endsWith(".json")) continue;
+      const filePath = path.join(dir, entry);
+      this.assertSessionSize(filePath);
+      const chunk = readJsonFile(filePath, null);
+      if (chunk?.sessionId !== sessionId || !Array.isArray(chunk.messages) || !chunk.messages.length) continue;
+      chunks.push({ start: Number.isSafeInteger(chunk.startIndex) ? chunk.startIndex : -1, at: String(chunk.messages[0]?.createdAt ?? ""),
+        modified: fs.statSync(filePath).mtimeMs, messages: chunk.messages });
+    }
+    chunks.sort((a, b) => a.start - b.start || a.at.localeCompare(b.at) || a.modified - b.modified || b.messages.length - a.messages.length);
+    const seen = new Set(), result = [];
+    for (const message of chunks.flatMap(chunk => chunk.messages)) {
+      if (typeof message?.id === "string" && seen.has(message.id)) continue;
+      if (typeof message?.id === "string") seen.add(message.id);
+      result.push(message);
+    }
+    return result;
   }
 
   assertSessionSize(filePath) {
