@@ -208,11 +208,24 @@ public actor DaemonClient {
     // Throws before returning a stream if the request itself can't even be
     // sent (bad host, non-2xx status); streaming failures thereafter surface
     // through the returned stream's `AsyncThrowingStream` itself.
-    public func sendMessageStreaming(text: String) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+    //
+    // `thread` puts the turn in one of the owner's two shared device threads
+    // ("agent" or "supervisor"), the same conversation the G2 glasses and
+    // any other paired phone read and write. A main from before shared
+    // threads ignores the field and keys the conversation on `from` instead,
+    // which is why the Supervisor chat also sends `from`/`sessionId` as
+    // "mobile-supervisor": on an older main that still keeps it apart from
+    // Chat, and on a newer one the thread wins.
+    public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
+                                     from: String? = nil, sessionId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
         var request = try authorizedRequest(path: "/message", method: "POST")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["text": text])
+        var body: [String: Any] = ["text": text]
+        if let thread { body["thread"] = thread.rawValue }
+        if let from { body["from"] = from }
+        if let sessionId { body["sessionId"] = sessionId }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         // A chat turn can run a tool loop; the daemon sends a heartbeat
         // frame every 15s specifically so this doesn't need to be short.
         request.timeoutInterval = 120
@@ -251,6 +264,90 @@ public actor DaemonClient {
         }
     }
 
+    // `GET /conversations/:thread/messages` -- the shared thread's stored
+    // user/assistant turns, oldest first. A main from before shared threads
+    // answers 404 (`DaemonError.notFound`); callers keep their local cache
+    // and say the main needs updating.
+    public func conversationMessages(thread: ConversationThread, before: String? = nil, limit: Int = 50) async throws -> ConversationPage {
+        var items = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 100)))]
+        if let before { items.append(URLQueryItem(name: "before", value: before)) }
+        let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/messages", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(ConversationPage.self, from: data)
+    }
+
+    // MARK: - Lifelog
+
+    // `GET /lifelog/moments` -- what the owner's G2 glasses heard, newest
+    // first. `date` is a local calendar day ("2026-09-28"); `query` filters
+    // by words, person, or topic. 404 on a main from before this route.
+    public func lifelogMoments(date: String?, query: String?, limit: Int = 100) async throws -> [LifelogMoment] {
+        var items: [URLQueryItem] = []
+        if let date, !date.isEmpty { items.append(URLQueryItem(name: "date", value: date)) }
+        if let query = query?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty {
+            items.append(URLQueryItem(name: "query", value: query))
+        }
+        items.append(URLQueryItem(name: "limit", value: String(min(max(limit, 1), 100))))
+        let request = try authorizedRequest(path: "/lifelog/moments", method: "GET", queryItems: items)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(LifelogMomentsResponse.self, from: data).moments
+    }
+
+    // MARK: - Fleet supervisor (mobile/FEATURES.md's Supervisor tab)
+
+    // 503 always means "no supervisor on this daemon", as does a 404 on
+    // state/scan/mode; the Supervisor screen maps both. On a question or an
+    // action a 404 means that one item is gone and 409 that it was already
+    // closed elsewhere -- `.notFound` / `.conflict`, as everywhere else.
+    public func fleetState() async throws -> FleetState {
+        let request = try authorizedRequest(path: "/fleet/api/state", method: "GET")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetState.self, from: data)
+    }
+
+    // A scan can take up to ~100s. No body: the route reads none.
+    public func fleetScan() async throws -> FleetState {
+        var request = try authorizedRequest(path: "/fleet/api/scan", method: "POST")
+        request.timeoutInterval = 120
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetState.self, from: data)
+    }
+
+    public func fleetSetMode(_ mode: FleetMode) async throws -> FleetState {
+        var request = try authorizedRequest(path: "/fleet/api/mode", method: "POST")
+        request.httpBody = Data(#"{"mode":"\#(mode.rawValue)"}"#.utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetState.self, from: data)
+    }
+
+    // The answer must be one of the question's own options. Relaying it to
+    // the agent can take up to ~190s.
+    public func fleetAnswer(questionID: String, answer: String) async throws -> FleetMutationResult {
+        var request = try authorizedRequest(path: "/fleet/api/questions/\(questionID)", method: "POST")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["answer": answer])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
+    public func fleetDismiss(questionID: String) async throws -> FleetMutationResult {
+        var request = try authorizedRequest(path: "/fleet/api/questions/\(questionID)", method: "POST")
+        request.httpBody = Data(#"{"dismiss":true}"#.utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
+    // Propose mode only; the daemon answers 409 for anything not "proposed".
+    public func fleetSendAction(id: String) async throws -> FleetMutationResult {
+        var request = try authorizedRequest(path: "/fleet/api/actions/\(id)/send", method: "POST")
+        request.timeoutInterval = 200
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(FleetMutationResult.self, from: data)
+    }
+
     // `GET /events` -- the long-lived broadcast connection (mobile/PROTOCOL.md
     // §7). Reconnect-with-backoff is the caller's job (see
     // `EventStreamController`): this returns one connection's worth of
@@ -270,7 +367,7 @@ public actor DaemonClient {
                     for try await line in Self.lines(of: bytes) {
                         if Task.isCancelled { break }
                         if let event = parser.feed(line) {
-                            continuation.yield(DaemonEvent.from(name: event.name))
+                            continuation.yield(DaemonEvent.from(name: event.name, data: event.data))
                         }
                     }
                     continuation.finish()
