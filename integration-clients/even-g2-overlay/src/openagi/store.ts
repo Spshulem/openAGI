@@ -1,6 +1,11 @@
 import { z } from 'zod'
 import type { KeyValueStorage } from '../storage/recovery-store'
 
+export type HomeMode = 'talk' | 'lifelog' | 'supervisor'
+export type ConversationThread = 'agent' | 'supervisor'
+const ConsentSchema = z.object({ id: z.string().min(1).max(200), grantedAt: z.number().finite().nullable().default(null), until: z.number().finite().nullable().default(null) })
+export type SavedConsent = z.infer<typeof ConsentSchema>
+
 const StateSchema = z.object({
   version: z.literal(2),
   nodeId: z.string().uuid(),
@@ -9,20 +14,17 @@ const StateSchema = z.object({
   conversationId: z.string().uuid().nullable(),
   continuation: z.string().max(200).nullable().default(null),
   interfaceStyle: z.enum(['focused', 'classic']).default('focused'),
-  lifelogPaused: z.boolean().default(false),
   savedDraft: z.string().max(4000).default(''),
-  pendingRequest: z.object({ id: z.string().max(80), conversationId: z.string().uuid(), continuation: z.string().max(200).nullable(), text: z.string().max(4000).nullable(), origin: z.string().url() }).nullable().default(null),
-  ambientEnabled: z.boolean().default(false),
-  lifelogEnabled: z.boolean().default(false),
-  backgroundListening: z.boolean().default(false),
-  lifelogConsent: z.object({ id: z.string().min(1).max(200), until: z.number().finite() }).nullable().default(null),
-  listeningMode: z.enum(['passive', 'wake']).default('passive'),
-  idleTapAction: z.enum(['talk', 'highlight']).default('talk'),
-  // 'supervisor': the glasses home opens the fleet supervisor, not a new question.
-  homeMode: z.enum(['ask', 'supervisor']).default('ask'),
-  lifelogTalkMode: z.enum(['tap', 'hold']).default('tap'),
+  pendingRequest: z.object({ id: z.string().max(80), conversationId: z.string().uuid(), continuation: z.string().max(200).nullable(), text: z.string().max(4000).nullable(), origin: z.string().url(), thread: z.enum(['agent', 'supervisor']).nullable().default(null) }).nullable().default(null),
+  // The one home setting: Talk (mic off at home), Lifelog (always listening
+  // with consent) or Supervisor (fleet questions and status).
+  homeMode: z.enum(['talk', 'lifelog', 'supervisor']).default('talk'),
+  // The owner's standing recording consent, given once on the phone and kept
+  // until they uncheck it, delete memory, or unpair.
+  recordingConsent: z.boolean().default(false),
+  // Main's grant for that consent. Persistent; main revokes only on request.
+  lifelogConsent: ConsentSchema.nullable().default(null),
   wakePhrase: z.string().trim().min(1).max(40).default('open agi'),
-  answerQuestions: z.boolean().default(true),
   speechModel: z.enum(['openai-buffered', 'nova-3', 'nova-2']).default('openai-buffered'),
   speechTransport: z.enum(['relay', 'direct']).default('relay'),
   autoSend: z.boolean().default(true),
@@ -33,17 +35,26 @@ const StateSchema = z.object({
 export type OpenAGIState = z.infer<typeof StateSchema>
 const KEY = 'openagi.g2.state.v2'
 
-function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'ambientEnabled' | 'listeningMode' | 'idleTapAction' | 'homeMode' | 'lifelogTalkMode' | 'wakePhrase' | 'answerQuestions' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
+// Before 0.5 the home was 'ask' or 'supervisor' plus separate lifelog,
+// listening, tap and hold switches. Keep the mode the owner was using; an
+// active consented lifelog becomes the standing consent, and main's grant is
+// re-read on start rather than trusted from the old 4-hour record.
+export function migrateState(raw: unknown): unknown {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw
+  const old = raw as Record<string, unknown>
+  // Every 0.5 state is written with recordingConsent.
+  if (Object.hasOwn(old, 'recordingConsent')) return raw
+  const lifelog = old.lifelogEnabled === true
+  const homeMode = old.homeMode === 'supervisor' ? 'supervisor' : lifelog ? 'lifelog' : 'talk'
+  return { ...old, homeMode, recordingConsent: homeMode === 'lifelog' && Boolean(old.lifelogConsent), lifelogConsent: null }
+}
+
+function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'homeMode' | 'wakePhrase' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
   return {
     version: 2, nodeId, nodeToken: null, node: null, conversationId: null,
-    continuation: null, interfaceStyle: 'focused', lifelogPaused: false, savedDraft: '', pendingRequest: null,
-    lifelogEnabled: false, lifelogConsent: null, backgroundListening: false,
-    ambientEnabled: preferences?.ambientEnabled ?? false, wakePhrase: preferences?.wakePhrase ?? 'open agi',
-    listeningMode: preferences?.listeningMode ?? 'passive',
-    idleTapAction: preferences?.idleTapAction ?? 'talk',
-    homeMode: preferences?.homeMode ?? 'ask',
-    lifelogTalkMode: preferences?.lifelogTalkMode ?? 'tap',
-    answerQuestions: preferences?.answerQuestions ?? true,
+    continuation: null, interfaceStyle: 'focused', savedDraft: '', pendingRequest: null,
+    homeMode: preferences?.homeMode ?? 'talk', recordingConsent: false, lifelogConsent: null,
+    wakePhrase: preferences?.wakePhrase ?? 'open agi',
     speechModel: preferences?.speechModel ?? 'openai-buffered',
     speechTransport: preferences?.speechTransport ?? 'relay',
     autoSend: preferences?.autoSend ?? true,
@@ -58,7 +69,7 @@ export class OpenAGIStore {
   async load(): Promise<OpenAGIState> {
     const raw = await this.storage.get(KEY)
     if (!raw) return this.snapshot()
-    try { this.state = StateSchema.parse(JSON.parse(raw)) } catch { await this.clearCredential() }
+    try { this.state = StateSchema.parse(migrateState(JSON.parse(raw))) } catch { await this.clearCredential() }
     return this.snapshot()
   }
   snapshot(): OpenAGIState { return structuredClone(this.state) }
@@ -75,7 +86,7 @@ export class OpenAGIStore {
   private async persistUpdate(patch: Partial<Omit<OpenAGIState, 'version'>>): Promise<OpenAGIState> {
     const changedMain = patch.agentOrigin !== undefined && patch.agentOrigin !== this.state.agentOrigin
     const changedCredential = patch.nodeToken !== undefined && patch.nodeToken !== this.state.nodeToken
-    const next = StateSchema.parse({ ...this.state, ...patch, ...(changedMain || changedCredential ? { history: [], continuation: null, pendingRequest: null, savedDraft: '', lifelogEnabled: false, lifelogPaused: false, lifelogConsent: null, backgroundListening: false } : {}), version: 2 })
+    const next = StateSchema.parse({ ...this.state, ...patch, ...(changedMain || changedCredential ? { history: [], continuation: null, pendingRequest: null, savedDraft: '', lifelogConsent: null } : {}), version: 2 })
     await this.storage.set(KEY, JSON.stringify(next))
     this.state = next
     return this.snapshot()

@@ -1,14 +1,18 @@
 import { OsEventTypeList, type EvenAppBridge } from '@evenrealities/even_hub_sdk'
 import { eventTypeOf, type InputHandlers } from '../even/input-controller'
 
+const GESTURES = [OsEventTypeList.CLICK_EVENT, OsEventTypeList.DOUBLE_CLICK_EVENT, OsEventTypeList.SCROLL_TOP_EVENT,
+  OsEventTypeList.SCROLL_BOTTOM_EVENT, OsEventTypeList.LONG_PRESS_EVENT, OsEventTypeList.LONG_PRESS_RELEASE_EVENT]
+
 /** The app routes double-tap: native exit confirmation at root, Back elsewhere. */
 export class AgentsInputController {
   private unsubscribe: (() => void) | null = null
   private pendingTap: ReturnType<typeof setTimeout> | null = null
-  private heldSource: number | null = null
-  private holdTimer: ReturnType<typeof setTimeout> | null = null
   private suppressTapUntil = 0
-  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers & { foreground?(active: boolean): void; holdStart?(): void; holdRelease?(): void; holdCancel?(): void }) {}
+  private heldUntil = 0
+  // input(): any glasses gesture proves the app is on the glasses now, even if
+  // Even never delivered (or delivered late) its foreground-enter event.
+  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers & { foreground?(active: boolean): void; input?(): void }) {}
   start(): void {
     if (this.unsubscribe) return
     this.unsubscribe = this.bridge.onEvenHubEvent(event => {
@@ -16,28 +20,18 @@ export class AgentsInputController {
       if (types.includes(OsEventTypeList.SYSTEM_EXIT_EVENT) || types.includes(OsEventTypeList.ABNORMAL_EXIT_EVENT)) {
         this.stop(); this.handlers.systemExit(); return
       }
-      if (types.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) { this.clearTap(); this.clearHold(); this.handlers.foreground?.(false); return }
+      if (types.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) { this.clearTap(); this.heldUntil = 0; this.handlers.foreground?.(false); return }
       if (types.includes(OsEventTypeList.FOREGROUND_ENTER_EVENT)) { this.handlers.foreground?.(true); return }
-      const press = [event.sysEvent, event.textEvent].find(e => e?.eventType === OsEventTypeList.LONG_PRESS_EVENT)
-      const release = [event.sysEvent, event.textEvent].find(e => e?.eventType === OsEventTypeList.LONG_PRESS_RELEASE_EVENT)
-      if (press || release) {
-        this.clearTap(); this.suppressTapUntil = Date.now() + 500
-        // A ring or the other temple must not release a press it did not start.
-        const envelope = press ?? release
-        const source = envelope && 'eventSource' in envelope ? envelope.eventSource : undefined
-        if (typeof source !== 'number') return
-        if (press && this.heldSource === null) {
-          this.heldSource = source
-          this.holdTimer = setTimeout(() => { this.clearHold(); this.suppressTapUntil = Date.now() + 500; this.handlers.holdCancel?.() }, 31_000)
-          this.handlers.holdStart?.()
-        }
-        else if (release && this.heldSource === source) { this.clearHold(); this.handlers.holdRelease?.() }
-        return
+      if (types.some(type => type !== null && GESTURES.includes(type))) this.handlers.input?.()
+      // A press-and-hold acts like one tap (start or stop talking); its release
+      // and any trailing click from the same press are not a second tap.
+      // Repeated press events while still holding are the same press.
+      if (types.includes(OsEventTypeList.LONG_PRESS_EVENT)) {
+        this.clearTap()
+        if (Date.now() >= this.heldUntil && Date.now() >= this.suppressTapUntil) this.handlers.tap()
+        this.heldUntil = Date.now() + 31_000; this.suppressTapUntil = Date.now() + 500; return
       }
-      if (this.heldSource !== null) {
-        if (types.includes(OsEventTypeList.DOUBLE_CLICK_EVENT)) { this.clearHold(); this.suppressTapUntil = Date.now() + 500; this.handlers.holdCancel?.() }
-        return
-      }
+      if (types.includes(OsEventTypeList.LONG_PRESS_RELEASE_EVENT)) { this.clearTap(); this.heldUntil = 0; this.suppressTapUntil = Date.now() + 500; return }
       if (types.includes(OsEventTypeList.DOUBLE_CLICK_EVENT)) {
         this.clearTap(); this.handlers.doubleTap(); return
       }
@@ -49,6 +43,5 @@ export class AgentsInputController {
     })
   }
   private clearTap(): void { if (this.pendingTap !== null) clearTimeout(this.pendingTap); this.pendingTap = null }
-  private clearHold(): void { if (this.holdTimer !== null) clearTimeout(this.holdTimer); this.holdTimer = null; this.heldSource = null }
-  stop(): void { this.clearTap(); this.clearHold(); this.unsubscribe?.(); this.unsubscribe = null }
+  stop(): void { this.clearTap(); this.unsubscribe?.(); this.unsubscribe = null }
 }

@@ -43,7 +43,7 @@ it('auto-send uploads buffered audio once without a separate transcription reque
     expect(f.store.snapshot().autoSend).toBe(true)
     await f.app.finishAsk()
     expect(f.listen).not.toHaveBeenCalled()
-    expect(f.ask).toHaveBeenCalledWith(expect.any(Blob), expect.any(String), expect.any(Function), expect.any(AbortSignal))
+    expect(f.ask).toHaveBeenCalledWith(expect.any(Blob), expect.any(String), expect.any(Function), expect.any(AbortSignal), 'agent')
     expect(f.ask).toHaveBeenCalledOnce()
     await f.app.sendDraft(); expect(f.ask).toHaveBeenCalledOnce()
   } finally { await f.app.systemExit() }
@@ -121,13 +121,16 @@ it('ignores repeated taps and finish while the microphone open is pending', asyn
   await app.systemExit()
 })
 
-it('keeps the ambient preference and wake phrase on a microphone failure', async () => {
-  const { app, audio, store, set } = await fixture()
-  audio.start.mockRejectedValueOnce(new Error('microphone unavailable'))
-  await app.configureAmbient(true, 'Peri', false)
-  expect(store.snapshot().ambientEnabled).toBe(true)
-  expect(store.snapshot().wakePhrase).toBe('Peri')
-  expect(set).toHaveBeenLastCalledWith('Listening paused', expect.stringContaining('not recording'))
+it('shows why a tap was ignored while the microphone opens, and a failed open on the glasses', async () => {
+  const { app, audio, renderer } = await fixture()
+  const flash = vi.fn(); Object.assign(renderer, { flash })
+  let fail!: (error: Error) => void
+  audio.start.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { fail = reject }))
+  const opening = app.startAsk()
+  app.tap()
+  expect(flash).toHaveBeenCalledWith('Microphone opening', expect.any(String))
+  fail(new Error('The glasses microphone did not open within 8 seconds.')); await opening
+  expect(renderer.message).toHaveBeenLastCalledWith('Could not ask agent', expect.stringContaining('did not open'))
   await app.systemExit()
 })
 
@@ -187,7 +190,7 @@ it('transcribes a valid WAV on Stop but only sends the reviewed text on confirma
   expect(header.getUint16(34, true)).toBe(16)
   expect(header.getUint32(40, true)).toBe(32000)
   await app.sendDraft()
-  expect(ask).toHaveBeenCalledWith('Hello', expect.any(String), expect.any(Function), expect.any(AbortSignal))
+  expect(ask).toHaveBeenCalledWith('Hello', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'agent')
   await app.systemExit()
 })
 
@@ -206,9 +209,9 @@ it('keeps a draft in its original conversation until discarded or sent', async (
   const { app, ask, receive, store } = await fixture()
   const id = store.snapshot().conversationId
   await app.startAsk(); receive(new Uint8Array(32000)); await app.finishAsk()
-  await app.newConversation(); await app.configureAmbient(true, 'Peri', false)
+  await app.newConversation(); await app.configureHomeMode('lifelog')
   expect(store.snapshot().conversationId).toBe(id)
-  expect(store.snapshot().ambientEnabled).toBe(false)
+  expect(store.snapshot().homeMode).toBe('talk')
   await app.rerecordDraft(); receive(new Uint8Array(32000)); await app.finishAsk(); await app.sendDraft()
   expect(ask).toHaveBeenCalledOnce()
   await app.systemExit()

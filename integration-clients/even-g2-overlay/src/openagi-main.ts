@@ -34,12 +34,11 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     ask: () => { void app.startAsk() },
     configureInterface: style => { void app.configureInterface(style) },
     pauseLifelog: () => { void app.pauseLifelog() },
+    resumeLifelog: () => { void app.resumeLifelog() },
     resumeRequest: () => { void app.resumeRequest() },
     dismissRequest: () => { void app.dismissRequest() },
     readHistory: (continuation, offset, query) => { void app.readHistory(continuation, offset, query) },
     continueHistory: continuation => { void app.continueHistory(continuation) },
-    configureBackgroundListening: enabled => { void app.configureBackgroundListening(enabled) },
-    retryListening: () => { void app.retryListening() },
     configureSpeech: (model, transport) => { void app.configureSpeech(model, transport) },
     toggleDisplay: () => app.toggleDisplay(),
     newConversation: () => { void app.newConversation() },
@@ -52,25 +51,21 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     configureProactive: settings => { void app.proactive.configure(settings) },
     refreshInbox: () => { void app.proactive.refresh() },
     openInbox: () => app.openInbox(),
-    memoryConsent: (enabled, consent) => { void app.configureMemory(enabled, consent) },
-    returnToLifelog: consent => { void app.returnToLifelog(consent) },
-    configureListeningMode: mode => { void app.configureListeningMode(mode) },
+    recordingConsent: consent => { void app.configureRecordingConsent(consent) },
+    deleteMemory: () => { void app.deleteMemory() },
     readLifelog: (query, offset) => { void app.readLifelog(query, offset) },
     inboxAction: (op, id, extra) => { void app.proactive.action(op, id, extra) },
     markMoment: () => { void app.markMoment() },
-    configureIdleTap: action => { void app.configureIdleTap(action) },
     configureHomeMode: mode => { void app.configureHomeMode(mode) },
-    configureLifelogTalkMode: mode => { void app.configureLifelogTalkMode(mode) },
     previousPage: () => app.scrollUp(),
     nextPage: () => app.scrollDown(),
     recentAnswer: () => { void app.recentAnswer() },
     exit: () => { void app.requestExit() },
     unlink: () => { void app.unlink() },
     connectAgent: (origin, token) => { void app.connectAgent(origin, token) },
-    configureAmbient: (enabled, wakePhrase, answerQuestions) => { void app.configureAmbient(enabled, wakePhrase, answerQuestions) },
   }, config.allowedOrigins)
   app = new OpenAGIG2App(api, store, new SerializedAudioSource(bridge), renderer, phone, config.allowedOrigins)
-  const input = new AgentsInputController(bridge, { tap: () => app.tap(), holdStart: () => { void app.holdStart() }, holdRelease: () => { void app.holdRelease() }, holdCancel: () => { void app.cancelHold() }, scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), foreground: active => app.setForeground(active), systemExit: () => { void app.systemExit() } })
+  const input = new AgentsInputController(bridge, { input: () => app.glassesInput(), tap: () => app.tap(), scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), foreground: active => app.setForeground(active), systemExit: () => { void app.systemExit() } })
   input.start()
   try { await app.boot() }
   catch (error) { renderer.message('OpenAGI could not start', safeOpenAGIError(error)); phone.set('Startup failed', safeOpenAGIError(error)) }
