@@ -9,7 +9,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { NodeRegistry } from "../src/node-registry.js";
-import { InMemoryAgentStore } from "../src/agent-store.js";
+import { FileBackedAgentStore, InMemoryAgentStore } from "../src/agent-store.js";
 import { lifelogMoments, observeSharedThreads, sharedThreadHistory } from "../src/shared-conversations.js";
 
 const OWNER = "shared-owner-token";
@@ -266,6 +266,27 @@ test("observeSharedThreads ignores other sessions and unwraps cleanly", () => {
   store.appendMessage("devices:supervisor:main", { role: "user", content: "after" });
   assert.equal(seen.length, 1);
   assert.throws(() => sharedThreadHistory(store, "owner"), { status: 400 });
+});
+
+test("shared history pages back through messages the store has archived", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-shared-archive-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new FileBackedAgentStore({ dir, ensureDefault: false, maxActiveMessages: 4, retainedMessages: 2 });
+  for (let i = 0; i < 11; i++) store.appendMessage("devices:agent:main", { role: i % 2 ? "assistant" : "user", content: `m${i}` });
+  assert.equal(store.getSession("devices:agent:main").messages.length < 11, true);
+  const texts = [];
+  let page = sharedThreadHistory(store, "agent", { limit: 3 });
+  texts.unshift(...page.messages.map(m => m.text));
+  while (page.nextBefore) {
+    page = sharedThreadHistory(store, "agent", { before: page.nextBefore, limit: 3 });
+    texts.unshift(...page.messages.map(m => m.text));
+  }
+  assert.deepEqual(texts, Array.from({ length: 11 }, (_, i) => `m${i}`));
+  const all = sharedThreadHistory(store, "agent", { limit: 100 });
+  assert.equal(all.messages.length, 11);
+  assert.equal(all.nextBefore, null);
+  const oldest = sharedThreadHistory(store, "agent", { before: all.messages[1].id, limit: 5 });
+  assert.deepEqual(oldest.messages.map(m => m.text), ["m0"]);
 });
 
 function proactiveState(now) {

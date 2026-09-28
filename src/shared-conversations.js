@@ -39,13 +39,19 @@ export function sharedThreadHistory(store, thread, { before, limit } = {}) {
   if (!Number.isSafeInteger(size) || size < 1 || size > 100) throw fail("invalid_history", 400, "limit must be 1 to 100.");
   if (before !== undefined && before !== null && (typeof before !== "string" || !MESSAGE_ID.test(before)))
     throw fail("invalid_history", 400, "before must be a message id.");
-  const visible = store.getSession(sessionId).messages.filter(m => ["user", "assistant"].includes(m?.role)
-    && typeof m.content === "string" && typeof m.id === "string");
-  let end = visible.length;
-  if (before) {
-    end = visible.findIndex(m => m.id === before);
-    if (end < 0) throw fail("unknown_message", 404, "That message is no longer in this thread's history.");
+  const isVisible = m => ["user", "assistant"].includes(m?.role) && typeof m.content === "string" && typeof m.id === "string";
+  const session = store.getSession(sessionId);
+  let visible = session.messages.filter(isVisible);
+  let end = before ? visible.findIndex(m => m.id === before) : visible.length;
+  // Older turns rotate into the store's archive; read it only when this page
+  // reaches past the active tail, then page through it the same way.
+  if ((end < 0 || end - size <= 0) && session.metadata?.historyArchived === true && typeof store.archivedMessages === "function") {
+    const active = new Set(visible.map(m => m.id));
+    const archived = store.archivedMessages(sessionId).filter(m => isVisible(m) && !active.has(m.id));
+    visible = [...archived, ...visible];
+    end = before ? visible.findIndex(m => m.id === before) : visible.length;
   }
+  if (end < 0) throw fail("unknown_message", 404, "That message is no longer in this thread's history.");
   const start = Math.max(0, end - size);
   return { thread, messages: visible.slice(start, end).map(projectMessage), nextBefore: start > 0 ? visible[start].id : null };
 }
