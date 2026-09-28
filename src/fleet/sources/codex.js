@@ -22,7 +22,7 @@ const WRAPPER_TAGS = [
 const METADATA_EVENTS = new Set(["thread_settings_applied"]);
 const THREAD_COLUMNS = [
   "id", "rollout_path", "updated_at", "updated_at_ms", "source", "model_provider", "cwd", "title", "name",
-  "archived", "git_branch", "git_origin_url", "model", "thread_source"
+  "archived", "git_branch", "git_origin_url", "model", "thread_source", "originator"
 ];
 
 const LB_TARGET = "codex_core::responses_retry";
@@ -336,6 +336,8 @@ function buildThread(row, context) {
       model: row.model || null,
       provider: row.model_provider || null,
       threadSource: row.thread_source || null,
+      // "codex_sdk_ts" = started by Conductor's Codex agent, shown in Conductor.
+      originator: row.originator || null,
       file: row.rollout_path || null,
       turnStartedAt: null,
       abortReason: null,

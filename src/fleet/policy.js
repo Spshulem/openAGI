@@ -4,7 +4,7 @@
 // untrusted and may carry instructions, so it never goes into a message
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
-import { DEFAULTS, SUPERVISOR_PREFIX, clampText, msSince, redactSecrets, shortHash } from "./contracts.js";
+import { DEFAULTS, SUPERVISOR_PREFIX, clampText, msSince, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
 import { renderTemplate } from "./playbooks.js";
 
 const MIN = 60_000;
@@ -53,8 +53,18 @@ const TOPIC_TITLES = {
 // ---------------------------------------------------------------------------
 // Routes
 
-export function chooseRoute(thread, mode) {
+// delivery: { mode: "cli" | "computer-use" | "computer-use-first", ready,
+// detail } (a bare mode string also works). ready === false means the last
+// readiness probe failed; null/undefined means not probed, treated as ready.
+export function chooseRoute(thread, mode, delivery = null) {
   if (!thread || thread.archived) return null;
+  const ui = deliveryOf(delivery);
+  if (ui.mode !== "cli") {
+    // Typing into the app has no fork risk, so every mode may use it.
+    if (uiTargetFor(thread) && ui.ready !== false) return "computer-use";
+    // Computer-use only: never a CLI, whatever the thread offers.
+    if (ui.mode === "computer-use") return null;
+  }
   if (thread.kind === "codex") return thread.writerLocked || !thread.cwd ? null : "codex-exec";
   if (thread.live?.peerName && thread.live?.pid) return "peer-relay";
   // claude -p --resume behind Conductor's back forks the transcript and
@@ -64,13 +74,26 @@ export function chooseRoute(thread, mode) {
   return null;
 }
 
+function deliveryOf(delivery) {
+  if (typeof delivery === "string") return { mode: delivery, ready: null, detail: null };
+  return { mode: delivery?.mode ?? "cli", ready: delivery?.ready ?? null, detail: delivery?.detail ?? null };
+}
+
+// Computer-use-only mode with an app that could show the thread, but computer
+// use is not ready right now: wait for it instead of asking to open the thread.
+export function uiWaitReason(thread, delivery) {
+  const ui = deliveryOf(delivery);
+  if (ui.mode !== "computer-use" || ui.ready !== false || !uiTargetFor(thread)) return null;
+  return `computer use not ready${ui.detail ? `: ${ui.detail}` : ""}`;
+}
+
 // Null while the owner is talking to the manager, while it is mid-turn, or
 // while it is down. Callers check managerBusy first to wait instead of asking.
-function managerRoute(manager, mode, limits, now) {
+function managerRoute(manager, mode, limits, now, delivery = null) {
   if (!manager) return null;
   if (managerBusy(manager, limits, now)) return null;
   if (managerDown(manager, now)) return null;
-  return chooseRoute(manager, mode);
+  return chooseRoute(manager, mode, delivery);
 }
 
 function managerBusy(manager, limits, now) {
@@ -111,8 +134,9 @@ function makeContext(classified, thread, options) {
   const { ledger = null, playbooks = new Map(), config = null, now = Date.now(), pr = null, infra = null, manager = null, escalationLedger = null } = options;
   const mode = options.mode ?? config?.mode ?? "observe";
   const limits = limitsOf(config);
+  const delivery = options.delivery ?? config?.delivery ?? null;
   return {
-    classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger,
+    classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery,
     mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
     progressMark: classified.readiness?.progressMark ?? { head: null, unresolved: null },
@@ -334,8 +358,12 @@ function resolveNudge(ctx, intent, base) {
   const maxAttempts = playbook.maxAttempts ?? limits.maxNudgesWithoutProgress;
   const vars = { ...ctx.facts, attempts: String(attempts), ...(intent.vars ?? {}) };
   if (attempts >= maxAttempts) return stuckDecision(ctx, playbook, vars, attempts, decision);
-  const route = chooseRoute(thread, ctx.mode);
-  if (!route) return unreachableDecision(ctx, decision);
+  const route = chooseRoute(thread, ctx.mode, ctx.delivery);
+  if (!route) {
+    const waitUi = uiWaitReason(thread, ctx.delivery);
+    if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}` };
+    return unreachableDecision(ctx, decision);
+  }
   return { ...decision, action: "nudge", route, message: renderTemplate(playbook.body, vars) };
 }
 
@@ -377,7 +405,9 @@ function resolveEscalation(ctx, intent, base) {
   const busy = managerBusy(ctx.manager, limits, now);
   if (busy) return { ...decision, action: "wait", reason: `${busy.reason}; ${intent.reason}`, notBefore: busy.notBefore };
   const vars = { ...ctx.facts, ...intent.vars };
-  const route = managerRoute(ctx.manager, ctx.mode, limits, now);
+  const route = managerRoute(ctx.manager, ctx.mode, limits, now, ctx.delivery);
+  const waitUi = route ? null : uiWaitReason(ctx.manager, ctx.delivery);
+  if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}` };
   if (!route) {
     return {
       ...decision, action: "ask-user",
@@ -486,6 +516,7 @@ export function decideInfra(infra, options = {}) {
   const { ledger = {}, playbooks = new Map(), config = null, now = Date.now(), threads = [], manager = null, blockedKeys = null } = options;
   const mode = options.mode ?? config?.mode ?? "observe";
   const limits = limitsOf(config);
+  const delivery = options.delivery ?? config?.delivery ?? null;
   const mutedKeys = keySet(options.mutedKeys);
   const health = infraHealth(infra, { config, now });
   const decisions = [];
@@ -498,7 +529,7 @@ export function decideInfra(infra, options = {}) {
     // failed source) keep getting their resume until it was tried.
     if (state.up && (wasDown || remembered.size)) {
       if (wasDown) decisions.push(infraDecision(key, { reason: `${INFRA_NAMES[kind]} recovered` }));
-      decisions.push(...recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, remembered, mutedKeys }));
+      decisions.push(...recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, remembered, mutedKeys, delivery }));
       if (wasDown) continue;
     }
     if (!state.problems.length) continue;
@@ -508,7 +539,7 @@ export function decideInfra(infra, options = {}) {
       decisions.push(infraDecision(key, { action: "wait", reason: "BuildBot3 SSH failed once", blockers: state.problems }));
       continue;
     }
-    decisions.push(escalateInfra(kind, state.problems, { infra, ledger, playbooks, limits, now, manager, mode, threads }));
+    decisions.push(escalateInfra(kind, state.problems, { infra, ledger, playbooks, limits, now, manager, mode, threads, delivery }));
     const downSince = readLedger(ledger, "infraDownSince", kind);
     const downMs = msSince(downSince, now);
     if (state.down && downMs !== null && downMs >= LONG_DOWN_MS) {
@@ -522,7 +553,7 @@ export function decideInfra(infra, options = {}) {
   return decisions;
 }
 
-function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, manager, mode, threads }) {
+function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, manager, mode, threads, delivery = null }) {
   const key = `infra:${kind}`;
   const playbookId = kind === "bb3" ? "manager-bb3" : "manager-lb";
   const base = infraDecision(key, { playbook: playbookId, reason: problems.join("; "), blockers: problems, targetKey: manager?.key ?? null });
@@ -534,7 +565,9 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   const busy = managerBusy(manager, limits, now);
   if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
   const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
-  const route = managerRoute(manager, mode, limits, now);
+  const route = managerRoute(manager, mode, limits, now, delivery);
+  const waitUi = route ? null : uiWaitReason(manager, delivery);
+  if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}` };
   if (!route) {
     return {
       ...base, action: "ask-user",
@@ -559,7 +592,7 @@ function waitingLines(threads, limits) {
   return `${lines.slice(0, 4).join(" ")}${extra}`;
 }
 
-function recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, remembered = new Set(), mutedKeys = new Set() }) {
+function recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, remembered = new Set(), mutedKeys = new Set(), delivery = null }) {
   const out = [];
   for (const item of threads ?? []) {
     const thread = item?.thread;
@@ -568,7 +601,7 @@ function recoveryNudges(kind, { threads, playbooks, config, now, mode, infra, re
     if (!recoverable(kind, classified, remembered.has(thread.key))) continue;
     // A thread still inside a turn or a background wait will notice by itself.
     if (thread.agentStatus === "running" || thread.agentStatus === "waiting") continue;
-    const ctx = makeContext(classified, thread, { ledger: item.ledger, playbooks, config, now, pr: item.pr ?? null, mode, infra });
+    const ctx = makeContext(classified, thread, { ledger: item.ledger, playbooks, config, now, pr: item.pr ?? null, mode, infra, delivery });
     const decision = resolveIntent(ctx, nudge("infra-recovered", `${INFRA_NAMES[kind]} is up`, { immediate: true, vars: { what: INFRA_NAMES[kind] } }));
     if (decision.action !== "none") out.push(decision);
   }

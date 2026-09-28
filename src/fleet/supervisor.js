@@ -8,13 +8,14 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { MODES, clampTail, clampText, parsePrRef, resolveFleetConfig, runCommand } from "./contracts.js";
+import { MODES, clampTail, clampText, linkUiHosts, parsePrRef, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "./policy.js";
 import { FleetStore } from "./store.js";
+import { createUiDriver } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -184,6 +185,8 @@ export class FleetSupervisor {
     this.lastThreads = new Map();
     this.branchLookups = new Map();
     this.answering = new Set();
+    this._uiDriver = undefined;
+    this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
   }
 
   now() {
@@ -209,8 +212,56 @@ export class FleetSupervisor {
 
   get executor() {
     if (this.deps.executor) return this.deps.executor;
-    this._executor ??= createExecutor({ config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers });
+    this._executor ??= createExecutor({
+      config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers,
+      ui: this.uiDriver, knownThreads: () => [...this.lastThreads.values()]
+    });
     return this._executor;
+  }
+
+  // Types into Conductor / the Codex app. An injected executor (tests, the
+  // dry-run scan) gets none, so readiness is never probed for it.
+  get uiDriver() {
+    if (this._uiDriver !== undefined) return this._uiDriver;
+    if (this.deps.uiDriver !== undefined) this._uiDriver = this.deps.uiDriver;
+    else if (this.deps.executor) this._uiDriver = null;
+    else {
+      this._uiDriver = createUiDriver({
+        config: this.config,
+        run: this.deps.run ?? runCommand,
+        evidenceDir: path.join(this.store.dir, "logs", "ui"),
+        activeSessions: () => this.runtime?.computerUseLog?.listSessions?.({ status: "active" }) ?? [],
+        now: () => this.now()
+      });
+    }
+    return this._uiDriver;
+  }
+
+  // { mode, ready, detail }: ready is null when not probed (cli, or no driver).
+  async probeDelivery() {
+    const mode = this.config.delivery ?? "cli";
+    let state = { mode, ready: null, detail: null };
+    const driver = mode === "cli" ? null : this.uiDriver;
+    if (driver?.readiness) {
+      try {
+        const result = await withTimeout(Promise.resolve(driver.readiness()), SOURCE_TIMEOUT_MS, "computer-use readiness");
+        state = { mode, ready: result?.ready === true, detail: result?.ready === true ? null : clampText(result?.detail ?? "not ready", 160) };
+      } catch (error) {
+        state = { mode, ready: false, detail: clampText(`readiness check failed: ${error?.message ?? error}`, 160) };
+      }
+    }
+    this.lastDelivery = { ...state, checkedAt: new Date(this.now()).toISOString() };
+    return state;
+  }
+
+  // Why an answer or resume has no route, in the owner's words.
+  noRouteDetail(thread, delivery) {
+    if (!thread) return "thread not seen since restart: scan first";
+    if (delivery?.mode === "computer-use") {
+      if (!uiTargetFor(thread)) return "no app shows this thread (terminal session): open it to answer";
+      if (delivery.ready === false) return `computer use not ready: ${delivery.detail ?? "check Open Computer Use"}`;
+    }
+    return "no live route: open the thread to answer";
   }
 
   get notifier() {
@@ -274,7 +325,10 @@ export class FleetSupervisor {
         lookbackHours: this.config.lookbackHours,
         push: this.config.push ?? null,
         relayModel: this.config.relayModel,
-        managerRef: this.config.managerRef
+        managerRef: this.config.managerRef,
+        delivery: this.lastDelivery.mode,
+        deliveryReady: this.lastDelivery.ready,
+        deliveryDetail: this.lastDelivery.detail
       }
     };
   }
@@ -308,12 +362,13 @@ export class FleetSupervisor {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
     let sent = 0;
     let blocked = 0;
+    const deliveryState = await this.probeDelivery();
     for (const key of keys) {
       // Read the store each time: a background resume that failed meanwhile
       // took its key back out, so that thread is sent again.
       if (this.store.question(question.id)?.deliveredThreadKeys?.includes(key)) { sent += 1; continue; }
       const thread = this.lastThreads.get(key);
-      const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
+      const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
       if (!thread || !route) { blocked += 1; continue; }
       const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
@@ -347,9 +402,10 @@ export class FleetSupervisor {
       const retry = question.kind === "infra" && answer === "retry";
       if ((question.kind === "agent-ask" || retry) && question.threadKey && answer !== "open thread") {
         const thread = this.lastThreads.get(question.threadKey);
-        const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose") : null;
+        const deliveryState = thread ? await this.probeDelivery() : null;
+        const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
         if (!thread || !route) {
-          delivery = { status: "blocked", route: null, detail: thread ? "no live route: open the thread to answer" : "thread not seen since restart: scan first" };
+          delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
         } else {
           const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
           delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
@@ -461,7 +517,8 @@ export class FleetSupervisor {
       guard("lb", () => (d.checkLb ?? buildbot3.checkLb)(config, { fetchImpl: d.fetchImpl, now: started }), null)
     ]);
 
-    const threads = mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [] });
+    // Conductor-hosted Codex threads learn which Conductor session shows them.
+    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [] }));
     const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
     const inScope = threads
       .filter((thread) => !thread.excluded)
@@ -482,6 +539,8 @@ export class FleetSupervisor {
     const playbooks = this.playbooks();
     const store = this.store;
     const mutedKeys = store.mutedKeys();
+    // Computer-use readiness, once per tick; the driver re-checks at each send.
+    const delivery = await this.probeDelivery();
     const items = [];
     for (const thread of inScope) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
@@ -500,14 +559,14 @@ export class FleetSupervisor {
       if (mutedKeys.has(thread.key)) {
         decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
 
     const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
-    const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys });
+    const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
     const health = infraHealth(infra, { config, now: started });
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
     if (lb) store.setInfraDown("lb", health.lb.down);
@@ -527,7 +586,7 @@ export class FleetSupervisor {
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
-    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager });
+    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery });
     store.recordSnapshot(snapshot);
     this.lastTickAt = snapshot.at;
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
@@ -653,6 +712,9 @@ export class FleetSupervisor {
     let sends = 0;
     // Threads a send was tried for this tick, whatever the outcome.
     const attempted = new Set();
+    // One app thread can back two fleet threads (a Conductor session and the
+    // Codex thread it hosts): type into it at most once per tick.
+    const typedInto = new Set();
 
     const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
     for (const fields of groupQuestions(asks, byKey)) {
@@ -692,6 +754,9 @@ export class FleetSupervisor {
         continue;
       }
       if (sends >= config.limits.maxSendsPerTick) continue;
+      const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
+      if (uiKey && typedInto.has(uiKey)) continue;
+      if (uiKey) typedInto.add(uiKey);
       sends += 1;
       attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
@@ -719,7 +784,7 @@ export class FleetSupervisor {
     return attempted;
   }
 
-  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager }) {
+  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null }) {
     const byState = {};
     const decisionFor = effectiveDecisions(decisions);
     const rows = items.map(({ thread, classified, pr }) => {
@@ -744,7 +809,7 @@ export class FleetSupervisor {
         lastAgentText: clampTail(thread.lastAgentText, 600),
         error: thread.error ? { kind: thread.error.kind, resetAt: thread.error.resetAt ?? null } : null,
         live: Boolean(thread.live),
-        route: chooseRoute(thread, mode),
+        route: chooseRoute(thread, mode, delivery),
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null } : null
       };
     });

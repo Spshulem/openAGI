@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { resolveFleetConfig } from "../src/fleet/contracts.js";
+import { resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
 import { findManagerSession, listConductorThreads } from "../src/fleet/sources/conductor.js";
 
 const NOW = Date.parse("2026-09-26T08:00:00.000Z");
@@ -323,4 +323,35 @@ test("a live peer on a permission prompt is waiting on the owner", async (t) => 
   assert.equal(threads["s-run"].meta.waitingFor, "permission prompt");
   assert.equal(threads["s-idle"].agentStatus, "idle");
   assert.equal(threads["s-idle"].meta.blockedOnOwner, false);
+});
+
+test("sessions carry the workspace id, tab title, and tab count the app deep link and UI check need", async (t) => {
+  const home = makeHome(t);
+  seed(home);
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  const run = threads["s-run"];
+  assert.equal(run.meta.conductorWorkspaceId, "w-madrid");
+  assert.equal(run.meta.conductorSessionId, "s-run");
+  assert.equal(run.meta.conductorSessionTitle, "Fix uploads");
+  // s-self shares the workspace; s-hidden is hidden and does not count.
+  assert.equal(run.meta.conductorWorkspaceSessions, 2);
+  assert.equal(run.meta.conductorTitleShared, false);
+  assert.equal(threads["s-wait"].meta.conductorSessionTitle, null, "Untitled is no title");
+  assert.equal(threads["s-idle"].meta.conductorWorkspaceSessions, 4);
+  assert.equal(threads["mgr-1"].meta.conductorWorkspaceSessions, 1);
+  const target = uiTargetFor(run);
+  assert.equal(target.deepLink, "conductor://workspace?id=w-madrid&session=s-run");
+  assert.equal(target.title, "Fix uploads");
+  assert.equal(target.sessionCount, 2);
+});
+
+test("two tabs with one title in a workspace are flagged as shared", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  db.prepare("UPDATE sessions SET title = 'Cairo work' WHERE id = 's-err'").run();
+  db.close();
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-idle"].meta.conductorTitleShared, true);
+  assert.equal(threads["s-abort"].meta.conductorTitleShared, false);
 });

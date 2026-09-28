@@ -6,6 +6,7 @@ import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { MESSAGE_PREFIX, buildRelayPrompt, createExecutor, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-"));
@@ -402,4 +403,147 @@ test("claude-resume re-reads live peers at send time and never forks a live sess
   const idle = createExecutor({ config, run, store, readLivePeers: () => new Map() });
   assert.equal((await idle.deliver({ thread: claudeThread(cwd), message: `${MESSAGE_PREFIX}continue`, route: "claude-resume" })).status, "sent");
   await idle.whenIdle();
+});
+
+// --- computer-use route (a fake UI driver; nothing touches a real app) -------
+
+const conductorUiThread = (cwd, extra = {}) => ({
+  key: "conductor:s1", kind: "conductor", id: "s1", title: "Fix billing", workspace: "madrid", cwd, archived: false, writerLocked: false,
+  live: null, agentStatus: "idle",
+  meta: { conductorWorkspaceId: "w-madrid", conductorSessionId: "s1", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 1 },
+  ...extra
+});
+
+function uiSetup(t, { results = [], delivery = "computer-use", hold = false, knownThreads = () => [] } = {}) {
+  const base = setup(t);
+  const config = { ...base.config, delivery };
+  const requests = [];
+  const releases = [];
+  let running = 0;
+  let maxRunning = 0;
+  const ui = {
+    async deliver(request) {
+      requests.push(request);
+      running += 1;
+      maxRunning = Math.max(maxRunning, running);
+      try {
+        if (hold) await new Promise((resolve) => releases.push(resolve));
+        return { status: "sent", detail: "typed into Conductor", evidence: ["/tmp/fa-before.png", "/tmp/fa-after.png"], ...(results.shift() ?? {}) };
+      } finally {
+        running -= 1;
+      }
+    }
+  };
+  // A private lock per test, so tests never wait on each other.
+  const executor = createExecutor({ config, run: base.run, store: base.store, logDir: path.join(base.home, "fleet", "logs"), ui, knownThreads, uiLock: createUiLock() });
+  return { ...base, config, executor, requests, releases, get maxRunning() { return maxRunning; } };
+}
+
+test("computer-use types through the UI driver: one line, no CLI, final result, evidence journaled", async (t) => {
+  const { cwd, calls, store, executor, requests } = uiSetup(t);
+  const result = await executor.deliver({ thread: conductorUiThread(cwd), message: "Ready to merge?\nCI red: lint.\n\nFix it.", route: "computer-use", playbook: "merge-ready" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "computer-use");
+  assert.equal(result.done, undefined, "a UI send is final: no background child");
+  assert.equal(calls.length, 0, "never runs codex or claude");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].text, `${MESSAGE_PREFIX}Ready to merge? CI red: lint. Fix it.`);
+  assert.equal(requests[0].target.deepLink, "conductor://workspace?id=w-madrid&session=s1");
+  assert.deepEqual(requests[0].identity.tokens, ["madrid"]);
+  assert.equal(requests[0].previousUnconfirmed, false);
+  const action = store.action(result.actionId);
+  assert.equal(action.status, "sent");
+  assert.equal(action.route, "computer-use");
+  assert.deepEqual(action.evidence, ["/tmp/fa-before.png", "/tmp/fa-after.png"]);
+  assert.deepEqual(executor.inFlight(), []);
+});
+
+test("computer-use: a desktop-held Codex writer lock does not block; a running turn and app-less threads do", async (t) => {
+  const { cwd, executor, requests } = uiSetup(t);
+  const codex = codexThread(cwd, { title: "Fix uploads", writerLocked: true, agentStatus: "idle" });
+  assert.equal((await executor.deliver({ thread: codex, message: "continue", route: "computer-use" })).status, "sent");
+  assert.equal(requests[0].target.deepLink, "codex://threads/t1");
+  const running = await executor.deliver({ thread: { ...codex, agentStatus: "running" }, message: "continue", route: "computer-use" });
+  assert.equal(running.status, "blocked");
+  assert.match(running.detail, /turn running/);
+  const terminal = await executor.deliver({ thread: claudeThread(cwd, { live: { peerName: "cli-1", pid: 9 } }), message: "continue", route: "computer-use" });
+  assert.equal(terminal.status, "blocked");
+  assert.match(terminal.detail, /no app shows this thread/);
+  const prompt = await executor.deliver({ thread: conductorUiThread(cwd, { meta: { ...conductorUiThread(cwd).meta, blockedOnOwner: true } }), message: "continue", route: "computer-use" });
+  assert.equal(prompt.status, "blocked");
+  assert.equal(requests.length, 1);
+});
+
+test("computer-use-only config refuses every CLI route, even from an older proposal", async (t) => {
+  const { cwd, calls, executor } = uiSetup(t);
+  for (const [thread, route] of [[codexThread(cwd), "codex-exec"], [claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 1 } }), "peer-relay"], [claudeThread(cwd), "claude-resume"]]) {
+    const result = await executor.deliver({ thread, message: "continue", route });
+    assert.equal(result.status, "blocked");
+    assert.match(result.detail, /computer-use delivery only/);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("computer-use maps blocked and failed results; an unconfirmed send is flagged on the retry", async (t) => {
+  const { cwd, store, executor, requests } = uiSetup(t, {
+    results: [
+      { status: "blocked", detail: "owner using Conductor", evidence: undefined },
+      { status: "failed", detail: "unconfirmed: may have been sent; check the thread before retrying", unconfirmed: true },
+      { status: "sent", detail: "already in thread (the earlier unconfirmed send landed)" }
+    ]
+  });
+  const thread = conductorUiThread(cwd);
+  const blocked = await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.detail, "owner using Conductor");
+  assert.equal(blocked.actionId, null, "nothing typed: not journaled as an action");
+  const failed = await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.unconfirmed, true);
+  assert.equal(store.action(failed.actionId).unconfirmed, true);
+  const retried = await executor.deliver({ thread, message: "continue", route: "computer-use" });
+  assert.equal(requests[2].previousUnconfirmed, true);
+  assert.equal(retried.status, "sent");
+  // A different message is not the unconfirmed one.
+  await executor.deliver({ thread, message: "something else", route: "computer-use" });
+  assert.equal(requests[3].previousUnconfirmed, false);
+});
+
+test("computer-use runs one app delivery at a time and one per app thread", async (t) => {
+  const { cwd, executor, releases, requests } = uiSetup(t, { hold: true });
+  const a = executor.deliver({ thread: conductorUiThread(cwd), message: "one", route: "computer-use" });
+  const b = executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "two", route: "computer-use" });
+  // The Codex thread Conductor hosts reaches the same Conductor tab.
+  const hosted = codexThread(cwd, { key: "codex:t9", id: "t9", meta: { originator: "codex_sdk_ts", conductorHost: { workspaceId: "w-madrid", sessionId: "s1", workspace: "madrid", title: "Fix billing", sessionCount: 1 } } });
+  const twin = await executor.deliver({ thread: hosted, message: "three", route: "computer-use" });
+  assert.equal(twin.status, "blocked");
+  assert.match(twin.detail, /in flight/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1, "the second waits for the UI lock");
+  releases.shift()();
+  assert.equal((await a).status, "sent");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  releases.shift()();
+  assert.equal((await b).status, "sent");
+});
+
+test("computer-use dry run describes the step without touching the UI; a missing driver blocks", async (t) => {
+  const { cwd, executor, requests } = uiSetup(t);
+  const dry = await executor.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use", dryRun: true });
+  assert.equal(dry.status, "dry-run");
+  assert.equal(dry.detail, "would type into Conductor: madrid");
+  assert.equal(requests.length, 0);
+  const base = setup(t);
+  const bare = createExecutor({ config: { ...base.config, delivery: "computer-use" }, run: base.run, store: base.store, uiLock: createUiLock() });
+  const none = await bare.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use" });
+  assert.equal(none.status, "blocked");
+  assert.match(none.detail, /computer use unavailable/);
+});
+
+test("computer-use passes every known thread so shared titles block as ambiguous", async (t) => {
+  const twin = codexThread("/x", { key: "codex:t2", id: "t2", title: "Fix uploads" });
+  const { cwd, executor, requests } = uiSetup(t, { knownThreads: () => [twin] });
+  await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use" });
+  assert.equal(requests[0].identity.ambiguous, true);
 });
