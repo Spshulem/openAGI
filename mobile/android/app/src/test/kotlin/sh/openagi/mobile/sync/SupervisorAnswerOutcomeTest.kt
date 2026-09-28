@@ -44,4 +44,12 @@ class SupervisorAnswerOutcomeTest {
         assertEquals(AnswerOutcome.Retry, answerOutcome(IllegalStateException("boom"), attempt = 0))
         assertEquals(AnswerOutcome.Failed, answerOutcome(DaemonException.Server(500), attempt = 2))
     }
+
+    @Test
+    fun aSuccessfulPostWhoseDeliveryWentNowhereIsUndelivered() {
+        assertEquals(AnswerOutcome.Done, answerOutcome(null, attempt = 0, deliveryStatus = "sent"))
+        assertEquals(AnswerOutcome.Done, answerOutcome(null, attempt = 0, deliveryStatus = null))
+        assertEquals(AnswerOutcome.Undelivered, answerOutcome(null, attempt = 0, deliveryStatus = "blocked"))
+        assertEquals(AnswerOutcome.Undelivered, answerOutcome(null, attempt = 0, deliveryStatus = "failed"))
+    }
 }

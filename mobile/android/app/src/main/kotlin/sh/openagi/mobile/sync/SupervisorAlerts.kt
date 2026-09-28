@@ -28,6 +28,9 @@ object SupervisorAlerts {
     private const val TEXT_MAX = 220
     private const val MAX_ACTIONS = 3
     private const val DISMISS = "dismiss"
+    // "open thread" asks the owner to open the agent's own app; posting it as
+    // an answer delivers nothing. Tapping the notification opens Supervisor.
+    private val NON_ACTIONS = listOf(DISMISS, "open thread")
     private const val FALLBACK_TITLE = "Needs you"
 
     // Every open question is posted once. "notified" is what stops a second
@@ -61,7 +64,7 @@ object SupervisorAlerts {
     // screen and the dashboard apply. Android shows at most three actions.
     fun actionOptions(q: FleetQuestion): List<String> =
         q.options
-            .filter { it.isNotBlank() && !it.trim().equals(DISMISS, ignoreCase = true) }
+            .filter { it.isNotBlank() && NON_ACTIONS.none { skip -> it.trim().equals(skip, ignoreCase = true) } }
             .distinct()
             .take(MAX_ACTIONS)
 

@@ -141,4 +141,10 @@ class SupervisorAlertsTest {
         assertTrue(text.endsWith("…"))
         assertTrue(!Character.isHighSurrogate(text[text.length - 2]))
     }
+
+    @Test
+    fun openThreadIsNeverAnAnswerButton() {
+        val q = FleetQuestion(id = "q1", options = listOf("yes", "open thread", "Dismiss"))
+        assertEquals(listOf("yes"), SupervisorAlerts.actionOptions(q))
+    }
 }

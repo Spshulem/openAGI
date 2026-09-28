@@ -116,7 +116,16 @@ class SupervisorAlertService : Service() {
 
     private suspend fun watchFleet(credentials: Credentials) = coroutineScope {
         val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
-        val coalescer = CheckCoalescer(DEBOUNCE_MILLIS) { checkSupervisorAlerts(applicationContext, client) }
+        val coalescer = CheckCoalescer(DEBOUNCE_MILLIS) {
+            when (checkSupervisorAlerts(applicationContext, client)) {
+                // No supervisor on this daemon, or it refused the phone: an
+                // SSE stream kept open forever would only spend battery. The
+                // 15-minute worker keeps checking; the next app open restarts
+                // this service.
+                AlertCheckResult.NoSupervisor, AlertCheckResult.Unauthorized -> stopSelf()
+                else -> Unit
+            }
+        }
         launch { coalescer.run() }
         // One check on start, then a slow poll: a stream that looks attached
         // but has silently stopped delivering must not hide a question for

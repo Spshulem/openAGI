@@ -19,9 +19,10 @@ import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import java.util.concurrent.TimeUnit
 
-enum class AnswerOutcome { Done, Retry, Failed }
+enum class AnswerOutcome { Done, Undelivered, Retry, Failed }
 
 private const val MAX_ANSWER_ATTEMPTS = 3
+private val DELIVERED = setOf("sent", "dry-run", "done")
 
 // The whole retry policy, pure so it is pinned on the JVM. `attempt` is
 // WorkManager's runAttemptCount: 0 on the first run.
@@ -32,8 +33,14 @@ private const val MAX_ANSWER_ATTEMPTS = 3
 // there is nothing left to send. A refused credential will not start working
 // on a retry. Everything else (offline, a timeout mid-relay, a daemon
 // restarting) gets three attempts in all.
-fun answerOutcome(error: Throwable?, attempt: Int): AnswerOutcome = when (error) {
-    null, is DaemonException.NotFound, is DaemonException.Conflict -> AnswerOutcome.Done
+//
+// A 200 can still mean the answer went nowhere: the daemon keeps the question
+// open when its delivery to the agent was blocked or failed (routes.js returns
+// {question, delivery}). That is Undelivered, never Done, or the ping would
+// clear and then come straight back as a new one.
+fun answerOutcome(error: Throwable?, attempt: Int, deliveryStatus: String? = null): AnswerOutcome = when (error) {
+    null -> if (deliveryStatus == null || deliveryStatus in DELIVERED) AnswerOutcome.Done else AnswerOutcome.Undelivered
+    is DaemonException.NotFound, is DaemonException.Conflict -> AnswerOutcome.Done
     is DaemonException.Unauthorized -> AnswerOutcome.Failed
     else -> if (attempt + 1 < MAX_ANSWER_ATTEMPTS) AnswerOutcome.Retry else AnswerOutcome.Failed
 }
@@ -52,8 +59,12 @@ class SupervisorAnswerWorker(context: Context, params: WorkerParameters) : Corou
             return Result.success()
         }
         val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
+        var deliveryStatus: String? = null
+        var deliveryDetail: String? = null
         val error = try {
-            if (answer == DISMISS) client.fleetDismiss(questionId) else client.fleetAnswer(questionId, answer)
+            val result = if (answer == DISMISS) client.fleetDismiss(questionId) else client.fleetAnswer(questionId, answer)
+            deliveryStatus = result.delivery?.status
+            deliveryDetail = result.delivery?.detail
             null
         } catch (cancellation: CancellationException) {
             // Stopped by the system (quota, constraints): WorkManager runs it
@@ -62,13 +73,24 @@ class SupervisorAnswerWorker(context: Context, params: WorkerParameters) : Corou
         } catch (failure: Exception) {
             failure
         }
-        return when (answerOutcome(error, runAttemptCount)) {
+        return when (answerOutcome(error, runAttemptCount, deliveryStatus)) {
             AnswerOutcome.Done -> {
-                SupervisorNotifier.cancel(applicationContext, questionId)
-                // Forgotten rather than kept: the daemon reopens a question
-                // under the same id when a background relay never reached the
-                // agent, and that reopen must ping again.
-                store.remove(questionId)
+                // Under the alert lock, so a check already holding an older
+                // "still open" answer cannot post this question again.
+                withAlertLock {
+                    SupervisorNotifier.cancel(applicationContext, questionId)
+                    // Forgotten rather than kept: the daemon reopens a question
+                    // under the same id when a background relay never reached the
+                    // agent, and that reopen must ping again.
+                    store.remove(questionId)
+                }
+                Result.success()
+            }
+            AnswerOutcome.Undelivered -> {
+                // Still open on the daemon; the id stays in the store so the
+                // next check does not re-post it as new.
+                val why = deliveryDetail?.trim()?.takeIf { it.isNotEmpty() } ?: "The agent could not be reached"
+                SupervisorNotifier.showFailed(applicationContext, questionId, "Not sent: $why")
                 Result.success()
             }
             AnswerOutcome.Retry -> Result.retry()

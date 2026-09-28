@@ -188,7 +188,13 @@ object SupervisorNotifier {
         question.createdAt?.let { builder.setWhen(it.toEpochMilli()).setShowWhen(true) }
         SupervisorAlerts.actionOptions(question).forEachIndexed { index, option ->
             val label = SupervisorAlerts.cap(option.trim(), ACTION_LABEL_MAX)
-            builder.addAction(0, label, answerIntent(context, question.id, option, index))
+            // A button tap relays text to a live coding agent, so it must not
+            // work from a locked phone showing full notification content.
+            builder.addAction(
+                NotificationCompat.Action.Builder(0, label, answerIntent(context, question.id, option, index))
+                    .setAuthenticationRequired(true)
+                    .build(),
+            )
         }
         return builder.build()
     }

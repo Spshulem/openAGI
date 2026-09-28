@@ -58,6 +58,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
+import java.net.SocketTimeoutException
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import sh.openagi.mobile.protocol.FleetAction
@@ -67,6 +72,11 @@ import sh.openagi.mobile.protocol.FleetQuestion
 import sh.openagi.mobile.protocol.FleetState
 import sh.openagi.mobile.protocol.FleetThread
 import sh.openagi.mobile.store.Credentials
+import sh.openagi.mobile.store.NotifiedQuestionsStore
+import sh.openagi.mobile.sync.AnswerOutcome
+import sh.openagi.mobile.sync.SupervisorNotifier
+import sh.openagi.mobile.sync.answerOutcome
+import sh.openagi.mobile.sync.withAlertLock
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.ui.components.ConnectionState
@@ -74,16 +84,11 @@ import sh.openagi.mobile.ui.components.EmptyState
 import sh.openagi.mobile.ui.components.PrimaryButton
 import sh.openagi.mobile.ui.components.RowGroup
 import sh.openagi.mobile.ui.components.ScreenHeader
+import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
 import sh.openagi.mobile.ui.theme.OpenAGIType
-import sh.openagi.mobile.ui.markdown.MarkdownView
 import sh.openagi.mobile.util.ErrorCopy
 import sh.openagi.mobile.util.RelativeTime
-import java.net.SocketTimeoutException
-import java.time.Instant
-import java.time.LocalDate
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
 
 // FEATURES.md's "Supervisor": the fleet supervisor's view of every coding
 // thread, read from /fleet/api/state. What needs a person comes first (its
@@ -207,6 +212,14 @@ fun SupervisorScreen(
                     SupervisorFormat.deliveryNote(result.delivery, "Answered.")
                 }
                 questionNote = question.id to note
+                // Answered here: clear its ping, unless the daemon kept it open
+                // because nothing was delivered.
+                if (answer == null || answerOutcome(null, 0, result.delivery?.status) == AnswerOutcome.Done) {
+                    withAlertLock {
+                        SupervisorNotifier.cancel(context, question.id)
+                        NotifiedQuestionsStore(context.filesDir).remove(question.id)
+                    }
+                }
                 result.state?.let { accept(order.next(), it) } ?: refresh()
             } catch (error: DaemonException) {
                 questionNote = question.id to failureNote(error, credentials.server)

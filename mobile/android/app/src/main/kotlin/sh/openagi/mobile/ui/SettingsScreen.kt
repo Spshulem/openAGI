@@ -117,11 +117,24 @@ fun SettingsScreen(
             )
 
             RowGroup {
+                // Blocked notifications mean no pings whatever the pref says, so
+                // the switch shows off and a tap goes to the system page.
+                val permitted = SupervisorAlertService.notificationsPermitted(context)
                 SwitchRow(
                     label = "Live supervisor alerts",
-                    help = "Pings you when an agent needs you. Keeps a quiet notification while on.",
-                    checked = liveAlerts,
+                    help = if (permitted) {
+                        "Pings you when an agent needs you. Keeps a quiet notification while on."
+                    } else {
+                        "Notifications are blocked. Tap to allow them."
+                    },
+                    checked = liveAlerts && permitted,
                     onCheckedChange = { on ->
+                        if (!permitted) {
+                            liveAlerts = true
+                            AlertPrefs.setLiveAlertsEnabled(context, true)
+                            openNotificationSettings(context)
+                            return@SwitchRow
+                        }
                         liveAlerts = on
                         AlertPrefs.setLiveAlertsEnabled(context, on)
                         if (on) {
