@@ -1167,8 +1167,10 @@ test("owner answers are typed into the app; blocked ones stay open with the reas
   await notReady.supervisor.tick();
   const waiting = notReady.supervisor.getState().questions.find((q) => q.kind === "agent-ask");
   const held = await notReady.supervisor.answerQuestion(waiting.id, "Starter");
-  assert.equal(held.question.status, "open");
-  assert.match(held.delivery.detail, /computer use not ready: Codex is not running/);
+  // The owner decided; only the typing waits, so the answer is kept.
+  assert.equal(held.question.status, "answered");
+  assert.equal(held.delivery.status, "queued");
+  assert.match(held.delivery.detail, /^Saved\. .*computer use not ready: Codex is not running/);
   assert.equal(notReady.delivered.length, 0);
 
   const terminal = makeThread({ key: "claude:c1", kind: "claude", id: "c1", live: { peerName: "cli-1", pid: 9, status: "idle" }, meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
@@ -2149,4 +2151,228 @@ test("more than 50 unreachable threads split into several stored groups", () => 
   const asks = keys.map((key) => ({ threadKey: key, action: "ask-user", playbook: "resume", reason: "can't deliver: could not verify thread.", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x", body: "y", options: ["done", "skip"] } }));
   const groups = groupQuestions(asks, byKey);
   assert.deepEqual(groups.map((g) => [g.dedupeKey, g.threadKeys.length]), [["deliver:group", 50], ["deliver:group:2", 10]]);
+});
+
+test("an answer kept while the Mac could not type is sent once it can, and leaves every list at once", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge despite behavior changes?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  const result = await supervisor.answerQuestion(q.id, "yes");
+  assert.equal(result.delivery.status, "queued");
+  assert.equal(supervisor.getState().questions.some((x) => x.id === q.id), false, "off the owner's list");
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0, "still cannot type");
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  const sent = delivered.filter((d) => d.playbook === "owner-answer");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].message, "Owner answer: yes. Continue with that.");
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "sent");
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("a kept answer the owner overtook in the thread is dropped, not sent", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let lastUserAt = ago(120 * MIN);
+  const asking = () => makeThread({ writerLocked: true, lastUserAt, lastUserText: "no, wait for Nikhil", meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [asking()] } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  lastUserAt = new Date(now + MIN).toISOString();
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0);
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "superseded");
+});
+
+test("a kept answer is never sent once the agent no longer asks that question", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let asking = true;
+  const thread = () => makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: asking ? { text: "Merge despite behavior changes?", options: ["yes", "no"] } : null } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [thread()] } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  asking = false;
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0, "no stale yes");
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "superseded");
+});
+
+test("a kept answer that cannot be sent within a day goes back to the owner", async (t) => {
+  let now = NOW;
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  for (let hour = 0; hour < 25; hour += 1) { now += 60 * MIN; await supervisor.tick(); }
+  assert.equal(supervisor.store.question(q.id).status, "open");
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "dropped");
+  assert.equal(supervisor.store.openQuestions().filter((x) => x.dedupeKey === q.dedupeKey).length, 1);
+});
+
+test("only a typing wait keeps an answer: a CLI fallback that fails leaves the question open", async (t) => {
+  const asking = makeThread({ meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }), appRunning: async () => true };
+  const { supervisor } = fixture(t, {
+    mode: "auto", delivery: "computer-use-first", threads: [asking],
+    deps: { uiDriver: driver, executor: { deliver: async (args) => ({ status: "failed", route: args.route, detail: "exit 1: out of credits", actionId: null }), inFlight: () => [], whenIdle: async () => {} } }
+  });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  const result = await supervisor.answerQuestion(q.id, "yes");
+  assert.equal(result.question.status, "open");
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("a kept answer sent by a background CLI child settles only when it reached the agent", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let reached = null;
+  const asking = makeThread({ meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const deliveries = [];
+  const { supervisor } = fixture(t, {
+    mode: "auto", delivery: "computer-use", threads: [asking], now: () => now,
+    deps: { uiDriver: driver, executor: { deliver: async (args) => { deliveries.push(args); return { status: "sent", route: args.route, detail: "started", actionId: null, done: new Promise((resolve) => { reached = resolve; }) }; }, inFlight: () => [], whenIdle: async () => {} } }
+  });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  const answers = () => deliveries.filter((d) => d.playbook === "owner-answer").length;
+  assert.equal(answers(), 1);
+  assert.equal(supervisor.store.queuedAnswers().length, 1, "kept until the child reports");
+  reached(false);
+  await new Promise((resolve) => setImmediate(resolve));
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(answers(), 2, "the child failed: sent again");
+  reached(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "sent");
+});
+
+test("a thread that just got a kept answer gets no automatic nudge the same tick, and pending answers are never pruned", async (t) => {
+  let now = NOW;
+  let ready = false;
+  // Asks and has a PR that would also get a merge-ready nudge.
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  for (let i = 0; i < 260; i += 1) supervisor.store.upsertQuestion({ dedupeKey: `junk:${i}`, kind: "infra", title: `t${i}`, options: ["ok"] }) && supervisor.store.dismissQuestion(supervisor.store.openQuestions().find((x) => x.dedupeKey === `junk:${i}`).id);
+  assert.ok(supervisor.store.question(q.id)?.pendingDelivery, "kept through pruning");
+  ready = true;
+  now += 5 * MIN;
+  const before = delivered.length;
+  await supervisor.tick();
+  const sent = delivered.slice(before).filter((d) => d.thread.key === "codex:t1");
+  assert.deepEqual(sent.map((d) => d.playbook), ["owner-answer"]);
+});
+
+test("a kept retry after a login or disk fix is sent even though that blocker is no longer asked", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let fixed = false;
+  const thread = () => makeThread({ writerLocked: true, agentStatus: fixed ? "idle" : "error", error: fixed ? null : { kind: "disk-full", resetAt: null }, meta: { originator: "Codex Desktop" } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "observe", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [thread()] } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "infra", dedupeKey: "infra:disk:codex:t1", threadKey: "codex:t1", title: "Disk full. Retry?", options: ["retry", "later"] });
+  const result = await supervisor.answerQuestion(q.id, "retry");
+  assert.equal(result.delivery.status, "queued");
+  fixed = true;
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 1);
+});
+
+test("a kept answer past its day goes back to the owner even while its source cannot be read", async (t) => {
+  let now = NOW;
+  let codexFails = false;
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => { if (codexFails) throw new Error("database is locked"); return [asking]; } } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  codexFails = true;
+  now += 25 * 60 * MIN;
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "dropped");
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("kept answers share the tick's send cap; the rest wait for the next tick", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const threads = Array.from({ length: DEFAULTS.maxSendsPerTick + 2 }, (_, i) => makeThread({ key: `codex:k${i}`, id: `k${i}`, cwd: `/work/k${i}`, writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: `Merge ${i}?`, options: ["yes", "no"] } } }));
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads, now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  for (const q of supervisor.getState().questions.filter((x) => x.kind === "agent-ask")) await supervisor.answerQuestion(q.id, "yes");
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.length, DEFAULTS.maxSendsPerTick);
+  assert.equal(supervisor.store.queuedAnswers().length, 2);
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("a kept retry the agent overtook (it spoke since) is dropped, not sent", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let lastAgentAt = ago(60 * MIN);
+  const thread = () => makeThread({ writerLocked: true, lastAgentAt, meta: { originator: "Codex Desktop" } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "observe", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [thread()] } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "infra", dedupeKey: "infra:login:codex:t1", threadKey: "codex:t1", title: "Logged out. Retry?", options: ["retry", "later"] });
+  await supervisor.answerQuestion(q.id, "retry");
+  lastAgentAt = new Date(now + MIN).toISOString();
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0);
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "superseded");
+});
+
+test("an answer is only reported saved if it was stored", async (t) => {
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  let supervisorRef = null;
+  let questionId = null;
+  // The question closes while the answer is being handled (a tick resolved it).
+  const driver = { readiness: async () => { if (questionId) supervisorRef.store.resolveQuestion(questionId, "condition gone"); return { ready: false, detail: "screen locked" }; } };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], deps: { uiDriver: driver } });
+  supervisorRef = supervisor;
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  questionId = q.id;
+  const result = await supervisor.answerQuestion(q.id, "yes");
+  assert.notEqual(result.delivery.status, "queued");
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
 });

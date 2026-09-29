@@ -327,15 +327,51 @@ export class FleetStore {
     return this._closeQuestion(id, "dismissed", null);
   }
 
+  // The owner answered, but the answer could not be typed yet: the question
+  // is answered (off the owner's list) and its message waits to be sent.
+  queueAnswer(id, answer, message) {
+    const text = clampText(answer, this.limits.bodyMax);
+    if (!text) return null;
+    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampText(message, this.limits.bodyMax), since: iso(this.now()) } });
+  }
+
+  queuedAnswers() {
+    return this.state.questions.filter((q) => q.status === "answered" && q.pendingDelivery).map((q) => ({ ...q }));
+  }
+
+  // A background send of a kept answer is in flight (at), or failed (null).
+  markQueuedSending(id, at = iso(this.now())) {
+    const question = this._findQuestion(id);
+    if (!question?.pendingDelivery) return null;
+    if (at) question.pendingDelivery.sendingAt = at;
+    else delete question.pendingDelivery.sendingAt;
+    this._save();
+    return { ...question };
+  }
+
+  // sent, superseded (the owner typed in the thread since, or the agent no
+  // longer asks it), or dropped.
+  settleQueuedAnswer(id, outcome) {
+    const question = this._findQuestion(id);
+    if (!question?.pendingDelivery) return null;
+    delete question.pendingDelivery;
+    question.deliveredAnswer = outcome;
+    question.updatedAt = iso(this.now());
+    this._save();
+    return { ...question };
+  }
+
   // A background send that never reached the agent puts the owner's answer
   // back in front of them instead of suppressing the question for a day,
   // and a retry sends to those threads again. A different, later answer
   // from the owner is not undone.
-  reopenQuestion(id, undeliveredKeys = [], { answer = null } = {}) {
+  reopenQuestion(id, undeliveredKeys = [], { answer = null, asked = false } = {}) {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
     if (question.status === "answered" && (answer === null || question.answer === answer)) {
       Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()) });
+      // Put back as a fresh ask, so it does not expire on the next read.
+      if (asked) Object.assign(question, { lastAskedAt: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
     }
     if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));
     this._save();
@@ -680,7 +716,8 @@ export class FleetStore {
 
   _pruneQuestions() {
     // Least recently asked first, so a close still holding back an ask stays.
-    const closed = this.state.questions.filter((q) => q.status !== "open").sort((a, b) => lastAskMs(a) - lastAskMs(b));
+    // An answer still waiting to be typed is the only copy: never pruned.
+    const closed = this.state.questions.filter((q) => q.status !== "open" && !q.pendingDelivery).sort((a, b) => lastAskMs(a) - lastAskMs(b));
     if (closed.length <= CLOSED_QUESTIONS_KEPT) return;
     const drop = new Set(closed.slice(0, closed.length - CLOSED_QUESTIONS_KEPT));
     this.state.questions = this.state.questions.filter((q) => !drop.has(q));
