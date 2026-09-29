@@ -504,6 +504,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {{reviewedHead: boolean|null, sha: string|null}} codexReview
  * @property {{required: boolean|null, freshOnHead: boolean|null, sha: string|null}} qa
  * @property {string|null} updatedAt
+ * @property {string|null} mergedAt
+ * @property {string|null} closedAt
  */
 
 /**

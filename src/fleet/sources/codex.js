@@ -171,8 +171,11 @@ function readResponseItem(summary, payload, at) {
     setAgent(summary, contentText(payload.content, ["output_text"]), at);
   } else if (payload.type === "function_call") {
     const name = String(payload.name ?? "");
-    if (name === "request_user_input_async") summary.pendingQuestion = questionTitle(payload.arguments, summary.lastAgent?.text) ?? summary.pendingQuestion;
-    else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
+    if (name === "request_user_input_async") {
+      // The ask time lets a PR merged after it close the question.
+      const asked = questionTitle(payload.arguments, summary.lastAgent?.text);
+      if (asked) summary.pendingQuestion = { ...asked, at };
+    } else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
   } else if (payload.type === "custom_tool_call" && String(payload.input ?? "").includes("attach_artifact")) {
     addAttachRefs(summary, payload.input, at);
   }
@@ -293,7 +296,7 @@ function applyRollout(thread, row, context) {
   // A stand-in from the agent's message ends on the ask, so keep its tail.
   const clampAsk = pending?.sealed ? clampTail : clampText;
   thread.meta.pendingQuestion = pending
-    ? { text: clampAsk(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)) }
+    ? { text: clampAsk(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pending.at ?? null }
     : null;
   // A Codex heartbeat automation already drives this thread; nudging it too
   // would double up.
@@ -304,18 +307,20 @@ function applyRollout(thread, row, context) {
   return summary.prRefs;
 }
 
-// An attachment whose head is the thread's branch comes first, then other
-// attachments (unknown head before a different head), then links the owner
-// typed. Newest first within a tier; same-second ties go to the higher PR.
+// The newest attachment is the thread's PR: a long thread moves on from the
+// PR its catalog branch names (#5442 merged, the ask was about #6453). Links
+// the owner typed come after every attachment. Same-second ties: own branch,
+// then unknown head, then a different head, then the higher PR.
 function refTier(entry, branch) {
-  if (entry.source !== "attachment") return 3;
   if (!entry.headBranch || !branch) return 1;
   return entry.headBranch === branch ? 0 : 2;
 }
 
 function orderPrRefs(entries, branch) {
-  const ranked = entries.map((entry) => ({ ...entry, tier: refTier(entry, branch), number: parsePrRef(entry.ref)?.number ?? 0 }));
-  ranked.sort((a, b) => a.tier - b.tier || b.at - a.at || b.number - a.number || a.ref.localeCompare(b.ref));
+  const ranked = entries.map((entry) => ({
+    ...entry, owner: entry.source === "attachment" ? 0 : 1, tier: refTier(entry, branch), number: parsePrRef(entry.ref)?.number ?? 0
+  }));
+  ranked.sort((a, b) => a.owner - b.owner || b.at - a.at || a.tier - b.tier || b.number - a.number || a.ref.localeCompare(b.ref));
   return [...new Set(ranked.map((entry) => entry.ref))];
 }
 

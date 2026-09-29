@@ -218,7 +218,7 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // click. A nudge cannot clear it.
   if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
   // Codex request_user_input: the real question is structured, not in the text.
-  if (thread.meta?.pendingQuestion) {
+  if (thread.meta?.pendingQuestion && !prSettledAfter(pr, structuredAskAt(thread))) {
     const pending = thread.meta.pendingQuestion;
     return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"] } });
   }
@@ -240,7 +240,7 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
     });
   }
 
-  const ask = detectAsk(text);
+  const ask = prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? "")) ? null : detectAsk(text);
   if (ask?.kind === "needs-human") return result("needs-human", `agent asks: ${ask.topic}`, { ask });
   if (ask?.kind === "in-scope") return result("asked-in-scope", "agent asked to do an in-scope step", { ask });
 
@@ -250,6 +250,24 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   }
   if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`);
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR");
+}
+
+// A PR merged or closed after the agent asked has answered the ask. An ask
+// made after that ("merged; QA it on staging?") stands, and so does one
+// whose time is unknown.
+function prSettledAfter(pr, askMs) {
+  if (!pr || !PR_DONE.has(pr.state) || !Number.isFinite(askMs)) return false;
+  const doneAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+  return Number.isFinite(doneAt) && doneAt > askMs;
+}
+
+// The agent's later words may repeat the structured ask, so the later time
+// counts. A question with no time of its own is never settled.
+function structuredAskAt(thread) {
+  const askedAt = Date.parse(thread.meta?.pendingQuestion?.at ?? "");
+  if (!Number.isFinite(askedAt)) return NaN;
+  const agentAt = Date.parse(thread.lastAgentAt ?? "");
+  return Number.isFinite(agentAt) ? Math.max(askedAt, agentAt) : askedAt;
 }
 
 function exclusionReason(thread, { pr, localGit, config }) {

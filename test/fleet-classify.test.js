@@ -222,6 +222,37 @@ test("classifyThread: PR states after the thread goes idle", () => {
   assert.equal(classify(makeThread({ prRefs: [] }), { pr: null }).state, "idle-no-pr");
 });
 
+test("classifyThread: a PR merged or closed after the ask settles it; an ask made after stands", () => {
+  const merged = (at) => makePr({ state: "MERGED", mergedAt: at, closedAt: at });
+  const ask = (at, text = "Want me to cut the production release?") => makeThread({ lastAgentText: text, lastAgentAt: at });
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: merged(ago(10 * MIN)) }).state, "done");
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ state: "CLOSED", mergedAt: null, closedAt: ago(10 * MIN) }) }).state, "done");
+  // An in-scope ask on a merged PR gets no auto-yes either.
+  assert.equal(classify(ask(ago(30 * MIN), "Should I push the fix?"), { pr: merged(ago(10 * MIN)) }).state, "done");
+  // unified-experience #6914: "merged; cut a staging release and QA it?" came after the merge.
+  const after = classify(ask(ago(10 * MIN), "PR #6914 is merged. Should I cut a staging release and QA it there?"), { pr: merged(ago(30 * MIN)) });
+  assert.equal(after.state, "needs-human");
+  // Unknown ask or merge time: keep asking.
+  assert.equal(classify(ask(null), { pr: merged(ago(10 * MIN)) }).state, "needs-human");
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ state: "MERGED" }) }).state, "needs-human");
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ mergedAt: null, closedAt: null }) }).state, "needs-human");
+});
+
+test("classifyThread: a structured Codex ask is settled by a later merge, not an earlier one", () => {
+  const merged = makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) });
+  const structured = (at, lastAgentAt, text = "Checked the build. Start a huddle and send a screenshot?") => makeThread({
+    lastAgentText: text, lastAgentAt, meta: { pendingQuestion: { text: "Start a solo huddle?", options: ["open thread"], at } }
+  });
+  // bb-recorder #282: asked, repeated in the final message, then merged hours later.
+  assert.equal(classify(structured(ago(40 * MIN), ago(30 * MIN)), { pr: merged }).state, "done");
+  // The agent's last words came after the merge: they may repeat the ask.
+  assert.equal(classify(structured(ago(40 * MIN), ago(5 * MIN)), { pr: merged }).ask?.structured, true);
+  assert.equal(classify(structured(ago(5 * MIN), ago(5 * MIN)), { pr: merged }).ask?.structured, true);
+  // No ask time of its own: never settled.
+  const untimed = makeThread({ lastAgentText: "asked", lastAgentAt: ago(30 * MIN), meta: { pendingQuestion: "Which billing plan?" } });
+  assert.equal(classify(untimed, { pr: merged }).ask?.structured, true);
+});
+
 test("exported pattern lists match the owner's real phrases", () => {
   const any = (list, text) => list.some((entry) => (entry.pattern ?? entry).test(text));
   assert.ok(any(WAITING_PATTERNS, "hosted CI is pending with one watcher running"));

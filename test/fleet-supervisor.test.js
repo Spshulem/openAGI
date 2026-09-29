@@ -1227,3 +1227,27 @@ test("a question stays open when its thread was only pushed out by the scan cap"
   await supervisor.tick();
   assert.equal(supervisor.store.question(question.id).status, "open");
 });
+
+test("an open agent question closes itself once its PR merges after the ask, and stays for an ask made after the merge", async (t) => {
+  const resolved = [];
+  const pending = { text: "Start a solo huddle and send a screenshot?", options: ["open thread"], at: ago(60 * MIN) };
+  const asker = makeThread({ lastAgentText: "Start a solo huddle and send a screenshot?", lastAgentAt: ago(55 * MIN), meta: { pendingQuestion: pending } });
+  const prs = new Map([["acme/app#7", makePr()]]);
+  const { supervisor } = fixture(t, { threads: [asker], prs });
+  supervisor.runtime = { outreach: { resolve: (id, decision, opts) => resolved.push([id, decision, opts.status]) } };
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.equal(question?.threadKey, "codex:t1");
+  supervisor.store.markQuestionNotified(question.id, { outreachId: "out_1" });
+  prs.set("acme/app#7", makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) }));
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions, []);
+  assert.deepEqual(resolved, [["out_1", "resolved", "dismissed"]]);
+
+  // Asked after the merge: a QA offer on the merged PR is still the owner's call.
+  const qa = makeThread({ key: "codex:t2", id: "t2", cwd: "/work/t2", lastAgentText: "PR #7 is merged. Should I cut a staging release and QA it there?", lastAgentAt: ago(5 * MIN) });
+  const later = fixture(t, { threads: [qa], prs: new Map([["acme/app#7", makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) })]]) });
+  await later.supervisor.tick();
+  await later.supervisor.tick();
+  assert.deepEqual(later.supervisor.getState().questions.map((q) => q.threadKey), ["codex:t2"]);
+});

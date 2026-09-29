@@ -310,7 +310,7 @@ test("listCodexThreads reports unknown when the rollout file is gone", async (t)
 test("parseRolloutTail tracks a pending structured question until the owner replies", () => {
   const text = (rows) => rows.map((row) => JSON.stringify(row)).join("\n");
   const pending = parseRolloutTail(text([ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")]));
-  assert.deepEqual(pending.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"] });
+  assert.deepEqual(pending.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"], at: iso(9 * MIN) });
   const answered = parseRolloutTail(text([
     ev.ask("Reuse the branch?", 9 * MIN),
     ev.user("<send_user_message_question_reply> [{\"answer\":\"Reuse the branch (recommended)\"}]", 5 * MIN)
@@ -327,8 +327,8 @@ test("listCodexThreads keeps a structured question's text and options", async (t
   addThread(ctx, { id: "t-ask", lines: [ev.started("q", 10 * MIN), ask, ev.complete("q", 8 * MIN, "asked")] });
   addThread(ctx, { id: "t-free", lines: [ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")] });
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
-  assert.deepEqual(map["t-ask"].meta.pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] });
-  assert.deepEqual(map["t-free"].meta.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"] });
+  assert.deepEqual(map["t-ask"].meta.pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"], at: iso(9 * MIN) });
+  assert.deepEqual(map["t-free"].meta.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"], at: iso(9 * MIN) });
 });
 
 test("cleanCodexUserText strips Codex Desktop wrappers", () => {
@@ -398,7 +398,7 @@ function attach(ctx, threadId, number, { at, headBranch = null, repo = "buildbet
       JSON.stringify({ url: `https://github.com/${repo}/pull/${number}`, root: null, headBranch }), at);
 }
 
-test("listCodexThreads ranks the thread's own attached PR first and owner links last", async (t) => {
+test("listCodexThreads ranks the newest attached PR first and owner links last", async (t) => {
   const ctx = makeHome(t);
   const idle = (turn) => [ev.started(turn, 30 * MIN), ev.complete(turn, 25 * MIN, "ok")];
   addThread(ctx, { id: "t-own", branch: "feature/jiminny-import-guardrails", lines: [
@@ -414,18 +414,42 @@ test("listCodexThreads ranks the thread's own attached PR first and owner links 
   addThread(ctx, { id: "t-tie", lines: idle("t1") });
   for (const number of [4811, 6237, 6453]) attach(ctx, "t-tie", number, { at: sec(100 * MIN) });
 
+  // Same second: the thread's own branch, then an unknown head, then another head.
+  addThread(ctx, { id: "t-same", branch: "feature/own", lines: idle("s1") });
+  attach(ctx, "t-same", 7003, { at: sec(100 * MIN), headBranch: "feature/other" });
+  attach(ctx, "t-same", 7002, { at: sec(100 * MIN) });
+  attach(ctx, "t-same", 7001, { at: sec(100 * MIN), headBranch: "feature/own" });
+
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
   assert.deepEqual(map["t-own"].prRefs, [
-    "buildbetter-app/buildbetter#6630",
-    "buildbetter-app/buildbetter#6200",
     "buildbetter-app/buildbetter#6100",
+    "buildbetter-app/buildbetter#6200",
+    "buildbetter-app/buildbetter#6630",
     "buildbetter-app/buildbetter#6376"
-  ], "own-branch attachment, unknown-head attachment, other-branch attachment, owner link; no browser-context URL");
+  ], "newest attachment first whatever its head; owner link last; no browser-context URL");
   assert.deepEqual(map["t-tie"].prRefs, [
     "buildbetter-app/buildbetter#6453",
     "buildbetter-app/buildbetter#6237",
     "buildbetter-app/buildbetter#4811"
   ]);
+  assert.deepEqual(map["t-same"].prRefs, [
+    "buildbetter-app/buildbetter#7001",
+    "buildbetter-app/buildbetter#7002",
+    "buildbetter-app/buildbetter#7003"
+  ]);
+});
+
+test("a thread that moved past its branch's merged PR is about the newest attachment (#5442 -> #6453)", async (t) => {
+  const ctx = makeHome(t);
+  addThread(ctx, { id: "t-moved", branch: "feature/interactive-reports-consolidation", lines: [
+    ev.started("m1", 30 * MIN), ev.ask("Set the credit price?", 26 * MIN), ev.complete("m1", 25 * MIN, "asked")
+  ] });
+  attach(ctx, "t-moved", 5442, { at: sec(14 * 24 * 60 * MIN), headBranch: "feature/interactive-reports-consolidation" });
+  attach(ctx, "t-moved", 6625, { at: sec(12 * 24 * 60 * MIN) });
+  for (const number of [4811, 6237, 6453]) attach(ctx, "t-moved", number, { at: sec(10 * 24 * 60 * MIN) });
+  const [thread] = await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) });
+  assert.equal(thread.prRefs[0], "buildbetter-app/buildbetter#6453");
+  assert.equal(thread.prRefs.at(-1), "buildbetter-app/buildbetter#5442");
 });
 
 test("listCodexThreads dates activity from the last turn row, not settings writes", async (t) => {
@@ -484,7 +508,7 @@ test("listCodexThreads exposes when an aborted turn was stopped", async (t) => {
 test("structured questions preserve string and labeled options", () => {
   for (const options of [["Starter", "Business annual (recommended)"], [{ label: "Starter", description: "Basic" }, { label: "Business annual (recommended)" }]]) {
     const row = { type: "response_item", payload: { type: "function_call", name: "request_user_input_async", arguments: JSON.stringify({ questions: [{ title: "Which plan?", options }] }) } };
-    assert.deepEqual(parseRolloutTail(JSON.stringify(row)).pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] });
+    assert.deepEqual(parseRolloutTail(JSON.stringify(row)).pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"], at: null });
   }
 });
 
