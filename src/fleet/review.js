@@ -352,8 +352,10 @@ function capCloses(entries, settled) {
 // contextFor(question) -> reviewContext(...). runModel({ system, prompt,
 // schema }) -> the structured output. Returns one verdict per question sent:
 // { id, decision, category, reason, title?, options?, duplicateOf?, deferred? }.
+// ownerNotes: the owner's own notes about this workspace (their private
+// SKILL.md), trusted, unlike anything copied from a transcript.
 // Throws when the model fails, so the caller can fail open.
-export async function reviewQuestions({ questions, others = [], contextFor = null, runModel, now = Date.now() } = {}) {
+export async function reviewQuestions({ questions, others = [], contextFor = null, runModel, now = Date.now(), ownerNotes = "" } = {}) {
   if (typeof runModel !== "function") throw new TypeError("reviewQuestions needs runModel");
   const list = (Array.isArray(questions) ? questions : []).filter((question) => question?.id);
   const entries = [];
@@ -379,7 +381,9 @@ export async function reviewQuestions({ questions, others = [], contextFor = nul
     "</questions>",
     ...(briefs.length ? ["<other_open>", dataJson(briefs.map(briefEntry)), "</other_open>"] : [])
   ].join("\n");
-  const output = await runModel({ system: REVIEW_SYSTEM_PROMPT, prompt, schema: REVIEW_SCHEMA });
+  const notes = String(ownerNotes ?? "").trim();
+  const system = notes ? `${REVIEW_SYSTEM_PROMPT}\n\nThe owner's notes about this workspace (written by the owner; follow them):\n${notes}` : REVIEW_SYSTEM_PROMPT;
+  const output = await runModel({ system, prompt, schema: REVIEW_SCHEMA });
   const reviews = Array.isArray(output?.reviews) ? output.reviews : null;
   if (!reviews) throw new Error("review returned no verdicts");
   const byId = new Map(entries.map((entry) => [entry.id, entry]));

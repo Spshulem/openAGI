@@ -87,8 +87,34 @@ Override one without a code change: copy it to
 `~/.openagi/skills/fleet-supervisor/playbooks/`) and edit. Same `id` wins.
 
 Ids: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`,
-`bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`.
-Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max attempts).
+`bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `account-switched`.
+Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max attempts),
+`restart_apps` (`account-switched` only: `conductor` and/or `codex`).
+
+## Your workspace, kept out of this repo
+
+Anything specific to your machine belongs in `~/.openagi/skills/fleet-supervisor/`,
+not in this public repo. The supervisor reads two things there:
+
+- `playbooks/<id>.md`: your copies of the playbooks above.
+- `SKILL.md`: notes about your setup, in plain words. The self-review reads
+  them as your instructions (the first 4,000 characters).
+
+After you answer **added** on a "threads capped" question, the supervisor sends
+`account-switched` to each capped thread. If your copy sets `restart_apps`, it first
+restarts that app in the background, since some apps only pick up a new account at
+launch. It won't restart while you are using the app or while another chat there is
+running, and it restarts at most once every 10 minutes. Example:
+
+```markdown
+---
+id: account-switched
+restart_apps: conductor
+---
+retry
+```
+
+To keep these files in version control, make `~/.openagi/skills` its own private git repo.
 
 ## Safety limits
 

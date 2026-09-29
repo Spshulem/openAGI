@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks, parsePlaybookText, renderTemplate } from "../src/fleet/playbooks.js";
+import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, parsePlaybookText, renderTemplate, userPlaybooksDir } from "../src/fleet/playbooks.js";
 import { SkillRegistry } from "../src/skills.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -41,7 +41,7 @@ test("parsePlaybookText reads flat frontmatter and body", () => {
     ""
   ].join("\n"), "fallback");
   assert.deepEqual(playbook, {
-    id: "merge-ready", body: "Ready to merge? {blockers}", cooldownMin: 12, maxAttempts: 3, ask: "#{pr} stuck. {blocker}. Help?"
+    id: "merge-ready", body: "Ready to merge? {blockers}", cooldownMin: 12, maxAttempts: 3, ask: "#{pr} stuck. {blocker}. Help?", restartApps: []
   });
   const bare = parsePlaybookText("Just a body.", "plain");
   assert.equal(bare.id, "plain");
@@ -107,4 +107,28 @@ test("fleet-supervisor SKILL.md loads through the skill registry and stays short
   }
   // Playbook files are templates, not skills of their own.
   assert.equal(registry.skills.has("merge-ready"), false);
+});
+
+test("restart_apps names only apps the fleet drives; the bundled account-switched restarts none", () => {
+  const parsed = parsePlaybookText("---\nid: account-switched\nrestart_apps: Conductor, codex, finder\n---\nretry");
+  assert.deepEqual(parsed.restartApps, ["conductor", "codex"]);
+  assert.equal(parsed.body, "retry");
+  const bundled = loadPlaybooks({ bundledDir: BUNDLED_PLAYBOOKS_DIR }).get("account-switched");
+  assert.deepEqual(bundled.restartApps, []);
+  assert.match(bundled.body, /added account capacity/);
+});
+
+test("the owner's private skill dir overrides playbooks and gives the review its notes", (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-owner-skill-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  assert.equal(loadOwnerNotes(dataDir), "");
+  fs.mkdirSync(userPlaybooksDir(dataDir), { recursive: true });
+  fs.writeFileSync(path.join(userPlaybooksDir(dataDir), "account-switched.md"), "---\nid: account-switched\nrestart_apps: conductor\n---\nretry\n");
+  fs.writeFileSync(path.join(dataDir, "skills", "fleet-supervisor", "SKILL.md"), "---\nname: my workspace\n---\n# Notes\nConductor needs a restart after an account switch.\n" + "x".repeat(9000));
+  const playbooks = loadPlaybooks({ bundledDir: BUNDLED_PLAYBOOKS_DIR, userDir: userPlaybooksDir(dataDir) });
+  assert.deepEqual(playbooks.get("account-switched").restartApps, ["conductor"]);
+  const notes = loadOwnerNotes(dataDir);
+  assert.match(notes, /^# Notes\nConductor needs a restart/);
+  assert.equal(notes.includes("name: my workspace"), false, "frontmatter dropped");
+  assert.equal(notes.length, 4000);
 });
