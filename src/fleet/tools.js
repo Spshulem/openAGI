@@ -11,6 +11,14 @@ const SOURCE = "integration:fleet-supervisor";
 const TOOL_NAMES = ["fleet_status", "fleet_thread", "fleet_scan", "fleet_send_message", "fleet_answer_question"];
 // A scan (and the review it runs) can take minutes; the chat waits this long.
 const SCAN_WAIT_MS = 90_000;
+// Asked again by the latest scan: its lastAskedAt is not older than that scan's
+// start (a scan retains, without re-asking, questions whose source failed).
+function stillAsked(question, snapshot) {
+  const askedMs = Date.parse(question.lastAskedAt ?? "");
+  const scanMs = Date.parse(snapshot?.at ?? "") - (Number(snapshot?.durationMs) || 0);
+  if (!Number.isFinite(askedMs) || !Number.isFinite(scanMs)) return null;
+  return askedMs >= scanMs;
+}
 const minutesSince = (iso, now) => {
   const ms = Date.parse(iso ?? "");
   return Number.isFinite(ms) ? Math.max(0, Math.round((now - ms) / 60_000)) : null;
@@ -62,13 +70,14 @@ export function fleetStatus(supervisor, { now = Date.now() } = {}) {
     // each open question again on every scan, and its review re-checks each
     // one against the thread, the PR and related threads.
     scannedMinutesAgo: minutesSince(snapshot?.at ?? state.lastTickAt, now),
-    freshness: "Scans run every few minutes. An open question was asked again on the latest scan (askedMinutesAgo) and re-checked by the supervisor's review (reviewedMinutesAgo, review). A question still open after the latest scan still stands; fleet_scan runs a new scan now.",
+    freshness: "Scans run every few minutes. stillAsked: true means the latest scan found the question still standing; false means that scan could not recheck it (its source failed, see failedSources), so treat it as unverified. reviewedMinutesAgo and review are the supervisor's own last re-check of it. fleet_scan runs a new scan now.",
     counts: snapshot?.counts ?? null,
     byHealth,
     questions: (state.questions ?? []).map((q) => ({
       id: q.id, title: q.title, options: q.options ?? [], threadKey: q.threadKey ?? null, prRef: q.prRef ?? null,
       firstAskedMinutesAgo: minutesSince(q.createdAt, now),
       askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.updatedAt ?? q.createdAt, now),
+      stillAsked: stillAsked(q, snapshot),
       reviewedMinutesAgo: minutesSince(q.reviewedAt, now),
       review: q.reviewReason ? clip(q.reviewReason, 200) : null
     })),
@@ -110,8 +119,10 @@ export function registerFleetTools(registry, supervisor) {
     description: "Read the coding-agent fleet the supervisor watches (Codex, Claude, Conductor threads): mode, last scan, counts, the owner's open questions, and up to 60 threads ordered red (stuck on the owner or an outage), yellow (needs a push), green (moving or done), gray (out of scope). Uses the last scan; does not scan, send, or answer anything.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: () => fleetStatus(supervisor) });
-  if (typeof supervisor.tick === "function") registry.register({ name: "fleet_scan", source: SOURCE, sideEffects: false,
-    description: "Run a new fleet scan now (threads, PRs, CI, and the supervisor's review of its open questions), then return the same view as fleet_status. Use it when the owner asks whether things are current. Sends nothing to any agent. A scan can take a few minutes; if it is still running after 90 seconds this returns the last scan and says so.",
+  // A scan is the supervisor's regular tick run early: in Auto it can send the
+  // nudges and kept answers that tick decides, so it is not read-only.
+  if (typeof supervisor.tick === "function") registry.register({ name: "fleet_scan", source: SOURCE, sideEffects: true,
+    description: "Run the supervisor's regular scan now instead of waiting for the next one (threads, PRs, CI, and its review of its open questions), then return the same view as fleet_status. Use it when the owner asks whether things are current. It is the same scan that runs every few minutes: in Auto mode it may send the nudges and saved answers that scan decides, exactly as the scheduled scan would. A scan can take a few minutes; if it is still running after 90 seconds this returns the last scan and says so.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: () => fleetScan(supervisor) });
   registry.register({ name: "fleet_thread", source: SOURCE, sideEffects: false,
