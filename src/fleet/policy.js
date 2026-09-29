@@ -5,6 +5,7 @@
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
 import { DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
+import { deliberateStop } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
 
 const MIN = 60_000;
@@ -13,7 +14,6 @@ const FAR_RESET_MS = 8 * HOUR;
 const UNREACHABLE_ASK_MS = 90 * MIN;
 const LONG_DOWN_MS = HOUR;
 // An abort within a minute of the owner's message is the owner hitting stop.
-const DELIBERATE_STOP_MS = MIN;
 // LB log rows older than this say nothing about the LB now.
 const LB_ERROR_FRESH_MS = 15 * MIN;
 
@@ -145,7 +145,7 @@ function makeContext(classified, thread, options) {
     classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery,
     mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
-    progressMark: classified.readiness?.progressMark ?? { head: null, unresolved: null },
+    progressMark: progressMarkFor(classified, thread, ledger),
     facts: factsFor(thread, pr, classified)
   };
 }
@@ -161,6 +161,7 @@ function intentFor(ctx) {
     case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
+    case "stopped": return nudge("resume", classified.reason);
     default: return { type: "none", reason: classified.reason };
   }
 }
@@ -447,24 +448,29 @@ function ownerActiveUntil(thread, limits, now) {
   return until > now ? new Date(until).toISOString() : null;
 }
 
-function deliberateStop(thread) {
-  if (thread.agentStatus !== "aborted") return false;
-  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
-  const userAt = Date.parse(thread.lastUserAt ?? "");
-  // Later metadata writes bump lastActivityAt; the source's abort time does not move.
-  const abortAt = Date.parse(thread.meta?.abortedAt ?? thread.lastActivityAt ?? "");
-  if (!Number.isFinite(userAt) || !Number.isFinite(abortAt)) return false;
-  const gap = abortAt - userAt;
-  return gap >= 0 && gap <= DELIBERATE_STOP_MS;
-}
 
 // Progress = a new head, or fewer open review threads, since the last nudge.
+// A stopped thread with no PR head to move shows progress by working: the
+// agent's words came at least WORKED_MS after the last nudge. worked names
+// that nudge, so a new one resets the budget and a quick relapse does not.
+const WORKED_MS = 10 * MIN;
+function progressMarkFor(classified, thread, ledger) {
+  const mark = classified.readiness?.progressMark ?? { head: null, unresolved: null };
+  if (classified.state !== "stopped") return mark;
+  const nudgedAt = Date.parse(ledger?.lastNudgeAt ?? "");
+  const agentAt = Date.parse(thread.lastAgentAt ?? "");
+  const worked = Number.isFinite(nudgedAt) && Number.isFinite(agentAt) && agentAt - nudgedAt >= WORKED_MS
+    ? ledger.lastNudgeAt : (ledger?.lastProgressMark?.worked ?? null);
+  return { ...mark, worked };
+}
+
 function attemptsWithoutProgress(ledger, mark) {
   const last = ledger?.lastProgressMark;
   if (last && mark) {
     const headMoved = Boolean(mark.head) && mark.head !== last.head;
     const resolved = Number.isFinite(mark.unresolved) && Number.isFinite(last.unresolved) && mark.unresolved < last.unresolved;
-    if (headMoved || resolved) return 0;
+    const worked = Boolean(mark.worked) && mark.worked !== last.worked;
+    if (headMoved || resolved || worked) return 0;
   }
   return Number(ledger?.attemptsWithoutProgress) || 0;
 }
@@ -627,7 +633,7 @@ function recoverable(kind, classified, remembered) {
   const { state, infraKind } = classified;
   if ((state === "infra-blocked" || state === "waiting-ci") && infraKind === kind) return true;
   if (!remembered) return false;
-  if (state === "pr-not-ready" || state === "idle-no-pr") return true;
+  if (state === "pr-not-ready" || state === "idle-no-pr" || state === "stopped") return true;
   return state === "waiting-ci" && !infraKind;
 }
 

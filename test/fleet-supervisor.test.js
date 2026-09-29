@@ -313,7 +313,7 @@ test("LB recovery resumes a remembered thread even after its error rows aged out
   const snapshot = await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 1);
   assert.equal(delivered[0].playbook, "infra-recovered");
-  assert.equal(snapshot.threads[0].state, "idle-no-pr");
+  assert.equal(snapshot.threads[0].state, "stopped");
   assert.equal(snapshot.threads[0].decision.action, "nudge");
   assert.equal(snapshot.threads[0].decision.playbook, "infra-recovered");
 });
@@ -1041,7 +1041,9 @@ test("a thread hidden by a failed source is remembered for an hour at most", asy
   codexFails = false;
   now += 5 * MIN;
   await supervisor.tick({ reason: "test" });
-  assert.equal(delivered.length, 0);
+  // The memory is gone, so no infra-recovered note; the interrupted turn
+  // itself still gets its plain resume.
+  assert.deepEqual(delivered.map((d) => d.playbook), ["resume"]);
 });
 
 test("leaving Auto mid-scan stops that tick's sends", async (t) => {

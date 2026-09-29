@@ -4,6 +4,8 @@
 
 import { DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, msSince } from "./contracts.js";
 
+const DELIBERATE_STOP_MS = 60_000;
+
 // Re-exported for callers that already import it from here.
 export { SUPERVISOR_PREFIX };
 
@@ -109,7 +111,7 @@ const CI_RUNNING = new Set(["PENDING", "EXPECTED"]);
 // or finished. Gray: out of scope or a state this build does not know.
 const HEALTH_BY_STATE = Object.freeze({
   running: "green", "waiting-ci": "green", "local-verify": "green", "asked-in-scope": "green", done: "green",
-  "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow",
+  "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow", stopped: "yellow",
   "needs-human": "red", "infra-blocked": "red"
 });
 
@@ -230,6 +232,14 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   const infraKind = infraBlockKind(thread, infra, text);
   if (infraKind) return result("infra-blocked", `blocked: ${infraKind}`, { infraKind });
 
+  // A turn that ended without finishing (an app restart kills open turns
+  // without a word; something other than the owner interrupted it) is
+  // stopped whatever its PR says. Its last words are mid-work, not a wait
+  // or an ask, and a merged or missing PR does not mean the work is done.
+  if (thread.agentStatus === "stalled" || (thread.agentStatus === "aborted" && !deliberateStop(thread))) {
+    return result("stopped", thread.agentStatus === "aborted" ? "turn interrupted mid-work" : "turn stopped mid-work, no end written");
+  }
+
   // A laptop verify often shows up as a background-task wait. It is the
   // violation, not a CI wait, so it must not be swallowed by waiting-ci.
   const localVerify = matchLocalVerify(thread, infra);
@@ -282,6 +292,19 @@ function exclusionReason(thread, { pr, localGit, config }) {
   const hasRepo = thread.repo || localGit?.remote || pr?.repo;
   if (!hasRepo && !thread.branch && !thread.prRefs?.length) return "no-repo";
   return null;
+}
+
+// The owner pressed stop: their message came within a minute before the
+// abort. A supervisor message is never the owner's.
+export function deliberateStop(thread) {
+  if (thread.agentStatus !== "aborted") return false;
+  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
+  const userAt = Date.parse(thread.lastUserAt ?? "");
+  // Later metadata writes bump lastActivityAt; the source's abort time does not move.
+  const abortAt = Date.parse(thread.meta?.abortedAt ?? thread.lastActivityAt ?? "");
+  if (!Number.isFinite(userAt) || !Number.isFinite(abortAt)) return false;
+  const gap = abortAt - userAt;
+  return gap >= 0 && gap <= DELIBERATE_STOP_MS;
 }
 
 function isRunning(thread, now, limits) {

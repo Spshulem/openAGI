@@ -112,15 +112,15 @@ details.thread>summary{padding:0}
     propose: 'Plans nudges. You tap Send.',
     auto: 'Sends nudges on its own, a few per scan.'
   };
-  var STATE_ORDER = ['needs-human', 'ready-needs-human', 'asked-in-scope', 'pr-not-ready', 'infra-blocked', 'local-verify',
+  var STATE_ORDER = ['needs-human', 'ready-needs-human', 'stopped', 'asked-in-scope', 'pr-not-ready', 'infra-blocked', 'local-verify',
     'waiting-ci', 'running', 'idle-no-pr', 'done', 'excluded'];
   var STATE_LABEL = {
-    'needs-human': 'Needs you', 'ready-needs-human': 'Ready, needs a human', 'asked-in-scope': 'Asked, in scope',
+    'needs-human': 'Needs you', 'ready-needs-human': 'Ready, needs a human', stopped: 'Stopped mid-turn', 'asked-in-scope': 'Asked, in scope',
     'pr-not-ready': 'PR not ready', 'infra-blocked': 'Infra blocked', 'local-verify': 'Verifying on laptop',
     'waiting-ci': 'Waiting on CI', running: 'Running', 'idle-no-pr': 'Idle, no PR', done: 'Done', excluded: 'Out of scope'
   };
   var STATE_TONE = {
-    'needs-human': 'hot', 'ready-needs-human': 'hot', 'asked-in-scope': 'warn', 'pr-not-ready': 'warn',
+    'needs-human': 'hot', 'ready-needs-human': 'hot', stopped: 'warn', 'asked-in-scope': 'warn', 'pr-not-ready': 'warn',
     'infra-blocked': 'warn', 'local-verify': 'warn', 'waiting-ci': 'good', running: 'good', 'idle-no-pr': 'dim',
     done: 'dim', excluded: 'dim'
   };
