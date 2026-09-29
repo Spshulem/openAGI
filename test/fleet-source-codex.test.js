@@ -100,6 +100,32 @@ function byId(threads) {
   return Object.fromEntries(threads.map((thread) => [thread.id, thread]));
 }
 
+test("a turn killed mid-tool stays stalled when reopening the thread writes settings rows", async (t) => {
+  const ctx = makeHome(t);
+  // An app-server restart ends the turn with no row; later the owner opens
+  // the thread, which bumps the file but runs nothing.
+  addThread(ctx, { id: "t-dead", mtimeAgo: MIN, lines: [
+    ev.started("h1", 90 * MIN), ev.assistant("I'm checking those write boundaries before changing them.", 70 * MIN),
+    ev.attachExec("https://github.com/buildbetter-app/buildbetter/pull/6453", 65 * MIN), ev.tokens(65 * MIN), ev.settings(MIN)
+  ] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "", stderr: "" }) }));
+  assert.equal(map["t-dead"].agentStatus, "stalled");
+  assert.equal(map["t-dead"].lastActivityAt, iso(65 * MIN));
+});
+
+test("only sidebar threads count as sharing a title", async (t) => {
+  const ctx = makeHome(t);
+  const lines = [ev.complete("x0", 20 * MIN, "done")];
+  addThread(ctx, { id: "t-a", name: "Plan interactive reports migration (4)", lines });
+  addThread(ctx, { id: "t-auto", name: "Plan interactive reports migration (4)", source: "exec", lines });
+  addThread(ctx, { id: "t-sub", name: "Plan interactive reports migration (4)", source: JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: "t-a", depth: 1 } } }), lines });
+  addThread(ctx, { id: "t-b", name: "Scope native mobile migration", lines });
+  addThread(ctx, { id: "t-c", name: "Scope native mobile migration", lines });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "", stderr: "" }) }));
+  assert.notEqual(map["t-a"].meta.codexTitleShared, true, "an exec run and a subagent are not twins");
+  assert.equal(map["t-b"].meta.codexTitleShared, true);
+});
+
 test("listCodexThreads classifies running, stalled, aborted, error, and idle threads", async (t) => {
   const ctx = makeHome(t);
   addThread(ctx, { id: "t-running", mtimeAgo: 2 * MIN, lines: [

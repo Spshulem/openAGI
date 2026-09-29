@@ -9,6 +9,10 @@ test("classifies real Claude error strings", () => {
   assert.equal(classifyErrorText("You've hit your weekly limit · resets Sep 28 at 9am (America/Los_Angeles)", now).kind, "session-limit");
   assert.equal(classifyErrorText("You've reached your Fable limit. Switch to another model to continue.", now).kind, "model-limit");
   assert.equal(classifyErrorText("You're out of usage credits. Run /usage-credits", now).kind, "usage-limit");
+  // Seen live in Conductor, 2026-09-28: it used to fall through to "other" and never resume.
+  const extra = classifyErrorText("You're out of extra usage · resets 12:30pm (America/Los_Angeles)", now);
+  assert.equal(extra.kind, "usage-limit");
+  assert.ok(extra.resetAt, "reset time parsed");
   assert.equal(classifyErrorText("API Error: 529 Overloaded. try again in a moment", now).kind, "overloaded");
   assert.equal(classifyErrorText("API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)", now).kind, "network");
   assert.equal(classifyErrorText("Not logged in · Please run /login", now).kind, "logged-out");

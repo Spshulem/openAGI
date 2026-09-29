@@ -66,7 +66,7 @@ test("ledger counts only sent nudges and resets on progress", (t) => {
   const now = clock();
   const store = new FleetStore({ dir: tempDir(t), now });
   const empty = store.ledgerFor("codex:a");
-  assert.deepEqual(empty, { nudges: [], lastProgressMark: null, attemptsWithoutProgress: 0, lastNudgeAt: null });
+  assert.deepEqual(empty, { nudges: [], lastProgressMark: null, attemptsWithoutProgress: 0, lastNudgeAt: null, undelivered: null });
 
   const mark = { head: "abc", unresolved: 2 };
   store.recordNudge("codex:a", { at: "2026-09-26T12:00:00.000Z", playbook: "merge-ready", route: "codex-exec", status: "sent", messageHash: "h1" }, mark);

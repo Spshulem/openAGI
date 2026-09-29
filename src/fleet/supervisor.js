@@ -86,8 +86,12 @@ function emptyBb3() {
 // (the same BuildBot3 problem seen by a thread and by infra) collapse too.
 const GROUPED_KINDS = Object.freeze({
   limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
-  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` }
+  open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` },
+  deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], title: (n) => `${n} stopped. Nudges can't get through. Nudge them?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
+const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck"]);
+// A resume of a stopped or capped turn goes before merge-ready chatter.
+const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 
 // The label single questions use, so a group never names a thread by its
 // session id or title (a first prompt, an automation prompt).
@@ -613,7 +617,7 @@ export class FleetSupervisor {
     // An escalation went to the manager, not this thread: history only, so it
     // spends neither the thread's nudge budget nor its cooldown.
     const status = action.kind === "escalate-manager" && delivery.status === "sent" ? "escalated" : delivery.status;
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status }, action.progressMark);
+    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status, detail: delivery.detail ?? null }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
     // back that one attempt. Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
@@ -910,7 +914,17 @@ export class FleetSupervisor {
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
-    for (const decision of decisions) {
+    // Resumes first, then the thread tried longest ago, so a few threads that
+    // cannot be reached never hold every slot while a stopped one waits.
+    const lastTried = (decision) => Date.parse(store.ledgerFor(decision.threadKey).nudges.at(-1)?.at ?? "") || 0;
+    const sendOrder = decisions
+      .map((decision, index) => ({ decision, index, first: SEND_FIRST.has(decision.playbook) ? 0 : 1, tried: lastTried(decision) }))
+      .sort((a, b) => a.first - b.first || a.tried - b.tried || a.index - b.index)
+      .map(({ decision }) => decision);
+    // Only a send that got past the app's checks spends a slot; blocked tries
+    // are cheap but still bounded.
+    let tries = 0;
+    for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
       const targetKey = decision.action === "escalate-manager" ? (decision.targetKey ?? manager?.key ?? null) : decision.threadKey;
@@ -930,13 +944,17 @@ export class FleetSupervisor {
         else store.recordAction({ ...record, status, at });
         continue;
       }
-      if (sends >= config.limits.maxSendsPerTick) continue;
+      if (sends >= config.limits.maxSendsPerTick || tries >= config.limits.maxSendsPerTick * 2) {
+        decision.reason = `${decision.reason}; deferred: send cap`;
+        continue;
+      }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
       if (uiKey && typedInto.has(uiKey)) continue;
       if (uiKey) typedInto.add(uiKey);
-      sends += 1;
+      tries += 1;
       attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
+      if (delivery.status !== "blocked") sends += 1;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
       else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
       this.recordSend(record, delivery);
@@ -982,7 +1000,10 @@ export class FleetSupervisor {
     const store = this.store;
     const now = this.now();
     // Only questions asked this tick; the rest close or wait for their source.
-    const open = store.openQuestions().filter((question) => asked.has(question.dedupeKey));
+    // The supervisor's own findings (it can't reach a thread, nudges made no
+    // progress) are facts, not guesses about an agent: the review never
+    // clears those.
+    const open = store.openQuestions().filter((question) => asked.has(question.dedupeKey) && !SELF_FINDING_KINDS.has(question.kind));
     if (!open.length) return unsettled;
     if (this.lastReview.failedAt && now - this.lastReview.failedAt < REVIEW_RETRY_MS) return unsettled;
     const prs = new Map(items.filter((item) => item.pr?.ref).map((item) => [item.pr.ref, item.pr]));

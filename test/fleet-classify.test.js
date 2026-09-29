@@ -380,7 +380,7 @@ test("matching PR head proves pushed commits even when upstream is main", () => 
 test("threadHealth maps every state to one colour", () => {
   const expected = {
     running: "green", "waiting-ci": "green", "local-verify": "green", "asked-in-scope": "green", done: "green",
-    "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow",
+    "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow", stopped: "yellow",
     "needs-human": "red", "infra-blocked": "red",
     excluded: "gray"
   };
@@ -456,4 +456,23 @@ test("classifyThread: a question list or a passing login/prod word gets the neut
   assert.equal(classify(makeThread({ lastAgentText: "Want me to cut the production release? Or hold it for Monday?" })).ask.topic, "production");
   assert.equal(classify(makeThread({ lastAgentText: "It needs your password in the browser. Can you log in?" })).ask.topic, "credentials");
   assert.equal(classify(makeThread({ lastAgentText: "Tests pass, so should I rotate the Stripe secret key in Vercel?" })).ask.topic, "credentials");
+});
+
+test("a turn that stopped mid-work is stopped, whatever its PR or last words say", () => {
+  // Killed by an app restart: no end row, quiet past the running window.
+  const dead = makeThread({ kind: "codex", key: "codex:t5", agentStatus: "stalled", lastAgentText: "I'm checking those write boundaries before changing them." });
+  assert.equal(classify(dead, { pr: makePr({ state: "MERGED", mergedAt: ago(10 * 24 * 60 * MIN) }) }).state, "stopped");
+  assert.equal(classify(dead, { pr: null }).state, "stopped");
+  assert.equal(classify({ ...dead, prRefs: [] }, { pr: null }).state, "stopped");
+  // Mid-turn words about waiting are not a wait once the turn is dead.
+  assert.equal(classify({ ...dead, lastAgentText: "Waiting for CI to finish on the new head." }).state, "stopped");
+  // Interrupted by something else (seven threads at once): stopped.
+  const interrupted = makeThread({ agentStatus: "aborted", meta: { abortedAt: ago(20 * MIN) }, lastUserAt: ago(60 * MIN) });
+  assert.equal(classify(interrupted).state, "stopped");
+  // The owner pressed stop right after writing: not the supervisor's to resume.
+  const deliberate = makeThread({ agentStatus: "aborted", meta: { abortedAt: ago(20 * MIN) }, lastUserAt: ago(20 * MIN + 30_000) });
+  assert.notEqual(classify(deliberate).state, "stopped");
+  // Still running, or asking the owner: not stopped.
+  assert.equal(classify(makeThread({ agentStatus: "running" })).state, "running");
+  assert.equal(classify({ ...dead, meta: { pendingQuestion: { text: "Pick a price?", options: ["$1", "$2"], at: ago(20 * MIN) } } }).state, "needs-human");
 });

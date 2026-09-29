@@ -9,7 +9,7 @@ const RULES = [
   // Order matters: the most specific signal wins.
   { kind: "model-limit", pattern: /You've reached your \w[\w .-]* limit|Switch to another model|Selected model is at capacity|model is at capacity/i },
   { kind: "session-limit", pattern: /You've hit your (?:session|weekly|daily) limit/i },
-  { kind: "usage-limit", pattern: /You've hit your usage limit|usage_limit_exceeded|usageLimitExceeded|out of usage credits|usage_limit_reached/i },
+  { kind: "usage-limit", pattern: /You've hit your usage limit|usage_limit_exceeded|usageLimitExceeded|out of usage credits|usage_limit_reached|You're out of extra usage/i },
   { kind: "logged-out", pattern: /Not logged in|Please run \/login|authentication_failed|OAuth token (?:has )?expired/i },
   { kind: "disk-full", pattern: /ENOSPC|no space left on device/i },
   { kind: "lb", pattern: /No available accounts|degraded mode|session bridge is cooling down|Previous response owner account|Invalid [`']?previous_response_id|continuity sources conflict|CODEX_LB_API_KEY|100\.99\.3\.113:2455|Incorrect API key provided/i },

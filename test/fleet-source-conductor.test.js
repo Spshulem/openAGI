@@ -368,3 +368,27 @@ test("two tabs with one title in a workspace are flagged as shared", async (t) =
   assert.equal(threads["s-idle"].meta.conductorTitleShared, true);
   assert.equal(threads["s-abort"].meta.conductorTitleShared, false);
 });
+
+test("a pending AskUserQuestion is the owner's question; its answer clears it", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  // Real shape from conductor.db (2026-09-28): the pick is a tool call.
+  const ask = (id) => ({
+    type: "assistant", session_id: "s-idle", parent_tool_use_id: null,
+    message: { role: "assistant", model: "claude-opus-5-5", content: [
+      { type: "text", text: "Here is the plan." },
+      { type: "tool_use", id, name: "mcp__conductor__AskUserQuestion", input: { questions: [{ header: "Split plan", question: "Split into two PRs. Go?", options: ["Go", { label: "Change it" }] }] } }
+    ] }
+  });
+  addMessage(db, "s-idle", "assistant", ask("toolu_ask1"), iso(5 * MIN));
+  db.close();
+  let threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.deepEqual(threads["s-idle"].meta.pendingQuestion, { text: "Split into two PRs. Go? (Go / Change it)", options: [], at: iso(5 * MIN) });
+
+  const again = new DatabaseSync(file);
+  addMessage(again, "s-idle", "assistant", { type: "user", session_id: "s-idle", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_ask1", content: "Go" }] } }, iso(3 * MIN));
+  again.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+});
