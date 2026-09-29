@@ -410,3 +410,115 @@ test("escalations, infra-down flags, and pushes persist", (t) => {
   assert.equal(reloaded.infraDown("lb"), false);
   assert.equal(reloaded.infraDownSince("lb"), null);
 });
+
+// ─── the supervisor's review of its own list ───────────────────────────────
+
+test("a review close holds while the same ask keeps coming, however long, and never comes back as a blip", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = { dedupeKey: "ready:o/r#7:abc", kind: "ready", title: "#7 ready. Merge?", options: ["merged", "later"] };
+  const first = store.upsertQuestion(ask);
+  const closed = store.closeByReview(first.id, { category: "stale", reason: "merged in another thread", fingerprint: "f1" });
+  assert.equal(closed.status, "resolved");
+  assert.equal(closed.resolvedBy, "review");
+  assert.equal(closed.resolveReason, "review: stale: merged in another thread");
+  assert.equal(closed.reviewFingerprint, "f1");
+  // Inside the reopen window and past a day of asking: still the closed record.
+  for (let hour = 0; hour < 30; hour += 3) {
+    now.advance(3 * HOUR);
+    const again = store.upsertQuestion(ask);
+    assert.equal(again.suppressed, true);
+    assert.equal(again.id, first.id);
+  }
+  assert.deepEqual(store.openQuestions(), []);
+  assert.deepEqual(store.reviewClosed().map((q) => q.id), [first.id], "reopenable while it holds");
+  // A day with no ask ends the hold: the next ask is a new question.
+  now.advance(25 * HOUR);
+  assert.deepEqual(store.reviewClosed(), []);
+  const fresh = store.upsertQuestion(ask);
+  assert.notEqual(fresh.id, first.id);
+  assert.equal(fresh.suppressed, undefined);
+});
+
+test("a review-closed group that covers another thread is a new question, not the old one revived", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const group = (keys) => ({ dedupeKey: "open:group", kind: "open", threadKeys: keys, title: `${keys.length} stuck, can't reach. Open them?`, options: ["opened", "skip"] });
+  const first = store.upsertQuestion(group(["codex:a", "codex:b"]));
+  store.closeByReview(first.id, { category: "done-elsewhere", reason: "another thread took both over" });
+  now.advance(10 * 60 * 1000);
+  assert.equal(store.upsertQuestion(group(["codex:a"])).suppressed, true, "a smaller group is the same ask");
+  const wider = store.upsertQuestion(group(["codex:a", "codex:c"]));
+  assert.notEqual(wider.id, first.id);
+  assert.equal(wider.reopened, undefined);
+  assert.equal(store.question(first.id).status, "resolved");
+});
+
+test("a review rewrite survives the same ask and yields to a reworded one", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = { dedupeKey: "ask:codex:a:h1", kind: "agent-ask", threadKey: "codex:a", title: "madrid: needs your call. Answer?", body: "Merge or wait?", options: ["yes", "no"] };
+  const first = store.upsertQuestion(ask);
+  const kept = store.recordReview(first.id, { title: "bb #6899: merge now?", options: ["merge now", "wait"], fingerprint: "f1", reason: "waits on the owner", category: "live" });
+  assert.equal(kept.title, "bb #6899: merge now?");
+  assert.deepEqual(kept.options, ["merge now", "wait"]);
+  assert.deepEqual(kept.askedAs, { title: ask.title, options: ["yes", "no"] });
+  assert.equal(kept.reviewReason, "waits on the owner");
+  assert.equal(kept.reviewedAt, new Date(T0).toISOString());
+
+  now.advance(5 * 60 * 1000);
+  const again = store.upsertQuestion(ask);
+  assert.equal(again.id, first.id);
+  assert.equal(again.title, "bb #6899: merge now?");
+  assert.deepEqual(again.options, ["merge now", "wait"]);
+  // A second review keeps the policy's wording underneath.
+  store.recordReview(first.id, { title: "bb #6899: merge with --admin?", fingerprint: "f2" });
+  assert.deepEqual(store.question(first.id).askedAs, { title: ask.title, options: ["yes", "no"] });
+
+  // The policy words it differently: its words show until the next review.
+  const reworded = store.upsertQuestion({ ...ask, title: "madrid: wants to merge. OK?" });
+  assert.equal(reworded.id, first.id);
+  assert.equal(reworded.title, "madrid: wants to merge. OK?");
+  assert.deepEqual(reworded.options, ["yes", "no"]);
+  assert.equal(reworded.askedAs, null);
+  assert.equal(store.recordReview("fq_missing", { title: "x" }), null);
+});
+
+test("a pinned question survives a review close; only a review close reopens, as the same record", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = { dedupeKey: "ask:codex:a:h1", kind: "agent-ask", threadKey: "codex:a", title: "Merge?", options: ["yes", "no"] };
+  const first = store.upsertQuestion(ask);
+  store.markQuestionNotified(first.id, { outreachId: "out_1" });
+  assert.equal(store.reopenReviewed(first.id), null, "an open question is not reopened");
+  store.closeByReview(first.id, { category: "junk", reason: "status line" });
+  assert.deepEqual(store.reviewClosed().map((q) => q.id), [first.id]);
+
+  now.advance(60 * 1000);
+  const back = store.reopenReviewed(first.id);
+  assert.equal(back.id, first.id);
+  assert.equal(back.status, "open");
+  assert.equal(back.pinned, true);
+  assert.equal(back.resolvedBy, null);
+  assert.equal(back.outreachId, "out_1");
+  assert.equal(back.reopenedAt, new Date(T0 + 60 * 1000).toISOString());
+  assert.equal(store.closeByReview(first.id, { category: "stale" }), null, "pinned");
+  assert.equal(store.question(first.id).status, "open");
+  assert.deepEqual(store.reviewClosed(), []);
+
+  // An owner dismissal is not a review close.
+  store.dismissQuestion(first.id);
+  assert.equal(store.reopenReviewed(first.id), null);
+});
+
+test("a review close is not reopened over a newer open copy of the same ask", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = { dedupeKey: "k", title: "Merge?", options: ["yes", "no"] };
+  const first = store.upsertQuestion(ask);
+  store.closeByReview(first.id, { category: "stale" });
+  now.advance(26 * HOUR);
+  const fresh = store.upsertQuestion(ask);
+  assert.notEqual(fresh.id, first.id);
+  assert.equal(store.reopenReviewed(first.id), null);
+});

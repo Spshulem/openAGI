@@ -75,7 +75,7 @@ class FakeElement {
 
 const STATIC_IDS = [
   "scan", "scanned", "timer", "modeHint", "status", "lastError", "needsList", "needsCount", "doingList", "doingCount",
-  "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto"
+  "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto", "reviewedBox", "reviewedCount", "reviewedList"
 ];
 
 function sampleState(overrides = {}) {
@@ -294,4 +294,26 @@ test("empty state before the first scan", async () => {
   assert.ok(page.el("needsList").textContent.includes("Nothing needs you"));
   assert.ok(page.el("fleetList").textContent.length > 0);
   assert.ok(page.el("scanned").textContent.includes("Not scanned"));
+  assert.equal(page.el("reviewedBox").hidden, true, "no review closes, no list");
+});
+
+test("questions the review closed list with their reason and a Reopen that posts { reopen: true }", async () => {
+  const evil = "<img src=x onerror=alert(1)>";
+  const closed = { id: "fq_rev", title: evil, status: "resolved", resolvedBy: "review", reviewCategory: "stale", reviewReason: "PR merged " + evil, answeredAt: new Date().toISOString() };
+  const page = boot({ state: sampleState({ reviewClosed: [closed] }) });
+  await settle();
+  assert.equal(page.el("reviewedBox").hidden, false);
+  assert.equal(page.el("reviewedCount").textContent, "1");
+  const list = page.el("reviewedList");
+  assert.ok(list.textContent.includes(evil), "plain text");
+  assert.ok(list.textContent.includes("stale: PR merged"));
+  page.responses.push({ status: 200, body: { question: { id: "fq_rev", status: "open" }, state: sampleState({ reviewClosed: [] }) } });
+  const reopen = findAll(list, (e) => e.tagName === "BUTTON" && e.textContent === "Reopen")[0];
+  await reopen.click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/questions/fq_rev");
+  assert.deepEqual(post.body, { reopen: true });
+  assert.equal(page.el("reviewedBox").hidden, true);
+  assert.match(page.el("status").textContent, /Reopened/);
 });

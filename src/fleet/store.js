@@ -20,6 +20,7 @@ const OPTION_MAX_CHARS = 40;
 const INFRA_BLOCKED_KEPT = 200;
 // The owner closed these; the same ask stays quiet for a TTL.
 const OWNER_CLOSED = new Set(["answered", "dismissed"]);
+const REVIEW_CLOSED_SHOWN = 20;
 
 // Only a delivered nudge spends the no-progress budget. A failed send still
 // starts the cooldown so a broken route is not retried every tick; dry-runs,
@@ -70,12 +71,34 @@ function lastAskMs(question) {
   return Math.max(toMs(question.lastAskedAt ?? question.createdAt, 0), toMs(question.answeredAt, 0));
 }
 
+// The supervisor's review closed it (stale, junk, a duplicate).
+function isReviewClosed(question) {
+  return question.status === "resolved" && question.resolvedBy === "review";
+}
+
 // A dismissal holds while the same ask keeps coming, and so does an answer
 // relayed to the agent's own question: its words stay up until it replies.
-// Other answers ("later", "keep going", "opened", "retry") leave the
-// condition to the owner, so the ask returns a TTL after the answer.
+// A review close holds the same way. Other answers ("later", "keep going",
+// "opened", "retry") leave the condition to the owner, so the ask returns a
+// TTL after the answer.
 function holdsWhileAsked(question) {
-  return question.status === "dismissed" || question.kind === "agent-ask";
+  return question.status === "dismissed" || question.kind === "agent-ask" || isReviewClosed(question);
+}
+
+// A group the review closed that now covers another thread is a new ask.
+function widens(question, fields) {
+  const covered = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
+  return (fields.threadKeys ?? []).some((key) => !covered.includes(key));
+}
+
+// The review's wording stands while the policy asks the same way (askedAs
+// is the policy's wording under the rewrite); a reworded ask shows the
+// policy's words until the next review.
+function keepReviewWording(question, fields) {
+  if (!question.askedAs) return;
+  const same = question.askedAs.title === fields.title && JSON.stringify(question.askedAs.options ?? []) === JSON.stringify(fields.options);
+  if (same) Object.assign(fields, { title: question.title, options: question.options });
+  else fields.askedAs = null;
 }
 
 // Start of an owner close's TTL.
@@ -197,6 +220,7 @@ export class FleetStore {
       // Still asked, so it has not expired. Not saved on its own: the next
       // write (at least the tick's snapshot) carries it.
       Object.assign(existing, { lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS) });
+      keepReviewWording(existing, fields);
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
       if (changed) {
         Object.assign(existing, fields, { updatedAt: iso(now) });
@@ -204,9 +228,9 @@ export class FleetStore {
       }
       return { ...existing };
     }
-    // An answer or dismissal holds (see holdsWhileAsked), so the next tick
-    // neither reopens it with a new id nor pushes the phone again.
-    const closed = this._ownerClosed(key, now);
+    // An answer, dismissal or review close holds (see holdsWhileAsked), so
+    // the next tick neither reopens it with a new id nor pushes the phone again.
+    const closed = this._ownerClosed(key, now, fields);
     if (closed) {
       if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
@@ -214,6 +238,7 @@ export class FleetStore {
     // Same record, same outreach copy, no second push.
     const resolved = this._recentlyResolved(key, now);
     if (resolved) {
+      keepReviewWording(resolved, fields);
       Object.assign(resolved, fields, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
         lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
@@ -276,6 +301,71 @@ export class FleetStore {
   // The supervisor closes a question itself once the condition behind it is gone.
   resolveQuestion(id, reason = null) {
     return this._closeQuestion(id, "resolved", null, { resolveReason: clampText(reason, 160) || null });
+  }
+
+  // The review kept an open question. A rewrite changes the same record
+  // (same dedupeKey), so its outreach copy updates in place; askedAs keeps
+  // the policy's wording so the next tick's ask does not undo it.
+  recordReview(id, { title = null, options = null, fingerprint = null, reason = null, category = null } = {}) {
+    const question = this._findQuestion(id);
+    if (!question || question.status !== "open") return null;
+    const now = iso(this.now());
+    const nextTitle = clampText(redactSecrets(title), this.limits.titleMax);
+    const nextOptions = normalizeOptions(options);
+    const retitled = Boolean(nextTitle) && nextTitle !== question.title;
+    const reoptioned = nextOptions.length > 0 && JSON.stringify(nextOptions) !== JSON.stringify(question.options);
+    if (retitled || reoptioned) {
+      question.askedAs ??= { title: question.title, options: [...(question.options ?? [])] };
+      if (retitled) question.title = nextTitle;
+      if (reoptioned) question.options = nextOptions;
+      question.updatedAt = now;
+    }
+    Object.assign(question, {
+      reviewedAt: now, reviewFingerprint: fingerprint, reviewReason: clampText(reason, 160) || null, reviewCategory: category ?? null
+    });
+    this._save();
+    return { ...question };
+  }
+
+  // The review closed it. It holds like a dismissal while the same ask keeps
+  // coming, and the reopen window never revives it. A pinned one stays.
+  closeByReview(id, { category = "stale", reason = null, fingerprint = null, duplicateOf = null } = {}) {
+    const question = this._findQuestion(id);
+    if (!question || question.pinned) return null;
+    const why = clampText(reason, 160) || null;
+    return this._closeQuestion(id, "resolved", null, {
+      resolvedBy: "review",
+      resolveReason: clampText(`review: ${category}: ${why ?? "no longer needs you"}`, 160),
+      reviewedAt: iso(this.now()), reviewFingerprint: fingerprint, reviewReason: why, reviewCategory: category,
+      duplicateOf: duplicateOf ?? null
+    });
+  }
+
+  // The owner brings back a question the review closed: same record, same
+  // id and outreach copy. Pinned, so the review keeps it until its ask changes.
+  reopenReviewed(id) {
+    const now = this.now();
+    const question = this._findQuestion(id);
+    if (!question || !isReviewClosed(question)) return null;
+    // A new copy of the same ask is already open (the hold ran out).
+    if (this.state.questions.some((q) => q.status === "open" && q.dedupeKey === question.dedupeKey)) return null;
+    Object.assign(question, {
+      status: "open", answeredAt: null, resolvedBy: null, resolveReason: null, duplicateOf: null, pinned: true,
+      reopenedAt: iso(now), updatedAt: iso(now), lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
+    });
+    this._save();
+    return { ...question };
+  }
+
+  // Review closes still holding an ask back, newest first, so the owner can
+  // reopen a wrong one.
+  reviewClosed(limit = REVIEW_CLOSED_SHOWN) {
+    const since = this.now() - QUESTION_TTL_MS;
+    return this.state.questions
+      .filter((q) => isReviewClosed(q) && lastAskMs(q) > since)
+      .sort((a, b) => toMs(b.answeredAt, 0) - toMs(a.answeredAt, 0))
+      .slice(0, Math.max(0, limit))
+      .map((q) => ({ ...q }));
   }
 
   // Expired questions not yet handed out; each is returned once.
@@ -464,10 +554,12 @@ export class FleetStore {
     return this.state.questions.find((q) => q.id === id) ?? null;
   }
 
-  _ownerClosed(key, now) {
+  // An owner close, or a review close of the same ask, still holding it back.
+  _ownerClosed(key, now, fields = {}) {
     let latest = null;
     for (const question of this.state.questions) {
-      if (question.dedupeKey !== key || !OWNER_CLOSED.has(question.status)) continue;
+      if (question.dedupeKey !== key) continue;
+      if (!OWNER_CLOSED.has(question.status) && !(isReviewClosed(question) && !widens(question, fields))) continue;
       if (toMs(question.answeredAt, null) === null || now - heldSinceMs(question) >= QUESTION_TTL_MS) continue;
       if (!latest || heldSinceMs(question) > heldSinceMs(latest)) latest = question;
     }
@@ -477,7 +569,8 @@ export class FleetStore {
   _recentlyResolved(key, now) {
     let latest = null;
     for (const question of this.state.questions) {
-      if (question.dedupeKey !== key || question.status !== "resolved") continue;
+      // A review close is never a blip.
+      if (question.dedupeKey !== key || question.status !== "resolved" || isReviewClosed(question)) continue;
       const closedAt = toMs(question.answeredAt, null);
       if (closedAt === null || now - closedAt >= REOPEN_MS) continue;
       if (!latest || closedAt > toMs(latest.answeredAt, 0)) latest = question;

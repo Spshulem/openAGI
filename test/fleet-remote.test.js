@@ -267,3 +267,63 @@ test('a blip on the computer keeps the same main outreach copy and G2 does not p
   assert.deepEqual(pings, [copy.id], 'no second ping on the glasses');
   assert.deepEqual(g2.dispatch('glasses', { op: 'feed' }).items.map(item => [item.id, item.notified]), [[copy.id, true]]);
 });
+
+// The Mac's review closes junk before the main mirrors it, and the owner can
+// reopen a wrong close from the main.
+test('a question the review closes never reaches the main or the glasses, and reopens from the main', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-remote-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const now = Date.parse('2026-09-26T12:00:00.000Z');
+  const ago = ms => new Date(now - ms).toISOString();
+  const thread = {
+    key: 'codex:t1', kind: 'codex', id: 't1', title: 'Current local time: sweep', cwd: '/work/t1', repo: 'acme/app', branch: 'spencer/fix', workspace: null,
+    agentStatus: 'idle', lastActivityAt: ago(60 * 60_000), lastAgentText: 'Status table. Want me to spend credits on a rerun?', lastAgentAt: ago(60 * 60_000),
+    lastUserText: 'continue', lastUserAt: ago(120 * 60_000), error: null, openTasks: [], prRefs: [], live: null, writerLocked: false, archived: false, excluded: null, meta: {}
+  };
+  let remote = null;
+  let mirroredMidReview = null;
+  const runModel = async ({ prompt }) => {
+    // The main polls while the model runs.
+    await remote.refresh();
+    mirroredMidReview = remote.runtime.outreach.list().length;
+    const [entry] = JSON.parse(prompt.split('<questions>\n')[1].split('\n</questions>')[0]);
+    return { reviews: [{ id: entry.id, decision: 'close', category: 'junk', reason: 'automation sweep status table' }] };
+  };
+  const config = resolveFleetConfig({}, { home: dir, mode: 'observe', limits: { ...DEFAULTS }, managerRef: 'none', push: null, review: { enabled: true } });
+  const mac = new FleetSupervisor({ dataDir: path.join(dir, 'mac'), config, deps: {
+    now: () => now, runModel,
+    executor: { deliver: async () => ({ status: 'sent' }), inFlight: () => [], whenIdle: async () => {} },
+    fetchImpl: async () => { throw new Error('no network in tests'); },
+    readLivePeers: () => new Map(),
+    listCodexThreads: async () => [thread], listClaudeThreads: async () => [], listConductorThreads: async () => [],
+    readCodexLbErrors: async () => [], findLocalHeavyVerification: async () => [],
+    readLocalGit: async () => ({ head: 'b'.repeat(40), branch: 'spencer/fix', upstream: 'origin/spencer/fix', ahead: 0, remote: 'acme/app' }),
+    findPrForBranch: async () => null, fetchPrStates: async () => new Map(),
+    probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: 'ok', reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
+    checkLb: async () => ({ healthy: true, detail: '200', watchLine: null }),
+    findManagerSession: () => null
+  } });
+  const capability = createFleetCapability(mac);
+  const outreach = new OutreachStore({ dir: path.join(dir, 'main-outreach') });
+  const runtime = { outreach, nodeCapabilities: { dispatch: async (...args) => capability.invoke(args[2], args[3]) } };
+  remote = new RemoteFleetSupervisor({ runtime, nodeId: 'mac' });
+  runtime.fleetSupervisor = remote;
+  const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime, now: () => now });
+  g2.dispatch('glasses', { op: 'configure', settings: { supervisorOnly: true } });
+
+  await mac.tick();
+  assert.equal(mirroredMidReview, 0, 'not mirrored while the review ran');
+  await remote.refresh();
+  assert.deepEqual(outreach.list(), []);
+  assert.deepEqual(g2.dispatch('glasses', { op: 'feed' }).items, []);
+  const [closed] = remote.getState().reviewClosed;
+  assert.equal(closed.reviewCategory, 'junk');
+
+  const route = createFleetRoute({ supervisor: remote });
+  const reopened = await route('POST', `/fleet/api/questions/${closed.id}`, null, async () => ({ reopen: true }));
+  assert.equal(reopened.status, 200);
+  assert.equal(reopened.body.question.pinned, true);
+  assert.deepEqual(mac.getState().questions.map(q => q.id), [closed.id]);
+  await remote.refresh();
+  assert.deepEqual(outreach.list().map(item => item.sourceRef.id), [closed.id]);
+});

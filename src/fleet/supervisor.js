@@ -8,12 +8,13 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { MODES, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { MODES, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
+import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
 import { createUiDriver } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
@@ -46,6 +47,10 @@ const INCIDENT_KEYS = Object.freeze({ "manager-bb3": "infra:bb3", "manager-lb": 
 const ESCALATION_STATUSES = new Set(["sent", "failed"]);
 // The snapshot row shows the decision that acts when a thread got two.
 const DECISION_RANK = Object.freeze({ nudge: 3, "escalate-manager": 3, "ask-user": 2, wait: 1, none: 0 });
+// A changed question alone waits this long after the last review (new ones
+// never wait); a failed review is not retried sooner than REVIEW_RETRY_MS.
+const REVIEW_MIN_GAP_MS = 10 * MIN;
+const REVIEW_RETRY_MS = 15 * MIN;
 
 function withTimeout(promise, ms, name) {
   let timer;
@@ -192,6 +197,11 @@ export class FleetSupervisor {
     this.answering = new Set();
     this._uiDriver = undefined;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
+    this._reviewRunner = null;
+    this.lastReview = { at: null, failedAt: null, error: null };
+    // New questions waiting on the review: hidden from the state the main
+    // mirrors until the review has seen them.
+    this.awaitingReview = new Set();
   }
 
   now() {
@@ -283,6 +293,13 @@ export class FleetSupervisor {
     return "no live route: open the thread to answer";
   }
 
+  // runModel for the review; tests inject a fake one.
+  get reviewRunner() {
+    if (this.deps.runModel) return this.deps.runModel;
+    this._reviewRunner ??= createReviewRunner({ config: this.config, run: this.deps.run ?? runCommand });
+    return this._reviewRunner;
+  }
+
   get notifier() {
     if (this.deps.notifier) return this.deps.notifier;
     this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl });
@@ -330,7 +347,7 @@ export class FleetSupervisor {
 
   getState() {
     const store = this.store;
-    const questions = store.openQuestions();
+    const questions = store.openQuestions().filter((question) => !this.awaitingReview.has(question.id));
     // A read can expire a question too (the /fleet page, the main's refresh)
     // while no tick runs.
     this.closeExpired();
@@ -342,6 +359,8 @@ export class FleetSupervisor {
       lastError: this.lastError,
       snapshot: withHealth(store.snapshot),
       questions,
+      // So the owner can reopen a wrong close.
+      reviewClosed: store.reviewClosed(),
       actions: store.actions(50),
       settings: {
         tickMinutes: Math.round(this.config.tickMs / MIN),
@@ -351,7 +370,13 @@ export class FleetSupervisor {
         managerRef: this.config.managerRef,
         delivery: this.lastDelivery.mode,
         deliveryReady: this.lastDelivery.ready,
-        deliveryDetail: this.lastDelivery.detail
+        deliveryDetail: this.lastDelivery.detail,
+        review: {
+          enabled: Boolean(this.config.review?.enabled),
+          model: this.config.review?.model ?? null,
+          lastAt: this.lastReview.at ? new Date(this.lastReview.at).toISOString() : null,
+          lastError: this.lastReview.error
+        }
       }
     };
   }
@@ -372,6 +397,20 @@ export class FleetSupervisor {
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
     return this.store.dismissQuestion(id);
+  }
+
+  // The owner reopens a question the review closed (a wrong call): same
+  // record, and its outreach copy comes back. Pinned, so the review keeps
+  // it until its ask changes.
+  reopenReviewed(id) {
+    const question = this.store.reopenReviewed(id);
+    if (!question) return null;
+    this.reopenOutreach(question);
+    this.store.recordAction({
+      kind: "review", playbook: "review", threadKey: question.threadKey ?? null, questionId: id, status: "done",
+      reason: clampText(`owner reopened: ${question.title}`, 300)
+    });
+    return question;
   }
 
   // The outreach copy (Mac overlay, G2) must not keep asking after the
@@ -798,6 +837,8 @@ export class FleetSupervisor {
     const typedInto = new Set();
 
     const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
+    const shownBefore = new Set(store.openQuestions().map((question) => question.id));
+    const toNotify = [];
     for (const fields of groupQuestions(asks, byKey)) {
       // Rebuilt without a failed source's threads, a group would drop them,
       // or shrink to one thread and ask it twice; the open group stays as it
@@ -812,8 +853,21 @@ export class FleetSupervisor {
       asked.add(question.dedupeKey);
       // The owner already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
+      toNotify.push({ id: question.id, reopened: Boolean(question.reopened) });
+    }
+    // The supervisor reviews its own list before a new question reaches the
+    // owner, so junk never pings; the main does not see it before then either.
+    if (this.config.review?.enabled) this.awaitingReview = new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id)));
+    try {
+      await this.reviewOpenQuestions({ asked, byKey, items });
+    } finally {
+      this.awaitingReview = new Set();
+    }
+    for (const { id, reopened } of toNotify) {
+      const question = store.question(id);
+      if (question?.status !== "open") continue;
       // A blip closed it: its own outreach copy comes back, not a new one.
-      if (question.reopened) this.reopenOutreach(question);
+      if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
@@ -874,6 +928,78 @@ export class FleetSupervisor {
     }
     this.closeExpired();
     return attempted;
+  }
+
+  // The supervisor manages its own needs-you list: one batched model call
+  // judges which open questions still need the owner (see review.js). It
+  // runs in every mode because it only edits the supervisor's own records
+  // and outreach copies, never a thread. A failure fails open: the
+  // questions go out as they would have without it.
+  async reviewOpenQuestions({ asked, byKey, items = [] }) {
+    const review = this.config.review;
+    if (!review?.enabled) return;
+    const store = this.store;
+    const now = this.now();
+    // Only questions asked this tick; the rest close or wait for their source.
+    const open = store.openQuestions().filter((question) => asked.has(question.dedupeKey));
+    if (!open.length) return;
+    if (this.lastReview.failedAt && now - this.lastReview.failedAt < REVIEW_RETRY_MS) return;
+    const prs = new Map(items.filter((item) => item.pr?.ref).map((item) => [item.pr.ref, item.pr]));
+    const states = new Map(items.map((item) => [item.thread.key, item.classified]));
+    const scope = { threads: byKey, prs, states, limits: this.config.limits };
+    const fingerprints = new Map(open.map((question) => [question.id, reviewFingerprint(question, scope)]));
+    const unreviewed = (question) => !question.reviewedAt;
+    const changed = (question) => Boolean(question.reviewedAt) && question.reviewFingerprint !== fingerprints.get(question.id);
+    const due = (question) => now - Date.parse(question.reviewedAt ?? "") >= review.intervalMs;
+    const quiet = now - (this.lastReview.at ?? 0) < REVIEW_MIN_GAP_MS;
+    if (!open.some(unreviewed) && !open.some(due) && (quiet || !open.some(changed))) return;
+    // Unreviewed, then changed, first: the batch cap drops the tail.
+    const rank = (question) => (unreviewed(question) ? 0 : changed(question) ? 1 : 2);
+    const ordered = [...open].sort((a, b) => rank(a) - rank(b));
+    let verdicts;
+    try {
+      verdicts = await reviewQuestions({ questions: ordered, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now });
+    } catch (error) {
+      const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
+      this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
+      store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
+      return;
+    }
+    this.lastReview = { at: now, failedAt: null, error: null };
+    this.applyReview(verdicts, fingerprints);
+  }
+
+  applyReview(verdicts, fingerprints) {
+    const store = this.store;
+    const decisions = [];
+    for (const verdict of verdicts) {
+      // The owner may have answered or dismissed it while the model ran.
+      const question = store.question(verdict.id);
+      if (question?.status !== "open") continue;
+      const fingerprint = fingerprints.get(question.id) ?? null;
+      if (verdict.decision === "close") {
+        const closed = store.closeByReview(question.id, { category: verdict.category, reason: verdict.reason, fingerprint, duplicateOf: verdict.duplicateOf ?? null });
+        if (closed) {
+          this.resolveOutreach(question, "resolved", "dismissed");
+          store.recordAction({
+            kind: "review", playbook: "review", threadKey: question.threadKey ?? null, questionId: question.id, status: "done",
+            reason: clampText(`closed ${verdict.category}: ${question.title}. ${verdict.reason}`, 300)
+          });
+          decisions.push({ id: question.id, decision: "close", category: verdict.category, reason: verdict.reason, duplicateOf: verdict.duplicateOf ?? null });
+          continue;
+        }
+      }
+      // Only an agent's own question takes new choices: the others carry
+      // meaning the supervisor acts on ("merged", "keep going", "added").
+      const options = question.kind === "agent-ask" ? verdict.options ?? null : null;
+      const kept = store.recordReview(question.id, { title: verdict.title ?? null, options, fingerprint, reason: verdict.reason, category: "live" });
+      decisions.push({ id: question.id, decision: "keep", category: "live", reason: verdict.reason, title: kept?.title ?? question.title });
+    }
+    const closed = decisions.filter((decision) => decision.decision === "close").length;
+    store.recordAction({
+      kind: "review", playbook: "review", threadKey: null, status: "done",
+      reason: `reviewed ${decisions.length}: ${closed} closed, ${decisions.length - closed} kept`, decisions
+    });
   }
 
   buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null }) {

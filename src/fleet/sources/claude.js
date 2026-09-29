@@ -329,6 +329,7 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     // The file time is only a fallback: metadata rows bump it without a turn.
     lastActivityAt: summary.lastTurnAt ?? toIso(mtimeMs),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
+    lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,

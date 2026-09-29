@@ -91,7 +91,8 @@ details.thread>summary{padding:0}
   <p id="status" class="status" role="status" aria-live="polite"></p>
 </header>
 <main>
-  <section aria-labelledby="needsH"><h2 id="needsH">Needs you <span id="needsCount" class="n"></span></h2><div id="needsList"></div></section>
+  <section aria-labelledby="needsH"><h2 id="needsH">Needs you <span id="needsCount" class="n"></span></h2><div id="needsList"></div>
+    <details id="reviewedBox" class="group" hidden><summary><span>Closed by review</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
   <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
   <section aria-labelledby="fleetH"><h2 id="fleetH">Fleet <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
@@ -306,6 +307,37 @@ details.thread>summary{padding:0}
     });
   }
 
+  // Questions the supervisor's review closed; Reopen brings one back and
+  // the review keeps it from then on.
+  function renderReviewed(list) {
+    var box = $('reviewedList');
+    box.replaceChildren();
+    $('reviewedBox').hidden = !list.length;
+    $('reviewedCount').textContent = list.length ? String(list.length) : '';
+    list.forEach(function (q) {
+      var row = el('div', 'item', null, box);
+      var head = el('div', 'head', null, row);
+      el('span', 't', q.title || 'Question', head);
+      if (q.answeredAt) el('span', 'dim', ago(q.answeredAt), head);
+      var why = typeof q.reviewReason === 'string' ? q.reviewReason : '';
+      if (why || q.reviewCategory) el('p', 'why', (q.reviewCategory ? q.reviewCategory + ': ' : '') + clip(why, 200), row);
+      var b = button('Reopen', 'btn', row, function () { return reopen(q, b); });
+    });
+  }
+
+  async function reopen(q, b) {
+    b.disabled = true;
+    try {
+      var r = await api('/fleet/api/questions/' + encodeURIComponent(q.id), { reopen: true });
+      if (r && r.state) render(r.state); else await load();
+      say('Reopened. The review keeps it now.');
+    } catch (e) {
+      b.disabled = false;
+      say(e.message, true);
+      if (e.status === 404 || e.status === 409) await load();
+    }
+  }
+
   async function decide(q, body, buttons) {
     buttons.forEach(function (b) { b.disabled = true; });
     try {
@@ -324,7 +356,7 @@ details.thread>summary{padding:0}
 
   function targetName(a, byKey) {
     var about = byKey.get(a.threadKey);
-    var name = about ? threadName(about) : (INFRA_NAME[a.threadKey] || a.threadKey || 'Unknown thread');
+    var name = about ? threadName(about) : (INFRA_NAME[a.threadKey] || a.threadKey || (a.kind === 'review' ? 'Needs-you review' : 'Unknown thread'));
     if (a.targetKey && a.targetKey !== a.threadKey) {
       var to = byKey.get(a.targetKey);
       name += ', to ' + (to ? threadName(to) : a.targetKey);
@@ -538,6 +570,7 @@ details.thread>summary{padding:0}
     (snap && Array.isArray(snap.threads) ? snap.threads : []).forEach(function (t) { byKey.set(t.key, t); });
     renderHeader(s);
     renderNeeds(Array.isArray(s.questions) ? s.questions : [], byKey);
+    renderReviewed(Array.isArray(s.reviewClosed) ? s.reviewClosed : []);
     renderDoing(Array.isArray(s.actions) ? s.actions : [], byKey);
     renderInfra(snap);
     renderFleet(snap);

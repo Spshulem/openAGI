@@ -155,6 +155,25 @@ test("{ dismiss: true } dismisses the question", async () => {
   assert.equal((await route("POST", path, url(path), body({ dismiss: true }))).status, 404);
 });
 
+test("{ reopen: true } reopens a question the review closed", async () => {
+  const supervisor = fakeSupervisor();
+  supervisor.reopenReviewed = (id) => {
+    supervisor.calls.push(["reopenReviewed", id]);
+    return id === "fq_closed" ? { id, status: "open", pinned: true } : null;
+  };
+  const route = createFleetRoute({ supervisor });
+  const path = "/fleet/api/questions/fq_closed";
+  const result = await route("POST", path, url(path), body({ reopen: true }));
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.question, { id: "fq_closed", status: "open", pinned: true });
+  assert.ok(result.body.state);
+  assert.equal(supervisor.calls.some((c) => c[0] === "answerQuestion" || c[0] === "dismissQuestion"), false);
+  const other = "/fleet/api/questions/fq_open1";
+  assert.equal((await route("POST", other, url(other), body({ reopen: true }))).status, 409);
+  delete supervisor.reopenReviewed;
+  assert.equal((await route("POST", path, url(path), body({ reopen: true }))).status, 503);
+});
+
 test("answer race: question closed between check and answer is 409", async () => {
   const supervisor = fakeSupervisor();
   supervisor.answerQuestion = async () => null;

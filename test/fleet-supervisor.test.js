@@ -31,7 +31,7 @@ function makePr(overrides = {}) {
   };
 }
 
-function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", deps = {}, now = () => NOW, limits = {}, deliverStatus = "sent", manager = null, delivery = undefined } = {}) {
+function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", deps = {}, now = () => NOW, limits = {}, deliverStatus = "sent", manager = null, delivery = undefined, review = undefined, env = {} } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-supervisor-"));
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const delivered = [];
@@ -42,7 +42,7 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
     whenIdle: async () => {}
   };
   const notifier = { notifyQuestion: async (q) => { notified.push(q); return { outreachId: null, pushed: false, skipped: "push-off" }; } };
-  const config = resolveFleetConfig({}, { home: dataDir, mode, limits: { ...DEFAULTS, ...limits }, managerRef: "none", ...(delivery ? { delivery } : {}) });
+  const config = resolveFleetConfig(env, { home: dataDir, mode, limits: { ...DEFAULTS, ...limits }, managerRef: "none", ...(delivery ? { delivery } : {}), ...(review ? { review } : {}) });
   const prMap = prs ?? new Map([["acme/app#7", makePr()]]);
   const supervisor = new FleetSupervisor({
     dataDir,
@@ -1397,4 +1397,271 @@ test("a failed PR read after a merge settled an ask neither reopens it nor raise
   await supervisor.tick();
   assert.deepEqual(supervisor.getState().questions.map((q) => q.threadKey), ["codex:t2"]);
   assert.equal(supervisor.store.question(question.id).status, "resolved");
+});
+
+// ─── the supervisor's review of its own needs-you list ─────────────────────
+
+const REVIEW_ON = { enabled: true };
+const MERGE_ASK = "Ready. Want me to merge with --admin or wait for Nikhil's approval?";
+const asking = (overrides = {}) => makeThread({ lastAgentText: MERGE_ASK, prRefs: [], ...overrides });
+
+// A fake model: decide(entries) returns the verdicts; every request is kept.
+function fakeModel(decide) {
+  const calls = [];
+  const runModel = async (request) => {
+    const entries = JSON.parse(request.prompt.split("<questions>\n")[1].split("\n</questions>")[0]);
+    calls.push({ ...request, entries });
+    return { reviews: decide(entries) };
+  };
+  return { runModel, calls };
+}
+
+function fakeOutreach() {
+  const calls = [];
+  let next = 0;
+  return {
+    calls,
+    append: (item) => { calls.push(["append", item.title, item.actions]); next += 1; return { id: `out_${next}` }; },
+    update: (id, patch) => { calls.push(["update", id, patch.title, patch.actions]); return { id }; },
+    resolve: (id, decision, opts) => { calls.push(["resolve", id, decision, opts?.status]); return { id }; },
+    reopen: (id) => { calls.push(["reopen", id]); return { id }; }
+  };
+}
+
+const reviewActions = (supervisor) => supervisor.getState().actions.filter((action) => action.kind === "review");
+
+test("review closes a stale question before it reaches the owner", async (t) => {
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "PR merged 2h ago" })));
+  const { supervisor, notified } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });
+  const outreach = fakeOutreach();
+  supervisor.runtime = { outreach };
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1);
+  assert.equal(model.calls[0].entries[0].threads[0].key, "codex:t1");
+  assert.deepEqual(supervisor.getState().questions, []);
+  assert.equal(notified.length, 0, "never pushed or posted");
+  const [closed] = supervisor.getState().reviewClosed;
+  assert.equal(closed.status, "resolved");
+  assert.equal(closed.resolvedBy, "review");
+  assert.equal(closed.resolveReason, "review: stale: PR merged 2h ago");
+  assert.equal(closed.reviewCategory, "stale");
+  assert.deepEqual(outreach.calls, [], "no copy was ever posted");
+  const actions = reviewActions(supervisor);
+  assert.ok(actions.some((a) => a.questionId === closed.id && /^closed stale: /.test(a.reason)));
+  assert.deepEqual(actions.find((a) => Array.isArray(a.decisions)).decisions.map((d) => [d.id, d.decision, d.category]), [[closed.id, "close", "stale"]]);
+  assert.equal((await supervisor.tick()).counts.needsYou, 0);
+});
+
+test("review keeps a live question and rewords it in place on the same outreach copy", async (t) => {
+  let now = NOW;
+  let title = "acme: admin merge or wait for Nikhil?";
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "agent waits on the owner", title, options: ["admin merge", "wait for Nikhil"] })));
+  const { supervisor, delivered } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel, notifier: undefined } });
+  const outreach = fakeOutreach();
+  supervisor.runtime = { outreach };
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.equal(question.title, title);
+  assert.deepEqual(question.options, ["admin merge", "wait for Nikhil"]);
+  assert.equal(question.reviewCategory, "live");
+  assert.ok(question.reviewFingerprint);
+  assert.deepEqual(outreach.calls[0], ["append", title, ["admin merge", "wait for Nikhil", "dismiss"]], "posted already reworded");
+
+  // The next ask repeats the policy's wording; the review's wording stays.
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1, "unchanged: not reviewed again");
+  assert.equal(supervisor.getState().questions[0].title, title);
+
+  // The interval passes and the review words it differently: same record, same copy.
+  title = "acme: merge now with --admin?";
+  now += 31 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 2);
+  const [again] = supervisor.getState().questions;
+  assert.equal(again.id, question.id);
+  assert.equal(again.dedupeKey, question.dedupeKey);
+  assert.equal(again.title, title);
+  assert.deepEqual(outreach.calls.filter((c) => c[0] === "append").length, 1);
+  assert.deepEqual(outreach.calls.at(-1), ["update", "out_1", title, ["admin merge", "wait for Nikhil", "dismiss"]]);
+
+  // The new choices are what the owner answers with.
+  const result = await supervisor.answerQuestion(question.id, "admin merge");
+  assert.equal(result.question.status, "answered");
+  assert.match(delivered[0].message, /^Owner answer: admin merge\./);
+});
+
+test("review marks a duplicate and keeps the question it duplicates", async (t) => {
+  const threads = [
+    asking(),
+    asking({ key: "codex:t2", id: "t2", cwd: "/work/t2", lastAgentText: "Merge it with --admin now, or wait for review?" })
+  ];
+  let firstId = null;
+  const model = fakeModel((entries) => {
+    firstId = entries.find((e) => e.threads[0].key === "codex:t1").id;
+    return entries.map((e) => (e.id === firstId
+      ? { id: e.id, decision: "keep", category: "live", reason: "real ask" }
+      : { id: e.id, decision: "close", category: "duplicate", reason: "same merge ask", duplicateOf: firstId }));
+  });
+  const { supervisor, notified } = fixture(t, { threads, prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1);
+  assert.equal(model.calls[0].entries.length, 2, "one batched call sees both");
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.id), [firstId]);
+  const [dup] = supervisor.getState().reviewClosed;
+  assert.equal(dup.threadKey, "codex:t2");
+  assert.equal(dup.duplicateOf, firstId);
+  assert.equal(dup.reviewCategory, "duplicate");
+  assert.deepEqual(notified.map((q) => q.id), [firstId]);
+});
+
+test("a review close holds while the same ask repeats, is never revived as a blip, and a new ask is new", async (t) => {
+  let now = NOW;
+  let thread = asking();
+  let verdict = "close";
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: verdict, category: verdict === "close" ? "junk" : "live", reason: "status line, no ask" })));
+  const { supervisor, notified } = fixture(t, { prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel, listCodexThreads: async () => [thread] } });
+  const outreach = fakeOutreach();
+  supervisor.runtime = { outreach };
+  await supervisor.tick();
+  const [closed] = supervisor.getState().reviewClosed;
+  assert.ok(closed);
+  // Asked for hours more: held, not reviewed again, never pushed.
+  for (let i = 0; i < 3; i += 1) {
+    now += 60 * MIN;
+    await supervisor.tick();
+  }
+  assert.deepEqual(supervisor.getState().questions, []);
+  assert.equal(model.calls.length, 1);
+  assert.equal(notified.length, 0);
+  // A turn in between, then the same ask inside the reopen window: still closed.
+  thread = asking({ agentStatus: "running" });
+  now += 5 * MIN;
+  await supervisor.tick();
+  thread = asking();
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions, []);
+  assert.equal(supervisor.store.question(closed.id).status, "resolved");
+  assert.equal(outreach.calls.some((c) => c[0] === "reopen"), false);
+  // A changed ask is a new question, reviewed before it is pushed.
+  verdict = "keep";
+  thread = asking({ lastAgentText: "Should I email the customer about the outage?" });
+  now += 5 * MIN;
+  await supervisor.tick();
+  const [fresh] = supervisor.getState().questions;
+  assert.ok(fresh && fresh.id !== closed.id);
+  assert.equal(model.calls.length, 2);
+  assert.deepEqual(notified.map((q) => q.id), [fresh.id]);
+});
+
+test("the owner reopens a review-closed question; pinned, the review keeps it", async (t) => {
+  let now = NOW;
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "optional offer" })));
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel } });
+  const outreach = fakeOutreach();
+  supervisor.runtime = { outreach };
+  await supervisor.tick();
+  const [closed] = supervisor.getState().reviewClosed;
+  // As if a copy had been posted before the review closed it.
+  supervisor.store.markQuestionNotified(closed.id, { outreachId: "out_9" });
+  outreach.calls.length = 0;
+
+  const reopened = supervisor.reopenReviewed(closed.id);
+  assert.equal(reopened.id, closed.id);
+  assert.equal(reopened.status, "open");
+  assert.equal(reopened.pinned, true);
+  assert.deepEqual(outreach.calls, [["reopen", "out_9"]]);
+  assert.deepEqual(supervisor.getState().reviewClosed, []);
+  assert.ok(reviewActions(supervisor).some((a) => /^owner reopened: /.test(a.reason)));
+  assert.equal(supervisor.reopenReviewed(closed.id), null, "only a review close reopens");
+
+  // The interval passes and the model says close again: pinned, it stays.
+  now += 31 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 2);
+  assert.equal(model.calls[1].entries[0].pinned, true);
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.id), [closed.id]);
+  assert.equal(supervisor.store.question(closed.id).status, "open");
+});
+
+test("a failed review fails open: the question goes out and the failure is logged", async (t) => {
+  let now = NOW;
+  let failing = true;
+  let calls = 0;
+  const runModel = async () => {
+    calls += 1;
+    if (failing) throw new Error("review timed out after 150s");
+    return { reviews: [] };
+  };
+  const { supervisor, notified } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel } });
+  await supervisor.tick();
+  assert.equal(calls, 1);
+  assert.equal(supervisor.getState().questions.length, 1);
+  assert.equal(notified.length, 1, "pushed as without the review");
+  const failed = reviewActions(supervisor).find((a) => a.status === "failed");
+  assert.match(failed.detail, /timed out/);
+  assert.match(supervisor.getState().settings.review.lastError, /timed out/);
+  // Not retried every tick.
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(calls, 1);
+  failing = false;
+  now += 15 * MIN;
+  await supervisor.tick();
+  assert.equal(calls, 2);
+  assert.equal(supervisor.getState().settings.review.lastError, null);
+  assert.equal(supervisor.getState().questions[0].reviewReason, "no verdict from the review");
+});
+
+test("a new question stays off the shared state until the review has seen it", async (t) => {
+  let holder = null;
+  let seen = null;
+  const runModel = async () => {
+    seen = holder.getState().questions.length;
+    return { reviews: [] };
+  };
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, deps: { runModel } });
+  holder = supervisor;
+  await supervisor.tick();
+  assert.equal(seen, 0, "the main cannot mirror it mid-review");
+  assert.equal(supervisor.getState().questions.length, 1);
+});
+
+test("an unchanged question is not reviewed again until it changes or the interval passes", async (t) => {
+  let now = NOW;
+  let thread = asking();
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "waits on the owner" })));
+  const { supervisor } = fixture(t, { prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel, listCodexThreads: async () => [thread] } });
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1);
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1);
+  // The thread moved: reviewed again, but not sooner than the gap after the last one.
+  thread = asking({ lastActivityAt: new Date(now - 30 * MIN).toISOString() });
+  now += 2 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1);
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 2);
+  now += 31 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 3);
+});
+
+test("OPENAGI_FLEET_REVIEW=0 turns the review off; it is on with the supervisor", async (t) => {
+  const off = fakeModel(() => []);
+  const disabled = fixture(t, { threads: [asking()], prs: new Map(), env: { OPENAGI_FLEET_SUPERVISOR: "1", OPENAGI_FLEET_REVIEW: "0" }, deps: { runModel: off.runModel } });
+  await disabled.supervisor.tick();
+  assert.equal(off.calls.length, 0);
+  assert.equal(disabled.notified.length, 1);
+  assert.equal(disabled.supervisor.getState().settings.review.enabled, false);
+
+  const on = fakeModel(() => []);
+  const enabled = fixture(t, { threads: [asking()], prs: new Map(), env: { OPENAGI_FLEET_SUPERVISOR: "1" }, deps: { runModel: on.runModel } });
+  await enabled.supervisor.tick();
+  assert.equal(on.calls.length, 1);
+  assert.equal(enabled.supervisor.getState().settings.review.enabled, true);
 });

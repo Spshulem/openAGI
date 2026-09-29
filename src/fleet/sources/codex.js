@@ -304,6 +304,7 @@ function applyRollout(thread, row, context) {
   thread.error = errorFor(summary.lifecycle, now, limits);
   if (summary.lastAgent) {
     thread.lastAgentText = clampTail(redactSecrets(summary.lastAgent.text), limits.excerptMax);
+    thread.lastAgentTail = clampTail(redactSecrets(summary.lastAgent.text), limits.reviewTailMax);
     thread.lastAgentAt = summary.lastAgent.at;
   }
   if (summary.lastUser) {
@@ -389,6 +390,7 @@ function buildThread(row, context) {
     agentStatus: "unknown",
     lastActivityAt: toIso(updatedMs),
     lastAgentText: "",
+    lastAgentTail: "",
     lastAgentAt: null,
     lastUserText: "",
     lastUserAt: null,

@@ -142,6 +142,7 @@ function foldClaudeInto(target, claude) {
   target.error = target.error ?? claude.error ?? null;
   if (!target.lastAgentText) {
     target.lastAgentText = claude.lastAgentText ?? "";
+    target.lastAgentTail = claude.lastAgentTail ?? "";
     target.lastAgentAt = claude.lastAgentAt ?? target.lastAgentAt ?? null;
   }
   target.cwd = target.cwd || claude.cwd || null;
