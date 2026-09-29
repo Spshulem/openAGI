@@ -568,8 +568,16 @@ export class OpenAGIG2App {
     void this.releaseToSend()
   }
   private async releaseToSend(): Promise<void> {
-    try { if (this.mode === 'listening') await this.finishAsk() }
-    finally { this.pushToTalk = false }
+    // Already finishing (the 30-second limit hit first): that finish sends.
+    if (this.mode !== 'listening') return
+    try { await this.finishAsk() } finally { this.cancelHold() }
+  }
+  // The 30-second recording limit: stop and finish what was said. During a
+  // hold that sends it (the release after does nothing); the owner is told.
+  private stopAtLimit(): void {
+    const held = this.pushToTalk
+    this.phone.set('30-second limit', held ? 'Recording stopped at 30 seconds; sending what you said.' : 'Recording stopped at 30 seconds.')
+    void this.finishAsk().finally(() => { if (held) this.cancelHold() })
   }
   // Push-to-talk sends on release whatever the review setting says.
   private sendsOnFinish(): boolean { return this.pushToTalk || this.store.snapshot().autoSend }
@@ -616,13 +624,13 @@ export class OpenAGIG2App {
     const text = this.draft; this.draft = ''; this.phone.draft?.(null)
     await this.runQuestion(text)
   }
-  private reviewDraft(text: string, recovery?: 'speech' | 'delivery'): void {
+  private reviewDraft(text: string, recovery?: 'speech' | 'delivery', sendNow = this.sendsOnFinish()): void {
     const clean = text.trim()
     if (!clean) throw new Error('No speech was recognized. Nothing was sent; please retry.')
     if (clean.length > 4000) throw new Error('Question is too long. Nothing was sent; please record a shorter question.')
     this.draft = clean; this.draftRecovery = recovery; this.mode = 'review'; this.pages = paginateText(plainAnswer(clean), 220); this.page = 0
     void this.store.update({ savedDraft: clean }).catch(error => this.phone.set('Draft is only on screen', `Could not save it for reopening: ${safeOpenAGIError(error)}`))
-    if (this.sendsOnFinish() && !recovery) { this.phone.transcript?.(clean); return }
+    if (sendNow && !recovery) { this.phone.transcript?.(clean); return }
     this.phone.transcript?.(clean); this.phone.draft?.(clean, recovery)
     this.phone.set('Review question · not sent', 'Tap to send. Double-tap goes back and keeps the draft. Swipe to read, or explicitly Discard on the phone.')
     this.showDraftPage()
@@ -890,7 +898,11 @@ export class OpenAGIG2App {
           displayedSecond = Math.floor(duration)
           this.phone.set('Recording question', `${duration.toFixed(1)} seconds received from G2. ${this.stopInstruction()}`)
         }
-      } catch (error) { void this.audio.stop(); this.fail(error) }
+      } catch (error) {
+        // At the 30-second limit the question so far is kept, not lost.
+        if (error instanceof Error && /30 second limit/.test(error.message)) { this.stopAtLimit(); return }
+        void this.audio.stop(); this.fail(error)
+      }
     });
       if (this.exited || !this.foregroundActive) { await this.audio.stop(); this.audioBuffer = null }
       else if (this.mode === 'listening') this.renderer.listening()
@@ -899,6 +911,8 @@ export class OpenAGIG2App {
     finally { this.microphoneOpening = false }
   }
   async finishAsk(): Promise<void> {
+    // Decided when the recording stops, so a release mid-finish cannot change it.
+    const sendNow = this.sendsOnFinish()
     if (!this.microphoneOpening && this.mode === 'listening' && this.liveSpeech) {
       const speech = this.liveSpeech
       this.mode = 'thinking'; clearTimeout(this.liveCaptureTimer)
@@ -916,7 +930,7 @@ export class OpenAGIG2App {
         this.liveSpeech = null; this.speechStart = null
         if (!text) throw new Error('No speech was recognized. Your question was not sent; please retry.')
         this.phone.activity?.(`Speech finalized in ${Date.now() - started}ms`)
-        this.reviewDraft(text)
+        this.reviewDraft(text, undefined, sendNow)
         finalized = true
       } catch (error) {
         const text = speech.snapshotText?.() ?? ''
@@ -924,7 +938,7 @@ export class OpenAGIG2App {
         if (!this.exited && !controller.signal.aborted) this.recoverQuestion(text, error, 'speech')
       }
       finally { await this.finishDraftPreparation(controller) }
-      if (finalized && !controller.signal.aborted && !this.exited && this.sendsOnFinish()) await this.sendDraft()
+      if (finalized && !controller.signal.aborted && !this.exited && sendNow) await this.sendDraft()
       return
     }
     if (this.microphoneOpening || this.mode !== 'listening' || !this.audioBuffer) return
@@ -936,7 +950,7 @@ export class OpenAGIG2App {
       await this.resumeListening()
       return
     }
-    if (this.sendsOnFinish() && !this.voiceTarget) { await this.runQuestion(audio.toWav()); return }
+    if (sendNow && !this.voiceTarget) { await this.runQuestion(audio.toWav()); return }
     const controller = new AbortController(); this.requestController = controller; this.preparingDraft = true
     this.phone.requestActive?.(true)
     this.phone.set('Transcribing for review', 'OpenAI transcribes after recording. Nothing is sent to the agent until you confirm.')
@@ -945,10 +959,10 @@ export class OpenAGIG2App {
     try {
       const state = this.store.snapshot()
       const result = await this.api.listen(audio.toWav(), state.conversationId!, { wakePhrase: state.wakePhrase, answerQuestions: false }, controller.signal)
-      if (!controller.signal.aborted && !this.exited) this.reviewDraft(result.question)
+      if (!controller.signal.aborted && !this.exited) this.reviewDraft(result.question, undefined, sendNow)
     } catch (error) { if (!controller.signal.aborted && !this.exited) this.fail(error) }
     finally { await this.finishDraftPreparation(controller) }
-    if (this.voiceTarget && this.sendsOnFinish() && !controller.signal.aborted && !this.exited) await this.sendDraft()
+    if (this.voiceTarget && sendNow && !controller.signal.aborted && !this.exited) await this.sendDraft()
   }
   private async finishDraftPreparation(controller: AbortController): Promise<void> {
     this.requestController = null; this.preparingDraft = false; this.cancelConfirmation = false; this.renderActiveProgress = null
@@ -1241,11 +1255,7 @@ export class OpenAGIG2App {
       this.phone.set('Recording question · live', `Words appear while you speak. ${this.stopInstruction()} Audio streams ${this.store.snapshot().speechTransport === 'relay' ? 'through your main to' : 'directly to'} Deepgram.`)
       // Live capture stops at 30 s. During a hold that sends what was said
       // (the release that follows does nothing), and the owner is told why.
-      this.liveCaptureTimer = setTimeout(() => {
-        const held = this.pushToTalk
-        if (held) this.phone.set('30-second limit', 'Recording stopped at 30 seconds; sending what you said.')
-        void this.finishAsk().finally(() => { if (held) this.cancelHold() })
-      }, 30_000)
+      this.liveCaptureTimer = setTimeout(() => this.stopAtLimit(), 30_000)
     } catch (error) { this.stopLiveSpeech(); if (!this.exited) this.fail(error) }
     finally { this.microphoneOpening = false }
   }

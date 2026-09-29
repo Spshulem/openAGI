@@ -203,6 +203,42 @@ it('Supervisor home: a hold past the 30-second live limit sends what was said an
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
+it('Supervisor home: a release just after the 30-second limit still sends, with review on', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    let finish!: (text: string) => void
+    f.speech.finish.mockImplementationOnce(() => new Promise<string>((resolve) => { finish = resolve }))
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(30_001)
+    // Released while the limit's finish is still waiting on the transcript.
+    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
+    finish('Resume my sessions'); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).toHaveBeenLastCalledWith('Resume my sessions', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('buffered speech: a recording that reaches 30 seconds is kept and finished, not lost', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    await f.store.update({ speechModel: 'openai-buffered' })
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    f.api.ask.mockResolvedValue({ question: 'Resume my sessions', reply: 'On it', sessionId: 's' })
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    // 16 kHz, 16-bit mono: 32,000 bytes a second; 31 seconds of frames.
+    for (let i = 0; i < 31; i += 1) f.receive(new Uint8Array(32_000))
+    await vi.advanceTimersByTimeAsync(1)
+    expect(f.phone.set).toHaveBeenCalledWith('30-second limit', expect.stringContaining('sending what you said'))
+    expect(f.api.ask).toHaveBeenCalledOnce()
+    expect(f.renderer.message).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('30 second limit'))
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
 it('a missed foreground-enter never strands the app: any glasses gesture resumes', async () => {
   vi.useFakeTimers()
   const f = await lifelogFixture()
