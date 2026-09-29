@@ -130,6 +130,115 @@ it('Supervisor: status page tap talks to the supervisor thread; an older main sa
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
+it('Supervisor home: press and hold talks to the supervisor, letting go sends without a review', async () => {
+  vi.useFakeTimers()
+  // Review is on (autoSend false): push-to-talk still sends on release.
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
+    expect(f.renderer.review).not.toHaveBeenCalled()
+    // Outside Supervisor home a hold stays a plain tap.
+    await f.app.configureHomeMode('talk')
+    expect(f.app.holdStart()).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('Supervisor home: letting go before the microphone opened still sends once it has', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    let opened!: () => void
+    f.audio.start.mockImplementationOnce(() => new Promise<void>((resolve) => { opened = resolve }))
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    f.app.holdRelease()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    opened(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('Supervisor home: leaving the glasses mid-hold sends nothing and the next tap follows the review setting', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    const status = { mode: 'auto', lastTickAt: null, needsYou: 0, counts: { red: 0, yellow: 0, green: 1, gray: 0 }, threads: [] }
+    vi.spyOn(f.app.proactive, 'fleetStatus').mockResolvedValue(status)
+    await f.app.configureHomeMode('supervisor')
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    f.app.setForeground(false); await vi.advanceTimersByTimeAsync(1)
+    f.app.setForeground(true); await vi.advanceTimersByTimeAsync(600)
+    expect(f.api.askText).not.toHaveBeenCalled()
+    // Status page, then a tapped recording: it goes to review, not straight out.
+    f.app.tap(); await vi.advanceTimersByTimeAsync(600)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(600)
+    f.app.tap(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).not.toHaveBeenCalled()
+    expect(f.phone.draft).toHaveBeenLastCalledWith('What time is it?', undefined)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('Supervisor home: a hold past the 30-second live limit sends what was said and says why', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(30_001)
+    expect(f.phone.set).toHaveBeenCalledWith('30-second limit', expect.stringContaining('sending what you said'))
+    expect(f.api.askText).toHaveBeenCalledOnce()
+    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).toHaveBeenCalledOnce()
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('Supervisor home: a release just after the 30-second limit still sends, with review on', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    let finish!: (text: string) => void
+    f.speech.finish.mockImplementationOnce(() => new Promise<string>((resolve) => { finish = resolve }))
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(30_001)
+    // Released while the limit's finish is still waiting on the transcript.
+    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
+    finish('Resume my sessions'); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).toHaveBeenLastCalledWith('Resume my sessions', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('buffered speech: a recording that reaches 30 seconds is kept and finished, not lost', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    await f.store.update({ speechModel: 'openai-buffered' })
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    f.api.ask.mockResolvedValue({ question: 'Resume my sessions', reply: 'On it', sessionId: 's' })
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    // 16 kHz, 16-bit mono: 32,000 bytes a second; 31 seconds of frames.
+    for (let i = 0; i < 31; i += 1) f.receive(new Uint8Array(32_000))
+    await vi.advanceTimersByTimeAsync(1)
+    expect(f.phone.set).toHaveBeenCalledWith('30-second limit', expect.stringContaining('sending what you said'))
+    expect(f.api.ask).toHaveBeenCalledOnce()
+    expect(f.renderer.message).not.toHaveBeenCalledWith(expect.anything(), expect.stringContaining('30 second limit'))
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
 it('a missed foreground-enter never strands the app: any glasses gesture resumes', async () => {
   vi.useFakeTimers()
   const f = await lifelogFixture()
