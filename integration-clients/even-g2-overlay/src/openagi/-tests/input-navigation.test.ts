@@ -72,3 +72,38 @@ it('a real system exit cancels queued gestures and releases app resources', asyn
     expect(actions.systemExit).toHaveBeenCalledOnce()
   } finally { input.stop(); vi.useRealTimers() }
 })
+
+it('a press-and-hold the app takes as push-to-talk sends on release; otherwise it is one tap', async () => {
+  vi.useFakeTimers()
+  const { input, actions, emit } = setup()
+  const holdStart = vi.fn(() => true)
+  const holdRelease = vi.fn()
+  Object.assign(actions, { holdStart, holdRelease })
+  try {
+    emit(OsEventTypeList.LONG_PRESS_EVENT, 1); emit(OsEventTypeList.LONG_PRESS_EVENT, 1)
+    expect(holdStart).toHaveBeenCalledOnce()
+    expect(actions.tap).not.toHaveBeenCalled()
+    emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 1); emit(OsEventTypeList.CLICK_EVENT)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(holdRelease).toHaveBeenCalledOnce()
+    expect(actions.tap).not.toHaveBeenCalled()
+    // Where the app does not offer push-to-talk, the hold is a tap and its release does nothing.
+    holdStart.mockReturnValue(false)
+    emit(OsEventTypeList.LONG_PRESS_EVENT, 1); emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 1)
+    expect(actions.tap).toHaveBeenCalledOnce()
+    expect(holdRelease).toHaveBeenCalledOnce()
+  } finally { input.stop(); vi.useRealTimers() }
+})
+
+it('leaving the glasses mid-hold cancels push-to-talk instead of sending', () => {
+  const { input, actions, emit } = setup()
+  const holdCancel = vi.fn()
+  const holdRelease = vi.fn()
+  Object.assign(actions, { holdStart: vi.fn(() => true), holdRelease, holdCancel })
+  try {
+    emit(OsEventTypeList.LONG_PRESS_EVENT, 1); emit(OsEventTypeList.FOREGROUND_EXIT_EVENT)
+    expect(holdCancel).toHaveBeenCalledOnce()
+    emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 1)
+    expect(holdRelease).not.toHaveBeenCalled()
+  } finally { input.stop() }
+})

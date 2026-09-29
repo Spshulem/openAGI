@@ -6,6 +6,7 @@ import { resolveDataDir } from "./data-dir.js";
 
 // Durable, cursor-indexed log of outreach items. Every item gets a monotonic
 // `seq` so a consumer can ask "everything after seq N" and never miss one.
+// A reopened or reworded item takes a new seq, so it is read again.
 //   status: "unseen" | "seen" | "acted" | "dismissed" | "error"
 
 export class OutreachStore {
@@ -91,6 +92,45 @@ export class OutreachStore {
     i.resolvedAt = nowIso();
     this.snapshot();
     this.runtime?.events?.emit?.("outreach-resolved", i);
+    return i;
+  }
+
+  // An item its source closed on its own (decision "resolved") comes back
+  // when that source reopens. Same id, so G2 (marks keyed by id) does not
+  // ping for it again. A new seq and an "outreach" event let the Mac overlay,
+  // which dropped it on outreach-resolved and reads past its cursor, add it back.
+  reopen(id) {
+    const i = this.items.get(id);
+    if (!i || i.status !== "dismissed" || i.decision !== "resolved") return null;
+    i.status = "seen";
+    i.decision = null;
+    i.resolvedAt = null;
+    i.seq = this.nextSeq++;
+    i.refreshedAt = nowIso();
+    this.snapshot();
+    this.runtime?.events?.emit?.("outreach", i);
+    return i;
+  }
+
+  // A source that rewords an open item ("4 stuck" -> "5 stuck") updates its
+  // text in place: same id and status, so G2 does not ping again. A new seq
+  // and an "outreach-updated" event carry the new text to the Mac overlay.
+  // Only the fields passed are touched. Every call also marks the item as
+  // still current (refreshedAt), saved with the next write.
+  update(id, patch = {}) {
+    const i = this.items.get(id);
+    if (!i || (i.status !== "unseen" && i.status !== "seen")) return null;
+    i.refreshedAt = nowIso();
+    const next = {};
+    if ("title" in patch) next.title = String(patch.title ?? "").trim() || "(untitled)";
+    if ("summary" in patch) next.summary = String(patch.summary ?? "");
+    if ("actions" in patch) next.actions = Array.isArray(patch.actions) ? patch.actions : [];
+    const changed = Object.keys(next).filter((key) => JSON.stringify(i[key]) !== JSON.stringify(next[key]));
+    if (!changed.length) return i;
+    for (const key of changed) i[key] = next[key];
+    i.seq = this.nextSeq++;
+    this.snapshot();
+    this.runtime?.events?.emit?.("outreach-updated", i);
     return i;
   }
 

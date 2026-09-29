@@ -75,7 +75,7 @@ class FakeElement {
 
 const STATIC_IDS = [
   "scan", "scanned", "timer", "modeHint", "status", "lastError", "needsList", "needsCount", "doingList", "doingCount",
-  "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto"
+  "infraStrip", "fleetList", "fleetCount", "mode-observe", "mode-propose", "mode-auto", "reviewedBox", "reviewedCount", "reviewedList"
 ];
 
 function sampleState(overrides = {}) {
@@ -294,4 +294,78 @@ test("empty state before the first scan", async () => {
   assert.ok(page.el("needsList").textContent.includes("Nothing needs you"));
   assert.ok(page.el("fleetList").textContent.length > 0);
   assert.ok(page.el("scanned").textContent.includes("Not scanned"));
+  assert.equal(page.el("reviewedBox").hidden, true, "no review closes, no list");
+});
+
+test("questions the supervisor cleared list compactly with category, reason and time; Reopen posts { reopen: true }", async () => {
+  const evil = "<img src=x onerror=alert(1)>";
+  const clearedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+  const closed = { id: "fq_rev", title: evil, status: "resolved", resolvedBy: "review", reviewCategory: "done-elsewhere", reviewReason: "PR merged " + evil, answeredAt: clearedAt };
+  const reopened = { ...closed, status: "open", resolvedBy: null, pinned: true, createdAt: new Date().toISOString(), options: ["yes", "no"] };
+  const page = boot({ state: sampleState({ reviewClosed: [closed] }) });
+  await settle();
+  assert.ok(fleetPage.includes("Cleared by supervisor"));
+  assert.equal(page.el("reviewedBox").hidden, false);
+  assert.equal(page.el("reviewedCount").textContent, "1");
+  const list = page.el("reviewedList");
+  assert.ok(list.textContent.includes(evil), "plain text");
+  assert.ok(list.textContent.includes("Done elsewhere"), "category label");
+  assert.ok(list.textContent.includes("PR merged"), "reason");
+  const at = findAll(list, (e) => e.textContent === "cleared 5m ago")[0];
+  assert.ok(at, "time");
+  assert.ok(at.title.length > 0, "exact time on hover");
+  const reopen = findAll(list, (e) => e.tagName === "BUTTON" && e.textContent === "Reopen")[0];
+  assert.match(reopen.className, /\bsm\b/, "compact button");
+  page.responses.push({ status: 200, body: { question: reopened, state: sampleState({ reviewClosed: [], questions: [reopened] }) } });
+  await reopen.click();
+  await settle();
+  const post = page.requests.find((r) => r.method === "POST");
+  assert.equal(post.path, "/fleet/api/questions/fq_rev");
+  assert.deepEqual(post.body, { reopen: true });
+  assert.equal(page.el("reviewedBox").hidden, true);
+  assert.match(page.el("status").textContent, /Reopened/);
+  const card = findAll(page.el("needsList"), (e) => e.dataset.id === "fq_rev")[0];
+  assert.ok(card.classList.contains("flash") && card.scrolled, "the reopened card is shown");
+  assert.ok(card.textContent.includes("You reopened it. The supervisor had said: PR merged"), "the overridden close reads as such");
+});
+
+test("a duplicate names the open question it duplicates", async () => {
+  const closed = { id: "fq_dup", title: "#12 ready. Merge?", status: "resolved", resolvedBy: "review", reviewCategory: "duplicate", reviewReason: "same PR", duplicateOf: "fq_one", answeredAt: new Date().toISOString() };
+  const page = boot({ state: sampleState({ reviewClosed: [closed, { ...closed, id: "fq_dup2", duplicateOf: "fq_gone" }] }) });
+  await settle();
+  const rows = findAll(page.el("reviewedList"), (e) => e.className === "item cleared");
+  assert.equal(rows.length, 2);
+  assert.ok(rows[0].textContent.includes("Duplicate"));
+  assert.ok(rows[0].textContent.includes("same as: <img src=x onerror=alert(1)>"), "the kept question's title, as text");
+  assert.equal(rows[1].textContent.includes("same as:"), false, "a target no longer open is not named");
+});
+
+test("a failed Reopen shows the error, re-enables the button and reloads", async () => {
+  const closed = { id: "fq_rev", title: "Merge?", status: "resolved", resolvedBy: "review", reviewCategory: "stale", reviewReason: "merged", answeredAt: new Date().toISOString() };
+  const page = boot({ state: sampleState({ reviewClosed: [closed] }) });
+  await settle();
+  page.responses.push({ status: 409, body: { error: "Only a question the review closed can be reopened." } });
+  const reopen = findAll(page.el("reviewedList"), (e) => e.tagName === "BUTTON" && e.textContent === "Reopen")[0];
+  const before = page.requests.length;
+  await reopen.click();
+  await settle();
+  assert.match(page.el("status").textContent, /Only a question the review closed/);
+  assert.equal(page.el("status").className, "status err");
+  assert.equal(reopen.disabled, false);
+  assert.ok(page.requests.slice(before).some((r) => r.method === "GET" && r.path === "/fleet/api/state"), "reloads the list");
+});
+
+test("an open question shows why the supervisor kept it, with the full reason on hover", async () => {
+  const long = "Owner must pick: the agent asked at 09:12 whether to merge #12 with admin override. " + "x".repeat(200);
+  const kept = { id: "fq_kept", dedupeKey: "k2", kind: "ready", title: "#12 ready. Merge?", options: ["merged", "later"], status: "open", createdAt: new Date().toISOString(), reviewCategory: "live", reviewReason: long, reviewedAt: new Date().toISOString() };
+  const plain = { id: "fq_plain", dedupeKey: "k3", kind: "ready", title: "#13 ready. Merge?", options: ["merged", "later"], status: "open", createdAt: new Date().toISOString() };
+  const page = boot({ state: sampleState({ questions: [kept, plain] }) });
+  await settle();
+  const cards = findAll(page.el("needsList"), (e) => e.tagName === "ARTICLE");
+  const note = findAll(cards[0], (e) => e.tagName === "P" && e.textContent.startsWith("Supervisor: "))[0];
+  assert.ok(note, "secondary line");
+  assert.ok(note.textContent.length < long.length, "clipped on the card");
+  assert.ok(note.title.startsWith(long), "full reason on hover");
+  assert.match(note.title, /reviewed /);
+  assert.equal(cards[1].textContent.includes("Supervisor:"), false, "no review, no line");
 });

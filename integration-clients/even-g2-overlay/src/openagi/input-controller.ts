@@ -10,9 +10,13 @@ export class AgentsInputController {
   private pendingTap: ReturnType<typeof setTimeout> | null = null
   private suppressTapUntil = 0
   private heldUntil = 0
+  // This press started push-to-talk, so its release sends.
+  private holding = false
   // input(): any glasses gesture proves the app is on the glasses now, even if
   // Even never delivered (or delivered late) its foreground-enter event.
-  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers & { foreground?(active: boolean): void; input?(): void }) {}
+  // holdStart: the app takes a press-and-hold as push-to-talk (true) where it
+  // offers it (Supervisor home); otherwise the hold is one tap as before.
+  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers & { foreground?(active: boolean): void; input?(): void; holdStart?(): boolean; holdRelease?(): void; holdCancel?(): void }) {}
   start(): void {
     if (this.unsubscribe) return
     this.unsubscribe = this.bridge.onEvenHubEvent(event => {
@@ -20,18 +24,30 @@ export class AgentsInputController {
       if (types.includes(OsEventTypeList.SYSTEM_EXIT_EVENT) || types.includes(OsEventTypeList.ABNORMAL_EXIT_EVENT)) {
         this.stop(); this.handlers.systemExit(); return
       }
-      if (types.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) { this.clearTap(); this.heldUntil = 0; this.handlers.foreground?.(false); return }
+      if (types.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) {
+        this.clearTap(); this.heldUntil = 0
+        if (this.holding) { this.holding = false; this.handlers.holdCancel?.() }
+        this.handlers.foreground?.(false); return
+      }
       if (types.includes(OsEventTypeList.FOREGROUND_ENTER_EVENT)) { this.handlers.foreground?.(true); return }
       if (types.some(type => type !== null && GESTURES.includes(type))) this.handlers.input?.()
-      // A press-and-hold acts like one tap (start or stop talking); its release
-      // and any trailing click from the same press are not a second tap.
-      // Repeated press events while still holding are the same press.
+      // A press-and-hold is push-to-talk where the app offers it, else one tap
+      // (start or stop talking); its release and any trailing click from the
+      // same press are not a second tap. Repeated press events while still
+      // holding are the same press.
       if (types.includes(OsEventTypeList.LONG_PRESS_EVENT)) {
         this.clearTap()
-        if (Date.now() >= this.heldUntil && Date.now() >= this.suppressTapUntil) this.handlers.tap()
+        if (Date.now() >= this.heldUntil && Date.now() >= this.suppressTapUntil) {
+          this.holding = this.handlers.holdStart?.() === true
+          if (!this.holding) this.handlers.tap()
+        }
         this.heldUntil = Date.now() + 31_000; this.suppressTapUntil = Date.now() + 500; return
       }
-      if (types.includes(OsEventTypeList.LONG_PRESS_RELEASE_EVENT)) { this.clearTap(); this.heldUntil = 0; this.suppressTapUntil = Date.now() + 500; return }
+      if (types.includes(OsEventTypeList.LONG_PRESS_RELEASE_EVENT)) {
+        this.clearTap(); this.heldUntil = 0; this.suppressTapUntil = Date.now() + 500
+        if (this.holding) { this.holding = false; this.handlers.holdRelease?.() }
+        return
+      }
       if (types.includes(OsEventTypeList.DOUBLE_CLICK_EVENT)) {
         this.clearTap(); this.handlers.doubleTap(); return
       }

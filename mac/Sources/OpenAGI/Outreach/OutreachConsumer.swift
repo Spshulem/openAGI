@@ -25,6 +25,9 @@ final class OutreachConsumer: ObservableObject {
 
   private var baseURL: URL?
   private var token: String = ""
+  // Ids already shown as a banner this run: an item its source reopened
+  // (new seq, same id) comes back to the list without a second banner.
+  private var presented = Set<String>()
   private var sse: OutreachSSEDelegate?
   private var sseSession: URLSession?
 
@@ -120,9 +123,13 @@ final class OutreachConsumer: ObservableObject {
         items.removeAll { $0.id == item.id }
         continue
       }
-      if items.contains(where: { $0.id == item.id }) { continue }
+      // A reworded item (new seq, same id) replaces its row in place.
+      if let index = items.firstIndex(where: { $0.id == item.id }) {
+        items[index] = item
+        continue
+      }
       items.insert(item, at: 0)
-      NotificationPresenter.shared.present(item)
+      if presented.insert(item.id).inserted { NotificationPresenter.shared.present(item) }
     }
   }
 
@@ -230,7 +237,8 @@ final class OutreachSSEDelegate: NSObject, URLSessionDataDelegate {
           dataLine += line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
         }
       }
-      if event == "outreach" {
+      if event == "outreach" || event == "outreach-updated" {
+        // New, reopened, or reworded: each has a new seq past our cursor.
         Task { @MainActor in await OutreachConsumer.shared.backfill() }
       } else if event == "outreach-resolved" {
         // resolve() server-side does NOT bump seq, so since=cursor backfill won't

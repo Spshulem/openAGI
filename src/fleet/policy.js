@@ -4,7 +4,8 @@
 // untrusted and may carry instructions, so it never goes into a message
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
-import { DEFAULTS, SUPERVISOR_PREFIX, clampText, msSince, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
+import { DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
+import { deliberateStop } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
 
 const MIN = 60_000;
@@ -12,8 +13,6 @@ const HOUR = 60 * MIN;
 const FAR_RESET_MS = 8 * HOUR;
 const UNREACHABLE_ASK_MS = 90 * MIN;
 const LONG_DOWN_MS = HOUR;
-// An abort within a minute of the owner's message is the owner hitting stop.
-const DELIBERATE_STOP_MS = MIN;
 // LB log rows older than this say nothing about the LB now.
 const LB_ERROR_FRESH_MS = 15 * MIN;
 
@@ -23,11 +22,13 @@ const MANAGER_DOWN_KINDS = new Set(["session-limit", "usage-limit", "model-limit
 const RESUME_STATUSES = new Set(["aborted", "stalled", "error"]);
 const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
+const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // Blockers only GitHub (or a later git read) can clear; nudging the agent
 // does nothing for them.
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
+const KIND_NAMES = { codex: "Codex", claude: "Claude", conductor: "Conductor" };
 // Thread-level and infra-level escalations of one incident share a cooldown.
 const ESCALATION_KEYS = { "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" };
 
@@ -91,6 +92,15 @@ export function uiWaitReason(thread, delivery) {
   return `computer use not ready${ui.detail ? `: ${ui.detail}` : ""}`;
 }
 
+// Either computer-use mode, when a thread the app shows has no route only
+// because computer use cannot type now: wait for it (the supervisor tells
+// the owner once it has waited a while) instead of calling it offline.
+function uiBlockedReason(thread, delivery) {
+  const ui = deliveryOf(delivery);
+  if (ui.mode === "cli" || ui.ready !== false || !uiTargetFor(thread)) return null;
+  return `computer use not ready${ui.detail ? `: ${ui.detail}` : ""}`;
+}
+
 // Null while the owner is talking to the manager, while it is mid-turn, or
 // while it is down. Callers check managerBusy first to wait instead of asking.
 function managerRoute(manager, mode, limits, now, delivery = null) {
@@ -143,7 +153,7 @@ function makeContext(classified, thread, options) {
     classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery,
     mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
-    progressMark: classified.readiness?.progressMark ?? { head: null, unresolved: null },
+    progressMark: progressMarkFor(classified, thread, ledger),
     facts: factsFor(thread, pr, classified)
   };
 }
@@ -159,6 +169,7 @@ function intentFor(ctx) {
     case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
+    case "stopped": return nudge("resume", classified.reason);
     default: return { type: "none", reason: classified.reason };
   }
 }
@@ -301,10 +312,16 @@ function agentAskIntent(ctx) {
   const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
   const options = ask.structured ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   const excerpt = ownerExcerpt(ask.text || thread.lastAgentText, ctx.limits.bodyMax);
+  // A sealed Codex ask brings its own key: its shown text is a stand-in.
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
-    question: question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
-      `ask:${thread.key}:${shortHash(ask.text ?? "")}`, "agent-ask")
+    question: {
+      ...question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
+        `ask:${thread.key}:${ask.key ?? shortHash(ask.text ?? "")}`, "agent-ask"),
+      // The body is only the ask sentence; the review needs what it is about.
+      askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
+      agentAskedAt: thread.lastAgentAt ?? null
+    }
   };
 }
 
@@ -322,7 +339,7 @@ function readyIntent(ctx) {
   const { pr, facts } = ctx;
   if (!pr) return { type: "none", reason: ctx.classified.reason };
   const needsApprove = pr.reviewDecision === "REVIEW_REQUIRED";
-  const title = needsApprove ? `#${pr.number} ready. Needs approve.` : `#${pr.number} ready. Merge?`;
+  const title = needsApprove ? `${facts.label} ready. Needs approve.` : `${facts.label} ready. Merge?`;
   const body = `${facts.prRef} at ${facts.head}: CI green, 0 open threads${needsApprove ? ", review required" : ""}.`;
   return {
     type: "ask", reason: ctx.classified.reason,
@@ -358,15 +375,30 @@ function resolveNudge(ctx, intent, base) {
   const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.nudgeCooldownMs;
   const cooledAt = addMs(ledger.lastNudgeAt, cooldownMs);
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: "cooldown", notBefore: cooledAt };
+  const undelivered = undeliveredStreak(ledger, thread);
+  if (undelivered) {
+    // Asked once per failure streak: after the owner's answer it only retries.
+    const due = !undelivered.ackedAt && undelivered.count >= UNDELIVERED_ASK_COUNT && now - Date.parse(undelivered.since) >= UNDELIVERED_ASK_MS;
+    if (due) return undeliveredDecision(ctx, decision, undelivered);
+    const retryAt = addMs(undelivered.lastAt, Math.min(UNDELIVERED_BACKOFF_MS * 2 ** (undelivered.count - 1), UNDELIVERED_BACKOFF_MAX_MS));
+    if (retryAt && Date.parse(retryAt) > now) {
+      return { ...decision, action: "wait", reason: `can't deliver (${undelivered.reason}); retry after backoff`, notBefore: retryAt };
+    }
+  }
   const attempts = attemptsWithoutProgress(ledger, ctx.progressMark);
   const maxAttempts = playbook.maxAttempts ?? limits.maxNudgesWithoutProgress;
   const vars = { ...ctx.facts, attempts: String(attempts), ...(intent.vars ?? {}) };
   if (attempts >= maxAttempts) return stuckDecision(ctx, playbook, vars, attempts, decision);
   const route = chooseRoute(thread, ctx.mode, ctx.delivery);
   if (!route) {
+    // No route only because computer use cannot type right now (a locked
+    // screen, secure input), in either computer-use mode: the supervisor
+    // tells the owner why once it has waited a while.
+    const ui = deliveryOf(ctx.delivery);
+    const uiBlocked = ui.mode !== "cli" && ui.ready === false && Boolean(uiTargetFor(thread));
     const waitUi = uiWaitReason(thread, ctx.delivery);
-    if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}` };
-    return unreachableDecision(ctx, decision);
+    if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
+    return { ...unreachableDecision(ctx, decision), uiBlocked };
   }
   return { ...decision, action: "nudge", route, message: renderTemplate(playbook.body, vars) };
 }
@@ -379,6 +411,41 @@ function stuckDecision(ctx, playbook, vars, attempts, decision) {
     question: question(ctx, renderTemplate(playbook.ask, vars),
       `${ctx.facts.label}: ${attempts} nudges, no new head, no thread resolved. Left: ${left}.`, ["keep going", "stop"],
       `stuck:${ctx.thread.key}:${playbook.id}:${ctx.progressMark.head ?? "none"}`, "stuck")
+  };
+}
+
+// Sends that keep failing back off (5, 10, 20, 40, then 60 min), and after
+// three over half an hour the owner hears about it once, with the reason.
+// Work in the thread since the last failure (the owner nudged it) clears it.
+const UNDELIVERED_BACKOFF_MS = 5 * MIN;
+const UNDELIVERED_BACKOFF_MAX_MS = 60 * MIN;
+const UNDELIVERED_ASK_COUNT = 3;
+const UNDELIVERED_ASK_MS = 30 * MIN;
+
+function undeliveredStreak(ledger, thread) {
+  const streak = ledger?.undelivered;
+  if (!streak?.count || !Number.isFinite(Date.parse(streak.lastAt ?? "")) || !Number.isFinite(Date.parse(streak.since ?? ""))) return null;
+  const activity = Date.parse(latest(thread.lastAgentAt, thread.lastActivityAt) ?? "");
+  return Number.isFinite(activity) && activity > Date.parse(streak.lastAt) ? null : streak;
+}
+
+// What the owner can do about a known failure.
+function deliveryHint(reason) {
+  const text = String(reason ?? "");
+  if (/two threads share this title|two sessions share this title|two workspaces share this name/.test(text)) return " Two chats share its name: rename or archive one.";
+  if (/could not verify thread|another (?:thread|session) is open|no session tab open/.test(text)) return " The app would not show this thread.";
+  if (/not running/.test(text)) return " Its app is closed.";
+  if (/computer use not ready/.test(text)) return " Computer use is not ready on this Mac.";
+  return "";
+}
+
+function undeliveredDecision(ctx, decision, streak) {
+  const minutesStuck = minutes(ctx.now - Date.parse(streak.since));
+  return {
+    ...decision, action: "ask-user", reason: `can't deliver: ${streak.reason}.${deliveryHint(streak.reason)}`,
+    question: question(ctx, `${ctx.facts.label} stopped. Can't nudge it. Nudge it?`,
+      `${ctx.facts.label} needs "${decision.playbook}". ${streak.count} sends failed over ${minutesStuck}m: ${streak.reason}.${deliveryHint(streak.reason)}`,
+      ["done", "skip"], `deliver:${ctx.thread.key}`, "deliver")
   };
 }
 
@@ -410,8 +477,9 @@ function resolveEscalation(ctx, intent, base) {
   if (busy) return { ...decision, action: "wait", reason: `${busy.reason}; ${intent.reason}`, notBefore: busy.notBefore };
   const vars = { ...ctx.facts, ...intent.vars };
   const route = managerRoute(ctx.manager, ctx.mode, limits, now, ctx.delivery);
-  const waitUi = route ? null : uiWaitReason(ctx.manager, ctx.delivery);
-  if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}` };
+  // A manager that is down stays offline whatever computer use does.
+  const waitUi = route || !ctx.manager || managerDown(ctx.manager, now) ? null : uiBlockedReason(ctx.manager, ctx.delivery);
+  if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}`, uiBlocked: true };
   if (!route) {
     return {
       ...decision, action: "ask-user",
@@ -439,24 +507,28 @@ function ownerActiveUntil(thread, limits, now) {
   return until > now ? new Date(until).toISOString() : null;
 }
 
-function deliberateStop(thread) {
-  if (thread.agentStatus !== "aborted") return false;
-  if (String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) return false;
-  const userAt = Date.parse(thread.lastUserAt ?? "");
-  // Later metadata writes bump lastActivityAt; the source's abort time does not move.
-  const abortAt = Date.parse(thread.meta?.abortedAt ?? thread.lastActivityAt ?? "");
-  if (!Number.isFinite(userAt) || !Number.isFinite(abortAt)) return false;
-  const gap = abortAt - userAt;
-  return gap >= 0 && gap <= DELIBERATE_STOP_MS;
+// Progress = a new head, or fewer open review threads, since the last nudge.
+// A stopped thread with no PR head to move shows progress by working: the
+// agent's words came at least WORKED_MS after the last nudge. worked names
+// that nudge, so a new one resets the budget and a quick relapse does not.
+const WORKED_MS = 10 * MIN;
+function progressMarkFor(classified, thread, ledger) {
+  const mark = classified.readiness?.progressMark ?? { head: null, unresolved: null };
+  if (classified.state !== "stopped") return mark;
+  const nudgedAt = Date.parse(ledger?.lastNudgeAt ?? "");
+  const agentAt = Date.parse(thread.lastAgentAt ?? "");
+  const worked = Number.isFinite(nudgedAt) && Number.isFinite(agentAt) && agentAt - nudgedAt >= WORKED_MS
+    ? ledger.lastNudgeAt : (ledger?.lastProgressMark?.worked ?? null);
+  return { ...mark, worked };
 }
 
-// Progress = a new head, or fewer open review threads, since the last nudge.
 function attemptsWithoutProgress(ledger, mark) {
   const last = ledger?.lastProgressMark;
   if (last && mark) {
     const headMoved = Boolean(mark.head) && mark.head !== last.head;
     const resolved = Number.isFinite(mark.unresolved) && Number.isFinite(last.unresolved) && mark.unresolved < last.unresolved;
-    if (headMoved || resolved) return 0;
+    const worked = Boolean(mark.worked) && mark.worked !== last.worked;
+    if (headMoved || resolved || worked) return 0;
   }
   return Number(ledger?.attemptsWithoutProgress) || 0;
 }
@@ -570,8 +642,8 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
   const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
   const route = managerRoute(manager, mode, limits, now, delivery);
-  const waitUi = route ? null : uiWaitReason(manager, delivery);
-  if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}` };
+  const waitUi = route || !manager || managerDown(manager, now) ? null : uiBlockedReason(manager, delivery);
+  if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}`, uiBlocked: true };
   if (!route) {
     return {
       ...base, action: "ask-user",
@@ -619,7 +691,7 @@ function recoverable(kind, classified, remembered) {
   const { state, infraKind } = classified;
   if ((state === "infra-blocked" || state === "waiting-ci") && infraKind === kind) return true;
   if (!remembered) return false;
-  if (state === "pr-not-ready" || state === "idle-no-pr") return true;
+  if (state === "pr-not-ready" || state === "idle-no-pr" || state === "stopped") return true;
   return state === "waiting-ci" && !infraKind;
 }
 
@@ -692,8 +764,13 @@ function factsFor(thread, pr, classified) {
   const blockers = (classified.blockers?.length ? classified.blockers : classified.readiness?.blockers) ?? [];
   const prRef = pr?.ref ?? thread.prRefs?.[0] ?? "";
   const prNumber = pr?.number ?? Number(/#(\d+)$/.exec(prRef)?.[1]);
+  const knownPr = Number.isFinite(prNumber) && prNumber > 0 ? prNumber : null;
+  // A PR done before the agent last spoke is old work on a reused branch
+  // (kingston's disk-full asks titled "ads #2", merged weeks earlier), so
+  // the label names the place instead.
+  const pastPr = prDoneBefore(pr, latest(thread.lastAgentAt, thread.meta?.pendingQuestion?.at));
   return {
-    pr: Number.isFinite(prNumber) && prNumber > 0 ? String(prNumber) : "",
+    pr: knownPr ? String(knownPr) : "",
     prRef: fact(prRef, 80),
     repo: fact(pr?.repo ?? thread.repo, 80),
     head: shortSha(pr?.headOid),
@@ -701,9 +778,15 @@ function factsFor(thread, pr, classified) {
     blockers: blockers.map((blocker) => fact(blocker, 80)).join("; "),
     blocker: fact(blockers[0], 80),
     thread: agentLabel(thread),
-    label: ownerLabel(thread, Number.isFinite(prNumber) && prNumber > 0 ? prNumber : null),
+    label: pastPr ? ownerLabel(thread, null, null) : ownerLabel(thread, knownPr, pr?.repo ?? parsePrRef(prRef)?.repo),
     reset: formatTime(thread.error?.resetAt)
   };
+}
+
+function prDoneBefore(pr, at) {
+  if (!pr || !DONE_PR_STATES.has(pr.state)) return false;
+  const doneAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+  return Number.isFinite(doneAt) && doneAt < Date.parse(at ?? "");
 }
 
 // Safe for agent-bound text: one line, no markup characters, bounded.
@@ -716,10 +799,16 @@ function agentLabel(thread) {
   return String(raw).replace(/[^\w .:#-]+/g, "").slice(0, 40);
 }
 
-function ownerLabel(thread, prNumber) {
-  const parts = [thread.workspace ? fact(thread.workspace, 30) : null, prNumber ? `#${prNumber}` : null].filter(Boolean);
-  if (parts.length) return parts.join(" ");
-  return fact(stripTags(thread.title), 30) || `${thread.kind} ${String(thread.id ?? "").slice(0, 8)}`;
+// Repo and PR name the work; else the folder, else the Codex app's name.
+// Never a thread title: a Claude one can be the owner's last message, a
+// Codex one an automation prompt. Never a session id either.
+export function ownerLabel(thread, prNumber, repo) {
+  const repoName = fact(String(repo ?? "").split("/").pop(), 30);
+  if (prNumber && repoName) return `${repoName} #${prNumber}`;
+  const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
+    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "");
+  if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
+  return place || `${KIND_NAMES[thread.kind] ?? "Agent"} chat`;
 }
 
 function ciSummary(pr) {

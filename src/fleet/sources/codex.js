@@ -6,8 +6,9 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  CONDUCTOR_CODEX_ORIGINATOR, runCommand, threadKey, toIso
+  CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
+import { asksOwner } from "../classify.js";
 import { classifyCodexErrorCode } from "../errors.js";
 import { identityToken } from "../ui-delivery.js";
 
@@ -15,6 +16,14 @@ const HOUR = 3_600_000;
 const TAIL_BYTES = 1024 * 1024;
 const AUTOMATION_SOURCES = new Set(["guardian_review", "subagent", "automation"]);
 const HEARTBEAT_PATTERN = /<heartbeat>|<automation_id>/;
+// Scheduled sweeps (usage-reset checks, chat watchdogs) run as codex exec;
+// their status tables quote other chats' asks.
+const EXEC_SOURCE = "exec";
+const CHAT_CHECKER_PATTERN = /\bchecking the user['’]s existing agent chats\b/i;
+// request_user_input titles are sometimes an encrypted blob ("gAAAAAB...").
+const FERNET_PATTERN = /^gAAAAA[A-Za-z0-9_=-]{20,}$/;
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]{80,}={0,2}$/;
+const SEALED_QUESTION = "Codex asked in the app";
 const PR_URL_PATTERN = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
 const WRAPPER_TAGS = [
   "environment_context", "in-app-browser-context", "user_instructions", "user_shell_command", "turn_aborted", "subagent_notification"
@@ -82,7 +91,24 @@ function contentText(content, types) {
 }
 
 function setAgent(summary, text, at) {
-  if (typeof text === "string" && text.trim()) summary.lastAgent = { text, at };
+  if (typeof text !== "string" || !text.trim()) return;
+  summary.lastAgent = { text, at };
+  settleSealedAsk(summary);
+}
+
+// A sealed ask the agent talked past, or ended its turn on, was not waiting
+// on the owner (#6896: "No additional user input is needed", then done),
+// unless the words standing in for it ask something themselves.
+function settleSealedAsk(summary) {
+  if (summary.pendingQuestion?.sealed && !asksOwner(summary.pendingQuestion.text)) summary.pendingQuestion = null;
+}
+
+// Long slash paths fit the base64 alphabet too; a real blob is very long,
+// or carries + or = and no path slash.
+function isCiphertext(value) {
+  if (FERNET_PATTERN.test(value)) return true;
+  if (!BASE64_PATTERN.test(value)) return false;
+  return value.length >= 200 || (/[+=]/.test(value) && !value.includes("/"));
 }
 
 function readUserInput(summary, raw, at) {
@@ -104,16 +130,22 @@ function readUserInput(summary, raw, at) {
   if (cleaned) summary.lastUser = { text: cleaned, at };
 }
 
-function questionTitle(args) {
+// fallback: the agent's last words, shown when the title is ciphertext.
+// keyText: the raw title, when the text shown is not it. The question is
+// keyed on it, so an owner's dismissal outlives a change in the stand-in.
+function questionTitle(args, fallback) {
   try {
     const parsed = typeof args === "string" ? JSON.parse(args) : args;
     const first = parsed?.questions?.[0];
-    const text = String(first?.title ?? first?.question ?? "").trim();
-    if (!text) return null;
+    const texts = [first?.title, first?.question].map((value) => String(value ?? "").trim()).filter(Boolean);
+    if (!texts.length) return null;
+    const text = texts.find((value) => !isCiphertext(value));
     const options = (first.options ?? []).map((option) => typeof option === "string" ? option : option?.label).filter(Boolean);
     // Multiple prompts and free text need the original thread's input surface.
     const supported = parsed.questions.length === 1 && options.length > 0 && options.length <= 4 && options.every((option) => option.length <= 40);
-    return { text, options: supported ? options : ["open thread"] };
+    const raw = text === texts[0] ? {} : { keyText: texts[0] };
+    if (!text) return { text: fallback?.trim() || SEALED_QUESTION, options: supported ? options : ["open thread"], sealed: true, ...raw };
+    return { text, options: supported ? options : ["open thread"], ...raw };
   } catch {
     return null;
   }
@@ -135,6 +167,7 @@ function readEvent(summary, payload, at) {
     case "task_complete":
       summary.lifecycle = { type: "task_complete", payload, at };
       setAgent(summary, payload.last_agent_message, at);
+      settleSealedAsk(summary);
       break;
     case "turn_aborted":
     case "error":
@@ -161,8 +194,11 @@ function readResponseItem(summary, payload, at) {
     setAgent(summary, contentText(payload.content, ["output_text"]), at);
   } else if (payload.type === "function_call") {
     const name = String(payload.name ?? "");
-    if (name === "request_user_input_async") summary.pendingQuestion = questionTitle(payload.arguments) ?? summary.pendingQuestion;
-    else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
+    if (name === "request_user_input_async") {
+      // The ask time lets a PR merged after it close the question.
+      const asked = questionTitle(payload.arguments, summary.lastAgent?.text);
+      if (asked) summary.pendingQuestion = { ...asked, at };
+    } else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
   } else if (payload.type === "custom_tool_call" && String(payload.input ?? "").includes("attach_artifact")) {
     addAttachRefs(summary, payload.input, at);
   }
@@ -205,7 +241,9 @@ function sourceIsSubagent(source) {
 function metadataExclusion(row, config) {
   if (Number(row.archived) === 1) return "archived";
   if (AUTOMATION_SOURCES.has(row.thread_source) || sourceIsSubagent(row.source)) return "automation";
-  if (HEARTBEAT_PATTERN.test(String(row.first_user_head ?? ""))) return "automation";
+  if (String(row.source ?? "").trim() === EXEC_SOURCE) return "automation";
+  const head = String(row.first_user_head ?? "");
+  if (HEARTBEAT_PATTERN.test(head) || CHAT_CHECKER_PATTERN.test(head)) return "automation";
   if ((config.selfSessionIds ?? []).includes(String(row.id))) return "self";
   return null;
 }
@@ -244,8 +282,12 @@ function statusFor(summary, mtimeMs, now, limits) {
   if (type === "turn_aborted") return "aborted";
   if (type === "error") return "error";
   if (summary.events === 0 || mtimeMs === null) return "unknown";
-  // No finished turn after the last start: in progress, or killed mid-turn.
-  return now - mtimeMs <= limits.runningWindowMs ? "running" : "stalled";
+  // No finished turn after the last start: in progress, or killed mid-turn
+  // (an app-server restart ends open turns without writing anything). Timed
+  // from the last turn row: opening a dead thread writes settings rows that
+  // bump the file, which must not make it look alive again.
+  const turnMs = Date.parse(summary.lastTurnAt ?? "");
+  return now - (Number.isFinite(turnMs) ? turnMs : mtimeMs) <= limits.runningWindowMs ? "running" : "stalled";
 }
 
 function applyRollout(thread, row, context) {
@@ -266,6 +308,7 @@ function applyRollout(thread, row, context) {
   thread.error = errorFor(summary.lifecycle, now, limits);
   if (summary.lastAgent) {
     thread.lastAgentText = clampTail(redactSecrets(summary.lastAgent.text), limits.excerptMax);
+    thread.lastAgentTail = clampTail(redactSecrets(summary.lastAgent.text), limits.reviewTailMax);
     thread.lastAgentAt = summary.lastAgent.at;
   }
   if (summary.lastUser) {
@@ -278,9 +321,14 @@ function applyRollout(thread, row, context) {
   thread.meta.abortedAt = aborted ? summary.lifecycle.at : null;
   thread.meta.lastSupervisorAt = summary.lastSupervisorAt;
   const pending = summary.pendingQuestion;
+  // A stand-in from the agent's message ends on the ask, so keep its tail.
+  const clampAsk = pending?.sealed ? clampTail : clampText;
   thread.meta.pendingQuestion = pending
-    ? { text: clampText(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)) }
+    ? { text: clampAsk(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pending.at ?? null }
     : null;
+  // The key the raw title gave the ask before it had a stand-in (a hash of
+  // the same clamped text), so a dismissal made then still matches.
+  if (pending?.keyText) thread.meta.pendingQuestion.key = shortHash(clampText(redactSecrets(pending.keyText), limits.bodyMax));
   // A Codex heartbeat automation already drives this thread; nudging it too
   // would double up.
   if (summary.lastInputHeartbeat) {
@@ -290,18 +338,20 @@ function applyRollout(thread, row, context) {
   return summary.prRefs;
 }
 
-// An attachment whose head is the thread's branch comes first, then other
-// attachments (unknown head before a different head), then links the owner
-// typed. Newest first within a tier; same-second ties go to the higher PR.
+// The newest attachment is the thread's PR: a long thread moves on from the
+// PR its catalog branch names (#5442 merged, the ask was about #6453). Links
+// the owner typed come after every attachment. Same-second ties: own branch,
+// then unknown head, then a different head, then the higher PR.
 function refTier(entry, branch) {
-  if (entry.source !== "attachment") return 3;
   if (!entry.headBranch || !branch) return 1;
   return entry.headBranch === branch ? 0 : 2;
 }
 
 function orderPrRefs(entries, branch) {
-  const ranked = entries.map((entry) => ({ ...entry, tier: refTier(entry, branch), number: parsePrRef(entry.ref)?.number ?? 0 }));
-  ranked.sort((a, b) => a.tier - b.tier || b.at - a.at || b.number - a.number || a.ref.localeCompare(b.ref));
+  const ranked = entries.map((entry) => ({
+    ...entry, owner: entry.source === "attachment" ? 0 : 1, tier: refTier(entry, branch), number: parsePrRef(entry.ref)?.number ?? 0
+  }));
+  ranked.sort((a, b) => a.owner - b.owner || b.at - a.at || a.tier - b.tier || b.number - a.number || a.ref.localeCompare(b.ref));
   return [...new Set(ranked.map((entry) => entry.ref))];
 }
 
@@ -318,8 +368,12 @@ function readSharedTitles(db, limits) {
   const pick = (name) => (present.has(name) ? name : `NULL AS ${name}`);
   const where = present.has("archived") ? " WHERE COALESCE(archived, 0) = 0" : "";
   const counts = new Map();
-  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("originator")} FROM threads${where}`).all()) {
+  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("originator")}, ${pick("source")} FROM threads${where}`).all()) {
     if (row.originator === CONDUCTOR_CODEX_ORIGINATOR) continue;
+    // Automation runs and subagents never show in the sidebar, so they
+    // cannot be mistaken for the thread on screen.
+    const source = String(row.source ?? "");
+    if (source === "exec" || source.includes("\"subagent\"")) continue;
     const token = identityToken(displayTitle(row, limits));
     if (token) counts.set(token, (counts.get(token) ?? 0) + 1);
   }
@@ -344,6 +398,7 @@ function buildThread(row, context) {
     agentStatus: "unknown",
     lastActivityAt: toIso(updatedMs),
     lastAgentText: "",
+    lastAgentTail: "",
     lastAgentAt: null,
     lastUserText: "",
     lastUserAt: null,
@@ -360,6 +415,8 @@ function buildThread(row, context) {
       threadSource: row.thread_source || null,
       // "codex_sdk_ts" = started by Conductor's Codex agent, shown in Conductor.
       originator: row.originator || null,
+      // The name set in the Codex app; title is the first prompt when unset.
+      catalogName: row.name ? clampText(redactSecrets(row.name), limits.titleMax) : null,
       file: row.rollout_path || null,
       turnStartedAt: null,
       abortReason: null,

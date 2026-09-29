@@ -27,7 +27,7 @@ function makePr(overrides = {}) {
     state: "OPEN", isDraft: false, headRef: "spencer/fix", headOid: HEAD, baseRef: "main", mergeState: "CLEAN",
     mergeable: "MERGEABLE", reviewDecision: "APPROVED", ci: { state: "SUCCESS", failing: [], pending: [] },
     unresolvedThreads: 0, codexReview: { reviewedHead: true, sha: "aaaaaaa" }, qa: { required: false, freshOnHead: null, sha: null },
-    updatedAt: ago(0), ...overrides
+    createdAt: ago(24 * 60 * MIN), updatedAt: ago(0), ...overrides
   };
 }
 
@@ -222,6 +222,37 @@ test("classifyThread: PR states after the thread goes idle", () => {
   assert.equal(classify(makeThread({ prRefs: [] }), { pr: null }).state, "idle-no-pr");
 });
 
+test("classifyThread: a PR merged or closed after the ask settles it; an ask made after stands", () => {
+  const merged = (at) => makePr({ state: "MERGED", mergedAt: at, closedAt: at });
+  const ask = (at, text = "Want me to cut the production release?") => makeThread({ lastAgentText: text, lastAgentAt: at });
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: merged(ago(10 * MIN)) }).state, "done");
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ state: "CLOSED", mergedAt: null, closedAt: ago(10 * MIN) }) }).state, "done");
+  // An in-scope ask on a merged PR gets no auto-yes either.
+  assert.equal(classify(ask(ago(30 * MIN), "Should I push the fix?"), { pr: merged(ago(10 * MIN)) }).state, "done");
+  // unified-experience #6914: "merged; cut a staging release and QA it?" came after the merge.
+  const after = classify(ask(ago(10 * MIN), "PR #6914 is merged. Should I cut a staging release and QA it there?"), { pr: merged(ago(30 * MIN)) });
+  assert.equal(after.state, "needs-human");
+  // Unknown ask or merge time: keep asking.
+  assert.equal(classify(ask(null), { pr: merged(ago(10 * MIN)) }).state, "needs-human");
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ state: "MERGED" }) }).state, "needs-human");
+  assert.equal(classify(ask(ago(30 * MIN)), { pr: makePr({ mergedAt: null, closedAt: null }) }).state, "needs-human");
+});
+
+test("classifyThread: a structured Codex ask is settled by a later merge, not an earlier one", () => {
+  const merged = makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) });
+  const structured = (at, lastAgentAt, text = "Checked the build. Start a huddle and send a screenshot?") => makeThread({
+    lastAgentText: text, lastAgentAt, meta: { pendingQuestion: { text: "Start a solo huddle?", options: ["open thread"], at } }
+  });
+  // bb-recorder #282: asked, repeated in the final message, then merged hours later.
+  assert.equal(classify(structured(ago(40 * MIN), ago(30 * MIN)), { pr: merged }).state, "done");
+  // The agent's last words came after the merge: they may repeat the ask.
+  assert.equal(classify(structured(ago(40 * MIN), ago(5 * MIN)), { pr: merged }).ask?.structured, true);
+  assert.equal(classify(structured(ago(5 * MIN), ago(5 * MIN)), { pr: merged }).ask?.structured, true);
+  // No ask time of its own: never settled.
+  const untimed = makeThread({ lastAgentText: "asked", lastAgentAt: ago(30 * MIN), meta: { pendingQuestion: "Which billing plan?" } });
+  assert.equal(classify(untimed, { pr: merged }).ask?.structured, true);
+});
+
 test("exported pattern lists match the owner's real phrases", () => {
   const any = (list, text) => list.some((entry) => (entry.pattern ?? entry).test(text));
   assert.ok(any(WAITING_PATTERNS, "hosted CI is pending with one watcher running"));
@@ -349,7 +380,7 @@ test("matching PR head proves pushed commits even when upstream is main", () => 
 test("threadHealth maps every state to one colour", () => {
   const expected = {
     running: "green", "waiting-ci": "green", "local-verify": "green", "asked-in-scope": "green", done: "green",
-    "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow",
+    "pr-not-ready": "yellow", "idle-no-pr": "yellow", "ready-needs-human": "yellow", stopped: "yellow",
     "needs-human": "red", "infra-blocked": "red",
     excluded: "gray"
   };
@@ -369,4 +400,79 @@ test("threadHealth turns an errored thread red unless it is running again", () =
   assert.equal(threadHealth("idle-no-pr", {}), "red");
   assert.equal(threadHealth("running", error), "green");
   assert.equal(threadHealth("excluded", error), "gray");
+});
+
+// Bug 5: the topic comes from the ask, not from a risky word in the recap.
+test("classifyThread: a risky word outside the ask keeps the owner but not the topic", () => {
+  // The real zurich #3 close: a cost bullet, then a merge offer.
+  const zurich = "- **Older articles:** our 300+ existing unlinked posts would now be blocked if we tried to republish them. "
+    + "Adding links to them is optional, and costs roughly $0.50–1 per post in Claude usage. "
+    + "The SEObot comparison is logged in the decision log as D-37, with a check-in on about Oct 28. "
+    + "The code is pushed as PR #3: https://github.com/Spshulem/AI-SEO/pull/3. I haven't merged it; say the word and I will.";
+  const offer = classify(makeThread({ lastAgentText: zurich }));
+  assert.equal(offer.state, "needs-human");
+  assert.equal(offer.ask.topic, "decision");
+  // A force-push named earlier still keeps a push ask with the owner.
+  const push = classify(makeThread({ lastAgentText: "I can force-push the rewritten branch. Tests pass. Should I push?" }));
+  assert.equal(push.state, "needs-human");
+  assert.equal(push.ask.topic, "decision");
+  // A bare ask takes its topic from the sentence before it.
+  assert.equal(classify(makeThread({ lastAgentText: "Backfilling the old posts costs about $150 in Claude usage. Want me to?" })).ask.topic, "money");
+  assert.equal(classify(makeThread({ lastAgentText: "Should I spend $150 of credits on the backfill?" })).ask.topic, "money");
+});
+
+// Review 6: only a PR that existed when the agent asked can settle the ask.
+test("classifyThread: a PR opened after the ask does not settle it", () => {
+  const done = (createdAt) => makePr({ state: "MERGED", createdAt, mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) });
+  // west-monroe: asked, then #6954 was opened and merged later.
+  const ask = makeThread({ lastAgentText: "Want me to list which portals have it installed so you can pick ones to remove?", lastAgentAt: ago(60 * MIN) });
+  assert.equal(classify(ask, { pr: done(ago(43 * MIN)) }).state, "needs-human");
+  // Unknown open time: not settled either.
+  assert.equal(classify(ask, { pr: done(null) }).state, "needs-human");
+  assert.equal(classify(ask, { pr: done(ago(90 * MIN)) }).state, "done");
+  // A structured ask counts from when it was asked, not from the agent's later words.
+  const structured = makeThread({
+    lastAgentText: "Still need the portal list.", lastAgentAt: ago(30 * MIN),
+    meta: { pendingQuestion: { text: "List the portals?", options: ["open thread"], at: ago(60 * MIN) } }
+  });
+  assert.equal(classify(structured, { pr: done(ago(45 * MIN)) }).ask?.structured, true);
+  assert.equal(classify(structured, { pr: done(ago(90 * MIN)) }).state, "done");
+});
+
+// Review 9: several questions, or a login or prod word that is not the step
+// asked for, keep the neutral topic.
+test("classifyThread: a question list or a passing login/prod word gets the neutral topic", () => {
+  const apia = "CI now passes on #6892, so the whole stack is green again.\n\nStill waiting on you:\n"
+    + "- Log client IPs on the API and stop MCP taking keys in the URL?\n- Fix the two password bugs?\n"
+    + "- #6930 shared views: own data only, or full-org data as today?\n"
+    + "- #6930 AI completion in reports: creator only, or other viewers with their own login?\n- Whether to merge #6668.";
+  const list = classify(makeThread({ lastAgentText: apia }));
+  assert.equal(list.state, "needs-human");
+  assert.equal(list.ask.topic, "decision");
+  const passing = classify(makeThread({ lastAgentText: "The prod deploy finished; want me to close the ticket?" }));
+  assert.equal(passing.state, "needs-human");
+  assert.equal(passing.ask.topic, "decision");
+  // A follow-on "Or ...?" is the same question, and the step keeps its topic.
+  assert.equal(classify(makeThread({ lastAgentText: "Want me to cut the production release? Or hold it for Monday?" })).ask.topic, "production");
+  assert.equal(classify(makeThread({ lastAgentText: "It needs your password in the browser. Can you log in?" })).ask.topic, "credentials");
+  assert.equal(classify(makeThread({ lastAgentText: "Tests pass, so should I rotate the Stripe secret key in Vercel?" })).ask.topic, "credentials");
+});
+
+test("a turn that stopped mid-work is stopped, whatever its PR or last words say", () => {
+  // Killed by an app restart: no end row, quiet past the running window.
+  const dead = makeThread({ kind: "codex", key: "codex:t5", agentStatus: "stalled", lastAgentText: "I'm checking those write boundaries before changing them." });
+  assert.equal(classify(dead, { pr: makePr({ state: "MERGED", mergedAt: ago(10 * 24 * 60 * MIN) }) }).state, "stopped");
+  assert.equal(classify(dead, { pr: null }).state, "stopped");
+  assert.equal(classify({ ...dead, prRefs: [] }, { pr: null }).state, "stopped");
+  // Mid-turn words about waiting are not a wait once the turn is dead.
+  assert.equal(classify({ ...dead, lastAgentText: "Waiting for CI to finish on the new head." }).state, "stopped");
+  // Interrupted by something else (seven threads at once): stopped.
+  const interrupted = makeThread({ agentStatus: "aborted", meta: { abortedAt: ago(20 * MIN) }, lastUserAt: ago(60 * MIN) });
+  assert.equal(classify(interrupted).state, "stopped");
+  // The owner pressed stop right after writing: not the supervisor's to resume.
+  const deliberate = makeThread({ agentStatus: "aborted", meta: { abortedAt: ago(20 * MIN) }, lastUserAt: ago(20 * MIN + 30_000) });
+  assert.notEqual(classify(deliberate).state, "stopped");
+  // Still running, or asking the owner: not stopped.
+  assert.equal(classify(makeThread({ agentStatus: "running" })).state, "running");
+  assert.equal(classify({ ...dead, meta: { pendingQuestion: { text: "Pick a price?", options: ["$1", "$2"], at: ago(20 * MIN) } } }).state, "needs-human");
 });

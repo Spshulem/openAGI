@@ -31,6 +31,8 @@ export interface OpenAGIPhoneActions {
   refreshInbox?(): void
   openInbox?(): void
   inboxAction?(op: InboxOperation, id?: string, extra?: Record<string, unknown>): void
+  // A supervisor question answered with one of its fixed choices.
+  answerQuestion?(id: string, answer: string): Promise<{ ok: boolean; detail: string }>
   markMoment?(): void
   configureHomeMode?(mode: HomeMode): void
   recordingConsent?(consent: boolean): void
@@ -126,7 +128,7 @@ export class OpenAGIPhoneCompanion {
           </section>
           <details class="ambient" data-page="listen"><summary>Talk, speech and activity settings</summary><h2>Talk controls</h2>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
-            <p>Turn off to review the transcript and confirm Send first. Tap the glasses to start talking and tap again to stop; a press-and-hold works like a tap.</p>
+            <p>Turn off to review the transcript and confirm Send first. Tap the glasses to start talking and tap again to stop; a press-and-hold works like a tap. In Supervisor, press and hold on the home screen to talk to the supervisor, and let go to send.</p>
             <h2>Speech recognition</h2><label for="speech-model">Speech model (not the agent's reasoning model)</label>
             <select id="speech-model"><option value="openai-buffered">OpenAI · buffered recording</option><option value="nova-3">Deepgram Nova 3 · live</option><option value="nova-2">Deepgram Nova 2 · live</option></select>
             <label for="speech-transport">Live speech connection</label>
@@ -216,6 +218,18 @@ export class OpenAGIPhoneCompanion {
     root.querySelector('#recording-consent')?.addEventListener('change', () => actions.recordingConsent?.(root.querySelector<HTMLInputElement>('#recording-consent')?.checked === true))
     root.querySelector('#delete-memory')?.addEventListener('click', () => { if (window.confirm('Stop memory and delete transcripts and suggestions on main? Recording consent turns off. Previously accepted tasks remain.')) actions.deleteMemory?.() })
     root.querySelector('#proactive-items')?.addEventListener('click', event => {
+      const answerButton = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-answer]') : null
+      if (answerButton?.dataset.id && answerButton.dataset.answer !== undefined) {
+        const card = answerButton.closest('details'), status = card?.querySelector<HTMLElement>('.answer-status')
+        const buttons = card ? [...card.querySelectorAll<HTMLButtonElement>('button')] : []
+        buttons.forEach(b => { b.disabled = true })
+        if (status) status.textContent = 'Sending…'
+        void actions.answerQuestion?.(answerButton.dataset.id, answerButton.dataset.answer).then(result => {
+          if (status) status.textContent = result.ok ? `Sent: ${answerButton.dataset.answer}.` : `Not sent. ${result.detail || 'The question stays open.'}`
+          if (!result.ok) buttons.forEach(b => { b.disabled = false })
+        })
+        return
+      }
       const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>('button[data-inbox-op]') : null
       const op = button?.dataset.inboxOp as InboxOperation | undefined
       if (!op || !button?.dataset.id) return
@@ -349,10 +363,16 @@ export class OpenAGIPhoneCompanion {
       const title = document.createElement('summary'); title.textContent = item.title
       const summary = document.createElement('p'); summary.textContent = item.summary
       card.append(title, summary)
+      // Supervisor questions answer here: one button per fixed choice.
+      const answers = item.supervisor ? (item.options ?? []).filter(o => o && o !== 'dismiss') : []
+      for (const option of answers) {
+        const b = document.createElement('button'); b.textContent = option; b.className = 'answer'; b.dataset.answer = option; b.dataset.id = item.id; card.append(b)
+      }
+      if (answers.length) { const status = document.createElement('p'); status.className = 'answer-status'; card.append(status) }
       for (const [op, text] of [['dismiss', 'Dismiss alert'], ['snooze', 'Snooze 1 hour'], ...(item.action === 'accept-task' ? [['accept-task', item.reminder ? 'Review reminder date & time' : 'Review and add user task']] : []), ...(item.action === 'complete-task' ? [['complete-task', 'Complete task on main']] : [])]) {
         const b = document.createElement('button'); b.textContent = text; b.dataset.inboxOp = op; b.dataset.id = item.id; card.append(b)
       }
-      if (!['accept-task', 'complete-task'].includes(item.action)) { const p = document.createElement('p'); p.textContent = 'Review details and approve any actions on your main.'; card.append(p) }
+      if (!answers.length && !['accept-task', 'complete-task'].includes(item.action)) { const p = document.createElement('p'); p.textContent = 'Review details and approve any actions on your main.'; card.append(p) }
       root.append(card)
     }
   }

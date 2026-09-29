@@ -67,12 +67,13 @@ function eventText(event) {
 
 function summarizeTail(rowsNewestFirst) {
   const summary = {
-    lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null
+    lastUserText: "", lastUserAt: null, lastAgentText: "", lastAgentAt: null, lastEnd: null, model: null, lastAt: null, turnStartedAt: null,
+    pendingAsk: null
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
-    summary.lastAt = latestIso(summary.lastAt, at);
     if (row.role === "user") {
+      summary.lastAt = latestIso(summary.lastAt, at);
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
       if (row.cancelled_at || row.sender_session_id || row.sender_api_key_name) continue;
       const text = String(row.content ?? "").trim();
@@ -84,10 +85,15 @@ function summarizeTail(rowsNewestFirst) {
     }
     const event = parseEvent(row.content);
     if (!event) continue;
+    // System rows (commands_changed and other state broadcasts) also land
+    // on idle tabs; only turn rows are activity.
+    if (event.type !== "system") summary.lastAt = latestIso(summary.lastAt, at);
     // Every SDK turn opens with system/init.
     if (event.type === "system" && event.subtype === "init") summary.turnStartedAt = at;
     else if (event.type === "assistant" && !event.parent_tool_use_id) {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
+      const ask = askUserQuestion(event, at);
+      if (ask) summary.pendingAsk = ask;
       const text = eventText(event);
       if (text) {
         summary.lastAgentText = text;
@@ -104,9 +110,32 @@ function summarizeTail(rowsNewestFirst) {
       }
     } else if (event.type === "error") {
       summary.lastEnd = { isError: true, text: String(event.content ?? ""), at };
+    } else if (event.type === "user" && summary.pendingAsk && answersTool(event, summary.pendingAsk.id)) {
+      summary.pendingAsk = null;
     }
   }
   return summary;
+}
+
+// Conductor's AskUserQuestion: the turn waits on the owner's pick while the
+// session reads "idle", and the question is in the tool call, not the text.
+function askUserQuestion(event, at) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  const call = content.find((block) => block?.type === "tool_use" && /AskUserQuestion$/.test(String(block.name ?? "")));
+  const questions = Array.isArray(call?.input?.questions) ? call.input.questions.filter((q) => q && typeof q.question === "string") : [];
+  if (!call?.id || !questions.length) return null;
+  // The pick is a widget in Conductor: typed text does not answer it, so the
+  // choices ride in the text and the owner answers in the app.
+  const choices = (q) => (Array.isArray(q.options) ? q.options : [])
+    .map((option) => (typeof option === "string" ? option : option?.label))
+    .filter((option) => typeof option === "string" && option.trim());
+  const text = questions.map((q) => (choices(q).length ? `${q.question.trim()} (${choices(q).join(" / ")})` : q.question.trim())).join(" / ");
+  return { id: String(call.id), at, text, options: [] };
+}
+
+function answersTool(event, id) {
+  const content = Array.isArray(event.message?.content) ? event.message.content : [];
+  return content.some((block) => block?.type === "tool_result" && String(block.tool_use_id ?? "") === id);
 }
 
 function readRecentMessages(db, sessionId) {
@@ -209,8 +238,11 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
     workspace: row.directory_name || null,
     claudeSessionId,
     agentStatus,
-    lastActivityAt: latestIso(dbTimeToIso(row.updated_at), summary.lastAt),
+    // sessions.updated_at moves on any row update (unread count, broadcasts),
+    // so it only stands in for a tab with no turn rows.
+    lastActivityAt: summary.lastAt ?? dbTimeToIso(row.updated_at),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
+    lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,
@@ -228,6 +260,9 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
       abortReason,
       abortedAt,
       blockedOnOwner,
+      pendingQuestion: summary.pendingAsk
+        ? { text: clampText(redactSecrets(summary.pendingAsk.text), limits.bodyMax), options: summary.pendingAsk.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: summary.pendingAsk.at }
+        : null,
       waitingFor: peer?.waitingFor ?? null,
       conductorStatus: row.status ?? null,
       derivedStatus: row.derived_status ?? null,

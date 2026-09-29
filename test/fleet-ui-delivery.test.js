@@ -6,7 +6,7 @@ import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   createPresenceProbe, createUiDriver, createUiLock, findComposer, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
-  parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity
+  conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity
 } from "../src/fleet/ui-delivery.js";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489", "hex").toString("base64");
@@ -32,10 +32,18 @@ function fakeApp(overrides = {}) {
     onType: null,
     onSend: null,
     onClickRow: (name) => { app.selected = name; },
+    // The page element: Codex labels it with the open thread's title,
+    // Conductor puts the open workspace and session in its URL.
+    page: null,
+    // Conductor sidebar links: { label, url, session }.
+    links: [],
+    onClickLink: (link) => { app.page = { ...app.page, url: `${link.url}?activeTabType=session&sessionId=${link.session}` }; },
     ...overrides
   };
   app.render = () => {
     const lines = [`App=${app.bundleId} (pid 42)`, `Window: ${JSON.stringify(app.windowTitle)}, App: Conductor.`, "0 standard window Conductor"];
+    if (app.page) lines.push(`  90 HTML content ${app.page.label ?? ""}, URL: ${app.page.url ?? "app://-/index.html"}`);
+    app.links.forEach((link, index) => lines.push(`  ${70 + index} link [${link.label}](${link.url})`));
     app.workspaces.forEach((name, index) => lines.push(`  ${index + 1} row${app.selected === name ? " (selected)" : ""} ${name}`));
     if (app.heading) lines.push(`  5 heading ${app.heading}`);
     app.transcript.forEach((text, index) => lines.push(`  ${20 + index} static text ${text}`));
@@ -64,6 +72,8 @@ function fakeTransport(app, { failOn = null } = {}) {
         else if (id === "62") {
           if (app.onSend) app.onSend();
           else if (app.composer) { app.transcript.push(app.composer); app.composer = ""; }
+        } else if (app.links[Number(id) - 70]) {
+          app.onClickLink(app.links[Number(id) - 70]);
         } else {
           const index = Number(id) - 1;
           if (app.workspaces[index]) app.onClickRow(app.workspaces[index]);
@@ -271,6 +281,114 @@ test("a thread that cannot be verified is blocked and nothing is typed", async (
   assert.equal(verifyIdentity(titled, { tokens: ["madrid"] }).ok, true);
 });
 
+// From real app states (2026-09-29): Codex titles its window "ChatGPT" and
+// labels the page with the open thread; Conductor titles its window
+// "Conductor" and names the open workspace and session only in the page URL.
+const CODEX_STATE = [
+  "App=com.openai.codex (pid 48009)",
+  'Window: "ChatGPT", App: ChatGPT.',
+  "0 standard window ChatGPT, Secondary Actions: Raise",
+  "\t1 container (settable, string) ChatGPT",
+  "\t\t2 scroll area",
+  "\t\t\t3 HTML content Scope native mobile migration, URL: app://-/index.html",
+  "\t\t\t\t40 button Plan interactive reports migration (5)",
+  "\t\t\t\t41 static text I'll check Plan interactive reports migration (5) next."
+].join("\n");
+const CONDUCTOR_URL = "tauri://localhost/repository/8e9afc2d-4507-4e1c-a41f-060884800531/workspace/693f5c83-2477-4e68-8391-e65883017205?activeTabType=session&sessionId=32114e3f-5d03-4511-b7d9-38587833288e&gitPanelTab=changes&gitDiff=all";
+const CONDUCTOR_STATE = [
+  "App=com.conductor.app (pid 19036)",
+  'Window: "Conductor", App: Conductor.',
+  "0 standard window Conductor, Secondary Actions: Raise",
+  "\t1 scroll area",
+  `\t\t2 HTML content Tauri + React + Typescript, URL: ${CONDUCTOR_URL}`,
+  "\t\t\t21 link [Add a reusable feature-onboarding framework +5.3k -60](tauri://localhost/repository/8e9afc2d-4507-4e1c-a41f-060884800531/workspace/c5a9a5e9-327d-4f1a-aa00-4598165bd180)",
+  "\t\t\t111 text apia",
+  "\t\t\t117 tab (selected) Close chat Canny issue prevention Nikhil Value: on"
+].join("\n");
+const stateOf = (text) => parseAppState({ content: [{ type: "text", text }] });
+
+test("Codex is verified by the page label, never by sidebar or transcript text", () => {
+  const state = stateOf(CODEX_STATE);
+  const page = state.elements.find((element) => element.role === "html content");
+  assert.equal(page.label, "Scope native mobile migration");
+  assert.equal(page.fields.url, "app://-/index.html");
+  assert.equal(verifyIdentity(state, { tokens: ["scope native mobile migration"] }).ok, true);
+  // Named in the sidebar and the transcript, but not the open thread.
+  assert.equal(verifyIdentity(state, { tokens: ["plan interactive reports migration (5)"] }).ok, false);
+  // Another known thread on the page is a mismatch.
+  assert.match(verifyIdentity(state, { tokens: ["fix billing"], conflicts: ["scope native mobile migration"] }).reason, /another thread is open/);
+});
+
+test("Conductor is verified by the workspace and session ids in the page URL", () => {
+  assert.deepEqual(conductorIds(CONDUCTOR_URL), { workspaceId: "693f5c83-2477-4e68-8391-e65883017205", sessionId: "32114e3f-5d03-4511-b7d9-38587833288e" });
+  assert.deepEqual(conductorIds("tauri://localhost/repository/r/workspace/w1"), { workspaceId: "w1", sessionId: null });
+  const state = stateOf(CONDUCTOR_STATE);
+  const ids = { workspaceId: "693f5c83-2477-4e68-8391-e65883017205", sessionId: "32114e3f-5d03-4511-b7d9-38587833288e" };
+  // The directory name ("apia") is only plain text there, so names alone fail.
+  assert.equal(verifyIdentity(state, { tokens: ["apia"] }).ok, false);
+  assert.equal(verifyIdentity(state, { tokens: ["apia"], ids }).ok, true);
+  assert.match(verifyIdentity(state, { tokens: [], ids: { ...ids, sessionId: "other" } }).reason, /another session is open/);
+  // A sidebar link naming another workspace is not the open page.
+  assert.equal(verifyIdentity(state, { tokens: [], ids: { workspaceId: "c5a9a5e9-327d-4f1a-aa00-4598165bd180", sessionId: ids.sessionId } }).ok, false);
+  const noTab = stateOf(CONDUCTOR_STATE.replace(/\?activeTabType=session&sessionId=[^&]+/, "?activeTabType=file"));
+  assert.match(verifyIdentity(noTab, { tokens: [], ids }).reason, /no session tab open/);
+});
+
+test("Conductor with the owner active elsewhere: clicks the in-app link to the workspace, proves it by URL", async (t) => {
+  const app = fakeApp({
+    workspaces: [],
+    page: { label: "Tauri + React + Typescript", url: "tauri://localhost/repository/r1/workspace/w-cairo?activeTabType=session&sessionId=s9" },
+    links: [
+      { label: "Cairo work +1 -1", url: "tauri://localhost/repository/r1/workspace/w-cairo", session: "s9" },
+      { label: "Fix billing +12 -3", url: "tauri://localhost/repository/r1/workspace/w-madrid", session: "s1" }
+    ]
+  });
+  const f = setup(t, { app });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(f.probe.opened, [], "owner active: no deep link");
+  assert.ok(f.calls().some((call) => call.name === "click" && call.args.element_index === "71"), "clicked the madrid link");
+  assert.equal(f.app.transcript.at(-1), MESSAGE);
+});
+
+test("Conductor showing another session after navigation is blocked, nothing typed", async (t) => {
+  const app = fakeApp({ workspaces: [], page: { label: "x", url: "tauri://localhost/repository/r1/workspace/w-madrid?activeTabType=session&sessionId=s2" } });
+  const f = setup(t, { app });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /another session is open/);
+  assert.deepEqual(typed(f.calls()), []);
+});
+
+test("a shared Codex title goes on only through the id link, from another open thread", async (t) => {
+  const codexThread = { key: "codex:t5", kind: "codex", id: "t5", title: "Plan interactive reports migration (5)", archived: false, meta: { codexTitleShared: true } };
+  const target = uiTargetFor(codexThread);
+  const identity = uiIdentity(codexThread, target, [codexThread]);
+  assert.equal(identity.shared, true);
+  const codexApp = (label) => fakeApp({ bundleId: "com.openai.codex", windowTitle: "ChatGPT", workspaces: [], page: { label, url: "app://-/index.html" } });
+
+  // Owner away, another thread open: the id link moves the page onto the title.
+  const moved = codexApp("Scope native mobile migration");
+  const away = fakeProbe({ idle: 10 * 60_000, onOpen: () => { moved.page = { ...moved.page, label: codexThread.title }; } });
+  const f = setup(t, { app: moved, probe: away });
+  const sent = await f.driver.deliver(f.request({ target, identity }));
+  assert.equal(sent.status, "sent", sent.detail);
+  assert.deepEqual(away.opened, ["codex://threads/t5"]);
+
+  // A thread with that title already open may be the twin: blocked.
+  const g = setup(t, { app: codexApp(codexThread.title), probe: fakeProbe({ idle: 10 * 60_000 }) });
+  const already = await g.driver.deliver(g.request({ target, identity }));
+  assert.equal(already.status, "blocked");
+  assert.match(already.detail, /already open/);
+  assert.deepEqual(typed(g.calls()), []);
+
+  // Owner active: no deep link, so no way to prove it.
+  const h = setup(t, { app: codexApp("Scope native mobile migration") });
+  const active = await h.driver.deliver(h.request({ target, identity }));
+  assert.equal(active.status, "blocked");
+  assert.match(active.detail, /two threads share this title/);
+});
+
 test("a draft in the composer is never overwritten", async (t) => {
   const f = setup(t, { app: fakeApp({ composer: "half-written owner note" }) });
   const result = await f.driver.deliver(f.request());
@@ -465,15 +583,21 @@ test("uiIdentity asks for the workspace, the session title when needed, and refu
   // Tab count unknown (older rows): the title is required as well.
   const unknownCount = conductorThread({ meta: { conductorWorkspaceId: "w-madrid", conductorSessionId: "s1", conductorSessionTitle: "Fix billing" } });
   assert.deepEqual(uiIdentity(unknownCount, uiTargetFor(unknownCount), [unknownCount]).tokens, ["madrid", "fix billing"]);
-  // Shared or missing titles cannot tell tabs apart.
+  // Shared or missing titles cannot tell tabs apart by name: those give no
+  // name tokens, and only the page URL's ids can prove the session.
+  const byIdOnly = (identity) => {
+    assert.equal(identity.ambiguous, false);
+    assert.deepEqual(identity.tokens, []);
+    assert.equal(identity.ids.workspaceId, "w-madrid");
+  };
   const twin = conductorThread({ key: "conductor:s2", id: "s2", meta: tabMeta("s2", "Fix billing") });
-  assert.equal(uiIdentity(madrid, target, [madrid, twin]).ambiguous, true);
+  byIdOnly(uiIdentity(madrid, target, [madrid, twin]));
   const shared = conductorThread({ meta: tabMeta("s1", "Fix billing", { conductorTitleShared: true }) });
-  assert.match(uiIdentity(shared, uiTargetFor(shared), [shared]).reason, /two sessions share this title/);
+  byIdOnly(uiIdentity(shared, uiTargetFor(shared), [shared]));
   const untitled = conductorThread({ title: "madrid", meta: tabMeta("s1", null) });
-  assert.match(uiIdentity(untitled, uiTargetFor(untitled), [untitled]).reason, /no title/);
+  byIdOnly(uiIdentity(untitled, uiTargetFor(untitled), [untitled]));
   const otherRepo = conductorThread({ key: "conductor:s9", id: "s9", meta: { conductorWorkspaceId: "w-other", conductorSessionId: "s9", conductorWorkspaceSessions: 1 } });
-  assert.match(uiIdentity(madrid, target, [madrid, otherRepo]).reason, /two workspaces share this name/);
+  byIdOnly(uiIdentity(madrid, target, [madrid, otherRepo]));
   const cairo = conductorThread({ key: "conductor:s5", id: "s5", workspace: "cairo", meta: { conductorWorkspaceId: "w-cairo", conductorSessionId: "s5", conductorWorkspaceSessions: 1 } });
   assert.deepEqual(uiIdentity(madrid, target, [madrid, cairo]).conflicts, ["cairo"]);
 
@@ -508,9 +632,9 @@ test("presence probes parse lsappinfo and ioreg output", async () => {
   assert.equal(parseIdleMs('  |   "HIDIdleTime" = 659028416\n'), 659);
   assert.equal(parseIdleMs("nothing"), null);
   const unlocked = '"IOConsoleLocked" = No\n"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserNameKey"="shooby"})';
-  assert.deepEqual(parseConsoleSession(unlocked), { locked: false, secureInput: false, onConsole: true });
+  assert.deepEqual(parseConsoleSession(unlocked), { locked: false, secureInput: false, secureInputPid: null, onConsole: true });
   const locked = '"IOConsoleUsers" = ({"CGSSessionScreenIsLocked"=Yes,"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionSecureInputPID"=812})';
-  assert.deepEqual(parseConsoleSession(locked), { locked: true, secureInput: true, onConsole: true });
+  assert.deepEqual(parseConsoleSession(locked), { locked: true, secureInput: true, secureInputPid: 812, onConsole: true });
   assert.equal(parseConsoleSession(""), null);
 
   const calls = [];
@@ -531,7 +655,7 @@ test("presence probes parse lsappinfo and ioreg output", async () => {
   assert.equal(await probe.frontApp(), "com.conductor.app");
   assert.equal(await probe.appRunning("com.conductor.app"), true);
   assert.equal(await probe.idleMs(), 150_000);
-  assert.deepEqual(await probe.session(), { locked: false, secureInput: false, onConsole: true });
+  assert.deepEqual(await probe.session(), { locked: false, secureInput: false, secureInputPid: null, onConsole: true });
   assert.equal(await probe.openUrl("codex://threads/t1"), true);
   assert.deepEqual(calls.at(-1), ["/usr/bin/open", "-g", "codex://threads/t1"]);
   assert.deepEqual(calls[1], ["/usr/bin/lsappinfo", "info", "-only", "bundleID", "ASN:0x0-0x86b86b:"]);
@@ -693,4 +817,49 @@ test("the read-only probe script reports what a delivery would see", async () =>
   assert.equal(report.stopVisible, true);
   assert.equal(report.identity.ok, false);
   assert.match(report.identity.reason, /cairo/);
+});
+
+test("the app restarter quits in the background, relaunches, and refuses while the owner uses the app", async () => {
+  const { createAppRestarter } = await import("../src/fleet/ui-delivery.js");
+  let clock = 0;
+  const runs = [];
+  let running = true;
+  const run = async (cmd, args) => {
+    runs.push([cmd, ...args]);
+    if (cmd === "osascript") running = false;
+    if (cmd === "open") running = true;
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const probe = fakeProbe({ appRunning: async () => running });
+  const restarter = createAppRestarter({ run, probe, now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const ok = await restarter.restart("conductor");
+  assert.deepEqual(ok, { ok: true, detail: "restarted Conductor" });
+  assert.deepEqual(runs, [["osascript", "-e", 'tell application id "com.conductor.app" to quit'], ["open", "-g", "-b", "com.conductor.app"]]);
+
+  const busy = createAppRestarter({ run, probe: fakeProbe({ front: "com.conductor.app", idle: 1_000 }), now: () => clock, sleep: async (ms) => { clock += ms; } });
+  assert.deepEqual(await busy.restart("conductor"), { ok: false, detail: "you are using Conductor" });
+
+  // A quit held up by the app (a confirm dialog) is not forced.
+  const stuck = createAppRestarter({ run: async () => ({ code: 0 }), probe: fakeProbe({ appRunning: async () => true }), now: () => clock, sleep: async (ms) => { clock += ms; } });
+  assert.deepEqual(await stuck.restart("conductor"), { ok: false, detail: "Conductor did not quit" });
+  assert.equal((await restarter.restart("finder")).ok, false);
+});
+
+test("the app holding secure input is named in the not-ready reason", async () => {
+  const { appNameFromPath } = await import("../src/fleet/ui-delivery.js");
+  assert.equal(appNameFromPath("/Applications/BuildBetter Staging.app/Contents/MacOS/BuildBetter Staging\n"), "BuildBetter Staging");
+  assert.equal(appNameFromPath("/usr/sbin/loginwindow"), "loginwindow");
+  assert.equal(appNameFromPath(""), null);
+  const session = parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=56400,"kCGSSessionOnConsoleKey"=Yes})');
+  assert.equal(session.secureInput, true);
+  assert.equal(session.secureInputPid, 56400);
+  assert.equal(parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=0})').secureInputPid, null);
+  // Fast user switching: an off-console session first must not hide the holder.
+  const multi = parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=0,"kCGSSessionOnConsoleKey"=No},{"kCGSSessionSecureInputPID"=812,"kCGSSessionOnConsoleKey"=Yes})');
+  assert.equal(multi.secureInput, true);
+  assert.equal(multi.secureInputPid, 812);
+  const probe = createPresenceProbe({ run: async (cmd) => ({ code: 0, stdout: cmd === "ps" ? "/Applications/BuildBetter Staging.app/Contents/MacOS/BuildBetter Staging\n" : '"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=56400,"kCGSSessionOnConsoleKey"=Yes})' }) });
+  assert.equal((await probe.session()).secureInputApp, "BuildBetter Staging");
+  const driver = createUiDriver({ config: { bins: { ocu: "/fake/ocu" }, limits: { ...DEFAULTS } }, probe: fakeProbe({ screen: { locked: false, secureInput: true, secureInputApp: "BuildBetter Staging", onConsole: true } }), binaryReady: () => true, computerUseEnabled: () => true, permissionProbe: async () => ({ accessibility: true, screenRecording: true }) });
+  assert.deepEqual(await driver.readiness(), { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" });
 });

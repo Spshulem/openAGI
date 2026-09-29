@@ -180,3 +180,18 @@ it('shows a safe transcript review with explicit send, re-record and discard con
   phone.draft(null)
   expect(document.querySelector<HTMLElement>('#draft-review')?.hidden).toBe(true)
 })
+
+it('answers a supervisor question from the phone with its fixed choices', async () => {
+  const answerQuestion = vi.fn().mockResolvedValue({ ok: true, detail: 'sent' })
+  const inboxAction = vi.fn()
+  const phone = new OpenAGIPhoneCompanion({ pair: vi.fn(), ask: vi.fn(), newConversation: vi.fn(), unlink: vi.fn(), connectAgent: vi.fn(), answerQuestion, inboxAction }, [])
+  phone.inbox([{ id: 'q1', title: '#6522 ready. Merge?', summary: 'CI green', important: true, seen: false, action: 'answer-fleet', category: 'approvals', supervisor: true, options: ['merged', 'later'] }])
+  const buttons = [...document.querySelectorAll<HTMLButtonElement>('#proactive-items button[data-answer]')].map(b => b.textContent)
+  expect(buttons).toEqual(['merged', 'later'])
+  expect(document.querySelector('#proactive-items')?.textContent).not.toContain('approve any actions on your main')
+  document.querySelector<HTMLButtonElement>('button[data-answer="later"]')?.click()
+  expect(answerQuestion).toHaveBeenCalledWith('q1', 'later')
+  await Promise.resolve(); await Promise.resolve()
+  expect(document.querySelector('.answer-status')?.textContent).toBe('Sent: later.')
+  expect(inboxAction).not.toHaveBeenCalled()
+})
