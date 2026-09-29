@@ -49,6 +49,7 @@ function emptyState() {
     escalations: {},
     infraDown: {},
     infraBlocked: {},
+    uiBlockedSince: {},
     infraUp: {},
     pushes: [],
     muted: {}
@@ -219,7 +220,11 @@ export class FleetStore {
     if (COOLDOWN_STATUSES.has(status)) ledger.lastNudgeAt = at;
     const detail = String(entry.detail ?? "");
     if (UNDELIVERED_STATUSES.has(status) && !BENIGN_BLOCKS.test(detail)) {
-      const prev = ledger.undelivered ?? null;
+      // The thread worked since the last failure: this is a new incident,
+      // and an answer to the old one does not cover it.
+      const workedSince = toMs(entry.threadActivityAt, null);
+      const ended = ledger.undelivered && workedSince !== null && workedSince > toMs(ledger.undelivered.lastAt, 0);
+      const prev = ended ? null : (ledger.undelivered ?? null);
       ledger.undelivered = { count: (prev?.count ?? 0) + 1, since: prev?.since ?? at, lastAt: at, reason: clampText(detail, 160) || status, ackedAt: prev?.ackedAt ?? null };
     } else if (REACHED_STATUSES.has(status)) {
       ledger.undelivered = null;
@@ -545,6 +550,19 @@ export class FleetStore {
     return Array.isArray(list) ? [...list] : [];
   }
 
+  // When each nudge first waited on computer use (thread key -> ISO time),
+  // kept across restarts so the paused-nudge alert's clock does not reset.
+  uiBlockedSince() {
+    return new Map(Object.entries(this.state.uiBlockedSince ?? {}).map(([key, at]) => [key, toMs(at, null)]).filter(([, ms]) => ms !== null));
+  }
+
+  setUiBlockedSince(map) {
+    const next = Object.fromEntries([...map].slice(0, INFRA_BLOCKED_KEPT).map(([key, ms]) => [key, iso(ms)]));
+    if (JSON.stringify(next) === JSON.stringify(this.state.uiBlockedSince ?? {})) return;
+    this.state.uiBlockedSince = next;
+    this._save();
+  }
+
   // ─── phone pushes (times only; never the endpoint) ──────────────────────
 
   recordPush(at) {
@@ -687,6 +705,7 @@ export class FleetStore {
       escalations: isObject(raw.escalations) ? raw.escalations : {},
       infraDown: isObject(raw.infraDown) ? raw.infraDown : {},
       infraBlocked: isObject(raw.infraBlocked) ? raw.infraBlocked : {},
+      uiBlockedSince: isObject(raw.uiBlockedSince) ? raw.uiBlockedSince : {},
       infraUp: isObject(raw.infraUp) ? raw.infraUp : {},
       pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
       muted: isObject(raw.muted) ? raw.muted : {}

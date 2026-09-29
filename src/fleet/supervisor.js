@@ -156,10 +156,11 @@ export function groupQuestions(asks, byKey) {
     titles.add(titleKey);
     out.push(single(decision));
   }
-  for (const [kind, all] of Object.entries(groups)) {
+  // The store keeps 50 members per question, so a bigger group splits.
+  const chunks = Object.entries(groups).flatMap(([kind, all]) => (all.length <= GROUP_MAX ? [[kind, all, 0]]
+    : Array.from({ length: Math.ceil(all.length / GROUP_MAX) }, (_, i) => [kind, all.slice(i * GROUP_MAX, (i + 1) * GROUP_MAX), i])));
+  for (const [kind, list, part] of chunks) {
     const spec = GROUPED_KINDS[kind];
-    // The store keeps 50 members; the title counts only what it keeps.
-    const list = all.slice(0, GROUP_MAX);
     const minSize = spec.minSize ?? 2;
     if (list.length === 1 && minSize > 1) out.push(single(list[0]));
     if (!list.length || list.length < minSize) continue;
@@ -170,7 +171,7 @@ export function groupQuestions(asks, byKey) {
       : threads.map(threadLabel).join(", ");
     const resets = threads.map((thread) => thread.error?.resetAt).filter(Boolean).sort();
     out.push({
-      kind, dedupeKey: spec.dedupeKey, options: spec.options, playbook: null, threadKey: null, prRef: null,
+      kind, dedupeKey: part ? `${spec.dedupeKey}:${part + 1}` : spec.dedupeKey, options: spec.options, playbook: null, threadKey: null, prRef: null,
       threadKeys: list.map((decision) => decision.threadKey),
       title: spec.title(list.length, formatReset(resets[0])),
       body: spec.body(labels)
@@ -236,7 +237,7 @@ export class FleetSupervisor {
     this.answering = new Set();
     this._uiDriver = undefined;
     this.restartedAt = new Map();
-    this.uiBlockedSince = new Map();
+    this._uiBlockedSince = null;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
     this._reviewRunner = null;
     this.lastReview = { at: null, failedAt: null, error: null };
@@ -251,6 +252,12 @@ export class FleetSupervisor {
 
   get dataDir() {
     return this.dataDirOption ?? resolveDataDir();
+  }
+
+  // Loaded with the store, which opens on first use.
+  get uiBlockedSince() {
+    this._uiBlockedSince ??= this.store.uiBlockedSince();
+    return this._uiBlockedSince;
   }
 
   get store() {
@@ -511,7 +518,7 @@ export class FleetSupervisor {
   // (the scan failed, or hit its cap) keeps its time; one that no longer
   // waits drops it, so the age is always that of a nudge still waiting.
   trackUiBlocked(decisions, { mode, delivery, threads, sourceErrors, started, config }) {
-    if (mode !== "auto" || delivery.ready !== false) { this.uiBlockedSince.clear(); return; }
+    if (mode !== "auto" || delivery.ready !== false) { this.uiBlockedSince.clear(); this.store.setUiBlockedSince(this.uiBlockedSince); return; }
     const now = new Set(decisions.filter((decision) => decision?.uiBlocked).map((decision) => decision.threadKey));
     const seen = new Set(threads.map((thread) => thread.key));
     const hidden = (key) => {
@@ -521,6 +528,7 @@ export class FleetSupervisor {
     };
     for (const key of [...this.uiBlockedSince.keys()]) if (!now.has(key) && !hidden(key)) this.uiBlockedSince.delete(key);
     for (const key of now) if (!this.uiBlockedSince.has(key)) this.uiBlockedSince.set(key, started);
+    this.store.setUiBlockedSince(this.uiBlockedSince);
   }
 
   // Restarts each listed app that shows one of these threads, once per ten
@@ -667,7 +675,9 @@ export class FleetSupervisor {
     // An escalation went to the manager, not this thread: history only, so it
     // spends neither the thread's nudge budget nor its cooldown.
     const status = action.kind === "escalate-manager" && delivery.status === "sent" ? "escalated" : delivery.status;
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status, detail: delivery.detail ?? null }, action.progressMark);
+    const thread = this.lastThreads.get(action.threadKey);
+    const threadActivityAt = thread ? (thread.lastAgentAt && Date.parse(thread.lastAgentAt) > Date.parse(thread.lastActivityAt ?? "") ? thread.lastAgentAt : thread.lastActivityAt) : null;
+    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
     // back that one attempt. Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
@@ -1031,6 +1041,8 @@ export class FleetSupervisor {
       const known = question.threadKey ? byKey.get(question.threadKey) : null;
       const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]);
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
+      // A group member a capped scan left out may still be failing.
+      if (!question.threadKey && (question.threadKeys ?? []).some((member) => !byKey.has(member) && cappedKinds.has(String(member).split(":")[0]))) continue;
       if (decided || supervisorOwned || threadGone) {
         const reason = decided ? `${decided.state}: ${decided.reason}` : threadGone ? `thread ${known?.excluded ?? "left the scan"}` : "no longer asked";
         store.resolveQuestion(question.id, reason);

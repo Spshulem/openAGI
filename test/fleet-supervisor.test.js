@@ -2107,11 +2107,46 @@ test("the pause age is that of a nudge still waiting: a new thread starts its ow
   assert.equal(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), undefined, "b has waited 2 minutes, not 31");
 });
 
-test("a delivery group keeps at most the store's 50 members and counts only those", () => {
+test("an answer to one failure streak does not cover the next one after the thread worked", async (t) => {
+  let now = NOW;
+  let lastAt = ago(40 * MIN);
+  const thread = () => makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: lastAt, lastActivityAt: lastAt });
+  const { supervisor } = fixture(t, {
+    mode: "auto", now: () => now,
+    deps: {
+      listCodexThreads: async () => [thread()],
+      executor: { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "could not verify thread", actionId: null }), inFlight: () => [], whenIdle: async () => {} }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const first = supervisor.store.openQuestions().find((q) => q.kind === "deliver");
+  await supervisor.answerQuestion(first.id, "skip");
+  assert.ok(supervisor.store.ledgerFor("codex:t1").undelivered.ackedAt);
+  // The owner nudged it by hand; it worked, then stopped again.
+  lastAt = new Date(now - 20 * MIN).toISOString();
+  for (let i = 0; i < 14; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  assert.equal(supervisor.store.ledgerFor("codex:t1").undelivered.ackedAt, null, "a new streak");
+  assert.ok(supervisor.store.openQuestions().find((q) => q.kind === "deliver"), "asked about the new incident");
+});
+
+test("the paused-nudge clock survives a restart", async (t) => {
+  let now = NOW;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const first = fixture(t, { mode: "auto", delivery: "computer-use", threads: [stopped], now: () => now, deps: { uiDriver: driver } });
+  await first.supervisor.tick({ reason: "test" });
+  now += 20 * MIN;
+  // Same data dir, new process.
+  const again = new FleetSupervisor({ dataDir: first.dataDir, config: first.supervisor.config, deps: { ...first.supervisor.deps, now: () => now } });
+  now += 11 * MIN;
+  await again.tick({ reason: "test" });
+  assert.match(again.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use").body, /for 31m/);
+});
+
+test("more than 50 unreachable threads split into several stored groups", () => {
   const keys = Array.from({ length: 60 }, (_, i) => `codex:t${i}`);
   const byKey = new Map(keys.map((key) => [key, makeThread({ key, id: key.split(":")[1] })]));
   const asks = keys.map((key) => ({ threadKey: key, action: "ask-user", playbook: "resume", reason: "can't deliver: could not verify thread.", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x", body: "y", options: ["done", "skip"] } }));
-  const [group] = groupQuestions(asks, byKey);
-  assert.equal(group.threadKeys.length, 50);
-  assert.match(group.title, /^50 stopped/);
+  const groups = groupQuestions(asks, byKey);
+  assert.deepEqual(groups.map((g) => [g.dedupeKey, g.threadKeys.length]), [["deliver:group", 50], ["deliver:group:2", 10]]);
 });

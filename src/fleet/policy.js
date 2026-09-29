@@ -92,6 +92,15 @@ export function uiWaitReason(thread, delivery) {
   return `computer use not ready${ui.detail ? `: ${ui.detail}` : ""}`;
 }
 
+// Either computer-use mode, when a thread the app shows has no route only
+// because computer use cannot type now: wait for it (the supervisor tells
+// the owner once it has waited a while) instead of calling it offline.
+function uiBlockedReason(thread, delivery) {
+  const ui = deliveryOf(delivery);
+  if (ui.mode === "cli" || ui.ready !== false || !uiTargetFor(thread)) return null;
+  return `computer use not ready${ui.detail ? `: ${ui.detail}` : ""}`;
+}
+
 // Null while the owner is talking to the manager, while it is mid-turn, or
 // while it is down. Callers check managerBusy first to wait instead of asking.
 function managerRoute(manager, mode, limits, now, delivery = null) {
@@ -468,7 +477,7 @@ function resolveEscalation(ctx, intent, base) {
   if (busy) return { ...decision, action: "wait", reason: `${busy.reason}; ${intent.reason}`, notBefore: busy.notBefore };
   const vars = { ...ctx.facts, ...intent.vars };
   const route = managerRoute(ctx.manager, ctx.mode, limits, now, ctx.delivery);
-  const waitUi = route ? null : uiWaitReason(ctx.manager, ctx.delivery);
+  const waitUi = route ? null : uiBlockedReason(ctx.manager, ctx.delivery);
   if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}`, uiBlocked: true };
   if (!route) {
     return {
@@ -632,7 +641,7 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
   const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
   const route = managerRoute(manager, mode, limits, now, delivery);
-  const waitUi = route ? null : uiWaitReason(manager, delivery);
+  const waitUi = route ? null : uiBlockedReason(manager, delivery);
   if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}`, uiBlocked: true };
   if (!route) {
     return {
