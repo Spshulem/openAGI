@@ -201,14 +201,19 @@ function withHealth(snapshot) {
   return { ...snapshot, threads: snapshot.threads.map((row) => (row?.health ? row : { ...row, health: threadHealth(row?.state, row?.error ?? null) })) };
 }
 
-// Delivery that failed only because typing has to wait, not because the
-// thread cannot be reached at all.
+// Delivery that failed only because typing into the app has to wait (a
+// strict computer-use Mac that cannot type now, or a typed send held back by
+// the owner at the keyboard or a running turn). A CLI fallback's failure is
+// not about typing, so it stays the owner's to see.
 const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input)/;
-function typingWaits(thread, deliveryState, delivery) {
+function typingWaits(thread, route, deliveryState, delivery) {
   if (!uiTargetFor(thread)) return false;
-  if (deliveryState?.mode !== "cli" && deliveryState?.ready === false) return true;
-  return TYPING_WAITS.test(String(delivery?.detail ?? ""));
+  if (!route) return deliveryState?.mode === "computer-use" && deliveryState?.ready === false;
+  return route === "computer-use" && TYPING_WAITS.test(String(delivery?.detail ?? ""));
 }
+// A background (CLI) send of a kept answer reports whether it reached the
+// agent later; until then the answer is not sent again.
+const QUEUED_SENDING_MS = 15 * 60_000;
 
 // Answers kept while the Mac could not type are dropped after this long; the
 // paused-nudge alert has told the owner why by then.
@@ -547,27 +552,40 @@ export class FleetSupervisor {
   }
 
   // Owner answers kept while the Mac could not type. Each goes to its agent
-  // once a route works; one the owner overtook in the thread (they typed
-  // there since), or older than a day, is dropped.
-  async deliverQueuedAnswers({ byKey, started, unknown }) {
+  // once a route works, and only while the agent still asks that same thing
+  // (this tick asked its dedupeKey): a stale "yes" must never land on a new
+  // question. One the owner overtook in the thread is dropped quietly; one
+  // older than a day, or whose thread is gone, goes back to the owner.
+  async deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked }) {
     const queued = this.store.queuedAnswers();
     if (!queued.length) return;
     const deliveryState = await this.probeDelivery();
     for (const question of queued) {
       const pending = question.pendingDelivery;
+      if (pending.sendingAt && started - Date.parse(pending.sendingAt) < QUEUED_SENDING_MS) continue;
       if (unknown([question.threadKey])) continue;
       const thread = byKey.get(question.threadKey);
-      const answeredMs = Date.parse(question.answeredAt ?? "");
-      if (!thread || started - Date.parse(pending.since) > QUEUED_ANSWER_MS) { this.store.settleQueuedAnswer(question.id, "dropped"); continue; }
-      if (Date.parse(thread.lastUserAt ?? "") > answeredMs && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) {
-        this.store.settleQueuedAnswer(question.id, "superseded");
+      // A full scan leaves threads out; that is not proof this one is gone.
+      if (!thread && cappedKinds.has(String(question.threadKey).split(":")[0])) continue;
+      if (!thread || started - Date.parse(pending.since) > QUEUED_ANSWER_MS) {
+        this.store.settleQueuedAnswer(question.id, "dropped");
+        // Back in front of the owner, unless the same ask already is.
+        if (!this.store.openQuestions().some((q) => q.dedupeKey === question.dedupeKey)) this.store.reopenQuestion(question.id, [], { answer: question.answer, asked: true });
         continue;
       }
+      const ownerSince = Date.parse(thread.lastUserAt ?? "") > Date.parse(question.answeredAt ?? "") && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
+      if (ownerSince || !asked.has(question.dedupeKey)) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
-      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
-      if (delivery.status === "sent") this.store.settleQueuedAnswer(question.id, "sent");
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
+      if (delivery.status !== "sent") continue;
+      if (!delivery.done) { this.store.settleQueuedAnswer(question.id, "sent"); continue; }
+      // A CLI child reports later whether it reached the agent.
+      this.store.markQueuedSending(question.id);
+      delivery.done
+        .then((reached) => (reached ? this.store.settleQueuedAnswer(question.id, "sent") : this.store.markQueuedSending(question.id, null)))
+        .catch(() => this.store.markQueuedSending(question.id, null));
     }
   }
 
@@ -633,7 +651,7 @@ export class FleetSupervisor {
         // The owner decided; only the typing has to wait (secure input, a
         // locked screen, the owner at the keyboard). Keep the answer and send
         // it once the Mac can type, instead of handing the question back.
-        if (thread && delivery.status !== "sent" && answer !== "open thread" && typingWaits(thread, deliveryState, delivery)) {
+        if (thread && delivery.status !== "sent" && answer !== "open thread" && typingWaits(thread, route, deliveryState, delivery)) {
           const queued = this.store.queueAnswer(id, answer, message);
           this.resolveOutreach(question, answer, "acted");
           this.applyOverride(question, answer);
@@ -1029,7 +1047,7 @@ export class FleetSupervisor {
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
-    await this.deliverQueuedAnswers({ byKey, started, unknown });
+    await this.deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked });
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.

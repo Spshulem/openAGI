@@ -339,7 +339,18 @@ export class FleetStore {
     return this.state.questions.filter((q) => q.status === "answered" && q.pendingDelivery).map((q) => ({ ...q }));
   }
 
-  // sent, superseded (the owner typed in the thread since), or dropped.
+  // A background send of a kept answer is in flight (at), or failed (null).
+  markQueuedSending(id, at = iso(this.now())) {
+    const question = this._findQuestion(id);
+    if (!question?.pendingDelivery) return null;
+    if (at) question.pendingDelivery.sendingAt = at;
+    else delete question.pendingDelivery.sendingAt;
+    this._save();
+    return { ...question };
+  }
+
+  // sent, superseded (the owner typed in the thread since, or the agent no
+  // longer asks it), or dropped.
   settleQueuedAnswer(id, outcome) {
     const question = this._findQuestion(id);
     if (!question?.pendingDelivery) return null;
@@ -354,11 +365,13 @@ export class FleetStore {
   // back in front of them instead of suppressing the question for a day,
   // and a retry sends to those threads again. A different, later answer
   // from the owner is not undone.
-  reopenQuestion(id, undeliveredKeys = [], { answer = null } = {}) {
+  reopenQuestion(id, undeliveredKeys = [], { answer = null, asked = false } = {}) {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
     if (question.status === "answered" && (answer === null || question.answer === answer)) {
       Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()) });
+      // Put back as a fresh ask, so it does not expire on the next read.
+      if (asked) Object.assign(question, { lastAskedAt: iso(this.now()), expiresAt: iso(this.now() + QUESTION_TTL_MS) });
     }
     if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));
     this._save();
