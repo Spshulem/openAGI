@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { uiIdentity } from "../src/fleet/ui-delivery.js";
-import { linkUiHosts, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
+import { clampText, linkUiHosts, resolveFleetConfig, shortHash, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   classifyLbError, cleanCodexUserText, listCodexThreads, parseRolloutTail, readCodexLbErrors
 } from "../src/fleet/sources/codex.js";
@@ -606,4 +606,71 @@ test("a ciphertext structured-question title is replaced by the agent's words or
   // The stand-in keeps the end of the message, where the ask is.
   assert.match(pending.text, /Should I keep this as a report or fix it\?$/);
   assert.ok(pending.text.length <= ctx.config.limits.bodyMax);
+});
+
+const SEALED_TITLE = "gAAAAABqujkpRnnobDR_oyUGwgwolJFyyBdBHiotOEYKl36AQL4v-F48lnbJYWpMIJtvJ10DiQAS-pd8-cHA-mRJlrFUc54UcgVsoceW9MzzUOBh==";
+const rollout = (rows) => rows.map((row) => JSON.stringify(row)).join("\n");
+
+// Review 4/13: a sealed ask the agent talked past, or ended its turn on, is
+// dropped unless the words standing in for it ask something.
+test("a sealed ask the agent moved past is dropped unless its stand-in asks", () => {
+  const status = "The type correction is committed as 6e94628a14. The functional regressions remain passing evidence.";
+  const before = [ev.started("q", 30 * MIN), ev.assistant(status, 29 * MIN), ev.ask(SEALED_TITLE, 28 * MIN)];
+  // #6896: a status line, the sealed ask, more work, then the handoff.
+  const movedOn = parseRolloutTail(rollout([...before,
+    ev.assistant("No additional user input is needed for the remaining checks.", 27 * MIN), ev.complete("q", 10 * MIN, "PR #6896 is code-complete and CI-green.")]));
+  assert.equal(movedOn.pendingQuestion, null);
+  // Ending the turn on it drops it too.
+  assert.equal(parseRolloutTail(rollout([...before, ev.complete("q", 27 * MIN, null)])).pendingQuestion, null);
+  // Nothing after it yet: it stays.
+  assert.equal(parseRolloutTail(rollout(before)).pendingQuestion?.sealed, true);
+  // The words before it ask something: it outlives more output and the turn end.
+  const asking = parseRolloutTail(rollout([
+    ev.started("q", 30 * MIN), ev.assistant(`${status} Should I keep this as a report or fix it?`, 29 * MIN), ev.ask(SEALED_TITLE, 28 * MIN),
+    ev.assistant("I'll hold here for your answer.", 27 * MIN), ev.complete("q", 26 * MIN, "I'll hold here for your answer.")
+  ]));
+  assert.match(asking.pendingQuestion?.text ?? "", /Should I keep this as a report or fix it\?$/);
+  // A readable structured ask is not dropped this way.
+  const plain = parseRolloutTail(rollout([
+    ev.started("q", 30 * MIN), ev.assistant(status, 29 * MIN), ev.ask("Reuse the branch?", 28 * MIN),
+    ev.assistant("Carrying on with the checks.", 27 * MIN), ev.complete("q", 26 * MIN, "done")
+  ]));
+  assert.equal(plain.pendingQuestion?.text, "Reuse the branch?");
+});
+
+// Review 7: a sealed ask keeps the key its raw title gave it before it had a
+// stand-in, so the owner's dismissal still matches; readable asks get none.
+test("a sealed ask is keyed on its raw title, not on the stand-in text", async (t) => {
+  const ctx = makeHome(t);
+  const lines = (intro) => [ev.started("q", 10 * MIN), ev.assistant(intro, 9.5 * MIN), ev.ask(SEALED_TITLE, 9 * MIN), ev.complete("q", 8 * MIN, intro)];
+  addThread(ctx, { id: "t-a", lines: lines("Checked the notes. Should I fix it?") });
+  addThread(ctx, { id: "t-b", lines: lines("Other words this time. Want me to fix it?") });
+  addThread(ctx, { id: "t-plain", lines: [ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  const legacy = shortHash(clampText(SEALED_TITLE, ctx.config.limits.bodyMax));
+  assert.notEqual(map["t-a"].meta.pendingQuestion.text, map["t-b"].meta.pendingQuestion.text);
+  assert.equal(map["t-a"].meta.pendingQuestion.key, legacy);
+  assert.equal(map["t-b"].meta.pendingQuestion.key, legacy);
+  assert.equal(map["t-plain"].meta.pendingQuestion.key, undefined);
+});
+
+// Review 17: a title is ciphertext only with real base64 traits.
+test("ciphertext titles need base64 traits; long slash paths stay readable", () => {
+  const asked = (title) => parseRolloutTail(JSON.stringify(ev.ask(title, 5 * MIN))).pendingQuestion;
+  const bytes = (n) => Buffer.from(Array.from({ length: n }, (_, index) => (index * 37 + 11) % 256));
+  const long = bytes(160).toString("base64");
+  const padded = bytes(73).toString("base64").replace(/\//g, "_");
+  assert.ok(long.length >= 200 && long.includes("/"));
+  assert.ok(padded.length < 200 && padded.endsWith("=="));
+  for (const title of [SEALED_TITLE, long, padded]) assert.equal(asked(title).sealed, true, title);
+  const readable = [
+    "/Volumes/Xtra/codex-worktrees/f808/bbapp/packages/apps/web-app/src/components/reports/detail-view",
+    "spencer/fleet-question-freshness-and-owner-labels-for-glasses-and-phone-follow-up-work",
+    "keep_the_legacy_report_generator_running_until_the_new_pipeline_has_been_verified_on_staging"
+  ];
+  for (const title of readable) {
+    assert.ok(title.length >= 80, title);
+    assert.equal(asked(title).text, title);
+    assert.equal(asked(title).sealed, undefined, title);
+  }
 });

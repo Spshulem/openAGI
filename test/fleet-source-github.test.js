@@ -38,6 +38,7 @@ function capturedResponse() {
           mergeStateStatus: "UNSTABLE",
           mergeable: "MERGEABLE",
           reviewDecision: null,
+          createdAt: "2026-09-25T21:02:10Z",
           updatedAt: "2026-09-26T07:44:31Z",
           mergedAt: null,
           closedAt: null,
@@ -130,7 +131,7 @@ test("buildPrQuery batches refs by repository with safe aliases", () => {
   assert.match(query, /reviewThreads\(first:100\)\{totalCount pageInfo\{hasNextPage\}/);
   assert.match(query, /statusCheckRollup\{state contexts\(first:30\)/);
   assert.match(query, /reviewThreads\(first:100\)/);
-  assert.match(query, /updatedAt mergedAt closedAt/);
+  assert.match(query, /createdAt updatedAt mergedAt closedAt/);
 });
 
 test("fetchPrStates normalizes the captured GraphQL response", async () => {
@@ -160,6 +161,8 @@ test("fetchPrStates normalizes the captured GraphQL response", async () => {
   assert.deepEqual(pr.codexReview, { reviewedHead: true, sha: "95720cc" });
   assert.deepEqual(pr.qa, { required: true, freshOnHead: false, sha: null });
   assert.equal(pr.updatedAt, "2026-09-26T07:44:31Z");
+  // Open time: only a PR that existed when the agent asked can settle the ask.
+  assert.equal(pr.createdAt, "2026-09-25T21:02:10Z");
   assert.equal(pr.mergedAt, null);
   assert.equal(pr.closedAt, null);
 

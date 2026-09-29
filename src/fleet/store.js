@@ -282,6 +282,12 @@ export class FleetStore {
     return { ...question };
   }
 
+  // The supervisor closed this question and no copy of it is open.
+  resolvedOnly(dedupeKey) {
+    const same = this.state.questions.filter((q) => q.dedupeKey === dedupeKey);
+    return same.some((q) => q.status === "resolved") && !same.some((q) => q.status === "open");
+  }
+
   openQuestions() {
     this._expireQuestions(this.now());
     return this.state.questions

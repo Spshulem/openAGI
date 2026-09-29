@@ -27,7 +27,7 @@ function makePr(overrides = {}) {
     state: "OPEN", isDraft: false, headRef: "spencer/fix", headOid: HEAD, baseRef: "main", mergeState: "UNSTABLE",
     mergeable: "MERGEABLE", reviewDecision: "APPROVED", ci: { state: "FAILURE", failing: ["verification"], pending: [] },
     unresolvedThreads: 2, codexReview: { reviewedHead: true, sha: "bbbbbbb" }, qa: { required: false, freshOnHead: null, sha: null },
-    updatedAt: ago(0), ...overrides
+    createdAt: ago(24 * 60 * MIN), updatedAt: ago(0), ...overrides
   };
 }
 
@@ -1314,4 +1314,55 @@ test("an expired question closes its outreach copy", async (t) => {
   await supervisor.tick();
   assert.equal(supervisor.store.question(question.id).status, "expired");
   assert.deepEqual(calls, [["out_1", "expired", "dismissed"]]);
+});
+
+// Review 1: a failed PR read after a merge settled an ask must not bring
+// the ask back, before or after a restart.
+test("a failed PR read after a merge settled an ask neither reopens it nor raises it anew", async (t) => {
+  let now = NOW;
+  let failing = false;
+  let prs = new Map([["acme/app#7", makePr()]]);
+  const fetchPrStates = async (refs, _config, { unread }) => {
+    if (!failing) return prs;
+    for (const ref of refs) unread.add(ref);
+    return new Map();
+  };
+  const threads = [makeThread({ lastAgentText: "Want me to cut the production release?", lastAgentAt: ago(55 * MIN) })];
+  const { supervisor, notified } = fixture(t, { threads, now: () => now, deps: { fetchPrStates } });
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  assert.equal(question?.kind, "agent-ask");
+
+  prs = new Map([["acme/app#7", makePr({ state: "MERGED", mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) })]]);
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "resolved");
+
+  // GitHub fails inside the reopen window and past it: the last merged read holds.
+  failing = true;
+  for (const step of [5 * MIN, 2 * 60 * MIN]) {
+    now += step;
+    const snapshot = await supervisor.tick();
+    assert.equal(snapshot.threads[0].state, "done");
+    assert.deepEqual(supervisor.getState().questions, []);
+  }
+  // A restart remembers no PR: the ask the supervisor closed waits for GitHub.
+  supervisor.settledPrs = new Map();
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions, []);
+  assert.equal(supervisor.store.question(question.id).status, "resolved");
+  assert.equal(notified.length, 1);
+
+  // A new ask on a thread GitHub cannot read is still raised.
+  threads.push(makeThread({ key: "codex:t2", id: "t2", cwd: "/work/t2", lastAgentText: "Should I email the customer about the outage?", lastAgentAt: ago(5 * MIN) }));
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.threadKey), ["codex:t2"]);
+
+  failing = false;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.threadKey), ["codex:t2"]);
+  assert.equal(supervisor.store.question(question.id).status, "resolved");
 });

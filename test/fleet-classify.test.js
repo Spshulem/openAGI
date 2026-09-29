@@ -27,7 +27,7 @@ function makePr(overrides = {}) {
     state: "OPEN", isDraft: false, headRef: "spencer/fix", headOid: HEAD, baseRef: "main", mergeState: "CLEAN",
     mergeable: "MERGEABLE", reviewDecision: "APPROVED", ci: { state: "SUCCESS", failing: [], pending: [] },
     unresolvedThreads: 0, codexReview: { reviewedHead: true, sha: "aaaaaaa" }, qa: { required: false, freshOnHead: null, sha: null },
-    updatedAt: ago(0), ...overrides
+    createdAt: ago(24 * 60 * MIN), updatedAt: ago(0), ...overrides
   };
 }
 
@@ -419,4 +419,41 @@ test("classifyThread: a risky word outside the ask keeps the owner but not the t
   // A bare ask takes its topic from the sentence before it.
   assert.equal(classify(makeThread({ lastAgentText: "Backfilling the old posts costs about $150 in Claude usage. Want me to?" })).ask.topic, "money");
   assert.equal(classify(makeThread({ lastAgentText: "Should I spend $150 of credits on the backfill?" })).ask.topic, "money");
+});
+
+// Review 6: only a PR that existed when the agent asked can settle the ask.
+test("classifyThread: a PR opened after the ask does not settle it", () => {
+  const done = (createdAt) => makePr({ state: "MERGED", createdAt, mergedAt: ago(10 * MIN), closedAt: ago(10 * MIN) });
+  // west-monroe: asked, then #6954 was opened and merged later.
+  const ask = makeThread({ lastAgentText: "Want me to list which portals have it installed so you can pick ones to remove?", lastAgentAt: ago(60 * MIN) });
+  assert.equal(classify(ask, { pr: done(ago(43 * MIN)) }).state, "needs-human");
+  // Unknown open time: not settled either.
+  assert.equal(classify(ask, { pr: done(null) }).state, "needs-human");
+  assert.equal(classify(ask, { pr: done(ago(90 * MIN)) }).state, "done");
+  // A structured ask counts from when it was asked, not from the agent's later words.
+  const structured = makeThread({
+    lastAgentText: "Still need the portal list.", lastAgentAt: ago(30 * MIN),
+    meta: { pendingQuestion: { text: "List the portals?", options: ["open thread"], at: ago(60 * MIN) } }
+  });
+  assert.equal(classify(structured, { pr: done(ago(45 * MIN)) }).ask?.structured, true);
+  assert.equal(classify(structured, { pr: done(ago(90 * MIN)) }).state, "done");
+});
+
+// Review 9: several questions, or a login or prod word that is not the step
+// asked for, keep the neutral topic.
+test("classifyThread: a question list or a passing login/prod word gets the neutral topic", () => {
+  const apia = "CI now passes on #6892, so the whole stack is green again.\n\nStill waiting on you:\n"
+    + "- Log client IPs on the API and stop MCP taking keys in the URL?\n- Fix the two password bugs?\n"
+    + "- #6930 shared views: own data only, or full-org data as today?\n"
+    + "- #6930 AI completion in reports: creator only, or other viewers with their own login?\n- Whether to merge #6668.";
+  const list = classify(makeThread({ lastAgentText: apia }));
+  assert.equal(list.state, "needs-human");
+  assert.equal(list.ask.topic, "decision");
+  const passing = classify(makeThread({ lastAgentText: "The prod deploy finished; want me to close the ticket?" }));
+  assert.equal(passing.state, "needs-human");
+  assert.equal(passing.ask.topic, "decision");
+  // A follow-on "Or ...?" is the same question, and the step keeps its topic.
+  assert.equal(classify(makeThread({ lastAgentText: "Want me to cut the production release? Or hold it for Monday?" })).ask.topic, "production");
+  assert.equal(classify(makeThread({ lastAgentText: "It needs your password in the browser. Can you log in?" })).ask.topic, "credentials");
+  assert.equal(classify(makeThread({ lastAgentText: "Tests pass, so should I rotate the Stripe secret key in Vercel?" })).ask.topic, "credentials");
 });

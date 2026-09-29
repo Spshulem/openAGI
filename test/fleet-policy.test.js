@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { classifyThread } from "../src/fleet/classify.js";
-import { DEFAULTS } from "../src/fleet/contracts.js";
+import { DEFAULTS, shortHash } from "../src/fleet/contracts.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks } from "../src/fleet/playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "../src/fleet/policy.js";
 
@@ -755,4 +755,31 @@ test("owner labels use repo and PR, then the folder, then the Codex app name", (
   const recorderPr = makePr({ ref: "buildbetter-app/bb-recorder#279", repo: "buildbetter-app/bb-recorder", number: 279 });
   const recorder = makeThread({ kind: "codex", key: "codex:01a0c4bd", workspace: null, cwd: "/Users/x/Dev/bb-recorder", prRefs: ["buildbetter-app/bb-recorder#279"] });
   assert.equal(run(recorder, { pr: recorderPr }).decision.question.title, "bb-recorder #279 ready. Merge?");
+});
+
+// Review 7: a structured ask with its own key is deduped on it, so a new
+// stand-in text still matches the owner's dismissal. Others keep text keys.
+test("a keyed structured ask dedupes on its key; the rest on their text", () => {
+  const pending = (extra) => makeThread({ meta: { pendingQuestion: { text: "Checked the notes. Should I fix it?", options: ["open thread"], at: ago(20 * MIN), ...extra } } });
+  assert.equal(run(pending({ key: "45673228c2da450b" })).decision.question.dedupeKey, "ask:conductor:s1:45673228c2da450b");
+  assert.equal(run(pending({})).decision.question.dedupeKey, `ask:conductor:s1:${shortHash("Checked the notes. Should I fix it?")}`);
+  const text = "Want me to cut the production release?";
+  assert.equal(run(makeThread({ lastAgentText: text })).decision.question.dedupeKey, `ask:conductor:s1:${shortHash(text)}`);
+});
+
+// Review 8: a PR done before the agent last spoke is not what it asks about.
+test("owner labels drop a PR that merged or closed before the ask", () => {
+  const kingston = makeThread({
+    workspace: "kingston", repo: "Spshulem/ads", prRefs: ["Spshulem/ads#2"], lastAgentAt: ago(10 * MIN),
+    lastAgentText: "Disk is full. Your call: can I clear ~/Library/Caches (13GB, rebuilds itself)? Or free space another way, then say go."
+  });
+  const ads = (extra) => makePr({ ref: "Spshulem/ads#2", repo: "Spshulem/ads", number: 2, ...extra });
+  const merged = ads({ state: "MERGED", mergedAt: ago(18 * 24 * 60 * MIN), closedAt: ago(18 * 24 * 60 * MIN) });
+  assert.equal(run(kingston, { pr: merged }).decision.question.title, "kingston: needs your call. Answer?");
+  const closed = ads({ state: "CLOSED", mergedAt: null, closedAt: ago(60 * MIN) });
+  assert.equal(run(kingston, { pr: closed }).decision.question.title, "kingston: needs your call. Answer?");
+  // Done after the ask (it was opened later, so it did not settle it), or open: the PR names the work.
+  const later = ads({ state: "MERGED", createdAt: ago(5 * MIN), mergedAt: ago(2 * MIN), closedAt: ago(2 * MIN) });
+  assert.equal(run(kingston, { pr: later }).decision.question.title, "ads #2: needs your call. Answer?");
+  assert.equal(run(kingston, { pr: ads({ unresolvedThreads: 1 }) }).decision.question.title, "ads #2: needs your call. Answer?");
 });

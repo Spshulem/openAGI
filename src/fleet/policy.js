@@ -23,6 +23,7 @@ const MANAGER_DOWN_KINDS = new Set(["session-limit", "usage-limit", "model-limit
 const RESUME_STATUSES = new Set(["aborted", "stalled", "error"]);
 const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
+const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // Blockers only GitHub (or a later git read) can clear; nudging the agent
 // does nothing for them.
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
@@ -302,10 +303,11 @@ function agentAskIntent(ctx) {
   const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
   const options = ask.structured ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   const excerpt = ownerExcerpt(ask.text || thread.lastAgentText, ctx.limits.bodyMax);
+  // A sealed Codex ask brings its own key: its shown text is a stand-in.
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
     question: question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
-      `ask:${thread.key}:${shortHash(ask.text ?? "")}`, "agent-ask")
+      `ask:${thread.key}:${ask.key ?? shortHash(ask.text ?? "")}`, "agent-ask")
   };
 }
 
@@ -694,6 +696,10 @@ function factsFor(thread, pr, classified) {
   const prRef = pr?.ref ?? thread.prRefs?.[0] ?? "";
   const prNumber = pr?.number ?? Number(/#(\d+)$/.exec(prRef)?.[1]);
   const knownPr = Number.isFinite(prNumber) && prNumber > 0 ? prNumber : null;
+  // A PR done before the agent last spoke is old work on a reused branch
+  // (kingston's disk-full asks titled "ads #2", merged weeks earlier), so
+  // the label names the place instead.
+  const pastPr = prDoneBefore(pr, latest(thread.lastAgentAt, thread.meta?.pendingQuestion?.at));
   return {
     pr: knownPr ? String(knownPr) : "",
     prRef: fact(prRef, 80),
@@ -703,9 +709,15 @@ function factsFor(thread, pr, classified) {
     blockers: blockers.map((blocker) => fact(blocker, 80)).join("; "),
     blocker: fact(blockers[0], 80),
     thread: agentLabel(thread),
-    label: ownerLabel(thread, knownPr, pr?.repo ?? parsePrRef(prRef)?.repo),
+    label: pastPr ? ownerLabel(thread, null, null) : ownerLabel(thread, knownPr, pr?.repo ?? parsePrRef(prRef)?.repo),
     reset: formatTime(thread.error?.resetAt)
   };
+}
+
+function prDoneBefore(pr, at) {
+  if (!pr || !DONE_PR_STATES.has(pr.state)) return false;
+  const doneAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+  return Number.isFinite(doneAt) && doneAt < Date.parse(at ?? "");
 }
 
 // Safe for agent-bound text: one line, no markup characters, bounded.

@@ -218,9 +218,9 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // click. A nudge cannot clear it.
   if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
   // Codex request_user_input: the real question is structured, not in the text.
-  if (thread.meta?.pendingQuestion && !prSettledAfter(pr, structuredAskAt(thread))) {
+  if (thread.meta?.pendingQuestion && !prSettledAfter(pr, Date.parse(thread.meta.pendingQuestion.at ?? ""), structuredAskAt(thread))) {
     const pending = thread.meta.pendingQuestion;
-    return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"] } });
+    return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"], key: pending.key ?? null } });
   }
 
   // Once the owner replied, the agent's last words are stale.
@@ -252,13 +252,16 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR");
 }
 
-// A PR merged or closed after the agent asked has answered the ask. An ask
-// made after that ("merged; QA it on staging?") stands, and so does one
-// whose time is unknown.
-function prSettledAfter(pr, askMs) {
+// A PR merged or closed after the agent asked has answered the ask, but only
+// if it existed when the agent asked: one opened later is new work (west-
+// monroe asked, then #6954 was opened and merged). An ask made after the
+// merge ("merged; QA it on staging?") stands, and so does one whose times
+// are unknown. lastMs: the agent's latest words, which may repeat the ask.
+function prSettledAfter(pr, askMs, lastMs = askMs) {
   if (!pr || !PR_DONE.has(pr.state) || !Number.isFinite(askMs)) return false;
+  const openedAt = Date.parse(pr.createdAt ?? "");
   const doneAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
-  return Number.isFinite(doneAt) && doneAt > askMs;
+  return Number.isFinite(openedAt) && openedAt <= askMs && Number.isFinite(doneAt) && doneAt > lastMs;
 }
 
 // The agent's later words may repeat the structured ask, so the later time
@@ -361,8 +364,13 @@ function detectAsk(text) {
   // The topic comes from the ask region only. A risky step anywhere else in
   // the closing message (a force-push two sentences before "Should I push?")
   // still keeps the ask with the owner, under a neutral topic: "$0.50 per
-  // post" in a recap does not make a merge offer a spend.
-  const hit = OUT_OF_SCOPE_PATTERNS.find(({ pattern }) => pattern.test(askRegion(sentences, askIndexes)));
+  // post" in a recap does not make a merge offer a spend. Several separate
+  // questions (apia: client IPs? the password bugs? shared views?) get the
+  // neutral topic too, and a login or prod topic must be the step asked for.
+  const region = askRegion(sentences, askIndexes);
+  const step = askRegion(sentences, askIndexes, true);
+  const hit = separateQuestions(sentences, askIndexes) > 1 ? null
+    : OUT_OF_SCOPE_PATTERNS.find(({ topic, pattern }) => pattern.test(STEP_TOPICS.has(topic) ? step : region));
   if (hit) return { kind: "needs-human", topic: hit.topic, options, text: askText };
   if (OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(text))) return { kind: "needs-human", topic: "decision", options, text: askText };
   const isChoice = options.length >= 2 && CHOICE_WORDS.test(askText);
@@ -396,6 +404,11 @@ function stepText(sentences, index) {
   return PLAN_WORDS.test(before) ? `${before} ${sentence}` : sentence;
 }
 
+// Whether any sentence asks the owner something, by the rules detectAsk uses.
+export function asksOwner(text) {
+  return splitSentences(text ?? "").some(isAsk);
+}
+
 function isAsk(sentence) {
   if (NOT_ASK.test(sentence)) return false;
   return /\?\s*$/.test(sentence)
@@ -405,18 +418,37 @@ function isAsk(sentence) {
 
 // The ask, the options after it, and the sentence before a bare ask
 // ("--admin merges now. Which?"): a short ask names no step itself.
-function askRegion(sentences, askIndexes) {
+// stepOnly drops what comes before "want me to" / "should I" in an ask.
+function askRegion(sentences, askIndexes, stepOnly = false) {
   const picked = new Set();
   for (const index of askIndexes) {
     if (index > 0 && sentences[index].split(/\s+/).length <= BARE_ASK_WORDS) picked.add(index - 1);
     picked.add(index);
     for (let next = index + 1; next < sentences.length && OPTION_LINE.test(sentences[next]); next += 1) picked.add(next);
   }
-  return [...picked].sort((a, b) => a - b).map((index) => sentences[index]).join(" ");
+  return [...picked].sort((a, b) => a - b)
+    .map((index) => (stepOnly && askIndexes.includes(index) ? fromAskPhrase(sentences[index]) : sentences[index])).join(" ");
+}
+
+// "The prod deploy is done; want me to close the ticket?" asks to close a ticket.
+function fromAskPhrase(sentence) {
+  const at = sentence.search(LEADING_ASK);
+  return at > 0 ? sentence.slice(at) : sentence;
+}
+
+// Questions, not follow-ons: "Can I clear the caches? Or free space another
+// way?" is one question.
+function separateQuestions(sentences, askIndexes) {
+  return askIndexes.filter((index) => /\?\s*$/.test(sentences[index]) && !/^(?:[-*•]\s*)?(?:or|else|otherwise)\b/i.test(sentences[index])).length;
 }
 
 const OPTION_LINE = /^(?:[1-9]|[A-C])[.)]\s/;
 const BARE_ASK_WORDS = 5;
+// A passing noun can name these ("the password bugs", "a production
+// customer"), so they count only in the step the agent asks to take.
+const STEP_TOPICS = new Set(["credentials", "production"]);
+// Ask phrases that come before the step they ask about.
+const LEADING_ASK = /\b(?:(?:do you )?want me to|would you like me to|(?:should|shall|may|can) I|(?:ok|okay)(?: for me)? to|let me know if you want)\b/i;
 
 function splitSentences(text) {
   return String(text).split(/(?<=[^\d\s][.?!])\s+|\n+/).map((part) => part.trim()).filter(Boolean);

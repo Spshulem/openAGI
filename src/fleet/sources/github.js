@@ -28,7 +28,7 @@ export const DEFAULT_UI_PATH_PREFIXES = Object.freeze({
 });
 
 const PR_FRAGMENT = [
-  "fragment P on PullRequest { number url title state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision updatedAt mergedAt closedAt",
+  "fragment P on PullRequest { number url title state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision createdAt updatedAt mergedAt closedAt",
   " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:30){nodes{__typename",
   " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state}}}}}}}",
   " reviewThreads(first:100){totalCount pageInfo{hasNextPage} nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
@@ -153,6 +153,8 @@ export function normalizePr(repo, node, config) {
     threadsTruncated: node.reviewThreads?.pageInfo?.hasNextPage === true,
     codexReview: codexReviewFor(comments, headOid, node.comments?.pageInfo?.hasPreviousPage === true),
     qa: qaFor(number, headOid, comments, files, uiPrefixesFor(repo, config), node.files?.pageInfo?.hasNextPage === true),
+    // Only a PR that existed when the agent asked can have answered the ask.
+    createdAt: node.createdAt ?? null,
     updatedAt: node.updatedAt ?? null,
     // When a merged or closed PR settled; an agent ask older than this is answered.
     mergedAt: node.mergedAt ?? null,

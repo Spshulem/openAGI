@@ -6,8 +6,9 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
-  CONDUCTOR_CODEX_ORIGINATOR, runCommand, threadKey, toIso
+  CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
+import { asksOwner } from "../classify.js";
 import { classifyCodexErrorCode } from "../errors.js";
 import { identityToken } from "../ui-delivery.js";
 
@@ -20,7 +21,8 @@ const HEARTBEAT_PATTERN = /<heartbeat>|<automation_id>/;
 const EXEC_SOURCE = "exec";
 const CHAT_CHECKER_PATTERN = /\bchecking the user['’]s existing agent chats\b/i;
 // request_user_input titles are sometimes an encrypted blob ("gAAAAAB...").
-const CIPHERTEXT_PATTERN = /^(?:gAAAAA[A-Za-z0-9_=-]{20,}|[A-Za-z0-9+/_-]{80,}={0,2})$/;
+const FERNET_PATTERN = /^gAAAAA[A-Za-z0-9_=-]{20,}$/;
+const BASE64_PATTERN = /^[A-Za-z0-9+/_-]{80,}={0,2}$/;
 const SEALED_QUESTION = "Codex asked in the app";
 const PR_URL_PATTERN = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
 const WRAPPER_TAGS = [
@@ -89,7 +91,24 @@ function contentText(content, types) {
 }
 
 function setAgent(summary, text, at) {
-  if (typeof text === "string" && text.trim()) summary.lastAgent = { text, at };
+  if (typeof text !== "string" || !text.trim()) return;
+  summary.lastAgent = { text, at };
+  settleSealedAsk(summary);
+}
+
+// A sealed ask the agent talked past, or ended its turn on, was not waiting
+// on the owner (#6896: "No additional user input is needed", then done),
+// unless the words standing in for it ask something themselves.
+function settleSealedAsk(summary) {
+  if (summary.pendingQuestion?.sealed && !asksOwner(summary.pendingQuestion.text)) summary.pendingQuestion = null;
+}
+
+// Long slash paths fit the base64 alphabet too; a real blob is very long,
+// or carries + or = and no path slash.
+function isCiphertext(value) {
+  if (FERNET_PATTERN.test(value)) return true;
+  if (!BASE64_PATTERN.test(value)) return false;
+  return value.length >= 200 || (/[+=]/.test(value) && !value.includes("/"));
 }
 
 function readUserInput(summary, raw, at) {
@@ -112,18 +131,21 @@ function readUserInput(summary, raw, at) {
 }
 
 // fallback: the agent's last words, shown when the title is ciphertext.
+// keyText: the raw title, when the text shown is not it. The question is
+// keyed on it, so an owner's dismissal outlives a change in the stand-in.
 function questionTitle(args, fallback) {
   try {
     const parsed = typeof args === "string" ? JSON.parse(args) : args;
     const first = parsed?.questions?.[0];
     const texts = [first?.title, first?.question].map((value) => String(value ?? "").trim()).filter(Boolean);
     if (!texts.length) return null;
-    const text = texts.find((value) => !CIPHERTEXT_PATTERN.test(value));
+    const text = texts.find((value) => !isCiphertext(value));
     const options = (first.options ?? []).map((option) => typeof option === "string" ? option : option?.label).filter(Boolean);
     // Multiple prompts and free text need the original thread's input surface.
     const supported = parsed.questions.length === 1 && options.length > 0 && options.length <= 4 && options.every((option) => option.length <= 40);
-    if (!text) return { text: fallback?.trim() || SEALED_QUESTION, options: supported ? options : ["open thread"], sealed: true };
-    return { text, options: supported ? options : ["open thread"] };
+    const raw = text === texts[0] ? {} : { keyText: texts[0] };
+    if (!text) return { text: fallback?.trim() || SEALED_QUESTION, options: supported ? options : ["open thread"], sealed: true, ...raw };
+    return { text, options: supported ? options : ["open thread"], ...raw };
   } catch {
     return null;
   }
@@ -145,6 +167,7 @@ function readEvent(summary, payload, at) {
     case "task_complete":
       summary.lifecycle = { type: "task_complete", payload, at };
       setAgent(summary, payload.last_agent_message, at);
+      settleSealedAsk(summary);
       break;
     case "turn_aborted":
     case "error":
@@ -298,6 +321,9 @@ function applyRollout(thread, row, context) {
   thread.meta.pendingQuestion = pending
     ? { text: clampAsk(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)), at: pending.at ?? null }
     : null;
+  // The key the raw title gave the ask before it had a stand-in (a hash of
+  // the same clamped text), so a dismissal made then still matches.
+  if (pending?.keyText) thread.meta.pendingQuestion.key = shortHash(clampText(redactSecrets(pending.keyText), limits.bodyMax));
   // A Codex heartbeat automation already drives this thread; nudging it too
   // would double up.
   if (summary.lastInputHeartbeat) {

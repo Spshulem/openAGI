@@ -35,6 +35,7 @@ const OPEN_ACTION = new Set(["planned", "proposed"]);
 const TRUNK_BRANCHES = new Set(["main", "master", "HEAD", "develop", "staging"]);
 const INFRA_KINDS = ["bb3", "lb"];
 const BLOCKED_STATES = new Set(["infra-blocked", "waiting-ci"]);
+const SETTLED_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // How long a remembered outage thread hidden by a failed source waits for it.
 const RECOVERY_HOLD_MS = 60 * MIN;
 // A manager escalation shares one cooldown per incident, whichever thread
@@ -184,6 +185,8 @@ export class FleetSupervisor {
     this.lastError = null;
     this.lastThreads = new Map();
     this.branchLookups = new Map();
+    // ref -> last MERGED or CLOSED read, for ticks GitHub cannot answer.
+    this.settledPrs = new Map();
     this.answering = new Set();
     this._uiDriver = undefined;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
@@ -571,7 +574,7 @@ export class FleetSupervisor {
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
     const unreadPrs = new Set();
-    const prs = await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs);
+    const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs), unreadPrs);
 
     const infra = {
       bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
@@ -744,6 +747,23 @@ export class FleetSupervisor {
     }
   }
 
+  // MERGED and CLOSED are final. A ref GitHub could not answer this tick
+  // keeps its last settled read, so an ask its merge settled is not raised
+  // again as a new question. Only refs linked this tick stay remembered.
+  withSettledPrs(prs, unread) {
+    const out = new Map(prs);
+    const kept = new Map();
+    for (const [ref, pr] of prs) if (SETTLED_PR_STATES.has(pr?.state)) kept.set(ref, pr);
+    for (const ref of unread) {
+      const last = this.settledPrs.get(ref);
+      if (!last) continue;
+      kept.set(ref, last);
+      out.set(ref, last);
+    }
+    this.settledPrs = kept;
+    return out;
+  }
+
   async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set() }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
@@ -751,6 +771,10 @@ export class FleetSupervisor {
     // PR question must not close now and come back as a new push next tick.
     const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
     const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key));
+    // With no settled read remembered (a fresh start), an unread PR cannot
+    // tell a merge that settled an ask from a live one: an ask the
+    // supervisor already closed waits for GitHub instead of coming back.
+    const prUnknown = new Set(items.filter((item) => item.prUnreadable).map(({ thread }) => thread.key));
     const at = new Date(started).toISOString();
     const asked = new Set();
     const openActions = store.actions(config.limits.maxActionsKept).filter((action) => OPEN_ACTION.has(action.status));
@@ -772,6 +796,7 @@ export class FleetSupervisor {
       const sameChoices = spec && (fields.threadKeys || JSON.stringify(fields.options) === JSON.stringify(spec.options));
       const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
+      if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
       const question = store.upsertQuestion(fields);
       asked.add(question.dedupeKey);
       // The owner already answered or dismissed this one; stay quiet.
