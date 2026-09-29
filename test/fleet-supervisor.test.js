@@ -2324,3 +2324,55 @@ test("a kept answer past its day goes back to the owner even while its source ca
   assert.equal(supervisor.store.question(q.id).deliveredAnswer, "dropped");
   assert.equal(supervisor.store.queuedAnswers().length, 0);
 });
+
+test("kept answers share the tick's send cap; the rest wait for the next tick", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const threads = Array.from({ length: DEFAULTS.maxSendsPerTick + 2 }, (_, i) => makeThread({ key: `codex:k${i}`, id: `k${i}`, cwd: `/work/k${i}`, writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: `Merge ${i}?`, options: ["yes", "no"] } } }));
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads, now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  for (const q of supervisor.getState().questions.filter((x) => x.kind === "agent-ask")) await supervisor.answerQuestion(q.id, "yes");
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.length, DEFAULTS.maxSendsPerTick);
+  assert.equal(supervisor.store.queuedAnswers().length, 2);
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("a kept retry the agent overtook (it spoke since) is dropped, not sent", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let lastAgentAt = ago(60 * MIN);
+  const thread = () => makeThread({ writerLocked: true, lastAgentAt, meta: { originator: "Codex Desktop" } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "observe", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [thread()] } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "infra", dedupeKey: "infra:login:codex:t1", threadKey: "codex:t1", title: "Logged out. Retry?", options: ["retry", "later"] });
+  await supervisor.answerQuestion(q.id, "retry");
+  lastAgentAt = new Date(now + MIN).toISOString();
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0);
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "superseded");
+});
+
+test("an answer is only reported saved if it was stored", async (t) => {
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  let supervisorRef = null;
+  let questionId = null;
+  // The question closes while the answer is being handled (a tick resolved it).
+  const driver = { readiness: async () => { if (questionId) supervisorRef.store.resolveQuestion(questionId, "condition gone"); return { ready: false, detail: "screen locked" }; } };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], deps: { uiDriver: driver } });
+  supervisorRef = supervisor;
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  questionId = q.id;
+  const result = await supervisor.answerQuestion(q.id, "yes");
+  assert.notEqual(result.delivery.status, "queued");
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});

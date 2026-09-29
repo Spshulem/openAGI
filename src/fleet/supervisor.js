@@ -556,14 +556,16 @@ export class FleetSupervisor {
   // (this tick asked its dedupeKey): a stale "yes" must never land on a new
   // question. One the owner overtook in the thread is dropped quietly; one
   // older than a day, or whose thread is gone, goes back to the owner.
-  async deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked, decided }) {
-    const contacted = new Set();
+  async deliverQueuedAnswers({ byKey, started, cappedKinds, asked, decided, sourceUnknown, budget = Infinity }) {
+    const contacted = { threads: new Set(), uiKeys: new Set(), sent: 0 };
     const queued = this.store.queuedAnswers();
     if (!queued.length) return contacted;
     const deliveryState = await this.probeDelivery();
     for (const question of queued) {
       const pending = question.pendingDelivery;
       const thread = byKey.get(question.threadKey);
+      // A background send still settling decides this one.
+      if (pending.sendingAt && started - Date.parse(pending.sendingAt) < QUEUED_SENDING_MS) continue;
       // A day without a way to type: back in front of the owner (unless the
       // same ask already is, or its thread is gone and nothing is left to answer).
       if (started - Date.parse(pending.since) > QUEUED_ANSWER_MS) {
@@ -571,24 +573,31 @@ export class FleetSupervisor {
         if (thread && !this.store.openQuestions().some((q) => q.dedupeKey === question.dedupeKey)) this.store.reopenQuestion(question.id, [], { answer: question.answer, asked: true });
         continue;
       }
-      if (pending.sendingAt && started - Date.parse(pending.sendingAt) < QUEUED_SENDING_MS) continue;
-      if (unknown([question.threadKey])) continue;
+      if (contacted.sent >= budget) continue;
+      // Only the thread's own source matters here: a git or PR read that
+      // failed says nothing about whether the agent can take the answer.
+      if (sourceUnknown([question.threadKey])) continue;
       // A full scan leaves threads out; that is not proof this one is gone.
       if (!thread && cappedKinds.has(String(question.threadKey).split(":")[0])) continue;
       if (!thread) { this.store.settleQueuedAnswer(question.id, "dropped"); continue; }
       // Past the scan's thread cap this tick: nothing was decided for it.
       if (!decided.has(thread.key)) continue;
       const ownerSince = Date.parse(thread.lastUserAt ?? "") > Date.parse(question.answeredAt ?? "") && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
-      // An agent's own question must still stand; a "retry" after the owner
-      // fixed a blocker is sent even though the blocker is no longer asked.
-      const stale = question.kind === "agent-ask" && !asked.has(question.dedupeKey);
+      // An agent's own question must still stand. A "retry" after the owner
+      // fixed a blocker is sent even though the blocker is no longer asked,
+      // unless the agent has spoken since (it recovered, or asks something new).
+      const agentSince = Date.parse(thread.lastAgentAt ?? "") > Date.parse(question.answeredAt ?? "");
+      const stale = question.kind === "agent-ask" ? !asked.has(question.dedupeKey) : agentSince;
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
       if (delivery.status !== "sent") continue;
-      contacted.add(thread.key);
+      contacted.sent += 1;
+      contacted.threads.add(thread.key);
+      const uiKey = uiTargetFor(thread)?.targetKey;
+      if (uiKey) contacted.uiKeys.add(uiKey);
       if (!delivery.done) { this.store.settleQueuedAnswer(question.id, "sent"); continue; }
       // A CLI child reports later whether it reached the agent.
       this.store.markQueuedSending(question.id);
@@ -662,10 +671,13 @@ export class FleetSupervisor {
         // locked screen, the owner at the keyboard). Keep the answer and send
         // it once the Mac can type, instead of handing the question back.
         if (thread && delivery.status !== "sent" && answer !== "open thread" && typingWaits(thread, route, deliveryState, delivery)) {
+          // A tick may have closed the question meanwhile; only a stored answer is "saved".
           const queued = this.store.queueAnswer(id, answer, message);
-          this.resolveOutreach(question, answer, "acted");
-          this.applyOverride(question, answer);
-          return { question: queued, delivery: { status: "queued", route: null, detail: `Saved. It goes to the agent once the Mac can type (${delivery.detail}).` } };
+          if (queued) {
+            this.resolveOutreach(question, answer, "acted");
+            this.applyOverride(question, answer);
+            return { question: queued, delivery: { status: "queued", route: null, detail: `Saved. It goes to the agent once the Mac can type (${delivery.detail}).` } };
+          }
         }
       }
       // A background resume can fail while the others are still sending;
@@ -1058,7 +1070,14 @@ export class FleetSupervisor {
     }
 
     // A thread that just got the owner's answer gets no automatic nudge too.
-    const answeredNow = await this.deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked, decided: new Set(items.map((item) => item.thread.key)) });
+    const answeredNow = await this.deliverQueuedAnswers({
+      byKey, started, cappedKinds, asked, sourceUnknown: fromFailedSource, budget: config.limits.maxSendsPerTick,
+      decided: new Set(items.map((item) => item.thread.key))
+    });
+    // Kept answers share the tick's send budget, and their app conversations
+    // (a Conductor tab and the Codex thread it hosts) get nothing else now.
+    sends += answeredNow.sent;
+    for (const key of answeredNow.uiKeys) typedInto.add(key);
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.
@@ -1073,7 +1092,7 @@ export class FleetSupervisor {
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
-      if (answeredNow.has(decision.threadKey)) continue;
+      if (answeredNow.threads.has(decision.threadKey)) continue;
       const targetKey = decision.action === "escalate-manager" ? (decision.targetKey ?? manager?.key ?? null) : decision.threadKey;
       const target = targetKey ? byKey.get(targetKey) : null;
       const record = {
