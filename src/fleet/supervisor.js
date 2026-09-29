@@ -87,9 +87,33 @@ function emptyBb3() {
 const GROUPED_KINDS = Object.freeze({
   limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
   open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` },
-  deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], title: (n) => `${n} stopped. Nudges can't get through. Nudge them?`, body: (labels) => `Sends keep failing: ${labels}.` }
+  // Always one question, even for one thread, so the owner's answer holds
+  // while the set of failing threads changes under it.
+  deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
-const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck"]);
+const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused"]);
+const GROUP_MAX = 50;
+// Computer use unable to type this long, with nudges waiting on it: the owner
+// hears why once (secure input held by an app, a locked screen), and the
+// question closes itself when typing works again.
+const PAUSED_ASK_MS = 30 * 60_000;
+
+function pausedDeliveryDecision(delivery, blockedSince, now) {
+  const waiting = blockedSince.size;
+  const since = waiting ? Math.min(...blockedSince.values()) : null;
+  if (!since || now - since < PAUSED_ASK_MS) return null;
+  const minutes = Math.round((now - since) / 60_000);
+  return {
+    threadKey: "infra:computer-use", state: "infra", action: "ask-user", playbook: null, message: null, blockers: [],
+    reason: `nudges paused: ${delivery.detail ?? "computer use not ready"}`, route: null, notBefore: null, targetKey: null, progressMark: null,
+    question: {
+      dedupeKey: "infra:computer-use", kind: "paused", threadKey: null,
+      title: "Nudges paused: can't type into apps. Fix it?",
+      body: `${delivery.detail ?? "Computer use is not ready"}. ${waiting} threads wait on a nudge, for ${minutes}m.`,
+      options: ["fixed", "skip"]
+    }
+  };
+}
 // A resume of a stopped or capped turn goes before merge-ready chatter.
 const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 
@@ -111,7 +135,7 @@ function formatReset(iso) {
 export function groupQuestions(asks, byKey) {
   const out = [];
   const titles = new Set();
-  const groups = { limit: [], open: [] };
+  const groups = { limit: [], open: [], deliver: [] };
   const single = (decision) => ({
     ...decision.question,
     threadKey: decision.threadKey.startsWith("infra:") ? null : decision.threadKey,
@@ -132,17 +156,25 @@ export function groupQuestions(asks, byKey) {
     titles.add(titleKey);
     out.push(single(decision));
   }
-  for (const [kind, list] of Object.entries(groups)) {
-    if (list.length === 1) out.push(single(list[0]));
-    if (list.length < 2) continue;
+  // The store keeps 50 members per question, so a bigger group splits.
+  const chunks = Object.entries(groups).flatMap(([kind, all]) => (all.length <= GROUP_MAX ? [[kind, all, 0]]
+    : Array.from({ length: Math.ceil(all.length / GROUP_MAX) }, (_, i) => [kind, all.slice(i * GROUP_MAX, (i + 1) * GROUP_MAX), i])));
+  for (const [kind, list, part] of chunks) {
     const spec = GROUPED_KINDS[kind];
+    const minSize = spec.minSize ?? 2;
+    if (list.length === 1 && minSize > 1) out.push(single(list[0]));
+    if (!list.length || list.length < minSize) continue;
     const threads = list.map((decision) => byKey.get(decision.threadKey)).filter(Boolean);
+    // A delivery failure names its reason, so the owner knows what to fix.
+    const labels = kind === "deliver"
+      ? list.map((decision) => `${threadLabel(byKey.get(decision.threadKey))} (${String(decision.reason ?? "").replace(/^can't deliver: /, "")})`).join(", ")
+      : threads.map(threadLabel).join(", ");
     const resets = threads.map((thread) => thread.error?.resetAt).filter(Boolean).sort();
     out.push({
-      kind, dedupeKey: spec.dedupeKey, options: spec.options, playbook: null, threadKey: null, prRef: null,
+      kind, dedupeKey: part ? `${spec.dedupeKey}:${part + 1}` : spec.dedupeKey, options: spec.options, playbook: null, threadKey: null, prRef: null,
       threadKeys: list.map((decision) => decision.threadKey),
       title: spec.title(list.length, formatReset(resets[0])),
-      body: spec.body(threads.map(threadLabel).join(", "))
+      body: spec.body(labels)
     });
   }
   return out;
@@ -205,6 +237,7 @@ export class FleetSupervisor {
     this.answering = new Set();
     this._uiDriver = undefined;
     this.restartedAt = new Map();
+    this._uiBlockedSince = null;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
     this._reviewRunner = null;
     this.lastReview = { at: null, failedAt: null, error: null };
@@ -219,6 +252,12 @@ export class FleetSupervisor {
 
   get dataDir() {
     return this.dataDirOption ?? resolveDataDir();
+  }
+
+  // Loaded with the store, which opens on first use.
+  get uiBlockedSince() {
+    this._uiBlockedSince ??= this.store.uiBlockedSince();
+    return this._uiBlockedSince;
   }
 
   get store() {
@@ -474,6 +513,26 @@ export class FleetSupervisor {
     return { status: blocked || !sent ? "blocked" : "sent", route: null, detail: `${sent} resumed, ${blocked} not reachable; open the thread and retry if needed` };
   }
 
+  // When each nudge first waited on computer use (Auto only: the other modes
+  // never send on their own). A thread its source could not show this tick
+  // (the scan failed, or hit its cap) keeps its time; one that no longer
+  // waits drops it, so the age is always that of a nudge still waiting.
+  trackUiBlocked(decisions, { mode, delivery, threads, sourceErrors, started, config }) {
+    if (mode !== "auto" || delivery.ready !== false) { this.uiBlockedSince.clear(); this.store.setUiBlockedSince(this.uiBlockedSince); return; }
+    const now = new Set(decisions.filter((decision) => decision?.uiBlocked).map((decision) => decision.threadKey));
+    const seen = new Set(threads.map((thread) => thread.key));
+    const hidden = (key) => {
+      // infra:bb3 and infra:lb belong to their probes, not a thread source.
+      const [kind, probe] = String(key).split(":");
+      if (kind === "infra") return Boolean(sourceErrors[probe]);
+      const capped = threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads;
+      return !seen.has(key) && (Boolean(sourceErrors[kind]) || capped);
+    };
+    for (const key of [...this.uiBlockedSince.keys()]) if (!now.has(key) && !hidden(key)) this.uiBlockedSince.delete(key);
+    for (const key of now) if (!this.uiBlockedSince.has(key)) this.uiBlockedSince.set(key, started);
+    this.store.setUiBlockedSince(this.uiBlockedSince);
+  }
+
   // Restarts each listed app that shows one of these threads, once per ten
   // minutes (a second answer after a partial send does not restart again).
   // Returns a blocked delivery when it must not or could not restart.
@@ -589,6 +648,7 @@ export class FleetSupervisor {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
     for (const key of keys) {
       if (question.kind === "stuck" && answer === "keep going") this.store.resetAttempts(key);
+      if (question.kind === "deliver") this.store.ackUndelivered(key);
       if ((question.kind === "stuck" && answer === "stop") || (question.kind === "open" && answer === "skip")) {
         this.store.mute(key, this.now() + MUTE_MS);
       }
@@ -617,7 +677,9 @@ export class FleetSupervisor {
     // An escalation went to the manager, not this thread: history only, so it
     // spends neither the thread's nudge budget nor its cooldown.
     const status = action.kind === "escalate-manager" && delivery.status === "sent" ? "escalated" : delivery.status;
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status, detail: delivery.detail ?? null }, action.progressMark);
+    const thread = this.lastThreads.get(action.threadKey);
+    const threadActivityAt = thread ? (thread.lastAgentAt && Date.parse(thread.lastAgentAt) > Date.parse(thread.lastActivityAt ?? "") ? thread.lastAgentAt : thread.lastActivityAt) : null;
+    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
     // back that one attempt. Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
@@ -702,6 +764,11 @@ export class FleetSupervisor {
     const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
+    // How long a nudge has waited on computer use, for telling the owner.
+    // The live mode: the owner may have left Auto while this tick scanned.
+    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions], { mode: this.mode, delivery, threads, sourceErrors, started, config });
+    const paused = pausedDeliveryDecision(delivery, this.uiBlockedSince, started);
+    if (paused) infraDecisions.push(paused);
     const health = infraHealth(infra, { config, now: started });
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
     if (lb) store.setInfraDown("lb", health.lb.down);
@@ -970,13 +1037,15 @@ export class FleetSupervisor {
       if (asked.has(question.dedupeKey)) continue;
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
       const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
-      const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
+      const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
       // source that hit its cap only proves absence for excluded threads.
       const known = question.threadKey ? byKey.get(question.threadKey) : null;
       const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]);
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
+      // A group member a capped scan left out may still be failing.
+      if (!question.threadKey && (question.threadKeys ?? []).some((member) => !byKey.has(member) && cappedKinds.has(String(member).split(":")[0]))) continue;
       if (decided || supervisorOwned || threadGone) {
         const reason = decided ? `${decided.state}: ${decided.reason}` : threadGone ? `thread ${known?.excluded ?? "left the scan"}` : "no longer asked";
         store.resolveQuestion(question.id, reason);

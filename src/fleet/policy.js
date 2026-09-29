@@ -92,6 +92,15 @@ export function uiWaitReason(thread, delivery) {
   return `computer use not ready${ui.detail ? `: ${ui.detail}` : ""}`;
 }
 
+// Either computer-use mode, when a thread the app shows has no route only
+// because computer use cannot type now: wait for it (the supervisor tells
+// the owner once it has waited a while) instead of calling it offline.
+function uiBlockedReason(thread, delivery) {
+  const ui = deliveryOf(delivery);
+  if (ui.mode === "cli" || ui.ready !== false || !uiTargetFor(thread)) return null;
+  return `computer use not ready${ui.detail ? `: ${ui.detail}` : ""}`;
+}
+
 // Null while the owner is talking to the manager, while it is mid-turn, or
 // while it is down. Callers check managerBusy first to wait instead of asking.
 function managerRoute(manager, mode, limits, now, delivery = null) {
@@ -368,7 +377,9 @@ function resolveNudge(ctx, intent, base) {
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: "cooldown", notBefore: cooledAt };
   const undelivered = undeliveredStreak(ledger, thread);
   if (undelivered) {
-    if (undelivered.count >= UNDELIVERED_ASK_COUNT && now - Date.parse(undelivered.since) >= UNDELIVERED_ASK_MS) return undeliveredDecision(ctx, decision, undelivered);
+    // Asked once per failure streak: after the owner's answer it only retries.
+    const due = !undelivered.ackedAt && undelivered.count >= UNDELIVERED_ASK_COUNT && now - Date.parse(undelivered.since) >= UNDELIVERED_ASK_MS;
+    if (due) return undeliveredDecision(ctx, decision, undelivered);
     const retryAt = addMs(undelivered.lastAt, Math.min(UNDELIVERED_BACKOFF_MS * 2 ** (undelivered.count - 1), UNDELIVERED_BACKOFF_MAX_MS));
     if (retryAt && Date.parse(retryAt) > now) {
       return { ...decision, action: "wait", reason: `can't deliver (${undelivered.reason}); retry after backoff`, notBefore: retryAt };
@@ -380,9 +391,14 @@ function resolveNudge(ctx, intent, base) {
   if (attempts >= maxAttempts) return stuckDecision(ctx, playbook, vars, attempts, decision);
   const route = chooseRoute(thread, ctx.mode, ctx.delivery);
   if (!route) {
+    // No route only because computer use cannot type right now (a locked
+    // screen, secure input), in either computer-use mode: the supervisor
+    // tells the owner why once it has waited a while.
+    const ui = deliveryOf(ctx.delivery);
+    const uiBlocked = ui.mode !== "cli" && ui.ready === false && Boolean(uiTargetFor(thread));
     const waitUi = uiWaitReason(thread, ctx.delivery);
-    if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}` };
-    return unreachableDecision(ctx, decision);
+    if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
+    return { ...unreachableDecision(ctx, decision), uiBlocked };
   }
   return { ...decision, action: "nudge", route, message: renderTemplate(playbook.body, vars) };
 }
@@ -426,7 +442,7 @@ function deliveryHint(reason) {
 function undeliveredDecision(ctx, decision, streak) {
   const minutesStuck = minutes(ctx.now - Date.parse(streak.since));
   return {
-    ...decision, action: "ask-user", reason: `can't deliver: ${streak.reason}`,
+    ...decision, action: "ask-user", reason: `can't deliver: ${streak.reason}.${deliveryHint(streak.reason)}`,
     question: question(ctx, `${ctx.facts.label} stopped. Can't nudge it. Nudge it?`,
       `${ctx.facts.label} needs "${decision.playbook}". ${streak.count} sends failed over ${minutesStuck}m: ${streak.reason}.${deliveryHint(streak.reason)}`,
       ["done", "skip"], `deliver:${ctx.thread.key}`, "deliver")
@@ -461,8 +477,9 @@ function resolveEscalation(ctx, intent, base) {
   if (busy) return { ...decision, action: "wait", reason: `${busy.reason}; ${intent.reason}`, notBefore: busy.notBefore };
   const vars = { ...ctx.facts, ...intent.vars };
   const route = managerRoute(ctx.manager, ctx.mode, limits, now, ctx.delivery);
-  const waitUi = route ? null : uiWaitReason(ctx.manager, ctx.delivery);
-  if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}` };
+  // A manager that is down stays offline whatever computer use does.
+  const waitUi = route || !ctx.manager || managerDown(ctx.manager, now) ? null : uiBlockedReason(ctx.manager, ctx.delivery);
+  if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}`, uiBlocked: true };
   if (!route) {
     return {
       ...decision, action: "ask-user",
@@ -625,8 +642,8 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
   const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
   const route = managerRoute(manager, mode, limits, now, delivery);
-  const waitUi = route ? null : uiWaitReason(manager, delivery);
-  if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}` };
+  const waitUi = route || !manager || managerDown(manager, now) ? null : uiBlockedReason(manager, delivery);
+  if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}`, uiBlocked: true };
   if (!route) {
     return {
       ...base, action: "ask-user",

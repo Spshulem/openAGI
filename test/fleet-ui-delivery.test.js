@@ -632,9 +632,9 @@ test("presence probes parse lsappinfo and ioreg output", async () => {
   assert.equal(parseIdleMs('  |   "HIDIdleTime" = 659028416\n'), 659);
   assert.equal(parseIdleMs("nothing"), null);
   const unlocked = '"IOConsoleLocked" = No\n"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserNameKey"="shooby"})';
-  assert.deepEqual(parseConsoleSession(unlocked), { locked: false, secureInput: false, onConsole: true });
+  assert.deepEqual(parseConsoleSession(unlocked), { locked: false, secureInput: false, secureInputPid: null, onConsole: true });
   const locked = '"IOConsoleUsers" = ({"CGSSessionScreenIsLocked"=Yes,"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionSecureInputPID"=812})';
-  assert.deepEqual(parseConsoleSession(locked), { locked: true, secureInput: true, onConsole: true });
+  assert.deepEqual(parseConsoleSession(locked), { locked: true, secureInput: true, secureInputPid: 812, onConsole: true });
   assert.equal(parseConsoleSession(""), null);
 
   const calls = [];
@@ -655,7 +655,7 @@ test("presence probes parse lsappinfo and ioreg output", async () => {
   assert.equal(await probe.frontApp(), "com.conductor.app");
   assert.equal(await probe.appRunning("com.conductor.app"), true);
   assert.equal(await probe.idleMs(), 150_000);
-  assert.deepEqual(await probe.session(), { locked: false, secureInput: false, onConsole: true });
+  assert.deepEqual(await probe.session(), { locked: false, secureInput: false, secureInputPid: null, onConsole: true });
   assert.equal(await probe.openUrl("codex://threads/t1"), true);
   assert.deepEqual(calls.at(-1), ["/usr/bin/open", "-g", "codex://threads/t1"]);
   assert.deepEqual(calls[1], ["/usr/bin/lsappinfo", "info", "-only", "bundleID", "ASN:0x0-0x86b86b:"]);
@@ -843,4 +843,23 @@ test("the app restarter quits in the background, relaunches, and refuses while t
   const stuck = createAppRestarter({ run: async () => ({ code: 0 }), probe: fakeProbe({ appRunning: async () => true }), now: () => clock, sleep: async (ms) => { clock += ms; } });
   assert.deepEqual(await stuck.restart("conductor"), { ok: false, detail: "Conductor did not quit" });
   assert.equal((await restarter.restart("finder")).ok, false);
+});
+
+test("the app holding secure input is named in the not-ready reason", async () => {
+  const { appNameFromPath } = await import("../src/fleet/ui-delivery.js");
+  assert.equal(appNameFromPath("/Applications/BuildBetter Staging.app/Contents/MacOS/BuildBetter Staging\n"), "BuildBetter Staging");
+  assert.equal(appNameFromPath("/usr/sbin/loginwindow"), "loginwindow");
+  assert.equal(appNameFromPath(""), null);
+  const session = parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=56400,"kCGSSessionOnConsoleKey"=Yes})');
+  assert.equal(session.secureInput, true);
+  assert.equal(session.secureInputPid, 56400);
+  assert.equal(parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=0})').secureInputPid, null);
+  // Fast user switching: an off-console session first must not hide the holder.
+  const multi = parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=0,"kCGSSessionOnConsoleKey"=No},{"kCGSSessionSecureInputPID"=812,"kCGSSessionOnConsoleKey"=Yes})');
+  assert.equal(multi.secureInput, true);
+  assert.equal(multi.secureInputPid, 812);
+  const probe = createPresenceProbe({ run: async (cmd) => ({ code: 0, stdout: cmd === "ps" ? "/Applications/BuildBetter Staging.app/Contents/MacOS/BuildBetter Staging\n" : '"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=56400,"kCGSSessionOnConsoleKey"=Yes})' }) });
+  assert.equal((await probe.session()).secureInputApp, "BuildBetter Staging");
+  const driver = createUiDriver({ config: { bins: { ocu: "/fake/ocu" }, limits: { ...DEFAULTS } }, probe: fakeProbe({ screen: { locked: false, secureInput: true, secureInputApp: "BuildBetter Staging", onConsole: true } }), binaryReady: () => true, computerUseEnabled: () => true, permissionProbe: async () => ({ accessibility: true, screenRecording: true }) });
+  assert.deepEqual(await driver.readiness(), { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" });
 });

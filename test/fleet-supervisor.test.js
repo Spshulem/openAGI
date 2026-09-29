@@ -1909,7 +1909,8 @@ test("a thread nudges keep failing to reach backs off, then the owner is told on
   assert.equal(delivered.length, 3);
   const asks = supervisor.store.openQuestions().filter((q) => q.kind === "deliver");
   assert.equal(asks.length, 1);
-  assert.match(asks[0].body, /3 sends failed/);
+  assert.equal(asks[0].dedupeKey, "deliver:group", "one grouped question, even for one thread");
+  assert.match(asks[0].body, /ambiguous: two threads share this title/);
   assert.match(asks[0].body, /rename or archive one/);
   // One question, kept while it stays true (the notifier dedupes the push).
   assert.equal(new Set(notified.filter((q) => q.kind === "deliver").map((q) => q.id)).size, 1);
@@ -1943,4 +1944,209 @@ test("the review never clears the supervisor's own can't-deliver finding", async
   const ask = supervisor.store.openQuestions().find((q) => q.kind === "deliver");
   assert.ok(ask, "still open");
   assert.ok(model.calls.every((call) => call.entries.every((entry) => entry.id !== ask.id)), "never sent to the review");
+});
+
+test("the pause clock starts only when a nudge waits, not when the screen merely locked hours ago", async (t) => {
+  let now = NOW;
+  let stalled = false;
+  const thread = () => makeThread({ agentStatus: stalled ? "stalled" : "running", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [thread()] } });
+  await supervisor.tick({ reason: "test" });
+  now += 3 * 60 * MIN;
+  stalled = true;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), undefined);
+  now += 31 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.match(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use").body, /for 31m/);
+});
+
+test("computer-use-first: a thread with no CLI fallback waiting on the UI counts toward the pause alert", async (t) => {
+  let now = NOW;
+  const locked = makeThread({ writerLocked: true, agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN), meta: { originator: "Codex Desktop" } });
+  const driver = { readiness: async () => ({ ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [locked], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick({ reason: "test" });
+  now += 31 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.ok(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"));
+});
+
+test("computer use unable to type for 30 min tells the owner once why, and the question closes when typing works", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [stopped], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick({ reason: "test" });
+  const paused = () => supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use");
+  assert.equal(paused(), undefined, "not yet: under 30 minutes");
+  now += 31 * MIN;
+  await supervisor.tick({ reason: "test" });
+  const q = paused();
+  assert.ok(q);
+  assert.equal(q.kind, "paused");
+  assert.match(q.body, /BuildBetter Staging has a password field focused\. 1 threads wait on a nudge/);
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.store.question(q.id).status, "resolved");
+});
+
+test("threads nudges can't reach are always one grouped question, so an answer holds as the set changes", () => {
+  const byKey = new Map([["codex:a", makeThread({ key: "codex:a", id: "a" })], ["codex:b", makeThread({ key: "codex:b", id: "b", prRefs: ["acme/app#8"] })]]);
+  const ask = (key) => ({ threadKey: key, action: "ask-user", playbook: "resume", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x stopped. Can't nudge it. Nudge it?", body: "3 sends failed", options: ["done", "skip"] } });
+  const out = groupQuestions([ask("codex:a"), ask("codex:b")], byKey);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].dedupeKey, "deliver:group");
+  assert.deepEqual(out[0].threadKeys, ["codex:a", "codex:b"]);
+  assert.match(out[0].title, /^2 stopped/);
+  // One thread left keeps the same key, so an owner answer still covers it.
+  const one = groupQuestions([{ ...ask("codex:b"), reason: "can't deliver: could not verify thread. The app would not show this thread." }], byKey);
+  assert.equal(one.length, 1);
+  assert.equal(one[0].dedupeKey, "deliver:group");
+  assert.match(one[0].title, /^1 stopped\. .* Nudge it\?$/);
+  assert.match(one[0].body, /\(could not verify thread\. The app would not show this thread\.\)/);
+});
+
+test("the owner's skip on the delivery group holds after one of its threads recovers", async (t) => {
+  let now = NOW;
+  const a = makeThread({ key: "codex:a", id: "a", cwd: "/work/a", agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const b = makeThread({ key: "codex:b", id: "b", cwd: "/work/b", agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const threads = [a, b];
+  const { supervisor, notified } = fixture(t, {
+    mode: "auto", threads, now: () => now,
+    deps: {
+      listCodexThreads: async () => threads,
+      executor: { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "could not verify thread", actionId: null }), inFlight: () => [], whenIdle: async () => {} }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const group = supervisor.store.openQuestions().find((q) => q.dedupeKey === "deliver:group");
+  assert.deepEqual([...group.threadKeys].sort(), ["codex:a", "codex:b"]);
+  await supervisor.answerQuestion(group.id, "skip");
+  // Thread a recovers; b still fails. No new question for b.
+  threads.splice(0, 1, { ...a, agentStatus: "running", lastActivityAt: new Date(now).toISOString(), lastAgentAt: new Date(now).toISOString() });
+  const before = new Set(notified.map((q) => q.id));
+  for (let i = 0; i < 3; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  assert.equal(supervisor.store.openQuestions().filter((q) => q.kind === "deliver").length, 0);
+  assert.equal(notified.filter((q) => !before.has(q.id) && q.kind === "deliver").length, 0);
+});
+
+test("a group answer covers only its threads: a new thread's delivery trouble is asked about on its own", async (t) => {
+  let now = NOW;
+  const stalled = (key) => makeThread({ key, id: key.split(":")[1], cwd: `/work/${key}`, agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const threads = [stalled("codex:a")];
+  const { supervisor } = fixture(t, {
+    mode: "auto", now: () => now,
+    deps: {
+      listCodexThreads: async () => threads,
+      executor: { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "could not verify thread", actionId: null }), inFlight: () => [], whenIdle: async () => {} }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const first = supervisor.store.openQuestions().find((q) => q.dedupeKey === "deliver:group");
+  await supervisor.answerQuestion(first.id, "skip");
+  // a recovers for good; b starts failing later.
+  threads.splice(0, 1, { ...threads[0], agentStatus: "running", lastActivityAt: new Date(now).toISOString(), lastAgentAt: new Date(now).toISOString() });
+  threads.push({ ...stalled("codex:b"), lastAgentAt: new Date(now - 40 * MIN).toISOString(), lastActivityAt: new Date(now - 40 * MIN).toISOString() });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const second = supervisor.store.openQuestions().find((q) => q.kind === "deliver");
+  assert.ok(second, "b is asked about");
+  assert.notEqual(second.id, first.id);
+  assert.deepEqual(second.threadKeys, ["codex:b"]);
+});
+
+test("the pause alert is for Auto only, and a failed scan does not reset it", async (t) => {
+  let now = NOW;
+  let codexFails = false;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const observe = fixture(t, { mode: "observe", delivery: "computer-use", threads: [stopped], now: () => now, deps: { uiDriver: driver } });
+  await observe.supervisor.tick({ reason: "test" });
+  now += 40 * MIN;
+  await observe.supervisor.tick({ reason: "test" });
+  assert.equal(observe.supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), undefined, "observe never sends, so nothing is paused");
+
+  now = NOW;
+  const auto = fixture(t, {
+    mode: "auto", delivery: "computer-use", now: () => now,
+    deps: { uiDriver: driver, listCodexThreads: async () => { if (codexFails) throw new Error("database is locked"); return [stopped]; } }
+  });
+  await auto.supervisor.tick({ reason: "test" });
+  now += 31 * MIN;
+  await auto.supervisor.tick({ reason: "test" });
+  const q = auto.supervisor.store.openQuestions().find((x) => x.dedupeKey === "infra:computer-use");
+  assert.ok(q);
+  codexFails = true;
+  now += 5 * MIN;
+  await auto.supervisor.tick({ reason: "test" });
+  assert.equal(auto.supervisor.store.question(q.id).status, "open", "a failed scan keeps the alert");
+  codexFails = false;
+  now += 5 * MIN;
+  await auto.supervisor.tick({ reason: "test" });
+  assert.equal(auto.supervisor.store.question(q.id).status, "open");
+  assert.match(auto.supervisor.store.question(q.id).body, /for 41m/, "the clock kept running");
+});
+
+test("the pause age is that of a nudge still waiting: a new thread starts its own clock", async (t) => {
+  let now = NOW;
+  let aStuck = true;
+  let bStuck = false;
+  const stalled = (key, stuck) => makeThread({ key, id: key.split(":")[1], cwd: `/work/${key}`, agentStatus: stuck ? "stalled" : "running", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [stalled("codex:a", aStuck), stalled("codex:b", bStuck)] } });
+  await supervisor.tick({ reason: "test" });
+  now += 29 * MIN;
+  aStuck = false;
+  bStuck = true;
+  await supervisor.tick({ reason: "test" });
+  now += 2 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), undefined, "b has waited 2 minutes, not 31");
+});
+
+test("an answer to one failure streak does not cover the next one after the thread worked", async (t) => {
+  let now = NOW;
+  let lastAt = ago(40 * MIN);
+  const thread = () => makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: lastAt, lastActivityAt: lastAt });
+  const { supervisor } = fixture(t, {
+    mode: "auto", now: () => now,
+    deps: {
+      listCodexThreads: async () => [thread()],
+      executor: { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "could not verify thread", actionId: null }), inFlight: () => [], whenIdle: async () => {} }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const first = supervisor.store.openQuestions().find((q) => q.kind === "deliver");
+  await supervisor.answerQuestion(first.id, "skip");
+  assert.ok(supervisor.store.ledgerFor("codex:t1").undelivered.ackedAt);
+  // The owner nudged it by hand; it worked, then stopped again.
+  lastAt = new Date(now - 20 * MIN).toISOString();
+  for (let i = 0; i < 14; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  assert.equal(supervisor.store.ledgerFor("codex:t1").undelivered.ackedAt, null, "a new streak");
+  assert.ok(supervisor.store.openQuestions().find((q) => q.kind === "deliver"), "asked about the new incident");
+});
+
+test("the paused-nudge clock survives a restart", async (t) => {
+  let now = NOW;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const first = fixture(t, { mode: "auto", delivery: "computer-use", threads: [stopped], now: () => now, deps: { uiDriver: driver } });
+  await first.supervisor.tick({ reason: "test" });
+  now += 20 * MIN;
+  // Same data dir, new process.
+  const again = new FleetSupervisor({ dataDir: first.dataDir, config: first.supervisor.config, deps: { ...first.supervisor.deps, now: () => now } });
+  now += 11 * MIN;
+  await again.tick({ reason: "test" });
+  assert.match(again.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use").body, /for 31m/);
+});
+
+test("more than 50 unreachable threads split into several stored groups", () => {
+  const keys = Array.from({ length: 60 }, (_, i) => `codex:t${i}`);
+  const byKey = new Map(keys.map((key) => [key, makeThread({ key, id: key.split(":")[1] })]));
+  const asks = keys.map((key) => ({ threadKey: key, action: "ask-user", playbook: "resume", reason: "can't deliver: could not verify thread.", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x", body: "y", options: ["done", "skip"] } }));
+  const groups = groupQuestions(asks, byKey);
+  assert.deepEqual(groups.map((g) => [g.dedupeKey, g.threadKeys.length]), [["deliver:group", 50], ["deliver:group:2", 10]]);
 });

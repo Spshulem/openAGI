@@ -49,6 +49,7 @@ function emptyState() {
     escalations: {},
     infraDown: {},
     infraBlocked: {},
+    uiBlockedSince: {},
     infraUp: {},
     pushes: [],
     muted: {}
@@ -189,6 +190,15 @@ export class FleetStore {
     return ledger ? structuredClone(ledger) : emptyLedger();
   }
 
+  // The owner answered or dismissed the can't-deliver question for this
+  // thread: it is not asked about again for this failure streak.
+  ackUndelivered(key) {
+    const ledger = this.state.ledger[key];
+    if (!ledger?.undelivered) return;
+    ledger.undelivered.ackedAt = iso(this.now());
+    this._save();
+  }
+
   recordNudge(key, entry = {}, progressMark) {
     if (!key) return null;
     const ledger = this.state.ledger[key] ?? emptyLedger();
@@ -210,8 +220,12 @@ export class FleetStore {
     if (COOLDOWN_STATUSES.has(status)) ledger.lastNudgeAt = at;
     const detail = String(entry.detail ?? "");
     if (UNDELIVERED_STATUSES.has(status) && !BENIGN_BLOCKS.test(detail)) {
-      const prev = ledger.undelivered ?? null;
-      ledger.undelivered = { count: (prev?.count ?? 0) + 1, since: prev?.since ?? at, lastAt: at, reason: clampText(detail, 160) || status };
+      // The thread worked since the last failure: this is a new incident,
+      // and an answer to the old one does not cover it.
+      const workedSince = toMs(entry.threadActivityAt, null);
+      const ended = ledger.undelivered && workedSince !== null && workedSince > toMs(ledger.undelivered.lastAt, 0);
+      const prev = ended ? null : (ledger.undelivered ?? null);
+      ledger.undelivered = { count: (prev?.count ?? 0) + 1, since: prev?.since ?? at, lastAt: at, reason: clampText(detail, 160) || status, ackedAt: prev?.ackedAt ?? null };
     } else if (REACHED_STATUSES.has(status)) {
       ledger.undelivered = null;
     }
@@ -256,7 +270,10 @@ export class FleetStore {
     }
     // An answer, dismissal or review close holds (see holdsWhileAsked), so
     // the next tick neither reopens it with a new id nor pushes the phone again.
-    const closed = this._ownerClosed(key, now, fields);
+    // A delivery-failure answer holds on each thread's failure streak (see
+    // ackUndelivered), so the group question itself never holds: a thread
+    // that starts failing later is asked about, one already answered is not.
+    const closed = fields.kind === "deliver" ? null : this._ownerClosed(key, now, fields);
     if (closed) {
       if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
@@ -533,6 +550,19 @@ export class FleetStore {
     return Array.isArray(list) ? [...list] : [];
   }
 
+  // When each nudge first waited on computer use (thread key -> ISO time),
+  // kept across restarts so the paused-nudge alert's clock does not reset.
+  uiBlockedSince() {
+    return new Map(Object.entries(this.state.uiBlockedSince ?? {}).map(([key, at]) => [key, toMs(at, null)]).filter(([, ms]) => ms !== null));
+  }
+
+  setUiBlockedSince(map) {
+    const next = Object.fromEntries([...map].slice(0, INFRA_BLOCKED_KEPT).map(([key, ms]) => [key, iso(ms)]));
+    if (JSON.stringify(next) === JSON.stringify(this.state.uiBlockedSince ?? {})) return;
+    this.state.uiBlockedSince = next;
+    this._save();
+  }
+
   // ─── phone pushes (times only; never the endpoint) ──────────────────────
 
   recordPush(at) {
@@ -597,7 +627,9 @@ export class FleetStore {
     let latest = null;
     for (const question of this.state.questions) {
       if (question.dedupeKey !== key) continue;
-      if (!OWNER_CLOSED.has(question.status) && !(isReviewClosed(question) && !widens(question, fields))) continue;
+      // A close covers the threads it named: a group that now names others
+      // (widened, or members shifted in) is a new question.
+      if (!(OWNER_CLOSED.has(question.status) || isReviewClosed(question)) || widens(question, fields)) continue;
       if (toMs(question.answeredAt, null) === null || holdEnded(question, now)) continue;
       if (!latest || heldSinceMs(question) > heldSinceMs(latest)) latest = question;
     }
@@ -675,6 +707,7 @@ export class FleetStore {
       escalations: isObject(raw.escalations) ? raw.escalations : {},
       infraDown: isObject(raw.infraDown) ? raw.infraDown : {},
       infraBlocked: isObject(raw.infraBlocked) ? raw.infraBlocked : {},
+      uiBlockedSince: isObject(raw.uiBlockedSince) ? raw.uiBlockedSince : {},
       infraUp: isObject(raw.infraUp) ? raw.infraUp : {},
       pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
       muted: isObject(raw.muted) ? raw.muted : {}

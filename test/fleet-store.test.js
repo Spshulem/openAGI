@@ -601,3 +601,16 @@ test("a review close is not reopened over a newer open copy of the same ask", (t
   assert.notEqual(fresh.id, first.id);
   assert.equal(store.reopenReviewed(first.id), null);
 });
+
+test("an owner close covers the threads it named: a group with other members is a new question", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const group = (keys) => ({ dedupeKey: "open:group", kind: "open", threadKeys: keys, title: `${keys.length} stuck, can't reach. Open them?`, options: ["opened", "skip"] });
+  const first = store.upsertQuestion(group(["codex:a", "codex:b"]));
+  store.answerQuestion(first.id, "skip");
+  now.advance(10 * 60 * 1000);
+  assert.equal(store.upsertQuestion(group(["codex:a"])).suppressed, true, "a smaller group is covered");
+  const shifted = store.upsertQuestion(group(["codex:c"]));
+  assert.equal(shifted.suppressed, undefined);
+  assert.notEqual(shifted.id, first.id);
+});
