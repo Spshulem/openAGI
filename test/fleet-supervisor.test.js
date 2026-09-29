@@ -2033,3 +2033,59 @@ test("the owner's skip on the delivery group holds after one of its threads reco
   assert.equal(supervisor.store.openQuestions().filter((q) => q.kind === "deliver").length, 0);
   assert.equal(notified.filter((q) => !before.has(q.id) && q.kind === "deliver").length, 0);
 });
+
+test("a group answer covers only its threads: a new thread's delivery trouble is asked about on its own", async (t) => {
+  let now = NOW;
+  const stalled = (key) => makeThread({ key, id: key.split(":")[1], cwd: `/work/${key}`, agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const threads = [stalled("codex:a")];
+  const { supervisor } = fixture(t, {
+    mode: "auto", now: () => now,
+    deps: {
+      listCodexThreads: async () => threads,
+      executor: { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "could not verify thread", actionId: null }), inFlight: () => [], whenIdle: async () => {} }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const first = supervisor.store.openQuestions().find((q) => q.dedupeKey === "deliver:group");
+  await supervisor.answerQuestion(first.id, "skip");
+  // a recovers for good; b starts failing later.
+  threads.splice(0, 1, { ...threads[0], agentStatus: "running", lastActivityAt: new Date(now).toISOString(), lastAgentAt: new Date(now).toISOString() });
+  threads.push({ ...stalled("codex:b"), lastAgentAt: new Date(now - 40 * MIN).toISOString(), lastActivityAt: new Date(now - 40 * MIN).toISOString() });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const second = supervisor.store.openQuestions().find((q) => q.kind === "deliver");
+  assert.ok(second, "b is asked about");
+  assert.notEqual(second.id, first.id);
+  assert.deepEqual(second.threadKeys, ["codex:b"]);
+});
+
+test("the pause alert is for Auto only, and a failed scan does not reset it", async (t) => {
+  let now = NOW;
+  let codexFails = false;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const observe = fixture(t, { mode: "observe", delivery: "computer-use", threads: [stopped], now: () => now, deps: { uiDriver: driver } });
+  await observe.supervisor.tick({ reason: "test" });
+  now += 40 * MIN;
+  await observe.supervisor.tick({ reason: "test" });
+  assert.equal(observe.supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), undefined, "observe never sends, so nothing is paused");
+
+  now = NOW;
+  const auto = fixture(t, {
+    mode: "auto", delivery: "computer-use", now: () => now,
+    deps: { uiDriver: driver, listCodexThreads: async () => { if (codexFails) throw new Error("database is locked"); return [stopped]; } }
+  });
+  await auto.supervisor.tick({ reason: "test" });
+  now += 31 * MIN;
+  await auto.supervisor.tick({ reason: "test" });
+  const q = auto.supervisor.store.openQuestions().find((x) => x.dedupeKey === "infra:computer-use");
+  assert.ok(q);
+  codexFails = true;
+  now += 5 * MIN;
+  await auto.supervisor.tick({ reason: "test" });
+  assert.equal(auto.supervisor.store.question(q.id).status, "open", "a failed scan keeps the alert");
+  codexFails = false;
+  now += 5 * MIN;
+  await auto.supervisor.tick({ reason: "test" });
+  assert.equal(auto.supervisor.store.question(q.id).status, "open");
+  assert.match(auto.supervisor.store.question(q.id).body, /for 41m/, "the clock kept running");
+});

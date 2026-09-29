@@ -729,9 +729,14 @@ export class FleetSupervisor {
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
     // How long a nudge has waited on computer use, for telling the owner.
-    const uiBlocked = items.filter(({ decision }) => decision.uiBlocked).length;
+    // Only Auto sends on its own, so only Auto can be paused. A thread source
+    // that failed this tick hid its threads: keep the clock and last count.
+    const sourceFailed = ["codex", "claude", "conductor"].some((kind) => sourceErrors[kind]);
+    let uiBlocked = mode === "auto" ? items.filter(({ decision }) => decision.uiBlocked).length : 0;
+    if (!uiBlocked && sourceFailed && mode === "auto" && delivery.ready === false) uiBlocked = this.lastUiBlocked ?? 0;
     if (uiBlocked && delivery.ready === false) this.notReadySince ??= started;
     else this.notReadySince = null;
+    this.lastUiBlocked = this.notReadySince ? uiBlocked : 0;
     const paused = pausedDeliveryDecision(delivery, uiBlocked, this.notReadySince, started);
     if (paused) infraDecisions.push(paused);
     const health = infraHealth(infra, { config, now: started });
@@ -911,7 +916,12 @@ export class FleetSupervisor {
     // One the last review could not settle yet is still new.
     const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
-    for (const fields of groupQuestions(asks, byKey)) {
+    // Threads a grouped answer already covers stay out of the next group, so
+    // a new thread's trouble is asked about on its own.
+    const coveredBy = new Map(Object.entries(GROUPED_KINDS).map(([kind, spec]) => [kind, store.coveredMembers(spec.dedupeKey)]));
+    const fresh = asks.filter((decision) => !coveredBy.get(decision.question.kind)?.has(decision.threadKey));
+    for (const decision of asks) if (!fresh.includes(decision)) asked.add(GROUPED_KINDS[decision.question.kind].dedupeKey);
+    for (const fields of groupQuestions(fresh, byKey)) {
       // Rebuilt without a failed source's threads, a group would drop them,
       // or shrink to one thread and ask it twice; the open group stays as it
       // is until that source reads again.

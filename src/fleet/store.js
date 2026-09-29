@@ -257,7 +257,12 @@ export class FleetStore {
     // An answer, dismissal or review close holds (see holdsWhileAsked), so
     // the next tick neither reopens it with a new id nor pushes the phone again.
     const closed = this._ownerClosed(key, now, fields);
-    if (closed) {
+    // A group answer covers the threads it named; a thread it never named is
+    // a new incident and gets its own question.
+    // (A review close already weighs widening in _ownerClosed.)
+    const uncovered = closed && OWNER_CLOSED.has(closed.status) && Array.isArray(fields.threadKeys)
+      && fields.threadKeys.some((member) => !this.coveredMembers(key, now).has(member));
+    if (closed && !uncovered) {
       if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
     }
@@ -590,6 +595,17 @@ export class FleetStore {
 
   _findQuestion(id) {
     return this.state.questions.find((q) => q.id === id) ?? null;
+  }
+
+  // Threads named by owner-closed questions of this key that still hold.
+  coveredMembers(key, now = this.now()) {
+    const covered = new Set();
+    for (const question of this.state.questions) {
+      if (question.dedupeKey !== key || !OWNER_CLOSED.has(question.status)) continue;
+      if (toMs(question.answeredAt, null) === null || holdEnded(question, now)) continue;
+      for (const member of question.threadKeys ?? (question.threadKey ? [question.threadKey] : [])) covered.add(member);
+    }
+    return covered;
   }
 
   // An owner close, or a review close of the same ask, still holding it back.
