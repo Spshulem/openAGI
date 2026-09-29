@@ -94,6 +94,18 @@ export class OutreachStore {
     return i;
   }
 
+  // An item its source closed on its own (decision "resolved") comes back
+  // when that source reopens. Same id and seq, so nothing pings for it again.
+  reopen(id) {
+    const i = this.items.get(id);
+    if (!i || i.status !== "dismissed" || i.decision !== "resolved") return null;
+    i.status = "seen";
+    i.decision = null;
+    i.resolvedAt = null;
+    this.snapshot();
+    return i;
+  }
+
   snapshot() {
     writeJsonAtomic(path.join(this.dir, "snapshot.json"), {
       version: 1,

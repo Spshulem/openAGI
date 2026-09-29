@@ -9,13 +9,17 @@ import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic } from "../fil
 import { DEFAULTS, MODES, clampText, redactSecrets } from "./contracts.js";
 
 const QUESTION_TTL_MS = 24 * 60 * 60 * 1000;
+// A question the supervisor closed and that is asked again this soon was a
+// blip: the same record comes back instead of a new one.
+const REOPEN_MS = 60 * 60 * 1000;
 const PUSH_KEEP_MS = 24 * 60 * 60 * 1000;
 const NUDGES_KEPT = 20;
 const CLOSED_QUESTIONS_KEPT = 200;
 const OPTIONS_MAX = 4;
 const OPTION_MAX_CHARS = 40;
 const INFRA_BLOCKED_KEPT = 200;
-// The owner closed these; the same ask stays quiet until its TTL passes.
+// The owner closed these; the same ask stays quiet until a TTL passes with
+// no ask.
 const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 
 // Only a delivered nudge spends the no-progress budget. A failed send still
@@ -61,6 +65,12 @@ function iso(ms) {
   return new Date(ms).toISOString();
 }
 
+// When the question was last asked (records saved before lastAskedAt used
+// createdAt), or closed if that came later.
+function lastAskMs(question) {
+  return Math.max(toMs(question.lastAskedAt ?? question.createdAt, 0), toMs(question.answeredAt, 0));
+}
+
 // Progress marks come from different producers; compare them key-order-free.
 function markKey(mark) {
   if (mark === null || mark === undefined) return "null";
@@ -93,6 +103,9 @@ export class FleetStore {
     this.now = now;
     this.lastWriteError = null;
     this.state = this._load();
+    // Expired questions whose outreach copy the supervisor still has to
+    // close; after a restart that includes older ones (closing is idempotent).
+    this.expired = this.state.questions.filter((q) => q.status === "expired" && q.outreachId).map((q) => ({ ...q }));
   }
 
   // ─── mode and snapshot ──────────────────────────────────────────────────
@@ -169,6 +182,9 @@ export class FleetStore {
     const key = String(dedupeKey ?? "").trim() || `${fields.threadKey ?? "fleet"}:${fields.title}`;
     const existing = this.state.questions.find((q) => q.status === "open" && q.dedupeKey === key);
     if (existing) {
+      // Still asked, so it has not expired. Not saved on its own: the next
+      // write (at least the tick's snapshot) carries it.
+      Object.assign(existing, { lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS) });
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
       if (changed) {
         Object.assign(existing, fields, { updatedAt: iso(now) });
@@ -179,7 +195,20 @@ export class FleetStore {
     // An answer or dismissal holds while the condition does, so the next
     // tick neither reopens it with a new id nor pushes the phone again.
     const closed = this._ownerClosed(key, now);
-    if (closed) return { ...closed, suppressed: true };
+    if (closed) {
+      closed.lastAskedAt = iso(now);
+      return { ...closed, suppressed: true };
+    }
+    // Same record, same outreach copy, no second push.
+    const resolved = this._recentlyResolved(key, now);
+    if (resolved) {
+      Object.assign(resolved, fields, {
+        status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
+        lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
+      });
+      this._save();
+      return { ...resolved, reopened: true };
+    }
     const question = {
       id: makeId("fq"),
       dedupeKey: key,
@@ -189,6 +218,7 @@ export class FleetStore {
       createdAt: iso(now),
       updatedAt: iso(now),
       answeredAt: null,
+      lastAskedAt: iso(now),
       expiresAt: iso(now + QUESTION_TTL_MS),
       outreachId: null,
       pushedAt: null
@@ -224,7 +254,7 @@ export class FleetStore {
     const question = this._findQuestion(id);
     if (!question || !["open", "answered"].includes(question.status)) return null;
     if (question.status === "answered" && (answer === null || question.answer === answer)) {
-      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, updatedAt: iso(this.now()) });
+      Object.assign(question, { status: "open", answer: null, answeredAt: null, outreachId: null, reopenedAt: null, updatedAt: iso(this.now()) });
     }
     if (question.deliveredThreadKeys) question.deliveredThreadKeys = question.deliveredThreadKeys.filter((key) => !undeliveredKeys.includes(key));
     this._save();
@@ -232,8 +262,13 @@ export class FleetStore {
   }
 
   // The supervisor closes a question itself once the condition behind it is gone.
-  resolveQuestion(id) {
-    return this._closeQuestion(id, "resolved", null);
+  resolveQuestion(id, reason = null) {
+    return this._closeQuestion(id, "resolved", null, { resolveReason: clampText(reason, 160) || null });
+  }
+
+  // Expired questions not yet handed out; each is returned once.
+  takeExpired() {
+    return this.expired.splice(0);
   }
 
   // Records how the notifier reached the owner so a later tick neither
@@ -415,14 +450,24 @@ export class FleetStore {
     let latest = null;
     for (const question of this.state.questions) {
       if (question.dedupeKey !== key || !OWNER_CLOSED.has(question.status)) continue;
+      if (toMs(question.answeredAt, null) === null || now - lastAskMs(question) >= QUESTION_TTL_MS) continue;
+      if (!latest || lastAskMs(question) > lastAskMs(latest)) latest = question;
+    }
+    return latest;
+  }
+
+  _recentlyResolved(key, now) {
+    let latest = null;
+    for (const question of this.state.questions) {
+      if (question.dedupeKey !== key || question.status !== "resolved") continue;
       const closedAt = toMs(question.answeredAt, null);
-      if (closedAt === null || now - closedAt >= QUESTION_TTL_MS) continue;
+      if (closedAt === null || now - closedAt >= REOPEN_MS) continue;
       if (!latest || closedAt > toMs(latest.answeredAt, 0)) latest = question;
     }
     return latest;
   }
 
-  _closeQuestion(id, status, answer) {
+  _closeQuestion(id, status, answer, extra = {}) {
     const now = this.now();
     this._expireQuestions(now);
     const question = this._findQuestion(id);
@@ -431,17 +476,21 @@ export class FleetStore {
     question.answer = answer;
     question.answeredAt = iso(now);
     question.updatedAt = iso(now);
+    Object.assign(question, extra);
     this._save();
     return { ...question };
   }
 
+  // Only a TTL with no ask expires a question; one still asked every tick
+  // keeps its id.
   _expireQuestions(now) {
     let changed = false;
     for (const question of this.state.questions) {
       if (question.status !== "open") continue;
-      if (now - toMs(question.createdAt, now) < QUESTION_TTL_MS) continue;
+      if (now - lastAskMs(question) < QUESTION_TTL_MS) continue;
       question.status = "expired";
       question.updatedAt = iso(now);
+      if (question.outreachId) this.expired.push({ ...question });
       changed = true;
     }
     if (changed) this._save();
@@ -449,7 +498,8 @@ export class FleetStore {
   }
 
   _pruneQuestions() {
-    const closed = this.state.questions.filter((q) => q.status !== "open");
+    // Least recently asked first, so a close still holding back an ask stays.
+    const closed = this.state.questions.filter((q) => q.status !== "open").sort((a, b) => lastAskMs(a) - lastAskMs(b));
     if (closed.length <= CLOSED_QUESTIONS_KEPT) return;
     const drop = new Set(closed.slice(0, closed.length - CLOSED_QUESTIONS_KEPT));
     this.state.questions = this.state.questions.filter((q) => !drop.has(q));

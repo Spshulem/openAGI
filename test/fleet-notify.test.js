@@ -173,3 +173,18 @@ test("no outreach store and closed questions degrade quietly", async (t) => {
   const survived = await throwing.notifyQuestion({ id: "fq_x", title: "t", body: "", options: [] });
   assert.equal(survived.outreachId, null);
 });
+
+test("a question reopened after a blip posts no second outreach item and no second push", async (t) => {
+  const { appended, fetches, notifier, question, store } = setup(t, { push: "buzzkit" });
+  assert.equal((await notifier.notifyQuestion(question)).pushed, true);
+  store.resolveQuestion(question.id, "running: turn in progress");
+  const back = store.upsertQuestion({
+    dedupeKey: "ready:o/r#6522", threadKey: "codex:t1", prRef: "o/r#6522",
+    title: "#6522 ready. Merge?", body: "CI green on abc1234. 0 open threads.", options: ["merge", "wait"]
+  });
+  assert.equal(back.id, question.id);
+  const result = await notifier.notifyQuestion(back);
+  assert.deepEqual(result, { outreachId: "out_1", pushed: false, skipped: "already-pushed" });
+  assert.equal(appended.length, 1);
+  assert.equal(fetches.length, 1);
+});

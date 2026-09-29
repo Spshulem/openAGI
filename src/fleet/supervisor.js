@@ -372,6 +372,11 @@ export class FleetSupervisor {
     try { this.runtime?.outreach?.resolve?.(question.outreachId, decision, { status }); } catch { /* best-effort */ }
   }
 
+  reopenOutreach(question) {
+    if (!question?.outreachId) return;
+    try { this.runtime?.outreach?.reopen?.(question.outreachId); } catch { /* best-effort */ }
+  }
+
   async resumeAll(question, message, settling = []) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
     let sent = 0;
@@ -771,6 +776,8 @@ export class FleetSupervisor {
       asked.add(question.dedupeKey);
       // The owner already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
+      // A blip closed it: its own outreach copy comes back, not a new one.
+      if (question.reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
@@ -815,7 +822,7 @@ export class FleetSupervisor {
     for (const question of store.openQuestions()) {
       if (asked.has(question.dedupeKey)) continue;
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
-      const decided = question.threadKey ? decisions.some((decision) => decision.threadKey === question.threadKey) : false;
+      const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
@@ -824,10 +831,13 @@ export class FleetSupervisor {
       const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]);
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       if (decided || supervisorOwned || threadGone) {
-        store.resolveQuestion(question.id);
+        const reason = decided ? `${decided.state}: ${decided.reason}` : threadGone ? `thread ${known?.excluded ?? "left the scan"}` : "no longer asked";
+        store.resolveQuestion(question.id, reason);
         this.resolveOutreach(question, "resolved", "dismissed");
       }
     }
+    // An expired question's copy must not keep asking on the Mac or G2.
+    for (const question of store.takeExpired()) this.resolveOutreach(question, "expired", "dismissed");
     return attempted;
   }
 

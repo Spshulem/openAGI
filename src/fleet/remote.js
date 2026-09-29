@@ -69,7 +69,12 @@ export class RemoteFleetSupervisor {
         outreach.resolve(item.id, 'resolved', { status: 'dismissed' });
       }
     }
+    const items = outreach.list();
     for (const q of this.state.questions) {
+      // A question the computer closed on a blip and reopened keeps its id:
+      // its old copy comes back, so the glasses do not ping for it again.
+      const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;
+      if (last && outreach.reopen?.(last.id)) continue;
       outreach.append({ type: 'fleet-question', sourceRef: { kind: 'fleet', id: q.id, nodeId: this.nodeId },
         title: q.title, summary: q.body, needsDecision: true,
         actions: [...(q.options ?? []), "dismiss"], dedupeOpen: true });

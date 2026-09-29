@@ -162,7 +162,7 @@ test("a question the owner answered or dismissed stays closed for its TTL", (t) 
   const resolved = store.upsertQuestion({ dedupeKey: "disk-full", title: "Disk full. Free space?" });
   store.resolveQuestion(resolved.id);
   const reopened = store.upsertQuestion({ dedupeKey: "disk-full", title: "Disk full. Free space?" });
-  assert.notEqual(reopened.id, resolved.id);
+  assert.equal(reopened.status, "open");
   assert.equal(reopened.suppressed, undefined);
 
   // Past the TTL the owner is asked again.
@@ -215,6 +215,104 @@ test("questions expire after 24 hours", (t) => {
   assert.equal(store.answerQuestion(question.id, "yes"), null);
   const fresh = store.upsertQuestion({ dedupeKey: "k", title: "Merge #6522?" });
   assert.notEqual(fresh.id, question.id);
+});
+
+test("a question asked every tick keeps its id past 24 hours and expires a TTL after the last ask", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const first = store.upsertQuestion({ dedupeKey: "ready:o/r#113:abc", title: "#113 ready. Merge?" });
+  store.markQuestionNotified(first.id, { outreachId: "out_1" });
+  for (let hour = 5; hour <= 40; hour += 5) {
+    now.advance(5 * HOUR);
+    assert.equal(store.upsertQuestion({ dedupeKey: "ready:o/r#113:abc", title: "#113 ready. Merge?" }).id, first.id);
+  }
+  assert.equal(store.question(first.id).lastAskedAt, new Date(T0 + 40 * HOUR).toISOString());
+  assert.deepEqual(store.takeExpired(), []);
+
+  now.advance(23 * HOUR);
+  assert.equal(store.openQuestions().length, 1);
+  now.advance(HOUR);
+  assert.deepEqual(store.openQuestions(), []);
+  assert.equal(store.question(first.id).status, "expired");
+  // Handed out once, so the supervisor closes the outreach copy once.
+  assert.deepEqual(store.takeExpired().map((q) => [q.id, q.outreachId]), [[first.id, "out_1"]]);
+  assert.deepEqual(store.takeExpired(), []);
+  // Asked again after a full TTL of silence: a new question.
+  assert.notEqual(store.upsertQuestion({ dedupeKey: "ready:o/r#113:abc", title: "#113 ready. Merge?" }).id, first.id);
+});
+
+test("expired questions saved with an outreach copy are handed out again after a reload", (t) => {
+  const dir = tempDir(t);
+  const now = clock();
+  const store = new FleetStore({ dir, now });
+  const question = store.upsertQuestion({ dedupeKey: "k", title: "Merge?" });
+  store.markQuestionNotified(question.id, { outreachId: "out_9" });
+  store.upsertQuestion({ dedupeKey: "other", title: "Other?" });
+  now.advance(25 * HOUR);
+  store.openQuestions();
+  const reloaded = new FleetStore({ dir, now });
+  assert.deepEqual(reloaded.takeExpired().map((q) => q.outreachId), ["out_9"]);
+});
+
+test("an owner close holds while the same ask keeps coming, and lapses after a TTL with no ask", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const asked = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?", options: ["merged", "later"] });
+  store.answerQuestion(asked.id, "later");
+  for (let hour = 12; hour <= 72; hour += 12) {
+    now.advance(12 * HOUR);
+    const again = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" });
+    assert.equal(again.id, asked.id, `still suppressed at ${hour}h`);
+    assert.equal(again.suppressed, true);
+  }
+  assert.deepEqual(store.openQuestions(), []);
+  now.advance(24 * HOUR);
+  const fresh = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" });
+  assert.notEqual(fresh.id, asked.id);
+  assert.equal(fresh.status, "open");
+});
+
+test("pruning closed questions keeps an owner close that is still being asked", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const asked = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" });
+  store.dismissQuestion(asked.id);
+  for (let n = 0; n < 201; n += 1) {
+    now.advance(60 * 1000);
+    store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" });
+    store.resolveQuestion(store.upsertQuestion({ dedupeKey: `k${n}`, title: `Q${n}?` }).id);
+  }
+  assert.equal(store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" }).id, asked.id);
+});
+
+test("a resolved question asked again within an hour reopens the same record", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const first = store.upsertQuestion({ dedupeKey: "open:group", title: "2 stuck, can't reach. Open them?" });
+  store.markQuestionNotified(first.id, { outreachId: "out_1", pushedAt: T0 });
+  const resolved = store.resolveQuestion(first.id, "wait: recently active");
+  assert.equal(resolved.resolveReason, "wait: recently active");
+
+  now.advance(30 * 60 * 1000);
+  const back = store.upsertQuestion({ dedupeKey: "open:group", title: "3 stuck, can't reach. Open them?" });
+  assert.equal(back.id, first.id);
+  assert.equal(back.reopened, true);
+  assert.equal(back.status, "open");
+  assert.equal(back.title, "3 stuck, can't reach. Open them?");
+  assert.equal(back.outreachId, "out_1");
+  assert.equal(back.pushedAt, new Date(T0).toISOString());
+  assert.equal(back.resolveReason, null);
+  assert.equal(back.reopenedAt, new Date(T0 + 30 * 60 * 1000).toISOString());
+  assert.equal(store.question(first.id).reopened, undefined, "the flag is never persisted");
+  assert.deepEqual(store.openQuestions().map((q) => q.id), [first.id]);
+
+  // Gone for over an hour: a new question.
+  store.resolveQuestion(first.id);
+  now.advance(61 * 60 * 1000);
+  const later = store.upsertQuestion({ dedupeKey: "open:group", title: "2 stuck, can't reach. Open them?" });
+  assert.notEqual(later.id, first.id);
+  assert.equal(later.outreachId, null);
+  assert.equal(later.reopened, undefined);
 });
 
 test("markQuestionNotified records outreach id and push time", (t) => {

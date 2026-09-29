@@ -63,3 +63,20 @@ test("list filters by status", () => {
   assert.equal(s.list({ status: "acted" }).length, 1);
   assert.equal(s.list({ status: "unseen" }).length, 1);
 });
+
+test("reopen brings back only an item its source resolved, with the same id and seq", () => {
+  const dir = tmpDir();
+  const s = new OutreachStore({ dir });
+  const auto = s.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: "fq_1" }, title: "Merge?" });
+  const owner = s.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: "fq_2" }, title: "Open?" });
+  const open = s.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: "fq_3" }, title: "Retry?" });
+  s.resolve(auto.id, "resolved", { status: "dismissed" });
+  s.resolve(owner.id, { action: "dismiss", by: "user" }, { status: "dismissed" });
+  assert.equal(s.reopen(auto.id).status, "seen");
+  assert.equal(s.reopen(owner.id), null);
+  assert.equal(s.reopen(open.id), null);
+  assert.equal(s.reopen("out_missing"), null);
+  const reloaded = new OutreachStore({ dir });
+  assert.deepEqual([reloaded.get(auto.id).status, reloaded.get(auto.id).seq, reloaded.get(auto.id).resolvedAt], ["seen", auto.seq, null]);
+  assert.equal(reloaded.get(owner.id).status, "dismissed");
+});

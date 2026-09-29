@@ -1251,3 +1251,67 @@ test("an open agent question closes itself once its PR merges after the ask, and
   await later.supervisor.tick();
   assert.deepEqual(later.supervisor.getState().questions.map((q) => q.threadKey), ["codex:t2"]);
 });
+
+test("a ready question asked every tick keeps one id past a day", async (t) => {
+  let now = NOW;
+  const green = makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  const { supervisor } = fixture(t, { prs: new Map([["acme/app#7", green]]), now: () => now });
+  await supervisor.tick();
+  const [ready] = supervisor.getState().questions;
+  assert.ok(ready);
+  for (const hours of [12, 13]) {
+    now += hours * 60 * MIN;
+    await supervisor.tick();
+  }
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.id), [ready.id]);
+});
+
+test("a one-tick blip reopens the same question and outreach copy instead of a new ask", async (t) => {
+  const calls = [];
+  let now = NOW;
+  let thread = makeThread();
+  const green = makePr({ ci: { state: "SUCCESS", failing: [], pending: [] }, unresolvedThreads: 0, mergeState: "CLEAN" });
+  const { supervisor, notified } = fixture(t, { prs: new Map([["acme/app#7", green]]), now: () => now, deps: { listCodexThreads: async () => [thread] } });
+  supervisor.runtime = { outreach: {
+    resolve: (id, decision, opts) => calls.push(["resolve", id, decision, opts.status]),
+    reopen: (id) => calls.push(["reopen", id])
+  } };
+  await supervisor.tick();
+  const [ready] = supervisor.getState().questions;
+  assert.match(ready.dedupeKey, /^ready:/);
+  supervisor.store.markQuestionNotified(ready.id, { outreachId: "out_1", pushedAt: new Date(NOW).toISOString() });
+
+  // One tick mid-turn closes it, and the reason is kept.
+  thread = makeThread({ agentStatus: "running" });
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions, []);
+  assert.equal(supervisor.store.question(ready.id).resolveReason, "running: turn in progress");
+
+  thread = makeThread();
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.deepEqual(supervisor.getState().questions.map((q) => q.id), [ready.id]);
+  assert.deepEqual(calls, [["resolve", "out_1", "resolved", "dismissed"], ["reopen", "out_1"]]);
+  assert.equal(notified.at(-1).id, ready.id);
+  assert.equal(notified.at(-1).outreachId, "out_1");
+});
+
+test("an expired question closes its outreach copy", async (t) => {
+  const calls = [];
+  let now = NOW;
+  const asking = makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
+  const newer = (n) => makeThread({ key: `codex:n${n}`, id: `n${n}`, title: `Newer ${n}`, prRefs: [], lastActivityAt: ago(n) });
+  let threads = [asking];
+  const { supervisor } = fixture(t, { now: () => now, limits: { maxThreads: 2 }, deps: { listCodexThreads: async () => threads } });
+  supervisor.runtime = { outreach: { resolve: (id, decision, opts) => calls.push([id, decision, opts.status]) } };
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  supervisor.store.markQuestionNotified(question.id, { outreachId: "out_1" });
+  // Only pushed out by the scan cap, so nothing resolves it: it expires.
+  threads = [newer(1), newer(2)];
+  now += 25 * 60 * MIN;
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(question.id).status, "expired");
+  assert.deepEqual(calls, [["out_1", "expired", "dismissed"]]);
+});

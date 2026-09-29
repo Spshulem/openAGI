@@ -85,3 +85,22 @@ test("the Mac capability forwards the owner's send and validates it", async () =
   const empty = await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: " " } });
   assert.equal(empty.response.status, 400);
 });
+
+test('a question reopened on the computer brings back its mirrored copy, so G2 does not ping again', async t => {
+  const { remote, runtime, state, dir } = fixture(t);
+  await remote.refresh();
+  const [first] = runtime.outreach.list();
+  const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime });
+  const node = g2.node('glasses');
+  node.settings.enabled = true;
+  node.settings.categories = ['approvals'];
+  node.marks[first.id] = { notified: true };
+  const question = state.questions[0];
+  state.questions = [];
+  await remote.refresh();
+  assert.equal(runtime.outreach.get(first.id).status, 'dismissed');
+  state.questions = [{ ...question, reopenedAt: '2026-09-28T06:04:03.000Z' }];
+  await remote.refresh();
+  assert.deepEqual(runtime.outreach.list().map(item => [item.id, item.status]), [[first.id, 'seen']]);
+  assert.deepEqual(g2.feed(node).map(item => [item.id, item.notified]), [[first.id, true]]);
+});
