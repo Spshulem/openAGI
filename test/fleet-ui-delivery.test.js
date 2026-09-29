@@ -694,3 +694,29 @@ test("the read-only probe script reports what a delivery would see", async () =>
   assert.equal(report.identity.ok, false);
   assert.match(report.identity.reason, /cairo/);
 });
+
+test("the app restarter quits in the background, relaunches, and refuses while the owner uses the app", async () => {
+  const { createAppRestarter } = await import("../src/fleet/ui-delivery.js");
+  let clock = 0;
+  const runs = [];
+  let running = true;
+  const run = async (cmd, args) => {
+    runs.push([cmd, ...args]);
+    if (cmd === "osascript") running = false;
+    if (cmd === "open") running = true;
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const probe = fakeProbe({ appRunning: async () => running });
+  const restarter = createAppRestarter({ run, probe, now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const ok = await restarter.restart("conductor");
+  assert.deepEqual(ok, { ok: true, detail: "restarted Conductor" });
+  assert.deepEqual(runs, [["osascript", "-e", 'tell application id "com.conductor.app" to quit'], ["open", "-g", "-b", "com.conductor.app"]]);
+
+  const busy = createAppRestarter({ run, probe: fakeProbe({ front: "com.conductor.app", idle: 1_000 }), now: () => clock, sleep: async (ms) => { clock += ms; } });
+  assert.deepEqual(await busy.restart("conductor"), { ok: false, detail: "you are using Conductor" });
+
+  // A quit held up by the app (a confirm dialog) is not forced.
+  const stuck = createAppRestarter({ run: async () => ({ code: 0 }), probe: fakeProbe({ appRunning: async () => true }), now: () => clock, sleep: async (ms) => { clock += ms; } });
+  assert.deepEqual(await stuck.restart("conductor"), { ok: false, detail: "Conductor did not quit" });
+  assert.equal((await restarter.restart("finder")).ok, false);
+});

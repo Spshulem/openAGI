@@ -363,6 +363,48 @@ export function createPresenceProbe({ bins = {}, run = runCommand, timeoutMs = D
 }
 
 // ---------------------------------------------------------------------------
+// App restart, only when an owner-written playbook asks (restart_apps)
+
+// Some apps read a new login only at launch, so after the owner switches
+// accounts their capped chats keep failing until the app restarts. Only the
+// apps the fleet types into, never while the owner is using that app, and
+// never a launch the owner did not ask for.
+const RESTART_WAIT_MS = 30_000;
+const RESTART_SETTLE_MS = 10_000;
+
+export function createAppRestarter({ bins = {}, run = runCommand, probe = null, limits = DEFAULTS, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+  const presence = probe ?? createPresenceProbe({ bins, run, timeoutMs: limits.uiStepTimeoutMs });
+  const waitFor = async (bundleId, want) => {
+    const deadline = now() + RESTART_WAIT_MS;
+    do {
+      if ((await presence.appRunning(bundleId)) === want) return true;
+      await sleep(1000);
+    } while (now() < deadline);
+    return false;
+  };
+  const exec = async (cmd, args) => {
+    try { await run(cmd, args, { timeoutMs: limits.uiStepTimeoutMs }); } catch { /* checked by waitFor */ }
+  };
+  return {
+    async restart(appKey) {
+      const app = UI_APPS[appKey];
+      if (!app) return { ok: false, detail: `${appKey} is not an app the fleet restarts` };
+      const idle = await presence.idleMs();
+      if ((await presence.frontApp()) === app.bundleId && !(idle !== null && idle >= limits.uiOwnerIdleMs)) return { ok: false, detail: `you are using ${app.name}` };
+      if (await presence.appRunning(app.bundleId)) {
+        // A quit the app holds up (an "are you sure" dialog) is not forced.
+        await exec("osascript", ["-e", `tell application id "${app.bundleId}" to quit`]);
+        if (!(await waitFor(app.bundleId, false))) return { ok: false, detail: `${app.name} did not quit` };
+      }
+      await exec(bins.open ?? "open", ["-g", "-b", app.bundleId]);
+      if (!(await waitFor(app.bundleId, true))) return { ok: false, detail: `${app.name} did not start` };
+      await sleep(RESTART_SETTLE_MS);
+      return { ok: true, detail: `restarted ${app.name}` };
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // One UI delivery at a time, process-wide
 
 export function createUiLock() {

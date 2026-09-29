@@ -1,8 +1,9 @@
 // Loads the supervisor's message templates from editable Markdown files.
 // Each playbook is `playbooks/<id>.md` with flat `key: value` frontmatter
-// (id, cooldown_min, max_attempts, ask) and a body with {placeholders}.
-// A user copy under <dataDir>/skills/fleet-supervisor/playbooks overrides the
-// bundled one, so the owner can change wording without a code change.
+// (id, cooldown_min, max_attempts, ask, restart_apps) and a body with
+// {placeholders}. A user copy under <dataDir>/skills/fleet-supervisor/
+// playbooks overrides the bundled one, so the owner can change wording and
+// workspace-specific steps without a code change or a commit here.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -12,9 +13,28 @@ export const BUNDLED_PLAYBOOKS_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)), "..", "..", "examples", "skills", "fleet-supervisor", "playbooks"
 );
 
-export function userPlaybooksDir(dataDir) {
-  return path.join(dataDir, "skills", "fleet-supervisor", "playbooks");
+// The owner's private supervisor skill: playbooks/ plus SKILL.md, notes
+// about this workspace that the supervisor's review reads. Kept out of the
+// repo so a public checkout carries no one's setup.
+export function userSkillDir(dataDir) {
+  return path.join(dataDir, "skills", "fleet-supervisor");
 }
+
+export function userPlaybooksDir(dataDir) {
+  return path.join(userSkillDir(dataDir), "playbooks");
+}
+
+const NOTES_MAX = 4000;
+
+// The owner's SKILL.md body (frontmatter dropped), bounded; "" when none.
+export function loadOwnerNotes(dataDir) {
+  const text = readText(path.join(userSkillDir(dataDir), "SKILL.md"));
+  const body = text.replace(/^---\s*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "").trim();
+  return body.slice(0, NOTES_MAX);
+}
+
+// Apps a playbook may restart before it sends (restart_apps: conductor).
+const RESTARTABLE = new Set(["conductor", "codex"]);
 
 export function loadPlaybooks({ bundledDir = BUNDLED_PLAYBOOKS_DIR, userDir = null } = {}) {
   const playbooks = new Map();
@@ -41,7 +61,8 @@ export function parsePlaybookText(text, fallbackId = "") {
     body,
     cooldownMin: positiveNumber(meta.cooldown_min),
     maxAttempts: positiveNumber(meta.max_attempts),
-    ask: String(meta.ask ?? "").trim()
+    ask: String(meta.ask ?? "").trim(),
+    restartApps: [...new Set(String(meta.restart_apps ?? "").split(/[\s,]+/).map((app) => app.trim().toLowerCase()).filter((app) => RESTARTABLE.has(app)))]
   };
 }
 

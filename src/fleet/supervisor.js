@@ -12,11 +12,11 @@ import { MODES, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSe
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
-import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
+import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
-import { createUiDriver } from "./ui-delivery.js";
+import { createAppRestarter, createUiDriver } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -174,6 +174,7 @@ function ownerDelivery(answer) {
 const RETRY_DELIVERY = "Owner fixed the blocker (login or disk). Retry: continue where you stopped.";
 // "added" on an account-cap question means new capacity: resume now.
 const ADDED_DELIVERY = "Owner added account capacity. Continue where you stopped.";
+const RESTART_REPEAT_MS = 10 * 60_000;
 
 export class FleetSupervisor {
   // forceMode pins the mode over the owner's saved choice (the dry-run CLI).
@@ -199,6 +200,7 @@ export class FleetSupervisor {
     this.settledPrs = new Map();
     this.answering = new Set();
     this._uiDriver = undefined;
+    this.restartedAt = new Map();
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
     this._reviewRunner = null;
     this.lastReview = { at: null, failedAt: null, error: null };
@@ -433,8 +435,10 @@ export class FleetSupervisor {
     try { this.runtime?.outreach?.reopen?.(question.outreachId); } catch { /* best-effort */ }
   }
 
-  async resumeAll(question, message, settling = []) {
+  async resumeAll(question, message, settling = [], { restartApps = [] } = {}) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
+    const restarted = await this.restartHosts(keys, restartApps);
+    if (restarted) return restarted;
     let sent = 0;
     let blocked = 0;
     const deliveryState = await this.probeDelivery();
@@ -466,6 +470,31 @@ export class FleetSupervisor {
     return { status: blocked || !sent ? "blocked" : "sent", route: null, detail: `${sent} resumed, ${blocked} not reachable; open the thread and retry if needed` };
   }
 
+  // Restarts each listed app that shows one of these threads, once per ten
+  // minutes (a second answer after a partial send does not restart again).
+  // Returns a blocked delivery when it must not or could not restart.
+  async restartHosts(keys, restartApps) {
+    const threads = keys.map((key) => this.lastThreads.get(key)).filter(Boolean);
+    for (const app of restartApps) {
+      if (!threads.some((thread) => uiTargetFor(thread)?.app === app)) continue;
+      if (this.now() - (this.restartedAt.get(app) ?? -Infinity) < RESTART_REPEAT_MS) continue;
+      const name = UI_APPS[app]?.name ?? app;
+      // A restart ends every running turn in that app, not just the capped ones.
+      const busy = [...this.lastThreads.values()].filter((thread) => !keys.includes(thread.key) && thread.agentStatus === "running" && uiTargetFor(thread)?.app === app);
+      if (busy.length) return { status: "blocked", route: null, detail: `${busy.length} chats still running in ${name}; a restart would stop them. Answer again when they finish.` };
+      const result = await this.appRestarter.restart(app);
+      this.store.recordAction({ kind: "restart", playbook: "account-switched", threadKey: null, status: result.ok ? "done" : "failed", reason: `restart ${name} after an account switch`, detail: result.detail, at: new Date(this.now()).toISOString() });
+      if (!result.ok) return { status: "blocked", route: null, detail: `${result.detail}; answer again to retry` };
+      this.restartedAt.set(app, this.now());
+    }
+    return null;
+  }
+
+  get appRestarter() {
+    this._appRestarter ??= this.deps.appRestarter ?? createAppRestarter({ bins: this.config.bins ?? {}, run: this.deps.run ?? runCommand, limits: this.config.limits });
+    return this._appRestarter;
+  }
+
   async answerQuestion(id, answer) {
     if (this.answering.has(id)) return null;
     const question = this.store.question(id);
@@ -479,7 +508,10 @@ export class FleetSupervisor {
       let delivery = null;
       const settling = [];
       if (question.kind === "limit" && answer === "added") {
-        delivery = await this.resumeAll(question, ADDED_DELIVERY, settling);
+        // The owner's own copy of this playbook says what their apps need
+        // after an account switch (a restart, a plain "retry").
+        const playbook = this.playbooks().get("account-switched");
+        delivery = await this.resumeAll(question, playbook?.body || ADDED_DELIVERY, settling, { restartApps: playbook?.restartApps ?? [] });
       }
       // An owner answer to the agent's own question, or "retry" after the owner
       // fixed a login/disk blocker, is an explicit instruction: every mode.
@@ -973,7 +1005,7 @@ export class FleetSupervisor {
     const others = open.filter((question) => !pending.includes(question));
     let verdicts;
     try {
-      verdicts = await reviewQuestions({ questions: ordered, others, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now });
+      verdicts = await reviewQuestions({ questions: ordered, others, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now, ownerNotes: loadOwnerNotes(this.dataDir) });
     } catch (error) {
       const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
       this.lastReview = { ...this.lastReview, failedAt: now, error: detail };

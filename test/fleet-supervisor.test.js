@@ -1783,3 +1783,73 @@ test("OPENAGI_FLEET_REVIEW=0 turns the review off; it is on with the supervisor"
   assert.equal(on.calls.length, 1);
   assert.equal(enabled.supervisor.getState().settings.review.enabled, true);
 });
+
+// ─── the owner's private playbooks: account switch ─────────────────────────
+
+function ownerPlaybook(dataDir, id, text) {
+  const dir = path.join(dataDir, "skills", "fleet-supervisor", "playbooks");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${id}.md`), text);
+}
+
+function fakeRestarter(result = { ok: true, detail: "restarted Conductor" }) {
+  const calls = [];
+  return { calls, restart: async (app) => { calls.push(app); return result; } };
+}
+
+const cappedTab = (id, extra = {}) => makeThread({ key: `conductor:${id}`, kind: "conductor", id, workspace: id, cwd: `/work/${id}`, agentStatus: "error", error: { kind: "usage-limit", resetAt: null }, meta: uiMeta(id), ...extra });
+
+test("after an account switch, the owner's playbook restarts Conductor once, then asks each capped chat to retry", async (t) => {
+  const restarter = fakeRestarter();
+  const threads = [cappedTab("s1"), cappedTab("s2")];
+  const { supervisor, delivered, dataDir } = fixture(t, { mode: "auto", delivery: "computer-use", threads, deps: { uiDriver: readyDriver(), appRestarter: restarter } });
+  ownerPlaybook(dataDir, "account-switched", "---\nid: account-switched\nrestart_apps: conductor\n---\nretry\n");
+  await supervisor.tick();
+  const before = delivered.length;
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "2 threads capped. Add acct?", options: ["wait", "added"], threadKeys: threads.map((thread) => thread.key) });
+  const result = await supervisor.answerQuestion(q.id, "added");
+  assert.equal(result.question.status, "answered", result.delivery?.detail);
+  assert.deepEqual(restarter.calls, ["conductor"]);
+  const sent = delivered.slice(before);
+  assert.deepEqual(sent.map((d) => d.message), ["retry", "retry"]);
+  assert.ok(supervisor.getState().actions.some((action) => action.kind === "restart" && action.status === "done"));
+});
+
+test("no restart while another Conductor chat is running, or when the bundled playbook asks for none", async (t) => {
+  const restarter = fakeRestarter();
+  const running = makeThread({ key: "conductor:busy", kind: "conductor", id: "busy", workspace: "busy", cwd: "/work/busy", agentStatus: "running", meta: uiMeta("busy") });
+  const threads = [cappedTab("s1"), running];
+  const { supervisor, delivered, dataDir } = fixture(t, { mode: "auto", delivery: "computer-use", threads, deps: { uiDriver: readyDriver(), appRestarter: restarter } });
+  ownerPlaybook(dataDir, "account-switched", "---\nid: account-switched\nrestart_apps: conductor\n---\nretry\n");
+  await supervisor.tick();
+  const before = delivered.length;
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Capped. Add acct?", options: ["wait", "added"], threadKeys: ["conductor:s1"] });
+  const result = await supervisor.answerQuestion(q.id, "added");
+  assert.equal(result.delivery.status, "blocked");
+  assert.match(result.delivery.detail, /1 chats still running in Conductor/);
+  assert.deepEqual(restarter.calls, []);
+  assert.equal(delivered.length, before, "nothing sent before the restart could happen");
+  assert.equal(supervisor.store.question(q.id).status, "open");
+
+  // The bundled playbook restarts nothing and keeps the generic message.
+  const plain = fakeRestarter();
+  const other = fixture(t, { mode: "auto", delivery: "computer-use", threads: [cappedTab("s3")], deps: { uiDriver: readyDriver(), appRestarter: plain } });
+  await other.supervisor.tick();
+  const q2 = other.supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Capped. Add acct?", options: ["wait", "added"], threadKeys: ["conductor:s3"] });
+  await other.supervisor.answerQuestion(q2.id, "added");
+  assert.deepEqual(plain.calls, []);
+  assert.match(other.delivered.at(-1).message, /Owner added account capacity/);
+});
+
+test("a failed restart leaves the question open to answer again", async (t) => {
+  const restarter = fakeRestarter({ ok: false, detail: "Conductor did not quit" });
+  const { supervisor, delivered, dataDir } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [cappedTab("s1")], deps: { uiDriver: readyDriver(), appRestarter: restarter } });
+  ownerPlaybook(dataDir, "account-switched", "---\nid: account-switched\nrestart_apps: conductor\n---\nretry\n");
+  await supervisor.tick();
+  const before = delivered.length;
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Capped. Add acct?", options: ["wait", "added"], threadKeys: ["conductor:s1"] });
+  const result = await supervisor.answerQuestion(q.id, "added");
+  assert.match(result.delivery.detail, /did not quit; answer again to retry/);
+  assert.equal(delivered.length, before);
+  assert.equal(supervisor.store.question(q.id).status, "open");
+});

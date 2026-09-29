@@ -350,3 +350,13 @@ test("review config: on with the supervisor, off with OPENAGI_FLEET_REVIEW=0, mo
   assert.equal(custom.intervalMs, 600_000);
   assert.equal(resolveFleetConfig({ OPENAGI_FLEET_SUPERVISOR: "1" }, { home: "/h", review: { enabled: false } }).review.enabled, false);
 });
+
+test("the owner's workspace notes go into the review's instructions, not the data", async () => {
+  const requests = [];
+  const runModel = async (request) => { requests.push(request); return { reviews: [] }; };
+  await reviewQuestions({ questions: [question()], now: NOW, runModel, ownerNotes: "Conductor chats that ran out of credits wait for a restart and a retry." });
+  assert.match(requests[0].system, /The owner's notes about this workspace[\s\S]*wait for a restart and a retry/);
+  assert.equal(requests[0].prompt.includes("wait for a restart"), false);
+  await reviewQuestions({ questions: [question()], now: NOW, runModel });
+  assert.equal(requests[1].system.includes("owner's notes"), false);
+});
