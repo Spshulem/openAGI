@@ -15,6 +15,13 @@ const HOUR = 3_600_000;
 const TAIL_BYTES = 1024 * 1024;
 const AUTOMATION_SOURCES = new Set(["guardian_review", "subagent", "automation"]);
 const HEARTBEAT_PATTERN = /<heartbeat>|<automation_id>/;
+// Scheduled sweeps (usage-reset checks, chat watchdogs) run as codex exec;
+// their status tables quote other chats' asks.
+const EXEC_SOURCE = "exec";
+const CHAT_CHECKER_PATTERN = /\bchecking the user['’]s existing agent chats\b/i;
+// request_user_input titles are sometimes an encrypted blob ("gAAAAAB...").
+const CIPHERTEXT_PATTERN = /^(?:gAAAAA[A-Za-z0-9_=-]{20,}|[A-Za-z0-9+/_-]{80,}={0,2})$/;
+const SEALED_QUESTION = "Codex asked in the app";
 const PR_URL_PATTERN = /github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)/g;
 const WRAPPER_TAGS = [
   "environment_context", "in-app-browser-context", "user_instructions", "user_shell_command", "turn_aborted", "subagent_notification"
@@ -104,15 +111,18 @@ function readUserInput(summary, raw, at) {
   if (cleaned) summary.lastUser = { text: cleaned, at };
 }
 
-function questionTitle(args) {
+// fallback: the agent's last words, shown when the title is ciphertext.
+function questionTitle(args, fallback) {
   try {
     const parsed = typeof args === "string" ? JSON.parse(args) : args;
     const first = parsed?.questions?.[0];
-    const text = String(first?.title ?? first?.question ?? "").trim();
-    if (!text) return null;
+    const texts = [first?.title, first?.question].map((value) => String(value ?? "").trim()).filter(Boolean);
+    if (!texts.length) return null;
+    const text = texts.find((value) => !CIPHERTEXT_PATTERN.test(value));
     const options = (first.options ?? []).map((option) => typeof option === "string" ? option : option?.label).filter(Boolean);
     // Multiple prompts and free text need the original thread's input surface.
     const supported = parsed.questions.length === 1 && options.length > 0 && options.length <= 4 && options.every((option) => option.length <= 40);
+    if (!text) return { text: fallback?.trim() || SEALED_QUESTION, options: supported ? options : ["open thread"], sealed: true };
     return { text, options: supported ? options : ["open thread"] };
   } catch {
     return null;
@@ -161,7 +171,7 @@ function readResponseItem(summary, payload, at) {
     setAgent(summary, contentText(payload.content, ["output_text"]), at);
   } else if (payload.type === "function_call") {
     const name = String(payload.name ?? "");
-    if (name === "request_user_input_async") summary.pendingQuestion = questionTitle(payload.arguments) ?? summary.pendingQuestion;
+    if (name === "request_user_input_async") summary.pendingQuestion = questionTitle(payload.arguments, summary.lastAgent?.text) ?? summary.pendingQuestion;
     else if (name.includes("attach_artifact")) addPrRefs(summary, payload.arguments, at, "attachment");
   } else if (payload.type === "custom_tool_call" && String(payload.input ?? "").includes("attach_artifact")) {
     addAttachRefs(summary, payload.input, at);
@@ -205,7 +215,9 @@ function sourceIsSubagent(source) {
 function metadataExclusion(row, config) {
   if (Number(row.archived) === 1) return "archived";
   if (AUTOMATION_SOURCES.has(row.thread_source) || sourceIsSubagent(row.source)) return "automation";
-  if (HEARTBEAT_PATTERN.test(String(row.first_user_head ?? ""))) return "automation";
+  if (String(row.source ?? "").trim() === EXEC_SOURCE) return "automation";
+  const head = String(row.first_user_head ?? "");
+  if (HEARTBEAT_PATTERN.test(head) || CHAT_CHECKER_PATTERN.test(head)) return "automation";
   if ((config.selfSessionIds ?? []).includes(String(row.id))) return "self";
   return null;
 }
@@ -278,8 +290,10 @@ function applyRollout(thread, row, context) {
   thread.meta.abortedAt = aborted ? summary.lifecycle.at : null;
   thread.meta.lastSupervisorAt = summary.lastSupervisorAt;
   const pending = summary.pendingQuestion;
+  // A stand-in from the agent's message ends on the ask, so keep its tail.
+  const clampAsk = pending?.sealed ? clampTail : clampText;
   thread.meta.pendingQuestion = pending
-    ? { text: clampText(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)) }
+    ? { text: clampAsk(redactSecrets(pending.text), limits.bodyMax), options: pending.options.map((option) => clampText(redactSecrets(option), limits.bodyMax)) }
     : null;
   // A Codex heartbeat automation already drives this thread; nudging it too
   // would double up.
@@ -360,6 +374,8 @@ function buildThread(row, context) {
       threadSource: row.thread_source || null,
       // "codex_sdk_ts" = started by Conductor's Codex agent, shown in Conductor.
       originator: row.originator || null,
+      // The name set in the Codex app; title is the first prompt when unset.
+      catalogName: row.name ? clampText(redactSecrets(row.name), limits.titleMax) : null,
       file: row.rollout_path || null,
       turnStartedAt: null,
       abortReason: null,

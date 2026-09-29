@@ -313,7 +313,8 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
   const prRefs = newestFirstUnique(summary.prRefs);
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const cwd = summary.cwd;
-  const title = summary.customTitle ?? summary.aiTitle ?? summary.agentName ?? (summary.lastUserText || id);
+  // Untitled: the folder, never the owner's last message or the session id.
+  const title = summary.customTitle ?? summary.aiTitle ?? summary.agentName ?? (path.basename(cwd ?? "") || "Claude chat");
   return {
     key: threadKey("claude", id),
     kind: "claude",

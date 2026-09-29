@@ -340,13 +340,13 @@ function detectAsk(text) {
   const askText = askIndexes.map((index) => sentences[index]).join(" ");
   const options = listedOptions(text);
   const recommended = /\(recommended\)/i.test(text);
-  // The risky step is often named just before the ask ("--admin merges now.
-  // Which?") or in the options after it, so both count. Earlier recap does not.
-  // Any risky step anywhere in the closing message (a force-push named two
-  // sentences before "Should I push?") keeps the ask with the owner.
-  const region = askRegion(sentences, askIndexes);
-  const hit = OUT_OF_SCOPE_PATTERNS.find(({ pattern }) => pattern.test(region) || pattern.test(text));
+  // The topic comes from the ask region only. A risky step anywhere else in
+  // the closing message (a force-push two sentences before "Should I push?")
+  // still keeps the ask with the owner, under a neutral topic: "$0.50 per
+  // post" in a recap does not make a merge offer a spend.
+  const hit = OUT_OF_SCOPE_PATTERNS.find(({ pattern }) => pattern.test(askRegion(sentences, askIndexes)));
   if (hit) return { kind: "needs-human", topic: hit.topic, options, text: askText };
+  if (OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(text))) return { kind: "needs-human", topic: "decision", options, text: askText };
   const isChoice = options.length >= 2 && CHOICE_WORDS.test(askText);
   // The agent already picked one: taking "(recommended)" is in scope only
   // when that option is itself a routine PR step.
@@ -385,10 +385,12 @@ function isAsk(sentence) {
     || NEED_YOU_PATTERNS.some((pattern) => pattern.test(sentence));
 }
 
+// The ask, the options after it, and the sentence before a bare ask
+// ("--admin merges now. Which?"): a short ask names no step itself.
 function askRegion(sentences, askIndexes) {
   const picked = new Set();
   for (const index of askIndexes) {
-    if (index > 0) picked.add(index - 1);
+    if (index > 0 && sentences[index].split(/\s+/).length <= BARE_ASK_WORDS) picked.add(index - 1);
     picked.add(index);
     for (let next = index + 1; next < sentences.length && OPTION_LINE.test(sentences[next]); next += 1) picked.add(next);
   }
@@ -396,6 +398,7 @@ function askRegion(sentences, askIndexes) {
 }
 
 const OPTION_LINE = /^(?:[1-9]|[A-C])[.)]\s/;
+const BARE_ASK_WORDS = 5;
 
 function splitSentences(text) {
   return String(text).split(/(?<=[^\d\s][.?!])\s+|\n+/).map((part) => part.trim()).filter(Boolean);

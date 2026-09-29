@@ -549,3 +549,37 @@ test("listCodexThreads flags a title shared with any unarchived Codex thread, ev
   assert.equal(identity.ambiguous, true);
   assert.match(identity.reason, /share this title/);
 });
+
+// Bug 5: scheduled sweeps quote other chats' asks; they are not work threads.
+test("listCodexThreads excludes codex exec sweeps and chat-checker runs as automation", async (t) => {
+  const ctx = makeHome(t);
+  const idleLines = [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "| chat | state |\n| Citations | Out of credits: answer with credits |")];
+  const checker = "Current local time: 2026-09-28 07:00:02 PDT. Do not retry a chat before its visible reset time.\nYou are checking the user's existing agent chats after usage resets.";
+  addThread(ctx, { id: "t-exec", source: "exec", title: "Current local time: 2026-09-28 07:00:02 PDT.", firstUserMessage: "Run one sweep.", lines: idleLines });
+  addThread(ctx, { id: "t-checker", title: checker, firstUserMessage: checker, lines: idleLines });
+  addThread(ctx, { id: "t-real", name: "Improve Slack huddle detection", lines: idleLines });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.equal(map["t-exec"].excluded, "automation");
+  assert.equal(map["t-checker"].excluded, "automation");
+  assert.equal(map["t-real"].excluded, null);
+  assert.equal(map["t-real"].meta.catalogName, "Improve Slack huddle detection");
+  assert.equal(map["t-checker"].meta.catalogName, null);
+});
+
+test("a ciphertext structured-question title is replaced by the agent's words or a neutral line", async (t) => {
+  const sealed = "gAAAAABqujkpRnnobDR_oyUGwgwolJFyyBdBHiotOEYKl36AQL4v-F48lnbJYWpMIJtvJ10DiQAS-pd8-cHA-mRJlrFUc54UcgVsoceW9MzzUOBh==";
+  const text = (rows) => rows.map((row) => JSON.stringify(row)).join("\n");
+  const bare = parseRolloutTail(text([ev.started("q", 10 * MIN), ev.ask(sealed, 9 * MIN)]));
+  assert.equal(bare.pendingQuestion.text, "Codex asked in the app");
+  assert.deepEqual(bare.pendingQuestion.options, ["open thread"]);
+
+  const ctx = makeHome(t);
+  const intro = `${"Checked the review notes. ".repeat(12)}Should I keep this as a report or fix it?`;
+  addThread(ctx, { id: "t-sealed", lines: [ev.started("q", 10 * MIN), ev.assistant(intro, 9.5 * MIN), ev.ask(sealed, 9 * MIN), ev.complete("q", 8 * MIN, "asked")] });
+  const [thread] = await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) });
+  const pending = thread.meta.pendingQuestion;
+  assert.doesNotMatch(pending.text, /gAAAAA/);
+  // The stand-in keeps the end of the message, where the ask is.
+  assert.match(pending.text, /Should I keep this as a report or fix it\?$/);
+  assert.ok(pending.text.length <= ctx.config.limits.bodyMax);
+});

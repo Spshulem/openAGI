@@ -370,3 +370,22 @@ test("threadHealth turns an errored thread red unless it is running again", () =
   assert.equal(threadHealth("running", error), "green");
   assert.equal(threadHealth("excluded", error), "gray");
 });
+
+// Bug 5: the topic comes from the ask, not from a risky word in the recap.
+test("classifyThread: a risky word outside the ask keeps the owner but not the topic", () => {
+  // The real zurich #3 close: a cost bullet, then a merge offer.
+  const zurich = "- **Older articles:** our 300+ existing unlinked posts would now be blocked if we tried to republish them. "
+    + "Adding links to them is optional, and costs roughly $0.50–1 per post in Claude usage. "
+    + "The SEObot comparison is logged in the decision log as D-37, with a check-in on about Oct 28. "
+    + "The code is pushed as PR #3: https://github.com/Spshulem/AI-SEO/pull/3. I haven't merged it; say the word and I will.";
+  const offer = classify(makeThread({ lastAgentText: zurich }));
+  assert.equal(offer.state, "needs-human");
+  assert.equal(offer.ask.topic, "decision");
+  // A force-push named earlier still keeps a push ask with the owner.
+  const push = classify(makeThread({ lastAgentText: "I can force-push the rewritten branch. Tests pass. Should I push?" }));
+  assert.equal(push.state, "needs-human");
+  assert.equal(push.ask.topic, "decision");
+  // A bare ask takes its topic from the sentence before it.
+  assert.equal(classify(makeThread({ lastAgentText: "Backfilling the old posts costs about $150 in Claude usage. Want me to?" })).ask.topic, "money");
+  assert.equal(classify(makeThread({ lastAgentText: "Should I spend $150 of credits on the backfill?" })).ask.topic, "money");
+});

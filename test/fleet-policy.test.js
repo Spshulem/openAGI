@@ -75,7 +75,7 @@ test("row: model-limit never resends continue and asks to switch model", () => {
   const { decision } = run(thread, { now: NOW + 5 * 60 * MIN });
   assert.equal(decision.action, "ask-user");
   assert.equal(decision.message, null);
-  assert.equal(decision.question.title, "madrid #6522: Fable capped. Switch model?");
+  assert.equal(decision.question.title, "app #6522: Fable capped. Switch model?");
 });
 
 test("row: overloaded/network backs off 5 then 15 min, then asks after 3 failed resumes", () => {
@@ -221,10 +221,10 @@ test("row: pr-not-ready gets a merge-readiness nudge listing the exact failing i
 test("row: ready-needs-human pings the owner once per head", () => {
   const merge = run(makeThread()).decision;
   assert.equal(merge.action, "ask-user");
-  assert.equal(merge.question.title, "#6522 ready. Merge?");
+  assert.equal(merge.question.title, "app #6522 ready. Merge?");
   assert.equal(merge.question.dedupeKey, `ready:acme/app#6522:${HEAD.slice(0, 10)}`);
   const approve = run(makeThread(), { pr: makePr({ reviewDecision: "REVIEW_REQUIRED", mergeState: "BLOCKED" }) }).decision;
-  assert.equal(approve.question.title, "#6522 ready. Needs approve.");
+  assert.equal(approve.question.title, "app #6522 ready. Needs approve.");
 });
 
 test("row: done, idle-no-pr, and running do nothing", () => {
@@ -516,7 +516,7 @@ test("F8: auto mode never says yes to a risky or unlisted ask", () => {
     assert.notEqual(decision.playbook, "in-scope-yes", text);
   }
   const permission = run(makeThread({ lastAgentText: "Should I email the customer about the outage?" })).decision;
-  assert.equal(permission.question.title, "madrid #6522: asks permission. OK?");
+  assert.equal(permission.question.title, "app #6522: asks permission. OK?");
 });
 
 test("F1: the manager never gets an automatic yes", () => {
@@ -675,7 +675,7 @@ test("F16: a thread blocked on a permission prompt gets one owner question, neve
   assert.equal(classified.state, "needs-human");
   assert.equal(decision.action, "ask-user");
   assert.equal(decision.message, null);
-  assert.equal(decision.question.title, "madrid #6522: waiting on a prompt. Open it?");
+  assert.equal(decision.question.title, "app #6522: waiting on a prompt. Open it?");
   assert.deepEqual(decision.question.options, ["opened", "later"]);
   assert.equal(decision.question.kind, "prompt");
   // Recovery never nudges it either.
@@ -728,4 +728,31 @@ test("an unreadable retry log keeps the LB unknown, never recovered", () => {
   const health = infraHealth({ bb3: bb3Base, lb }, { config, now: NOW });
   assert.equal(health.lb.up, false);
   assert.equal(infraHealth({ bb3: bb3Base, lb: { ...lb, errorsUnknown: false } }, { config, now: NOW }).lb.up, true);
+});
+
+// Bug 5: owner labels name the repo and PR, else the folder; never a session
+// id, the owner's own words, or an automation prompt.
+test("owner labels use repo and PR, then the folder, then the Codex app name", () => {
+  const ask = { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } };
+  const codexPr = makePr({ ref: "buildbetter-app/buildbetter#6896", repo: "buildbetter-app/buildbetter", number: 6896 });
+  const codex = makeThread({
+    key: "codex:01a0e673", kind: "codex", id: "01a0e673", workspace: null, cwd: "/Volumes/Xtra/codex-worktrees/f808/bbapp",
+    repo: "buildbetter-app/buildbetter", prRefs: ["buildbetter-app/buildbetter#6896"], live: null, meta: ask
+  });
+  assert.equal(run(codex, { pr: codexPr }).decision.question.title, "buildbetter #6896: needs your call. Answer?");
+
+  const claude = makeThread({
+    key: "claude:4396b7d2", kind: "claude", id: "4396b7d2-da42-42e4-97b0-aca39b2d9a45", title: "4396b7d2-da42-42e4-97b0-aca39b2d9a45",
+    workspace: null, cwd: "/Users/x/Dev/g2", prRefs: [], lastUserText: "ship the mobile build", live: null, meta: ask
+  });
+  assert.equal(run(claude, { pr: null }).decision.question.title, "g2: needs your call. Answer?");
+
+  const sweep = { kind: "codex", key: "codex:x", id: "x", workspace: null, cwd: null, prRefs: [], title: "Current local time: 2026-09-28", live: null };
+  assert.equal(run(makeThread({ ...sweep, meta: { ...ask, catalogName: "Improve Slack huddle detection" } }), { pr: null }).decision.question.title,
+    "Improve Slack huddle detection: needs your call. Answer?");
+  assert.equal(run(makeThread({ ...sweep, meta: ask }), { pr: null }).decision.question.title, "Codex chat: needs your call. Answer?");
+
+  const recorderPr = makePr({ ref: "buildbetter-app/bb-recorder#279", repo: "buildbetter-app/bb-recorder", number: 279 });
+  const recorder = makeThread({ kind: "codex", key: "codex:01a0c4bd", workspace: null, cwd: "/Users/x/Dev/bb-recorder", prRefs: ["buildbetter-app/bb-recorder#279"] });
+  assert.equal(run(recorder, { pr: recorderPr }).decision.question.title, "bb-recorder #279 ready. Merge?");
 });
