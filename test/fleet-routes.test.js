@@ -174,6 +174,31 @@ test("{ reopen: true } reopens a question the review closed", async () => {
   assert.equal((await route("POST", path, url(path), body({ reopen: true }))).status, 503);
 });
 
+test("state carries the supervisor's clears and review notes; a reopen answers with the fresh state", async () => {
+  const supervisor = fakeSupervisor();
+  const cleared = { id: "fq_closed", dedupeKey: "k2", title: "#7 ready. Merge?", status: "resolved", resolvedBy: "review", reviewCategory: "stale", reviewReason: "merged", answeredAt: "2026-09-26T00:30:00.000Z" };
+  Object.assign(supervisor.state.questions[0], { reviewCategory: "live", reviewReason: "the agent waits on you", reviewedAt: "2026-09-26T00:10:00.000Z" });
+  supervisor.state.reviewClosed = [cleared];
+  supervisor.reopenReviewed = (id) => {
+    const question = supervisor.state.reviewClosed.find((q) => q.id === id);
+    if (!question) return null;
+    supervisor.state.reviewClosed = [];
+    const open = { ...question, status: "open", resolvedBy: null, pinned: true };
+    supervisor.state.questions.push(open);
+    return open;
+  };
+  const route = createFleetRoute({ supervisor });
+  const got = await route("GET", "/fleet/api/state", url("/fleet/api/state"), body({}));
+  assert.deepEqual(got.body.reviewClosed, [cleared]);
+  assert.equal(got.body.questions[0].reviewReason, "the agent waits on you");
+  const path = "/fleet/api/questions/fq_closed";
+  const result = await route("POST", path, url(path), body({ reopen: true }));
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.state.reviewClosed, []);
+  assert.deepEqual(result.body.state.questions.map((q) => q.id), ["fq_open1", "fq_closed"]);
+  assert.equal((await route("POST", path, url(path), body({ reopen: true }))).status, 409, "reopens once");
+});
+
 test("answer race: question closed between check and answer is 409", async () => {
   const supervisor = fakeSupervisor();
   supervisor.answerQuestion = async () => null;

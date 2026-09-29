@@ -358,11 +358,13 @@ export class FleetStore {
   }
 
   // Review closes still holding an ask back, newest first, so the owner can
-  // reopen a wrong one.
+  // reopen a wrong one. One whose ask is open again (a widened group) is
+  // left out: it can no longer be reopened.
   reviewClosed(limit = REVIEW_CLOSED_SHOWN) {
     const since = this.now() - QUESTION_TTL_MS;
+    const openKeys = new Set(this.state.questions.filter((q) => q.status === "open").map((q) => q.dedupeKey));
     return this.state.questions
-      .filter((q) => isReviewClosed(q) && lastAskMs(q) > since)
+      .filter((q) => isReviewClosed(q) && lastAskMs(q) > since && !openKeys.has(q.dedupeKey))
       .sort((a, b) => toMs(b.answeredAt, 0) - toMs(a.answeredAt, 0))
       .slice(0, Math.max(0, limit))
       .map((q) => ({ ...q }));

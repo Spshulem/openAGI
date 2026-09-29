@@ -235,9 +235,11 @@ agent can act on; the same outreach item updates in place.
   a new question.
 - If the model fails or times out (150 s), questions go out as before and the
   error shows in **Doing**. It retries after 15 minutes.
-- Every decision is in **Doing** (`review`). **Closed by review** under
-  **Needs you** lists recent closes; **Reopen** brings one back as the same
-  item and pins it, so the review keeps it until its ask changes. API:
+- Every decision is in **Doing** (`review`). **Cleared by supervisor** under
+  **Needs you** lists closes from the last day (and older ones still holding
+  back an ask), with category, reason and time; **Reopen** brings one back as
+  the same item and pins it, so the review keeps it until its ask changes.
+  An open question shows the review's reason under it. API:
   `POST /fleet/api/questions/<id>` with `{ "reopen": true }`.
 - It runs in every mode. It only edits the supervisor's own list; it never
   messages a thread.

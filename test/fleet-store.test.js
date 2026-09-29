@@ -448,10 +448,14 @@ test("a review-closed group that covers another thread is a new question, not th
   store.closeByReview(first.id, { category: "done-elsewhere", reason: "another thread took both over" });
   now.advance(10 * 60 * 1000);
   assert.equal(store.upsertQuestion(group(["codex:a"])).suppressed, true, "a smaller group is the same ask");
+  assert.deepEqual(store.reviewClosed().map((q) => q.id), [first.id]);
   const wider = store.upsertQuestion(group(["codex:a", "codex:c"]));
   assert.notEqual(wider.id, first.id);
   assert.equal(wider.reopened, undefined);
   assert.equal(store.question(first.id).status, "resolved");
+  // Its ask is open again, so the page does not offer a Reopen that fails.
+  assert.deepEqual(store.reviewClosed(), []);
+  assert.equal(store.reopenReviewed(first.id), null);
 });
 
 test("a review rewrite survives the same ask and yields to a reworded one", (t) => {
