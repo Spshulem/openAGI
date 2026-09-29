@@ -31,6 +31,12 @@ const ASK_CONTEXT_MAX = 600;
 // proposals, and blocked attempts are history only.
 const ATTEMPT_STATUSES = new Set(["sent"]);
 const COOLDOWN_STATUSES = new Set(["sent", "failed", "owner-answer"]);
+// A send that never reached the thread, for backoff and for telling the
+// owner. The owner at the keyboard, or a turn still running, is not the
+// route failing: those wait for the next tick and leave the streak alone.
+const UNDELIVERED_STATUSES = new Set(["blocked", "failed"]);
+const REACHED_STATUSES = new Set(["sent", "owner-answer", "escalated"]);
+const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed)/;
 
 function emptyState() {
   return {
@@ -133,7 +139,7 @@ function normalizeOptions(options) {
 }
 
 function emptyLedger() {
-  return { nudges: [], lastProgressMark: null, attemptsWithoutProgress: 0, lastNudgeAt: null };
+  return { nudges: [], lastProgressMark: null, attemptsWithoutProgress: 0, lastNudgeAt: null, undelivered: null };
 }
 
 export class FleetStore {
@@ -202,6 +208,13 @@ export class FleetStore {
     }
     if (ATTEMPT_STATUSES.has(status)) ledger.attemptsWithoutProgress += 1;
     if (COOLDOWN_STATUSES.has(status)) ledger.lastNudgeAt = at;
+    const detail = String(entry.detail ?? "");
+    if (UNDELIVERED_STATUSES.has(status) && !BENIGN_BLOCKS.test(detail)) {
+      const prev = ledger.undelivered ?? null;
+      ledger.undelivered = { count: (prev?.count ?? 0) + 1, since: prev?.since ?? at, lastAt: at, reason: clampText(detail, 160) || status };
+    } else if (REACHED_STATUSES.has(status)) {
+      ledger.undelivered = null;
+    }
     this.state.ledger[key] = ledger;
     this._save();
     return structuredClone(ledger);

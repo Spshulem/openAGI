@@ -584,7 +584,7 @@ test("F5: recovery resumes threads remembered as blocked after their log rows ex
   const aborted = makeThread({ key: "codex:x1", kind: "codex", id: "x1", live: null, agentStatus: "aborted", prRefs: [], error: null, lastUserAt: ago(3 * 60 * MIN) });
   const infra = { bb3: bb3Base, lb: lbOk, localVerify: [] };
   const classified = classifyThread(aborted, { pr: null, localGit: cleanGit, infra, now: NOW, config });
-  assert.equal(classified.state, "idle-no-pr");
+  assert.equal(classified.state, "stopped");
   const items = [{ thread: aborted, classified, pr: null, ledger: {} }];
   const ledger = { infraDown: { lb: true, bb3: false } };
   const forgotten = decideInfra(infra, { ledger, playbooks, config, now: NOW, threads: items, manager, mode: "auto" });
@@ -782,4 +782,30 @@ test("owner labels drop a PR that merged or closed before the ask", () => {
   const later = ads({ state: "MERGED", createdAt: ago(5 * MIN), mergedAt: ago(2 * MIN), closedAt: ago(2 * MIN) });
   assert.equal(run(kingston, { pr: later }).decision.question.title, "ads #2: needs your call. Answer?");
   assert.equal(run(kingston, { pr: ads({ unresolvedThreads: 1 }) }).decision.question.title, "ads #2: needs your call. Answer?");
+});
+
+test("a stopped turn gets a resume nudge even with a merged PR or none, after the idle gate", () => {
+  const dead = makeThread({ agentStatus: "stalled", lastAgentAt: ago(20 * MIN), lastActivityAt: ago(20 * MIN) });
+  for (const pr of [makePr({ state: "MERGED", mergedAt: ago(9 * 24 * 60 * MIN) }), null]) {
+    const { classified, decision } = run(dead, { pr });
+    assert.equal(classified.state, "stopped");
+    assert.equal(decision.action, "nudge");
+    assert.equal(decision.playbook, "resume");
+  }
+  const fresh = run(makeThread({ agentStatus: "stalled", lastAgentAt: ago(5 * MIN), lastActivityAt: ago(5 * MIN) }), { pr: null });
+  assert.equal(fresh.decision.action, "wait");
+});
+
+test("a stopped thread that worked after its last nudge gets a fresh budget; a quick relapse does not", () => {
+  const nudges = [{ at: ago(90 * MIN), playbook: "resume", status: "sent" }];
+  // Died 2 minutes after the nudge: no work, the budget is spent, the owner is asked.
+  const relapse = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(88 * MIN), lastActivityAt: ago(88 * MIN) });
+  const mark = run(relapse, { pr: null }).decision.progressMark;
+  const spent = { nudges, lastNudgeAt: ago(90 * MIN), attemptsWithoutProgress: 3, lastProgressMark: { ...mark, worked: null } };
+  assert.equal(run(relapse, { pr: null, ledger: spent }).decision.action, "ask-user");
+  // Worked 40 minutes after the nudge, then died: nudged again.
+  const worked = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(50 * MIN), lastActivityAt: ago(50 * MIN) });
+  const { decision } = run(worked, { pr: null, ledger: spent });
+  assert.equal(decision.action, "nudge");
+  assert.equal(decision.progressMark.worked, ago(90 * MIN));
 });

@@ -282,8 +282,12 @@ function statusFor(summary, mtimeMs, now, limits) {
   if (type === "turn_aborted") return "aborted";
   if (type === "error") return "error";
   if (summary.events === 0 || mtimeMs === null) return "unknown";
-  // No finished turn after the last start: in progress, or killed mid-turn.
-  return now - mtimeMs <= limits.runningWindowMs ? "running" : "stalled";
+  // No finished turn after the last start: in progress, or killed mid-turn
+  // (an app-server restart ends open turns without writing anything). Timed
+  // from the last turn row: opening a dead thread writes settings rows that
+  // bump the file, which must not make it look alive again.
+  const turnMs = Date.parse(summary.lastTurnAt ?? "");
+  return now - (Number.isFinite(turnMs) ? turnMs : mtimeMs) <= limits.runningWindowMs ? "running" : "stalled";
 }
 
 function applyRollout(thread, row, context) {
@@ -364,8 +368,12 @@ function readSharedTitles(db, limits) {
   const pick = (name) => (present.has(name) ? name : `NULL AS ${name}`);
   const where = present.has("archived") ? " WHERE COALESCE(archived, 0) = 0" : "";
   const counts = new Map();
-  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("originator")} FROM threads${where}`).all()) {
+  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("originator")}, ${pick("source")} FROM threads${where}`).all()) {
     if (row.originator === CONDUCTOR_CODEX_ORIGINATOR) continue;
+    // Automation runs and subagents never show in the sidebar, so they
+    // cannot be mistaken for the thread on screen.
+    const source = String(row.source ?? "");
+    if (source === "exec" || source.includes("\"subagent\"")) continue;
     const token = identityToken(displayTitle(row, limits));
     if (token) counts.set(token, (counts.get(token) ?? 0) + 1);
   }

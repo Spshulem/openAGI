@@ -313,7 +313,7 @@ test("LB recovery resumes a remembered thread even after its error rows aged out
   const snapshot = await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 1);
   assert.equal(delivered[0].playbook, "infra-recovered");
-  assert.equal(snapshot.threads[0].state, "idle-no-pr");
+  assert.equal(snapshot.threads[0].state, "stopped");
   assert.equal(snapshot.threads[0].decision.action, "nudge");
   assert.equal(snapshot.threads[0].decision.playbook, "infra-recovered");
 });
@@ -1041,7 +1041,9 @@ test("a thread hidden by a failed source is remembered for an hour at most", asy
   codexFails = false;
   now += 5 * MIN;
   await supervisor.tick({ reason: "test" });
-  assert.equal(delivered.length, 0);
+  // The memory is gone, so no infra-recovered note; the interrupted turn
+  // itself still gets its plain resume.
+  assert.deepEqual(delivered.map((d) => d.playbook), ["resume"]);
 });
 
 test("leaving Auto mid-scan stops that tick's sends", async (t) => {
@@ -1105,14 +1107,18 @@ test("computer-use not ready: the tick waits and sends nothing; computer-use-fir
   assert.deepEqual(first.delivered.map((d) => d.route), ["codex-exec"]);
 });
 
-test("a blocked app send spends no attempt and no cooldown, so the next tick tries again", async (t) => {
+test("a blocked app send spends no attempt and no cooldown, but backs off before trying again", async (t) => {
   let now = NOW;
   const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", deliverStatus: "blocked", now: () => now, deps: { uiDriver: readyDriver() } });
   await supervisor.tick({ reason: "test" });
   const ledger = supervisor.store.ledgerFor("codex:t1");
   assert.equal(ledger.attemptsWithoutProgress ?? 0, 0);
   assert.equal(ledger.lastNudgeAt ?? null, null);
+  assert.equal(ledger.undelivered.count, 1);
   now += MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 1, "backing off: 5 min after the first block");
+  now += 5 * MIN;
   await supervisor.tick({ reason: "test" });
   assert.equal(delivered.length, 2);
 });
@@ -1782,4 +1788,89 @@ test("OPENAGI_FLEET_REVIEW=0 turns the review off; it is on with the supervisor"
   await enabled.supervisor.tick();
   assert.equal(on.calls.length, 1);
   assert.equal(enabled.supervisor.getState().settings.review.enabled, true);
+});
+
+test("threads that cannot be reached never starve a stopped one: blocked tries use no send slot", async (t) => {
+  // Five merge-ready threads tried more recently than the stopped one, all blocked.
+  const busy = Array.from({ length: 5 }, (_, i) => makeThread({ key: `codex:b${i}`, id: `b${i}`, cwd: `/work/b${i}` }));
+  const stopped = makeThread({ key: "codex:dead", id: "dead", cwd: "/work/dead", agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", threads: [...busy, stopped],
+    deps: {
+      executor: {
+        deliver: async (args) => { delivered.push(args); return { status: args.thread.key === "codex:dead" ? "sent" : "blocked", route: args.route, detail: "could not verify thread", actionId: null }; },
+        inFlight: () => [], whenIdle: async () => {}
+      }
+    }
+  });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered[0].thread.key, "codex:dead", "a resume goes first");
+  assert.equal(delivered[0].playbook, "resume");
+  // Blocked tries are bounded (twice the send cap) and spend no slot.
+  assert.equal(delivered.length, 1 + Math.min(busy.length, DEFAULTS.maxSendsPerTick * 2 - 1));
+});
+
+test("sends past the cap are marked deferred, not dropped silently", async (t) => {
+  const many = Array.from({ length: DEFAULTS.maxSendsPerTick + 2 }, (_, i) => makeThread({ key: `codex:m${i}`, id: `m${i}`, cwd: `/work/m${i}` }));
+  const { supervisor, delivered } = fixture(t, { mode: "auto", threads: many });
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, DEFAULTS.maxSendsPerTick);
+  const deferred = snapshot.threads.filter((row) => /deferred: send cap/.test(row.decision?.reason ?? ""));
+  assert.equal(deferred.length, 2);
+});
+
+test("a thread nudges keep failing to reach backs off, then the owner is told once with the reason", async (t) => {
+  let now = NOW;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const { supervisor, delivered, notified } = fixture(t, {
+    mode: "auto", threads: [stopped], now: () => now,
+    deps: {
+      executor: {
+        deliver: async (args) => { delivered.push(args); return { status: "blocked", route: args.route, detail: "ambiguous: two threads share this title", actionId: null }; },
+        inFlight: () => [], whenIdle: async () => {}
+      }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) {
+    await supervisor.tick({ reason: "test" });
+    now += 5 * MIN;
+  }
+  // 0, 5 (backoff 5), 15 (backoff 10), then 30+ min in with 3 failures: ask.
+  assert.equal(delivered.length, 3);
+  const asks = supervisor.store.openQuestions().filter((q) => q.kind === "deliver");
+  assert.equal(asks.length, 1);
+  assert.match(asks[0].body, /3 sends failed/);
+  assert.match(asks[0].body, /rename or archive one/);
+  // One question, kept while it stays true (the notifier dedupes the push).
+  assert.equal(new Set(notified.filter((q) => q.kind === "deliver").map((q) => q.id)).size, 1);
+  assert.equal(supervisor.store.ledgerFor("codex:t1").undelivered.count, 3);
+});
+
+test("the owner at the keyboard or a running turn does not count as a failed send", async (t) => {
+  const store = new (await import("../src/fleet/store.js")).FleetStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "fleet-ledger-")), now: () => NOW });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "owner using Codex" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "turn running (Stop is visible)" });
+  assert.equal(store.ledgerFor("codex:a").undelivered, null);
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "could not verify thread: \"x\" is not the open thread" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "failed", detail: "Open Computer Use stopped, timed out, or disconnected" });
+  assert.equal(store.ledgerFor("codex:a").undelivered.count, 2);
+  store.recordNudge("codex:a", { playbook: "resume", status: "sent" });
+  assert.equal(store.ledgerFor("codex:a").undelivered, null);
+});
+
+test("the review never clears the supervisor's own can't-deliver finding", async (t) => {
+  let now = NOW;
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "junk", reason: "looks like a status line" })));
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const { supervisor } = fixture(t, {
+    mode: "auto", threads: [stopped], now: () => now, review: REVIEW_ON,
+    deps: {
+      runModel: model.runModel,
+      executor: { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "could not verify thread", actionId: null }), inFlight: () => [], whenIdle: async () => {} }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const ask = supervisor.store.openQuestions().find((q) => q.kind === "deliver");
+  assert.ok(ask, "still open");
+  assert.ok(model.calls.every((call) => call.entries.every((entry) => entry.id !== ask.id)), "never sent to the review");
 });

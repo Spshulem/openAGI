@@ -20,7 +20,7 @@ export const ERROR_KINDS = Object.freeze([
 
 // Supervisor-level classification. Order matters: first match wins.
 export const STATES = Object.freeze([
-  "excluded", "running", "infra-blocked", "waiting-ci", "local-verify", "needs-human",
+  "excluded", "running", "infra-blocked", "stopped", "waiting-ci", "local-verify", "needs-human",
   "asked-in-scope", "pr-not-ready", "ready-needs-human", "done", "idle-no-pr"
 ]);
 
