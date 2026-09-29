@@ -55,6 +55,12 @@ export function createNotifier({
     }
   };
 
+  const shown = (question) => ({
+    title: clampText(question.title, limits.titleMax),
+    summary: clampText(question.body, limits.bodyMax),
+    actions: outreachActions(question.options)
+  });
+
   const postOutreach = (question) => {
     const outreach = runtime?.outreach;
     if (typeof outreach?.append !== "function") return null;
@@ -62,16 +68,22 @@ export function createNotifier({
       const item = outreach.append({
         type: "fleet-question",
         sourceRef: { kind: "fleet", id: question.id },
-        title: clampText(question.title, limits.titleMax),
-        summary: clampText(question.body, limits.bodyMax),
+        ...shown(question),
         needsDecision: true,
-        actions: outreachActions(question.options),
         dedupeOpen: true
       });
       return item?.id ?? null;
     } catch {
       return null;
     }
+  };
+
+  // A reworded question ("4 stuck" -> "5 stuck") refreshes its open copy in
+  // place, so the same item shows the new text without a second ping.
+  const refreshOutreach = (outreachId, question) => {
+    const outreach = runtime?.outreach;
+    if (typeof outreach?.update !== "function") return;
+    try { outreach.update(outreachId, shown(question)); } catch { /* best-effort */ }
   };
 
   const push = async (question, at) => {
@@ -118,6 +130,7 @@ export function createNotifier({
     if (latest.status && latest.status !== "open") return { outreachId: null, pushed: false, skipped: "closed" };
     const at = current();
     const outreachId = latest.outreachId ?? postOutreach(latest);
+    if (outreachId) refreshOutreach(outreachId, latest);
     const result = await push(latest, at);
     if (store && ((outreachId && outreachId !== latest.outreachId) || result.pushed)) {
       store.markQuestionNotified?.(latest.id, { outreachId, pushedAt: result.pushed ? at.toISOString() : undefined });

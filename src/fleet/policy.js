@@ -4,7 +4,7 @@
 // untrusted and may carry instructions, so it never goes into a message
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
-import { DEFAULTS, SUPERVISOR_PREFIX, clampText, msSince, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
+import { DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
 import { renderTemplate } from "./playbooks.js";
 
 const MIN = 60_000;
@@ -23,11 +23,13 @@ const MANAGER_DOWN_KINDS = new Set(["session-limit", "usage-limit", "model-limit
 const RESUME_STATUSES = new Set(["aborted", "stalled", "error"]);
 const CI_DONE = new Set(["SUCCESS", "FAILURE", "ERROR"]);
 const CI_FAILING = new Set(["FAILURE", "ERROR"]);
+const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // Blockers only GitHub (or a later git read) can clear; nudging the agent
 // does nothing for them.
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
+const KIND_NAMES = { codex: "Codex", claude: "Claude", conductor: "Conductor" };
 // Thread-level and infra-level escalations of one incident share a cooldown.
 const ESCALATION_KEYS = { "manager-bb3": "infra:bb3", "manager-lb": "infra:lb" };
 
@@ -301,10 +303,16 @@ function agentAskIntent(ctx) {
   const topicTitle = TOPIC_TITLES[ask.topic] ?? "asks you. Answer?";
   const options = ask.structured ? ask.options : ask.options?.length >= 2 ? ask.options.slice(0, 3) : ["yes", "no"];
   const excerpt = ownerExcerpt(ask.text || thread.lastAgentText, ctx.limits.bodyMax);
+  // A sealed Codex ask brings its own key: its shown text is a stand-in.
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
-    question: question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
-      `ask:${thread.key}:${shortHash(ask.text ?? "")}`, "agent-ask")
+    question: {
+      ...question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
+        `ask:${thread.key}:${ask.key ?? shortHash(ask.text ?? "")}`, "agent-ask"),
+      // The body is only the ask sentence; the review needs what it is about.
+      askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
+      agentAskedAt: thread.lastAgentAt ?? null
+    }
   };
 }
 
@@ -322,7 +330,7 @@ function readyIntent(ctx) {
   const { pr, facts } = ctx;
   if (!pr) return { type: "none", reason: ctx.classified.reason };
   const needsApprove = pr.reviewDecision === "REVIEW_REQUIRED";
-  const title = needsApprove ? `#${pr.number} ready. Needs approve.` : `#${pr.number} ready. Merge?`;
+  const title = needsApprove ? `${facts.label} ready. Needs approve.` : `${facts.label} ready. Merge?`;
   const body = `${facts.prRef} at ${facts.head}: CI green, 0 open threads${needsApprove ? ", review required" : ""}.`;
   return {
     type: "ask", reason: ctx.classified.reason,
@@ -692,8 +700,13 @@ function factsFor(thread, pr, classified) {
   const blockers = (classified.blockers?.length ? classified.blockers : classified.readiness?.blockers) ?? [];
   const prRef = pr?.ref ?? thread.prRefs?.[0] ?? "";
   const prNumber = pr?.number ?? Number(/#(\d+)$/.exec(prRef)?.[1]);
+  const knownPr = Number.isFinite(prNumber) && prNumber > 0 ? prNumber : null;
+  // A PR done before the agent last spoke is old work on a reused branch
+  // (kingston's disk-full asks titled "ads #2", merged weeks earlier), so
+  // the label names the place instead.
+  const pastPr = prDoneBefore(pr, latest(thread.lastAgentAt, thread.meta?.pendingQuestion?.at));
   return {
-    pr: Number.isFinite(prNumber) && prNumber > 0 ? String(prNumber) : "",
+    pr: knownPr ? String(knownPr) : "",
     prRef: fact(prRef, 80),
     repo: fact(pr?.repo ?? thread.repo, 80),
     head: shortSha(pr?.headOid),
@@ -701,9 +714,15 @@ function factsFor(thread, pr, classified) {
     blockers: blockers.map((blocker) => fact(blocker, 80)).join("; "),
     blocker: fact(blockers[0], 80),
     thread: agentLabel(thread),
-    label: ownerLabel(thread, Number.isFinite(prNumber) && prNumber > 0 ? prNumber : null),
+    label: pastPr ? ownerLabel(thread, null, null) : ownerLabel(thread, knownPr, pr?.repo ?? parsePrRef(prRef)?.repo),
     reset: formatTime(thread.error?.resetAt)
   };
+}
+
+function prDoneBefore(pr, at) {
+  if (!pr || !DONE_PR_STATES.has(pr.state)) return false;
+  const doneAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+  return Number.isFinite(doneAt) && doneAt < Date.parse(at ?? "");
 }
 
 // Safe for agent-bound text: one line, no markup characters, bounded.
@@ -716,10 +735,16 @@ function agentLabel(thread) {
   return String(raw).replace(/[^\w .:#-]+/g, "").slice(0, 40);
 }
 
-function ownerLabel(thread, prNumber) {
-  const parts = [thread.workspace ? fact(thread.workspace, 30) : null, prNumber ? `#${prNumber}` : null].filter(Boolean);
-  if (parts.length) return parts.join(" ");
-  return fact(stripTags(thread.title), 30) || `${thread.kind} ${String(thread.id ?? "").slice(0, 8)}`;
+// Repo and PR name the work; else the folder, else the Codex app's name.
+// Never a thread title: a Claude one can be the owner's last message, a
+// Codex one an automation prompt. Never a session id either.
+export function ownerLabel(thread, prNumber, repo) {
+  const repoName = fact(String(repo ?? "").split("/").pop(), 30);
+  if (prNumber && repoName) return `${repoName} #${prNumber}`;
+  const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)
+    || (thread.kind === "codex" ? fact(stripTags(thread.meta?.catalogName), 30) : "");
+  if (prNumber) return place ? `${place} #${prNumber}` : `#${prNumber}`;
+  return place || `${KIND_NAMES[thread.kind] ?? "Agent"} chat`;
 }
 
 function ciSummary(pr) {

@@ -55,6 +55,9 @@ h2 .n{color:var(--muted);font-weight:500;font-variant-numeric:tabular-nums}
 .msg{margin:6px 0 0;font-size:14px;color:var(--soft);overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .why{margin:4px 0 0;font-size:13px;color:var(--muted);overflow-wrap:anywhere}
 .item .btn{margin-top:10px;width:100%}
+.item.cleared{padding:8px 0}
+.cleared .t{font-weight:500}
+.item .btn.sm{margin:0;width:auto;min-height:40px;padding:6px 14px;font-size:14px}
 .chip{display:inline-block;padding:1px 9px;border:1px solid currentColor;border-radius:999px;font-size:12.5px;font-weight:600;line-height:1.6;white-space:nowrap}
 .good{color:var(--accent)}.warn{color:var(--warn)}.hot{color:var(--hot)}.dim{color:var(--muted)}
 .strip{display:flex;flex-wrap:wrap;gap:8px}
@@ -91,7 +94,8 @@ details.thread>summary{padding:0}
   <p id="status" class="status" role="status" aria-live="polite"></p>
 </header>
 <main>
-  <section aria-labelledby="needsH"><h2 id="needsH">Needs you <span id="needsCount" class="n"></span></h2><div id="needsList"></div></section>
+  <section aria-labelledby="needsH"><h2 id="needsH">Needs you <span id="needsCount" class="n"></span></h2><div id="needsList"></div>
+    <details id="reviewedBox" class="group" hidden><summary><span>Cleared by supervisor</span><span id="reviewedCount" class="n"></span></summary><div id="reviewedList" class="list"></div></details></section>
   <section aria-labelledby="doingH"><h2 id="doingH">Doing <span id="doingCount" class="n"></span></h2><div id="doingList"></div></section>
   <section aria-labelledby="infraH"><h2 id="infraH">Infra</h2><div id="infraStrip" class="strip"></div></section>
   <section aria-labelledby="fleetH"><h2 id="fleetH">Fleet <span id="fleetCount" class="n"></span></h2><div id="fleetList"></div></section>
@@ -125,6 +129,7 @@ details.thread>summary{padding:0}
   var ACTION_TONE = { planned: 'dim', proposed: 'warn', sent: 'good', 'dry-run': 'dim', blocked: 'hot', failed: 'hot', done: 'good' };
   var ROUTE_LABEL = { 'codex-exec': 'Codex resume', 'peer-relay': 'live relay', 'claude-resume': 'Claude resume', 'computer-use': 'typed in app' };
   var INFRA_NAME = { 'infra:bb3': 'BuildBot3', 'infra:lb': 'Codex load balancer' };
+  var CLEARED_LABEL = { stale: 'Stale', junk: 'Junk', duplicate: 'Duplicate', 'done-elsewhere': 'Done elsewhere' };
   var DOING_MAX = 20;
 
   var params = new URLSearchParams(location.search);
@@ -293,6 +298,7 @@ details.thread>summary{padding:0}
       if (q.prRef) link(shortRef(q.prRef), prHref(t && t.pr, q.prRef), ctx);
       if (q.createdAt) el('span', null, ago(q.createdAt), ctx);
       if (q.body) el('p', null, q.body, card);
+      reviewNote(q, card);
       var opts = el('div', 'opts', null, card);
       var buttons = [];
       var options = Array.isArray(q.options) ? q.options.filter(function (o) { return o && o !== 'dismiss'; }) : [];
@@ -304,6 +310,54 @@ details.thread>summary{padding:0}
       buttons.push(button('Dismiss', 'btn ghost', opts, function () { return decide(q, { dismiss: true }, buttons); }));
       if (q.kind === 'agent-ask') el('p', 'note', 'Your answer goes to the agent.', card);
     });
+  }
+
+  // Why the supervisor's review kept an open question (live), or the close
+  // the owner overrode with Reopen; the full reason and time on hover.
+  function reviewNote(q, card) {
+    var why = typeof q.reviewReason === 'string' ? q.reviewReason : '';
+    if (!why) return;
+    var overridden = q.pinned && q.reviewCategory && q.reviewCategory !== 'live';
+    var note = el('p', 'note', (overridden ? 'You reopened it. The supervisor had said: ' : 'Supervisor: ') + clip(why, 160), card);
+    note.title = why + (q.reviewedAt ? ' (reviewed ' + when(q.reviewedAt) + ')' : '');
+  }
+
+  // Questions the supervisor's review cleared in the last day (or still
+  // holding back an ask that keeps coming), newest first. Reopen brings one
+  // back and the review keeps it from then on.
+  function renderReviewed(list, open) {
+    var box = $('reviewedList');
+    box.replaceChildren();
+    $('reviewedBox').hidden = !list.length;
+    $('reviewedCount').textContent = list.length ? String(list.length) : '';
+    var titles = new Map(open.map(function (q) { return [q.id, q.title]; }));
+    list.forEach(function (q) {
+      var row = el('div', 'item cleared', null, box);
+      var head = el('div', 'head', null, row);
+      el('span', 't', q.title || 'Question', head);
+      var b = button('Reopen', 'btn sm', head, function () { return reopen(q, b); });
+      var sub = el('div', 'sub', null, row);
+      if (q.reviewCategory) el('span', 'chip dim', CLEARED_LABEL[q.reviewCategory] || q.reviewCategory, sub);
+      if (q.answeredAt) el('span', null, 'cleared ' + ago(q.answeredAt), sub).title = when(q.answeredAt);
+      if (q.duplicateOf && titles.has(q.duplicateOf)) el('span', null, 'same as: ' + clip(titles.get(q.duplicateOf), 80), sub);
+      if (typeof q.reviewReason === 'string' && q.reviewReason) el('p', 'why', clip(q.reviewReason, 200), row);
+    });
+  }
+
+  async function reopen(q, b) {
+    b.disabled = true;
+    try {
+      var r = await api('/fleet/api/questions/' + encodeURIComponent(q.id), { reopen: true });
+      // Show where it went: back under Needs you.
+      focusId = q.id;
+      if (r && r.state) render(r.state); else await load();
+      say('Reopened. The supervisor keeps it now.');
+    } catch (e) {
+      b.disabled = false;
+      // Reload first: a clean reload clears the status line.
+      if (e.status === 404 || e.status === 409) await load();
+      say(e.message, true);
+    }
   }
 
   async function decide(q, body, buttons) {
@@ -324,7 +378,7 @@ details.thread>summary{padding:0}
 
   function targetName(a, byKey) {
     var about = byKey.get(a.threadKey);
-    var name = about ? threadName(about) : (INFRA_NAME[a.threadKey] || a.threadKey || 'Unknown thread');
+    var name = about ? threadName(about) : (INFRA_NAME[a.threadKey] || a.threadKey || (a.kind === 'review' ? 'Needs-you review' : 'Unknown thread'));
     if (a.targetKey && a.targetKey !== a.threadKey) {
       var to = byKey.get(a.targetKey);
       name += ', to ' + (to ? threadName(to) : a.targetKey);
@@ -537,7 +591,9 @@ details.thread>summary{padding:0}
     var byKey = new Map();
     (snap && Array.isArray(snap.threads) ? snap.threads : []).forEach(function (t) { byKey.set(t.key, t); });
     renderHeader(s);
-    renderNeeds(Array.isArray(s.questions) ? s.questions : [], byKey);
+    var questions = Array.isArray(s.questions) ? s.questions : [];
+    renderNeeds(questions, byKey);
+    renderReviewed(Array.isArray(s.reviewClosed) ? s.reviewClosed : [], questions);
     renderDoing(Array.isArray(s.actions) ? s.actions : [], byKey);
     renderInfra(snap);
     renderFleet(snap);

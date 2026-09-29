@@ -71,6 +71,9 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_RELAY_MODEL` | `claude-haiku-4-5-20251001` | Model for the `claude -p` relay to live Claude/Conductor sessions |
 | `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
 | `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
+| `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
+| `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
+| `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
 
 `OPENAGI_PUBLIC_URL`, when set, makes phone pushes deep-link to `/fleet?q=<id>`.
 
@@ -207,6 +210,54 @@ unreachable, so retrying the group does not resend to those threads.
 Switching away from **Propose** invalidates pending Send buttons. The scan CLI
 copies persisted state into a temporary directory when given `--data-dir`; it
 never writes the daemon's state or sends messages.
+
+## The supervisor reviews its own list
+
+The supervisor manages its own needs-you list. After each scan, one batched
+`claude -p` call (structured output, no tools, no hooks, not saved as a
+session) reads the open questions that are new, changed, or due, up to 15,
+each with its thread, PR, the agent message it came from, and related
+threads (same PR, workspace, or repo). The other open questions are listed
+briefly so duplicates still show. It closes what no longer needs you:
+
+- an optional offer ("want me to X?") that blocks nothing,
+- an ask about a PR that shipped (work after the merge, like a release or
+  staging QA, still counts), or a thread that moved on,
+- work another thread did, or a call you already made elsewhere,
+- status lines, automation relays, and duplicates of a question about the
+  same thread (two threads asking the same thing each need their answer).
+
+When unsure it keeps the question. An agent's own question it keeps may get
+a clearer title (repo #PR plus the ask) and short answers the agent can act
+on; the same outreach item updates in place. The supervisor's own questions
+(ready, stuck, limits) keep their title and buttons.
+
+- New questions are reviewed before they reach the phone, glasses, or main,
+  so junk never pings.
+- It runs right away for a new question, and at most every 10 minutes when a
+  question's thread or PR changed or it is due: `OPENAGI_FLEET_REVIEW_MS`
+  after its last review, then 2x and 4x that while nothing changes. The
+  longest-unreviewed go first; a new question past the 15 waits (unseen)
+  for the next review.
+- At most a quarter of a batch (3 at least) closes per review; the rest wait
+  for the next one. A close needs a reason.
+- A closed question stays closed while the same ask repeats, for up to 6
+  hours. Then the same ask is a new question, reviewed again before it pings.
+  A changed ask is a new question.
+- If the model fails or times out (6 min), questions go out as before and the
+  error shows in **Doing**. It retries after 15 minutes.
+- Every decision is in **Doing** (`review`). **Cleared by supervisor** under
+  **Needs you** lists every close asked in the last day, one per ask, with
+  category, reason and time; **Reopen** brings one back as
+  the same item and pins it, so the review keeps it until its ask changes.
+  An open question shows the review's reason under it. API:
+  `POST /fleet/api/questions/<id>` with `{ "reopen": true }`.
+- It runs in every mode. It only edits the supervisor's own list; it never
+  messages a thread.
+
+The default model is `claude-sonnet-5`, confirmed by the owner on 2026-09-29. On
+26 hand-audited questions it agreed with the audit on 20, versus 17 for Haiku 4.5.
+Set `OPENAGI_FLEET_REVIEW_MODEL` to use another model.
 
 ## One supervisor shared by main, Android and G2
 

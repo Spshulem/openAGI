@@ -71,8 +71,8 @@ function summarizeTail(rowsNewestFirst) {
   };
   for (const row of [...rowsNewestFirst].reverse()) {
     const at = dbTimeToIso(row.created_at);
-    summary.lastAt = latestIso(summary.lastAt, at);
     if (row.role === "user") {
+      summary.lastAt = latestIso(summary.lastAt, at);
       // Cancelled drafts and messages from other sessions or API keys are not the owner.
       if (row.cancelled_at || row.sender_session_id || row.sender_api_key_name) continue;
       const text = String(row.content ?? "").trim();
@@ -84,6 +84,9 @@ function summarizeTail(rowsNewestFirst) {
     }
     const event = parseEvent(row.content);
     if (!event) continue;
+    // System rows (commands_changed and other state broadcasts) also land
+    // on idle tabs; only turn rows are activity.
+    if (event.type !== "system") summary.lastAt = latestIso(summary.lastAt, at);
     // Every SDK turn opens with system/init.
     if (event.type === "system" && event.subtype === "init") summary.turnStartedAt = at;
     else if (event.type === "assistant" && !event.parent_tool_use_id) {
@@ -209,8 +212,11 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
     workspace: row.directory_name || null,
     claudeSessionId,
     agentStatus,
-    lastActivityAt: latestIso(dbTimeToIso(row.updated_at), summary.lastAt),
+    // sessions.updated_at moves on any row update (unread count, broadcasts),
+    // so it only stands in for a tab with no turn rows.
+    lastActivityAt: summary.lastAt ?? dbTimeToIso(row.updated_at),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
+    lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,

@@ -172,8 +172,8 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.equal(run.title, "Fix uploads");
   assert.equal(run.lastUserText, "keep going");
   assert.equal(run.lastUserAt, iso(10 * MIN));
-  // SQLite datetime('now') is UTC even without a zone suffix.
-  assert.equal(run.lastActivityAt, iso(MIN));
+  // The last turn row, not sessions.updated_at.
+  assert.equal(run.lastActivityAt, iso(2 * MIN));
   assert.equal(run.excluded, null);
   assert.equal(run.live, null);
   assert.equal(run.meta.derivedStatus, "in-progress");
@@ -186,7 +186,7 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.deepEqual(wait.openTasks, [{ id: "open-1", description: "Run bb-quick on fixed candidate", kind: "local_bash", startedAt: iso(23 * MIN) }]);
   assert.deepEqual(wait.live, { peerName: "sydney-5a", pid: 501, status: "idle" });
   assert.equal(wait.meta.unreadCount, 1);
-  assert.equal(wait.lastActivityAt, iso(20 * MIN));
+  assert.equal(wait.lastActivityAt, iso(21 * MIN));
 
   const limited = threads["s-limit"];
   assert.equal(limited.agentStatus, "error");
@@ -215,6 +215,8 @@ test("lists in-scope Conductor sessions with normalized status and context", asy
   assert.equal(aborted.error, null);
 
   assert.equal(threads["s-self"].excluded, "self");
+  // No turn rows: updated_at stands in. SQLite datetime('now') is UTC even without a zone suffix.
+  assert.equal(threads["s-self"].lastActivityAt, iso(MIN));
   // The manager stays visible for escalation even when it is outside the lookback.
   assert.equal(threads["mgr-1"].excluded, "stale");
   assert.equal(threads["mgr-1"].meta.dbRemote, null);
@@ -302,6 +304,17 @@ test("zoneless message times read as UTC on a non-UTC machine", async (t) => {
   const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: (pid) => pid === 701 }));
   assert.equal(threads["s-idle"].lastUserAt, iso(5 * MIN));
   assert.equal(threads["s-wait"].openTasks.find((task) => task.id === "tz-1")?.startedAt, iso(4 * MIN));
+});
+
+test("a broadcast row or updated_at bump does not make an idle tab look active", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-idle", "assistant", { type: "system", subtype: "commands_changed", session_id: "s-idle" }, iso(2 * MIN));
+  db.prepare("UPDATE sessions SET updated_at = ? WHERE id = 's-idle'").run(sqliteTime(2 * MIN));
+  db.close();
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, peers: new Map() }));
+  assert.equal(threads["s-idle"].lastActivityAt, iso(16 * MIN));
 });
 
 test("an aborted session exposes when the owner stopped it", async (t) => {

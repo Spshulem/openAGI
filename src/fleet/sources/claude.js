@@ -313,7 +313,8 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
   const prRefs = newestFirstUnique(summary.prRefs);
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const cwd = summary.cwd;
-  const title = summary.customTitle ?? summary.aiTitle ?? summary.agentName ?? (summary.lastUserText || id);
+  // Untitled: the folder, never the owner's last message or the session id.
+  const title = summary.customTitle ?? summary.aiTitle ?? summary.agentName ?? (path.basename(cwd ?? "") || "Claude chat");
   return {
     key: threadKey("claude", id),
     kind: "claude",
@@ -328,6 +329,7 @@ function buildThread({ id, file, mtimeMs }, summary, { config, now, peers }) {
     // The file time is only a fallback: metadata rows bump it without a turn.
     lastActivityAt: summary.lastTurnAt ?? toIso(mtimeMs),
     lastAgentText: clampTail(redactSecrets(summary.lastAgentText), limits.excerptMax),
+    lastAgentTail: clampTail(redactSecrets(summary.lastAgentText), limits.reviewTailMax),
     lastAgentAt: summary.lastAgentAt,
     lastUserText: excerpt(summary.lastUserText),
     lastUserAt: summary.lastUserAt,

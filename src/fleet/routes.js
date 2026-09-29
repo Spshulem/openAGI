@@ -30,7 +30,14 @@ export function createFleetRoute({ supervisor } = {}) {
 
   async function handleQuestion(id, readBody) {
     const body = await readObject(readBody);
-    if (!body) return fail(400, "Send a JSON object: { answer } or { dismiss: true }.");
+    if (!body) return fail(400, "Send a JSON object: { answer }, { dismiss: true } or { reopen: true }.");
+    // Brings back a question the supervisor's review closed.
+    if (body.reopen === true) {
+      if (typeof supervisor.reopenReviewed !== "function") return fail(503, "Reopening is not available.");
+      const question = await supervisor.reopenReviewed(id);
+      if (!question) return fail(409, "Only a question the review closed can be reopened.");
+      return ok({ question, state: state() });
+    }
     const open = (state().questions ?? []).find((q) => q?.id === id);
     if (body.dismiss === true) {
       if (!open) return fail(404, "No open question with that id.");

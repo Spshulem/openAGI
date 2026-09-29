@@ -8,12 +8,13 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { MODES, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { MODES, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
-import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "./policy.js";
+import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
+import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
 import { createUiDriver } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
@@ -35,6 +36,7 @@ const OPEN_ACTION = new Set(["planned", "proposed"]);
 const TRUNK_BRANCHES = new Set(["main", "master", "HEAD", "develop", "staging"]);
 const INFRA_KINDS = ["bb3", "lb"];
 const BLOCKED_STATES = new Set(["infra-blocked", "waiting-ci"]);
+const SETTLED_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // How long a remembered outage thread hidden by a failed source waits for it.
 const RECOVERY_HOLD_MS = 60 * MIN;
 // A manager escalation shares one cooldown per incident, whichever thread
@@ -45,6 +47,13 @@ const INCIDENT_KEYS = Object.freeze({ "manager-bb3": "infra:bb3", "manager-lb": 
 const ESCALATION_STATUSES = new Set(["sent", "failed"]);
 // The snapshot row shows the decision that acts when a thread got two.
 const DECISION_RANK = Object.freeze({ nudge: 3, "escalate-manager": 3, "ask-user": 2, wait: 1, none: 0 });
+// A changed or due question waits this long after the last review (new ones
+// never wait); a failed review is not retried sooner than REVIEW_RETRY_MS.
+const REVIEW_MIN_GAP_MS = 10 * MIN;
+const REVIEW_RETRY_MS = 15 * MIN;
+// An unchanged question kept again and again is re-checked at 1x, 2x, then
+// at most 4x the review interval.
+const REVIEW_BACKOFF_MAX = 2;
 
 function withTimeout(promise, ms, name) {
   let timer;
@@ -80,11 +89,13 @@ const GROUPED_KINDS = Object.freeze({
   open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` }
 });
 
+// The label single questions use, so a group never names a thread by its
+// session id or title (a first prompt, an automation prompt).
 function threadLabel(thread) {
   if (!thread) return "?";
-  const pr = /#(\d+)$/.exec(thread.prRefs?.[0] ?? "")?.[1];
-  const name = thread.workspace ?? clampText(String(thread.title ?? "").replace(/[<>]/g, ""), 24);
-  return pr ? `${name} #${pr}` : name;
+  const ref = thread.prRefs?.[0] ?? "";
+  const pr = Number(/#(\d+)$/.exec(ref)?.[1]);
+  return ownerLabel(thread, pr > 0 ? pr : null, parsePrRef(ref)?.repo);
 }
 
 function formatReset(iso) {
@@ -184,9 +195,16 @@ export class FleetSupervisor {
     this.lastError = null;
     this.lastThreads = new Map();
     this.branchLookups = new Map();
+    // ref -> last MERGED or CLOSED read, for ticks GitHub cannot answer.
+    this.settledPrs = new Map();
     this.answering = new Set();
     this._uiDriver = undefined;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
+    this._reviewRunner = null;
+    this.lastReview = { at: null, failedAt: null, error: null };
+    // New questions waiting on the review: hidden from the state the main
+    // mirrors until the review has seen them.
+    this.awaitingReview = new Set();
   }
 
   now() {
@@ -278,6 +296,13 @@ export class FleetSupervisor {
     return "no live route: open the thread to answer";
   }
 
+  // runModel for the review; tests inject a fake one.
+  get reviewRunner() {
+    if (this.deps.runModel) return this.deps.runModel;
+    this._reviewRunner ??= createReviewRunner({ config: this.config, run: this.deps.run ?? runCommand });
+    return this._reviewRunner;
+  }
+
   get notifier() {
     if (this.deps.notifier) return this.deps.notifier;
     this._notifier ??= createNotifier({ config: this.config, store: this.store, runtime: this.runtime, fetchImpl: this.deps.fetchImpl });
@@ -325,6 +350,10 @@ export class FleetSupervisor {
 
   getState() {
     const store = this.store;
+    const questions = store.openQuestions().filter((question) => !this.awaitingReview.has(question.id));
+    // A read can expire a question too (the /fleet page, the main's refresh)
+    // while no tick runs.
+    this.closeExpired();
     return {
       mode: this.mode,
       enabled: Boolean(this.config.enabled),
@@ -332,7 +361,9 @@ export class FleetSupervisor {
       lastTickAt: this.lastTickAt ?? store.snapshot?.at ?? null,
       lastError: this.lastError,
       snapshot: withHealth(store.snapshot),
-      questions: store.openQuestions(),
+      questions,
+      // So the owner can reopen a wrong close.
+      reviewClosed: store.reviewClosed(),
       actions: store.actions(50),
       settings: {
         tickMinutes: Math.round(this.config.tickMs / MIN),
@@ -342,7 +373,13 @@ export class FleetSupervisor {
         managerRef: this.config.managerRef,
         delivery: this.lastDelivery.mode,
         deliveryReady: this.lastDelivery.ready,
-        deliveryDetail: this.lastDelivery.detail
+        deliveryDetail: this.lastDelivery.detail,
+        review: {
+          enabled: Boolean(this.config.review?.enabled),
+          model: this.config.review?.model ?? null,
+          lastAt: this.lastReview.at ? new Date(this.lastReview.at).toISOString() : null,
+          lastError: this.lastReview.error
+        }
       }
     };
   }
@@ -365,11 +402,35 @@ export class FleetSupervisor {
     return this.store.dismissQuestion(id);
   }
 
+  // The owner reopens a question the review closed (a wrong call): same
+  // record, and its outreach copy comes back. Pinned, so the review keeps
+  // it until its ask changes.
+  reopenReviewed(id) {
+    const question = this.store.reopenReviewed(id);
+    if (!question) return null;
+    this.reopenOutreach(question);
+    this.store.recordAction({
+      kind: "review", playbook: "review", threadKey: question.threadKey ?? null, questionId: id, status: "done",
+      reason: clampText(`owner reopened: ${question.title}`, 300)
+    });
+    return question;
+  }
+
   // The outreach copy (Mac overlay, G2) must not keep asking after the
   // question closed on /fleet or by itself.
   resolveOutreach(question, decision, status) {
     if (!question?.outreachId) return;
     try { this.runtime?.outreach?.resolve?.(question.outreachId, decision, { status }); } catch { /* best-effort */ }
+  }
+
+  // An expired question's copy must not keep asking on the Mac or G2.
+  closeExpired() {
+    for (const question of this.store.takeExpired()) this.resolveOutreach(question, "expired", "dismissed");
+  }
+
+  reopenOutreach(question) {
+    if (!question?.outreachId) return;
+    try { this.runtime?.outreach?.reopen?.(question.outreachId); } catch { /* best-effort */ }
   }
 
   async resumeAll(question, message, settling = []) {
@@ -566,7 +627,7 @@ export class FleetSupervisor {
     const localGit = await this.readGit(inScope, config, run, sourceErrors);
     await this.resolvePrRefs(inScope, localGit, config, run, sourceErrors);
     const unreadPrs = new Set();
-    const prs = await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs);
+    const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs), unreadPrs);
 
     const infra = {
       bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
@@ -739,6 +800,23 @@ export class FleetSupervisor {
     }
   }
 
+  // MERGED and CLOSED are final. A ref GitHub could not answer this tick
+  // keeps its last settled read, so an ask its merge settled is not raised
+  // again as a new question. Only refs linked this tick stay remembered.
+  withSettledPrs(prs, unread) {
+    const out = new Map(prs);
+    const kept = new Map();
+    for (const [ref, pr] of prs) if (SETTLED_PR_STATES.has(pr?.state)) kept.set(ref, pr);
+    for (const ref of unread) {
+      const last = this.settledPrs.get(ref);
+      if (!last) continue;
+      kept.set(ref, last);
+      out.set(ref, last);
+    }
+    this.settledPrs = kept;
+    return out;
+  }
+
   async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set() }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
@@ -746,6 +824,10 @@ export class FleetSupervisor {
     // PR question must not close now and come back as a new push next tick.
     const gitUnknown = new Set(items.filter((item) => item.gitUnreadable || item.prUnreadable).map(({ thread }) => thread.key));
     const unknown = (keys) => fromFailedSource(keys) || keys.some((key) => gitUnknown.has(key));
+    // With no settled read remembered (a fresh start), an unread PR cannot
+    // tell a merge that settled an ask from a live one: an ask the
+    // supervisor already closed waits for GitHub instead of coming back.
+    const prUnknown = new Set(items.filter((item) => item.prUnreadable).map(({ thread }) => thread.key));
     const at = new Date(started).toISOString();
     const asked = new Set();
     const openActions = store.actions(config.limits.maxActionsKept).filter((action) => OPEN_ACTION.has(action.status));
@@ -758,6 +840,9 @@ export class FleetSupervisor {
     const typedInto = new Set();
 
     const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
+    // One the last review could not settle yet is still new.
+    const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
+    const toNotify = [];
     for (const fields of groupQuestions(asks, byKey)) {
       // Rebuilt without a failed source's threads, a group would drop them,
       // or shrink to one thread and ask it twice; the open group stays as it
@@ -767,10 +852,29 @@ export class FleetSupervisor {
       const sameChoices = spec && (fields.threadKeys || JSON.stringify(fields.options) === JSON.stringify(spec.options));
       const open = sameChoices ? store.openQuestions().find((q) => q.dedupeKey === spec.dedupeKey && covers(q)) : null;
       if (open && fromFailedSource(open.threadKeys ?? [])) { asked.add(open.dedupeKey); continue; }
+      if (fields.kind === "agent-ask" && prUnknown.has(fields.threadKey) && store.resolvedOnly(fields.dedupeKey)) continue;
       const question = store.upsertQuestion(fields);
       asked.add(question.dedupeKey);
       // The owner already answered or dismissed this one; stay quiet.
       if (question.suppressed) continue;
+      toNotify.push({ id: question.id, reopened: Boolean(question.reopened) });
+    }
+    // The supervisor reviews its own list before a new question reaches the
+    // owner, so junk never pings; the main does not see it before then either.
+    this.awaitingReview = this.config.review?.enabled ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id))) : new Set();
+    let unsettled = new Set();
+    try {
+      unsettled = await this.reviewOpenQuestions({ asked, byKey, items });
+    } finally {
+      // A new one the review did not get to (the batch cap, a deferred
+      // close) waits for the next review; a failed review lets all out.
+      this.awaitingReview = new Set([...this.awaitingReview].filter((id) => unsettled.has(id)));
+    }
+    for (const { id, reopened } of toNotify) {
+      const question = store.question(id);
+      if (question?.status !== "open" || this.awaitingReview.has(id)) continue;
+      // A blip closed it: its own outreach copy comes back, not a new one.
+      if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
@@ -815,7 +919,7 @@ export class FleetSupervisor {
     for (const question of store.openQuestions()) {
       if (asked.has(question.dedupeKey)) continue;
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
-      const decided = question.threadKey ? decisions.some((decision) => decision.threadKey === question.threadKey) : false;
+      const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
@@ -824,11 +928,100 @@ export class FleetSupervisor {
       const evictable = cappedKinds.has(String(question.threadKey ?? "").split(":")[0]);
       const threadGone = Boolean(question.threadKey) && (known ? Boolean(known.excluded) : !evictable);
       if (decided || supervisorOwned || threadGone) {
-        store.resolveQuestion(question.id);
+        const reason = decided ? `${decided.state}: ${decided.reason}` : threadGone ? `thread ${known?.excluded ?? "left the scan"}` : "no longer asked";
+        store.resolveQuestion(question.id, reason);
         this.resolveOutreach(question, "resolved", "dismissed");
       }
     }
+    this.closeExpired();
     return attempted;
+  }
+
+  // The supervisor manages its own needs-you list: one batched model call
+  // judges which open questions still need the owner (see review.js). It
+  // runs in every mode because it only edits the supervisor's own records
+  // and outreach copies, never a thread. A failure fails open: the
+  // questions go out as they would have without it. Returns the ids of
+  // questions never reviewed that this review did not settle either.
+  async reviewOpenQuestions({ asked, byKey, items = [] }) {
+    const unsettled = new Set();
+    const review = this.config.review;
+    if (!review?.enabled) return unsettled;
+    const store = this.store;
+    const now = this.now();
+    // Only questions asked this tick; the rest close or wait for their source.
+    const open = store.openQuestions().filter((question) => asked.has(question.dedupeKey));
+    if (!open.length) return unsettled;
+    if (this.lastReview.failedAt && now - this.lastReview.failedAt < REVIEW_RETRY_MS) return unsettled;
+    const prs = new Map(items.filter((item) => item.pr?.ref).map((item) => [item.pr.ref, item.pr]));
+    const states = new Map(items.map((item) => [item.thread.key, item.classified]));
+    const scope = { threads: byKey, prs, states, limits: this.config.limits };
+    const fingerprints = new Map(open.map((question) => [question.id, reviewFingerprint(question, scope)]));
+    const unreviewed = (question) => !question.reviewedAt;
+    const changed = (question) => Boolean(question.reviewedAt) && question.reviewFingerprint !== fingerprints.get(question.id);
+    const backoff = (question) => 2 ** Math.min(question.reviewStreak ?? 0, REVIEW_BACKOFF_MAX);
+    const due = (question) => now - Date.parse(question.reviewedAt ?? "") >= review.intervalMs * backoff(question);
+    const pending = open.filter((question) => unreviewed(question) || changed(question) || due(question));
+    if (!pending.length) return unsettled;
+    // Only a new question skips the gap, so a backlog past the batch cap
+    // does not call the model every tick.
+    if (!pending.some(unreviewed) && now - (this.lastReview.at ?? 0) < REVIEW_MIN_GAP_MS) return unsettled;
+    // New, then changed, then the longest since its review: the batch cap
+    // drops the tail, and the next review starts there.
+    const rank = (question) => (unreviewed(question) ? 0 : changed(question) ? 1 : 2);
+    const ordered = [...pending].sort((a, b) => rank(a) - rank(b) || String(a.reviewedAt ?? "").localeCompare(String(b.reviewedAt ?? "")));
+    const others = open.filter((question) => !pending.includes(question));
+    let verdicts;
+    try {
+      verdicts = await reviewQuestions({ questions: ordered, others, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now });
+    } catch (error) {
+      const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
+      this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
+      store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
+      return unsettled;
+    }
+    this.lastReview = { at: now, failedAt: null, error: null };
+    this.applyReview(verdicts, fingerprints);
+    const settled = new Set(verdicts.filter((verdict) => !verdict.deferred).map((verdict) => verdict.id));
+    for (const question of pending) if (unreviewed(question) && !settled.has(question.id)) unsettled.add(question.id);
+    return unsettled;
+  }
+
+  applyReview(verdicts, fingerprints) {
+    const store = this.store;
+    const decisions = [];
+    let deferred = 0;
+    for (const verdict of verdicts) {
+      // The owner may have answered or dismissed it while the model ran, or
+      // be answering it now: the answer wins.
+      const question = store.question(verdict.id);
+      if (question?.status !== "open" || this.answering.has(verdict.id)) continue;
+      // Over the close cap: left as it was for the next review.
+      if (verdict.deferred) { deferred += 1; continue; }
+      const fingerprint = fingerprints.get(question.id) ?? null;
+      if (verdict.decision === "close") {
+        const closed = store.closeByReview(question.id, { category: verdict.category, reason: verdict.reason, fingerprint, duplicateOf: verdict.duplicateOf ?? null });
+        if (closed) {
+          this.resolveOutreach(question, "resolved", "dismissed");
+          store.recordAction({
+            kind: "review", playbook: "review", threadKey: question.threadKey ?? null, questionId: question.id, status: "done",
+            reason: clampText(`closed ${verdict.category}: ${question.title}. ${verdict.reason}`, 300)
+          });
+          decisions.push({ id: question.id, decision: "close", category: verdict.category, reason: verdict.reason, duplicateOf: verdict.duplicateOf ?? null });
+          continue;
+        }
+      }
+      // Only an agent's own question takes new choices: the others carry
+      // meaning the supervisor acts on ("merged", "keep going", "added").
+      const options = question.kind === "agent-ask" ? verdict.options ?? null : null;
+      const kept = store.recordReview(question.id, { title: verdict.title ?? null, options, fingerprint, reason: verdict.reason, category: "live" });
+      decisions.push({ id: question.id, decision: "keep", category: "live", reason: verdict.reason, title: kept?.title ?? question.title });
+    }
+    const closed = decisions.filter((decision) => decision.decision === "close").length;
+    store.recordAction({
+      kind: "review", playbook: "review", threadKey: null, status: "done",
+      reason: `reviewed ${decisions.length}: ${closed} closed, ${decisions.length - closed} kept${deferred ? `, ${deferred} closes deferred` : ""}`, decisions
+    });
   }
 
   buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null }) {

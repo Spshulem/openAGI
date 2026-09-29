@@ -142,6 +142,7 @@ function foldClaudeInto(target, claude) {
   target.error = target.error ?? claude.error ?? null;
   if (!target.lastAgentText) {
     target.lastAgentText = claude.lastAgentText ?? "";
+    target.lastAgentTail = claude.lastAgentTail ?? "";
     target.lastAgentAt = claude.lastAgentAt ?? target.lastAgentAt ?? null;
   }
   target.cwd = target.cwd || claude.cwd || null;
@@ -218,9 +219,9 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // click. A nudge cannot clear it.
   if (thread.meta?.blockedOnOwner === true) return result("needs-human", "blocked on a permission prompt", { ask: { ...BLOCKED_ON_OWNER_ASK, options: [...BLOCKED_ON_OWNER_ASK.options] } });
   // Codex request_user_input: the real question is structured, not in the text.
-  if (thread.meta?.pendingQuestion) {
+  if (thread.meta?.pendingQuestion && !prSettledAfter(pr, Date.parse(thread.meta.pendingQuestion.at ?? ""), structuredAskAt(thread))) {
     const pending = thread.meta.pendingQuestion;
-    return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"] } });
+    return result("needs-human", "agent asks: structured question", { ask: { topic: "decision", structured: true, text: pending.text ?? String(pending), options: pending.options?.length ? pending.options : ["open thread"], key: pending.key ?? null } });
   }
 
   // Once the owner replied, the agent's last words are stale.
@@ -240,7 +241,7 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
     });
   }
 
-  const ask = detectAsk(text);
+  const ask = prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? "")) ? null : detectAsk(text);
   if (ask?.kind === "needs-human") return result("needs-human", `agent asks: ${ask.topic}`, { ask });
   if (ask?.kind === "in-scope") return result("asked-in-scope", "agent asked to do an in-scope step", { ask });
 
@@ -250,6 +251,27 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   }
   if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`);
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR");
+}
+
+// A PR merged or closed after the agent asked has answered the ask, but only
+// if it existed when the agent asked: one opened later is new work (west-
+// monroe asked, then #6954 was opened and merged). An ask made after the
+// merge ("merged; QA it on staging?") stands, and so does one whose times
+// are unknown. lastMs: the agent's latest words, which may repeat the ask.
+function prSettledAfter(pr, askMs, lastMs = askMs) {
+  if (!pr || !PR_DONE.has(pr.state) || !Number.isFinite(askMs)) return false;
+  const openedAt = Date.parse(pr.createdAt ?? "");
+  const doneAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
+  return Number.isFinite(openedAt) && openedAt <= askMs && Number.isFinite(doneAt) && doneAt > lastMs;
+}
+
+// The agent's later words may repeat the structured ask, so the later time
+// counts. A question with no time of its own is never settled.
+function structuredAskAt(thread) {
+  const askedAt = Date.parse(thread.meta?.pendingQuestion?.at ?? "");
+  if (!Number.isFinite(askedAt)) return NaN;
+  const agentAt = Date.parse(thread.lastAgentAt ?? "");
+  return Number.isFinite(agentAt) ? Math.max(askedAt, agentAt) : askedAt;
 }
 
 function exclusionReason(thread, { pr, localGit, config }) {
@@ -340,13 +362,18 @@ function detectAsk(text) {
   const askText = askIndexes.map((index) => sentences[index]).join(" ");
   const options = listedOptions(text);
   const recommended = /\(recommended\)/i.test(text);
-  // The risky step is often named just before the ask ("--admin merges now.
-  // Which?") or in the options after it, so both count. Earlier recap does not.
-  // Any risky step anywhere in the closing message (a force-push named two
-  // sentences before "Should I push?") keeps the ask with the owner.
+  // The topic comes from the ask region only. A risky step anywhere else in
+  // the closing message (a force-push two sentences before "Should I push?")
+  // still keeps the ask with the owner, under a neutral topic: "$0.50 per
+  // post" in a recap does not make a merge offer a spend. Several separate
+  // questions (apia: client IPs? the password bugs? shared views?) get the
+  // neutral topic too, and a login or prod topic must be the step asked for.
   const region = askRegion(sentences, askIndexes);
-  const hit = OUT_OF_SCOPE_PATTERNS.find(({ pattern }) => pattern.test(region) || pattern.test(text));
+  const step = askRegion(sentences, askIndexes, true);
+  const hit = separateQuestions(sentences, askIndexes) > 1 ? null
+    : OUT_OF_SCOPE_PATTERNS.find(({ topic, pattern }) => pattern.test(STEP_TOPICS.has(topic) ? step : region));
   if (hit) return { kind: "needs-human", topic: hit.topic, options, text: askText };
+  if (OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(text))) return { kind: "needs-human", topic: "decision", options, text: askText };
   const isChoice = options.length >= 2 && CHOICE_WORDS.test(askText);
   // The agent already picked one: taking "(recommended)" is in scope only
   // when that option is itself a routine PR step.
@@ -378,6 +405,11 @@ function stepText(sentences, index) {
   return PLAN_WORDS.test(before) ? `${before} ${sentence}` : sentence;
 }
 
+// Whether any sentence asks the owner something, by the rules detectAsk uses.
+export function asksOwner(text) {
+  return splitSentences(text ?? "").some(isAsk);
+}
+
 function isAsk(sentence) {
   if (NOT_ASK.test(sentence)) return false;
   return /\?\s*$/.test(sentence)
@@ -385,17 +417,39 @@ function isAsk(sentence) {
     || NEED_YOU_PATTERNS.some((pattern) => pattern.test(sentence));
 }
 
-function askRegion(sentences, askIndexes) {
+// The ask, the options after it, and the sentence before a bare ask
+// ("--admin merges now. Which?"): a short ask names no step itself.
+// stepOnly drops what comes before "want me to" / "should I" in an ask.
+function askRegion(sentences, askIndexes, stepOnly = false) {
   const picked = new Set();
   for (const index of askIndexes) {
-    if (index > 0) picked.add(index - 1);
+    if (index > 0 && sentences[index].split(/\s+/).length <= BARE_ASK_WORDS) picked.add(index - 1);
     picked.add(index);
     for (let next = index + 1; next < sentences.length && OPTION_LINE.test(sentences[next]); next += 1) picked.add(next);
   }
-  return [...picked].sort((a, b) => a - b).map((index) => sentences[index]).join(" ");
+  return [...picked].sort((a, b) => a - b)
+    .map((index) => (stepOnly && askIndexes.includes(index) ? fromAskPhrase(sentences[index]) : sentences[index])).join(" ");
+}
+
+// "The prod deploy is done; want me to close the ticket?" asks to close a ticket.
+function fromAskPhrase(sentence) {
+  const at = sentence.search(LEADING_ASK);
+  return at > 0 ? sentence.slice(at) : sentence;
+}
+
+// Questions, not follow-ons: "Can I clear the caches? Or free space another
+// way?" is one question.
+function separateQuestions(sentences, askIndexes) {
+  return askIndexes.filter((index) => /\?\s*$/.test(sentences[index]) && !/^(?:[-*•]\s*)?(?:or|else|otherwise)\b/i.test(sentences[index])).length;
 }
 
 const OPTION_LINE = /^(?:[1-9]|[A-C])[.)]\s/;
+const BARE_ASK_WORDS = 5;
+// A passing noun can name these ("the password bugs", "a production
+// customer"), so they count only in the step the agent asks to take.
+const STEP_TOPICS = new Set(["credentials", "production"]);
+// Ask phrases that come before the step they ask about.
+const LEADING_ASK = /\b(?:(?:do you )?want me to|would you like me to|(?:should|shall|may|can) I|(?:ok|okay)(?: for me)? to|let me know if you want)\b/i;
 
 function splitSentences(text) {
   return String(text).split(/(?<=[^\d\s][.?!])\s+|\n+/).map((part) => part.trim()).filter(Boolean);

@@ -38,7 +38,10 @@ function capturedResponse() {
           mergeStateStatus: "UNSTABLE",
           mergeable: "MERGEABLE",
           reviewDecision: null,
+          createdAt: "2026-09-25T21:02:10Z",
           updatedAt: "2026-09-26T07:44:31Z",
+          mergedAt: null,
+          closedAt: null,
           commits: { nodes: [{ commit: {
             oid: HEAD_6878,
             committedDate: "2026-09-26T07:38:09Z",
@@ -81,6 +84,8 @@ function capturedResponse() {
           mergeable: "UNKNOWN",
           reviewDecision: null,
           updatedAt: "2026-09-17T02:48:50Z",
+          mergedAt: "2026-09-17T02:48:50Z",
+          closedAt: "2026-09-17T02:48:50Z",
           commits: { nodes: [{ commit: {
             oid: "6b2e7a4cf16d649f73d9e750c2396cbf490628f3",
             committedDate: "2026-09-17T02:48:16Z",
@@ -126,6 +131,7 @@ test("buildPrQuery batches refs by repository with safe aliases", () => {
   assert.match(query, /reviewThreads\(first:100\)\{totalCount pageInfo\{hasNextPage\}/);
   assert.match(query, /statusCheckRollup\{state contexts\(first:30\)/);
   assert.match(query, /reviewThreads\(first:100\)/);
+  assert.match(query, /createdAt updatedAt mergedAt closedAt/);
 });
 
 test("fetchPrStates normalizes the captured GraphQL response", async () => {
@@ -155,9 +161,16 @@ test("fetchPrStates normalizes the captured GraphQL response", async () => {
   assert.deepEqual(pr.codexReview, { reviewedHead: true, sha: "95720cc" });
   assert.deepEqual(pr.qa, { required: true, freshOnHead: false, sha: null });
   assert.equal(pr.updatedAt, "2026-09-26T07:44:31Z");
+  // Open time: only a PR that existed when the agent asked can settle the ask.
+  assert.equal(pr.createdAt, "2026-09-25T21:02:10Z");
+  assert.equal(pr.mergedAt, null);
+  assert.equal(pr.closedAt, null);
 
   const merged = prs.get("Spshulem/openAGI#108");
   assert.equal(merged.state, "MERGED");
+  // Merge time: an agent ask older than this is settled.
+  assert.equal(merged.mergedAt, "2026-09-17T02:48:50Z");
+  assert.equal(merged.closedAt, "2026-09-17T02:48:50Z");
   assert.deepEqual(merged.ci, { state: "SUCCESS", failing: [], pending: [] });
   assert.equal(merged.unresolvedThreads, 0);
   // A usage-limit notice is not a review summary.

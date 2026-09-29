@@ -295,6 +295,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   events.on("computer-use", (data) => broadcast("computer-use", data));
   events.on("outreach", (data) => broadcast("outreach", data));
   events.on("outreach-resolved", (data) => broadcast("outreach-resolved", data));
+  events.on("outreach-updated", (data) => broadcast("outreach-updated", data));
   events.on("coding-agents", (data) => broadcast("coding-agents", data));
   events.on("fleet", (data) => broadcast("fleet", data));
   events.on("conversation.updated", (data) => broadcast("conversation.updated", data));

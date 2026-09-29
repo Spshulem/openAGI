@@ -65,6 +65,8 @@ export const DEFAULTS = Object.freeze({
   titleMax: 100,
   bodyMax: 220,
   excerptMax: 600,
+  // The self-review reads this much of each thread's last agent message.
+  reviewTailMax: 1500,
   maxThreads: 150,
   maxActionsKept: 300,
   // Computer-use delivery: the owner counts as away after this much input
@@ -81,6 +83,12 @@ export const DEFAULT_BB3_HOST = "dev@100.99.3.113";
 export const DEFAULT_LB_URL = "http://100.99.3.113:2455";
 export const DEFAULT_MANAGER_REF = "0056f770-e054-484b-a712-4cc036dacf6f";
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
+// Model for the review of the needs-you list, chosen by the owner on
+// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.
+export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
+export const DEFAULT_REVIEW_MS = 30 * MIN;
+// Sonnet took about 3 minutes on 13 questions, mostly thinking.
+export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
 
 export function defaultPaths(home = os.homedir()) {
   return {
@@ -147,6 +155,10 @@ function envFlag(value) {
   return /^(1|true|yes|on)$/i.test(String(value ?? "").trim());
 }
 
+function envOff(value) {
+  return /^(0|false|no|off)$/i.test(String(value ?? "").trim());
+}
+
 function envNumber(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -161,8 +173,9 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     : "observe";
   const selfSessionIds = [env.CLAUDE_CODE_SESSION_ID, env.CONDUCTOR_SESSION_ID, ...(overrides.selfSessionIds ?? [])]
     .filter(Boolean);
+  const enabled = overrides.enabled ?? envFlag(env.OPENAGI_FLEET_SUPERVISOR);
   return {
-    enabled: overrides.enabled ?? envFlag(env.OPENAGI_FLEET_SUPERVISOR),
+    enabled,
     mode,
     push: (overrides.push ?? String(env.OPENAGI_FLEET_PUSH ?? "").trim()) || null,
     lookbackHours: overrides.lookbackHours ?? envNumber(env.OPENAGI_FLEET_LOOKBACK_HOURS, DEFAULTS.lookbackHours),
@@ -177,6 +190,14 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},
     delivery: DELIVERY_MODES.includes(overrides.delivery) ? overrides.delivery : parseDeliveryMode(env.OPENAGI_FLEET_DELIVERY),
+    // The supervisor's review of its own needs-you list: on with the
+    // supervisor unless OPENAGI_FLEET_REVIEW=0.
+    review: {
+      enabled: overrides.review?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_REVIEW)),
+      model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL),
+      intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
+      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
+    },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
     bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env), ...(overrides.bins ?? {}) }
@@ -469,6 +490,7 @@ export async function openReadOnlyDb(filePath) {
  * @property {string} agentStatus         one of AGENT_STATUS
  * @property {string|null} lastActivityAt ISO
  * @property {string} lastAgentText       untrusted, redacted, <= excerptMax
+ * @property {string} lastAgentTail       the same message, <= reviewTailMax (self-review only)
  * @property {string|null} lastAgentAt
  * @property {string} lastUserText
  * @property {string|null} lastUserAt
@@ -504,6 +526,8 @@ export async function openReadOnlyDb(filePath) {
  * @property {{reviewedHead: boolean|null, sha: string|null}} codexReview
  * @property {{required: boolean|null, freshOnHead: boolean|null, sha: string|null}} qa
  * @property {string|null} updatedAt
+ * @property {string|null} mergedAt
+ * @property {string|null} closedAt
  */
 
 /**

@@ -577,3 +577,20 @@ test("many newer excluded transcripts never hide an older in-scope one", async (
   const threads = await listClaudeThreads(makeConfig(home, { limits: { maxThreads: 1 } }), { now: NOW, isPidAlive: () => false });
   assert.ok(threads.some((thread) => thread.id === "real-old" && !thread.excluded));
 });
+
+// Bug 5: an untitled transcript is named after its folder, never the owner's
+// last message or the session id.
+test("an untitled thread is titled with its folder", async (t) => {
+  const home = makeHome(t);
+  const cwd = "/Users/x/Dev/g2";
+  const id = "4396b7d2-da42-42e4-97b0-aca39b2d9a45";
+  const r = rowsFor(id, cwd);
+  writeTranscript(home, cwd, id, [
+    ...r.history(60 * MIN),
+    r.prompt("ship the mobile build to the distiller", iso(30 * MIN)),
+    r.text("Distiller still runs the old build. Want me to redeploy it?", iso(27 * MIN))
+  ], NOW - 27 * MIN);
+  const [thread] = await listClaudeThreads(makeConfig(home), { now: NOW, isPidAlive: () => false });
+  assert.equal(thread.title, "g2");
+  assert.equal(thread.lastUserText, "ship the mobile build to the distiller");
+});

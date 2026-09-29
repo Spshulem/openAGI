@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { uiIdentity } from "../src/fleet/ui-delivery.js";
-import { linkUiHosts, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
+import { clampText, linkUiHosts, resolveFleetConfig, shortHash, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   classifyLbError, cleanCodexUserText, listCodexThreads, parseRolloutTail, readCodexLbErrors
 } from "../src/fleet/sources/codex.js";
@@ -310,7 +310,7 @@ test("listCodexThreads reports unknown when the rollout file is gone", async (t)
 test("parseRolloutTail tracks a pending structured question until the owner replies", () => {
   const text = (rows) => rows.map((row) => JSON.stringify(row)).join("\n");
   const pending = parseRolloutTail(text([ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")]));
-  assert.deepEqual(pending.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"] });
+  assert.deepEqual(pending.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"], at: iso(9 * MIN) });
   const answered = parseRolloutTail(text([
     ev.ask("Reuse the branch?", 9 * MIN),
     ev.user("<send_user_message_question_reply> [{\"answer\":\"Reuse the branch (recommended)\"}]", 5 * MIN)
@@ -327,8 +327,8 @@ test("listCodexThreads keeps a structured question's text and options", async (t
   addThread(ctx, { id: "t-ask", lines: [ev.started("q", 10 * MIN), ask, ev.complete("q", 8 * MIN, "asked")] });
   addThread(ctx, { id: "t-free", lines: [ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")] });
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
-  assert.deepEqual(map["t-ask"].meta.pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] });
-  assert.deepEqual(map["t-free"].meta.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"] });
+  assert.deepEqual(map["t-ask"].meta.pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"], at: iso(9 * MIN) });
+  assert.deepEqual(map["t-free"].meta.pendingQuestion, { text: "Reuse the branch?", options: ["open thread"], at: iso(9 * MIN) });
 });
 
 test("cleanCodexUserText strips Codex Desktop wrappers", () => {
@@ -398,7 +398,7 @@ function attach(ctx, threadId, number, { at, headBranch = null, repo = "buildbet
       JSON.stringify({ url: `https://github.com/${repo}/pull/${number}`, root: null, headBranch }), at);
 }
 
-test("listCodexThreads ranks the thread's own attached PR first and owner links last", async (t) => {
+test("listCodexThreads ranks the newest attached PR first and owner links last", async (t) => {
   const ctx = makeHome(t);
   const idle = (turn) => [ev.started(turn, 30 * MIN), ev.complete(turn, 25 * MIN, "ok")];
   addThread(ctx, { id: "t-own", branch: "feature/jiminny-import-guardrails", lines: [
@@ -414,18 +414,42 @@ test("listCodexThreads ranks the thread's own attached PR first and owner links 
   addThread(ctx, { id: "t-tie", lines: idle("t1") });
   for (const number of [4811, 6237, 6453]) attach(ctx, "t-tie", number, { at: sec(100 * MIN) });
 
+  // Same second: the thread's own branch, then an unknown head, then another head.
+  addThread(ctx, { id: "t-same", branch: "feature/own", lines: idle("s1") });
+  attach(ctx, "t-same", 7003, { at: sec(100 * MIN), headBranch: "feature/other" });
+  attach(ctx, "t-same", 7002, { at: sec(100 * MIN) });
+  attach(ctx, "t-same", 7001, { at: sec(100 * MIN), headBranch: "feature/own" });
+
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
   assert.deepEqual(map["t-own"].prRefs, [
-    "buildbetter-app/buildbetter#6630",
-    "buildbetter-app/buildbetter#6200",
     "buildbetter-app/buildbetter#6100",
+    "buildbetter-app/buildbetter#6200",
+    "buildbetter-app/buildbetter#6630",
     "buildbetter-app/buildbetter#6376"
-  ], "own-branch attachment, unknown-head attachment, other-branch attachment, owner link; no browser-context URL");
+  ], "newest attachment first whatever its head; owner link last; no browser-context URL");
   assert.deepEqual(map["t-tie"].prRefs, [
     "buildbetter-app/buildbetter#6453",
     "buildbetter-app/buildbetter#6237",
     "buildbetter-app/buildbetter#4811"
   ]);
+  assert.deepEqual(map["t-same"].prRefs, [
+    "buildbetter-app/buildbetter#7001",
+    "buildbetter-app/buildbetter#7002",
+    "buildbetter-app/buildbetter#7003"
+  ]);
+});
+
+test("a thread that moved past its branch's merged PR is about the newest attachment (#5442 -> #6453)", async (t) => {
+  const ctx = makeHome(t);
+  addThread(ctx, { id: "t-moved", branch: "feature/interactive-reports-consolidation", lines: [
+    ev.started("m1", 30 * MIN), ev.ask("Set the credit price?", 26 * MIN), ev.complete("m1", 25 * MIN, "asked")
+  ] });
+  attach(ctx, "t-moved", 5442, { at: sec(14 * 24 * 60 * MIN), headBranch: "feature/interactive-reports-consolidation" });
+  attach(ctx, "t-moved", 6625, { at: sec(12 * 24 * 60 * MIN) });
+  for (const number of [4811, 6237, 6453]) attach(ctx, "t-moved", number, { at: sec(10 * 24 * 60 * MIN) });
+  const [thread] = await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) });
+  assert.equal(thread.prRefs[0], "buildbetter-app/buildbetter#6453");
+  assert.equal(thread.prRefs.at(-1), "buildbetter-app/buildbetter#5442");
 });
 
 test("listCodexThreads dates activity from the last turn row, not settings writes", async (t) => {
@@ -484,7 +508,7 @@ test("listCodexThreads exposes when an aborted turn was stopped", async (t) => {
 test("structured questions preserve string and labeled options", () => {
   for (const options of [["Starter", "Business annual (recommended)"], [{ label: "Starter", description: "Basic" }, { label: "Business annual (recommended)" }]]) {
     const row = { type: "response_item", payload: { type: "function_call", name: "request_user_input_async", arguments: JSON.stringify({ questions: [{ title: "Which plan?", options }] }) } };
-    assert.deepEqual(parseRolloutTail(JSON.stringify(row)).pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"] });
+    assert.deepEqual(parseRolloutTail(JSON.stringify(row)).pendingQuestion, { text: "Which plan?", options: ["Starter", "Business annual (recommended)"], at: null });
   }
 });
 
@@ -548,4 +572,105 @@ test("listCodexThreads flags a title shared with any unarchived Codex thread, ev
   const identity = uiIdentity(map["t-recent"], uiTargetFor(map["t-recent"]), Object.values(map));
   assert.equal(identity.ambiguous, true);
   assert.match(identity.reason, /share this title/);
+});
+
+// Bug 5: scheduled sweeps quote other chats' asks; they are not work threads.
+test("listCodexThreads excludes codex exec sweeps and chat-checker runs as automation", async (t) => {
+  const ctx = makeHome(t);
+  const idleLines = [ev.started("x", 30 * MIN), ev.complete("x", 25 * MIN, "| chat | state |\n| Citations | Out of credits: answer with credits |")];
+  const checker = "Current local time: 2026-09-28 07:00:02 PDT. Do not retry a chat before its visible reset time.\nYou are checking the user's existing agent chats after usage resets.";
+  addThread(ctx, { id: "t-exec", source: "exec", title: "Current local time: 2026-09-28 07:00:02 PDT.", firstUserMessage: "Run one sweep.", lines: idleLines });
+  addThread(ctx, { id: "t-checker", title: checker, firstUserMessage: checker, lines: idleLines });
+  addThread(ctx, { id: "t-real", name: "Improve Slack huddle detection", lines: idleLines });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  assert.equal(map["t-exec"].excluded, "automation");
+  assert.equal(map["t-checker"].excluded, "automation");
+  assert.equal(map["t-real"].excluded, null);
+  assert.equal(map["t-real"].meta.catalogName, "Improve Slack huddle detection");
+  assert.equal(map["t-checker"].meta.catalogName, null);
+});
+
+test("a ciphertext structured-question title is replaced by the agent's words or a neutral line", async (t) => {
+  const sealed = "gAAAAABqujkpRnnobDR_oyUGwgwolJFyyBdBHiotOEYKl36AQL4v-F48lnbJYWpMIJtvJ10DiQAS-pd8-cHA-mRJlrFUc54UcgVsoceW9MzzUOBh==";
+  const text = (rows) => rows.map((row) => JSON.stringify(row)).join("\n");
+  const bare = parseRolloutTail(text([ev.started("q", 10 * MIN), ev.ask(sealed, 9 * MIN)]));
+  assert.equal(bare.pendingQuestion.text, "Codex asked in the app");
+  assert.deepEqual(bare.pendingQuestion.options, ["open thread"]);
+
+  const ctx = makeHome(t);
+  const intro = `${"Checked the review notes. ".repeat(12)}Should I keep this as a report or fix it?`;
+  addThread(ctx, { id: "t-sealed", lines: [ev.started("q", 10 * MIN), ev.assistant(intro, 9.5 * MIN), ev.ask(sealed, 9 * MIN), ev.complete("q", 8 * MIN, "asked")] });
+  const [thread] = await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) });
+  const pending = thread.meta.pendingQuestion;
+  assert.doesNotMatch(pending.text, /gAAAAA/);
+  // The stand-in keeps the end of the message, where the ask is.
+  assert.match(pending.text, /Should I keep this as a report or fix it\?$/);
+  assert.ok(pending.text.length <= ctx.config.limits.bodyMax);
+});
+
+const SEALED_TITLE = "gAAAAABqujkpRnnobDR_oyUGwgwolJFyyBdBHiotOEYKl36AQL4v-F48lnbJYWpMIJtvJ10DiQAS-pd8-cHA-mRJlrFUc54UcgVsoceW9MzzUOBh==";
+const rollout = (rows) => rows.map((row) => JSON.stringify(row)).join("\n");
+
+// Review 4/13: a sealed ask the agent talked past, or ended its turn on, is
+// dropped unless the words standing in for it ask something.
+test("a sealed ask the agent moved past is dropped unless its stand-in asks", () => {
+  const status = "The type correction is committed as 6e94628a14. The functional regressions remain passing evidence.";
+  const before = [ev.started("q", 30 * MIN), ev.assistant(status, 29 * MIN), ev.ask(SEALED_TITLE, 28 * MIN)];
+  // #6896: a status line, the sealed ask, more work, then the handoff.
+  const movedOn = parseRolloutTail(rollout([...before,
+    ev.assistant("No additional user input is needed for the remaining checks.", 27 * MIN), ev.complete("q", 10 * MIN, "PR #6896 is code-complete and CI-green.")]));
+  assert.equal(movedOn.pendingQuestion, null);
+  // Ending the turn on it drops it too.
+  assert.equal(parseRolloutTail(rollout([...before, ev.complete("q", 27 * MIN, null)])).pendingQuestion, null);
+  // Nothing after it yet: it stays.
+  assert.equal(parseRolloutTail(rollout(before)).pendingQuestion?.sealed, true);
+  // The words before it ask something: it outlives more output and the turn end.
+  const asking = parseRolloutTail(rollout([
+    ev.started("q", 30 * MIN), ev.assistant(`${status} Should I keep this as a report or fix it?`, 29 * MIN), ev.ask(SEALED_TITLE, 28 * MIN),
+    ev.assistant("I'll hold here for your answer.", 27 * MIN), ev.complete("q", 26 * MIN, "I'll hold here for your answer.")
+  ]));
+  assert.match(asking.pendingQuestion?.text ?? "", /Should I keep this as a report or fix it\?$/);
+  // A readable structured ask is not dropped this way.
+  const plain = parseRolloutTail(rollout([
+    ev.started("q", 30 * MIN), ev.assistant(status, 29 * MIN), ev.ask("Reuse the branch?", 28 * MIN),
+    ev.assistant("Carrying on with the checks.", 27 * MIN), ev.complete("q", 26 * MIN, "done")
+  ]));
+  assert.equal(plain.pendingQuestion?.text, "Reuse the branch?");
+});
+
+// Review 7: a sealed ask keeps the key its raw title gave it before it had a
+// stand-in, so the owner's dismissal still matches; readable asks get none.
+test("a sealed ask is keyed on its raw title, not on the stand-in text", async (t) => {
+  const ctx = makeHome(t);
+  const lines = (intro) => [ev.started("q", 10 * MIN), ev.assistant(intro, 9.5 * MIN), ev.ask(SEALED_TITLE, 9 * MIN), ev.complete("q", 8 * MIN, intro)];
+  addThread(ctx, { id: "t-a", lines: lines("Checked the notes. Should I fix it?") });
+  addThread(ctx, { id: "t-b", lines: lines("Other words this time. Want me to fix it?") });
+  addThread(ctx, { id: "t-plain", lines: [ev.started("q", 10 * MIN), ev.ask("Reuse the branch?", 9 * MIN), ev.complete("q", 8 * MIN, "asked")] });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) }));
+  const legacy = shortHash(clampText(SEALED_TITLE, ctx.config.limits.bodyMax));
+  assert.notEqual(map["t-a"].meta.pendingQuestion.text, map["t-b"].meta.pendingQuestion.text);
+  assert.equal(map["t-a"].meta.pendingQuestion.key, legacy);
+  assert.equal(map["t-b"].meta.pendingQuestion.key, legacy);
+  assert.equal(map["t-plain"].meta.pendingQuestion.key, undefined);
+});
+
+// Review 17: a title is ciphertext only with real base64 traits.
+test("ciphertext titles need base64 traits; long slash paths stay readable", () => {
+  const asked = (title) => parseRolloutTail(JSON.stringify(ev.ask(title, 5 * MIN))).pendingQuestion;
+  const bytes = (n) => Buffer.from(Array.from({ length: n }, (_, index) => (index * 37 + 11) % 256));
+  const long = bytes(160).toString("base64");
+  const padded = bytes(73).toString("base64").replace(/\//g, "_");
+  assert.ok(long.length >= 200 && long.includes("/"));
+  assert.ok(padded.length < 200 && padded.endsWith("=="));
+  for (const title of [SEALED_TITLE, long, padded]) assert.equal(asked(title).sealed, true, title);
+  const readable = [
+    "/Volumes/Xtra/codex-worktrees/f808/bbapp/packages/apps/web-app/src/components/reports/detail-view",
+    "spencer/fleet-question-freshness-and-owner-labels-for-glasses-and-phone-follow-up-work",
+    "keep_the_legacy_report_generator_running_until_the_new_pipeline_has_been_verified_on_staging"
+  ];
+  for (const title of readable) {
+    assert.ok(title.length >= 80, title);
+    assert.equal(asked(title).text, title);
+    assert.equal(asked(title).sealed, undefined, title);
+  }
 });
