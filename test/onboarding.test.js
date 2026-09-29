@@ -2,8 +2,11 @@
 // reset configured values, saved secrets are visibly marked, and /health
 // exposes firstRun so the Mac app can walk a fresh install to the wizard.
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { renderWizard, isFirstRun } from "../src/setup-wizard.js";
+import { renderWizard, isFirstRun, saveEnv } from "../src/setup-wizard.js";
 import { createDefaultRuntime, createHostedInterface } from "../src/index.js";
 
 test("fresh wizard generates a token and uses defaults", () => {
@@ -12,6 +15,32 @@ test("fresh wizard generates a token and uses defaults", () => {
   assert.match(html, /value="claude-sonnet-4-6"/);
   assert.match(html, /value="gpt-5"/);
   assert.ok(!html.includes("✓ saved"), "no saved markers on a fresh install");
+});
+
+test("wizard distinguishes host-owned ChatGPT OAuth from Codex-owned login and API-key billing", () => {
+  const html = renderWizard({ existingEnv: {} });
+  assert.match(html, /value="openai-chatgpt"/);
+  assert.match(html, /value="openai-chatgpt"[^>]*disabled/);
+  assert.match(html, /OPENAGI_CHATGPT_MODEL/);
+  assert.match(html, /name="OPENAGI_CHATGPT_MODEL" value="" placeholder="Select an exact/);
+  const enabled = renderWizard({ existingEnv: { OPENAGI_CHATGPT_ENABLED: "1" } });
+  assert.match(enabled, /value="openai-chatgpt"(?![^>]*disabled)[^>]*>/);
+  assert.match(html, /OPENAGI_CHATGPT_REASONING_EFFORT/);
+  assert.match(html, /configured effort/i);
+  assert.match(html, /Codex credentials are not read/i);
+  assert.match(html, /OPENAGI_CHATGPT_CAPABILITY_TIER/);
+  assert.match(html, /provisional-chat-only/);
+  assert.match(html, /name="OPENAGI_CHATGPT_ENABLED" value="1"/);
+  assert.match(html, /effective effort.*unknown/i);
+  assert.match(html, /no OpenAGI or Codex tool effects/i);
+});
+
+test("wizard persists the explicit provisional ChatGPT OAuth opt-in", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-chatgpt-wizard-"));
+  try {
+    saveEnv({ dataDir, values: { OPENAGI_CHATGPT_ENABLED: "1" } });
+    assert.match(fs.readFileSync(path.join(dataDir, ".env"), "utf8"), /^OPENAGI_CHATGPT_ENABLED=1$/m);
+  } finally { fs.rmSync(dataDir, { recursive: true, force: true }); }
 });
 
 test("re-run wizard keeps the existing auth token instead of rotating it", () => {

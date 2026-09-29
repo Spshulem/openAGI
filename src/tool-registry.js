@@ -791,15 +791,22 @@ export function registerCoreTools(registry, runtime) {
       additionalProperties: false
     },
     handler: async (args) => {
-      process.env.OPENAGI_PROVIDER = args.preference;
+      if (!["auto", "anthropic", "openai"].includes(args.preference)) {
+        throw new Error("set_provider only accepts auto, anthropic, or openai; qualify Codex through owner administration first.");
+      }
       const { createModelProvider } = await import("./model-provider.js");
       if (runtime.agentHost) {
-        runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+        await runtime.agentHost.replaceModelProvider(createModelProvider({
+          preferred: args.preference,
+          dataDir: runtime.dataDir,
+          budgetGuard: runtime.budget
+        }), { waitForDrain: false });
       }
+      process.env.OPENAGI_PROVIDER = args.preference;
       // Persist
       try {
         const { saveEnv } = await import("./setup-wizard.js");
-        saveEnv({ values: { OPENAGI_PROVIDER: args.preference } });
+        saveEnv({ dataDir: runtime.dataDir, values: { OPENAGI_PROVIDER: args.preference } });
       } catch { /* ignore */ }
       return {
         preference: args.preference,

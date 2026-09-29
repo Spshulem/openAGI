@@ -10,11 +10,14 @@
 #
 # After the tunnel is up:
 #   1. Copy the public URL it prints (e.g. https://abc123.trycloudflare.com).
-#   2. Set OPENAGI_PUBLIC_URL=<that URL> in .openagi/.env and restart the daemon
+#   2. Make sure OPENAGI_AUTH_TOKEN is already configured. The tunnel is a
+#      public origin for webhooks; it is not a safe first-run setup or owner-chat
+#      provenance boundary.
+#   3. Set OPENAGI_PUBLIC_URL=<that URL> in .openagi/.env and restart the daemon
 #      (so Twilio signature verification can reconstruct the canonical URL).
-#   3. Paste <URL>/channels/twilio/webhook into your Twilio number's
+#   4. Paste <URL>/channels/twilio/webhook into your Twilio number's
 #      "A message comes in" webhook field.
-#   4. (Optional) For Telegram, register the webhook with:
+#   5. (Optional) For Telegram, register the webhook with:
 #        curl -F "url=<URL>/channels/telegram/webhook" \
 #             -F "secret_token=$TELEGRAM_WEBHOOK_SECRET" \
 #             "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook"

@@ -7,6 +7,14 @@
 #        ./scripts/install-systemd.sh user        # current user only (rootless)
 #        ./scripts/install-systemd.sh uninstall   # remove
 #
+# Optional:
+#   OPENAGI_SERVICE_DIR=/home/me/.local/share/openagi/current \
+#        ./scripts/install-systemd.sh user
+#
+# OPENAGI_SERVICE_DIR lets a release manager point the unit at an already
+# staged, validated release/current symlink without running the service from a
+# mutable checkout.
+#
 # After install:
 #   journalctl -u openagi -f       # tail logs (system)
 #   journalctl --user -u openagi -f # tail logs (user mode)
@@ -14,6 +22,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UNIT_PROJECT_DIR="${OPENAGI_SERVICE_DIR:-${PROJECT_DIR}}"
 NODE_BIN="${OPENAGI_NODE_BIN:-$(command -v node || true)}"
 MODE="${1:-system}"
 
@@ -23,6 +32,18 @@ if [[ -z "${NODE_BIN}" ]]; then
 fi
 
 UNIT_NAME="openagi.service"
+
+require_absolute_path() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "${value}" || "${value}" != /* || "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+    echo "ERROR: ${name} must be an absolute path without newlines." >&2
+    exit 1
+  fi
+}
+
+require_absolute_path OPENAGI_SERVICE_DIR "${UNIT_PROJECT_DIR}"
+require_absolute_path OPENAGI_NODE_BIN "${NODE_BIN}"
 
 build_unit() {
   cat <<EOF
@@ -34,8 +55,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${NODE_BIN} ${PROJECT_DIR}/examples/hosted-server.js
-WorkingDirectory=${PROJECT_DIR}
+ExecStart=${NODE_BIN} ${UNIT_PROJECT_DIR}/examples/hosted-server.js
+WorkingDirectory=${UNIT_PROJECT_DIR}
 EnvironmentFile=-${2}/.env
 Environment=OPENAGI_DATA_DIR=${2}
 # Restart=always (not on-failure): the setup wizard applies new settings by
@@ -49,18 +70,28 @@ StandardError=journal
 
 # Hardening (skipped in user mode where some are not honored)
 NoNewPrivileges=true
+RestrictNamespaces=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 # Writable: the data dir, AND the install dir itself — self-update
 # (openagi update / OPENAGI_AUTO_UPDATE) git-pulls the checkout, which
 # ProtectHome=read-only would otherwise block ("Read-only file system").
-ReadWritePaths=${2} ${PROJECT_DIR}
+ReadWritePaths=${2} ${UNIT_PROJECT_DIR}
 
 [Install]
 WantedBy=${1:-multi-user.target}
 EOF
 }
+
+if [[ "${OPENAGI_INSTALL_SYSTEMD_PRINT_UNIT:-0}" == "1" ]]; then
+  if [[ "${MODE}" == "user" ]]; then
+    build_unit default.target "${HOME}/.openagi"
+  else
+    build_unit multi-user.target "${UNIT_PROJECT_DIR}/.openagi"
+  fi
+  exit 0
+fi
 
 if [[ "${MODE}" == "uninstall" ]]; then
   if systemctl --user is-active "${UNIT_NAME}" &>/dev/null; then
@@ -91,7 +122,11 @@ if [[ "${MODE}" == "user" ]]; then
   mkdir -p "$HOME/.openagi"
   build_unit default.target "${HOME}/.openagi" > "$HOME/.config/systemd/user/${UNIT_NAME}"
   systemctl --user daemon-reload
-  systemctl --user enable --now "${UNIT_NAME}"
+  systemctl --user enable "${UNIT_NAME}"
+  # If the service already exists, enabling the unit leaves the old ExecStart
+  # process running. Restart explicitly so the just-written unit and release
+  # path are the bytes that systemd is supervising.
+  systemctl --user restart "${UNIT_NAME}"
   echo "Installed user service. Tail: journalctl --user -u openagi -f"
   exit 0
 fi
@@ -104,19 +139,20 @@ fi
 
 # Create dedicated user if missing
 if ! id -u openagi &>/dev/null; then
-  useradd --system --shell /usr/sbin/nologin --home-dir "${PROJECT_DIR}" openagi
+  useradd --system --shell /usr/sbin/nologin --home-dir "${UNIT_PROJECT_DIR}" openagi
   echo "Created system user 'openagi'."
 fi
-mkdir -p "${PROJECT_DIR}/.openagi"
-chown -R openagi:openagi "${PROJECT_DIR}/.openagi" 2>/dev/null || true
+mkdir -p "${UNIT_PROJECT_DIR}/.openagi"
+chown -R openagi:openagi "${UNIT_PROJECT_DIR}/.openagi" 2>/dev/null || true
 
-# System service runs as User=openagi, whose home is PROJECT_DIR, so its
-# data dir is the already-chowned ${PROJECT_DIR}/.openagi (NOT the root/sudo
+# System service runs as User=openagi, whose home is UNIT_PROJECT_DIR, so its
+# data dir is the already-chowned ${UNIT_PROJECT_DIR}/.openagi (NOT the root/sudo
 # invoker's ${HOME}, which the openagi user can't write).
-build_unit multi-user.target "${PROJECT_DIR}/.openagi" > "/etc/systemd/system/${UNIT_NAME}"
+build_unit multi-user.target "${UNIT_PROJECT_DIR}/.openagi" > "/etc/systemd/system/${UNIT_NAME}"
 # Pin User=openagi for system mode by appending — done inline so build_unit stays portable
 sed -i '/^\[Service\]/a User=openagi\nGroup=openagi' "/etc/systemd/system/${UNIT_NAME}"
 
 systemctl daemon-reload
-systemctl enable --now "${UNIT_NAME}"
+systemctl enable "${UNIT_NAME}"
+systemctl restart "${UNIT_NAME}"
 echo "Installed system service. Tail: journalctl -u openagi -f"

@@ -3431,29 +3431,38 @@ test("drafts: send endpoint routes through a real channel and marks sent only on
     },
     events: { on: () => {}, emit: () => {} }
   };
-  const app = createHostedInterface(fakeRuntime, { port: 0 });
-  const address = await app.listen();
+  // Earlier integration tests intentionally exercise persistent environment
+  // updates. This endpoint fixture must retain its unauthenticated/private
+  // contract independently of those process-global values.
+  const savedPublicUrl = process.env.OPENAGI_PUBLIC_URL;
+  delete process.env.OPENAGI_PUBLIC_URL;
+  let app;
+  try {
+    app = createHostedInterface(fakeRuntime, { port: 0, authToken: "", publicUrl: "" });
+    const address = await app.listen();
+    const d = drafts.add({ title: "Heads up", body: "on my way", kind: "message", recipient: "+155****0000" });
 
-  const d = drafts.add({ title: "Heads up", body: "on my way", kind: "message", recipient: "+15550000" });
+    // Bad channel rejected (email has no transport).
+    let resp = await fetch(`${address.url}/drafts/${d.id}/send`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "email", target: "x@y.com" })
+    });
+    assert.equal(resp.status, 400);
+    assert.equal(drafts.get(d.id).status, "pending", "not sent on bad channel");
 
-  // Bad channel rejected (email has no transport).
-  let resp = await fetch(`${address.url}/drafts/${d.id}/send`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "email", target: "x@y.com" })
-  });
-  assert.equal(resp.status, 400);
-  assert.equal(drafts.get(d.id).status, "pending", "not sent on bad channel");
-
-  // Real channel delivers + marks sent.
-  resp = await fetch(`${address.url}/drafts/${d.id}/send`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "telegram", target: "+15550000" })
-  });
-  assert.equal(resp.status, 200);
-  assert.equal(delivered.length, 1);
-  assert.equal(delivered[0].text, "on my way");
-  assert.equal(drafts.get(d.id).status, "sent");
-
-  await app.close();
-  fs.rmSync(dir, { recursive: true });
+    // Real channel delivers + marks sent.
+    resp = await fetch(`${address.url}/drafts/${d.id}/send`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel: "telegram", target: "+155****0000" })
+    });
+    assert.equal(resp.status, 200);
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].text, "on my way");
+    assert.equal(drafts.get(d.id).status, "sent");
+  } finally {
+    await app?.close();
+    if (savedPublicUrl === undefined) delete process.env.OPENAGI_PUBLIC_URL;
+    else process.env.OPENAGI_PUBLIC_URL = savedPublicUrl;
+    fs.rmSync(dir, { recursive: true });
+  }
 });
 
 test("auth: verifyBuildBetterWebhook fails closed without a secret, matches header or query", async () => {
