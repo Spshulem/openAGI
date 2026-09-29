@@ -71,7 +71,7 @@ export function identityToken(value) {
 // Role phrases OCU prints before an element's label (AX role descriptions).
 // Longest first so "search text field" is not read as "search".
 const ROLE_PHRASES = [
-  "search text field", "secure text field", "text entry area", "standard window", "disclosure triangle", "pop up button",
+  "search text field", "secure text field", "text entry area", "standard window", "disclosure triangle", "pop up button", "html content",
   "menu bar item", "radio button", "menu button", "outline row", "scroll area", "value indicator", "static text", "text field",
   "text area", "text view", "check box", "combo box", "menu item", "tab group", "split group", "web area", "scroll bar",
   "heading", "button", "link", "row", "cell", "tab", "group", "image", "list", "table", "outline", "toolbar", "dialog", "sheet",
@@ -80,6 +80,9 @@ const ROLE_PHRASES = [
 const FIELD_MARKER = /(?:^|,?\s+)(Value|Placeholder|ID|Description|Help|Title|URL): /g;
 const EDITABLE_ROLES = new Set(["text entry area", "text area", "text field", "text view", "combo box"]);
 const HEADING_ROLE = /^heading$/;
+// The page itself: Codex labels it with the open thread's title, Conductor
+// puts the open workspace and session ids in its URL.
+const WEB_AREA_ROLE = /^(html content|web area)$/;
 const BUTTON_ROLE = /button$/;
 const COMPOSER_HINT = /composer|message|prompt|reply|follow[- ]?up|ask (?:codex|anything)|type a|send a/i;
 const STOP_LABEL = /^(stop|stop generating|stop response|stop agent|interrupt|cancel turn)\b/i;
@@ -238,21 +241,44 @@ function labelToken(element) {
 export function verifyIdentity(state, identity) {
   const tokens = identity?.tokens ?? [];
   if (!state) return { ok: false, reason: "no app state" };
+  const webAreas = state.elements.filter((element) => WEB_AREA_ROLE.test(element.role));
+  // Conductor's page URL names the open workspace and session: exact proof,
+  // whatever the sidebar or tab titles say.
+  if (identity?.ids) {
+    const shownIds = webAreas.map((element) => conductorIds(element.fields.url)).find((ids) => ids.workspaceId);
+    if (shownIds) {
+      if (shownIds.workspaceId === identity.ids.workspaceId && shownIds.sessionId === identity.ids.sessionId) return { ok: true, reason: null };
+      return { ok: false, reason: shownIds.sessionId ? "could not verify thread: another session is open" : "could not verify thread: no session tab open" };
+    }
+  }
   if (!tokens.length) return { ok: false, reason: "nothing to verify the thread by" };
   const title = normalizeUiText(state.windowTitle).toLowerCase();
   const selected = state.elements.filter((element) => element.selected);
   const headings = state.elements.filter((element) => HEADING_ROLE.test(element.role));
-  const shown = new Set([identityToken(state.windowTitle), ...selected.map(labelToken)].filter(Boolean));
+  // Exactly the page label, never text inside it: a transcript can name
+  // every other thread.
+  const pages = webAreas.map(labelToken).filter(Boolean);
+  const shown = new Set([identityToken(state.windowTitle), ...selected.map(labelToken), ...pages].filter(Boolean));
   for (const other of identity?.conflicts ?? []) {
     if (!tokens.includes(other) && shown.has(other)) return { ok: false, reason: "could not verify thread: another thread is open" };
   }
   for (const token of tokens) {
     const found = title.includes(token)
       || selected.some((element) => element.search.includes(token))
-      || headings.some((element) => labelToken(element) === token);
+      || headings.some((element) => labelToken(element) === token)
+      || pages.includes(token);
     if (!found) return { ok: false, reason: `could not verify thread: "${token}" is not the open thread` };
   }
   return { ok: true, reason: null };
+}
+
+// Workspace and session ids from a Conductor page URL, e.g.
+// tauri://localhost/repository/<r>/workspace/<w>?activeTabType=session&sessionId=<s>
+export function conductorIds(url) {
+  const text = String(url ?? "");
+  const workspaceId = /\/workspace\/([\w-]{1,80})(?:[/?#]|$)/.exec(text)?.[1] ?? null;
+  const sessionId = /[?&]sessionId=([\w-]{1,80})(?:&|#|$)/.exec(text)?.[1] ?? null;
+  return { workspaceId, sessionId };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +291,31 @@ function isUntitled(value, extra = []) {
 
 const distinct = (values, mine) => [...new Set(values.filter((value) => value && !mine.includes(value)))];
 
+// Names that prove a Conductor session when its page shows no URL.
+function conductorIdentity(target, others) {
+  const blocked = (reason, ambiguous = true) => ({ tokens: [], conflicts: [], ambiguous, reason });
+  const workspace = identityToken(target.workspace);
+  if (!workspace) return blocked("no workspace name to verify", false);
+  const elsewhere = others.filter(({ target: t }) => t.workspaceId !== target.workspaceId);
+  if (elsewhere.some(({ target: t }) => identityToken(t.workspace) === workspace)) return blocked("ambiguous: two workspaces share this name");
+  const siblings = others.filter(({ target: t }) => t.workspaceId === target.workspaceId && t.sessionId !== target.sessionId);
+  const workspaceConflicts = elsewhere.map(({ target: t }) => identityToken(t.workspace));
+  // One tab: the workspace name proves it. More tabs, or a count the
+  // source could not read: the tab title must be shown too.
+  if (!siblings.length && target.sessionCount === 1) {
+    return { tokens: [workspace], conflicts: distinct(workspaceConflicts, [workspace]), ambiguous: false, reason: null };
+  }
+  const title = identityToken(target.title);
+  if (isUntitled(target.title, [target.workspace, target.sessionId])) {
+    return blocked("ambiguous: several sessions in the workspace and this one has no title");
+  }
+  if (target.titleShared || siblings.some(({ target: t }) => identityToken(t.title) === title)) {
+    return blocked("ambiguous: two sessions share this title");
+  }
+  const siblingTitles = siblings.map(({ target: t }) => identityToken(t.title));
+  return { tokens: [workspace, title], conflicts: distinct([...workspaceConflicts, ...siblingTitles], [workspace, title]), ambiguous: false, reason: null };
+}
+
 // threads: every thread the supervisor knows, to detect shared names and to
 // recognise another thread being open (conflicts).
 export function uiIdentity(thread, target, threads = []) {
@@ -274,30 +325,22 @@ export function uiIdentity(thread, target, threads = []) {
     .filter((entry) => entry.target && entry.target.app === target.app && entry.target.targetKey !== target.targetKey);
   const blocked = (reason, ambiguous = true) => ({ tokens: [], conflicts: [], ambiguous, reason });
   if (target.app === "conductor") {
-    const workspace = identityToken(target.workspace);
-    if (!workspace) return blocked("no workspace name to verify", false);
-    const elsewhere = others.filter(({ target: t }) => t.workspaceId !== target.workspaceId);
-    if (elsewhere.some(({ target: t }) => identityToken(t.workspace) === workspace)) return blocked("ambiguous: two workspaces share this name");
-    const siblings = others.filter(({ target: t }) => t.workspaceId === target.workspaceId && t.sessionId !== target.sessionId);
-    const workspaceConflicts = elsewhere.map(({ target: t }) => identityToken(t.workspace));
-    // One tab: the workspace name proves it. More tabs, or a count the
-    // source could not read: the tab title must be shown too.
-    if (!siblings.length && target.sessionCount === 1) {
-      return { tokens: [workspace], conflicts: distinct(workspaceConflicts, [workspace]), ambiguous: false, reason: null };
+    const legacy = conductorIdentity(target, others);
+    // The page URL proves the session by id, so shared or missing names do
+    // not matter there; the names stay for Conductor builds without it.
+    if (target.workspaceId && target.sessionId) {
+      const tab = isUntitled(target.title, [target.workspace, target.sessionId]) ? null : identityToken(target.title);
+      return { ...legacy, ids: { workspaceId: target.workspaceId, sessionId: target.sessionId }, tab, ambiguous: false, reason: null };
     }
-    const title = identityToken(target.title);
-    if (isUntitled(target.title, [target.workspace, target.sessionId])) {
-      return blocked("ambiguous: several sessions in the workspace and this one has no title");
-    }
-    if (target.titleShared || siblings.some(({ target: t }) => identityToken(t.title) === title)) {
-      return blocked("ambiguous: two sessions share this title");
-    }
-    const siblingTitles = siblings.map(({ target: t }) => identityToken(t.title));
-    return { tokens: [workspace, title], conflicts: distinct([...workspaceConflicts, ...siblingTitles], [workspace, title]), ambiguous: false, reason: null };
+    return legacy;
   }
   const title = identityToken(target.title);
   if (!title || /^codex [0-9a-f-]{8}$/i.test(title)) return blocked("no thread title to verify", false);
-  if (target.titleShared || others.some(({ target: t }) => identityToken(t.title) === title)) return blocked("ambiguous: two threads share this title");
+  if (target.titleShared || others.some(({ target: t }) => identityToken(t.title) === title)) {
+    // The title cannot tell the twins apart; only a deep link by id that
+    // visibly moves the app onto that title can (see steps).
+    return { ...blocked("ambiguous: two threads share this title"), tokens: [title], shared: true };
+  }
   return { tokens: [title], conflicts: distinct(others.map(({ target: t }) => identityToken(t.title)), [title]), ambiguous: false, reason: null };
 }
 
@@ -604,6 +647,9 @@ export function createUiDriver({
   // may add text after it), never a link, and only when exactly one matches;
   // a label inside a row clicks the row.
   async function navigateByClicks(ctx, state, identity, signal) {
+    if (identity.ids && state.elements.some((element) => WEB_AREA_ROLE.test(element.role) && conductorIds(element.fields.url).workspaceId)) {
+      return navigateConductor(ctx, state, identity, signal);
+    }
     for (const token of identity.tokens) {
       if (verifyIdentity(state, { tokens: [token] }).ok) continue;
       const matches = state.elements.filter((element) => {
@@ -621,6 +667,26 @@ export function createUiDriver({
     }
   }
 
+  // Conductor: the sidebar link to exactly this workspace (an in-app
+  // tauri://localhost link, never an outside one), then the session's tab
+  // when exactly one tab carries its title. The page URL then proves it.
+  async function navigateConductor(ctx, state, identity, signal) {
+    const { workspaceId } = identity.ids;
+    const shown = () => state.elements.filter((element) => WEB_AREA_ROLE.test(element.role)).map((element) => conductorIds(element.fields.url)).find((ids) => ids.workspaceId);
+    if (shown()?.workspaceId !== workspaceId) {
+      const links = state.elements.filter((element) => element.role === "link"
+        && /\]\(tauri:\/\/localhost\/repository\/[\w-]+\/workspace\/([\w-]+)\)$/.exec(element.label)?.[1] === workspaceId);
+      if (links.length !== 1) return;
+      await click(ctx, links[0], signal);
+      await sleep(limits.uiPollMs);
+      state = await readState(ctx, signal);
+    }
+    if (!identity.tab || shown()?.sessionId === identity.ids.sessionId) return;
+    const tabs = state.elements.filter((element) => element.role === "tab" && element.search.includes(identity.tab));
+    if (tabs.length !== 1) return;
+    await click(ctx, tabs[0], signal);
+  }
+
   async function steps(request, signal, ctx) {
     const { target, identity = { tokens: [] } } = request;
     const text = ctx.text;
@@ -632,8 +698,9 @@ export function createUiDriver({
     // 0. Readiness, fresh.
     const ready = await readiness();
     if (!ready.ready) return outcome(ctx, "blocked", `computer use not ready: ${ready.detail}`);
-    if (identity.ambiguous) return outcome(ctx, "blocked", identity.reason ?? "ambiguous thread");
-    if (!identity.tokens?.length) return outcome(ctx, "blocked", identity.reason ?? "nothing to verify the thread by");
+    // A shared title goes on only through its id link (checked below).
+    if (identity.ambiguous && !(identity.shared && target.deepLink)) return outcome(ctx, "blocked", identity.reason ?? "ambiguous thread");
+    if (!identity.tokens?.length && !identity.ids) return outcome(ctx, "blocked", identity.reason ?? "nothing to verify the thread by");
 
     // 1. Presence: never launch the app; never type while the owner uses it.
     const running = await presence.appRunning(target.bundleId);
@@ -648,6 +715,12 @@ export function createUiDriver({
     ctx.transport = makeTransport({ timeoutMs: ctx.stepTimeoutMs });
     let state = await readState(ctx, signal);
     let verified = verifyIdentity(state, identity);
+    if (identity.shared) {
+      // A twin may be the one on screen: only the id link, while the owner
+      // is away, starting from another thread, proves which one opened.
+      if (!ownerWasIdle) return outcome(ctx, "blocked", identity.reason);
+      if (verified.ok) return outcome(ctx, "blocked", `${identity.reason}; a thread with that title is already open`);
+    }
     if (!verified.ok) {
       if (ownerWasIdle) {
         // A deep link can bring the app forward; only while the owner is away.
