@@ -854,6 +854,10 @@ test("the app holding secure input is named in the not-ready reason", async () =
   assert.equal(session.secureInput, true);
   assert.equal(session.secureInputPid, 56400);
   assert.equal(parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=0})').secureInputPid, null);
+  // Fast user switching: an off-console session first must not hide the holder.
+  const multi = parseConsoleSession('"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=0,"kCGSSessionOnConsoleKey"=No},{"kCGSSessionSecureInputPID"=812,"kCGSSessionOnConsoleKey"=Yes})');
+  assert.equal(multi.secureInput, true);
+  assert.equal(multi.secureInputPid, 812);
   const probe = createPresenceProbe({ run: async (cmd) => ({ code: 0, stdout: cmd === "ps" ? "/Applications/BuildBetter Staging.app/Contents/MacOS/BuildBetter Staging\n" : '"IOConsoleUsers" = ({"kCGSSessionSecureInputPID"=56400,"kCGSSessionOnConsoleKey"=Yes})' }) });
   assert.equal((await probe.session()).secureInputApp, "BuildBetter Staging");
   const driver = createUiDriver({ config: { bins: { ocu: "/fake/ocu" }, limits: { ...DEFAULTS } }, probe: fakeProbe({ screen: { locked: false, secureInput: true, secureInputApp: "BuildBetter Staging", onConsole: true } }), binaryReady: () => true, computerUseEnabled: () => true, permissionProbe: async () => ({ accessibility: true, screenRecording: true }) });

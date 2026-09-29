@@ -380,9 +380,14 @@ function resolveNudge(ctx, intent, base) {
   if (attempts >= maxAttempts) return stuckDecision(ctx, playbook, vars, attempts, decision);
   const route = chooseRoute(thread, ctx.mode, ctx.delivery);
   if (!route) {
+    // No route only because computer use cannot type right now (a locked
+    // screen, secure input), in either computer-use mode: the supervisor
+    // tells the owner why once it has waited a while.
+    const ui = deliveryOf(ctx.delivery);
+    const uiBlocked = ui.mode !== "cli" && ui.ready === false && Boolean(uiTargetFor(thread));
     const waitUi = uiWaitReason(thread, ctx.delivery);
-    if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}` };
-    return unreachableDecision(ctx, decision);
+    if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
+    return { ...unreachableDecision(ctx, decision), uiBlocked };
   }
   return { ...decision, action: "nudge", route, message: renderTemplate(playbook.body, vars) };
 }
@@ -426,7 +431,7 @@ function deliveryHint(reason) {
 function undeliveredDecision(ctx, decision, streak) {
   const minutesStuck = minutes(ctx.now - Date.parse(streak.since));
   return {
-    ...decision, action: "ask-user", reason: `can't deliver: ${streak.reason}`,
+    ...decision, action: "ask-user", reason: `can't deliver: ${streak.reason}.${deliveryHint(streak.reason)}`,
     question: question(ctx, `${ctx.facts.label} stopped. Can't nudge it. Nudge it?`,
       `${ctx.facts.label} needs "${decision.playbook}". ${streak.count} sends failed over ${minutesStuck}m: ${streak.reason}.${deliveryHint(streak.reason)}`,
       ["done", "skip"], `deliver:${ctx.thread.key}`, "deliver")

@@ -364,7 +364,9 @@ export function parseIdleMs(stdout) {
 export function parseConsoleSession(stdout) {
   const text = String(stdout ?? "");
   if (!/IOConsoleUsers|IOConsoleLocked/.test(text)) return null;
-  const securePid = Number(/"kCGSSessionSecureInputPID"\s*=\s*(\d+)/.exec(text)?.[1] ?? 0);
+  // Every session dictionary counts (fast user switching lists several):
+  // any holder blocks typing.
+  const securePid = [...text.matchAll(/"kCGSSessionSecureInputPID"\s*=\s*(\d+)/g)].map((match) => Number(match[1])).find((pid) => pid > 0) ?? 0;
   return {
     locked: /"IOConsoleLocked"\s*=\s*Yes/.test(text) || /"CGSSessionScreenIsLocked"\s*=\s*Yes/.test(text),
     secureInput: securePid > 0,

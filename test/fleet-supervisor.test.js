@@ -1909,7 +1909,8 @@ test("a thread nudges keep failing to reach backs off, then the owner is told on
   assert.equal(delivered.length, 3);
   const asks = supervisor.store.openQuestions().filter((q) => q.kind === "deliver");
   assert.equal(asks.length, 1);
-  assert.match(asks[0].body, /3 sends failed/);
+  assert.equal(asks[0].dedupeKey, "deliver:group", "one grouped question, even for one thread");
+  assert.match(asks[0].body, /ambiguous: two threads share this title/);
   assert.match(asks[0].body, /rename or archive one/);
   // One question, kept while it stays true (the notifier dedupes the push).
   assert.equal(new Set(notified.filter((q) => q.kind === "deliver").map((q) => q.id)).size, 1);
@@ -1945,6 +1946,33 @@ test("the review never clears the supervisor's own can't-deliver finding", async
   assert.ok(model.calls.every((call) => call.entries.every((entry) => entry.id !== ask.id)), "never sent to the review");
 });
 
+test("the pause clock starts only when a nudge waits, not when the screen merely locked hours ago", async (t) => {
+  let now = NOW;
+  let stalled = false;
+  const thread = () => makeThread({ agentStatus: stalled ? "stalled" : "running", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [thread()] } });
+  await supervisor.tick({ reason: "test" });
+  now += 3 * 60 * MIN;
+  stalled = true;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), undefined);
+  now += 31 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.match(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use").body, /for 31m/);
+});
+
+test("computer-use-first: a thread with no CLI fallback waiting on the UI counts toward the pause alert", async (t) => {
+  let now = NOW;
+  const locked = makeThread({ writerLocked: true, agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN), meta: { originator: "Codex Desktop" } });
+  const driver = { readiness: async () => ({ ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [locked], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick({ reason: "test" });
+  now += 31 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.ok(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"));
+});
+
 test("computer use unable to type for 30 min tells the owner once why, and the question closes when typing works", async (t) => {
   let now = NOW;
   let ready = false;
@@ -1966,7 +1994,7 @@ test("computer use unable to type for 30 min tells the owner once why, and the q
   assert.equal(supervisor.store.question(q.id).status, "resolved");
 });
 
-test("several threads nudges can't reach become one grouped question", () => {
+test("threads nudges can't reach are always one grouped question, so an answer holds as the set changes", () => {
   const byKey = new Map([["codex:a", makeThread({ key: "codex:a", id: "a" })], ["codex:b", makeThread({ key: "codex:b", id: "b", prRefs: ["acme/app#8"] })]]);
   const ask = (key) => ({ threadKey: key, action: "ask-user", playbook: "resume", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x stopped. Can't nudge it. Nudge it?", body: "3 sends failed", options: ["done", "skip"] } });
   const out = groupQuestions([ask("codex:a"), ask("codex:b")], byKey);
@@ -1974,4 +2002,34 @@ test("several threads nudges can't reach become one grouped question", () => {
   assert.equal(out[0].dedupeKey, "deliver:group");
   assert.deepEqual(out[0].threadKeys, ["codex:a", "codex:b"]);
   assert.match(out[0].title, /^2 stopped/);
+  // One thread left keeps the same key, so an owner answer still covers it.
+  const one = groupQuestions([{ ...ask("codex:b"), reason: "can't deliver: could not verify thread. The app would not show this thread." }], byKey);
+  assert.equal(one.length, 1);
+  assert.equal(one[0].dedupeKey, "deliver:group");
+  assert.match(one[0].title, /^1 stopped\. .* Nudge it\?$/);
+  assert.match(one[0].body, /\(could not verify thread\. The app would not show this thread\.\)/);
+});
+
+test("the owner's skip on the delivery group holds after one of its threads recovers", async (t) => {
+  let now = NOW;
+  const a = makeThread({ key: "codex:a", id: "a", cwd: "/work/a", agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const b = makeThread({ key: "codex:b", id: "b", cwd: "/work/b", agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const threads = [a, b];
+  const { supervisor, notified } = fixture(t, {
+    mode: "auto", threads, now: () => now,
+    deps: {
+      listCodexThreads: async () => threads,
+      executor: { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "could not verify thread", actionId: null }), inFlight: () => [], whenIdle: async () => {} }
+    }
+  });
+  for (let i = 0; i < 12; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  const group = supervisor.store.openQuestions().find((q) => q.dedupeKey === "deliver:group");
+  assert.deepEqual([...group.threadKeys].sort(), ["codex:a", "codex:b"]);
+  await supervisor.answerQuestion(group.id, "skip");
+  // Thread a recovers; b still fails. No new question for b.
+  threads.splice(0, 1, { ...a, agentStatus: "running", lastActivityAt: new Date(now).toISOString(), lastAgentAt: new Date(now).toISOString() });
+  const before = new Set(notified.map((q) => q.id));
+  for (let i = 0; i < 3; i += 1) { await supervisor.tick({ reason: "test" }); now += 5 * MIN; }
+  assert.equal(supervisor.store.openQuestions().filter((q) => q.kind === "deliver").length, 0);
+  assert.equal(notified.filter((q) => !before.has(q.id) && q.kind === "deliver").length, 0);
 });

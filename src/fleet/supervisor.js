@@ -87,7 +87,9 @@ function emptyBb3() {
 const GROUPED_KINDS = Object.freeze({
   limit: { dedupeKey: "limit:group", options: ["wait", "added"], match: ["wait", "added"], title: (n, reset) => `${n} threads capped. Reset ${reset}. Add acct?`, body: (labels) => `Waiting on reset: ${labels}.` },
   open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` },
-  deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], title: (n) => `${n} stopped. Nudges can't get through. Nudge them?`, body: (labels) => `Sends keep failing: ${labels}.` }
+  // Always one question, even for one thread, so the owner's answer holds
+  // while the set of failing threads changes under it.
+  deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
 const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck"]);
 // Computer use unable to type this long, with nudges waiting on it: the owner
@@ -95,10 +97,8 @@ const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck"]);
 // question closes itself when typing works again.
 const PAUSED_ASK_MS = 30 * 60_000;
 
-function pausedDeliveryDecision(delivery, items, since, now) {
-  if (!since || now - since < PAUSED_ASK_MS) return null;
-  const waiting = items.filter(({ decision }) => /computer use not ready/.test(String(decision?.reason ?? ""))).length;
-  if (!waiting) return null;
+function pausedDeliveryDecision(delivery, waiting, since, now) {
+  if (!since || !waiting || now - since < PAUSED_ASK_MS) return null;
   const minutes = Math.round((now - since) / 60_000);
   return {
     threadKey: "infra:computer-use", state: "infra", action: "ask-user", playbook: null, message: null, blockers: [],
@@ -154,16 +154,21 @@ export function groupQuestions(asks, byKey) {
     out.push(single(decision));
   }
   for (const [kind, list] of Object.entries(groups)) {
-    if (list.length === 1) out.push(single(list[0]));
-    if (list.length < 2) continue;
     const spec = GROUPED_KINDS[kind];
+    const minSize = spec.minSize ?? 2;
+    if (list.length === 1 && minSize > 1) out.push(single(list[0]));
+    if (!list.length || list.length < minSize) continue;
     const threads = list.map((decision) => byKey.get(decision.threadKey)).filter(Boolean);
+    // A delivery failure names its reason, so the owner knows what to fix.
+    const labels = kind === "deliver"
+      ? list.map((decision) => `${threadLabel(byKey.get(decision.threadKey))} (${String(decision.reason ?? "").replace(/^can't deliver: /, "")})`).join(", ")
+      : threads.map(threadLabel).join(", ");
     const resets = threads.map((thread) => thread.error?.resetAt).filter(Boolean).sort();
     out.push({
       kind, dedupeKey: spec.dedupeKey, options: spec.options, playbook: null, threadKey: null, prRef: null,
       threadKeys: list.map((decision) => decision.threadKey),
       title: spec.title(list.length, formatReset(resets[0])),
-      body: spec.body(threads.map(threadLabel).join(", "))
+      body: spec.body(labels)
     });
   }
   return out;
@@ -697,9 +702,6 @@ export class FleetSupervisor {
     const mutedKeys = store.mutedKeys();
     // Computer-use readiness, once per tick; the driver re-checks at each send.
     const delivery = await this.probeDelivery();
-    // How long computer use has been unable to type, for telling the owner.
-    if (delivery.mode !== "cli" && delivery.ready === false) this.notReadySince ??= started;
-    else this.notReadySince = null;
     const items = [];
     for (const thread of inScope) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
@@ -726,7 +728,11 @@ export class FleetSupervisor {
     const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
-    const paused = pausedDeliveryDecision(delivery, items, this.notReadySince, started);
+    // How long a nudge has waited on computer use, for telling the owner.
+    const uiBlocked = items.filter(({ decision }) => decision.uiBlocked).length;
+    if (uiBlocked && delivery.ready === false) this.notReadySince ??= started;
+    else this.notReadySince = null;
+    const paused = pausedDeliveryDecision(delivery, uiBlocked, this.notReadySince, started);
     if (paused) infraDecisions.push(paused);
     const health = infraHealth(infra, { config, now: started });
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
