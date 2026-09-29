@@ -328,3 +328,31 @@ test("answering a supervisor question from the glasses uses its fixed choices", 
   assert.deepEqual(status.threads.map(r => r.name), ["apia", "cairo"]);
   assert.equal(status.needsYou, 1);
 });
+
+test("dismissing a supervisor question on the glasses closes it on the fleet computer; snooze stays local", async (t) => {
+  const { runtime, call, outreach, now, advance } = fixture(t);
+  const at = new Date(now()).toISOString();
+  const question = (id, ref) => ({ id, status: "unseen", createdAt: at, sourceRef: { kind: "fleet", id: ref }, title: `Merge ${ref}?`, summary: "", needsDecision: true, actions: ["merged", "dismiss"] });
+  outreach.push(question("o-1", "fq_1"), question("o-2", "fq_2"), question("o-3", "fq_3"),
+    { id: "o-mail", status: "unseen", createdAt: at, sourceRef: { kind: "email", id: "m1" }, title: "Invoice", summary: "", needsDecision: true, actions: [] });
+  runtime.outreach.get = (id) => outreach.find(i => i.id === id);
+  const dismissed = [];
+  let offline = false;
+  runtime.fleetSupervisor = { dismissQuestion: async (id) => { dismissed.push(id); if (offline) throw new Error("Fleet computer unavailable"); return { id, status: "dismissed" }; } };
+  call({ op: "configure", settings: { enabled: true } });
+  call({ op: "snooze", id: "o-1" });
+  call({ op: "dismiss", id: "o-mail" });
+  assert.deepEqual(dismissed, []);
+  advance(3600_000);
+  call({ op: "dismiss", id: "o-1" });
+  assert.deepEqual(dismissed, ["fq_1"]);
+  // Computer offline: the glasses still drop it.
+  offline = true;
+  assert.equal(call({ op: "dismiss", id: "o-2" }).ok, true);
+  await new Promise(setImmediate);
+  assert.deepEqual(dismissed, ["fq_1", "fq_2"]);
+  // A local supervisor that throws cannot fail the glasses dismissal either.
+  runtime.fleetSupervisor = { dismissQuestion: () => { throw new Error("store busy"); } };
+  assert.equal(call({ op: "dismiss", id: "o-3" }).ok, true);
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
+});

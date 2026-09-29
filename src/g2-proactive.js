@@ -145,7 +145,9 @@ export class G2Proactive {
         n.marks[item.id] = mark;
         // Bound dedup metadata; source feed itself excludes resolved/old items.
         const keys = Object.keys(n.marks); for (const key of keys.slice(0, Math.max(0, keys.length - 1000))) delete n.marks[key];
-        this.save(); return { ok: true, notify: body.op === "notify" };
+        this.save();
+        if (body.op === "dismiss" && item.supervisor) this.dismissFleet(item.id);
+        return { ok: true, notify: body.op === "notify" };
       }
       case "accept-task": {
         if (body.confirm !== true) reject("Confirm this suggested task first");
@@ -259,6 +261,16 @@ export class G2Proactive {
     n.marks[body.id] = { ...(n.marks[body.id] ?? {}), dismissed: true };
     this.save();
     return { ok: true, detail: clean(result.delivery?.detail ?? "Answered", 200) };
+  }
+  // Dismissing a supervisor question on the glasses closes it on the fleet
+  // computer too, as the phone's dismiss does. Fire and forget: when the
+  // computer is offline the question stays open there, but the glasses keep
+  // their own dismissal.
+  dismissFleet(id) {
+    const source = this.runtime?.outreach?.get?.(id);
+    const supervisor = this.runtime?.fleetSupervisor;
+    if (source?.sourceRef?.kind !== "fleet" || !supervisor?.dismissQuestion) return;
+    try { Promise.resolve(supervisor.dismissQuestion(source.sourceRef.id)).catch(() => {}); } catch { /* same: the glasses mark stands */ }
   }
   // A glanceable read of the supervisor for the glasses: counts by colour and
   // the red threads first. Read-only; nothing here reaches an agent.

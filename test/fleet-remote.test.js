@@ -13,7 +13,8 @@ function fixture(t) {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const state = { mode: 'observe', enabled: true, lastError: null, snapshot: { threads: [] }, questions: [{ id: 'fq_one', title: 'Which branch?', body: 'Pick a branch', options: ['feature', 'main'] }], actions: [] };
   const supervisor = { getState: () => structuredClone(state), tick: async () => state.snapshot, setMode: mode => (state.mode = mode),
-    answerQuestion: async (id, answer) => { const question = state.questions.find(q => q.id === id); state.questions = []; return { question: { ...question, status: 'answered', answer }, delivery: { status: 'sent' } }; } };
+    answerQuestion: async (id, answer) => { const question = state.questions.find(q => q.id === id); state.questions = []; return { question: { ...question, status: 'answered', answer }, delivery: { status: 'sent' } }; },
+    dismissQuestion: id => { const question = state.questions.find(q => q.id === id); state.questions = state.questions.filter(q => q.id !== id); return question ? { ...question, status: 'dismissed' } : null; } };
   const capability = createFleetCapability(supervisor);
   const calls = [];
   const runtime = { outreach: new OutreachStore({ dir: path.join(dir, 'outreach') }), nodeCapabilities: { dispatch: async (...args) => {
@@ -59,6 +60,37 @@ test('offline node retains last state and cannot falsely confirm an answer', asy
   assert.equal(remote.getState().questions.length, 1);
   assert.equal(runtime.outreach.list()[0].status, 'unseen');
   assert.match(remote.getState().lastError, /unavailable/);
+});
+
+test('dismissing a mirrored question on the glasses closes it on the computer', async t => {
+  const { remote, runtime, dir, state, calls } = fixture(t);
+  runtime.fleetSupervisor = remote;
+  await remote.refresh();
+  const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime });
+  g2.dispatch('glasses', { op: 'configure', settings: { enabled: true, categories: ['approvals'] } });
+  const [item] = g2.dispatch('glasses', { op: 'feed' }).items;
+  assert.equal(g2.dispatch('glasses', { op: 'dismiss', id: item.id }).ok, true);
+  await new Promise(setImmediate);
+  assert.deepEqual(calls.at(-1)[3], { method: 'POST', path: '/fleet/api/questions/fq_one', body: { dismiss: true } });
+  assert.equal(state.questions.length, 0);
+  assert.equal(runtime.outreach.list()[0].status, 'dismissed');
+  assert.equal(g2.dispatch('glasses', { op: 'feed' }).items.length, 0);
+});
+
+test('an offline computer keeps the question open but the glasses keep their dismissal', async t => {
+  const { remote, runtime, dir, state } = fixture(t);
+  runtime.fleetSupervisor = remote;
+  await remote.refresh();
+  runtime.nodeCapabilities.dispatch = async () => { throw new Error('offline'); };
+  const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime });
+  g2.dispatch('glasses', { op: 'configure', settings: { enabled: true, categories: ['approvals'] } });
+  const [item] = g2.dispatch('glasses', { op: 'feed' }).items;
+  assert.equal(g2.dispatch('glasses', { op: 'dismiss', id: item.id }).ok, true);
+  await new Promise(setImmediate);
+  assert.match(remote.getState().lastError, /unavailable/);
+  assert.equal(state.questions.length, 1);
+  assert.equal(runtime.outreach.list()[0].status, 'unseen');
+  assert.equal(g2.dispatch('glasses', { op: 'feed' }).items.length, 0);
 });
 
 test('node capability refuses arbitrary routes, commands, and methods', async t => {
