@@ -13,7 +13,6 @@ const HOUR = 60 * MIN;
 const FAR_RESET_MS = 8 * HOUR;
 const UNREACHABLE_ASK_MS = 90 * MIN;
 const LONG_DOWN_MS = HOUR;
-// An abort within a minute of the owner's message is the owner hitting stop.
 // LB log rows older than this say nothing about the LB now.
 const LB_ERROR_FRESH_MS = 15 * MIN;
 
@@ -490,7 +489,6 @@ function ownerActiveUntil(thread, limits, now) {
   const until = at + limits.ownerRecentMs;
   return until > now ? new Date(until).toISOString() : null;
 }
-
 
 // Progress = a new head, or fewer open review threads, since the last nudge.
 // A stopped thread with no PR head to move shows progress by working: the
