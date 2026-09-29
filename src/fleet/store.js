@@ -627,7 +627,9 @@ export class FleetStore {
     let latest = null;
     for (const question of this.state.questions) {
       if (question.dedupeKey !== key) continue;
-      if (!OWNER_CLOSED.has(question.status) && !(isReviewClosed(question) && !widens(question, fields))) continue;
+      // A close covers the threads it named: a group that now names others
+      // (widened, or members shifted in) is a new question.
+      if (!(OWNER_CLOSED.has(question.status) || isReviewClosed(question)) || widens(question, fields)) continue;
       if (toMs(question.answeredAt, null) === null || holdEnded(question, now)) continue;
       if (!latest || heldSinceMs(question) > heldSinceMs(latest)) latest = question;
     }

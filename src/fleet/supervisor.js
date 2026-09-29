@@ -522,7 +522,9 @@ export class FleetSupervisor {
     const now = new Set(decisions.filter((decision) => decision?.uiBlocked).map((decision) => decision.threadKey));
     const seen = new Set(threads.map((thread) => thread.key));
     const hidden = (key) => {
-      const kind = String(key).split(":")[0];
+      // infra:bb3 and infra:lb belong to their probes, not a thread source.
+      const [kind, probe] = String(key).split(":");
+      if (kind === "infra") return Boolean(sourceErrors[probe]);
       const capped = threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads;
       return !seen.has(key) && (Boolean(sourceErrors[kind]) || capped);
     };
@@ -763,7 +765,8 @@ export class FleetSupervisor {
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
     // How long a nudge has waited on computer use, for telling the owner.
-    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions], { mode, delivery, threads, sourceErrors, started, config });
+    // The live mode: the owner may have left Auto while this tick scanned.
+    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions], { mode: this.mode, delivery, threads, sourceErrors, started, config });
     const paused = pausedDeliveryDecision(delivery, this.uiBlockedSince, started);
     if (paused) infraDecisions.push(paused);
     const health = infraHealth(infra, { config, now: started });

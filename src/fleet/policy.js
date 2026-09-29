@@ -477,7 +477,8 @@ function resolveEscalation(ctx, intent, base) {
   if (busy) return { ...decision, action: "wait", reason: `${busy.reason}; ${intent.reason}`, notBefore: busy.notBefore };
   const vars = { ...ctx.facts, ...intent.vars };
   const route = managerRoute(ctx.manager, ctx.mode, limits, now, ctx.delivery);
-  const waitUi = route ? null : uiBlockedReason(ctx.manager, ctx.delivery);
+  // A manager that is down stays offline whatever computer use does.
+  const waitUi = route || !ctx.manager || managerDown(ctx.manager, now) ? null : uiBlockedReason(ctx.manager, ctx.delivery);
   if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}`, uiBlocked: true };
   if (!route) {
     return {
@@ -641,7 +642,7 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
   const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
   const route = managerRoute(manager, mode, limits, now, delivery);
-  const waitUi = route ? null : uiBlockedReason(manager, delivery);
+  const waitUi = route || !manager || managerDown(manager, now) ? null : uiBlockedReason(manager, delivery);
   if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}`, uiBlocked: true };
   if (!route) {
     return {
