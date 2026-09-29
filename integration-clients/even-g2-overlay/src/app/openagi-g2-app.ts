@@ -158,6 +158,9 @@ export class OpenAGIG2App {
     this.foregroundActive = false
     this.proactive.setForeground(false)
     this.clearNotice()
+    // A hold cut short by leaving the glasses sends nothing, and the next
+    // recording follows the review setting again.
+    this.cancelHold()
     this.memoryRequest++; this.lifelogRequest++; this.voiceTarget = null
     clearTimeout(this.lifelogKickTimer); clearTimeout(this.lifelogRetryTimer)
     this.audioBuffer = null
@@ -526,6 +529,8 @@ export class OpenAGIG2App {
       this.flash('Microphone opening', 'Wait for Listening, then tap to stop.'); return
     }
     this.lastTapAt = Date.now()
+    // A tap is never push-to-talk: its recording follows the review setting.
+    if (!this.askStarting && !this.microphoneOpening && this.mode !== 'listening') this.cancelHold()
     this.clearNotice()
     if (this.requestController) {
       if (this.cancelConfirmation) this.cancelRequest()
@@ -555,6 +560,7 @@ export class OpenAGIG2App {
     void this.startAsk().then(() => { if (this.releasePending) { this.releasePending = false; void this.releaseToSend() } })
     return true
   }
+  cancelHold(): void { this.pushToTalk = false; this.releasePending = false }
   holdRelease(): void {
     if (!this.pushToTalk) return
     // Let go before the microphone opened: send once it has.
@@ -950,7 +956,7 @@ export class OpenAGIG2App {
     if (controller.signal.aborted && !this.exited) { this.showHome(); await this.resumeListening() }
     else if (this.mode === 'message') await this.resumeListening()
   }
-  private stopInstruction(): string { return this.pushToTalk ? 'Let go to send.' : this.store.snapshot().autoSend ? 'Tap to stop and send automatically.' : 'Tap to stop and review before sending.' }
+  private stopInstruction(): string { return this.pushToTalk ? 'Let go to send (30 seconds at most).' : this.store.snapshot().autoSend ? 'Tap to stop and send automatically.' : 'Tap to stop and review before sending.' }
   async configureAutoSend(enabled: boolean): Promise<void> {
     if (this.exited || this.microphoneOpening || this.navigationBusy || this.requestController || ['listening', 'thinking', 'review', 'pairing'].includes(this.mode)) {
       this.phone.autoSend?.(this.store.snapshot().autoSend)
@@ -1233,7 +1239,13 @@ export class OpenAGIG2App {
       if (this.exited || !this.foregroundActive || this.liveSpeech !== speech) { await this.audio.stop(); return }
       this.renderer.listening()
       this.phone.set('Recording question · live', `Words appear while you speak. ${this.stopInstruction()} Audio streams ${this.store.snapshot().speechTransport === 'relay' ? 'through your main to' : 'directly to'} Deepgram.`)
-      this.liveCaptureTimer = setTimeout(() => { void this.finishAsk() }, 30_000)
+      // Live capture stops at 30 s. During a hold that sends what was said
+      // (the release that follows does nothing), and the owner is told why.
+      this.liveCaptureTimer = setTimeout(() => {
+        const held = this.pushToTalk
+        if (held) this.phone.set('30-second limit', 'Recording stopped at 30 seconds; sending what you said.')
+        void this.finishAsk().finally(() => { if (held) this.cancelHold() })
+      }, 30_000)
     } catch (error) { this.stopLiveSpeech(); if (!this.exited) this.fail(error) }
     finally { this.microphoneOpening = false }
   }

@@ -94,3 +94,16 @@ it('a press-and-hold the app takes as push-to-talk sends on release; otherwise i
     expect(holdRelease).toHaveBeenCalledOnce()
   } finally { input.stop(); vi.useRealTimers() }
 })
+
+it('leaving the glasses mid-hold cancels push-to-talk instead of sending', () => {
+  const { input, actions, emit } = setup()
+  const holdCancel = vi.fn()
+  const holdRelease = vi.fn()
+  Object.assign(actions, { holdStart: vi.fn(() => true), holdRelease, holdCancel })
+  try {
+    emit(OsEventTypeList.LONG_PRESS_EVENT, 1); emit(OsEventTypeList.FOREGROUND_EXIT_EVENT)
+    expect(holdCancel).toHaveBeenCalledOnce()
+    emit(OsEventTypeList.LONG_PRESS_RELEASE_EVENT, 1)
+    expect(holdRelease).not.toHaveBeenCalled()
+  } finally { input.stop() }
+})

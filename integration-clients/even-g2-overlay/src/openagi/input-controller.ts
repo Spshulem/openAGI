@@ -16,7 +16,7 @@ export class AgentsInputController {
   // Even never delivered (or delivered late) its foreground-enter event.
   // holdStart: the app takes a press-and-hold as push-to-talk (true) where it
   // offers it (Supervisor home); otherwise the hold is one tap as before.
-  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers & { foreground?(active: boolean): void; input?(): void; holdStart?(): boolean; holdRelease?(): void }) {}
+  constructor(private readonly bridge: Pick<EvenAppBridge, 'onEvenHubEvent'>, private readonly handlers: InputHandlers & { foreground?(active: boolean): void; input?(): void; holdStart?(): boolean; holdRelease?(): void; holdCancel?(): void }) {}
   start(): void {
     if (this.unsubscribe) return
     this.unsubscribe = this.bridge.onEvenHubEvent(event => {
@@ -24,7 +24,11 @@ export class AgentsInputController {
       if (types.includes(OsEventTypeList.SYSTEM_EXIT_EVENT) || types.includes(OsEventTypeList.ABNORMAL_EXIT_EVENT)) {
         this.stop(); this.handlers.systemExit(); return
       }
-      if (types.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) { this.clearTap(); this.heldUntil = 0; this.holding = false; this.handlers.foreground?.(false); return }
+      if (types.includes(OsEventTypeList.FOREGROUND_EXIT_EVENT)) {
+        this.clearTap(); this.heldUntil = 0
+        if (this.holding) { this.holding = false; this.handlers.holdCancel?.() }
+        this.handlers.foreground?.(false); return
+      }
       if (types.includes(OsEventTypeList.FOREGROUND_ENTER_EVENT)) { this.handlers.foreground?.(true); return }
       if (types.some(type => type !== null && GESTURES.includes(type))) this.handlers.input?.()
       // A press-and-hold is push-to-talk where the app offers it, else one tap
