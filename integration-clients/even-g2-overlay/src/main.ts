@@ -65,6 +65,7 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     configureListeningMode: mode => { void app.configureListeningMode(mode) },
     readLifelog: (query, offset) => { void app.readLifelog(query, offset) },
     inboxAction: (op, id, extra) => { void app.proactive.action(op, id, extra) },
+    answerQuestion: (id, answer) => app.proactive.answer(id, answer),
     markMoment: () => { void app.markMoment() },
     configureIdleTap: action => { void app.configureIdleTap(action) },
     configureLifelogTalkMode: mode => { void app.configureLifelogTalkMode(mode) },
