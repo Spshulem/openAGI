@@ -364,11 +364,21 @@ export function parseIdleMs(stdout) {
 export function parseConsoleSession(stdout) {
   const text = String(stdout ?? "");
   if (!/IOConsoleUsers|IOConsoleLocked/.test(text)) return null;
+  const securePid = Number(/"kCGSSessionSecureInputPID"\s*=\s*(\d+)/.exec(text)?.[1] ?? 0);
   return {
     locked: /"IOConsoleLocked"\s*=\s*Yes/.test(text) || /"CGSSessionScreenIsLocked"\s*=\s*Yes/.test(text),
-    secureInput: /"kCGSSessionSecureInputPID"\s*=\s*[1-9]\d*/.test(text),
+    secureInput: securePid > 0,
+    secureInputPid: securePid > 0 ? securePid : null,
     onConsole: /"kCGSSessionOnConsoleKey"\s*=\s*Yes/.test(text) ? true : /"kCGSSessionOnConsoleKey"\s*=\s*No/.test(text) ? false : null
   };
+}
+
+// "/Applications/BuildBetter Staging.app/Contents/MacOS/BuildBetter Staging" -> "BuildBetter Staging".
+export function appNameFromPath(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const bundle = /([^/]+)\.app(?:\/|$)/.exec(text)?.[1];
+  return clampText(bundle ?? path.basename(text), 60) || null;
 }
 
 export function createPresenceProbe({ bins = {}, run = runCommand, timeoutMs = DEFAULTS.uiStepTimeoutMs } = {}) {
@@ -395,7 +405,10 @@ export function createPresenceProbe({ bins = {}, run = runCommand, timeoutMs = D
       return parseIdleMs(await exec(ioreg, ["-c", "IOHIDSystem", "-d", "4", "-r", "-k", "HIDIdleTime"]));
     },
     async session() {
-      return parseConsoleSession(await exec(ioreg, ["-n", "Root", "-d1"]));
+      const session = parseConsoleSession(await exec(ioreg, ["-n", "Root", "-d1"]));
+      // Which app holds secure input, so the owner knows what to click away from.
+      if (session?.secureInputPid) session.secureInputApp = appNameFromPath(await exec(bins.ps ?? "ps", ["-o", "comm=", "-p", String(session.secureInputPid)]));
+      return session;
     },
     // -g: do not bring the app forward. Only used while the owner is away.
     async openUrl(url) {
@@ -586,7 +599,7 @@ export function createUiDriver({
       const session = await presence.session();
       if (!session) return notReady("screen state unknown");
       if (session.locked) return notReady("screen locked");
-      if (session.secureInput) return notReady("secure input is on (a password field has focus)");
+      if (session.secureInput) return notReady(`secure input is on: ${session.secureInputApp ? `${session.secureInputApp} has a password field focused` : "a password field has focus"}`);
       if (session.onConsole === false) return notReady("not the console session");
       const granted = await permissions();
       if (!granted.ok) return notReady(granted.detail);

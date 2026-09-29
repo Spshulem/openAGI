@@ -90,6 +90,27 @@ const GROUPED_KINDS = Object.freeze({
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], title: (n) => `${n} stopped. Nudges can't get through. Nudge them?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
 const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck"]);
+// Computer use unable to type this long, with nudges waiting on it: the owner
+// hears why once (secure input held by an app, a locked screen), and the
+// question closes itself when typing works again.
+const PAUSED_ASK_MS = 30 * 60_000;
+
+function pausedDeliveryDecision(delivery, items, since, now) {
+  if (!since || now - since < PAUSED_ASK_MS) return null;
+  const waiting = items.filter(({ decision }) => /computer use not ready/.test(String(decision?.reason ?? ""))).length;
+  if (!waiting) return null;
+  const minutes = Math.round((now - since) / 60_000);
+  return {
+    threadKey: "infra:computer-use", state: "infra", action: "ask-user", playbook: null, message: null, blockers: [],
+    reason: `nudges paused: ${delivery.detail ?? "computer use not ready"}`, route: null, notBefore: null, targetKey: null, progressMark: null,
+    question: {
+      dedupeKey: "infra:computer-use", kind: "deliver", threadKey: null,
+      title: "Nudges paused: can't type into apps. Fix it?",
+      body: `${delivery.detail ?? "Computer use is not ready"}. ${waiting} threads wait on a nudge, for ${minutes}m.`,
+      options: ["fixed", "skip"]
+    }
+  };
+}
 // A resume of a stopped or capped turn goes before merge-ready chatter.
 const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 
@@ -111,7 +132,7 @@ function formatReset(iso) {
 export function groupQuestions(asks, byKey) {
   const out = [];
   const titles = new Set();
-  const groups = { limit: [], open: [] };
+  const groups = { limit: [], open: [], deliver: [] };
   const single = (decision) => ({
     ...decision.question,
     threadKey: decision.threadKey.startsWith("infra:") ? null : decision.threadKey,
@@ -676,6 +697,9 @@ export class FleetSupervisor {
     const mutedKeys = store.mutedKeys();
     // Computer-use readiness, once per tick; the driver re-checks at each send.
     const delivery = await this.probeDelivery();
+    // How long computer use has been unable to type, for telling the owner.
+    if (delivery.mode !== "cli" && delivery.ready === false) this.notReadySince ??= started;
+    else this.notReadySince = null;
     const items = [];
     for (const thread of inScope) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
@@ -702,6 +726,8 @@ export class FleetSupervisor {
     const byItem = new Map(items.map(({ thread }) => [thread.key, thread]));
     const blockedKeys = { bb3: this.rememberedBlocked("bb3", byItem), lb: this.rememberedBlocked("lb", byItem) };
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
+    const paused = pausedDeliveryDecision(delivery, items, this.notReadySince, started);
+    if (paused) infraDecisions.push(paused);
     const health = infraHealth(infra, { config, now: started });
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
     if (lb) store.setInfraDown("lb", health.lb.down);
@@ -970,7 +996,7 @@ export class FleetSupervisor {
       if (asked.has(question.dedupeKey)) continue;
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
       const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
-      const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group)/.test(String(question.dedupeKey ?? ""));
+      const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
       // scope, while its source read fine: nothing is left to answer. A
       // source that hit its cap only proves absence for excluded threads.

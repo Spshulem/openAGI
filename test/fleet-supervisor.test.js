@@ -1944,3 +1944,34 @@ test("the review never clears the supervisor's own can't-deliver finding", async
   assert.ok(ask, "still open");
   assert.ok(model.calls.every((call) => call.entries.every((entry) => entry.id !== ask.id)), "never sent to the review");
 });
+
+test("computer use unable to type for 30 min tells the owner once why, and the question closes when typing works", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const stopped = makeThread({ agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [stopped], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick({ reason: "test" });
+  const paused = () => supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use");
+  assert.equal(paused(), undefined, "not yet: under 30 minutes");
+  now += 31 * MIN;
+  await supervisor.tick({ reason: "test" });
+  const q = paused();
+  assert.ok(q);
+  assert.equal(q.kind, "deliver");
+  assert.match(q.body, /BuildBetter Staging has a password field focused\. 1 threads wait on a nudge/);
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.store.question(q.id).status, "resolved");
+});
+
+test("several threads nudges can't reach become one grouped question", () => {
+  const byKey = new Map([["codex:a", makeThread({ key: "codex:a", id: "a" })], ["codex:b", makeThread({ key: "codex:b", id: "b", prRefs: ["acme/app#8"] })]]);
+  const ask = (key) => ({ threadKey: key, action: "ask-user", playbook: "resume", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x stopped. Can't nudge it. Nudge it?", body: "3 sends failed", options: ["done", "skip"] } });
+  const out = groupQuestions([ask("codex:a"), ask("codex:b")], byKey);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].dedupeKey, "deliver:group");
+  assert.deepEqual(out[0].threadKeys, ["codex:a", "codex:b"]);
+  assert.match(out[0].title, /^2 stopped/);
+});
