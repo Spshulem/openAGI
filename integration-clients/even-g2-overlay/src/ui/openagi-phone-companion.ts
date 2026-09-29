@@ -128,7 +128,7 @@ export class OpenAGIPhoneCompanion {
           </section>
           <details class="ambient" data-page="listen"><summary>Talk, speech and activity settings</summary><h2>Talk controls</h2>
             <label><input id="auto-send" type="checkbox" checked> Send automatically when I stop talking</label>
-            <p>Turn off to review the transcript and confirm Send first. Tap the glasses to start talking and tap again to stop; a press-and-hold works like a tap.</p>
+            <p>Turn off to review the transcript and confirm Send first. Tap the glasses to start talking and tap again to stop; a press-and-hold works like a tap. In Supervisor, press and hold on the home screen to talk to the supervisor, and let go to send.</p>
             <h2>Speech recognition</h2><label for="speech-model">Speech model (not the agent's reasoning model)</label>
             <select id="speech-model"><option value="openai-buffered">OpenAI · buffered recording</option><option value="nova-3">Deepgram Nova 3 · live</option><option value="nova-2">Deepgram Nova 2 · live</option></select>
             <label for="speech-transport">Live speech connection</label>

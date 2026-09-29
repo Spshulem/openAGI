@@ -47,7 +47,7 @@ export class OpenAGIGlassesRenderer {
   transcript(text: string): void { this.show(`LIVE SPEECH\n\n${tail(text, 260)}\n\n${this.stopHint()}`, false) }
   unpaired(): void { this.show('Agents\n\nPair or add an agent\nfrom the phone screen.\n\nDouble-tap: exit', true) }
   pairing(): void { this.show('Agents\n\nPair OpenAGI or add\nan agent URL + token\non the phone screen.', true) }
-  supervisorHome(questions: number): void { this.show(`Supervisor\n\nTap: ${questions ? `${questions} question${questions === 1 ? '' : 's'} for you` : 'thread status'}\nSwipe down: thread status\n${this.inboxLine()}Double-tap: exit`, true) }
+  supervisorHome(questions: number): void { this.show(`Supervisor\n\nTap: ${questions ? `${questions} question${questions === 1 ? '' : 's'} for you` : 'thread status'}\nHold: talk, let go to send\nSwipe down: thread status\n${this.inboxLine()}Double-tap: exit`, true) }
   home(device?: string): void { this.show(`Talk${device ? ` · ${device}` : ''}\n\nTap: talk to agent\nTap again: ${this.sendOnStop ? 'send' : 'review'}\n\n${this.inboxLine()}Swipe down: Recent\nDouble-tap: exit`, true) }
   lifelogHome(state: LifelogHomeState, detail = ''): void {
     const title = state === 'consent' ? 'Lifelog · needs consent' : state === 'paused' ? 'Lifelog paused' : state === 'waiting' ? 'Lifelog · waiting' : 'Lifelog · starting'

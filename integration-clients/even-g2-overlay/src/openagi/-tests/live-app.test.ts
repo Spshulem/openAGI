@@ -130,6 +130,42 @@ it('Supervisor: status page tap talks to the supervisor thread; an older main sa
   } finally { await f.app.systemExit(); vi.useRealTimers() }
 })
 
+it('Supervisor home: press and hold talks to the supervisor, letting go sends without a review', async () => {
+  vi.useFakeTimers()
+  // Review is on (autoSend false): push-to-talk still sends on release.
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(f.audio.start).toHaveBeenCalledOnce()
+    f.app.holdRelease(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
+    expect(f.renderer.review).not.toHaveBeenCalled()
+    // Outside Supervisor home a hold stays a plain tap.
+    await f.app.configureHomeMode('talk')
+    expect(f.app.holdStart()).toBe(false)
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
+it('Supervisor home: letting go before the microphone opened still sends once it has', async () => {
+  vi.useFakeTimers()
+  const f = await fixture({ autoSend: false })
+  try {
+    vi.spyOn(f.app.proactive, 'configure').mockResolvedValue()
+    await f.app.configureHomeMode('supervisor')
+    let opened!: () => void
+    f.audio.start.mockImplementationOnce(() => new Promise<void>((resolve) => { opened = resolve }))
+    expect(f.app.holdStart()).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    f.app.holdRelease()
+    expect(f.api.askText).not.toHaveBeenCalled()
+    opened(); await vi.advanceTimersByTimeAsync(1)
+    expect(f.api.askText).toHaveBeenLastCalledWith('What time is it?', expect.any(String), expect.any(Function), expect.any(AbortSignal), 'supervisor')
+  } finally { await f.app.systemExit(); vi.useRealTimers() }
+})
+
 it('a missed foreground-enter never strands the app: any glasses gesture resumes', async () => {
   vi.useFakeTimers()
   const f = await lifelogFixture()
