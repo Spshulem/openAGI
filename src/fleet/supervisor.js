@@ -8,7 +8,7 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { MODES, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
@@ -200,6 +200,19 @@ function withHealth(snapshot) {
   if (!Array.isArray(snapshot?.threads) || snapshot.threads.every((row) => row?.health)) return snapshot;
   return { ...snapshot, threads: snapshot.threads.map((row) => (row?.health ? row : { ...row, health: threadHealth(row?.state, row?.error ?? null) })) };
 }
+
+// Delivery that failed only because typing has to wait, not because the
+// thread cannot be reached at all.
+const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input)/;
+function typingWaits(thread, deliveryState, delivery) {
+  if (!uiTargetFor(thread)) return false;
+  if (deliveryState?.mode !== "cli" && deliveryState?.ready === false) return true;
+  return TYPING_WAITS.test(String(delivery?.detail ?? ""));
+}
+
+// Answers kept while the Mac could not type are dropped after this long; the
+// paused-nudge alert has told the owner why by then.
+const QUEUED_ANSWER_MS = 24 * 60 * 60_000;
 
 function ownerDelivery(answer) {
   // Options are fixed strings chosen by policy, never agent text.
@@ -533,6 +546,31 @@ export class FleetSupervisor {
     this.store.setUiBlockedSince(this.uiBlockedSince);
   }
 
+  // Owner answers kept while the Mac could not type. Each goes to its agent
+  // once a route works; one the owner overtook in the thread (they typed
+  // there since), or older than a day, is dropped.
+  async deliverQueuedAnswers({ byKey, started, unknown }) {
+    const queued = this.store.queuedAnswers();
+    if (!queued.length) return;
+    const deliveryState = await this.probeDelivery();
+    for (const question of queued) {
+      const pending = question.pendingDelivery;
+      if (unknown([question.threadKey])) continue;
+      const thread = byKey.get(question.threadKey);
+      const answeredMs = Date.parse(question.answeredAt ?? "");
+      if (!thread || started - Date.parse(pending.since) > QUEUED_ANSWER_MS) { this.store.settleQueuedAnswer(question.id, "dropped"); continue; }
+      if (Date.parse(thread.lastUserAt ?? "") > answeredMs && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX)) {
+        this.store.settleQueuedAnswer(question.id, "superseded");
+        continue;
+      }
+      const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
+      if (!route) continue;
+      const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+      if (delivery.status === "sent") this.store.settleQueuedAnswer(question.id, "sent");
+    }
+  }
+
   // Restarts each listed app that shows one of these threads, once per ten
   // minutes (a second answer after a partial send does not restart again).
   // Returns a blocked delivery when it must not or could not restart.
@@ -583,14 +621,23 @@ export class FleetSupervisor {
         const thread = this.lastThreads.get(question.threadKey);
         const deliveryState = thread ? await this.probeDelivery() : null;
         const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
+        const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
         if (!thread || !route) {
           delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
         } else {
-          const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
           delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
           if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
           // Starts the cooldown but does not spend the no-progress nudge budget.
           this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+        }
+        // The owner decided; only the typing has to wait (secure input, a
+        // locked screen, the owner at the keyboard). Keep the answer and send
+        // it once the Mac can type, instead of handing the question back.
+        if (thread && delivery.status !== "sent" && answer !== "open thread" && typingWaits(thread, deliveryState, delivery)) {
+          const queued = this.store.queueAnswer(id, answer, message);
+          this.resolveOutreach(question, answer, "acted");
+          this.applyOverride(question, answer);
+          return { question: queued, delivery: { status: "queued", route: null, detail: `Saved. It goes to the agent once the Mac can type (${delivery.detail}).` } };
         }
       }
       // A background resume can fail while the others are still sending;
@@ -766,7 +813,8 @@ export class FleetSupervisor {
     const infraDecisions = decideInfra(infra, { ledger: store, playbooks, config, now: started, threads: items, manager, mode, blockedKeys, mutedKeys, delivery });
     // How long a nudge has waited on computer use, for telling the owner.
     // The live mode: the owner may have left Auto while this tick scanned.
-    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions], { mode: this.mode, delivery, threads, sourceErrors, started, config });
+    const queuedWaits = this.store.queuedAnswers().map((question) => ({ threadKey: question.threadKey, uiBlocked: true }));
+    this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions, ...queuedWaits], { mode: this.mode, delivery, threads, sourceErrors, started, config });
     const paused = pausedDeliveryDecision(delivery, this.uiBlockedSince, started);
     if (paused) infraDecisions.push(paused);
     const health = infraHealth(infra, { config, now: started });
@@ -980,6 +1028,8 @@ export class FleetSupervisor {
       if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
+
+    await this.deliverQueuedAnswers({ byKey, started, unknown });
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.

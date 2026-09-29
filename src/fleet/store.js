@@ -327,6 +327,29 @@ export class FleetStore {
     return this._closeQuestion(id, "dismissed", null);
   }
 
+  // The owner answered, but the answer could not be typed yet: the question
+  // is answered (off the owner's list) and its message waits to be sent.
+  queueAnswer(id, answer, message) {
+    const text = clampText(answer, this.limits.bodyMax);
+    if (!text) return null;
+    return this._closeQuestion(id, "answered", text, { pendingDelivery: { message: clampText(message, this.limits.bodyMax), since: iso(this.now()) } });
+  }
+
+  queuedAnswers() {
+    return this.state.questions.filter((q) => q.status === "answered" && q.pendingDelivery).map((q) => ({ ...q }));
+  }
+
+  // sent, superseded (the owner typed in the thread since), or dropped.
+  settleQueuedAnswer(id, outcome) {
+    const question = this._findQuestion(id);
+    if (!question?.pendingDelivery) return null;
+    delete question.pendingDelivery;
+    question.deliveredAnswer = outcome;
+    question.updatedAt = iso(this.now());
+    this._save();
+    return { ...question };
+  }
+
   // A background send that never reached the agent puts the owner's answer
   // back in front of them instead of suppressing the question for a day,
   // and a retry sends to those threads again. A different, later answer

@@ -1167,8 +1167,10 @@ test("owner answers are typed into the app; blocked ones stay open with the reas
   await notReady.supervisor.tick();
   const waiting = notReady.supervisor.getState().questions.find((q) => q.kind === "agent-ask");
   const held = await notReady.supervisor.answerQuestion(waiting.id, "Starter");
-  assert.equal(held.question.status, "open");
-  assert.match(held.delivery.detail, /computer use not ready: Codex is not running/);
+  // The owner decided; only the typing waits, so the answer is kept.
+  assert.equal(held.question.status, "answered");
+  assert.equal(held.delivery.status, "queued");
+  assert.match(held.delivery.detail, /^Saved\. .*computer use not ready: Codex is not running/);
   assert.equal(notReady.delivered.length, 0);
 
   const terminal = makeThread({ key: "claude:c1", kind: "claude", id: "c1", live: { peerName: "cli-1", pid: 9, status: "idle" }, meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
@@ -2149,4 +2151,46 @@ test("more than 50 unreachable threads split into several stored groups", () => 
   const asks = keys.map((key) => ({ threadKey: key, action: "ask-user", playbook: "resume", reason: "can't deliver: could not verify thread.", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x", body: "y", options: ["done", "skip"] } }));
   const groups = groupQuestions(asks, byKey);
   assert.deepEqual(groups.map((g) => [g.dedupeKey, g.threadKeys.length]), [["deliver:group", 50], ["deliver:group:2", 10]]);
+});
+
+test("an answer kept while the Mac could not type is sent once it can, and leaves every list at once", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge despite behavior changes?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  const result = await supervisor.answerQuestion(q.id, "yes");
+  assert.equal(result.delivery.status, "queued");
+  assert.equal(supervisor.getState().questions.some((x) => x.id === q.id), false, "off the owner's list");
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0, "still cannot type");
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  const sent = delivered.filter((d) => d.playbook === "owner-answer");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].message, "Owner answer: yes. Continue with that.");
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "sent");
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("a kept answer the owner overtook in the thread is dropped, not sent", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let lastUserAt = ago(120 * MIN);
+  const asking = () => makeThread({ writerLocked: true, lastUserAt, lastUserText: "no, wait for Nikhil", meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [asking()] } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  lastUserAt = new Date(now + MIN).toISOString();
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0);
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "superseded");
 });
