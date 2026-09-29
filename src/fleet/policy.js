@@ -367,6 +367,14 @@ function resolveNudge(ctx, intent, base) {
   const cooldownMs = playbook.cooldownMin ? playbook.cooldownMin * MIN : limits.nudgeCooldownMs;
   const cooledAt = addMs(ledger.lastNudgeAt, cooldownMs);
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: "cooldown", notBefore: cooledAt };
+  const undelivered = undeliveredStreak(ledger, thread);
+  if (undelivered) {
+    if (undelivered.count >= UNDELIVERED_ASK_COUNT && now - Date.parse(undelivered.since) >= UNDELIVERED_ASK_MS) return undeliveredDecision(ctx, decision, undelivered);
+    const retryAt = addMs(undelivered.lastAt, Math.min(UNDELIVERED_BACKOFF_MS * 2 ** (undelivered.count - 1), UNDELIVERED_BACKOFF_MAX_MS));
+    if (retryAt && Date.parse(retryAt) > now) {
+      return { ...decision, action: "wait", reason: `can't deliver (${undelivered.reason}); retry after backoff`, notBefore: retryAt };
+    }
+  }
   const attempts = attemptsWithoutProgress(ledger, ctx.progressMark);
   const maxAttempts = playbook.maxAttempts ?? limits.maxNudgesWithoutProgress;
   const vars = { ...ctx.facts, attempts: String(attempts), ...(intent.vars ?? {}) };
@@ -388,6 +396,41 @@ function stuckDecision(ctx, playbook, vars, attempts, decision) {
     question: question(ctx, renderTemplate(playbook.ask, vars),
       `${ctx.facts.label}: ${attempts} nudges, no new head, no thread resolved. Left: ${left}.`, ["keep going", "stop"],
       `stuck:${ctx.thread.key}:${playbook.id}:${ctx.progressMark.head ?? "none"}`, "stuck")
+  };
+}
+
+// Sends that keep failing back off (5, 10, 20, 40, then 60 min), and after
+// three over half an hour the owner hears about it once, with the reason.
+// Work in the thread since the last failure (the owner nudged it) clears it.
+const UNDELIVERED_BACKOFF_MS = 5 * MIN;
+const UNDELIVERED_BACKOFF_MAX_MS = 60 * MIN;
+const UNDELIVERED_ASK_COUNT = 3;
+const UNDELIVERED_ASK_MS = 30 * MIN;
+
+function undeliveredStreak(ledger, thread) {
+  const streak = ledger?.undelivered;
+  if (!streak?.count || !Number.isFinite(Date.parse(streak.lastAt ?? "")) || !Number.isFinite(Date.parse(streak.since ?? ""))) return null;
+  const activity = Date.parse(latest(thread.lastAgentAt, thread.lastActivityAt) ?? "");
+  return Number.isFinite(activity) && activity > Date.parse(streak.lastAt) ? null : streak;
+}
+
+// What the owner can do about a known failure.
+function deliveryHint(reason) {
+  const text = String(reason ?? "");
+  if (/two threads share this title|two sessions share this title|two workspaces share this name/.test(text)) return " Two chats share its name: rename or archive one.";
+  if (/could not verify thread|another (?:thread|session) is open|no session tab open/.test(text)) return " The app would not show this thread.";
+  if (/not running/.test(text)) return " Its app is closed.";
+  if (/computer use not ready/.test(text)) return " Computer use is not ready on this Mac.";
+  return "";
+}
+
+function undeliveredDecision(ctx, decision, streak) {
+  const minutesStuck = minutes(ctx.now - Date.parse(streak.since));
+  return {
+    ...decision, action: "ask-user", reason: `can't deliver: ${streak.reason}`,
+    question: question(ctx, `${ctx.facts.label} stopped. Can't nudge it. Nudge it?`,
+      `${ctx.facts.label} needs "${decision.playbook}". ${streak.count} sends failed over ${minutesStuck}m: ${streak.reason}.${deliveryHint(streak.reason)}`,
+      ["done", "skip"], `deliver:${ctx.thread.key}`, "deliver")
   };
 }
 
