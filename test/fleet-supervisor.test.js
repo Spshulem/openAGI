@@ -2290,3 +2290,37 @@ test("a thread that just got a kept answer gets no automatic nudge the same tick
   const sent = delivered.slice(before).filter((d) => d.thread.key === "codex:t1");
   assert.deepEqual(sent.map((d) => d.playbook), ["owner-answer"]);
 });
+
+test("a kept retry after a login or disk fix is sent even though that blocker is no longer asked", async (t) => {
+  let now = NOW;
+  let ready = false;
+  let fixed = false;
+  const thread = () => makeThread({ writerLocked: true, agentStatus: fixed ? "idle" : "error", error: fixed ? null : { kind: "disk-full", resetAt: null }, meta: { originator: "Codex Desktop" } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "observe", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [thread()] } });
+  await supervisor.tick();
+  const q = supervisor.store.upsertQuestion({ kind: "infra", dedupeKey: "infra:disk:codex:t1", threadKey: "codex:t1", title: "Disk full. Retry?", options: ["retry", "later"] });
+  const result = await supervisor.answerQuestion(q.id, "retry");
+  assert.equal(result.delivery.status, "queued");
+  fixed = true;
+  ready = true;
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 1);
+});
+
+test("a kept answer past its day goes back to the owner even while its source cannot be read", async (t) => {
+  let now = NOW;
+  let codexFails = false;
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => { if (codexFails) throw new Error("database is locked"); return [asking]; } } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  codexFails = true;
+  now += 25 * 60 * MIN;
+  await supervisor.tick();
+  assert.equal(supervisor.store.question(q.id).deliveredAnswer, "dropped");
+  assert.equal(supervisor.store.queuedAnswers().length, 0);
+});

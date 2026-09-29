@@ -556,26 +556,33 @@ export class FleetSupervisor {
   // (this tick asked its dedupeKey): a stale "yes" must never land on a new
   // question. One the owner overtook in the thread is dropped quietly; one
   // older than a day, or whose thread is gone, goes back to the owner.
-  async deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked }) {
+  async deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked, decided }) {
     const contacted = new Set();
     const queued = this.store.queuedAnswers();
     if (!queued.length) return contacted;
     const deliveryState = await this.probeDelivery();
     for (const question of queued) {
       const pending = question.pendingDelivery;
-      if (pending.sendingAt && started - Date.parse(pending.sendingAt) < QUEUED_SENDING_MS) continue;
-      if (unknown([question.threadKey])) continue;
       const thread = byKey.get(question.threadKey);
-      // A full scan leaves threads out; that is not proof this one is gone.
-      if (!thread && cappedKinds.has(String(question.threadKey).split(":")[0])) continue;
-      if (!thread || started - Date.parse(pending.since) > QUEUED_ANSWER_MS) {
+      // A day without a way to type: back in front of the owner (unless the
+      // same ask already is, or its thread is gone and nothing is left to answer).
+      if (started - Date.parse(pending.since) > QUEUED_ANSWER_MS) {
         this.store.settleQueuedAnswer(question.id, "dropped");
-        // Back in front of the owner, unless the same ask already is.
-        if (!this.store.openQuestions().some((q) => q.dedupeKey === question.dedupeKey)) this.store.reopenQuestion(question.id, [], { answer: question.answer, asked: true });
+        if (thread && !this.store.openQuestions().some((q) => q.dedupeKey === question.dedupeKey)) this.store.reopenQuestion(question.id, [], { answer: question.answer, asked: true });
         continue;
       }
+      if (pending.sendingAt && started - Date.parse(pending.sendingAt) < QUEUED_SENDING_MS) continue;
+      if (unknown([question.threadKey])) continue;
+      // A full scan leaves threads out; that is not proof this one is gone.
+      if (!thread && cappedKinds.has(String(question.threadKey).split(":")[0])) continue;
+      if (!thread) { this.store.settleQueuedAnswer(question.id, "dropped"); continue; }
+      // Past the scan's thread cap this tick: nothing was decided for it.
+      if (!decided.has(thread.key)) continue;
       const ownerSince = Date.parse(thread.lastUserAt ?? "") > Date.parse(question.answeredAt ?? "") && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
-      if (ownerSince || !asked.has(question.dedupeKey)) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
+      // An agent's own question must still stand; a "retry" after the owner
+      // fixed a blocker is sent even though the blocker is no longer asked.
+      const stale = question.kind === "agent-ask" && !asked.has(question.dedupeKey);
+      if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
@@ -1051,7 +1058,7 @@ export class FleetSupervisor {
     }
 
     // A thread that just got the owner's answer gets no automatic nudge too.
-    const answeredNow = await this.deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked });
+    const answeredNow = await this.deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked, decided: new Set(items.map((item) => item.thread.key)) });
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.
