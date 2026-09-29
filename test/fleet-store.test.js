@@ -254,22 +254,55 @@ test("expired questions saved with an outreach copy are handed out again after a
   assert.deepEqual(reloaded.takeExpired().map((q) => q.outreachId), ["out_9"]);
 });
 
-test("an owner close holds while the same ask keeps coming, and lapses after a TTL with no ask", (t) => {
+test("a dismissal or an answer to the agent's ask holds while the same ask keeps coming, and lapses after a TTL with no ask", (t) => {
   const now = clock();
   const store = new FleetStore({ dir: tempDir(t), now });
-  const asked = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?", options: ["merged", "later"] });
-  store.answerQuestion(asked.id, "later");
+  const dismissed = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?", options: ["merged", "later"], kind: "ready" });
+  store.dismissQuestion(dismissed.id);
+  const relayed = store.upsertQuestion({ dedupeKey: "ask:codex:t1:abc", title: "t1: asks you. Answer?", options: ["yes", "no"], kind: "agent-ask" });
+  store.answerQuestion(relayed.id, "yes");
   for (let hour = 12; hour <= 72; hour += 12) {
     now.advance(12 * HOUR);
-    const again = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" });
-    assert.equal(again.id, asked.id, `still suppressed at ${hour}h`);
-    assert.equal(again.suppressed, true);
+    for (const [key, closed] of [["ready:o/r#7:abc", dismissed], ["ask:codex:t1:abc", relayed]]) {
+      const again = store.upsertQuestion({ dedupeKey: key, title: closed.title, kind: closed.kind });
+      assert.equal(again.id, closed.id, `${key} still suppressed at ${hour}h`);
+      assert.equal(again.suppressed, true);
+    }
   }
   assert.deepEqual(store.openQuestions(), []);
   now.advance(24 * HOUR);
-  const fresh = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?" });
-  assert.notEqual(fresh.id, asked.id);
+  const fresh = store.upsertQuestion({ dedupeKey: "ready:o/r#7:abc", title: "#7 ready. Merge?", kind: "ready" });
+  assert.notEqual(fresh.id, dismissed.id);
   assert.equal(fresh.status, "open");
+  assert.notEqual(store.upsertQuestion({ dedupeKey: "ask:codex:t1:abc", title: "t1: asks you. Answer?", kind: "agent-ask" }).id, relayed.id);
+});
+
+test("an answer that leaves the condition to the owner holds only a TTL from the answer, even while still asked", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const cases = [
+    ["ready:o/r#7:abc", "ready", ["merged", "later"], "later"],
+    ["stuck:codex:t1:resume:abc", "stuck", ["keep going", "stop"], "keep going"],
+    ["open:codex:t2", "open", ["opened", "skip"], "opened"],
+    ["logged-out:codex:t3", "infra", ["retry", "later"], "retry"]
+  ];
+  const answered = cases.map(([dedupeKey, kind, options, answer]) => {
+    const question = store.upsertQuestion({ dedupeKey, kind, options, title: `${kind}?` });
+    store.answerQuestion(question.id, answer);
+    return question;
+  });
+  const ask = () => cases.map(([dedupeKey, kind, options]) => store.upsertQuestion({ dedupeKey, kind, options, title: `${kind}?` }));
+  for (let minutes = 0; minutes < 24 * 60 - 10; minutes += 10) {
+    now.advance(10 * 60 * 1000);
+    assert.ok(ask().every((q, index) => q.suppressed && q.id === answered[index].id), `held at ${minutes + 10}m`);
+  }
+  now.advance(10 * 60 * 1000);
+  const back = ask();
+  back.forEach((q, index) => {
+    assert.notEqual(q.id, answered[index].id, `${cases[index][3]} asks again`);
+    assert.equal(q.status, "open");
+    assert.equal(q.suppressed, undefined);
+  });
 });
 
 test("pruning closed questions keeps an owner close that is still being asked", (t) => {

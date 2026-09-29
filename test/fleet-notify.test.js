@@ -204,6 +204,7 @@ test("a reworded question updates its open outreach copy in place, with no secon
   const item = outreach.get(first.outreachId);
   assert.deepEqual([item.title, item.summary, item.actions, item.status], ["5 stuck, can't reach", "5 threads", ["retry", "wait", "dismiss"], "seen"]);
   assert.equal(outreach.list().length, 1);
-  assert.deepEqual(events, ["outreach"]);
+  // The Mac overlay re-reads the copy; nothing new is posted.
+  assert.deepEqual(events, ["outreach", "outreach-updated"]);
   assert.equal(fetches.length, 1);
 });

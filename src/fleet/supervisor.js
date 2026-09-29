@@ -13,7 +13,7 @@ import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
-import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth } from "./policy.js";
+import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { FleetStore } from "./store.js";
 import { createUiDriver } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
@@ -81,11 +81,13 @@ const GROUPED_KINDS = Object.freeze({
   open: { dedupeKey: "open:group", options: ["opened", "skip"], title: (n) => `${n} stuck, can't reach. Open them?`, body: (labels) => `No live session to message: ${labels}.` }
 });
 
+// The label single questions use, so a group never names a thread by its
+// session id or title (a first prompt, an automation prompt).
 function threadLabel(thread) {
   if (!thread) return "?";
-  const pr = /#(\d+)$/.exec(thread.prRefs?.[0] ?? "")?.[1];
-  const name = thread.workspace ?? clampText(String(thread.title ?? "").replace(/[<>]/g, ""), 24);
-  return pr ? `${name} #${pr}` : name;
+  const ref = thread.prRefs?.[0] ?? "";
+  const pr = Number(/#(\d+)$/.exec(ref)?.[1]);
+  return ownerLabel(thread, pr > 0 ? pr : null, parsePrRef(ref)?.repo);
 }
 
 function formatReset(iso) {
@@ -328,6 +330,10 @@ export class FleetSupervisor {
 
   getState() {
     const store = this.store;
+    const questions = store.openQuestions();
+    // A read can expire a question too (the /fleet page, the main's refresh)
+    // while no tick runs.
+    this.closeExpired();
     return {
       mode: this.mode,
       enabled: Boolean(this.config.enabled),
@@ -335,7 +341,7 @@ export class FleetSupervisor {
       lastTickAt: this.lastTickAt ?? store.snapshot?.at ?? null,
       lastError: this.lastError,
       snapshot: withHealth(store.snapshot),
-      questions: store.openQuestions(),
+      questions,
       actions: store.actions(50),
       settings: {
         tickMinutes: Math.round(this.config.tickMs / MIN),
@@ -373,6 +379,11 @@ export class FleetSupervisor {
   resolveOutreach(question, decision, status) {
     if (!question?.outreachId) return;
     try { this.runtime?.outreach?.resolve?.(question.outreachId, decision, { status }); } catch { /* best-effort */ }
+  }
+
+  // An expired question's copy must not keep asking on the Mac or G2.
+  closeExpired() {
+    for (const question of this.store.takeExpired()) this.resolveOutreach(question, "expired", "dismissed");
   }
 
   reopenOutreach(question) {
@@ -861,8 +872,7 @@ export class FleetSupervisor {
         this.resolveOutreach(question, "resolved", "dismissed");
       }
     }
-    // An expired question's copy must not keep asking on the Mac or G2.
-    for (const question of store.takeExpired()) this.resolveOutreach(question, "expired", "dismissed");
+    this.closeExpired();
     return attempted;
   }
 

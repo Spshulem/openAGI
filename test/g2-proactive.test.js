@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { G2Proactive } from "../src/g2-proactive.js";
+import { OutreachStore } from "../src/outreach-store.js";
 import { NodeRegistry } from "../src/node-registry.js";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 
@@ -355,4 +356,26 @@ test("dismissing a supervisor question on the glasses closes it on the fleet com
   runtime.fleetSupervisor = { dismissQuestion: () => { throw new Error("store busy"); } };
   assert.equal(call({ op: "dismiss", id: "o-3" }).ok, true);
   assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
+});
+
+test("a long-lived supervisor question stays on the glasses past 200 newer resolved items and its first week", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "g2-proactive-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const outreach = new OutreachStore({ dir: path.join(dir, "outreach") });
+  const store = new G2Proactive({ dir: path.join(dir, "g2"), runtime: { outreach } });
+  const call = (body) => store.dispatch("one", body);
+  const ask = (ref, title) => outreach.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: ref, nodeId: "mac" }, title, summary: "", needsDecision: true, actions: ["merged", "dismiss"] });
+  const live = ask("fq_live", "#7 ready. Merge?");
+  const orphan = ask("fq_gone", "#8 ready. Merge?");
+  // Both first asked 8 days ago.
+  live.createdAt = orphan.createdAt = new Date(Date.now() - 8 * 86400_000).toISOString();
+  for (let n = 0; n < 200; n += 1) {
+    const done = outreach.append({ type: "draft", title: `Draft ${n}`, needsDecision: true });
+    outreach.resolve(done.id, { action: "approve", by: "user" });
+  }
+  call({ op: "configure", settings: { supervisorOnly: true } });
+  // The supervisor still asks the live one: the mirror refreshes its copy.
+  outreach.update(live.id, { title: "#7 ready. Merge?" });
+  // The orphan, which nothing refreshes, still ages out.
+  assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), [live.id]);
 });

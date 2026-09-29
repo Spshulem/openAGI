@@ -733,7 +733,7 @@ function agentLabel(thread) {
 // Repo and PR name the work; else the folder, else the Codex app's name.
 // Never a thread title: a Claude one can be the owner's last message, a
 // Codex one an automation prompt. Never a session id either.
-function ownerLabel(thread, prNumber, repo) {
+export function ownerLabel(thread, prNumber, repo) {
   const repoName = fact(String(repo ?? "").split("/").pop(), 30);
   if (prNumber && repoName) return `${repoName} #${prNumber}`;
   const place = fact(thread.workspace || String(thread.cwd ?? "").replace(/\/+$/, "").split("/").pop(), 30)

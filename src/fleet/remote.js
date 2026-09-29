@@ -26,12 +26,16 @@ export class RemoteFleetSupervisor {
     this.state = { mode: 'observe', enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
     this.refreshing = null;
     this.timer = null;
+    // Glasses dismissals the computer was offline for, sent on the next refresh.
+    this.pendingDismissals = new Set();
   }
   getState() { return structuredClone(this.state); }
   async request(method, path, body) {
+    let reached = false;
     try {
       const result = await this.runtime.nodeCapabilities.dispatch(this.nodeId, 'fleet-supervisor', 'request', { method, path, body }, { timeoutMs: 120000 });
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
+      reached = true;
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
       this.mirrorQuestions();
       if (result.response?.status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
@@ -39,17 +43,40 @@ export class RemoteFleetSupervisor {
     } catch (error) {
       this.state.lastError = 'Fleet computer unavailable or request failed. Retry when it is online.';
       // Preserve the last snapshot/questions through connection outages.
-      throw new Error(this.state.lastError);
+      throw Object.assign(new Error(this.state.lastError), { reached });
     }
   }
   refresh() {
-    if (!this.refreshing) this.refreshing = this.request('GET', '/fleet/api/state').finally(() => { this.refreshing = null; });
+    if (!this.refreshing) {
+      this.refreshing = this.request('GET', '/fleet/api/state')
+        .then(async (body) => { await this.replayDismissals(); return body; })
+        .finally(() => { this.refreshing = null; });
+    }
     return this.refreshing;
   }
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
   async answerQuestion(id, answer) { return this.request('POST', `/fleet/api/questions/${id}`, { answer }); }
-  async dismissQuestion(id) { return (await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true })).question; }
+  // replay: a dismissal that could not reach the computer is kept and sent
+  // again once it is back (the glasses already dropped the question).
+  async dismissQuestion(id, { replay = false } = {}) {
+    try {
+      const body = await this.request('POST', `/fleet/api/questions/${id}`, { dismiss: true });
+      this.pendingDismissals.delete(id);
+      return body.question;
+    } catch (error) {
+      if (replay && !error.reached) this.pendingDismissals.add(id);
+      else this.pendingDismissals.delete(id);
+      throw error;
+    }
+  }
+  async replayDismissals() {
+    for (const id of [...this.pendingDismissals]) {
+      // Closed on the computer meanwhile: nothing left to dismiss.
+      if (!this.state.questions.some(q => q.id === id)) { this.pendingDismissals.delete(id); continue; }
+      try { await this.dismissQuestion(id, { replay: true }); } catch { /* kept if still unreachable */ }
+    }
+  }
   async sendProposed(id) { return this.request('POST', `/fleet/api/actions/${id}/send`); }
   async sendOwnerMessage(threadKey, message) { return this.request('POST', '/fleet/api/send', { threadKey, message }); }
   start() {

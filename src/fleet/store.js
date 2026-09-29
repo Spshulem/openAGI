@@ -18,8 +18,7 @@ const CLOSED_QUESTIONS_KEPT = 200;
 const OPTIONS_MAX = 4;
 const OPTION_MAX_CHARS = 40;
 const INFRA_BLOCKED_KEPT = 200;
-// The owner closed these; the same ask stays quiet until a TTL passes with
-// no ask.
+// The owner closed these; the same ask stays quiet for a TTL.
 const OWNER_CLOSED = new Set(["answered", "dismissed"]);
 
 // Only a delivered nudge spends the no-progress budget. A failed send still
@@ -69,6 +68,19 @@ function iso(ms) {
 // createdAt), or closed if that came later.
 function lastAskMs(question) {
   return Math.max(toMs(question.lastAskedAt ?? question.createdAt, 0), toMs(question.answeredAt, 0));
+}
+
+// A dismissal holds while the same ask keeps coming, and so does an answer
+// relayed to the agent's own question: its words stay up until it replies.
+// Other answers ("later", "keep going", "opened", "retry") leave the
+// condition to the owner, so the ask returns a TTL after the answer.
+function holdsWhileAsked(question) {
+  return question.status === "dismissed" || question.kind === "agent-ask";
+}
+
+// Start of an owner close's TTL.
+function heldSinceMs(question) {
+  return holdsWhileAsked(question) ? lastAskMs(question) : toMs(question.answeredAt, 0);
 }
 
 // Progress marks come from different producers; compare them key-order-free.
@@ -192,11 +204,11 @@ export class FleetStore {
       }
       return { ...existing };
     }
-    // An answer or dismissal holds while the condition does, so the next
-    // tick neither reopens it with a new id nor pushes the phone again.
+    // An answer or dismissal holds (see holdsWhileAsked), so the next tick
+    // neither reopens it with a new id nor pushes the phone again.
     const closed = this._ownerClosed(key, now);
     if (closed) {
-      closed.lastAskedAt = iso(now);
+      if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
     }
     // Same record, same outreach copy, no second push.
@@ -456,8 +468,8 @@ export class FleetStore {
     let latest = null;
     for (const question of this.state.questions) {
       if (question.dedupeKey !== key || !OWNER_CLOSED.has(question.status)) continue;
-      if (toMs(question.answeredAt, null) === null || now - lastAskMs(question) >= QUESTION_TTL_MS) continue;
-      if (!latest || lastAskMs(question) > lastAskMs(latest)) latest = question;
+      if (toMs(question.answeredAt, null) === null || now - heldSinceMs(question) >= QUESTION_TTL_MS) continue;
+      if (!latest || heldSinceMs(question) > heldSinceMs(latest)) latest = question;
     }
     return latest;
   }

@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { createFleetCapability, RemoteFleetSupervisor } from '../src/fleet/remote.js';
 import { createFleetRoute } from '../src/fleet/routes.js';
+import { DEFAULTS, resolveFleetConfig } from '../src/fleet/contracts.js';
+import { FleetSupervisor } from '../src/fleet/supervisor.js';
 import { OutreachStore } from '../src/outreach-store.js';
 import { G2Proactive } from '../src/g2-proactive.js';
 
@@ -77,10 +79,11 @@ test('dismissing a mirrored question on the glasses closes it on the computer', 
   assert.equal(g2.dispatch('glasses', { op: 'feed' }).items.length, 0);
 });
 
-test('an offline computer keeps the question open but the glasses keep their dismissal', async t => {
-  const { remote, runtime, dir, state } = fixture(t);
+test('an offline computer keeps the question open, the glasses keep their dismissal, and it lands after reconnect', async t => {
+  const { remote, runtime, dir, state, calls } = fixture(t);
   runtime.fleetSupervisor = remote;
   await remote.refresh();
+  const online = runtime.nodeCapabilities.dispatch;
   runtime.nodeCapabilities.dispatch = async () => { throw new Error('offline'); };
   const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime });
   g2.dispatch('glasses', { op: 'configure', settings: { enabled: true, categories: ['approvals'] } });
@@ -91,6 +94,35 @@ test('an offline computer keeps the question open but the glasses keep their dis
   assert.equal(state.questions.length, 1);
   assert.equal(runtime.outreach.list()[0].status, 'unseen');
   assert.equal(g2.dispatch('glasses', { op: 'feed' }).items.length, 0);
+  // Still offline on the next refresh: kept for later.
+  await assert.rejects(remote.refresh(), /unavailable/);
+  assert.equal(state.questions.length, 1);
+
+  runtime.nodeCapabilities.dispatch = online;
+  await remote.refresh();
+  assert.deepEqual(calls.at(-1)[3], { method: 'POST', path: '/fleet/api/questions/fq_one', body: { dismiss: true } });
+  assert.equal(state.questions.length, 0);
+  assert.equal(runtime.outreach.list()[0].status, 'dismissed');
+  // Sent once.
+  const sent = calls.length;
+  await remote.refresh();
+  assert.equal(calls.length, sent + 1);
+});
+
+test('a missed glasses dismissal is dropped when the computer closed the question meanwhile', async t => {
+  const { remote, runtime, state, calls } = fixture(t);
+  await remote.refresh();
+  const online = runtime.nodeCapabilities.dispatch;
+  runtime.nodeCapabilities.dispatch = async () => { throw new Error('offline'); };
+  await assert.rejects(remote.dismissQuestion('fq_one', { replay: true }), /unavailable/);
+  // A page dismissal that failed is not replayed.
+  await assert.rejects(remote.dismissQuestion('fq_two'), /unavailable/);
+  assert.deepEqual([...remote.pendingDismissals], ['fq_one']);
+  state.questions = [];
+  runtime.nodeCapabilities.dispatch = online;
+  await remote.refresh();
+  assert.deepEqual(calls.map(c => c[3].path), ['/fleet/api/state', '/fleet/api/state']);
+  assert.deepEqual([...remote.pendingDismissals], []);
 });
 
 test('node capability refuses arbitrary routes, commands, and methods', async t => {
@@ -158,4 +190,80 @@ test('a reworded question updates its mirrored copy in place, so G2 shows the ne
   state.questions = [{ id: 'fq_one', title: 'Which branch, again?', body: 'Pick one', options: ['main'], reopenedAt: '2026-09-28T06:04:03.000Z' }];
   await remote.refresh();
   assert.deepEqual(runtime.outreach.list().map(item => [item.id, item.status, item.title, item.actions]), [[first.id, 'seen', 'Which branch, again?', ['main', 'dismiss']]]);
+});
+
+// End to end: the Mac's real store and supervisor behind the node capability,
+// the main's mirror and outreach store, and the glasses' feed.
+test('a blip on the computer keeps the same main outreach copy and G2 does not ping again', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-remote-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let now = Date.parse('2026-09-26T12:00:00.000Z');
+  const ago = ms => new Date(now - ms).toISOString();
+  const ask = "Ready. Want me to merge with --admin or wait for Nikhil's approval?";
+  let lastAgentText = ask;
+  const thread = () => ({
+    key: 'codex:t1', kind: 'codex', id: 't1', title: 'Fix billing', cwd: '/work/t1', repo: 'acme/app', branch: 'spencer/fix', workspace: null,
+    agentStatus: 'idle', lastActivityAt: ago(60 * 60_000), lastAgentText, lastAgentAt: ago(60 * 60_000), lastUserText: 'continue', lastUserAt: ago(120 * 60_000),
+    error: null, openTasks: [], prRefs: [], live: null, writerLocked: false, archived: false, excluded: null, meta: {}
+  });
+  const config = resolveFleetConfig({}, { home: dir, mode: 'observe', limits: { ...DEFAULTS }, managerRef: 'none', push: null });
+  const mac = new FleetSupervisor({ dataDir: path.join(dir, 'mac'), config, deps: {
+    now: () => now,
+    executor: { deliver: async () => ({ status: 'sent' }), inFlight: () => [], whenIdle: async () => {} },
+    fetchImpl: async () => { throw new Error('no network in tests'); },
+    readLivePeers: () => new Map(),
+    listCodexThreads: async () => [thread()], listClaudeThreads: async () => [], listConductorThreads: async () => [],
+    readCodexLbErrors: async () => [], findLocalHeavyVerification: async () => [],
+    readLocalGit: async () => ({ head: 'b'.repeat(40), branch: 'spencer/fix', upstream: 'origin/spencer/fix', ahead: 0, remote: 'acme/app' }),
+    findPrForBranch: async () => null, fetchPrStates: async () => new Map(),
+    probeBuildBot3: async () => ({ reachable: true, checkedAt: ago(0), gate: { state: 'ok', reason: null, since: null }, fullQueue: 0, quickQueue: 0, load: [1, 1, 1], runs: [], timersDead: [], error: null }),
+    checkLb: async () => ({ healthy: true, detail: '200', watchLine: null }),
+    findManagerSession: () => null
+  } });
+  const capability = createFleetCapability(mac);
+  const events = [];
+  const outreach = new OutreachStore({ dir: path.join(dir, 'main-outreach'), runtime: { events: { emit: (name, item) => events.push([name, item.id]) } } });
+  const runtime = { outreach, nodeCapabilities: { dispatch: async (...args) => capability.invoke(args[2], args[3]) } };
+  const remote = new RemoteFleetSupervisor({ runtime, nodeId: 'mac' });
+  runtime.fleetSupervisor = remote;
+  const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime, now: () => now });
+  g2.dispatch('glasses', { op: 'configure', settings: { supervisorOnly: true } });
+  // What the glasses app does on each feed read: ping once for a new item.
+  const pings = [];
+  const glance = () => {
+    for (const item of g2.dispatch('glasses', { op: 'feed' }).items) {
+      if (item.notified || !g2.dispatch('glasses', { op: 'can-notify', id: item.id }).notify) continue;
+      g2.dispatch('glasses', { op: 'notify', id: item.id });
+      pings.push(item.id);
+    }
+  };
+
+  await mac.tick();
+  const [question] = mac.getState().questions;
+  assert.equal(question.kind, 'agent-ask');
+  await remote.refresh();
+  const [copy] = outreach.list();
+  glance();
+  assert.deepEqual(pings, [copy.id]);
+
+  // Blip: the ask drops out for one tick, then is back within the hour.
+  lastAgentText = 'Pushed.';
+  now += 10 * 60_000;
+  await mac.tick();
+  assert.deepEqual(mac.getState().questions, []);
+  await remote.refresh();
+  assert.equal(outreach.get(copy.id).status, 'dismissed');
+  glance();
+
+  lastAgentText = ask;
+  now += 20 * 60_000;
+  await mac.tick();
+  const [back] = mac.getState().questions;
+  assert.equal(back.id, question.id);
+  await remote.refresh();
+  assert.deepEqual(outreach.list().map(item => [item.id, item.status]), [[copy.id, 'seen']]);
+  assert.deepEqual(events.filter(([name]) => name === 'outreach'), [['outreach', copy.id], ['outreach', copy.id]], 'appended, then reopened for the Mac overlay');
+  glance();
+  assert.deepEqual(pings, [copy.id], 'no second ping on the glasses');
+  assert.deepEqual(g2.dispatch('glasses', { op: 'feed' }).items.map(item => [item.id, item.notified]), [[copy.id, true]]);
 });

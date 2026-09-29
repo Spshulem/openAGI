@@ -263,14 +263,14 @@ export class G2Proactive {
     return { ok: true, detail: clean(result.delivery?.detail ?? "Answered", 200) };
   }
   // Dismissing a supervisor question on the glasses closes it on the fleet
-  // computer too, as the phone's dismiss does. Fire and forget: when the
-  // computer is offline the question stays open there, but the glasses keep
-  // their own dismissal.
+  // computer too, as the phone's dismiss does. Fire and forget: the glasses
+  // keep their own dismissal, and one the offline computer missed reaches it
+  // on the next refresh (replay).
   dismissFleet(id) {
     const source = this.runtime?.outreach?.get?.(id);
     const supervisor = this.runtime?.fleetSupervisor;
     if (source?.sourceRef?.kind !== "fleet" || !supervisor?.dismissQuestion) return;
-    try { Promise.resolve(supervisor.dismissQuestion(source.sourceRef.id)).catch(() => {}); } catch { /* same: the glasses mark stands */ }
+    try { Promise.resolve(supervisor.dismissQuestion(source.sourceRef.id, { replay: true })).catch(() => {}); } catch { /* same: the glasses mark stands */ }
   }
   // A glanceable read of the supervisor for the glasses: counts by colour and
   // the red threads first. Read-only; nothing here reaches an agent.
@@ -296,8 +296,12 @@ export class G2Proactive {
     // Supervisor mode lists supervisor questions even before "Show updates
     // from my main" is on, and pings for them (see can-notify).
     if (n.settings.enabled || n.settings.supervisorOnly) {
-      for (const i of (this.runtime?.outreach?.list?.() ?? []).slice(0, 200)) {
-        if (!["unseen", "seen"].includes(i.status) || Date.parse(i.createdAt) < this.now() - 7 * DAY) continue;
+      // Open items before the cap, so resolved history cannot push a live
+      // question off the glasses. A supervisor question asked for days stays
+      // while its source keeps it current (refreshedAt).
+      const open = (this.runtime?.outreach?.list?.() ?? []).filter(i => ["unseen", "seen"].includes(i.status));
+      for (const i of open.slice(0, 200)) {
+        if (Date.parse(i.refreshedAt ?? i.createdAt) < this.now() - 7 * DAY) continue;
         const kind = i.sourceRef?.kind === "draft"
           ? this.runtime?.drafts?.get?.(i.sourceRef.id)?.kind ?? "draft"
           : i.sourceRef?.kind;

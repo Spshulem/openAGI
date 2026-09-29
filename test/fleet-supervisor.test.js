@@ -178,9 +178,24 @@ test("groupQuestions collapses limit and unreachable bursts and duplicate titles
   const limit = grouped.find((q) => q.kind === "limit");
   assert.match(limit.title, /^2 threads capped\. Reset /);
   assert.deepEqual(limit.threadKeys, ["a", "b"]);
-  assert.match(limit.body, /cairo #1, apia #2/);
+  // Repo and PR name the work, as in single questions.
+  assert.match(limit.body, /app #1, app #2/);
   assert.equal(grouped.filter((q) => q.title.startsWith("BB3 jammed")).length, 1);
   assert.equal(grouped.find((q) => q.kind === "open").threadKey, "c");
+});
+
+test("grouped questions name threads by owner label, never a session id or a prompt", () => {
+  const session = "4396b7d2-da42-42e4-97b0-aca39b2d9a45";
+  const byKey = new Map([
+    [`claude:${session}`, makeThread({ key: `claude:${session}`, kind: "claude", id: session, title: "please fix the login flow and push", cwd: "/Users/me/Dev/g2", repo: null, prRefs: [] })],
+    ["codex:01a0e850", makeThread({ key: "codex:01a0e850", id: "01a0e850-c6b0-7911", title: "Current local time: 2026-09-28. Do not retry a chat", cwd: null, repo: null, prRefs: [] })],
+    ["conductor:c1", makeThread({ key: "conductor:c1", kind: "conductor", id: "c1", title: "Setup Flow Redesign", workspace: "cape-town", prRefs: ["acme/app#6817"] })]
+  ]);
+  const asks = [...byKey.keys()].map((threadKey) => ({ threadKey, playbook: null, question: { title: "stuck", body: "x", options: ["opened", "skip"], dedupeKey: `open:${threadKey}`, kind: "open" } }));
+  const [group] = groupQuestions(asks, byKey);
+  assert.equal(group.dedupeKey, "open:group");
+  assert.equal(group.body, "No live session to message: g2, Codex chat, app #6817.");
+  assert.doesNotMatch(group.body, /4396b7d2|01a0e850|login flow|Current local time|Setup Flow/);
 });
 
 test("groupQuestions keeps distinct agent questions sharing a display title", () => {
@@ -1314,6 +1329,23 @@ test("an expired question closes its outreach copy", async (t) => {
   await supervisor.tick();
   assert.equal(supervisor.store.question(question.id).status, "expired");
   assert.deepEqual(calls, [["out_1", "expired", "dismissed"]]);
+});
+
+test("a question that expires on a state read, with no tick running, closes its outreach copy once", async (t) => {
+  const calls = [];
+  let now = NOW;
+  const asking = makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } });
+  const { supervisor } = fixture(t, { threads: [asking], now: () => now });
+  supervisor.runtime = { outreach: { resolve: (id, decision, opts) => calls.push([id, decision, opts.status]) } };
+  await supervisor.tick();
+  const [question] = supervisor.getState().questions;
+  supervisor.store.markQuestionNotified(question.id, { outreachId: "out_1" });
+  // Ticks stopped (the Mac asleep); the /fleet page or the main reads state.
+  now += 25 * 60 * MIN;
+  assert.deepEqual(supervisor.getState().questions, []);
+  assert.deepEqual(calls, [["out_1", "expired", "dismissed"]]);
+  supervisor.getState();
+  assert.equal(calls.length, 1);
 });
 
 // Review 1: a failed PR read after a merge settled an ask must not bring
