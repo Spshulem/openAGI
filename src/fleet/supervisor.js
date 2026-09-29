@@ -47,10 +47,13 @@ const INCIDENT_KEYS = Object.freeze({ "manager-bb3": "infra:bb3", "manager-lb": 
 const ESCALATION_STATUSES = new Set(["sent", "failed"]);
 // The snapshot row shows the decision that acts when a thread got two.
 const DECISION_RANK = Object.freeze({ nudge: 3, "escalate-manager": 3, "ask-user": 2, wait: 1, none: 0 });
-// A changed question alone waits this long after the last review (new ones
+// A changed or due question waits this long after the last review (new ones
 // never wait); a failed review is not retried sooner than REVIEW_RETRY_MS.
 const REVIEW_MIN_GAP_MS = 10 * MIN;
 const REVIEW_RETRY_MS = 15 * MIN;
+// An unchanged question kept again and again is re-checked at 1x, 2x, then
+// at most 4x the review interval.
+const REVIEW_BACKOFF_MAX = 2;
 
 function withTimeout(promise, ms, name) {
   let timer;
@@ -837,7 +840,8 @@ export class FleetSupervisor {
     const typedInto = new Set();
 
     const asks = decisions.filter((decision) => decision.action === "ask-user" && decision.question);
-    const shownBefore = new Set(store.openQuestions().map((question) => question.id));
+    // One the last review could not settle yet is still new.
+    const shownBefore = new Set(store.openQuestions().map((question) => question.id).filter((id) => !this.awaitingReview.has(id)));
     const toNotify = [];
     for (const fields of groupQuestions(asks, byKey)) {
       // Rebuilt without a failed source's threads, a group would drop them,
@@ -857,15 +861,18 @@ export class FleetSupervisor {
     }
     // The supervisor reviews its own list before a new question reaches the
     // owner, so junk never pings; the main does not see it before then either.
-    if (this.config.review?.enabled) this.awaitingReview = new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id)));
+    this.awaitingReview = this.config.review?.enabled ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id))) : new Set();
+    let unsettled = new Set();
     try {
-      await this.reviewOpenQuestions({ asked, byKey, items });
+      unsettled = await this.reviewOpenQuestions({ asked, byKey, items });
     } finally {
-      this.awaitingReview = new Set();
+      // A new one the review did not get to (the batch cap, a deferred
+      // close) waits for the next review; a failed review lets all out.
+      this.awaitingReview = new Set([...this.awaitingReview].filter((id) => unsettled.has(id)));
     }
     for (const { id, reopened } of toNotify) {
       const question = store.question(id);
-      if (question?.status !== "open") continue;
+      if (question?.status !== "open" || this.awaitingReview.has(id)) continue;
       // A blip closed it: its own outreach copy comes back, not a new one.
       if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
@@ -934,48 +941,63 @@ export class FleetSupervisor {
   // judges which open questions still need the owner (see review.js). It
   // runs in every mode because it only edits the supervisor's own records
   // and outreach copies, never a thread. A failure fails open: the
-  // questions go out as they would have without it.
+  // questions go out as they would have without it. Returns the ids of
+  // questions never reviewed that this review did not settle either.
   async reviewOpenQuestions({ asked, byKey, items = [] }) {
+    const unsettled = new Set();
     const review = this.config.review;
-    if (!review?.enabled) return;
+    if (!review?.enabled) return unsettled;
     const store = this.store;
     const now = this.now();
     // Only questions asked this tick; the rest close or wait for their source.
     const open = store.openQuestions().filter((question) => asked.has(question.dedupeKey));
-    if (!open.length) return;
-    if (this.lastReview.failedAt && now - this.lastReview.failedAt < REVIEW_RETRY_MS) return;
+    if (!open.length) return unsettled;
+    if (this.lastReview.failedAt && now - this.lastReview.failedAt < REVIEW_RETRY_MS) return unsettled;
     const prs = new Map(items.filter((item) => item.pr?.ref).map((item) => [item.pr.ref, item.pr]));
     const states = new Map(items.map((item) => [item.thread.key, item.classified]));
     const scope = { threads: byKey, prs, states, limits: this.config.limits };
     const fingerprints = new Map(open.map((question) => [question.id, reviewFingerprint(question, scope)]));
     const unreviewed = (question) => !question.reviewedAt;
     const changed = (question) => Boolean(question.reviewedAt) && question.reviewFingerprint !== fingerprints.get(question.id);
-    const due = (question) => now - Date.parse(question.reviewedAt ?? "") >= review.intervalMs;
-    const quiet = now - (this.lastReview.at ?? 0) < REVIEW_MIN_GAP_MS;
-    if (!open.some(unreviewed) && !open.some(due) && (quiet || !open.some(changed))) return;
-    // Unreviewed, then changed, first: the batch cap drops the tail.
+    const backoff = (question) => 2 ** Math.min(question.reviewStreak ?? 0, REVIEW_BACKOFF_MAX);
+    const due = (question) => now - Date.parse(question.reviewedAt ?? "") >= review.intervalMs * backoff(question);
+    const pending = open.filter((question) => unreviewed(question) || changed(question) || due(question));
+    if (!pending.length) return unsettled;
+    // Only a new question skips the gap, so a backlog past the batch cap
+    // does not call the model every tick.
+    if (!pending.some(unreviewed) && now - (this.lastReview.at ?? 0) < REVIEW_MIN_GAP_MS) return unsettled;
+    // New, then changed, then the longest since its review: the batch cap
+    // drops the tail, and the next review starts there.
     const rank = (question) => (unreviewed(question) ? 0 : changed(question) ? 1 : 2);
-    const ordered = [...open].sort((a, b) => rank(a) - rank(b));
+    const ordered = [...pending].sort((a, b) => rank(a) - rank(b) || String(a.reviewedAt ?? "").localeCompare(String(b.reviewedAt ?? "")));
+    const others = open.filter((question) => !pending.includes(question));
     let verdicts;
     try {
-      verdicts = await reviewQuestions({ questions: ordered, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now });
+      verdicts = await reviewQuestions({ questions: ordered, others, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now });
     } catch (error) {
       const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
       this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
       store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
-      return;
+      return unsettled;
     }
     this.lastReview = { at: now, failedAt: null, error: null };
     this.applyReview(verdicts, fingerprints);
+    const settled = new Set(verdicts.filter((verdict) => !verdict.deferred).map((verdict) => verdict.id));
+    for (const question of pending) if (unreviewed(question) && !settled.has(question.id)) unsettled.add(question.id);
+    return unsettled;
   }
 
   applyReview(verdicts, fingerprints) {
     const store = this.store;
     const decisions = [];
+    let deferred = 0;
     for (const verdict of verdicts) {
-      // The owner may have answered or dismissed it while the model ran.
+      // The owner may have answered or dismissed it while the model ran, or
+      // be answering it now: the answer wins.
       const question = store.question(verdict.id);
-      if (question?.status !== "open") continue;
+      if (question?.status !== "open" || this.answering.has(verdict.id)) continue;
+      // Over the close cap: left as it was for the next review.
+      if (verdict.deferred) { deferred += 1; continue; }
       const fingerprint = fingerprints.get(question.id) ?? null;
       if (verdict.decision === "close") {
         const closed = store.closeByReview(question.id, { category: verdict.category, reason: verdict.reason, fingerprint, duplicateOf: verdict.duplicateOf ?? null });
@@ -998,7 +1020,7 @@ export class FleetSupervisor {
     const closed = decisions.filter((decision) => decision.decision === "close").length;
     store.recordAction({
       kind: "review", playbook: "review", threadKey: null, status: "done",
-      reason: `reviewed ${decisions.length}: ${closed} closed, ${decisions.length - closed} kept`, decisions
+      reason: `reviewed ${decisions.length}: ${closed} closed, ${decisions.length - closed} kept${deferred ? `, ${deferred} closes deferred` : ""}`, decisions
     });
   }
 

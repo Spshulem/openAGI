@@ -413,7 +413,7 @@ test("escalations, infra-down flags, and pushes persist", (t) => {
 
 // ─── the supervisor's review of its own list ───────────────────────────────
 
-test("a review close holds while the same ask keeps coming, however long, and never comes back as a blip", (t) => {
+test("a review close holds while the same ask keeps coming for six hours, and never comes back as a blip", (t) => {
   const now = clock();
   const store = new FleetStore({ dir: tempDir(t), now });
   const ask = { dedupeKey: "ready:o/r#7:abc", kind: "ready", title: "#7 ready. Merge?", options: ["merged", "later"] };
@@ -423,21 +423,96 @@ test("a review close holds while the same ask keeps coming, however long, and ne
   assert.equal(closed.resolvedBy, "review");
   assert.equal(closed.resolveReason, "review: stale: merged in another thread");
   assert.equal(closed.reviewFingerprint, "f1");
-  // Inside the reopen window and past a day of asking: still the closed record.
-  for (let hour = 0; hour < 30; hour += 3) {
-    now.advance(3 * HOUR);
+  // Inside the reopen window and for hours of asking: still the closed record.
+  for (let hour = 0; hour < 5; hour += 1) {
+    now.advance(HOUR);
     const again = store.upsertQuestion(ask);
     assert.equal(again.suppressed, true);
     assert.equal(again.id, first.id);
   }
   assert.deepEqual(store.openQuestions(), []);
   assert.deepEqual(store.reviewClosed().map((q) => q.id), [first.id], "reopenable while it holds");
-  // A day with no ask ends the hold: the next ask is a new question.
+  // A model's guess is checked again: six hours after the close, the same
+  // ask is a new question (the supervisor reviews it before it pings).
+  now.advance(HOUR);
+  const recheck = store.upsertQuestion(ask);
+  assert.notEqual(recheck.id, first.id);
+  assert.equal(recheck.suppressed, undefined);
+  assert.equal(recheck.reopened, undefined);
+  assert.deepEqual(store.reviewClosed(), [], "its ask is open again");
+  // Closed again: the Cleared list shows one row per ask, the newest.
+  store.closeByReview(recheck.id, { category: "stale", reason: "still merged" });
+  assert.deepEqual(store.reviewClosed().map((q) => q.id), [recheck.id]);
+  // A day with no ask drops it from the list.
   now.advance(25 * HOUR);
   assert.deepEqual(store.reviewClosed(), []);
   const fresh = store.upsertQuestion(ask);
-  assert.notEqual(fresh.id, first.id);
-  assert.equal(fresh.suppressed, undefined);
+  assert.notEqual(fresh.id, recheck.id);
+});
+
+test("every held review close is listed for Reopen, past the old limit of 20", (t) => {
+  const store = new FleetStore({ dir: tempDir(t), now: clock() });
+  for (let i = 0; i < 30; i += 1) {
+    const q = store.upsertQuestion({ dedupeKey: `ask:codex:t${i}:h`, kind: "agent-ask", threadKey: `codex:t${i}`, title: `Merge ${i}?`, options: ["yes", "no"] });
+    store.closeByReview(q.id, { category: "junk", reason: "status line" });
+  }
+  assert.equal(store.reviewClosed().length, 30);
+});
+
+test("only the supervisor's own resolve counts as resolvedOnly, not a review close", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = { dedupeKey: "ask:codex:a:h", kind: "agent-ask", threadKey: "codex:a", title: "Merge?", options: ["yes", "no"] };
+  const first = store.upsertQuestion(ask);
+  assert.equal(store.resolvedOnly(ask.dedupeKey), false, "open");
+  store.resolveQuestion(first.id, "pr merged");
+  assert.equal(store.resolvedOnly(ask.dedupeKey), true);
+  now.advance(2 * HOUR);
+  const second = store.upsertQuestion(ask);
+  store.closeByReview(second.id, { category: "stale", reason: "optional offer" });
+  // The review close is left to upsertQuestion, which keeps its ask time fresh.
+  assert.equal(store.resolvedOnly(ask.dedupeKey), false);
+  now.advance(HOUR);
+  assert.equal(store.upsertQuestion(ask).suppressed, true);
+  assert.equal(store.question(second.id).lastAskedAt, new Date(T0 + 3 * HOUR).toISOString());
+});
+
+test("an agent's ask keeps the message it came from; a re-raised one takes the new one", (t) => {
+  const now = clock();
+  const store = new FleetStore({ dir: tempDir(t), now });
+  const ask = (context, at) => ({
+    dedupeKey: "ask:codex:a:h", kind: "agent-ask", threadKey: "codex:a", title: "remote-dev: asks you. Answer?", body: "Want me to make that edit?",
+    options: ["yes", "no"], askContext: context, agentAskedAt: at
+  });
+  const first = store.upsertQuestion(ask(`${"x".repeat(900)} Edit the pr-verification skill (token sk-ant-abcdefghijklmnopqrstuvwxyz0123456789). Want me to make that edit?`, "2026-09-26T11:50:00.000Z"));
+  assert.equal(first.askContext.length, 600);
+  assert.match(first.askContext, /Want me to make that edit\?$/);
+  assert.doesNotMatch(first.askContext, /sk-ant-abcdefghij/);
+  assert.equal(first.agentAskedAt, "2026-09-26T11:50:00.000Z");
+  // The thread moved on while the ask stays open: the first context stands.
+  now.advance(10 * 60 * 1000);
+  const again = store.upsertQuestion(ask("Disk is at 91%; the app reconnected.", "2026-09-26T12:05:00.000Z"));
+  assert.equal(again.id, first.id);
+  assert.equal(again.agentAskedAt, "2026-09-26T11:50:00.000Z");
+  // Closed and asked again: the new sighting is the context.
+  store.resolveQuestion(first.id, "moved on");
+  now.advance(10 * 60 * 1000);
+  const back = store.upsertQuestion(ask("New run. Want me to make that edit?", "2026-09-26T12:15:00.000Z"));
+  assert.equal(back.id, first.id);
+  assert.equal(back.reopened, true);
+  assert.equal(back.askContext, "New run. Want me to make that edit?");
+  assert.equal(back.agentAskedAt, "2026-09-26T12:15:00.000Z");
+  // Other kinds carry none.
+  assert.equal(store.upsertQuestion({ dedupeKey: "ready:x", kind: "ready", title: "#7 ready. Merge?", options: ["merged", "later"] }).askContext, undefined);
+});
+
+test("a review kept with nothing changed counts a streak; a change resets it", (t) => {
+  const store = new FleetStore({ dir: tempDir(t), now: clock() });
+  const q = store.upsertQuestion({ dedupeKey: "k", kind: "agent-ask", title: "Merge?", options: ["yes", "no"] });
+  assert.equal(store.recordReview(q.id, { fingerprint: "f1" }).reviewStreak, 0);
+  assert.equal(store.recordReview(q.id, { fingerprint: "f1" }).reviewStreak, 1);
+  assert.equal(store.recordReview(q.id, { fingerprint: "f1" }).reviewStreak, 2);
+  assert.equal(store.recordReview(q.id, { fingerprint: "f2" }).reviewStreak, 0);
 });
 
 test("a review-closed group that covers another thread is a new question, not the old one revived", (t) => {

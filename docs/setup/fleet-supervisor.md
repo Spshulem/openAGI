@@ -73,7 +73,7 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
 | `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review. **Confirm it before relying on it** |
-| `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review every open question at least this often (30 min) |
+| `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
 
 `OPENAGI_PUBLIC_URL`, when set, makes phone pushes deep-link to `/fleet?q=<id>`.
 
@@ -215,29 +215,40 @@ never writes the daemon's state or sends messages.
 
 The supervisor manages its own needs-you list. After each scan, one batched
 `claude -p` call (structured output, no tools, no hooks, not saved as a
-session) reads every open question with its thread, PR, and related threads
-(same PR, workspace, or repo). It closes what no longer needs you:
+session) reads the open questions that are new, changed, or due, up to 15,
+each with its thread, PR, the agent message it came from, and related
+threads (same PR, workspace, or repo). The other open questions are listed
+briefly so duplicates still show. It closes what no longer needs you:
 
 - an optional offer ("want me to X?") that blocks nothing,
-- a PR that shipped, or a thread that moved on,
+- an ask about a PR that shipped (work after the merge, like a release or
+  staging QA, still counts), or a thread that moved on,
 - work another thread did, or a call you already made elsewhere,
-- status lines, automation relays, and duplicates.
+- status lines, automation relays, and duplicates of a question about the
+  same thread (two threads asking the same thing each need their answer).
 
-When unsure it keeps the question. A kept question may get a clearer title
-(repo #PR plus the ask) and, for an agent's own question, short answers the
-agent can act on; the same outreach item updates in place.
+When unsure it keeps the question. An agent's own question it keeps may get
+a clearer title (repo #PR plus the ask) and short answers the agent can act
+on; the same outreach item updates in place. The supervisor's own questions
+(ready, stuck, limits) keep their title and buttons.
 
 - New questions are reviewed before they reach the phone, glasses, or main,
   so junk never pings.
-- It runs again when a question is new, its thread or PR changed (at most
-  every 10 minutes), or every `OPENAGI_FLEET_REVIEW_MS`.
-- A closed question stays closed while the same ask repeats. A changed ask is
-  a new question.
-- If the model fails or times out (150 s), questions go out as before and the
+- It runs right away for a new question, and at most every 10 minutes when a
+  question's thread or PR changed or it is due: `OPENAGI_FLEET_REVIEW_MS`
+  after its last review, then 2x and 4x that while nothing changes. The
+  longest-unreviewed go first; a new question past the 15 waits (unseen)
+  for the next review.
+- At most a quarter of a batch (3 at least) closes per review; the rest wait
+  for the next one. A close needs a reason.
+- A closed question stays closed while the same ask repeats, for up to 6
+  hours. Then the same ask is a new question, reviewed again before it pings.
+  A changed ask is a new question.
+- If the model fails or times out (6 min), questions go out as before and the
   error shows in **Doing**. It retries after 15 minutes.
 - Every decision is in **Doing** (`review`). **Cleared by supervisor** under
-  **Needs you** lists closes from the last day (and older ones still holding
-  back an ask), with category, reason and time; **Reopen** brings one back as
+  **Needs you** lists every close asked in the last day, one per ask, with
+  category, reason and time; **Reopen** brings one back as
   the same item and pins it, so the review keeps it until its ask changes.
   An open question shows the review's reason under it. API:
   `POST /fleet/api/questions/<id>` with `{ "reopen": true }`.

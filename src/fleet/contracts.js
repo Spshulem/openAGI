@@ -87,7 +87,8 @@ export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
 // (docs/setup/fleet-supervisor.md); OPENAGI_FLEET_REVIEW_MODEL overrides.
 export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
 export const DEFAULT_REVIEW_MS = 30 * MIN;
-const REVIEW_TIMEOUT_MS = 150_000;
+// Sonnet took about 3 minutes on 13 questions, mostly thinking.
+export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
 
 export function defaultPaths(home = os.homedir()) {
   return {
@@ -195,7 +196,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       enabled: overrides.review?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_REVIEW)),
       model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL),
       intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
-      timeoutMs: overrides.review?.timeoutMs ?? REVIEW_TIMEOUT_MS
+      timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
     },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },

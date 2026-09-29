@@ -1491,7 +1491,7 @@ test("review keeps a live question and rewords it in place on the same outreach 
   assert.match(delivered[0].message, /^Owner answer: admin merge\./);
 });
 
-test("review marks a duplicate and keeps the question it duplicates", async (t) => {
+test("review keeps a duplicate on another thread: that agent needs its own answer", async (t) => {
   const threads = [
     asking(),
     asking({ key: "codex:t2", id: "t2", cwd: "/work/t2", lastAgentText: "Merge it with --admin now, or wait for review?" })
@@ -1507,12 +1507,130 @@ test("review marks a duplicate and keeps the question it duplicates", async (t) 
   await supervisor.tick();
   assert.equal(model.calls.length, 1);
   assert.equal(model.calls[0].entries.length, 2, "one batched call sees both");
-  assert.deepEqual(supervisor.getState().questions.map((q) => q.id), [firstId]);
-  const [dup] = supervisor.getState().reviewClosed;
-  assert.equal(dup.threadKey, "codex:t2");
-  assert.equal(dup.duplicateOf, firstId);
-  assert.equal(dup.reviewCategory, "duplicate");
-  assert.deepEqual(notified.map((q) => q.id), [firstId]);
+  // Closed, t2's answer would never reach t2 once t1's is answered.
+  const open = supervisor.getState().questions;
+  assert.deepEqual(open.map((q) => q.threadKey).sort(), ["codex:t1", "codex:t2"]);
+  assert.equal(open.find((q) => q.threadKey === "codex:t2").reviewReason, "same merge ask");
+  assert.deepEqual(supervisor.getState().reviewClosed, []);
+  assert.equal(notified.length, 2);
+});
+
+test("a backlog past the batch cap is reviewed oldest first and never calls the model every tick", async (t) => {
+  let now = NOW;
+  const threads = Array.from({ length: 20 }, (_, i) => asking({
+    key: `codex:t${i}`, id: `t${i}`, cwd: `/work/t${i}`, lastAgentText: `Ready. Want me to merge #${i} with --admin or wait for Nikhil's approval?`
+  }));
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "waits on the owner" })));
+  const { supervisor, notified } = fixture(t, { threads, prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1);
+  assert.equal(model.calls[0].entries.length, 15);
+  // The five it could not fit wait for the next review, off every surface.
+  assert.equal(notified.length, 15);
+  assert.equal(supervisor.getState().questions.length, 15);
+  const first = new Set(model.calls[0].entries.map((e) => e.id));
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 2, "a new question never waits for the gap");
+  assert.equal(model.calls[1].entries.length, 5);
+  assert.ok(model.calls[1].entries.every((e) => !first.has(e.id)));
+  // The notifier is called each tick (it skips what it already posted).
+  assert.deepEqual(new Set(notified.map((q) => q.id)).size, 20);
+  // Two hours of ticks: each question re-checked on its interval, which
+  // doubles while nothing changes; at most one call per ten minutes.
+  const at = [];
+  for (let minute = 10; minute <= 120; minute += 5) {
+    now = NOW + minute * MIN;
+    const before = model.calls.length;
+    await supervisor.tick();
+    if (model.calls.length > before) at.push([minute, model.calls.at(-1).entries.length]);
+  }
+  assert.deepEqual(at, [[30, 15], [40, 5], [90, 15], [100, 5]]);
+  // The first batch comes back first, the oldest review first.
+  assert.deepEqual(new Set(model.calls[2].entries.map((e) => e.id)), first);
+});
+
+test("a mass close is capped: the rest stay held and are reviewed on the next tick", async (t) => {
+  let now = NOW;
+  let verdict = "close";
+  const threads = Array.from({ length: 12 }, (_, i) => asking({
+    key: `codex:t${i}`, id: `t${i}`, cwd: `/work/t${i}`, lastAgentText: `Ready. Want me to merge #${i} with --admin or wait for Nikhil's approval?`
+  }));
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: verdict, category: verdict === "close" ? "junk" : "live", reason: "status line" })));
+  const { supervisor, notified } = fixture(t, { threads, prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick();
+  assert.equal(supervisor.getState().reviewClosed.length, 3);
+  assert.equal(supervisor.getState().questions.length, 0, "the deferred nine are still unreviewed");
+  assert.equal(notified.length, 0);
+  assert.match(reviewActions(supervisor).find((a) => Array.isArray(a.decisions)).reason, /reviewed 3: 3 closed, 0 kept, 9 closes deferred/);
+  verdict = "keep";
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(model.calls.length, 2);
+  assert.equal(model.calls[1].entries.length, 9);
+  assert.equal(supervisor.getState().questions.length, 9);
+  assert.equal(notified.length, 9);
+});
+
+test("a review close is checked again after its hold; an unreadable PR does not strand it", async (t) => {
+  let now = NOW;
+  const thread = asking({ prRefs: ["acme/app#7"] });
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "optional offer" })));
+  const { supervisor, notified } = fixture(t, {
+    threads: [thread], now: () => now, review: REVIEW_ON,
+    deps: { runModel: model.runModel, fetchPrStates: async (refs, config, { unread }) => { for (const ref of refs) unread.add(ref); return new Map(); } }
+  });
+  await supervisor.tick();
+  assert.equal(model.calls.length, 1);
+  for (let hour = 1; hour <= 30; hour += 1) {
+    now = NOW + hour * 60 * MIN;
+    await supervisor.tick();
+  }
+  // Re-raised and re-reviewed every six hours, never pushed while the
+  // review still closes it, and always reopenable.
+  assert.equal(model.calls.length, 6);
+  assert.equal(notified.length, 0);
+  const cleared = supervisor.getState().reviewClosed;
+  assert.equal(cleared.length, 1);
+  assert.equal(cleared[0].lastAskedAt, new Date(now).toISOString());
+});
+
+test("an owner answer in flight wins over a review that closes the question", async (t) => {
+  let release = null;
+  const sent = [];
+  const executor = {
+    deliver: (args) => new Promise((resolve) => { sent.push(args); release = () => resolve({ status: "sent", route: args.route, detail: "ok", actionId: null }); }),
+    inFlight: () => [],
+    whenIdle: async () => {}
+  };
+  let holder = null;
+  let answering = null;
+  const model = fakeModel((entries) => {
+    answering = holder.answerQuestion(entries[0].id, entries[0].options[0]);
+    return entries.map((e) => ({ id: e.id, decision: "close", category: "stale", reason: "moot" }));
+  });
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel, executor } });
+  holder = supervisor;
+  await supervisor.tick();
+  while (!release) await new Promise((resolve) => setImmediate(resolve));
+  release();
+  const result = await answering;
+  assert.equal(sent.length, 1);
+  assert.equal(result.question.status, "answered");
+  assert.equal(result.question.resolvedBy, undefined);
+  assert.deepEqual(supervisor.getState().reviewClosed, []);
+});
+
+test("the review sees the agent message an ask came from and when it was sent", async (t) => {
+  const tail = "I can update the shared pr-verification skill so it syncs to GitHub. Want me to make that edit?";
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "waits" })));
+  const { supervisor } = fixture(t, {
+    threads: [asking({ lastAgentText: tail, lastAgentTail: tail, lastAgentAt: ago(20 * MIN) })], prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel }
+  });
+  await supervisor.tick();
+  const [entry] = model.calls[0].entries;
+  assert.equal(entry.askContext, tail);
+  assert.equal(entry.askedAt, ago(20 * MIN));
 });
 
 test("a review close holds while the same ask repeats, is never revived as a blip, and a new ask is new", async (t) => {

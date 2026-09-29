@@ -4,7 +4,7 @@
 // untrusted and may carry instructions, so it never goes into a message
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
-import { DEFAULTS, SUPERVISOR_PREFIX, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
+import { DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
 import { renderTemplate } from "./playbooks.js";
 
 const MIN = 60_000;
@@ -306,8 +306,13 @@ function agentAskIntent(ctx) {
   // A sealed Codex ask brings its own key: its shown text is a stand-in.
   return {
     type: "ask", reason: `agent asks: ${ask.topic ?? "question"}`,
-    question: question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
-      `ask:${thread.key}:${ask.key ?? shortHash(ask.text ?? "")}`, "agent-ask")
+    question: {
+      ...question(ctx, `${ctx.facts.label}: ${topicTitle}`, excerpt, options,
+        `ask:${thread.key}:${ask.key ?? shortHash(ask.text ?? "")}`, "agent-ask"),
+      // The body is only the ask sentence; the review needs what it is about.
+      askContext: clampTail(redactSecrets(thread.lastAgentTail || thread.lastAgentText), ctx.limits.excerptMax),
+      agentAskedAt: thread.lastAgentAt ?? null
+    }
   };
 }
 
