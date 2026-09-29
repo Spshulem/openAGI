@@ -557,8 +557,9 @@ export class FleetSupervisor {
   // question. One the owner overtook in the thread is dropped quietly; one
   // older than a day, or whose thread is gone, goes back to the owner.
   async deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked }) {
+    const contacted = new Set();
     const queued = this.store.queuedAnswers();
-    if (!queued.length) return;
+    if (!queued.length) return contacted;
     const deliveryState = await this.probeDelivery();
     for (const question of queued) {
       const pending = question.pendingDelivery;
@@ -580,6 +581,7 @@ export class FleetSupervisor {
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
       if (delivery.status !== "sent") continue;
+      contacted.add(thread.key);
       if (!delivery.done) { this.store.settleQueuedAnswer(question.id, "sent"); continue; }
       // A CLI child reports later whether it reached the agent.
       this.store.markQueuedSending(question.id);
@@ -587,6 +589,7 @@ export class FleetSupervisor {
         .then((reached) => (reached ? this.store.settleQueuedAnswer(question.id, "sent") : this.store.markQueuedSending(question.id, null)))
         .catch(() => this.store.markQueuedSending(question.id, null));
     }
+    return contacted;
   }
 
   // Restarts each listed app that shows one of these threads, once per ten
@@ -1047,7 +1050,8 @@ export class FleetSupervisor {
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
-    await this.deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked });
+    // A thread that just got the owner's answer gets no automatic nudge too.
+    const answeredNow = await this.deliverQueuedAnswers({ byKey, started, unknown, cappedKinds, asked });
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.
@@ -1062,6 +1066,7 @@ export class FleetSupervisor {
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
+      if (answeredNow.has(decision.threadKey)) continue;
       const targetKey = decision.action === "escalate-manager" ? (decision.targetKey ?? manager?.key ?? null) : decision.threadKey;
       const target = targetKey ? byKey.get(targetKey) : null;
       const record = {

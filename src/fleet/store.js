@@ -716,7 +716,8 @@ export class FleetStore {
 
   _pruneQuestions() {
     // Least recently asked first, so a close still holding back an ask stays.
-    const closed = this.state.questions.filter((q) => q.status !== "open").sort((a, b) => lastAskMs(a) - lastAskMs(b));
+    // An answer still waiting to be typed is the only copy: never pruned.
+    const closed = this.state.questions.filter((q) => q.status !== "open" && !q.pendingDelivery).sort((a, b) => lastAskMs(a) - lastAskMs(b));
     if (closed.length <= CLOSED_QUESTIONS_KEPT) return;
     const drop = new Set(closed.slice(0, closed.length - CLOSED_QUESTIONS_KEPT));
     this.state.questions = this.state.questions.filter((q) => !drop.has(q));

@@ -2270,3 +2270,23 @@ test("a kept answer sent by a background CLI child settles only when it reached 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(supervisor.store.question(q.id).deliveredAnswer, "sent");
 });
+
+test("a thread that just got a kept answer gets no automatic nudge the same tick, and pending answers are never pruned", async (t) => {
+  let now = NOW;
+  let ready = false;
+  // Asks and has a PR that would also get a merge-ready nudge.
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  await supervisor.answerQuestion(q.id, "yes");
+  for (let i = 0; i < 260; i += 1) supervisor.store.upsertQuestion({ dedupeKey: `junk:${i}`, kind: "infra", title: `t${i}`, options: ["ok"] }) && supervisor.store.dismissQuestion(supervisor.store.openQuestions().find((x) => x.dedupeKey === `junk:${i}`).id);
+  assert.ok(supervisor.store.question(q.id)?.pendingDelivery, "kept through pruning");
+  ready = true;
+  now += 5 * MIN;
+  const before = delivered.length;
+  await supervisor.tick();
+  const sent = delivered.slice(before).filter((d) => d.thread.key === "codex:t1");
+  assert.deepEqual(sent.map((d) => d.playbook), ["owner-answer"]);
+});
