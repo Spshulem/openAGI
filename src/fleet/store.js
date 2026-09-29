@@ -189,6 +189,15 @@ export class FleetStore {
     return ledger ? structuredClone(ledger) : emptyLedger();
   }
 
+  // The owner answered or dismissed the can't-deliver question for this
+  // thread: it is not asked about again for this failure streak.
+  ackUndelivered(key) {
+    const ledger = this.state.ledger[key];
+    if (!ledger?.undelivered) return;
+    ledger.undelivered.ackedAt = iso(this.now());
+    this._save();
+  }
+
   recordNudge(key, entry = {}, progressMark) {
     if (!key) return null;
     const ledger = this.state.ledger[key] ?? emptyLedger();
@@ -211,7 +220,7 @@ export class FleetStore {
     const detail = String(entry.detail ?? "");
     if (UNDELIVERED_STATUSES.has(status) && !BENIGN_BLOCKS.test(detail)) {
       const prev = ledger.undelivered ?? null;
-      ledger.undelivered = { count: (prev?.count ?? 0) + 1, since: prev?.since ?? at, lastAt: at, reason: clampText(detail, 160) || status };
+      ledger.undelivered = { count: (prev?.count ?? 0) + 1, since: prev?.since ?? at, lastAt: at, reason: clampText(detail, 160) || status, ackedAt: prev?.ackedAt ?? null };
     } else if (REACHED_STATUSES.has(status)) {
       ledger.undelivered = null;
     }
@@ -256,13 +265,11 @@ export class FleetStore {
     }
     // An answer, dismissal or review close holds (see holdsWhileAsked), so
     // the next tick neither reopens it with a new id nor pushes the phone again.
-    const closed = this._ownerClosed(key, now, fields);
-    // A group answer covers the threads it named; a thread it never named is
-    // a new incident and gets its own question.
-    // (A review close already weighs widening in _ownerClosed.)
-    const uncovered = closed && OWNER_CLOSED.has(closed.status) && Array.isArray(fields.threadKeys)
-      && fields.threadKeys.some((member) => !this.coveredMembers(key, now).has(member));
-    if (closed && !uncovered) {
+    // A delivery-failure answer holds on each thread's failure streak (see
+    // ackUndelivered), so the group question itself never holds: a thread
+    // that starts failing later is asked about, one already answered is not.
+    const closed = fields.kind === "deliver" ? null : this._ownerClosed(key, now, fields);
+    if (closed) {
       if (holdsWhileAsked(closed)) closed.lastAskedAt = iso(now);
       return { ...closed, suppressed: true };
     }
@@ -595,17 +602,6 @@ export class FleetStore {
 
   _findQuestion(id) {
     return this.state.questions.find((q) => q.id === id) ?? null;
-  }
-
-  // Threads named by owner-closed questions of this key that still hold.
-  coveredMembers(key, now = this.now()) {
-    const covered = new Set();
-    for (const question of this.state.questions) {
-      if (question.dedupeKey !== key || !OWNER_CLOSED.has(question.status)) continue;
-      if (toMs(question.answeredAt, null) === null || holdEnded(question, now)) continue;
-      for (const member of question.threadKeys ?? (question.threadKey ? [question.threadKey] : [])) covered.add(member);
-    }
-    return covered;
   }
 
   // An owner close, or a review close of the same ask, still holding it back.

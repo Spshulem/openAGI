@@ -368,7 +368,9 @@ function resolveNudge(ctx, intent, base) {
   if (cooledAt && Date.parse(cooledAt) > now) return { ...decision, action: "wait", reason: "cooldown", notBefore: cooledAt };
   const undelivered = undeliveredStreak(ledger, thread);
   if (undelivered) {
-    if (undelivered.count >= UNDELIVERED_ASK_COUNT && now - Date.parse(undelivered.since) >= UNDELIVERED_ASK_MS) return undeliveredDecision(ctx, decision, undelivered);
+    // Asked once per failure streak: after the owner's answer it only retries.
+    const due = !undelivered.ackedAt && undelivered.count >= UNDELIVERED_ASK_COUNT && now - Date.parse(undelivered.since) >= UNDELIVERED_ASK_MS;
+    if (due) return undeliveredDecision(ctx, decision, undelivered);
     const retryAt = addMs(undelivered.lastAt, Math.min(UNDELIVERED_BACKOFF_MS * 2 ** (undelivered.count - 1), UNDELIVERED_BACKOFF_MAX_MS));
     if (retryAt && Date.parse(retryAt) > now) {
       return { ...decision, action: "wait", reason: `can't deliver (${undelivered.reason}); retry after backoff`, notBefore: retryAt };
@@ -467,7 +469,7 @@ function resolveEscalation(ctx, intent, base) {
   const vars = { ...ctx.facts, ...intent.vars };
   const route = managerRoute(ctx.manager, ctx.mode, limits, now, ctx.delivery);
   const waitUi = route ? null : uiWaitReason(ctx.manager, ctx.delivery);
-  if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}` };
+  if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${intent.reason}`, uiBlocked: true };
   if (!route) {
     return {
       ...decision, action: "ask-user",
@@ -631,7 +633,7 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
   const route = managerRoute(manager, mode, limits, now, delivery);
   const waitUi = route ? null : uiWaitReason(manager, delivery);
-  if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}` };
+  if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}`, uiBlocked: true };
   if (!route) {
     return {
       ...base, action: "ask-user",

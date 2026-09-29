@@ -1986,7 +1986,7 @@ test("computer use unable to type for 30 min tells the owner once why, and the q
   await supervisor.tick({ reason: "test" });
   const q = paused();
   assert.ok(q);
-  assert.equal(q.kind, "deliver");
+  assert.equal(q.kind, "paused");
   assert.match(q.body, /BuildBetter Staging has a password field focused\. 1 threads wait on a nudge/);
   ready = true;
   now += 5 * MIN;
@@ -2088,4 +2088,30 @@ test("the pause alert is for Auto only, and a failed scan does not reset it", as
   await auto.supervisor.tick({ reason: "test" });
   assert.equal(auto.supervisor.store.question(q.id).status, "open");
   assert.match(auto.supervisor.store.question(q.id).body, /for 41m/, "the clock kept running");
+});
+
+test("the pause age is that of a nudge still waiting: a new thread starts its own clock", async (t) => {
+  let now = NOW;
+  let aStuck = true;
+  let bStuck = false;
+  const stalled = (key, stuck) => makeThread({ key, id: key.split(":")[1], cwd: `/work/${key}`, agentStatus: stuck ? "stalled" : "running", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const driver = { readiness: async () => ({ ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", now: () => now, deps: { uiDriver: driver, listCodexThreads: async () => [stalled("codex:a", aStuck), stalled("codex:b", bStuck)] } });
+  await supervisor.tick({ reason: "test" });
+  now += 29 * MIN;
+  aStuck = false;
+  bStuck = true;
+  await supervisor.tick({ reason: "test" });
+  now += 2 * MIN;
+  await supervisor.tick({ reason: "test" });
+  assert.equal(supervisor.store.openQuestions().find((q) => q.dedupeKey === "infra:computer-use"), undefined, "b has waited 2 minutes, not 31");
+});
+
+test("a delivery group keeps at most the store's 50 members and counts only those", () => {
+  const keys = Array.from({ length: 60 }, (_, i) => `codex:t${i}`);
+  const byKey = new Map(keys.map((key) => [key, makeThread({ key, id: key.split(":")[1] })]));
+  const asks = keys.map((key) => ({ threadKey: key, action: "ask-user", playbook: "resume", reason: "can't deliver: could not verify thread.", question: { kind: "deliver", dedupeKey: `deliver:${key}`, title: "x", body: "y", options: ["done", "skip"] } }));
+  const [group] = groupQuestions(asks, byKey);
+  assert.equal(group.threadKeys.length, 50);
+  assert.match(group.title, /^50 stopped/);
 });
