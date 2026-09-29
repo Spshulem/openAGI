@@ -83,8 +83,8 @@ export const DEFAULT_BB3_HOST = "dev@100.99.3.113";
 export const DEFAULT_LB_URL = "http://100.99.3.113:2455";
 export const DEFAULT_MANAGER_REF = "0056f770-e054-484b-a712-4cc036dacf6f";
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
-// Model for the review of the needs-you list. The owner must confirm it
-// (docs/setup/fleet-supervisor.md); OPENAGI_FLEET_REVIEW_MODEL overrides.
+// Model for the review of the needs-you list, chosen by the owner on
+// 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.
 export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
 export const DEFAULT_REVIEW_MS = 30 * MIN;
 // Sonnet took about 3 minutes on 13 questions, mostly thinking.

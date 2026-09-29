@@ -72,7 +72,7 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
 | `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
-| `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review. **Confirm it before relying on it** |
+| `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
 | `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
 
 `OPENAGI_PUBLIC_URL`, when set, makes phone pushes deep-link to `/fleet?q=<id>`.
@@ -255,8 +255,9 @@ on; the same outreach item updates in place. The supervisor's own questions
 - It runs in every mode. It only edits the supervisor's own list; it never
   messages a thread.
 
-The default model `claude-sonnet-5` is a placeholder until the owner confirms
-it. Set `OPENAGI_FLEET_REVIEW_MODEL` to the model you choose.
+The default model is `claude-sonnet-5`, confirmed by the owner on 2026-09-29. On
+26 hand-audited questions it agreed with the audit on 20, versus 17 for Haiku 4.5.
+Set `OPENAGI_FLEET_REVIEW_MODEL` to use another model.
 
 ## One supervisor shared by main, Android and G2
 
