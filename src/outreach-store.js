@@ -106,6 +106,23 @@ export class OutreachStore {
     return i;
   }
 
+  // A source that rewords an open item ("4 stuck" -> "5 stuck") updates its
+  // text in place. Same id, seq, and status, and no event, so nothing pings
+  // for it again. Only the fields passed are touched.
+  update(id, patch = {}) {
+    const i = this.items.get(id);
+    if (!i || (i.status !== "unseen" && i.status !== "seen")) return null;
+    const next = {};
+    if ("title" in patch) next.title = String(patch.title ?? "").trim() || "(untitled)";
+    if ("summary" in patch) next.summary = String(patch.summary ?? "");
+    if ("actions" in patch) next.actions = Array.isArray(patch.actions) ? patch.actions : [];
+    const changed = Object.keys(next).filter((key) => JSON.stringify(i[key]) !== JSON.stringify(next[key]));
+    if (!changed.length) return i;
+    for (const key of changed) i[key] = next[key];
+    this.snapshot();
+    return i;
+  }
+
   snapshot() {
     writeJsonAtomic(path.join(this.dir, "snapshot.json"), {
       version: 1,

@@ -6,6 +6,7 @@ import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { createNotifier } from "../src/fleet/notify.js";
+import { OutreachStore } from "../src/outreach-store.js";
 
 const ENDPOINT = "https://ping.buzzkit.dev/secret-device-id-123";
 // Local-time constructors keep these tests independent of the machine zone.
@@ -186,5 +187,23 @@ test("a question reopened after a blip posts no second outreach item and no seco
   const result = await notifier.notifyQuestion(back);
   assert.deepEqual(result, { outreachId: "out_1", pushed: false, skipped: "already-pushed" });
   assert.equal(appended.length, 1);
+  assert.equal(fetches.length, 1);
+});
+
+test("a reworded question updates its open outreach copy in place, with no second push", async (t) => {
+  const { home, config, store, fetches } = setup(t, { push: "buzzkit" });
+  const events = [];
+  const outreach = new OutreachStore({ dir: path.join(home, "outreach"), runtime: { events: { emit: (name) => events.push(name) } } });
+  const notifier = createNotifier({ config, store, runtime: { outreach }, fetchImpl: async (url, init) => { fetches.push(init); return { ok: true, status: 200 }; }, now: () => NOON, log: () => {} });
+  const ask = (n, options) => store.upsertQuestion({ dedupeKey: "stuck:mac", title: `${n} stuck, can't reach`, body: `${n} threads`, options });
+  const first = await notifier.notifyQuestion(ask(4, ["retry"]));
+  outreach.markSeen([first.outreachId]);
+
+  const second = await notifier.notifyQuestion(ask(5, ["retry", "wait"]));
+  assert.deepEqual(second, { outreachId: first.outreachId, pushed: false, skipped: "already-pushed" });
+  const item = outreach.get(first.outreachId);
+  assert.deepEqual([item.title, item.summary, item.actions, item.status], ["5 stuck, can't reach", "5 threads", ["retry", "wait", "dismiss"], "seen"]);
+  assert.equal(outreach.list().length, 1);
+  assert.deepEqual(events, ["outreach"]);
   assert.equal(fetches.length, 1);
 });

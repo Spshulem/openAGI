@@ -104,3 +104,26 @@ test('a question reopened on the computer brings back its mirrored copy, so G2 d
   assert.deepEqual(runtime.outreach.list().map(item => [item.id, item.status]), [[first.id, 'seen']]);
   assert.deepEqual(g2.feed(node).map(item => [item.id, item.notified]), [[first.id, true]]);
 });
+
+test('a reworded question updates its mirrored copy in place, so G2 shows the new text without a ping', async t => {
+  const { remote, runtime, state, dir } = fixture(t);
+  await remote.refresh();
+  const [first] = runtime.outreach.list();
+  runtime.outreach.markSeen([first.id]);
+  const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime });
+  const node = g2.node('glasses');
+  node.settings.enabled = true;
+  node.settings.categories = ['approvals'];
+  node.marks[first.id] = { notified: true };
+  state.questions = [{ id: 'fq_one', title: 'Which branch now?', body: 'Pick one', options: ['feature', 'main', 'release'] }];
+  await remote.refresh();
+  assert.deepEqual(runtime.outreach.list().map(item => [item.id, item.status, item.title, item.summary]), [[first.id, 'seen', 'Which branch now?', 'Pick one']]);
+  assert.deepEqual(g2.feed(node).map(item => [item.id, item.title, item.options, item.notified]), [[first.id, 'Which branch now?', ['feature', 'main', 'release'], true]]);
+
+  // Reopened after a blip with new text: the old copy comes back reworded.
+  state.questions = [];
+  await remote.refresh();
+  state.questions = [{ id: 'fq_one', title: 'Which branch, again?', body: 'Pick one', options: ['main'], reopenedAt: '2026-09-28T06:04:03.000Z' }];
+  await remote.refresh();
+  assert.deepEqual(runtime.outreach.list().map(item => [item.id, item.status, item.title, item.actions]), [[first.id, 'seen', 'Which branch, again?', ['main', 'dismiss']]]);
+});

@@ -80,3 +80,28 @@ test("reopen brings back only an item its source resolved, with the same id and 
   assert.deepEqual([reloaded.get(auto.id).status, reloaded.get(auto.id).seq, reloaded.get(auto.id).resolvedAt], ["seen", auto.seq, null]);
   assert.equal(reloaded.get(owner.id).status, "dismissed");
 });
+
+test("update rewords only an open item, in place and without an event", () => {
+  const dir = tmpDir();
+  const events = [];
+  const s = new OutreachStore({ dir, runtime: { events: { emit: (name) => events.push(name) } } });
+  const a = s.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: "fq_1" }, title: "4 stuck", summary: "Four threads", actions: ["retry", "dismiss"] });
+  const closed = s.append({ type: "fleet-question", sourceRef: { kind: "fleet", id: "fq_2" }, title: "Merge?" });
+  s.markSeen([a.id]);
+  s.resolve(closed.id, { action: "merge", by: "user" });
+  events.length = 0;
+
+  const updated = s.update(a.id, { title: " 5 stuck ", actions: ["retry", "wait", "dismiss"] });
+  assert.equal(updated.id, a.id);
+  assert.deepEqual([updated.title, updated.summary, updated.actions], ["5 stuck", "Four threads", ["retry", "wait", "dismiss"]]);
+  assert.deepEqual([updated.seq, updated.status, updated.createdAt], [a.seq, "seen", a.createdAt]);
+  assert.deepEqual(events, []);
+
+  assert.equal(s.update(closed.id, { title: "Merge now?" }), null);
+  assert.equal(s.get(closed.id).title, "Merge?");
+  assert.equal(s.update("out_missing", { title: "x" }), null);
+
+  const reloaded = new OutreachStore({ dir });
+  assert.equal(reloaded.list().length, 2);
+  assert.equal(reloaded.get(a.id).title, "5 stuck");
+});
