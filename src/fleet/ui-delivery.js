@@ -1095,7 +1095,9 @@ export function createUiDriver({
       return outcome(ctx, "blocked", `${changed}; ${cleared ? "cleared our text" : "could not clear the composer, check it"}`);
     }
 
-    // 9. Send: the Send button, else Return in the focused composer.
+    // 9. Send: the Send button, else Return in the focused composer. Out of
+    // time before either: still "typed", so recovery clears our text.
+    within(ctx, 1);
     ctx.phase = "sending";
     const send = findSendButton(state);
     let pressed = false;
