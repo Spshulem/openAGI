@@ -359,7 +359,7 @@ function orderPrRefs(entries, branch) {
 // without context blocks (in-app browser, environment), markdown as text.
 function shownFirstMessage(title) {
   let text = String(title);
-  const request = /(?:^|\n)## My request:[ \t]*\n?/.exec(text);
+  const request = /(?:^|\n)##\s*My request(?: for Codex)?:[ \t]*\n?/i.exec(text);
   if (request) text = text.slice(request.index + request[0].length);
   return text
     .replace(/<([\w-]{1,60})(?:\s[^>]{0,200})?>[\s\S]*?<\/\1>/g, " ")

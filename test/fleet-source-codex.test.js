@@ -744,6 +744,7 @@ test("first-message labels are read as the app shows them, and a name another th
   addThread(ctx, { id: "t-plain", name: "Ship usage export", title: "this wont impact more users that dont use the success stuff correct?", lines });
   addThread(ctx, { id: "t-foleon", name: "Foleon (2)", title: `${browser}\n\n## My request:\nthis wont impact more users that dont use the success stuff correct?`, lines });
   addThread(ctx, { id: "t-files", name: "Upload transcripts", title: "# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n\n## My request:\nI'm pretty sure we don't allow people to upload transcripts", lines });
+  addThread(ctx, { id: "t-legacy", name: "Fix CI imports", title: "# Files mentioned by the user:\n\n## a.png: /tmp/a.png\n## My request for Codex:\nplease fix the lint job on main", lines });
   addThread(ctx, { id: "t-md", name: "Posthog scope", title: "[posthog/posthog](https://github.com/posthog/posthog) Let me just scope out **the funnels**", lines });
   addThread(ctx, { id: "t-cont", name: "Build Jev speed demo", title: "Can you pull? I'm trying to do a demo, just pure demo mode", segment: "01a0cc96-8d86-7603-9d51-c26c28e0bfbb", lines });
   // A name that another thread's first message can show instead.
@@ -753,6 +754,7 @@ test("first-message labels are read as the app shows them, and a name another th
   assert.equal(map["t-foleon"].meta.firstMessageTitle, "this wont impact more users that dont use the success stuff correct?");
   assert.equal(map["t-plain"].meta.codexFirstMessageShared, true, "the same request with the in-app browser open");
   assert.equal(map["t-files"].meta.firstMessageTitle, "I'm pretty sure we don't allow people to upload transcripts");
+  assert.equal(map["t-legacy"].meta.firstMessageTitle, "please fix the lint job on main", "the older 'My request for Codex' header");
   assert.equal(map["t-md"].meta.firstMessageTitle, "posthog/posthog Let me just scope out the funnels");
   assert.equal(map["t-cont"].meta.firstMessageTitle, null, "a continuation segment's label is not in the catalog");
   assert.equal(map["t-named"].meta.codexTitleShared, true);
