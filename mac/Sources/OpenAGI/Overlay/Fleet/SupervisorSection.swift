@@ -120,7 +120,7 @@ struct SupervisorSection: View {
           .font(.system(size: 10)).foregroundStyle(.secondary)
       } else if question.answersInThread {
         // Tap a choice here, or type something else in the agent's own app.
-        Text("Or answer in the agent's own app.")
+        Text("Or answer in the agent's own app, then Scan now.")
           .font(.system(size: 10)).foregroundStyle(.tertiary)
       }
       if !options.isEmpty {
