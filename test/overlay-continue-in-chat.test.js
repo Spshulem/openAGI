@@ -367,7 +367,11 @@ test("Mac Quick Ask names the session before waiting and offers the handoff in e
   const root = path.resolve(import.meta.dirname, "..");
   const appState = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/AppState.swift"), "utf8");
   const overlay = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/Overlay/OverlayView.swift"), "utf8");
-  assert.match(appState, /let sessionId = lastAskSessionId \?\? "overlay:user:main"/);
+  assert.match(appState, /nonisolated static let overlayTasksSessionId = "overlay:user:main"/);
+  assert.match(appState, /nonisolated static let overlaySupervisorSessionId = "overlay:supervisor:main"/);
+  assert.match(appState, /sessionId: String = AppState\.overlayTasksSessionId,[\s\S]{0,120}requestId preparedRequestId/);
+  assert.match(appState, /let requestId = preparedRequestId \?\? beginOverlayAsk\(sessionId: sessionId\)/);
+  assert.match(appState, /func beginOverlayAsk\(sessionId: String = AppState\.overlayTasksSessionId\) -> String \{[\s\S]{0,200}lastAskSessionId = sessionId/);
   assert.match(appState, /lastAskSessionId = sessionId[\s\S]{0,900}"sessionId": sessionId/);
   assert.match(appState, /setValue\("text\/event-stream", forHTTPHeaderField: "Accept"\)/);
   assert.match(appState, /case "delta"[\s\S]{0,350}onTextDelta\?\(delta\.text, delta\.reset == true\)/);
@@ -403,7 +407,7 @@ test("Mac Quick Ask owns a durable inline approval surface", () => {
   assert.match(overlay, /Button\("Open chat"\) \{ app\.openChatSession\(approvals\.lastChatSessionId\) \}/);
   assert.match(overlay, /ForEach\(approvals\.items\)[\s\S]{0,500}\.frame\(maxHeight: 230\)/);
   assert.match(overlay, /Open all approvals in main app/);
-  assert.match(overlay, /await approvals\.refresh\(\)/);
+  assert.match(overlay, /(await|async let \w+: Void =) approvals\.refresh\(\)/);
   assert.match(appState, /if event == "pending-action"[\s\S]{0,700}PendingApprovalConsumer\.shared\.refresh\(\)[\s\S]{0,300}OverlayState\.shared\.expanded = true/);
   assert.match(appState, /if event == "pending-action-resolved"[\s\S]{0,160}PendingApprovalConsumer\.shared\.refresh\(\)/);
 });
@@ -433,4 +437,36 @@ test("appendMessage renders the chip for user turns", async () => {
   const { script } = await boot();
   const body = extractFunction(script, "appendMessage");
   assert.match(body, /screenContextChip\(/, "appendMessage drops the screen-context chip on the floor");
+});
+
+test("Mac Quick Ask has a Supervisor tab backed by the local fleet API", () => {
+  const root = path.resolve(import.meta.dirname, "..");
+  const appState = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/AppState.swift"), "utf8");
+  const overlay = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/Overlay/OverlayView.swift"), "utf8");
+  const overlayState = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/Overlay/OverlayState.swift"), "utf8");
+  const consumer = fs.readFileSync(path.join(root, "mac/Sources/OpenAGI/Overlay/Fleet/FleetConsumer.swift"), "utf8");
+
+  assert.match(consumer, /path: "\/fleet\/api\/state"/);
+  assert.match(consumer, /path: "\/fleet\/api\/questions\/\\\(id\)"/);
+  assert.match(consumer, /path: "\/fleet\/api\/scan"/);
+  assert.doesNotMatch(consumer, /fleet\/api\/send/, "the overlay never sends free text to an agent thread");
+  assert.match(consumer, /guard mine == generation else \{ return \}/);
+
+  // Height watchers: the new state has to resize the manually sized panel.
+  assert.match(overlay, /fleetActionWatchers\(fleetWatchers\(briefWatchers\(/);
+  assert.match(overlay, /\.onChange\(of: fleet\.questions\)/);
+  assert.match(overlay, /\.onChange\(of: state\.tab\)/);
+  assert.match(overlay, /\.onChange\(of: state\.fleetContext\)/);
+  for (const field of ["available", "status", "isLoading", "scanning", "inFlight", "lastOutcome", "lastError", "notes", "stillSending"]) {
+    assert.match(overlay, new RegExp(`\\.onChange\\(of: fleet\\.${field}\\)`), `fleet.${field} is watched`);
+  }
+  assert.match(overlay, /await fleet\.refresh\(\)/);
+  assert.match(overlay, /SupervisorSection\(\)/);
+
+  // The Supervisor tab asks in its own session, with fleet context and no screen capture.
+  assert.match(overlayState, /supervisor \? AppState\.overlaySupervisorSessionId : AppState\.overlayTasksSessionId/);
+  assert.match(overlayState, /chatContext = fleetContext \?\? \.fleetOverview/);
+
+  assert.match(appState, /event == "fleet"[\s\S]{0,200}scheduleFleetRefresh\(\)/);
+  assert.match(appState, /FleetConsumer\.shared\.refresh\(\)/);
 });

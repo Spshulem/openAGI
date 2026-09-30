@@ -692,7 +692,7 @@ export function formatScreenContextBlock(screenContext) {
   return `\nActive window the user is looking at right now (${where}):\n${body}\nGround your answer in this if it's relevant; don't quote it back verbatim.\n`;
 }
 
-const BRIEF_ENTITY_KINDS = new Set(["task", "draft", "suggestion", "clarification"]);
+const BRIEF_ENTITY_KINDS = new Set(["task", "draft", "suggestion", "clarification", "fleet"]);
 const BRIEF_ITEM_KINDS = new Set(["focus", ...BRIEF_ENTITY_KINDS]);
 
 /// Resolve a Quick Ask row reference against the current local store. The
@@ -706,6 +706,9 @@ export function resolveBriefContext(runtime, raw) {
   const refId = boundedText(raw.entityRef?.id, 300);
   const referenceMatchesRow = refKind === kind || (kind === "focus" && refKind === "task");
   if (refKind && !referenceMatchesRow) return null;
+  // The Supervisor tab asks about the coding-agent supervisor. Its state is
+  // read live here, so a client title or a stale id never reaches the prompt.
+  if (kind === "fleet") return resolveFleetContext(runtime, refKind === "fleet" ? refId : "");
 
   let record = null;
   if (refKind && refId) {
@@ -735,6 +738,70 @@ export function resolveBriefContext(runtime, raw) {
     content: resolved.content,
     resolvedFromStore: Boolean(record)
   };
+}
+
+const FLEET_OVERVIEW_QUESTIONS = 12;
+
+/// The supervisor's live state as chat context: one open question when the
+/// id names one, else an overview of what is open. Null when the supervisor
+/// is missing, fails, or is off with nothing open.
+function resolveFleetContext(runtime, id) {
+  let state = null;
+  try {
+    state = runtime?.fleetSupervisor?.getState?.() ?? null;
+  } catch {
+    return null;
+  }
+  if (!state || typeof state !== "object" || typeof state.then === "function") return null;
+  const questions = Array.isArray(state.questions)
+    ? state.questions.filter((q) => q && typeof q === "object" && typeof q.id === "string" && q.id)
+    : [];
+  if (state.enabled === false && questions.length === 0) return null;
+
+  const question = id ? questions.find((q) => q.id === id) : null;
+  const questionTitle = question ? boundedText(question.title, 500) : "";
+  if (question && questionTitle) {
+    return {
+      kind: "fleet",
+      entityRef: { kind: "fleet", id },
+      title: questionTitle,
+      summary: boundedText(question.body, 1_000),
+      content: boundedText(JSON.stringify({
+        questionId: question.id,
+        kind: typeof question.kind === "string" ? question.kind : null,
+        options: fleetOptions(question.options),
+        threadKey: typeof question.threadKey === "string" ? question.threadKey : null,
+        prRef: typeof question.prRef === "string" ? question.prRef : null,
+        reviewReason: typeof question.reviewReason === "string" ? question.reviewReason : null,
+        askContext: boundedText(question.askContext, 1_500) || null
+      }), 6_000),
+      resolvedFromStore: true
+    };
+  }
+
+  // No id, or one that is no longer open: the overview, never the client text.
+  const mode = typeof state.mode === "string" && state.mode ? state.mode : "unknown";
+  const lastScan = typeof state.lastTickAt === "string" && state.lastTickAt ? state.lastTickAt : "never";
+  const listed = questions.slice(0, FLEET_OVERVIEW_QUESTIONS).map((q) => ({
+    id: q.id,
+    title: boundedText(q.title, 120),
+    options: fleetOptions(q.options),
+    threadKey: typeof q.threadKey === "string" ? q.threadKey : null,
+    kind: typeof q.kind === "string" ? q.kind : null
+  }));
+  return {
+    kind: "fleet",
+    entityRef: null,
+    title: "Coding-agent supervisor",
+    summary: `mode ${mode} · last scan ${lastScan} · ${questions.length} open`,
+    content: boundedText(JSON.stringify({ openQuestions: listed }), 6_000),
+    resolvedFromStore: true
+  };
+}
+
+function fleetOptions(options) {
+  if (!Array.isArray(options)) return [];
+  return options.filter((option) => typeof option === "string").slice(0, 12).map((option) => option.slice(0, 200));
 }
 
 function briefRecordFields(kind, record) {

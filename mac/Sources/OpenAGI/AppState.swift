@@ -216,6 +216,8 @@ final class AppState: ObservableObject {
         // Reconcile durable approvals on recovery, without requiring the user
         // to close and reopen a panel that still displays an outage error.
         Task { await PendingApprovalConsumer.shared.refresh() }
+        // Same for the supervisor's questions: the pill badge counts them.
+        Task { await FleetConsumer.shared.refresh() }
       }
       if h.firstRun == true && !offeredSetupThisLaunch {
         offeredSetupThisLaunch = true
@@ -396,10 +398,31 @@ final class AppState: ObservableObject {
     }
   }
 
+  private var fleetRefreshTask: Task<Void, Never>?
+
+  /// Coalesce supervisor refetches: a tick emits "fleet" plus one outreach
+  /// event per question it opened or closed, and they all want one GET.
+  func scheduleFleetRefresh() {
+    guard fleetRefreshTask == nil else { return }   // the open window will pick it up
+    fleetRefreshTask = Task { [self] in
+      try? await Task.sleep(nanoseconds: 1_000_000_000)
+      fleetRefreshTask = nil
+      if Task.isCancelled { return }
+      await FleetConsumer.shared.refresh()
+    }
+  }
+
   func handleSSEEvent(_ event: String, _ data: String) {
     // The brief is server-composed, so a change to any of its sources means the
     // ranking may have moved — refetch rather than mutating local state.
     if Self.briefRelevantEvents.contains(event) { scheduleBriefRefresh() }
+    // Supervisor questions: a finished tick, a question's outreach copy
+    // opening or closing, or an approved fleet_answer_question.
+    if event == "fleet"
+      || (event.hasPrefix("outreach") && data.contains("fleet-question"))
+      || event == "pending-action-resolved" {
+      scheduleFleetRefresh()
+    }
     if event == "cron", data.contains("\"op\":\"run\"") {
       notify(title: "OpenAGI", body: "Scheduled job fired.", path: "/")
     }
@@ -599,9 +622,15 @@ final class AppState: ObservableObject {
   /// OverlayState flips `isLoading` before capture starts, so without this tiny
   /// preflight the working-state handoff button has a brief window where it can
   /// only open an unrelated blank chat.
+  /// The Tasks and Supervisor tabs each keep their own durable conversation.
+  nonisolated static let overlayTasksSessionId = "overlay:user:main"
+  nonisolated static let overlaySupervisorSessionId = "overlay:supervisor:main"
+
   @discardableResult
-  func beginOverlayAsk() -> String {
-    if lastAskSessionId == nil { lastAskSessionId = "overlay:user:main" }
+  func beginOverlayAsk(sessionId: String = AppState.overlayTasksSessionId) -> String {
+    // Always the tab's own session: carrying the last one over would send a
+    // Tasks ask into the supervisor conversation.
+    lastAskSessionId = sessionId
     let requestId = "ask_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     lastAskRequestId = requestId
     return requestId
@@ -613,6 +642,7 @@ final class AppState: ObservableObject {
     text: String,
     screenContext: ScreenContext?,
     briefContext: BriefChatContext? = nil,
+    sessionId: String = AppState.overlayTasksSessionId,
     requestId preparedRequestId: String? = nil,
     onProgress: ((String) -> Void)? = nil,
     onTextDelta: ((String, Bool) -> Void)? = nil
@@ -622,8 +652,7 @@ final class AppState: ObservableObject {
     // the id up front keeps "Continue in main app" honest during work and after
     // any client-side disconnect. Explicit sessionId also prevents specialist
     // routing from silently moving this turn to an id the popup cannot predict.
-    let sessionId = lastAskSessionId ?? "overlay:user:main"
-    let requestId = preparedRequestId ?? beginOverlayAsk()
+    let requestId = preparedRequestId ?? beginOverlayAsk(sessionId: sessionId)
     lastAskSessionId = sessionId
     lastAskRequestId = requestId
 
