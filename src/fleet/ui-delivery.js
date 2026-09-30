@@ -886,7 +886,9 @@ export function createUiDriver({
   // must stay there: typing goes to the frontmost app.
   async function ownerCheck(ctx, target) {
     const reason = await ownerReason(ctx, target);
-    if (reason) sawOwner(ctx);
+    // An unread front app is a probe hiccup, not the owner: putting their app
+    // back still re-probes before it moves anything.
+    if (reason && reason !== "front app unknown") sawOwner(ctx);
     return reason;
   }
 

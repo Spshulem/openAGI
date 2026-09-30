@@ -314,6 +314,25 @@ test("an unknown front app blocks: it could hide the screen saver, and nothing c
   assert.deepEqual(f.probe.activated, []);
 });
 
+test("an unknown front app after the fleet brought its app forward still puts the owner's app back", async (t) => {
+  const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
+  const probe = fakeProbe({ onOpen: () => { app.selected = "madrid"; } });
+  // One lsappinfo hiccup at the owner check after the activation settled.
+  let reads = null;
+  const activate = probe.activate;
+  probe.activate = async (bundleId) => { if (bundleId === app.bundleId) reads = 0; return activate(bundleId); };
+  probe.frontApp = async () => {
+    if (reads !== null && ++reads === 2) return null;
+    return probe.front;
+  };
+  const f = setup(t, { app, probe });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "front app unknown");
+  assert.deepEqual(typed(f.calls()), []);
+  assert.deepEqual(probe.activated, ["com.conductor.app", "com.google.Chrome"]);
+});
+
 test("the front app turning unknown during a slow read: nothing opened or brought forward", async (t) => {
   const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
   const f = setup(t, { app, probe: fakeProbe({ onOpen: () => { app.selected = "madrid"; } }) });
