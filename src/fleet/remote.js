@@ -20,10 +20,12 @@ export function createFleetCapability(supervisor) {
 
 const REQUEST_TIMEOUT_MS = 120000;
 // A request that types into an app waits for the whole UI delivery (a Codex
-// one runs 1-3 min): lock wait, uiDeliveryTimeoutMs, then uiCleanupMs for
-// clearing on failure and putting the owner's app back, which the driver
-// never runs past. The broker's own ceiling, so the main does not report a
-// failure for an answer the Mac then sends.
+// one runs 1-3 min): uiDeliveryTimeoutMs, then uiCleanupMs for clearing on
+// failure and putting the owner's app back, which the driver never runs
+// past. Both count from the request's start (probes, lock wait and earlier
+// sends in it included). The broker's own ceiling (dispatch in
+// src/node-control.js), so the main does not report a failure for an answer
+// the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 const DELIVERING = /^\/fleet\/api\/(send|questions\/[^/]+|actions\/[^/]+\/send)$/;
 

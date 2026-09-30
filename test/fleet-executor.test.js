@@ -448,6 +448,10 @@ test("computer-use types through the UI driver: one line, no CLI, final result, 
   assert.equal(calls.length, 0, "never runs codex or claude");
   assert.equal(requests.length, 1);
   assert.equal(requests[0].text, `${MESSAGE_PREFIX}Ready to merge? CI red: lint. Fix it.`);
+  assert.ok(requests[0].spentMs >= 0 && requests[0].spentMs < 1000, "the caller's time, lock wait added");
+  // A caller's request time carries through to the driver.
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "Second note.", route: "computer-use", playbook: "owner-answer", spentMs: 60_000 });
+  assert.ok(requests[1].spentMs >= 60_000);
   assert.equal(requests[0].target.deepLink, "conductor://workspace?id=w-madrid&session=s1");
   assert.deepEqual(requests[0].identity.tokens, ["madrid"]);
   assert.equal(requests[0].previousUnconfirmed, false);

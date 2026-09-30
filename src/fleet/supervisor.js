@@ -506,7 +506,9 @@ export class FleetSupervisor {
     try { this.runtime?.outreach?.reopen?.(question.outreachId); } catch { /* best-effort */ }
   }
 
-  async resumeAll(question, message, settling = [], { restartApps = [] } = {}) {
+  // startedAt: when the owner's request began (Date.now): an app send counts
+  // its time from there, so a remote request ends inside the broker's 5 min.
+  async resumeAll(question, message, settling = [], { restartApps = [], startedAt = Date.now() } = {}) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
     const restarted = await this.restartHosts(keys, restartApps);
     if (restarted) return restarted;
@@ -528,7 +530,7 @@ export class FleetSupervisor {
         if (typedInto.get(uiKey)) { sent += 1; this.store.markQuestionDelivered(question.id, key); } else blocked += 1;
         continue;
       }
-      const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+      const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt });
       if (uiKey) typedInto.set(uiKey, delivery.status === "sent");
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
       if (delivery.status === "sent") {
@@ -652,6 +654,7 @@ export class FleetSupervisor {
   }
 
   async answerQuestion(id, answer) {
+    const startedAt = Date.now();
     if (this.answering.has(id)) return null;
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
@@ -667,7 +670,7 @@ export class FleetSupervisor {
         // The owner's own copy of this playbook says what their apps need
         // after an account switch (a restart, a plain "retry").
         const playbook = this.playbooks().get("account-switched");
-        delivery = await this.resumeAll(question, playbook?.body || ADDED_DELIVERY, settling, { restartApps: playbook?.restartApps ?? [] });
+        delivery = await this.resumeAll(question, playbook?.body || ADDED_DELIVERY, settling, { restartApps: playbook?.restartApps ?? [], startedAt });
       }
       // An owner answer to the agent's own question, or "retry" after the owner
       // fixed a login/disk blocker, is an explicit instruction: every mode.
@@ -680,7 +683,7 @@ export class FleetSupervisor {
         if (!thread || !route) {
           delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
         } else {
-          delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+          delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt });
           if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
           // Starts the cooldown but does not spend the no-progress nudge budget.
           this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
@@ -738,13 +741,14 @@ export class FleetSupervisor {
   // fleet_send_message, after approval). Same delivery as an owner answer:
   // on a computer-use Mac it is typed into the app, never a CLI.
   async sendOwnerMessage(threadKey, message) {
+    const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
     const thread = this.lastThreads.get(threadKey);
     const deliveryState = thread ? await this.probeDelivery() : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message" });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt });
     this.store.recordNudge(thread.key, { playbook: "owner-message", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null } };
   }

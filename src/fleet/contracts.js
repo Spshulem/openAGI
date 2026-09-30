@@ -77,13 +77,18 @@ export const DEFAULTS = Object.freeze({
   // A Codex app state read alone takes 11-25 s.
   uiOwnerIdleMs: 2 * MIN,
   uiStepTimeoutMs: 10_000,
+  // A presence command that ignores SIGTERM settles this long after its
+  // timeout (runCommand's kill grace).
+  uiKillGraceMs: 5_000,
   uiReadTimeoutMs: 45_000,
   // Codex: link, two reads, activate, read, focus, type, read, send, confirm,
   // typing included.
   uiDeliveryTimeoutMs: 205_000,
-  // After that deadline: the one probe still running, two reads of
-  // clearing, and putting the owner's app back, none past it. Lock wait,
-  // delivery and this must stay under the node broker's 5 min.
+  // After that deadline: the one probe still running (two commands, kill
+  // grace included) or readiness, then clearing (up to two reads) and
+  // putting the owner's app back in what is left, none past it. Both count
+  // from the owner's request start (its probes and the lock wait included),
+  // so delivery and this stay under the node broker's 5 min.
   uiCleanupMs: 90_000,
   // Another delivery holding the lock: busy at once, retried next scan (a
   // remote send has no room in the broker's 5 min to wait it out).

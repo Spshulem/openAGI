@@ -1194,11 +1194,13 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   let running = 0;
   let most = 0;
   const routes = [];
+  const spent = [];
   const executor = {
     deliver: async (args) => {
       running += 1;
       most = Math.max(most, running);
       routes.push(args.route);
+      spent.push(args.spentMs);
       await new Promise((resolve) => setTimeout(resolve, 5));
       running -= 1;
       return { status: "sent", route: args.route, detail: "typed into Codex", actionId: null };
@@ -1215,6 +1217,10 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   assert.equal(result.question.status, "answered");
   assert.deepEqual(routes, ["computer-use", "computer-use", "computer-use"]);
   assert.equal(most, 1);
+  // Each send counts its time from the owner's request, earlier sends included,
+  // so the whole request stays inside the broker's 5 min.
+  assert.ok(spent.every(Number.isFinite), String(spent));
+  assert.ok(spent[1] >= spent[0] + 5 && spent[2] >= spent[1] + 5, String(spent));
 });
 
 test("the owner's own message to a thread goes through the supervisor's delivery", async (t) => {
@@ -1225,6 +1231,7 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered.length, 1);
   assert.equal(delivered[0].message, "Rebase on main.");
   assert.equal(delivered[0].playbook, "owner-message");
+  assert.ok(delivered[0].spentMs >= 0, "its probes count toward the request's time");
   assert.equal((await supervisor.sendOwnerMessage("codex:missing", "hi")).delivery.status, "blocked");
   assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
 });
@@ -1886,7 +1893,10 @@ test("threads that cannot be reached never starve a stopped one: blocked tries u
 
 test("a computer-use send that times out defers the tick's other app sends", async (t) => {
   const many = Array.from({ length: 3 }, (_, i) => makeThread({ key: `codex:u${i}`, id: `u${i}`, cwd: `/work/u${i}`, title: `Thread ${i}`, writerLocked: true, meta: { originator: "Codex Desktop" } }));
-  for (const detail of ["Open Computer Use timed out after 45s on get_app_state; nothing typed", "Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.; nothing typed", "delivery timed out; nothing typed"]) {
+  for (const detail of ["Open Computer Use timed out after 45s on get_app_state; nothing typed", "Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.; nothing typed", "delivery timed out; nothing typed",
+    // An input call that may still be running in the shared app agent, and a send refused until it has settled.
+    "Open Computer Use timed out on input; unconfirmed: check the thread before retrying",
+    "Open Computer Use timed out on input earlier; waiting for it to finish; nothing typed"]) {
     const delivered = [];
     const executor = { deliver: async (args) => { delivered.push(args); return { status: "failed", route: args.route, detail, actionId: null }; }, inFlight: () => [], whenIdle: async () => {} };
     const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: many, deps: { executor, uiDriver: readyDriver() } });

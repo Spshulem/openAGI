@@ -315,8 +315,8 @@ test("the fleet's own clicks and keys do not count as the owner coming back", as
   const app = fakeApp();
   const f = setup(t, { app, probe });
   probe.idleMs = async () => (hidAt === null ? 10 * 60_000 : f.now() - hidAt);
-  // Keyboard-fallback typing: its last key event lands as the call ends.
-  app.onType = (text) => { f.advance(3_000); hidAt = f.now(); return text; };
+  // Keyboard-fallback typing: its keys land, then the call's closing snapshot.
+  app.onType = (text) => { hidAt = f.now(); f.advance(3_000); return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
   assert.deepEqual(probe.activated, ["com.conductor.app", "com.google.Chrome"]);
@@ -1242,58 +1242,61 @@ test("the screen saver starting during a slow read: nothing opened or brought fo
   }
 });
 
-test("a delivery cut off after typing ends, clearing and restore included, inside its cap plus the cleanup", async (t) => {
-  const limits = { ...DEFAULTS, uiDeliveryTimeoutMs: 1_500, uiCleanupMs: 600, uiReadTimeoutMs: 2_000, uiStepTimeoutMs: 100 };
-  const app = fakeApp();
-  const probe = fakeProbe();
-  let hung = false;
-  // After typing, reads never answer and every probe command takes its whole timeout.
-  for (const [name, commands] of [["frontApp", 2], ["idleMs", 1], ["appRunning", 1], ["activate", 1]]) {
-    const fn = probe[name];
-    probe[name] = async (...args) => {
-      if (hung) await new Promise((resolve) => setTimeout(resolve, commands * limits.uiStepTimeoutMs));
-      return fn(...args);
-    };
-  }
-  app.onType = (text) => { hung = true; return text; };
-  const engines = [];
-  const f = setup(t, {
-    app, probe,
-    driverOptions: {
-      config: { bins: { ocu: "/fake/OpenComputerUse" }, limits },
-      now: Date.now,
-      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5))),
-      transportFactory: () => {
-        const inner = fakeTransport(app);
-        engines.push(inner);
-        return {
-          call: (name, args, signal, options = {}) => (hung && name === "get_app_state")
-            ? new Promise((_resolve, reject) => {
-              inner.calls.push({ name, args, options });
-              const fail = () => { clearTimeout(timer); reject(new Error("Open Computer Use timed out")); };
-              const timer = setTimeout(fail, options.timeoutMs);
-              signal?.addEventListener("abort", fail, { once: true });
-            })
-            : inner.call(name, args, signal, options),
-          close: () => inner.close()
-        };
-      }
+test("a delivery cut off after typing ends, clearing and restore included, inside its cap plus the cleanup, counted from the request's start", async (t) => {
+  // spentMs: the request's probes before the send.
+  for (const spentMs of [0, 500]) {
+    const limits = { ...DEFAULTS, uiDeliveryTimeoutMs: 1_500, uiCleanupMs: 600, uiReadTimeoutMs: 2_000, uiStepTimeoutMs: 100, uiKillGraceMs: 0 };
+    const app = fakeApp();
+    const probe = fakeProbe();
+    let hung = false;
+    // After typing, reads never answer and every probe command takes its whole timeout.
+    for (const [name, commands] of [["frontApp", 2], ["idleMs", 1], ["appRunning", 1], ["activate", 1]]) {
+      const fn = probe[name];
+      probe[name] = async (...args) => {
+        if (hung) await new Promise((resolve) => setTimeout(resolve, commands * limits.uiStepTimeoutMs));
+        return fn(...args);
+      };
     }
-  });
-  const start = Date.now();
-  const result = await f.driver.deliver(f.request({ text: "[OpenAGI supervisor] hi" }));
-  const took = Date.now() - start;
-  assert.equal(result.status, "failed");
-  assert.match(result.detail, /^delivery timed out; not sent/);
-  assert.deepEqual(engines.flatMap((engine) => engine.calls).filter((call) => call.name === "type_text").length, 1);
-  assert.ok(took <= limits.uiDeliveryTimeoutMs + limits.uiCleanupMs + 150, `${took} ms`);
+    app.onType = (text) => { hung = true; return text; };
+    const engines = [];
+    const f = setup(t, {
+      app, probe,
+      driverOptions: {
+        config: { bins: { ocu: "/fake/OpenComputerUse" }, limits },
+        now: Date.now,
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5))),
+        transportFactory: () => {
+          const inner = fakeTransport(app);
+          engines.push(inner);
+          return {
+            call: (name, args, signal, options = {}) => (hung && name === "get_app_state")
+              ? new Promise((_resolve, reject) => {
+                inner.calls.push({ name, args, options });
+                const fail = () => { clearTimeout(timer); reject(new Error("Open Computer Use timed out")); };
+                const timer = setTimeout(fail, options.timeoutMs);
+                signal?.addEventListener("abort", fail, { once: true });
+              })
+              : inner.call(name, args, signal, options),
+            close: () => inner.close()
+          };
+        }
+      }
+    });
+    const start = Date.now();
+    const result = await f.driver.deliver(f.request({ text: "[OpenAGI supervisor] hi", spentMs }));
+    const took = Date.now() - start;
+    assert.equal(result.status, "failed");
+    assert.match(result.detail, /^delivery timed out; not sent/);
+    assert.deepEqual(engines.flatMap((engine) => engine.calls).filter((call) => call.name === "type_text").length, 1);
+    assert.ok(took <= limits.uiDeliveryTimeoutMs + limits.uiCleanupMs - spentMs + 150, `${spentMs}: ${took} ms`);
+  }
 });
 
 test("an input call that times out may still land: unconfirmed, nothing cleared, typed, or brought forward after it", async (t) => {
   const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 10 * 60_000 : 0) } });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "failed");
-  assert.equal(result.detail, "unconfirmed: an input call timed out; check the thread");
+  assert.equal(result.detail, "Open Computer Use timed out on input; unconfirmed: check the thread before retrying");
   assert.equal(result.unconfirmed, true);
   assert.equal(f.transports.length, 1, "no fresh engine to clear with");
   assert.equal(names(f.calls()).at(-1), "type_text", "no call after it");
@@ -1302,7 +1305,7 @@ test("an input call that times out may still land: unconfirmed, nothing cleared,
   const g = setup(t, { transportOptions: { latency: (name, args) => (name === "click" && args.element_index === "62" ? 10 * 60_000 : 0) } });
   const send = await g.driver.deliver(g.request());
   assert.equal(send.status, "failed");
-  assert.equal(send.detail, "unconfirmed: an input call timed out; check the thread");
+  assert.equal(send.detail, "Open Computer Use timed out on input; unconfirmed: check the thread before retrying");
   assert.equal(send.unconfirmed, true);
   assert.equal(g.calls().filter((call) => call.name === "press_key").length, 0);
   assert.equal(names(g.calls()).at(-1), "click");
@@ -1314,8 +1317,9 @@ test("the owner's input during a slow typing call, or as a failed one ends, is t
   const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 20_000 : 0), advance: (ms) => clock.advance(ms) } });
   clock.advance = f.advance;
   const hid = hidClock(f);
-  // Typing takes 20 s (an AX value set: no HID event); the owner clicks 2 s in.
-  f.app.onType = (text) => { hid.at = f.now() - 18_000; return text; };
+  // Typing takes 20 s (an AX value set: no HID event); the owner clicks 10 s
+  // in, well after the fleet's own input could still land.
+  f.app.onType = (text) => { hid.at = f.now() - 10_000; return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
   assert.equal(result.detail, "owner using Conductor; cleared our text");
@@ -1327,6 +1331,59 @@ test("the owner's input during a slow typing call, or as a failed one ends, is t
   const failed = await g.driver.deliver(g.request());
   assert.equal(failed.status, "failed");
   assert.deepEqual(g.probe.activated, ["com.conductor.app"], "the owner's input as it failed is theirs: nothing put back over them");
+});
+
+test("the fleet's keys and typing land before a slow closing snapshot: still not the owner", async (t) => {
+  // Codex: each call ends with a 12 s snapshot after its input landed.
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" || name === "press_key" ? 12_000 : 0), advance: (ms) => f.advance(ms) } });
+  const hid = hidClock(f, { keysReset: false });
+  const typingMs = Math.ceil(MESSAGE.length * 25);
+  // Keyboard-fallback typing posts its keys over typingMs from the call's start.
+  f.app.onType = (text) => { hid.at = f.now() - 12_000 + typingMs; return text; };
+  f.app.sendButton = false;
+  f.app.onKey = () => { hid.at = f.now() - 12_000; };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").at(-1).args.key, "Return");
+  assert.deepEqual(f.probe.activated, ["com.conductor.app", "com.google.Chrome"], "the owner's app is put back");
+  // The next delivery right after is not held up by that Return.
+  f.advance(20_000);
+  const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
+  assert.equal(next.status, "sent", next.detail);
+});
+
+test("after an input call times out, no delivery types until it has had time to finish", async (t) => {
+  let slow = true;
+  const f = setup(t, { transportOptions: { latency: (name) => (slow && name === "type_text" ? 10 * 60_000 : 0) } });
+  const first = await f.driver.deliver(f.request());
+  assert.equal(first.detail, "Open Computer Use timed out on input; unconfirmed: check the thread before retrying");
+  slow = false;
+  f.app.composer = "";
+  const count = f.calls().length;
+  const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
+  assert.equal(next.status, "blocked");
+  assert.equal(next.detail, "Open Computer Use timed out on input earlier; waiting for it to finish; nothing typed");
+  assert.equal(f.calls().length, count, "nothing read or typed");
+  f.advance(10 * 60_000);
+  const later = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
+  assert.equal(later.status, "sent", later.detail);
+});
+
+test("a request that already spent its time before the send types nothing", async (t) => {
+  const f = setup(t);
+  const result = await f.driver.deliver(f.request({ spentMs: DEFAULTS.uiDeliveryTimeoutMs }));
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "no time left in this request for another app send; nothing typed, retry");
+  assert.deepEqual(f.calls(), []);
+  assert.equal(f.permissionChecks, 0, "nothing probed");
+  // Readiness ran into the cap: no presence probe starts after it.
+  const g = setup(t);
+  const session = g.probe.session;
+  g.probe.session = async () => { g.advance(30_000); return session(); };
+  const late = await g.driver.deliver(g.request({ spentMs: DEFAULTS.uiDeliveryTimeoutMs - 20_000 }));
+  assert.equal(late.status, "failed");
+  assert.equal(late.detail, "delivery timed out; nothing typed");
+  assert.deepEqual(g.calls(), []);
 });
 
 test("after the link, a first read that matches is read again: the latest decides what is used", async (t) => {

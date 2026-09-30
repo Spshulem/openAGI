@@ -14,7 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { OcuTransport, readOcuPermissions } from "../integrations/ocu-transport.js";
+import { OCU_CLOSE_GRACE_MS, OcuTransport, readOcuPermissions } from "../integrations/ocu-transport.js";
 import { parseOcuPermissions } from "../integrations/open-computer-use-executor.js";
 import { DEFAULTS, SUPERVISOR_PREFIX, UI_APPS, clampText, redactSecrets, runCommand, uiTargetFor } from "./contracts.js";
 
@@ -29,9 +29,12 @@ const SLOW_NAVIGATION = new Set(["com.openai.codex"]);
 // The fleet's own app agent, apart from the owner's other sessions.
 const OCU_AGENT_NAMESPACE = "openagi-fleet";
 // The fleet's own keys (and keyboard-fallback typing) reset HIDIdleTime; an
-// owner's last input within this slack of the end of the fleet's last such
-// call that finished is the fleet's. Accessibility clicks post no HID event.
+// owner's last input within this slack of when the fleet's last finished key
+// or typing call posted it is the fleet's. Accessibility clicks post no HID event.
 const OWN_INPUT_SLACK_MS = 1500;
+// How long after a key or typing call starts (typing time added) OCU can
+// still be posting its input, before the call's closing snapshot.
+const OWN_INPUT_POST_MS = 5000;
 // Frontmost while the screen saver runs or the login window shows.
 const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
 const PERMISSION_OK_TTL_MS = 10 * MIN;
@@ -424,10 +427,10 @@ export function appNameFromPath(value) {
   return clampText(bundle ?? path.basename(text), 60) || null;
 }
 
-export function createPresenceProbe({ bins = {}, run = runCommand, timeoutMs = DEFAULTS.uiStepTimeoutMs } = {}) {
+export function createPresenceProbe({ bins = {}, run = runCommand, timeoutMs = DEFAULTS.uiStepTimeoutMs, killGraceMs = DEFAULTS.uiKillGraceMs } = {}) {
   const exec = async (cmd, args) => {
     try {
-      const result = await run(cmd, args, { timeoutMs });
+      const result = await run(cmd, args, { timeoutMs, killGraceMs });
       return result && !result.error && !result.timedOut && result.code === 0 ? String(result.stdout ?? "") : null;
     } catch {
       return null;
@@ -614,14 +617,19 @@ export function createUiDriver({
 } = {}) {
   const limits = { ...DEFAULTS, ...(config.limits ?? {}) };
   const bins = config.bins ?? {};
-  const presence = probe ?? createPresenceProbe({ bins, run, timeoutMs: limits.uiStepTimeoutMs });
+  const presence = probe ?? createPresenceProbe({ bins, run, timeoutMs: limits.uiStepTimeoutMs, killGraceMs: limits.uiKillGraceMs });
+  // The longest one presence command can take.
+  const commandMs = limits.uiStepTimeoutMs + limits.uiKillGraceMs;
   const makeTransport = transportFactory ?? (({ timeoutMs }) => new OcuTransport(bins.ocu, { timeoutMs, appAgentProxy: true, agentNamespace: OCU_AGENT_NAMESPACE }));
   const readPermissions = permissionProbe
     ?? (async () => parseOcuPermissions(await readOcuPermissions(bins.ocu, undefined, { appAgentProxy: true, agentNamespace: OCU_AGENT_NAMESPACE, timeoutMs: limits.uiStepTimeoutMs })));
   let permissionCache = null;
-  // When this driver's last key or typing call finished, across deliveries:
+  // When this driver's last key or typing input landed, across deliveries:
   // the next delivery in the same tick must not read it as the owner.
   let lastOwnInput = null;
+  // Nothing cancels an input call that timed out in the shared app agent: no
+  // delivery (a remote send included) types until it has had time to finish.
+  let inputSettlesAt = 0;
 
   const permissions = async () => {
     const at = now();
@@ -670,8 +678,10 @@ export function createUiDriver({
     // Typing comes out of the same budget (checked before it starts).
     // Clearing and putting the owner's app back get uiCleanupMs more and
     // never run past it, so a remote send ends inside the broker's 5 min.
-    const timer = setTimeout(() => controller.abort(), limits.uiDeliveryTimeoutMs);
-    const start = now();
+    // spentMs: what the request already spent before this delivery (its
+    // probes, earlier sends); both caps count from the request's start.
+    const start = now() - Math.max(0, Number(request.spentMs) || 0);
+    const timer = setTimeout(() => controller.abort(), Math.max(0, start + limits.uiDeliveryTimeoutMs - now()));
     const endsAt = start + limits.uiDeliveryTimeoutMs;
     const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt, deadline: endsAt, hardEndsAt: endsAt + limits.uiCleanupMs,
       slowest: 0, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
@@ -681,6 +691,8 @@ export function createUiDriver({
       return await recover(error, ctx, controller.signal.aborted || now() >= ctx.endsAt);
     } finally {
       clearTimeout(timer);
+      // The engine gets its close grace, the agent another action's worth.
+      if (ctx.inputInFlight) inputSettlesAt = now() + OCU_CLOSE_GRACE_MS + limits.uiReadTimeoutMs + ctx.typingMs;
       await restoreFront(ctx);
       try { ctx.transport?.close(); } catch { /* already closed */ }
     }
@@ -694,8 +706,8 @@ export function createUiDriver({
     const target = ctx.request.target;
     if (ctx.inputInFlight || !ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
     // Each probe only if it ends inside the request's budget with every
-    // command at its timeout (frontApp runs two).
-    const fits = (commands) => now() + commands * limits.uiStepTimeoutMs <= ctx.hardEndsAt;
+    // command at its timeout and kill grace (frontApp runs two).
+    const fits = (commands) => now() + commands * commandMs <= ctx.hardEndsAt;
     try {
       if (!fits(2) || (await presence.frontApp()) !== target.bundleId) return;
       if (!fits(1) || !ownerAway(ctx, await presence.idleMs())) return;
@@ -705,9 +717,9 @@ export function createUiDriver({
     } catch { /* best-effort */ }
   }
 
-  // Away: no input for uiOwnerIdleMs, or the last input came right as the
-  // driver's own last key or typing call finished (which reset the idle
-  // clock). Not the whole call: the owner can type during a slow one.
+  // Away: no input for uiOwnerIdleMs, or the last input is the driver's own
+  // last key or typing (which reset the idle clock), as markOwnInput saw it.
+  // Not the whole call: the owner can type during a slow one.
   function ownerAway(ctx, idle) {
     if (idle === null || idle === undefined) return false;
     if (idle >= limits.uiOwnerIdleMs) return true;
@@ -730,7 +742,8 @@ export function createUiDriver({
   }
 
   // No probe starts past the deadline in force; the one running then (two
-  // commands at most) is what uiCleanupMs allows for.
+  // commands at most, kill grace included), or readiness (two commands and
+  // the permission check), is what uiCleanupMs allows for.
   function probeNow(ctx, name, ...args) {
     if (now() >= ctx.deadline) throw new StepError("delivery timed out");
     return presence[name](...args);
@@ -738,22 +751,35 @@ export function createUiDriver({
 
   // One OCU action. Each ends with a fresh snapshot, so it gets a read's
   // budget. Keys and typing may post HID events: only a call that finished
-  // marks when, so it is not read as the owner (never after the owner was
-  // seen). One that timed out may still be running (nothing cancels it):
-  // no more input after it.
+  // marks when (never after the owner was seen). One that timed out may
+  // still be running (nothing cancels it): no more input after it.
   async function act(ctx, name, args, signal, { timeoutMs = limits.uiReadTimeoutMs, hid = false } = {}) {
     if (ctx.inputInFlight) throw new StepError("an input call timed out");
     const start = now();
+    let result;
     try {
-      const result = await ctx.transport.call(name, args, signal, { timeoutMs: within(ctx, timeoutMs) });
-      if (hid && !ctx.ownerSeen) ctx.ownInput = lastOwnInput = now();
-      return result;
+      result = await ctx.transport.call(name, args, signal, { timeoutMs: within(ctx, timeoutMs) });
     } catch (error) {
       if (error?.inFlight) ctx.inputInFlight = true;
       throw error;
     } finally {
       if (name !== "type_text") ctx.slowest = Math.max(ctx.slowest, now() - start);
     }
+    if (hid && !ctx.ownerSeen) await markOwnInput(ctx, start, name === "type_text" ? ctx.typingMs : 0);
+    return result;
+  }
+
+  // The input lands before the call's closing snapshot (10-25 s in Codex),
+  // so the call's end is not when: the idle clock says. It is the fleet's
+  // only inside the time the input itself takes; later input is the owner's.
+  async function markOwnInput(ctx, start, inputMs) {
+    if (now() + commandMs > ctx.deadline) return;
+    try {
+      const idle = await presence.idleMs();
+      if (idle === null || idle === undefined) return;
+      const at = now() - idle;
+      if (at >= start - OWN_INPUT_SLACK_MS && at <= start + inputMs + OWN_INPUT_POST_MS) ctx.ownInput = lastOwnInput = at;
+    } catch { /* nothing marked */ }
   }
 
   // An unconfirmed outcome carries how many copies the thread showed before
@@ -859,6 +885,9 @@ export function createUiDriver({
     // Only the apps in UI_APPS are ever driven.
     if (!ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", `${target.bundleId} is not an app the fleet types into`);
     if (!text) return outcome(ctx, "blocked", "empty message");
+    // Worded to stop the tick's other app sends too (supervisor UI_STALLED).
+    if (now() < inputSettlesAt) return outcome(ctx, "blocked", "Open Computer Use timed out on input earlier; waiting for it to finish; nothing typed");
+    if (now() >= ctx.endsAt) return outcome(ctx, "blocked", "no time left in this request for another app send; nothing typed, retry");
 
     // 0. Readiness, fresh.
     const ready = await readiness();
@@ -868,13 +897,14 @@ export function createUiDriver({
     if (!identity.tokens?.length && !identity.ids) return outcome(ctx, "blocked", identity.reason ?? "nothing to verify the thread by");
 
     // 1. Presence: never launch the app; act only while the owner is away,
-    // since typing needs the app in front.
-    const running = await presence.appRunning(target.bundleId);
+    // since typing needs the app in front. Readiness may have used up the
+    // request's time: no probe starts past it.
+    const running = await probeNow(ctx, "appRunning", target.bundleId);
     if (running === null) return outcome(ctx, "blocked", `could not tell whether ${target.name} is running`);
     if (!running) return outcome(ctx, "blocked", `${target.name} is not running`);
-    const frontBefore = await presence.frontApp();
+    const frontBefore = await probeNow(ctx, "frontApp");
     if (SCREEN_SAVER_APPS.has(frontBefore)) return outcome(ctx, "blocked", "screen saver on");
-    if (!ownerAway(ctx, await presence.idleMs())) {
+    if (!ownerAway(ctx, await probeNow(ctx, "idleMs"))) {
       sawOwner(ctx);
       if (frontBefore === target.bundleId || frontBefore === null) return outcome(ctx, "blocked", `owner using ${target.name}`);
       return outcome(ctx, "blocked", `waiting for idle: ${target.name} must be in front to type`);
@@ -1046,8 +1076,9 @@ export function createUiDriver({
   }
 
   // An input call that timed out may still be running: nothing is cleared,
-  // typed, or brought forward after it.
-  const inFlightOutcome = (ctx) => outcome(ctx, "failed", "unconfirmed: an input call timed out; check the thread", { unconfirmed: true });
+  // typed, or brought forward after it. Worded to stop the tick's other app
+  // sends too (supervisor UI_STALLED).
+  const inFlightOutcome = (ctx) => outcome(ctx, "failed", "Open Computer Use timed out on input; unconfirmed: check the thread before retrying", { unconfirmed: true });
 
   async function recover(error, ctx, timedOut) {
     if (ctx.inputInFlight) return inFlightOutcome(ctx);
