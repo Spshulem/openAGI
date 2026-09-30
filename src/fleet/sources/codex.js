@@ -396,12 +396,13 @@ function readSharedTitles(db, limits) {
   const where = present.has("archived") ? " WHERE COALESCE(archived, 0) = 0" : "";
   const counts = new Map();
   const labels = new Map();
-  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("rollout_path")}, ${pick("originator")}, ${pick("source")} FROM threads${where}`).all()) {
+  const head = present.has("first_user_message") ? "substr(first_user_message, 1, 400) AS first_user_head" : "NULL AS first_user_head";
+  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("rollout_path")}, ${pick("originator")}, ${pick("source")}, ${pick("thread_source")}, ${head} FROM threads${where}`).all()) {
     if (row.originator === CONDUCTOR_CODEX_ORIGINATOR) continue;
-    // Automation runs and subagents never show in the sidebar, so they
-    // cannot be mistaken for the thread on screen.
-    const source = String(row.source ?? "");
-    if (source === "exec" || source.includes("\"subagent\"")) continue;
+    // Automation runs, reviews, heartbeats and subagents never show in the
+    // sidebar, so they cannot be mistaken for the thread on screen. The
+    // supervisor's own thread does show.
+    if (metadataExclusion(row, {}) === "automation") continue;
     const token = identityToken(displayTitle(row, limits));
     if (token) counts.set(token, (counts.get(token) ?? 0) + 1);
     for (const label of [token, identityToken(firstMessageTitle(row, limits))]) {

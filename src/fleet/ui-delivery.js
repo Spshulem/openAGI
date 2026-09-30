@@ -751,6 +751,9 @@ export function createUiDriver({
       if (!fits(1) || !ownerAway(ctx, await presence.idleMs())) return;
       // open -b launches an app that quit meanwhile; never that.
       if (!fits(1) || (await presence.appRunning(ctx.frontBefore)) !== true) return;
+      // That probe can be slow: the owner may be back or have switched apps.
+      if (!fits(3) || (await presence.frontApp()) !== target.bundleId) return;
+      if (!ownerAway(ctx, await presence.idleMs())) return;
       if (fits(1)) await presence.activate(ctx.frontBefore);
     } catch { /* best-effort */ }
   }

@@ -314,6 +314,22 @@ test("an unknown front app blocks: it could hide the screen saver, and nothing c
   assert.deepEqual(f.probe.activated, []);
 });
 
+test("the owner's app is not put back if they return while the running check is slow", async (t) => {
+  const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
+  const probe = fakeProbe({ onOpen: () => { app.selected = "madrid"; } });
+  const running = probe.appRunning;
+  // Checking that Chrome still runs takes long enough for the owner to come
+  // back and click into Slack.
+  probe.appRunning = async (bundleId) => {
+    if (bundleId === "com.google.Chrome") { probe.front = "com.tinyspeck.slackmacgap"; probe.idle = 500; }
+    return running(bundleId);
+  };
+  const f = setup(t, { app, probe });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(probe.activated, ["com.conductor.app"], "Chrome is not pulled over the owner");
+});
+
 test("an unknown front app after the fleet brought its app forward still puts the owner's app back", async (t) => {
   const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
   const probe = fakeProbe({ onOpen: () => { app.selected = "madrid"; } });
