@@ -87,9 +87,10 @@ export class OcuTransport {
     });
     child.on("error", () => { if (this.proc === child) this.close(); });
     child.on("exit", () => {
-      // Input it ran may still be running in the agent: not finished.
-      for (const [id, late] of [...this.late]) if (late.child === child) this.settleLate(id, false);
+      // Close first, so input still pending becomes late on this child; then
+      // settle it all: input it ran may still be running in the agent.
       if (this.proc === child) this.close();
+      for (const [id, late] of [...this.late]) if (late.child === child) this.settleLate(id, false);
     });
     child.stdin.on("error", () => { if (this.proc === child) this.close(); });
     const result = await this.request("initialize", { protocolVersion: "2024-11-05", capabilities: {},

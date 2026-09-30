@@ -563,7 +563,7 @@ export function createInputLatch() {
     get held() { return orphaned || open.size > 0; },
     get detail() {
       if (orphaned) return "an earlier input call has not finished and its engine exited; typing paused until OpenAGI restarts";
-      return open.size ? "an earlier input call has not finished; typing paused" : null;
+      return open.size ? "an earlier input call has not finished; typing paused until it answers or OpenAGI restarts" : null;
     },
     hold(settled) {
       const token = {};

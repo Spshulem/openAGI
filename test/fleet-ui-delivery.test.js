@@ -1368,12 +1368,12 @@ test("after an input call times out, nothing types until its late answer shows i
   f.app.composer = "";
   const count = f.calls().length;
   // Surfaced as not ready (the supervisor's paused-nudge alert), not a benign wait.
-  assert.deepEqual(await f.driver.readiness(), { ready: false, detail: "an earlier input call has not finished; typing paused" });
+  assert.deepEqual(await f.driver.readiness(), { ready: false, detail: "an earlier input call has not finished; typing paused until it answers or OpenAGI restarts" });
   // Long past any estimate (close grace, a read, the typing time).
   f.advance(60 * 60_000);
   const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
   assert.equal(next.status, "blocked");
-  assert.equal(next.detail, "computer use not ready: an earlier input call has not finished; typing paused; nothing typed");
+  assert.equal(next.detail, "computer use not ready: an earlier input call has not finished; typing paused until it answers or OpenAGI restarts; nothing typed");
   assert.equal(f.calls().length, count, "nothing read or typed");
   assert.equal(f.probe.activated.length, 1, "no other app brought forward");
   // The late answer arrives on the still-open engine: typing resumes.

@@ -227,8 +227,9 @@ Safety rules:
   or brought forward. The tick's other app sends wait, and no app send (a
   remote one included) types until Open Computer Use answers that call late,
   however long it takes: computer use shows as not ready ("an earlier input
-  call has not finished; typing paused") and the paused-nudge alert tells you.
-  If its engine exits first, typing stays paused until OpenAGI restarts.
+  call has not finished; typing paused until it answers or OpenAGI
+  restarts") and the paused-nudge alert tells you. If its engine exits first,
+  typing stays paused until OpenAGI restarts.
 - A Codex thread the app labels by its first message is verified by that
   label only after the link moved the app onto it; already open, it is
   **blocked** (another thread can show the same first message).

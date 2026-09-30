@@ -240,3 +240,15 @@ test("input cut off by close, whose engine then exits, is not proven finished", 
   f.child.emit("exit", 0);
   assert.deepEqual(await error.settled, { completed: false });
 });
+
+test("input still pending when its engine exits is not proven finished, and leaves nothing waiting", async () => {
+  const f = agentFixture({ closeGraceMs: 20 });
+  await f.client.connect();
+  const typing = f.client.call("type_text", { app: "com.openai.codex", text: "hi" });
+  await new Promise(resolve => setImmediate(resolve));
+  f.child.emit("exit", 0);
+  const error = await typing.catch((caught) => caught);
+  assert.equal(error.inFlight, true);
+  assert.deepEqual(await error.settled, { completed: false });
+  assert.equal(f.client.late.size, 0);
+});
