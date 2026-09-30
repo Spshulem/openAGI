@@ -7,6 +7,7 @@ struct OverlayView: View {
   @ObservedObject var approvals = PendingApprovalConsumer.shared
   @ObservedObject var brief = BriefConsumer.shared
   @ObservedObject var briefEditor = BriefEditorState.shared
+  @ObservedObject var fleet = FleetConsumer.shared
   @FocusState private var fieldFocused: Bool
   @State private var pillHovered = false
   // Per-item reply text for the targeted chat field, keyed by outreach id.
@@ -23,7 +24,7 @@ struct OverlayView: View {
   // a single chain of sixteen generic .onChange overloads. Opaque helper
   // boundaries preserve modifier order without changing view identity/state.
   var body: some View {
-    briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))
+    fleetActionWatchers(fleetWatchers(briefWatchers(approvalWatchers(applicationWatchers(composerWatchers(panelWatchers(panelBody)))))))
   }
 
   private var panelBody: some View {
@@ -127,9 +128,53 @@ struct OverlayView: View {
     .onChange(of: briefEditor.expandedItemID) { _, _ in onContentChange() }
   }
 
+  // The Supervisor tab. Same rule as the brief: every FleetConsumer field that
+  // adds, removes or reshapes a row in SupervisorSection is watched here, and
+  // the tab itself swaps the whole list below the ask field.
+  private func fleetWatchers<V: View>(_ content: V) -> some View {
+    content
+    .onChange(of: state.tab) { _, tab in
+      if tab == .supervisor { Task { await fleet.refresh() } }
+      onContentChange()
+    }
+    // The chip's text and the highlighted row.
+    .onChange(of: state.fleetContext) { _, _ in onContentChange() }
+    // The whole array, not the count: a same-count swap changes row heights.
+    .onChange(of: fleet.questions) { _, _ in onContentChange() }
+    // Shows or hides the tab picker in the header.
+    .onChange(of: fleet.available) { _, _ in onContentChange() }
+    // The status line's text and the "Last scan failed" row.
+    .onChange(of: fleet.status) { _, _ in onContentChange() }
+  }
+
+  private func fleetActionWatchers<V: View>(_ content: V) -> some View {
+    content
+    .onChange(of: fleet.isLoading) { _, _ in onContentChange() }
+    .onChange(of: fleet.scanning) { _, _ in onContentChange() }
+    .onChange(of: fleet.inFlight) { _, _ in onContentChange() }
+    .onChange(of: fleet.lastOutcome) { _, _ in onContentChange() }
+    .onChange(of: fleet.lastError) { _, _ in onContentChange() }
+  }
+
+  /// Outreach rows for "Needs you". Supervisor questions also arrive as
+  /// outreach; while the Supervisor tab shows them, they are not listed twice.
+  private var visibleOutreach: [OutreachItem] {
+    outreach.items.filter { item in
+      item.type != "pending-action" && !(fleet.available && item.type == "fleet-question")
+    }
+  }
+
   // Combined attention count shown on the collapsed pill badge.
   private var pillBadgeCount: Int {
-    brief.items.count + outreach.items.filter { $0.type != "pending-action" }.count + approvals.items.count
+    brief.items.count + visibleOutreach.count + approvals.items.count
+      + (fleet.available ? fleet.questions.count : 0)
+  }
+
+  private var askPlaceholder: String {
+    if state.tab == .supervisor {
+      return state.fleetContext == nil ? "Ask the supervisor…" : "Ask about this question…"
+    }
+    return state.briefContext == nil ? "Ask about what you're looking at…" : "Ask about this item…"
   }
 
   private var pill: some View {
@@ -160,6 +205,17 @@ struct OverlayView: View {
     VStack(alignment: .leading, spacing: 8) {
       HStack {
         Text("Ask OpenAGI").font(.caption).foregroundStyle(.secondary)
+        if fleet.available {
+          Picker("View", selection: Binding(get: { state.tab }, set: { state.selectTab($0) })) {
+            Text("Tasks").tag(OverlayTab.tasks)
+            Text(fleet.questions.isEmpty ? "Supervisor" : "Supervisor \(fleet.questions.count)")
+              .tag(OverlayTab.supervisor)
+          }
+          .pickerStyle(.segmented)
+          .labelsHidden()
+          .controlSize(.small)
+          .fixedSize()
+        }
         Spacer()
         Button(action: {
           withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) { state.expanded = false }
@@ -173,18 +229,18 @@ struct OverlayView: View {
       if app.status == .down {
         Text("OpenAGI is offline").font(.caption).foregroundStyle(.red)
       }
-      TextField(state.briefContext == nil ? "Ask about what you're looking at…" : "Ask about this item…", text: $state.question)
+      TextField(askPlaceholder, text: $state.question)
         .textFieldStyle(.roundedBorder)
         .focused($fieldFocused)
         .disabled(app.status == .down || state.isLoading || state.isDetached)
         .onSubmit { Task { await state.ask() } }
-      if let selected = state.briefContext {
+      if let selected = state.activeContext {
         HStack(spacing: 5) {
           Text("About: \(selected.title)")
             .font(.system(size: 10, weight: .medium))
             .lineLimit(1)
           Spacer(minLength: 4)
-          Button { state.clearBriefContext() } label: {
+          Button { state.clearActiveContext() } label: {
             Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
           }
           .buttonStyle(.plain)
@@ -327,27 +383,32 @@ struct OverlayView: View {
           }
         }
       }
-      let visibleOutreach = outreach.items.filter { $0.type != "pending-action" }
-      if !visibleOutreach.isEmpty {
+      if state.tab == .supervisor {
         Divider()
-        Text("Needs you").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
-        ScrollView {
-          VStack(alignment: .leading, spacing: 8) {
-            ForEach(visibleOutreach.prefix(6)) { item in
-              outreachRow(item)
+        SupervisorSection()
+      } else {
+        let needsYou = visibleOutreach
+        if !needsYou.isEmpty {
+          Divider()
+          Text("Needs you").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+          ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+              ForEach(needsYou.prefix(6)) { item in
+                outreachRow(item)
+              }
             }
           }
+          .frame(maxHeight: 240)
         }
-        .frame(maxHeight: 240)
-      }
-      // Gate on everything BriefSection can render, not just the rows. Gating on
-      // items alone hid the section the instant the last item was acted on —
-      // which is exactly when "Task added" / "Skill created" lands, so the
-      // confirmation for the final decision was never visible. It also hid a
-      // failed refresh's error and the "N older" count on an empty brief.
-      if brief.hasContent {
-        Divider()
-        BriefSection()
+        // Gate on everything BriefSection can render, not just the rows. Gating on
+        // items alone hid the section the instant the last item was acted on —
+        // which is exactly when "Task added" / "Skill created" lands, so the
+        // confirmation for the final decision was never visible. It also hid a
+        // failed refresh's error and the "N older" count on an empty brief.
+        if brief.hasContent {
+          Divider()
+          BriefSection()
+        }
       }
     }
     .padding(12)
@@ -359,6 +420,7 @@ struct OverlayView: View {
       Task {
         await brief.refresh()
         await approvals.refresh()
+        await fleet.refresh()
       }
     }
     .onChange(of: state.expanded) { _, expanded in if expanded { fieldFocused = true } }
