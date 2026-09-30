@@ -2376,3 +2376,33 @@ test("an answer is only reported saved if it was stored", async (t) => {
   assert.notEqual(result.delivery.status, "queued");
   assert.equal(supervisor.store.queuedAnswers().length, 0);
 });
+
+test("Scan now rechecks every open question with the review, not only new or due ones", async (t) => {
+  let now = NOW;
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "still waits on the owner" })));
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick({ reason: "interval" });
+  assert.equal(model.calls.length, 1, "a new question is reviewed");
+  now += 11 * MIN;
+  await supervisor.tick({ reason: "interval" });
+  assert.equal(model.calls.length, 1, "unchanged and not due: no review on a scheduled scan");
+  await supervisor.tick({ reason: "owner-scan" });
+  assert.equal(model.calls.length, 2, "the owner's Scan now rechecks it");
+  assert.equal(model.calls[1].entries.length, 1);
+});
+
+test("Scan now reviews every open question even past one batch, and an overlapping scan gets its own", async (t) => {
+  const threads = Array.from({ length: 20 }, (_, i) => asking({ key: `codex:q${i}`, id: `q${i}`, cwd: `/work/q${i}`, lastAgentText: `Want me to merge #${i} now or wait for review?` }));
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "waits" })));
+  const { supervisor } = fixture(t, { threads, prs: new Map(), review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick({ reason: "owner-scan" });
+  const reviewed = new Set(model.calls.flatMap((call) => call.entries.map((e) => e.id)));
+  assert.equal(reviewed.size, supervisor.store.openQuestions().filter((q) => q.kind === "agent-ask").length);
+  assert.ok(model.calls.length >= 2, "more than one batch");
+  // An owner scan that lands while a scan runs is run again, forced, after it.
+  const calls = model.calls.length;
+  const first = supervisor.tick({ reason: "interval" });
+  const second = supervisor.tick({ reason: "owner-scan" });
+  await first; await second;
+  assert.ok(model.calls.length > calls, "the follow-up forced a review");
+});

@@ -809,3 +809,19 @@ test("a stopped thread that worked after its last nudge gets a fresh budget; a q
   assert.equal(decision.action, "nudge");
   assert.equal(decision.progressMark.worked, ago(90 * MIN));
 });
+
+test("infra: a long BB3 outage names its cause; a gated box is not called down or told to reboot", () => {
+  const since = ago(90 * MIN);
+  const ledger = { infraDown: { bb3: true }, infraDownSince: { bb3: since } };
+  const gated = { bb3: { ...bb3Base, gate: { state: "blocked", reason: "26 GiB disk free, floor is 50", since } }, lb: lbOk, localVerify: [] };
+  const ask = decideInfra(gated, { ledger, playbooks, config, now: NOW, threads: [], manager }).find((d) => d.action === "ask-user");
+  assert.equal(ask.question.title, "BB3 builds paused 1h+: 26 GiB disk free, floor is 50. Fix it?");
+  assert.match(ask.question.body, /gate blocked 90m \(26 GiB disk free, floor is 50\)/);
+  const unreachable = { bb3: { ...bb3Base, reachable: false }, lb: lbOk, localVerify: [] };
+  const down = decideInfra(unreachable, { ledger, playbooks, config, now: NOW, threads: [], manager }).find((d) => d.action === "ask-user");
+  assert.equal(down.question.title, "BB3 unreachable 1h+. Reboot box?");
+  // A probe that did not finish vouches for nothing.
+  const unknown = { bb3: { ...bb3Base, reachable: null, gate: { state: "blocked", reason: "26 GiB disk free, floor is 50", since } }, lb: lbOk, localVerify: [] };
+  const unsure = decideInfra(unknown, { ledger, playbooks, config, now: NOW, threads: [], manager }).find((d) => d.action === "ask-user");
+  assert.equal(unsure.question.title, "BB3 out 1h+, cause unknown. Check it?");
+});

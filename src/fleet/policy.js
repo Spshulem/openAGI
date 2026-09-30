@@ -555,7 +555,9 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
   const bb3Problems = [];
   if (bb3?.reachable === false) bb3Problems.push("SSH unreachable");
   const gateMs = msSince(bb3?.gate?.since, now);
-  if (bb3?.gate?.state === "blocked" && gateMs !== null && gateMs >= limits.gateBlockedEscalateMs) bb3Problems.push(`gate blocked ${minutes(gateMs)}m`);
+  if (bb3?.gate?.state === "blocked" && gateMs !== null && gateMs >= limits.gateBlockedEscalateMs) {
+    bb3Problems.push(`gate blocked ${minutes(gateMs)}m${bb3.gate.reason ? ` (${clampText(bb3.gate.reason, 80)})` : ""}`);
+  }
   if (slow.full.length) bb3Problems.push(`${slow.full.length} full verify >${minutes(limits.fullVerifyEscalateMs)}m`);
   if (slow.quick.length) bb3Problems.push(`${slow.quick.length} bb-quick >${minutes(limits.quickVerifyEscalateMs)}m`);
   if (bb3?.timersDead?.length) bb3Problems.push(`timers dead: ${bb3.timersDead.map((name) => fact(name, 40)).join(", ")}`);
@@ -619,7 +621,16 @@ export function decideInfra(infra, options = {}) {
     const downSince = readLedger(ledger, "infraDownSince", kind);
     const downMs = msSince(downSince, now);
     if (state.down && downMs !== null && downMs >= LONG_DOWN_MS) {
-      const title = kind === "bb3" ? "BB3 down 1h+. Reboot box?" : "Codex LB down 1h+. Help?";
+      // A box that answers but refuses builds (its gate, e.g. low disk) is
+      // not down, and a reboot would not fix it: say which it is.
+      // Only a probe that got through vouches for the gate's reason; an
+      // incomplete one (reachable null) leaves the cause unknown.
+      const reachable = infra?.bb3?.reachable;
+      const gated = kind === "bb3" && reachable === true && infra?.bb3?.gate?.state === "blocked";
+      const title = kind !== "bb3" ? "Codex LB down 1h+. Help?"
+        : gated ? `BB3 builds paused 1h+${infra.bb3.gate.reason ? `: ${clampText(infra.bb3.gate.reason, 40)}` : ""}. Fix it?`
+        : reachable === false ? "BB3 unreachable 1h+. Reboot box?"
+        : "BB3 out 1h+, cause unknown. Check it?";
       decisions.push(infraDecision(key, {
         action: "ask-user", reason: `${INFRA_NAMES[kind]} down ${minutes(downMs)}m`, blockers: state.problems,
         question: clampQuestion({ title, body: `${state.problems.join("; ")}.`, options: ["on it", "later"], dedupeKey: `${key}:long-down`, kind: "infra" }, limits)

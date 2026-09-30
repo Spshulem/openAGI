@@ -85,7 +85,7 @@ test("POST /fleet/api/scan runs a manual tick and returns state", async () => {
   const route = createFleetRoute({ supervisor });
   const result = await route("POST", "/fleet/api/scan", url("/fleet/api/scan"), body({}));
   assert.equal(result.status, 200);
-  assert.deepEqual(supervisor.calls.find((c) => c[0] === "tick"), ["tick", "manual"]);
+  assert.deepEqual(supervisor.calls.find((c) => c[0] === "tick"), ["tick", "owner-scan"]);
   assert.equal(result.body.lastTickAt, "2026-09-26T01:00:00.000Z");
   assert.equal((await route("GET", "/fleet/api/scan", url("/fleet/api/scan"), body({}))).status, 405);
 });
