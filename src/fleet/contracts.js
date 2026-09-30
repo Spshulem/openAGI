@@ -78,9 +78,13 @@ export const DEFAULTS = Object.freeze({
   uiOwnerIdleMs: 2 * MIN,
   uiStepTimeoutMs: 10_000,
   uiReadTimeoutMs: 45_000,
-  // Codex: link, two reads, activate, read, focus, type, read, send, confirm.
-  // Plus two reads of clearing, it must stay under the node broker's 5 min.
+  // Codex: link, two reads, activate, read, focus, type, read, send, confirm,
+  // typing included. With a lock wait and two reads of clearing, it must
+  // stay under the node broker's 5 min.
   uiDeliveryTimeoutMs: 205_000,
+  // Another delivery holding the lock: busy at once, retried next scan (a
+  // remote send has no room in the broker's 5 min to wait it out).
+  uiLockWaitMs: 0,
   uiNavigateMs: 5_000,
   // Codex can still show the previous thread on the first read after its link.
   uiNavigateSlowMs: 60_000,

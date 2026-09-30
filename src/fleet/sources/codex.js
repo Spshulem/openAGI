@@ -355,15 +355,32 @@ function orderPrRefs(entries, branch) {
   return [...new Set(ranked.map((entry) => entry.ref))];
 }
 
+// A first message as the app shows it: the request after the files list,
+// without context blocks (in-app browser, environment), markdown as text.
+function shownFirstMessage(title) {
+  let text = String(title);
+  const request = /(?:^|\n)## My request:[ \t]*\n?/.exec(text);
+  if (request) text = text.slice(request.index + request[0].length);
+  return text
+    .replace(/<([\w-]{1,60})(?:\s[^>]{0,200})?>[\s\S]*?<\/\1>/g, " ")
+    .replace(/<[^>]{0,200}>/g, " ")
+    .replace(/!?\[([^\]]{0,200})\]\([^)\s]{0,500}\)/g, "$1")
+    .replace(/\*\*|__|`/g, "")
+    .replace(/^#{1,6}\s+/gm, "");
+}
+
 function displayTitle(row, limits) {
   return clampText(redactSecrets(row.name || row.title || `Codex ${String(row.id).slice(0, 8)}`), limits.titleMax);
 }
 
 // The Codex app labels some named threads (page and sidebar) by their first
-// message instead of the name. Null when there is no name or they match.
+// message instead of the name. Null when there is no name or they match, or
+// when the rollout is a continuation segment: the app then shows that
+// segment's first request, which the catalog does not hold.
 function firstMessageTitle(row, limits) {
   if (!row.name || !row.title) return null;
-  const text = clampText(redactSecrets(String(row.title).replace(/<[^>]{0,200}>/g, " ")), limits.titleMax);
+  if (/_[0-9a-f]{8}-[0-9a-f-]{27}\.jsonl$/i.test(String(row.rollout_path ?? ""))) return null;
+  const text = clampText(redactSecrets(shownFirstMessage(row.title)), limits.titleMax);
   const token = identityToken(text);
   return token && token !== identityToken(displayTitle(row, limits)) ? text : null;
 }
@@ -379,7 +396,7 @@ function readSharedTitles(db, limits) {
   const where = present.has("archived") ? " WHERE COALESCE(archived, 0) = 0" : "";
   const counts = new Map();
   const labels = new Map();
-  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("originator")}, ${pick("source")} FROM threads${where}`).all()) {
+  for (const row of db.prepare(`SELECT id, ${pick("name")}, ${pick("title")}, ${pick("rollout_path")}, ${pick("originator")}, ${pick("source")} FROM threads${where}`).all()) {
     if (row.originator === CONDUCTOR_CODEX_ORIGINATOR) continue;
     // Automation runs and subagents never show in the sidebar, so they
     // cannot be mistaken for the thread on screen.
@@ -581,7 +598,9 @@ export async function listCodexThreads(config, options = {}) {
     let shared = { names: new Set(), labels: new Map() };
     try { shared = readSharedTitles(db, limits); } catch { /* older schema */ }
     for (const thread of built) {
-      if (shared.names.has(identityToken(thread.title))) thread.meta.codexTitleShared = true;
+      // Another thread labelled by its first message can show our name too.
+      const name = identityToken(thread.title);
+      if (shared.names.has(name) || [...(shared.labels.get(name) ?? [])].some((id) => id !== thread.id)) thread.meta.codexTitleShared = true;
       const alt = identityToken(thread.meta.firstMessageTitle);
       if (alt && [...(shared.labels.get(alt) ?? [])].some((id) => id !== thread.id)) thread.meta.codexFirstMessageShared = true;
     }

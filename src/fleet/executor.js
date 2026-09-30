@@ -344,7 +344,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       } catch (error) {
         return { status: "failed", detail: `computer use failed: ${detailText(error?.message ?? error)}; nothing confirmed` };
       }
-    }, { waitMs: limits.uiDeliveryTimeoutMs });
+    }, { waitMs: limits.uiLockWaitMs });
     if (locked.busy) result = { status: "blocked", detail: "busy: another app delivery is running; retry" };
     else result = locked.value ?? { status: "failed", detail: "computer use returned nothing" };
     const status = ["sent", "failed", "blocked"].includes(result.status) ? result.status : "failed";

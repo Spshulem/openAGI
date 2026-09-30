@@ -70,7 +70,8 @@ test('requests that type into an app outlast a whole UI delivery; reads keep the
   await remote.answerQuestion('fq_one', 'feature');
   const [read, answer] = calls.map(c => c[4].timeoutMs);
   assert.equal(read, 120000);
-  assert.ok(answer > DEFAULTS.uiDeliveryTimeoutMs + 2 * DEFAULTS.uiReadTimeoutMs, 'delivery plus the clearing of a failed one');
+  // Typing is inside the delivery's cap; the lock wait is not.
+  assert.ok(answer >= DEFAULTS.uiLockWaitMs + DEFAULTS.uiDeliveryTimeoutMs + 2 * DEFAULTS.uiReadTimeoutMs, 'lock wait, delivery, and the clearing of a failed one');
   assert.ok(answer <= 5 * 60 * 1000, 'within the broker ceiling');
 });
 

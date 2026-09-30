@@ -214,8 +214,15 @@ Each send, in order. Any failed check stops before typing:
 
 Safety rules:
 
-- One app delivery at a time. 45 s per app read, 10 s per other UI step,
-  150 s per delivery. A timed-out send defers the tick's other app sends.
+- One app delivery at a time; a second one is **blocked** as busy at once
+  and retried. 45 s per app read, 10 s per other UI step, 205 s per delivery,
+  typing included. After the deep link, Codex gets 60 s and at least two
+  reads to show the thread. Typing starts only with time left to type, send,
+  and confirm; otherwise it is **blocked** with nothing typed. A timed-out
+  send defers the tick's other app sends.
+- A Codex thread the app labels by its first message is verified by that
+  label only after the link moved the app onto it; already open, it is
+  **blocked** (another thread can show the same first message).
 - Only Conductor (`com.conductor.app`) and the Codex app (`com.openai.codex`).
   No clipboard, no paste, no app launch, no pointer moves.
 - Text typed before a failed check is cleared only when it is provably ours.

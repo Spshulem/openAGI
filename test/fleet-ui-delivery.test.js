@@ -1137,7 +1137,10 @@ test("Codex showing a thread by its first message: the alt title proves it, neve
   assert.deepEqual(identity.tokens, ["audit openai model versions"]);
   assert.deepEqual(identity.altTokens, ["openai just launched their gpt-6 models"]);
   assert.ok(identity.conflicts.includes("intruder") && identity.conflicts.includes("continue"), "other threads' names and first messages are conflicts");
-  assert.equal(verifyIdentity(codexLabelled(AUDIT_LABEL, [`row (selected) ${AUDIT_LABEL}`, "row continue"]), identity).ok, true);
+  assert.deepEqual(verifyIdentity(codexLabelled(AUDIT_LABEL, [`row (selected) ${AUDIT_LABEL}`, "row continue"]), identity), { ok: true, reason: null, byAlt: true });
+  // Only exactly the page label or a heading: a selected browser tab can hold any text.
+  assert.equal(verifyIdentity(codexLabelled("Daily investor pipeline push", [`tab (selected) ${AUDIT_FIRST} · Pull Request #6700`]), identity).ok, false);
+  assert.equal(verifyIdentity(codexLabelled("Daily investor pipeline push", [`heading ${AUDIT_LABEL}`]), identity).ok, true);
   // Without the alt tokens the same screen fails as it did live.
   assert.match(verifyIdentity(codexLabelled(AUDIT_LABEL), { ...identity, altTokens: [] }).reason, /"audit openai model versions" is not the open thread/);
   // Another thread's name or first message shown: a mismatch, whatever the alt says.
@@ -1159,8 +1162,27 @@ test("a shared, short, or clashing first-message title is never used to verify",
   assert.deepEqual(altOf(codexNamed("t-none", "Fix the upload retry bug", null)), []);
 });
 
+test("a name another known thread's first message can show is shared: only a link that moves the app proves it", () => {
+  const retry = codexNamed("t-retry", "Fix the upload retry bug", null);
+  const labelled = codexNamed("t-work", "Retry work", "Fix the upload retry bug");
+  const identity = uiIdentity(retry, uiTargetFor(retry), [retry, labelled]);
+  assert.equal(identity.shared, true);
+  assert.equal(identity.ambiguous, true);
+});
+
+test("a first-message label already open proves nothing: blocked, no link, nothing typed", async (t) => {
+  const app = fakeApp({ bundleId: "com.openai.codex", windowTitle: "ChatGPT", workspaces: [], selected: null, page: { label: AUDIT_LABEL, url: "app://-/index.html" } });
+  const f = setup(t, { app });
+  const target = uiTargetFor(auditThread);
+  const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(auditThread, target, [auditThread, intruderThread]), evidenceName: "fa_alt_open" });
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /only its first message is shown/);
+  assert.deepEqual(f.probe.opened, []);
+  assert.deepEqual(typed(f.calls()), []);
+});
+
 test("Codex navigation reads at least twice after the link, within its slower window", async (t) => {
-  const run = async (limits, readsUntilMoved) => {
+  const run = async (limits, readsUntilMoved, callMs = null) => {
     const app = fakeApp({ bundleId: "com.openai.codex", windowTitle: "ChatGPT", workspaces: [], selected: null, page: { label: "Daily investor pipeline push", url: "app://-/index.html" } });
     let pending = 0;
     const render = app.render;
@@ -1170,12 +1192,15 @@ test("Codex navigation reads at least twice after the link, within its slower wi
     };
     const clock = {};
     const probe = fakeProbe({ onOpen: () => { pending = readsUntilMoved; } });
-    const f = setup(t, { app, probe, transportOptions: { latency: (name) => (name === "get_app_state" ? 20_000 : 1_000), advance: (ms) => clock.advance(ms) },
+    const f = setup(t, { app, probe, transportOptions: { latency: (name) => callMs ?? (name === "get_app_state" ? 20_000 : 1_000), advance: (ms) => clock.advance(ms) },
       driverOptions: { config: { bins: { ocu: "/fake/OpenComputerUse" }, limits: { ...DEFAULTS, ...limits } } } });
     clock.advance = f.advance;
     const target = uiTargetFor(auditThread);
+    const start = f.now();
     const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(auditThread, target, [auditThread, intruderThread]), evidenceName: "fa_alt" });
-    return { result, probe, app };
+    // The fake clock never fires the real abort timer: the cap is checked here.
+    assert.ok(f.now() - start <= DEFAULTS.uiDeliveryTimeoutMs, `${f.now() - start} ms`);
+    return { result, probe, app, calls: f.calls() };
   };
   // The first read after the link outlasts the window and still shows the old thread.
   const two = await run({ uiNavigateSlowMs: 1_000 }, 2);
@@ -1188,4 +1213,13 @@ test("Codex navigation reads at least twice after the link, within its slower wi
   const late = await run({ uiNavigateSlowMs: 1_000 }, 3);
   assert.equal(late.result.status, "blocked");
   assert.match(late.result.detail, /is not the open thread/);
+  // Live-like 25 s for every call: two reads after the link leave too little
+  // to type, send and confirm inside the cap, so nothing is typed.
+  const slow = await run({}, 2, 25_000);
+  assert.equal(slow.result.status, "blocked");
+  assert.match(slow.result.detail, /^not enough time left to type and confirm \(\d+ s\); nothing typed$/);
+  assert.deepEqual(typed(slow.calls), []);
+  // At 17 s a call (the live low end), the same navigation is sent in time.
+  const typical = await run({}, 2, 17_000);
+  assert.equal(typical.result.status, "sent", typical.result.detail);
 });

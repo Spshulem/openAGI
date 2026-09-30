@@ -264,8 +264,9 @@ function labelToken(element) {
 // transcript or sidebar text is not enough: a manager thread's transcript can
 // name every other workspace. A selected element or window title that is
 // exactly another known thread of the same app is a mismatch, whatever else
-// matched. altTokens (Codex's first-message label) prove it by the same
-// rules when the name does not, never past a conflict.
+// matched. altTokens (Codex's first-message label) prove it only as exactly
+// the page label or a heading, when the name does not, never past a
+// conflict; byAlt then says so (steps accept that only after a link).
 export function verifyIdentity(state, identity) {
   const tokens = identity?.tokens ?? [];
   if (!state) return { ok: false, reason: "no app state" };
@@ -291,13 +292,15 @@ export function verifyIdentity(state, identity) {
   for (const other of identity?.conflicts ?? []) {
     if (!tokens.includes(other) && !altTokens.includes(other) && shown.has(other)) return { ok: false, reason: "could not verify thread: another thread is open" };
   }
+  const labelled = (token) => headings.some((element) => labelToken(element) === token) || pages.includes(token);
   const found = (token) => title.includes(token)
     || selected.some((element) => element.search.includes(token))
-    || headings.some((element) => labelToken(element) === token)
-    || pages.includes(token);
+    || labelled(token);
   const missing = tokens.find((token) => !found(token));
-  if (missing && !(altTokens.length && altTokens.every(found))) return { ok: false, reason: `could not verify thread: "${missing}" is not the open thread` };
-  return { ok: true, reason: null };
+  if (!missing) return { ok: true, reason: null };
+  // A selected browser tab or the window title can hold any text.
+  if (altTokens.length && altTokens.every(labelled)) return { ok: true, reason: null, byAlt: true };
+  return { ok: false, reason: `could not verify thread: "${missing}" is not the open thread` };
 }
 
 // Workspace and session ids from a Conductor page URL, e.g.
@@ -364,7 +367,8 @@ export function uiIdentity(thread, target, threads = []) {
   }
   const title = identityToken(target.title);
   if (!title || /^codex [0-9a-f-]{8}$/i.test(title)) return blocked("no thread title to verify", false);
-  if (target.titleShared || others.some(({ target: t }) => identityToken(t.title) === title)) {
+  // Another thread labelled by its first message can show our name too.
+  if (target.titleShared || others.some(({ target: t }) => identityToken(t.title) === title || identityToken(t.altTitle) === title)) {
     // The title cannot tell the twins apart; only a deep link by id that
     // visibly moves the app onto that title can (see steps).
     return { ...blocked("ambiguous: two threads share this title"), tokens: [title], shared: true };
@@ -659,8 +663,10 @@ export function createUiDriver({
     const typingMs = Math.ceil(text.length * TYPING_MS_PER_CHAR);
     const controller = new AbortController();
     // Not unref'd: the abort must fire even if a hung call holds nothing else open.
-    const timer = setTimeout(() => controller.abort(), limits.uiDeliveryTimeoutMs + typingMs);
-    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null };
+    // Typing comes out of the same budget (checked before it starts), so a
+    // remote send's clearing still ends inside the broker's 5 min.
+    const timer = setTimeout(() => controller.abort(), limits.uiDeliveryTimeoutMs);
+    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt: now() + limits.uiDeliveryTimeoutMs, slowest: 0, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null };
     try {
       return await steps(request, controller.signal, ctx);
     } catch (error) {
@@ -711,6 +717,7 @@ export function createUiDriver({
     try {
       return await ctx.transport.call(name, args, signal, { timeoutMs });
     } finally {
+      if (name !== "type_text") ctx.slowest = Math.max(ctx.slowest, now() - start);
       if (hid && !ctx.ownerSeen) ctx.ownInput = lastOwnInput = { start, end: now() };
     }
   }
@@ -731,7 +738,9 @@ export function createUiDriver({
   async function readState(ctx, signal) {
     if (signal?.aborted) throw new StepError("delivery timed out");
     const app = ctx.request.target.bundleId;
+    const start = now();
     const result = await ctx.transport.call("get_app_state", { app, text_limit: "max", max_tree_nodes: STATE_TREE_NODES_BY_APP[app] ?? STATE_TREE_NODES }, signal, { timeoutMs: limits.uiReadTimeoutMs });
+    ctx.slowest = Math.max(ctx.slowest, now() - start);
     const state = parseAppState(result);
     if (state.bundleId && state.bundleId !== app) throw new StepError(`app state came from ${state.bundleId}`);
     return state;
@@ -843,6 +852,9 @@ export function createUiDriver({
     // A twin may be the one on screen: only the id link, starting from
     // another thread, proves which one opened.
     if (identity.shared && verified.ok) return outcome(ctx, "blocked", `${identity.reason}; a thread with that title is already open`);
+    // Likewise a first-message label: a thread the catalog does not label
+    // that way can show it. It counts only once a link moved the app onto it.
+    if (verified.byAlt) return outcome(ctx, "blocked", "could not verify thread: only its first message is shown, which another thread can show too; open another thread");
     if (!verified.ok) {
       const back = await ownerCheck(ctx, target);
       if (back) return outcome(ctx, "blocked", back);
@@ -914,8 +926,14 @@ export function createUiDriver({
     if (!holds(found.composer)) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
     if (!verifyIdentity(state, identity).ok) return outcome(ctx, "blocked", "thread changed before typing");
 
-    // 7. Type, one line. The owner once more, right before: the click and
-    // read above can take tens of seconds.
+    // 7. Type, one line, only with time left to type, read, send and read
+    // the confirmation at this delivery's slowest call: cut short after the
+    // send, a delivery can only report "may have been sent". The owner once
+    // more, right before: the click and read above can take tens of seconds.
+    const left = ctx.endsAt - now();
+    if (left < (leftover ? 3 : 4) * ctx.slowest + (leftover ? 0 : ctx.typingMs)) {
+      return outcome(ctx, "blocked", `not enough time left to type and confirm (${Math.round(left / 1000)} s); nothing typed`);
+    }
     const beforeTyping = await ownerCheck(ctx, target);
     if (beforeTyping) return outcome(ctx, "blocked", beforeTyping);
     ctx.phase = "typing";
