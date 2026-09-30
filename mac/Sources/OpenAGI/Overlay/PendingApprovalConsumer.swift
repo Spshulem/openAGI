@@ -16,6 +16,27 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
   let createdAt: String?
   let sourceSessionId: String?
   let codingReply: CodingReplyReview?
+  let fleetMessage: FleetMessageReview?
+
+  /// fleet_send_message: the owner's own words, typed into a coding thread.
+  /// The generic summary is cut at 240 characters; this is the whole text.
+  struct FleetMessageReview: Decodable, Equatable {
+    let key: String
+    let message: String
+    let name: String?
+
+    var text: String { "To \(name ?? key) (\(key))\n\n\(message)" }
+  }
+
+  /// The complete text to read before approving, for tools that send words
+  /// to an agent. Nil for every other tool.
+  var reviewText: String? { codingReply?.text ?? fleetMessage?.text }
+
+  /// A tool that sends words to an agent, whose full text this build could
+  /// not decode: approve it where the full text is shown instead.
+  var needsDashboardReview: Bool {
+    ["reply_to_coding_agent", "start_coding_agent", "fleet_send_message"].contains(toolName) && reviewText == nil
+  }
 
   struct CodingReplyReview: Decodable, Equatable {
     let provider: String
@@ -51,6 +72,8 @@ struct PendingApproval: Identifiable, Decodable, Equatable {
     sourceSessionId = try c.decodeIfPresent(Context.self, forKey: .context)?.sessionId
     codingReply = ["reply_to_coding_agent", "start_coding_agent"].contains(toolName)
       ? try? c.decode(CodingReplyReview.self, forKey: .args) : nil
+    fleetMessage = toolName == "fleet_send_message"
+      ? try? c.decode(FleetMessageReview.self, forKey: .args) : nil
   }
 }
 

@@ -407,7 +407,7 @@ test("Mac Quick Ask owns a durable inline approval surface", () => {
   assert.match(overlay, /Button\("Open chat"\) \{ app\.openChatSession\(approvals\.lastChatSessionId\) \}/);
   assert.match(overlay, /ForEach\(approvals\.items\)[\s\S]{0,500}\.frame\(maxHeight: 230\)/);
   assert.match(overlay, /Open all approvals in main app/);
-  assert.match(overlay, /await approvals\.refresh\(\)/);
+  assert.match(overlay, /(await|async let \w+: Void =) approvals\.refresh\(\)/);
   assert.match(appState, /if event == "pending-action"[\s\S]{0,700}PendingApprovalConsumer\.shared\.refresh\(\)[\s\S]{0,300}OverlayState\.shared\.expanded = true/);
   assert.match(appState, /if event == "pending-action-resolved"[\s\S]{0,160}PendingApprovalConsumer\.shared\.refresh\(\)/);
 });
@@ -457,7 +457,7 @@ test("Mac Quick Ask has a Supervisor tab backed by the local fleet API", () => {
   assert.match(overlay, /\.onChange\(of: fleet\.questions\)/);
   assert.match(overlay, /\.onChange\(of: state\.tab\)/);
   assert.match(overlay, /\.onChange\(of: state\.fleetContext\)/);
-  for (const field of ["available", "status", "isLoading", "scanning", "inFlight", "lastOutcome", "lastError"]) {
+  for (const field of ["available", "status", "isLoading", "scanning", "inFlight", "lastOutcome", "lastError", "notes", "stillSending"]) {
     assert.match(overlay, new RegExp(`\\.onChange\\(of: fleet\\.${field}\\)`), `fleet.${field} is watched`);
   }
   assert.match(overlay, /await fleet\.refresh\(\)/);

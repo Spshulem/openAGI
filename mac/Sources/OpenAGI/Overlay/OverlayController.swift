@@ -36,6 +36,9 @@ final class OverlayController {
 
   func toggle() {
     guard Self.isEnabled else { return }
+    // ⌥Space means "ask about my screen": open on Tasks, whichever tab was
+    // left showing. Notification and tray opens pick their own tab.
+    if panel?.isVisible != true || !OverlayState.shared.expanded { OverlayState.shared.selectTab(.tasks) }
     if panel?.isVisible == true {
       withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
         OverlayState.shared.expanded.toggle()

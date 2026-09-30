@@ -57,6 +57,7 @@ final class OverlayState: ObservableObject {
   func selectTab(_ newTab: OverlayTab) {
     guard tab != newTab else { return }
     tab = newTab
+    if newTab == .tasks { FleetConsumer.shared.supervisorTabLeft() }
     guard !isLoading, !isDetached else { return }
     answer = ""
     error = nil

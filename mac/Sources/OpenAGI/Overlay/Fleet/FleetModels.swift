@@ -46,6 +46,30 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   }
 }
 
+extension FleetQuestion {
+  /// Options the owner can tap. "open thread" is left out: the supervisor
+  /// can't carry it to the agent and always hands it back.
+  var tappableOptions: [String] { options.filter { $0 != Self.openThread } }
+
+  /// True when the answer has to be typed in the agent's own app.
+  var answersInThread: Bool { options.contains(Self.openThread) }
+
+  static let openThread = "open thread"
+
+  /// "on it" -> "On it" for the supervisor's own fixed answers. An agent's
+  /// own choices stay exactly as the agent wrote them (branch names, paths).
+  func label(for option: String) -> String {
+    guard kind != "agent-ask", let first = option.first else { return option }
+    return first.uppercased() + option.dropFirst()
+  }
+}
+
+/// What the last answer or dismissal of one question did, shown in its row.
+struct FleetNote: Equatable {
+  let text: String
+  let isError: Bool
+}
+
 // init(from:) in an extension keeps the synthesized memberwise init.
 extension FleetQuestion {
   /// Only `id` is required: it is the one thing the client cannot invent.

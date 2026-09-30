@@ -154,13 +154,18 @@ struct OverlayView: View {
     .onChange(of: fleet.inFlight) { _, _ in onContentChange() }
     .onChange(of: fleet.lastOutcome) { _, _ in onContentChange() }
     .onChange(of: fleet.lastError) { _, _ in onContentChange() }
+    // A note line inside a question's row, and the spinner of an answer
+    // that timed out here but may still be sending.
+    .onChange(of: fleet.notes) { _, _ in onContentChange() }
+    .onChange(of: fleet.stillSending) { _, _ in onContentChange() }
   }
 
   /// Outreach rows for "Needs you". Supervisor questions also arrive as
-  /// outreach; while the Supervisor tab shows them, they are not listed twice.
+  /// outreach; the ones the Supervisor tab lists are not listed twice. Another
+  /// node's questions (no local copy) stay here.
   private var visibleOutreach: [OutreachItem] {
     outreach.items.filter { item in
-      item.type != "pending-action" && !(fleet.available && item.type == "fleet-question")
+      item.type != "pending-action" && !fleet.lists(item)
     }
   }
 
@@ -417,10 +422,13 @@ struct OverlayView: View {
     .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.white.opacity(0.1), lineWidth: 1))
     .onAppear {
       fieldFocused = true
+      // In parallel: the Supervisor picker must not wait on the brief and
+      // shift the header while the owner is already typing.
       Task {
-        await brief.refresh()
-        await approvals.refresh()
-        await fleet.refresh()
+        async let briefDone: Void = brief.refresh()
+        async let approvalsDone: Void = approvals.refresh()
+        async let fleetDone: Void = fleet.refresh()
+        _ = await (briefDone, approvalsDone, fleetDone)
       }
     }
     .onChange(of: state.expanded) { _, expanded in if expanded { fieldFocused = true } }
@@ -436,11 +444,11 @@ struct OverlayView: View {
            ? "Computer Use"
            : approval.toolName.replacingOccurrences(of: "_", with: " ").capitalized)
         .font(.system(size: 10)).foregroundStyle(.secondary)
-      if let review = approval.codingReply {
+      if let review = approval.reviewText {
         // The generic summary is capped at 240 characters. Keep the complete
         // bound instruction reviewable before the adjacent approval button.
         ScrollView {
-          Text(review.text)
+          Text(review)
             .font(.system(size: 11))
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -449,7 +457,7 @@ struct OverlayView: View {
         .frame(height: 160)
       }
       HStack(spacing: 8) {
-        if ["reply_to_coding_agent", "start_coding_agent"].contains(approval.toolName) && approval.codingReply == nil {
+        if approval.needsDashboardReview {
           Button("Review in dashboard") { app.openDashboard(path: "/?tab=approvals") }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)

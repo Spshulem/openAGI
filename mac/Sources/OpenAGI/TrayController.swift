@@ -92,6 +92,8 @@ struct TrayMenu: View {
     let count = outreach.items.count
     if count > 0 {
       Button("● \(count) need\(count == 1 ? "s" : "") you…") {
+        // Supervisor when every item is a question that tab lists instead.
+        OverlayState.shared.selectTab(FleetConsumer.shared.tab(showing: outreach.items))
         OverlayController.shared.show()
         OverlayState.shared.expanded = true
       }
