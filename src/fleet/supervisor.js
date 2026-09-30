@@ -16,7 +16,7 @@ import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, userPlaybooksDir 
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
-import { DEADLINE_MARGIN_MS, RESTART_MAX_MS, createAppRestarter, createUiDriver } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, createAppRestarter, createUiDriver, restartMaxMs } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -652,7 +652,7 @@ export class FleetSupervisor {
       if (busy.length) return { status: "blocked", route: null, detail: `${busy.length} chats still running in ${name}; a restart would stop them. Answer again when they finish.` };
       // A restart the remote caller cannot wait out would go on changing the
       // desktop after it gave up: none starts without room to finish.
-      if (Number.isFinite(deadlineAt) && Date.now() + RESTART_MAX_MS > deadlineAt - DEADLINE_MARGIN_MS) {
+      if (Number.isFinite(deadlineAt) && Date.now() + restartMaxMs(this.config.limits) > deadlineAt - DEADLINE_MARGIN_MS) {
         return { status: "blocked", route: null, detail: `no time left in this request to restart ${name}; answer again to retry` };
       }
       const result = await this.appRestarter.restart(app);

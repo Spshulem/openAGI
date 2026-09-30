@@ -481,9 +481,16 @@ export function createPresenceProbe({ bins = {}, run = runCommand, timeoutMs = D
 // never a launch the owner did not ask for.
 const RESTART_WAIT_MS = 30_000;
 const RESTART_SETTLE_MS = 10_000;
-// The longest one restart can take: waiting for the quit and the launch, the
-// settle, and a few commands that each may run to their timeout.
-export const RESTART_MAX_MS = 2 * RESTART_WAIT_MS + RESTART_SETTLE_MS + 4 * (DEFAULTS.uiStepTimeoutMs + DEFAULTS.uiKillGraceMs);
+const RESTART_POLL_MS = 1000;
+
+// The longest one restart can take, from its sequence below: idle (1
+// command), frontApp (2), appRunning (1), quit (1) and open (1), and two waits
+// that each can overrun their 30 s by one more appRunning and poll, then the
+// settle. Every command may run to its timeout plus kill grace.
+export function restartMaxMs(limits = DEFAULTS) {
+  const command = limits.uiStepTimeoutMs + limits.uiKillGraceMs;
+  return 6 * command + 2 * (RESTART_WAIT_MS + command + RESTART_POLL_MS) + RESTART_SETTLE_MS;
+}
 
 export function createAppRestarter({ bins = {}, run = runCommand, probe = null, limits = DEFAULTS, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
   const presence = probe ?? createPresenceProbe({ bins, run, timeoutMs: limits.uiStepTimeoutMs });
@@ -491,7 +498,7 @@ export function createAppRestarter({ bins = {}, run = runCommand, probe = null, 
     const deadline = now() + RESTART_WAIT_MS;
     do {
       if ((await presence.appRunning(bundleId)) === want) return true;
-      await sleep(1000);
+      await sleep(RESTART_POLL_MS);
     } while (now() < deadline);
     return false;
   };

@@ -1002,6 +1002,37 @@ test("the read-only probe script reports what a delivery would see", async () =>
   assert.match(report.identity.reason, /cairo/);
 });
 
+test("a restart with every command at its timeout, and the app changing at the last check, ends inside restartMaxMs", async () => {
+  const { createAppRestarter, restartMaxMs } = await import("../src/fleet/ui-delivery.js");
+  const slow = DEFAULTS.uiStepTimeoutMs + DEFAULTS.uiKillGraceMs;
+  // The app quits (then starts) only on the n-th check of each wait, when the
+  // check itself started just before the wait's 30 s were up.
+  for (const [call, flipAfter] of [[slow, 2], [slow - 1, 3], [14_000, 3], [1_000, 29]]) {
+    let clock = 0;
+    let running = true;
+    let checks = 0;
+    let phase = "quit";
+    const probe = {
+      frontApp: async () => { clock += 2 * call; return "com.google.Chrome"; },
+      idleMs: async () => { clock += call; return 10 * 60_000; },
+      appRunning: async () => {
+        clock += call;
+        if (phase === "wait" && ++checks >= flipAfter) { running = !running; checks = -Infinity; }
+        return running;
+      }
+    };
+    const run = async (cmd) => {
+      clock += call;
+      phase = "wait";
+      checks = 0;
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const restarter = createAppRestarter({ run, probe, now: () => clock, sleep: async (ms) => { clock += ms; } });
+    const result = await restarter.restart("conductor");
+    assert.ok(clock <= restartMaxMs(), `${clock} ms over ${restartMaxMs()} ms (${result.detail})`);
+  }
+});
+
 test("the app restarter quits in the background, relaunches, and refuses while the owner uses the app", async () => {
   const { createAppRestarter } = await import("../src/fleet/ui-delivery.js");
   let clock = 0;
