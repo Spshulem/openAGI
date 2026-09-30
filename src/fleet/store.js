@@ -258,7 +258,8 @@ export class FleetStore {
     if (existing) {
       // Still asked, so it has not expired. Not saved on its own: the next
       // write (at least the tick's snapshot) carries it.
-      Object.assign(existing, { lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS) });
+      // scanAskedAt: only a scan asking it sets this (a reopen does not).
+      Object.assign(existing, { lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS) });
       if (!existing.askContext && origin.askContext) Object.assign(existing, origin);
       keepReviewWording(existing, fields);
       const changed = Object.keys(fields).some((name) => JSON.stringify(existing[name]) !== JSON.stringify(fields[name]));
@@ -284,7 +285,7 @@ export class FleetStore {
       keepReviewWording(resolved, fields);
       Object.assign(resolved, fields, origin.askContext ? origin : {}, {
         status: "open", answeredAt: null, resolveReason: null, reopenedAt: iso(now), updatedAt: iso(now),
-        lastAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
+        lastAskedAt: iso(now), scanAskedAt: iso(now), expiresAt: iso(now + QUESTION_TTL_MS)
       });
       this._save();
       return { ...resolved, reopened: true };
@@ -300,6 +301,7 @@ export class FleetStore {
       updatedAt: iso(now),
       answeredAt: null,
       lastAskedAt: iso(now),
+      scanAskedAt: iso(now),
       expiresAt: iso(now + QUESTION_TTL_MS),
       outreachId: null,
       pushedAt: null

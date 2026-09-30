@@ -38,9 +38,9 @@ test("fleet_status says how current each question is, and fleet_scan rescans fir
   const now = Date.parse("2026-09-29T23:30:00.000Z");
   const questions = [
     { id: "fq_9", title: "bb-recorder #271: merge?", options: ["yes", "no"], threadKey: "codex:a", prRef: "acme/bb-recorder#271", status: "open",
-      createdAt: "2026-09-29T20:00:00.000Z", lastAskedAt: "2026-09-29T23:28:00.000Z", reviewedAt: "2026-09-29T23:10:00.000Z", reviewReason: "PR #271 open and green; the agent still waits on the merge call." },
+      createdAt: "2026-09-29T20:00:00.000Z", lastAskedAt: "2026-09-29T23:28:00.000Z", scanAskedAt: "2026-09-29T23:28:00.000Z", reviewedAt: "2026-09-29T23:10:00.000Z", reviewReason: "PR #271 open and green; the agent still waits on the merge call." },
     // Its source failed on the latest scan: kept, not re-asked.
-    { id: "fq_old", title: "old ask", options: ["yes", "no"], threadKey: "claude:b", status: "open", createdAt: "2026-09-29T19:00:00.000Z", lastAskedAt: "2026-09-29T23:00:00.000Z" }
+    { id: "fq_old", title: "old ask", options: ["yes", "no"], threadKey: "claude:b", status: "open", createdAt: "2026-09-29T19:00:00.000Z", lastAskedAt: "2026-09-29T23:00:00.000Z", scanAskedAt: "2026-09-29T23:00:00.000Z" }
   ];
   const state = { lastTickAt: "2026-09-29T23:28:00.000Z", snapshot: { at: "2026-09-29T23:28:00.000Z", durationMs: 60_000, counts: {}, threads: [], sourceErrors: { claude: "locked" } }, questions };
   const status = fleetStatus({ getState: () => ({ mode: "auto", enabled: true, running: false, questions: [], actions: [], settings: {}, ...state }) }, { now });
@@ -52,8 +52,9 @@ test("fleet_status says how current each question is, and fleet_scan rescans fir
     firstAskedMinutesAgo: 210, askedMinutesAgo: 2, stillAsked: true, reviewedMinutesAgo: 20, review: "PR #271 open and green; the agent still waits on the merge call."
   });
   assert.equal(status.questions[1].stillAsked, false, "not rechecked: its source failed");
-  // Reopened by the owner after the scan: not the scan finding it.
-  const reopened = fleetStatus({ getState: () => ({ ...state, mode: "auto", questions: [{ id: "fq_r", title: "r", options: [], lastAskedAt: "2026-09-29T23:29:00.000Z", createdAt: "2026-09-29T20:00:00.000Z", updatedAt: "2026-09-29T23:29:30.000Z" }], actions: [], settings: {} }) }, { now });
+  // Reopened by the owner (during or after the scan): only a scan asking it
+  // counts, and this one was last scan-asked before the latest scan.
+  const reopened = fleetStatus({ getState: () => ({ ...state, mode: "auto", questions: [{ id: "fq_r", title: "r", options: [], lastAskedAt: "2026-09-29T23:27:30.000Z", scanAskedAt: "2026-09-29T22:00:00.000Z", createdAt: "2026-09-29T20:00:00.000Z" }], actions: [], settings: {} }) }, { now });
   assert.equal(reopened.questions[0].stillAsked, false);
   // A record saved before lastAskedAt existed counts from its creation, not its last update.
   const legacy = fleetStatus({ getState: () => ({ ...state, mode: "auto", questions: [{ id: "fq_l", title: "l", options: [], createdAt: "2026-09-29T20:00:00.000Z", updatedAt: "2026-09-29T23:29:00.000Z" }], actions: [], settings: {} }) }, { now });
@@ -76,6 +77,9 @@ test("fleet_status says how current each question is, and fleet_scan rescans fir
   const slow = await fleetScan({ getState: () => ({ mode: "auto", enabled: true, running: true, actions: [], settings: {}, ...live }), tick: () => { live = { ...state, questions: [] }; return new Promise(() => {}); } }, { waitMs: 5 });
   assert.match(slow.scan, /still running/);
   assert.equal(slow.questions.length, 2);
+  // A scan already running when the call began: its questions are not vouched for.
+  const busy = await fleetScan({ getState: () => ({ mode: "auto", enabled: true, running: true, actions: [], settings: {}, ...state }), tick: () => new Promise(() => {}) }, { waitMs: 5 });
+  assert.ok(busy.questions.every((q) => q.stillAsked === null));
   const failed = await fleetScan({ ...fakeSupervisor(state), tick: async () => { throw new Error("boom"); } }, { waitMs: 50 });
   assert.match(failed.scan, /failed/);
 });

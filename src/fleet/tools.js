@@ -18,11 +18,11 @@ function scanStartMs(snapshot) {
   return Number.isFinite(endMs) ? endMs - (Number(snapshot?.durationMs) || 0) : NaN;
 }
 
-// Asked again by the latest scan: its lastAskedAt falls inside that scan
-// (a scan keeps, without re-asking, questions whose source failed; a reopen
-// after the scan is not the scan finding it).
+// Asked again by the latest scan: a scan (not a reopen) asked it inside that
+// scan's window. A scan keeps, without re-asking, questions whose source
+// failed. Null when it cannot be told (a record from before scanAskedAt).
 function stillAsked(question, snapshot) {
-  const askedMs = Date.parse(question.lastAskedAt ?? "");
+  const askedMs = Date.parse(question.scanAskedAt ?? "");
   const startMs = scanStartMs(snapshot);
   const endMs = Date.parse(snapshot?.at ?? "");
   if (!Number.isFinite(askedMs) || !Number.isFinite(startMs)) return null;
@@ -64,7 +64,11 @@ function compactRow(row) {
 }
 
 export function fleetStatus(supervisor, { now = Date.now() } = {}) {
-  const state = readState(supervisor);
+  return statusFrom(readState(supervisor), now);
+}
+
+// The view for one read of the state, with ages as of `now`.
+function statusFrom(state, now, { midScan = false } = {}) {
   const snapshot = state.snapshot ?? null;
   const rows = (snapshot?.threads ?? []).filter((row) => row?.key).map(compactRow);
   rows.sort((a, b) => (HEALTH_ORDER[a.health] ?? 4) - (HEALTH_ORDER[b.health] ?? 4) || activityMs(b) - activityMs(a));
@@ -86,7 +90,8 @@ export function fleetStatus(supervisor, { now = Date.now() } = {}) {
       id: q.id, title: q.title, options: q.options ?? [], threadKey: q.threadKey ?? null, prRef: q.prRef ?? null,
       firstAskedMinutesAgo: minutesSince(q.createdAt, now),
       askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.createdAt, now),
-      stillAsked: stillAsked(q, snapshot),
+      // Mid-scan, question records may already be updated past the snapshot.
+      stillAsked: midScan ? null : stillAsked(q, snapshot),
       reviewedMinutesAgo: minutesSince(q.reviewedAt, now),
       review: q.reviewReason ? clip(q.reviewReason, 200) : null
     })),
@@ -98,9 +103,9 @@ export function fleetStatus(supervisor, { now = Date.now() } = {}) {
 }
 
 export async function fleetScan(supervisor, { waitMs = SCAN_WAIT_MS } = {}) {
-  // Taken before the scan: a scan still running has already updated some
-  // questions, so its half-done state is never shown as the previous scan.
-  const before = fleetStatus(supervisor);
+  // The state from before this call. If a scan was already running, its
+  // question records may be ahead of its snapshot, so they are not vouched for.
+  const before = structuredClone(readState(supervisor));
   let timer = null;
   const outcome = await Promise.race([
     Promise.resolve().then(() => supervisor.tick({ reason: "chat" })).then(() => "done", () => "failed"),
@@ -108,7 +113,9 @@ export async function fleetScan(supervisor, { waitMs = SCAN_WAIT_MS } = {}) {
   ]);
   clearTimeout(timer);
   if (outcome === "done") return { scan: "fresh", ...fleetStatus(supervisor) };
-  return { scan: outcome === "running" ? "still running; this is the previous scan, ask again in a minute" : "failed; this is the previous scan", ...before };
+  // Ages as of now, not as of when this call began.
+  const previous = statusFrom(before, Date.now(), { midScan: Boolean(before.running) });
+  return { scan: outcome === "running" ? "still running; this is the previous scan, ask again in a minute" : "failed; this is the previous scan", ...previous };
 }
 
 export function fleetThread(supervisor, args = {}) {
