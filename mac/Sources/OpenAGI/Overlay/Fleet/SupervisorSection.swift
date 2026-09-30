@@ -114,10 +114,14 @@ struct SupervisorSection: View {
       if question.kind == "agent-ask" && !options.isEmpty {
         Text("Your answer goes to the agent.").font(.system(size: 10)).foregroundStyle(.secondary)
       }
-      if question.answersInThread {
+      if question.answersInThread && options.isEmpty {
         // The supervisor can't carry this answer; it would only hand it back.
         Text("Answer this in the agent's own app, then Scan now.")
           .font(.system(size: 10)).foregroundStyle(.secondary)
+      } else if question.answersInThread {
+        // Tap a choice here, or type something else in the agent's own app.
+        Text("Or answer in the agent's own app.")
+          .font(.system(size: 10)).foregroundStyle(.tertiary)
       }
       if !options.isEmpty {
         ViewThatFits(in: .horizontal) {
