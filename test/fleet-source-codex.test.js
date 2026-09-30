@@ -126,6 +126,36 @@ test("only sidebar threads count as sharing a title", async (t) => {
   assert.equal(map["t-b"].meta.codexTitleShared, true);
 });
 
+test("a named thread carries its first-message title, shared when any sidebar thread could show it", async (t) => {
+  const ctx = makeHome(t);
+  const lines = [ev.complete("x0", 20 * MIN, "done")];
+  addThread(ctx, { id: "t-audit", name: "Audit OpenAI model versions", title: "<environment_context>x</environment_context> OpenAI just launched their GPT-6 models so for all of our Luna, Soul, and Terra agents", lines });
+  addThread(ctx, { id: "t-intruder", name: "Intruder", title: "continue", lines });
+  addThread(ctx, { id: "t-same", name: "Fix uploads", title: "fix  uploads", lines });
+  addThread(ctx, { id: "t-unnamed", title: "Plan the billing export", lines });
+  // Another thread's name, or another thread's first message, can be the label on screen.
+  addThread(ctx, { id: "t-a", name: "Rename bucket", title: "Plan the billing export", lines });
+  addThread(ctx, { id: "t-b", name: "Ship reports", title: "Review the pricing page copy", lines });
+  addThread(ctx, { id: "t-old", updatedAgo: 60 * 24 * 60 * MIN, name: "Old one", title: "Review the pricing page copy" });
+  // Not in the Codex sidebar: never a twin.
+  addThread(ctx, { id: "t-c", name: "Draft launch post", title: "Write the changelog entry", lines });
+  addThread(ctx, { id: "t-exec", name: "Sweep", title: "Write the changelog entry", source: "exec", lines });
+  addThread(ctx, { id: "t-arch", archived: 1, name: "Archived", title: "Write the changelog entry" });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "", stderr: "" }) }));
+  assert.equal(map["t-audit"].meta.firstMessageTitle, "x OpenAI just launched their GPT-6 models so for all of our Luna, Soul, and Terra agents");
+  assert.notEqual(map["t-audit"].meta.codexFirstMessageShared, true);
+  assert.equal(map["t-intruder"].meta.firstMessageTitle, "continue");
+  assert.equal(map["t-same"].meta.firstMessageTitle, null, "same as the name");
+  assert.equal(map["t-unnamed"].meta.firstMessageTitle, null, "no name: the title is already the label");
+  assert.equal(map["t-a"].meta.codexFirstMessageShared, true, "another thread's name");
+  assert.equal(map["t-b"].meta.codexFirstMessageShared, true, "another thread's first message, even outside the lookback");
+  assert.notEqual(map["t-c"].meta.codexFirstMessageShared, true);
+  const target = uiTargetFor(map["t-a"]);
+  assert.equal(target.altTitle, "Plan the billing export");
+  assert.equal(target.altTitleShared, true);
+  assert.deepEqual(uiIdentity(map["t-a"], target, [map["t-a"]]).altTokens, []);
+});
+
 test("listCodexThreads classifies running, stalled, aborted, error, and idle threads", async (t) => {
   const ctx = makeHome(t);
   addThread(ctx, { id: "t-running", mtimeAgo: 2 * MIN, lines: [

@@ -94,7 +94,8 @@ test("OPENAGI_FLEET_DELIVERY picks cli, computer-use, or computer-use-first; any
   const limits = resolveFleetConfig({}, { home: "/h" }).limits;
   assert.equal(limits.uiOwnerIdleMs, 120_000);
   assert.equal(limits.uiStepTimeoutMs, 10_000);
-  assert.equal(limits.uiDeliveryTimeoutMs, 150_000);
+  assert.equal(limits.uiDeliveryTimeoutMs, 205_000);
+  assert.equal(limits.uiNavigateSlowMs, 60_000);
   assert.equal(limits.uiReadTimeoutMs, 45_000);
   assert.equal(limits.uiActivateMs, 3_000);
 });

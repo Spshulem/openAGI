@@ -24,6 +24,8 @@ const MIN = 60_000;
 // composer sits near node 1500-2300 with its sidebar open.
 const STATE_TREE_NODES = 3000;
 const STATE_TREE_NODES_BY_APP = { "com.openai.codex": 6000 };
+// Apps whose first read after a deep link can still show the previous thread.
+const SLOW_NAVIGATION = new Set(["com.openai.codex"]);
 // The fleet's own app agent, apart from the owner's other sessions.
 const OCU_AGENT_NAMESPACE = "openagi-fleet";
 // The fleet's own keys (and keyboard-fallback typing) reset HIDIdleTime; an
@@ -38,6 +40,8 @@ const PERMISSION_OK_TTL_MS = 10 * MIN;
 const PERMISSION_FAIL_TTL_MS = 30 * MIN;
 const CONFIRM_CHARS = 60;
 const TOKEN_MAX = 40;
+// A first-message title this short ("continue") proves nothing.
+const ALT_TOKEN_MIN = 12;
 const EVIDENCE_KEPT = 200;
 const SNIPPET_MAX = 64 * 1024;
 const DETAIL_MAX = 200;
@@ -260,7 +264,8 @@ function labelToken(element) {
 // transcript or sidebar text is not enough: a manager thread's transcript can
 // name every other workspace. A selected element or window title that is
 // exactly another known thread of the same app is a mismatch, whatever else
-// matched.
+// matched. altTokens (Codex's first-message label) prove it by the same
+// rules when the name does not, never past a conflict.
 export function verifyIdentity(state, identity) {
   const tokens = identity?.tokens ?? [];
   if (!state) return { ok: false, reason: "no app state" };
@@ -282,16 +287,16 @@ export function verifyIdentity(state, identity) {
   // every other thread.
   const pages = webAreas.map(labelToken).filter(Boolean);
   const shown = new Set([identityToken(state.windowTitle), ...selected.map(labelToken), ...pages].filter(Boolean));
+  const altTokens = identity?.altTokens ?? [];
   for (const other of identity?.conflicts ?? []) {
-    if (!tokens.includes(other) && shown.has(other)) return { ok: false, reason: "could not verify thread: another thread is open" };
+    if (!tokens.includes(other) && !altTokens.includes(other) && shown.has(other)) return { ok: false, reason: "could not verify thread: another thread is open" };
   }
-  for (const token of tokens) {
-    const found = title.includes(token)
-      || selected.some((element) => element.search.includes(token))
-      || headings.some((element) => labelToken(element) === token)
-      || pages.includes(token);
-    if (!found) return { ok: false, reason: `could not verify thread: "${token}" is not the open thread` };
-  }
+  const found = (token) => title.includes(token)
+    || selected.some((element) => element.search.includes(token))
+    || headings.some((element) => labelToken(element) === token)
+    || pages.includes(token);
+  const missing = tokens.find((token) => !found(token));
+  if (missing && !(altTokens.length && altTokens.every(found))) return { ok: false, reason: `could not verify thread: "${missing}" is not the open thread` };
   return { ok: true, reason: null };
 }
 
@@ -364,7 +369,12 @@ export function uiIdentity(thread, target, threads = []) {
     // visibly moves the app onto that title can (see steps).
     return { ...blocked("ambiguous: two threads share this title"), tokens: [title], shared: true };
   }
-  return { tokens: [title], conflicts: distinct(others.map(({ target: t }) => identityToken(t.title)), [title]), ambiguous: false, reason: null };
+  const otherLabels = others.flatMap(({ target: t }) => [identityToken(t.title), identityToken(t.altTitle)]);
+  // The first message proves the thread only when no other thread can be
+  // labelled with it.
+  const alt = identityToken(target.altTitle);
+  const altTokens = alt && alt.length >= ALT_TOKEN_MIN && alt !== title && !target.altTitleShared && !otherLabels.includes(alt) ? [alt] : [];
+  return { tokens: [title], altTokens, conflicts: distinct(otherLabels, [title, ...altTokens]), ambiguous: false, reason: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -840,12 +850,15 @@ export function createUiDriver({
       // The link can bring the app forward itself (Codex does): the owner's
       // app is put back at the end all the same.
       ctx.activated = true;
-      const deadline = now() + limits.uiNavigateMs;
+      // At least two reads: a slow first one can still show the old thread.
+      const deadline = now() + (SLOW_NAVIGATION.has(target.bundleId) ? limits.uiNavigateSlowMs : limits.uiNavigateMs);
+      let reads = 0;
       do {
         await sleep(limits.uiPollMs);
         state = await readState(ctx, signal);
+        reads += 1;
         verified = verifyIdentity(state, identity);
-      } while (!verified.ok && now() < deadline);
+      } while (!verified.ok && (reads < 2 || now() < deadline));
       if (!verified.ok) return outcome(ctx, "blocked", verified.reason);
     }
 

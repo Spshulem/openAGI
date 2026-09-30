@@ -1109,3 +1109,83 @@ test("Codex-slow clicks and keys get a read's budget, not a step's", async (t) =
   assert.equal(result.status, "sent", result.detail);
   assert.deepEqual(names(f.calls()).filter((name) => name !== "get_app_state"), ["click", "type_text", "press_key"]);
 });
+
+// Live 2026-09-30: Codex labelled thread 01a0cae7 ("Audit OpenAI model
+// versions") by its first message, truncated, and the sidebar likewise.
+const AUDIT_FIRST = "OpenAI just launched their GPT-6 models so for all of our Luna, Soul, and Terra ...";
+const AUDIT_LABEL = "OpenAI just launched their GPT-6 models so for all of our L…";
+const codexNamed = (id, title, firstMessageTitle, extra = {}) => ({
+  key: `codex:${id}`, kind: "codex", id, title, archived: false, meta: { originator: "Codex Desktop", firstMessageTitle, ...extra }
+});
+const auditThread = codexNamed("01a0cae7-09a3-7023-a300-30b1c87d1553", "Audit OpenAI model versions", AUDIT_FIRST);
+const intruderThread = codexNamed("0199-intruder", "Intruder", "continue");
+const codexLabelled = (page, rows = []) => stateOf([
+  "App=com.openai.codex (pid 38786)",
+  'Window: "ChatGPT", App: ChatGPT.',
+  "0 standard window ChatGPT, Secondary Actions: Raise",
+  "\t1 container (settable, string) ChatGPT",
+  "\t\t2 scroll area",
+  `\t\t\t3 HTML content ${page}, URL: app://-/index.html`,
+  ...rows.map((row, index) => `\t\t\t\t${40 + index} ${row}`)
+].join("\n"));
+
+test("Codex showing a thread by its first message: the alt title proves it, never past another thread", () => {
+  const target = uiTargetFor(auditThread);
+  assert.equal(target.altTitle, AUDIT_FIRST);
+  assert.equal(target.altTitleShared, false);
+  const identity = uiIdentity(auditThread, target, [auditThread, intruderThread]);
+  assert.deepEqual(identity.tokens, ["audit openai model versions"]);
+  assert.deepEqual(identity.altTokens, ["openai just launched their gpt-6 models"]);
+  assert.ok(identity.conflicts.includes("intruder") && identity.conflicts.includes("continue"), "other threads' names and first messages are conflicts");
+  assert.equal(verifyIdentity(codexLabelled(AUDIT_LABEL, [`row (selected) ${AUDIT_LABEL}`, "row continue"]), identity).ok, true);
+  // Without the alt tokens the same screen fails as it did live.
+  assert.match(verifyIdentity(codexLabelled(AUDIT_LABEL), { ...identity, altTokens: [] }).reason, /"audit openai model versions" is not the open thread/);
+  // Another thread's name or first message shown: a mismatch, whatever the alt says.
+  assert.match(verifyIdentity(codexLabelled(AUDIT_LABEL, ["row (selected) Intruder"]), identity).reason, /another thread is open/);
+  assert.match(verifyIdentity(codexLabelled(AUDIT_LABEL, ["row (selected) continue"]), identity).reason, /another thread is open/);
+  assert.equal(verifyIdentity(codexLabelled("continue"), identity).ok, false);
+  // Mentioned in the transcript is not shown.
+  assert.equal(verifyIdentity(codexLabelled("Daily investor pipeline push", [`static text ${AUDIT_LABEL}`]), identity).ok, false);
+});
+
+test("a shared, short, or clashing first-message title is never used to verify", () => {
+  const altOf = (thread, threads = [thread]) => uiIdentity(thread, uiTargetFor(thread), threads).altTokens;
+  assert.deepEqual(altOf(codexNamed("t-s", "Audit OpenAI model versions", AUDIT_FIRST, { codexFirstMessageShared: true })), []);
+  assert.deepEqual(altOf(codexNamed("t-short", "Rename the bucket", "fix the bug")), []);
+  assert.deepEqual(altOf(codexNamed("t-same", "Audit OpenAI model versions", "audit  OpenAI model versions")), []);
+  // Another known thread named, or first-messaged, the same.
+  assert.deepEqual(altOf(auditThread, [auditThread, codexNamed("t-named", AUDIT_FIRST, null)]), []);
+  assert.deepEqual(altOf(auditThread, [auditThread, codexNamed("t-first", "Other work", AUDIT_FIRST)]), []);
+  assert.deepEqual(altOf(codexNamed("t-none", "Fix the upload retry bug", null)), []);
+});
+
+test("Codex navigation reads at least twice after the link, within its slower window", async (t) => {
+  const run = async (limits, readsUntilMoved) => {
+    const app = fakeApp({ bundleId: "com.openai.codex", windowTitle: "ChatGPT", workspaces: [], selected: null, page: { label: "Daily investor pipeline push", url: "app://-/index.html" } });
+    let pending = 0;
+    const render = app.render;
+    app.render = () => {
+      if (pending && --pending === 0) app.page = { ...app.page, label: AUDIT_LABEL };
+      return render();
+    };
+    const clock = {};
+    const probe = fakeProbe({ onOpen: () => { pending = readsUntilMoved; } });
+    const f = setup(t, { app, probe, transportOptions: { latency: (name) => (name === "get_app_state" ? 20_000 : 1_000), advance: (ms) => clock.advance(ms) },
+      driverOptions: { config: { bins: { ocu: "/fake/OpenComputerUse" }, limits: { ...DEFAULTS, ...limits } } } });
+    clock.advance = f.advance;
+    const target = uiTargetFor(auditThread);
+    const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(auditThread, target, [auditThread, intruderThread]), evidenceName: "fa_alt" });
+    return { result, probe, app };
+  };
+  // The first read after the link outlasts the window and still shows the old thread.
+  const two = await run({ uiNavigateSlowMs: 1_000 }, 2);
+  assert.equal(two.result.status, "sent", two.result.detail);
+  assert.deepEqual(two.probe.opened, ["codex://threads/01a0cae7-09a3-7023-a300-30b1c87d1553"]);
+  assert.equal(two.app.transcript.at(-1), MESSAGE);
+  // Codex's own window outlasts Conductor's 5 s: a third 20 s read still counts.
+  const three = await run({}, 3);
+  assert.equal(three.result.status, "sent", three.result.detail);
+  const late = await run({ uiNavigateSlowMs: 1_000 }, 3);
+  assert.equal(late.result.status, "blocked");
+  assert.match(late.result.detail, /is not the open thread/);
+});

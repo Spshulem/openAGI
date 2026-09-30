@@ -78,8 +78,12 @@ export const DEFAULTS = Object.freeze({
   uiOwnerIdleMs: 2 * MIN,
   uiStepTimeoutMs: 10_000,
   uiReadTimeoutMs: 45_000,
-  uiDeliveryTimeoutMs: 150_000,
+  // Codex: link, two reads, activate, read, focus, type, read, send, confirm.
+  // Plus two reads of clearing, it must stay under the node broker's 5 min.
+  uiDeliveryTimeoutMs: 205_000,
   uiNavigateMs: 5_000,
+  // Codex can still show the previous thread on the first read after its link.
+  uiNavigateSlowMs: 60_000,
   // Bringing the app to the front for the send.
   uiActivateMs: 3_000,
   uiConfirmMs: 8_000,
@@ -277,7 +281,10 @@ export function uiTargetFor(thread) {
       threadId: String(thread.id),
       title: thread.title ?? null,
       // Another unarchived Codex thread anywhere in the catalog has this title.
-      titleShared: meta.codexTitleShared === true
+      titleShared: meta.codexTitleShared === true,
+      // The first message, which the app shows instead of some names.
+      altTitle: meta.firstMessageTitle ?? null,
+      altTitleShared: meta.codexFirstMessageShared === true
     };
   }
   return null;
