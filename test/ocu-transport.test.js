@@ -189,3 +189,20 @@ test("the namespace reaches the permission probe too", async () => {
     callback(null, "");
   });
 });
+
+test("through the app agent, input that times out or is cut off is marked in flight; reads and owned engines are not", async t => {
+  const f = agentFixture({ closeGraceMs: 0 }); t.after(() => f.client.close());
+  await assert.rejects(f.client.call("get_app_state", {}, undefined, { timeoutMs: 20 }), error => /timed out/.test(error.message) && !error.inFlight);
+  for (const name of ["type_text", "press_key", "click"]) {
+    await assert.rejects(f.client.call(name, {}, undefined, { timeoutMs: 20 }), error => /timed out/.test(error.message) && error.inFlight === true, name);
+  }
+  // Cut off by the caller's deadline: the agent's input keeps running.
+  const abort = new AbortController();
+  const typing = f.client.call("type_text", {}, abort.signal);
+  await new Promise(resolve => setImmediate(resolve));
+  abort.abort();
+  await assert.rejects(typing, error => error.inFlight === true);
+  // An owned engine is killed, which cancels its input.
+  const owned = fixture({ hang: true });
+  await assert.rejects(() => owned.client.call("type_text", {}), error => /unconfirmed/.test(error.message) && !error.inFlight);
+});

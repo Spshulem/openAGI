@@ -29,8 +29,8 @@ const SLOW_NAVIGATION = new Set(["com.openai.codex"]);
 // The fleet's own app agent, apart from the owner's other sessions.
 const OCU_AGENT_NAMESPACE = "openagi-fleet";
 // The fleet's own keys (and keyboard-fallback typing) reset HIDIdleTime; an
-// owner's last input that falls inside the fleet's last such call (plus this
-// slack) is the fleet's. Accessibility clicks post no HID event.
+// owner's last input within this slack of the end of the fleet's last such
+// call that finished is the fleet's. Accessibility clicks post no HID event.
 const OWN_INPUT_SLACK_MS = 1500;
 // Frontmost while the screen saver runs or the login window shows.
 const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
@@ -265,8 +265,8 @@ function labelToken(element) {
 // name every other workspace. A selected element or window title that is
 // exactly another known thread of the same app is a mismatch, whatever else
 // matched. altTokens (Codex's first-message label) prove it only as exactly
-// the page label or a heading, when the name does not, never past a
-// conflict; byAlt then says so (steps accept that only after a link).
+// the app's own page label, when the name does not, never past a conflict;
+// byAlt then says so (steps accept that only after a link).
 export function verifyIdentity(state, identity) {
   const tokens = identity?.tokens ?? [];
   if (!state) return { ok: false, reason: "no app state" };
@@ -287,6 +287,10 @@ export function verifyIdentity(state, identity) {
   // Exactly the page label, never text inside it: a transcript can name
   // every other thread.
   const pages = webAreas.map(labelToken).filter(Boolean);
+  // A heading can be markdown in any thread's transcript, and an in-app
+  // browser page can carry any title: a first message only as the app's page.
+  const ownPage = OWN_PAGE[state.bundleId];
+  const appPages = webAreas.filter((element) => !ownPage || ownPage.test(String(element.fields.url ?? ""))).map(labelToken).filter(Boolean);
   const shown = new Set([identityToken(state.windowTitle), ...selected.map(labelToken), ...pages].filter(Boolean));
   const altTokens = identity?.altTokens ?? [];
   for (const other of identity?.conflicts ?? []) {
@@ -299,7 +303,7 @@ export function verifyIdentity(state, identity) {
   const missing = tokens.find((token) => !found(token));
   if (!missing) return { ok: true, reason: null };
   // A selected browser tab or the window title can hold any text.
-  if (altTokens.length && altTokens.every(labelled)) return { ok: true, reason: null, byAlt: true };
+  if (altTokens.length && altTokens.every((token) => appPages.includes(token))) return { ok: true, reason: null, byAlt: true };
   return { ok: false, reason: `could not verify thread: "${missing}" is not the open thread` };
 }
 
@@ -615,7 +619,7 @@ export function createUiDriver({
   const readPermissions = permissionProbe
     ?? (async () => parseOcuPermissions(await readOcuPermissions(bins.ocu, undefined, { appAgentProxy: true, agentNamespace: OCU_AGENT_NAMESPACE, timeoutMs: limits.uiStepTimeoutMs })));
   let permissionCache = null;
-  // The window of this driver's last key or typing call, across deliveries:
+  // When this driver's last key or typing call finished, across deliveries:
   // the next delivery in the same tick must not read it as the owner.
   let lastOwnInput = null;
 
@@ -663,14 +667,18 @@ export function createUiDriver({
     const typingMs = Math.ceil(text.length * TYPING_MS_PER_CHAR);
     const controller = new AbortController();
     // Not unref'd: the abort must fire even if a hung call holds nothing else open.
-    // Typing comes out of the same budget (checked before it starts), so a
-    // remote send's clearing still ends inside the broker's 5 min.
+    // Typing comes out of the same budget (checked before it starts).
+    // Clearing and putting the owner's app back get uiCleanupMs more and
+    // never run past it, so a remote send ends inside the broker's 5 min.
     const timer = setTimeout(() => controller.abort(), limits.uiDeliveryTimeoutMs);
-    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt: now() + limits.uiDeliveryTimeoutMs, slowest: 0, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null };
+    const start = now();
+    const endsAt = start + limits.uiDeliveryTimeoutMs;
+    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt, deadline: endsAt, hardEndsAt: endsAt + limits.uiCleanupMs,
+      slowest: 0, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
     try {
       return await steps(request, controller.signal, ctx);
     } catch (error) {
-      return await recover(error, ctx, controller.signal.aborted);
+      return await recover(error, ctx, controller.signal.aborted || now() >= ctx.endsAt);
     } finally {
       clearTimeout(timer);
       await restoreFront(ctx);
@@ -680,26 +688,31 @@ export function createUiDriver({
 
   // The owner's previous app goes back in front, only if the target is still
   // there and the owner has not come back (never pull an app from under them).
+  // Never while an input call that timed out may still be running: it
+  // would land in the owner's app.
   async function restoreFront(ctx) {
     const target = ctx.request.target;
-    if (!ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    if (ctx.inputInFlight || !ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    // Each probe only if it ends inside the request's budget with every
+    // command at its timeout (frontApp runs two).
+    const fits = (commands) => now() + commands * limits.uiStepTimeoutMs <= ctx.hardEndsAt;
     try {
-      if ((await presence.frontApp()) !== target.bundleId) return;
-      if (!ownerAway(ctx, await presence.idleMs())) return;
+      if (!fits(2) || (await presence.frontApp()) !== target.bundleId) return;
+      if (!fits(1) || !ownerAway(ctx, await presence.idleMs())) return;
       // open -b launches an app that quit meanwhile; never that.
-      if ((await presence.appRunning(ctx.frontBefore)) !== true) return;
-      await presence.activate(ctx.frontBefore);
+      if (!fits(1) || (await presence.appRunning(ctx.frontBefore)) !== true) return;
+      if (fits(1)) await presence.activate(ctx.frontBefore);
     } catch { /* best-effort */ }
   }
 
-  // Away: no input for uiOwnerIdleMs, or the last input fell inside the
-  // driver's own last key or typing call (which reset the idle clock).
+  // Away: no input for uiOwnerIdleMs, or the last input came right as the
+  // driver's own last key or typing call finished (which reset the idle
+  // clock). Not the whole call: the owner can type during a slow one.
   function ownerAway(ctx, idle) {
     if (idle === null || idle === undefined) return false;
     if (idle >= limits.uiOwnerIdleMs) return true;
-    if (!ctx.ownInput) return false;
-    const lastInputAt = now() - idle;
-    return lastInputAt >= ctx.ownInput.start && lastInputAt <= ctx.ownInput.end + OWN_INPUT_SLACK_MS;
+    if (!Number.isFinite(ctx.ownInput)) return false;
+    return Math.abs(now() - idle - ctx.ownInput) <= OWN_INPUT_SLACK_MS;
   }
 
   // Once the owner is seen, only real idle time counts again: no discount
@@ -709,16 +722,37 @@ export function createUiDriver({
     ctx.ownInput = lastOwnInput = null;
   }
 
+  // No call runs past the deadline in force: the steps', then clearing's.
+  function within(ctx, ms) {
+    const left = ctx.deadline - now();
+    if (left <= 0) throw new StepError("delivery timed out");
+    return Math.min(ms, left);
+  }
+
+  // No probe starts past the deadline in force; the one running then (two
+  // commands at most) is what uiCleanupMs allows for.
+  function probeNow(ctx, name, ...args) {
+    if (now() >= ctx.deadline) throw new StepError("delivery timed out");
+    return presence[name](...args);
+  }
+
   // One OCU action. Each ends with a fresh snapshot, so it gets a read's
-  // budget. Keys and typing may post HID events: their window is kept so
-  // they are not read as the owner (never after the owner was seen).
+  // budget. Keys and typing may post HID events: only a call that finished
+  // marks when, so it is not read as the owner (never after the owner was
+  // seen). One that timed out may still be running (nothing cancels it):
+  // no more input after it.
   async function act(ctx, name, args, signal, { timeoutMs = limits.uiReadTimeoutMs, hid = false } = {}) {
+    if (ctx.inputInFlight) throw new StepError("an input call timed out");
     const start = now();
     try {
-      return await ctx.transport.call(name, args, signal, { timeoutMs });
+      const result = await ctx.transport.call(name, args, signal, { timeoutMs: within(ctx, timeoutMs) });
+      if (hid && !ctx.ownerSeen) ctx.ownInput = lastOwnInput = now();
+      return result;
+    } catch (error) {
+      if (error?.inFlight) ctx.inputInFlight = true;
+      throw error;
     } finally {
       if (name !== "type_text") ctx.slowest = Math.max(ctx.slowest, now() - start);
-      if (hid && !ctx.ownerSeen) ctx.ownInput = lastOwnInput = { start, end: now() };
     }
   }
 
@@ -739,7 +773,7 @@ export function createUiDriver({
     if (signal?.aborted) throw new StepError("delivery timed out");
     const app = ctx.request.target.bundleId;
     const start = now();
-    const result = await ctx.transport.call("get_app_state", { app, text_limit: "max", max_tree_nodes: STATE_TREE_NODES_BY_APP[app] ?? STATE_TREE_NODES }, signal, { timeoutMs: limits.uiReadTimeoutMs });
+    const result = await ctx.transport.call("get_app_state", { app, text_limit: "max", max_tree_nodes: STATE_TREE_NODES_BY_APP[app] ?? STATE_TREE_NODES }, signal, { timeoutMs: within(ctx, limits.uiReadTimeoutMs) });
     ctx.slowest = Math.max(ctx.slowest, now() - start);
     const state = parseAppState(result);
     if (state.bundleId && state.bundleId !== app) throw new StepError(`app state came from ${state.bundleId}`);
@@ -778,7 +812,8 @@ export function createUiDriver({
       state = await readState(ctx, signal);
       ({ composer } = composerIn(ctx, state));
       return Boolean(composer) && !normalizeUiText(composer.value);
-    } catch {
+    } catch (error) {
+      if (ctx.inputInFlight) throw error;
       return false;
     }
   }
@@ -792,8 +827,10 @@ export function createUiDriver({
   }
 
   async function ownerReason(ctx, target) {
-    const front = await presence.frontApp();
-    const idle = await presence.idleMs();
+    const front = await probeNow(ctx, "frontApp");
+    // It can start during a slow read: nothing comes forward over it.
+    if (SCREEN_SAVER_APPS.has(front)) return "screen saver on";
+    const idle = await probeNow(ctx, "idleMs");
     if (!ownerAway(ctx, idle)) {
       if (front === target.bundleId || front === null) return `owner using ${target.name}`;
       if (!ctx.inFront) return `waiting for idle: ${target.name} must be in front to type`;
@@ -804,15 +841,15 @@ export function createUiDriver({
 
   async function bringToFront(ctx, target) {
     // open -b launches an app that quit meanwhile; never that.
-    if ((await presence.appRunning(target.bundleId)) !== true) return false;
-    if (!(await presence.activate(target.bundleId))) return false;
+    if ((await probeNow(ctx, "appRunning", target.bundleId)) !== true) return false;
+    if (!(await probeNow(ctx, "activate", target.bundleId))) return false;
     ctx.activated = true;
     const deadline = now() + limits.uiActivateMs;
     do {
-      if ((await presence.frontApp()) === target.bundleId) return true;
+      if ((await probeNow(ctx, "frontApp")) === target.bundleId) return true;
       await sleep(limits.uiPollMs);
     } while (now() < deadline);
-    return (await presence.frontApp()) === target.bundleId;
+    return (await probeNow(ctx, "frontApp")) === target.bundleId;
   }
 
   async function steps(request, signal, ctx) {
@@ -858,11 +895,13 @@ export function createUiDriver({
     if (!verified.ok) {
       const back = await ownerCheck(ctx, target);
       if (back) return outcome(ctx, "blocked", back);
-      if (!(await presence.openUrl(target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
+      if (!(await probeNow(ctx, "openUrl", target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
       // The link can bring the app forward itself (Codex does): the owner's
       // app is put back at the end all the same.
       ctx.activated = true;
-      // At least two reads: a slow first one can still show the old thread.
+      // At least two reads, even when the first matches: the sidebar row
+      // can switch before the page and composer do. The latest read decides,
+      // and only its elements are used.
       const deadline = now() + (SLOW_NAVIGATION.has(target.bundleId) ? limits.uiNavigateSlowMs : limits.uiNavigateMs);
       let reads = 0;
       do {
@@ -870,7 +909,7 @@ export function createUiDriver({
         state = await readState(ctx, signal);
         reads += 1;
         verified = verifyIdentity(state, identity);
-      } while (!verified.ok && (reads < 2 || now() < deadline));
+      } while (reads < 2 || (!verified.ok && now() < deadline));
       if (!verified.ok) return outcome(ctx, "blocked", verified.reason);
     }
 
@@ -878,7 +917,7 @@ export function createUiDriver({
     // first: nothing comes forward over an owner who came back.
     const moved = await ownerCheck(ctx, target);
     if (moved) return outcome(ctx, "blocked", moved);
-    if ((await presence.frontApp()) !== target.bundleId) {
+    if ((await probeNow(ctx, "frontApp")) !== target.bundleId) {
       if (!(await bringToFront(ctx, target))) return outcome(ctx, "blocked", `could not bring ${target.name} to the front`);
       state = await readState(ctx, signal);
       verified = verifyIdentity(state, identity);
@@ -976,7 +1015,8 @@ export function createUiDriver({
       try {
         await click(ctx, send, signal);
         pressed = true;
-      } catch {
+      } catch (error) {
+        if (ctx.inputInFlight) throw error;
         // Press Return only if the click provably did nothing.
         const after = await readState(ctx, signal);
         const again = composerIn(ctx, after).composer;
@@ -1005,23 +1045,33 @@ export function createUiDriver({
     return outcome(ctx, "failed", "unconfirmed: may have been sent; check the thread before retrying", { unconfirmed: true });
   }
 
+  // An input call that timed out may still be running: nothing is cleared,
+  // typed, or brought forward after it.
+  const inFlightOutcome = (ctx) => outcome(ctx, "failed", "unconfirmed: an input call timed out; check the thread", { unconfirmed: true });
+
   async function recover(error, ctx, timedOut) {
+    if (ctx.inputInFlight) return inFlightOutcome(ctx);
     const reason = timedOut ? "delivery timed out" : detailText(error?.message ?? error) || "Open Computer Use error";
     if (ctx.phase === "check") return outcome(ctx, "failed", `${reason}; nothing typed`);
     if (ctx.phase === "sending" || ctx.phase === "sent") {
       return outcome(ctx, "failed", `${reason}; unconfirmed: may have been sent; check the thread before retrying`, { unconfirmed: true });
     }
     // Typed, not sent: a fresh engine clears our text, bounded by about
-    // two slow reads.
+    // two slow reads and by what is left of uiCleanupMs.
+    ctx.deadline = ctx.hardEndsAt;
     let cleared = false;
     try {
       try { ctx.transport?.close(); } catch { /* already closed */ }
-      ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
-      const signal = AbortSignal.timeout(limits.uiReadTimeoutMs * 2);
-      cleared = await clearComposer(ctx, signal, { ownerPresent: ctx.ownerSeen });
+      const left = ctx.hardEndsAt - now();
+      if (left > 0) {
+        ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
+        const signal = AbortSignal.timeout(Math.min(limits.uiReadTimeoutMs * 2, left));
+        cleared = await clearComposer(ctx, signal, { ownerPresent: ctx.ownerSeen });
+      }
     } catch {
       cleared = false;
     }
+    if (ctx.inputInFlight) return inFlightOutcome(ctx);
     return outcome(ctx, "failed", `${reason}; not sent; ${cleared ? "cleared our text" : "our text may still be in the composer"}`);
   }
 

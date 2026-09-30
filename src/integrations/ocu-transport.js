@@ -18,6 +18,8 @@ function engineEnvironment({ appAgentProxy = false, agentNamespace = null } = {}
 // An app-agent engine killed mid-request takes the shared agent down with
 // it, so a closed one gets this long to finish before SIGKILL.
 export const OCU_CLOSE_GRACE_MS = 30_000;
+// Calls that only read. Any other tool is input.
+const READ_TOOLS = new Set(["get_app_state", "list_apps"]);
 
 export function readOcuPermissions(command, run = execFile, { appAgentProxy = false, agentNamespace = null, timeoutMs = 3000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -92,17 +94,21 @@ export class OcuTransport {
         error ? reject(error) : resolve(value);
       };
       const abort = () => this.close();
-      // An app-agent engine outlives a slow call: only that call fails, and
-      // its late answer is dropped (its id is gone). An owned engine is
-      // killed, which is what cancels its input.
+      // Nothing cancels an app-agent call: ending or killing the proxy leaves
+      // the agent's input running. A slow read only fails, and its late
+      // answer is dropped (its id is gone); slow input is marked inFlight, as
+      // it may still land. An owned engine is killed, which cancels its input.
+      const entry = { input: this.appAgentProxy && method === "tools/call" && !READ_TOOLS.has(params?.name), sent: false,
+        resolve: value => finish(null, value), reject: error => finish(error) };
       const expire = () => this.appAgentProxy
-        ? finish(new Error(`Open Computer Use timed out after ${Math.round(timeoutMs / 1000)}s on ${params?.name ?? method}`))
+        ? entry.reject(inFlight(new Error(`Open Computer Use timed out after ${Math.round(timeoutMs / 1000)}s on ${params?.name ?? method}`), entry))
         : this.close();
       const timer = setTimeout(expire, timeoutMs);
-      this.pending.set(id, { resolve: value => finish(null, value), reject: error => finish(error) });
+      this.pending.set(id, entry);
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) return abort();
       this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      entry.sent = true;
     });
   }
   async call(name, args, signal, { timeoutMs } = {}) {
@@ -120,6 +126,11 @@ export class OcuTransport {
       try { child.stdin.end(); } catch { /* already closed */ }
       setTimeout(() => child.kill("SIGKILL"), this.closeGraceMs).unref?.();
     } else child?.kill("SIGKILL");
-    for (const pending of [...this.pending.values()]) pending.reject(new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed."));
+    for (const pending of [...this.pending.values()]) pending.reject(inFlight(new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed."), pending));
   }
+}
+
+function inFlight(error, entry) {
+  if (entry.input && entry.sent) error.inFlight = true;
+  return error;
 }

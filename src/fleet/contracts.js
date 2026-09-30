@@ -79,9 +79,12 @@ export const DEFAULTS = Object.freeze({
   uiStepTimeoutMs: 10_000,
   uiReadTimeoutMs: 45_000,
   // Codex: link, two reads, activate, read, focus, type, read, send, confirm,
-  // typing included. With a lock wait and two reads of clearing, it must
-  // stay under the node broker's 5 min.
+  // typing included.
   uiDeliveryTimeoutMs: 205_000,
+  // After that deadline: the one probe still running, two reads of
+  // clearing, and putting the owner's app back, none past it. Lock wait,
+  // delivery and this must stay under the node broker's 5 min.
+  uiCleanupMs: 90_000,
   // Another delivery holding the lock: busy at once, retried next scan (a
   // remote send has no room in the broker's 5 min to wait it out).
   uiLockWaitMs: 0,

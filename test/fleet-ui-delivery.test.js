@@ -62,7 +62,8 @@ function fakeApp(overrides = {}) {
 }
 
 // latency: (name, args) => ms a call takes; a call slower than its timeout
-// fails like OCU's, else the clock moves on by that much.
+// fails like OCU's through the app agent (input marked inFlight: it may
+// still land), else the clock moves on by that much.
 function fakeTransport(app, { failOn = null, latency = null, advance = null } = {}) {
   const transport = {
     calls: [],
@@ -72,7 +73,7 @@ function fakeTransport(app, { failOn = null, latency = null, advance = null } = 
       if (failOn && failOn(name, args, transport.calls.length)) throw new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.");
       const cost = latency?.(name, args) ?? 0;
       const limit = options.timeoutMs ?? transport.options?.timeoutMs ?? Infinity;
-      if (cost > limit) throw new Error(`Open Computer Use timed out after ${Math.round(limit / 1000)}s on ${name}`);
+      if (cost > limit) throw Object.assign(new Error(`Open Computer Use timed out after ${Math.round(limit / 1000)}s on ${name}`), name === "get_app_state" ? {} : { inFlight: true });
       advance?.(cost);
       if (name === "get_app_state") return app.render();
       if (name === "click") {
@@ -314,7 +315,8 @@ test("the fleet's own clicks and keys do not count as the owner coming back", as
   const app = fakeApp();
   const f = setup(t, { app, probe });
   probe.idleMs = async () => (hidAt === null ? 10 * 60_000 : f.now() - hidAt);
-  app.onType = (text) => { hidAt = f.now(); f.advance(3_000); return text; };
+  // Keyboard-fallback typing: its last key event lands as the call ends.
+  app.onType = (text) => { f.advance(3_000); hidAt = f.now(); return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
   assert.deepEqual(probe.activated, ["com.conductor.app", "com.google.Chrome"]);
@@ -1060,7 +1062,8 @@ test("the owner adding words after our text: nothing cleared, no keys, no click"
   const f = setup(t);
   const render = f.app.render;
   f.app.onType = (text) => {
-    f.app.render = () => { if (!f.app.composer.endsWith("hold on")) f.app.composer += " wait, hold on"; f.probe.idleMs = async () => 200; return render(); };
+    // They type a few seconds after our text went in.
+    f.app.render = () => { if (!f.app.composer.endsWith("hold on")) { f.advance(3_000); f.app.composer += " wait, hold on"; } f.probe.idleMs = async () => 200; return render(); };
     return text;
   };
   const result = await f.driver.deliver(f.request());
@@ -1138,9 +1141,8 @@ test("Codex showing a thread by its first message: the alt title proves it, neve
   assert.deepEqual(identity.altTokens, ["openai just launched their gpt-6 models"]);
   assert.ok(identity.conflicts.includes("intruder") && identity.conflicts.includes("continue"), "other threads' names and first messages are conflicts");
   assert.deepEqual(verifyIdentity(codexLabelled(AUDIT_LABEL, [`row (selected) ${AUDIT_LABEL}`, "row continue"]), identity), { ok: true, reason: null, byAlt: true });
-  // Only exactly the page label or a heading: a selected browser tab can hold any text.
+  // Only exactly the app's page label: a selected browser tab can hold any text.
   assert.equal(verifyIdentity(codexLabelled("Daily investor pipeline push", [`tab (selected) ${AUDIT_FIRST} · Pull Request #6700`]), identity).ok, false);
-  assert.equal(verifyIdentity(codexLabelled("Daily investor pipeline push", [`heading ${AUDIT_LABEL}`]), identity).ok, true);
   // Without the alt tokens the same screen fails as it did live.
   assert.match(verifyIdentity(codexLabelled(AUDIT_LABEL), { ...identity, altTokens: [] }).reason, /"audit openai model versions" is not the open thread/);
   // Another thread's name or first message shown: a mismatch, whatever the alt says.
@@ -1222,4 +1224,149 @@ test("Codex navigation reads at least twice after the link, within its slower wi
   // At 17 s a call (the live low end), the same navigation is sent in time.
   const typical = await run({}, 2, 17_000);
   assert.equal(typical.result.status, "sent", typical.result.detail);
+});
+
+test("the screen saver starting during a slow read: nothing opened or brought forward over it", async (t) => {
+  for (const selected of ["madrid", "cairo"]) {
+    const app = fakeApp({ selected, onClickRow: () => {} });
+    const f = setup(t, { app, probe: fakeProbe({ onOpen: () => { app.selected = "madrid"; } }) });
+    const render = app.render;
+    // Idle stays long: the owner is away, the Mac is not free to use.
+    app.render = () => { f.probe.front = "com.apple.ScreenSaver.Engine"; return render(); };
+    const result = await f.driver.deliver(f.request());
+    assert.equal(result.status, "blocked", selected);
+    assert.equal(result.detail, "screen saver on");
+    assert.deepEqual(f.probe.opened, []);
+    assert.deepEqual(f.probe.activated, [], "nothing brought forward over the screen saver");
+    assert.deepEqual(typed(f.calls()), []);
+  }
+});
+
+test("a delivery cut off after typing ends, clearing and restore included, inside its cap plus the cleanup", async (t) => {
+  const limits = { ...DEFAULTS, uiDeliveryTimeoutMs: 1_500, uiCleanupMs: 600, uiReadTimeoutMs: 2_000, uiStepTimeoutMs: 100 };
+  const app = fakeApp();
+  const probe = fakeProbe();
+  let hung = false;
+  // After typing, reads never answer and every probe command takes its whole timeout.
+  for (const [name, commands] of [["frontApp", 2], ["idleMs", 1], ["appRunning", 1], ["activate", 1]]) {
+    const fn = probe[name];
+    probe[name] = async (...args) => {
+      if (hung) await new Promise((resolve) => setTimeout(resolve, commands * limits.uiStepTimeoutMs));
+      return fn(...args);
+    };
+  }
+  app.onType = (text) => { hung = true; return text; };
+  const engines = [];
+  const f = setup(t, {
+    app, probe,
+    driverOptions: {
+      config: { bins: { ocu: "/fake/OpenComputerUse" }, limits },
+      now: Date.now,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5))),
+      transportFactory: () => {
+        const inner = fakeTransport(app);
+        engines.push(inner);
+        return {
+          call: (name, args, signal, options = {}) => (hung && name === "get_app_state")
+            ? new Promise((_resolve, reject) => {
+              inner.calls.push({ name, args, options });
+              const fail = () => { clearTimeout(timer); reject(new Error("Open Computer Use timed out")); };
+              const timer = setTimeout(fail, options.timeoutMs);
+              signal?.addEventListener("abort", fail, { once: true });
+            })
+            : inner.call(name, args, signal, options),
+          close: () => inner.close()
+        };
+      }
+    }
+  });
+  const start = Date.now();
+  const result = await f.driver.deliver(f.request({ text: "[OpenAGI supervisor] hi" }));
+  const took = Date.now() - start;
+  assert.equal(result.status, "failed");
+  assert.match(result.detail, /^delivery timed out; not sent/);
+  assert.deepEqual(engines.flatMap((engine) => engine.calls).filter((call) => call.name === "type_text").length, 1);
+  assert.ok(took <= limits.uiDeliveryTimeoutMs + limits.uiCleanupMs + 150, `${took} ms`);
+});
+
+test("an input call that times out may still land: unconfirmed, nothing cleared, typed, or brought forward after it", async (t) => {
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 10 * 60_000 : 0) } });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "failed");
+  assert.equal(result.detail, "unconfirmed: an input call timed out; check the thread");
+  assert.equal(result.unconfirmed, true);
+  assert.equal(f.transports.length, 1, "no fresh engine to clear with");
+  assert.equal(names(f.calls()).at(-1), "type_text", "no call after it");
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "the owner's app is not put back under running input");
+  // A Send click that times out: no Return after it.
+  const g = setup(t, { transportOptions: { latency: (name, args) => (name === "click" && args.element_index === "62" ? 10 * 60_000 : 0) } });
+  const send = await g.driver.deliver(g.request());
+  assert.equal(send.status, "failed");
+  assert.equal(send.detail, "unconfirmed: an input call timed out; check the thread");
+  assert.equal(send.unconfirmed, true);
+  assert.equal(g.calls().filter((call) => call.name === "press_key").length, 0);
+  assert.equal(names(g.calls()).at(-1), "click");
+  assert.deepEqual(g.probe.activated, ["com.conductor.app"]);
+});
+
+test("the owner's input during a slow typing call, or as a failed one ends, is theirs", async (t) => {
+  const clock = {};
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 20_000 : 0), advance: (ms) => clock.advance(ms) } });
+  clock.advance = f.advance;
+  const hid = hidClock(f);
+  // Typing takes 20 s (an AX value set: no HID event); the owner clicks 2 s in.
+  f.app.onType = (text) => { hid.at = f.now() - 18_000; return text; };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Conductor; cleared our text");
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "their app is not swapped in over them");
+  // A key or typing call that failed marks nothing as the fleet's.
+  let ghid = null;
+  const g = setup(t, { transportOptions: { failOn: (name) => { if (name !== "type_text") return false; ghid.touch(); return true; } } });
+  ghid = hidClock(g);
+  const failed = await g.driver.deliver(g.request());
+  assert.equal(failed.status, "failed");
+  assert.deepEqual(g.probe.activated, ["com.conductor.app"], "the owner's input as it failed is theirs: nothing put back over them");
+});
+
+test("after the link, a first read that matches is read again: the latest decides what is used", async (t) => {
+  const app = fakeApp({ bundleId: "com.openai.codex", windowTitle: "ChatGPT", workspaces: [], selected: null,
+    page: { label: "Daily investor pipeline push", url: "app://-/index.html" }, composer: "half-written note for the pipeline" });
+  const probe = fakeProbe({
+    onOpen: () => {
+      // The link brings Codex forward; its label switches a read before the composer does.
+      probe.front = "com.openai.codex";
+      app.page = { ...app.page, label: AUDIT_LABEL };
+      const render = app.render;
+      let reads = 0;
+      app.render = () => { if (++reads === 2) app.composer = ""; return render(); };
+    }
+  });
+  const f = setup(t, { app, probe });
+  const target = uiTargetFor(auditThread);
+  const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(auditThread, target, [auditThread, intruderThread]), evidenceName: "fa_nav" });
+  assert.equal(result.status, "sent", result.detail);
+  assert.equal(app.transcript.at(-1), MESSAGE);
+  assert.deepEqual(names(f.calls()).slice(0, 4), ["get_app_state", "get_app_state", "get_app_state", "click"], "two reads after the link before the focus click");
+});
+
+test("a first-message title shows only as the app's page label, never a transcript heading or a browser page", async (t) => {
+  const identity = uiIdentity(auditThread, uiTargetFor(auditThread), [auditThread, intruderThread]);
+  assert.equal(verifyIdentity(codexLabelled("Daily investor pipeline push", [`heading ${AUDIT_LABEL}`]), identity).ok, false);
+  const browser = stateOf([
+    "App=com.openai.codex (pid 38786)",
+    'Window: "ChatGPT", App: ChatGPT.',
+    "0 standard window ChatGPT",
+    "\t1 HTML content Daily investor pipeline push, URL: app://-/index.html",
+    `\t\t2 HTML content ${AUDIT_LABEL}, URL: https://github.com/acme/app/pull/6700`
+  ].join("\n"));
+  assert.equal(verifyIdentity(browser, identity).ok, false);
+  // The link lands on another thread whose transcript has that markdown heading: nothing typed.
+  const app = fakeApp({ bundleId: "com.openai.codex", windowTitle: "ChatGPT", workspaces: [], selected: null, page: { label: "Daily investor pipeline push", url: "app://-/index.html" } });
+  const f = setup(t, { app, probe: fakeProbe({ onOpen: () => { app.page = { ...app.page, label: "Other work" }; app.heading = AUDIT_LABEL; } }) });
+  const target = uiTargetFor(auditThread);
+  const result = await f.driver.deliver({ text: MESSAGE, target, identity, evidenceName: "fa_heading" });
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /is not the open thread/);
+  assert.deepEqual(typed(f.calls()), []);
 });
