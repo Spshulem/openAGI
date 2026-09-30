@@ -26,8 +26,9 @@ const STATE_TREE_NODES = 3000;
 const STATE_TREE_NODES_BY_APP = { "com.openai.codex": 6000 };
 // The fleet's own app agent, apart from the owner's other sessions.
 const OCU_AGENT_NAMESPACE = "openagi-fleet";
-// The fleet's own clicks and keys reset HIDIdleTime; an idle time that
-// reaches back to (about) its last input is still the owner away.
+// The fleet's own keys (and keyboard-fallback typing) reset HIDIdleTime; an
+// owner's last input that falls inside the fleet's last such call (plus this
+// slack) is the fleet's. Accessibility clicks post no HID event.
 const OWN_INPUT_SLACK_MS = 1500;
 // Frontmost while the screen saver runs or the login window shows.
 const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
@@ -600,9 +601,9 @@ export function createUiDriver({
   const readPermissions = permissionProbe
     ?? (async () => parseOcuPermissions(await readOcuPermissions(bins.ocu, undefined, { appAgentProxy: true, agentNamespace: OCU_AGENT_NAMESPACE, timeoutMs: limits.uiStepTimeoutMs })));
   let permissionCache = null;
-  // When this driver last clicked or typed, across deliveries: the next
-  // delivery in the same tick must not read it as the owner.
-  let lastOwnInputAt = null;
+  // The window of this driver's last key or typing call, across deliveries:
+  // the next delivery in the same tick must not read it as the owner.
+  let lastOwnInput = null;
 
   const permissions = async () => {
     const at = now();
@@ -649,7 +650,7 @@ export function createUiDriver({
     const controller = new AbortController();
     // Not unref'd: the abort must fire even if a hung call holds nothing else open.
     const timer = setTimeout(() => controller.abort(), limits.uiDeliveryTimeoutMs + typingMs);
-    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, ownInputAt: lastOwnInputAt, activated: false, inFront: false, frontBefore: null };
+    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null };
     try {
       return await steps(request, controller.signal, ctx);
     } catch (error) {
@@ -665,28 +666,42 @@ export function createUiDriver({
   // there and the owner has not come back (never pull an app from under them).
   async function restoreFront(ctx) {
     const target = ctx.request.target;
-    if (!ctx.activated || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    if (!ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
     try {
       if ((await presence.frontApp()) !== target.bundleId) return;
       if (!ownerAway(ctx, await presence.idleMs())) return;
+      // open -b launches an app that quit meanwhile; never that.
+      if ((await presence.appRunning(ctx.frontBefore)) !== true) return;
       await presence.activate(ctx.frontBefore);
     } catch { /* best-effort */ }
   }
 
-  // Away: no input for uiOwnerIdleMs, or none since the driver's own last
-  // click or key (which reset the idle clock).
+  // Away: no input for uiOwnerIdleMs, or the last input fell inside the
+  // driver's own last key or typing call (which reset the idle clock).
   function ownerAway(ctx, idle) {
     if (idle === null || idle === undefined) return false;
     if (idle >= limits.uiOwnerIdleMs) return true;
-    return Boolean(ctx.ownInputAt) && idle + OWN_INPUT_SLACK_MS >= now() - ctx.ownInputAt;
+    if (!ctx.ownInput) return false;
+    const lastInputAt = now() - idle;
+    return lastInputAt >= ctx.ownInput.start && lastInputAt <= ctx.ownInput.end + OWN_INPUT_SLACK_MS;
   }
 
-  // Every click or key this driver posts, so it is not read as the owner.
-  async function act(ctx, name, args, signal, options) {
+  // Once the owner is seen, only real idle time counts again: no discount
+  // for the fleet's input, now or in the next delivery.
+  function sawOwner(ctx) {
+    ctx.ownerSeen = true;
+    ctx.ownInput = lastOwnInput = null;
+  }
+
+  // One OCU action. Each ends with a fresh snapshot, so it gets a read's
+  // budget. Keys and typing may post HID events: their window is kept so
+  // they are not read as the owner (never after the owner was seen).
+  async function act(ctx, name, args, signal, { timeoutMs = limits.uiReadTimeoutMs, hid = false } = {}) {
+    const start = now();
     try {
-      return await ctx.transport.call(name, args, signal, options);
+      return await ctx.transport.call(name, args, signal, { timeoutMs });
     } finally {
-      ctx.ownInputAt = lastOwnInputAt = now();
+      if (hid && !ctx.ownerSeen) ctx.ownInput = lastOwnInput = { start, end: now() };
     }
   }
 
@@ -718,18 +733,21 @@ export function createUiDriver({
   // reset the owner's idle clock.
   const click = (ctx, element, signal) => act(ctx, "click", { app: ctx.request.target.bundleId, element_index: element.id, click_method: "accessibility" }, signal);
 
-  const press = (ctx, key, signal) => act(ctx, "press_key", { app: ctx.request.target.bundleId, key }, signal);
+  const press = (ctx, key, signal) => act(ctx, "press_key", { app: ctx.request.target.bundleId, key }, signal, { hid: true });
 
   // Removes only what this delivery typed: the composer was proven empty
   // before typing, and it must now hold our text (or a start of it), so
   // select-all in the focused composer selects nothing of the owner's.
-  async function clearComposer(ctx, signal) {
+  // With the owner back, only exactly our text, already focused: they may
+  // have added words, or be typing in another field a click would steal.
+  async function clearComposer(ctx, signal, { ownerPresent = false } = {}) {
     try {
       let state = await readState(ctx, signal);
       let { composer } = composerIn(ctx, state);
       if (!composer) return false;
       if (!normalizeUiText(composer.value)) return true;
       if (!looksLikeOurs(composer.value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
+      if (ownerPresent && (normalizeUiText(composer.value) !== normalizeUiText(ctx.text) || !isComposerFocused(state, composer))) return false;
       if (!isComposerFocused(state, composer)) {
         await click(ctx, composer, signal);
         state = await readState(ctx, signal);
@@ -749,6 +767,12 @@ export function createUiDriver({
   // Null while it is still safe to go on. Once the target is in front it
   // must stay there: typing goes to the frontmost app.
   async function ownerCheck(ctx, target) {
+    const reason = await ownerReason(ctx, target);
+    if (reason) sawOwner(ctx);
+    return reason;
+  }
+
+  async function ownerReason(ctx, target) {
     const front = await presence.frontApp();
     const idle = await presence.idleMs();
     if (!ownerAway(ctx, idle)) {
@@ -760,6 +784,8 @@ export function createUiDriver({
   }
 
   async function bringToFront(ctx, target) {
+    // open -b launches an app that quit meanwhile; never that.
+    if ((await presence.appRunning(target.bundleId)) !== true) return false;
     if (!(await presence.activate(target.bundleId))) return false;
     ctx.activated = true;
     const deadline = now() + limits.uiActivateMs;
@@ -793,11 +819,14 @@ export function createUiDriver({
     const frontBefore = await presence.frontApp();
     if (SCREEN_SAVER_APPS.has(frontBefore)) return outcome(ctx, "blocked", "screen saver on");
     if (!ownerAway(ctx, await presence.idleMs())) {
+      sawOwner(ctx);
       if (frontBefore === target.bundleId || frontBefore === null) return outcome(ctx, "blocked", `owner using ${target.name}`);
       return outcome(ctx, "blocked", `waiting for idle: ${target.name} must be in front to type`);
     }
+    ctx.frontBefore = frontBefore;
 
-    // 2. Navigate to the thread: the deep link, in the background.
+    // 2. Navigate to the thread: the deep link, in the background. A read
+    // can take tens of seconds, so the owner is checked again after it.
     ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
     let state = await readState(ctx, signal);
     let verified = verifyIdentity(state, identity);
@@ -805,7 +834,12 @@ export function createUiDriver({
     // another thread, proves which one opened.
     if (identity.shared && verified.ok) return outcome(ctx, "blocked", `${identity.reason}; a thread with that title is already open`);
     if (!verified.ok) {
+      const back = await ownerCheck(ctx, target);
+      if (back) return outcome(ctx, "blocked", back);
       if (!(await presence.openUrl(target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
+      // The link can bring the app forward itself (Codex does): the owner's
+      // app is put back at the end all the same.
+      ctx.activated = true;
       const deadline = now() + limits.uiNavigateMs;
       do {
         await sleep(limits.uiPollMs);
@@ -813,13 +847,13 @@ export function createUiDriver({
         verified = verifyIdentity(state, identity);
       } while (!verified.ok && now() < deadline);
       if (!verified.ok) return outcome(ctx, "blocked", verified.reason);
-      const moved = await ownerCheck(ctx, target);
-      if (moved) return outcome(ctx, "blocked", moved);
     }
 
-    // 3. The app in front, then the thread checked again.
+    // 3. The app in front, then the thread checked again. Fresh owner check
+    // first: nothing comes forward over an owner who came back.
+    const moved = await ownerCheck(ctx, target);
+    if (moved) return outcome(ctx, "blocked", moved);
     if ((await presence.frontApp()) !== target.bundleId) {
-      ctx.frontBefore = frontBefore;
       if (!(await bringToFront(ctx, target))) return outcome(ctx, "blocked", `could not bring ${target.name} to the front`);
       state = await readState(ctx, signal);
       verified = verifyIdentity(state, identity);
@@ -856,8 +890,8 @@ export function createUiDriver({
 
     // 6. Focus the composer with an accessibility click; OCU reports focus
     // only for the frontmost app, so that is checked first.
-    const moved = await ownerCheck(ctx, target);
-    if (moved) return outcome(ctx, "blocked", moved);
+    const beforeFocus = await ownerCheck(ctx, target);
+    if (beforeFocus) return outcome(ctx, "blocked", beforeFocus);
     if (!isComposerFocused(state, found.composer)) {
       await click(ctx, found.composer, signal);
       state = await readState(ctx, signal);
@@ -867,9 +901,12 @@ export function createUiDriver({
     if (!holds(found.composer)) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
     if (!verifyIdentity(state, identity).ok) return outcome(ctx, "blocked", "thread changed before typing");
 
-    // 7. Type, one line.
+    // 7. Type, one line. The owner once more, right before: the click and
+    // read above can take tens of seconds.
+    const beforeTyping = await ownerCheck(ctx, target);
+    if (beforeTyping) return outcome(ctx, "blocked", beforeTyping);
     ctx.phase = "typing";
-    if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiStepTimeoutMs + ctx.typingMs });
+    if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs, hid: true });
     ctx.phase = "typed";
 
     // 8. Same thread, and the composer holds exactly our text.
@@ -881,6 +918,12 @@ export function createUiDriver({
       return outcome(ctx, "blocked", "thread changed before send; our text may be left as a draft in the thread, check it");
     }
     found = composerIn(ctx, state);
+    // The owner first: text that does not match may be theirs.
+    const back = await ownerCheck(ctx, target);
+    if (back) {
+      const cleared = await clearComposer(ctx, signal, { ownerPresent: true });
+      return outcome(ctx, "blocked", `${back}; ${cleared ? "cleared our text" : "our text may still be in the composer"}`);
+    }
     if (!found.composer || normalizeUiText(found.composer.value) !== normalizeUiText(text)) {
       const cleared = await clearComposer(ctx, signal);
       keep(ctx, "after", state);
@@ -888,7 +931,7 @@ export function createUiDriver({
     }
     const changed = hasStopButton(state) ? "turn started before send"
       : hasPermissionPrompt(state) ? "permission prompt appeared before send"
-      : await ownerCheck(ctx, target);
+      : null;
     if (changed) {
       const cleared = await clearComposer(ctx, signal);
       return outcome(ctx, "blocked", `${changed}; ${cleared ? "cleared our text" : "could not clear the composer, check it"}`);
@@ -944,7 +987,7 @@ export function createUiDriver({
       try { ctx.transport?.close(); } catch { /* already closed */ }
       ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
       const signal = AbortSignal.timeout(limits.uiReadTimeoutMs * 2);
-      cleared = await clearComposer(ctx, signal);
+      cleared = await clearComposer(ctx, signal, { ownerPresent: ctx.ownerSeen });
     } catch {
       cleared = false;
     }

@@ -567,7 +567,10 @@ export class FleetSupervisor {
   // question. One the owner overtook in the thread is dropped quietly; one
   // older than a day, or whose thread is gone, goes back to the owner.
   async deliverQueuedAnswers({ byKey, started, cappedKinds, asked, decided, sourceUnknown, budget = Infinity }) {
-    const contacted = { threads: new Set(), uiKeys: new Set(), sent: 0 };
+    // uiStalled: a computer-use send timed out or lost Open Computer Use;
+    // the rest of the tick's typing waits (the send loop too).
+    const contacted = { threads: new Set(), uiKeys: new Set(), sent: 0, uiStalled: false };
+    let tries = 0;
     const queued = this.store.queuedAnswers();
     if (!queued.length) return contacted;
     const deliveryState = await this.probeDelivery();
@@ -601,8 +604,13 @@ export class FleetSupervisor {
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
+      if (contacted.uiStalled && route === "computer-use") continue;
+      // Failed tries are bounded too, like the send loop's.
+      if (tries >= budget * 2) continue;
+      tries += 1;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
+      if (route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) contacted.uiStalled = true;
       if (delivery.status !== "sent") continue;
       contacted.sent += 1;
       contacted.threads.add(thread.key);
@@ -1104,7 +1112,7 @@ export class FleetSupervisor {
     let tries = 0;
     // A computer-use send that timed out or lost Open Computer Use leaves
     // the app agent busy or restarting: the rest of the tick's typing waits.
-    let uiStalled = false;
+    let uiStalled = answeredNow.uiStalled === true;
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;

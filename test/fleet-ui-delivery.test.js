@@ -61,13 +61,19 @@ function fakeApp(overrides = {}) {
   return app;
 }
 
-function fakeTransport(app, { failOn = null } = {}) {
+// latency: (name, args) => ms a call takes; a call slower than its timeout
+// fails like OCU's, else the clock moves on by that much.
+function fakeTransport(app, { failOn = null, latency = null, advance = null } = {}) {
   const transport = {
     calls: [],
     closed: 0,
     async call(name, args, _signal, options = {}) {
       transport.calls.push({ name, args: { ...args }, options });
       if (failOn && failOn(name, args, transport.calls.length)) throw new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.");
+      const cost = latency?.(name, args) ?? 0;
+      const limit = options.timeoutMs ?? transport.options?.timeoutMs ?? Infinity;
+      if (cost > limit) throw new Error(`Open Computer Use timed out after ${Math.round(limit / 1000)}s on ${name}`);
+      advance?.(cost);
       if (name === "get_app_state") return app.render();
       if (name === "click") {
         const id = String(args.element_index);
@@ -89,6 +95,7 @@ function fakeTransport(app, { failOn = null } = {}) {
         return { isError: false, content: [] };
       }
       if (name === "press_key") {
+        app.onKey?.(args.key);
         if (args.key === "super+a") app.selectAll = true;
         else if (args.key === "BackSpace" && app.selectAll) { app.composer = ""; app.selectAll = false; }
         else if (args.key === "Return" && app.composer) {
@@ -796,11 +803,12 @@ test("Codex: owner away opens codex://threads/<id> with no prefill, then verifie
   assert.match(result.detail, /typed into Codex/);
   assert.deepEqual(probe.opened, ["codex://threads/0199-abc"]);
   assert.ok(f.calls().every((call) => call.args.app === "com.openai.codex"), "only the target bundle id is driven");
-  // Codex reads are slow and deep: their own budget; only typing gets more.
+  // Codex reads are slow and deep: their own budget. Every action ends with
+  // a fresh snapshot, so it gets a read's budget; typing gets more.
   const reads = f.calls().filter((call) => call.name === "get_app_state");
   assert.ok(reads.every((call) => call.args.max_tree_nodes === 6000 && call.options.timeoutMs === DEFAULTS.uiReadTimeoutMs));
-  assert.equal(f.calls().find((call) => call.name === "type_text").options.timeoutMs, DEFAULTS.uiStepTimeoutMs + Math.ceil(MESSAGE.length * 25));
-  assert.equal(f.calls().find((call) => call.name === "click").options.timeoutMs, undefined);
+  assert.equal(f.calls().find((call) => call.name === "type_text").options.timeoutMs, DEFAULTS.uiReadTimeoutMs + Math.ceil(MESSAGE.length * 25));
+  assert.ok(f.calls().filter((call) => call.name === "click").every((call) => call.options.timeoutMs === DEFAULTS.uiReadTimeoutMs));
   assert.equal(f.transports[0].options.timeoutMs, DEFAULTS.uiStepTimeoutMs);
 });
 
@@ -971,4 +979,133 @@ test("the app holding secure input is named in the not-ready reason", async () =
   assert.equal((await probe.session()).secureInputApp, "BuildBetter Staging");
   const driver = createUiDriver({ config: { bins: { ocu: "/fake/ocu" }, limits: { ...DEFAULTS } }, probe: fakeProbe({ screen: { locked: false, secureInput: true, secureInputApp: "BuildBetter Staging", onConsole: true } }), binaryReady: () => true, computerUseEnabled: () => true, permissionProbe: async () => ({ accessibility: true, screenRecording: true }) });
   assert.deepEqual(await driver.readiness(), { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" });
+});
+
+// HIDIdleTime as the Mac keeps it: only the owner's input and posted keys
+// reset it; accessibility clicks and an AX value set (OCU's typing into a
+// settable composer) do not.
+function hidClock(f, { keysReset = true } = {}) {
+  const clock = { at: f.now() - 10 * 60_000, touch: () => { clock.at = f.now(); } };
+  f.probe.idleMs = async () => f.now() - clock.at;
+  if (keysReset) f.app.onKey = clock.touch;
+  return clock;
+}
+
+test("the owner coming back during the first slow read: nothing opened or brought forward", async (t) => {
+  for (const selected of ["madrid", "cairo"]) {
+    const app = fakeApp({ selected, onClickRow: () => {} });
+    const f = setup(t, { app, probe: fakeProbe({ onOpen: () => { app.selected = "madrid"; } }) });
+    const render = app.render;
+    app.render = () => { f.probe.idleMs = async () => 500; return render(); };
+    const result = await f.driver.deliver(f.request());
+    assert.equal(result.status, "blocked", selected);
+    assert.equal(result.detail, "waiting for idle: Conductor must be in front to type");
+    assert.deepEqual(f.probe.opened, [], "no deep link over the owner");
+    assert.deepEqual(f.probe.activated, [], "nothing brought forward");
+    assert.equal(f.calls().filter((call) => call.name !== "get_app_state").length, 0);
+  }
+});
+
+test("owner input during the focus click, then a slow read: seen before typing, nothing typed, their app kept", async (t) => {
+  const clock = {};
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "get_app_state" ? 20_000 : 3_000), advance: (ms) => clock.advance(ms) } });
+  clock.advance = f.advance;
+  const hid = hidClock(f);
+  const render = f.app.render;
+  // The owner clicks in the frontmost target as the focus click returns.
+  let touched = false;
+  f.app.render = () => { if (f.app.focused === "61" && !touched) { touched = true; hid.at = f.now() - 20_000; } return render(); };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Conductor");
+  assert.deepEqual(typed(f.calls()), []);
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "not pulled away from the owner");
+});
+
+test("owner input during a slow Send click is not the fleet's: the next delivery waits", async (t) => {
+  const clock = {};
+  const f = setup(t, { transportOptions: { latency: (name, args) => (name === "click" && args.element_index === "62" ? 5_000 : 0), advance: (ms) => clock.advance(ms) } });
+  clock.advance = f.advance;
+  // Typing sets the composer's value: no HID event.
+  const hid = hidClock(f);
+  f.app.onSend = () => { hid.at = f.now() - 1_000; f.app.transcript.push(f.app.composer); f.app.composer = ""; };
+  const first = await f.driver.deliver(f.request());
+  assert.equal(first.status, "sent", first.detail);
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "the owner is back: their app is not swapped in over them");
+  f.advance(10_000);
+  const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
+  assert.equal(next.status, "blocked");
+  assert.match(next.detail, /^owner using Conductor/);
+  assert.equal(typed(f.calls()).length, 1);
+});
+
+test("once the owner is seen, the fleet's clearing keys never count as them being away", async (t) => {
+  const f = setup(t);
+  const hid = hidClock(f);
+  const render = f.app.render;
+  // After typing, the owner clicks into the thread and watches.
+  f.app.render = () => { if (f.app.composer === MESSAGE && hid.at < f.now() - 60_000) { f.advance(5_000); hid.touch(); } return render(); };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Conductor; cleared our text");
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "not restored after the clearing keys");
+  f.advance(3_000);
+  const next = await f.driver.deliver(f.request());
+  assert.equal(next.status, "blocked");
+  assert.equal(next.detail, "owner using Conductor");
+  assert.equal(typed(f.calls()).length, 1);
+});
+
+test("the owner adding words after our text: nothing cleared, no keys, no click", async (t) => {
+  const f = setup(t);
+  const render = f.app.render;
+  f.app.onType = (text) => {
+    f.app.render = () => { if (!f.app.composer.endsWith("hold on")) f.app.composer += " wait, hold on"; f.probe.idleMs = async () => 200; return render(); };
+    return text;
+  };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
+  assert.equal(f.app.composer, `${MESSAGE} wait, hold on`);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
+  assert.equal(f.calls().filter((call) => call.name === "click").length, 1, "only the focus click before typing");
+});
+
+test("a deep link that brings the app forward itself still gets the owner's app put back", async (t) => {
+  const app = fakeApp({ bundleId: "com.openai.codex", workspaces: [], selected: null, windowTitle: "Codex" });
+  const probe = fakeProbe({ onOpen: () => { app.windowTitle = "Fix the upload retry bug"; probe.front = "com.openai.codex"; } });
+  const f = setup(t, { app, probe });
+  const thread = { key: "codex:t1", kind: "codex", id: "0199-abc", title: "Fix the upload retry bug", meta: { originator: "Codex Desktop" } };
+  const target = uiTargetFor(thread);
+  const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(thread, target, [thread]), evidenceName: "fa_codex" });
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(probe.activated, ["com.google.Chrome"]);
+  assert.equal(probe.front, "com.google.Chrome");
+});
+
+test("an app that quit is never launched to bring it forward or put it back", async (t) => {
+  const f = setup(t);
+  f.probe.appRunning = async (bundleId) => bundleId === "com.conductor.app";
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "Chrome quit: not relaunched");
+  const g = setup(t);
+  let checks = 0;
+  g.probe.appRunning = async () => (checks += 1) === 1;
+  const gone = await g.driver.deliver(g.request());
+  assert.equal(gone.status, "blocked");
+  assert.equal(gone.detail, "could not bring Conductor to the front");
+  assert.deepEqual(g.probe.activated, []);
+});
+
+test("Codex-slow clicks and keys get a read's budget, not a step's", async (t) => {
+  const clock = {};
+  const app = fakeApp({ bundleId: "com.openai.codex", workspaces: [], selected: null, windowTitle: "Fix the upload retry bug", sendButton: false });
+  const f = setup(t, { app, transportOptions: { latency: (name) => (name === "get_app_state" ? 20_000 : 12_000), advance: (ms) => clock.advance(ms) } });
+  clock.advance = f.advance;
+  const thread = { key: "codex:t1", kind: "codex", id: "0199-abc", title: "Fix the upload retry bug", meta: { originator: "Codex Desktop" } };
+  const target = uiTargetFor(thread);
+  const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(thread, target, [thread]), evidenceName: "fa_codex" });
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(names(f.calls()).filter((name) => name !== "get_app_state"), ["click", "type_text", "press_key"]);
 });

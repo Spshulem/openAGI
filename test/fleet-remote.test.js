@@ -64,6 +64,16 @@ test('offline node retains last state and cannot falsely confirm an answer', asy
   assert.match(remote.getState().lastError, /unavailable/);
 });
 
+test('requests that type into an app outlast a whole UI delivery; reads keep the short timeout', async t => {
+  const { remote, calls } = fixture(t);
+  await remote.refresh();
+  await remote.answerQuestion('fq_one', 'feature');
+  const [read, answer] = calls.map(c => c[4].timeoutMs);
+  assert.equal(read, 120000);
+  assert.ok(answer > DEFAULTS.uiDeliveryTimeoutMs + 2 * DEFAULTS.uiReadTimeoutMs, 'delivery plus the clearing of a failed one');
+  assert.ok(answer <= 5 * 60 * 1000, 'within the broker ceiling');
+});
+
 test('dismissing a mirrored question on the glasses closes it on the computer', async t => {
   const { remote, runtime, dir, state, calls } = fixture(t);
   runtime.fleetSupervisor = remote;

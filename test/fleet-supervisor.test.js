@@ -2348,6 +2348,28 @@ test("a kept answer past its day goes back to the owner even while its source ca
   assert.equal(supervisor.store.queuedAnswers().length, 0);
 });
 
+test("a kept answer whose send stalls Open Computer Use stops the tick's other typing", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const asking = Array.from({ length: 3 }, (_, i) => makeThread({ key: `codex:k${i}`, id: `k${i}`, cwd: `/work/k${i}`, title: `Ask ${i}`, writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: `Merge ${i}?`, options: ["yes", "no"] } } }));
+  const stopped = makeThread({ key: "codex:dead", id: "dead", cwd: "/work/dead", title: "Stopped", writerLocked: true, agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN), meta: { originator: "Codex Desktop" } });
+  const delivered = [];
+  const executor = { deliver: async (args) => { delivered.push(args); return { status: "failed", route: args.route, detail: "Open Computer Use timed out after 45s on get_app_state; nothing typed", actionId: null }; }, inFlight: () => [], whenIdle: async () => {} };
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [...asking, stopped], now: () => now, deps: { uiDriver: driver, executor } });
+  await supervisor.tick();
+  for (const q of supervisor.getState().questions.filter((x) => x.kind === "agent-ask")) await supervisor.answerQuestion(q.id, "yes");
+  assert.equal(supervisor.store.queuedAnswers().length, 3);
+  delivered.length = 0;
+  ready = true;
+  now += 5 * MIN;
+  const snapshot = await supervisor.tick();
+  assert.equal(delivered.length, 1, "one stalled send, then nothing else types this tick");
+  assert.equal(delivered[0].playbook, "owner-answer");
+  assert.equal(supervisor.store.queuedAnswers().length, 3, "the others wait for the next tick");
+  assert.ok(snapshot.threads.some((row) => row.key === "codex:dead" && /deferred: Open Computer Use stalled/.test(row.decision?.reason ?? "")));
+});
+
 test("kept answers share the tick's send cap; the rest wait for the next tick", async (t) => {
   let now = NOW;
   let ready = false;
