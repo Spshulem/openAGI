@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
+import { DEFAULTS, resolveFleetConfig, uiTargetFor } from "../src/fleet/contracts.js";
 import { findManagerSession, listConductorThreads } from "../src/fleet/sources/conductor.js";
 
 const NOW = Date.parse("2026-09-26T08:00:00.000Z");
@@ -323,6 +323,27 @@ test("an aborted session exposes when the owner stopped it", async (t) => {
   const threads = byId(await listConductorThreads(makeConfig(home), { now: NOW, isPidAlive: () => false }));
   assert.equal(threads["s-abort"].meta.abortedAt, iso(45 * MIN));
   assert.equal(threads["s-idle"].meta.abortedAt, null);
+});
+
+test("a working tab silent past silentTurnMs is stalled, or waiting when it owns live tasks", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  // s-run's last turn row is 2 min before NOW; s-self has no turn rows at all.
+  const later = NOW + DEFAULTS.silentTurnMs;
+  const threads = byId(await listConductorThreads(makeConfig(home), { now: later - 5 * MIN, peers: new Map() }));
+  assert.equal(threads["s-run"].agentStatus, "running");
+  const silent = byId(await listConductorThreads(makeConfig(home), { now: later, peers: new Map() }));
+  assert.equal(silent["s-run"].agentStatus, "stalled");
+  assert.equal(silent["s-run"].meta.conductorStatus, "working");
+  assert.equal(silent["s-self"].agentStatus, "running");
+  // A background task the live process still owns makes it a wait on that task.
+  const db = new DatabaseSync(file);
+  addMessage(db, "s-run", "assistant", sdk.taskStarted("s-run", "bbq-1", "Wait for bb-quick"), iso(3 * MIN));
+  db.close();
+  writePeer(home, { pid: 801, sessionId: "s-run", name: "madrid-8a", status: "idle", entrypoint: "sdk-ts", updatedAt: NOW });
+  const tasks = byId(await listConductorThreads(makeConfig(home), { now: later, isPidAlive: (pid) => pid === 801 }));
+  assert.equal(tasks["s-run"].agentStatus, "waiting");
+  assert.equal(tasks["s-run"].openTasks[0]?.id, "bbq-1");
 });
 
 test("a live peer on a permission prompt is waiting on the owner", async (t) => {

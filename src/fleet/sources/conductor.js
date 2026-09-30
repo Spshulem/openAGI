@@ -209,15 +209,19 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
   const blockedOnOwner = peerBlockedOnOwner(peer);
-  const { agentStatus, error, abortReason, abortedAt = null } = blockedOnOwner
+  const { agentStatus: reported, error, abortReason, abortedAt = null } = blockedOnOwner
     ? { agentStatus: "waiting", error: null, abortReason: null }
     : statusAndError(row.status, summary.lastEnd, now, limits.excerptMax);
   // Only running or waiting sessions still own background tasks, and only
   // those started by the live process: conductor.db never records the ones
   // killed with an earlier process.
-  const openTasks = agentStatus === "waiting" || agentStatus === "running"
+  const openTasks = reported === "waiting" || reported === "running"
     ? liveTasks(readOpenTasks(db, row.id, sinceIso), peer)
     : [];
+  // Conductor keeps a hung turn "working" for hours. With no transcript row
+  // for that long it is a wait on its tasks, or stalled like a silent Codex turn.
+  const silent = reported === "running" && now - Date.parse(summary.lastAt ?? "") >= limits.silentTurnMs;
+  const agentStatus = silent ? (openTasks.length ? "waiting" : "stalled") : reported;
   const excerpt = (text) => clampText(redactSecrets(text), limits.excerptMax);
   const title = row.title && row.title !== "Untitled" ? row.title : row.pr_title || row.directory_name || row.id;
   const selfIds = config.selfSessionIds ?? [];

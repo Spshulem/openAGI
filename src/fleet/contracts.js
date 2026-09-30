@@ -52,6 +52,9 @@ export const DEFAULTS = Object.freeze({
   fullVerifyEscalateMs: 30 * MIN,
   quickVerifyEscalateMs: 15 * MIN,
   waitingTaskMaxMs: 45 * MIN,
+  // No transcript row this long: a Conductor "working" turn is hung, and a
+  // wait on a background task gets the agent asked for a status.
+  silentTurnMs: 60 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
   lbErrorFreshMs: 15 * MIN,
   managerEscalationCooldownMs: 60 * MIN,
