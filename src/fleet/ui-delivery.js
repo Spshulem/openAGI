@@ -1051,12 +1051,14 @@ export function createUiDriver({
     // the confirmation at this delivery's slowest call: cut short after the
     // send, a delivery can only report "may have been sent". The owner once
     // more, right before: the click and read above can take tens of seconds.
-    // The two owner checks still ahead (before typing, after the read that
-    // follows it) count at this delivery's slowest one; with none measured,
-    // at every command's timeout and kill grace (frontApp runs two, idleMs one).
+    // The presence probes still ahead (the owner checks before typing and
+    // after the read that follows it, and the idle read that marks our
+    // typing) count at this delivery's slowest owner check each; with none
+    // measured, at every command's timeout and kill grace (frontApp runs
+    // two, idleMs one).
     const left = ctx.endsAt - now();
     const probeRound = ctx.slowestProbe ?? 3 * commandMs;
-    if (left < (leftover ? 3 : 4) * ctx.slowest + (leftover ? 0 : ctx.typingMs) + 2 * probeRound) {
+    if (left < (leftover ? 3 : 4) * ctx.slowest + (leftover ? 0 : ctx.typingMs) + (leftover ? 2 : 3) * probeRound) {
       return outcome(ctx, "blocked", `not enough time left to type and confirm (${Math.round(left / 1000)} s); nothing typed`);
     }
     const beforeTyping = await ownerCheck(ctx, target);

@@ -1566,3 +1566,20 @@ test("slow presence probes count in the typing budget: the delivery refuses to t
   const sent = await g.driver.deliver(g.request());
   assert.equal(sent.status, "sent", sent.detail);
 });
+
+test("the idle read that marks our typing counts in the typing budget: typed text is never left unsent for want of time", async (t) => {
+  // frontApp 12.5 s and idleMs 15 s: the owner checks alone fit, but not
+  // with the idle read after type_text.
+  const probe = fakeProbe();
+  const clock = {};
+  const front = probe.frontApp;
+  const idle = probe.idleMs;
+  probe.frontApp = async () => { clock.advance(12_500); return front(); };
+  probe.idleMs = async () => { clock.advance(15_000); return idle(); };
+  const f = setup(t, { probe });
+  clock.advance = f.advance;
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /^not enough time left to type and confirm \(\d+ s\); nothing typed$/);
+  assert.deepEqual(typed(f.calls()), []);
+});
