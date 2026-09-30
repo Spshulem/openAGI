@@ -776,6 +776,9 @@ export class FleetSupervisor {
 
   async _tick(reason) {
     const started = this.now();
+    // The owner asked for this scan ("Scan now", the chat): recheck every
+    // open question, not only the new, changed or due ones.
+    this.forceReview = reason === "owner-scan" || reason === "chat";
     const mode = this.mode;
     const config = { ...this.config, mode };
     const run = this.deps.run ?? runCommand;
@@ -1182,11 +1185,12 @@ export class FleetSupervisor {
     const changed = (question) => Boolean(question.reviewedAt) && question.reviewFingerprint !== fingerprints.get(question.id);
     const backoff = (question) => 2 ** Math.min(question.reviewStreak ?? 0, REVIEW_BACKOFF_MAX);
     const due = (question) => now - Date.parse(question.reviewedAt ?? "") >= review.intervalMs * backoff(question);
-    const pending = open.filter((question) => unreviewed(question) || changed(question) || due(question));
+    const forced = this.forceReview === true;
+    const pending = forced ? open : open.filter((question) => unreviewed(question) || changed(question) || due(question));
     if (!pending.length) return unsettled;
     // Only a new question skips the gap, so a backlog past the batch cap
     // does not call the model every tick.
-    if (!pending.some(unreviewed) && now - (this.lastReview.at ?? 0) < REVIEW_MIN_GAP_MS) return unsettled;
+    if (!forced && !pending.some(unreviewed) && now - (this.lastReview.at ?? 0) < REVIEW_MIN_GAP_MS) return unsettled;
     // New, then changed, then the longest since its review: the batch cap
     // drops the tail, and the next review starts there.
     const rank = (question) => (unreviewed(question) ? 0 : changed(question) ? 1 : 2);

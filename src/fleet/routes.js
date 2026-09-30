@@ -75,7 +75,8 @@ export function createFleetRoute({ supervisor } = {}) {
       if (parts.length === 1 && parts[0] === "scan") {
         if (method !== "POST") return fail(405, "Use POST.");
         try {
-          await supervisor.tick({ reason: "manual" });
+          // The owner's Scan now: rechecks every open question too.
+          await supervisor.tick({ reason: "owner-scan" });
         } catch {
           return fail(500, "Scan failed.", { state: state() });
         }

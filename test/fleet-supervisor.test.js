@@ -2376,3 +2376,17 @@ test("an answer is only reported saved if it was stored", async (t) => {
   assert.notEqual(result.delivery.status, "queued");
   assert.equal(supervisor.store.queuedAnswers().length, 0);
 });
+
+test("Scan now rechecks every open question with the review, not only new or due ones", async (t) => {
+  let now = NOW;
+  const model = fakeModel((entries) => entries.map((e) => ({ id: e.id, decision: "keep", category: "live", reason: "still waits on the owner" })));
+  const { supervisor } = fixture(t, { threads: [asking()], prs: new Map(), now: () => now, review: REVIEW_ON, deps: { runModel: model.runModel } });
+  await supervisor.tick({ reason: "interval" });
+  assert.equal(model.calls.length, 1, "a new question is reviewed");
+  now += 11 * MIN;
+  await supervisor.tick({ reason: "interval" });
+  assert.equal(model.calls.length, 1, "unchanged and not due: no review on a scheduled scan");
+  await supervisor.tick({ reason: "owner-scan" });
+  assert.equal(model.calls.length, 2, "the owner's Scan now rechecks it");
+  assert.equal(model.calls[1].entries.length, 1);
+});

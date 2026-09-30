@@ -157,7 +157,7 @@ test("state, scan, mode, answer, and send go through the JSON API", async (t) =>
   const scan = await json("/fleet/api/scan", {});
   assert.equal(scan.status, 200);
   assert.equal(scan.body.lastTickAt, "2026-09-26T01:00:00.000Z");
-  assert.deepEqual(fleet.calls.filter(([name]) => name === "tick"), [["tick", "manual"]]);
+  assert.deepEqual(fleet.calls.filter(([name]) => name === "tick"), [["tick", "owner-scan"]]);
 
   const mode = await json("/fleet/api/mode", { mode: "propose" });
   assert.equal(mode.status, 200);
