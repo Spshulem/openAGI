@@ -23,6 +23,9 @@ function fakeApp(overrides = {}) {
     heading: null,
     composer: "",
     focused: null,
+    // OCU prints focus and types only for the frontmost app; setup() ties
+    // this to the fake presence probe.
+    frontmost: true,
     selectAll: false,
     transcript: ["[OpenAGI supervisor] earlier note", "Pushed the fix."],
     stop: false,
@@ -52,7 +55,7 @@ function fakeApp(overrides = {}) {
     if (app.sendButton) lines.push("  62 button Send");
     if (app.stop) lines.push("  63 button Stop");
     if (app.prompt) lines.push("  64 button Allow once");
-    if (app.focused) lines.push(`The focused UI element is ${app.focused} text entry area.`);
+    if (app.focused && app.frontmost) lines.push(`The focused UI element is ${app.focused} text entry area.`);
     return { isError: false, content: [{ type: "text", text: `${lines.join("\n")}\n` }, { type: "image", mimeType: "image/png", data: PNG }] };
   };
   return app;
@@ -62,8 +65,8 @@ function fakeTransport(app, { failOn = null } = {}) {
   const transport = {
     calls: [],
     closed: 0,
-    async call(name, args) {
-      transport.calls.push({ name, args: { ...args } });
+    async call(name, args, _signal, options = {}) {
+      transport.calls.push({ name, args: { ...args }, options });
       if (failOn && failOn(name, args, transport.calls.length)) throw new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.");
       if (name === "get_app_state") return app.render();
       if (name === "click") {
@@ -81,7 +84,7 @@ function fakeTransport(app, { failOn = null } = {}) {
         return { isError: false, content: [] };
       }
       if (name === "type_text") {
-        if (app.focused !== "61") throw new Error("type_text requires a focused editable text element");
+        if (!app.frontmost || app.focused !== "61") throw new Error("type_text requires a focused editable text element");
         app.composer += app.onType ? app.onType(args.text) : args.text;
         return { isError: false, content: [] };
       }
@@ -104,16 +107,18 @@ function fakeTransport(app, { failOn = null } = {}) {
 function fakeProbe(overrides = {}) {
   const probe = {
     front: "com.google.Chrome",
-    idle: 1_000,
+    idle: 10 * 60_000,
     running: true,
     screen: { locked: false, secureInput: false, onConsole: true },
     opened: [],
+    activated: [],
     onOpen: null,
     async frontApp() { return probe.front; },
     async appRunning() { return probe.running; },
     async idleMs() { return probe.idle; },
     async session() { return probe.screen; },
     async openUrl(url) { probe.opened.push(url); probe.onOpen?.(url); return true; },
+    async activate(bundleId) { probe.activated.push(bundleId); probe.front = bundleId; return true; },
     ...overrides
   };
   return probe;
@@ -126,6 +131,7 @@ const conductorThread = (extra = {}) => ({
 
 function setup(t, { app = fakeApp(), probe = fakeProbe(), transportOptions = {}, driverOptions = {}, evidence = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-ui-"));
+  Object.defineProperty(app, "frontmost", { get: () => probe.front === app.bundleId, configurable: true });
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   let clock = Date.parse("2026-09-27T12:00:00.000Z");
   const transports = [];
@@ -147,19 +153,22 @@ function setup(t, { app = fakeApp(), probe = fakeProbe(), transportOptions = {},
   const target = uiTargetFor(thread);
   const request = (extra = {}) => ({ text: MESSAGE, target, identity: uiIdentity(thread, target, [thread]), evidenceName: "fa_test", ...extra });
   const calls = () => transports.flatMap((transport) => transport.calls);
-  return { app, probe, driver, transports, calls, request, dir, get permissionChecks() { return permissionChecks; } };
+  return { app, probe, driver, transports, calls, request, dir, now: () => clock, advance: (ms) => { clock += ms; }, get permissionChecks() { return permissionChecks; } };
 }
 
 const names = (calls) => calls.map((call) => call.name);
 const typed = (calls) => calls.filter((call) => call.name === "type_text").map((call) => call.args.text);
 
-test("happy path: verify, focus, type one line, check, send, confirm", async (t) => {
+test("happy path: verify, bring forward, focus, type one line, check, send, confirm, put the owner's app back", async (t) => {
   const f = setup(t);
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
   assert.match(result.detail, /typed into Conductor/);
-  assert.deepEqual(names(f.calls()), ["get_app_state", "click", "get_app_state", "type_text", "get_app_state", "click", "get_app_state"]);
-  const [, focus, , , , send] = f.calls();
+  assert.deepEqual(names(f.calls()), ["get_app_state", "get_app_state", "click", "get_app_state", "type_text", "get_app_state", "click", "get_app_state"]);
+  const [read, , focus, , , , send] = f.calls();
+  assert.equal(read.args.max_tree_nodes, 3000);
+  assert.deepEqual(f.probe.activated, ["com.conductor.app", "com.google.Chrome"], "brought forward, then the owner's app restored");
+  assert.equal(f.probe.front, "com.google.Chrome");
   assert.deepEqual(focus.args, { app: "com.conductor.app", element_index: "61", click_method: "accessibility" });
   assert.deepEqual(send.args, { app: "com.conductor.app", element_index: "62", click_method: "accessibility" });
   assert.deepEqual(typed(f.calls()), [MESSAGE]);
@@ -249,22 +258,63 @@ test("an ambiguous thread identity blocks before any UI call", async (t) => {
   assert.equal(f.transports.length, 0);
 });
 
-test("owner active elsewhere: background row click, never a deep link", async (t) => {
-  const f = setup(t, { app: fakeApp({ selected: "cairo" }) });
+test("owner active in another app: waits for idle, nothing opened, clicked, or brought forward", async (t) => {
+  const f = setup(t, { app: fakeApp({ selected: "cairo" }), probe: fakeProbe({ idle: 1_000 }) });
   const result = await f.driver.deliver(f.request());
-  assert.equal(result.status, "sent", result.detail);
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "waiting for idle: Conductor must be in front to type");
+  assert.equal(f.transports.length, 0);
   assert.deepEqual(f.probe.opened, []);
-  const rowClick = f.calls().find((call) => call.name === "click");
-  assert.deepEqual(rowClick.args, { app: "com.conductor.app", element_index: "1", click_method: "accessibility" });
+  assert.deepEqual(f.probe.activated, []);
 });
 
-test("owner away: the deep link opens in the background", async (t) => {
+test("owner away: the deep link opens in the background, then the app comes forward for the send", async (t) => {
   const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
   const probe = fakeProbe({ idle: 10 * 60_000, onOpen: () => { app.selected = "madrid"; } });
   const f = setup(t, { app, probe });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
   assert.deepEqual(probe.opened, ["conductor://workspace?id=w-madrid&session=s1"]);
+  assert.deepEqual(probe.activated, ["com.conductor.app", "com.google.Chrome"]);
+  assert.equal(f.calls().filter((call) => call.name === "click" && call.args.element_index === "1").length, 0, "no sidebar clicks");
+});
+
+test("the screen saver in front blocks before any UI call", async (t) => {
+  for (const front of ["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]) {
+    const f = setup(t, { probe: fakeProbe({ front }) });
+    const result = await f.driver.deliver(f.request());
+    assert.equal(result.status, "blocked");
+    assert.equal(result.detail, "screen saver on");
+    assert.equal(f.transports.length, 0);
+    assert.deepEqual(f.probe.activated, []);
+  }
+});
+
+test("an app that will not come forward blocks before typing", async (t) => {
+  const probe = fakeProbe({ activate: async (bundleId) => { probe.activated.push(bundleId); return true; } });
+  const f = setup(t, { probe });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "could not bring Conductor to the front");
+  assert.deepEqual(typed(f.calls()), []);
+  assert.deepEqual(probe.activated, ["com.conductor.app"], "nothing to restore: the owner's app never left the front");
+});
+
+test("the fleet's own clicks and keys do not count as the owner coming back", async (t) => {
+  // HIDIdleTime restarts at every event the fleet posts.
+  let hidAt = null;
+  const probe = fakeProbe();
+  const app = fakeApp();
+  const f = setup(t, { app, probe });
+  probe.idleMs = async () => (hidAt === null ? 10 * 60_000 : f.now() - hidAt);
+  app.onType = (text) => { hidAt = f.now(); f.advance(3_000); return text; };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(probe.activated, ["com.conductor.app", "com.google.Chrome"]);
+  // The next delivery right after is not held up by them either.
+  f.advance(2_000);
+  const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
+  assert.equal(next.status, "sent", next.detail);
 });
 
 test("a thread that cannot be verified is blocked and nothing is typed", async (t) => {
@@ -273,7 +323,8 @@ test("a thread that cannot be verified is blocked and nothing is typed", async (
   assert.equal(result.status, "blocked");
   assert.match(result.detail, /could not verify thread/);
   assert.deepEqual(typed(f.calls()), []);
-  assert.deepEqual(f.probe.opened, []);
+  assert.equal(f.probe.opened.length, 1, "the deep link was tried");
+  assert.deepEqual(f.probe.activated, [], "never brought forward");
   // Plain transcript text naming the workspace is not proof.
   const state = parseAppState(fakeApp({ selected: "cairo", transcript: ["madrid is waiting on CI"] }).render());
   assert.equal(verifyIdentity(state, { tokens: ["madrid"] }).ok, false);
@@ -334,7 +385,7 @@ test("Conductor is verified by the workspace and session ids in the page URL", (
   assert.match(verifyIdentity(noTab, { tokens: [], ids }).reason, /no session tab open/);
 });
 
-test("Conductor with the owner active elsewhere: clicks the in-app link to the workspace, proves it by URL", async (t) => {
+test("Conductor: the deep link moves the page, proven by the URL, never a sidebar click", async (t) => {
   const app = fakeApp({
     workspaces: [],
     page: { label: "Tauri + React + Typescript", url: "tauri://localhost/repository/r1/workspace/w-cairo?activeTabType=session&sessionId=s9" },
@@ -343,11 +394,12 @@ test("Conductor with the owner active elsewhere: clicks the in-app link to the w
       { label: "Fix billing +12 -3", url: "tauri://localhost/repository/r1/workspace/w-madrid", session: "s1" }
     ]
   });
-  const f = setup(t, { app });
+  const probe = fakeProbe({ onOpen: () => { app.page = { ...app.page, url: "tauri://localhost/repository/r1/workspace/w-madrid?activeTabType=session&sessionId=s1" }; } });
+  const f = setup(t, { app, probe });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
-  assert.deepEqual(f.probe.opened, [], "owner active: no deep link");
-  assert.ok(f.calls().some((call) => call.name === "click" && call.args.element_index === "71"), "clicked the madrid link");
+  assert.deepEqual(f.probe.opened, ["conductor://workspace?id=w-madrid&session=s1"]);
+  assert.equal(f.calls().filter((call) => call.name === "click" && Number(call.args.element_index) >= 70 && Number(call.args.element_index) < 80).length, 0);
   assert.equal(f.app.transcript.at(-1), MESSAGE);
 });
 
@@ -382,11 +434,12 @@ test("a shared Codex title goes on only through the id link, from another open t
   assert.match(already.detail, /already open/);
   assert.deepEqual(typed(g.calls()), []);
 
-  // Owner active: no deep link, so no way to prove it.
-  const h = setup(t, { app: codexApp("Scope native mobile migration") });
+  // Owner active: nothing happens until they are away.
+  const h = setup(t, { app: codexApp("Scope native mobile migration"), probe: fakeProbe({ idle: 1_000 }) });
   const active = await h.driver.deliver(h.request({ target, identity }));
   assert.equal(active.status, "blocked");
-  assert.match(active.detail, /two threads share this title/);
+  assert.match(active.detail, /^waiting for idle: Codex must be in front/);
+  assert.equal(h.transports.length, 0);
 });
 
 test("a draft in the composer is never overwritten", async (t) => {
@@ -394,7 +447,7 @@ test("a draft in the composer is never overwritten", async (t) => {
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
   assert.match(result.detail, /draft in composer/);
-  assert.deepEqual(names(f.calls()), ["get_app_state"]);
+  assert.deepEqual(names(f.calls()), ["get_app_state", "get_app_state"]);
   assert.equal(f.app.composer, "half-written owner note");
 });
 
@@ -432,16 +485,18 @@ test("a thread change before send blocks without clearing another thread's compo
   assert.equal(f.calls().filter((call) => call.name === "click" && call.args.element_index === "62").length, 0);
 });
 
-test("the owner coming back before send clears our text and blocks", async (t) => {
+test("the owner coming back before send clears our text, blocks, and keeps their app in front", async (t) => {
   const probe = fakeProbe();
   const app = fakeApp();
-  app.onType = (text) => { probe.front = "com.conductor.app"; probe.idle = 200; return text; };
   const f = setup(t, { app, probe });
+  // Input after the fleet's own last key, well past the slack.
+  app.onType = (text) => { probe.idleMs = async () => { f.advance(5_000); return 200; }; return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
   assert.match(result.detail, /owner using Conductor; cleared our text/);
   assert.equal(app.composer, "");
   assert.equal(app.transcript.includes(MESSAGE), false);
+  assert.deepEqual(probe.activated, ["com.conductor.app"], "the previous app is not restored under the owner");
 });
 
 test("a send that never shows in the transcript is failed and unconfirmed", async (t) => {
@@ -506,7 +561,7 @@ test("a transport failure before typing fails closed and closes the transport", 
 
 test("a transport failure after typing clears our text with a fresh engine", async (t) => {
   const app = fakeApp();
-  const f = setup(t, { app, transportOptions: { failOn: (name, _args, n) => name === "get_app_state" && n === 5 } });
+  const f = setup(t, { app, transportOptions: { failOn: (name, _args, n) => name === "get_app_state" && n === 6 } });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "failed");
   assert.match(result.detail, /not sent; cleared our text/);
@@ -537,6 +592,53 @@ test("the composer must be the only text area, and focus must land in it", async
   assert.equal(result.status, "failed");
   assert.match(result.detail, /could not focus the composer; nothing typed/);
   assert.deepEqual(typed(f.calls()), []);
+});
+
+// From real trees (2026-09-30): Codex's composer says "Do anything" and sits
+// beside the in-app browser's URL combo box and a GitHub comment box;
+// Conductor's session has a "Terminal input" text area too.
+const CODEX_BROWSER_STATE = [
+  "App=com.openai.codex (pid 38786)",
+  'Window: "ChatGPT", App: ChatGPT.',
+  "0 standard window ChatGPT, Secondary Actions: Raise",
+  "\t1 container (settable, string) ChatGPT",
+  "\t\t2 scroll area",
+  "\t\t\t3 HTML content Fix billing, URL: app://-/index.html",
+  "\t\t\t\t26 combo box (settable, string) Command menu Search chats",
+  "\t\t\t\t30 group",
+  "\t\t\t\t\t2296 text entry area (settable, string) Do anything Do anything\\n",
+  "\t\t\t\t\t2327 combo box (settable, string) Search or enter a URL Value: github.com",
+  "\t\t\t\t\t2338 HTML content Pull Request #6988, URL: https://github.com/buildbetter-app/buildbetter/pull/6988",
+  "\t\t\t\t\t\t4832 text area (settable, string) Comment"
+].join("\n");
+const CONDUCTOR_TERMINAL_STATE = [
+  "App=com.conductor.app (pid 72610)",
+  'Window: "Conductor", App: Conductor.',
+  "0 standard window Conductor, Secondary Actions: Raise",
+  "\t1 scroll area",
+  `\t\t2 HTML content Tauri + React + Typescript, URL: ${CONDUCTOR_URL}`,
+  "\t\t\t174 container composer",
+  "\t\t\t\t175 text entry area (settable, string) Secondary Actions: Show Writing Tools",
+  "\t\t\t266 container",
+  "\t\t\t\t267 text entry area (settable, string) Terminal input, Secondary Actions: Show Writing Tools"
+].join("\n");
+
+test("findComposer: Codex's Do anything box, never a combo box or the in-app browser", () => {
+  assert.equal(findComposer(stateOf(CODEX_BROWSER_STATE)).composer.id, "2296");
+  assert.equal(findComposer(stateOf(CODEX_BROWSER_STATE), "com.openai.codex").composer.id, "2296");
+  // Without the composer, the single-editable fallback picks nothing left.
+  const noComposer = stateOf(CODEX_BROWSER_STATE.replace(/\n\t+2296 [^\n]*/, ""));
+  assert.equal(findComposer(noComposer).composer, null);
+  assert.match(findComposer(noComposer).reason, /composer not found/);
+});
+
+test("findComposer: Conductor's composer container only, never its Terminal input", () => {
+  assert.equal(findComposer(stateOf(CONDUCTOR_TERMINAL_STATE)).composer.id, "175");
+  const terminalOnly = stateOf(CONDUCTOR_TERMINAL_STATE.replace(/\n\t+174 [^\n]*\n\t+175 [^\n]*/, ""));
+  assert.equal(findComposer(terminalOnly).composer, null);
+  // An editable outside the composer container is not the composer either.
+  const loose = stateOf(CONDUCTOR_TERMINAL_STATE.replace("174 container composer", "174 container"));
+  assert.equal(findComposer(loose).composer, null);
 });
 
 test("parseAppState reads header, window, elements, fields, and focus", () => {
@@ -694,41 +796,46 @@ test("Codex: owner away opens codex://threads/<id> with no prefill, then verifie
   assert.match(result.detail, /typed into Codex/);
   assert.deepEqual(probe.opened, ["codex://threads/0199-abc"]);
   assert.ok(f.calls().every((call) => call.args.app === "com.openai.codex"), "only the target bundle id is driven");
+  // Codex reads are slow and deep: their own budget; only typing gets more.
+  const reads = f.calls().filter((call) => call.name === "get_app_state");
+  assert.ok(reads.every((call) => call.args.max_tree_nodes === 6000 && call.options.timeoutMs === DEFAULTS.uiReadTimeoutMs));
+  assert.equal(f.calls().find((call) => call.name === "type_text").options.timeoutMs, DEFAULTS.uiStepTimeoutMs + Math.ceil(MESSAGE.length * 25));
+  assert.equal(f.calls().find((call) => call.name === "click").options.timeoutMs, undefined);
+  assert.equal(f.transports[0].options.timeoutMs, DEFAULTS.uiStepTimeoutMs);
 });
 
-test("the frontmost app changing while the owner is active aborts before typing", async (t) => {
+test("another app coming to the front after the target was brought forward aborts before typing", async (t) => {
   const probe = fakeProbe();
-  const app = fakeApp({ selected: "cairo", onClickRow: (name) => { app.selected = name; probe.front = "com.apple.Terminal"; } });
+  const app = fakeApp();
+  const render = app.render;
+  let reads = 0;
+  app.render = () => { reads += 1; if (reads === 2) probe.front = "com.apple.Terminal"; return render(); };
   const f = setup(t, { app, probe });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
   assert.match(result.detail, /frontmost app changed/);
   assert.deepEqual(typed(f.calls()), []);
+  assert.equal(f.calls().filter((call) => call.name === "click").length, 0);
+  assert.deepEqual(probe.activated, ["com.conductor.app"], "the app now in front is left alone");
 });
 
-test("navigation never clicks a link, and never guesses between two matches", async (t) => {
-  const app = fakeApp({ selected: "cairo" });
-  const render = app.render;
-  app.render = () => {
-    const out = render();
-    out.content[0].text = out.content[0].text.replace("  1 row madrid", "  1 link madrid");
-    return out;
-  };
-  const f = setup(t, { app });
+test("a background app never reports focus, so nothing is typed into it", async (t) => {
+  // The target never comes forward in time: OCU prints no focus line.
+  const probe = fakeProbe({ activate: async (bundleId) => { probe.activated.push(bundleId); return true; } });
+  const f = setup(t, { probe, driverOptions: { config: { bins: { ocu: "/fake/OpenComputerUse" }, limits: { ...DEFAULTS, uiActivateMs: 0 } } } });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.equal(f.calls().filter((call) => call.name === "click").length, 0);
-
-  const twice = fakeApp({ selected: "cairo", workspaces: ["madrid", "cairo", "madrid"] });
-  const g = setup(t, { app: twice });
-  assert.equal((await g.driver.deliver(g.request())).status, "blocked");
-  assert.equal(g.calls().filter((call) => call.name === "click").length, 0);
+  assert.deepEqual(typed(f.calls()), []);
+  f.app.focused = "61";
+  assert.equal(parseAppState(f.app.render()).focusedId, null);
+  probe.front = "com.conductor.app";
+  assert.equal(parseAppState(f.app.render()).focusedId, "61");
 });
 
-test("focus falls back to one event posted to the app when accessibility did not focus", async (t) => {
+test("focus uses an accessibility click only, never an event posted to the app", async (t) => {
   const app = fakeApp();
   const f = setup(t, { app });
-  // Accessibility press on the composer does nothing; app_post focuses it.
+  // Accessibility press on the composer does nothing.
   const driver = createUiDriver({
     config: { bins: { ocu: "/fake/OpenComputerUse" }, limits: { ...DEFAULTS } },
     probe: f.probe,
@@ -752,9 +859,11 @@ test("focus falls back to one event posted to the app when accessibility did not
     sleep: async () => {}
   });
   const result = await driver.deliver(f.request());
-  assert.equal(result.status, "sent", result.detail);
+  assert.equal(result.status, "failed");
+  assert.match(result.detail, /could not focus the composer; nothing typed/);
   const focusClicks = f.calls().filter((call) => call.name === "click" && call.args.element_index === "61").map((call) => call.args.click_method);
-  assert.deepEqual(focusClicks, ["accessibility", "app_post"]);
+  assert.deepEqual(focusClicks, ["accessibility"]);
+  assert.equal(f.calls().filter((call) => call.args.click_method === "app_post").length, 0);
 });
 
 test("the transport is closed even when the UI never answers in time", async (t) => {

@@ -1884,6 +1884,25 @@ test("threads that cannot be reached never starve a stopped one: blocked tries u
   assert.equal(delivered.length, 1 + Math.min(busy.length, DEFAULTS.maxSendsPerTick * 2 - 1));
 });
 
+test("a computer-use send that times out defers the tick's other app sends", async (t) => {
+  const many = Array.from({ length: 3 }, (_, i) => makeThread({ key: `codex:u${i}`, id: `u${i}`, cwd: `/work/u${i}`, title: `Thread ${i}`, writerLocked: true, meta: { originator: "Codex Desktop" } }));
+  for (const detail of ["Open Computer Use timed out after 45s on get_app_state; nothing typed", "Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.; nothing typed", "delivery timed out; nothing typed"]) {
+    const delivered = [];
+    const executor = { deliver: async (args) => { delivered.push(args); return { status: "failed", route: args.route, detail, actionId: null }; }, inFlight: () => [], whenIdle: async () => {} };
+    const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: many, deps: { executor, uiDriver: readyDriver() } });
+    const snapshot = await supervisor.tick({ reason: "test" });
+    assert.equal(delivered.length, 1, detail);
+    assert.equal(delivered[0].route, "computer-use");
+    assert.equal(snapshot.threads.filter((row) => /deferred: Open Computer Use stalled/.test(row.decision?.reason ?? "")).length, 2);
+  }
+  // Any other failure lets the rest go on.
+  const delivered = [];
+  const executor = { deliver: async (args) => { delivered.push(args); return { status: "failed", route: args.route, detail: "could not focus the composer; nothing typed", actionId: null }; }, inFlight: () => [], whenIdle: async () => {} };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: many, deps: { executor, uiDriver: readyDriver() } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 3);
+});
+
 test("sends past the cap are marked deferred, not dropped silently", async (t) => {
   const many = Array.from({ length: DEFAULTS.maxSendsPerTick + 2 }, (_, i) => makeThread({ key: `codex:m${i}`, id: `m${i}`, cwd: `/work/m${i}` }));
   const { supervisor, delivered } = fixture(t, { mode: "auto", threads: many });
@@ -1925,6 +1944,8 @@ test("the owner at the keyboard or a running turn does not count as a failed sen
   const store = new (await import("../src/fleet/store.js")).FleetStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "fleet-ledger-")), now: () => NOW });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "owner using Codex" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "turn running (Stop is visible)" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "waiting for idle: Codex must be in front to type" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "screen saver on" });
   assert.equal(store.ledgerFor("codex:a").undelivered, null);
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "could not verify thread: \"x\" is not the open thread" });
   store.recordNudge("codex:a", { playbook: "resume", status: "failed", detail: "Open Computer Use stopped, timed out, or disconnected" });

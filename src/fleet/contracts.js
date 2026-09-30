@@ -74,10 +74,14 @@ export const DEFAULTS = Object.freeze({
   maxActionsKept: 300,
   // Computer-use delivery: the owner counts as away after this much input
   // idle time; each Open Computer Use call and each whole delivery is capped.
+  // A Codex app state read alone takes 11-25 s.
   uiOwnerIdleMs: 2 * MIN,
   uiStepTimeoutMs: 10_000,
-  uiDeliveryTimeoutMs: 45_000,
+  uiReadTimeoutMs: 45_000,
+  uiDeliveryTimeoutMs: 150_000,
   uiNavigateMs: 5_000,
+  // Bringing the app to the front for the send.
+  uiActivateMs: 3_000,
   uiConfirmMs: 8_000,
   uiPollMs: 500
 });

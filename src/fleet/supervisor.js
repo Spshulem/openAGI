@@ -207,7 +207,9 @@ function withHealth(snapshot) {
 // strict computer-use Mac that cannot type now, or a typed send held back by
 // the owner at the keyboard or a running turn). A CLI fallback's failure is
 // not about typing, so it stays the owner's to see.
-const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input)/;
+const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input|waiting for idle|screen saver on)/;
+// A computer-use send that ends this way stops the tick's other ones.
+const UI_STALLED = /^(Open Computer Use timed out|Open Computer Use stopped|delivery timed out)/;
 function typingWaits(thread, route, deliveryState, delivery) {
   if (!uiTargetFor(thread)) return false;
   if (!route) return deliveryState?.mode === "computer-use" && deliveryState?.ready === false;
@@ -1100,6 +1102,9 @@ export class FleetSupervisor {
     // Only a send that got past the app's checks spends a slot; blocked tries
     // are cheap but still bounded.
     let tries = 0;
+    // A computer-use send that timed out or lost Open Computer Use leaves
+    // the app agent busy or restarting: the rest of the tick's typing waits.
+    let uiStalled = false;
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
@@ -1125,6 +1130,10 @@ export class FleetSupervisor {
         decision.reason = `${decision.reason}; deferred: send cap`;
         continue;
       }
+      if (uiStalled && decision.route === "computer-use") {
+        decision.reason = `${decision.reason}; deferred: Open Computer Use stalled`;
+        continue;
+      }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
       if (uiKey && typedInto.has(uiKey)) continue;
       if (uiKey) typedInto.add(uiKey);
@@ -1132,6 +1141,7 @@ export class FleetSupervisor {
       attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
       if (delivery.status !== "blocked") sends += 1;
+      if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
       else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
       this.recordSend(record, delivery);

@@ -6,8 +6,10 @@
 // Fail closed. Every step either proves it is safe to go on or returns
 // "blocked" (nothing typed, retry later) / "failed" (see detail). Never
 // overwrites a draft, never presses send after a failed check, never uses the
-// clipboard, never launches an app, and opens a deep link only while the
-// owner is away from the keyboard. One delivery at a time (see UI_LOCK).
+// clipboard, never launches an app, and acts only while the owner is away
+// from the keyboard: Open Computer Use reports focus and types only into the
+// frontmost app, so the target is brought forward for the send and the
+// owner's previous app put back. One delivery at a time (see UI_LOCK).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -18,8 +20,17 @@ import { DEFAULTS, SUPERVISOR_PREFIX, UI_APPS, clampText, redactSecrets, runComm
 
 const MIN = 60_000;
 // OCU get_app_state budget. The composer and Send button sit at the end of a
-// long transcript, so the default 1200-node tree can cut them off.
+// long transcript, so the default 1200-node tree can cut them off. Codex's
+// composer sits near node 1500-2300 with its sidebar open.
 const STATE_TREE_NODES = 3000;
+const STATE_TREE_NODES_BY_APP = { "com.openai.codex": 6000 };
+// The fleet's own app agent, apart from the owner's other sessions.
+const OCU_AGENT_NAMESPACE = "openagi-fleet";
+// The fleet's own clicks and keys reset HIDIdleTime; an idle time that
+// reaches back to (about) its last input is still the owner away.
+const OWN_INPUT_SLACK_MS = 1500;
+// Frontmost while the screen saver runs or the login window shows.
+const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
 const PERMISSION_OK_TTL_MS = 10 * MIN;
 // `doctor` opens Open Computer Use's onboarding window when a grant is
 // missing, so a failed probe is not repeated every tick.
@@ -84,13 +95,13 @@ const HEADING_ROLE = /^heading$/;
 // puts the open workspace and session ids in its URL.
 const WEB_AREA_ROLE = /^(html content|web area)$/;
 const BUTTON_ROLE = /button$/;
-const COMPOSER_HINT = /composer|message|prompt|reply|follow[- ]?up|ask (?:codex|anything)|type a|send a/i;
+const COMPOSER_HINT = /composer|message|prompt|reply|follow[- ]?up|ask (?:codex|anything)|do anything|type a|send a/i;
+// The app's own page; any other web area is an in-app browser tab (Codex's
+// shows GitHub, whose comment box is no composer).
+const OWN_PAGE = { "com.openai.codex": /^app:\/\//, "com.conductor.app": /^tauri:\/\/localhost/ };
 const STOP_LABEL = /^(stop|stop generating|stop response|stop agent|interrupt|cancel turn)\b/i;
 const PROMPT_LABEL = /^(allow|allow once|always allow|allow for (?:this )?session|approve|deny|don't allow|do not allow|reject|yes, allow)\b/i;
 const SEND_LABEL = /^(send|send message|submit)\b/i;
-// What navigation may click: sidebar rows and tabs, or a label inside one.
-const ROW_ROLES = /^(row|outline row|cell|tab|radio button)$/;
-const NAV_ROLES = /^(row|outline row|cell|tab|radio button|button|static text)$/;
 
 function parseElementLine(depth, id, rest) {
   let body = String(rest ?? "");
@@ -175,10 +186,22 @@ function isEditable(element) {
   return element.flags.includes("settable") && /text/.test(element.role) && !/search|secure/.test(element.role);
 }
 
+function inOtherPage(element, ownPage) {
+  const page = ancestors(element).find((node) => WEB_AREA_ROLE.test(node.role));
+  return Boolean(page) && !ownPage.test(String(page.fields.url ?? ""));
+}
+
 // Exactly one composer: prefer editables labelled (or inside a form labelled)
 // like a composer; with none labelled, a single editable is the composer.
-export function findComposer(state) {
-  const editables = (state?.elements ?? []).filter(isEditable);
+// Never a combo box (URL bar, "Search chats"), never inside an in-app
+// browser page, and in Conductor only inside its "composer" container (its
+// "Terminal input" is a shell).
+export function findComposer(state, bundleId = state?.bundleId) {
+  const ownPage = OWN_PAGE[bundleId] ?? null;
+  const editables = (state?.elements ?? []).filter((element) => isEditable(element) && element.role !== "combo box"
+    && !(ownPage && inOtherPage(element, ownPage))
+    && !(bundleId === "com.conductor.app" && (/terminal input/i.test(element.hint)
+      || !ancestors(element).some((node) => normalizeUiText(node.label).toLowerCase() === "composer"))));
   if (!editables.length) return { composer: null, reason: "composer not found" };
   const hinted = editables.filter((element) => COMPOSER_HINT.test(element.hint) || ancestors(element).some((node) => COMPOSER_HINT.test(node.hint)));
   const pool = hinted.length ? hinted : editables;
@@ -213,10 +236,9 @@ export function looksLikeOurs(value, text) {
   return have.startsWith(ours.slice(0, Math.min(ours.length, SUPERVISOR_PREFIX.length + 10)));
 }
 
+// Only OCU's focus line counts; it prints one only for the frontmost app.
 export function isComposerFocused(state, composer) {
-  if (!composer) return false;
-  if (state?.focusedId !== null && state?.focusedId !== undefined) return state.focusedId === composer.id;
-  return composer.focused;
+  return Boolean(composer) && state?.focusedId === composer.id;
 }
 
 // How many transcript elements show the needle. Text fields never count: a
@@ -416,6 +438,11 @@ export function createPresenceProbe({ bins = {}, run = runCommand, timeoutMs = D
     async openUrl(url) {
       const out = await exec(bins.open ?? "open", ["-g", url]);
       return out !== null;
+    },
+    // Brings a running app to the front (no -g). Only while the owner is away.
+    async activate(bundleId) {
+      const out = await exec(bins.open ?? "open", ["-b", bundleId]);
+      return out !== null;
     }
   };
 }
@@ -569,10 +596,13 @@ export function createUiDriver({
   const limits = { ...DEFAULTS, ...(config.limits ?? {}) };
   const bins = config.bins ?? {};
   const presence = probe ?? createPresenceProbe({ bins, run, timeoutMs: limits.uiStepTimeoutMs });
-  const makeTransport = transportFactory ?? (({ timeoutMs }) => new OcuTransport(bins.ocu, { timeoutMs, appAgentProxy: true }));
+  const makeTransport = transportFactory ?? (({ timeoutMs }) => new OcuTransport(bins.ocu, { timeoutMs, appAgentProxy: true, agentNamespace: OCU_AGENT_NAMESPACE }));
   const readPermissions = permissionProbe
-    ?? (async () => parseOcuPermissions(await readOcuPermissions(bins.ocu, undefined, { appAgentProxy: true, timeoutMs: limits.uiStepTimeoutMs })));
+    ?? (async () => parseOcuPermissions(await readOcuPermissions(bins.ocu, undefined, { appAgentProxy: true, agentNamespace: OCU_AGENT_NAMESPACE, timeoutMs: limits.uiStepTimeoutMs })));
   let permissionCache = null;
+  // When this driver last clicked or typed, across deliveries: the next
+  // delivery in the same tick must not read it as the owner.
+  let lastOwnInputAt = null;
 
   const permissions = async () => {
     const at = now();
@@ -619,14 +649,44 @@ export function createUiDriver({
     const controller = new AbortController();
     // Not unref'd: the abort must fire even if a hung call holds nothing else open.
     const timer = setTimeout(() => controller.abort(), limits.uiDeliveryTimeoutMs + typingMs);
-    const ctx = { phase: "check", transport: null, evidence: [], text, request, stepTimeoutMs: limits.uiStepTimeoutMs + typingMs };
+    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, ownInputAt: lastOwnInputAt, activated: false, inFront: false, frontBefore: null };
     try {
       return await steps(request, controller.signal, ctx);
     } catch (error) {
       return await recover(error, ctx, controller.signal.aborted);
     } finally {
       clearTimeout(timer);
+      await restoreFront(ctx);
       try { ctx.transport?.close(); } catch { /* already closed */ }
+    }
+  }
+
+  // The owner's previous app goes back in front, only if the target is still
+  // there and the owner has not come back (never pull an app from under them).
+  async function restoreFront(ctx) {
+    const target = ctx.request.target;
+    if (!ctx.activated || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    try {
+      if ((await presence.frontApp()) !== target.bundleId) return;
+      if (!ownerAway(ctx, await presence.idleMs())) return;
+      await presence.activate(ctx.frontBefore);
+    } catch { /* best-effort */ }
+  }
+
+  // Away: no input for uiOwnerIdleMs, or none since the driver's own last
+  // click or key (which reset the idle clock).
+  function ownerAway(ctx, idle) {
+    if (idle === null || idle === undefined) return false;
+    if (idle >= limits.uiOwnerIdleMs) return true;
+    return Boolean(ctx.ownInputAt) && idle + OWN_INPUT_SLACK_MS >= now() - ctx.ownInputAt;
+  }
+
+  // Every click or key this driver posts, so it is not read as the owner.
+  async function act(ctx, name, args, signal, options) {
+    try {
+      return await ctx.transport.call(name, args, signal, options);
+    } finally {
+      ctx.ownInputAt = lastOwnInputAt = now();
     }
   }
 
@@ -645,24 +705,20 @@ export function createUiDriver({
 
   async function readState(ctx, signal) {
     if (signal?.aborted) throw new StepError("delivery timed out");
-    const result = await ctx.transport.call("get_app_state", { app: ctx.request.target.bundleId, text_limit: "max", max_tree_nodes: STATE_TREE_NODES }, signal);
+    const app = ctx.request.target.bundleId;
+    const result = await ctx.transport.call("get_app_state", { app, text_limit: "max", max_tree_nodes: STATE_TREE_NODES_BY_APP[app] ?? STATE_TREE_NODES }, signal, { timeoutMs: limits.uiReadTimeoutMs });
     const state = parseAppState(result);
-    if (state.bundleId && state.bundleId !== ctx.request.target.bundleId) throw new StepError(`app state came from ${state.bundleId}`);
+    if (state.bundleId && state.bundleId !== app) throw new StepError(`app state came from ${state.bundleId}`);
     return state;
   }
 
-  async function click(ctx, element, signal) {
-    const app = ctx.request.target.bundleId;
-    // Accessibility first, then a direct post to the app's process. Neither
-    // moves the pointer; the global-pointer fallback stays disabled.
-    try {
-      await ctx.transport.call("click", { app, element_index: element.id, click_method: "accessibility" }, signal);
-    } catch {
-      await ctx.transport.call("click", { app, element_index: element.id, click_method: "app_post" }, signal);
-    }
-  }
+  const composerIn = (ctx, state) => findComposer(state, ctx.request.target.bundleId);
 
-  const press = (ctx, key, signal) => ctx.transport.call("press_key", { app: ctx.request.target.bundleId, key }, signal);
+  // Accessibility only: it does not move the pointer or post events that
+  // reset the owner's idle clock.
+  const click = (ctx, element, signal) => act(ctx, "click", { app: ctx.request.target.bundleId, element_index: element.id, click_method: "accessibility" }, signal);
+
+  const press = (ctx, key, signal) => act(ctx, "press_key", { app: ctx.request.target.bundleId, key }, signal);
 
   // Removes only what this delivery typed: the composer was proven empty
   // before typing, and it must now hold our text (or a start of it), so
@@ -670,78 +726,48 @@ export function createUiDriver({
   async function clearComposer(ctx, signal) {
     try {
       let state = await readState(ctx, signal);
-      let { composer } = findComposer(state);
+      let { composer } = composerIn(ctx, state);
       if (!composer) return false;
       if (!normalizeUiText(composer.value)) return true;
       if (!looksLikeOurs(composer.value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
       if (!isComposerFocused(state, composer)) {
         await click(ctx, composer, signal);
         state = await readState(ctx, signal);
-        ({ composer } = findComposer(state));
+        ({ composer } = composerIn(ctx, state));
         if (!composer || !isComposerFocused(state, composer)) return false;
       }
       await press(ctx, "super+a", signal);
       await press(ctx, "BackSpace", signal);
       state = await readState(ctx, signal);
-      ({ composer } = findComposer(state));
+      ({ composer } = composerIn(ctx, state));
       return Boolean(composer) && !normalizeUiText(composer.value);
     } catch {
       return false;
     }
   }
 
-  async function ownerCheck(ctx, target, { ownerWasIdle, frontBefore }) {
+  // Null while it is still safe to go on. Once the target is in front it
+  // must stay there: typing goes to the frontmost app.
+  async function ownerCheck(ctx, target) {
     const front = await presence.frontApp();
     const idle = await presence.idleMs();
-    const idleNow = idle !== null && idle >= limits.uiOwnerIdleMs;
-    if (!idleNow && (front === target.bundleId || front === null)) return `owner using ${target.name}`;
-    if (!ownerWasIdle && front !== frontBefore) return "frontmost app changed";
+    if (!ownerAway(ctx, idle)) {
+      if (front === target.bundleId || front === null) return `owner using ${target.name}`;
+      if (!ctx.inFront) return `waiting for idle: ${target.name} must be in front to type`;
+    }
+    if (ctx.inFront && front !== target.bundleId) return "frontmost app changed";
     return null;
   }
 
-  // Background accessibility clicks only: the sidebar row, then the session
-  // tab. Clicks only an element whose own label is exactly the token (a row
-  // may add text after it), never a link, and only when exactly one matches;
-  // a label inside a row clicks the row.
-  async function navigateByClicks(ctx, state, identity, signal) {
-    if (identity.ids && state.elements.some((element) => WEB_AREA_ROLE.test(element.role) && conductorIds(element.fields.url).workspaceId)) {
-      return navigateConductor(ctx, state, identity, signal);
-    }
-    for (const token of identity.tokens) {
-      if (verifyIdentity(state, { tokens: [token] }).ok) continue;
-      const matches = state.elements.filter((element) => {
-        if (!NAV_ROLES.test(element.role) || isEditable(element)) return false;
-        const label = normalizeUiText(element.label || element.fields.title || element.fields.description || "").toLowerCase();
-        if (identityToken(label) === token) return true;
-        return ROW_ROLES.test(element.role) && label.startsWith(`${token} `);
-      });
-      if (matches.length !== 1) return;
-      let pick = matches[0];
-      if (!ROW_ROLES.test(pick.role)) pick = ancestors(pick).slice(0, 3).find((node) => ROW_ROLES.test(node.role)) ?? pick;
-      await click(ctx, pick, signal);
+  async function bringToFront(ctx, target) {
+    if (!(await presence.activate(target.bundleId))) return false;
+    ctx.activated = true;
+    const deadline = now() + limits.uiActivateMs;
+    do {
+      if ((await presence.frontApp()) === target.bundleId) return true;
       await sleep(limits.uiPollMs);
-      state = await readState(ctx, signal);
-    }
-  }
-
-  // Conductor: the sidebar link to exactly this workspace (an in-app
-  // tauri://localhost link, never an outside one), then the session's tab
-  // when exactly one tab carries its title. The page URL then proves it.
-  async function navigateConductor(ctx, state, identity, signal) {
-    const { workspaceId } = identity.ids;
-    const shown = () => state.elements.filter((element) => WEB_AREA_ROLE.test(element.role)).map((element) => conductorIds(element.fields.url)).find((ids) => ids.workspaceId);
-    if (shown()?.workspaceId !== workspaceId) {
-      const links = state.elements.filter((element) => element.role === "link"
-        && /\]\(tauri:\/\/localhost\/repository\/[\w-]+\/workspace\/([\w-]+)\)$/.exec(element.label)?.[1] === workspaceId);
-      if (links.length !== 1) return;
-      await click(ctx, links[0], signal);
-      await sleep(limits.uiPollMs);
-      state = await readState(ctx, signal);
-    }
-    if (!identity.tab || shown()?.sessionId === identity.ids.sessionId) return;
-    const tabs = state.elements.filter((element) => element.role === "tab" && element.search.includes(identity.tab));
-    if (tabs.length !== 1) return;
-    await click(ctx, tabs[0], signal);
+    } while (now() < deadline);
+    return (await presence.frontApp()) === target.bundleId;
   }
 
   async function steps(request, signal, ctx) {
@@ -759,32 +785,27 @@ export function createUiDriver({
     if (identity.ambiguous && !(identity.shared && target.deepLink)) return outcome(ctx, "blocked", identity.reason ?? "ambiguous thread");
     if (!identity.tokens?.length && !identity.ids) return outcome(ctx, "blocked", identity.reason ?? "nothing to verify the thread by");
 
-    // 1. Presence: never launch the app; never type while the owner uses it.
+    // 1. Presence: never launch the app; act only while the owner is away,
+    // since typing needs the app in front.
     const running = await presence.appRunning(target.bundleId);
     if (running === null) return outcome(ctx, "blocked", `could not tell whether ${target.name} is running`);
     if (!running) return outcome(ctx, "blocked", `${target.name} is not running`);
     const frontBefore = await presence.frontApp();
-    const idle = await presence.idleMs();
-    const ownerWasIdle = idle !== null && idle >= limits.uiOwnerIdleMs;
-    if (!ownerWasIdle && (frontBefore === target.bundleId || frontBefore === null)) return outcome(ctx, "blocked", `owner using ${target.name}`);
+    if (SCREEN_SAVER_APPS.has(frontBefore)) return outcome(ctx, "blocked", "screen saver on");
+    if (!ownerAway(ctx, await presence.idleMs())) {
+      if (frontBefore === target.bundleId || frontBefore === null) return outcome(ctx, "blocked", `owner using ${target.name}`);
+      return outcome(ctx, "blocked", `waiting for idle: ${target.name} must be in front to type`);
+    }
 
-    // 2. Navigate to the thread.
-    ctx.transport = makeTransport({ timeoutMs: ctx.stepTimeoutMs });
+    // 2. Navigate to the thread: the deep link, in the background.
+    ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
     let state = await readState(ctx, signal);
     let verified = verifyIdentity(state, identity);
-    if (identity.shared) {
-      // A twin may be the one on screen: only the id link, while the owner
-      // is away, starting from another thread, proves which one opened.
-      if (!ownerWasIdle) return outcome(ctx, "blocked", identity.reason);
-      if (verified.ok) return outcome(ctx, "blocked", `${identity.reason}; a thread with that title is already open`);
-    }
+    // A twin may be the one on screen: only the id link, starting from
+    // another thread, proves which one opened.
+    if (identity.shared && verified.ok) return outcome(ctx, "blocked", `${identity.reason}; a thread with that title is already open`);
     if (!verified.ok) {
-      if (ownerWasIdle) {
-        // A deep link can bring the app forward; only while the owner is away.
-        if (!(await presence.openUrl(target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
-      } else {
-        await navigateByClicks(ctx, state, identity, signal);
-      }
+      if (!(await presence.openUrl(target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
       const deadline = now() + limits.uiNavigateMs;
       do {
         await sleep(limits.uiPollMs);
@@ -792,11 +813,21 @@ export function createUiDriver({
         verified = verifyIdentity(state, identity);
       } while (!verified.ok && now() < deadline);
       if (!verified.ok) return outcome(ctx, "blocked", verified.reason);
-      const moved = await ownerCheck(ctx, target, { ownerWasIdle, frontBefore });
+      const moved = await ownerCheck(ctx, target);
       if (moved) return outcome(ctx, "blocked", moved);
     }
 
-    // 3. Guards on what the thread shows.
+    // 3. The app in front, then the thread checked again.
+    if ((await presence.frontApp()) !== target.bundleId) {
+      ctx.frontBefore = frontBefore;
+      if (!(await bringToFront(ctx, target))) return outcome(ctx, "blocked", `could not bring ${target.name} to the front`);
+      state = await readState(ctx, signal);
+      verified = verifyIdentity(state, identity);
+      if (!verified.ok) return outcome(ctx, "blocked", verified.reason);
+    }
+    ctx.inFront = true;
+
+    // 4. Guards on what the thread shows.
     if (hasStopButton(state)) return outcome(ctx, "blocked", "turn running (Stop is visible)");
     if (hasPermissionPrompt(state)) return outcome(ctx, "blocked", "permission prompt visible: open it");
     const needle = text.slice(0, SUPERVISOR_PREFIX.length + 1 + CONFIRM_CHARS);
@@ -813,9 +844,9 @@ export function createUiDriver({
     }
     ctx.priorCount = copies;
 
-    // 4. Composer: exactly one, and empty. Exactly this message left unsent
+    // 5. Composer: exactly one, and empty. Exactly this message left unsent
     // by an earlier attempt is ours: it is sent as is, never retyped.
-    let found = findComposer(state);
+    let found = composerIn(ctx, state);
     if (!found.composer) return outcome(ctx, "blocked", found.reason);
     const leftover = normalizeUiText(found.composer.value) === normalizeUiText(text);
     if (normalizeUiText(found.composer.value) && !leftover) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
@@ -823,26 +854,25 @@ export function createUiDriver({
     keep(ctx, "before", state);
     const holds = (composer) => normalizeUiText(composer.value) === (leftover ? normalizeUiText(text) : "");
 
-    // 5. Focus the composer without moving the pointer: accessibility first,
-    // then one event posted to the app's process.
-    await click(ctx, found.composer, signal);
-    state = await readState(ctx, signal);
-    found = findComposer(state);
-    if (found.composer && !isComposerFocused(state, found.composer) && holds(found.composer)) {
-      await ctx.transport.call("click", { app: target.bundleId, element_index: found.composer.id, click_method: "app_post" }, signal);
+    // 6. Focus the composer with an accessibility click; OCU reports focus
+    // only for the frontmost app, so that is checked first.
+    const moved = await ownerCheck(ctx, target);
+    if (moved) return outcome(ctx, "blocked", moved);
+    if (!isComposerFocused(state, found.composer)) {
+      await click(ctx, found.composer, signal);
       state = await readState(ctx, signal);
-      found = findComposer(state);
+      found = composerIn(ctx, state);
     }
     if (!found.composer || !isComposerFocused(state, found.composer)) return outcome(ctx, "failed", "could not focus the composer; nothing typed");
     if (!holds(found.composer)) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
     if (!verifyIdentity(state, identity).ok) return outcome(ctx, "blocked", "thread changed before typing");
 
-    // 6. Type, one line.
+    // 7. Type, one line.
     ctx.phase = "typing";
-    if (!leftover) await ctx.transport.call("type_text", { app: target.bundleId, text }, signal);
+    if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiStepTimeoutMs + ctx.typingMs });
     ctx.phase = "typed";
 
-    // 7. Same thread, and the composer holds exactly our text.
+    // 8. Same thread, and the composer holds exactly our text.
     state = await readState(ctx, signal);
     if (!verifyIdentity(state, identity).ok) {
       // Our text stays with the thread it was typed into; the thread on
@@ -850,7 +880,7 @@ export function createUiDriver({
       keep(ctx, "after", state);
       return outcome(ctx, "blocked", "thread changed before send; our text may be left as a draft in the thread, check it");
     }
-    found = findComposer(state);
+    found = composerIn(ctx, state);
     if (!found.composer || normalizeUiText(found.composer.value) !== normalizeUiText(text)) {
       const cleared = await clearComposer(ctx, signal);
       keep(ctx, "after", state);
@@ -858,24 +888,24 @@ export function createUiDriver({
     }
     const changed = hasStopButton(state) ? "turn started before send"
       : hasPermissionPrompt(state) ? "permission prompt appeared before send"
-      : await ownerCheck(ctx, target, { ownerWasIdle, frontBefore });
+      : await ownerCheck(ctx, target);
     if (changed) {
       const cleared = await clearComposer(ctx, signal);
       return outcome(ctx, "blocked", `${changed}; ${cleared ? "cleared our text" : "could not clear the composer, check it"}`);
     }
 
-    // 8. Send: the Send button, else Return in the focused composer.
+    // 9. Send: the Send button, else Return in the focused composer.
     ctx.phase = "sending";
     const send = findSendButton(state);
     let pressed = false;
     if (send) {
       try {
-        await ctx.transport.call("click", { app: target.bundleId, element_index: send.id, click_method: "accessibility" }, signal);
+        await click(ctx, send, signal);
         pressed = true;
       } catch {
         // Press Return only if the click provably did nothing.
         const after = await readState(ctx, signal);
-        const again = findComposer(after).composer;
+        const again = composerIn(ctx, after).composer;
         if (!again || normalizeUiText(again.value) !== normalizeUiText(text) || transcriptCount(after, needle, again) > beforeCount) {
           ctx.phase = "sent";
           throw new StepError("send click failed midway");
@@ -885,12 +915,12 @@ export function createUiDriver({
     if (!pressed) await press(ctx, "Return", signal);
     ctx.phase = "sent";
 
-    // 9. Confirm: composer empty and one more transcript copy of our text.
+    // 10. Confirm: composer empty and one more transcript copy of our text.
     const deadline = now() + limits.uiConfirmMs;
     do {
       await sleep(limits.uiPollMs);
       state = await readState(ctx, signal);
-      const composer = findComposer(state).composer;
+      const composer = composerIn(ctx, state).composer;
       const empty = composer ? !normalizeUiText(composer.value) : false;
       if (empty && transcriptCount(state, needle, composer) > beforeCount) {
         keep(ctx, "after", state);
@@ -907,12 +937,13 @@ export function createUiDriver({
     if (ctx.phase === "sending" || ctx.phase === "sent") {
       return outcome(ctx, "failed", `${reason}; unconfirmed: may have been sent; check the thread before retrying`, { unconfirmed: true });
     }
-    // Typed, not sent: a fresh engine, bounded by one step, clears our text.
+    // Typed, not sent: a fresh engine clears our text, bounded by about
+    // two slow reads.
     let cleared = false;
     try {
       try { ctx.transport?.close(); } catch { /* already closed */ }
       ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
-      const signal = AbortSignal.timeout(limits.uiStepTimeoutMs * 2);
+      const signal = AbortSignal.timeout(limits.uiReadTimeoutMs * 2);
       cleared = await clearComposer(ctx, signal);
     } catch {
       cleared = false;

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
-import { OcuTransport, readOcuPermissions } from "../src/integrations/ocu-transport.js";
+import { OCU_CLOSE_GRACE_MS, OcuTransport, readOcuPermissions } from "../src/integrations/ocu-transport.js";
 import { OCU_RELEASE } from "../src/integrations/ocu-release.js";
 
 function fixture({ hang = false, malformed = false, refused = false, responseLine } = {}) {
@@ -124,4 +124,68 @@ test("the fleet's app-agent opt-in keeps pointer fallback off and only lifts the
     assert.equal(options.timeout, 10_000);
     callback(null, "Permissions: accessibility=granted, screenRecording=granted");
   }, { appAgentProxy: true, timeoutMs: 10_000 });
+});
+
+// The fleet's app-agent engine: a fixture that answers only what it is told to.
+function agentFixture({ closeGraceMs } = {}) {
+  const child = new EventEmitter(); let spawnArgs, kills = 0, stdinEnded = false; const requests = [];
+  child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.kill = () => { kills += 1; };
+  child.stdin = new Writable({ write(chunk, _encoding, done) {
+    const request = JSON.parse(String(chunk)); requests.push(request);
+    if (request.method === "initialize") queueMicrotask(() => child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { serverInfo: { name: "fixture" } } }) + "\n"));
+    done();
+  }, final(done) { stdinEnded = true; done(); } });
+  const answer = (id) => child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: { isError: false, content: [] } }) + "\n");
+  const client = new OcuTransport("/native/OpenComputerUse", { timeoutMs: 1000, appAgentProxy: true, agentNamespace: "openagi-fleet",
+    ...(closeGraceMs === undefined ? {} : { closeGraceMs }), spawnImpl: (...args) => { spawnArgs = args; return child; } });
+  return { client, requests, answer, get kills() { return kills; }, get stdinEnded() { return stdinEnded; }, get spawnArgs() { return spawnArgs; } };
+}
+
+test("a per-call timeout fails only that call and keeps the app-agent engine running", async t => {
+  const f = agentFixture({ closeGraceMs: 0 }); t.after(() => f.client.close());
+  const slow = f.client.call("get_app_state", { app: "com.openai.codex" }, undefined, { timeoutMs: 20 });
+  await assert.rejects(slow, error => error.message.startsWith("Open Computer Use timed out"));
+  assert.equal(f.kills, 0); assert.ok(f.client.proc, "engine still connected");
+  // Its late answer is dropped; the next call is answered normally.
+  f.answer(f.requests.find(r => r.method === "tools/call").id);
+  const next = f.client.call("click", { app: "com.openai.codex" });
+  await new Promise(resolve => setImmediate(resolve));
+  f.answer(f.requests.filter(r => r.method === "tools/call")[1].id);
+  assert.deepEqual(await next, { isError: false, content: [] });
+  assert.equal(f.spawnArgs[2].env.OPEN_COMPUTER_USE_AGENT_SOCKET_NAMESPACE, "openagi-fleet");
+});
+
+test("closing an app-agent engine ends its input and kills it only after the grace period", async () => {
+  assert.equal(OCU_CLOSE_GRACE_MS, 30_000);
+  const f = agentFixture({ closeGraceMs: 20 });
+  await f.client.connect();
+  const pending = f.client.call("get_app_state", {});
+  await new Promise(resolve => setImmediate(resolve));
+  f.client.close();
+  await assert.rejects(pending, /unconfirmed/);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.stdinEnded, true); assert.equal(f.kills, 0);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(f.kills, 1);
+  // An abort still closes at once (the caller's deadline).
+  const g = agentFixture({ closeGraceMs: 20 }); const abort = new AbortController();
+  await g.client.connect();
+  const aborted = g.client.call("get_app_state", {}, abort.signal);
+  await new Promise(resolve => setImmediate(resolve));
+  abort.abort();
+  await assert.rejects(aborted, /unconfirmed/);
+  assert.equal(g.client.proc, null);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(g.kills, 1);
+});
+
+test("the namespace reaches the permission probe too", async () => {
+  await readOcuPermissions("/native/OpenComputerUse", (_file, _args, options, callback) => {
+    assert.equal(options.env.OPEN_COMPUTER_USE_AGENT_SOCKET_NAMESPACE, "openagi-fleet");
+    callback(null, "Permissions: accessibility=granted, screenRecording=granted");
+  }, { appAgentProxy: true, agentNamespace: "openagi-fleet" });
+  await readOcuPermissions("/native/OpenComputerUse", (_file, _args, options, callback) => {
+    assert.equal(options.env.OPEN_COMPUTER_USE_AGENT_SOCKET_NAMESPACE, undefined);
+    callback(null, "");
+  });
 });

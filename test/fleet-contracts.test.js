@@ -94,7 +94,9 @@ test("OPENAGI_FLEET_DELIVERY picks cli, computer-use, or computer-use-first; any
   const limits = resolveFleetConfig({}, { home: "/h" }).limits;
   assert.equal(limits.uiOwnerIdleMs, 120_000);
   assert.equal(limits.uiStepTimeoutMs, 10_000);
-  assert.equal(limits.uiDeliveryTimeoutMs, 45_000);
+  assert.equal(limits.uiDeliveryTimeoutMs, 150_000);
+  assert.equal(limits.uiReadTimeoutMs, 45_000);
+  assert.equal(limits.uiActivateMs, 3_000);
 });
 
 test("resolveOcuPath: explicit path, else open-computer-use on PATH, preferring the bundled native engine", () => {

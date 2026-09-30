@@ -186,15 +186,21 @@ Setup on the coding Mac:
    `OPENAGI_FLEET_MODE=propose`, and restart OpenAGI. Set
    `OPENAGI_FLEET_OCU_PATH` if the launchd `PATH` cannot find the binary.
 
+The supervisor types only while you are away: 2+ min with no keyboard or
+mouse input, screen unlocked, no screen saver. Open Computer Use can only type
+into the frontmost app, so it brings Conductor or Codex forward for the send,
+then puts your previous app back. If you come back mid-send, it stops and
+leaves your app alone.
+
 Each send, in order. Any failed check stops before typing:
 
 - Ready: permissions granted, screen unlocked, secure input off, no OpenAGI
   computer-use session running.
-- The app is already running (never launched) and you are not using it: it is
-  frontmost and you touched the keyboard or mouse in the last 2 min means
-  "owner using <App>".
-- Opens the thread. While you are away it opens the deep link with `open -g`.
-  While you are active it only uses background accessibility clicks.
+- The app is already running (never launched) and you are away. Input in the
+  last 2 min blocks as "owner using <App>" (it is in front) or "waiting for
+  idle" (it is not). The fleet's own clicks and keys do not count.
+- Opens the thread with its deep link (`open -g`), then brings the app to the
+  front.
 - Proves the right thread is open: workspace name, plus the tab title when the
   workspace has more than one tab (Codex: thread title). Shared or missing
   names block as "ambiguous".
@@ -208,7 +214,8 @@ Each send, in order. Any failed check stops before typing:
 
 Safety rules:
 
-- One app delivery at a time. 10 s per UI step, 45 s per delivery.
+- One app delivery at a time. 45 s per app read, 10 s per other UI step,
+  150 s per delivery. A timed-out send defers the tick's other app sends.
 - Only Conductor (`com.conductor.app`) and the Codex app (`com.openai.codex`).
   No clipboard, no paste, no app launch, no pointer moves.
 - Text typed before a failed check is cleared only when it is provably ours.
