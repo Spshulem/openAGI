@@ -44,13 +44,20 @@ test("fleet_status says how current each question is, and fleet_scan rescans fir
   ];
   const state = { lastTickAt: "2026-09-29T23:28:00.000Z", snapshot: { at: "2026-09-29T23:28:00.000Z", durationMs: 60_000, counts: {}, threads: [], sourceErrors: { claude: "locked" } }, questions };
   const status = fleetStatus({ getState: () => ({ mode: "auto", enabled: true, running: false, questions: [], actions: [], settings: {}, ...state }) }, { now });
-  assert.equal(status.scannedMinutesAgo, 2);
+  // The scan started looking a minute before it finished.
+  assert.equal(status.scannedMinutesAgo, 3);
   assert.match(status.freshness, /stillAsked: true means the latest scan found the question still standing/);
   assert.deepEqual(status.questions[0], {
     id: "fq_9", title: "bb-recorder #271: merge?", options: ["yes", "no"], threadKey: "codex:a", prRef: "acme/bb-recorder#271",
     firstAskedMinutesAgo: 210, askedMinutesAgo: 2, stillAsked: true, reviewedMinutesAgo: 20, review: "PR #271 open and green; the agent still waits on the merge call."
   });
   assert.equal(status.questions[1].stillAsked, false, "not rechecked: its source failed");
+  // Reopened by the owner after the scan: not the scan finding it.
+  const reopened = fleetStatus({ getState: () => ({ ...state, mode: "auto", questions: [{ id: "fq_r", title: "r", options: [], lastAskedAt: "2026-09-29T23:29:00.000Z", createdAt: "2026-09-29T20:00:00.000Z", updatedAt: "2026-09-29T23:29:30.000Z" }], actions: [], settings: {} }) }, { now });
+  assert.equal(reopened.questions[0].stillAsked, false);
+  // A record saved before lastAskedAt existed counts from its creation, not its last update.
+  const legacy = fleetStatus({ getState: () => ({ ...state, mode: "auto", questions: [{ id: "fq_l", title: "l", options: [], createdAt: "2026-09-29T20:00:00.000Z", updatedAt: "2026-09-29T23:29:00.000Z" }], actions: [], settings: {} }) }, { now });
+  assert.equal(legacy.questions[0].askedMinutesAgo, 210);
   assert.deepEqual(status.failedSources, ["claude"]);
 
   let ticks = 0;
@@ -63,8 +70,12 @@ test("fleet_status says how current each question is, and fleet_scan rescans fir
   assert.equal(ticks, 1);
   assert.equal(result.scan, "fresh");
   // A scan that outlasts the wait returns the previous scan and says so.
-  const slow = await fleetScan({ ...fakeSupervisor(state), tick: () => new Promise(() => {}) }, { waitMs: 5 });
+  // A scan that has already touched questions when the wait ends still
+  // returns the state from before it started.
+  let live = state;
+  const slow = await fleetScan({ getState: () => ({ mode: "auto", enabled: true, running: true, actions: [], settings: {}, ...live }), tick: () => { live = { ...state, questions: [] }; return new Promise(() => {}); } }, { waitMs: 5 });
   assert.match(slow.scan, /still running/);
+  assert.equal(slow.questions.length, 2);
   const failed = await fleetScan({ ...fakeSupervisor(state), tick: async () => { throw new Error("boom"); } }, { waitMs: 50 });
   assert.match(failed.scan, /failed/);
 });

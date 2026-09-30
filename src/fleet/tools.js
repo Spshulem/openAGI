@@ -11,13 +11,22 @@ const SOURCE = "integration:fleet-supervisor";
 const TOOL_NAMES = ["fleet_status", "fleet_thread", "fleet_scan", "fleet_send_message", "fleet_answer_question"];
 // A scan (and the review it runs) can take minutes; the chat waits this long.
 const SCAN_WAIT_MS = 90_000;
-// Asked again by the latest scan: its lastAskedAt is not older than that scan's
-// start (a scan retains, without re-asking, questions whose source failed).
+// When the latest scan started looking (its snapshot time is when it
+// finished; durationMs is the gap).
+function scanStartMs(snapshot) {
+  const endMs = Date.parse(snapshot?.at ?? "");
+  return Number.isFinite(endMs) ? endMs - (Number(snapshot?.durationMs) || 0) : NaN;
+}
+
+// Asked again by the latest scan: its lastAskedAt falls inside that scan
+// (a scan keeps, without re-asking, questions whose source failed; a reopen
+// after the scan is not the scan finding it).
 function stillAsked(question, snapshot) {
   const askedMs = Date.parse(question.lastAskedAt ?? "");
-  const scanMs = Date.parse(snapshot?.at ?? "") - (Number(snapshot?.durationMs) || 0);
-  if (!Number.isFinite(askedMs) || !Number.isFinite(scanMs)) return null;
-  return askedMs >= scanMs;
+  const startMs = scanStartMs(snapshot);
+  const endMs = Date.parse(snapshot?.at ?? "");
+  if (!Number.isFinite(askedMs) || !Number.isFinite(startMs)) return null;
+  return askedMs >= startMs && askedMs <= endMs;
 }
 const minutesSince = (iso, now) => {
   const ms = Date.parse(iso ?? "");
@@ -69,14 +78,14 @@ export function fleetStatus(supervisor, { now = Date.now() } = {}) {
     // How current this is: the supervisor rescans every few minutes and asks
     // each open question again on every scan, and its review re-checks each
     // one against the thread, the PR and related threads.
-    scannedMinutesAgo: minutesSince(snapshot?.at ?? state.lastTickAt, now),
+    scannedMinutesAgo: Number.isFinite(scanStartMs(snapshot)) ? minutesSince(new Date(scanStartMs(snapshot)).toISOString(), now) : minutesSince(state.lastTickAt, now),
     freshness: "Scans run every few minutes. stillAsked: true means the latest scan found the question still standing; false means that scan could not recheck it (its source failed, see failedSources), so treat it as unverified. reviewedMinutesAgo and review are the supervisor's own last re-check of it. fleet_scan runs a new scan now.",
     counts: snapshot?.counts ?? null,
     byHealth,
     questions: (state.questions ?? []).map((q) => ({
       id: q.id, title: q.title, options: q.options ?? [], threadKey: q.threadKey ?? null, prRef: q.prRef ?? null,
       firstAskedMinutesAgo: minutesSince(q.createdAt, now),
-      askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.updatedAt ?? q.createdAt, now),
+      askedMinutesAgo: minutesSince(q.lastAskedAt ?? q.createdAt, now),
       stillAsked: stillAsked(q, snapshot),
       reviewedMinutesAgo: minutesSince(q.reviewedAt, now),
       review: q.reviewReason ? clip(q.reviewReason, 200) : null
@@ -89,15 +98,17 @@ export function fleetStatus(supervisor, { now = Date.now() } = {}) {
 }
 
 export async function fleetScan(supervisor, { waitMs = SCAN_WAIT_MS } = {}) {
+  // Taken before the scan: a scan still running has already updated some
+  // questions, so its half-done state is never shown as the previous scan.
+  const before = fleetStatus(supervisor);
   let timer = null;
   const outcome = await Promise.race([
     Promise.resolve().then(() => supervisor.tick({ reason: "chat" })).then(() => "done", () => "failed"),
     new Promise((resolve) => { timer = setTimeout(() => resolve("running"), waitMs); })
   ]);
   clearTimeout(timer);
-  const status = fleetStatus(supervisor);
-  if (outcome === "done") return { scan: "fresh", ...status };
-  return { scan: outcome === "running" ? "still running; this is the previous scan, ask again in a minute" : "failed; this is the previous scan", ...status };
+  if (outcome === "done") return { scan: "fresh", ...fleetStatus(supervisor) };
+  return { scan: outcome === "running" ? "still running; this is the previous scan, ask again in a minute" : "failed; this is the previous scan", ...before };
 }
 
 export function fleetThread(supervisor, args = {}) {
