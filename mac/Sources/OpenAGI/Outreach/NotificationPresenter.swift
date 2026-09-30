@@ -94,8 +94,15 @@ final class NotificationPresenter {
       let fleet = FleetConsumer.shared
       if let item = OutreachConsumer.shared.items.first(where: { $0.id == id }) {
         OverlayState.shared.selectTab(fleet.tab(showing: [item]))
+      } else if category == "fleet-question" {
+        // Tapped before the panel's lists loaded (a cold launch): read the
+        // supervisor first, so the tab is chosen from its real state.
+        Task {
+          await fleet.refresh()
+          OverlayState.shared.selectTab(fleet.available ? .supervisor : .tasks)
+        }
       } else {
-        OverlayState.shared.selectTab(category == "fleet-question" && fleet.available ? .supervisor : .tasks)
+        OverlayState.shared.selectTab(.tasks)
       }
       OverlayController.shared.show()
       OverlayState.shared.expanded = true

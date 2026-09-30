@@ -55,10 +55,11 @@ final class OverlayState: ObservableObject {
   /// Switch lists. An answer on screen belongs to the other tab's session, so
   /// it goes, unless it is still streaming. The typed question stays.
   func selectTab(_ newTab: OverlayTab) {
-    guard tab != newTab else { return }
+    // An answer still streaming belongs to the tab that asked; switching
+    // mid-request would show it under the other tab.
+    guard tab != newTab, !isLoading, !isDetached else { return }
     tab = newTab
     if newTab == .tasks { FleetConsumer.shared.supervisorTabLeft() }
-    guard !isLoading, !isDetached else { return }
     answer = ""
     error = nil
     contextNote = nil

@@ -218,6 +218,7 @@ struct OverlayView: View {
           }
           .pickerStyle(.segmented)
           .labelsHidden()
+          .disabled(state.isLoading || state.isDetached)
           .controlSize(.small)
           .fixedSize()
         }
