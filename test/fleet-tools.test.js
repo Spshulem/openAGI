@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ToolRegistry } from "../src/tool-registry.js";
-import { registerFleetTools } from "../src/fleet/tools.js";
+import { fleetScan, fleetStatus, registerFleetTools } from "../src/fleet/tools.js";
 import { createDefaultRuntime } from "../src/index.js";
 
 function row(overrides = {}) {
@@ -33,6 +33,56 @@ function registry(supervisor) {
   registerFleetTools(tools, supervisor);
   return tools;
 }
+
+test("fleet_status says how current each question is, and fleet_scan rescans first", async () => {
+  const now = Date.parse("2026-09-29T23:30:00.000Z");
+  const questions = [
+    { id: "fq_9", title: "bb-recorder #271: merge?", options: ["yes", "no"], threadKey: "codex:a", prRef: "acme/bb-recorder#271", status: "open",
+      createdAt: "2026-09-29T20:00:00.000Z", lastAskedAt: "2026-09-29T23:28:00.000Z", scanAskedAt: "2026-09-29T23:28:00.000Z", reviewedAt: "2026-09-29T23:10:00.000Z", reviewReason: "PR #271 open and green; the agent still waits on the merge call." },
+    // Its source failed on the latest scan: kept, not re-asked.
+    { id: "fq_old", title: "old ask", options: ["yes", "no"], threadKey: "claude:b", status: "open", createdAt: "2026-09-29T19:00:00.000Z", lastAskedAt: "2026-09-29T23:00:00.000Z", scanAskedAt: "2026-09-29T23:00:00.000Z" }
+  ];
+  const state = { lastTickAt: "2026-09-29T23:28:00.000Z", snapshot: { at: "2026-09-29T23:28:00.000Z", durationMs: 60_000, counts: {}, threads: [], sourceErrors: { claude: "locked" } }, questions };
+  const status = fleetStatus({ getState: () => ({ mode: "auto", enabled: true, running: false, questions: [], actions: [], settings: {}, ...state }) }, { now });
+  // The scan started looking a minute before it finished.
+  assert.equal(status.scannedMinutesAgo, 3);
+  assert.match(status.freshness, /stillAsked: true means the latest scan found the question still standing/);
+  assert.deepEqual(status.questions[0], {
+    id: "fq_9", title: "bb-recorder #271: merge?", options: ["yes", "no"], threadKey: "codex:a", prRef: "acme/bb-recorder#271",
+    firstAskedMinutesAgo: 210, askedMinutesAgo: 2, stillAsked: true, reviewedMinutesAgo: 20, review: "PR #271 open and green; the agent still waits on the merge call."
+  });
+  assert.equal(status.questions[1].stillAsked, false, "not rechecked: its source failed");
+  // Reopened by the owner (during or after the scan): only a scan asking it
+  // counts, and this one was last scan-asked before the latest scan.
+  const reopened = fleetStatus({ getState: () => ({ ...state, mode: "auto", questions: [{ id: "fq_r", title: "r", options: [], lastAskedAt: "2026-09-29T23:27:30.000Z", scanAskedAt: "2026-09-29T22:00:00.000Z", createdAt: "2026-09-29T20:00:00.000Z" }], actions: [], settings: {} }) }, { now });
+  assert.equal(reopened.questions[0].stillAsked, false);
+  // A record saved before lastAskedAt existed counts from its creation, not its last update.
+  const legacy = fleetStatus({ getState: () => ({ ...state, mode: "auto", questions: [{ id: "fq_l", title: "l", options: [], createdAt: "2026-09-29T20:00:00.000Z", updatedAt: "2026-09-29T23:29:00.000Z" }], actions: [], settings: {} }) }, { now });
+  assert.equal(legacy.questions[0].askedMinutesAgo, 210);
+  assert.deepEqual(status.failedSources, ["claude"]);
+
+  let ticks = 0;
+  const scanning = { ...fakeSupervisor(state), tick: async () => { ticks += 1; } };
+  const tools = registry(scanning);
+  // It is the regular tick run early, which can send in Auto.
+  assert.equal(tools.get("fleet_scan").sideEffects, true);
+  const { ok, result } = await tools.invoke("fleet_scan", {});
+  assert.equal(ok, true);
+  assert.equal(ticks, 1);
+  assert.equal(result.scan, "fresh");
+  // A scan that outlasts the wait returns the previous scan and says so.
+  // A scan that has already touched questions when the wait ends still
+  // returns the state from before it started.
+  let live = state;
+  const slow = await fleetScan({ getState: () => ({ mode: "auto", enabled: true, running: true, actions: [], settings: {}, ...live }), tick: () => { live = { ...state, questions: [] }; return new Promise(() => {}); } }, { waitMs: 5 });
+  assert.match(slow.scan, /still running/);
+  assert.equal(slow.questions.length, 2);
+  // A scan already running when the call began: its questions are not vouched for.
+  const busy = await fleetScan({ getState: () => ({ mode: "auto", enabled: true, running: true, actions: [], settings: {}, ...state }), tick: () => new Promise(() => {}) }, { waitMs: 5 });
+  assert.ok(busy.questions.every((q) => q.stillAsked === null));
+  const failed = await fleetScan({ ...fakeSupervisor(state), tick: async () => { throw new Error("boom"); } }, { waitMs: 50 });
+  assert.match(failed.scan, /failed/);
+});
 
 test("registers two read-only fleet tools and replaces them on re-register", () => {
   const tools = registry(fakeSupervisor());
@@ -78,7 +128,7 @@ test("fleet_status lists red, yellow, green, gray, newest first, compact", async
   assert.equal(result.threads[1].name, "Fix billing");
   assert.equal(result.threads[2].pr, null);
   assert.equal(result.threads[3].health, "green");
-  assert.deepEqual(result.questions, [{ id: "fq_1", title: "Merge #7?", options: ["yes", "no"], threadKey: "c" }]);
+  assert.deepEqual(result.questions, [{ id: "fq_1", title: "Merge #7?", options: ["yes", "no"], threadKey: "c", prRef: null, firstAskedMinutesAgo: null, askedMinutesAgo: null, stillAsked: null, reviewedMinutesAgo: null, review: null }]);
   // Source names only: source error text can carry paths.
   assert.deepEqual(result.failedSources, ["claude"]);
   const text = JSON.stringify(result);
