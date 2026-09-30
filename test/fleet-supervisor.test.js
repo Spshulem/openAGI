@@ -7,7 +7,7 @@ import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetSupervisor, groupQuestions } from "../src/fleet/supervisor.js";
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
-import { DEADLINE_MARGIN_MS } from "../src/fleet/ui-delivery.js";
+import { DEADLINE_MARGIN_MS, RESTART_MAX_MS } from "../src/fleet/ui-delivery.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -1937,6 +1937,25 @@ test("after an account switch, the owner's playbook restarts Conductor once, the
   const sent = delivered.slice(before);
   assert.deepEqual(sent.map((d) => d.message), ["retry", "retry"]);
   assert.ok(supervisor.getState().actions.some((action) => action.kind === "restart" && action.status === "done"));
+});
+
+test("a remote answer too close to its deadline does not start a restart", async (t) => {
+  const restarter = fakeRestarter();
+  const threads = [cappedTab("s1")];
+  const { supervisor, delivered, dataDir } = fixture(t, { mode: "auto", delivery: "computer-use", threads, deps: { uiDriver: readyDriver(), appRestarter: restarter } });
+  ownerPlaybook(dataDir, "account-switched", "---\nid: account-switched\nrestart_apps: conductor\n---\nretry\n");
+  await supervisor.tick();
+  const before = delivered.length;
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Capped. Add acct?", options: ["wait", "added"], threadKeys: ["conductor:s1"] });
+  const result = await supervisor.answerQuestion(q.id, "added", { deadlineAt: Date.now() + RESTART_MAX_MS });
+  assert.equal(result.delivery.status, "blocked");
+  assert.match(result.delivery.detail, /no time left in this request to restart Conductor/);
+  assert.deepEqual(restarter.calls, []);
+  assert.equal(delivered.length, before);
+  assert.equal(supervisor.store.question(q.id).status, "open");
+  // With room for the restart, it goes ahead.
+  const again = await supervisor.answerQuestion(q.id, "added", { deadlineAt: Date.now() + RESTART_MAX_MS + DEADLINE_MARGIN_MS + 60_000 });
+  assert.deepEqual(restarter.calls, ["conductor"], again.delivery?.detail);
 });
 
 test("no restart while another Conductor chat is running, or when the bundled playbook asks for none", async (t) => {

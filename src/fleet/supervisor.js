@@ -16,7 +16,7 @@ import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, userPlaybooksDir 
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
-import { DEADLINE_MARGIN_MS, createAppRestarter, createUiDriver } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, RESTART_MAX_MS, createAppRestarter, createUiDriver } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -516,7 +516,7 @@ export class FleetSupervisor {
   // deadlineAt: when a remote caller stops waiting, its queue time included.
   async resumeAll(question, message, settling = [], { restartApps = [], startedAt = Date.now(), deadlineAt = null } = {}) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
-    const restarted = await this.restartHosts(keys, restartApps);
+    const restarted = await this.restartHosts(keys, restartApps, deadlineAt);
     if (restarted) return restarted;
     let sent = 0;
     let blocked = 0;
@@ -641,7 +641,7 @@ export class FleetSupervisor {
   // Restarts each listed app that shows one of these threads, once per ten
   // minutes (a second answer after a partial send does not restart again).
   // Returns a blocked delivery when it must not or could not restart.
-  async restartHosts(keys, restartApps) {
+  async restartHosts(keys, restartApps, deadlineAt = null) {
     const threads = keys.map((key) => this.lastThreads.get(key)).filter(Boolean);
     for (const app of restartApps) {
       if (!threads.some((thread) => uiTargetFor(thread)?.app === app)) continue;
@@ -650,6 +650,11 @@ export class FleetSupervisor {
       // A restart ends every running turn in that app, not just the capped ones.
       const busy = [...this.lastThreads.values()].filter((thread) => !keys.includes(thread.key) && thread.agentStatus === "running" && uiTargetFor(thread)?.app === app);
       if (busy.length) return { status: "blocked", route: null, detail: `${busy.length} chats still running in ${name}; a restart would stop them. Answer again when they finish.` };
+      // A restart the remote caller cannot wait out would go on changing the
+      // desktop after it gave up: none starts without room to finish.
+      if (Number.isFinite(deadlineAt) && Date.now() + RESTART_MAX_MS > deadlineAt - DEADLINE_MARGIN_MS) {
+        return { status: "blocked", route: null, detail: `no time left in this request to restart ${name}; answer again to retry` };
+      }
       const result = await this.appRestarter.restart(app);
       this.store.recordAction({ kind: "restart", playbook: "account-switched", threadKey: null, status: result.ok ? "done" : "failed", reason: `restart ${name} after an account switch`, detail: result.detail, at: new Date(this.now()).toISOString() });
       if (!result.ok) return { status: "blocked", route: null, detail: `${result.detail}; answer again to retry` };
