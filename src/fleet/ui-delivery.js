@@ -51,7 +51,7 @@ const DETAIL_MAX = 200;
 const TYPING_MS_PER_CHAR = 25;
 // A remote caller's deadline is the main's clock and its answer needs the
 // trip back: the driver ends this long before it.
-const DEADLINE_MARGIN_MS = 5000;
+export const DEADLINE_MARGIN_MS = 5000;
 const ALLOWED_BUNDLES = new Set(Object.values(UI_APPS).map((app) => app.bundleId));
 
 // ---------------------------------------------------------------------------
@@ -721,7 +721,7 @@ export function createUiDriver({
     const endsAt = Math.min(start + limits.uiDeliveryTimeoutMs, hardEndsAt - limits.uiCleanupMs);
     const timer = setTimeout(() => controller.abort(), Math.max(0, endsAt - now()));
     const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt, deadline: endsAt, hardEndsAt,
-      slowest: 0, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
+      slowest: 0, slowestProbe: null, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
     try {
       return await steps(request, controller.signal, ctx);
     } catch (error) {
@@ -885,7 +885,10 @@ export function createUiDriver({
   // Null while it is still safe to go on. Once the target is in front it
   // must stay there: typing goes to the frontmost app.
   async function ownerCheck(ctx, target) {
+    const start = now();
     const reason = await ownerReason(ctx, target);
+    // Its slowest round is what the owner checks still ahead cost (step 7).
+    ctx.slowestProbe = Math.max(ctx.slowestProbe ?? 0, now() - start);
     // An unread front app is a probe hiccup, not the owner: putting their app
     // back still re-probes before it moves anything.
     if (reason && reason !== "front app unknown") sawOwner(ctx);
@@ -909,6 +912,10 @@ export function createUiDriver({
   async function bringToFront(ctx, target) {
     // open -b launches an app that quit meanwhile; never that.
     if ((await probeNow(ctx, "appRunning", target.bundleId)) !== true) return false;
+    // That probe can take a command's timeout and kill grace: the owner may
+    // have come back, switched apps, or the screen saver started meanwhile.
+    const back = await ownerCheck(ctx, target);
+    if (back) return back;
     if (!(await probeNow(ctx, "activate", target.bundleId))) return false;
     ctx.activated = true;
     const deadline = now() + limits.uiActivateMs;
@@ -992,7 +999,8 @@ export function createUiDriver({
     const moved = await ownerCheck(ctx, target);
     if (moved) return outcome(ctx, "blocked", moved);
     if ((await probeNow(ctx, "frontApp")) !== target.bundleId) {
-      if (!(await bringToFront(ctx, target))) return outcome(ctx, "blocked", `could not bring ${target.name} to the front`);
+      const brought = await bringToFront(ctx, target);
+      if (brought !== true) return outcome(ctx, "blocked", brought || `could not bring ${target.name} to the front`);
       state = await readState(ctx, signal);
       verified = verifyIdentity(state, identity);
       if (!verified.ok) return outcome(ctx, "blocked", verified.reason);
@@ -1043,8 +1051,12 @@ export function createUiDriver({
     // the confirmation at this delivery's slowest call: cut short after the
     // send, a delivery can only report "may have been sent". The owner once
     // more, right before: the click and read above can take tens of seconds.
+    // The two owner checks still ahead (before typing, after the read that
+    // follows it) count at this delivery's slowest one; with none measured,
+    // at every command's timeout and kill grace (frontApp runs two, idleMs one).
     const left = ctx.endsAt - now();
-    if (left < (leftover ? 3 : 4) * ctx.slowest + (leftover ? 0 : ctx.typingMs)) {
+    const probeRound = ctx.slowestProbe ?? 3 * commandMs;
+    if (left < (leftover ? 3 : 4) * ctx.slowest + (leftover ? 0 : ctx.typingMs) + 2 * probeRound) {
       return outcome(ctx, "blocked", `not enough time left to type and confirm (${Math.round(left / 1000)} s); nothing typed`);
     }
     const beforeTyping = await ownerCheck(ctx, target);

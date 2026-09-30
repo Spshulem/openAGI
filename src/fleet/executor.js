@@ -10,11 +10,14 @@ import path from "node:path";
 import { ensureDir } from "../file-utils.js";
 import { DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { classifyErrorText } from "./errors.js";
-import { UI_LOCK, flattenMessage, uiIdentity } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, UI_LOCK, flattenMessage, uiIdentity } from "./ui-delivery.js";
 
 export const MESSAGE_PREFIX = `${SUPERVISOR_PREFIX} `;
 
 const RELAY_TIMEOUT_MS = 180_000;
+// A relay cut short can still have delivered (then a retry duplicates it),
+// so one is not started for a remote caller with less time than this left.
+const RELAY_MIN_MS = 60_000;
 // A resumed turn can run for an hour (CI waits, bb-quick). Only the child we
 // spawned is ever killed, and only after this ceiling.
 const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
@@ -301,11 +304,11 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     }
   };
 
-  const relay = async (thread, step, base, actionId, env) => {
+  const relay = async (thread, step, base, actionId, env, timeoutMs = RELAY_TIMEOUT_MS) => {
     try { ensureDir(step.cwd); } catch { /* the runner surfaces a real failure */ }
     let result;
     try {
-      result = await runner(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs: RELAY_TIMEOUT_MS });
+      result = await runner(step.cmd, step.args, { cwd: step.cwd, env, timeoutMs });
     } catch (error) {
       result = { code: null, stdout: "", stderr: "", timedOut: false, error: error?.message ?? String(error) };
     }
@@ -313,7 +316,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     const output = `${stdout} ${result?.stderr ?? ""}`.trim();
     let detail = null;
     if (result?.timedOut) {
-      detail = `relay timed out after ${RELAY_TIMEOUT_MS / 1000}s`;
+      detail = `relay timed out after ${Math.round(timeoutMs / 1000)}s`;
     } else if (result?.error || result?.code !== 0) {
       detail = `relay failed: ${summariseRelayFailure(output, step.cwd) || firstLine(result?.error) || firstLine(result?.stderr) || `exit ${result?.code}`}`;
     } else {
@@ -441,11 +444,15 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
         active.delete(step.target.targetKey);
       }
     }
+    // A remote caller (deadlineAt) reports failure at its deadline: nothing
+    // starts after it, and a relay gets only what is left, less the trip back.
+    const left = Number.isFinite(deadlineAt) ? deadlineAt - DEADLINE_MARGIN_MS - Date.now() : Infinity;
+    if (step.background ? left <= 0 : left < RELAY_MIN_MS) return blocked("no time left in this request to deliver; not sent, retry");
     active.add(thread.key);
     const env = childEnv(route);
     if (step.background) return launch(thread, step, base, actionId, env);
     try {
-      return await relay(thread, step, base, actionId, env);
+      return await relay(thread, step, base, actionId, env, Math.min(RELAY_TIMEOUT_MS, left));
     } finally {
       active.delete(thread.key);
     }

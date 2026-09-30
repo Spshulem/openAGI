@@ -16,7 +16,7 @@ import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, userPlaybooksDir 
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
-import { createAppRestarter, createUiDriver } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, createAppRestarter, createUiDriver } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -520,6 +520,7 @@ export class FleetSupervisor {
     if (restarted) return restarted;
     let sent = 0;
     let blocked = 0;
+    let late = 0;
     const deliveryState = await this.probeDelivery();
     // A Conductor session and the Codex thread it hosts are one app
     // conversation: one typed send covers every key that maps to it.
@@ -536,6 +537,9 @@ export class FleetSupervisor {
         if (typedInto.get(uiKey)) { sent += 1; this.store.markQuestionDelivered(question.id, key); } else blocked += 1;
         continue;
       }
+      // Past the caller's deadline it reports failure: no member starts then
+      // (a relay or background resume would still land, and a retry repeat it).
+      if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt - DEADLINE_MARGIN_MS) { late += 1; continue; }
       const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
       if (uiKey) typedInto.set(uiKey, delivery.status === "sent");
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
@@ -546,7 +550,7 @@ export class FleetSupervisor {
       }
       else blocked += 1;
     }
-    return { status: blocked || !sent ? "blocked" : "sent", route: null, detail: `${sent} resumed, ${blocked} not reachable; open the thread and retry if needed` };
+    return { status: blocked || late || !sent ? "blocked" : "sent", route: null, detail: `${sent} resumed, ${blocked} not reachable${late ? `, ${late} not sent (out of time)` : ""}; open the thread and retry if needed` };
   }
 
   // When each nudge first waited on computer use (Auto only: the other modes

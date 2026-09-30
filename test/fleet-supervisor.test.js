@@ -7,6 +7,7 @@ import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetSupervisor, groupQuestions } from "../src/fleet/supervisor.js";
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
+import { DEADLINE_MARGIN_MS } from "../src/fleet/ui-delivery.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -1228,6 +1229,33 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   assert.ok(spent.every(Number.isFinite), String(spent));
   // Ms wall-clock readings: each 5 ms send can read as less, but it grows.
   assert.ok(spent[1] > spent[0] && spent[2] > spent[1], String(spent));
+});
+
+test("a grouped resume starts no member past the caller's deadline: the rest are reported not sent", async (t) => {
+  const capped = ["t1", "t2", "t3"].map((id) => makeThread({
+    key: `codex:${id}`, id, title: `Fix ${id}`, cwd: `/work/${id}`, agentStatus: "error", writerLocked: true, meta: { originator: "Codex Desktop" },
+    error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() }
+  }));
+  const delivered = [];
+  const executor = {
+    // The first send uses up what the broker had left.
+    deliver: async (args) => {
+      delivered.push(args.thread.key);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return { status: "sent", route: args.route, detail: "typed into Codex", actionId: null };
+    },
+    inFlight: () => [],
+    whenIdle: async () => {}
+  };
+  const { supervisor } = fixture(t, { delivery: "computer-use", threads: capped, deps: { executor, uiDriver: readyDriver() } });
+  await supervisor.tick({ reason: "test" });
+  const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
+  assert.ok(group);
+  const result = await supervisor.answerQuestion(group.id, "added", { deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 30 });
+  assert.equal(delivered.length, 1, "no member started after the deadline");
+  assert.equal(result.delivery.status, "blocked");
+  assert.equal(result.delivery.detail, "1 resumed, 0 not reachable, 2 not sent (out of time); open the thread and retry if needed");
+  assert.equal(result.question.status, "open", "still actionable");
 });
 
 test("a Scan now through the node broker types into no app: those wait for the next tick, CLI sends still go", async (t) => {

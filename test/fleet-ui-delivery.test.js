@@ -1524,3 +1524,45 @@ test("a first-message title shows only as the app's page label, never a transcri
   assert.match(result.detail, /is not the open thread/);
   assert.deepEqual(typed(f.calls()), []);
 });
+
+test("the owner back, or the screen saver on, during the running check before activation: nothing brought forward", async (t) => {
+  for (const [change, detail] of [
+    [(probe) => { probe.idle = 1_000; }, "waiting for idle: Conductor must be in front to type"],
+    [(probe) => { probe.idle = 1_000; probe.front = "com.apple.Safari"; }, "waiting for idle: Conductor must be in front to type"],
+    [(probe) => { probe.front = "com.apple.ScreenSaver.Engine"; }, "screen saver on"]
+  ]) {
+    const probe = fakeProbe();
+    let checks = 0;
+    // The second running check is bringToFront's: it can take a command's
+    // timeout, and the owner comes back meanwhile.
+    probe.appRunning = async () => { if (++checks === 2) change(probe); return probe.running; };
+    const f = setup(t, { probe });
+    const result = await f.driver.deliver(f.request());
+    assert.equal(result.status, "blocked");
+    assert.equal(result.detail, detail);
+    assert.deepEqual(f.probe.activated, [], "nothing activated over them");
+    assert.deepEqual(typed(f.calls()), []);
+  }
+});
+
+test("slow presence probes count in the typing budget: the delivery refuses to type rather than run out before Send", async (t) => {
+  const probe = fakeProbe();
+  const clock = {};
+  // Every owner check takes 45 s (idleMs), OCU calls none.
+  const idle = probe.idleMs;
+  probe.idleMs = async () => { clock.advance(45_000); return idle(); };
+  const f = setup(t, { probe });
+  clock.advance = f.advance;
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /^not enough time left to type and confirm \(\d+ s\); nothing typed$/);
+  assert.deepEqual(typed(f.calls()), []);
+  assert.deepEqual(f.app.transcript.slice(-1), ["Pushed the fix."]);
+  // The same probes at 5 s leave the time: it is sent.
+  const quick = fakeProbe();
+  const quickIdle = quick.idleMs;
+  quick.idleMs = async () => { g.advance(5_000); return quickIdle(); };
+  const g = setup(t, { probe: quick });
+  const sent = await g.driver.deliver(g.request());
+  assert.equal(sent.status, "sent", sent.detail);
+});

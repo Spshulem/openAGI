@@ -6,7 +6,7 @@ import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { MESSAGE_PREFIX, buildRelayPrompt, createExecutor, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
-import { createUiLock } from "../src/fleet/ui-delivery.js";
+import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-"));
@@ -148,6 +148,29 @@ test("dry-run checks preconditions but never calls run", async (t) => {
   assert.equal(calls.length, 0);
   assert.deepEqual(executor.inFlight(), []);
   assert.deepEqual(store.actions(), []);
+});
+
+test("a remote caller's deadline bounds non-UI sends: no relay it cannot finish, no background resume after it", async (t) => {
+  const { cwd, calls, executor } = setup(t, { results: [{ code: 0, stdout: "DONE\n" }, { code: 0, stdout: "done" }] });
+  const peer = claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 4242, status: "idle" } });
+  // 30 s left after the trip back: too little for a relay.
+  const short = await executor.deliver({ thread: peer, message: "hi", route: "peer-relay", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 30_000 });
+  assert.equal(short.status, "blocked");
+  assert.equal(short.detail, "no time left in this request to deliver; not sent, retry");
+  // Past the deadline: no background resume starts either.
+  const late = await executor.deliver({ thread: codexThread(cwd), message: "retry", route: "codex-exec", playbook: "owner-answer", deadlineAt: Date.now() - 1 });
+  assert.equal(late.status, "blocked");
+  assert.equal(calls.length, 0, "nothing started");
+  assert.deepEqual(executor.inFlight(), []);
+  // 100 s left: the relay runs, bounded by them.
+  const bounded = await executor.deliver({ thread: peer, message: "hi", route: "peer-relay", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 100_000 });
+  assert.equal(bounded.status, "sent", bounded.detail);
+  assert.ok(calls[0].timeoutMs <= 100_000 && calls[0].timeoutMs > 90_000, String(calls[0].timeoutMs));
+  // Before the deadline a background resume starts (its turn is not bounded by it).
+  const resumed = await executor.deliver({ thread: codexThread(cwd), message: "retry", route: "codex-exec", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 1_000 });
+  assert.equal(resumed.status, "sent");
+  assert.equal(calls.length, 2);
+  await executor.whenIdle();
 });
 
 test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) => {
