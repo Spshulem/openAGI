@@ -445,14 +445,16 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       }
     }
     // A remote caller (deadlineAt) reports failure at its deadline: nothing
-    // starts after it, and a relay gets only what is left, less the trip back.
+    // starts after it, and a relay gets only what is left, less the trip back
+    // and the kill grace runCommand adds when the child ignores SIGTERM.
     const left = Number.isFinite(deadlineAt) ? deadlineAt - DEADLINE_MARGIN_MS - Date.now() : Infinity;
-    if (step.background ? left <= 0 : left < RELAY_MIN_MS) return blocked("no time left in this request to deliver; not sent, retry");
+    const relayMs = left - DEFAULTS.uiKillGraceMs;
+    if (step.background ? left <= 0 : relayMs < RELAY_MIN_MS) return blocked("no time left in this request to deliver; not sent, retry");
     active.add(thread.key);
     const env = childEnv(route);
     if (step.background) return launch(thread, step, base, actionId, env);
     try {
-      return await relay(thread, step, base, actionId, env, Math.min(RELAY_TIMEOUT_MS, left));
+      return await relay(thread, step, base, actionId, env, Math.min(RELAY_TIMEOUT_MS, relayMs));
     } finally {
       active.delete(thread.key);
     }

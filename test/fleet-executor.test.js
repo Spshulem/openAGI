@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveFleetConfig } from "../src/fleet/contracts.js";
+import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { MESSAGE_PREFIX, buildRelayPrompt, createExecutor, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
 import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
@@ -162,10 +162,10 @@ test("a remote caller's deadline bounds non-UI sends: no relay it cannot finish,
   assert.equal(late.status, "blocked");
   assert.equal(calls.length, 0, "nothing started");
   assert.deepEqual(executor.inFlight(), []);
-  // 100 s left: the relay runs, bounded by them.
+  // 100 s left: the relay runs, bounded by them less the kill grace.
   const bounded = await executor.deliver({ thread: peer, message: "hi", route: "peer-relay", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 100_000 });
   assert.equal(bounded.status, "sent", bounded.detail);
-  assert.ok(calls[0].timeoutMs <= 100_000 && calls[0].timeoutMs > 90_000, String(calls[0].timeoutMs));
+  assert.ok(calls[0].timeoutMs <= 100_000 - DEFAULTS.uiKillGraceMs && calls[0].timeoutMs > 90_000, String(calls[0].timeoutMs));
   // Before the deadline a background resume starts (its turn is not bounded by it).
   const resumed = await executor.deliver({ thread: codexThread(cwd), message: "retry", route: "codex-exec", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 1_000 });
   assert.equal(resumed.status, "sent");

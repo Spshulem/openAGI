@@ -232,8 +232,11 @@ export function hasPermissionPrompt(state) {
   return (state?.elements ?? []).some((element) => BUTTON_ROLE.test(element.role) && PROMPT_LABEL.test(buttonLabel(element)));
 }
 
-export function findSendButton(state) {
-  const buttons = (state?.elements ?? []).filter((element) => BUTTON_ROLE.test(element.role) && !element.disabled && SEND_LABEL.test(buttonLabel(element)));
+// Only the app's own page: an in-app browser tab's Submit is no chat's Send.
+export function findSendButton(state, bundleId = state?.bundleId) {
+  const ownPage = OWN_PAGE[bundleId] ?? null;
+  const buttons = (state?.elements ?? []).filter((element) => BUTTON_ROLE.test(element.role) && !element.disabled && SEND_LABEL.test(buttonLabel(element))
+    && !(ownPage && inOtherPage(element, ownPage)));
   return buttons.length === 1 ? buttons[0] : null;
 }
 
@@ -872,17 +875,24 @@ export function createUiDriver({
   // have added words, or be typing in another field a click would steal.
   async function clearComposer(ctx, signal, { ownerPresent = false } = {}) {
     try {
+      // Presence is checked fresh, not assumed: an owner back at the keys may
+      // have added to our text, and then only exactly our text, already
+      // focused, is cleared.
+      const exactOnly = ownerPresent || Boolean(await ownerCheck(ctx, ctx.request.target));
+      const exact = (composer) => normalizeUiText(composer.value) === normalizeUiText(ctx.text);
       let state = await readState(ctx, signal);
       let { composer } = composerIn(ctx, state);
       if (!composer) return false;
       if (!normalizeUiText(composer.value)) return true;
       if (!looksLikeOurs(composer.value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
-      if (ownerPresent && (normalizeUiText(composer.value) !== normalizeUiText(ctx.text) || !isComposerFocused(state, composer))) return false;
+      if (exactOnly && (!exact(composer) || !isComposerFocused(state, composer))) return false;
       if (!isComposerFocused(state, composer)) {
         await click(ctx, composer, signal);
         state = await readState(ctx, signal);
         ({ composer } = composerIn(ctx, state));
         if (!composer || !isComposerFocused(state, composer)) return false;
+        // The click and read are slow: the owner may be back by now.
+        if (!exact(composer) && (await ownerCheck(ctx, ctx.request.target))) return false;
       }
       await press(ctx, "super+a", signal);
       await press(ctx, "BackSpace", signal);
@@ -1112,7 +1122,7 @@ export function createUiDriver({
     // time before either: still "typed", so recovery clears our text.
     within(ctx, 1);
     ctx.phase = "sending";
-    const send = findSendButton(state);
+    const send = findSendButton(state, target.bundleId);
     let pressed = false;
     if (send) {
       try {

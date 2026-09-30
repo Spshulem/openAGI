@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
-  createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
+  createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
   conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity
 } from "../src/fleet/ui-delivery.js";
 
@@ -643,6 +643,19 @@ test("a transport failure after typing clears our text with a fresh engine", asy
   assert.equal(app.composer, "");
 });
 
+test("a read failing after typing while the owner adds to our text: recovery leaves their words alone", async (t) => {
+  const probe = fakeProbe();
+  const app = fakeApp();
+  const f = setup(t, { app, probe, transportOptions: { failOn: (name, _args, n) => name === "get_app_state" && n === 6 } });
+  // The owner comes back and types after our text, well past the slack.
+  app.onType = (text) => { probe.idleMs = async () => { f.advance(5_000); return 200; }; return `${text} wait`; };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "failed");
+  assert.doesNotMatch(result.detail, /cleared our text/);
+  assert.equal(app.composer, `${MESSAGE} wait`);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no select-all or delete");
+});
+
 test("a transport failure after send is unconfirmed", async (t) => {
   const f = setup(t, { transportOptions: { failOn: (name, args) => name === "click" && args.element_index === "62" } });
   const app = f.app;
@@ -703,6 +716,13 @@ test("findComposer: Codex's Do anything box, never a combo box or the in-app bro
   const noComposer = stateOf(CODEX_BROWSER_STATE.replace(/\n\t+2296 [^\n]*/, ""));
   assert.equal(findComposer(noComposer).composer, null);
   assert.match(findComposer(noComposer).reason, /composer not found/);
+});
+
+test("findSendButton: only the app's own page, never an in-app browser Submit", () => {
+  const withSubmit = stateOf(`${CODEX_BROWSER_STATE}\n\t\t\t\t\t\t4833 button Submit`);
+  assert.equal(findSendButton(withSubmit, "com.openai.codex"), null);
+  const withSend = stateOf(CODEX_BROWSER_STATE.replace("\t\t\t\t\t2327 combo box", "\t\t\t\t\t2297 button Send message\n\t\t\t\t\t2327 combo box") + "\n\t\t\t\t\t\t4833 button Submit");
+  assert.equal(findSendButton(withSend, "com.openai.codex")?.id, "2297");
 });
 
 test("findComposer: Conductor's composer container only, never its Terminal input", () => {
