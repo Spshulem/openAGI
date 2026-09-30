@@ -92,6 +92,8 @@ const GROUPED_KINDS = Object.freeze({
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
 const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused"]);
+// The owner's Scan now reviews at most this many batches (15 questions each).
+const FORCED_REVIEW_ROUNDS = 4;
 const GROUP_MAX = 50;
 // Computer use unable to type this long, with nudges waiting on it: the owner
 // hears why once (secure input held by an app, a locked screen), and the
@@ -400,6 +402,12 @@ export class FleetSupervisor {
   }
 
   tick({ reason = "manual" } = {}) {
+    // The owner's scan arriving mid-tick gets its own full recheck right
+    // after, instead of riding on a scan that did not force the review.
+    if (this.running && (reason === "owner-scan" || reason === "chat")) {
+      this.forcedFollowUp ??= this.running.catch(() => {}).then(() => { this.forcedFollowUp = null; return this.tick({ reason }); });
+      return this.forcedFollowUp;
+    }
     if (this.running) return this.running;
     this.running = this._tick(reason)
       .then((snapshot) => { this.lastError = null; return snapshot; })
@@ -1196,18 +1204,31 @@ export class FleetSupervisor {
     const rank = (question) => (unreviewed(question) ? 0 : changed(question) ? 1 : 2);
     const ordered = [...pending].sort((a, b) => rank(a) - rank(b) || String(a.reviewedAt ?? "").localeCompare(String(b.reviewedAt ?? "")));
     const others = open.filter((question) => !pending.includes(question));
-    let verdicts;
-    try {
-      verdicts = await reviewQuestions({ questions: ordered, others, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now, ownerNotes: loadOwnerNotes(this.dataDir) });
-    } catch (error) {
-      const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
-      this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
-      store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
-      return unsettled;
+    // One model call holds up to a batch; the owner's own scan keeps going
+    // until every open question was rechecked (bounded).
+    const settled = new Set();
+    let remaining = ordered;
+    for (let round = 0; remaining.length && round < (forced ? FORCED_REVIEW_ROUNDS : 1); round += 1) {
+      let verdicts;
+      try {
+        const rest = [...others, ...ordered.filter((question) => !remaining.includes(question))];
+        verdicts = await reviewQuestions({ questions: remaining, others: rest, contextFor: (question) => reviewContext(question, scope), runModel: this.reviewRunner, now, ownerNotes: loadOwnerNotes(this.dataDir) });
+      } catch (error) {
+        const detail = clampText(redactSecrets(error?.message ?? String(error)), 200);
+        this.lastReview = { ...this.lastReview, failedAt: now, error: detail };
+        store.recordAction({ kind: "review", playbook: "review", threadKey: null, status: "failed", reason: "review failed; questions go out unreviewed", detail });
+        break;
+      }
+      this.lastReview = { at: now, failedAt: null, error: null };
+      this.applyReview(verdicts, fingerprints);
+      const answered = new Set(verdicts.map((verdict) => verdict.id));
+      for (const verdict of verdicts) if (!verdict.deferred) settled.add(verdict.id);
+      const next = remaining.filter((question) => !answered.has(question.id));
+      if (next.length === remaining.length) break;
+      remaining = next;
     }
-    this.lastReview = { at: now, failedAt: null, error: null };
-    this.applyReview(verdicts, fingerprints);
-    const settled = new Set(verdicts.filter((verdict) => !verdict.deferred).map((verdict) => verdict.id));
+    // A failed review lets every new question out, as before.
+    if (this.lastReview.failedAt === now) return unsettled;
     for (const question of pending) if (unreviewed(question) && !settled.has(question.id)) unsettled.add(question.id);
     return unsettled;
   }

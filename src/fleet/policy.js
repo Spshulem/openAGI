@@ -623,10 +623,14 @@ export function decideInfra(infra, options = {}) {
     if (state.down && downMs !== null && downMs >= LONG_DOWN_MS) {
       // A box that answers but refuses builds (its gate, e.g. low disk) is
       // not down, and a reboot would not fix it: say which it is.
-      const gated = kind === "bb3" && infra?.bb3?.reachable !== false && infra?.bb3?.gate?.state === "blocked";
+      // Only a probe that got through vouches for the gate's reason; an
+      // incomplete one (reachable null) leaves the cause unknown.
+      const reachable = infra?.bb3?.reachable;
+      const gated = kind === "bb3" && reachable === true && infra?.bb3?.gate?.state === "blocked";
       const title = kind !== "bb3" ? "Codex LB down 1h+. Help?"
         : gated ? `BB3 builds paused 1h+${infra.bb3.gate.reason ? `: ${clampText(infra.bb3.gate.reason, 40)}` : ""}. Fix it?`
-        : "BB3 unreachable 1h+. Reboot box?";
+        : reachable === false ? "BB3 unreachable 1h+. Reboot box?"
+        : "BB3 out 1h+, cause unknown. Check it?";
       decisions.push(infraDecision(key, {
         action: "ask-user", reason: `${INFRA_NAMES[kind]} down ${minutes(downMs)}m`, blockers: state.problems,
         question: clampQuestion({ title, body: `${state.problems.join("; ")}.`, options: ["on it", "later"], dedupeKey: `${key}:long-down`, kind: "infra" }, limits)
