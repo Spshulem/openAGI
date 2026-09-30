@@ -929,6 +929,8 @@ test("manager escalations from a thread never spend that thread's nudge budget",
   });
   const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [waiting], now: () => now, manager: makeManager() });
   for (let hour = 0; hour < 3; hour += 1) {
+    // The agent posts along the way; an hour of silence would get it a status check.
+    waiting.lastAgentAt = waiting.lastActivityAt = new Date(now - MIN).toISOString();
     await supervisor.tick({ reason: "test" });
     now += 61 * MIN;
   }

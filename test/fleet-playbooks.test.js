@@ -12,7 +12,7 @@ const skillDir = path.join(repoRoot, "examples", "skills", "fleet-supervisor");
 
 const EXPECTED_IDS = [
   "resume", "merge-ready", "ci-finished", "no-local-verify", "in-scope-yes",
-  "bb3-slow-agent", "infra-recovered", "manager-bb3", "manager-lb"
+  "bb3-slow-agent", "infra-recovered", "manager-bb3", "manager-lb", "status-check"
 ];
 
 function tmpDir(prefix) {

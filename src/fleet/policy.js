@@ -243,18 +243,26 @@ function backoffIntent(ctx, errorAt, kind) {
 }
 
 function waitingIntent(ctx) {
-  const { classified, pr, limits } = ctx;
+  const { classified, pr, limits, thread, now } = ctx;
   const wait = classified.wait ?? {};
   const age = wait.ageMs ?? 0;
   const ci = pr?.ci ?? {};
   const ciDone = pr?.state === "OPEN" && CI_DONE.has(ci.state) && !ci.pending?.length;
   const ciFailing = Boolean(pr) && (CI_FAILING.has(ci.state) || Boolean(ci.failing?.length));
+  // A verify behind a blocked gate or a hung watcher never wakes its agent,
+  // and the manager may not get through either: past this long with no word
+  // from the agent, it is asked for a status itself.
+  const quietMs = msSince(latest(thread.lastAgentAt, thread.lastActivityAt), now);
+  const silent = wait.source === "task" && age >= limits.silentTurnMs && quietMs !== null && quietMs >= limits.silentTurnMs;
   if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs) {
     // Full runs are only for reproducing a hosted CI failure.
     if (!ciFailing) return nudge("bb3-slow-agent", `full verify ${minutes(age)}m; hosted CI not failing`, { immediate: true, vars: { age: minutes(age) } });
+    if (silent) return statusCheck("bb-verify --full", quietMs);
     return escalateIntent(ctx, "bb-verify --full", age);
   }
-  if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) return escalateIntent(ctx, "bb-quick", age);
+  if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) {
+    return silent ? statusCheck("bb-quick", quietMs) : escalateIntent(ctx, "bb-quick", age);
+  }
   if (wait.source === "task") {
     // Conductor wakes itself when the task ends. Past 45 min the task is a
     // stuck watcher or a long-lived process (a dev server), so treat it as idle.
@@ -264,6 +272,7 @@ function waitingIntent(ctx) {
     if (pr?.state === "OPEN" && blockers.length && !blockers.includes("CI running")) {
       return nudge("merge-ready", `waiting ${minutes(age)}m; not ready: ${blockers.join("; ")}`, { immediate: true });
     }
+    if (silent) return statusCheck("a background task", quietMs);
     return { type: "wait", reason: wait.reason ?? "waiting on a background task" };
   }
   // The agent ended its turn to wait and nothing will wake it but us.
@@ -271,6 +280,11 @@ function waitingIntent(ctx) {
   if (pr?.state === "OPEN" && !ci.state && age >= limits.waitingTaskMaxMs) return nudge("merge-ready", "no CI on head after waiting");
   if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
   return { type: "wait", reason: pr ? "CI still running" : wait.reason ?? "waiting" };
+}
+
+function statusCheck(what, quietMs) {
+  const quiet = minutes(quietMs);
+  return nudge("status-check", `no word in ${quiet}m while waiting on ${what}`, { immediate: true, vars: { what, quiet } });
 }
 
 function escalateIntent(ctx, what, age) {

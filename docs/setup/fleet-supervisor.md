@@ -87,7 +87,8 @@ Override one without a code change: copy it to
 `~/.openagi/skills/fleet-supervisor/playbooks/`) and edit. Same `id` wins.
 
 Ids: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`,
-`bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `account-switched`.
+`bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `account-switched`,
+`status-check`.
 Frontmatter: `cooldown_min`, `max_attempts`, `ask` (question to you after max attempts),
 `restart_apps` (`account-switched` only: `conductor` and/or `codex`).
 

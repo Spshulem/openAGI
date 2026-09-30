@@ -167,6 +167,30 @@ test("row: a Conductor wait on a non-verify task is idle after 45 min", () => {
   assert.equal(run(thread).decision.playbook, "ci-finished");
 });
 
+test("row: an agent silent an hour on a background wait is asked for a status", () => {
+  // The #6470 case: bb-quick queued behind a blocked BuildBot3 gate for four
+  // hours. The manager escalation never landed and the agent never heard.
+  const quick = { id: "t1", description: "Wait for bb-quick on the #6522 merge", kind: "local_bash", startedAt: ago(240 * MIN) };
+  const quiet = { agentStatus: "waiting", openTasks: [quick], lastAgentAt: ago(239 * MIN), lastActivityAt: ago(239 * MIN) };
+  const pending = makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } });
+  const check = run(makeThread(quiet), { pr: pending }).decision;
+  assert.equal(check.action, "nudge");
+  assert.equal(check.playbook, "status-check");
+  assert.match(check.message, /No update from you in 239m while you wait on bb-quick/);
+  assert.match(check.reason, /no word in 239m/);
+  // Under an hour of silence the manager still gets it first.
+  const recent = makeThread({ ...quiet, lastAgentAt: ago(30 * MIN), lastActivityAt: ago(30 * MIN) });
+  assert.equal(run(recent, { pr: pending }).decision.action, "escalate-manager");
+  // Once an hour, and after three checks with no progress the owner is asked.
+  const ledger = { lastNudgeAt: ago(20 * MIN), nudges: [{ at: ago(20 * MIN), playbook: "status-check", route: "peer-relay", status: "sent" }] };
+  assert.equal(run(makeThread(quiet), { pr: pending, ledger }).decision.action, "wait");
+  // A non-verify watcher past 45 min with nothing else to say gets the same check.
+  const watcher = { ...quick, description: "Watch the deploy" };
+  const idle = run(makeThread({ ...quiet, openTasks: [watcher] }), { pr: null }).decision;
+  assert.equal(idle.playbook, "status-check");
+  assert.match(idle.message, /a background task/);
+});
+
 test("row: local-verify gets the no-local-verify nudge right away", () => {
   const thread = makeThread({ lastAgentAt: ago(MIN), lastActivityAt: ago(MIN) });
   const infra = { localVerify: [{ pid: 9, command: "pnpm verify:pr", cwd: "/work/madrid", ageSec: 400, threadKey: "conductor:s1" }] };

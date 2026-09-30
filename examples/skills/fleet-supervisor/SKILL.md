@@ -46,7 +46,7 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 | codex-lb | escalate to manager; `infra-recovered` when LB healthy | manager offline, or LB down 1 h+ |
 | logged out / disk full | nothing | at once, one line |
 | waiting-ci | watch; when CI ends on the head, `ci-finished` | never |
-| waiting-ci too long | bb-quick over 15 min or needed full verify over 30 min: escalate to manager. Unneeded full verify: `bb3-slow-agent` | manager offline |
+| waiting-ci too long | bb-quick over 15 min or needed full verify over 30 min: escalate to manager. Unneeded full verify: `bb3-slow-agent`. Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
 | local-verify | `no-local-verify` | never |
 | asked-in-scope | `in-scope-yes` | never |
 | needs-human | nothing | one caveman question with buttons |
@@ -88,7 +88,7 @@ When BuildBot3 or codex-lb comes back, every thread blocked on it gets `infra-re
 
 ## Playbooks
 
-Wording lives in `playbooks/<id>.md`: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`, `bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`.
+Wording lives in `playbooks/<id>.md`: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`, `bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `status-check`.
 Frontmatter: `id`, `cooldown_min`, `max_attempts`, `ask` (owner question after max attempts; empty = never ping).
 Placeholders: `{pr}`, `{head}`, `{blockers}`, `{blocker}`, `{ci}`, `{reset}`, `{thread}`, `{repo}`, `{label}`, `{attempts}`, `{what}`, `{problems}`.
 Override: copy a file to `<dataDir>/skills/fleet-supervisor/playbooks/<id>.md`.
