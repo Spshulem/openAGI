@@ -207,7 +207,7 @@ function withHealth(snapshot) {
 // strict computer-use Mac that cannot type now, or a typed send held back by
 // the owner at the keyboard or a running turn). A CLI fallback's failure is
 // not about typing, so it stays the owner's to see.
-const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input|waiting for idle|screen saver on)/;
+const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input|waiting for idle|screen saver on|front app unknown)/;
 // A computer-use send that ends this way stops the tick's other ones.
 const UI_STALLED = /^(Open Computer Use timed out|Open Computer Use stopped|delivery timed out)/;
 function typingWaits(thread, route, deliveryState, delivery) {
@@ -403,15 +403,20 @@ export class FleetSupervisor {
     this.kickTimer = null;
   }
 
-  tick({ reason = "manual" } = {}) {
+  // deferUi: a scan that came through the node broker, which stops waiting
+  // before a computer-use send would end; its app sends wait for the next
+  // scheduled tick (CLI sends and the review still run).
+  tick({ reason = "manual", deferUi = false } = {}) {
     // The owner's scan arriving mid-tick gets its own full recheck right
     // after, instead of riding on a scan that did not force the review.
+    // Any local request in the queue lets that one type.
     if (this.running && (reason === "owner-scan" || reason === "chat")) {
-      this.forcedFollowUp ??= this.running.catch(() => {}).then(() => { this.forcedFollowUp = null; return this.tick({ reason }); });
+      this.followUpDefersUi = (this.forcedFollowUp ? this.followUpDefersUi : true) && deferUi;
+      this.forcedFollowUp ??= this.running.catch(() => {}).then(() => { this.forcedFollowUp = null; return this.tick({ reason, deferUi: this.followUpDefersUi }); });
       return this.forcedFollowUp;
     }
     if (this.running) return this.running;
-    this.running = this._tick(reason)
+    this.running = this._tick(reason, { deferUi })
       .then((snapshot) => { this.lastError = null; return snapshot; })
       .catch((error) => {
         this.lastError = clampText(error?.message ?? String(error), 300);
@@ -569,7 +574,7 @@ export class FleetSupervisor {
   // (this tick asked its dedupeKey): a stale "yes" must never land on a new
   // question. One the owner overtook in the thread is dropped quietly; one
   // older than a day, or whose thread is gone, goes back to the owner.
-  async deliverQueuedAnswers({ byKey, started, cappedKinds, asked, decided, sourceUnknown, budget = Infinity }) {
+  async deliverQueuedAnswers({ byKey, started, cappedKinds, asked, decided, sourceUnknown, budget = Infinity, deferUi = false }) {
     // uiStalled: a computer-use send timed out or lost Open Computer Use;
     // the rest of the tick's typing waits (the send loop too).
     const contacted = { threads: new Set(), uiKeys: new Set(), sent: 0, uiStalled: false };
@@ -607,7 +612,7 @@ export class FleetSupervisor {
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
-      if (contacted.uiStalled && route === "computer-use") continue;
+      if ((contacted.uiStalled || deferUi) && route === "computer-use") continue;
       // Failed tries are bounded too, like the send loop's.
       if (tries >= budget * 2) continue;
       tries += 1;
@@ -797,7 +802,7 @@ export class FleetSupervisor {
     }
   }
 
-  async _tick(reason) {
+  async _tick(reason, { deferUi = false } = {}) {
     const started = this.now();
     // The owner asked for this scan ("Scan now", the chat): recheck every
     // open question, not only the new, changed or due ones.
@@ -901,7 +906,7 @@ export class FleetSupervisor {
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1034,7 +1039,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set() }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1097,7 +1102,7 @@ export class FleetSupervisor {
 
     // A thread that just got the owner's answer gets no automatic nudge too.
     const answeredNow = await this.deliverQueuedAnswers({
-      byKey, started, cappedKinds, asked, sourceUnknown: fromFailedSource, budget: config.limits.maxSendsPerTick,
+      byKey, started, cappedKinds, asked, sourceUnknown: fromFailedSource, budget: config.limits.maxSendsPerTick, deferUi,
       decided: new Set(items.map((item) => item.thread.key))
     });
     // Kept answers share the tick's send budget, and their app conversations
@@ -1145,6 +1150,10 @@ export class FleetSupervisor {
       }
       if (uiStalled && decision.route === "computer-use") {
         decision.reason = `${decision.reason}; deferred: Open Computer Use stalled`;
+        continue;
+      }
+      if (deferUi && decision.route === "computer-use") {
+        decision.reason = `${decision.reason}; deferred: remote scan`;
         continue;
       }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;

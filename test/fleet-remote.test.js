@@ -191,6 +191,15 @@ test("a send queued 200 s before this Mac picked it up keeps the broker's deadli
   assert.deepEqual(seen.at(-1), ["send", { deadlineAt: null }]);
 });
 
+test("a Scan now through the broker ticks without app sends; the Mac's own page scans as before", async () => {
+  const ticks = [];
+  const supervisor = { getState: () => ({ mode: "auto", questions: [], actions: [], snapshot: null, settings: {} }), tick: async (options) => { ticks.push(options); return null; } };
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  assert.equal((await createFleetCapability(supervisor).invoke("request", { method: "POST", path: "/fleet/api/scan" }, { expiresAt })).response.status, 200);
+  assert.equal((await createFleetRoute({ supervisor })("POST", "/fleet/api/scan", null, async () => ({}))).status, 200);
+  assert.deepEqual(ticks, [{ reason: "owner-scan", deferUi: true }, { reason: "owner-scan" }]);
+});
+
 test('a question reopened on the computer brings back its mirrored copy, so G2 does not ping again', async t => {
   const { remote, runtime, state, dir } = fixture(t);
   await remote.refresh();

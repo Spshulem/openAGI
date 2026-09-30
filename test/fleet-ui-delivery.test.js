@@ -304,6 +304,29 @@ test("the screen saver in front blocks before any UI call", async (t) => {
   }
 });
 
+test("an unknown front app blocks: it could hide the screen saver, and nothing could be put back", async (t) => {
+  const f = setup(t, { probe: fakeProbe({ front: null }) });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "front app unknown");
+  assert.equal(f.transports.length, 0);
+  assert.deepEqual(f.probe.opened, []);
+  assert.deepEqual(f.probe.activated, []);
+});
+
+test("the front app turning unknown during a slow read: nothing opened or brought forward", async (t) => {
+  const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
+  const f = setup(t, { app, probe: fakeProbe({ onOpen: () => { app.selected = "madrid"; } }) });
+  const render = app.render;
+  app.render = () => { f.probe.front = null; return render(); };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "front app unknown");
+  assert.deepEqual(f.probe.opened, []);
+  assert.deepEqual(f.probe.activated, []);
+  assert.deepEqual(typed(f.calls()), []);
+});
+
 test("an app that will not come forward blocks before typing", async (t) => {
   const probe = fakeProbe({ activate: async (bundleId) => { probe.activated.push(bundleId); return true; } });
   const f = setup(t, { probe });

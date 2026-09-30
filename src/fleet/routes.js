@@ -63,8 +63,8 @@ export function createFleetRoute({ supervisor } = {}) {
   }
 
   // deadlineAt: when a remote caller stops waiting (ms, this clock); app
-  // sends end before it.
-  return async function fleetRoute(method, pathname, url, readBody, { deadlineAt = null } = {}) {
+  // sends end before it. remote: the request came through the node broker.
+  return async function fleetRoute(method, pathname, url, readBody, { deadlineAt = null, remote = false } = {}) {
     const sendOptions = { deadlineAt };
     if (!pathname.startsWith(PREFIX)) return null;
     if (!supervisor) return fail(503, "Fleet supervisor is not available.");
@@ -78,8 +78,10 @@ export function createFleetRoute({ supervisor } = {}) {
       if (parts.length === 1 && parts[0] === "scan") {
         if (method !== "POST") return fail(405, "Use POST.");
         try {
-          // The owner's Scan now: rechecks every open question too.
-          await supervisor.tick({ reason: "owner-scan" });
+          // The owner's Scan now: rechecks every open question too. One
+          // through the broker types nothing: the broker would stop waiting
+          // mid-send, and a retried scan would nudge again.
+          await supervisor.tick({ reason: "owner-scan", ...(remote ? { deferUi: true } : {}) });
         } catch {
           return fail(500, "Scan failed.", { state: state() });
         }

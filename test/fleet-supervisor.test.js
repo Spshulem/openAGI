@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetSupervisor, groupQuestions } from "../src/fleet/supervisor.js";
+import { createFleetCapability } from "../src/fleet/remote.js";
+import { createFleetRoute } from "../src/fleet/routes.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -1224,7 +1226,77 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   // Each send counts its time from the owner's request, earlier sends included,
   // so the whole request stays inside the broker's 5 min.
   assert.ok(spent.every(Number.isFinite), String(spent));
-  assert.ok(spent[1] >= spent[0] + 5 && spent[2] >= spent[1] + 5, String(spent));
+  // Ms wall-clock readings: each 5 ms send can read as less, but it grows.
+  assert.ok(spent[1] > spent[0] && spent[2] > spent[1], String(spent));
+});
+
+test("a Scan now through the node broker types into no app: those wait for the next tick, CLI sends still go", async (t) => {
+  let now = NOW;
+  const app = makeThread();
+  const cli = makeThread({ key: "claude:c1", kind: "claude", id: "c1", cwd: "/work/c1", branch: "spencer/other", prRefs: [], agentStatus: "stalled", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN), live: { peerName: "cli-1", pid: 9, status: "idle" } });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [app, cli], now: () => now, deps: { uiDriver: readyDriver() } });
+  const capability = createFleetCapability(supervisor);
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  const scanned = await capability.invoke("request", { method: "POST", path: "/fleet/api/scan" }, { expiresAt });
+  assert.equal(scanned.response.status, 200);
+  assert.deepEqual(delivered.map((d) => d.route), ["peer-relay"], "the CLI send goes; the app send waits");
+  const row = scanned.state.snapshot.threads.find((r) => r.key === app.key);
+  assert.match(row.decision.reason, /deferred: remote scan$/);
+  // The next scheduled tick types it.
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "interval" });
+  assert.deepEqual(delivered.map((d) => d.route), ["peer-relay", "computer-use"]);
+  // A local Scan now (the Mac's own page) types as before.
+  const local = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [app], deps: { uiDriver: readyDriver() } });
+  await createFleetRoute({ supervisor: local.supervisor })("POST", "/fleet/api/scan", null, async () => ({}));
+  assert.deepEqual(local.delivered.map((d) => d.route), ["computer-use"]);
+});
+
+test("a Scan now arriving mid-tick defers app sends only if every scan waiting on it came through the broker", async (t) => {
+  for (const [callers, routes] of [[["remote"], []], [["remote", "local"], ["computer-use"]], [["local", "remote"], ["computer-use"]]]) {
+    let release = null;
+    const gate = new Promise((resolve) => { release = resolve; });
+    let reads = 0;
+    // The running tick sees no thread (it sends nothing); the follow-up does.
+    const listCodexThreads = async () => { reads += 1; if (reads === 1) { await gate; return []; } return [makeThread()]; };
+    const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", deps: { uiDriver: readyDriver(), listCodexThreads } });
+    const first = supervisor.tick({ reason: "interval" });
+    const waiting = callers.map((caller) => supervisor.tick({ reason: "owner-scan", ...(caller === "remote" ? { deferUi: true } : {}) }));
+    release();
+    await first;
+    await Promise.all(waiting);
+    assert.deepEqual(delivered.map((d) => d.route), routes, callers.join(","));
+  }
+});
+
+test("an answer blocked because the Mac could not tell the front app is kept, not handed back", async (t) => {
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const executor = { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "front app unknown", actionId: null }), inFlight: () => [], whenIdle: async () => {} };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], deps: { executor, uiDriver: readyDriver() } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  const result = await supervisor.answerQuestion(q.id, "yes");
+  assert.equal(result.delivery.status, "queued");
+  assert.match(result.delivery.detail, /front app unknown/);
+});
+
+test("a kept answer waits out a Scan now through the node broker when it would be typed", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  assert.equal((await supervisor.answerQuestion(q.id, "yes")).delivery.status, "queued");
+  ready = true;
+  now += 5 * MIN;
+  await createFleetCapability(supervisor).invoke("request", { method: "POST", path: "/fleet/api/scan" });
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0);
+  assert.equal(supervisor.store.queuedAnswers().length, 1);
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 1);
 });
 
 test("the owner's own message to a thread goes through the supervisor's delivery", async (t) => {
@@ -1963,6 +2035,7 @@ test("the owner at the keyboard or a running turn does not count as a failed sen
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "turn running (Stop is visible)" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "waiting for idle: Codex must be in front to type" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "screen saver on" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "front app unknown" });
   assert.equal(store.ledgerFor("codex:a").undelivered, null);
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "could not verify thread: \"x\" is not the open thread" });
   store.recordNudge("codex:a", { playbook: "resume", status: "failed", detail: "Open Computer Use stopped, timed out, or disconnected" });

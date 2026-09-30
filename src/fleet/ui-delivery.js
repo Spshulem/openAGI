@@ -899,6 +899,7 @@ export function createUiDriver({
       if (front === target.bundleId || front === null) return `owner using ${target.name}`;
       if (!ctx.inFront) return `waiting for idle: ${target.name} must be in front to type`;
     }
+    if (front === null) return "front app unknown";
     if (ctx.inFront && front !== target.bundleId) return "frontmost app changed";
     return null;
   }
@@ -947,6 +948,9 @@ export function createUiDriver({
       if (frontBefore === target.bundleId || frontBefore === null) return outcome(ctx, "blocked", `owner using ${target.name}`);
       return outcome(ctx, "blocked", `waiting for idle: ${target.name} must be in front to type`);
     }
+    // Unknown is not safe: a failed probe can hide the screen saver, and the
+    // owner's app could not be put back.
+    if (frontBefore === null) return outcome(ctx, "blocked", "front app unknown");
     ctx.frontBefore = frontBefore;
 
     // 2. Navigate to the thread: the deep link, in the background. A read

@@ -17,7 +17,7 @@ export function createFleetCapability(supervisor) {
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const deadlineAt = Date.parse(expiresAt ?? '');
       const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
-        { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null });
+        { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null, remote: true });
       return { response, state: supervisor.getState() };
     }
   };
