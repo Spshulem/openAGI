@@ -124,6 +124,26 @@ Every completion that originates from a phone sends `completedVia:
 "mobile"`, so the daemon's own task history can always tell a phone tap
 apart from the CLI, the dashboard, or the agent itself.
 
+## Supervisor notifications (Android)
+
+The fleet supervisor's "needs you" questions arrive as Android
+notifications, read from the paired daemon itself — still no push service.
+To try it:
+
+1. Pair the phone with a daemon that runs the supervisor (a main with
+   `OPENAGI_FLEET_NODE` mirrors the coding Mac's questions; see
+   `docs/setup/fleet-supervisor.md`).
+2. Allow notifications when the app asks, right after pairing. Missed it?
+   Settings → **Live supervisor alerts** opens the system page. A quiet
+   "Watching your agents" notification means the live connection is up.
+3. Wait for a question (the Supervisor tab's **Needs you**). It posts within
+   a few seconds of the daemon's next `fleet` event, or 5 minutes at most.
+4. Tap an option in the shade. It reads "Sending your answer…", then clears
+   once the daemon confirms; the tab shows the question gone. Answering it on
+   the Mac instead clears the notification on the phone's next check.
+
+With the switch off, the 15-minute background refresh is the only check.
+
 ## The protocol and the fixtures
 
 `mobile/PROTOCOL.md` is the one written contract both apps implement —

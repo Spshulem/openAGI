@@ -1,9 +1,13 @@
 package sh.openagi.mobile
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.consumeWindowInsets
@@ -18,9 +22,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
 import sh.openagi.mobile.protocol.ConversationUpdated
 import sh.openagi.mobile.protocol.PairingPayload
 import sh.openagi.mobile.protocol.ProtocolJson
+import sh.openagi.mobile.store.AlertPrefs
 import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.sync.fetchInboxBadgeCount
@@ -40,6 +46,8 @@ import sh.openagi.mobile.ui.TodayScreen
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
+import sh.openagi.mobile.sync.SupervisorAlertService
+import sh.openagi.mobile.sync.SupervisorNotifier
 import sh.openagi.mobile.sync.forgetPairing
 import sh.openagi.mobile.ui.components.SwitchDaemonDialog
 import sh.openagi.mobile.ui.components.AppNavigationBar
@@ -84,6 +92,15 @@ class MainActivity : ComponentActivity() {
     private val inboxBadgeState = mutableIntStateOf(0)
     private val streamAttachedState = mutableStateOf(false)
 
+    // A tap on a supervisor notification names the tab to open. Held here for
+    // the same reason as pendingPairingState: with the app already open, the
+    // tap arrives via onNewIntent, outside any composition.
+    private val pendingTabState = mutableStateOf<AppTab?>(null)
+
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         credentialsState.value = Credentials.load(this)
@@ -92,6 +109,10 @@ class MainActivity : ComponentActivity() {
         // hands it back on every later relaunch from the launcher or recents,
         // re-raising the switch prompt for a code the daemon already spent.
         intent?.data = null
+        // Only on a fresh start: a restored Activity keeps its original
+        // intent, and the notification tapped long ago must not override the
+        // tab the person has since moved to.
+        if (savedInstanceState == null) takeAlertTab(intent)
 
         setContent {
             // Folding, unfolding, or rotating the phone is handled in place
@@ -162,6 +183,19 @@ class MainActivity : ComponentActivity() {
                                 chatConversation.thread -> chatConversation.requestRefresh(client)
                                 supervisorConversation.thread -> supervisorConversation.requestRefresh(client)
                             }
+                        }
+                    }
+                    // Once per pairing: the app opened already paired, or a
+                    // pairing just completed.
+                    LaunchedEffect(credentials) { startSupervisorAlerts() }
+                    // Opened from a supervisor notification: show the
+                    // questions themselves, not a chat left open over them.
+                    val pendingTab = pendingTabState.value
+                    LaunchedEffect(pendingTab) {
+                        if (pendingTab != null) {
+                            selectedTab = pendingTab
+                            if (pendingTab == AppTab.SUPERVISOR) supervisorChatOpen.value = false
+                            pendingTabState.value = null
                         }
                     }
                     LaunchedEffect(credentials) {
@@ -272,10 +306,41 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         pendingPairingState.value = intent.data?.let { PairingPayload.from(it) }
         intent.data = null
+        takeAlertTab(intent)
     }
 
     override fun onResume() {
         super.onResume()
         resumeSignalState.intValue += 1
+        // Also how alerts come back after notifications were turned on in
+        // system settings, or the service was stopped from the task manager.
+        SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
+    }
+
+    // Consumed once, like the pair link above: left on the intent, a later
+    // relaunch from recents would jump back to Supervisor.
+    private fun takeAlertTab(intent: Intent?) {
+        if (intent == null) return
+        if (intent.getStringExtra(SupervisorNotifier.EXTRA_TAB) == SupervisorNotifier.TAB_SUPERVISOR ||
+            intent.hasExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+        ) {
+            pendingTabState.value = AppTab.SUPERVISOR
+        }
+        intent.removeExtra(SupervisorNotifier.EXTRA_TAB)
+        intent.removeExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+    }
+
+    // Asks for the notification permission once, ever: someone who said no is
+    // not asked again on every launch, and Settings' switch leads them to the
+    // system page instead.
+    private fun startSupervisorAlerts() {
+        SupervisorNotifier.ensureChannels(this)
+        val needsGrant = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (needsGrant && !AlertPrefs.notificationPermissionAsked(this)) {
+            AlertPrefs.setNotificationPermissionAsked(this)
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        SupervisorAlertService.startIfEnabled(this, paired = true)
     }
 }

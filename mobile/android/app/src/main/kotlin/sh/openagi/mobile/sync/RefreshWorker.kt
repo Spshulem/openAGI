@@ -19,13 +19,18 @@ import java.util.concurrent.TimeUnit
 class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val credentials = Credentials.load(applicationContext) ?: return Result.success()
+        val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
         val coordinator = RefreshCoordinator(
-            DaemonClient(credentials.server, credentials.nodeId, credentials.token),
+            client,
             SnapshotStore(applicationContext.filesDir),
             OutboundQueue(applicationContext.filesDir),
         )
         coordinator.refresh()
         TodayWidget().updateAll(applicationContext)
+        // Supervisor alerts' fallback for when SupervisorAlertService is not
+        // running (switched off, or Android refused to start it). Harmless
+        // alongside it: the check is serialized and only posts what is new.
+        checkSupervisorAlerts(applicationContext, client)
         // An offline phone is the normal case off the tailnet, not a failure
         // worth exponential backoff on a 15-minute schedule, so every outcome
         // is success.

@@ -134,6 +134,20 @@ coding thread and says which ones need you. This tab is its phone view.
 - A daemon without a supervisor (a 404 or 503 on these routes) shows
   "Supervisor isn't running on this daemon." instead of an error.
 
+**Supervisor notifications (Android).** Each open question is also a system
+notification: its title, its body, and one button per option (up to three).
+A button answers from the shade: the notification reads "Sending your
+answer…" and goes away once the daemon confirms, or says the answer could not
+be sent. Tapping any of them opens this tab. A question closed anywhere else
+clears its notification on the next check; swiping one away only hides it.
+The phone reads its own paired daemon's `GET /fleet/api/state`, never a push
+service. While **Live supervisor alerts** is on (Settings; on by default), a
+foreground service holds `GET /events` open, checks a few seconds after a
+`fleet` or `outreach` event and every 5 minutes, and shows a quiet "Watching
+your agents" notification. Off, or when Android will not start it, the
+15-minute background refresh checks instead. The notification permission is
+asked for once, after pairing.
+
 Health is a field on every thread. When a daemon does not send it, the phone
 derives the same thing from `state`:
 
@@ -171,6 +185,8 @@ Routes: `GET /lifelog/moments` (`date`, `query`, `limit`).
 
 - The connection: host, node id, when it last synced. Host and id in mono.
 - Refresh now.
+- Live supervisor alerts (Android): on or off, see Supervisor. Turning it on
+  while notifications are blocked opens the system page for them.
 - Revoke this phone — clears the credential, the snapshot and the outbox, and
   tells the daemon. Confirmation required.
 - Build version, so a bug report can name one.

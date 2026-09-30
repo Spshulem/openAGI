@@ -3,6 +3,7 @@ package sh.openagi.mobile.sync
 import android.content.Context
 import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
+import sh.openagi.mobile.store.NotifiedQuestionsStore
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.transport.DaemonClient
@@ -20,8 +21,17 @@ suspend fun forgetPairing(context: Context, credentials: Credentials) {
     } catch (error: Exception) {
         // Ignored: the local forget below still proceeds.
     }
-    Credentials.clear(context)
-    RefreshWorker.cancel(context)
+    // Under the alert lock: a check that fetched the old daemon's questions
+    // must not post them after this clears the shade.
+    withAlertLock {
+        Credentials.clear(context)
+        RefreshWorker.cancel(context)
+        // Stop watching first; the service would otherwise go on posting the old
+        // daemon's questions, which the forgotten credential can no longer answer.
+        SupervisorAlertService.stop(context)
+        // Also cancels answers still queued, and empties the notified-ids store.
+        SupervisorNotifier.cancelAll(context, NotifiedQuestionsStore(context.filesDir))
+    }
     // Through the stores rather than deleting files directly, so each delete
     // holds the lock every writer for that file holds.
     SnapshotStore(context.filesDir).delete()
