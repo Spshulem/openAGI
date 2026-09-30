@@ -43,7 +43,9 @@ export class OcuTransport {
     this.closeGraceMs = closeGraceMs;
     this.nextId = 0;
     this.pending = new Map();
-    this.buffer = "";
+    // Input calls that timed out or were cut off through the app agent, by
+    // id: their engine stays up until each answers late or the engine exits.
+    this.late = new Map();
   }
   async connect(signal) {
     if (this.proc) return;
@@ -57,19 +59,26 @@ export class OcuTransport {
     this.proc = child;
     child.stderr.resume();
     child.stdout.setEncoding("utf8");
+    let buffer = "";
     child.stdout.on("data", chunk => {
-      if (this.proc !== child) return;
-      this.buffer += chunk;
-      if (Buffer.byteLength(this.buffer) > 16 * 1024 * 1024) return this.close();
+      const current = this.proc === child;
+      // A closed engine is still read while input it ran may answer late.
+      if (!current && !this.lateFor(child)) return;
+      const broken = () => (current ? this.close() : this.drop(child));
+      buffer += chunk;
+      if (Buffer.byteLength(buffer) > 16 * 1024 * 1024) return broken();
       let end;
-      while ((end = this.buffer.indexOf("\n")) >= 0) {
-        const line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + 1);
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
         if (!line.trim()) continue;
         let value;
-        try { value = JSON.parse(line); } catch { this.close(); return; }
+        try { value = JSON.parse(line); } catch { broken(); return; }
         if (!value || typeof value !== "object" || Array.isArray(value) || value.jsonrpc !== "2.0") {
-          this.close(); return;
+          broken(); return;
         }
+        // Any answer, result or error, means the agent finished that input.
+        if (this.late.get(value.id)?.child === child) { this.settleLate(value.id, true); continue; }
+        if (!current) continue;
         const pending = this.pending.get(value.id);
         if (!pending) continue;
         if (value.error || !Object.hasOwn(value, "result")) pending.reject(new Error("Open Computer Use rejected the request."));
@@ -77,7 +86,11 @@ export class OcuTransport {
       }
     });
     child.on("error", () => { if (this.proc === child) this.close(); });
-    child.on("exit", () => { if (this.proc === child) this.close(); });
+    child.on("exit", () => {
+      // Input it ran may still be running in the agent: not finished.
+      for (const [id, late] of [...this.late]) if (late.child === child) this.settleLate(id, false);
+      if (this.proc === child) this.close();
+    });
     child.stdin.on("error", () => { if (this.proc === child) this.close(); });
     const result = await this.request("initialize", { protocolVersion: "2024-11-05", capabilities: {},
       clientInfo: { name: "openagi-computer-node", version: "1" } }, signal);
@@ -97,11 +110,12 @@ export class OcuTransport {
       // Nothing cancels an app-agent call: ending or killing the proxy leaves
       // the agent's input running. A slow read only fails, and its late
       // answer is dropped (its id is gone); slow input is marked inFlight, as
-      // it may still land. An owned engine is killed, which cancels its input.
-      const entry = { input: this.appAgentProxy && method === "tools/call" && !READ_TOOLS.has(params?.name), sent: false,
+      // it may still land, with a settled promise for when it provably ended.
+      // An owned engine is killed, which cancels its input.
+      const entry = { id, child: this.proc, input: this.appAgentProxy && method === "tools/call" && !READ_TOOLS.has(params?.name), sent: false,
         resolve: value => finish(null, value), reject: error => finish(error) };
       const expire = () => this.appAgentProxy
-        ? entry.reject(inFlight(new Error(`Open Computer Use timed out after ${Math.round(timeoutMs / 1000)}s on ${params?.name ?? method}`), entry))
+        ? entry.reject(this.inFlight(new Error(`Open Computer Use timed out after ${Math.round(timeoutMs / 1000)}s on ${params?.name ?? method}`), entry))
         : this.close();
       const timer = setTimeout(expire, timeoutMs);
       this.pending.set(id, entry);
@@ -120,17 +134,41 @@ export class OcuTransport {
     return result;
   }
   close() {
-    const child = this.proc; this.proc = null; this.buffer = "";
-    if (child && this.appAgentProxy && this.closeGraceMs > 0) {
+    const child = this.proc; this.proc = null;
+    for (const pending of [...this.pending.values()]) pending.reject(this.inFlight(new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed."), pending));
+    if (child) this.release(child);
+  }
+  // An engine with input in flight is neither ended nor killed, so the late
+  // answer can arrive: released once the last one settles.
+  release(child) {
+    if (this.lateFor(child)) return;
+    if (this.appAgentProxy && this.closeGraceMs > 0) {
       // End of input lets the engine finish its request and exit on its own.
       try { child.stdin.end(); } catch { /* already closed */ }
       setTimeout(() => child.kill("SIGKILL"), this.closeGraceMs).unref?.();
-    } else child?.kill("SIGKILL");
-    for (const pending of [...this.pending.values()]) pending.reject(inFlight(new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed."), pending));
+    } else child.kill("SIGKILL");
   }
-}
-
-function inFlight(error, entry) {
-  if (entry.input && entry.sent) error.inFlight = true;
-  return error;
+  // A closed engine that stops speaking JSON-RPC proves nothing finished.
+  drop(child) {
+    for (const [id, late] of [...this.late]) if (late.child === child) this.settleLate(id, false);
+  }
+  lateFor(child) {
+    for (const late of this.late.values()) if (late.child === child) return true;
+    return false;
+  }
+  settleLate(id, completed) {
+    const late = this.late.get(id);
+    if (!late) return;
+    this.late.delete(id);
+    late.settle({ completed });
+    if (late.child && late.child !== this.proc) this.release(late.child);
+  }
+  inFlight(error, entry) {
+    if (!entry.input || !entry.sent) return error;
+    error.inFlight = true;
+    // Resolves { completed: true } on the late answer, { completed: false }
+    // when the engine exits (or breaks) first: the input may still run.
+    error.settled = new Promise(resolve => { this.late.set(entry.id, { child: entry.child, settle: resolve }); });
+    return error;
+  }
 }

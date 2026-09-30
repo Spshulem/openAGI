@@ -14,7 +14,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { OCU_CLOSE_GRACE_MS, OcuTransport, readOcuPermissions } from "../integrations/ocu-transport.js";
+import { OcuTransport, readOcuPermissions } from "../integrations/ocu-transport.js";
 import { parseOcuPermissions } from "../integrations/open-computer-use-executor.js";
 import { DEFAULTS, SUPERVISOR_PREFIX, UI_APPS, clampText, redactSecrets, runCommand, uiTargetFor } from "./contracts.js";
 
@@ -49,6 +49,9 @@ const EVIDENCE_KEPT = 200;
 const SNIPPET_MAX = 64 * 1024;
 const DETAIL_MAX = 200;
 const TYPING_MS_PER_CHAR = 25;
+// A remote caller's deadline is the main's clock and its answer needs the
+// trip back: the driver ends this long before it.
+const DEADLINE_MARGIN_MS = 5000;
 const ALLOWED_BUNDLES = new Set(Object.values(UI_APPS).map((app) => app.bundleId));
 
 // ---------------------------------------------------------------------------
@@ -548,6 +551,36 @@ export function createUiLock() {
 
 export const UI_LOCK = createUiLock();
 
+// Nothing cancels an input call that timed out in the app agent, and no
+// estimate says when it ends: no delivery (a remote send included) types
+// until its late answer shows it finished. If its engine exits first the
+// agent may still be running it: typing stays paused until the daemon
+// restarts. settled: the transport's inFlight promise ({ completed }).
+export function createInputLatch() {
+  const open = new Set();
+  let orphaned = false;
+  return {
+    get held() { return orphaned || open.size > 0; },
+    get detail() {
+      if (orphaned) return "an earlier input call has not finished and its engine exited; typing paused until OpenAGI restarts";
+      return open.size ? "an earlier input call has not finished; typing paused" : null;
+    },
+    hold(settled) {
+      const token = {};
+      open.add(token);
+      Promise.resolve(settled).then((result) => {
+        open.delete(token);
+        if (result?.completed !== true) orphaned = true;
+      }, () => {
+        open.delete(token);
+        orphaned = true;
+      });
+    }
+  };
+}
+
+export const UI_INPUT_LATCH = createInputLatch();
+
 // ---------------------------------------------------------------------------
 // Evidence
 
@@ -612,6 +645,7 @@ export function createUiDriver({
   computerUseEnabled = () => isComputerUseEnabled(),
   binaryReady = defaultBinaryReady,
   evidenceDir = null,
+  inputLatch = UI_INPUT_LATCH,
   now = Date.now,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 } = {}) {
@@ -627,9 +661,6 @@ export function createUiDriver({
   // When this driver's last key or typing input landed, across deliveries:
   // the next delivery in the same tick must not read it as the owner.
   let lastOwnInput = null;
-  // Nothing cancels an input call that timed out in the shared app agent: no
-  // delivery (a remote send included) types until it has had time to finish.
-  let inputSettlesAt = 0;
 
   const permissions = async () => {
     const at = now();
@@ -655,6 +686,7 @@ export function createUiDriver({
       let active = [];
       try { active = activeSessions() ?? []; } catch { active = []; }
       if (active.length) return notReady("an OpenAGI computer-use session is active");
+      if (inputLatch.held) return notReady(inputLatch.detail);
       const session = await presence.session();
       if (!session) return notReady("screen state unknown");
       if (session.locked) return notReady("screen locked");
@@ -680,10 +712,15 @@ export function createUiDriver({
     // never run past it, so a remote send ends inside the broker's 5 min.
     // spentMs: what the request already spent before this delivery (its
     // probes, earlier sends); both caps count from the request's start.
+    // deadlineAt: when a remote caller stops waiting (the broker's expiry,
+    // queue time before this Mac picked it up included): everything,
+    // cleanup too, ends DEADLINE_MARGIN_MS before it.
     const start = now() - Math.max(0, Number(request.spentMs) || 0);
-    const timer = setTimeout(() => controller.abort(), Math.max(0, start + limits.uiDeliveryTimeoutMs - now()));
-    const endsAt = start + limits.uiDeliveryTimeoutMs;
-    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt, deadline: endsAt, hardEndsAt: endsAt + limits.uiCleanupMs,
+    const callerEndsAt = Number.isFinite(request.deadlineAt) ? request.deadlineAt - DEADLINE_MARGIN_MS : Infinity;
+    const hardEndsAt = Math.min(start + limits.uiDeliveryTimeoutMs + limits.uiCleanupMs, callerEndsAt);
+    const endsAt = Math.min(start + limits.uiDeliveryTimeoutMs, hardEndsAt - limits.uiCleanupMs);
+    const timer = setTimeout(() => controller.abort(), Math.max(0, endsAt - now()));
+    const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt, deadline: endsAt, hardEndsAt,
       slowest: 0, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
     try {
       return await steps(request, controller.signal, ctx);
@@ -691,8 +728,6 @@ export function createUiDriver({
       return await recover(error, ctx, controller.signal.aborted || now() >= ctx.endsAt);
     } finally {
       clearTimeout(timer);
-      // The engine gets its close grace, the agent another action's worth.
-      if (ctx.inputInFlight) inputSettlesAt = now() + OCU_CLOSE_GRACE_MS + limits.uiReadTimeoutMs + ctx.typingMs;
       await restoreFront(ctx);
       try { ctx.transport?.close(); } catch { /* already closed */ }
     }
@@ -760,7 +795,10 @@ export function createUiDriver({
     try {
       result = await ctx.transport.call(name, args, signal, { timeoutMs: within(ctx, timeoutMs) });
     } catch (error) {
-      if (error?.inFlight) ctx.inputInFlight = true;
+      if (error?.inFlight) {
+        ctx.inputInFlight = true;
+        inputLatch.hold(error.settled);
+      }
       throw error;
     } finally {
       if (name !== "type_text") ctx.slowest = Math.max(ctx.slowest, now() - start);
@@ -885,8 +923,8 @@ export function createUiDriver({
     // Only the apps in UI_APPS are ever driven.
     if (!ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", `${target.bundleId} is not an app the fleet types into`);
     if (!text) return outcome(ctx, "blocked", "empty message");
-    // Worded to stop the tick's other app sends too (supervisor UI_STALLED).
-    if (now() < inputSettlesAt) return outcome(ctx, "blocked", "Open Computer Use timed out on input earlier; waiting for it to finish; nothing typed");
+    // Not ready, like readiness says: the paused-nudge alert tells the owner.
+    if (inputLatch.held) return outcome(ctx, "blocked", `computer use not ready: ${inputLatch.detail}; nothing typed`);
     if (now() >= ctx.endsAt) return outcome(ctx, "blocked", "no time left in this request for another app send; nothing typed, retry");
 
     // 0. Readiness, fresh.

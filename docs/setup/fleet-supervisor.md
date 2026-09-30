@@ -217,14 +217,18 @@ Safety rules:
 - One app delivery at a time; a second one is **blocked** as busy at once
   and retried. 45 s per app read, 10 s per other UI step, 205 s per delivery,
   typing included; clearing a failed one and putting your app back get 90 s
-  more, never past it. From the phone or the main, the time counts from the
-  request's start, so the whole request ends inside the 5 min limit. After the deep link, every app gets at least two reads
+  more, never past it. From the phone or the main, the time counts from when
+  the main sent the request (time queued before the Mac picked it up
+  included), so the whole request ends inside the 5 min limit. After the deep link, every app gets at least two reads
   (Codex up to 60 s) to show the thread. Typing starts only with time left to
   type, send, and confirm; otherwise it is **blocked** with nothing typed. An
   input call (typing, a key, a click) that times out may still land: the
   result is **failed** and *unconfirmed*, and nothing more is typed, cleared,
   or brought forward. The tick's other app sends wait, and no app send (a
-  remote one included) types until that input has had time to finish.
+  remote one included) types until Open Computer Use answers that call late,
+  however long it takes: computer use shows as not ready ("an earlier input
+  call has not finished; typing paused") and the paused-nudge alert tells you.
+  If its engine exits first, typing stays paused until OpenAGI restarts.
 - A Codex thread the app labels by its first message is verified by that
   label only after the link moved the app onto it; already open, it is
   **blocked** (another thread can show the same first message).

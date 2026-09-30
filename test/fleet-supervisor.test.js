@@ -1195,12 +1195,14 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   let most = 0;
   const routes = [];
   const spent = [];
+  const deadlines = [];
   const executor = {
     deliver: async (args) => {
       running += 1;
       most = Math.max(most, running);
       routes.push(args.route);
       spent.push(args.spentMs);
+      deadlines.push(args.deadlineAt);
       await new Promise((resolve) => setTimeout(resolve, 5));
       running -= 1;
       return { status: "sent", route: args.route, detail: "typed into Codex", actionId: null };
@@ -1212,10 +1214,12 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   await supervisor.tick({ reason: "test" });
   const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
   assert.ok(group);
-  const result = await supervisor.answerQuestion(group.id, "added");
+  const deadlineAt = Date.now() + 100_000;
+  const result = await supervisor.answerQuestion(group.id, "added", { deadlineAt });
   assert.equal(result.delivery.status, "sent");
   assert.equal(result.question.status, "answered");
   assert.deepEqual(routes, ["computer-use", "computer-use", "computer-use"]);
+  assert.deepEqual(deadlines, [deadlineAt, deadlineAt, deadlineAt], "a remote caller's deadline reaches every send");
   assert.equal(most, 1);
   // Each send counts its time from the owner's request, earlier sends included,
   // so the whole request stays inside the broker's 5 min.
@@ -1232,6 +1236,9 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered[0].message, "Rebase on main.");
   assert.equal(delivered[0].playbook, "owner-message");
   assert.ok(delivered[0].spentMs >= 0, "its probes count toward the request's time");
+  assert.equal(delivered[0].deadlineAt, null);
+  await supervisor.sendOwnerMessage("codex:t1", "Rebase again.", { deadlineAt: 1234 });
+  assert.equal(delivered[1].deadlineAt, 1234, "a remote caller's deadline reaches the send");
   assert.equal((await supervisor.sendOwnerMessage("codex:missing", "hi")).delivery.status, "blocked");
   assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
 });

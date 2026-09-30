@@ -691,7 +691,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (capability?.ready !== true || !capability.operations?.includes?.(command.operation)) {
           throw new Error(capability?.detail || "node capability operation is not ready");
         }
-        return await provider.invoke(command.operation, command.payload ?? {});
+        // When the main stops waiting, queue time included (the fleet's
+        // app sends end inside it).
+        return await provider.invoke(command.operation, command.payload ?? {}, { expiresAt: command.expiresAt });
       },
       fetchImpl: options.nodeControlFetch ?? globalThis.fetch,
       pollMs: options.nodeControlPollMs,

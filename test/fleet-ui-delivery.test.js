@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
-  createPresenceProbe, createUiDriver, createUiLock, findComposer, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
+  createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
   conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity
 } from "../src/fleet/ui-delivery.js";
 
@@ -63,17 +63,22 @@ function fakeApp(overrides = {}) {
 
 // latency: (name, args) => ms a call takes; a call slower than its timeout
 // fails like OCU's through the app agent (input marked inFlight: it may
-// still land), else the clock moves on by that much.
+// still land, until its late answer, late[i]({ completed: true })), else the
+// clock moves on by that much.
 function fakeTransport(app, { failOn = null, latency = null, advance = null } = {}) {
   const transport = {
     calls: [],
     closed: 0,
+    late: [],
     async call(name, args, _signal, options = {}) {
       transport.calls.push({ name, args: { ...args }, options });
       if (failOn && failOn(name, args, transport.calls.length)) throw new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.");
       const cost = latency?.(name, args) ?? 0;
       const limit = options.timeoutMs ?? transport.options?.timeoutMs ?? Infinity;
-      if (cost > limit) throw Object.assign(new Error(`Open Computer Use timed out after ${Math.round(limit / 1000)}s on ${name}`), name === "get_app_state" ? {} : { inFlight: true });
+      if (cost > limit) {
+        throw Object.assign(new Error(`Open Computer Use timed out after ${Math.round(limit / 1000)}s on ${name}`),
+          name === "get_app_state" ? {} : { inFlight: true, settled: new Promise((resolve) => transport.late.push(resolve)) });
+      }
       advance?.(cost);
       if (name === "get_app_state") return app.render();
       if (name === "click") {
@@ -153,6 +158,7 @@ function setup(t, { app = fakeApp(), probe = fakeProbe(), transportOptions = {},
     computerUseEnabled: () => true,
     activeSessions: () => [],
     evidenceDir: evidence ? path.join(dir, "evidence") : null,
+    inputLatch: createInputLatch(),
     now: () => clock,
     sleep: async (ms) => { clock += ms; },
     ...driverOptions
@@ -1352,21 +1358,50 @@ test("the fleet's keys and typing land before a slow closing snapshot: still not
   assert.equal(next.status, "sent", next.detail);
 });
 
-test("after an input call times out, no delivery types until it has had time to finish", async (t) => {
+test("after an input call times out, nothing types until its late answer shows it finished, however long that takes", async (t) => {
   let slow = true;
   const f = setup(t, { transportOptions: { latency: (name) => (slow && name === "type_text" ? 10 * 60_000 : 0) } });
+  assert.deepEqual(await f.driver.readiness(), { ready: true, detail: null });
   const first = await f.driver.deliver(f.request());
   assert.equal(first.detail, "Open Computer Use timed out on input; unconfirmed: check the thread before retrying");
   slow = false;
   f.app.composer = "";
   const count = f.calls().length;
+  // Surfaced as not ready (the supervisor's paused-nudge alert), not a benign wait.
+  assert.deepEqual(await f.driver.readiness(), { ready: false, detail: "an earlier input call has not finished; typing paused" });
+  // Long past any estimate (close grace, a read, the typing time).
+  f.advance(60 * 60_000);
   const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
   assert.equal(next.status, "blocked");
-  assert.equal(next.detail, "Open Computer Use timed out on input earlier; waiting for it to finish; nothing typed");
+  assert.equal(next.detail, "computer use not ready: an earlier input call has not finished; typing paused; nothing typed");
   assert.equal(f.calls().length, count, "nothing read or typed");
-  f.advance(10 * 60_000);
+  assert.equal(f.probe.activated.length, 1, "no other app brought forward");
+  // The late answer arrives on the still-open engine: typing resumes.
+  f.transports[0].late[0]({ completed: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await f.driver.readiness(), { ready: true, detail: null });
   const later = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
   assert.equal(later.status, "sent", later.detail);
+});
+
+test("the input latch is process-wide, and an engine that exits before the late answer keeps it until restart", async (t) => {
+  const latch = createInputLatch();
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 10 * 60_000 : 0) }, driverOptions: { inputLatch: latch } });
+  const g = setup(t, { driverOptions: { inputLatch: latch } });
+  await f.driver.deliver(f.request());
+  // Another driver (another thread's delivery) sharing the latch types nothing.
+  const other = await g.driver.deliver(g.request());
+  assert.equal(other.status, "blocked");
+  assert.match(other.detail, /^computer use not ready: an earlier input call has not finished; typing paused/);
+  assert.deepEqual(g.calls(), []);
+  f.transports[0].late[0]({ completed: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(await g.driver.readiness(), { ready: false, detail: "an earlier input call has not finished and its engine exited; typing paused until OpenAGI restarts" });
+  // A timed-out input call with no way to see it end holds it as well.
+  const bare = createInputLatch();
+  bare.hold(undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bare.held, true);
 });
 
 test("a request that already spent its time before the send types nothing", async (t) => {
@@ -1384,6 +1419,26 @@ test("a request that already spent its time before the send types nothing", asyn
   assert.equal(late.status, "failed");
   assert.equal(late.detail, "delivery timed out; nothing typed");
   assert.deepEqual(g.calls(), []);
+});
+
+test("a remote request queued 200 s before this Mac picked it up ends inside the broker's deadline, typing nothing it cannot finish", async (t) => {
+  // Codex-like: every call takes 20 s. The broker gives the command 300 s
+  // from dispatch; it waited 200 s in the queue, so 100 s are left.
+  const clock = {};
+  const f = setup(t, { transportOptions: { latency: () => 20_000, advance: (ms) => clock.advance(ms) } });
+  clock.advance = f.advance;
+  const deadlineAt = f.now() + 100_000;
+  const result = await f.driver.deliver(f.request({ deadlineAt }));
+  assert.notEqual(result.status, "sent");
+  assert.match(result.detail, /nothing typed/);
+  assert.deepEqual(typed(f.calls()), [], "nothing typed");
+  assert.ok(f.now() <= deadlineAt, `ended ${f.now() - deadlineAt} ms after the caller gave up`);
+  // With the whole window left, the same send goes through.
+  const g = setup(t, { transportOptions: { latency: () => 20_000, advance: (ms) => g.advance(ms) } });
+  const fresh = g.now() + 300_000;
+  const sent = await g.driver.deliver(g.request({ deadlineAt: fresh }));
+  assert.equal(sent.status, "sent", sent.detail);
+  assert.ok(g.now() <= fresh);
 });
 
 test("after the link, a first read that matches is read again: the latest decides what is used", async (t) => {

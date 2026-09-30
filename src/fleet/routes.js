@@ -28,7 +28,7 @@ async function readObject(readBody) {
 export function createFleetRoute({ supervisor } = {}) {
   const state = () => supervisor.getState();
 
-  async function handleQuestion(id, readBody) {
+  async function handleQuestion(id, readBody, sendOptions) {
     const body = await readObject(readBody);
     if (!body) return fail(400, "Send a JSON object: { answer }, { dismiss: true } or { reopen: true }.");
     // Brings back a question the supervisor's review closed.
@@ -50,19 +50,22 @@ export function createFleetRoute({ supervisor } = {}) {
     if (!open) return fail(404, "No open question with that id.");
     const options = Array.isArray(open.options) ? open.options : [];
     if (answer !== "dismiss" && !options.includes(answer)) return fail(400, "Pick one of the question's options.");
-    const result = await supervisor.answerQuestion(id, answer);
+    const result = await supervisor.answerQuestion(id, answer, sendOptions);
     if (!result) return fail(409, "Question already closed.");
     return ok({ question: result.question ?? null, delivery: result.delivery ?? null, state: state() });
   }
 
-  async function handleSend(id) {
-    const result = await supervisor.sendProposed(id);
+  async function handleSend(id, sendOptions) {
+    const result = await supervisor.sendProposed(id, sendOptions);
     if (result) return ok({ action: result.action ?? null, delivery: result.delivery ?? null, state: state() });
     const known = (state().actions ?? []).some((a) => a?.id === id);
     return known ? fail(409, "Only a proposed action can be sent.") : fail(404, "No action with that id.");
   }
 
-  return async function fleetRoute(method, pathname, url, readBody) {
+  // deadlineAt: when a remote caller stops waiting (ms, this clock); app
+  // sends end before it.
+  return async function fleetRoute(method, pathname, url, readBody, { deadlineAt = null } = {}) {
+    const sendOptions = { deadlineAt };
     if (!pathname.startsWith(PREFIX)) return null;
     if (!supervisor) return fail(503, "Fleet supervisor is not available.");
     const parts = pathname.slice(PREFIX.length).split("/");
@@ -94,7 +97,7 @@ export function createFleetRoute({ supervisor } = {}) {
       if (parts.length === 2 && parts[0] === "questions") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad question id.");
-        return await handleQuestion(parts[1], readBody);
+        return await handleQuestion(parts[1], readBody, sendOptions);
       }
       if (parts.length === 1 && parts[0] === "send") {
         if (method !== "POST") return fail(405, "Use POST.");
@@ -104,13 +107,13 @@ export function createFleetRoute({ supervisor } = {}) {
         if (!/^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
-        const result = await supervisor.sendOwnerMessage(threadKey, message);
+        const result = await supervisor.sendOwnerMessage(threadKey, message, sendOptions);
         return ok({ delivery: result?.delivery ?? null, state: state() });
       }
       if (parts.length === 3 && parts[0] === "actions" && parts[2] === "send") {
         if (method !== "POST") return fail(405, "Use POST.");
         if (!ID_PATTERN.test(parts[1])) return fail(400, "Bad action id.");
-        return await handleSend(parts[1]);
+        return await handleSend(parts[1], sendOptions);
       }
     } catch {
       // Supervisor internals can carry paths or transcript text; keep them out.

@@ -8,11 +8,16 @@ export function createFleetCapability(supervisor) {
     async health() {
       return { capability: { id: 'fleet-supervisor', ready: true, operations: ['request'], detail: 'Fleet on this computer' } };
     },
-    async invoke(operation, payload) {
+    // expiresAt: the broker's deadline for this command (from its dispatch,
+    // so time queued before this Mac picked it up counts): app sends end
+    // inside it.
+    async invoke(operation, payload, { expiresAt = null } = {}) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
           || !/^\/fleet\/api\/(state|scan|mode|send|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
-      const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {});
+      const deadlineAt = Date.parse(expiresAt ?? '');
+      const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
+        { deadlineAt: Number.isFinite(deadlineAt) ? deadlineAt : null });
       return { response, state: supervisor.getState() };
     }
   };
@@ -23,9 +28,10 @@ const REQUEST_TIMEOUT_MS = 120000;
 // one runs 1-3 min): uiDeliveryTimeoutMs, then uiCleanupMs for clearing on
 // failure and putting the owner's app back, which the driver never runs
 // past. Both count from the request's start (probes, lock wait and earlier
-// sends in it included). The broker's own ceiling (dispatch in
-// src/node-control.js), so the main does not report a failure for an answer
-// the Mac then sends.
+// sends in it included), and end inside the command's expiresAt (time queued
+// before the Mac picked it up included). The broker's own ceiling (dispatch
+// in src/node-control.js), so the main does not report a failure for an
+// answer the Mac then sends.
 const DELIVERY_TIMEOUT_MS = 5 * 60 * 1000;
 const DELIVERING = /^\/fleet\/api\/(send|questions\/[^/]+|actions\/[^/]+\/send)$/;
 

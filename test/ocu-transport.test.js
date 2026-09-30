@@ -138,7 +138,7 @@ function agentFixture({ closeGraceMs } = {}) {
   const answer = (id) => child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result: { isError: false, content: [] } }) + "\n");
   const client = new OcuTransport("/native/OpenComputerUse", { timeoutMs: 1000, appAgentProxy: true, agentNamespace: "openagi-fleet",
     ...(closeGraceMs === undefined ? {} : { closeGraceMs }), spawnImpl: (...args) => { spawnArgs = args; return child; } });
-  return { client, requests, answer, get kills() { return kills; }, get stdinEnded() { return stdinEnded; }, get spawnArgs() { return spawnArgs; } };
+  return { client, child, requests, answer, get kills() { return kills; }, get stdinEnded() { return stdinEnded; }, get spawnArgs() { return spawnArgs; } };
 }
 
 test("a per-call timeout fails only that call and keeps the app-agent engine running", async t => {
@@ -205,4 +205,38 @@ test("through the app agent, input that times out or is cut off is marked in fli
   // An owned engine is killed, which cancels its input.
   const owned = fixture({ hang: true });
   await assert.rejects(() => owned.client.call("type_text", {}), error => /unconfirmed/.test(error.message) && !error.inFlight);
+});
+
+test("a closed engine with input in flight stays up until that input answers late, then ends as usual", async () => {
+  const f = agentFixture({ closeGraceMs: 20 });
+  const typing = f.client.call("type_text", { app: "com.openai.codex", text: "hi" }, undefined, { timeoutMs: 20 });
+  let error;
+  await typing.catch((caught) => { error = caught; });
+  assert.equal(error.inFlight, true);
+  let outcome = null;
+  error.settled.then((value) => { outcome = value; });
+  f.client.close();
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(f.stdinEnded, false, "input stays open so the late answer can come");
+  assert.equal(f.kills, 0, "never killed while the input may still run");
+  assert.equal(outcome, null);
+  f.answer(f.requests.find(r => r.params?.name === "type_text").id);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(outcome, { completed: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.stdinEnded, true);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(f.kills, 1);
+});
+
+test("input cut off by close, whose engine then exits, is not proven finished", async () => {
+  const f = agentFixture({ closeGraceMs: 20 });
+  await f.client.connect();
+  const clicking = f.client.call("click", { app: "com.openai.codex", element_index: "3" });
+  await new Promise(resolve => setImmediate(resolve));
+  f.client.close();
+  const error = await clicking.catch((caught) => caught);
+  assert.equal(error.inFlight, true);
+  f.child.emit("exit", 0);
+  assert.deepEqual(await error.settled, { completed: false });
 });

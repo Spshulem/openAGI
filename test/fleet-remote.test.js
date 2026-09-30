@@ -169,6 +169,28 @@ test("the Mac capability forwards the owner's send and validates it", async () =
   assert.equal(empty.response.status, 400);
 });
 
+test("a send queued 200 s before this Mac picked it up keeps the broker's deadline, not a fresh 5 min", async () => {
+  const seen = [];
+  const supervisor = {
+    getState: () => ({ mode: "propose", questions: [{ id: "fq_one", options: ["feature"] }], actions: [{ id: "fa_one" }], snapshot: null, settings: {} }),
+    sendOwnerMessage: async (_key, _message, options) => { seen.push(["send", options]); return { delivery: { status: "sent" } }; },
+    answerQuestion: async (_id, _answer, options) => { seen.push(["answer", options]); return { question: null, delivery: { status: "sent" } }; },
+    sendProposed: async (_id, options) => { seen.push(["action", options]); return { action: null, delivery: { status: "sent" } }; }
+  };
+  const capability = createFleetCapability(supervisor);
+  // node-control's dispatch: expiresAt is 300 s from createdAt, 200 s of it spent queued.
+  const createdAt = Date.now() - 200_000;
+  const expiresAt = new Date(createdAt + 5 * 60 * 1000).toISOString();
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: "Push it." } }, { expiresAt });
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/questions/fq_one", body: { answer: "feature" } }, { expiresAt });
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/actions/fa_one/send" }, { expiresAt });
+  assert.deepEqual(seen, [["send", { deadlineAt: Date.parse(expiresAt) }], ["answer", { deadlineAt: Date.parse(expiresAt) }], ["action", { deadlineAt: Date.parse(expiresAt) }]]);
+  assert.ok(Date.parse(expiresAt) - Date.now() <= 100_000, "about 100 s left, not a fresh 5 min");
+  // A local call (no broker) has no deadline.
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: "Push it." } });
+  assert.deepEqual(seen.at(-1), ["send", { deadlineAt: null }]);
+});
+
 test('a question reopened on the computer brings back its mirrored copy, so G2 does not ping again', async t => {
   const { remote, runtime, state, dir } = fixture(t);
   await remote.refresh();

@@ -452,6 +452,11 @@ test("computer-use types through the UI driver: one line, no CLI, final result, 
   // A caller's request time carries through to the driver.
   await executor.deliver({ thread: conductorUiThread(cwd), message: "Second note.", route: "computer-use", playbook: "owner-answer", spentMs: 60_000 });
   assert.ok(requests[1].spentMs >= 60_000);
+  assert.equal(requests[1].deadlineAt, null, "a local caller has no broker deadline");
+  // A remote caller's broker deadline (its queue time included) reaches the driver.
+  const deadlineAt = Date.now() + 100_000;
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "Third note.", route: "computer-use", playbook: "owner-message", deadlineAt });
+  assert.equal(requests[2].deadlineAt, deadlineAt);
   assert.equal(requests[0].target.deepLink, "conductor://workspace?id=w-madrid&session=s1");
   assert.deepEqual(requests[0].identity.tokens, ["madrid"]);
   assert.equal(requests[0].previousUnconfirmed, false);

@@ -330,7 +330,8 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // Synchronous: the result is final when this returns, so there is no done
   // promise and nothing for reopenIfUndelivered to wait on.
   // spentMs: what the caller's request already spent; the lock wait adds to it.
-  const typeInApp = async (thread, step, base, actionId, text, spentMs) => {
+  // deadlineAt: when a remote caller stops waiting (null: no such caller).
+  const typeInApp = async (thread, step, base, actionId, text, spentMs, deadlineAt) => {
     const target = step.target;
     const entered = Date.now();
     const evidenceName = actionId ?? `${thread.kind}-${String(thread.id).slice(0, 8)}-${Date.now()}`;
@@ -342,7 +343,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       const guard = unconfirmed.get(target.targetKey);
       const previousUnconfirmed = guard?.hash === base.messageHash ? { priorCount: guard.priorCount } : false;
       try {
-        return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName, spentMs: spentMs + (Date.now() - entered) });
+        return await ui.deliver({ thread, text, target, identity, previousUnconfirmed, evidenceName, spentMs: spentMs + (Date.now() - entered), deadlineAt });
       } catch (error) {
         return { status: "failed", detail: `computer use failed: ${detailText(error?.message ?? error)}; nothing confirmed` };
       }
@@ -405,7 +406,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     return sent;
   };
 
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0 } = {}) {
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
@@ -434,7 +435,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       active.add(thread.key);
       active.add(step.target.targetKey);
       try {
-        return await typeInApp(thread, step, base, actionId, text, spentMs);
+        return await typeInApp(thread, step, base, actionId, text, spentMs, deadlineAt);
       } finally {
         active.delete(thread.key);
         active.delete(step.target.targetKey);
