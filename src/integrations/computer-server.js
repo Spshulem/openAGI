@@ -76,23 +76,36 @@ export function createComputerExecutor({
     lease?.helperControllers?.clear?.();
   };
 
-  const runForLease = async (lease, fn) => {
+  const runForLease = async (lease, fn, parentSignal = null) => {
     const controller = new AbortController();
+    const onParentAbort = () => controller.abort(parentSignal?.reason);
     lease.helperControllers.add(controller);
     helperControllers.add(controller);
+    parentSignal?.addEventListener?.("abort", onParentAbort, { once: true });
+    if (parentSignal?.aborted) onParentAbort();
     try {
       return await fn(controller.signal);
     } finally {
+      parentSignal?.removeEventListener?.("abort", onParentAbort);
       lease.helperControllers.delete(controller);
       helperControllers.delete(controller);
     }
   };
 
-  const inspect = async () => {
-    if (typeof capabilityStatus === "function") return normalizeCapabilityStatus(await capabilityStatus());
+  const inspect = async ({ signal = null } = {}) => {
+    if (signal?.aborted) throw new Error("computer request was cancelled");
+    if (typeof capabilityStatus === "function") {
+      const status = normalizeCapabilityStatus(await capabilityStatus({ signal }));
+      if (signal?.aborted) throw new Error("computer request was cancelled");
+      return status;
+    }
     if (helperPath) {
       try {
-        const { stdout } = await helperRun(helperPath, "status", null, { timeoutMs: 3_000, maxStdoutBytes: 128 * 1024 });
+        const { stdout } = await helperRun(helperPath, "status", null, {
+          timeoutMs: 3_000,
+          maxStdoutBytes: 128 * 1024,
+          signal
+        });
         return normalizeCapabilityStatus(JSON.parse(String(stdout)));
       } catch (error) {
         return normalizeCapabilityStatus({ detail: mapError(error) });
@@ -109,7 +122,7 @@ export function createComputerExecutor({
   const purgeExpired = () => {
     const at = now();
     for (const [id, lease] of leases) {
-      if (at > lease.expiresAt || at - lease.lastUsedAt > idleLeaseMs) {
+      if (at >= lease.expiresAt || at - lease.lastUsedAt >= idleLeaseMs) {
         abortLeaseHelpers(lease);
         leases.delete(id);
         if (leasesBySession.get(lease.sessionId) === id) leasesBySession.delete(lease.sessionId);
@@ -117,7 +130,7 @@ export function createComputerExecutor({
     }
   };
 
-  const startLease = async (payload) => {
+  const startLease = async (payload, signal = null) => {
     purgeExpired();
     const sessionId = validId(payload?.sessionId, "sessionId");
     const goalHash = typeof payload?.goalHash === "string" && /^[a-f0-9]{64}$/.test(payload.goalHash)
@@ -130,7 +143,8 @@ export function createComputerExecutor({
       if (existing.goalHash !== goalHash) throw new Error("session id already belongs to a different approved goal");
       return leasePublic(existing);
     }
-    const status = await inspect();
+    const status = await inspect({ signal });
+    if (signal?.aborted) throw new Error("computer request was cancelled");
     // Screenshot is a supported operation even when the current foreground
     // window is privacy-excluded. Its invoke path re-checks live availability.
     const supported = ["session.end", "screenshot", ...status.operations];
@@ -160,6 +174,7 @@ export function createComputerExecutor({
       allowedOperations,
       frames: new Map(),
       results: new Map(),
+      actionIds: new Map(),
       helperControllers: new Set(),
       executing: 0
     };
@@ -176,7 +191,11 @@ export function createComputerExecutor({
     const lease = leases.get(leaseId);
     if (!lease) throw new Error("computer-use node lease is missing or expired");
     const signature = actionSignature(operation, payload);
+    const seen = lease.actionIds.get(actionId);
     const cached = lease.results.get(actionId);
+    if (seen && (seen.sequence !== sequence || seen.operation !== operation || seen.signature !== signature)) {
+      throw new Error("computer-use action id was reused with different input");
+    }
     if (cached) {
       if (cached.sequence !== sequence || cached.operation !== operation || cached.signature !== signature) {
         throw new Error("computer-use action id was reused with different input");
@@ -188,6 +207,11 @@ export function createComputerExecutor({
       }
       return cached.result;
     }
+    if (seen) {
+      const failure = new Error("computer-use action result is no longer available");
+      failure.nodeSequenceConsumed = true;
+      throw failure;
+    }
     if (!Number.isSafeInteger(sequence) || sequence !== lease.lastSequence + 1) {
       throw new Error(`computer-use action sequence must be ${lease.lastSequence + 1}`);
     }
@@ -198,6 +222,7 @@ export function createComputerExecutor({
     if (operation !== "session.end" && lease.executing > 0) {
       throw new Error("another computer-use action is still executing");
     }
+    lease.actionIds.set(actionId, { sequence, operation, signature });
     lease.lastSequence = sequence;
     lease.lastUsedAt = now();
     lease.executing += 1;
@@ -238,18 +263,25 @@ export function createComputerExecutor({
     return { ok: true };
   };
 
-  const invoke = async (operation, payload = {}) => {
-    if (operation === "session.start") return await startLease(payload);
+  const invoke = async (operation, payload = {}, { signal = null } = {}) => {
+    if (signal?.aborted) throw new Error("computer request was cancelled");
+    if (operation === "session.start") return await startLease(payload, signal);
     if (operation === "session.end") return endLease(payload);
     return withLease(operation, payload, async (lease) => {
+      const authorization = {
+        leaseId: lease.id,
+        actionId: validId(payload?.actionId, "actionId"),
+        sequence: Number(payload?.sequence),
+        expiresAtMs: lease.expiresAt
+      };
       if (operation === "screenshot") {
-        const status = await inspect();
+        const status = await inspect({ signal });
         if (!status.screenshotReady) throw new Error(status.detail || "live screenshot is not currently available");
-        const shot = await runForLease(lease, async (signal) => (
+        const shot = await runForLease(lease, async (helperSignal) => (
           screenshot
-            ? await screenshot(run, await geometry(run), { signal })
-            : await screenshotFromHelper(helperRun, helperPath, { signal })
-        ));
+            ? await screenshot(run, await geometry(run), { signal: helperSignal })
+            : await screenshotFromHelper(helperRun, helperPath, { signal: helperSignal, authorization })
+        ), signal);
         const frameId = `cuframe_${crypto.randomUUID().replaceAll("-", "")}`;
         const focus = normalizePrivateFocus(shot.focus);
         const { focus: _privateFocus, elements: _privateElements, ...publicShot } = shot;
@@ -264,7 +296,7 @@ export function createComputerExecutor({
         return { ...publicShot, frameId };
       }
       if (!INPUT_OPERATIONS.includes(operation)) throw new Error("unsupported computer-use operation");
-      const status = await inspect();
+      const status = await inspect({ signal });
       if (!status.inputReady || !status.operations.includes(operation)) {
         throw new Error(status.detail || `${operation} is not currently available`);
       }
@@ -273,11 +305,12 @@ export function createComputerExecutor({
         // Typed text goes through stdin, never argv: command arguments are
         // visible to other local processes via ps even when the audit log is
         // properly redacted.
-        const helperResult = await runForLease(lease, (signal) => helperRun(helperPath, operation, action, {
+        const helperResult = await runForLease(lease, (helperSignal) => helperRun(helperPath, operation, action, {
           timeoutMs: 10_000,
           maxStdoutBytes: 128 * 1024,
-          signal
-        }));
+          signal: helperSignal,
+          authorization
+        }), signal);
         if (operation !== "list_apps") lease.frames.clear();
         if (operation === "list_apps") return normalizeApplicationList(helperResult.stdout);
         if (operation === "activate_app") return normalizeActivatedApplication(helperResult.stdout);
@@ -288,8 +321,8 @@ export function createComputerExecutor({
   };
 
   return {
-    async health() {
-      const status = await inspect();
+    async health({ signal = null } = {}) {
+      const status = await inspect({ signal });
       const baselineInput = status.inputReady
         && BASELINE_INPUT_OPERATIONS.every((operation) => status.operations.includes(operation));
       // Input alone is insufficient: the agent needs a fresh visual frame
@@ -336,14 +369,22 @@ export function createComputerExecutor({
 export function createComputerServer({ token, executor = null, ...executorOptions } = {}) {
   const computer = executor ?? createComputerExecutor(executorOptions);
   return http.createServer((req, res) => {
+    const requestController = new AbortController();
+    const abortRequest = () => requestController.abort();
+    req.once("aborted", abortRequest);
+    res.once("close", () => {
+      if (!res.writableEnded) abortRequest();
+    });
     const send = (code, body) => {
+      if (requestController.signal.aborted || res.destroyed || res.writableEnded) return;
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     };
     const url = new URL(req.url, "http://x");
     if (!authorized(req, token)) return send(401, { error: "unauthorized" });
     if (req.method === "GET" && url.pathname === "/health") {
-      return computer.health().then((body) => send(200, body), (error) => send(500, { error: mapError(error) }));
+      return computer.health({ signal: requestController.signal })
+        .then((body) => send(200, body), (error) => send(500, { error: mapError(error) }));
     }
     if (req.method !== "POST") return send(404, { error: "not found" });
 
@@ -355,7 +396,7 @@ export function createComputerServer({ token, executor = null, ...executorOption
       try {
         const operation = operationForPath(url.pathname);
         if (!operation) return send(404, { error: "not found" });
-        return send(200, await computer.invoke(operation, body));
+        return send(200, await computer.invoke(operation, body, { signal: requestController.signal }));
       } catch (error) {
         return send(500, {
           error: mapError(error),
@@ -632,14 +673,42 @@ function normalizePrivateFocus(raw) {
   return { windowID, processIdentifier, bundleIdentifier, title, x, y, width, height };
 }
 
+function normalizeHelperAuthorization(raw) {
+  if (raw == null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new Error("computer helper authority is invalid");
+  const leaseId = validId(raw.leaseId, "leaseId");
+  const actionId = validId(raw.actionId, "actionId");
+  const sequence = finiteInteger(raw.sequence, "sequence");
+  const expiresAtMs = finiteInteger(raw.expiresAtMs, "expiresAtMs");
+  if (sequence < 1 || expiresAtMs <= 0) throw new Error("computer helper authority is invalid");
+  return { leaseId, actionId, sequence, expiresAtMs };
+}
+
 export function runComputerHelper(helperPath, operation, payload = null, {
   timeoutMs = 10_000,
   maxStdoutBytes = 128 * 1024,
   maxStderrBytes = 32 * 1024,
-  signal = null
+  signal = null,
+  authorization = null
 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(helperPath, [operation], { stdio: ["pipe", "pipe", "pipe"] });
+    const boundedTimeoutMs = Number.isFinite(Number(timeoutMs)) ? Math.max(1, Number(timeoutMs)) : 10_000;
+    const authority = normalizeHelperAuthorization(authorization);
+    const deadlineMs = Math.min(Date.now() + boundedTimeoutMs, authority?.expiresAtMs ?? Number.MAX_SAFE_INTEGER);
+    const child = spawn(helperPath, [operation], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        OPENAGI_LINUX_ACTION_ID: crypto.randomUUID(),
+        OPENAGI_LINUX_DEADLINE_MS: String(deadlineMs),
+        ...(authority ? {
+          OPENAGI_LINUX_LEASE_ID: authority.leaseId,
+          OPENAGI_LINUX_APPROVAL_ACTION_ID: authority.actionId,
+          OPENAGI_LINUX_SEQUENCE: String(authority.sequence),
+          OPENAGI_LINUX_LEASE_EXPIRES_MS: String(authority.expiresAtMs)
+        } : {})
+      }
+    });
     activeHelperChildren.add(child);
     const stdout = [];
     const stderr = [];
@@ -700,7 +769,7 @@ export function runComputerHelper(helperPath, operation, payload = null, {
     });
     const timer = setTimeout(() => {
       terminateCooperatively(new Error("computer helper timed out"));
-    }, Math.max(1, timeoutMs));
+    }, boundedTimeoutMs);
     timer.unref?.();
     signal?.addEventListener?.("abort", onAbort, { once: true });
     if (signal?.aborted) {
@@ -720,13 +789,14 @@ export function cancelComputerHelperProcesses() {
   for (const child of activeHelperChildren) child.kill("SIGKILL");
 }
 
-async function screenshotFromHelper(helperRun, helperPath, { signal = null } = {}) {
+async function screenshotFromHelper(helperRun, helperPath, { signal = null, authorization = null } = {}) {
   if (!helperPath) throw new Error("the signed OpenAGI computer helper is unavailable");
   const { stdout } = await helperRun(helperPath, "screenshot", null, {
     timeoutMs: 10_000,
     maxStdoutBytes: 16 * 1024 * 1024,
     maxStderrBytes: 32 * 1024,
-    signal
+    signal,
+    authorization
   });
   const shot = JSON.parse(String(stdout));
   if (shot?.format !== "png" || typeof shot?.base64 !== "string"

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openagi-linux-companion"
+version = "0.1.0"
+description = "Wayland desktop companion for OpenAGI"
+requires-python = ">=3.11"
+license = { text = "PolyForm-Noncommercial-1.0.0" }
+authors = [{ name = "OpenAGI contributors" }]
+dependencies = [
+  "dbus-next>=0.2.3",
+  "Pillow>=10",
+  "PySide6>=6.7",
+]
+
+[project.scripts]
+openagi-linux-companion = "openagi_linux.app:main"
+openagi-linux-helper = "openagi_linux.helper:main"
+
+[tool.setuptools]
+packages = ["openagi_linux"]

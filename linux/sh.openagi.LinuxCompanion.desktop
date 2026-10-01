@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OpenAGI Linux Companion
+Comment=Wayland desktop integration for OpenAGI
+Exec=openagi-linux-companion
+Icon=applications-system
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+NoDisplay=true

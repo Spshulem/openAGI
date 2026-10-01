@@ -9,6 +9,12 @@ import { g2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
+import { createModelProvider } from "./model-provider.js";
+import { handleCodexOAuthRoute } from "./codex-oauth-routes.js";
+import { handleChatGptHostOAuthRoute } from "./chatgpt-host-routes.js";
+import { ChatGptHostOAuth } from "./chatgpt-host-oauth.js";
+import { SecretToolChatGptStore } from "./chatgpt-secret-store.js";
+import { clearChatGptModelSelection, writeChatGptModelSelection } from "./chatgpt-model-selection.js";
 import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
 import { codingSupervisorUi } from "./coding-supervisor-ui.js";
 import { VocaleoClient } from "./integrations/vocaleo.js";
@@ -23,14 +29,23 @@ import { createRequire } from "node:module";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 const PACKAGE_VERSION = createRequire(import.meta.url)("../package.json").version;
+const FORWARDED_PEER_HEADERS = [
+  "forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip", "cf-connecting-ip", "true-client-ip"
+];
 import {
   buildSetCookie,
   checkAuth,
   checkOrigin,
+  isLoopbackHost,
   isPublicRoute,
   verifyTelegramSecret,
   verifyBuildBetterWebhook
 } from "./auth.js";
+
+function isDirectLoopbackRequest(req, url) {
+  if (!isLoopbackHost(req.socket?.remoteAddress ?? "") || !isLoopbackHost(url.hostname)) return false;
+  return !FORWARDED_PEER_HEADERS.some((header) => req.headers[header] !== undefined);
+}
 import { ChannelManager } from "./channels.js";
 import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
@@ -87,7 +102,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   const port = options.port ?? 43210;
   // Read these dynamically so the setup wizard can update them mid-flight.
   const getAuthToken = () => options.authToken ?? process.env.OPENAGI_AUTH_TOKEN ?? null;
-  const getPublicUrl = () => options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null;
+  const declaredPublicIngress = () => [options.publicUrl, process.env.OPENAGI_PUBLIC_URL]
+    .some((value) => typeof value === "string" && value.trim().length > 0);
+  const getPublicUrl = () => [options.publicUrl, process.env.OPENAGI_PUBLIC_URL]
+    .find((value) => typeof value === "string" && value.trim().length > 0) ?? null;
   const getTelegramSecret = () => options.telegramSecret ?? process.env.TELEGRAM_WEBHOOK_SECRET ?? null;
   // dataDir is resolved ONCE here and threaded explicitly into both
   // NodeRegistry's dir and the cache path below — NodeRegistry must NOT be
@@ -97,6 +115,60 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // process (a main + a node) would otherwise silently collide on the same
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
+  let codexAdminProvider = options.codexProvider ?? null;
+  let chatgptAdminOAuth = options.chatgptOAuth ?? null;
+  const chatgptEnabled = options.chatgptEnabled === true || process.env.OPENAGI_CHATGPT_ENABLED === "1";
+  const getChatGptAdminOAuth = () => {
+    if (chatgptAdminOAuth) return chatgptAdminOAuth;
+    chatgptAdminOAuth = new ChatGptHostOAuth({ store: new SecretToolChatGptStore() });
+    return chatgptAdminOAuth;
+  };
+  const attestChatGptModelSelection = async (model = process.env.OPENAGI_CHATGPT_MODEL) => {
+    if (!chatgptEnabled) return false;
+    try {
+      const oauth = getChatGptAdminOAuth();
+      if (!(await oauth.status()).connected) return false;
+      const models = await oauth.listModels();
+      const credentialGeneration = await oauth.getCredentialGeneration?.();
+      if (typeof model !== "string" || !/^[a-zA-Z0-9_.-]{1,100}$/.test(model)
+        || !Array.isArray(models) || !models.includes(model) || typeof credentialGeneration !== "string") return false;
+      return { model, credentialGeneration };
+    } catch { return false; }
+  };
+  const chatgptReadyForSelection = async (model) => Boolean(await attestChatGptModelSelection(model));
+  const getCodexAdminProvider = () => {
+    if (runtime.agentHost?.modelProvider?.providerId === "openai-codex") {
+      return runtime.agentHost.modelProvider;
+    }
+    if (codexAdminProvider && runtime.agentHost?.wasProviderRetired?.(codexAdminProvider)) codexAdminProvider = null;
+    if (codexAdminProvider) return codexAdminProvider;
+    codexAdminProvider = createModelProvider({
+      preferred: "openai-codex",
+      dataDir,
+      budgetGuard: runtime.budget
+    });
+    return codexAdminProvider;
+  };
+  const switchRuntimeProvider = async (preference) => {
+    if (!runtime.agentHost) {
+      if (codexAdminProvider) await codexAdminProvider.close?.();
+      codexAdminProvider = null;
+      return null;
+    }
+    const previous = runtime.agentHost.modelProvider;
+    const next = preference === "openai-codex"
+      ? getCodexAdminProvider()
+      : createModelProvider({
+          preferred: preference, dataDir, budgetGuard: runtime.budget,
+          ...(preference === "openai-chatgpt" ? { chatgptOAuth: getChatGptAdminOAuth(), chatgptEnabled } : {})
+        });
+    await runtime.agentHost.replaceModelProvider(next);
+    if (preference !== "openai-codex" && codexAdminProvider) {
+      if (codexAdminProvider !== previous) await codexAdminProvider.close?.();
+      codexAdminProvider = null;
+    }
+    return next;
+  };
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
   const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
@@ -124,7 +196,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         : localCapabilityCache;
       const local = localCapabilities.length ? [{
         nodeId: localIdentity.nodeId,
-        name: localIdentity.name || "This Mac",
+        name: localIdentity.name || "This computer",
         capabilities: localCapabilities,
         local: true,
         seenAt: new Date().toISOString()
@@ -813,6 +885,39 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // but on first run it bypasses the auth gate since no token exists yet.
       const setupActive = isFirstRun();
       const setupRoutes = pathname === "/setup" || pathname === "/setup/save" || pathname === "/setup/test";
+      const directLoopbackRequest = isDirectLoopbackRequest(req, url);
+      // TCP peer address and HTTP headers cannot distinguish a browser from
+      // an opaque local reverse proxy. While public ingress is configured,
+      // fail closed for every subscription-owner capability rather than
+      // allowing a bearer holder to forge a loopback Host or strip forwarding
+      // headers. A future Unix-socket owner channel can make this usable with
+      // public ingress without weakening this boundary.
+      const privateTopology = isLoopbackHost(host) && !declaredPublicIngress();
+      const directOwnerRequest = privateTopology && Boolean(getAuthToken())
+        && !requestNodeId && directLoopbackRequest;
+      const assertChatGptOwnerAuthority = () => {
+        const currentPrivateTopology = isLoopbackHost(host) && !declaredPublicIngress();
+        const currentToken = getAuthToken();
+        const currentAuth = currentToken ? checkAuth(req, url, currentToken) : { ok: false };
+        if (!currentPrivateTopology || !currentToken || !directLoopbackRequest || requestNodeId || !currentAuth.ok) {
+          throw Object.assign(new Error("ChatGPT subscription is limited to interactive owner chat."), {
+            code: "CHATGPT_PROVENANCE_DENIED"
+          });
+        }
+      };
+
+      // A public tunnel/reverse proxy still reaches us from 127.0.0.1. When no
+      // dashboard token exists yet, auth is intentionally open only for direct
+      // loopback first-run use; a public Host must not be able to set the first
+      // token or bootstrap later subscription-owner provenance.
+      if (!getAuthToken() && !isPublicRoute(pathname) && !(privateTopology && directLoopbackRequest)
+        && !nodeScopedAuth && !authenticatedG2CrossOrigin) {
+        res.writeHead(401, {
+          "content-type": "application/json; charset=utf-8",
+          "WWW-Authenticate": "Bearer"
+        });
+        return res.end(JSON.stringify({ error: "unauthorized", reason: "first-run setup requires direct loopback or a configured token" }));
+      }
 
       if (isG2NodeCorsRoute(pathname)) applyG2NodeCorsHeaders(res);
       if (method === "OPTIONS" && isG2NodeCorsRoute(pathname)) {
@@ -864,6 +969,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (auth.setCookie) extraCookies.push(buildSetCookie(getAuthToken()));
       }
 
+      if (await handleCodexOAuthRoute({
+        req,
+        res,
+        url,
+        provider: pathname === "/admin/providers/openai-codex" || pathname.startsWith("/admin/providers/openai-codex/")
+          ? getCodexAdminProvider()
+          : null,
+        authToken: getAuthToken()
+      })) return;
+
+      if (await handleChatGptHostOAuthRoute({
+        req, res, url,
+        oauth: pathname === "/admin/providers/openai-chatgpt" || pathname.startsWith("/admin/providers/openai-chatgpt/")
+          ? getChatGptAdminOAuth() : null,
+        authToken: getAuthToken(), allowLogin: chatgptEnabled, interactiveOwner: directOwnerRequest
+      })) return;
+
       // Sign-in: server-side cookie set, then redirect. Works without JS.
       // Public route — the token in the body IS the credential.
       if (method === "POST" && pathname === "/sign-in") {
@@ -888,18 +1010,34 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // KEPT (a re-run used to silently rotate it on save), provider/
         // model/budget show their current values, and already-set secrets
         // get a "saved" marker instead of looking unconfigured.
-        return sendHtml(res, 200, renderWizard({ existingEnv: process.env }), extraCookies);
+        return sendHtml(res, 200, renderWizard({ existingEnv: process.env, dataDir }), extraCookies);
       }
       if (method === "POST" && pathname === "/setup/save") {
         const body = await readJson(req);
-        const dataDir = resolveDataDir();
-        const result = saveEnv({ dataDir, values: body });
-        try {
-          const { createModelProvider } = await import("./model-provider.js");
-          if (runtime.agentHost) {
-            runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+        const clear = Array.isArray(body?.clear)
+          ? body.clear.filter((key) => key === "OPENAGI_CHATGPT_ENABLED") : [];
+        if (body && typeof body === "object") delete body.clear;
+        if (clear.includes("OPENAGI_CHATGPT_ENABLED") && body?.OPENAGI_PROVIDER === "openai-chatgpt") {
+          return sendJson(res, 400, { error: "chatgpt-enable-required" });
+        }
+        if (body?.OPENAGI_PROVIDER === "openai-codex" && !getCodexAdminProvider()?.isConfigured?.()) {
+          return sendJson(res, 409, { error: "Codex is not qualified. Save its non-secret settings with a working provider selected, then qualify Codex before switching." });
+        }
+        if (body?.OPENAGI_PROVIDER === "openai-chatgpt") {
+          if (!directOwnerRequest) return sendJson(res, 403, { error: "owner-loopback-required" });
+          const selection = await attestChatGptModelSelection(body.OPENAGI_CHATGPT_MODEL);
+          if (!selection) {
+            return sendJson(res, 409, { error: "chatgpt-not-qualified" });
           }
-        } catch { /* swallow */ }
+          try { writeChatGptModelSelection({ dataDir, ...selection }); }
+          catch { return sendJson(res, 409, { error: "chatgpt-not-qualified" }); }
+        }
+        if (clear.includes("OPENAGI_CHATGPT_ENABLED")) {
+          try { clearChatGptModelSelection(dataDir); }
+          catch { return sendJson(res, 409, { error: "chatgpt-not-qualified" }); }
+        }
+        const result = saveEnv({ dataDir, values: body, clear });
+        await switchRuntimeProvider(process.env.OPENAGI_PROVIDER ?? "auto");
         return sendJson(res, 200, result);
       }
       if (method === "POST" && pathname === "/setup/test") {
@@ -908,7 +1046,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         try {
           // ephemeral: the connectivity test must not seed a session, task,
           // memory item, or outcome — it's plumbing, not conversation.
-          const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup", ephemeral: true });
+          // Owner provenance is derived from the authenticated direct-loopback
+          // request; it never comes from JSON supplied by the caller.
+          const localOwner = directOwnerRequest;
+          const turn = await channels.handleLocalMessage(
+            { text: body.text ?? "Say hi in one short sentence.", from: "setup", ephemeral: true },
+            { localOwner, assertChatGptOwnerAuthority }
+          );
           return sendJson(res, 200, { reply: turn.reply, model: turn.model });
         } catch (error) {
           return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
@@ -1806,6 +1950,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        // A local tunnel/reverse proxy also connects from loopback. Only the
+        // dashboard's configured, authenticated owner session can lend the
+        // subscription provider owner authority; checkAuth ran above. With no
+        // configured token that gate permits all callers, so fail closed here.
+        const localOwner = directOwnerRequest;
         let body = await readJsonLimited(req, requestNodeId ? 128 * 1024 : 2 * 1024 * 1024);
         if (requestNodeId) {
           const allowed = new Set(["text", "from", "sessionId", "thread"]);
@@ -1854,13 +2003,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // response stream, not a broadcast that another signed-in client can
         // accidentally observe.
         if (acceptsEventStream(req)) {
-          return streamLocalMessage(res, channels, body);
+          return streamLocalMessage(res, channels, body, localOwner, assertChatGptOwnerAuthority);
         }
         // Chat must return a structured error, not a generic 500: the
         // dashboard needs to distinguish "budget cap hit" / "provider auth
         // failed" / "network blip" to show something actionable.
         try {
-          const result = await channels.handleLocalMessage(body);
+          const result = await channels.handleLocalMessage(body, { localOwner, assertChatGptOwnerAuthority });
           return sendJson(res, 200, result);
         } catch (error) {
           return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
@@ -1985,27 +2134,36 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           preference: process.env.OPENAGI_PROVIDER ?? "auto",
           available: {
             anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
-            openai: Boolean(process.env.OPENAI_API_KEY)
+            openai: Boolean(process.env.OPENAI_API_KEY),
+            "openai-codex": getCodexAdminProvider()?.isConfigured?.() === true,
+            "openai-chatgpt": directOwnerRequest && await chatgptReadyForSelection()
           }
         });
       }
       if (method === "POST" && pathname === "/admin/provider") {
         const body = await readJson(req);
         const choice = String(body.preference ?? "").toLowerCase();
-        if (!["auto", "anthropic", "openai"].includes(choice)) {
-          return sendJson(res, 400, { error: "preference must be one of: auto, anthropic, openai" });
+        if (!["auto", "anthropic", "openai", "openai-codex", "openai-chatgpt"].includes(choice)) {
+          return sendJson(res, 400, { error: "preference must be one of: auto, anthropic, openai, openai-codex, openai-chatgpt" });
+        }
+        if (choice === "openai-codex" && !getCodexAdminProvider()?.isConfigured?.()) {
+          return sendJson(res, 409, { error: "codex-not-qualified" });
+        }
+        if (choice === "openai-chatgpt") {
+          if (!directOwnerRequest) return sendJson(res, 403, { error: "owner-loopback-required" });
+          const selection = await attestChatGptModelSelection();
+          if (!selection) {
+            return sendJson(res, 409, { error: "chatgpt-not-qualified" });
+          }
+          try { writeChatGptModelSelection({ dataDir, ...selection }); }
+          catch { return sendJson(res, 409, { error: "chatgpt-not-qualified" }); }
         }
         process.env.OPENAGI_PROVIDER = choice;
-        try {
-          const { createModelProvider } = await import("./model-provider.js");
-          if (runtime.agentHost) {
-            runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
-          }
-        } catch { /* swallow */ }
+        await switchRuntimeProvider(choice);
         // Also persist to .env so it survives restart.
         try {
           const { saveEnv } = await import("./setup-wizard.js");
-          saveEnv({ values: { OPENAGI_PROVIDER: choice } });
+          saveEnv({ dataDir, values: { OPENAGI_PROVIDER: choice } });
         } catch { /* fall back to runtime-only */ }
         return sendJson(res, 200, {
           preference: choice,
@@ -3523,6 +3681,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           .catch(() => {})
           .then(() => stopNodeControlWorker())
           .catch(() => {})
+          .then(() => runtime.agentHost?.close?.())
+          .catch(() => {})
+          .then(() => (
+            codexAdminProvider && codexAdminProvider !== runtime.agentHost?.modelProvider
+              ? codexAdminProvider.close?.()
+              : null
+          ))
+          .catch(() => {})
           .finally(() => {
             nodeControlBroker.close();
             server.close((error) => (error ? reject(error) : resolve()));
@@ -3601,7 +3767,7 @@ function bindScopedNodeMessage(body, requestNodeId) {
 // assistant record remains authoritative and a disconnected client recovers it
 // from the named session. Provider adapters expose text only, never reasoning,
 // tool arguments or tool results.
-async function streamLocalMessage(res, channels, body) {
+async function streamLocalMessage(res, channels, body, localOwner = false, assertChatGptOwnerAuthority = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -3663,7 +3829,9 @@ async function streamLocalMessage(res, channels, body) {
   };
 
   try {
-    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta });
+    const result = await channels.handleLocalMessage(body, {
+      onProgress, onTextDelta, localOwner, assertChatGptOwnerAuthority
+    });
     sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
     write("final", result);
   } catch (error) {
@@ -9760,7 +9928,8 @@ function renderProviderSwitch(p) {
   const opts = [
     \`<option value="auto" \${p.preference === "auto" ? "selected" : ""}>auto</option>\`,
     \`<option value="anthropic" \${p.preference === "anthropic" ? "selected" : ""} \${!p.available?.anthropic ? "disabled" : ""}>Anthropic\${p.available?.anthropic ? "" : " (no key)"}</option>\`,
-    \`<option value="openai" \${p.preference === "openai" ? "selected" : ""} \${!p.available?.openai ? "disabled" : ""}>OpenAI / ChatGPT\${p.available?.openai ? "" : " (no key)"}</option>\`
+    \`<option value="openai" \${p.preference === "openai" ? "selected" : ""} \${!p.available?.openai ? "disabled" : ""}>OpenAI / ChatGPT\${p.available?.openai ? "" : " (no key)"}</option>\`,
+    \`<option value="openai-chatgpt" \${p.preference === "openai-chatgpt" ? "selected" : ""} \${!p.available?.["openai-chatgpt"] ? "disabled" : ""}>ChatGPT OAuth (OpenAGI)\${p.available?.["openai-chatgpt"] ? "" : " (not ready)"}</option>\`
   ].join("");
   host.innerHTML = \`<label style="color:var(--muted);">model: <select id="providerSelect" style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 6px;font-size:12px;">\${opts}</select></label>\`;
   document.getElementById("providerSelect").addEventListener("change", async (e) => {

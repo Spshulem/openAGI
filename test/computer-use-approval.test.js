@@ -565,6 +565,74 @@ test("explicit node route map dispatches drag and negotiates it into the lease",
   }
 });
 
+test("explicit node deadline covers a stalled response body, not only its headers", async () => {
+  const previous = {
+    node: process.env.OPENAGI_COMPUTER_NODE,
+    token: process.env.OPENAGI_COMPUTER_NODE_TOKEN,
+    insecure: process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY
+  };
+  process.env.OPENAGI_COMPUTER_NODE = "https://computer.example";
+  process.env.OPENAGI_COMPUTER_NODE_TOKEN = "scoped-test-token";
+  delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-body-deadline-"));
+  const tools = new ToolRegistry();
+  const runtime = {
+    tools,
+    pendingActions: new PendingActionStore({ dir: path.join(dataDir, "pending") }),
+    computerUseLog: new ComputerUseLog({ dir: path.join(dataDir, "computer-use") }),
+    observations: { search: async () => [] }
+  };
+  registerComputerUseTools(tools, runtime, {
+    nodeRequestTimeoutMs: 25,
+    fetchImpl: async (url, options) => {
+      const route = new URL(url).pathname;
+      if (route === "/health") {
+        return new Response(JSON.stringify({
+          capability: {
+            id: "computer-use", screenshotReady: true, inputReady: true,
+            operations: ["session.start", "session.end", "screenshot"]
+          }
+        }), { status: 200 });
+      }
+      if (route === "/session/start") {
+        return new Response(JSON.stringify({ leaseId: "lease-body-deadline", nextSequence: 1 }), { status: 200 });
+      }
+      if (route === "/screenshot") {
+        return new Response(new ReadableStream({
+          start(controller) {
+            options.signal.addEventListener("abort", () => controller.error(options.signal.reason), { once: true });
+          }
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }
+  });
+  const context = { sessionId: "chat:body-deadline" };
+  runtime.computerUseLog.startSession({
+    goal: "Inspect the selected window",
+    approvedBy: "user",
+    sourceSessionId: context.sessionId,
+    targetNodeId: "explicit"
+  });
+  try {
+    const outcome = await Promise.race([
+      tools.get("computer_screenshot").handler({ reasoning: "Inspect before acting" }, context)
+        .then(() => "resolved", (error) => error),
+      new Promise((resolve) => setTimeout(() => resolve("still-pending"), 150))
+    ]);
+    assert.notEqual(outcome, "still-pending", "the body read must remain inside the node deadline");
+    assert.match(String(outcome?.message ?? outcome), /timed out|aborted/i);
+  } finally {
+    if (previous.node === undefined) delete process.env.OPENAGI_COMPUTER_NODE;
+    else process.env.OPENAGI_COMPUTER_NODE = previous.node;
+    if (previous.token === undefined) delete process.env.OPENAGI_COMPUTER_NODE_TOKEN;
+    else process.env.OPENAGI_COMPUTER_NODE_TOKEN = previous.token;
+    if (previous.insecure === undefined) delete process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY;
+    else process.env.OPENAGI_ALLOW_INSECURE_NODE_RELAY = previous.insecure;
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("approved computer actions bypass scrutiny re-confirmation without persisting typed text", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-sensitive-"));
   const tools = new ToolRegistry();

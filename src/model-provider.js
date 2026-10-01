@@ -1,4 +1,12 @@
 import { ModelRouter } from "./model-router.js";
+import path from "node:path";
+import { resolveDataDir } from "./data-dir.js";
+import { CodexAppServerClient } from "./codex-app-server-client.js";
+import { CodexExplicitFallbackProvider, CodexOAuthProvider, CodexProviderError } from "./codex-oauth-provider.js";
+import { ChatGptHostOAuth } from "./chatgpt-host-oauth.js";
+import { SecretToolChatGptStore } from "./chatgpt-secret-store.js";
+import { ChatGptHostResponsesProvider } from "./chatgpt-host-provider.js";
+import { readChatGptModelSelection } from "./chatgpt-model-selection.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
 // than these ceilings, but explicit limits keep a broken or hostile compatible
@@ -79,6 +87,7 @@ export class OpenAIResponsesProvider {
     this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
+    this.noFinalRetry = options.noFinalRetry === true;
     this.budgetGuard = options.budgetGuard ?? null;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.streamLimits = normalizeSseLimits(options.streamLimits);
@@ -124,6 +133,13 @@ export class OpenAIResponsesProvider {
     const baseInstructions = instructions ?? buildDefaultInstructions({ agent });
     const toolList = tools.length > 0 ? tools : toolRegistry?.toOpenAITools?.() ?? [];
     const toolCalls = [];
+    // Host-owned turns must never let one handler mutate the authority used by
+    // the next handler (approval, scrutiny, cancellation, or specialist scope).
+    const toolAuthority = this.preserveEncryptedReasoning ? {
+      ...context,
+      __allowedTools: Array.isArray(context.__allowedTools)
+        ? Object.freeze([...context.__allowedTools]) : context.__allowedTools
+    } : context;
 
     let response;
     let needsFinalAnswer = false;
@@ -171,6 +187,14 @@ export class OpenAIResponsesProvider {
       // Append the assistant's function_call items so the model can see its own
       // last turn on the next hop (replaces what previous_response_id would've done).
       for (const item of response.output ?? []) {
+        if (this.preserveEncryptedReasoning && item.type === "reasoning"
+          && typeof item.encrypted_content === "string" && item.encrypted_content) {
+          // Only the host-owned Codex route opts in. This input is scoped to
+          // one generate() call and its fixed model/issuer, never session history.
+          conversationInput.push({ type: "reasoning",
+            ...(Array.isArray(item.summary) ? { summary: item.summary } : {}),
+            encrypted_content: item.encrypted_content });
+        }
         if (item.type === "function_call") {
           conversationInput.push({
             type: "function_call",
@@ -182,10 +206,18 @@ export class OpenAIResponsesProvider {
       }
 
       for (const call of calls) {
-        context.signal?.throwIfAborted();
+        toolAuthority.signal?.throwIfAborted();
+        if (this.preserveEncryptedReasoning) {
+          if (typeof context.__chatgptCheckCredential !== "function") {
+            throw Object.assign(new Error("ChatGPT credential guard unavailable."), { code: "CHATGPT_CREDENTIAL_CHANGED" });
+          }
+          await context.__chatgptCheckCredential();
+          toolAuthority.signal?.throwIfAborted();
+        }
         notifyProgress(onProgress, { stage: "tool", provider: "openai", model, hop: hop + 1, tool: call.name });
         const parsedArgs = safeParseJson(call.arguments) ?? {};
-        const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, context) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
+        const invocationContext = this.preserveEncryptedReasoning ? { ...toolAuthority } : context;
+        const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, invocationContext) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
         toolCalls.push({ name: call.name, arguments: parsedArgs, result: invocation });
         const result = invocation.ok ? invocation.result : { error: invocation.error };
         // A tool that returns a screenshot (computer_screenshot) carries the PNG
@@ -222,7 +254,7 @@ export class OpenAIResponsesProvider {
       if (hop === maxToolHops - 1) needsFinalAnswer = true;
     }
 
-    if (!response || needsFinalAnswer) {
+    if (!response || (needsFinalAnswer && !this.noFinalRetry)) {
       const hop = maxToolHops + 1;
       notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop, maxToolHops: hop });
       const body = {
@@ -683,8 +715,66 @@ export function createModelProvider(options = {}) {
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
 
-  // Explicit preference wins. anthropic | openai | auto (default).
+  // Explicit preference wins. Codex is intentionally excluded from auto and
+  // returned even while unready so a selected ChatGPT session can never fall
+  // through to an API key or the deterministic provider.
   const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
+  if (preference === "openai-chatgpt") {
+    const oauth = options.chatgptOAuth ?? new ChatGptHostOAuth({ store: options.chatgptStore ?? new SecretToolChatGptStore() });
+    const dataDir = path.resolve(options.dataDir ?? resolveDataDir());
+    const configuredModel = options.chatgpt?.model ?? process.env.OPENAGI_CHATGPT_MODEL;
+    const model = configuredModel || "unselected";
+    const reasoningEffort = options.chatgpt?.reasoningEffort ?? process.env.OPENAGI_CHATGPT_REASONING_EFFORT ?? "medium";
+    const capabilityTier = String(options.chatgpt?.capabilityTier ?? process.env.OPENAGI_CHATGPT_CAPABILITY_TIER ?? "provisional-chat-only").toLowerCase();
+    if (typeof model !== "string" || !/^[a-zA-Z0-9_.-]{1,100}$/.test(model)) throw new TypeError("Invalid ChatGPT model identifier.");
+    if (!["none", "minimal", "low", "medium", "high", "xhigh"].includes(reasoningEffort)) {
+      throw new TypeError("Invalid configured ChatGPT reasoning effort.");
+    }
+    if (capabilityTier !== "provisional-chat-only") {
+      throw new TypeError("Only the provisional ChatGPT OAuth chat-only capability tier is available.");
+    }
+    const baseProvider = new OpenAIResponsesProvider({
+      apiKey: "host-...th", baseUrl: "https://chatgpt.com/backend-api/codex", model, reasoningEffort,
+      budgetGuard: null, maxToolHops: 1, noFinalRetry: true,
+      router: new ModelRouter({ envPrefix: "OPENAGI_CHATGPT", baseModel: model })
+    });
+    const selection = readChatGptModelSelection(dataDir);
+    const selectedModel = selection?.model === model ? selection : null;
+    return new ChatGptHostResponsesProvider({ oauth, baseProvider, consumeSse,
+      fetchImpl: options.chatgpt?.fetchImpl,
+      qualified: (options.chatgptEnabled === true || process.env.OPENAGI_CHATGPT_ENABLED === "1") && Boolean(selectedModel),
+      ownerOnly: true,
+      capabilityTier,
+      pinnedModel: Boolean(configuredModel) && Boolean(selectedModel),
+      selectionGeneration: selectedModel?.credentialGeneration ?? null,
+      readSelection: () => readChatGptModelSelection(dataDir) });
+  }
+  if (preference === "openai-codex") {
+    const capabilityTier = String(options.codex?.capabilityTier ?? process.env.OPENAGI_CODEX_CAPABILITY_TIER ?? "chat-only").toLowerCase();
+    if (capabilityTier !== "chat-only") {
+      throw new CodexProviderError("Only the qualified Codex chat-only capability tier is available.", {
+        code: "CODEX_CAPABILITY_TIER"
+      });
+    }
+    const dataDir = path.resolve(options.dataDir ?? resolveDataDir());
+    const client = options.codexClient ?? new CodexAppServerClient({
+      ...(options.codex ?? {}),
+      codexHome: options.codex?.codexHome ?? path.join(dataDir, "codex"),
+      workDir: options.codex?.workDir ?? path.join(dataDir, "codex", "work")
+    });
+    const codex = new CodexOAuthProvider({
+      client,
+      model: options.codex?.model,
+      reasoningEffort: options.codex?.reasoningEffort
+    });
+    const fallbackId = String(options.codexFallback ?? process.env.OPENAGI_CODEX_FALLBACK_PROVIDER ?? "none").toLowerCase();
+    if (!fallbackId || fallbackId === "none") return codex;
+    if (!["anthropic", "openai"].includes(fallbackId)) {
+      throw new CodexProviderError("Codex fallback must be none, anthropic, or openai.", { code: "CODEX_FALLBACK_CONFIG" });
+    }
+    const fallback = options.codexFallbackProvider ?? (fallbackId === "anthropic" ? anthropic : openai);
+    return new CodexExplicitFallbackProvider({ primary: codex, fallback, fallbackId });
+  }
   if (preference === "openai" && openai.isConfigured()) return openai;
   if (preference === "anthropic" && anthropic.isConfigured()) return anthropic;
 
@@ -854,7 +944,7 @@ function isEventStream(response) {
   return String(response?.headers?.get?.("content-type") ?? "").toLowerCase().includes("text/event-stream");
 }
 
-async function consumeSse(body, onEvent, onChunk = null, rawLimits = DEFAULT_SSE_LIMITS) {
+export async function consumeSse(body, onEvent, onChunk = null, rawLimits = DEFAULT_SSE_LIMITS) {
   if (!body?.getReader) throw new Error("Provider response stream was unavailable.");
   const limits = normalizeSseLimits(rawLimits);
   const reader = body.getReader();

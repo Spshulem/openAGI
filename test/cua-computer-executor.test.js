@@ -11,11 +11,51 @@ import {
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
 
-function fakeCua({ permissions = { accessibility: true, screen_recording: true, source: { attribution: "driver-daemon" } } } = {}) {
+test("configured native backend forwards the environment-scoped Linux helper", async () => {
+  const calls = [];
+  const executor = createConfiguredComputerExecutor({
+    env: {
+      OPENAGI_COMPUTER_BACKEND: "native",
+      OPENAGI_COMPUTER_HELPER: "/home/user/.local/lib/openagi/openagi-linux-helper"
+    },
+    helperRun: async (helperPath, operation, payload) => {
+      calls.push([helperPath, operation, payload]);
+      return {
+        stdout: Buffer.from(JSON.stringify({
+          screenshotReady: true,
+          inputReady: true,
+          capturePrerequisitesReady: true,
+          operations: ["click", "drag", "move", "type", "key", "scroll"],
+          detail: "ready"
+        })),
+        stderr: Buffer.alloc(0)
+      };
+    }
+  });
+
+  const health = await executor.health();
+  assert.equal(health.ok, true);
+  assert.deepEqual(calls, [[
+    "/home/user/.local/lib/openagi/openagi-linux-helper",
+    "status",
+    null
+  ]]);
+});
+
+function fakeCua({
+  permissions = { accessibility: true, screen_recording: true, source: { attribution: "driver-daemon" } },
+  health = null
+} = {}) {
   const calls = [];
   const run = async (binary, args, payload) => {
     calls.push({ binary, args, payload });
-    if (args[0] === "permissions") return { stdout: Buffer.from(JSON.stringify(permissions)), stderr: Buffer.alloc(0) };
+    if (args[0] === "permissions") {
+      if (permissions === null) throw new Error("permissions is not available on Linux");
+      return { stdout: Buffer.from(JSON.stringify(permissions)), stderr: Buffer.alloc(0) };
+    }
+    if (args[1] === "health_report") {
+      return { stdout: Buffer.from(JSON.stringify(health)), stderr: Buffer.alloc(0) };
+    }
     if (args[1] === "list_windows") {
       return {
         stdout: Buffer.from(JSON.stringify({ windows: [{
@@ -132,6 +172,48 @@ test("Cua readiness fails closed without an absolute executable or permissions",
   assert.equal(status.screenshotReady, true);
   assert.equal(status.inputReady, false);
   await assert.rejects(() => start(denied).then((lease) => invoke(denied, lease, 1, "type", { text: "no" })), /frame|outside|failed/);
+});
+
+test("Cua readiness uses health_report on Linux and keeps Linux modifiers native", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-cua-linux-test-"));
+  const cua = fakeCua({
+    permissions: null,
+    health: {
+      schema_version: "1",
+      platform: "linux",
+      driver_version: "0.28.2",
+      overall: "ok",
+      checks: [
+        { name: "binary_version", status: "pass", message: "ok" },
+        { name: "platform_supported", status: "pass", message: "ok" },
+        { name: "session_active", status: "pass", message: "ok" },
+        { name: "ax_capability", status: "pass", message: "AT-SPI available" },
+        { name: "screen_capture_capability", status: "pass", message: "X11 capture available" }
+      ]
+    }
+  });
+  const executor = createCuaComputerExecutor({
+    binaryPath: "/opt/reviewed/cua-driver",
+    binaryReady: () => true,
+    run: cua.run,
+    tempRoot: dir
+  });
+  try {
+    const status = (await executor.health()).capability;
+    assert.equal(status.ready, true);
+    assert.equal(status.screenshotReady, true);
+    assert.equal(status.inputReady, true);
+    assert.match(status.detail, /Linux/);
+
+    const active = await start(executor);
+    const shot = await invoke(executor, active, 1, "screenshot");
+    await invoke(executor, active, 2, "key", { frameId: shot.frameId, chord: "ctrl+alt+t" });
+    const hotkey = cua.calls.find((call) => call.args[1] === "hotkey");
+    assert.deepEqual(hotkey.payload.keys, ["control", "alt", "t"]);
+  } finally {
+    await executor.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("configured executor defaults to native and opts into Cua explicitly", async () => {

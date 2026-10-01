@@ -37,12 +37,16 @@ export class ChannelManager {
       // session, no memory write, no outcome — just a model round-trip.
       ephemeral: body.ephemeral === true
     }, {
+      localOwner: options.localOwner === true,
       // Transport-owned callback. It is deliberately not read from `body`:
       // callers of the public HTTP API must not be able to inject executable
       // values into the host. The streamed /message transport uses this to
       // keep a slow tool-using turn visibly alive.
       onProgress: options.onProgress,
-      onTextDelta: options.onTextDelta
+      onTextDelta: options.onTextDelta,
+      // Host-owned subscription authority must remain current until the
+      // outbound provider dispatch, not only at HTTP request admission.
+      assertChatGptOwnerAuthority: options.assertChatGptOwnerAuthority
     });
   }
 

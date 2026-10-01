@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { createComputerExecutor, createComputerServer, runComputerHelper } from "../src/integrations/computer-server.js";
@@ -289,15 +290,31 @@ test("node lease enforces goal binding, monotonic sequence, expiry and idempoten
     () => computer.invoke("session.start", { sessionId: "chat:bound", goalHash: "b".repeat(64) }),
     /different approved goal/
   );
-  now += 51;
+  now += 50;
   await assert.rejects(() => action(computer, active, 2, "screenshot"), /missing or expired/);
+});
+
+test("action ids remain single-use for the full lease after cached results are pruned", async () => {
+  let executions = 0;
+  const computer = executor({ screenshot: async () => { executions += 1; return screenshotResult(); } });
+  const active = await lease(computer, "chat:action-id-retention", 30);
+
+  for (let sequence = 1; sequence <= 21; sequence += 1) {
+    await action(computer, active, sequence, "screenshot");
+  }
+
+  await assert.rejects(
+    () => action(computer, active, 22, "screenshot", {}, "action_1"),
+    /action id was reused/
+  );
+  assert.equal(executions, 21);
 });
 
 test("helper receives typed text on stdin, while strict inputs reject unsafe fallbacks", async () => {
   const calls = [];
   const computer = executor({
     helperPath: "/signed/helper",
-    helperRun: async (command, operation, payload) => { calls.push({ command, operation, payload }); return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) }; },
+    helperRun: async (command, operation, payload, options) => { calls.push({ command, operation, payload, options }); return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) }; },
     screenshot: async () => screenshotResult()
   });
   const active = await lease(computer);
@@ -305,6 +322,11 @@ test("helper receives typed text on stdin, while strict inputs reject unsafe fal
   await action(computer, active, 2, "type", { frameId: shot.frameId, text: "private words" });
   assert.equal(calls.at(-1).operation, "type");
   assert.deepEqual(calls.at(-1).payload, { text: "private words", focus: privateFocus });
+  assert.deepEqual(
+    { ...calls.at(-1).options.authorization, expiresAtMs: 0 },
+    { leaseId: active.leaseId, actionId: "action_2", sequence: 2, expiresAtMs: 0 }
+  );
+  assert.ok(Number.isSafeInteger(calls.at(-1).options.authorization.expiresAtMs));
   assert.equal(JSON.stringify([calls.at(-1).command, calls.at(-1).operation]).includes("private words"), false);
   const nextShot = await action(computer, active, 3, "screenshot");
   await assert.rejects(() => action(computer, active, 4, "key", { frameId: nextShot.frameId, chord: "cmd+not-a-key" }), /supported key/);
@@ -382,12 +404,20 @@ test("session end remains available after the physical-action limit is reached",
 test("helper runner writes payload to stdin, bounds output, and never places it in argv", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-helper-test-"));
   const helper = path.join(dir, "helper.js");
-  fs.writeFileSync(helper, `#!/usr/bin/env node\nlet s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write(JSON.stringify({argv:process.argv.slice(2),payload:JSON.parse(s)})));\n`, { mode: 0o700 });
+  fs.writeFileSync(helper, `#!/usr/bin/env node\nlet s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>process.stdout.write(JSON.stringify({argv:process.argv.slice(2),payload:JSON.parse(s),requestId:process.env.OPENAGI_LINUX_ACTION_ID,deadlineMs:process.env.OPENAGI_LINUX_DEADLINE_MS,leaseId:process.env.OPENAGI_LINUX_LEASE_ID,approvalActionId:process.env.OPENAGI_LINUX_APPROVAL_ACTION_ID,sequence:process.env.OPENAGI_LINUX_SEQUENCE,expiresAtMs:process.env.OPENAGI_LINUX_LEASE_EXPIRES_MS})));\n`, { mode: 0o700 });
   try {
-    const result = await runComputerHelper(helper, "type", { text: "stdin-only-secret" }, { timeoutMs: 2_000 });
+    const authorization = { leaseId: "culease_runner", actionId: "action_runner", sequence: 9, expiresAtMs: Date.now() + 20_000 };
+    const result = await runComputerHelper(helper, "type", { text: "stdin-only-secret" }, { timeoutMs: 2_000, authorization });
     const parsed = JSON.parse(String(result.stdout));
     assert.deepEqual(parsed.argv, ["type"]);
     assert.deepEqual(parsed.payload, { text: "stdin-only-secret" });
+    assert.match(parsed.requestId, /^[0-9a-f-]{36}$/);
+    assert.ok(Number(parsed.deadlineMs) > Date.now());
+    assert.ok(Number(parsed.deadlineMs) <= Date.now() + 2_000);
+    assert.deepEqual(
+      { leaseId: parsed.leaseId, actionId: parsed.approvalActionId, sequence: Number(parsed.sequence), expiresAtMs: Number(parsed.expiresAtMs) },
+      authorization
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -416,6 +446,114 @@ test("helper cancellation requests cooperative cleanup before any hard kill", as
     assert.equal(fs.readFileSync(marker, "utf8"), "yes");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("disconnecting an HTTP client aborts its in-flight helper action", async () => {
+  let markStarted;
+  let markAborted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const aborted = new Promise((resolve) => { markAborted = resolve; });
+  const computer = createComputerExecutor({
+    helperPath: "/signed/helper",
+    capabilityStatus: ready,
+    helperRun: async (_path, operation, _payload, options = {}) => {
+      if (operation === "status") return { stdout: Buffer.from(JSON.stringify(await ready())), stderr: Buffer.alloc(0) };
+      markStarted();
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          markAborted();
+          reject(new Error("helper aborted"));
+        };
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) onAbort();
+      });
+      return { stdout: Buffer.from("[]"), stderr: Buffer.alloc(0) };
+    }
+  });
+  const active = await lease(computer, "chat:http-disconnect");
+  const server = createComputerServer({ token: "owner-token", executor: computer });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    const body = JSON.stringify({
+      leaseId: active.leaseId,
+      actionId: "action_http_disconnect",
+      sequence: 1
+    });
+    const request = http.request({
+      host: "127.0.0.1",
+      port: address.port,
+      path: "/list-apps",
+      method: "POST",
+      headers: {
+        authorization: "Bearer owner-token",
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(body)
+      }
+    });
+    request.on("error", () => {});
+    request.end(body);
+    await started;
+    request.destroy();
+    await Promise.race([
+      aborted,
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("helper was not aborted")), 250);
+        timer.unref?.();
+      })
+    ]);
+  } finally {
+    await computer.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("disconnecting a health request aborts its in-flight helper status probe", async () => {
+  let markStarted;
+  let markAborted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const aborted = new Promise((resolve) => { markAborted = resolve; });
+  const computer = createComputerExecutor({
+    helperPath: "/signed/helper",
+    helperRun: async (_path, operation, _payload, options = {}) => {
+      assert.equal(operation, "status");
+      markStarted();
+      await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          markAborted();
+          reject(new Error("status helper aborted"));
+        };
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) onAbort();
+      });
+      return { stdout: Buffer.from("{}"), stderr: Buffer.alloc(0) };
+    }
+  });
+  const server = createComputerServer({ token: "owner-token", executor: computer });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const request = http.request({
+      host: "127.0.0.1",
+      port: server.address().port,
+      path: "/health",
+      method: "GET",
+      headers: { authorization: "Bearer owner-token" }
+    });
+    request.on("error", () => {});
+    request.end();
+    await started;
+    request.destroy();
+    await Promise.race([
+      aborted,
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("status helper was not aborted")), 250);
+        timer.unref?.();
+      })
+    ]);
+  } finally {
+    await computer.close();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

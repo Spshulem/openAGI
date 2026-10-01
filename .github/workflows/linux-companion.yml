@@ -1,0 +1,108 @@
+name: Linux companion
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/linux-companion.yml"
+      - "linux/**"
+      - "src/hosted-interface.js"
+      - "src/integrations/computer-server.js"
+      - "src/integrations/computer-use.js"
+      - "src/integrations/cua-computer-executor.js"
+      - "test/computer-server.test.js"
+      - "test/computer-use-approval.test.js"
+      - "test/cua-computer-executor.test.js"
+      - "test/linux-companion-contract.test.js"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/linux-companion.yml"
+      - "linux/**"
+      - "src/hosted-interface.js"
+      - "src/integrations/computer-server.js"
+      - "src/integrations/computer-use.js"
+      - "src/integrations/cua-computer-executor.js"
+      - "test/computer-server.test.js"
+      - "test/computer-use-approval.test.js"
+      - "test/cua-computer-executor.test.js"
+      - "test/linux-companion-contract.test.js"
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  companion-headless:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      OPENAGI_LINUX_TESSERACT: /usr/bin/tesseract
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONWARNINGS: error::ResourceWarning
+      QT_QPA_PLATFORM: offscreen
+      XDG_SESSION_TYPE: wayland
+      WAYLAND_DISPLAY: wayland-0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native Python, GStreamer, and OCR dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gir1.2-gst-plugins-base-1.0 \
+            gir1.2-gstreamer-1.0 \
+            gstreamer1.0-plugins-base \
+            libdbus-1-3 \
+            libxkbcommon0 \
+            python3-gi \
+            python3-gst-1.0 \
+            python3-venv \
+            tesseract-ocr
+      - name: Install the companion in a system-integrated virtual environment
+        run: |
+          python3 -m venv --system-site-packages .venv
+          cp -a linux "$RUNNER_TEMP/openagi-linux-source"
+          .venv/bin/python -m pip install --disable-pip-version-check "$RUNNER_TEMP/openagi-linux-source"
+      - name: Run headless companion tests
+        run: |
+          export PYTHONPATH="$PWD/linux:$PWD/linux/tests"
+          .venv/bin/python - <<'PY'
+          import pathlib
+          import unittest
+
+          excluded = {
+              "test_app_doctor",
+              "test_app_smoke",
+              "test_desktop_bridge",
+              "test_portal_backend_live",
+          }
+          modules = [
+              path.stem
+              for path in sorted(pathlib.Path("linux/tests").glob("test_*.py"))
+              if path.stem not in excluded
+          ]
+          modules.append("test_portal_backend_live.PortalBackendLifecycleTests")
+          suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+      - run: bash -n linux/install-user.sh
+      - name: Parse Python sources
+        run: |
+          .venv/bin/python - <<'PY'
+          import ast
+          import pathlib
+
+          for path in pathlib.Path("linux").rglob("*.py"):
+              ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+          PY

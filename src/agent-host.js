@@ -20,14 +20,35 @@ export class AgentHost {
     this.runtime = options.runtime;
     if (!this.runtime) throw new Error("AgentHost requires a runtime.");
     this.store = options.store ?? new InMemoryAgentStore(options.storeOptions);
-    this.modelProvider = options.modelProvider ?? createModelProvider(options.modelProviderOptions);
+    const modelProvider = options.modelProvider ?? createModelProvider(options.modelProviderOptions);
+    this._providerSlot = providerSlot(modelProvider);
+    this.retiredModelProviders = new WeakSet();
+    this.closing = false;
+    this.closePromise = null;
     // A conversation is an ordered log. Serialize turns that target the same
     // session so two clients cannot race mutating tools or append replies out
     // of order. Different sessions still run concurrently.
     this.sessionTurnTails = new Map();
   }
 
+  get modelProvider() {
+    return this._providerSlot.provider;
+  }
+
+  wasProviderRetired(provider) {
+    return this.retiredModelProviders.has(provider);
+  }
+
+  set modelProvider(nextProvider) {
+    void this.replaceModelProvider(nextProvider).catch(() => {});
+  }
+
   async handleMessage(input, options = {}) {
+    if (this.closing) {
+      const error = new Error("Agent host is shutting down.");
+      error.code = "AGENT_HOST_CLOSING";
+      throw error;
+    }
     const queueKey = String(
       input?.sessionId ?? `${input?.channel ?? "local"}:${input?.from ?? "user"}:${input?.agentId ?? "main"}`
     );
@@ -50,6 +71,10 @@ export class AgentHost {
     let agentId = input.agentId ?? "main";
     const text = String(input.text ?? input.message ?? "").trim();
     if (!text) throw new Error("Message text is required.");
+    // The temporary direct ChatGPT OAuth tier is deliberately bounded to an
+    // owner chat reply plus its session/operational receipt. It must not enter
+    // OpenAGI's task, memory, specialist, outcome, or tool paths.
+    const provisionalChatOnly = isProvisionalChatOnlyProvider(this.modelProvider);
     // A brief selection is a reference, not client-authored prompt text. Resolve
     // it against the live store before it reaches the model, and persist only
     // the normalized form so the dashboard handoff keeps the same context.
@@ -73,7 +98,7 @@ export class AgentHost {
     // Specialist routing: see if any active specialist's bounded scope matches.
     // The caller can opt out by passing input.routeTo === false (used by sub-agents to avoid loops).
     let routing = null;
-    if (input.routeTo !== false && this.runtime.specialistRouter && agentId === "main") {
+    if (!provisionalChatOnly && input.routeTo !== false && this.runtime.specialistRouter && agentId === "main") {
       const tags = ["message", channel];
       const specialists = this.runtime.propagation?.list?.() ?? [];
       const decision = await this.runtime.specialistRouter.decide(text, tags, specialists);
@@ -90,7 +115,7 @@ export class AgentHost {
     // Auto-task detection — if the user said "remind me to X" / "todo: X" /
     // "I need to X", create a task in the user queue without requiring them
     // to invoke add_task. Best-effort; failures don't block the chat reply.
-    if (!ephemeral && this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot") {
+    if (!ephemeral && !provisionalChatOnly && this.runtime?.tasks?.add && agentId === "main" && channel !== "autopilot") {
       const detected = detectTaskInChat(text);
       if (detected) {
         try {
@@ -122,11 +147,13 @@ export class AgentHost {
     });
 
     let assistantPersisted = false;
+    const providerLease = this.#acquireModelProvider();
+    const modelProvider = providerLease.provider;
     try {
     // Refuse known budget-blocked requests before expensive memory/signal
     // processing and snapshot writes. Keep the provider's own later check
     // for concurrent spending, and retain the normal durable failure reply.
-    this.modelProvider.budgetGuard?.check?.();
+    modelProvider.budgetGuard?.check?.();
     // Incremental session indexing (search_sessions): every persisted message
     // is added to the FTS index as it lands. Best-effort — an indexing failure
     // must never block a chat reply. Ephemeral turns leave no trace anywhere,
@@ -135,17 +162,19 @@ export class AgentHost {
       this.runtime.sessionIndex.indexMessage(sessionId, agentId, sessionBefore.messages.at(-1)).catch(() => {});
     }
 
-    if (!ephemeral && channel !== "autopilot" && channel !== "cron") {
+    if (!ephemeral && !provisionalChatOnly && channel !== "autopilot" && channel !== "cron") {
       try { this.runtime.outcomes?.resolveByUserFollowup?.(sessionId, text); } catch { /* best effort */ }
     }
 
     const signal = await this.messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides: input.scrutinyOverrides ?? null });
     const isSpecialist = agent.role === "specialist";
-    const output = this.runtime.processSignal(signal, {
-      scope: isSpecialist ? `specialist:${agent.id}` : "main",
-      parentSpecialistId: isSpecialist ? agent.id : null,
-      ephemeral
-    });
+    const output = provisionalChatOnly
+      ? provisionalChatOnlyOutput()
+      : this.runtime.processSignal(signal, {
+          scope: isSpecialist ? `specialist:${agent.id}` : "main",
+          parentSpecialistId: isSpecialist ? agent.id : null,
+          ephemeral
+        });
 
     if (output.propagation?.specialist) {
       this.ensureSpecialistAgent(output.propagation.specialist, agentId);
@@ -160,8 +189,8 @@ export class AgentHost {
     //               human message is never silently dropped
     //   propagate → full access (the specialist spawn already happened above)
     const verdict = output.scrutiny.action;
-    const toolPolicy = verdict === "watch" ? "read-only" : verdict === "ask" ? "confirm" : verdict === "ignore" ? "none" : "full";
-    const toolRegistry = this.runtime.tools;
+    const toolPolicy = provisionalChatOnly || verdict === "ignore" ? "none" : verdict === "watch" ? "read-only" : verdict === "ask" ? "confirm" : "full";
+    const toolRegistry = provisionalChatOnly ? null : this.runtime.tools;
     let tools = toolPolicy === "none"
       ? []
       : (toolRegistry?.toOpenAITools?.({ readOnly: toolPolicy === "read-only" }) ?? []);
@@ -180,7 +209,7 @@ export class AgentHost {
     // Lava intuition (C2): top principles from the vector store inserted into
     // the prompt as soft hints — distinct from explicit memoryHits.
     let intuitions = [];
-    if (this.runtime.vectorStore) {
+    if (!provisionalChatOnly && this.runtime.vectorStore) {
       try {
         const rawHits = await this.runtime.vectorStore.search("principle", text, { limit: 10, minScore: 0.1 });
         intuitions = filterPrincipleHits(rawHits, this.runtime.memory, { limit: 3 });
@@ -217,7 +246,7 @@ export class AgentHost {
     const computerUseToolHops = this.runtime.computerUseLog?.activeSessionFor?.(sessionId)
       ? boundedComputerUseToolHops(process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS)
       : undefined;
-    const modelResult = await this.modelProvider.generate({
+    const modelResult = await modelProvider.generate({
       input: text,
       agent,
       // Delivery channel is not provenance: scheduled work can deliver to
@@ -248,6 +277,8 @@ export class AgentHost {
         signal: options.signal,
         ...(requestId ? { requestId } : {}),
         channel,
+        localOwner: options.localOwner === true,
+        assertChatGptOwnerAuthority: options.assertChatGptOwnerAuthority,
         ...(channel === "g2" ? { sourceNodeId: metadata.sourceNodeId } : {}),
         from,
         target: from,
@@ -280,6 +311,9 @@ export class AgentHost {
       error.code = "EMPTY_MODEL_RESPONSE";
       throw error;
     }
+    const providerUsage = normalizeProviderUsage(modelResult.usage);
+    const providerFallback = normalizeProviderFallback(modelResult.fallback);
+    const operationalReceipt = normalizeOperationalReceipt(modelResult.operationalReceipt);
 
     reportProgress("saving", { sessionId });
 
@@ -296,7 +330,7 @@ export class AgentHost {
     const meaningfulAutopilotWork = input.origin !== "autopilot" || recordedToolCalls.some((call) => (
       toolRegistry?.get?.(call.name)?.sideEffects === true
     ));
-    const outcomeRecord = ephemeral || !meaningfulAutopilotWork ? null : this.runtime.outcomes?.record({
+    const outcomeRecord = ephemeral || provisionalChatOnly || !meaningfulAutopilotWork ? null : this.runtime.outcomes?.record({
       kind: input.origin === "autopilot" ? "autopilot-fire" : input.origin === "cron" ? "cron-fire" : "agent-reply",
       refId: null, // patched after we know assistant message id
       signalId: signal.id,
@@ -332,11 +366,14 @@ export class AgentHost {
           metadata: {
             provider: modelResult.provider,
             model: modelResult.model,
-            responseId: modelResult.id,
+            responseId: operationalReceipt ? null : modelResult.id,
             outputId: output.id,
             outcomeId: outcomeRecord?.id ?? null,
+            ...(providerUsage ? { usage: providerUsage } : {}),
+            ...(providerFallback ? { providerFallback } : {}),
+            ...(operationalReceipt ? { operationalReceipt } : {}),
             ...(requestId ? { requestId } : {}),
-            toolCalls: (modelResult.toolCalls ?? []).map((call) => ({
+            toolCalls: (provisionalChatOnly ? [] : (modelResult.toolCalls ?? [])).map((call) => ({
               name: call.name,
               arguments: durableToolArguments(toolRegistry, call),
               ok: call.result?.ok ?? false
@@ -351,7 +388,7 @@ export class AgentHost {
       this.runtime.sessionIndex.indexMessage(sessionId, agentId, sessionAfter.messages.at(-1)).catch(() => {});
     }
 
-    if (!ephemeral) {
+    if (!ephemeral && !provisionalChatOnly) {
       try { this.runtime.memory.remember(
         {
           source: "agent-host",
@@ -392,8 +429,11 @@ export class AgentHost {
       model: {
         provider: modelResult.provider,
         model: modelResult.model,
-        configured: this.modelProvider.isConfigured()
+        configured: modelProvider.isConfigured()
       },
+      ...(providerUsage ? { usage: providerUsage } : {}),
+      ...(providerFallback ? { fallback: providerFallback } : {}),
+      ...(operationalReceipt ? { operationalReceipt } : {}),
       output
     };
     } catch (error) {
@@ -436,6 +476,8 @@ export class AgentHost {
         ...(failure.openagiRequestId ? { requestId: failure.openagiRequestId } : {})
       });
       throw failure;
+    } finally {
+      await providerLease.release();
     }
   }
 
@@ -596,6 +638,82 @@ Stay inside the bounded scope. If the user's request falls outside it, say so an
     });
   }
 
+  async replaceModelProvider(nextProvider, { waitForDrain = true } = {}) {
+    if (this.closing) {
+      const error = new Error("Agent host is shutting down.");
+      error.code = "AGENT_HOST_CLOSING";
+      throw error;
+    }
+    assertModelProvider(nextProvider);
+    const retiring = this._providerSlot;
+    if (retiring.provider === nextProvider) return { replaced: false };
+
+    // Publish the new provider before waiting for the old one to drain. Every
+    // turn holds a lease on one slot, so no turn can mix providers.
+    this._providerSlot = providerSlot(nextProvider);
+    this.retiredModelProviders.add(retiring.provider);
+    retiring.retiring = true;
+    retiring.retired = new Promise((resolve, reject) => {
+      retiring.resolveRetired = resolve;
+      retiring.rejectRetired = reject;
+    });
+    if (retiring.active === 0) this.#finishRetiringProvider(retiring);
+    if (!waitForDrain) {
+      // A model-initiated set_provider call still owns the old slot until its
+      // turn returns. Waiting here would deadlock that very turn.
+      void retiring.retired.catch(() => {
+        console.warn("[openagi] retired model provider failed to close");
+      });
+      return { replaced: true, retirementPending: retiring.active > 0 };
+    }
+    await retiring.retired;
+    return { replaced: true };
+  }
+
+  close() {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    this.closePromise = (async () => {
+      await Promise.allSettled([...this.sessionTurnTails.values()]);
+      const slot = this._providerSlot;
+      if (!slot.retiring) {
+        slot.retiring = true;
+        slot.retired = new Promise((resolve, reject) => {
+          slot.resolveRetired = resolve;
+          slot.rejectRetired = reject;
+        });
+      }
+      if (slot.active === 0) this.#finishRetiringProvider(slot);
+      await slot.retired;
+    })();
+    return this.closePromise;
+  }
+
+  #acquireModelProvider() {
+    const slot = this._providerSlot;
+    slot.active += 1;
+    let released = false;
+    return {
+      provider: slot.provider,
+      release: async () => {
+        if (released) return;
+        released = true;
+        slot.active = Math.max(0, slot.active - 1);
+        if (slot.retiring && slot.active === 0) {
+          this.#finishRetiringProvider(slot);
+          await slot.closePromise?.catch(() => {});
+        }
+      }
+    };
+  }
+
+  #finishRetiringProvider(slot) {
+    if (slot.closePromise) return slot.closePromise;
+    slot.closePromise = Promise.resolve().then(() => slot.provider.close?.());
+    slot.closePromise.then(slot.resolveRetired, slot.rejectRetired);
+    return slot.closePromise;
+  }
+
   status() {
     return {
       provider: friendlyProviderLabel(this.modelProvider),
@@ -605,6 +723,99 @@ Stay inside the bounded scope. If the user's request falls outside it, say so an
       sessions: this.store.listSessions()
     };
   }
+}
+
+function isProvisionalChatOnlyProvider(provider) {
+  return provider?.providerId === "openai-chatgpt"
+    && provider?.capabilityTier === "provisional-chat-only";
+}
+
+function provisionalChatOnlyOutput() {
+  return {
+    id: createId("output"),
+    scrutiny: {
+      action: "ignore",
+      score: 0,
+      reasons: ["Temporary ChatGPT OAuth tier: no OpenAGI effects."],
+      dimensions: { novelty: 0, risk: 0, repetition: 0 }
+    },
+    customContext: [],
+    propagation: { created: false, specialist: null }
+  };
+}
+
+function providerSlot(provider) {
+  return {
+    provider,
+    active: 0,
+    retiring: false,
+    retired: null,
+    resolveRetired: null,
+    rejectRetired: null,
+    closePromise: null
+  };
+}
+
+function assertModelProvider(provider) {
+  if (!provider || typeof provider.generate !== "function" || typeof provider.isConfigured !== "function") {
+    throw new TypeError("Model provider must implement generate() and isConfigured().");
+  }
+}
+
+function normalizeProviderUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const inputTokens = nonNegativeIntegerOrNull(usage.inputTokens ?? usage.input_tokens ?? usage.prompt_tokens);
+  const outputTokens = nonNegativeIntegerOrNull(usage.outputTokens ?? usage.output_tokens ?? usage.completion_tokens);
+  const billingMode = typeof usage.billingMode === "string" ? usage.billingMode.slice(0, 64) : null;
+  const usd = usage.usd === null ? null : Number.isFinite(usage.usd) && usage.usd >= 0 ? usage.usd : null;
+  if (billingMode === null && inputTokens === null && outputTokens === null && usage.usd === undefined) return null;
+  return { billingMode, usd, inputTokens, outputTokens, quota: null };
+}
+
+function normalizeProviderFallback(fallback) {
+  if (!fallback || typeof fallback !== "object") return null;
+  const from = boundedMetadataString(fallback.from);
+  const to = boundedMetadataString(fallback.to);
+  const reason = boundedMetadataString(fallback.reason);
+  return from && to && reason ? { from, to, reason } : null;
+}
+
+function normalizeOperationalReceipt(receipt) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+    || receipt.schema !== "openagi.codex-provisional-turn.v1"
+    || receipt.scope !== "owner-interactive-chat-only"
+    || receipt.transport !== "chatgpt-codex-responses"
+    || receipt.capabilityTier !== "provisional-chat-only"
+    || receipt.reasoningEffortEffective !== "unknown"
+    || receipt.terminalResponse !== "completed"
+    || receipt.toolEffects !== "none") return null;
+  const modelRequested = boundedMetadataString(receipt.modelRequested);
+  const modelReported = boundedMetadataString(receipt.modelReported);
+  const reasoningEffortConfigured = boundedMetadataString(receipt.reasoningEffortConfigured);
+  const responseIdSha256 = typeof receipt.responseIdSha256 === "string" && /^[a-f0-9]{64}$/.test(receipt.responseIdSha256)
+    ? receipt.responseIdSha256 : null;
+  if (!modelRequested || modelReported !== modelRequested || !reasoningEffortConfigured || !responseIdSha256) return null;
+  return {
+    schema: "openagi.codex-provisional-turn.v1",
+    scope: "owner-interactive-chat-only",
+    transport: "chatgpt-codex-responses",
+    capabilityTier: "provisional-chat-only",
+    modelRequested,
+    modelReported,
+    reasoningEffortConfigured,
+    reasoningEffortEffective: "unknown",
+    terminalResponse: "completed",
+    toolEffects: "none",
+    responseIdSha256
+  };
+}
+
+function boundedMetadataString(value) {
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, 128) : null;
+}
+
+function nonNegativeIntegerOrNull(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 // Progress is advisory and must never be able to fail an otherwise healthy

@@ -12,6 +12,8 @@ import { resolveDataDir } from "./data-dir.js";
 
 const WIZARD_FIELDS = [
   "OPENAGI_PROVIDER",
+  "OPENAGI_CODEX_BIN", "OPENAGI_CODEX_CAPABILITY_TIER", "OPENAGI_CODEX_FALLBACK_PROVIDER", "OPENAGI_CODEX_MODEL", "OPENAGI_CODEX_REASONING_EFFORT", "OPENAGI_CODEX_SHA256",
+  "OPENAGI_CHATGPT_ENABLED", "OPENAGI_CHATGPT_MODEL", "OPENAGI_CHATGPT_REASONING_EFFORT", "OPENAGI_CHATGPT_CAPABILITY_TIER",
   "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
   "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT",
   "OPENAGI_AUTH_TOKEN",
@@ -116,7 +118,7 @@ function parseEnvText(text) {
   return out;
 }
 
-export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
+export function renderWizard({ proposedToken, existingEnv = {}, dataDir } = {}) {
   // Re-running /setup must NOT rotate the auth token: every save used to
   // overwrite OPENAGI_AUTH_TOKEN with a fresh value because the hidden field
   // always submitted. Keep the existing token when there is one.
@@ -209,7 +211,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
       <h2>1 / 8</h2>
       <h3>Welcome</h3>
       <p>OpenAGI is an always-on local agent: chat, scheduled prompts, MCP tools, SMS/Telegram channels, automatic task tracking from your calls/issues/notes.<br>
-      Everything runs on this machine. State stays in <code>${escapeHtml(envFilePath().replace(/\\/g, "/"))}</code>.</p>
+      Everything runs on this machine. State stays in <code>${escapeHtml(envFilePath(dataDir).replace(/\\/g, "/"))}</code>.</p>
       <p>This wizard takes ~3 minutes. You can change anything later by re-running <code>/setup</code> or via the <code>Integrations</code> tab.</p>
       <p><strong>Using Even G2?</strong> Finish setup on your main computer, then open <a href="/g2/connect" target="_blank" rel="noopener">Connect glasses</a> for a single-use connection card and speech-readiness guidance. Your glasses never need your owner token.</p>
     </div>
@@ -222,7 +224,46 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
         <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="auto" ${providerChecked("auto")}> Auto · use whichever has a key (Anthropic preferred)</label>
         <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="anthropic" ${providerChecked("anthropic")}> Anthropic · Claude Sonnet 4.6</label>
         <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai" ${providerChecked("openai")}> OpenAI · ChatGPT (GPT-5)</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai-codex" ${providerChecked("openai-codex")}> OpenAI Codex · Sign in with ChatGPT (no API key)</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai-chatgpt" ${providerChecked("openai-chatgpt")} ${existingEnv.OPENAGI_CHATGPT_ENABLED === "1" ? "" : "disabled"}> OpenAI Codex OAuth · provisional owner chat (explicit opt-in)</label>
       </div>
+
+      <h3 style="margin-top:14px;">OpenAI Codex OAuth — provisional chat-only</h3>
+      <p>This separate, opt-in route stores its own login in the OS Secret Service; Codex credentials are not read or copied. It requires <code>OPENAGI_CHATGPT_ENABLED=1</code> at startup, an owner-initiated device login and account model discovery. It uses the direct Codex Responses transport, exactly one upstream request per owner message, and no OpenAGI or Codex tool effects. OpenAGI persists a content-free local receipt only after the terminal response reports the requested model. The configured effort is a request; effective effort is unknown.</p>
+      <label class="opt"><input type="checkbox" name="OPENAGI_CHATGPT_ENABLED" value="1" ${existingEnv.OPENAGI_CHATGPT_ENABLED === "1" ? "checked" : ""}> I explicitly enable this provisional, owner-interactive, chat-only OAuth route (restart after saving before selecting it).</label>
+      <label>OPENAGI_CHATGPT_MODEL</label>
+      <input type="text" name="OPENAGI_CHATGPT_MODEL" value="${val("OPENAGI_CHATGPT_MODEL")}" placeholder="Select an exact model from your account catalogue first">
+      <label>OPENAGI_CHATGPT_REASONING_EFFORT (configured effort)</label>
+      <select name="OPENAGI_CHATGPT_REASONING_EFFORT">
+        ${["low", "medium", "high", "xhigh"].map((effort) => `<option value="${effort}" ${(existingEnv.OPENAGI_CHATGPT_REASONING_EFFORT ?? "medium") === effort ? "selected" : ""}>${effort}</option>`).join("")}
+      </select>
+      <label style="margin-top:8px;">OPENAGI_CHATGPT_CAPABILITY_TIER</label>
+      <input type="text" name="OPENAGI_CHATGPT_CAPABILITY_TIER" value="provisional-chat-only" readonly>
+
+      <h3 style="margin-top:14px;">OpenAI Codex via ChatGPT</h3>
+      <p>This uses the session managed by the official Codex app-server. It is separate from <code>OPENAGI_AUTH_TOKEN</code>, which protects this dashboard, and from <code>OPENAI_API_KEY</code>, which is billed through the OpenAI API. OpenAGI never reads or copies Codex credentials.</p>
+      <div class="row">
+        <div><label>OPENAGI_CODEX_BIN</label><input type="text" name="OPENAGI_CODEX_BIN" value="${val("OPENAGI_CODEX_BIN")}" placeholder="/absolute/path/to/codex"></div>
+        <div><label>OPENAGI_CODEX_SHA256</label><input type="text" name="OPENAGI_CODEX_SHA256" value="${val("OPENAGI_CODEX_SHA256")}" placeholder="64 lowercase hexadecimal characters"></div>
+      </div>
+      <p>Both fields are required before qualification. OpenAGI resolves the executable and refuses inference if its SHA-256 changes. Keep a working primary provider selected while saving these settings; Codex cannot become the default until its isolation and live canaries pass. This wizard does not perform Codex login.</p>
+      <label>OPENAGI_CODEX_MODEL</label>
+      <input type="text" name="OPENAGI_CODEX_MODEL" value="${val("OPENAGI_CODEX_MODEL", "gpt-5.3-codex")}">
+      <div class="row" style="margin-top:8px;">
+        <div><label>OPENAGI_CODEX_REASONING_EFFORT</label><select name="OPENAGI_CODEX_REASONING_EFFORT">
+          ${["low", "medium", "high", "xhigh"].map((effort) => `<option value="${effort}" ${(existingEnv.OPENAGI_CODEX_REASONING_EFFORT ?? "medium") === effort ? "selected" : ""}>${effort}</option>`).join("")}
+        </select></div>
+        <div><label>OPENAGI_CODEX_CAPABILITY_TIER</label><input type="text" name="OPENAGI_CODEX_CAPABILITY_TIER" value="chat-only" readonly></div>
+      </div>
+      <label style="margin-top:8px;">OPENAGI_CODEX_FALLBACK_PROVIDER</label>
+      <select name="OPENAGI_CODEX_FALLBACK_PROVIDER">
+        ${[
+          ["none", "None · fail closed"],
+          ["openai", "OpenAI API key"],
+          ["anthropic", "Anthropic API key"]
+        ].map(([value, label]) => `<option value="${value}" ${(existingEnv.OPENAGI_CODEX_FALLBACK_PROVIDER ?? "none") === value ? "selected" : ""}>${label}</option>`).join("")}
+      </select>
+      <p>Fallback is explicit and produces a visible provider-fallback event. It applies only to interactive chat and never silently routes scheduled or autopilot work through the ChatGPT subscription.</p>
 
       <h3 style="margin-top:14px;">Anthropic key</h3>
       <p>Get one at <a href="https://console.anthropic.com/" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
@@ -393,7 +434,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
 
     <div class="step">
       <h3>Save and test</h3>
-      <p>This writes your settings to <code>${escapeHtml(envFilePath().replace(/\\/g, "/"))}</code>, sets the auth cookie in this browser, and sends a "hi" through the agent to confirm it works.</p>
+      <p>This writes your settings to <code>${escapeHtml(envFilePath(dataDir).replace(/\\/g, "/"))}</code>, sets the auth cookie in this browser, and sends a "hi" through the agent to confirm it works.</p>
       <div class="actions">
         <button type="submit" id="saveBtn">Save and continue</button>
       </div>
@@ -474,6 +515,9 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
     const fd = new FormData(e.target);
     const obj = {};
     for (const [k, v] of fd.entries()) if (v !== "") obj[k] = v;
+    if (!e.target.elements.OPENAGI_CHATGPT_ENABLED?.checked) {
+      obj.clear = ["OPENAGI_CHATGPT_ENABLED"];
+    }
 
     const out = document.getElementById("output");
     out.style.display = "block";

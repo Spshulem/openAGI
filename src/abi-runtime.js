@@ -1383,7 +1383,7 @@ export function createDefaultRuntime(options = {}) {
         store: options.agentStore,
         storeOptions: options.agentStoreOptions,
         modelProvider: options.modelProvider,
-        modelProviderOptions: { ...(options.modelProviderOptions ?? {}), budgetGuard: runtime.budget }
+        modelProviderOptions: { dataDir: options.dataDir, ...(options.modelProviderOptions ?? {}), budgetGuard: runtime.budget }
       });
   }
   // First boot / backfill: when the session index is empty (missing DB, or a
