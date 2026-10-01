@@ -323,15 +323,19 @@ export class FleetSupervisor {
   }
 
   // { mode, ready, detail }: ready is null when not probed (cli, or no driver).
-  async probeDelivery() {
+  // deadlineAt: a remote caller's. Its probes end before it, and a request
+  // with no time left reports computer use not ready (the send waits).
+  async probeDelivery({ deadlineAt = null } = {}) {
     const mode = this.config.delivery ?? "cli";
     let state = { mode, ready: null, detail: null };
     const driver = mode === "cli" ? null : this.uiDriver;
+    const left = () => (Number.isFinite(deadlineAt) ? deadlineAt - DEADLINE_MARGIN_MS - Date.now() : SOURCE_TIMEOUT_MS);
     if (driver?.readiness) {
+      if (left() <= 0) return { mode, ready: false, detail: "no time left in this request" };
       try {
-        const result = await withTimeout(Promise.resolve(driver.readiness()), SOURCE_TIMEOUT_MS, "computer-use readiness");
+        const result = await withTimeout(Promise.resolve(driver.readiness()), Math.min(SOURCE_TIMEOUT_MS, left()), "computer-use readiness");
         state = { mode, ready: result?.ready === true, detail: result?.ready === true ? null : clampText(result?.detail ?? "not ready", 160) };
-        if (state.ready && mode === "computer-use-first" && driver.appRunning) state.apps = await this.probeApps(driver);
+        if (state.ready && mode === "computer-use-first" && driver.appRunning) state.apps = await this.probeApps(driver, left);
       } catch (error) {
         state = { mode, ready: false, detail: clampText(`readiness check failed: ${error?.message ?? error}`, 160) };
       }
@@ -341,11 +345,12 @@ export class FleetSupervisor {
   }
 
   // bundleId -> running (true/false), or null when it could not be told.
-  async probeApps(driver) {
+  async probeApps(driver, left = () => SOURCE_TIMEOUT_MS) {
     const apps = {};
     for (const { bundleId } of Object.values(UI_APPS)) {
       try {
-        apps[bundleId] = await withTimeout(Promise.resolve(driver.appRunning(bundleId)), SOURCE_TIMEOUT_MS, "app presence");
+        if (left() <= 0) throw new Error("no time left");
+        apps[bundleId] = await withTimeout(Promise.resolve(driver.appRunning(bundleId)), Math.min(SOURCE_TIMEOUT_MS, left()), "app presence");
       } catch {
         apps[bundleId] = null;
       }
@@ -521,7 +526,7 @@ export class FleetSupervisor {
     let sent = 0;
     let blocked = 0;
     let late = 0;
-    const deliveryState = await this.probeDelivery();
+    const deliveryState = await this.probeDelivery({ deadlineAt });
     // A Conductor session and the Codex thread it hosts are one app
     // conversation: one typed send covers every key that maps to it.
     const typedInto = new Map();
@@ -692,7 +697,7 @@ export class FleetSupervisor {
       const retry = question.kind === "infra" && answer === "retry";
       if ((question.kind === "agent-ask" || retry) && question.threadKey && answer !== "open thread") {
         const thread = this.lastThreads.get(question.threadKey);
-        const deliveryState = thread ? await this.probeDelivery() : null;
+        const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
         const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
         const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
         if (!thread || !route) {
@@ -760,7 +765,7 @@ export class FleetSupervisor {
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
     const thread = this.lastThreads.get(threadKey);
-    const deliveryState = thread ? await this.probeDelivery() : null;
+    const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt });

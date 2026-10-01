@@ -50,8 +50,9 @@ const SNIPPET_MAX = 64 * 1024;
 const DETAIL_MAX = 200;
 const TYPING_MS_PER_CHAR = 25;
 // A remote caller's deadline is the main's clock and its answer needs the
-// trip back: the driver ends this long before it.
-export const DEADLINE_MARGIN_MS = 5000;
+// trip back: the node's result upload may take its full 10 s
+// (src/node-control.js) plus processing, so the driver ends this long before it.
+export const DEADLINE_MARGIN_MS = 15_000;
 const ALLOWED_BUNDLES = new Set(Object.values(UI_APPS).map((app) => app.bundleId));
 
 // ---------------------------------------------------------------------------
@@ -364,7 +365,8 @@ function conductorIdentity(target, others) {
 // recognise another thread being open (conflicts).
 export function uiIdentity(thread, target, threads = []) {
   if (!target) return { tokens: [], conflicts: [], ambiguous: false, reason: "no app shows this thread" };
-  const others = (threads ?? []).filter((other) => other && other.key !== thread?.key && !other.archived)
+  // Automation runs, reviews and subagents never show in the app's sidebar.
+  const others = (threads ?? []).filter((other) => other && other.key !== thread?.key && !other.archived && other.excluded !== "automation")
     .map((other) => ({ other, target: uiTargetFor(other) }))
     .filter((entry) => entry.target && entry.target.app === target.app && entry.target.targetKey !== target.targetKey);
   const blocked = (reason, ambiguous = true) => ({ tokens: [], conflicts: [], ambiguous, reason });

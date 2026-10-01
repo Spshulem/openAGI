@@ -1327,6 +1327,18 @@ test("a kept answer waits out a Scan now through the node broker when it would b
   assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 1);
 });
 
+test("a remote send with no time left skips the readiness probe and waits", async (t) => {
+  let probes = 0;
+  const driver = { readiness: async () => { probes += 1; return { ready: true, detail: null }; } };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [makeThread({ meta: { originator: "Codex Desktop" } })], deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const before = { probes, sent: delivered.length };
+  const result = await supervisor.sendOwnerMessage("codex:t1", "Rebase on main.", { deadlineAt: Date.now() + DEADLINE_MARGIN_MS - 1 });
+  assert.equal(result.delivery.status, "blocked");
+  assert.equal(probes, before.probes, "no readiness probe past the deadline");
+  assert.equal(delivered.length, before.sent);
+});
+
 test("the owner's own message to a thread goes through the supervisor's delivery", async (t) => {
   const { supervisor, delivered } = fixture(t, { threads: [makeThread()] });
   await supervisor.tick();

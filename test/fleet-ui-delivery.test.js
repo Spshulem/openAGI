@@ -1247,6 +1247,18 @@ const codexLabelled = (page, rows = []) => stateOf([
   ...rows.map((row, index) => `\t\t\t\t${40 + index} ${row}`)
 ].join("\n"));
 
+test("a hidden automation's labels never make a real thread's name or first message look shared", () => {
+  const target = uiTargetFor(auditThread);
+  // A review run whose first message is our thread's name, kept in memory.
+  const review = { ...codexNamed("0199-review", "Guardian", "Audit OpenAI model versions"), excluded: "automation" };
+  const identity = uiIdentity(auditThread, target, [auditThread, review]);
+  assert.equal(identity.ambiguous, false);
+  assert.deepEqual(identity.altTokens, ["openai just launched their gpt-6 models"]);
+  assert.equal(identity.conflicts.includes("guardian"), false);
+  // The same thread shown in the sidebar does make it shared.
+  assert.equal(uiIdentity(auditThread, target, [auditThread, { ...review, excluded: null }]).ambiguous, true);
+});
+
 test("Codex showing a thread by its first message: the alt title proves it, never past another thread", () => {
   const target = uiTargetFor(auditThread);
   assert.equal(target.altTitle, AUDIT_FIRST);
