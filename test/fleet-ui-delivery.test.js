@@ -1601,12 +1601,12 @@ test("after an input call times out, nothing types until its late answer shows i
   f.app.composer = "";
   const count = f.calls().length;
   // Surfaced as not ready (the supervisor's paused-nudge alert), not a benign wait.
-  assert.deepEqual(await f.driver.readiness(), { ready: false, detail: "an earlier input call has not finished; typing paused until it answers or OpenAGI restarts" });
+  assert.deepEqual(await f.driver.readiness(), { ready: false, detail: "an earlier input call has not finished; typing paused until it answers" });
   // Long past any estimate (close grace, a read, the typing time).
   f.advance(60 * 60_000);
   const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
   assert.equal(next.status, "blocked");
-  assert.equal(next.detail, "computer use not ready: an earlier input call has not finished; typing paused until it answers or OpenAGI restarts; nothing typed");
+  assert.equal(next.detail, "computer use not ready: an earlier input call has not finished; typing paused until it answers; nothing typed");
   assert.equal(f.calls().length, count, "nothing read or typed");
   assert.equal(f.probe.activated.length, 1, "no other app brought forward");
   // The late answer arrives on the still-open engine: typing resumes.
@@ -1617,8 +1617,13 @@ test("after an input call times out, nothing types until its late answer shows i
   assert.equal(later.status, "sent", later.detail);
 });
 
-test("the input latch is process-wide, and an engine that exits before the late answer keeps it until restart", async (t) => {
-  const latch = createInputLatch();
+test("the input latch is process-wide, and an engine that exits before the late answer keeps it 30 min, across restarts", async (t) => {
+  let clock = Date.parse("2026-09-30T12:00:00.000Z");
+  const latch = createInputLatch({ now: () => clock });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-latch-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "ui-input-orphaned.json");
+  latch.persistTo(file);
   const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 10 * 60_000 : 0) }, driverOptions: { inputLatch: latch } });
   const g = setup(t, { driverOptions: { inputLatch: latch } });
   await f.driver.deliver(f.request());
@@ -1629,12 +1634,48 @@ test("the input latch is process-wide, and an engine that exits before the late 
   assert.deepEqual(g.calls(), []);
   f.transports[0].late[0]({ completed: false });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(await g.driver.readiness(), { ready: false, detail: "an earlier input call has not finished and its engine exited; typing paused until OpenAGI restarts" });
+  assert.deepEqual(await g.driver.readiness(), { ready: false, detail: "an earlier input call never answered and may still run in Open Computer Use; typing paused until 12:30 UTC" });
+  // A restart (a new latch reading the same file) keeps the pause.
+  const restarted = createInputLatch({ now: () => clock });
+  restarted.persistTo(file);
+  assert.equal(restarted.held, true);
+  // 30 min on, it lifts, and the file goes.
+  clock += 30 * 60_000;
+  assert.equal(restarted.held, false);
+  assert.equal(fs.existsSync(file), false);
   // A timed-out input call with no way to see it end holds it as well.
   const bare = createInputLatch();
   bare.hold(undefined);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(bare.held, true);
+});
+
+test("after a Return send, the owner's app goes back once only that key happened and they are away", async (t) => {
+  const f = setup(t);
+  const hid = hidClock(f);
+  f.app.sendButton = false;
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "not right after our own key");
+  // Not away long enough yet: kept.
+  f.advance(30_000);
+  await f.driver.readiness();
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"]);
+  // Away long enough, nothing since our key: Chrome goes back.
+  f.advance(DEFAULTS.uiOwnerIdleMs);
+  await f.driver.readiness();
+  assert.deepEqual(f.probe.activated, ["com.conductor.app", "com.google.Chrome"]);
+
+  // Input after our key is the owner's: nothing is put back, ever.
+  const g = setup(t);
+  const ghid = hidClock(g);
+  g.app.sendButton = false;
+  await g.driver.deliver(g.request());
+  g.advance(10_000);
+  ghid.touch();
+  g.advance(DEFAULTS.uiOwnerIdleMs + 1_000);
+  await g.driver.readiness();
+  assert.deepEqual(g.probe.activated, ["com.conductor.app"]);
 });
 
 test("a request that already spent its time before the send types nothing", async (t) => {

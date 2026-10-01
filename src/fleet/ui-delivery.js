@@ -34,6 +34,11 @@ const OCU_AGENT_NAMESPACE = "openagi-fleet";
 // posts a HID event; its key presses (Return) and keyboard-fallback typing
 // do, and nothing that follows them needs the owner away except putting
 // their app back, which then simply waits for real idle.
+// After a Return send, the owner's app goes back on a later readiness check
+// once nothing but that key has happened and they have been away long
+// enough; given up after this long.
+const RESTORE_PENDING_MS = 30 * MIN;
+const RESTORE_KEY_SLACK_MS = 2000;
 // A presence check (idle, front app, idle) is trusted only if it took at most
 // this long: a slower one may describe a moment that has passed, so the send
 // waits for a fresh one instead. Real lsappinfo and ioreg calls take ~50 ms.
@@ -586,24 +591,49 @@ export const UI_LOCK = createUiLock();
 // until its late answer shows it finished. If its engine exits first the
 // agent may still be running it: typing stays paused until the daemon
 // restarts. settled: the transport's inFlight promise ({ completed }).
-export function createInputLatch() {
+// An input whose engine exited unanswered may still run in the app agent,
+// and nothing cancels it there, a restart included: typing stays paused this
+// long after, and the pause is kept on disk so a restart does not lift it.
+export const ORPHAN_HOLD_MS = 30 * MIN;
+
+export function createInputLatch({ now = Date.now } = {}) {
   const open = new Set();
-  let orphaned = false;
+  let orphanedAt = null;
+  let file = null;
+  const orphaned = () => {
+    if (orphanedAt === null) return false;
+    if (now() - orphanedAt < ORPHAN_HOLD_MS) return true;
+    orphanedAt = null;
+    if (file) try { fs.rmSync(file, { force: true }); } catch { /* retried next time */ }
+    return false;
+  };
+  const orphan = () => {
+    orphanedAt = now();
+    if (file) try { ensureDir(path.dirname(file)); fs.writeFileSync(file, JSON.stringify({ orphanedAt: new Date(orphanedAt).toISOString() }), { mode: 0o600 }); } catch { /* held in memory still */ }
+  };
   return {
-    get held() { return orphaned || open.size > 0; },
+    get held() { return orphaned() || open.size > 0; },
     get detail() {
-      if (orphaned) return "an earlier input call has not finished and its engine exited; typing paused until OpenAGI restarts";
-      return open.size ? "an earlier input call has not finished; typing paused until it answers or OpenAGI restarts" : null;
+      if (orphaned()) return `an earlier input call never answered and may still run in Open Computer Use; typing paused until ${new Date(orphanedAt + ORPHAN_HOLD_MS).toISOString().slice(11, 16)} UTC`;
+      return open.size ? "an earlier input call has not finished; typing paused until it answers" : null;
+    },
+    // Keeps the pause in this file, and picks up one left by an earlier run.
+    persistTo(path_) {
+      file = path_;
+      try {
+        const at = Date.parse(JSON.parse(fs.readFileSync(file, "utf8"))?.orphanedAt ?? "");
+        if (Number.isFinite(at)) orphanedAt = Math.max(orphanedAt ?? at, at);
+      } catch { /* none */ }
     },
     hold(settled) {
       const token = {};
       open.add(token);
       Promise.resolve(settled).then((result) => {
         open.delete(token);
-        if (result?.completed !== true) orphaned = true;
+        if (result?.completed !== true) orphan();
       }, () => {
         open.delete(token);
-        orphaned = true;
+        orphan();
       });
     }
   };
@@ -704,9 +734,31 @@ export function createUiDriver({
     return permissionCache;
   };
 
+  // The owner's app a Return send could not put back yet (see restoreFront).
+  let pendingRestore = null;
+
+  async function retryRestore() {
+    const pending = pendingRestore;
+    if (!pending) return;
+    if (now() - pending.keyEnd > RESTORE_PENDING_MS) { pendingRestore = null; return; }
+    try {
+      const taken = now();
+      const idle = await presence.idleMs();
+      const front = await presence.frontApp();
+      if (now() - taken > PRESENCE_FRESH_MS) return;
+      // Input after our key is the owner's, or another app is in front (the
+      // screen saver too): they took over, nothing to put back.
+      if (idle === null || front !== pending.bundleId || now() - idle > pending.keyEnd + RESTORE_KEY_SLACK_MS) { pendingRestore = null; return; }
+      if (!ownerAway(idle)) return;
+      pendingRestore = null;
+      if ((await presence.appRunning(pending.frontBefore)) === true) await presence.activate(pending.frontBefore);
+    } catch { /* tried again at the next check */ }
+  }
+
   // Fresh at every send; cheap enough to run once per tick as well.
   async function readiness() {
     const notReady = (detail) => ({ ready: false, detail });
+    await retryRestore();
     try {
       if (!computerUseEnabled()) return notReady("computer use is off (OPENAGI_COMPUTER_USE)");
       if (!bins.ocu || !binaryReady(bins.ocu)) return notReady("Open Computer Use not found: set OPENAGI_FLEET_OCU_PATH");
@@ -777,7 +829,12 @@ export function createUiDriver({
       if ((await probeNow(ctx, "appRunning", ctx.frontBefore)) !== true) return;
       // The same quick check as before typing, right before the switch: the
       // target still in front, no screen saver, the owner away.
-      if (await ownerReason(ctx, target)) return;
+      const reason = await ownerReason(ctx, target);
+      if (reason) {
+        // Our own Return reset the idle clock: retried later (retryRestore).
+        if (Number.isFinite(ctx.keyEnd) && /^owner using /.test(reason)) pendingRestore = { frontBefore: ctx.frontBefore, bundleId: target.bundleId, keyEnd: ctx.keyEnd };
+        return;
+      }
       await probeNow(ctx, "activate", ctx.frontBefore);
     } catch { /* best-effort */ }
   }
@@ -1112,6 +1169,7 @@ export function createUiDriver({
       const away = await ownerCheck(ctx, target);
       if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
       await press(ctx, "Return", signal);
+      ctx.keyEnd = now();
     }
     ctx.phase = "sent";
 

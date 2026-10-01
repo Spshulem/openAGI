@@ -16,7 +16,7 @@ import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, userPlaybooksDir 
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
-import { DEADLINE_MARGIN_MS, createAppRestarter, createUiDriver, restartMaxMs } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppRestarter, createUiDriver, restartMaxMs } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -311,6 +311,8 @@ export class FleetSupervisor {
     if (this.deps.uiDriver !== undefined) this._uiDriver = this.deps.uiDriver;
     else if (this.deps.executor) this._uiDriver = null;
     else {
+      // An orphaned input's pause outlives a restart (see ORPHAN_HOLD_MS).
+      UI_INPUT_LATCH.persistTo(path.join(this.store.dir, "ui-input-orphaned.json"));
       this._uiDriver = createUiDriver({
         config: this.config,
         run: this.deps.run ?? runCommand,
