@@ -762,15 +762,19 @@ export function createUiDriver({
   // would land in the owner's app.
   async function restoreFront(ctx) {
     const target = ctx.request.target;
-    if (ctx.inputInFlight || !ctx.activated || !ctx.inFront || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    if (ctx.inputInFlight || !ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    // A deep link can bring the app forward before navigation fails: what
+    // counts is that the target is in front now, which the check below probes.
+    ctx.inFront = true;
     // Within the cleanup budget; probeNow starts a probe only if it fits.
     ctx.deadline = ctx.hardEndsAt;
     try {
       // open -b launches an app that quit meanwhile; never that.
       if ((await probeNow(ctx, "appRunning", ctx.frontBefore)) !== true) return;
       // The same quick check as before typing, right before the switch: the
-      // target still in front, the owner away, no screen saver.
-      if (await ownerReason(ctx, target)) return;
+      // target still in front, no screen saver, and the owner away by real
+      // idle time (input taken for the fleet's own may have been theirs).
+      if (await ownerReason(ctx, target, { discount: false })) return;
       await probeNow(ctx, "activate", ctx.frontBefore);
     } catch { /* best-effort */ }
   }
@@ -778,10 +782,10 @@ export function createUiDriver({
   // Away: no input for uiOwnerIdleMs, or the last input is the driver's own
   // last key or typing (which reset the idle clock), as markOwnInput saw it.
   // Not the whole call: the owner can type during a slow one.
-  function ownerAway(ctx, idle) {
+  function ownerAway(ctx, idle, { discount = true } = {}) {
     if (idle === null || idle === undefined) return false;
     if (idle >= limits.uiOwnerIdleMs) return true;
-    if (!Number.isFinite(ctx.ownInput)) return false;
+    if (!discount || !Number.isFinite(ctx.ownInput)) return false;
     return Math.abs(now() - idle - ctx.ownInput) <= OWN_INPUT_SLACK_MS;
   }
 
@@ -893,7 +897,11 @@ export function createUiDriver({
       let { composer } = composerIn(ctx, state);
       if (!composer) return false;
       if (!normalizeUiText(composer.value)) return true;
-      if (!looksLikeOurs(composer.value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
+      // Only our text, as typed or as the app mangled it, never longer: what
+      // was added to it may be the owner's, and input that overlapped ours
+      // cannot be told apart from theirs.
+      const value = normalizeUiText(composer.value);
+      if (value.length > normalizeUiText(ctx.text).length || !looksLikeOurs(value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
       // Every read is slow: presence again right before each input.
       if (await ownerCheck(ctx, ctx.request.target)) return false;
       if (!isComposerFocused(state, composer)) {
@@ -929,7 +937,9 @@ export function createUiDriver({
     return reason;
   }
 
-  async function ownerReason(ctx, target) {
+  // discount false: only real idle time counts, never input taken for the
+  // fleet's own (the owner's can overlap it).
+  async function ownerReason(ctx, target, { discount = true } = {}) {
     // The front app is read last, so a screen saver that started during the
     // idle probe (or a slow read before it) is seen: nothing comes forward over it.
     const taken = now();
@@ -940,7 +950,7 @@ export function createUiDriver({
     // Each probe can stall: only a quick check describes now.
     if (now() - taken > PRESENCE_FRESH_MS) return "presence check too slow";
     const idle = idleBefore === null || idleAfter === null ? null : Math.min(idleBefore, idleAfter);
-    if (!ownerAway(ctx, idle)) {
+    if (!ownerAway(ctx, idle, { discount })) {
       if (front === target.bundleId || front === null) return `owner using ${target.name}`;
       if (!ctx.inFront) return `waiting for idle: ${target.name} must be in front to type`;
     }

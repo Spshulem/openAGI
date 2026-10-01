@@ -394,7 +394,9 @@ test("the fleet's own clicks and keys do not count as the owner coming back", as
   app.onType = (text) => { hidAt = f.now(); f.advance(3_000); return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
-  assert.deepEqual(probe.activated, ["com.conductor.app", "com.google.Chrome"]);
+  // Input taken for the fleet's own may overlap the owner's: never grounds
+  // to switch apps, so their app is not put back after HID typing.
+  assert.deepEqual(probe.activated, ["com.conductor.app"]);
   // The next delivery right after is not held up by them either.
   f.advance(2_000);
   const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
@@ -967,6 +969,19 @@ test("the UI lock runs one delivery at a time and reports busy after the wait", 
   assert.deepEqual(order, ["first:start", "first:end", "second"]);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(lock.busy, false);
+});
+
+test("Codex coming forward on its link, then navigation failing: the owner's app is put back", async (t) => {
+  const app = fakeApp({ bundleId: "com.openai.codex", workspaces: [], selected: null, windowTitle: "Another thread" });
+  const probe = fakeProbe({ idle: 10 * 60_000, onOpen: () => { probe.front = "com.openai.codex"; } });
+  const f = setup(t, { app, probe });
+  const thread = { key: "codex:t1", kind: "codex", id: "0199-abc", title: "Fix the upload retry bug", meta: { originator: "Codex Desktop" } };
+  const target = uiTargetFor(thread);
+  const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(thread, target, [thread]), evidenceName: "fa_codex" });
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /could not verify thread/);
+  assert.deepEqual(typed(f.calls()), []);
+  assert.deepEqual(probe.activated, ["com.google.Chrome"], "the link brought Codex forward; Chrome goes back");
 });
 
 test("Codex: owner away opens codex://threads/<id> with no prefill, then verifies by title", async (t) => {
@@ -1563,7 +1578,7 @@ test("the fleet's keys and typing land before a slow closing snapshot: still not
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
   assert.equal(f.calls().filter((call) => call.name === "press_key").at(-1).args.key, "Return");
-  assert.deepEqual(f.probe.activated, ["com.conductor.app", "com.google.Chrome"], "the owner's app is put back");
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "no switch on input that may overlap the owner's");
   // The next delivery right after is not held up by that Return.
   f.advance(20_000);
   const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
