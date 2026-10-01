@@ -216,15 +216,15 @@ Safety rules:
 
 - One app delivery at a time; a second one is **blocked** as busy at once
   and retried. 45 s per app read, 10 s per other UI step, 205 s per delivery,
-  typing included; clearing a failed one and putting your app back get 90 s
-  more, never past it. From the phone or the main, the time counts from when
+  typing included; putting your app back after it gets up to 90 s more,
+  never past it. From the phone or the main, the time counts from when
   the main sent the request (time queued before the Mac picked it up
   included), so the whole request ends inside the 5 min limit. After the deep link, every app gets at least two reads
   (Codex up to 60 s) to show the thread. Typing starts only with time left to
   type, send, and confirm; otherwise it is **blocked** with nothing typed. An
   input call (typing, a key, a click) that times out may still land: the
-  result is **failed** and *unconfirmed*, and nothing more is typed, cleared,
-  or brought forward. The tick's other app sends wait, and no app send (a
+  result is **failed** and *unconfirmed*, and nothing more is typed or
+  brought forward. The tick's other app sends wait, and no app send (a
   remote one included) types until Open Computer Use answers that call late,
   however long it takes: computer use shows as not ready ("an earlier input
   call has not finished; typing paused until it answers or OpenAGI
@@ -235,7 +235,9 @@ Safety rules:
   **blocked** (another thread can show the same first message).
 - Only Conductor (`com.conductor.app`) and the Codex app (`com.openai.codex`).
   No clipboard, no paste, no app launch, no pointer moves.
-- Text typed before a failed check is cleared only when it is provably ours.
+- Typed text is never erased: a select-all and delete could take your edits
+  with it. Text typed before a failed check stays as a draft (a retry sends
+  exactly it), and the result says to check it.
 - Before and after screenshots go to `<dataDir>/fleet/logs/ui/` (0600, newest
   200 kept). Their paths are on the action record.
 - Blocked means nothing was typed: no attempt spent, retried next scan.

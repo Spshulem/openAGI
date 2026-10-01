@@ -41,6 +41,8 @@ const OWN_INPUT_POST_MS = 5000;
 const PRESENCE_FRESH_MS = 3000;
 // Frontmost while the screen saver runs or the login window shows.
 const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
+// Unsent text is never erased (see step 8 of the delivery).
+const LEFT_AS_DRAFT = "our text is left as a draft, check it";
 const PERMISSION_OK_TTL_MS = 10 * MIN;
 // `doctor` opens Open Computer Use's onboarding window when a grant is
 // missing, so a failed probe is not repeated every tick.
@@ -118,6 +120,10 @@ const OWN_PAGE = { "com.openai.codex": /^app:\/\//, "com.conductor.app": /^tauri
 const STOP_LABEL = /^(stop|stop generating|stop response|stop agent|interrupt|cancel turn)\b/i;
 const PROMPT_LABEL = /^(allow|allow once|always allow|allow for (?:this )?session|approve|deny|don't allow|do not allow|reject|yes, allow)\b/i;
 const SEND_LABEL = /^(send|send message|submit)\b/i;
+// A window title's app suffix ("madrid — Conductor").
+const APP_TITLE_SUFFIX = /\s+[—–-]\s+(?:conductor|codex|chatgpt)$/i;
+// A sidebar row's trailing diff stats ("+12k -48", "+✱✱").
+const ROW_STATS = /(?:\s+[+-](?:[\d.,]+[kKmM]?|✱+))+$/;
 
 function parseElementLine(depth, id, rest) {
   let body = String(rest ?? "");
@@ -245,17 +251,6 @@ export function findSendButton(state, bundleId = state?.bundleId) {
   return buttons.length === 1 ? buttons[0] : null;
 }
 
-// Text as compared once the app's smart punctuation (curly quotes, an
-// ellipsis, dashes) is undone; nothing else counts as the same text.
-export function smartPunctuation(text) {
-  return normalizeUiText(text)
-    .replace(/[\u2018\u2019\u201b\u2032]/g, "'")
-    .replace(/[\u201c\u201d\u201f\u2033]/g, '"')
-    .replace(/\u2026/g, "...")
-    .replace(/\u2014/g, "--")
-    .replace(/\u2013/g, "-");
-}
-
 // True when the composer holds (part of) the text this delivery typed. Only
 // then is it ours to clear: a changed thread can show the owner's own draft.
 export function looksLikeOurs(value, text) {
@@ -306,7 +301,6 @@ export function verifyIdentity(state, identity) {
     }
   }
   if (!tokens.length) return { ok: false, reason: "nothing to verify the thread by" };
-  const title = normalizeUiText(state.windowTitle).toLowerCase();
   const selected = state.elements.filter((element) => element.selected);
   const headings = state.elements.filter((element) => HEADING_ROLE.test(element.role));
   // Exactly the page label, never text inside it: a transcript can name every
@@ -326,8 +320,11 @@ export function verifyIdentity(state, identity) {
   // or page, and (in the apps the fleet drives, whose page holds the
   // transcript) never a heading, which can be markdown in another thread.
   const labelled = (token) => (!ownPage && headings.some((element) => labelToken(element) === token)) || appPages.includes(token);
-  const found = (token) => title.includes(token)
-    || ownSelected.some((element) => element.search.includes(token))
+  // Exactly the token, never a longer title that starts with it ("fix login"
+  // is not "fix login redirect"); a sidebar row may add its diff stats.
+  const shows = (element, token) => identityToken(normalizeUiText(element.label || element.fields.title || "").replace(ROW_STATS, "")) === token;
+  const found = (token) => identityToken(normalizeUiText(state.windowTitle).replace(APP_TITLE_SUFFIX, "")) === token
+    || ownSelected.some((element) => shows(element, token))
     || labelled(token);
   const missing = tokens.find((token) => !found(token));
   if (!missing) return { ok: true, reason: null };
@@ -893,47 +890,6 @@ export function createUiDriver({
 
   const press = (ctx, key, signal) => act(ctx, "press_key", { app: ctx.request.target.bundleId, key }, signal, { hid: true });
 
-  // Removes only what this delivery typed: the composer was proven empty
-  // before typing, and it must now hold our text (or a start of it), so
-  // select-all in the focused composer selects nothing of the owner's.
-  // With the owner back, only exactly our text, already focused: they may
-  // have added words, or be typing in another field a click would steal.
-  async function clearComposer(ctx, signal, { ownerPresent = false } = {}) {
-    try {
-      // No click or key once the owner may be at the keys: what the last read
-      // showed as focused may be their field by now. Our text then stays as a
-      // draft, and the outcome says to check it.
-      if (ownerPresent || (await ownerCheck(ctx, ctx.request.target))) return false;
-      let state = await readState(ctx, signal);
-      let { composer } = composerIn(ctx, state);
-      if (!composer) return false;
-      if (!normalizeUiText(composer.value)) return true;
-      // Only exactly our text, or what the app's smart punctuation made of
-      // it: any other change may be the owner's, and input that overlapped
-      // ours cannot be told apart from theirs.
-      if (smartPunctuation(composer.value) !== smartPunctuation(ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
-      // Every read is slow: presence again right before each input.
-      if (await ownerCheck(ctx, ctx.request.target)) return false;
-      if (!isComposerFocused(state, composer)) {
-        await click(ctx, composer, signal);
-        state = await readState(ctx, signal);
-        ({ composer } = composerIn(ctx, state));
-        if (!composer || !isComposerFocused(state, composer)) return false;
-        if (await ownerCheck(ctx, ctx.request.target)) return false;
-      }
-      await press(ctx, "super+a", signal);
-      // Each key is its own call: the owner may be back after the first.
-      if (await ownerCheck(ctx, ctx.request.target)) return false;
-      await press(ctx, "BackSpace", signal);
-      state = await readState(ctx, signal);
-      ({ composer } = composerIn(ctx, state));
-      return Boolean(composer) && !normalizeUiText(composer.value);
-    } catch (error) {
-      if (ctx.inputInFlight) throw error;
-      return false;
-    }
-  }
-
   // Null while it is still safe to go on. Once the target is in front it
   // must stay there: typing goes to the frontmost app.
   async function ownerCheck(ctx, target) {
@@ -1139,26 +1095,22 @@ export function createUiDriver({
     }
     found = composerIn(ctx, state);
     // The owner first: text that does not match may be theirs.
+    // Nothing typed is ever erased: a select-all and delete cannot be told
+    // apart from erasing what the owner typed meanwhile. Unsent text stays
+    // as a draft (a retry sends exactly it), and the outcome says to check it.
     const back = await ownerCheck(ctx, target);
-    if (back) {
-      const cleared = await clearComposer(ctx, signal, { ownerPresent: true });
-      return outcome(ctx, "blocked", `${back}; ${cleared ? "cleared our text" : "our text may still be in the composer"}`);
-    }
+    if (back) return outcome(ctx, "blocked", `${back}; ${LEFT_AS_DRAFT}`);
     if (!found.composer || normalizeUiText(found.composer.value) !== normalizeUiText(text)) {
-      const cleared = await clearComposer(ctx, signal);
       keep(ctx, "after", state);
-      return outcome(ctx, "failed", `text mismatch, not sent${cleared ? "; cleared our text" : "; could not clear the composer, check it"}`);
+      return outcome(ctx, "failed", `text mismatch, not sent; ${LEFT_AS_DRAFT}`);
     }
     const changed = hasStopButton(state) ? "turn started before send"
       : hasPermissionPrompt(state) ? "permission prompt appeared before send"
       : null;
-    if (changed) {
-      const cleared = await clearComposer(ctx, signal);
-      return outcome(ctx, "blocked", `${changed}; ${cleared ? "cleared our text" : "could not clear the composer, check it"}`);
-    }
+    if (changed) return outcome(ctx, "blocked", `${changed}; ${LEFT_AS_DRAFT}`);
 
     // 9. Send: the Send button, else Return in the focused composer. Out of
-    // time before either: still "typed", so recovery clears our text.
+    // time before either: still "typed", nothing sent.
     within(ctx, 1);
     ctx.phase = "sending";
     const send = findSendButton(state, target.bundleId);
@@ -1176,9 +1128,18 @@ export function createUiDriver({
           ctx.phase = "sent";
           throw new StepError("send click failed midway");
         }
+        state = after;
       }
     }
-    if (!pressed) await press(ctx, "Return", signal);
+    if (!pressed) {
+      // Return goes to whatever has focus: the same guards as before typing,
+      // on the latest read, right before the key.
+      const composer = composerIn(ctx, state).composer;
+      if (!composer || !isComposerFocused(state, composer) || !verifyIdentity(state, identity).ok) return outcome(ctx, "blocked", `send not pressed: the composer lost focus or the thread changed; ${LEFT_AS_DRAFT}`);
+      const away = await ownerCheck(ctx, target);
+      if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
+      await press(ctx, "Return", signal);
+    }
     ctx.phase = "sent";
 
     // 10. Confirm: composer empty and one more transcript copy of our text.
@@ -1209,23 +1170,8 @@ export function createUiDriver({
     if (ctx.phase === "sending" || ctx.phase === "sent") {
       return outcome(ctx, "failed", `${reason}; unconfirmed: may have been sent; check the thread before retrying`, { unconfirmed: true });
     }
-    // Typed, not sent: a fresh engine clears our text, bounded by about
-    // two slow reads and by what is left of uiCleanupMs.
-    ctx.deadline = ctx.hardEndsAt;
-    let cleared = false;
-    try {
-      try { ctx.transport?.close(); } catch { /* already closed */ }
-      const left = ctx.hardEndsAt - now();
-      if (left > 0) {
-        ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
-        const signal = AbortSignal.timeout(Math.min(limits.uiReadTimeoutMs * 2, left));
-        cleared = await clearComposer(ctx, signal, { ownerPresent: ctx.ownerSeen });
-      }
-    } catch {
-      cleared = false;
-    }
-    if (ctx.inputInFlight) return inFlightOutcome(ctx);
-    return outcome(ctx, "failed", `${reason}; not sent; ${cleared ? "cleared our text" : "our text may still be in the composer"}`);
+    // Typed, not sent: the text stays as a draft (see step 8).
+    return outcome(ctx, "failed", `${reason}; not sent; ${LEFT_AS_DRAFT}`);
   }
 
   // The owner's apps, checked once per tick so computer-use-first can fall

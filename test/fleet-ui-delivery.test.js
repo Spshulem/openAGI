@@ -551,16 +551,15 @@ test("a running turn or a permission prompt blocks", async (t) => {
 const SMART_TEXT = "[OpenAGI supervisor] Don't merge yet... CI red: lint. Fix it and report the new head.";
 const smartly = (text) => text.replace("'", "\u2019").replace("...", "\u2026");
 
-test("a text mismatch from smart punctuation clears our text and never sends", async (t) => {
+test("a text mismatch never sends, and nothing typed is ever erased", async (t) => {
   const app = fakeApp({ onType: smartly });
   const f = setup(t, { app });
   const result = await f.driver.deliver(f.request({ text: SMART_TEXT }));
   assert.equal(result.status, "failed");
-  assert.match(result.detail, /text mismatch, not sent; cleared our text/);
-  const keys = f.calls().filter((call) => call.name === "press_key").map((call) => call.args.key);
-  assert.deepEqual(keys, ["super+a", "BackSpace"]);
+  assert.equal(result.detail, "text mismatch, not sent; our text is left as a draft, check it");
+  assert.equal(app.composer, smartly(SMART_TEXT));
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no select-all, no delete");
   assert.equal(f.calls().filter((call) => call.name === "click" && call.args.element_index === "62").length, 0, "Send never clicked");
-  assert.equal(app.composer, "");
   assert.equal(app.transcript.includes(MESSAGE), false);
 });
 
@@ -570,19 +569,8 @@ test("any other change to our text is left alone: it may be the owner's", async 
   const f = setup(t, { app });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "failed");
-  assert.match(result.detail, /text mismatch, not sent; could not clear the composer, check it/);
+  assert.match(result.detail, /text mismatch, not sent; our text is left as a draft, check it/);
   assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
-});
-
-test("the owner switching apps during select-all: no BackSpace follows", async (t) => {
-  const app = fakeApp({ onType: smartly });
-  const f = setup(t, { app });
-  app.onKey = (key) => { if (key === "super+a") f.probe.front = "com.tinyspeck.slackmacgap"; };
-  const result = await f.driver.deliver(f.request({ text: SMART_TEXT }));
-  assert.equal(result.status, "failed");
-  assert.doesNotMatch(result.detail, /cleared our text/);
-  const keys = f.calls().filter((call) => call.name === "press_key").map((call) => call.args.key);
-  assert.deepEqual(keys, ["super+a"]);
 });
 
 test("a thread change before send blocks without clearing another thread's composer", async (t) => {
@@ -605,7 +593,7 @@ test("the owner coming back before send leaves our text as a draft, blocks, and 
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
   // No key once they may be at the keys: what looked focused may be theirs.
-  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
+  assert.equal(result.detail, "owner using Conductor; our text is left as a draft, check it");
   assert.equal(app.composer, MESSAGE);
   assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
   assert.equal(app.transcript.includes(MESSAGE), false);
@@ -672,15 +660,16 @@ test("a transport failure before typing fails closed and closes the transport", 
   assert.deepEqual(typed(f.calls()), []);
 });
 
-test("a transport failure after typing clears our text with a fresh engine", async (t) => {
+test("a transport failure after typing leaves our text as a draft: no second engine, no keys", async (t) => {
   const app = fakeApp();
   const f = setup(t, { app, transportOptions: { failOn: (name, _args, n) => name === "get_app_state" && n === 6 } });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "failed");
-  assert.match(result.detail, /not sent; cleared our text/);
-  assert.equal(f.transports.length, 2);
+  assert.match(result.detail, /not sent; our text is left as a draft, check it$/);
+  assert.equal(f.transports.length, 1);
   assert.ok(f.transports.every((transport) => transport.closed >= 1));
-  assert.equal(app.composer, "");
+  assert.equal(app.composer, MESSAGE);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
 });
 
 test("a read failing after typing while the owner adds to our text: recovery leaves their words alone", async (t) => {
@@ -694,42 +683,6 @@ test("a read failing after typing while the owner adds to our text: recovery lea
   assert.doesNotMatch(result.detail, /cleared our text/);
   assert.equal(app.composer, `${MESSAGE} wait`);
   assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no select-all or delete");
-});
-
-test("the owner adding to our text during cleanup's slow read: recovery leaves it alone", async (t) => {
-  const probe = fakeProbe();
-  const app = fakeApp();
-  let failed = false;
-  const failOn = (name, _args, n) => {
-    if (name !== "get_app_state") return false;
-    if (!failed && n === 6) { failed = true; return true; }
-    // Cleanup's read: the owner is back and types after our text.
-    if (failed && app.composer === MESSAGE) { app.composer = `${MESSAGE} wait`; probe.idleMs = async () => 200; }
-    return false;
-  };
-  const f = setup(t, { app, probe, transportOptions: { failOn } });
-  const result = await f.driver.deliver(f.request());
-  assert.equal(result.status, "failed");
-  assert.equal(app.composer, `${MESSAGE} wait`);
-  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no select-all or delete");
-});
-
-test("the owner back during cleanup's read, our text unchanged: still no click or key", async (t) => {
-  const probe = fakeProbe();
-  const app = fakeApp();
-  let failed = false;
-  const failOn = (name, _args, n) => {
-    if (name !== "get_app_state") return false;
-    if (!failed && n === 6) { failed = true; return true; }
-    // Cleanup's read: the owner is back, our text untouched so far.
-    if (failed) probe.idleMs = async () => 200;
-    return false;
-  };
-  const f = setup(t, { app, probe, transportOptions: { failOn } });
-  const result = await f.driver.deliver(f.request());
-  assert.equal(result.status, "failed");
-  assert.equal(app.composer, MESSAGE);
-  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
 });
 
 test("the owner back during a slow front-app lookup is seen before typing", async (t) => {
@@ -761,6 +714,26 @@ test("the screen saver starting during an idle probe: nothing brought forward ov
   assert.equal(result.detail, "screen saver on");
   assert.deepEqual(probe.activated, []);
   assert.deepEqual(typed(f.calls()), []);
+});
+
+test("a failed Send click: no Return if the owner switched apps meanwhile", async (t) => {
+  let probe = null;
+  const f = setup(t, { transportOptions: { failOn: (name, args) => {
+    if (name === "click" && args.element_index === "62") { probe.front = "com.tinyspeck.slackmacgap"; return true; }
+    return false;
+  } } });
+  probe = f.probe;
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /our text is left as a draft, check it$/);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no Return");
+});
+
+test("a window title proves only exactly the thread, not a longer title starting the same", () => {
+  const longer = parseAppState(fakeApp({ selected: "cairo", windowTitle: "madrid redirect" }).render());
+  assert.equal(verifyIdentity(longer, { tokens: ["madrid"] }).ok, false);
+  const suffixed = parseAppState(fakeApp({ selected: "cairo", windowTitle: "madrid — Conductor" }).render());
+  assert.equal(verifyIdentity(suffixed, { tokens: ["madrid"] }).ok, true);
 });
 
 test("a transport failure after send is unconfirmed", async (t) => {
@@ -1306,7 +1279,7 @@ test("once the owner is seen, no clearing keys are pressed and the next delivery
   f.app.render = () => { if (f.app.composer === MESSAGE && hid.at < f.now() - 60_000) { f.advance(5_000); hid.touch(); } return render(); };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
+  assert.equal(result.detail, "owner using Conductor; our text is left as a draft, check it");
   assert.deepEqual(f.probe.activated, ["com.conductor.app"], "not restored over the owner");
   f.advance(3_000);
   const next = await f.driver.deliver(f.request());
@@ -1325,7 +1298,7 @@ test("the owner adding words after our text: nothing cleared, no keys, no click"
   };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
+  assert.equal(result.detail, "owner using Conductor; our text is left as a draft, check it");
   assert.equal(f.app.composer, `${MESSAGE} wait, hold on`);
   assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
   assert.equal(f.calls().filter((call) => call.name === "click").length, 1, "only the focus click before typing");
@@ -1591,7 +1564,7 @@ test("the owner's input during a slow typing call, or as a failed one ends, is t
   f.app.onType = (text) => { hid.at = f.now() - 10_000; return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
+  assert.equal(result.detail, "owner using Conductor; our text is left as a draft, check it");
   assert.deepEqual(f.probe.activated, ["com.conductor.app"], "their app is not swapped in over them");
   // A key or typing call that failed marks nothing as the fleet's.
   let ghid = null;
