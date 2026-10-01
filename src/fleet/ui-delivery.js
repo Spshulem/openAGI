@@ -762,19 +762,16 @@ export function createUiDriver({
   // would land in the owner's app.
   async function restoreFront(ctx) {
     const target = ctx.request.target;
-    if (ctx.inputInFlight || !ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
-    // Each probe only if it ends inside the request's budget with every
-    // command at its timeout and kill grace (frontApp runs two).
-    const fits = (commands) => now() + commands * commandMs <= ctx.hardEndsAt;
+    if (ctx.inputInFlight || !ctx.activated || !ctx.inFront || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    // Within the cleanup budget; probeNow starts a probe only if it fits.
+    ctx.deadline = ctx.hardEndsAt;
     try {
-      if (!fits(2) || (await presence.frontApp()) !== target.bundleId) return;
-      if (!fits(1) || !ownerAway(ctx, await presence.idleMs())) return;
       // open -b launches an app that quit meanwhile; never that.
-      if (!fits(1) || (await presence.appRunning(ctx.frontBefore)) !== true) return;
-      // That probe can be slow: the owner may be back or have switched apps.
-      if (!fits(3) || (await presence.frontApp()) !== target.bundleId) return;
-      if (!ownerAway(ctx, await presence.idleMs())) return;
-      if (fits(1)) await presence.activate(ctx.frontBefore);
+      if ((await probeNow(ctx, "appRunning", ctx.frontBefore)) !== true) return;
+      // The same quick check as before typing, right before the switch: the
+      // target still in front, the owner away, no screen saver.
+      if (await ownerReason(ctx, target)) return;
+      await probeNow(ctx, "activate", ctx.frontBefore);
     } catch { /* best-effort */ }
   }
 

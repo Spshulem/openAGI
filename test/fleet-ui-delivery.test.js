@@ -330,6 +330,17 @@ test("the owner's app is not put back if they return while the running check is 
   assert.deepEqual(probe.activated, ["com.conductor.app"], "Chrome is not pulled over the owner");
 });
 
+test("a slow presence check after the send: the owner's app is not switched in on stale readings", async (t) => {
+  const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
+  const probe = fakeProbe({ onOpen: () => { app.selected = "madrid"; } });
+  const idle = probe.idleMs;
+  const f = setup(t, { app, probe });
+  probe.idleMs = async () => { if (app.transcript.includes(MESSAGE)) f.advance(4_000); return idle(); };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(probe.activated, ["com.conductor.app"], "Chrome is not switched in");
+});
+
 test("an unknown front app after the fleet brought its app forward still puts the owner's app back", async (t) => {
   const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
   const probe = fakeProbe({ onOpen: () => { app.selected = "madrid"; } });
