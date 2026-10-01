@@ -207,7 +207,7 @@ function withHealth(snapshot) {
 // strict computer-use Mac that cannot type now, or a typed send held back by
 // the owner at the keyboard or a running turn). A CLI fallback's failure is
 // not about typing, so it stays the owner's to see.
-const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input|waiting for idle|screen saver on|front app unknown)/;
+const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input|waiting for idle|screen saver on|front app unknown|presence check too slow)/;
 // A computer-use send that ends this way stops the tick's other ones.
 const UI_STALLED = /^(Open Computer Use timed out|Open Computer Use stopped|delivery timed out)/;
 function typingWaits(thread, route, deliveryState, delivery) {

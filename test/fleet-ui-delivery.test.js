@@ -547,6 +547,17 @@ test("a text mismatch clears our text and never sends", async (t) => {
   assert.equal(app.transcript.includes(MESSAGE), false);
 });
 
+test("the owner switching apps during select-all: no BackSpace follows", async (t) => {
+  const app = fakeApp({ onType: (text) => text.replace("lint.", "lint…") });
+  const f = setup(t, { app });
+  app.onKey = (key) => { if (key === "super+a") f.probe.front = "com.tinyspeck.slackmacgap"; };
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "failed");
+  assert.doesNotMatch(result.detail, /cleared our text/);
+  const keys = f.calls().filter((call) => call.name === "press_key").map((call) => call.args.key);
+  assert.deepEqual(keys, ["super+a"]);
+});
+
 test("a thread change before send blocks without clearing another thread's composer", async (t) => {
   const app = fakeApp();
   app.onType = (text) => { app.selected = "cairo"; return text; };
@@ -563,7 +574,7 @@ test("the owner coming back before send leaves our text as a draft, blocks, and 
   const app = fakeApp();
   const f = setup(t, { app, probe });
   // Input after the fleet's own last key, well past the slack.
-  app.onType = (text) => { probe.idleMs = async () => { f.advance(5_000); return 200; }; return text; };
+  app.onType = (text) => { probe.idleMs = async () => { f.advance(1_400); return 200; }; return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
   // No key once they may be at the keys: what looked focused may be theirs.
@@ -1693,32 +1704,31 @@ test("the owner back, or the screen saver on, during the running check before ac
   }
 });
 
-test("slow presence probes count in the typing budget: the delivery refuses to type rather than run out before Send", async (t) => {
+test("a slow presence check is not trusted: the send waits for a quick one, nothing typed", async (t) => {
   const probe = fakeProbe();
   const clock = {};
-  // Every owner check takes 45 s (idleMs), OCU calls none.
+  // Idle probes stall for 2 s each: one owner check takes over 3 s.
   const idle = probe.idleMs;
-  probe.idleMs = async () => { clock.advance(45_000); return idle(); };
+  probe.idleMs = async () => { clock.advance(2_000); return idle(); };
   const f = setup(t, { probe });
   clock.advance = f.advance;
   const result = await f.driver.deliver(f.request());
-  // Out of time before typing, by the budget or the deadline: nothing typed.
-  assert.notEqual(result.status, "sent");
-  assert.match(result.detail, /nothing typed$/);
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "presence check too slow");
   assert.deepEqual(typed(f.calls()), []);
   assert.deepEqual(f.app.transcript.slice(-1), ["Pushed the fix."]);
-  // The same probes at 5 s leave the time: it is sent.
+  // Quick probes describe now: it is sent.
   const quick = fakeProbe();
   const quickIdle = quick.idleMs;
-  quick.idleMs = async () => { g.advance(5_000); return quickIdle(); };
+  quick.idleMs = async () => { g.advance(500); return quickIdle(); };
   const g = setup(t, { probe: quick });
   const sent = await g.driver.deliver(g.request());
   assert.equal(sent.status, "sent", sent.detail);
 });
 
-test("the idle read that marks our typing counts in the typing budget: typed text is never left unsent for want of time", async (t) => {
-  // frontApp 12.5 s and idleMs 15 s: the owner checks alone fit, but not
-  // with the idle read after type_text.
+test("slow probes never leave typed text unsent: nothing is typed", async (t) => {
+  // frontApp 12.5 s and idleMs 15 s: refused before typing, whether by the
+  // presence freshness rule or the typing budget.
   const probe = fakeProbe();
   const clock = {};
   const front = probe.frontApp;
@@ -1729,6 +1739,6 @@ test("the idle read that marks our typing counts in the typing budget: typed tex
   clock.advance = f.advance;
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.match(result.detail, /^not enough time left to type and confirm \(\d+ s\); nothing typed$/);
+  assert.match(result.detail, /^(presence check too slow|not enough time left to type and confirm \(\d+ s\); nothing typed)$/);
   assert.deepEqual(typed(f.calls()), []);
 });

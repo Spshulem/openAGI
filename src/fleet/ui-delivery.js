@@ -35,6 +35,10 @@ const OWN_INPUT_SLACK_MS = 1500;
 // How long after a key or typing call starts (typing time added) OCU can
 // still be posting its input, before the call's closing snapshot.
 const OWN_INPUT_POST_MS = 5000;
+// A presence check (idle, front app, idle) is trusted only if it took at most
+// this long: a slower one may describe a moment that has passed, so the send
+// waits for a fresh one instead. Real lsappinfo and ioreg calls take ~50 ms.
+const PRESENCE_FRESH_MS = 3000;
 // Frontmost while the screen saver runs or the login window shows.
 const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
 const PERMISSION_OK_TTL_MS = 10 * MIN;
@@ -903,6 +907,8 @@ export function createUiDriver({
         if (await ownerCheck(ctx, ctx.request.target)) return false;
       }
       await press(ctx, "super+a", signal);
+      // Each key is its own call: the owner may be back after the first.
+      if (await ownerCheck(ctx, ctx.request.target)) return false;
       await press(ctx, "BackSpace", signal);
       state = await readState(ctx, signal);
       ({ composer } = composerIn(ctx, state));
@@ -929,11 +935,13 @@ export function createUiDriver({
   async function ownerReason(ctx, target) {
     // The front app is read last, so a screen saver that started during the
     // idle probe (or a slow read before it) is seen: nothing comes forward over it.
+    const taken = now();
     const idleBefore = await probeNow(ctx, "idleMs");
     const front = await probeNow(ctx, "frontApp");
     if (SCREEN_SAVER_APPS.has(front)) return "screen saver on";
-    // The front-app lookup is slow too: the owner may be back since.
     const idleAfter = await probeNow(ctx, "idleMs");
+    // Each probe can stall: only a quick check describes now.
+    if (now() - taken > PRESENCE_FRESH_MS) return "presence check too slow";
     const idle = idleBefore === null || idleAfter === null ? null : Math.min(idleBefore, idleAfter);
     if (!ownerAway(ctx, idle)) {
       if (front === target.bundleId || front === null) return `owner using ${target.name}`;

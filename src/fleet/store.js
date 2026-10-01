@@ -36,7 +36,7 @@ const COOLDOWN_STATUSES = new Set(["sent", "failed", "owner-answer"]);
 // route failing: those wait for the next tick and leave the streak alone.
 const UNDELIVERED_STATUSES = new Set(["blocked", "failed"]);
 const REACHED_STATUSES = new Set(["sent", "owner-answer", "escalated"]);
-const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on|front app unknown)/;
+const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on|front app unknown|presence check too slow)/;
 
 function emptyState() {
   return {
