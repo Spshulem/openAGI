@@ -801,8 +801,11 @@ export function createUiDriver({
   // No probe starts past the deadline in force; the one running then (two
   // commands at most, kill grace included), or readiness (two commands and
   // the permission check), is what uiCleanupMs allows for.
+  // No probe starts past the deadline in force, nor unless it can finish
+  // (every command at its timeout and kill grace) before the hard end.
   function probeNow(ctx, name, ...args) {
-    if (now() >= ctx.deadline) throw new StepError("delivery timed out");
+    const commands = name === "frontApp" ? 2 : 1;
+    if (now() >= ctx.deadline || now() + commands * commandMs > ctx.hardEndsAt) throw new StepError("delivery timed out");
     return presence[name](...args);
   }
 
@@ -881,26 +884,23 @@ export function createUiDriver({
   // have added words, or be typing in another field a click would steal.
   async function clearComposer(ctx, signal, { ownerPresent = false } = {}) {
     try {
-      // Presence is checked fresh, not assumed: an owner back at the keys may
-      // have added to our text, and then only exactly our text, already
-      // focused, is cleared.
-      const exactOnly = ownerPresent || Boolean(await ownerCheck(ctx, ctx.request.target));
-      const exact = (composer) => normalizeUiText(composer.value) === normalizeUiText(ctx.text);
+      // No click or key once the owner may be at the keys: what the last read
+      // showed as focused may be their field by now. Our text then stays as a
+      // draft, and the outcome says to check it.
+      if (ownerPresent || (await ownerCheck(ctx, ctx.request.target))) return false;
       let state = await readState(ctx, signal);
       let { composer } = composerIn(ctx, state);
       if (!composer) return false;
       if (!normalizeUiText(composer.value)) return true;
       if (!looksLikeOurs(composer.value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
-      if (exactOnly && (!exact(composer) || !isComposerFocused(state, composer))) return false;
-      // That read is slow: an owner back meanwhile may have added to our text.
-      if (!exactOnly && !exact(composer) && (await ownerCheck(ctx, ctx.request.target))) return false;
+      // Every read is slow: presence again right before each input.
+      if (await ownerCheck(ctx, ctx.request.target)) return false;
       if (!isComposerFocused(state, composer)) {
         await click(ctx, composer, signal);
         state = await readState(ctx, signal);
         ({ composer } = composerIn(ctx, state));
         if (!composer || !isComposerFocused(state, composer)) return false;
-        // The click and read are slow: the owner may be back by now.
-        if (!exact(composer) && (await ownerCheck(ctx, ctx.request.target))) return false;
+        if (await ownerCheck(ctx, ctx.request.target)) return false;
       }
       await press(ctx, "super+a", signal);
       await press(ctx, "BackSpace", signal);
@@ -929,9 +929,12 @@ export function createUiDriver({
   async function ownerReason(ctx, target) {
     // The front app is read last, so a screen saver that started during the
     // idle probe (or a slow read before it) is seen: nothing comes forward over it.
-    const idle = await probeNow(ctx, "idleMs");
+    const idleBefore = await probeNow(ctx, "idleMs");
     const front = await probeNow(ctx, "frontApp");
     if (SCREEN_SAVER_APPS.has(front)) return "screen saver on";
+    // The front-app lookup is slow too: the owner may be back since.
+    const idleAfter = await probeNow(ctx, "idleMs");
+    const idle = idleBefore === null || idleAfter === null ? null : Math.min(idleBefore, idleAfter);
     if (!ownerAway(ctx, idle)) {
       if (front === target.bundleId || front === null) return `owner using ${target.name}`;
       if (!ctx.inFront) return `waiting for idle: ${target.name} must be in front to type`;

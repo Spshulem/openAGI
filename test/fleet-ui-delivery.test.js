@@ -558,7 +558,7 @@ test("a thread change before send blocks without clearing another thread's compo
   assert.equal(f.calls().filter((call) => call.name === "click" && call.args.element_index === "62").length, 0);
 });
 
-test("the owner coming back before send clears our text, blocks, and keeps their app in front", async (t) => {
+test("the owner coming back before send leaves our text as a draft, blocks, and keeps their app in front", async (t) => {
   const probe = fakeProbe();
   const app = fakeApp();
   const f = setup(t, { app, probe });
@@ -566,8 +566,10 @@ test("the owner coming back before send clears our text, blocks, and keeps their
   app.onType = (text) => { probe.idleMs = async () => { f.advance(5_000); return 200; }; return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.match(result.detail, /owner using Conductor; cleared our text/);
-  assert.equal(app.composer, "");
+  // No key once they may be at the keys: what looked focused may be theirs.
+  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
+  assert.equal(app.composer, MESSAGE);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
   assert.equal(app.transcript.includes(MESSAGE), false);
   assert.deepEqual(probe.activated, ["com.conductor.app"], "the previous app is not restored under the owner");
 });
@@ -672,6 +674,41 @@ test("the owner adding to our text during cleanup's slow read: recovery leaves i
   assert.equal(result.status, "failed");
   assert.equal(app.composer, `${MESSAGE} wait`);
   assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no select-all or delete");
+});
+
+test("the owner back during cleanup's read, our text unchanged: still no click or key", async (t) => {
+  const probe = fakeProbe();
+  const app = fakeApp();
+  let failed = false;
+  const failOn = (name, _args, n) => {
+    if (name !== "get_app_state") return false;
+    if (!failed && n === 6) { failed = true; return true; }
+    // Cleanup's read: the owner is back, our text untouched so far.
+    if (failed) probe.idleMs = async () => 200;
+    return false;
+  };
+  const f = setup(t, { app, probe, transportOptions: { failOn } });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "failed");
+  assert.equal(app.composer, MESSAGE);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
+});
+
+test("the owner back during a slow front-app lookup is seen before typing", async (t) => {
+  const probe = fakeProbe();
+  const front = probe.frontApp;
+  const idle = probe.idleMs;
+  // The owner comes back during the 7th front-app lookup, the last check
+  // before typing: an idle read taken before that lookup still says away.
+  let lookups = 0;
+  let back = false;
+  probe.frontApp = async () => { if (++lookups === 7) back = true; return front(); };
+  probe.idleMs = async () => (back ? 200 : idle());
+  const f = setup(t, { probe });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Conductor");
+  assert.deepEqual(typed(f.calls()), []);
 });
 
 test("the screen saver starting during an idle probe: nothing brought forward over it", async (t) => {
@@ -1188,7 +1225,7 @@ test("owner input during a slow Send click is not the fleet's: the next delivery
   assert.equal(typed(f.calls()).length, 1);
 });
 
-test("once the owner is seen, the fleet's clearing keys never count as them being away", async (t) => {
+test("once the owner is seen, no clearing keys are pressed and the next delivery waits for real idle", async (t) => {
   const f = setup(t);
   const hid = hidClock(f);
   const render = f.app.render;
@@ -1196,8 +1233,8 @@ test("once the owner is seen, the fleet's clearing keys never count as them bein
   f.app.render = () => { if (f.app.composer === MESSAGE && hid.at < f.now() - 60_000) { f.advance(5_000); hid.touch(); } return render(); };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.equal(result.detail, "owner using Conductor; cleared our text");
-  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "not restored after the clearing keys");
+  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "not restored over the owner");
   f.advance(3_000);
   const next = await f.driver.deliver(f.request());
   assert.equal(next.status, "blocked");
@@ -1481,7 +1518,7 @@ test("the owner's input during a slow typing call, or as a failed one ends, is t
   f.app.onType = (text) => { hid.at = f.now() - 10_000; return text; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "blocked");
-  assert.equal(result.detail, "owner using Conductor; cleared our text");
+  assert.equal(result.detail, "owner using Conductor; our text may still be in the composer");
   assert.deepEqual(f.probe.activated, ["com.conductor.app"], "their app is not swapped in over them");
   // A key or typing call that failed marks nothing as the fleet's.
   let ghid = null;
@@ -1665,8 +1702,9 @@ test("slow presence probes count in the typing budget: the delivery refuses to t
   const f = setup(t, { probe });
   clock.advance = f.advance;
   const result = await f.driver.deliver(f.request());
-  assert.equal(result.status, "blocked");
-  assert.match(result.detail, /^not enough time left to type and confirm \(\d+ s\); nothing typed$/);
+  // Out of time before typing, by the budget or the deadline: nothing typed.
+  assert.notEqual(result.status, "sent");
+  assert.match(result.detail, /nothing typed$/);
   assert.deepEqual(typed(f.calls()), []);
   assert.deepEqual(f.app.transcript.slice(-1), ["Pushed the fix."]);
   // The same probes at 5 s leave the time: it is sent.
