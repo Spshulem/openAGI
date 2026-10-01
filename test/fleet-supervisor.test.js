@@ -2094,11 +2094,13 @@ test("the owner at the keyboard or a running turn does not count as a failed sen
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "turn running (Stop is visible)" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "waiting for idle: Codex must be in front to type" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "screen saver on" });
-  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "front app unknown" });
   assert.equal(store.ledgerFor("codex:a").undelivered, null);
+  // A presence probe that keeps failing is a failure the owner should hear about.
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "front app unknown" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "presence check too slow" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "could not verify thread: \"x\" is not the open thread" });
   store.recordNudge("codex:a", { playbook: "resume", status: "failed", detail: "Open Computer Use stopped, timed out, or disconnected" });
-  assert.equal(store.ledgerFor("codex:a").undelivered.count, 2);
+  assert.equal(store.ledgerFor("codex:a").undelivered.count, 4);
   store.recordNudge("codex:a", { playbook: "resume", status: "sent" });
   assert.equal(store.ledgerFor("codex:a").undelivered, null);
 });

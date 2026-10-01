@@ -1678,6 +1678,56 @@ test("after a Return send, the owner's app goes back once only that key happened
   assert.deepEqual(g.probe.activated, ["com.conductor.app"]);
 });
 
+test("the owner back during the deferred restore's front-app probe: nothing switched", async (t) => {
+  const f = setup(t);
+  const hid = hidClock(f);
+  f.app.sendButton = false;
+  await f.driver.deliver(f.request());
+  f.advance(DEFAULTS.uiOwnerIdleMs + 1_000);
+  const front = f.probe.frontApp;
+  f.probe.frontApp = async () => { hid.touch(); return front(); };
+  await f.driver.readiness();
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"]);
+});
+
+test("an input that timed out after the app came forward: the owner's app goes back only once it answers done", async (t) => {
+  let slow = true;
+  const f = setup(t, { transportOptions: { latency: (name) => (slow && name === "type_text" ? 10 * 60_000 : 0) } });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.unconfirmed, true);
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "nothing moves while it may land");
+  f.advance(DEFAULTS.uiOwnerIdleMs + 1_000);
+  await f.driver.readiness();
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "still unanswered");
+  slow = false;
+  f.transports[0].late[0]({ completed: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  f.advance(DEFAULTS.uiOwnerIdleMs + 1_000);
+  await f.driver.readiness();
+  assert.deepEqual(f.probe.activated, ["com.conductor.app", "com.google.Chrome"]);
+});
+
+test("the in-flight pause is on disk at once, so a restart before the answer keeps it", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-latch-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "ui-input-orphaned.json");
+  const latch = createInputLatch();
+  latch.persistTo(file);
+  latch.hold(new Promise(() => {}));
+  assert.equal(fs.existsSync(file), true);
+  const restarted = createInputLatch();
+  restarted.persistTo(file);
+  assert.equal(restarted.held, true);
+  // Proven done in a run that saw it: the file goes.
+  const done = createInputLatch();
+  done.persistTo(path.join(dir, "other.json"));
+  let finish;
+  done.hold(new Promise((resolve) => { finish = resolve; }));
+  finish({ completed: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fs.existsSync(path.join(dir, "other.json")), false);
+});
+
 test("a request that already spent its time before the send types nothing", async (t) => {
   const f = setup(t);
   const result = await f.driver.deliver(f.request({ spentMs: DEFAULTS.uiDeliveryTimeoutMs }));

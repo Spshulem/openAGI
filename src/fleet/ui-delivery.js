@@ -600,16 +600,26 @@ export function createInputLatch({ now = Date.now } = {}) {
   const open = new Set();
   let orphanedAt = null;
   let file = null;
+  // On disk from the moment an input is in flight (a restart may come before
+  // it answers) until it is proven done; a run that finds it treats it as
+  // orphaned from then.
+  const write = (state) => {
+    if (!file) return;
+    try { ensureDir(path.dirname(file)); fs.writeFileSync(file, JSON.stringify(state), { mode: 0o600 }); } catch { /* held in memory still */ }
+  };
+  const clear = () => {
+    if (file) try { fs.rmSync(file, { force: true }); } catch { /* retried next time */ }
+  };
   const orphaned = () => {
     if (orphanedAt === null) return false;
     if (now() - orphanedAt < ORPHAN_HOLD_MS) return true;
     orphanedAt = null;
-    if (file) try { fs.rmSync(file, { force: true }); } catch { /* retried next time */ }
+    if (!open.size) clear();
     return false;
   };
   const orphan = () => {
     orphanedAt = now();
-    if (file) try { ensureDir(path.dirname(file)); fs.writeFileSync(file, JSON.stringify({ orphanedAt: new Date(orphanedAt).toISOString() }), { mode: 0o600 }); } catch { /* held in memory still */ }
+    write({ orphanedAt: new Date(orphanedAt).toISOString() });
   };
   return {
     get held() { return orphaned() || open.size > 0; },
@@ -621,16 +631,19 @@ export function createInputLatch({ now = Date.now } = {}) {
     persistTo(path_) {
       file = path_;
       try {
-        const at = Date.parse(JSON.parse(fs.readFileSync(file, "utf8"))?.orphanedAt ?? "");
+        const saved = JSON.parse(fs.readFileSync(file, "utf8")) ?? {};
+        const at = Date.parse(saved.orphanedAt ?? saved.inFlightSince ?? "");
         if (Number.isFinite(at)) orphanedAt = Math.max(orphanedAt ?? at, at);
       } catch { /* none */ }
     },
     hold(settled) {
       const token = {};
       open.add(token);
+      if (orphanedAt === null) write({ inFlightSince: new Date(now()).toISOString() });
       Promise.resolve(settled).then((result) => {
         open.delete(token);
         if (result?.completed !== true) orphan();
+        else if (!open.size && orphanedAt === null) clear();
       }, () => {
         open.delete(token);
         orphan();
@@ -740,12 +753,20 @@ export function createUiDriver({
   async function retryRestore() {
     const pending = pendingRestore;
     if (!pending) return;
+    // Waiting on a timed-out input: nothing moves until it answered.
+    if (!Number.isFinite(pending.keyEnd)) {
+      if (now() - pending.since > RESTORE_PENDING_MS) pendingRestore = null;
+      return;
+    }
     if (now() - pending.keyEnd > RESTORE_PENDING_MS) { pendingRestore = null; return; }
     try {
+      // The same idle, front app, idle snapshot as ownerReason.
       const taken = now();
-      const idle = await presence.idleMs();
+      const idleBefore = await presence.idleMs();
       const front = await presence.frontApp();
+      const idleAfter = await presence.idleMs();
       if (now() - taken > PRESENCE_FRESH_MS) return;
+      const idle = idleBefore === null || idleAfter === null ? null : Math.min(idleBefore, idleAfter);
       // Input after our key is the owner's, or another app is in front (the
       // screen saver too): they took over, nothing to put back.
       if (idle === null || front !== pending.bundleId || now() - idle > pending.keyEnd + RESTORE_KEY_SLACK_MS) { pendingRestore = null; return; }
@@ -818,7 +839,19 @@ export function createUiDriver({
   // would land in the owner's app.
   async function restoreFront(ctx) {
     const target = ctx.request.target;
-    if (ctx.inputInFlight || !ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    if (!ctx.activated || ctx.ownerSeen || !ctx.frontBefore || ctx.frontBefore === target?.bundleId || SCREEN_SAVER_APPS.has(ctx.frontBefore)) return;
+    if (ctx.inputInFlight) {
+      // Nothing moves while it may still land; once it answers done, the
+      // owner's app goes back the deferred way (retryRestore), never if not.
+      const pending = { frontBefore: ctx.frontBefore, bundleId: target.bundleId, keyEnd: null, since: now() };
+      pendingRestore = pending;
+      Promise.resolve(ctx.inputSettled).then((result) => {
+        if (pendingRestore !== pending) return;
+        if (result?.completed === true) pending.keyEnd = now();
+        else pendingRestore = null;
+      }, () => { if (pendingRestore === pending) pendingRestore = null; });
+      return;
+    }
     // A deep link can bring the app forward before navigation fails: what
     // counts is that the target is in front now, which the check below probes.
     ctx.inFront = true;
@@ -878,6 +911,7 @@ export function createUiDriver({
     } catch (error) {
       if (error?.inFlight) {
         ctx.inputInFlight = true;
+        ctx.inputSettled = error.settled;
         inputLatch.hold(error.settled);
       }
       throw error;
