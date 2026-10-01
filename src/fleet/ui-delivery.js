@@ -28,13 +28,12 @@ const STATE_TREE_NODES_BY_APP = { "com.openai.codex": 6000 };
 const SLOW_NAVIGATION = new Set(["com.openai.codex"]);
 // The fleet's own app agent, apart from the owner's other sessions.
 const OCU_AGENT_NAMESPACE = "openagi-fleet";
-// The fleet's own keys (and keyboard-fallback typing) reset HIDIdleTime; an
-// owner's last input within this slack of when the fleet's last finished key
-// or typing call posted it is the fleet's. Accessibility clicks post no HID event.
-const OWN_INPUT_SLACK_MS = 1500;
-// How long after a key or typing call starts (typing time added) OCU can
-// still be posting its input, before the call's closing snapshot.
-const OWN_INPUT_POST_MS = 5000;
+// Presence is read from HIDIdleTime alone, and any input there counts as the
+// owner's. Open Computer Use types into a settable composer by setting its
+// accessibility value and clicks through accessibility, neither of which
+// posts a HID event; its key presses (Return) and keyboard-fallback typing
+// do, and nothing that follows them needs the owner away except putting
+// their app back, which then simply waits for real idle.
 // A presence check (idle, front app, idle) is trusted only if it took at most
 // this long: a slower one may describe a moment that has passed, so the send
 // waits for a fresh one instead. Real lsappinfo and ioreg calls take ~50 ms.
@@ -689,9 +688,6 @@ export function createUiDriver({
   const readPermissions = permissionProbe
     ?? (async () => parseOcuPermissions(await readOcuPermissions(bins.ocu, undefined, { appAgentProxy: true, agentNamespace: OCU_AGENT_NAMESPACE, timeoutMs: limits.uiStepTimeoutMs })));
   let permissionCache = null;
-  // When this driver's last key or typing input landed, across deliveries:
-  // the next delivery in the same tick must not read it as the owner.
-  let lastOwnInput = null;
 
   const permissions = async () => {
     const at = now();
@@ -752,7 +748,7 @@ export function createUiDriver({
     const endsAt = Math.min(start + limits.uiDeliveryTimeoutMs, hardEndsAt - limits.uiCleanupMs);
     const timer = setTimeout(() => controller.abort(), Math.max(0, endsAt - now()));
     const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt, deadline: endsAt, hardEndsAt,
-      slowest: 0, slowestProbe: null, ownInput: lastOwnInput, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
+      slowest: 0, slowestProbe: null, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
     try {
       return await steps(request, controller.signal, ctx);
     } catch (error) {
@@ -780,28 +776,19 @@ export function createUiDriver({
       // open -b launches an app that quit meanwhile; never that.
       if ((await probeNow(ctx, "appRunning", ctx.frontBefore)) !== true) return;
       // The same quick check as before typing, right before the switch: the
-      // target still in front, no screen saver, and the owner away by real
-      // idle time (input taken for the fleet's own may have been theirs).
-      if (await ownerReason(ctx, target, { discount: false })) return;
+      // target still in front, no screen saver, the owner away.
+      if (await ownerReason(ctx, target)) return;
       await probeNow(ctx, "activate", ctx.frontBefore);
     } catch { /* best-effort */ }
   }
 
-  // Away: no input for uiOwnerIdleMs, or the last input is the driver's own
-  // last key or typing (which reset the idle clock), as markOwnInput saw it.
-  // Not the whole call: the owner can type during a slow one.
-  function ownerAway(ctx, idle, { discount = true } = {}) {
-    if (idle === null || idle === undefined) return false;
-    if (idle >= limits.uiOwnerIdleMs) return true;
-    if (!discount || !Number.isFinite(ctx.ownInput)) return false;
-    return Math.abs(now() - idle - ctx.ownInput) <= OWN_INPUT_SLACK_MS;
+  // Away: no input for uiOwnerIdleMs.
+  function ownerAway(idle) {
+    return idle !== null && idle !== undefined && idle >= limits.uiOwnerIdleMs;
   }
 
-  // Once the owner is seen, only real idle time counts again: no discount
-  // for the fleet's input, now or in the next delivery.
   function sawOwner(ctx) {
     ctx.ownerSeen = true;
-    ctx.ownInput = lastOwnInput = null;
   }
 
   // No call runs past the deadline in force: the steps', then clearing's.
@@ -823,10 +810,9 @@ export function createUiDriver({
   }
 
   // One OCU action. Each ends with a fresh snapshot, so it gets a read's
-  // budget. Keys and typing may post HID events: only a call that finished
-  // marks when (never after the owner was seen). One that timed out may
-  // still be running (nothing cancels it): no more input after it.
-  async function act(ctx, name, args, signal, { timeoutMs = limits.uiReadTimeoutMs, hid = false } = {}) {
+  // budget. One that timed out may still be running (nothing cancels it):
+  // no more input after it.
+  async function act(ctx, name, args, signal, { timeoutMs = limits.uiReadTimeoutMs } = {}) {
     if (ctx.inputInFlight) throw new StepError("an input call timed out");
     const start = now();
     let result;
@@ -841,21 +827,7 @@ export function createUiDriver({
     } finally {
       if (name !== "type_text") ctx.slowest = Math.max(ctx.slowest, now() - start);
     }
-    if (hid && !ctx.ownerSeen) await markOwnInput(ctx, start, name === "type_text" ? ctx.typingMs : 0);
     return result;
-  }
-
-  // The input lands before the call's closing snapshot (10-25 s in Codex),
-  // so the call's end is not when: the idle clock says. It is the fleet's
-  // only inside the time the input itself takes; later input is the owner's.
-  async function markOwnInput(ctx, start, inputMs) {
-    if (now() + commandMs > ctx.deadline) return;
-    try {
-      const idle = await presence.idleMs();
-      if (idle === null || idle === undefined) return;
-      const at = now() - idle;
-      if (at >= start - OWN_INPUT_SLACK_MS && at <= start + inputMs + OWN_INPUT_POST_MS) ctx.ownInput = lastOwnInput = at;
-    } catch { /* nothing marked */ }
   }
 
   // An unconfirmed outcome carries how many copies the thread showed before
@@ -888,7 +860,7 @@ export function createUiDriver({
   // reset the owner's idle clock.
   const click = (ctx, element, signal) => act(ctx, "click", { app: ctx.request.target.bundleId, element_index: element.id, click_method: "accessibility" }, signal);
 
-  const press = (ctx, key, signal) => act(ctx, "press_key", { app: ctx.request.target.bundleId, key }, signal, { hid: true });
+  const press = (ctx, key, signal) => act(ctx, "press_key", { app: ctx.request.target.bundleId, key }, signal);
 
   // Null while it is still safe to go on. Once the target is in front it
   // must stay there: typing goes to the frontmost app.
@@ -903,9 +875,7 @@ export function createUiDriver({
     return reason;
   }
 
-  // discount false: only real idle time counts, never input taken for the
-  // fleet's own (the owner's can overlap it).
-  async function ownerReason(ctx, target, { discount = true } = {}) {
+  async function ownerReason(ctx, target) {
     // The front app is read last, so a screen saver that started during the
     // idle probe (or a slow read before it) is seen: nothing comes forward over it.
     const taken = now();
@@ -916,7 +886,7 @@ export function createUiDriver({
     // Each probe can stall: only a quick check describes now.
     if (now() - taken > PRESENCE_FRESH_MS) return "presence check too slow";
     const idle = idleBefore === null || idleAfter === null ? null : Math.min(idleBefore, idleAfter);
-    if (!ownerAway(ctx, idle, { discount })) {
+    if (!ownerAway(idle)) {
       if (front === target.bundleId || front === null) return `owner using ${target.name}`;
       if (!ctx.inFront) return `waiting for idle: ${target.name} must be in front to type`;
     }
@@ -970,7 +940,7 @@ export function createUiDriver({
     if (!running) return outcome(ctx, "blocked", `${target.name} is not running`);
     const frontBefore = await probeNow(ctx, "frontApp");
     if (SCREEN_SAVER_APPS.has(frontBefore)) return outcome(ctx, "blocked", "screen saver on");
-    if (!ownerAway(ctx, await probeNow(ctx, "idleMs"))) {
+    if (!ownerAway(await probeNow(ctx, "idleMs"))) {
       sawOwner(ctx);
       if (frontBefore === target.bundleId || frontBefore === null) return outcome(ctx, "blocked", `owner using ${target.name}`);
       return outcome(ctx, "blocked", `waiting for idle: ${target.name} must be in front to type`);
@@ -1082,7 +1052,7 @@ export function createUiDriver({
     const beforeTyping = await ownerCheck(ctx, target);
     if (beforeTyping) return outcome(ctx, "blocked", beforeTyping);
     ctx.phase = "typing";
-    if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs, hid: true });
+    if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs });
     ctx.phase = "typed";
 
     // 8. Same thread, and the composer holds exactly our text.
@@ -1133,9 +1103,12 @@ export function createUiDriver({
     }
     if (!pressed) {
       // Return goes to whatever has focus: the same guards as before typing,
-      // on the latest read, right before the key.
+      // on the latest read, right before the key. A failed click may still
+      // have started a turn or raised a prompt.
       const composer = composerIn(ctx, state).composer;
       if (!composer || !isComposerFocused(state, composer) || !verifyIdentity(state, identity).ok) return outcome(ctx, "blocked", `send not pressed: the composer lost focus or the thread changed; ${LEFT_AS_DRAFT}`);
+      const started = hasStopButton(state) ? "turn started before send" : hasPermissionPrompt(state) ? "permission prompt appeared before send" : null;
+      if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`);
       const away = await ownerCheck(ctx, target);
       if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
       await press(ctx, "Return", signal);

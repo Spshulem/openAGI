@@ -198,7 +198,9 @@ Each send, in order. Any failed check stops before typing:
   computer-use session running.
 - The app is already running (never launched) and you are away. Input in the
   last 2 min blocks as "owner using <App>" (it is in front) or "waiting for
-  idle" (it is not). The fleet's own clicks and keys do not count.
+  idle" (it is not). Any input counts, a key the fleet pressed included: it
+  cannot be told apart from yours. Typing sets the composer's value and
+  clicks go through accessibility, so neither counts.
 - Opens the thread with its deep link (`open -g`), then brings the app to the
   front.
 - Proves the right thread is open: workspace name, plus the tab title when the

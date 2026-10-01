@@ -383,24 +383,24 @@ test("an app that will not come forward blocks before typing", async (t) => {
   assert.deepEqual(probe.activated, ["com.conductor.app"], "nothing to restore: the owner's app never left the front");
 });
 
-test("the fleet's own clicks and keys do not count as the owner coming back", async (t) => {
-  // HIDIdleTime restarts at every event the fleet posts.
+test("keyboard-fallback typing is input like any other: no send until real idle, then the draft goes as is", async (t) => {
+  // HIDIdleTime restarts at every event posted, the fleet's included: it
+  // cannot be told apart from the owner's, so it counts as theirs.
   let hidAt = null;
   const probe = fakeProbe();
   const app = fakeApp();
   const f = setup(t, { app, probe });
   probe.idleMs = async () => (hidAt === null ? 10 * 60_000 : f.now() - hidAt);
-  // Keyboard-fallback typing: its keys land, then the call's closing snapshot.
   app.onType = (text) => { hidAt = f.now(); f.advance(3_000); return text; };
   const result = await f.driver.deliver(f.request());
-  assert.equal(result.status, "sent", result.detail);
-  // Input taken for the fleet's own may overlap the owner's: never grounds
-  // to switch apps, so their app is not put back after HID typing.
-  assert.deepEqual(probe.activated, ["com.conductor.app"]);
-  // The next delivery right after is not held up by them either.
-  f.advance(2_000);
-  const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
-  assert.equal(next.status, "sent", next.detail);
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Conductor; our text is left as a draft, check it");
+  assert.equal(app.composer, MESSAGE);
+  // Once the input is old enough, the retry sends exactly that draft, untyped.
+  f.advance(DEFAULTS.uiOwnerIdleMs);
+  const retry = await f.driver.deliver(f.request());
+  assert.equal(retry.status, "sent", retry.detail);
+  assert.match(retry.detail, /sent the text an earlier attempt left/);
 });
 
 test("a thread that cannot be verified is blocked and nothing is typed", async (t) => {
@@ -1575,23 +1575,20 @@ test("the owner's input during a slow typing call, or as a failed one ends, is t
   assert.deepEqual(g.probe.activated, ["com.conductor.app"], "the owner's input as it failed is theirs: nothing put back over them");
 });
 
-test("the fleet's keys and typing land before a slow closing snapshot: still not the owner", async (t) => {
-  // Codex: each call ends with a 12 s snapshot after its input landed.
+test("a Return send is input like any other: the owner's app waits for real idle, as does the next send", async (t) => {
+  // Codex: the key lands, then a 12 s snapshot. Typing sets the value (no HID).
   const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" || name === "press_key" ? 12_000 : 0), advance: (ms) => f.advance(ms) } });
   const hid = hidClock(f, { keysReset: false });
-  const typingMs = Math.ceil(MESSAGE.length * 25);
-  // Keyboard-fallback typing posts its keys over typingMs from the call's start.
-  f.app.onType = (text) => { hid.at = f.now() - 12_000 + typingMs; return text; };
   f.app.sendButton = false;
   f.app.onKey = () => { hid.at = f.now() - 12_000; };
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
   assert.equal(f.calls().filter((call) => call.name === "press_key").at(-1).args.key, "Return");
-  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "no switch on input that may overlap the owner's");
-  // The next delivery right after is not held up by that Return.
+  assert.deepEqual(f.probe.activated, ["com.conductor.app"], "no switch until real idle");
   f.advance(20_000);
   const next = await f.driver.deliver(f.request({ text: `${MESSAGE} Second note.` }));
-  assert.equal(next.status, "sent", next.detail);
+  assert.equal(next.status, "blocked");
+  assert.match(next.detail, /^owner using Conductor/);
 });
 
 test("after an input call times out, nothing types until its late answer shows it finished, however long that takes", async (t) => {
