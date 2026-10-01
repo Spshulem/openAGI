@@ -656,6 +656,38 @@ test("a read failing after typing while the owner adds to our text: recovery lea
   assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no select-all or delete");
 });
 
+test("the owner adding to our text during cleanup's slow read: recovery leaves it alone", async (t) => {
+  const probe = fakeProbe();
+  const app = fakeApp();
+  let failed = false;
+  const failOn = (name, _args, n) => {
+    if (name !== "get_app_state") return false;
+    if (!failed && n === 6) { failed = true; return true; }
+    // Cleanup's read: the owner is back and types after our text.
+    if (failed && app.composer === MESSAGE) { app.composer = `${MESSAGE} wait`; probe.idleMs = async () => 200; }
+    return false;
+  };
+  const f = setup(t, { app, probe, transportOptions: { failOn } });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "failed");
+  assert.equal(app.composer, `${MESSAGE} wait`);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0, "no select-all or delete");
+});
+
+test("the screen saver starting during an idle probe: nothing brought forward over it", async (t) => {
+  const app = fakeApp({ selected: "cairo", onClickRow: () => {} });
+  const probe = fakeProbe({ onOpen: () => { app.selected = "madrid"; } });
+  let idleReads = 0;
+  // The 4th idle read is the owner check right before activation.
+  probe.idleMs = async () => { if (++idleReads === 4) probe.front = "com.apple.ScreenSaver.Engine"; return probe.idle; };
+  const f = setup(t, { app, probe });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "screen saver on");
+  assert.deepEqual(probe.activated, []);
+  assert.deepEqual(typed(f.calls()), []);
+});
+
 test("a transport failure after send is unconfirmed", async (t) => {
   const f = setup(t, { transportOptions: { failOn: (name, args) => name === "click" && args.element_index === "62" } });
   const app = f.app;
@@ -805,12 +837,12 @@ test("uiIdentity asks for the workspace, the session title when needed, and refu
   assert.deepEqual(uiIdentity(generic, uiTargetFor(generic), [generic]).tokens, []);
 });
 
-test("verifyIdentity: selected rows and exact headings prove the thread; another open thread is a mismatch", () => {
+test("verifyIdentity: selected rows prove the thread, a heading never does; another open thread is a mismatch", () => {
   const madridShown = parseAppState(fakeApp().render());
   assert.equal(verifyIdentity(madridShown, { tokens: ["madrid"], conflicts: ["cairo"] }).ok, true);
   const cairoShown = parseAppState(fakeApp({ selected: "cairo", heading: "madrid" }).render());
-  // The heading alone would pass, but the selected row is another workspace.
-  assert.equal(verifyIdentity(cairoShown, { tokens: ["madrid"] }).ok, true);
+  // A heading can be markdown in another thread's transcript: no proof.
+  assert.equal(verifyIdentity(cairoShown, { tokens: ["madrid"] }).ok, false);
   const conflict = verifyIdentity(cairoShown, { tokens: ["madrid"], conflicts: ["cairo"] });
   assert.equal(conflict.ok, false);
   assert.match(conflict.reason, /another thread is open/);

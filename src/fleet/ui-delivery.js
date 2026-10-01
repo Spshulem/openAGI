@@ -306,9 +306,13 @@ export function verifyIdentity(state, identity) {
   for (const other of identity?.conflicts ?? []) {
     if (!tokens.includes(other) && !altTokens.includes(other) && shown.has(other)) return { ok: false, reason: "could not verify thread: another thread is open" };
   }
-  const labelled = (token) => headings.some((element) => labelToken(element) === token) || pages.includes(token);
+  // Proof comes only from the app's own chrome: never an in-app browser tab
+  // or page, and (in the apps the fleet drives, whose page holds the
+  // transcript) never a heading, which can be markdown in another thread.
+  const ownSelected = selected.filter((element) => !(ownPage && inOtherPage(element, ownPage)));
+  const labelled = (token) => (!ownPage && headings.some((element) => labelToken(element) === token)) || appPages.includes(token);
   const found = (token) => title.includes(token)
-    || selected.some((element) => element.search.includes(token))
+    || ownSelected.some((element) => element.search.includes(token))
     || labelled(token);
   const missing = tokens.find((token) => !found(token));
   if (!missing) return { ok: true, reason: null };
@@ -888,6 +892,8 @@ export function createUiDriver({
       if (!normalizeUiText(composer.value)) return true;
       if (!looksLikeOurs(composer.value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
       if (exactOnly && (!exact(composer) || !isComposerFocused(state, composer))) return false;
+      // That read is slow: an owner back meanwhile may have added to our text.
+      if (!exactOnly && !exact(composer) && (await ownerCheck(ctx, ctx.request.target))) return false;
       if (!isComposerFocused(state, composer)) {
         await click(ctx, composer, signal);
         state = await readState(ctx, signal);
@@ -921,10 +927,11 @@ export function createUiDriver({
   }
 
   async function ownerReason(ctx, target) {
-    const front = await probeNow(ctx, "frontApp");
-    // It can start during a slow read: nothing comes forward over it.
-    if (SCREEN_SAVER_APPS.has(front)) return "screen saver on";
+    // The front app is read last, so a screen saver that started during the
+    // idle probe (or a slow read before it) is seen: nothing comes forward over it.
     const idle = await probeNow(ctx, "idleMs");
+    const front = await probeNow(ctx, "frontApp");
+    if (SCREEN_SAVER_APPS.has(front)) return "screen saver on";
     if (!ownerAway(ctx, idle)) {
       if (front === target.bundleId || front === null) return `owner using ${target.name}`;
       if (!ctx.inFront) return `waiting for idle: ${target.name} must be in front to type`;
