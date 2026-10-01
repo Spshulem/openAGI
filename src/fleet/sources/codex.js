@@ -358,10 +358,9 @@ function orderPrRefs(entries, branch) {
 // A first message as the app shows it: the request after the files list,
 // without context blocks (in-app browser, environment), markdown as text.
 function shownFirstMessage(title) {
-  let text = String(title);
-  const request = /(?:^|\n)##\s*My request(?: for Codex)?:[ \t]*\n?/i.exec(text);
-  if (request) text = text.slice(request.index + request[0].length);
-  return text
+  // The same wrapper cleanup as the transcript reader (every known block,
+  // the last request header), then any other paired or stray tag.
+  return cleanCodexUserText(title)
     .replace(/<([\w-]{1,60})(?:\s[^>]{0,200})?>[\s\S]*?<\/\1>/g, " ")
     .replace(/<[^>]{0,200}>/g, " ")
     .replace(/!?\[([^\]]{0,200})\]\([^)\s]{0,500}\)/g, "$1")

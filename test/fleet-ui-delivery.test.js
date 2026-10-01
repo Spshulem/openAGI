@@ -547,10 +547,14 @@ test("a running turn or a permission prompt blocks", async (t) => {
   }
 });
 
-test("a text mismatch clears our text and never sends", async (t) => {
-  const app = fakeApp({ onType: (text) => text.replace("lint.", "lint…") });
+// The app's smart punctuation turns what was typed into a different string.
+const SMART_TEXT = "[OpenAGI supervisor] Don't merge yet... CI red: lint. Fix it and report the new head.";
+const smartly = (text) => text.replace("'", "\u2019").replace("...", "\u2026");
+
+test("a text mismatch from smart punctuation clears our text and never sends", async (t) => {
+  const app = fakeApp({ onType: smartly });
   const f = setup(t, { app });
-  const result = await f.driver.deliver(f.request());
+  const result = await f.driver.deliver(f.request({ text: SMART_TEXT }));
   assert.equal(result.status, "failed");
   assert.match(result.detail, /text mismatch, not sent; cleared our text/);
   const keys = f.calls().filter((call) => call.name === "press_key").map((call) => call.args.key);
@@ -560,11 +564,21 @@ test("a text mismatch clears our text and never sends", async (t) => {
   assert.equal(app.transcript.includes(MESSAGE), false);
 });
 
+test("any other change to our text is left alone: it may be the owner's", async (t) => {
+  // Shorter than ours and still starting like ours: an owner's edit.
+  const app = fakeApp({ onType: (text) => text.replace("lint. Fix it, push, and report the new head.", "lint. Wait.") });
+  const f = setup(t, { app });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "failed");
+  assert.match(result.detail, /text mismatch, not sent; could not clear the composer, check it/);
+  assert.equal(f.calls().filter((call) => call.name === "press_key").length, 0);
+});
+
 test("the owner switching apps during select-all: no BackSpace follows", async (t) => {
-  const app = fakeApp({ onType: (text) => text.replace("lint.", "lint…") });
+  const app = fakeApp({ onType: smartly });
   const f = setup(t, { app });
   app.onKey = (key) => { if (key === "super+a") f.probe.front = "com.tinyspeck.slackmacgap"; };
-  const result = await f.driver.deliver(f.request());
+  const result = await f.driver.deliver(f.request({ text: SMART_TEXT }));
   assert.equal(result.status, "failed");
   assert.doesNotMatch(result.detail, /cleared our text/);
   const keys = f.calls().filter((call) => call.name === "press_key").map((call) => call.args.key);
@@ -969,6 +983,28 @@ test("the UI lock runs one delivery at a time and reports busy after the wait", 
   assert.deepEqual(order, ["first:start", "first:end", "second"]);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(lock.busy, false);
+});
+
+test("an activation that worked but reported failure still gets the owner's app put back", async (t) => {
+  // The thread is already open: no link, only the activation moves the app.
+  const app = fakeApp();
+  const probe = fakeProbe();
+  const activate = probe.activate;
+  probe.activate = async (bundleId) => { await activate(bundleId); return bundleId !== app.bundleId; };
+  const f = setup(t, { app, probe });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /could not bring Conductor to the front/);
+  assert.deepEqual(probe.activated, ["com.conductor.app", "com.google.Chrome"]);
+});
+
+test("an in-app browser page titled like another thread is no conflict", () => {
+  const target = uiTargetFor(auditThread);
+  const identity = uiIdentity(auditThread, target, [auditThread, intruderThread]);
+  const state = stateOf(CODEX_BROWSER_STATE
+    .replace("HTML content Fix billing", "HTML content Audit OpenAI model versions")
+    .replace("HTML content Pull Request #6988", "HTML content Intruder"));
+  assert.deepEqual(verifyIdentity(state, identity), { ok: true, reason: null });
 });
 
 test("Codex coming forward on its link, then navigation failing: the owner's app is put back", async (t) => {

@@ -245,6 +245,17 @@ export function findSendButton(state, bundleId = state?.bundleId) {
   return buttons.length === 1 ? buttons[0] : null;
 }
 
+// Text as compared once the app's smart punctuation (curly quotes, an
+// ellipsis, dashes) is undone; nothing else counts as the same text.
+export function smartPunctuation(text) {
+  return normalizeUiText(text)
+    .replace(/[\u2018\u2019\u201b\u2032]/g, "'")
+    .replace(/[\u201c\u201d\u201f\u2033]/g, '"')
+    .replace(/\u2026/g, "...")
+    .replace(/\u2014/g, "--")
+    .replace(/\u2013/g, "-");
+}
+
 // True when the composer holds (part of) the text this delivery typed. Only
 // then is it ours to clear: a changed thread can show the owner's own draft.
 export function looksLikeOurs(value, text) {
@@ -298,14 +309,15 @@ export function verifyIdentity(state, identity) {
   const title = normalizeUiText(state.windowTitle).toLowerCase();
   const selected = state.elements.filter((element) => element.selected);
   const headings = state.elements.filter((element) => HEADING_ROLE.test(element.role));
-  // Exactly the page label, never text inside it: a transcript can name
-  // every other thread.
-  const pages = webAreas.map(labelToken).filter(Boolean);
-  // A heading can be markdown in any thread's transcript, and an in-app
-  // browser page can carry any title: a first message only as the app's page.
+  // Exactly the page label, never text inside it: a transcript can name every
+  // other thread. A heading can be markdown in any thread's transcript, and an
+  // in-app browser page can carry any title.
   const ownPage = OWN_PAGE[state.bundleId];
   const appPages = webAreas.filter((element) => !ownPage || ownPage.test(String(element.fields.url ?? ""))).map(labelToken).filter(Boolean);
-  const shown = new Set([identityToken(state.windowTitle), ...selected.map(labelToken), ...pages].filter(Boolean));
+  // Conflicts and proof read the same chrome: an in-app browser page or tab
+  // can carry any title without another thread being open.
+  const ownSelected = selected.filter((element) => !(ownPage && inOtherPage(element, ownPage)));
+  const shown = new Set([identityToken(state.windowTitle), ...ownSelected.map(labelToken), ...appPages].filter(Boolean));
   const altTokens = identity?.altTokens ?? [];
   for (const other of identity?.conflicts ?? []) {
     if (!tokens.includes(other) && !altTokens.includes(other) && shown.has(other)) return { ok: false, reason: "could not verify thread: another thread is open" };
@@ -313,7 +325,6 @@ export function verifyIdentity(state, identity) {
   // Proof comes only from the app's own chrome: never an in-app browser tab
   // or page, and (in the apps the fleet drives, whose page holds the
   // transcript) never a heading, which can be markdown in another thread.
-  const ownSelected = selected.filter((element) => !(ownPage && inOtherPage(element, ownPage)));
   const labelled = (token) => (!ownPage && headings.some((element) => labelToken(element) === token)) || appPages.includes(token);
   const found = (token) => title.includes(token)
     || ownSelected.some((element) => element.search.includes(token))
@@ -897,11 +908,10 @@ export function createUiDriver({
       let { composer } = composerIn(ctx, state);
       if (!composer) return false;
       if (!normalizeUiText(composer.value)) return true;
-      // Only our text, as typed or as the app mangled it, never longer: what
-      // was added to it may be the owner's, and input that overlapped ours
-      // cannot be told apart from theirs.
-      const value = normalizeUiText(composer.value);
-      if (value.length > normalizeUiText(ctx.text).length || !looksLikeOurs(value, ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
+      // Only exactly our text, or what the app's smart punctuation made of
+      // it: any other change may be the owner's, and input that overlapped
+      // ours cannot be told apart from theirs.
+      if (smartPunctuation(composer.value) !== smartPunctuation(ctx.text) || !verifyIdentity(state, ctx.request.identity).ok) return false;
       // Every read is slow: presence again right before each input.
       if (await ownerCheck(ctx, ctx.request.target)) return false;
       if (!isComposerFocused(state, composer)) {
@@ -966,8 +976,10 @@ export function createUiDriver({
     // have come back, switched apps, or the screen saver started meanwhile.
     const back = await ownerCheck(ctx, target);
     if (back) return back;
-    if (!(await probeNow(ctx, "activate", target.bundleId))) return false;
+    // Marked before the result: an activation that worked but timed out
+    // still gets the owner's app put back (cleanup probes the front app).
     ctx.activated = true;
+    if (!(await probeNow(ctx, "activate", target.bundleId))) return false;
     const deadline = now() + limits.uiActivateMs;
     do {
       if ((await probeNow(ctx, "frontApp")) === target.bundleId) return true;
@@ -1026,10 +1038,10 @@ export function createUiDriver({
     if (!verified.ok) {
       const back = await ownerCheck(ctx, target);
       if (back) return outcome(ctx, "blocked", back);
-      if (!(await probeNow(ctx, "openUrl", target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
-      // The link can bring the app forward itself (Codex does): the owner's
-      // app is put back at the end all the same.
+      // The link can bring the app forward itself (Codex does), even when the
+      // command then fails: the owner's app is put back at the end all the same.
       ctx.activated = true;
+      if (!(await probeNow(ctx, "openUrl", target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
       // At least two reads, even when the first matches: the sidebar row
       // can switch before the page and composer do. The latest read decides,
       // and only its elements are used.
