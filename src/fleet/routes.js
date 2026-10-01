@@ -3,6 +3,7 @@
 // { status, body }, or null for paths it does not own.
 
 import { MODES } from "./contracts.js";
+import { DEADLINE_MARGIN_MS } from "./ui-delivery.js";
 
 const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
@@ -81,7 +82,16 @@ export function createFleetRoute({ supervisor } = {}) {
           // The owner's Scan now: rechecks every open question too. One
           // through the broker types nothing: the broker would stop waiting
           // mid-send, and a retried scan would nudge again.
-          await supervisor.tick({ reason: "owner-scan", ...(remote ? { deferUi: true } : {}) });
+          const scan = supervisor.tick({ reason: "owner-scan", ...(remote ? { deferUi: true } : {}) });
+          // It can ride a follow-up a local scan shares, which may type: a
+          // broker caller gets its answer before its deadline, the scan still
+          // running if it must.
+          if (remote && Number.isFinite(deadlineAt)) {
+            let timer;
+            const cutoff = new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, deadlineAt - DEADLINE_MARGIN_MS - Date.now()), false); });
+            const done = await Promise.race([Promise.resolve(scan).then(() => true), cutoff]).finally(() => clearTimeout(timer));
+            if (!done) Promise.resolve(scan).catch(() => {});
+          } else await scan;
         } catch {
           return fail(500, "Scan failed.", { state: state() });
         }

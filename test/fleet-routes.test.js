@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createFleetRoute } from "../src/fleet/routes.js";
+import { DEADLINE_MARGIN_MS } from "../src/fleet/ui-delivery.js";
 
 function fakeSupervisor() {
   const calls = [];
@@ -88,6 +89,19 @@ test("POST /fleet/api/scan runs a manual tick and returns state", async () => {
   assert.deepEqual(supervisor.calls.find((c) => c[0] === "tick"), ["tick", "owner-scan"]);
   assert.equal(result.body.lastTickAt, "2026-09-26T01:00:00.000Z");
   assert.equal((await route("GET", "/fleet/api/scan", url("/fleet/api/scan"), body({}))).status, 405);
+});
+
+test("a scan through the broker answers before its deadline, even when the tick it rides runs on", async () => {
+  const supervisor = fakeSupervisor();
+  let calls = 0;
+  supervisor.tick = (opts) => { calls += 1; supervisor.calls.push(["tick", opts.reason, opts.deferUi]); return new Promise(() => {}); };
+  const route = createFleetRoute({ supervisor });
+  const started = Date.now();
+  const result = await route("POST", "/fleet/api/scan", url("/fleet/api/scan"), body({}), { remote: true, deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 50 });
+  assert.equal(result.status, 200);
+  assert.ok(Date.now() - started < DEADLINE_MARGIN_MS, "answered before the deadline");
+  assert.deepEqual(supervisor.calls.find((c) => c[0] === "tick"), ["tick", "owner-scan", true]);
+  assert.equal(calls, 1);
 });
 
 test("scan failure is a 500 with state, never a thrown error", async () => {
