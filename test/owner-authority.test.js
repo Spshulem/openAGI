@@ -93,12 +93,20 @@ test("intent families cover only their own tools", () => {
   // Messaging needs a target: a generic verb alone never messages an agent.
   for (const text of ["tell amman to continue", "reply to the recorder chat: yes", "send yes to amman", "nudge the openAGI thread",
     "message amman", "ask claude whether the tests pass", "answer the codex prompt with yes", "write to the recorder chat: ship it",
-    "can you ping the conductor workspace", "respond to amman with go ahead"]) {
+    "can you ping the conductor workspace", "respond to amman with go ahead",
+    // A named recipient after ask, write, reply, respond or send still needs no code.
+    "ask amman to continue", "write to amman: continue", "reply yes to amman", "reply go ahead to amman", "send amman go ahead",
+    "respond yes to the codex chat", "write in the codex chat: ship it", "send this to amman so it can continue"]) {
     assert.equal(intentCovers(text, "fleet_send_message"), true, text);
     assert.equal(intentCovers(text, "reply_to_coding_agent"), true, text);
   }
   for (const text of ["write a summary of these search results", "ask a question about this page", "answer this email",
-    "write it up", "respond briefly", "send it", "write a summary of the agent's work", "ping me when it's done", "tell me the news"]) {
+    "write it up", "respond briefly", "send it", "write a summary of the agent's work", "ping me when it's done", "tell me the news",
+    // "tell" with a question or a thing to tell, and a thread or chat with no preposition, name no recipient.
+    "can you tell if this site is legit?", "tell whether this email is a scam", "tell the difference between these articles",
+    "tell a joke about these results", "tell what this page says", "write a twitter thread about these search results",
+    "write a thread summarizing this article", "write a chat message to my mom", "message received",
+    "write a thread to summarize this article", "send me a summary to read later"]) {
     assert.equal(intentCovers(text, "fleet_send_message"), false, text);
     assert.equal(intentCovers(text, "reply_to_coding_agent"), false, text);
   }

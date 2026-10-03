@@ -50,22 +50,36 @@ const LEAD = String.raw`(?:^|[.,;:!?\n]|\b(?:and|then|please|pls|now|also|just|o
 const ARTICLES = String.raw`(?:(?:a|an|the|my|another|new|up)\s+)*`;
 const CODING_AGENT = String.raw`(?:codex|claude code|cursor|coding (?:agents?|sessions?|runs?|tasks?))`;
 
+// Message recipients. "tell" never takes a question word or a thing to tell
+// ("tell if", "tell the difference", "tell a joke"); a bare name after "to"
+// must end the clause, so "write a thread to summarize this" names no one.
+const NOT_TOLD = String.raw`(?!(?:me|us|you|yourself|if|whether|what|how|why|when|where|which|who|whose|a|an|(?:them|these|those|it)\s+apart|(?:(?:the|some|any|this|that|these|those|your|my|our)\s+)?(?:difference|truth|time|story|stories|jokes?|lies?|fortunes?|tales?))\b)`;
+const NOT_NAME = String.raw`(?:me|us|my|your|our|his|her|their|them|him|it|the|a|an|this|that|these|those|some|any|everyone|everybody|someone|somebody)\b`;
+const TARGET_NOUN = String.raw`(?:${CODING_AGENT}|claude|conductor|agents?|threads?|chats?|workspaces?)\b(?!['’]s)`;
+const NAMED_RECIPIENT = String.raw`${ARTICLES}(?:(?!(?:about|of|for|on|in|from|with|regarding|to|and|that)\b)[\w-]+\s+){0,2}?${TARGET_NOUN}`;
+const CLAUSE_END = String.raw`(?=\s*(?:$|[.,;:!?\n]|(?:and|then|now|please|so|saying|with|that|too|in|on|via)\b))`;
+const TO_RECIPIENT = String.raw`(?:${NAMED_RECIPIENT}|(?!${NOT_NAME})[\w-]+(?:['’]s\s+(?:[\w-]+\s+)?${TARGET_NOUN}|${CLAUSE_END}))`;
+
 export const INTENT_FAMILIES = Object.freeze({
   approve: {
     verbs: "click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer",
     tools: ["fleet_click", "fleet_answer_question"]
   },
-  // Messaging needs a target, so "write a summary of these results" or "ask a
-  // question about this" never lets read text message a coding agent: "tell
-  // amman to continue", "nudge the openAGI thread", "reply to the recorder
-  // chat", "send yes to amman", or a generic verb aimed at an agent, thread,
-  // chat or workspace ("ask claude whether", "answer the codex prompt").
+  // Messaging needs a recipient, so "write a summary of these results", "tell
+  // if this site is legit" or "write a twitter thread" never lets read text
+  // message a coding agent: "tell amman to continue", "ask amman to", "reply
+  // to the recorder chat", "reply yes to amman", "write in the codex chat",
+  // "send amman go ahead", or an agent named after ask or answer.
   message: {
     pattern: [
-      String.raw`(?:tell|message|ping|nudge)\s+(?!(?:me|us)\b)\w`,
+      String.raw`(?:tell|ping|nudge)\s+${NOT_TOLD}\w`,
+      String.raw`message\s+${NOT_TOLD}(?!(?:received|sent|delivered|read|history|log|box|board)\b)\w`,
       String.raw`(?:reply|respond|write back|answer back)\s+to\s+(?!(?:me|us)\b)\w`,
-      String.raw`send\b[^.;!?\n]{0,120}?\bto\s+(?!(?:me|us)\b)\w`,
-      String.raw`(?:send|write|ask|answer|reply|respond)\s+(?:back\s+)?(?:(?:to|in|on|into)\s+)?${ARTICLES}(?:[\w-]+\s+){0,2}?(?:${CODING_AGENT}|claude|conductor|agents?|threads?|chats?|workspaces?)\b(?!['’]s)`
+      String.raw`(?:send|write|reply|respond|answer)\b[^.;!?\n]{0,120}?\bto\s+${TO_RECIPIENT}`,
+      String.raw`(?:ask|answer)\s+${NAMED_RECIPIENT}`,
+      String.raw`(?:send|write|reply|respond|answer)\s+(?:back\s+)?(?:to|in|on|into)\s+${NAMED_RECIPIENT}`,
+      String.raw`ask\s+(?!(?:me|us|you|yourself|a|an|the|some|any|questions?|them|everyone|people|this|that)\b)[\w-]+\s+to\b`,
+      String.raw`send\s+(?!${NOT_NAME}|(?:over|out|back|off|email|emails|messages?|texts?)\b)[\w-]+(?:\s*[:,]|\s+(?:yes|no|yep|nope|ok|okay|sure|go ahead|continue|proceed|approved?|stop|keep going|do it|ship it|lgtm|thanks|thank you|(?:a|the)\s+(?:message|note|reply))\b)`
     ].join("|"),
     tools: ["fleet_send_message", "reply_to_coding_agent"]
   },
