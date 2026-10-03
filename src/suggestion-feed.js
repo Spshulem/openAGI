@@ -101,14 +101,22 @@ function readDirNormalized(dir, status, forceSource = null) {
 
 function cachedEnvelope(file, forceSource) {
   let stat;
-  try { stat = fs.statSync(file); } catch { fileCache.delete(file); return null; }
+  try {
+    stat = fs.statSync(file);
+  } catch (error) {
+    fileCache.delete(file);
+    // Gone (or replaced mid-listing) is nothing to show; anything else is a
+    // filesystem fault the caller must see, as readJsonFile reports it.
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") return null;
+    throw error;
+  }
   const hit = fileCache.get(file);
-  // A copy: callers may annotate what they get back.
-  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size && hit.forceSource === forceSource) return { ...hit.envelope };
+  // A deep copy: callers may annotate what they get back, nested fields too.
+  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size && hit.forceSource === forceSource) return structuredClone(hit.envelope);
   const raw = readJsonFile(file, null);
   const envelope = raw ? normalize(raw, file, forceSource) : null;
   // A half-written file is read again next time, not cached as empty.
-  if (envelope) fileCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, forceSource, envelope: { ...envelope } });
+  if (envelope) fileCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, forceSource, envelope: structuredClone(envelope) });
   else fileCache.delete(file);
   return envelope;
 }

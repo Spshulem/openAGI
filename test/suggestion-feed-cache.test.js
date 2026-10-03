@@ -37,7 +37,24 @@ test("listing suggestions reads each unchanged file once, then only what changed
   const ids = listAllSuggestions(runtime).map((s) => s.id);
   assert.equal(ids.includes("sug_4"), false);
   assert.equal(ids.includes("sug_new"), true);
-  // What callers get back is theirs to change.
-  listAllSuggestions(runtime)[0].title = "changed";
-  assert.notEqual(listAllSuggestions(runtime)[0].title, "changed");
+  // What callers get back is theirs to change, nested fields included.
+  write("sug_nested", { sequence: { steps: ["a"] } });
+  const mine = listAllSuggestions(runtime).find((s) => s.id === "sug_nested");
+  mine.title = "changed";
+  mine.sequence.steps.push("b");
+  const again = listAllSuggestions(runtime).find((s) => s.id === "sug_nested");
+  assert.equal(again.title, "sug_nested");
+  assert.deepEqual(again.sequence.steps, ["a"]);
+});
+
+test("a filesystem fault while listing is raised, not shown as no suggestions", (t) => {
+  const { runtime, write } = setup(t);
+  write("sug_1");
+  const stat = fs.statSync;
+  fs.statSync = (file, ...rest) => {
+    if (String(file).endsWith("sug_1.json")) throw Object.assign(new Error("too many open files"), { code: "EMFILE" });
+    return stat(file, ...rest);
+  };
+  t.after(() => { fs.statSync = stat; });
+  assert.throws(() => listAllSuggestions(runtime), /too many open files/);
 });
