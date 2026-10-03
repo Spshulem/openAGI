@@ -40,10 +40,11 @@ test("listing suggestions reads each unchanged file once, then only what changed
   // What callers get back is theirs to change, nested fields included.
   write("sug_nested", { sequence: { steps: ["a"] } });
   const mine = listAllSuggestions(runtime).find((s) => s.id === "sug_nested");
+  const title = mine.title;
   mine.title = "changed";
   mine.sequence.steps.push("b");
   const again = listAllSuggestions(runtime).find((s) => s.id === "sug_nested");
-  assert.equal(again.title, "sug_nested");
+  assert.equal(again.title, title);
   assert.deepEqual(again.sequence.steps, ["a"]);
 });
 
