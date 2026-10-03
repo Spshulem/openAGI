@@ -313,6 +313,8 @@ test("an owner's reply instruction runs at once; others still queue; start_codin
   const remoteTools = new ToolRegistry();
   registerCodingSupervisorTools(remoteTools, remote);
   const start = remoteTools.get("start_coding_agent");
+  // The owner's workspace list never taints a coding turn.
+  assert.equal(remoteTools.get("list_coding_workspaces").untrustedOutput, false);
   assert.deepEqual(start.parameters.required, ["provider", "workspaceId"]);
   assert.match(start.parameters.properties.draftId.description, /never merge, release, restart or touch ~\/\.openagi/);
   assert.match(start.description, /Runs on the owner's instruction/);

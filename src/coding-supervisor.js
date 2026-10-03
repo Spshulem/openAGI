@@ -481,6 +481,8 @@ export function registerCodingSupervisorTools(registry, supervisor) {
     handler: (args, context) => { if (!context?.__confirmed) throw new Error("Explicit approval is required."); return supervisor.startApproved(args); }
   });
   if (!supervisor.external || supervisor.remote) registry.register({ name: "list_coding_workspaces", source: "integration:coding-supervisor", sideEffects: false,
+    // The owner's own configured workspace ids and labels: reading it never taints a coding turn.
+    trustedOutput: true,
     description: "List the owner's configured coding workspace IDs and installed provider CLIs. Installation does not prove authentication.",
     parameters: { type: "object", properties: {}, additionalProperties: false }, handler: () => supervisor.setup() });
   registry.register({ name: "list_coding_agents", source: "integration:coding-supervisor", sideEffects: false,

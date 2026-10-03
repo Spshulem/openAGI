@@ -47,6 +47,9 @@ export function authorityRecord(principal) {
 // the text ("open Safari", not just "open").
 const LEAD = String.raw`(?:^|[.,;:!?\n]|\b(?:and|then|please|pls|now|also|just|ok|okay|yes|yeah|yep|so|let's|lets|go ahead and|(?:can|could|would|will) you|(?:want|need) you to)\b)\s*(?:(?:please|just|now|also)\s+)*`;
 
+const ARTICLES = String.raw`(?:(?:a|an|the|my|another|new|up)\s+)*`;
+const CODING_AGENT = String.raw`(?:codex|claude code|cursor|coding (?:agents?|sessions?|runs?|tasks?))`;
+
 export const INTENT_FAMILIES = Object.freeze({
   approve: {
     verbs: "click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer",
@@ -65,18 +68,37 @@ export const INTENT_FAMILIES = Object.freeze({
     nouns: /\b(computer|screen|mac|desktop|window|browser|safari|chrome|firefox|finder|website|site|web ?page|tab|app)\b/i,
     tools: ["start_computer_use_session"]
   },
-  // Coding needs coding phrasing, not just a verb: a dispatch verb right
-  // before a coding agent ("have codex fix", "spin up a coding agent") or a
-  // repair verb aimed at code ("fix the failing tests", "repair PR 12"), so
-  // "get the latest news" or "watch the game" never launch an agent.
+  // Coding needs coding phrasing, not just a verb, so "get the latest news",
+  // "have the agent check the news" or "get codex's status" never launch an
+  // agent: a coding verb said on its own ("implement dark mode"), a dispatch
+  // verb right before a coding agent or session ("use codex to", "spin up a
+  // coding agent"), a bare agent or Claude only with a coding verb after it
+  // ("have claude fix ..."), or a repair verb in text naming code (below).
   coding: {
-    pattern: String.raw`(?:(?:start|launch|kick off|spin up|fire up|get|have|put|watch|monitor)\s+(?:(?:a|an|the|my|another|new|up)\s+)*(?:codex|claude|cursor|coding agents?|agents?)\b|(?:fix|repair|implement|build|debug|refactor)\s+(?:[\w'#-]+\s+){0,3}?(?:bugs?|tests?|build|ci|prs?|pull requests?|branch|repo|repository|code|codebase|crash|error|regression|feature)\b)`,
+    pattern: [
+      String.raw`(?:implement|debug|refactor)\b`,
+      String.raw`(?:start|launch|kick off|spin up|fire up|use|run|send)\s+${ARTICLES}${CODING_AGENT}\b(?!['’]s)`,
+      String.raw`(?:have|get|make|ask|let)\s+${ARTICLES}${CODING_AGENT}\s+to\b`,
+      String.raw`(?:start|launch|kick off|spin up|fire up|send|have|get|make|ask|let)\s+${ARTICLES}(?:${CODING_AGENT}|claude|agents?)\s+(?:in\s+)?(?:to\s+)?(?:(?:go|please|now|then)\s+)?(?:fix|repair|build|implement|debug|refactor|patch|rebase)\b`
+    ].join("|"),
     tools: ["start_coding_agent", "watch_coding_agent"]
+  },
+  // "fix the G2 upload page", "check CI on PR 142 and fix it": a repair verb
+  // counts only when the text names code somewhere.
+  repair: {
+    verbs: "fix|repair|build|patch",
+    nouns: /\b(bugs?|tests?|(?:the|a|my|this|that|failing|broken|ci) builds?|ci|prs?|pull requests?|branch(?:es)?|repo|repository|code|codebase|crash(?:es)?|errors?|regressions?|features?|issues?|pages?|screens?|modules?|flows?|functions?|endpoints?)\b/i,
+    tools: ["start_coding_agent", "watch_coding_agent"]
+  },
+  // Watching an agent: "watch codex", "monitor the claude session".
+  watch: {
+    pattern: String.raw`(?:watch|monitor|keep an eye on|keep watching|stop watching)\s+(?:(?:a|an|the|my|that|this)\s+)*(?:codex|claude|cursor|coding agents?|agents?|coding sessions?)\b(?!'s)`,
+    tools: ["watch_coding_agent"]
   }
 });
 
 const FAMILY_PATTERNS = new Map(Object.entries(INTENT_FAMILIES).map(([name, family]) =>
-  [name, new RegExp(`${LEAD}${family.pattern ?? `(?:${family.verbs})\\b`}`, "i")]));
+  [name, new RegExp(`${LEAD}${family.pattern ? `(?:${family.pattern})` : `(?:${family.verbs})\\b`}`, "i")]));
 
 export function intentFamilies(text) {
   const value = String(text ?? "");

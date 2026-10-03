@@ -76,13 +76,20 @@ test("intent families cover only their own tools", () => {
   assert.equal(intentCovers("summarize this", "start_computer_use_session"), false);
   assert.equal(intentCovers("open the PR", "start_computer_use_session"), false, "computer needs a computer noun");
   // Coding needs coding phrasing: generic verbs alone never launch an agent.
-  for (const text of ["have claude fix the login bug", "spin up a coding agent", "fix the failing tests", "repair PR 140", "watch codex"]) {
+  for (const text of ["have claude fix the login bug", "spin up a coding agent", "fix the failing tests", "repair PR 140", "watch codex",
+    "Implement dark mode in the openAGI repo", "Refactor the fleet supervisor", "Debug why the G2 page is blank", "fix issue #42",
+    "start a coding session", "check CI on PR 142 and fix it", "use codex to fix the build", "run Claude Code on the openAGI repo",
+    "send codex in to fix the build", "get codex to add a test", "have the agent fix the crash"]) {
     assert.equal(intentCovers(text, "start_coding_agent") || intentCovers(text, "watch_coding_agent"), true, text);
   }
-  for (const text of ["get the latest news", "watch the game", "monitor the stock price", "put it on my calendar", "have a look at my email", "fix it", "build me a website"]) {
+  for (const text of ["get the latest news", "watch the game", "monitor the stock price", "put it on my calendar", "have a look at my email", "fix it", "build me a website",
+    // A bare agent or Claude needs a coding verb after it; a possessive is not a dispatch.
+    "have the agent check the news", "get my agent to summarize the news", "have claude summarize my email", "get codex's status",
+    "get codex status", "put the agent's notes in a doc", "start claude", "fix my calendar"]) {
     assert.equal(intentCovers(text, "start_coding_agent"), false, text);
     assert.equal(intentCovers(text, "watch_coding_agent"), false, text);
   }
+  assert.equal(intentCovers("watch codex", "start_coding_agent"), false, "watching never starts an agent");
   // A gated tool outside every family always needs the code.
   assert.equal(intentCovers("send it, approve it, restart it", "schedule_message"), false);
 });
