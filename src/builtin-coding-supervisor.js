@@ -12,10 +12,33 @@ const MODEL = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,99}$/;
 const ID = /^[a-f0-9-]{36}$/;
 const MAX_OUTPUT = 2 * 1024 * 1024;
 const MAX_RUN_MS = 10 * 60_000;
+const MAX_MESSAGE = 4000;
+// A workspace the owner marked trusted (OPENAGI_CODING_TRUSTED_WORKSPACES on
+// this node) runs a repair session: writes and pushes a branch, so it gets
+// the time and brief size that takes.
+const TRUSTED_MAX_RUN_MS = 2 * 60 * 60_000;
+const TRUSTED_MAX_MESSAGE = 16_000;
+const TRUSTED_CLAUDE_TOOLS = "Bash(git:*),Bash(gh:*),Bash(node:*),Bash(npm:*)";
 
-export function codingChildEnv(env = process.env) {
-  return Object.fromEntries(["HOME", "USER", "PATH", "LANG", "TMPDIR", "CODEX_HOME"]
-    .filter(key => env[key] !== undefined).map(key => [key, env[key]]));
+// A trusted session also needs the owner's own CLI logins and Git push key.
+export function codingChildEnv(env = process.env, { trusted = false } = {}) {
+  const keys = ["HOME", "USER", "PATH", "LANG", "TMPDIR", "CODEX_HOME", ...(trusted ? ["CLAUDE_CONFIG_DIR", "CCODEX_HOME", "SSH_AUTH_SOCK"] : [])];
+  return Object.fromEntries(keys.filter(key => env[key] !== undefined).map(key => [key, env[key]]));
+}
+
+// Absolute Git project folders the owner set on this node, by real path.
+// Anything else (relative, missing, not Git, home or root) is ignored.
+export function trustedWorkspacePaths(value = process.env.OPENAGI_CODING_TRUSTED_WORKSPACES) {
+  const out = new Set();
+  for (const entry of String(value ?? "").split(/[,:\n]+/).map(item => item.trim()).filter(Boolean)) {
+    if (!path.isAbsolute(entry)) continue;
+    try {
+      const real = fs.realpathSync(entry);
+      if (real === path.parse(real).root || real === os.homedir() || !fs.existsSync(path.join(real, ".git"))) continue;
+      out.add(real);
+    } catch { /* missing: not trusted */ }
+  }
+  return out;
 }
 
 export function findCodingExecutable(provider, env = process.env) {
@@ -29,30 +52,42 @@ export function findCodingExecutable(provider, env = process.env) {
 }
 
 // Fixed argument vectors, never a shell command. Task text travels on stdin.
-// Claude retains its manual provider gate. Codex is explicitly read-only;
-// broader coding permissions are not silently inherited from user config.
-export function codingArguments(provider, { nativeId, model, effort } = {}) {
+// Restricted (the default): Claude retains its manual provider gate, and
+// Codex is explicitly read-only; broader coding permissions are not silently
+// inherited from user config. Trusted (a workspace the owner listed on this
+// node): Codex writes inside the workspace with network for git and gh, under
+// the owner's own config and login, and never stops to ask; Claude accepts
+// edits and may run only git, gh, node and npm.
+export function codingArguments(provider, { nativeId, model, effort, trusted = false } = {}) {
   if (!PROVIDERS.includes(provider)) throw new Error("Unknown coding provider.");
   if (model && !MODEL.test(model)) throw new Error("Invalid model identifier.");
   if (nativeId && !ID.test(nativeId)) throw new Error("Invalid provider session identifier.");
   if (effort && !["low", "medium", "high"].includes(effort)) throw new Error("Unsupported reasoning effort.");
-  if (provider === "codex") return ["exec", "--json", "--color", "never", "--sandbox", "read-only", "--ignore-user-config",
-    ...(model ? ["--model", model] : []), ...(effort ? ["-c", `model_reasoning_effort=${JSON.stringify(effort)}`] : []),
+  const codexTail = [...(model ? ["--model", model] : []), ...(effort ? ["-c", `model_reasoning_effort=${JSON.stringify(effort)}`] : []),
     ...(nativeId ? ["resume", nativeId] : []), "-"];
-  return ["--print", "--verbose", "--output-format", "stream-json", "--permission-mode", "manual",
+  if (provider === "codex" && trusted) return ["exec", "--json", "--color", "never", "--sandbox", "workspace-write",
+    "-c", "sandbox_workspace_write.network_access=true", "-c", 'approval_policy="never"', ...codexTail];
+  if (provider === "codex") return ["exec", "--json", "--color", "never", "--sandbox", "read-only", "--ignore-user-config", ...codexTail];
+  const permissions = trusted ? ["--permission-mode", "acceptEdits", "--allowedTools", TRUSTED_CLAUDE_TOOLS] : ["--permission-mode", "manual"];
+  return ["--print", "--verbose", "--output-format", "stream-json", ...permissions,
     "--permission-prompts", "none", "--setting-sources", "", "--settings", '{"disableAllHooks":true}',
     "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
     ...(nativeId ? ["--resume", nativeId] : []), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : [])];
 }
 
 export class BuiltinCodingSupervisor {
-  constructor({ dataDir, spawnImpl = spawn, findExecutable = findCodingExecutable, timeoutMs = MAX_RUN_MS, killGraceMs = 2000, onChange = () => {} }) {
+  constructor({ dataDir, spawnImpl = spawn, findExecutable = findCodingExecutable, timeoutMs = MAX_RUN_MS, trustedTimeoutMs = TRUSTED_MAX_RUN_MS,
+    trustedWorkspaces = process.env.OPENAGI_CODING_TRUSTED_WORKSPACES, env = process.env, killGraceMs = 2000, onChange = () => {} }) {
     this.dir = path.join(dataDir, "coding-supervisor", "builtin");
     this.configFile = path.join(this.dir, "config.json");
     this.config = readJsonFile(this.configFile, { enabled: false, workspaces: [] });
     this.spawn = spawnImpl;
     this.findExecutable = findExecutable;
     this.timeoutMs = timeoutMs;
+    this.trustedTimeoutMs = trustedTimeoutMs;
+    // Read once: the owner sets it in the node's environment, never a model.
+    this.trusted = trustedWorkspacePaths(trustedWorkspaces);
+    this.env = env;
     this.killGraceMs = killGraceMs;
     this.onChange = onChange;
     this.children = new Map();
@@ -86,13 +121,21 @@ export class BuiltinCodingSupervisor {
     return this.setup();
   }
 
+  isTrusted(workspace) {
+    return Boolean(workspace?.path) && this.trusted.has(workspace.path);
+  }
+
+  maxMessage(workspace) {
+    return this.isTrusted(workspace) ? TRUSTED_MAX_MESSAGE : MAX_MESSAGE;
+  }
+
   setup() {
     return { builtin: true, enabled: this.config.enabled === true,
-      workspaces: (this.config.workspaces || []).map(({ id, label }) => ({ id, label })),
+      workspaces: (this.config.workspaces || []).map((workspace) => ({ id: workspace.id, label: workspace.label, trusted: this.isTrusted(workspace) })),
       providers: PROVIDERS.map(provider => ({ provider, installed: Boolean(this.findExecutable(provider)),
         authentication: "Sign in with the provider CLI; the first approved run verifies the account.",
         loginCommand: provider === "codex" ? "codex login" : "claude auth login" })),
-      limitation: "Codex runs read-only. Claude keeps manual permissions; denied actions require review in Claude Code. No provider permissions are approved automatically. CLI usage is billed by your provider and is not capped by OpenAGI's chat budget." };
+      limitation: "Codex runs read-only. Claude keeps manual permissions; denied actions require review in Claude Code. No provider permissions are approved automatically. A workspace listed in OPENAGI_CODING_TRUSTED_WORKSPACES on this computer is trusted instead: Codex writes in it with network and no prompts, Claude accepts edits and runs git, gh, node and npm, for up to two hours. CLI usage is billed by your provider and is not capped by OpenAGI's chat budget." };
   }
 
   workspace(id) {
@@ -108,7 +151,8 @@ export class BuiltinCodingSupervisor {
     const workspace = this.workspace(args.workspaceId);
     if (!this.findExecutable(args.provider)) throw new Error("Install and sign in to the selected coding CLI first.");
     codingArguments(args.provider, args);
-    if (typeof args.message !== "string" || !args.message.trim() || args.message.length > 4000 || args.message.includes("\0")) throw new Error("Enter an instruction of 1–4000 characters.");
+    const max = this.maxMessage(workspace);
+    if (typeof args.message !== "string" || !args.message.trim() || args.message.length > max || args.message.includes("\0")) throw new Error(`Enter an instruction of 1–${max} characters.`);
     return { provider: args.provider, workspaceId: workspace.id, project: workspace.path, message: args.message,
       model: args.model || null, effort: args.effort || null, sessionId: crypto.randomUUID(), preparedAt: Date.now() };
   }
@@ -162,15 +206,16 @@ export class BuiltinCodingSupervisor {
     const workspace = this.workspace(row.workspaceId);
     if ([...this.records.values()].some(record => record.workspaceId === row.workspaceId && record.status === "interrupted")) throw new Error("An interrupted session may still own this workspace. Reconcile it in the provider before using another workspace.");
     if (this.children.size >= 2 || [...this.children.values()].some(child => child.workspaceId === row.workspaceId)) throw new Error("A writer already owns this workspace or the concurrency limit is reached.");
-    if (typeof message !== "string" || !message.trim() || message.length > 4000 || message.includes("\0")) throw new Error("Invalid coding instruction.");
+    if (typeof message !== "string" || !message.trim() || message.length > this.maxMessage(workspace) || message.includes("\0")) throw new Error("Invalid coding instruction.");
     const executable = this.findExecutable(row.provider);
     if (!executable) throw new Error("The provider CLI is unavailable.");
+    const trusted = this.isTrusted(workspace);
     row.status = "working";
     row.turns = [...row.turns.slice(-5), { role: "user", text: message }];
     row.updatedAt = new Date().toISOString();
     this.save(); // Persist before launch; a crash must never cause an automatic retry.
     let child;
-    try { child = this.spawn(executable, codingArguments(row.provider, row), { cwd: workspace.path, env: codingChildEnv(), stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
+    try { child = this.spawn(executable, codingArguments(row.provider, { ...row, trusted }), { cwd: workspace.path, env: codingChildEnv(this.env, { trusted }), stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" }); }
     catch { row.status = "failed"; this.save(); throw new Error("Could not start the provider CLI."); }
     const owned = { child, workspaceId: row.workspaceId, stopped: false };
     this.children.set(row.id, owned);
@@ -185,7 +230,7 @@ export class BuiltinCodingSupervisor {
       owned.stopped = true; kill("SIGTERM");
       killTimer = setTimeout(() => kill("SIGKILL"), this.killGraceMs);
     };
-    const timer = setTimeout(() => { failed = true; owned.stop(); }, this.timeoutMs);
+    const timer = setTimeout(() => { failed = true; owned.stop(); }, trusted ? this.trustedTimeoutMs : this.timeoutMs);
     const line = value => {
       let event; try { event = JSON.parse(value); } catch { return; }
       if (!event || typeof event !== "object" || Array.isArray(event)) return;

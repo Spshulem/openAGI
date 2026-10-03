@@ -11,6 +11,16 @@ const STATES = new Set([...ATTENTION, "working", "idle"]);
 const PROVIDERS = new Set(["claude", "codex"]);
 const ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/;
 const adapterFile = fileURLToPath(new URL("../scripts/coding-supervisor-adapter.mjs", import.meta.url));
+const CODING_CAPABILITY = "coding-supervisor";
+// What an owner-approved repair session on a coding node is told before the
+// brief, whatever the brief says.
+export const REPAIR_PREAMBLE = [
+  "OpenAGI repair brief. Rules for this session:",
+  "- Start a new branch from origin/main (git fetch first).",
+  "- Use Node 22 and run tests one file at a time: node --test --test-concurrency=1 test/<file>.test.js.",
+  "- Commit, push the branch, and open a pull request with gh pr create. Report the PR URL.",
+  "- Never merge, release, deploy or restart services, and never read or write ~/.openagi."
+].join("\n");
 const digest = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const clean = (value, length = 160) => String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, length);
 
@@ -81,9 +91,13 @@ export class CodingSupervisor {
     this.runtime = runtime;
     this.remoteNodeId = remoteNodeId || null;
     this.remote = Boolean(this.remoteNodeId);
+    // The node the last call resolved to (see resolveNode).
+    this.activeNodeId = null;
     if (this.remote) call = async (request) => {
       if (!runtime?.nodeCapabilities) throw new Error("The coding node transport is not ready.");
-      return runtime.nodeCapabilities.dispatch(this.remoteNodeId, "coding-supervisor", request.operation, request,
+      // An approved start or reply goes to the node it was approved for.
+      const nodeId = request.codingNodeId ? this.assertPinnedNode(request.codingNodeId) : this.resolveNode();
+      return runtime.nodeCapabilities.dispatch(nodeId, CODING_CAPABILITY, request.operation, request,
         { timeoutMs: request.operation === "reply" ? 65_000 : 30_000 });
     };
     this.now = now;
@@ -115,17 +129,92 @@ export class CodingSupervisor {
     writeJsonAtomic(this.file, this.state);
   }
 
+  // Coding nodes whose coding-supervisor capability is online and ready.
+  readyCodingNodes() {
+    const entries = this.runtime?.nodeCapabilities?.list?.(CODING_CAPABILITY) ?? [];
+    return entries.filter((entry) => entry?.nodeId && entry.capabilities?.some?.((capability) => capability.id === CODING_CAPABILITY && capability.ready));
+  }
+
+  // Which node this call goes to, decided now: the configured node while it
+  // is live and ready, else the one ready coding node. Otherwise an error the
+  // owner can act on: which node, when it was last seen, and the fix.
+  resolveNode() {
+    const facade = this.runtime?.nodeCapabilities;
+    // A transport that cannot list nodes can only reach the configured one.
+    if (typeof facade?.list !== "function") return (this.activeNodeId = this.remoteNodeId);
+    const ready = this.readyCodingNodes();
+    const configured = ready.find((entry) => entry.nodeId === this.remoteNodeId);
+    if (configured) return (this.activeNodeId = configured.nodeId);
+    if (ready.length === 1) return (this.activeNodeId = ready[0].nodeId);
+    throw new Error(this.unavailableDetail(ready));
+  }
+
+  nodeName(nodeId) {
+    return this.runtime?.nodeCapabilities?.describe?.(nodeId)?.name || nodeId;
+  }
+
+  unavailableDetail(ready = this.readyCodingNodes()) {
+    if (ready.length > 1) {
+      return `${ready.length} coding nodes are ready (${ready.map((entry) => entry.name || entry.nodeId).join(", ")}) and the configured one is not among them. Fix: set OPENAGI_CODING_SUPERVISOR_NODE on this main to one of them and restart it.`;
+    }
+    const info = this.runtime?.nodeCapabilities?.describe?.(this.remoteNodeId) ?? null;
+    const name = info?.name || this.remoteNodeId;
+    const seen = info?.lastSeenAt ? `last seen ${info.lastSeenAt}` : "never seen by this main";
+    const advertised = (info?.capabilities ?? []).find((capability) => capability?.id === CODING_CAPABILITY) ?? null;
+    if (!info?.online) {
+      return `Coding node ${name} is not connected (${seen}). Fix: open OpenAGI on that Mac, check it is still paired to this main (Nodes), and keep it awake; it reconnects within a minute.`;
+    }
+    if (!advertised) {
+      return `Coding node ${name} is connected (${seen}) but does not run the coding supervisor. Fix: update OpenAGI on that Mac and make sure OPENAGI_CODING_NODE is not 0 there.`;
+    }
+    return `Coding node ${name} is connected (${seen}) but its coding supervisor is not ready: ${advertised.detail || "no detail"}. Fix: open Integrations on that Mac and choose at least one Git workspace for the coding supervisor.`;
+  }
+
+  // An approval names its node; it runs there only while that node is ready.
+  assertPinnedNode(nodeId) {
+    const facade = this.runtime?.nodeCapabilities;
+    if (!nodeId) throw new Error("The coding node changed since approval.");
+    if (typeof facade?.list !== "function") {
+      if (nodeId !== this.remoteNodeId) throw new Error("The coding node changed since approval.");
+      return nodeId;
+    }
+    if (!this.readyCodingNodes().some((entry) => entry.nodeId === nodeId)) {
+      throw new Error(`The coding node changed since approval: ${this.nodeName(nodeId)} is not ready now. Request it again.`);
+    }
+    return nodeId;
+  }
+
+  // The node watches are bound to: the resolved remote node, else "local".
+  currentNodeId() {
+    return this.remote ? this.resolveNode() : this.remoteNodeId || "local";
+  }
+
+  watchNodeId() {
+    return this.remote ? this.activeNodeId || this.remoteNodeId : this.remoteNodeId || "local";
+  }
+
+  // A draft on main becomes the brief of a repair session: the fixed rules
+  // first, then the draft's own text.
+  repairMessage(draftId) {
+    const draft = this.runtime?.drafts?.get?.(String(draftId ?? ""));
+    if (!draft || typeof draft.body !== "string" || !draft.body.trim()) throw new Error("No draft with that id. Save the repair brief as a draft first.");
+    return `${REPAIR_PREAMBLE}\n\nBrief${draft.title ? `: ${clean(draft.title, 200)}` : ""}\n${draft.body.trim()}`;
+  }
+
   setup() {
-    return this.remote ? this.request({ operation: "setup" }).then(value => ({ ...value, remote: true, nodeId: this.remoteNodeId, external: false }))
+    return this.remote ? this.request({ operation: "setup" }).then(value => ({ ...value, remote: true, nodeId: this.activeNodeId || this.remoteNodeId, external: false }))
       : { ...this.builtin.setup(), external: this.external };
   }
   async prepareStart(args) {
-    if (!this.remote) return this.builtin.prepare(args);
-    return { ...await this.request({ operation: "prepare-start", ...args }), codingNodeId: this.remoteNodeId };
+    const { draftId, ...rest } = args ?? {};
+    const request = draftId ? { ...rest, message: this.repairMessage(draftId) } : rest;
+    if (!this.remote) return this.builtin.prepare(request);
+    const codingNodeId = this.resolveNode();
+    return { ...await this.request({ operation: "prepare-start", ...request, codingNodeId }), codingNodeId };
   }
   async startApproved(args) {
     if (!this.remote) return this.builtin.start(args);
-    if (args.codingNodeId !== this.remoteNodeId) throw new Error("The coding node changed since approval.");
+    this.assertPinnedNode(args.codingNodeId);
     return this.request({ ...args, operation: "start" });
   }
   configure(args) {
@@ -185,12 +274,12 @@ export class CodingSupervisor {
   }
 
   watchKey(target) {
-    return `${this.remoteNodeId || "local"}:${target.provider}:${target.sessionId}`;
+    return `${this.watchNodeId()}:${target.provider}:${target.sessionId}`;
   }
 
   watches() {
     return Object.values(this.state.watches).map(({ provider, sessionId, nodeId }) => ({
-      provider, sessionId, nodeId, active: nodeId === (this.remoteNodeId || "local")
+      provider, sessionId, nodeId, active: nodeId === this.watchNodeId()
     }));
   }
 
@@ -208,7 +297,7 @@ export class CodingSupervisor {
     if (!session) throw new Error("Refresh and select a currently visible session.");
     if (Object.keys(this.state.watches).length >= 20) throw new Error("Stop an existing watch first (20 maximum).");
     // Establish a baseline without reading or announcing historical output.
-    this.state.watches[key] = { ...target, nodeId: this.remoteNodeId || "local",
+    this.state.watches[key] = { ...target, nodeId: this.watchNodeId(),
       status: session.status, lastActivityAt: session.lastActivityAt };
     this.save();
     return { ...target, watching: true };
@@ -268,12 +357,12 @@ export class CodingSupervisor {
     const snapshot = await this.list();
     const session = snapshot.sessions.find((item) => item.provider === target.provider && item.sessionId === target.sessionId);
     if (!session?.replyAvailable) throw new Error("This session cannot receive a safe programmatic reply. Open it in its owning app.");
-    return { ...target, message: args.message, project: session.project, ...(this.remote ? { codingNodeId: this.remoteNodeId } : {}),
+    return { ...target, message: args.message, project: session.project, ...(this.remote ? { codingNodeId: this.activeNodeId || this.remoteNodeId } : {}),
       fingerprint: session.fingerprint, requestId: crypto.randomUUID(), preparedAt: this.now() };
   }
 
   async reply(args) {
-    if (this.remote && args.codingNodeId !== this.remoteNodeId) throw new Error("The coding node changed since approval.");
+    if (this.remote) this.assertPinnedNode(args.codingNodeId);
     const target = validateCodingTarget(args);
     if (!/^[a-f0-9-]{36}$/.test(args.requestId ?? "") || !/^[a-f0-9]{64}$/.test(args.fingerprint ?? "")
       || typeof args.message !== "string" || !args.message.trim() || args.message.length > 4_000 || args.message.includes("\0")) {
@@ -306,7 +395,7 @@ export class CodingSupervisor {
     this.save();
     try {
       const result = await this.request({ operation: "reply", ...target, message: args.message, fingerprint: args.fingerprint,
-        requestId: args.requestId, preparedAt: args.preparedAt });
+        requestId: args.requestId, preparedAt: args.preparedAt, ...(this.remote ? { codingNodeId: args.codingNodeId } : {}) });
       if (!["accepted", "queued", "blocked"].includes(result?.status)
         || result.sessionId !== target.sessionId || result.provider !== target.provider) throw new Error("Unconfirmed delivery.");
       receipt.status = result.status;
@@ -365,17 +454,24 @@ export function registerCodingSupervisorTools(registry, supervisor) {
   registry.register({ name: "watch_coding_agent", source: "integration:coding-supervisor", needsConfirmation: true,
     description: "Watch or stop watching one exact coding session. Runs on the owner's instruction; from anyone else it waits for the owner's approval. Watching reads recent assistant output on status changes and retains previews in main outreach, visible to opted-in G2 devices. No automatic replies, retries or provider permission approvals. Polling makes no model calls.",
     parameters: { type: "object", properties: { ...targetSchema, enabled: { type: "boolean" } }, required: ["provider", "sessionId", "enabled"], additionalProperties: false },
-    prepareApprovalArgs: args => ({ ...validateCodingTarget(args), enabled: args.enabled, codingNodeId: supervisor.remoteNodeId || "local" }),
+    prepareApprovalArgs: args => ({ ...validateCodingTarget(args), enabled: args.enabled, codingNodeId: supervisor.currentNodeId() }),
     approvalTtlMs: 600_000,
     summarize: args => `${args.enabled ? "Watch and share recent output from" : "Stop watching"} ${args.provider} ${args.sessionId} on ${args.codingNodeId}. Previews are saved in main outreach and available to opted-in G2 devices.`,
     handler: (args, context) => {
-      if (!context?.__confirmed || args.codingNodeId !== (supervisor.remoteNodeId || "local")) throw new Error("Approve the watch for the current coding node first.");
+      if (!context?.__confirmed || args.codingNodeId !== supervisor.currentNodeId()) throw new Error("Approve the watch for the current coding node first.");
       return supervisor.setWatch(args);
     } });
   if (!supervisor.external || supervisor.remote) registry.register({ name: "start_coding_agent", source: "integration:coding-supervisor", needsConfirmation: true,
     description: "Start an OpenAGI-managed coding CLI in an owner-selected Git workspace. Runs on the owner's instruction; from anyone else it waits for the owner's approval. Codex is read-only and Claude keeps manual permissions unless the coding node marks the workspace trusted. Never claim acceptance means task completion. Use list_coding_workspaces for exact workspace IDs.",
-    parameters: { type: "object", properties: { provider: targetSchema.provider, workspaceId: { type: "string" }, message: { type: "string", maxLength: 4000 }, model: { type: "string" }, effort: { type: "string", enum: ["low", "medium", "high"] } }, required: ["provider", "workspaceId", "message"], additionalProperties: false },
-    prepareApprovalArgs: args => supervisor.prepareStart(args), approvalTtlMs: 600_000,
+    parameters: { type: "object", properties: { provider: targetSchema.provider, workspaceId: { type: "string" },
+      message: { type: "string", maxLength: 16000, description: "The instruction. 4000 characters at most unless the workspace is trusted on its node (16000)." },
+      draftId: { type: "string", description: "A saved draft on this main to send as a repair brief, after OpenAGI's fixed repair rules (new branch from origin/main, Node 22 tests one file at a time, commit, push, gh pr create; never merge, release, restart or touch ~/.openagi). Replaces message." },
+      model: { type: "string" }, effort: { type: "string", enum: ["low", "medium", "high"] } },
+    required: ["provider", "workspaceId"], additionalProperties: false },
+    prepareApprovalArgs: async args => {
+      if (!args.draftId && (typeof args.message !== "string" || !args.message.trim())) throw new Error("Pass a message or a draftId.");
+      return supervisor.prepareStart(args);
+    }, approvalTtlMs: 600_000,
     approvalDedupeKey: (args, context) => digest(JSON.stringify([context.sessionId, args.provider, args.workspaceId, args.message, args.model, args.effort])),
     summarize: args => `Start ${args.provider} in ${args.project}: ${args.message}`,
     handler: (args, context) => { if (!context?.__confirmed) throw new Error("Explicit approval is required."); return supervisor.startApproved(args); }

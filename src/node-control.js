@@ -170,14 +170,30 @@ export class NodeControlBroker {
     });
   }
 
+  // The last poll from a node (even an offline one), for saying how long
+  // it has been gone. Null when it never polled since this main started.
+  lastSeen(nodeId) {
+    const record = this.nodes.get(text(nodeId, 200) ?? "");
+    if (!record) return null;
+    return { seenAt: new Date(record.seenAt).toISOString(), online: this.now() - record.seenAt <= this.onlineMs, capabilities: record.capabilities };
+  }
+
   dispatch(nodeId, capability, operation, payload, { timeoutMs = this.commandTimeoutMs, sessionId = null } = {}) {
-    const record = this.list(capability).find((entry) => entry.nodeId === nodeId);
-    const advertised = record?.capabilities.find((entry) => entry.id === capability);
+    const known = this.nodes.get(nodeId);
+    const online = known && this.now() - known.seenAt <= this.onlineMs;
+    const advertised = online ? known.capabilities.find((entry) => entry.id === capability) : null;
+    // Three different fixes, so three different errors: the node is off or
+    // its worker stopped polling; it runs without this capability; or the
+    // capability itself reports why it cannot act.
+    if (!online) {
+      return Promise.reject(new Error(`selected node is not connected (no poll in ${Math.round(this.onlineMs / 1000)} s)`));
+    }
+    if (!advertised) return Promise.reject(new Error(`selected node does not advertise ${capability}`));
     // Revocation remains available when capture/input readiness drops (locked
     // screen, Secure Input, permission change, or a newly excluded window).
     // Those states must disable actions, never disable Stop.
-    if (!advertised || (operation !== "session.end" && !advertised.ready)) {
-      return Promise.reject(new Error("selected node capability is not ready"));
+    if (operation !== "session.end" && !advertised.ready) {
+      return Promise.reject(new Error(`selected node capability is not ready: ${advertised.detail || "no detail reported"}`));
     }
     if (!advertised.operations.includes(operation)) {
       return Promise.reject(new Error(`selected node does not support ${operation}`));
@@ -546,6 +562,7 @@ export function createNodeControlWorker({
         // run while that probe is pending, after its controller-abort sweep;
         // never create a fresh long-poll once shutdown has begun.
         if (stopped) break;
+        const pollStartedAt = Date.now();
         const body = await post("/nodes/control/poll", {
           nodeId,
           capabilities: advertised,
@@ -556,7 +573,12 @@ export function createNodeControlWorker({
           return await readJsonResponseLimited(response, MAX_POLL_RESPONSE_BYTES);
         });
         const command = body?.command;
-        if (!command || typeof command.id !== "string") continue;
+        if (!command || typeof command.id !== "string") {
+          // A long poll that came back empty at once (a replaced poll, a
+          // proxy, a misbehaving main) must not turn into a tight loop.
+          if (Date.now() - pollStartedAt < 100) await sleep(Math.min(retryMs, 250));
+          continue;
+        }
         if (revocationsOnly && command.operation !== "session.end") {
           throw new Error("revocation-only poll returned ordinary work");
         }

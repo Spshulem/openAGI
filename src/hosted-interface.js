@@ -70,6 +70,7 @@ import {
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
 import { executeApprovedAction } from "./approval-executor.js";
+import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
 import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 import {
@@ -170,6 +171,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     },
     removeNode(nodeId, reason) {
       return nodeControlBroker.removeNode(nodeId, reason);
+    },
+    // Name, last poll and advertised capabilities of one node, online or
+    // not, so an unreachable node can be named in an error with its fix.
+    describe(nodeId) {
+      if (typeof nodeId !== "string" || !nodeId) return null;
+      const entry = nodeRegistry.list().find((item) => item.nodeId === nodeId) ?? null;
+      const seen = nodeControlBroker.lastSeen(nodeId);
+      return { nodeId, name: entry?.name ?? null, lastSeenAt: seen?.seenAt ?? entry?.lastSeenAt ?? null,
+        online: Boolean(seen?.online), capabilities: seen?.capabilities ?? [] };
     }
   };
   runtime.nodeCapabilities = capabilityFacade;
@@ -615,14 +625,50 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   let computerExecutor = null;
   let imessageNodeCapability = null;
   let imessageBridgeRuntime = null;
+  let codingNode = null;
   const tickerMs = options.tickerMs ?? Number.parseInt(process.env.OPENAGI_TICKER_MS ?? "10000", 10);
 
   const computerUseEnabledHere = () => {
     const value = String(process.env.OPENAGI_COMPUTER_USE ?? "").toLowerCase();
     return options.nodeControlEnabled ?? (value === "1" || value === "true" || value === "yes");
   };
+  // This Mac's coding supervisor for its main: on by default once paired to
+  // one (the main can then list, start and reply to coding sessions here);
+  // OPENAGI_CODING_NODE=0 or 1 overrides. With no workspaces chosen it lists
+  // nothing and starts nothing.
+  const codingNodeEnabledHere = () => {
+    if (typeof options.codingNodeEnabled === "boolean") return options.codingNodeEnabled;
+    const value = String(getServiceEnv().OPENAGI_CODING_NODE ?? "").trim().toLowerCase();
+    if (["0", "false", "no", "off"].includes(value)) return false;
+    if (["1", "true", "yes", "on"].includes(value)) return true;
+    return Boolean(readNodeConfig(dataDir)?.remote);
+  };
+  const codingNodeProvider = () => {
+    codingNode ??= options.codingNodeCapability ?? createCodingNodeCapability({
+      dataDir: path.join(dataDir, "coding-node"),
+      backendDir: getServiceEnv().OPENAGI_CODING_SUPERVISOR_DIR || undefined
+    });
+    return {
+      async health() {
+        let detail = "Coding supervisor on this computer";
+        try {
+          const setup = codingNode.supervisor.builtin.setup();
+          const trusted = setup.workspaces.filter((workspace) => workspace.trusted).length;
+          detail = setup.workspaces.length
+            ? `${setup.workspaces.length} coding workspaces${trusted ? ` (${trusted} trusted)` : ""}`
+            : "No coding workspaces chosen on this computer yet";
+        } catch { /* the capability's own detail */ }
+        // Ready even with no workspaces, so the main can configure some.
+        return { ok: true, service: "coding", capability: { ...codingNode.capability, ready: true, detail } };
+      },
+      async invoke(operation, payload) {
+        return codingNode.execute({ capability: CODING_CAPABILITY, operation, payload: payload ?? {} });
+      }
+    };
+  };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
+    if (codingNodeEnabledHere()) providers.set(CODING_CAPABILITY, codingNodeProvider());
     if (process.env.OPENAGI_FLEET_SUPERVISOR === "1" && !process.env.OPENAGI_FLEET_NODE && runtime.fleetSupervisor) {
       providers.set("fleet-supervisor", createFleetCapability(runtime.fleetSupervisor));
     }
@@ -3491,6 +3537,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         sseClients.clear();
         channels?.stop?.();
         runtime.codingSupervisor?.stop();
+        codingNode?.stop?.();
         runtime.fleetSupervisor?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
