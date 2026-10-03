@@ -100,9 +100,9 @@ export class OpenAIResponsesProvider {
     return this.model;
   }
 
-  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, onProgress, onTextDelta }) {
+  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
     const model = this.resolveModel({ model: modelOverride, tier, task });
-    const maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
+    let maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
     this.budgetGuard?.check();
 
@@ -219,6 +219,7 @@ export class OpenAIResponsesProvider {
       // loop stopped here with the last function_call response and persisted
       // "(no text)". Reserve one additional model call with no tools so it can
       // summarize the results without any chance of invoking them twice.
+      maxToolHops = extendedToolHops(extendToolHops, maxToolHops);
       if (hop === maxToolHops - 1) needsFinalAnswer = true;
     }
 
@@ -383,10 +384,10 @@ export class AnthropicProvider {
     return this.model;
   }
 
-  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, onProgress, onTextDelta }) {
+  async generate({ input, instructions, turnContext, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task, maxToolHops: maxToolHopsOverride, extendToolHops, onProgress, onTextDelta }) {
     if (!this.apiKey) throw new Error("ANTHROPIC_API_KEY is not configured.");
     const model = this.resolveModel({ model: modelOverride, tier, task });
-    const maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
+    let maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     this.budgetGuard?.check();
 
     const tools = toolRegistry?.toAnthropicTools?.() ?? [];
@@ -484,6 +485,7 @@ export class AnthropicProvider {
         });
       }
       convo.push({ role: "user", content: toolResults });
+      maxToolHops = extendedToolHops(extendToolHops, maxToolHops);
       if (hop === maxToolHops - 1) needsFinalAnswer = true;
     }
 
@@ -926,6 +928,16 @@ function normalizeSseLimits(value = {}) {
 
 function positiveInteger(value, fallback) {
   return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+// A turn may earn a higher bound mid-way (a computer-use session it just
+// started): the caller's extendToolHops() is asked after each tool round and
+// can only raise the bound, never lower it.
+function extendedToolHops(extend, current) {
+  if (typeof extend !== "function") return current;
+  let wanted;
+  try { wanted = Number(extend()); } catch { return current; }
+  return Number.isSafeInteger(wanted) && wanted > current ? Math.min(64, wanted) : current;
 }
 
 function boundedToolHops(value, fallback) {

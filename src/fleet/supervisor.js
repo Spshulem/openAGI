@@ -12,11 +12,11 @@ import { MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, p
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
 import { createExecutor } from "./executor.js";
 import { createNotifier } from "./notify.js";
-import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, userPlaybooksDir } from "./playbooks.js";
+import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
-import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppRestarter, createUiDriver, restartMaxMs } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -121,6 +121,11 @@ const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 
 // The label single questions use, so a group never names a thread by its
 // session id or title (a first prompt, an automation prompt).
+// What changes when a thread moves: its newest agent or owner text and state.
+function activityMark(thread) {
+  return [thread?.lastAgentAt ?? null, thread?.lastUserAt ?? null, thread?.lastActivityAt ?? null, thread?.agentStatus ?? null].join("|");
+}
+
 function threadLabel(thread) {
   if (!thread) return "?";
   const ref = thread.prRefs?.[0] ?? "";
@@ -233,6 +238,26 @@ const RETRY_DELIVERY = "Owner fixed the blocker (login or disk). Retry: continue
 // "added" on an account-cap question means new capacity: resume now.
 const ADDED_DELIVERY = "Owner added account capacity. Continue where you stopped.";
 const RESTART_REPEAT_MS = 10 * 60_000;
+const APP_ACTIONS = new Set(["open", "quit", "restart"]);
+// A chat an app quit or restart stopped gets its one resume while the
+// record is younger than this.
+const APP_RESTART_KEEP_MS = 2 * 60 * MIN;
+const APP_RESTARTED_DELIVERY = "The owner restarted {app}, which stopped this chat mid-turn. Continue where you stopped.";
+// A permission card read on screen holds until the thread moves past it.
+const PROMPT_TTL_MS = 6 * 60 * MIN;
+const PROMPT_ACTIVITY_SLACK_MS = 5_000;
+// A tick's screen read that found no card waits this long (doubling per
+// repeat, up to the max) before the same unmoved thread is read again.
+const CARDLESS_READ_MS = 15 * MIN;
+const CARDLESS_READ_MAX_MS = 2 * 60 * MIN;
+// Open Computer Use unable to read an app (cgWindowNotFound): asked about
+// once it failed this often, over this many ticks and this long, with no
+// good read since.
+const UNREADABLE_MIN_HITS = 3;
+const UNREADABLE_MIN_TICKS = 2;
+const UNREADABLE_MIN_MS = 10 * MIN;
+// Outcomes that prove the app's window was read.
+const READ_THE_APP = /^(turn running|draft in composer|could not verify thread|thread changed|permission prompt|text mismatch|composer)/;
 
 export class FleetSupervisor {
   // forceMode pins the mode over the owner's saved choice (the dry-run CLI).
@@ -258,8 +283,15 @@ export class FleetSupervisor {
     this.settledPrs = new Map();
     this.answering = new Set();
     this._uiDriver = undefined;
-    this.restartedAt = new Map();
     this._uiBlockedSince = null;
+    // threadKey -> { text, buttons, stateId, at }: permission cards a send,
+    // read or click saw on screen.
+    this.prompts = new Map();
+    // app -> { since, hits: [{ at, tick }] }: reads Open Computer Use failed.
+    this.unreadable = new Map();
+    // threadKey -> { mark, at, count }: tick reads that found no card.
+    this.cardlessReads = new Map();
+    this.tickCount = 0;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
     this._reviewRunner = null;
     this.lastReview = { at: null, failedAt: null, error: null };
@@ -548,6 +580,7 @@ export class FleetSupervisor {
       // (a relay or background resume would still land, and a retry repeat it).
       if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt - DEADLINE_MARGIN_MS) { late += 1; continue; }
       const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
+      if (route === "computer-use") this.noteUiResult(thread, delivery);
       if (uiKey) typedInto.set(uiKey, delivery.status === "sent");
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
       if (delivery.status === "sent") {
@@ -628,6 +661,7 @@ export class FleetSupervisor {
       if (tries >= budget * 2) continue;
       tries += 1;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
+      if (route === "computer-use") this.noteUiResult(thread, delivery);
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
       if (route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) contacted.uiStalled = true;
       if (delivery.status !== "sent") continue;
@@ -652,7 +686,7 @@ export class FleetSupervisor {
     const threads = keys.map((key) => this.lastThreads.get(key)).filter(Boolean);
     for (const app of restartApps) {
       if (!threads.some((thread) => uiTargetFor(thread)?.app === app)) continue;
-      if (this.now() - (this.restartedAt.get(app) ?? -Infinity) < RESTART_REPEAT_MS) continue;
+      if (this.now() - (this.store.restartedAt(app) ?? -Infinity) < RESTART_REPEAT_MS) continue;
       const name = UI_APPS[app]?.name ?? app;
       // A restart ends every running turn in that app, not just the capped ones.
       const busy = [...this.lastThreads.values()].filter((thread) => !keys.includes(thread.key) && thread.agentStatus === "running" && uiTargetFor(thread)?.app === app);
@@ -665,14 +699,264 @@ export class FleetSupervisor {
       const result = await this.appRestarter.restart(app);
       this.store.recordAction({ kind: "restart", playbook: "account-switched", threadKey: null, status: result.ok ? "done" : "failed", reason: `restart ${name} after an account switch`, detail: result.detail, at: new Date(this.now()).toISOString() });
       if (!result.ok) return { status: "blocked", route: null, detail: `${result.detail}; answer again to retry` };
-      this.restartedAt.set(app, this.now());
+      this.store.markRestarted(app, this.now());
     }
     return null;
   }
 
   get appRestarter() {
-    this._appRestarter ??= this.deps.appRestarter ?? createAppRestarter({ bins: this.config.bins ?? {}, run: this.deps.run ?? runCommand, limits: this.config.limits });
-    return this._appRestarter;
+    return this.appController;
+  }
+
+  // open / quit / restart for Conductor and the Codex app (ui-delivery's
+  // createAppController); tests inject one.
+  get appController() {
+    this._appController ??= this.deps.appController ?? this.deps.appRestarter
+      ?? createAppController({ bins: this.config.bins ?? {}, run: this.deps.run ?? runCommand, limits: this.config.limits });
+    return this._appController;
+  }
+
+  // The chats running in an app right now, read fresh from the sources that
+  // can show it (Codex and Conductor). A thread the last scan saw that this
+  // read does not list (a full page) keeps its last state. null when a
+  // source failed: unknown is not idle.
+  async liveRunningIn(app) {
+    const config = { ...this.config, mode: this.mode };
+    const d = this.deps;
+    const now = this.now();
+    let peers = new Map();
+    try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch { /* peers only label sessions */ }
+    let fresh;
+    try {
+      const [codexThreads, conductorThreads] = await Promise.all([
+        withTimeout(Promise.resolve().then(() => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now, run: d.run ?? runCommand })), SOURCE_TIMEOUT_MS, "codex"),
+        withTimeout(Promise.resolve().then(() => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now, peers })), SOURCE_TIMEOUT_MS, "conductor")
+      ]);
+      fresh = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: [], conductor: conductorThreads ?? [] }));
+    } catch {
+      return null;
+    }
+    const byKey = new Map([...this.lastThreads].filter(([, thread]) => thread?.kind === "codex" || thread?.kind === "conductor"));
+    for (const thread of fresh) byKey.set(thread.key, thread);
+    return [...byKey.values()].filter((thread) => thread?.agentStatus === "running" && uiTargetFor(thread)?.app === app);
+  }
+
+  // The chats a quit or restart would stop, as the owner is asked to approve
+  // them: the same live read appAction checks, chats the scan leaves out
+  // (no repo, past the cap) included. null when a source failed.
+  async runningInApp(app) {
+    const live = await this.liveRunningIn(app);
+    return live ? live.map((thread) => ({ key: thread.key, name: thread.workspace || thread.title || thread.key })) : null;
+  }
+
+  // The owner's open, quit or restart of one app. Quit and restart stop every
+  // turn running in it: expectRunning is the chats the owner approved
+  // stopping, and any other running chat blocks it. The stopped chats are
+  // kept (in the store) and each gets one resume once the app is back.
+  async appAction(app, action, { expectRunning = null, deadlineAt = null } = {}) {
+    const spec = UI_APPS[app];
+    if (!spec || !APP_ACTIONS.has(action)) return { ok: false, app, action, detail: "Use open, quit or restart for conductor or codex." };
+    let running = [...this.lastThreads.values()].filter((thread) => thread?.agentStatus === "running" && uiTargetFor(thread)?.app === app);
+    if (action !== "open") {
+      // The last scan can be minutes old: re-read the app's chats now, so a
+      // turn started since then is counted too.
+      const live = await this.liveRunningIn(app);
+      if (!live) return { ok: false, app, action, running: running.map((thread) => thread.key), detail: `could not read which chats are running in ${spec.name}; a ${action} could stop one. Ask again.` };
+      running = live;
+      const approved = new Set(Array.isArray(expectRunning) ? expectRunning : []);
+      const unapproved = running.filter((thread) => !approved.has(thread.key));
+      if (unapproved.length) {
+        return { ok: false, app, action, running: running.map((thread) => thread.key),
+          detail: `${unapproved.length} more chats running in ${spec.name} than approved (${unapproved.map(threadLabel).join(", ")}); a ${action} would stop them. Ask again.` };
+      }
+    }
+    // A remote caller that would give up mid-restart would leave the desktop changing.
+    if (Number.isFinite(deadlineAt) && Date.now() + restartMaxMs(this.config.limits) > deadlineAt - DEADLINE_MARGIN_MS) {
+      return { ok: false, app, action, detail: `no time left in this request to ${action} ${spec.name}; ask again` };
+    }
+    const controller = this.appController;
+    if (typeof controller?.[action] !== "function") return { ok: false, app, action, detail: `${action} is not available on this Mac` };
+    const result = await controller[action](app);
+    const at = this.now();
+    this.store.recordAction({ kind: action === "restart" ? "restart" : `${action}-app`, playbook: "owner-app", threadKey: null,
+      status: result?.ok ? "done" : "failed", reason: `owner: ${action} ${spec.name}`, detail: clampText(result?.detail ?? "", 200), at: new Date(at).toISOString() });
+    if (result?.ok) {
+      const stopped = running.map((thread) => thread.key);
+      if (action === "restart") {
+        this.store.markRestarted(app, at);
+        if (stopped.length) this.store.setAppRestart(app, { action, at: new Date(at).toISOString(), threadKeys: stopped, due: true, done: [] });
+      } else if (action === "quit" && stopped.length) {
+        // Resumed only once the fleet opens the app again.
+        this.store.setAppRestart(app, { action, at: new Date(at).toISOString(), threadKeys: stopped, due: false, done: [] });
+      } else if (action === "open") {
+        const quit = this.store.appRestart(app);
+        if (quit && quit.action === "quit" && !quit.due) this.store.setAppRestart(app, { ...quit, due: true, openedAt: new Date(at).toISOString() });
+      }
+      this.unreadable.delete(app);
+    }
+    return { ok: Boolean(result?.ok), app, action, detail: result?.detail ?? null, running: running.map((thread) => thread.key) };
+  }
+
+  // The thread the owner names, and the app that shows it.
+  // threads: every thread known (shared titles); the last scan's by default.
+  uiThread(threadKey, thread = null, threads = null) {
+    const found = thread ?? this.lastThreads.get(threadKey) ?? null;
+    if (!found) return { error: "thread not seen since restart: scan first" };
+    const target = uiTargetFor(found);
+    if (!target) return { error: "no app shows this thread (terminal session)" };
+    const driver = this.uiDriver;
+    if (!driver) return { error: "computer use unavailable on this Mac" };
+    return { thread: found, target, driver, identity: uiIdentity(found, target, threads ?? [...this.lastThreads.values()]) };
+  }
+
+  // What one thread's screen shows: its permission card (buttons, stateId),
+  // whether a turn runs, Resume buttons, the transcript's tail. No input.
+  // navigate: false reads only a thread already on screen (no deep link).
+  async screenThread(threadKey, { deadlineAt = null, thread = null, threads = null, navigate = true } = {}) {
+    const found = this.uiThread(threadKey, thread, threads);
+    if (found.error) return { status: "blocked", detail: found.error, screen: null };
+    if (typeof found.driver.inspect !== "function") return { status: "blocked", detail: "screen reads unavailable on this Mac", screen: null };
+    let result;
+    try {
+      result = await found.driver.inspect({ target: found.target, identity: found.identity, evidenceName: `screen-${found.thread.kind}-${String(found.thread.id).slice(0, 8)}-${this.now()}`, deadlineAt, navigate });
+    } catch (error) {
+      result = { status: "failed", detail: clampText(redactSecrets(`computer use failed: ${error?.message ?? error}`), 200) };
+    }
+    this.noteUiResult(found.thread, result);
+    return { status: result?.status ?? "failed", detail: result?.detail ?? null, ...(result?.code ? { code: result.code } : {}), screen: result?.screen ?? null };
+  }
+
+  // Clicks one button of the thread's permission card (or its one Resume
+  // button) by exact label; stateId pins the card the owner saw.
+  async clickThread(threadKey, label, { stateId = null, deadlineAt = null, thread = null } = {}) {
+    const found = this.uiThread(threadKey, thread);
+    if (found.error) return { delivery: { status: "blocked", route: null, detail: found.error }, prompt: null };
+    if (typeof found.driver.clickLabel !== "function") return { delivery: { status: "blocked", route: null, detail: "clicking unavailable on this Mac" }, prompt: null };
+    let result;
+    try {
+      result = await found.driver.clickLabel({ target: found.target, identity: found.identity, label, stateId, evidenceName: `click-${found.thread.kind}-${String(found.thread.id).slice(0, 8)}-${this.now()}`, deadlineAt });
+    } catch (error) {
+      result = { status: "failed", detail: clampText(redactSecrets(`computer use failed: ${error?.message ?? error}; nothing confirmed`), 200) };
+    }
+    this.noteUiResult(found.thread, result);
+    this.store.recordAction({ kind: "click", playbook: "owner-click", threadKey: found.thread.key, route: "computer-use", status: result?.status ?? "failed",
+      reason: clampText(`owner: click ${label}`, 300), detail: clampText(result?.detail ?? "", 200), at: new Date(this.now()).toISOString() });
+    return { delivery: { status: result?.status ?? "failed", route: "computer-use", detail: result?.detail ?? null, ...(result?.code ? { code: result.code } : {}) }, prompt: result?.prompt ?? null };
+  }
+
+  // What an app send, read or click learned: the card it saw (or that none
+  // shows now), and whether Open Computer Use could read the app at all.
+  noteUiResult(thread, result) {
+    const target = uiTargetFor(thread);
+    if (!target || !result) return;
+    const at = this.now();
+    if (result.code === "appUnreadable") {
+      const entry = this.unreadable.get(target.app) ?? { since: at, hits: [] };
+      entry.hits = [...entry.hits, { at, tick: this.tickCount }].slice(-20);
+      this.unreadable.set(target.app, entry);
+      return;
+    }
+    const card = result.prompt ?? result.screen?.prompt ?? null;
+    if (["sent", "read"].includes(result.status) || card || READ_THE_APP.test(String(result.detail ?? ""))) this.unreadable.delete(target.app);
+    if (card?.stateId && Array.isArray(card.buttons)) this.prompts.set(thread.key, { text: clampText(card.text ?? "", 300), buttons: card.buttons.slice(0, 6), stateId: card.stateId, at });
+    else if (["sent", "read"].includes(result.status)) this.prompts.delete(thread.key);
+  }
+
+  // A read of this thread found no card, the thread has not moved since, and
+  // its backoff (15 min, doubling to 2 h) has not run out.
+  cardlessReadFresh(thread, at = this.now()) {
+    const entry = this.cardlessReads.get(thread?.key);
+    if (!entry) return false;
+    if (entry.mark !== activityMark(thread)) { this.cardlessReads.delete(thread.key); return false; }
+    return at - entry.at < Math.min(CARDLESS_READ_MAX_MS, CARDLESS_READ_MS * 2 ** Math.max(0, entry.count - 1));
+  }
+
+  // The card a thread is waiting on, while the thread has not moved past it.
+  livePrompt(thread) {
+    const entry = this.prompts.get(thread?.key);
+    if (!entry) return null;
+    const activity = Math.max(Date.parse(thread.lastAgentAt ?? "") || 0, Date.parse(thread.lastActivityAt ?? "") || 0);
+    if (this.now() - entry.at > PROMPT_TTL_MS || activity > entry.at + PROMPT_ACTIVITY_SLACK_MS) {
+      this.prompts.delete(thread.key);
+      return null;
+    }
+    return { text: entry.text, buttons: [...entry.buttons], stateId: entry.stateId };
+  }
+
+  // Open Computer Use has failed to read an app for a while: one question,
+  // asked every tick it holds, closing itself after a good read.
+  unreadableDecisions(started, threads) {
+    const out = [];
+    for (const [app, entry] of this.unreadable) {
+      const ticks = new Set(entry.hits.map((hit) => hit.tick));
+      if (entry.hits.length < UNREADABLE_MIN_HITS || ticks.size < UNREADABLE_MIN_TICKS || started - entry.since < UNREADABLE_MIN_MS) continue;
+      const name = UI_APPS[app]?.name ?? app;
+      const running = threads.filter((thread) => thread?.agentStatus === "running" && uiTargetFor(thread)?.app === app);
+      out.push({
+        threadKey: `infra:unreadable-${app}`, state: "infra", action: "ask-user", playbook: null, message: null, blockers: [],
+        reason: `computer use can't read ${name}`, route: null, notBefore: null, targetKey: null, progressMark: null,
+        question: {
+          dedupeKey: `infra:unreadable:${app}`, kind: "infra", threadKey: null,
+          title: `Computer use can't read ${name}. Restart it?`,
+          body: running.length
+            ? `Open Computer Use finds no ${name} window, so nothing can be read or typed. Running in ${name}: ${running.map(threadLabel).join(", ")}. A restart stops them; each gets a resume once ${name} is back.`
+            : `Open Computer Use finds no ${name} window, so nothing can be read or typed. No chats are running in ${name}.`,
+          options: ["restart", "later"],
+          meta: { app, runningKeys: running.map((thread) => thread.key) }
+        }
+      });
+    }
+    return out;
+  }
+
+  // After the owner's restart (or an open that follows the fleet's quit),
+  // each chat it stopped gets app-restarted.md once, in any mode, unless the
+  // owner wrote to it since or it is running again.
+  async resumeAfterRestart({ byKey, started, deferUi = false, sourceUnknown = () => false }) {
+    const out = { sent: 0, threads: new Set(), uiKeys: new Set() };
+    const records = this.store.appRestarts().filter((record) => record.due);
+    if (!records.length) return out;
+    const deliveryState = await this.probeDelivery();
+    const body = this.playbooks().get("app-restarted")?.body || APP_RESTARTED_DELIVERY;
+    for (const { app, ...record } of records) {
+      const at = Date.parse(record.at ?? "");
+      if (!Number.isFinite(at) || started - at > APP_RESTART_KEEP_MS) { this.store.setAppRestart(app, null); continue; }
+      const done = new Set(record.done ?? []);
+      // A Conductor session and the Codex thread it hosts are one chat on
+      // screen: it gets one resume, and every key showing it is settled.
+      const targetOf = (key) => uiTargetFor(byKey.get(key))?.targetKey ?? null;
+      const resumed = new Set([...done].map(targetOf).filter(Boolean));
+      for (const key of record.threadKeys ?? []) {
+        if (done.has(key) || sourceUnknown([key])) continue;
+        const thread = byKey.get(key);
+        if (resumed.has(targetOf(key))) { done.add(key); continue; }
+        const ownerSince = thread && Date.parse(thread.lastUserAt ?? "") > at && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
+        if (!thread || ownerSince) { done.add(key); continue; }
+        if (thread.agentStatus === "running") {
+          // Running again only if the agent wrote after the restart. A turn the
+          // restart killed still reads "running" for a while (Codex's rollout
+          // window, Conductor's hung "working"): wait for it, do not drop it.
+          // (Agent text only: a relaunch can touch the rollout file.)
+          if ((Date.parse(thread.lastAgentAt ?? "") || 0) > at) done.add(key);
+          continue;
+        }
+        const route = chooseRoute(thread, "auto", deliveryState);
+        if (!route || (deferUi && route === "computer-use")) continue;
+        const delivery = await this.executor.deliver({ thread, message: renderTemplate(body, { app: UI_APPS[app]?.name ?? app }), route, playbook: "app-restarted" });
+        if (route === "computer-use") this.noteUiResult(thread, delivery);
+        this.store.recordNudge(thread.key, { playbook: "app-restarted", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+        if (delivery.status !== "sent") continue;
+        done.add(key);
+        out.sent += 1;
+        out.threads.add(key);
+        const uiKey = uiTargetFor(thread)?.targetKey;
+        if (uiKey) { out.uiKeys.add(uiKey); resumed.add(uiKey); }
+      }
+      for (const key of record.threadKeys ?? []) if (resumed.has(targetOf(key))) done.add(key);
+      const left = (record.threadKeys ?? []).filter((key) => !done.has(key));
+      this.store.setAppRestart(app, left.length ? { ...record, done: [...done] } : null);
+    }
+    return out;
   }
 
   async answerQuestion(id, answer, { deadlineAt = null } = {}) {
@@ -688,6 +972,20 @@ export class FleetSupervisor {
     try {
       let delivery = null;
       const settling = [];
+      // A tap on one of a permission card's buttons clicks that button in
+      // the thread (the card the question was raised for: its stateId).
+      if (question.kind === "prompt" && question.threadKey && !["later", "opened"].includes(answer)) {
+        const clicked = await this.clickThread(question.threadKey, answer, { stateId: question.meta?.promptStateId ?? null, deadlineAt });
+        delivery = clicked.delivery;
+        if (delivery.status !== "sent") return { question: this.store.question(id), delivery };
+      }
+      // "restart" on the can't-read question restarts that app, stopping
+      // only the chats the question listed.
+      if (question.kind === "infra" && answer === "restart" && question.meta?.app) {
+        const result = await this.appAction(question.meta.app, "restart", { expectRunning: question.meta.runningKeys ?? [], deadlineAt });
+        delivery = { status: result.ok ? "sent" : "blocked", route: null, detail: result.detail };
+        if (!result.ok) return { question: this.store.question(id), delivery };
+      }
       if (question.kind === "limit" && answer === "added") {
         // The owner's own copy of this playbook says what their apps need
         // after an account switch (a restart, a plain "retry").
@@ -706,6 +1004,7 @@ export class FleetSupervisor {
           delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
         } else {
           delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
+          if (route === "computer-use") this.noteUiResult(thread, delivery);
           if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
           // Starts the cooldown but does not spend the no-progress nudge budget.
           this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
@@ -771,8 +1070,12 @@ export class FleetSupervisor {
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt });
+    if (route === "computer-use") this.noteUiResult(thread, delivery);
     this.store.recordNudge(thread.key, { playbook: "owner-message", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
-    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null } };
+    // A card in the way comes back with the block: the owner can answer it
+    // (fleet_click) and send again.
+    const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
+    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) } };
   }
 
   applyOverride(question, answer) {
@@ -796,6 +1099,7 @@ export class FleetSupervisor {
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
     const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
+    if (action.route === "computer-use") this.noteUiResult(thread, delivery);
     this.recordSend(action, delivery);
     return { action: this.store.action(actionId), delivery };
   }
@@ -820,6 +1124,7 @@ export class FleetSupervisor {
 
   async _tick(reason, { deferUi = false } = {}) {
     const started = this.now();
+    this.tickCount += 1;
     // The owner asked for this scan ("Scan now", the chat): recheck every
     // open question, not only the new, changed or due ones.
     this.forceReview = reason === "owner-scan" || reason === "chat";
@@ -872,6 +1177,30 @@ export class FleetSupervisor {
     const mutedKeys = store.mutedKeys();
     // Computer-use readiness, once per tick; the driver re-checks at each send.
     const delivery = await this.probeDelivery();
+    // One thread waiting on a permission card whose buttons are not known
+    // yet gets one screen read per tick, so its question offers them.
+    // Never in Observe (it drives nothing); in Propose only a thread already
+    // on screen is read (no deep link moves the app). A read that found no
+    // card is not repeated until the thread moves, then with backoff.
+    if (!deferUi && this.mode !== "observe" && delivery.ready === true && typeof this.uiDriver?.inspect === "function") {
+      const waiting = inScope.find((thread) => thread.meta?.blockedOnOwner === true && !mutedKeys.has(thread.key) && uiTargetFor(thread)
+        && !this.livePrompt(thread) && !this.cardlessReadFresh(thread, started));
+      if (waiting) {
+        try { await this.screenThread(waiting.key, { thread: waiting, threads, navigate: this.mode === "auto" }); } catch { /* a read is best-effort */ }
+        if (this.livePrompt(waiting)) this.cardlessReads.delete(waiting.key);
+        else {
+          const last = this.cardlessReads.get(waiting.key);
+          const mark = activityMark(waiting);
+          this.cardlessReads.set(waiting.key, { mark, at: started, count: last?.mark === mark ? last.count + 1 : 1 });
+        }
+      }
+    }
+    // A card seen on screen: the thread waits on the owner, and its buttons
+    // become the question's options (policy agentAskIntent).
+    for (const thread of inScope) {
+      const card = this.livePrompt(thread);
+      if (card) thread.meta = { ...thread.meta, blockedOnOwner: true, prompt: card };
+    }
     const items = [];
     for (const thread of inScope) {
       const pr = prs.get(thread.prRefs?.[0]) ?? null;
@@ -904,6 +1233,7 @@ export class FleetSupervisor {
     this.trackUiBlocked([...items.map((item) => item.decision), ...infraDecisions, ...queuedWaits], { mode: this.mode, delivery, threads, sourceErrors, started, config });
     const paused = pausedDeliveryDecision(delivery, this.uiBlockedSince, started);
     if (paused) infraDecisions.push(paused);
+    infraDecisions.push(...this.unreadableDecisions(started, threads));
     const health = infraHealth(infra, { config, now: started });
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
     if (lb) store.setInfraDown("lb", health.lb.down);
@@ -1125,6 +1455,11 @@ export class FleetSupervisor {
     // (a Conductor tab and the Codex thread it hosts) get nothing else now.
     sends += answeredNow.sent;
     for (const key of answeredNow.uiKeys) typedInto.add(key);
+    // Chats an app restart stopped get their one resume, and nothing else now.
+    const restartedNow = await this.resumeAfterRestart({ byKey, started, deferUi, sourceUnknown: fromFailedSource });
+    sends += restartedNow.sent;
+    for (const key of restartedNow.uiKeys) typedInto.add(key);
+    for (const key of restartedNow.threads) answeredNow.threads.add(key);
 
     // Resumes first, then the thread tried longest ago, so a few threads that
     // cannot be reached never hold every slot while a stopped one waits.
@@ -1178,6 +1513,7 @@ export class FleetSupervisor {
       tries += 1;
       attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
+      if (decision.route === "computer-use") this.noteUiResult(target, delivery);
       if (delivery.status !== "blocked") sends += 1;
       if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
@@ -1343,6 +1679,10 @@ export class FleetSupervisor {
         lastAgentText: clampTail(thread.lastAgentText, 600),
         error: thread.error ? { kind: thread.error.kind, resetAt: thread.error.resetAt ?? null } : null,
         live: Boolean(thread.live),
+        // The app that shows it (fleet_app pins the chats an app action stops)
+        // and the permission card it waits on (fleet_click's labels).
+        app: uiTargetFor(thread)?.app ?? null,
+        ...(thread.meta?.prompt ? { prompt: { text: clampText(thread.meta.prompt.text, 300), buttons: thread.meta.prompt.buttons, stateId: thread.meta.prompt.stateId } } : {}),
         route: chooseRoute(thread, mode, delivery),
         decision: decision ? { action: decision.action, playbook: decision.playbook, reason: clampText(decision.reason, 160), notBefore: decision.notBefore ?? null } : null
       };

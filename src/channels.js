@@ -42,7 +42,13 @@ export class ChannelManager {
       // values into the host. The streamed /message transport uses this to
       // keep a slow tool-using turn visibly alive.
       onProgress: options.onProgress,
-      onTextDelta: options.onTextDelta
+      onTextDelta: options.onTextDelta,
+      // Minted by the transport after its auth (owner-authority.js); a body
+      // field can never become one.
+      principal: options.principal ?? null,
+      // The approval continuation's action id (hosted-interface), never a
+      // body field: it lets that one turn drive the lease it was approved for.
+      ...(typeof options.continuationOf === "string" ? { continuationOf: options.continuationOf } : {})
     });
   }
 

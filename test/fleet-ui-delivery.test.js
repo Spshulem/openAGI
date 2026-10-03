@@ -6,7 +6,7 @@ import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
-  conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity
+  conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController
 } from "../src/fleet/ui-delivery.js";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489", "hex").toString("base64");
@@ -54,7 +54,17 @@ function fakeApp(overrides = {}) {
     lines.push(`    61 text entry area (settable, string)${app.composer ? ` Value: ${app.composer}` : ""}`);
     if (app.sendButton) lines.push("  62 button Send");
     if (app.stop) lines.push("  63 button Stop");
-    if (app.prompt) lines.push("  64 button Allow once");
+    if (app.prompt) {
+      // A permission card: its question, then its buttons, each inside an
+      // unlabelled frame button the way OCU 0.3.6 prints them.
+      lines.push("  64 group Permission request");
+      lines.push(`    65 static text ${app.promptText ?? "Run npm test in madrid?"}`);
+      (app.promptButtons ?? ["Allow once", "Deny"]).forEach((label, index) => {
+        lines.push(`    ${80 + index} button Frame: x=1, y=1, w=1, h=1`);
+        lines.push(`      ${66 + index} button ${label} Frame: x=847, y=1038, w=84, h=17`);
+      });
+    }
+    if (app.resume) lines.push("  69 button Resume goal");
     if (app.focused && app.frontmost) lines.push(`The focused UI element is ${app.focused} text entry area.`);
     return { isError: false, content: [{ type: "text", text: `${lines.join("\n")}\n` }, { type: "image", mimeType: "image/png", data: PNG }] };
   };
@@ -65,14 +75,15 @@ function fakeApp(overrides = {}) {
 // fails like OCU's through the app agent (input marked inFlight: it may
 // still land, until its late answer, late[i]({ completed: true })), else the
 // clock moves on by that much.
-function fakeTransport(app, { failOn = null, latency = null, advance = null } = {}) {
+function fakeTransport(app, { failOn = null, failError = null, latency = null, advance = null, onCall = null } = {}) {
   const transport = {
     calls: [],
     closed: 0,
     late: [],
     async call(name, args, _signal, options = {}) {
       transport.calls.push({ name, args: { ...args }, options });
-      if (failOn && failOn(name, args, transport.calls.length)) throw new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.");
+      onCall?.(name, args);
+      if (failOn && failOn(name, args, transport.calls.length)) throw failError?.() ?? new Error("Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.");
       const cost = latency?.(name, args) ?? 0;
       const limit = options.timeoutMs ?? transport.options?.timeoutMs ?? Infinity;
       if (cost > limit) {
@@ -83,6 +94,13 @@ function fakeTransport(app, { failOn = null, latency = null, advance = null } = 
       if (name === "get_app_state") return app.render();
       if (name === "click") {
         const id = String(args.element_index);
+        const card = app.promptButtons ?? ["Allow once", "Deny"];
+        if (app.prompt && Number(id) >= 66 && Number(id) < 66 + card.length) {
+          app.clicked = card[Number(id) - 66];
+          if (!app.promptSticks) app.prompt = false;
+          return { isError: false, content: [] };
+        }
+        if (id === "69" && app.resume) { app.clicked = "Resume goal"; app.resume = false; app.stop = true; return { isError: false, content: [] }; }
         if (id === "61") app.focused = "61";
         else if (id === "62") {
           if (app.onSend) app.onSend();
@@ -544,6 +562,12 @@ test("a running turn or a permission prompt blocks", async (t) => {
     assert.equal(result.status, "blocked");
     assert.match(result.detail, pattern);
     assert.deepEqual(typed(f.calls()), []);
+    if (overrides.prompt) {
+      // The card comes back with the block, so the owner can answer it remotely.
+      assert.deepEqual(result.prompt.buttons, ["Allow once", "Deny"]);
+      assert.equal(result.prompt.text, "Run npm test in madrid?");
+      assert.match(result.prompt.stateId, /^[0-9a-f]{16}$/);
+    }
   }
 });
 
@@ -1182,7 +1206,7 @@ test("the app restarter quits in the background, relaunches, and refuses while t
   const probe = fakeProbe({ appRunning: async () => running });
   const restarter = createAppRestarter({ run, probe, now: () => clock, sleep: async (ms) => { clock += ms; } });
   const ok = await restarter.restart("conductor");
-  assert.deepEqual(ok, { ok: true, detail: "restarted Conductor" });
+  assert.deepEqual(ok, { ok: true, wasRunning: true, detail: "restarted Conductor" });
   assert.deepEqual(runs, [["osascript", "-e", 'tell application id "com.conductor.app" to quit'], ["open", "-g", "-b", "com.conductor.app"]]);
 
   const busy = createAppRestarter({ run, probe: fakeProbe({ front: "com.conductor.app", idle: 1_000 }), now: () => clock, sleep: async (ms) => { clock += ms; } });
@@ -1190,7 +1214,7 @@ test("the app restarter quits in the background, relaunches, and refuses while t
 
   // A quit held up by the app (a confirm dialog) is not forced.
   const stuck = createAppRestarter({ run: async () => ({ code: 0 }), probe: fakeProbe({ appRunning: async () => true }), now: () => clock, sleep: async (ms) => { clock += ms; } });
-  assert.deepEqual(await stuck.restart("conductor"), { ok: false, detail: "Conductor did not quit" });
+  assert.deepEqual(await stuck.restart("conductor"), { ok: false, wasRunning: true, detail: "Conductor did not quit: it may be asking to confirm quit" });
   assert.equal((await restarter.restart("finder")).ok, false);
 });
 
@@ -1892,4 +1916,203 @@ test("slow probes never leave typed text unsent: nothing is typed", async (t) =>
   assert.equal(result.status, "blocked");
   assert.match(result.detail, /^(presence check too slow|not enough time left to type and confirm \(\d+ s\); nothing typed)$/);
   assert.deepEqual(typed(f.calls()), []);
+});
+
+// ---------------------------------------------------------------------------
+// Permission cards, screen reads, clicks, app control
+
+
+test("Codex's 'Approve for me' permission-mode menu is not a permission prompt (real 0.3.6 tree)", () => {
+  const text = fs.readFileSync(new URL("./fixtures/fleet-ui/codex-approve-for-me.txt", import.meta.url), "utf8");
+  const state = stateOf(text);
+  const approve = state.elements.find((element) => element.id === "2684");
+  assert.equal(approve.label, "Approve for me", "the Frame suffix is geometry, not label");
+  assert.match(approve.fields.frame, /^x=847/);
+  assert.equal(promptButtons(state), null);
+  assert.equal(hasPermissionPrompt(state), false);
+  assert.equal(findComposer(state).composer?.id, "2678", "the composer is still found");
+});
+
+test("a permission card needs two exact choices, one positive, outside menus", () => {
+  const card = (buttons, wrap = "group Approval") => stateOf([
+    "App=com.openai.codex (pid 1)", 'Window: "Codex", App: Codex.', "0 standard window Codex",
+    "  1 HTML content Fix login, URL: app://-/index.html",
+    `    2 ${wrap}`, "      3 static text Codex wants to run: npm test", ...buttons.map((label, index) => `      ${4 + index} button ${label}`)
+  ].join("\n"));
+  const found = promptButtons(card(["Allow once", "Don\u2019t Allow"]));
+  assert.deepEqual(found.buttons, ["Allow once", "Don\u2019t Allow"]);
+  assert.equal(found.text, "Codex wants to run: npm test");
+  assert.equal(promptButtons(card(["Approve", "Reject"])).buttons.length, 2);
+  assert.equal(promptButtons(card(["Yes", "No"])).buttons.length, 2);
+  assert.equal(promptButtons(card(["Allow once"])), null, "one button is not a card");
+  assert.equal(promptButtons(card(["Deny", "Reject"])), null, "no positive choice");
+  assert.equal(promptButtons(card(["Approve for me", "Deny"])), null, "labels match exactly");
+  assert.equal(promptButtons(card(["Allow", "Deny"], "menu Permissions")), null, "inside a menu");
+  // The id follows the card's content.
+  assert.notEqual(promptButtons(card(["Allow", "Deny"])).stateId, promptButtons(card(["Allow", "Reject"])).stateId);
+});
+
+test("inspect reads the open thread with the owner at the keyboard, and never deep links under them", async (t) => {
+  const here = setup(t, { app: fakeApp({ prompt: true }), probe: fakeProbe({ front: "com.conductor.app", idle: 2_000 }) });
+  const read = await here.driver.inspect(here.request());
+  assert.equal(read.status, "read", read.detail);
+  assert.deepEqual(read.screen.prompt.buttons, ["Allow once", "Deny"]);
+  assert.equal(read.screen.running, false);
+  assert.equal(read.screen.draft, false);
+  assert.match(read.screen.text, /Pushed the fix\./);
+  assert.deepEqual(names(here.calls()), ["get_app_state"], "a read, nothing else");
+  assert.deepEqual(here.probe.opened, []);
+
+  const elsewhere = setup(t, { app: fakeApp({ selected: "cairo" }), probe: fakeProbe({ front: "com.conductor.app", idle: 2_000 }) });
+  const moved = await elsewhere.driver.inspect(elsewhere.request());
+  assert.equal(moved.status, "blocked");
+  assert.match(moved.detail, /owner at the keyboard/);
+  assert.deepEqual(elsewhere.probe.opened, [], "no deep link while the owner is here");
+});
+
+test("a read that brings the app forward puts the owner's app back", async (t) => {
+  let probe;
+  probe = fakeProbe();
+  const f = setup(t, { probe, transportOptions: { onCall: (name) => { if (name === "get_app_state") probe.front = "com.conductor.app"; } } });
+  const read = await f.driver.inspect(f.request());
+  assert.equal(read.status, "read", read.detail);
+  assert.deepEqual(probe.activated, ["com.google.Chrome"]);
+  assert.equal(probe.front, "com.google.Chrome");
+});
+
+test("clickLabel clicks one card button through accessibility and confirms the card is gone", async (t) => {
+  const f = setup(t, { app: fakeApp({ prompt: true }), probe: fakeProbe({ front: "com.conductor.app", idle: 2_000 }) });
+  const { screen } = await f.driver.inspect(f.request());
+  const result = await f.driver.clickLabel(f.request({ label: "allow once", stateId: screen.prompt.stateId }));
+  assert.equal(result.status, "sent", result.detail);
+  assert.equal(result.detail, "clicked Allow once in Conductor");
+  assert.equal(f.app.clicked, "Allow once");
+  const click = f.calls().find((call) => call.name === "click");
+  assert.deepEqual(click.args, { app: "com.conductor.app", element_index: "66", click_method: "accessibility" });
+  assert.deepEqual(f.probe.activated, [], "nothing brought forward");
+});
+
+test("clickLabel refuses a changed card, an ambiguous label, and anything off the card", async (t) => {
+  const changed = setup(t, { app: fakeApp({ prompt: true }) });
+  const { screen } = await changed.driver.inspect(changed.request());
+  changed.app.promptText = "Run rm -rf build in madrid?";
+  const stale = await changed.driver.clickLabel(changed.request({ label: "Allow once", stateId: screen.prompt.stateId }));
+  assert.equal(stale.status, "blocked");
+  assert.equal(stale.detail, "prompt changed; read again");
+  assert.notEqual(stale.prompt.stateId, screen.prompt.stateId);
+
+  const twins = setup(t, { app: fakeApp({ prompt: true, promptButtons: ["Allow once", "Allow once", "Deny"] }) });
+  const ambiguous = await twins.driver.clickLabel(twins.request({ label: "Allow once" }));
+  assert.equal(ambiguous.status, "failed");
+  assert.match(ambiguous.detail, /on 2 buttons/);
+
+  const off = setup(t, { app: fakeApp({ prompt: true }) });
+  const refused = await off.driver.clickLabel(off.request({ label: "Send" }));
+  assert.equal(refused.status, "failed");
+  assert.equal(refused.detail, '"Send" is not a button the fleet clicks here; clickable: Allow once, Deny');
+  for (const f of [changed, twins, off]) assert.equal(f.calls().filter((call) => call.name === "click").length, 0, "nothing clicked");
+});
+
+test("clickLabel presses the one Resume goal button and reports a card that stays", async (t) => {
+  const f = setup(t, { app: fakeApp({ resume: true }) });
+  const resumed = await f.driver.clickLabel(f.request({ label: "Resume goal" }));
+  assert.equal(resumed.status, "sent", resumed.detail);
+  assert.equal(f.app.clicked, "Resume goal");
+
+  const sticky = setup(t, { app: fakeApp({ prompt: true, promptSticks: true }) });
+  const stuck = await sticky.driver.clickLabel(sticky.request({ label: "Deny" }));
+  assert.equal(stuck.status, "failed");
+  assert.match(stuck.detail, /still shows/);
+});
+
+test("Open Computer Use's cgWindowNotFound is reported as appUnreadable", async (t) => {
+  const f = setup(t, { transportOptions: {
+    failOn: (name) => name === "get_app_state",
+    failError: () => Object.assign(new Error("Open Computer Use could not complete the action."), { ocuText: "Apple event error -10005: cgWindowNotFound" })
+  } });
+  for (const result of [await f.driver.deliver(f.request()), await f.driver.inspect(f.request())]) {
+    assert.equal(result.status, "blocked");
+    assert.equal(result.code, "appUnreadable");
+    assert.match(result.detail, /can't read Conductor/);
+  }
+  assert.deepEqual(typed(f.calls()), []);
+});
+
+test("the app controller opens in the background, quits without force, and guards the owner", async () => {
+  let clock = 0;
+  const runs = [];
+  let running = false;
+  const run = async (cmd, args) => {
+    runs.push([cmd, ...args]);
+    if (cmd === "osascript") running = false;
+    if (cmd === "open") running = true;
+    return { code: 0 };
+  };
+  const probe = fakeProbe({ appRunning: async () => running });
+  const apps = createAppController({ run, probe, now: () => clock, sleep: async (ms) => { clock += ms; } });
+  assert.deepEqual(await apps.open("codex"), { ok: true, wasRunning: false, detail: "opened Codex" });
+  assert.deepEqual(await apps.open("codex"), { ok: true, wasRunning: true, detail: "Codex is already running" });
+  assert.deepEqual(await apps.quit("codex"), { ok: true, wasRunning: true, detail: "quit Codex" });
+  assert.deepEqual(await apps.quit("codex"), { ok: true, wasRunning: false, detail: "Codex is not running" });
+  assert.deepEqual(runs, [["open", "-g", "-b", "com.openai.codex"], ["osascript", "-e", 'tell application id "com.openai.codex" to quit']]);
+  assert.ok(!runs.flat().some((part) => /kill|-9|SIGKILL/.test(part)), "never a kill");
+  const using = createAppController({ run, probe: fakeProbe({ front: "com.openai.codex", idle: 500, appRunning: async () => true }), now: () => clock, sleep: async (ms) => { clock += ms; } });
+  assert.deepEqual(await using.quit("codex"), { ok: false, detail: "you are using Codex" });
+  assert.equal((await apps.open("finder")).ok, false);
+});
+
+test("an unknown app presence is a failed quit or restart, never a quiet success", async () => {
+  let clock = 0;
+  const runs = [];
+  const run = async (cmd, args) => { runs.push([cmd, ...args]); return { code: 0 }; };
+  // createPresenceProbe returns null when lsappinfo fails.
+  const apps = createAppController({ run, probe: fakeProbe({ appRunning: async () => null }), now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const quit = await apps.quit("codex");
+  assert.equal(quit.ok, false);
+  assert.match(quit.detail, /could not tell whether Codex is running/);
+  const restart = await apps.restart("codex");
+  assert.equal(restart.ok, false);
+  assert.match(restart.detail, /could not tell whether Codex is running/);
+  assert.deepEqual(runs, [], "nothing quit or opened");
+});
+
+test("the typing guard still blocks every card the old detector blocked, shortcut hints included", async (t) => {
+  const cards = [
+    [["Yes, allow", "Do not allow"], true],
+    [["Approve"], false],
+    [["Allow for session", "Deny"], true],
+    [["Approve once", "Deny"], true],
+    [["Approve and run", "Reject"], true],
+    [["Allow once ⌘↩", "Deny (esc)"], true]
+  ];
+  for (const [buttons, clickable] of cards) {
+    const f = setup(t, { app: fakeApp({ prompt: true, promptButtons: buttons }) });
+    const result = await f.driver.deliver(f.request());
+    assert.equal(result.status, "blocked", buttons.join("|"));
+    assert.match(result.detail, /^permission prompt visible/, buttons.join("|"));
+    assert.deepEqual(typed(f.calls()), [], buttons.join("|"));
+    if (clickable) {
+      assert.deepEqual(result.prompt.buttons, buttons.map((label) => label.replace(/\s*(?:⌘↩|\(esc\))$/u, "")), "a full card comes back without shortcut hints");
+    } else {
+      assert.equal(result.prompt, undefined, "a lone button blocks typing but is no card fleet_click answers");
+      assert.match(result.detail, /\(Approve\): answer it first/);
+    }
+  }
+});
+
+test("a card button with a shortcut hint is clicked by its plain label", async (t) => {
+  const f = setup(t, { app: fakeApp({ prompt: true, promptButtons: ["Allow once ⌘↩", "Deny (esc)"] }), probe: fakeProbe({ front: "com.conductor.app", idle: 2_000 }) });
+  const { screen } = await f.driver.inspect(f.request());
+  assert.deepEqual(screen.prompt.buttons, ["Allow once", "Deny"]);
+  const result = await f.driver.clickLabel(f.request({ label: "Allow once", stateId: screen.prompt.stateId }));
+  assert.equal(result.status, "sent", result.detail);
+  assert.equal(f.app.clicked, "Allow once ⌘↩");
+});
+
+test("a background read with navigate off never deep links to another thread", async (t) => {
+  const f = setup(t, { app: fakeApp({ selected: "cairo" }) });
+  const read = await f.driver.inspect(f.request({ navigate: false }));
+  assert.equal(read.status, "blocked");
+  assert.match(read.detail, /shows another thread; not moving it/);
+  assert.deepEqual(f.probe.opened, []);
 });

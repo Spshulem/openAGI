@@ -13,6 +13,7 @@ import { NodeEnrollmentCodes } from "../src/node-enrollment.js";
 import { NodeRegistry } from "../src/node-registry.js";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { isPublicRoute } from "../src/auth.js";
+import { isOwnerPrincipal } from "../src/owner-authority.js";
 
 function wavBase64(seconds = 0.2) {
   const pcmBytes = Math.floor(16_000 * 2 * seconds);
@@ -53,8 +54,8 @@ function makeChannel() {
       return { ok: true, json: async () => ({ text: "What is on my calendar?" }) };
     },
     agentHost: {
-      handleMessage: async (input) => {
-        turns.push(input);
+      handleMessage: async (input, options) => {
+        turns.push({ ...input, principal: options?.principal ?? null });
         return { reply: "You have a planning call at 2 PM.", session: { id: input.sessionId } };
       }
     }
@@ -77,6 +78,16 @@ test("an enrolled G2 node is transiently transcribed into a node-bound chat", as
   assert.notEqual(turns[0].sessionId, "owner-session");
   assert.equal(turns[0].metadata.sourceNodeId, nodeId);
   assert.equal(turns[0].metadata.audioDurationSeconds, 0.2);
+});
+
+test("a tap (ask) speaks as the owner; ambient listening never does", async () => {
+  const { channel, turns, nodeId } = makeChannel();
+  const conversationId = crypto.randomUUID();
+  await channel.ask({ text: "click approve", conversationId }, nodeId);
+  await channel.listen({ audioBase64: wavBase64(), conversationId, forceAnswer: true }, nodeId);
+  assert.equal(isOwnerPrincipal(turns[0].principal), true);
+  assert.deepEqual({ via: turns[0].principal.via, nodeId: turns[0].principal.nodeId }, { via: "g2", nodeId });
+  assert.equal(turns[1].principal, null);
 });
 
 test("transcription-only listening returns a trigger without starting agent work", async () => {

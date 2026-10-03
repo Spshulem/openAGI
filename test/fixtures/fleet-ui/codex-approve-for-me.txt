@@ -1,0 +1,26 @@
+App=com.openai.codex (pid 38786)
+Window: "ChatGPT", App: ChatGPT.
+0 standard window ChatGPT, Secondary Actions: Raise
+	1 container (settable, string) ChatGPT
+		2 scroll area
+			3 HTML content Fixture thread, URL: app://-/index.html
+											2672 container
+												2673 button Frame: x=1103, y=927, w=29, h=30
+												2674 heading Latest response Value: 4
+													2675 text Latest response
+												2676 button Frame: x=786, y=978, w=2, h=1
+												2677 container
+													2678 text entry area (settable, string) Do anything Do anything\n
+														2679 text Do anything
+													2680 button Frame: x=793, y=1034, w=26, h=25
+														2681 button Add files and more
+													2682 pop up button Change permissions
+														2683 image
+														2684 button Approve for me Frame: x=847, y=1038, w=84, h=17
+													2685 button Frame: x=1248, y=1034, w=136, h=25
+														2686 pop up button GPT-6 Sol Medium
+													2687 button Frame: x=1384, y=1034, w=25, h=25
+														2688 button Dictate
+													2689 button Stop
+
+The focused UI element is 2678 text entry area (settable, string) Do anything Do anything\n.

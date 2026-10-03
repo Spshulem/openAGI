@@ -155,6 +155,31 @@ test("an autopilot tool waiting for approval is not recorded as completed work",
   assert.equal(runtime.outcomes.recent(10).some((o) => o.kind === "autopilot-fire"), false);
 });
 
+test("a tool held for the owner's spoken confirmation is not an attempted call", async () => {
+  const runtime = createDurableRuntime({
+    dataDir: tmpDir("outcome-fb-owner-hold-"),
+    modelProvider: {
+      isConfigured: () => true,
+      model: "stub",
+      generate: async () => ({
+        id: "response-owner-hold",
+        provider: "stub",
+        model: "stub",
+        text: "Say the code to confirm.",
+        toolCalls: [{
+          name: "add_task",
+          arguments: { title: "Held for the owner" },
+          result: { ok: true, result: { status: "awaiting_owner_confirmation", actionId: "act_held" } }
+        }]
+      })
+    }
+  });
+  await runtime.agentHost.handleMessage({ channel: "local", from: "user", text: "add a task" });
+  const recorded = runtime.outcomes.recent(10).filter((o) => o.kind === "agent-reply");
+  assert.equal(recorded.length, 1);
+  assert.deepEqual(recorded[0].toolCalls, [], "approval later records the real call once");
+});
+
 test("sensitive tool arguments are redacted from durable chat transcripts", async () => {
   const secretText = "a typed value that must never land in history";
   const runtime = createDurableRuntime({

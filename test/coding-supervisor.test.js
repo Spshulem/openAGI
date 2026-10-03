@@ -288,3 +288,40 @@ test("dashboard script parses and keeps transcript and session values out of HTM
   assert.match(codingSupervisorUi, /textContent = turn.role/);
   assert.match(codingSupervisorUi, /Open approval/);
 });
+
+test("an owner's reply instruction runs at once; others still queue; start_coding_agent takes a draft as a repair brief", async (t) => {
+  const { ownerPrincipal } = await import("../src/owner-authority.js");
+  const f = fixture(t);
+  const tools = new ToolRegistry();
+  const pending = new PendingActionStore({ dir: path.join(f.dataDir, "pending") });
+  tools.bindPendingActions(pending);
+  registerCodingSupervisorTools(tools, f.supervisor);
+  const owner = { sessionId: "devices:agent:main", __owner: ownerPrincipal("phone", "p"), __turn: { untrusted: false, intent: "tell the codex session to rebase" } };
+  const sent = await tools.invoke("reply_to_coding_agent", { ...target, message: "Rebase on main." }, owner);
+  assert.equal(sent.result.status, "accepted");
+  assert.equal(f.sent.length, 1);
+  assert.equal(pending.list({ status: "approved" })[0].decidedBy, "owner:phone");
+  const queued = await tools.invoke("reply_to_coding_agent", { ...target, message: "Rebase again." }, { sessionId: "imessage" });
+  assert.equal(queued.result.status, "awaiting_confirmation");
+  assert.equal(f.sent.length, 1);
+  // The start tool (a remote coding node here): a draft id stands in for the
+  // message, behind fixed rules.
+  const drafts = { get: (id) => (id === "draft_9" ? { title: "Fix", body: "Do the fix." } : null) };
+  const remote = new CodingSupervisor({ dataDir: path.join(f.dataDir, "remote"), remoteNodeId: "mac",
+    runtime: { ...f.runtime, drafts, nodeCapabilities: { dispatch: async (_node, _capability, _operation, payload) => ({ ...payload, project: "/fixture" }) } } });
+  t.after(() => remote.stop());
+  const remoteTools = new ToolRegistry();
+  registerCodingSupervisorTools(remoteTools, remote);
+  const start = remoteTools.get("start_coding_agent");
+  // The owner's workspace list never taints a coding turn.
+  assert.equal(remoteTools.get("list_coding_workspaces").untrustedOutput, false);
+  assert.deepEqual(start.parameters.required, ["provider", "workspaceId"]);
+  assert.match(start.parameters.properties.draftId.description, /never merge, release, restart or touch ~\/\.openagi/);
+  assert.match(start.description, /Runs on the owner's instruction/);
+  const prepared = await start.prepareApprovalArgs({ provider: "codex", workspaceId: "w", draftId: "draft_9" }, {});
+  assert.match(prepared.message, /^OpenAGI repair brief\./);
+  assert.match(prepared.message, /Do the fix\.$/);
+  assert.equal("draftId" in prepared, false);
+  assert.equal(prepared.codingNodeId, "mac");
+  await assert.rejects(Promise.resolve().then(() => start.prepareApprovalArgs({ provider: "codex", workspaceId: "w" }, {})), /message or a draftId/);
+});

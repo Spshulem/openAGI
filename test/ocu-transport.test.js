@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
-import { OCU_CLOSE_GRACE_MS, OcuTransport, readOcuPermissions } from "../src/integrations/ocu-transport.js";
+import { OCU_CLOSE_GRACE_MS, OcuTransport, readOcuPermissions, redactedOcuText } from "../src/integrations/ocu-transport.js";
 import { OCU_RELEASE } from "../src/integrations/ocu-release.js";
 
-function fixture({ hang = false, malformed = false, refused = false, responseLine } = {}) {
+function fixture({ hang = false, malformed = false, refused = false, refusalText = null, responseLine } = {}) {
   const child = new EventEmitter(); let killed = false, spawnArgs, requests = [];
   child.stdout = new PassThrough(); child.stderr = new PassThrough();
   child.kill = () => { killed = true; };
@@ -15,7 +15,7 @@ function fixture({ hang = false, malformed = false, refused = false, responseLin
       if (responseLine) { child.stdout.write(responseLine + "\n"); return; }
       if (malformed) { child.stdout.write("not json\n"); return; }
       const result = request.method === "initialize" ? { serverInfo: { name: "fixture", version: "0.3.3" } }
-        : { isError: refused, content: [] };
+        : { isError: refused, content: refusalText ? [{ type: "text", text: refusalText }] : [] };
       child.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n");
     });
     done();
@@ -251,4 +251,15 @@ test("input still pending when its engine exits is not proven finished, and leav
   assert.equal(error.inFlight, true);
   assert.deepEqual(await error.settled, { completed: false });
   assert.equal(f.client.late.size, 0);
+});
+
+test("a refusal carries Open Computer Use's own words, bounded and redacted", async t => {
+  const f = fixture({ refused: true, refusalText: "Apple event error -10005: cgWindowNotFound\nwhile reading com.conductor.app token=sk-proj-abcdefghijklmnop0123" });
+  t.after(() => f.client.close());
+  const error = await f.client.call("get_app_state", { app: "com.conductor.app" }).catch((caught) => caught);
+  assert.match(error.message, /could not complete/);
+  assert.match(error.ocuText, /^Apple event error -10005: cgWindowNotFound while reading com\.conductor\.app/);
+  assert.doesNotMatch(error.ocuText, /sk-proj|abcdefghijklmnop/);
+  assert.ok(redactedOcuText("x".repeat(500)).length <= 200);
+  assert.equal(redactedOcuText(`a ${"Z".repeat(40)} b`), "a [redacted] b");
 });

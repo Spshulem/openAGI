@@ -11,6 +11,7 @@
 // frontmost app, so the target is brought forward for the send and the
 // owner's previous app put back. One delivery at a time (see UI_LOCK).
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
@@ -47,6 +48,8 @@ const PRESENCE_FRESH_MS = 3000;
 const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
 // OCU calls that act on the app (reads do not).
 const INPUT_TOOLS = new Set(["click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_secondary_action"]);
+// Open Computer Use's "Apple event error -10005: cgWindowNotFound".
+const APP_UNREADABLE = /cgWindowNotFound|-10005/i;
 // Unsent text is never erased (see step 8 of the delivery).
 const LEFT_AS_DRAFT = "our text is left as a draft, check it";
 const PERMISSION_OK_TTL_MS = 10 * MIN;
@@ -112,7 +115,9 @@ const ROLE_PHRASES = [
   "heading", "button", "link", "row", "cell", "tab", "group", "image", "list", "table", "outline", "toolbar", "dialog", "sheet",
   "window", "form"
 ].sort((a, b) => b.length - a.length);
-const FIELD_MARKER = /(?:^|,?\s+)(Value|Placeholder|ID|Description|Help|Title|URL): /g;
+// OCU 0.3.6 appends "Frame: x=.., y=.., w=.., h=.." to an element's line; it
+// is geometry, never part of the label ("Approve for me Frame: ...").
+const FIELD_MARKER = /(?:^|,?\s+)(Value|Placeholder|ID|Description|Help|Title|URL|Frame): /g;
 const EDITABLE_ROLES = new Set(["text entry area", "text area", "text field", "text view", "combo box"]);
 const HEADING_ROLE = /^heading$/;
 // The page itself: Codex labels it with the open thread's title, Conductor
@@ -124,7 +129,25 @@ const COMPOSER_HINT = /composer|message|prompt|reply|follow[- ]?up|ask (?:codex|
 // shows GitHub, whose comment box is no composer).
 const OWN_PAGE = { "com.openai.codex": /^app:\/\//, "com.conductor.app": /^tauri:\/\/localhost/ };
 const STOP_LABEL = /^(stop|stop generating|stop response|stop agent|interrupt|cancel turn)\b/i;
-const PROMPT_LABEL = /^(allow|allow once|always allow|allow for (?:this )?session|approve|deny|don't allow|do not allow|reject|yes, allow)\b/i;
+// A permission or approval card: at least two of these exact labels side by
+// side, one of them positive. "Approve for me" (Codex's permission-mode
+// menu) and a lone "Run" in a transcript are not one.
+const POSITIVE_PROMPT_BUTTONS = new Set(["allow", "allow once", "always allow", "allow for this session", "allow for session", "yes, allow",
+  "approve", "approve once", "approve and run", "always approve", "accept", "yes", "run"]);
+const PROMPT_BUTTONS = new Set([...POSITIVE_PROMPT_BUTTONS, "deny", "don't allow", "do not allow", "reject", "decline", "no"]);
+// The guard that stops typing is wider: any one of these on its own, as a
+// plain own-page button, means a card may be waiting (the old detector's
+// vocabulary, matched exactly so "Approve for me" is not one). Generic
+// "yes", "no" and "run" count only as part of a card above.
+const GUARD_PROMPT_BUTTONS = new Set([...PROMPT_BUTTONS].filter((label) => !["yes", "no", "run", "accept", "decline"].includes(label)));
+// Shortcut hints a button label can carry: "Allow once ⌘↩", "Deny (esc)", "Yes [y]".
+const SHORTCUT_SUFFIX = /(?:\s*(?:[\u2318\u2325\u21e7\u2303\u21a9\u21b5\u23ce\u238b\u232b\ufe0e]+|[([][^()[\]]{1,6}[)\]]))+$/u;
+// Pop-ups and menus hold choices for settings, never a card's answer.
+const MENU_ROLES = /^(pop up button|menu button|menu|menu item|menu bar item|combo box)$/;
+const PROMPT_TEXT_MAX = 300;
+// Plain buttons that resume a stopped turn; clicked only when exactly one shows.
+const RESUME_LABELS = new Set(["resume goal", "retry", "resume"]);
+const SCREEN_TEXT_MAX = 1500;
 const SEND_LABEL = /^(send|send message|submit)\b/i;
 // A window title's app suffix ("madrid — Conductor").
 const APP_TITLE_SUFFIX = /\s+[—–-]\s+(?:conductor|codex|chatgpt)$/i;
@@ -245,8 +268,134 @@ export function hasStopButton(state) {
   return (state?.elements ?? []).some((element) => BUTTON_ROLE.test(element.role) && STOP_LABEL.test(buttonLabel(element)));
 }
 
-export function hasPermissionPrompt(state) {
-  return (state?.elements ?? []).some((element) => BUTTON_ROLE.test(element.role) && PROMPT_LABEL.test(buttonLabel(element)));
+// A card button's label without a trailing shortcut hint ("Allow once ⌘↩").
+function cardLabel(element) {
+  return cleanChoice(buttonLabel(element));
+}
+
+function cleanChoice(text) {
+  return normalizeUiText(text).replace(SHORTCUT_SUFFIX, "").trim();
+}
+
+// Lowercased label for matching card buttons ("Don’t Allow" -> "don't allow").
+function choiceLabel(element) {
+  return choiceText(buttonLabel(element));
+}
+
+function choiceText(text) {
+  return cleanChoice(text).toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/[.!:\u2026]+$/, "").trim();
+}
+
+// A plain own-page button: not a pop-up or menu, not inside one, not in an
+// in-app browser page.
+function ownPlainButtons(state, bundleId) {
+  const ownPage = OWN_PAGE[bundleId] ?? null;
+  return (state?.elements ?? []).filter((element) => BUTTON_ROLE.test(element.role) && !MENU_ROLES.test(element.role)
+    && !element.disabled && !(ownPage && inOtherPage(element, ownPage))
+    && !ancestors(element).some((node) => MENU_ROLES.test(node.role)));
+}
+
+// OCU wraps a labelled button in an unlabelled frame button: the card is the
+// nearest ancestor that is not a button.
+function cardOf(element) {
+  for (let node = element.parent; node; node = node.parent) if (!BUTTON_ROLE.test(node.role)) return node;
+  return null;
+}
+
+// Every element under node, in tree order (OCU prints depth-first).
+function descendants(state, node) {
+  const elements = state?.elements ?? [];
+  const start = elements.indexOf(node);
+  if (start < 0) return [];
+  const out = [];
+  for (let index = start + 1; index < elements.length && elements[index].depth > node.depth; index += 1) out.push(elements[index]);
+  return out;
+}
+
+function cardText(state, card) {
+  const textOf = (node) => descendants(state, node).filter((element) => !BUTTON_ROLE.test(element.role) && !isEditable(element))
+    .map((element) => normalizeUiText([element.label, element.value].filter(Boolean).join(" "))).filter(Boolean).join(" ");
+  // A card whose buttons sit in their own row: the question is beside it.
+  const text = textOf(card) || (card.parent ? textOf(card.parent) : "");
+  return clampText(redactSecrets(text), PROMPT_TEXT_MAX);
+}
+
+// The newest permission or approval card on the app's own page, with its
+// elements (internal), or null.
+function findPrompt(state, bundleId = state?.bundleId) {
+  const cards = new Map();
+  for (const element of ownPlainButtons(state, bundleId)) {
+    if (!PROMPT_BUTTONS.has(choiceLabel(element))) continue;
+    const card = cardOf(element);
+    if (!card) continue;
+    if (!cards.has(card)) cards.set(card, []);
+    cards.get(card).push(element);
+  }
+  let found = null;
+  for (const [card, buttons] of cards) {
+    if (buttons.length < 2 || !buttons.some((element) => POSITIVE_PROMPT_BUTTONS.has(choiceLabel(element)))) continue;
+    // Tree order: the last card is the newest in the transcript.
+    found = { card, buttons };
+  }
+  if (!found) return null;
+  const labels = [...new Set(found.buttons.map(cardLabel))];
+  const text = cardText(state, found.card);
+  const stateId = crypto.createHash("sha256").update(JSON.stringify([bundleId ?? null, text, labels])).digest("hex").slice(0, 16);
+  return { ...found, text, labels, stateId };
+}
+
+// What a blocked delivery reports and fleet_screen shows: the card's question,
+// its exact button labels, and an id that changes when the card does.
+export function promptButtons(state, bundleId = state?.bundleId) {
+  const found = findPrompt(state, bundleId);
+  return found ? { text: found.text, buttons: found.labels, stateId: found.stateId } : null;
+}
+
+// The guard before typing: a full card, or any one plain own-page button
+// with a permission label. Wider than what fleet_click may click.
+export function hasPermissionPrompt(state, bundleId = state?.bundleId) {
+  return promptButtons(state, bundleId) !== null || guardLabels(state, bundleId).length > 0;
+}
+
+function guardLabels(state, bundleId = state?.bundleId) {
+  return [...new Set(ownPlainButtons(state, bundleId).filter((element) => GUARD_PROMPT_BUTTONS.has(choiceLabel(element))).map(cardLabel))];
+}
+
+// What blocks a send: { prompt } when it is a card fleet_click can answer,
+// { labels } when only the wider guard saw one, or null.
+function promptBlock(state, bundleId) {
+  const prompt = promptButtons(state, bundleId);
+  if (prompt) return { prompt };
+  const labels = guardLabels(state, bundleId);
+  return labels.length ? { labels } : null;
+}
+
+function promptBlockDetail(block, lead) {
+  return block.prompt ? `${lead}: answer it first (fleet_click), then send again`
+    : `${lead} (${block.labels.join(", ")}): answer it first`;
+}
+
+// Own-page Resume / Retry buttons, by exact label.
+function resumeButtons(state, bundleId = state?.bundleId) {
+  return ownPlainButtons(state, bundleId).filter((element) => RESUME_LABELS.has(choiceLabel(element)));
+}
+
+// What one thread's screen shows, for the owner (untrusted text: an agent
+// wrote it). No input, no composer contents.
+export function screenSummary(state, bundleId = state?.bundleId) {
+  const composer = findComposer(state, bundleId).composer;
+  const ownPage = OWN_PAGE[bundleId] ?? null;
+  const text = (state?.elements ?? []).filter((element) => !BUTTON_ROLE.test(element.role) && !isEditable(element)
+    && !(ownPage && inOtherPage(element, ownPage)) && /text|heading/.test(element.role))
+    .map((element) => normalizeUiText(element.label || element.value)).filter(Boolean).join("\n");
+  return {
+    prompt: promptButtons(state, bundleId),
+    running: hasStopButton(state),
+    resume: [...new Set(resumeButtons(state, bundleId).map(buttonLabel))],
+    draft: Boolean(composer && normalizeUiText(composer.value)),
+    // The tail: the newest messages sit at the end of the transcript.
+    text: String(redactSecrets(text.slice(-SCREEN_TEXT_MAX * 2))).slice(-SCREEN_TEXT_MAX)
+  };
 }
 
 // Only the app's own page: an in-app browser tab's Submit is no chat's Send.
@@ -519,7 +668,11 @@ export function restartMaxMs(limits = DEFAULTS) {
   return 6 * command + 2 * (RESTART_WAIT_MS + command + RESTART_POLL_MS) + RESTART_SETTLE_MS;
 }
 
-export function createAppRestarter({ bins = {}, run = runCommand, probe = null, limits = DEFAULTS, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+// open (in the background), quit and restart one of the apps the fleet
+// drives, on the owner's instruction or an owner-written playbook. A quit is
+// the app's own (an AppleScript quit it may hold up with a dialog), never a
+// kill, and never while the owner is using that app.
+export function createAppController({ bins = {}, run = runCommand, probe = null, limits = DEFAULTS, now = Date.now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
   const presence = probe ?? createPresenceProbe({ bins, run, timeoutMs: limits.uiStepTimeoutMs });
   const waitFor = async (bundleId, want) => {
     const deadline = now() + RESTART_WAIT_MS;
@@ -532,24 +685,56 @@ export function createAppRestarter({ bins = {}, run = runCommand, probe = null, 
   const exec = async (cmd, args) => {
     try { await run(cmd, args, { timeoutMs: limits.uiStepTimeoutMs }); } catch { /* checked by waitFor */ }
   };
+  const appFor = (appKey) => UI_APPS[appKey] ?? null;
+  const unknown = (appKey) => ({ ok: false, detail: `${appKey} is not an app the fleet opens or quits` });
+  const ownerUsing = async (app) => {
+    const idle = await presence.idleMs();
+    return (await presence.frontApp()) === app.bundleId && !(idle !== null && idle >= limits.uiOwnerIdleMs);
+  };
+  const quit = async (app) => {
+    const running = await presence.appRunning(app.bundleId);
+    // null: lsappinfo could not tell. Never report a quit that was not tried.
+    if (running === null) return { ok: false, detail: `could not tell whether ${app.name} is running (lsappinfo failed); nothing was quit` };
+    if (running === false) return { ok: true, wasRunning: false, detail: `${app.name} is not running` };
+    // A quit the app holds up (an "are you sure" dialog) is not forced.
+    await exec("osascript", ["-e", `tell application id "${app.bundleId}" to quit`]);
+    if (!(await waitFor(app.bundleId, false))) return { ok: false, wasRunning: true, detail: `${app.name} did not quit: it may be asking to confirm quit` };
+    return { ok: true, wasRunning: true, detail: `quit ${app.name}` };
+  };
+  const launch = async (app) => {
+    await exec(bins.open ?? "open", ["-g", "-b", app.bundleId]);
+    if (!(await waitFor(app.bundleId, true))) return { ok: false, wasRunning: false, detail: `${app.name} did not start` };
+    await sleep(RESTART_SETTLE_MS);
+    return { ok: true, wasRunning: false, detail: `opened ${app.name}` };
+  };
   return {
+    async open(appKey) {
+      const app = appFor(appKey);
+      if (!app) return unknown(appKey);
+      if (await presence.appRunning(app.bundleId)) return { ok: true, wasRunning: true, detail: `${app.name} is already running` };
+      return launch(app);
+    },
+    async quit(appKey) {
+      const app = appFor(appKey);
+      if (!app) return unknown(appKey);
+      if (await ownerUsing(app)) return { ok: false, detail: `you are using ${app.name}` };
+      return quit(app);
+    },
     async restart(appKey) {
-      const app = UI_APPS[appKey];
+      const app = appFor(appKey);
       if (!app) return { ok: false, detail: `${appKey} is not an app the fleet restarts` };
-      const idle = await presence.idleMs();
-      if ((await presence.frontApp()) === app.bundleId && !(idle !== null && idle >= limits.uiOwnerIdleMs)) return { ok: false, detail: `you are using ${app.name}` };
-      if (await presence.appRunning(app.bundleId)) {
-        // A quit the app holds up (an "are you sure" dialog) is not forced.
-        await exec("osascript", ["-e", `tell application id "${app.bundleId}" to quit`]);
-        if (!(await waitFor(app.bundleId, false))) return { ok: false, detail: `${app.name} did not quit` };
-      }
-      await exec(bins.open ?? "open", ["-g", "-b", app.bundleId]);
-      if (!(await waitFor(app.bundleId, true))) return { ok: false, detail: `${app.name} did not start` };
-      await sleep(RESTART_SETTLE_MS);
-      return { ok: true, detail: `restarted ${app.name}` };
+      if (await ownerUsing(app)) return { ok: false, detail: `you are using ${app.name}` };
+      const quitting = await quit(app);
+      if (!quitting.ok) return quitting;
+      const opening = await launch(app);
+      if (!opening.ok) return opening;
+      return { ok: true, wasRunning: quitting.wasRunning, detail: `restarted ${app.name}` };
     }
   };
 }
+
+// The account-switch playbook's restart; same controller.
+export const createAppRestarter = createAppController;
 
 // ---------------------------------------------------------------------------
 // One UI delivery at a time, process-wide
@@ -721,6 +906,7 @@ export function createUiDriver({
   binaryReady = defaultBinaryReady,
   evidenceDir = null,
   inputLatch = UI_INPUT_LATCH,
+  uiLock = UI_LOCK,
   now = Date.now,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 } = {}) {
@@ -807,6 +993,12 @@ export function createUiDriver({
 
   // request: { text, target, identity, previousUnconfirmed, evidenceName }
   async function deliver(request = {}) {
+    return run(request, (ctx, signal) => steps(request, signal, ctx));
+  }
+
+  // Every request's one budget and its cleanup: the owner's app goes back
+  // and the transport closes whatever happened.
+  async function run(request, body) {
     const text = flattenMessage(request.text);
     // type_text is one call that can outlast a normal step on a long message.
     const typingMs = Math.ceil(text.length * TYPING_MS_PER_CHAR);
@@ -828,7 +1020,7 @@ export function createUiDriver({
     const ctx = { phase: "check", transport: null, evidence: [], text, request, typingMs, endsAt, deadline: endsAt, hardEndsAt,
       slowest: 0, slowestProbe: null, ownerSeen: false, activated: false, inFront: false, frontBefore: null, inputInFlight: false };
     try {
-      return await steps(request, controller.signal, ctx);
+      return await body(ctx, controller.signal);
     } catch (error) {
       return await recover(error, ctx, controller.signal.aborted || now() >= ctx.endsAt);
     } finally {
@@ -1027,60 +1219,71 @@ export function createUiDriver({
     return (await probeNow(ctx, "frontApp")) === target.bundleId;
   }
 
-  async function steps(request, signal, ctx) {
-    const { target, identity = { tokens: [] } } = request;
-    const text = ctx.text;
-    if (!target?.bundleId) return outcome(ctx, "blocked", "no app shows this thread");
-    // Only the apps in UI_APPS are ever driven.
-    if (!ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", `${target.bundleId} is not an app the fleet types into`);
-    if (!text) return outcome(ctx, "blocked", "empty message");
-    // Not ready, like readiness says: the paused-nudge alert tells the owner.
-    if (inputLatch.held) return outcome(ctx, "blocked", `computer use not ready: ${inputLatch.detail}; nothing typed`);
-    if (now() >= ctx.endsAt) return outcome(ctx, "blocked", "no time left in this request for another app send; nothing typed, retry");
+  // Steps 0-2 of every request: readiness, presence, then the thread open
+  // and verified. needFront: the request types, so the owner must be away
+  // before anything happens. A read or an accessibility click (no front
+  // needed) proceeds with the owner at the keyboard while the thread is
+  // already on screen; the deep link, which moves the app, still waits for
+  // them to be away. Returns { blocked } or { state }.
+  async function openThread(ctx, signal, { needFront, navigate = true }) {
+    const { target, identity = { tokens: [] } } = ctx.request;
+    const blocked = (detail) => ({ blocked: outcome(ctx, "blocked", detail) });
 
     // 0. Readiness, fresh.
     const ready = await readiness();
-    if (!ready.ready) return outcome(ctx, "blocked", `computer use not ready: ${ready.detail}`);
+    if (!ready.ready) return blocked(`computer use not ready: ${ready.detail}`);
     // A shared title goes on only through its id link (checked below).
-    if (identity.ambiguous && !(identity.shared && target.deepLink)) return outcome(ctx, "blocked", identity.reason ?? "ambiguous thread");
-    if (!identity.tokens?.length && !identity.ids) return outcome(ctx, "blocked", identity.reason ?? "nothing to verify the thread by");
+    if (identity.ambiguous && !(identity.shared && target.deepLink)) return blocked(identity.reason ?? "ambiguous thread");
+    if (!identity.tokens?.length && !identity.ids) return blocked(identity.reason ?? "nothing to verify the thread by");
 
     // 1. Presence: never launch the app; act only while the owner is away,
     // since typing needs the app in front. Readiness may have used up the
     // request's time: no probe starts past it.
     const running = await probeNow(ctx, "appRunning", target.bundleId);
-    if (running === null) return outcome(ctx, "blocked", `could not tell whether ${target.name} is running`);
-    if (!running) return outcome(ctx, "blocked", `${target.name} is not running`);
+    if (running === null) return blocked(`could not tell whether ${target.name} is running`);
+    if (!running) return blocked(`${target.name} is not running`);
     const frontBefore = await probeNow(ctx, "frontApp");
-    if (SCREEN_SAVER_APPS.has(frontBefore)) return outcome(ctx, "blocked", "screen saver on");
+    if (SCREEN_SAVER_APPS.has(frontBefore)) return blocked("screen saver on");
+    let ownerHere = false;
     if (!ownerAway(await probeNow(ctx, "idleMs"))) {
       sawOwner(ctx);
-      if (frontBefore === target.bundleId || frontBefore === null) return outcome(ctx, "blocked", `owner using ${target.name}`);
-      return outcome(ctx, "blocked", `waiting for idle: ${target.name} must be in front to type`);
+      ownerHere = true;
+      if (needFront) {
+        if (frontBefore === target.bundleId || frontBefore === null) return blocked(`owner using ${target.name}`);
+        return blocked(`waiting for idle: ${target.name} must be in front to type`);
+      }
     }
     // Unknown is not safe: a failed probe can hide the screen saver, and the
     // owner's app could not be put back.
-    if (frontBefore === null) return outcome(ctx, "blocked", "front app unknown");
+    if (frontBefore === null) return blocked("front app unknown");
     ctx.frontBefore = frontBefore;
 
     // 2. Navigate to the thread: the deep link, in the background. A read
     // can take tens of seconds, so the owner is checked again after it.
     ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
+    // Marked before the first read: an Open Computer Use read can bring the
+    // app forward by itself, and the owner's app then goes back (restoreFront
+    // re-probes first and moves nothing that did not move).
+    ctx.activated = true;
     let state = await readState(ctx, signal);
     let verified = verifyIdentity(state, identity);
     // A twin may be the one on screen: only the id link, starting from
     // another thread, proves which one opened.
-    if (identity.shared && verified.ok) return outcome(ctx, "blocked", `${identity.reason}; a thread with that title is already open`);
+    if (identity.shared && verified.ok) return blocked(`${identity.reason}; a thread with that title is already open`);
     // Likewise a first-message label: a thread the catalog does not label
     // that way can show it. It counts only once a link moved the app onto it.
-    if (verified.byAlt) return outcome(ctx, "blocked", "could not verify thread: only its first message is shown, which another thread can show too; open another thread");
+    if (verified.byAlt) return blocked("could not verify thread: only its first message is shown, which another thread can show too; open another thread");
     if (!verified.ok) {
+      // A background read that may not move the app (Propose mode).
+      if (!navigate) return blocked(`${target.name} shows another thread; not moving it`);
+      // The link switches the owner's app to another thread: never under them.
+      if (!needFront && ownerHere) return blocked(`owner at the keyboard: ${target.name} shows another thread; open it there`);
       const back = await ownerCheck(ctx, target);
-      if (back) return outcome(ctx, "blocked", back);
+      if (back) return blocked(back);
       // The link can bring the app forward itself (Codex does), even when the
       // command then fails: the owner's app is put back at the end all the same.
       ctx.activated = true;
-      if (!(await probeNow(ctx, "openUrl", target.deepLink))) return outcome(ctx, "blocked", `could not open the ${target.name} link`);
+      if (!(await probeNow(ctx, "openUrl", target.deepLink))) return blocked(`could not open the ${target.name} link`);
       // At least two reads, even when the first matches: the sidebar row
       // can switch before the page and composer do. The latest read decides,
       // and only its elements are used.
@@ -1092,8 +1295,27 @@ export function createUiDriver({
         reads += 1;
         verified = verifyIdentity(state, identity);
       } while (reads < 2 || (!verified.ok && now() < deadline));
-      if (!verified.ok) return outcome(ctx, "blocked", verified.reason);
+      if (!verified.ok) return blocked(verified.reason);
     }
+    return { state };
+  }
+
+  async function steps(request, signal, ctx) {
+    const { target, identity = { tokens: [] } } = request;
+    const text = ctx.text;
+    if (!target?.bundleId) return outcome(ctx, "blocked", "no app shows this thread");
+    // Only the apps in UI_APPS are ever driven.
+    if (!ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", `${target.bundleId} is not an app the fleet types into`);
+    if (!text) return outcome(ctx, "blocked", "empty message");
+    // Not ready, like readiness says: the paused-nudge alert tells the owner.
+    if (inputLatch.held) return outcome(ctx, "blocked", `computer use not ready: ${inputLatch.detail}; nothing typed`);
+    if (now() >= ctx.endsAt) return outcome(ctx, "blocked", "no time left in this request for another app send; nothing typed, retry");
+
+    // 0-2. Ready, the owner away, the thread open and verified.
+    const opened = await openThread(ctx, signal, { needFront: true });
+    if (opened.blocked) return opened.blocked;
+    let state = opened.state;
+    let verified;
 
     // 3. The app in front, then the thread checked again. Fresh owner check
     // first: nothing comes forward over an owner who came back.
@@ -1110,7 +1332,10 @@ export function createUiDriver({
 
     // 4. Guards on what the thread shows.
     if (hasStopButton(state)) return outcome(ctx, "blocked", "turn running (Stop is visible)");
-    if (hasPermissionPrompt(state)) return outcome(ctx, "blocked", "permission prompt visible: open it");
+    // The card's buttons go back with the block, so the owner can answer it
+    // from anywhere (fleet_click) instead of opening the app.
+    const shown = promptBlock(state, target.bundleId);
+    if (shown) return outcome(ctx, "blocked", promptBlockDetail(shown, "permission prompt visible"), shown.prompt ? { prompt: shown.prompt } : {});
     const needle = text.slice(0, SUPERVISOR_PREFIX.length + 1 + CONFIRM_CHARS);
     const copies = transcriptCount(state, text);
     if (request.previousUnconfirmed) {
@@ -1187,10 +1412,11 @@ export function createUiDriver({
       keep(ctx, "after", state);
       return outcome(ctx, "failed", `text mismatch, not sent; ${LEFT_AS_DRAFT}`);
     }
+    const raised = promptBlock(state, target.bundleId);
     const changed = hasStopButton(state) ? "turn started before send"
-      : hasPermissionPrompt(state) ? "permission prompt appeared before send"
+      : raised ? "permission prompt appeared before send"
       : null;
-    if (changed) return outcome(ctx, "blocked", `${changed}; ${LEFT_AS_DRAFT}`);
+    if (changed) return outcome(ctx, "blocked", `${changed}; ${LEFT_AS_DRAFT}`, raised?.prompt ? { prompt: raised.prompt } : {});
 
     // 9. Send: the Send button, else Return in the focused composer. Out of
     // time before either: still "typed", nothing sent.
@@ -1220,8 +1446,9 @@ export function createUiDriver({
       // have started a turn or raised a prompt.
       const composer = composerIn(ctx, state).composer;
       if (!composer || !isComposerFocused(state, composer) || !verifyIdentity(state, identity).ok) return outcome(ctx, "blocked", `send not pressed: the composer lost focus or the thread changed; ${LEFT_AS_DRAFT}`);
-      const started = hasStopButton(state) ? "turn started before send" : hasPermissionPrompt(state) ? "permission prompt appeared before send" : null;
-      if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`);
+      const card = promptBlock(state, target.bundleId);
+      const started = hasStopButton(state) ? "turn started before send" : card ? "permission prompt appeared before send" : null;
+      if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`, card?.prompt ? { prompt: card.prompt } : {});
       const away = await ownerCheck(ctx, target);
       if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
       await press(ctx, "Return", signal);
@@ -1252,6 +1479,12 @@ export function createUiDriver({
 
   async function recover(error, ctx, timedOut) {
     if (ctx.inputInFlight) return inFlightOutcome(ctx);
+    // Open Computer Use 0.3.5-0.3.6 cannot find the app's window (a
+    // WindowServer state an app restart or reboot clears): nothing about the
+    // thread is known, so it is its own kind the supervisor can count.
+    if (!timedOut && ctx.phase === "check" && APP_UNREADABLE.test(`${error?.message ?? ""} ${error?.ocuText ?? ""}`)) {
+      return outcome(ctx, "blocked", `can't read ${ctx.request.target?.name ?? "the app"}: Open Computer Use finds no window (cgWindowNotFound); nothing typed`, { code: "appUnreadable" });
+    }
     const reason = timedOut ? "delivery timed out" : detailText(error?.message ?? error) || "Open Computer Use error";
     if (ctx.phase === "check") return outcome(ctx, "failed", `${reason}; nothing typed`);
     if (ctx.phase === "sending" || ctx.phase === "sent") {
@@ -1261,9 +1494,91 @@ export function createUiDriver({
     return outcome(ctx, "failed", `${reason}; not sent; ${LEFT_AS_DRAFT}`);
   }
 
+  // One read or click at a time with every other app request (deliveries
+  // hold the same lock in the executor).
+  async function locked(fn) {
+    const result = await uiLock.run(fn, { waitMs: limits.uiLockWaitMs });
+    return result.busy ? { status: "blocked", detail: "busy: another app request is running; retry" } : result.value;
+  }
+
+  // Reads one thread's screen: its permission card (buttons and stateId),
+  // whether a turn runs, any Resume button, and the transcript's tail. No
+  // input; the thread already on screen is read even with the owner at the
+  // keyboard. request: { target, identity, evidenceName, deadlineAt }
+  async function inspect(request = {}) {
+    return locked(() => run(request, async (ctx, signal) => {
+      const target = request.target;
+      if (!target?.bundleId || !ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", "no app the fleet reads shows this thread");
+      const opened = await openThread(ctx, signal, { needFront: false, navigate: request.navigate !== false });
+      if (opened.blocked) return opened.blocked;
+      keep(ctx, "screen", opened.state);
+      return outcome(ctx, "read", `read ${target.name}`, { screen: screenSummary(opened.state, target.bundleId) });
+    }));
+  }
+
+  // Which element a label names on this screen: a button of the current
+  // permission card (its stateId, when given, must still match), or the one
+  // Resume goal / Retry / Resume button. Anything else is refused with the
+  // labels that are clickable.
+  function clickChoice(state, label, stateId, bundleId) {
+    const want = choiceText(label);
+    const prompt = findPrompt(state, bundleId);
+    const resumes = resumeButtons(state, bundleId);
+    const clickable = [...new Set([...(prompt?.labels ?? []), ...resumes.map(buttonLabel)])];
+    const refuse = (detail, status = "failed") => ({ status, detail, prompt: prompt ? { text: prompt.text, buttons: prompt.labels, stateId: prompt.stateId } : null });
+    if (prompt && prompt.labels.some((shown) => choiceText(shown) === want)) {
+      if (stateId && stateId !== prompt.stateId) return refuse("prompt changed; read again", "blocked");
+      const matches = prompt.buttons.filter((element) => choiceLabel(element) === want);
+      if (matches.length !== 1) return refuse(`"${label}" is on ${matches.length} buttons; not clicking`);
+      return { element: matches[0], label: buttonLabel(matches[0]), gone: (next) => findPrompt(next, bundleId)?.stateId !== prompt.stateId };
+    }
+    if (RESUME_LABELS.has(want)) {
+      const matches = resumes.filter((element) => choiceLabel(element) === want);
+      if (matches.length === 1) {
+        return { element: matches[0], label: buttonLabel(matches[0]),
+          gone: (next) => hasStopButton(next) || !resumeButtons(next, bundleId).some((element) => choiceLabel(element) === want) };
+      }
+      if (matches.length > 1) return refuse(`"${label}" is on ${matches.length} buttons; not clicking`);
+    }
+    return refuse(`"${label}" is not a button the fleet clicks here; clickable: ${clickable.length ? clickable.join(", ") : "none"}`);
+  }
+
+  // Clicks one permission-card or Resume button by its exact label, through
+  // accessibility (no foreground, no pointer), then re-reads until the card
+  // is gone. request: { target, identity, label, stateId, evidenceName, deadlineAt }
+  async function clickLabel(request = {}) {
+    return locked(() => run(request, async (ctx, signal) => {
+      const target = request.target;
+      if (!target?.bundleId || !ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", "no app the fleet drives shows this thread");
+      if (!normalizeUiText(request.label)) return outcome(ctx, "blocked", "no label to click");
+      if (inputLatch.held) return outcome(ctx, "blocked", `computer use not ready: ${inputLatch.detail}; nothing clicked`);
+      const opened = await openThread(ctx, signal, { needFront: false });
+      if (opened.blocked) return opened.blocked;
+      let state = opened.state;
+      const choice = clickChoice(state, request.label, request.stateId ?? null, target.bundleId);
+      if (!choice.element) return outcome(ctx, choice.status, choice.detail, choice.prompt ? { prompt: choice.prompt } : {});
+      keep(ctx, "before", state);
+      ctx.phase = "sending";
+      await click(ctx, choice.element, signal);
+      ctx.phase = "sent";
+      const deadline = now() + limits.uiConfirmMs;
+      do {
+        await sleep(limits.uiPollMs);
+        state = await readState(ctx, signal);
+        if (choice.gone(state)) {
+          keep(ctx, "after", state);
+          const next = promptButtons(state, target.bundleId);
+          return outcome(ctx, "sent", `clicked ${choice.label} in ${target.name}`, next ? { prompt: next } : {});
+        }
+      } while (now() < deadline);
+      keep(ctx, "after", state);
+      return outcome(ctx, "failed", `clicked ${choice.label}, but it still shows; read the thread again before retrying`, { unconfirmed: true });
+    }));
+  }
+
   // The owner's apps, checked once per tick so computer-use-first can fall
   // back to the CLI for a thread whose app is closed.
   const appRunning = (bundleId) => presence.appRunning(bundleId);
 
-  return { readiness, deliver, appRunning };
+  return { readiness, deliver, inspect, clickLabel, appRunning };
 }

@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { G2Requests } from "../src/g2-requests.js";
+import { G2Channel } from "../src/integrations/g2-channel.js";
+import { isOwnerPrincipal } from "../src/owner-authority.js";
 
 function fixture(t, extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "g2-receipts-"));
@@ -87,4 +89,23 @@ test("restart reconciles an already persisted public reply without repeating wor
   assert.equal(restored.get("a", id).state, "completed");
   assert.equal(restored.submit("a", id, f.body).result.reply, "Already done");
   assert.equal(f.calls(), 1);
+});
+
+test("an experience submit reaches the agent as the owner's G2 tap", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "g2-receipts-owner-"));
+  const seen = [];
+  const channel = new G2Channel({
+    dir: path.join(dir, "channel"),
+    nodeRegistry: { enrollment: () => ({ platform: "even_g2", name: "G2" }), touchEnrollment() {} },
+    agentHost: { store: null, handleMessage: async (input, options) => { seen.push(options?.principal); return { reply: "ok", session: { id: input.sessionId } }; } }
+  });
+  const store = new G2Requests({ dir: path.join(dir, "requests"), channel, sweepMs: 0 });
+  t.after(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const id = `${Date.now()}_${randomUUID()}`;
+  store.submit("g2-node", id, { text: "click approve", conversationId: "test-conversation" });
+  for (let i = 0; i < 100 && store.get("g2-node", id).state !== "completed"; i++) await flush();
+  assert.equal(store.get("g2-node", id).state, "completed");
+  assert.equal(isOwnerPrincipal(seen[0]), true);
+  assert.equal(seen[0].via, "g2");
+  assert.equal(seen[0].nodeId, "g2-node");
 });

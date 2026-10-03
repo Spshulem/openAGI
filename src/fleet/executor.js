@@ -184,7 +184,7 @@ function checkPreconditions(thread, route, message, config) {
     // turn is not. The UI re-checks for a Stop button before typing.
     if (!uiTargetFor(thread)) return "no app shows this thread: open it";
     if (thread.agentStatus === "running") return "turn running";
-    if (thread.meta?.blockedOnOwner === true) return "waiting on a permission prompt: open it";
+    if (thread.meta?.blockedOnOwner === true) return "waiting on a permission prompt: answer it first (fleet_screen shows its buttons, fleet_click answers it)";
   }
   if (route === "codex-exec") {
     if (thread.kind !== "codex") return "codex-exec needs a codex thread";
@@ -361,6 +361,10 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     const extra = {};
     if (Array.isArray(result.evidence) && result.evidence.length) extra.evidence = result.evidence;
     if (result.unconfirmed) extra.unconfirmed = true;
+    // A permission card the send found, and a failure kind (appUnreadable),
+    // for the supervisor to act on.
+    if (result.prompt && typeof result.prompt === "object") extra.prompt = result.prompt;
+    if (typeof result.code === "string") extra.code = result.code;
     // A blocked UI send typed nothing: journal it only against an existing
     // action, like every other blocked delivery. The target and guard state
     // are journaled so a restarted executor can rebuild the guard.

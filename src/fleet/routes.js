@@ -9,6 +9,10 @@ const PREFIX = "/fleet/api/";
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
 const ANSWER_MAX = 200;
 const SEND_MAX = 2000;
+const LABEL_MAX = 80;
+const THREAD_KEY = /^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/;
+const APPS = new Set(["conductor", "codex"]);
+const APP_ACTIONS = new Set(["open", "quit", "restart"]);
 
 const ok = (body) => ({ status: 200, body });
 const fail = (status, error, extra = {}) => ({ status, body: { error, ...extra } });
@@ -116,11 +120,57 @@ export function createFleetRoute({ supervisor } = {}) {
         const body = await readObject(readBody);
         const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
         const message = typeof body?.message === "string" ? body.message.trim() : "";
-        if (!/^(codex|claude|conductor):[A-Za-z0-9_.-]{1,120}$/.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
+        if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
         if (!message || message.length > SEND_MAX) return fail(400, `Message must be 1-${SEND_MAX} characters.`);
         if (typeof supervisor.sendOwnerMessage !== "function") return fail(503, "Sending is not available.");
         const result = await supervisor.sendOwnerMessage(threadKey, message, sendOptions);
         return ok({ delivery: result?.delivery ?? null, state: state() });
+      }
+      // One thread's screen: its permission card, whether a turn runs, the
+      // transcript's tail. No input.
+      if (parts.length === 1 && parts[0] === "screen") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
+        if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
+        if (typeof supervisor.screenThread !== "function") return fail(503, "Screen reads are not available.");
+        const screen = await supervisor.screenThread(threadKey, sendOptions);
+        return ok({ ...screen, state: state() });
+      }
+      // One button of a thread's permission card (or its Resume button), by
+      // exact label; stateId pins the card the caller read.
+      if (parts.length === 1 && parts[0] === "click") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        const body = await readObject(readBody);
+        const threadKey = typeof body?.threadKey === "string" ? body.threadKey.trim() : "";
+        const label = typeof body?.label === "string" ? body.label.trim() : "";
+        const stateId = body?.stateId === undefined || body?.stateId === null ? null : String(body.stateId);
+        if (!THREAD_KEY.test(threadKey)) return fail(400, "Pass a thread key from the fleet state.");
+        if (!label || label.length > LABEL_MAX) return fail(400, `Label must be 1-${LABEL_MAX} characters.`);
+        if (stateId !== null && !/^[0-9a-f]{16}$/.test(stateId)) return fail(400, "Bad stateId.");
+        if (typeof supervisor.clickThread !== "function") return fail(503, "Clicking is not available.");
+        const result = await supervisor.clickThread(threadKey, label, { ...sendOptions, stateId });
+        return ok({ delivery: result?.delivery ?? null, prompt: result?.prompt ?? null, state: state() });
+      }
+      // The chats a quit or restart would stop right now, read live.
+      if (parts.length === 3 && parts[0] === "apps" && parts[2] === "running") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (!APPS.has(parts[1])) return fail(404, "Unknown fleet route.");
+        if (typeof supervisor.runningInApp !== "function") return fail(503, "App control is not available.");
+        const running = await supervisor.runningInApp(parts[1]);
+        if (!running) return fail(503, "Could not read which chats are running.");
+        return ok({ running, state: state() });
+      }
+      // Open, quit or restart Conductor or the Codex app. expectRunning: the
+      // chats the caller approved stopping.
+      if (parts.length === 3 && parts[0] === "apps") {
+        if (method !== "POST") return fail(405, "Use POST.");
+        if (!APPS.has(parts[1]) || !APP_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");
+        const body = (await readObject(readBody)) ?? {};
+        const expectRunning = Array.isArray(body.expectRunning) ? body.expectRunning.filter((key) => typeof key === "string" && THREAD_KEY.test(key)).slice(0, 50) : [];
+        if (typeof supervisor.appAction !== "function") return fail(503, "App control is not available.");
+        const result = await supervisor.appAction(parts[1], parts[2], { ...sendOptions, expectRunning });
+        return ok({ result, state: state() });
       }
       if (parts.length === 3 && parts[0] === "actions" && parts[2] === "send") {
         if (method !== "POST") return fail(405, "Use POST.");

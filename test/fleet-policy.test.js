@@ -849,3 +849,22 @@ test("infra: a long BB3 outage names its cause; a gated box is not called down o
   const unsure = decideInfra(unknown, { ledger, playbooks, config, now: NOW, threads: [], manager }).find((d) => d.action === "ask-user");
   assert.equal(unsure.question.title, "BB3 out 1h+, cause unknown. Check it?");
 });
+
+test("a permission card read on screen: its buttons (up to three) plus later, one question per card", () => {
+  const card = { text: "Run npm test in madrid?", buttons: ["Allow once", "Always allow", "Deny", "Reject"], stateId: "0123456789abcdef" };
+  const waiting = makeThread({
+    agentStatus: "waiting", lastAgentAt: ago(24 * 60 * MIN), lastActivityAt: ago(24 * 60 * MIN),
+    meta: { conductorWorkspaceId: "w-madrid", conductorSessionId: "s1", conductorSessionTitle: "Fix billing", conductorWorkspaceSessions: 1, blockedOnOwner: true, prompt: card }
+  });
+  const { decision } = run(waiting, { pr: makePr() });
+  assert.equal(decision.action, "ask-user");
+  assert.equal(decision.question.kind, "prompt");
+  assert.deepEqual(decision.question.options, ["Allow once", "Always allow", "Deny", "later"]);
+  assert.equal(decision.question.dedupeKey, "prompt:conductor:s1:0123456789abcdef");
+  assert.deepEqual(decision.question.meta, { promptStateId: "0123456789abcdef" });
+  assert.match(decision.question.body, /Run npm test in madrid\?/);
+  // No app shows the thread (a terminal session): the old open-it question.
+  const terminal = makeThread({ kind: "claude", key: "claude:c9", id: "c9", agentStatus: "waiting", lastAgentAt: ago(24 * 60 * MIN), lastActivityAt: ago(24 * 60 * MIN),
+    live: { peerName: "p9", pid: 9, status: "waiting" }, meta: { blockedOnOwner: true, prompt: card } });
+  assert.deepEqual(run(terminal, { pr: makePr() }).decision.question.options, ["opened", "later"]);
+});

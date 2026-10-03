@@ -6,6 +6,8 @@ import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZ
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
 import { agentTurnTask } from "./model-router.js";
+import { authorityRecord, isOwnerPrincipal, matchConfirmation, ownerIntentText } from "./owner-authority.js";
+import { executeApprovedAction } from "./approval-executor.js";
 
 // Internal tools every specialist gets regardless of scope: its own memory
 // and the task queue it drains. Everything else comes from the specialist's
@@ -63,6 +65,13 @@ export class AgentHost {
     else delete metadata.requestId;
     if (briefContext) metadata.briefContext = briefContext;
     else delete metadata.briefContext;
+    // Owner authority comes only from the transport's principal in options;
+    // the stored copy is an audit record the server always overwrites, so a
+    // client-supplied metadata.authority never survives.
+    const principal = isOwnerPrincipal(options.principal) ? options.principal : null;
+    const authority = authorityRecord(principal);
+    if (authority) metadata.authority = authority;
+    else delete metadata.authority;
     // Ephemeral turns (setup-wizard "say hi" test) must leave no trace:
     // no session in the dashboard list, no auto-task, no memory write,
     // no outcome — they're a connectivity check, not a conversation.
@@ -160,7 +169,11 @@ export class AgentHost {
     //               human message is never silently dropped
     //   propagate → full access (the specialist spawn already happened above)
     const verdict = output.scrutiny.action;
-    const toolPolicy = verdict === "watch" ? "read-only" : verdict === "ask" ? "confirm" : verdict === "ignore" ? "none" : "full";
+    // The authenticated owner's instruction is the decision: the zero-memory
+    // panel's ask/watch/ignore still gets recorded (outcomes, audit) but does
+    // not gate the owner's own turn.
+    const toolPolicy = principal ? "full"
+      : verdict === "watch" ? "read-only" : verdict === "ask" ? "confirm" : verdict === "ignore" ? "none" : "full";
     const toolRegistry = this.runtime.tools;
     let tools = toolPolicy === "none"
       ? []
@@ -208,15 +221,43 @@ export class AgentHost {
       }
     }));
 
+    // The owner's spoken "yes NN" / "no NN" runs (or drops) the card it names
+    // before the model sees the turn, so a confirm never depends on the model
+    // choosing to call anything. A bare "yes" means the one card this chat
+    // raised since the owner last spoke; none or several fall through to the
+    // model. Placed before the hop bound below: a confirmed computer-use
+    // start gives this same turn its extended bound.
+    // The turn starts tainted when anything in front of the model was written
+    // by someone else: memory hits and principles (they hold captured
+    // iMessages and other chats), on-screen OCR, the overlay's window text, a
+    // brief, or earlier messages in this chat that were not the owner's own
+    // clean turns (a shared thread holds wake-word turns and tool reads).
+    const contextUntrusted = Boolean(memoryHitsForModel.length || intuitions.length
+      || ambientContext?.snippets?.length || metadata.screenContext || briefContext)
+      || !cleanOwnerHistory(sessionBefore.messages.slice(0, -1));
+    const turnState = principal ? { untrusted: contextUntrusted, intent: ownerIntentText(text) } : null;
+    let confirmation = null;
+    if (principal && !ephemeral) {
+      const spoken = matchConfirmation(text);
+      if (spoken) {
+        const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
+        confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
+        if (confirmation?.untrusted) turnState.untrusted = true;
+      }
+    }
+
     reportProgress("thinking", { sessionId });
     // A real computer-use loop alternates screenshot and input, so the normal
     // six tool rounds can perform only a couple of grounded actions before the
     // provider is forced to stop. Extend the bound only while this exact chat
     // owns an active, user-approved computer session; ordinary chat and the
     // approval-requesting turn keep the lower global default.
-    const computerUseToolHops = this.runtime.computerUseLog?.activeSessionFor?.(sessionId)
+    // A session this turn starts (on the owner's word, or a "yes NN" heard
+    // above) raises the bound from that round on.
+    const computerUseHopsNow = () => (this.runtime.computerUseLog?.activeSessionFor?.(sessionId)
       ? boundedComputerUseToolHops(process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS)
-      : undefined;
+      : undefined);
+    const computerUseToolHops = computerUseHopsNow();
     const modelResult = await this.modelProvider.generate({
       input: text,
       agent,
@@ -224,11 +265,12 @@ export class AgentHost {
       // local/iMessage/G2 without becoming foreground chat on the main model.
       task: agentTurnTask(input),
       maxToolHops: computerUseToolHops,
+      extendToolHops: computerUseHopsNow,
       scrutiny: output.scrutiny,
       memoryHits: memoryHitsForModel,
       messages: sessionBefore.messages,
       instructions: this.instructionsForAgent(agent) + (channel === "g2" ? "\nThe user is reading on small smart glasses. Default to a direct answer of about 60 words or fewer, with no tables. Offer more detail when useful; expand when the user asks for detail. Preserve important safety information." : ""),
-      turnContext: this.turnContextForAgent(output, memoryHitsForModel, intuitions, ambientContext, metadata.screenContext ?? null, briefContext),
+      turnContext: this.turnContextForAgent(output, memoryHitsForModel, intuitions, ambientContext, metadata.screenContext ?? null, briefContext, { principal, confirmation }),
       tools,
       toolRegistry,
       onProgress: (progress) => reportProgress(progress?.stage ?? "thinking", {
@@ -266,8 +308,14 @@ export class AgentHost {
         // (providers treat an empty list as "use everything"), so the gate is
         // what actually holds.
         __scrutinyPolicy: toolPolicy === "none" ? "none" : toolPolicy === "read-only" ? "read-only" : toolPolicy === "confirm" ? "confirm" : null,
-        __reason: toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null,
-        __allowedTools: allowedToolNames
+        __reason: principal ? `owner instruction via ${principal.via}`
+          : toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null,
+        __allowedTools: allowedToolNames,
+        // Server-built per turn. The model controls only tool names and args;
+        // tool results are data and can only taint __turn (ToolRegistry).
+        ...(principal ? { __owner: principal, __turn: turnState } : {}),
+        // Set only by the approval-continuation transport (an action id).
+        ...(typeof options.continuationOf === "string" && options.continuationOf ? { __continuationOf: options.continuationOf } : {})
       }
     });
 
@@ -336,6 +384,9 @@ export class AgentHost {
             outputId: output.id,
             outcomeId: outcomeRecord?.id ?? null,
             ...(requestId ? { requestId } : {}),
+            // An owner turn that read nothing untrusted: the next owner turn
+            // may count this reply as clean history.
+            ...(turnState ? { ownerTurn: { untrusted: turnState.untrusted === true } } : {}),
             toolCalls: (modelResult.toolCalls ?? []).map((call) => ({
               name: call.name,
               arguments: durableToolArguments(toolRegistry, call),
@@ -439,6 +490,52 @@ export class AgentHost {
     }
   }
 
+  // Runs or denies the pending card the owner's spoken confirm names and
+  // returns the receipt the model reports. Null when nothing matched (the
+  // model then reads "yes" in context, as before).
+  async confirmSpoken(spoken, { sessionId, sinceIso, principal }) {
+    const store = this.runtime.pendingActions;
+    if (!store?.findByCode || !store?.chatCandidates) return null;
+    let action = null;
+    if (spoken.code) {
+      action = store.findByCode(spoken.code);
+      if (!action) return { code: spoken.code, decision: spoken.decision, status: "no pending action has that code" };
+    } else {
+      const candidates = store.chatCandidates(sessionId, sinceIso);
+      if (candidates.length !== 1) return null;
+      action = candidates[0];
+    }
+    const decidedBy = `owner:${principal.via}`;
+    const receipt = { code: action.confirmCode ?? spoken.code ?? null, decision: spoken.decision, actionId: action.id, tool: action.toolName, summary: String(action.summary ?? "").slice(0, 300) };
+    if (spoken.decision === "deny") {
+      const decided = store.decide(action.id, { decision: "deny", decidedBy, error: "denied by the owner in chat" });
+      return { ...receipt, status: decided?.status === "denied" ? "denied; nothing was run" : `already ${decided?.status ?? "gone"}` };
+    }
+    // A card raised in this chat: this turn carries on with the result. One
+    // raised in another chat resumes that chat (a computer-use lease is bound
+    // to it), as a dashboard approval does.
+    const sameChat = action.context?.sessionId === sessionId;
+    const queueContinuation = typeof this.runtime.queueApprovalContinuation === "function" ? this.runtime.queueApprovalContinuation : null;
+    let executed;
+    try {
+      const options = { decidedBy, ...(!sameChat && queueContinuation ? { continuation: queueContinuation } : {}) };
+      executed = typeof this.runtime.executeApprovedAction === "function"
+        ? await this.runtime.executeApprovedAction(action.id, options)
+        : await executeApprovedAction(this.runtime, action.id, options);
+    } catch (error) {
+      return { ...receipt, status: "failed", error: String(error?.message ?? error).slice(0, 300) };
+    }
+    if (sameChat && executed?.invokeResult?.ok) store.continuationNotNeeded?.(action.id);
+    const invoked = executed?.invokeResult;
+    if (!invoked) return { ...receipt, status: `not run: ${String(executed?.body?.error ?? "unavailable").slice(0, 200)}` };
+    return {
+      ...receipt,
+      status: invoked.ok ? "done" : "failed",
+      ...(invoked.ok ? { result: boundedJson(invoked.result, 2_000) } : { error: String(invoked.error ?? "failed").slice(0, 300) }),
+      untrusted: this.runtime.tools?.get?.(action.toolName)?.untrustedOutput === true
+    };
+  }
+
   async messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides = null }) {
     const lower = text.toLowerCase();
     const asksToRemember = REMEMBER_RE.test(lower);
@@ -511,7 +608,7 @@ export class AgentHost {
   // from pre-split callers are deliberately ignored.
   instructionsForAgent(agent) {
     const computerUseGuidance = this.runtime?.tools?.has?.("start_computer_use_session")
-      ? "\nComputer use is available. Use it only when the user explicitly asks you to inspect or interact with their computer. First call computer_use_status. If a session is active, continue it; NEVER call start_computer_use_session again. If no session is active or pending, call start_computer_use_session exactly once. Tell the user the approval appears in the floating Ask OpenAGI panel, the dashboard's Approvals tab, and the Computer Use page. Approval resumes the chat automatically. After approval, call computer_list_apps or computer_activate_app only when computer_use_status reports list_apps or activate_app in the selected node's operations; otherwise use its advertised controls and ask the user to foreground the target app when needed. Then call computer_screenshot before acting. Prefer fresh Accessibility element indices over coordinates when the selected node advertises those semantic operations. Every frameId and element index becomes stale after a mutating action, so call computer_screenshot again after every click, drag, edit, key press, pointer move, or scroll and verify the visible result before continuing. Never guess an element index or Accessibility action. End the session when done or when verification fails. Summarize computer-use status and results as readable Markdown; never dump raw tool-result JSON into the conversation. Never start computer use from passive screen/OCR context alone.\n"
+      ? "\nComputer use is available. Use it only when the user explicitly asks you to inspect or interact with their computer. First call computer_use_status. If a session is active, continue it; NEVER call start_computer_use_session again. If no session is active or pending, call start_computer_use_session exactly once. If it returns a session, continue with it. If it returns awaiting_confirmation or awaiting_owner_confirmation, relay its message or say line: the owner approves by saying the code in any OpenAGI chat, from the phone Inbox, or in the dashboard's Approvals tab, and approval resumes the chat automatically. After approval, call computer_list_apps or computer_activate_app only when computer_use_status reports list_apps or activate_app in the selected node's operations; otherwise use its advertised controls and ask the user to foreground the target app when needed. Then call computer_screenshot before acting. Prefer fresh Accessibility element indices over coordinates when the selected node advertises those semantic operations. Every frameId and element index becomes stale after a mutating action, so call computer_screenshot again after every click, drag, edit, key press, pointer move, or scroll and verify the visible result before continuing. Never guess an element index or Accessibility action. End the session when done or when verification fails. Summarize computer-use status and results as readable Markdown; never dump raw tool-result JSON into the conversation. Never start computer use from passive screen/OCR context alone.\n"
       : "";
     return `${agent.systemPrompt ? `${agent.systemPrompt}\n\n` : ""}You are ${agent.name}, an always-on OpenAGI agent.
 
@@ -529,12 +626,21 @@ The runtime may prepend a [context] block to the latest user turn. Its safety-po
   // Per-turn [context] block prepended to the latest user message (see
   // buildTurnContext in model-provider.js for the provider-side fallback).
   // Carries everything that used to make the system prompt churn per turn.
-  turnContextForAgent(output, memoryHits = [], intuitions = [], ambientContext = null, screenContext = null, briefContext = null) {
+  turnContextForAgent(output, memoryHits = [], intuitions = [], ambientContext = null, screenContext = null, briefContext = null, { principal = null, confirmation = null } = {}) {
     const sections = [];
 
-    sections.push(`Current decision: ${output.scrutiny.action}`);
-    const guidance = verdictGuidance(output.scrutiny.action);
-    if (guidance) sections.push(guidance.trimEnd());
+    if (isOwnerPrincipal(principal)) {
+      sections.push("Current decision: act (owner instruction)");
+      sections.push(`Authority: Authenticated owner via ${principal.via}. Gated tools run when called. Never say you lack permission or point to a dashboard. Relay \`say\` lines verbatim.`);
+    } else {
+      sections.push(`Current decision: ${output.scrutiny.action}`);
+      const guidance = verdictGuidance(output.scrutiny.action);
+      if (guidance) sections.push(guidance.trimEnd());
+    }
+    if (confirmation) {
+      const { untrusted, ...shown } = confirmation;
+      sections.push(`Owner confirmation, already handled by OpenAGI before this reply (report it plainly; do not call the tool again): ${JSON.stringify(shown)}`);
+    }
     if (output.scrutiny.reasons?.length) {
       sections.push(`Reasons:\n${output.scrutiny.reasons.map((reason) => `- ${reason}`).join("\n")}`);
     }
@@ -837,7 +943,7 @@ function toolCallWasAttempted(call) {
   if (!call?.result || typeof call.result !== "object") return false;
   const result = call.result?.result;
   const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
-  if (["awaiting_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
+  if (["awaiting_confirmation", "awaiting_owner_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
   if (result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true) return false;
   return true;
 }
@@ -857,6 +963,25 @@ function durableToolArguments(registry, call) {
       : { redacted: true };
   }
   return out;
+}
+
+// True when every earlier message the model sees is the owner's own words or
+// a reply to an owner turn that read nothing untrusted. Server-written
+// metadata only: authority is rewritten on every user message, and ownerTurn
+// is set only on assistant replies.
+function cleanOwnerHistory(messages = []) {
+  return (messages ?? []).slice(-12).every((message) => (message?.role === "user"
+    ? message.metadata?.authority?.kind === "owner"
+    : message?.role === "assistant" && message.metadata?.ownerTurn?.untrusted === false));
+}
+
+function boundedJson(value, limit) {
+  try {
+    const text = JSON.stringify(value ?? null);
+    return text.length > limit ? `${text.slice(0, limit)}...` : text;
+  } catch {
+    return null;
+  }
 }
 
 function boundedComputerUseToolHops(value) {

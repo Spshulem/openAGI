@@ -614,3 +614,21 @@ test("an owner close covers the threads it named: a group with other members is 
   assert.equal(shifted.suppressed, undefined);
   assert.notEqual(shifted.id, first.id);
 });
+
+test("app restart records, the last restart time and question meta survive a reload", (t) => {
+  const dir = tempDir(t);
+  const now = clock();
+  const store = new FleetStore({ dir, now });
+  store.setAppRestart("conductor", { action: "restart", at: new Date(T0).toISOString(), threadKeys: ["conductor:s1"], due: true, done: [] });
+  store.markRestarted("conductor", T0);
+  const question = store.upsertQuestion({ dedupeKey: "infra:unreadable:conductor", kind: "infra", title: "Restart?", options: ["restart", "later"],
+    meta: { app: "conductor", runningKeys: ["conductor:s1", 7], ignored: { nested: true } } });
+  assert.deepEqual(question.meta, { app: "conductor", runningKeys: ["conductor:s1"] });
+  const reloaded = new FleetStore({ dir, now });
+  assert.deepEqual(reloaded.appRestart("conductor").threadKeys, ["conductor:s1"]);
+  assert.deepEqual(reloaded.appRestarts().map((record) => record.app), ["conductor"]);
+  assert.equal(reloaded.restartedAt("conductor"), T0);
+  assert.deepEqual(reloaded.question(question.id).meta, { app: "conductor", runningKeys: ["conductor:s1"] });
+  reloaded.setAppRestart("conductor", null);
+  assert.equal(new FleetStore({ dir, now }).appRestart("conductor"), null);
+});

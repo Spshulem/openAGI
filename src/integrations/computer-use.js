@@ -30,6 +30,7 @@
 // via a separate `reasoning` param that the agent is instructed to fill.
 import crypto from "node:crypto";
 import { pinnedRemoteOrigin } from "../node-control.js";
+import { isOwnerPrincipal } from "../owner-authority.js";
 
 const SAFETY_NOTE = "Computer use is experimental. Every action is logged with the reasoning you provide; the log is visible to the user. Input synthesis requires a reachable computer-use node; without one, those calls are logged and refused, so do not assume they succeed.";
 
@@ -338,6 +339,14 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
     }
     const active = runtime.computerUseLog.activeSessionFor(sourceSessionId);
     if (!active) throw new Error("No active computer-use session. Call start_computer_use_session first and have the user approve.");
+    // A session the owner's own word started (no approval card) answers only
+    // to the owner's turns, and to the one continuation of a card the owner
+    // approved by code. A wake-word or relayed turn in the same chat cannot
+    // drive it.
+    if (String(active.approvedBy ?? "").startsWith("owner:") && !isOwnerPrincipal(context.__owner)
+        && !(context.__continuationOf && context.__continuationOf === active.approvalActionId)) {
+      throw new Error("This computer-use session was started by the owner; only the owner's own messages can drive it.");
+    }
     return active;
   };
 
@@ -476,6 +485,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   registry.register({
     name: "computer_use_status",
     sideEffects: false,
+    trustedOutput: true,
     description: "Check whether a computer-use session is already active or awaiting approval. Call this before start_computer_use_session and after the user approves; never create a second start request when a session is active.",
     parameters: {
       type: "object",
@@ -489,9 +499,11 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         .filter((action) => action.toolName === "start_computer_use_session" && action.context?.sessionId === context.sessionId) ?? [];
       const discoveredNodes = runtime.nodeCapabilities?.list?.("computer-use")?.map?.((entry) => {
         const capability = entry.capabilities?.find?.((candidate) => candidate.id === "computer-use") ?? null;
+        // No node name: a node reports its own, so it is text the owner did
+        // not write, and this output is read as trusted. start resolves the
+        // name the owner says.
         return {
           nodeId: entry.nodeId,
-          name: entry.name ?? null,
           ready: capability?.ready === true,
           operations: Array.isArray(capability?.operations) ? capability.operations : []
         };
@@ -503,7 +515,6 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       const availableNodes = explicitStatus
         ? [{
             nodeId: "explicit",
-            name: null,
             ready: Boolean(explicitProbe?.reachable && explicitProbe.inputAvailable
               && explicitProbe.operations.includes("session.start")),
             operations: explicitProbe?.operations ?? []
@@ -511,9 +522,9 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         : discoveredNodes;
       return {
         active: Boolean(active),
+        // No goal either: it can quote text a tool read. The chat has it.
         session: active ? {
           id: active.id,
-          goal: active.goal,
           startedAt: active.startedAt
         } : null,
         awaitingApproval: pending.length > 0,
@@ -530,12 +541,12 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
 
   registry.register({
     name: "start_computer_use_session",
-    description: "Open a computer-use session for a user-stated goal. First call computer_use_status. If a session is active, continue it and do not call this tool again. Otherwise this creates ONE request in the dashboard's Approvals tab and Computer Use page. Approval automatically resumes the chat; subsequent computer_* actions in the approved session won't re-prompt. " + SAFETY_NOTE,
+    description: "Open a computer-use session for a user-stated goal. First call computer_use_status. If a session is active, continue it and do not call this tool again. Otherwise call it once: on the owner's own instruction it starts the session at once; from anyone else it creates ONE approval request with a code (the owner approves by saying the code in any OpenAGI chat, the phone Inbox, or the dashboard's Approvals tab) and approval resumes the chat. Subsequent computer_* actions in the session won't re-prompt. " + SAFETY_NOTE,
     parameters: {
       type: "object",
       properties: {
         goal: { type: "string", description: "What the user is trying to accomplish, in one sentence. Will be shown verbatim in the approval card." },
-        node: { type: "string", description: "Optional node name or id. Use a value returned by computer_use_status when the user names a specific Mac." },
+        node: { type: "string", description: "Optional node name or id. When the user names a specific Mac, pass that name, or a nodeId returned by computer_use_status." },
         nodeId: { type: "string", description: "Immutable node id resolved before approval. Do not invent this value." },
         nodeName: { type: "string", description: "Display name resolved before approval. Do not invent this value." }
       },
@@ -619,7 +630,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       }
       const session = runtime.computerUseLog.startSession({
         goal: args.goal,
-        approvedBy: "user",
+        approvedBy: typeof context.__approvedBy === "string" ? context.__approvedBy : "user",
         approvalActionId: context.__confirmationActionId ?? null,
         sourceSessionId: context.sessionId,
         targetNodeId: args.nodeId,
@@ -657,6 +668,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   registry.register({
     name: "computer_screenshot",
     sideEffects: false,
+    untrustedOutput: true,
     description: "Read the current screen state. A connected computer-use node returns a live image; observation-only mode returns the most recent OCR text + active app from the local observation store.",
     parameters: {
       type: "object",

@@ -1,8 +1,10 @@
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { ensureDir, writeJsonAtomic, readJsonFile, appendJsonLine } from "./file-utils.js";
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
+import { authorityRecord } from "./owner-authority.js";
 
 // File-backed queue of agent-initiated actions awaiting human approval.
 // When the agent invokes a tool flagged `needsConfirmation: true`, the
@@ -14,10 +16,13 @@ import { resolveDataDir } from "./data-dir.js";
 // Persistence: same JSONL+snapshot pattern as TaskStore so a daemon crash
 // mid-action-queue doesn't lose anything.
 
+const CODE_RETIRE_MS = 24 * 60 * 60_000;
+
 export class PendingActionStore {
-  constructor({ dir, now = () => Date.now() } = {}) {
+  constructor({ dir, now = () => Date.now(), randomInt = crypto.randomInt } = {}) {
     this.dir = dir ?? path.join(resolveDataDir(), "pending-actions");
     this.now = now;
+    this.randomInt = randomInt;
     ensureDir(this.dir);
     this.actions = new Map();
     this.events = null;
@@ -55,9 +60,17 @@ export class PendingActionStore {
     return this.actions.get(id) ?? null;
   }
 
-  enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null }) {
-    const boundedDedupeKey = typeof dedupeKey === "string" ? dedupeKey.slice(0, 500) : null;
-    if (boundedDedupeKey) {
+  // announce: false keeps the card off the SSE bus (and so off the outreach
+  // feed): the owner is answering in chat, or already approved it.
+  // mode: "queue" waits for an approval surface; "chat" waits for the owner
+  // to say "yes NN" in an OpenAGI chat; "owner" is a record of a call the
+  // owner's own instruction ran. Every card gets a short spoken code.
+  enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null, announce = true, mode = "queue", confirmCode = true, _reuse = true }) {
+    const cardMode = ["queue", "chat", "owner"].includes(mode) ? mode : "queue";
+    const boundedDedupeKey = typeof dedupeKey === "string" && dedupeKey
+      ? dedupeKey.slice(0, 500)
+      : cardMode === "chat" ? argsDigest(toolName, args, context?.sessionId) : null;
+    if (boundedDedupeKey && _reuse) {
       const existing = this.list({ status: "pending" }).find((candidate) =>
         candidate.toolName === toolName && candidate.dedupeKey === boundedDedupeKey
       );
@@ -76,6 +89,8 @@ export class PendingActionStore {
       summary: summary ?? `Run ${toolName}`,
       reason: reason ?? null,
       dedupeKey: boundedDedupeKey,
+      mode: cardMode,
+      confirmCode: confirmCode === false ? null : this._newCode(typeof confirmCode === "string" ? confirmCode : null),
       status: "pending",
       createdAt,
       expiresAt: boundedTtlMs ? new Date(createdMs + boundedTtlMs).toISOString() : null,
@@ -86,14 +101,61 @@ export class PendingActionStore {
     };
     this.actions.set(action.id, action);
     this._appendJournal({ op: "enqueue", action });
-    this.events?.emit?.("pending-action", {
+    if (announce) this.events?.emit?.("pending-action", {
       id: action.id,
       toolName: action.toolName,
       summary: action.summary,
       reason: action.reason,
+      // So an approval surface can show what the owner may say instead.
+      code: action.confirmCode,
       createdAt: action.createdAt
     });
     return action;
+  }
+
+  // A call the authenticated owner's own instruction ran: journaled like any
+  // approval (so the dashboard history shows it), never announced, and
+  // claimed at once so no other surface can approve it again.
+  recordOwnerApproved({ toolName, args, context, summary, reason, dedupeKey, approvedBy }) {
+    const action = this.enqueue({ toolName, args, context, summary, reason, dedupeKey, announce: false, mode: "owner", confirmCode: false, _reuse: false });
+    return this.claimForExecution(action.id, { claimedBy: approvedBy ?? "owner" });
+  }
+
+  // The pending card a spoken "yes NN" names, in any session.
+  findByCode(code) {
+    const want = String(code ?? "").trim();
+    if (!/^\d{2,3}$/.test(want)) return null;
+    return this.list({ status: "pending" }).find((action) => action.confirmCode === want) ?? null;
+  }
+
+  // Chat-mode cards this session raised since sinceIso: the ones a bare "yes"
+  // can mean.
+  chatCandidates(sessionId, sinceIso = null) {
+    if (typeof sessionId !== "string" || !sessionId) return [];
+    const since = Date.parse(sinceIso ?? "");
+    return this.list({ status: "pending" }).filter((action) => action.mode === "chat"
+      && action.context?.sessionId === sessionId
+      && (!Number.isFinite(since) || Date.parse(action.createdAt) >= since));
+  }
+
+  _newCode(requested) {
+    // A code stays retired for a day after its card was made, whatever became
+    // of the card: an owner who heard "yes 42" an hour ago must never approve
+    // a newer, unrelated card by saying it late.
+    const since = this.now() - CODE_RETIRE_MS;
+    const taken = new Set([...this.actions.values()]
+      .filter((action) => action.status === "pending" || Date.parse(action.createdAt ?? "") >= since)
+      .map((action) => action.confirmCode).filter(Boolean));
+    if (requested && /^\d{2,3}$/.test(requested) && !taken.has(requested)) return requested;
+    // Two digits are easy to say; once most are in use or retired, three.
+    const shortTaken = [...taken].filter((code) => code.length === 2).length;
+    const [low, high] = shortTaken >= 80 ? [100, 1000] : [10, 100];
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const code = String(this.randomInt(low, high));
+      if (!taken.has(code)) return code;
+    }
+    for (let value = low; value < high; value += 1) if (!taken.has(String(value))) return String(value);
+    return null;
   }
 
   // Synchronously claim a pending action before its side effect is awaited.
@@ -183,10 +245,23 @@ export class PendingActionStore {
     return continuation;
   }
 
+  // The turn that approved it went on itself (an owner instruction, or the
+  // owner's "yes NN" in the chat that asked): nothing to resume, now or
+  // after a restart.
+  continuationNotNeeded(id) {
+    const action = this.actions.get(id);
+    if (!action || action.status !== "approved" || action.continuation) return action?.continuation ?? null;
+    action.continuation = { status: "not-needed", updatedAt: new Date(this.now()).toISOString() };
+    this._appendJournal({ op: "continuation", id, continuation: action.continuation });
+    return action.continuation;
+  }
+
   recoverableContinuations({ toolName } = {}) {
     return [...this.actions.values()].filter((action) =>
       action.status === "approved"
       && action.error == null
+      // An owner-mode record ran inside the owner's own turn.
+      && action.mode !== "owner"
       && (!toolName || action.toolName === toolName)
       && action.context?.sessionId
       && (!action.continuation || ["pending", "failed", "delivering"].includes(action.continuation.status))
@@ -348,6 +423,16 @@ function serializableContext(ctx) {
     channel: ctx.channel ?? null,
     from: ctx.from ?? null,
     target: ctx.target ?? null,
-    origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null
+    origin: ctx.origin === "autopilot" || ctx.origin === "cron" ? ctx.origin : null,
+    // Audit only: a replayed record is plain data and never owner authority.
+    authority: authorityRecord(ctx.__owner)
   };
+}
+
+// Scoped to the originating chat: the same request from two owner chats is
+// two cards, each bound to its own chat's context.
+export function argsDigest(toolName, args, sessionId = null) {
+  let serialized;
+  try { serialized = JSON.stringify([toolName, args ?? {}, sessionId ?? null]); } catch { serialized = `${toolName}:${sessionId ?? ""}`; }
+  return `chat:${crypto.createHash("sha256").update(serialized).digest("hex").slice(0, 32)}`;
 }

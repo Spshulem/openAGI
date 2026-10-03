@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createNodeControlWorker, NodeControlBroker, sanitizeNodeCapabilities } from "../src/node-control.js";
+import { createNodeControlWorker, NodeControlBroker, sanitizeNodeCapabilities, matchNodeSelector } from "../src/node-control.js";
 import { NodeRegistry } from "../src/node-registry.js";
 
 const capability = () => [{
@@ -601,4 +601,53 @@ test("node enrollment stores only a hash and binds authentication to node id", (
   assert.equal(registry.authenticate("node-a", token), false);
   assert.deepEqual(registry.enroll("node-a", "b".repeat(43)), { created: true });
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("dispatch says which of three things is wrong: not connected, not advertised, or not ready", async () => {
+  let now = Date.parse("2026-10-03T12:00:00.000Z");
+  const broker = new NodeControlBroker({ now: () => now });
+  await assert.rejects(broker.dispatch("never-seen", "coding-supervisor", "list", {}), /selected node is not connected \(no poll in 90 s\)/);
+  broker.advertise("mac", [{ id: "computer-use", ready: true, operations: ["screenshot"] }]);
+  await assert.rejects(broker.dispatch("mac", "coding-supervisor", "list", {}), /selected node does not advertise coding-supervisor/);
+  broker.advertise("mac", [{ id: "coding-supervisor", ready: false, operations: ["list"], detail: "No coding workspaces chosen" }]);
+  await assert.rejects(broker.dispatch("mac", "coding-supervisor", "list", {}), /selected node capability is not ready: No coding workspaces chosen/);
+  assert.equal(broker.lastSeen("mac").online, true);
+  now += 91_000;
+  await assert.rejects(broker.dispatch("mac", "coding-supervisor", "list", {}), /not connected \(no poll in 90 s\)/);
+  assert.deepEqual({ online: broker.lastSeen("mac").online, seenAt: broker.lastSeen("mac").seenAt }, { online: false, seenAt: "2026-10-03T12:00:00.000Z" });
+  assert.equal(broker.lastSeen("never-seen"), null);
+});
+
+test("a long poll that returns empty at once backs off instead of spinning", async () => {
+  let polls = 0;
+  const worker = createNodeControlWorker({
+    remote: "https://main.example", token: "t".repeat(43), nodeId: "mac", capabilities: async () => [],
+    execute: async () => ({}), retryMs: 1_000,
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/nodes/control/poll")) polls += 1;
+      return { ok: true, status: 200, headers: new Headers({ "content-type": "application/json" }), body: null, text: async () => "{}", json: async () => ({}),
+        arrayBuffer: async () => new TextEncoder().encode("{}").buffer };
+    }
+  });
+  worker.start();
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  await worker.stop();
+  assert.ok(polls >= 1 && polls <= 4, `polled ${polls} times in 600 ms`);
+});
+
+test("a loose node name picks a node only when exactly one ready node matches", () => {
+  const pro = { nodeId: "6f1c", name: "Spencers-MacBook-Pro" };
+  const studio = { nodeId: "9a2e", name: "Studio Mac" };
+  const nodes = [pro, studio];
+  assert.equal(matchNodeSelector(nodes, "6F1C"), pro, "exact id");
+  assert.equal(matchNodeSelector(nodes, "studio mac"), studio, "exact name");
+  assert.equal(matchNodeSelector(nodes, "MacBook"), pro);
+  assert.equal(matchNodeSelector(nodes, "my macbook pro"), pro);
+  assert.equal(matchNodeSelector(nodes, "Spencer's MacBook"), pro);
+  assert.equal(matchNodeSelector(nodes, "studio"), studio);
+  assert.equal(matchNodeSelector(nodes, "mac"), null, "two match: never the first");
+  assert.equal(matchNodeSelector(nodes, "my computer"), null);
+  assert.equal(matchNodeSelector(nodes, "imac"), null);
+  assert.equal(matchNodeSelector(nodes, null), null, "no selector with two nodes");
+  assert.equal(matchNodeSelector([pro], null), pro);
 });

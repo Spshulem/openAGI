@@ -55,12 +55,25 @@ function emptyState() {
     uiBlockedSince: {},
     infraUp: {},
     pushes: [],
-    muted: {}
+    muted: {},
+    appRestarts: {},
+    restartedAt: {}
   };
 }
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// Only short strings and lists of them; never an agent's free text.
+function questionMeta(meta) {
+  if (!isObject(meta)) return null;
+  const out = {};
+  for (const [key, value] of Object.entries(meta).slice(0, 8)) {
+    if (typeof value === "string") out[key] = value.slice(0, 120);
+    else if (Array.isArray(value)) out[key] = value.filter((item) => typeof item === "string").slice(0, 20).map((item) => item.slice(0, 200));
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 function makeId(prefix) {
@@ -239,7 +252,9 @@ export class FleetStore {
 
   // ─── needs-you questions ────────────────────────────────────────────────
 
-  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null } = {}) {
+  // meta: small facts the supervisor acts on when the owner answers (a
+  // permission card's stateId, an app and the chats running in it).
+  upsertQuestion({ dedupeKey, kind = null, threadKey = null, threadKeys = null, prRef = null, title, body = "", options = [], playbook = null, askContext = null, agentAskedAt = null, meta = null } = {}) {
     const now = this.now();
     this._expireQuestions(now);
     // Where an agent's ask came from, as first seen: the thread may move on
@@ -254,7 +269,8 @@ export class FleetStore {
       playbook: playbook ?? null,
       kind: kind ?? null,
       // Grouped questions ("5 threads capped") cover several threads.
-      threadKeys: Array.isArray(threadKeys) && threadKeys.length ? threadKeys.slice(0, 50) : null
+      threadKeys: Array.isArray(threadKeys) && threadKeys.length ? threadKeys.slice(0, 50) : null,
+      ...(questionMeta(meta) ? { meta: questionMeta(meta) } : {})
     };
     const key = String(dedupeKey ?? "").trim() || `${fields.threadKey ?? "fleet"}:${fields.title}`;
     const existing = this.state.questions.find((q) => q.status === "open" && q.dedupeKey === key);
@@ -604,6 +620,39 @@ export class FleetStore {
     this._save();
   }
 
+  // ─── app restarts ───────────────────────────────────────────────────────
+
+  // The chats an app quit or restart stopped (app -> { action, at, threadKeys,
+  // due, done }), kept across a daemon restart so each still gets its one
+  // resume once the app is back.
+  appRestart(app) {
+    const record = this.state.appRestarts?.[app];
+    return isObject(record) ? structuredClone(record) : null;
+  }
+
+  appRestarts() {
+    return Object.entries(this.state.appRestarts ?? {}).filter(([, record]) => isObject(record)).map(([app, record]) => ({ app, ...structuredClone(record) }));
+  }
+
+  setAppRestart(app, record) {
+    this.state.appRestarts ??= {};
+    if (record) this.state.appRestarts[app] = { ...record, threadKeys: (record.threadKeys ?? []).slice(0, 50), done: (record.done ?? []).slice(0, 50) };
+    else delete this.state.appRestarts[app];
+    this._save();
+  }
+
+  // When the fleet last restarted an app (ms), so a second answer does not
+  // restart it again within minutes, a daemon restart included.
+  restartedAt(app) {
+    return toMs(this.state.restartedAt?.[app], null);
+  }
+
+  markRestarted(app, at = this.now()) {
+    this.state.restartedAt ??= {};
+    this.state.restartedAt[app] = iso(toMs(at, this.now()));
+    this._save();
+  }
+
   // ─── phone pushes (times only; never the endpoint) ──────────────────────
 
   recordPush(at) {
@@ -752,7 +801,9 @@ export class FleetStore {
       uiBlockedSince: isObject(raw.uiBlockedSince) ? raw.uiBlockedSince : {},
       infraUp: isObject(raw.infraUp) ? raw.infraUp : {},
       pushes: Array.isArray(raw.pushes) ? raw.pushes.filter((p) => typeof p === "string") : [],
-      muted: isObject(raw.muted) ? raw.muted : {}
+      muted: isObject(raw.muted) ? raw.muted : {},
+      appRestarts: isObject(raw.appRestarts) ? raw.appRestarts : {},
+      restartedAt: isObject(raw.restartedAt) ? raw.restartedAt : {}
     };
   }
 

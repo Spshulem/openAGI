@@ -543,6 +543,8 @@ Response — verified live against the daemon:
       "summary": "Send an email to someone@example.com",
       "reason": null,
       "dedupeKey": null,
+      "mode": "queue",
+      "confirmCode": "42",
       "status": "pending",
       "createdAt": "2026-09-20T01:40:25.625Z",
       "expiresAt": null,
@@ -554,6 +556,11 @@ Response — verified live against the daemon:
   ]
 }
 ```
+
+`confirmCode` is the short code the owner can say instead ("yes 42" in any
+OpenAGI chat). `mode` is `queue` (waits for an approval surface), `chat`
+(raised in the owner's own chat, which answers it by code) or `owner` (a
+record of a call the owner's own instruction ran; never pending).
 
 (`mobile/fixtures/pending-actions.json` pins the empty-list shape,
 `{"actions": []}`, because the fixture daemon has nothing pending; the object

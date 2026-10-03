@@ -60,6 +60,28 @@ export function sanitizeNodeCapabilities(raw) {
   return out;
 }
 
+// The ready node an owner names. An exact id or name wins; else a loose name
+// ("MacBook", "my macbook" for "Spencers-MacBook-Pro") picks one only when
+// exactly one ready node's name holds every word. Never the first of several.
+const LOOSE_FILLER = new Set(["my", "the", "this", "that", "on", "computer"]);
+
+export function matchNodeSelector(candidates, selector, nameOf = (entry) => entry.name) {
+  const value = typeof selector === "string" ? selector.trim().toLowerCase() : "";
+  if (!value) return candidates.length === 1 ? candidates[0] : null;
+  const byId = candidates.find((entry) => entry.nodeId.toLowerCase() === value);
+  if (byId) return byId;
+  const lower = (entry) => (typeof nameOf(entry) === "string" ? nameOf(entry).toLowerCase() : "");
+  const named = candidates.filter((entry) => lower(entry) === value);
+  if (named.length) return named.length === 1 ? named[0] : null;
+  const words = value.replace(/['\u2019]/g, "").split(/[^a-z0-9]+/).filter((word) => word && !LOOSE_FILLER.has(word));
+  if (!words.length) return null;
+  const loose = candidates.filter((entry) => {
+    const compact = lower(entry).replace(/[^a-z0-9]+/g, "");
+    return compact && words.every((word) => compact.includes(word));
+  });
+  return loose.length === 1 ? loose[0] : null;
+}
+
 export class NodeControlBroker {
   constructor({ now = () => Date.now(), onlineMs = DEFAULT_ONLINE_MS, commandTimeoutMs = DEFAULT_COMMAND_TIMEOUT_MS } = {}) {
     this.now = now;
@@ -102,18 +124,11 @@ export class NodeControlBroker {
     const candidates = this.list(capabilityId).filter((record) => (
       record.capabilities.some((capability) => capability.ready)
     ));
-    const selector = text(nodeId ?? nodeName, 200)?.toLowerCase() ?? null;
     // Implicit routing is safe only when there is exactly one eligible node.
     // A newly paired (or compromised) node must never win control merely by
     // being first in insertion order.
-    if (!selector) return candidates.length === 1 ? candidates[0] : null;
-    const exactId = candidates.find((record) => record.nodeId.toLowerCase() === selector);
-    if (exactId) return exactId;
     const names = new Map(registry?.list?.().map?.((entry) => [entry.nodeId, entry.name]) ?? []);
-    const named = candidates.filter((record) => (
-      typeof names.get(record.nodeId) === "string" && names.get(record.nodeId).toLowerCase() === selector
-    ));
-    return named.length === 1 ? named[0] : null;
+    return matchNodeSelector(candidates, text(nodeId ?? nodeName, 200), (record) => names.get(record.nodeId));
   }
 
   async poll(nodeId, capabilities, {
@@ -170,14 +185,30 @@ export class NodeControlBroker {
     });
   }
 
+  // The last poll from a node (even an offline one), for saying how long
+  // it has been gone. Null when it never polled since this main started.
+  lastSeen(nodeId) {
+    const record = this.nodes.get(text(nodeId, 200) ?? "");
+    if (!record) return null;
+    return { seenAt: new Date(record.seenAt).toISOString(), online: this.now() - record.seenAt <= this.onlineMs, capabilities: record.capabilities };
+  }
+
   dispatch(nodeId, capability, operation, payload, { timeoutMs = this.commandTimeoutMs, sessionId = null } = {}) {
-    const record = this.list(capability).find((entry) => entry.nodeId === nodeId);
-    const advertised = record?.capabilities.find((entry) => entry.id === capability);
+    const known = this.nodes.get(nodeId);
+    const online = known && this.now() - known.seenAt <= this.onlineMs;
+    const advertised = online ? known.capabilities.find((entry) => entry.id === capability) : null;
+    // Three different fixes, so three different errors: the node is off or
+    // its worker stopped polling; it runs without this capability; or the
+    // capability itself reports why it cannot act.
+    if (!online) {
+      return Promise.reject(new Error(`selected node is not connected (no poll in ${Math.round(this.onlineMs / 1000)} s)`));
+    }
+    if (!advertised) return Promise.reject(new Error(`selected node does not advertise ${capability}`));
     // Revocation remains available when capture/input readiness drops (locked
     // screen, Secure Input, permission change, or a newly excluded window).
     // Those states must disable actions, never disable Stop.
-    if (!advertised || (operation !== "session.end" && !advertised.ready)) {
-      return Promise.reject(new Error("selected node capability is not ready"));
+    if (operation !== "session.end" && !advertised.ready) {
+      return Promise.reject(new Error(`selected node capability is not ready: ${advertised.detail || "no detail reported"}`));
     }
     if (!advertised.operations.includes(operation)) {
       return Promise.reject(new Error(`selected node does not support ${operation}`));
@@ -546,6 +577,7 @@ export function createNodeControlWorker({
         // run while that probe is pending, after its controller-abort sweep;
         // never create a fresh long-poll once shutdown has begun.
         if (stopped) break;
+        const pollStartedAt = Date.now();
         const body = await post("/nodes/control/poll", {
           nodeId,
           capabilities: advertised,
@@ -556,7 +588,12 @@ export function createNodeControlWorker({
           return await readJsonResponseLimited(response, MAX_POLL_RESPONSE_BYTES);
         });
         const command = body?.command;
-        if (!command || typeof command.id !== "string") continue;
+        if (!command || typeof command.id !== "string") {
+          // A long poll that came back empty at once (a replaced poll, a
+          // proxy, a misbehaving main) must not turn into a tight loop.
+          if (Date.now() - pollStartedAt < 100) await sleep(Math.min(retryMs, 250));
+          continue;
+        }
         if (revocationsOnly && command.operation !== "session.end") {
           throw new Error("revocation-only poll returned ordinary work");
         }

@@ -74,3 +74,83 @@ test('remote coding node binds approvals to the node and refuses unsupported ope
   assert.equal((await node.supervisor.reply(prepared)).status, 'accepted');
   assert.equal(deliveries, 1);
 });
+
+function nodeFacade(nodes, dispatched, node) {
+  return {
+    list: (id) => nodes.filter((entry) => entry.capabilities.some((capability) => capability.id === id)),
+    describe: (nodeId) => ({ nodeId, name: { 'mac-old': 'Old Mac' }[nodeId] ?? null, lastSeenAt: '2026-10-03T09:15:00.000Z', online: false, capabilities: [] }),
+    dispatch: async (nodeId, capability, operation, payload) => { dispatched.push([nodeId, operation]); return node.execute({ capability, operation, payload }); }
+  };
+}
+
+test('main resolves the coding node at call time, pins approvals to it, and names the fix when none is ready', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-node-resolve-'));
+  const project = path.join(fs.realpathSync(dir), 'project');
+  fs.mkdirSync(path.join(project, '.git'), { recursive: true });
+  const node = createCodingNodeCapability({ dataDir: path.join(dir, 'node'), builtinOptions: { findExecutable: () => '/fixture/codex', trustedWorkspaces: project, spawnImpl: () => { throw new Error('no spawn in this test'); } } });
+  node.supervisor.builtin.configure({ enabled: true, workspaces: [project] });
+  const ready = { id: 'coding-supervisor', ready: true, operations: node.capability.operations };
+  const nodes = [{ nodeId: 'mac-new', name: 'Spencer Mac', capabilities: [ready] }];
+  const dispatched = [];
+  const runtime = { nodeCapabilities: nodeFacade(nodes, dispatched, node), drafts: { get: (id) => (id === 'draft_1' ? { title: 'Fix the fleet', body: 'Make Conductor reads recover.' } : null) } };
+  // Configured for a Mac that is gone: the one ready coding node takes the work.
+  const main = new CodingSupervisor({ dataDir: path.join(dir, 'main'), runtime, remoteNodeId: 'mac-old' });
+  t.after(() => { main.stop(); node.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const setup = await main.setup();
+  assert.equal(setup.nodeId, 'mac-new');
+  assert.deepEqual(dispatched.at(-1), ['mac-new', 'setup']);
+  const workspaceId = setup.workspaces[0].id;
+
+  // A draft becomes a repair brief behind the fixed rules.
+  const prepared = await main.prepareStart({ provider: 'codex', workspaceId, draftId: 'draft_1' });
+  assert.equal(prepared.codingNodeId, 'mac-new');
+  assert.match(prepared.message, /^OpenAGI repair brief\. Rules for this session:\n- Start a new branch from origin\/main/);
+  assert.match(prepared.message, /Never merge, release, deploy or restart services, and never read or write ~\/\.openagi\./);
+  assert.match(prepared.message, /Brief: Fix the fleet\nMake Conductor reads recover\.$/);
+  await assert.rejects(main.prepareStart({ provider: 'codex', workspaceId, draftId: 'missing' }), /No draft with that id/);
+
+  // The pinned node must still be ready when the approval runs.
+  nodes.length = 0;
+  await assert.rejects(main.startApproved(prepared), /node changed since approval: mac-new is not ready now/);
+  assert.equal(dispatched.filter(([, operation]) => operation === 'start').length, 0);
+  await assert.rejects(main.list(), /Coding node Old Mac is not connected \(last seen 2026-10-03T09:15:00\.000Z\)\. Fix: open OpenAGI on that Mac/);
+
+  // Two ready nodes and neither is the configured one: which to choose is the owner's call.
+  nodes.push({ nodeId: 'mac-a', name: 'A', capabilities: [ready] }, { nodeId: 'mac-b', name: 'B', capabilities: [ready] });
+  await assert.rejects(main.list(), /2 coding nodes are ready \(A, B\).*set OPENAGI_CODING_SUPERVISOR_NODE/);
+});
+
+test('a paired install advertises its coding node by default; OPENAGI_CODING_NODE=0 turns it off', async t => {
+  const { createDurableRuntime, createHostedInterface } = await import('../src/index.js');
+  for (const [value, expected] of [['1', true], ['0', false]]) {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-node-provider-'));
+    const runtime = createDurableRuntime({ dataDir, registerDefaults: false, integrations: false, skills: false, autoConnectMcp: false });
+    const app = createHostedInterface(runtime, { dataDir, host: '127.0.0.1', port: 0, authToken: 'x', tickerMs: 0, nodeControlEnabled: false,
+      serviceEnv: { OPENAGI_CODING_NODE: value } });
+    await app.listen();
+    try {
+      await runtime.nodeCapabilities.refresh();
+      const local = runtime.nodeCapabilities.list('coding-supervisor').find((entry) => entry.local);
+      assert.equal(Boolean(local), expected, `OPENAGI_CODING_NODE=${value}`);
+      if (expected) {
+        const capability = local.capabilities[0];
+        assert.equal(capability.ready, true, 'ready, so its main can choose workspaces');
+        assert.match(capability.detail, /^No coding workspaces chosen on this computer yet: open OpenAGI's Integrations page on this Mac/);
+        const listed = await runtime.nodeCapabilities.dispatch(local.nodeId, 'coding-supervisor', 'list', { operation: 'list' });
+        assert.deepEqual(listed.sessions, [], 'inert with no workspaces');
+        // The node serves this Mac's own supervisor: the workspaces its
+        // Integrations page chose are the ones the main sees.
+        const marker = { workspaces: [{ id: 'openAGI', trusted: true }], providers: [] };
+        runtime.codingSupervisor.builtin.setup = () => marker;
+        assert.deepEqual(await runtime.nodeCapabilities.dispatch(local.nodeId, 'coding-supervisor', 'setup', { operation: 'setup' }), marker);
+        await runtime.nodeCapabilities.refresh();
+        const refreshed = runtime.nodeCapabilities.list('coding-supervisor').find((entry) => entry.local);
+        assert.equal(refreshed.capabilities[0].detail, '1 coding workspaces (1 trusted)');
+      }
+    } finally {
+      await app.close();
+      runtime.observations?.db?.close(); runtime.vectorStore?.db?.close(); runtime.sessionIndex?.db?.close();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  }
+});
