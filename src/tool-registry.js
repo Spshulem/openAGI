@@ -315,6 +315,15 @@ export class ToolRegistry {
       dedupeKey: chatKey, approvedBy: `owner:${owner.via}`
     });
     if (!claim) return { ok: false, error: "Could not record the owner's approval; nothing was run." };
+    // The owner's instruction runs what an earlier code card in this chat
+    // asked for: retire that card now, before the first await, so no other
+    // chat or the dashboard can approve it while this one runs.
+    for (const card of this.pendingActions.list({ status: "pending" })) {
+      if (card.mode === "chat" && card.toolName === tool.name && card.dedupeKey === chatKey
+          && card.context?.sessionId === (context.sessionId ?? null)) {
+        this.pendingActions.decide(card.id, { decision: "deny", decidedBy: "system", error: "superseded: the owner's instruction ran it" });
+      }
+    }
     const outcome = await this.runHandler(tool, args, {
       ...context,
       // The handler's view only. The turn's own context keeps no __confirmed,
@@ -331,14 +340,6 @@ export class ToolRegistry {
       error: outcome.ok ? null : outcome.error,
       executionId: claim.executionId
     });
-    // The owner's instruction ran what an earlier code card in this chat
-    // asked for: that card must not run it a second time.
-    for (const card of this.pendingActions.list({ status: "pending" })) {
-      if (card.mode === "chat" && card.toolName === tool.name && card.dedupeKey === chatKey
-          && card.context?.sessionId === (context.sessionId ?? null)) {
-        this.pendingActions.decide(card.id, { decision: "deny", decidedBy: "system", error: "superseded: the owner's instruction ran it" });
-      }
-    }
     return outcome;
   }
 }

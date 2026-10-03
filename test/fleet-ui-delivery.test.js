@@ -2061,6 +2061,21 @@ test("the app controller opens in the background, quits without force, and guard
   assert.equal((await apps.open("finder")).ok, false);
 });
 
+test("an unknown app presence is a failed quit or restart, never a quiet success", async () => {
+  let clock = 0;
+  const runs = [];
+  const run = async (cmd, args) => { runs.push([cmd, ...args]); return { code: 0 }; };
+  // createPresenceProbe returns null when lsappinfo fails.
+  const apps = createAppController({ run, probe: fakeProbe({ appRunning: async () => null }), now: () => clock, sleep: async (ms) => { clock += ms; } });
+  const quit = await apps.quit("codex");
+  assert.equal(quit.ok, false);
+  assert.match(quit.detail, /could not tell whether Codex is running/);
+  const restart = await apps.restart("codex");
+  assert.equal(restart.ok, false);
+  assert.match(restart.detail, /could not tell whether Codex is running/);
+  assert.deepEqual(runs, [], "nothing quit or opened");
+});
+
 test("the typing guard still blocks every card the old detector blocked, shortcut hints included", async (t) => {
   const cards = [
     [["Yes, allow", "Do not allow"], true],

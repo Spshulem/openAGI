@@ -173,6 +173,11 @@ export class BuiltinCodingSupervisor {
     if (!this.findExecutable(args.provider)) throw new Error("Install and sign in to the selected coding CLI first.");
     codingArguments(args.provider, args);
     const max = this.maxMessage(workspace);
+    // A repair brief branches, edits, commits and pushes: a read-only Codex or
+    // a prompt-less manual Claude could never finish it.
+    if (typeof args.message === "string" && args.message.includes(REPAIR_BASE_TOKEN) && !this.isTrusted(workspace)) {
+      throw new Error(`A repair brief needs a trusted workspace, and ${workspace.label || "this workspace"} is read-only for coding agents. Fix: on that Mac, add its folder to OPENAGI_CODING_TRUSTED_WORKSPACES and restart OpenAGI, or send a plain message instead.`);
+    }
     const message = typeof args.message === "string" && args.message.includes(REPAIR_BASE_TOKEN)
       ? args.message.replaceAll(REPAIR_BASE_TOKEN, repositoryDefaultBranch(workspace.path)) : args.message;
     if (typeof message !== "string" || !message.trim() || message.length > max || message.includes("\0")) throw new Error(`Enter an instruction of 1–${max} characters.`);

@@ -55,8 +55,18 @@ export const INTENT_FAMILIES = Object.freeze({
     verbs: "click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer",
     tools: ["fleet_click", "fleet_answer_question"]
   },
+  // Messaging needs a target, so "write a summary of these results" or "ask a
+  // question about this" never lets read text message a coding agent: "tell
+  // amman to continue", "nudge the openAGI thread", "reply to the recorder
+  // chat", "send yes to amman", or a generic verb aimed at an agent, thread,
+  // chat or workspace ("ask claude whether", "answer the codex prompt").
   message: {
-    verbs: "send|tell(?!\\s+(?:me|us)\\b)|reply|respond|nudge|write|message|ask|ping|answer",
+    pattern: [
+      String.raw`(?:tell|message|ping|nudge)\s+(?!(?:me|us)\b)\w`,
+      String.raw`(?:reply|respond|write back|answer back)\s+to\s+(?!(?:me|us)\b)\w`,
+      String.raw`send\b[^.;!?\n]{0,120}?\bto\s+(?!(?:me|us)\b)\w`,
+      String.raw`(?:send|write|ask|answer|reply|respond)\s+(?:back\s+)?(?:(?:to|in|on|into)\s+)?${ARTICLES}(?:[\w-]+\s+){0,2}?(?:${CODING_AGENT}|claude|conductor|agents?|threads?|chats?|workspaces?)\b(?!['’]s)`
+    ].join("|"),
     tools: ["fleet_send_message", "reply_to_coding_agent"]
   },
   app: {

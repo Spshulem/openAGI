@@ -90,6 +90,18 @@ test("intent families cover only their own tools", () => {
     assert.equal(intentCovers(text, "watch_coding_agent"), false, text);
   }
   assert.equal(intentCovers("watch codex", "start_coding_agent"), false, "watching never starts an agent");
+  // Messaging needs a target: a generic verb alone never messages an agent.
+  for (const text of ["tell amman to continue", "reply to the recorder chat: yes", "send yes to amman", "nudge the openAGI thread",
+    "message amman", "ask claude whether the tests pass", "answer the codex prompt with yes", "write to the recorder chat: ship it",
+    "can you ping the conductor workspace", "respond to amman with go ahead"]) {
+    assert.equal(intentCovers(text, "fleet_send_message"), true, text);
+    assert.equal(intentCovers(text, "reply_to_coding_agent"), true, text);
+  }
+  for (const text of ["write a summary of these search results", "ask a question about this page", "answer this email",
+    "write it up", "respond briefly", "send it", "write a summary of the agent's work", "ping me when it's done", "tell me the news"]) {
+    assert.equal(intentCovers(text, "fleet_send_message"), false, text);
+    assert.equal(intentCovers(text, "reply_to_coding_agent"), false, text);
+  }
   // A gated tool outside every family always needs the code.
   assert.equal(intentCovers("send it, approve it, restart it", "schedule_message"), false);
 });

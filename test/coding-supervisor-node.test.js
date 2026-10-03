@@ -87,7 +87,7 @@ test('main resolves the coding node at call time, pins approvals to it, and name
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coding-node-resolve-'));
   const project = path.join(fs.realpathSync(dir), 'project');
   fs.mkdirSync(path.join(project, '.git'), { recursive: true });
-  const node = createCodingNodeCapability({ dataDir: path.join(dir, 'node'), builtinOptions: { findExecutable: () => '/fixture/codex', spawnImpl: () => { throw new Error('no spawn in this test'); } } });
+  const node = createCodingNodeCapability({ dataDir: path.join(dir, 'node'), builtinOptions: { findExecutable: () => '/fixture/codex', trustedWorkspaces: project, spawnImpl: () => { throw new Error('no spawn in this test'); } } });
   node.supervisor.builtin.configure({ enabled: true, workspaces: [project] });
   const ready = { id: 'coding-supervisor', ready: true, operations: node.capability.operations };
   const nodes = [{ nodeId: 'mac-new', name: 'Spencer Mac', capabilities: [ready] }];

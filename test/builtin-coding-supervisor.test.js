@@ -19,7 +19,8 @@ function fixture(t, options = {}) {
     child.kill = signal => { child.killedWith = signal; if (signal === "SIGKILL") child.emit("close", 137); };
     children.push(child); return child;
   };
-  const supervisor = new BuiltinCodingSupervisor({ dataDir, findExecutable: () => "/fixture/provider", spawnImpl, ...options });
+  const { trusted, ...rest } = options;
+  const supervisor = new BuiltinCodingSupervisor({ dataDir, findExecutable: () => "/fixture/provider", spawnImpl, ...(trusted ? { trustedWorkspaces: project } : {}), ...rest });
   const setup = supervisor.configure({ enabled: true, workspaces: [project] });
   const prepare = message => supervisor.prepare({ provider: "codex", workspaceId: setup.workspaces[0].id, message: message || "Inspect this fixture" });
   t.after(() => { for (const child of children) child.emit("close", 1); supervisor.stop(); fs.rmSync(dataDir, { recursive: true, force: true }); });
@@ -32,8 +33,15 @@ function finish(child, text = "Fixture done") {
   child.stdout.write('{"type":"turn.completed"}\n'); child.emit("close", 0);
 }
 
-test("a repair brief branches from the workspace's own default branch", t => {
+test("a repair brief needs a trusted workspace: read-only agents could never branch, commit or push", t => {
   const f = fixture(t);
+  const brief = `${REPAIR_PREAMBLE}\n\nBrief: Fix\nDo the fix.`;
+  assert.throws(() => f.prepare(brief), /repair brief needs a trusted workspace.*OPENAGI_CODING_TRUSTED_WORKSPACES/);
+  assert.equal(f.prepare("Inspect this fixture").message, "Inspect this fixture", "a plain message still runs read-only");
+});
+
+test("a repair brief branches from the workspace's own default branch", t => {
+  const f = fixture(t, { trusted: true });
   const git = (...args) => execFileSync("git", ["-C", f.project, ...args], { stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
   const brief = `${REPAIR_PREAMBLE}\n\nBrief: Fix\nDo the fix.`;
   // Not a usable repository: the safe default.

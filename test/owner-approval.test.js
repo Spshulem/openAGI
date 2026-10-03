@@ -144,6 +144,28 @@ test("an owner instruction supersedes the identical code card in its chat", asyn
   assert.equal(h.store.get(other.result.actionId).status, "pending", "a different card is left alone");
 });
 
+test("the superseded card is retired before the owner's run starts, so nothing can approve it mid-run", async (t) => {
+  const h = harness(t);
+  let heldId = null;
+  const midRun = [];
+  h.registry.register({
+    name: "fleet_send_message", needsConfirmation: true,
+    handler: async () => {
+      // Another chat or the dashboard approving the old card while this runs.
+      midRun.push(h.store.claimForExecution(heldId, { claimedBy: "dashboard" }));
+      return { sent: true };
+    }
+  });
+  const tainted = h.ownerContext("g2", "what's new?");
+  tainted.__turn.untrusted = true;
+  const held = await h.registry.invoke("fleet_send_message", { key: "codex:1", text: "go" }, tainted);
+  heldId = held.result.actionId;
+  const ran = await h.registry.invoke("fleet_send_message", { key: "codex:1", text: "go" }, h.ownerContext("g2", "tell amman to go"));
+  assert.equal(ran.ok, true);
+  assert.deepEqual(midRun, [null], "the old card could not be claimed while the replacement ran");
+  assert.equal(h.store.get(heldId).status, "denied");
+});
+
 test("the same held request from two owner chats is two cards, one per chat", async (t) => {
   const h = harness(t);
   const first = h.ownerContext("g2", "what's new?");

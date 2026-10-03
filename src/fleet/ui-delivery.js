@@ -692,7 +692,10 @@ export function createAppController({ bins = {}, run = runCommand, probe = null,
     return (await presence.frontApp()) === app.bundleId && !(idle !== null && idle >= limits.uiOwnerIdleMs);
   };
   const quit = async (app) => {
-    if (!(await presence.appRunning(app.bundleId))) return { ok: true, wasRunning: false, detail: `${app.name} is not running` };
+    const running = await presence.appRunning(app.bundleId);
+    // null: lsappinfo could not tell. Never report a quit that was not tried.
+    if (running === null) return { ok: false, detail: `could not tell whether ${app.name} is running (lsappinfo failed); nothing was quit` };
+    if (running === false) return { ok: true, wasRunning: false, detail: `${app.name} is not running` };
     // A quit the app holds up (an "are you sure" dialog) is not forced.
     await exec("osascript", ["-e", `tell application id "${app.bundleId}" to quit`]);
     if (!(await waitFor(app.bundleId, false))) return { ok: false, wasRunning: true, detail: `${app.name} did not quit: it may be asking to confirm quit` };
