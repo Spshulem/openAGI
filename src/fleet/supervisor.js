@@ -16,7 +16,7 @@ import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, userPlaybooksDir 
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
 import { FleetStore } from "./store.js";
-import { createAppRestarter, createUiDriver } from "./ui-delivery.js";
+import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppRestarter, createUiDriver, restartMaxMs } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -207,7 +207,9 @@ function withHealth(snapshot) {
 // strict computer-use Mac that cannot type now, or a typed send held back by
 // the owner at the keyboard or a running turn). A CLI fallback's failure is
 // not about typing, so it stays the owner's to see.
-const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input)/;
+const TYPING_WAITS = /^(computer use not ready|owner using |turn running|frontmost app changed|secure input|waiting for idle|screen saver on|front app unknown|presence check too slow)/;
+// A computer-use send that ends this way stops the tick's other ones.
+const UI_STALLED = /^(Open Computer Use timed out|Open Computer Use stopped|delivery timed out)/;
 function typingWaits(thread, route, deliveryState, delivery) {
   if (!uiTargetFor(thread)) return false;
   if (!route) return deliveryState?.mode === "computer-use" && deliveryState?.ready === false;
@@ -309,6 +311,8 @@ export class FleetSupervisor {
     if (this.deps.uiDriver !== undefined) this._uiDriver = this.deps.uiDriver;
     else if (this.deps.executor) this._uiDriver = null;
     else {
+      // An orphaned input's pause outlives a restart (see ORPHAN_HOLD_MS).
+      UI_INPUT_LATCH.persistTo(path.join(this.store.dir, "ui-input-orphaned.json"));
       this._uiDriver = createUiDriver({
         config: this.config,
         run: this.deps.run ?? runCommand,
@@ -321,15 +325,19 @@ export class FleetSupervisor {
   }
 
   // { mode, ready, detail }: ready is null when not probed (cli, or no driver).
-  async probeDelivery() {
+  // deadlineAt: a remote caller's. Its probes end before it, and a request
+  // with no time left reports computer use not ready (the send waits).
+  async probeDelivery({ deadlineAt = null } = {}) {
     const mode = this.config.delivery ?? "cli";
     let state = { mode, ready: null, detail: null };
     const driver = mode === "cli" ? null : this.uiDriver;
+    const left = () => (Number.isFinite(deadlineAt) ? deadlineAt - DEADLINE_MARGIN_MS - Date.now() : SOURCE_TIMEOUT_MS);
     if (driver?.readiness) {
+      if (left() <= 0) return { mode, ready: false, detail: "no time left in this request" };
       try {
-        const result = await withTimeout(Promise.resolve(driver.readiness()), SOURCE_TIMEOUT_MS, "computer-use readiness");
+        const result = await withTimeout(Promise.resolve(driver.readiness()), Math.min(SOURCE_TIMEOUT_MS, left()), "computer-use readiness");
         state = { mode, ready: result?.ready === true, detail: result?.ready === true ? null : clampText(result?.detail ?? "not ready", 160) };
-        if (state.ready && mode === "computer-use-first" && driver.appRunning) state.apps = await this.probeApps(driver);
+        if (state.ready && mode === "computer-use-first" && driver.appRunning) state.apps = await this.probeApps(driver, left);
       } catch (error) {
         state = { mode, ready: false, detail: clampText(`readiness check failed: ${error?.message ?? error}`, 160) };
       }
@@ -339,11 +347,12 @@ export class FleetSupervisor {
   }
 
   // bundleId -> running (true/false), or null when it could not be told.
-  async probeApps(driver) {
+  async probeApps(driver, left = () => SOURCE_TIMEOUT_MS) {
     const apps = {};
     for (const { bundleId } of Object.values(UI_APPS)) {
       try {
-        apps[bundleId] = await withTimeout(Promise.resolve(driver.appRunning(bundleId)), SOURCE_TIMEOUT_MS, "app presence");
+        if (left() <= 0) throw new Error("no time left");
+        apps[bundleId] = await withTimeout(Promise.resolve(driver.appRunning(bundleId)), Math.min(SOURCE_TIMEOUT_MS, left()), "app presence");
       } catch {
         apps[bundleId] = null;
       }
@@ -401,15 +410,20 @@ export class FleetSupervisor {
     this.kickTimer = null;
   }
 
-  tick({ reason = "manual" } = {}) {
+  // deferUi: a scan that came through the node broker, which stops waiting
+  // before a computer-use send would end; its app sends wait for the next
+  // scheduled tick (CLI sends and the review still run).
+  tick({ reason = "manual", deferUi = false } = {}) {
     // The owner's scan arriving mid-tick gets its own full recheck right
     // after, instead of riding on a scan that did not force the review.
+    // Any local request in the queue lets that one type.
     if (this.running && (reason === "owner-scan" || reason === "chat")) {
-      this.forcedFollowUp ??= this.running.catch(() => {}).then(() => { this.forcedFollowUp = null; return this.tick({ reason }); });
+      this.followUpDefersUi = (this.forcedFollowUp ? this.followUpDefersUi : true) && deferUi;
+      this.forcedFollowUp ??= this.running.catch(() => {}).then(() => { this.forcedFollowUp = null; return this.tick({ reason, deferUi: this.followUpDefersUi }); });
       return this.forcedFollowUp;
     }
     if (this.running) return this.running;
-    this.running = this._tick(reason)
+    this.running = this._tick(reason, { deferUi })
       .then((snapshot) => { this.lastError = null; return snapshot; })
       .catch((error) => {
         this.lastError = clampText(error?.message ?? String(error), 300);
@@ -504,13 +518,17 @@ export class FleetSupervisor {
     try { this.runtime?.outreach?.reopen?.(question.outreachId); } catch { /* best-effort */ }
   }
 
-  async resumeAll(question, message, settling = [], { restartApps = [] } = {}) {
+  // startedAt: when the owner's request began (Date.now): an app send counts
+  // its time from there, so a remote request ends inside the broker's 5 min.
+  // deadlineAt: when a remote caller stops waiting, its queue time included.
+  async resumeAll(question, message, settling = [], { restartApps = [], startedAt = Date.now(), deadlineAt = null } = {}) {
     const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
-    const restarted = await this.restartHosts(keys, restartApps);
+    const restarted = await this.restartHosts(keys, restartApps, deadlineAt);
     if (restarted) return restarted;
     let sent = 0;
     let blocked = 0;
-    const deliveryState = await this.probeDelivery();
+    let late = 0;
+    const deliveryState = await this.probeDelivery({ deadlineAt });
     // A Conductor session and the Codex thread it hosts are one app
     // conversation: one typed send covers every key that maps to it.
     const typedInto = new Map();
@@ -526,7 +544,10 @@ export class FleetSupervisor {
         if (typedInto.get(uiKey)) { sent += 1; this.store.markQuestionDelivered(question.id, key); } else blocked += 1;
         continue;
       }
-      const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+      // Past the caller's deadline it reports failure: no member starts then
+      // (a relay or background resume would still land, and a retry repeat it).
+      if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt - DEADLINE_MARGIN_MS) { late += 1; continue; }
+      const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
       if (uiKey) typedInto.set(uiKey, delivery.status === "sent");
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
       if (delivery.status === "sent") {
@@ -536,7 +557,7 @@ export class FleetSupervisor {
       }
       else blocked += 1;
     }
-    return { status: blocked || !sent ? "blocked" : "sent", route: null, detail: `${sent} resumed, ${blocked} not reachable; open the thread and retry if needed` };
+    return { status: blocked || late || !sent ? "blocked" : "sent", route: null, detail: `${sent} resumed, ${blocked} not reachable${late ? `, ${late} not sent (out of time)` : ""}; open the thread and retry if needed` };
   }
 
   // When each nudge first waited on computer use (Auto only: the other modes
@@ -564,8 +585,11 @@ export class FleetSupervisor {
   // (this tick asked its dedupeKey): a stale "yes" must never land on a new
   // question. One the owner overtook in the thread is dropped quietly; one
   // older than a day, or whose thread is gone, goes back to the owner.
-  async deliverQueuedAnswers({ byKey, started, cappedKinds, asked, decided, sourceUnknown, budget = Infinity }) {
-    const contacted = { threads: new Set(), uiKeys: new Set(), sent: 0 };
+  async deliverQueuedAnswers({ byKey, started, cappedKinds, asked, decided, sourceUnknown, budget = Infinity, deferUi = false }) {
+    // uiStalled: a computer-use send timed out or lost Open Computer Use;
+    // the rest of the tick's typing waits (the send loop too).
+    const contacted = { threads: new Set(), uiKeys: new Set(), sent: 0, uiStalled: false };
+    let tries = 0;
     const queued = this.store.queuedAnswers();
     if (!queued.length) return contacted;
     const deliveryState = await this.probeDelivery();
@@ -599,8 +623,13 @@ export class FleetSupervisor {
       if (ownerSince || stale) { this.store.settleQueuedAnswer(question.id, "superseded"); continue; }
       const route = chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState);
       if (!route) continue;
+      if ((contacted.uiStalled || deferUi) && route === "computer-use") continue;
+      // Failed tries are bounded too, like the send loop's.
+      if (tries >= budget * 2) continue;
+      tries += 1;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
       this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
+      if (route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) contacted.uiStalled = true;
       if (delivery.status !== "sent") continue;
       contacted.sent += 1;
       contacted.threads.add(thread.key);
@@ -619,7 +648,7 @@ export class FleetSupervisor {
   // Restarts each listed app that shows one of these threads, once per ten
   // minutes (a second answer after a partial send does not restart again).
   // Returns a blocked delivery when it must not or could not restart.
-  async restartHosts(keys, restartApps) {
+  async restartHosts(keys, restartApps, deadlineAt = null) {
     const threads = keys.map((key) => this.lastThreads.get(key)).filter(Boolean);
     for (const app of restartApps) {
       if (!threads.some((thread) => uiTargetFor(thread)?.app === app)) continue;
@@ -628,6 +657,11 @@ export class FleetSupervisor {
       // A restart ends every running turn in that app, not just the capped ones.
       const busy = [...this.lastThreads.values()].filter((thread) => !keys.includes(thread.key) && thread.agentStatus === "running" && uiTargetFor(thread)?.app === app);
       if (busy.length) return { status: "blocked", route: null, detail: `${busy.length} chats still running in ${name}; a restart would stop them. Answer again when they finish.` };
+      // A restart the remote caller cannot wait out would go on changing the
+      // desktop after it gave up: none starts without room to finish.
+      if (Number.isFinite(deadlineAt) && Date.now() + restartMaxMs(this.config.limits) > deadlineAt - DEADLINE_MARGIN_MS) {
+        return { status: "blocked", route: null, detail: `no time left in this request to restart ${name}; answer again to retry` };
+      }
       const result = await this.appRestarter.restart(app);
       this.store.recordAction({ kind: "restart", playbook: "account-switched", threadKey: null, status: result.ok ? "done" : "failed", reason: `restart ${name} after an account switch`, detail: result.detail, at: new Date(this.now()).toISOString() });
       if (!result.ok) return { status: "blocked", route: null, detail: `${result.detail}; answer again to retry` };
@@ -641,7 +675,8 @@ export class FleetSupervisor {
     return this._appRestarter;
   }
 
-  async answerQuestion(id, answer) {
+  async answerQuestion(id, answer, { deadlineAt = null } = {}) {
+    const startedAt = Date.now();
     if (this.answering.has(id)) return null;
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
@@ -657,20 +692,20 @@ export class FleetSupervisor {
         // The owner's own copy of this playbook says what their apps need
         // after an account switch (a restart, a plain "retry").
         const playbook = this.playbooks().get("account-switched");
-        delivery = await this.resumeAll(question, playbook?.body || ADDED_DELIVERY, settling, { restartApps: playbook?.restartApps ?? [] });
+        delivery = await this.resumeAll(question, playbook?.body || ADDED_DELIVERY, settling, { restartApps: playbook?.restartApps ?? [], startedAt, deadlineAt });
       }
       // An owner answer to the agent's own question, or "retry" after the owner
       // fixed a login/disk blocker, is an explicit instruction: every mode.
       const retry = question.kind === "infra" && answer === "retry";
       if ((question.kind === "agent-ask" || retry) && question.threadKey && answer !== "open thread") {
         const thread = this.lastThreads.get(question.threadKey);
-        const deliveryState = thread ? await this.probeDelivery() : null;
+        const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
         const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
         const message = retry ? RETRY_DELIVERY : ownerDelivery(answer);
         if (!thread || !route) {
           delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
         } else {
-          delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer" });
+          delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
           if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
           // Starts the cooldown but does not spend the no-progress nudge budget.
           this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
@@ -727,14 +762,15 @@ export class FleetSupervisor {
   // The owner's own words to one thread (the supervisor chat's
   // fleet_send_message, after approval). Same delivery as an owner answer:
   // on a computer-use Mac it is typed into the app, never a CLI.
-  async sendOwnerMessage(threadKey, message) {
+  async sendOwnerMessage(threadKey, message, { deadlineAt = null } = {}) {
+    const startedAt = Date.now();
     const text = String(message ?? "").trim();
     if (!text) return { delivery: { status: "blocked", route: null, detail: "empty message" } };
     const thread = this.lastThreads.get(threadKey);
-    const deliveryState = thread ? await this.probeDelivery() : null;
+    const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
-    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message" });
+    const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt });
     this.store.recordNudge(thread.key, { playbook: "owner-message", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null } };
   }
@@ -750,7 +786,7 @@ export class FleetSupervisor {
     }
   }
 
-  async sendProposed(actionId) {
+  async sendProposed(actionId, { deadlineAt = null } = {}) {
     if (this.mode !== "propose") return null;
     const action = this.store.action(actionId);
     if (!action || action.status !== "proposed") return null;
@@ -759,7 +795,7 @@ export class FleetSupervisor {
       const updated = this.store.updateAction(actionId, { status: "blocked", detail: "thread not seen in the last scan" });
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
-    const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId });
+    const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
     this.recordSend(action, delivery);
     return { action: this.store.action(actionId), delivery };
   }
@@ -782,7 +818,7 @@ export class FleetSupervisor {
     }
   }
 
-  async _tick(reason) {
+  async _tick(reason, { deferUi = false } = {}) {
     const started = this.now();
     // The owner asked for this scan ("Scan now", the chat): recheck every
     // open question, not only the new, changed or due ones.
@@ -886,7 +922,7 @@ export class FleetSupervisor {
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1019,7 +1055,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set() }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1082,7 +1118,7 @@ export class FleetSupervisor {
 
     // A thread that just got the owner's answer gets no automatic nudge too.
     const answeredNow = await this.deliverQueuedAnswers({
-      byKey, started, cappedKinds, asked, sourceUnknown: fromFailedSource, budget: config.limits.maxSendsPerTick,
+      byKey, started, cappedKinds, asked, sourceUnknown: fromFailedSource, budget: config.limits.maxSendsPerTick, deferUi,
       decided: new Set(items.map((item) => item.thread.key))
     });
     // Kept answers share the tick's send budget, and their app conversations
@@ -1100,6 +1136,9 @@ export class FleetSupervisor {
     // Only a send that got past the app's checks spends a slot; blocked tries
     // are cheap but still bounded.
     let tries = 0;
+    // A computer-use send that timed out or lost Open Computer Use leaves
+    // the app agent busy or restarting: the rest of the tick's typing waits.
+    let uiStalled = answeredNow.uiStalled === true;
     for (const decision of sendOrder) {
       if (!SENDING.has(decision.action) || !decision.message) continue;
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
@@ -1125,6 +1164,14 @@ export class FleetSupervisor {
         decision.reason = `${decision.reason}; deferred: send cap`;
         continue;
       }
+      if (uiStalled && decision.route === "computer-use") {
+        decision.reason = `${decision.reason}; deferred: Open Computer Use stalled`;
+        continue;
+      }
+      if (deferUi && decision.route === "computer-use") {
+        decision.reason = `${decision.reason}; deferred: remote scan`;
+        continue;
+      }
       const uiKey = decision.route === "computer-use" ? uiTargetFor(target)?.targetKey ?? null : null;
       if (uiKey && typedInto.has(uiKey)) continue;
       if (uiKey) typedInto.add(uiKey);
@@ -1132,6 +1179,7 @@ export class FleetSupervisor {
       attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
       if (delivery.status !== "blocked") sends += 1;
+      if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
       else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
       this.recordSend(record, delivery);

@@ -74,10 +74,30 @@ export const DEFAULTS = Object.freeze({
   maxActionsKept: 300,
   // Computer-use delivery: the owner counts as away after this much input
   // idle time; each Open Computer Use call and each whole delivery is capped.
+  // A Codex app state read alone takes 11-25 s.
   uiOwnerIdleMs: 2 * MIN,
   uiStepTimeoutMs: 10_000,
-  uiDeliveryTimeoutMs: 45_000,
+  // A presence command that ignores SIGTERM settles this long after its
+  // timeout (runCommand's kill grace).
+  uiKillGraceMs: 5_000,
+  uiReadTimeoutMs: 45_000,
+  // Codex: link, two reads, activate, read, focus, type, read, send, confirm,
+  // typing included.
+  uiDeliveryTimeoutMs: 205_000,
+  // After that deadline: the one probe still running (two commands, kill
+  // grace included) or readiness, then clearing (up to two reads) and
+  // putting the owner's app back in what is left, none past it. Both count
+  // from the owner's request start (its probes and the lock wait included),
+  // so delivery and this stay under the node broker's 5 min.
+  uiCleanupMs: 90_000,
+  // Another delivery holding the lock: busy at once, retried next scan (a
+  // remote send has no room in the broker's 5 min to wait it out).
+  uiLockWaitMs: 0,
   uiNavigateMs: 5_000,
+  // Codex can still show the previous thread on the first read after its link.
+  uiNavigateSlowMs: 60_000,
+  // Bringing the app to the front for the send.
+  uiActivateMs: 3_000,
   uiConfirmMs: 8_000,
   uiPollMs: 500
 });
@@ -273,7 +293,10 @@ export function uiTargetFor(thread) {
       threadId: String(thread.id),
       title: thread.title ?? null,
       // Another unarchived Codex thread anywhere in the catalog has this title.
-      titleShared: meta.codexTitleShared === true
+      titleShared: meta.codexTitleShared === true,
+      // The first message, which the app shows instead of some names.
+      altTitle: meta.firstMessageTitle ?? null,
+      altTitleShared: meta.codexFirstMessageShared === true
     };
   }
   return null;

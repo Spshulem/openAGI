@@ -36,7 +36,10 @@ const COOLDOWN_STATUSES = new Set(["sent", "failed", "owner-answer"]);
 // route failing: those wait for the next tick and leave the streak alone.
 const UNDELIVERED_STATUSES = new Set(["blocked", "failed"]);
 const REACHED_STATUSES = new Set(["sent", "owner-answer", "escalated"]);
-const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed)/;
+// The owner being active is no failure. A presence probe that keeps failing
+// ("front app unknown", "presence check too slow") is: it builds the streak
+// so the owner hears why nothing lands.
+const BENIGN_BLOCKS = /^(owner using |turn running|frontmost app changed|waiting for idle|screen saver on)/;
 
 function emptyState() {
   return {

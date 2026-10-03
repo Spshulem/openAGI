@@ -186,15 +186,23 @@ Setup on the coding Mac:
    `OPENAGI_FLEET_MODE=propose`, and restart OpenAGI. Set
    `OPENAGI_FLEET_OCU_PATH` if the launchd `PATH` cannot find the binary.
 
+The supervisor types only while you are away: 2+ min with no keyboard or
+mouse input, screen unlocked, no screen saver. Open Computer Use can only type
+into the frontmost app, so it brings Conductor or Codex forward for the send,
+then puts your previous app back. If you come back mid-send, it stops and
+leaves your app alone.
+
 Each send, in order. Any failed check stops before typing:
 
 - Ready: permissions granted, screen unlocked, secure input off, no OpenAGI
   computer-use session running.
-- The app is already running (never launched) and you are not using it: it is
-  frontmost and you touched the keyboard or mouse in the last 2 min means
-  "owner using <App>".
-- Opens the thread. While you are away it opens the deep link with `open -g`.
-  While you are active it only uses background accessibility clicks.
+- The app is already running (never launched) and you are away. Input in the
+  last 2 min blocks as "owner using <App>" (it is in front) or "waiting for
+  idle" (it is not). Any input counts, a key the fleet pressed included: it
+  cannot be told apart from yours. Typing sets the composer's value and
+  clicks go through accessibility, so neither counts.
+- Opens the thread with its deep link (`open -g`), then brings the app to the
+  front.
 - Proves the right thread is open: workspace name, plus the tab title when the
   workspace has more than one tab (Codex: thread title). Shared or missing
   names block as "ambiguous".
@@ -208,10 +216,30 @@ Each send, in order. Any failed check stops before typing:
 
 Safety rules:
 
-- One app delivery at a time. 10 s per UI step, 45 s per delivery.
+- One app delivery at a time; a second one is **blocked** as busy at once
+  and retried. 45 s per app read, 10 s per other UI step, 205 s per delivery,
+  typing included; putting your app back after it gets up to 90 s more,
+  never past it. From the phone or the main, the time counts from when
+  the main sent the request (time queued before the Mac picked it up
+  included), so the whole request ends inside the 5 min limit. After the deep link, every app gets at least two reads
+  (Codex up to 60 s) to show the thread. Typing starts only with time left to
+  type, send, and confirm; otherwise it is **blocked** with nothing typed. An
+  input call (typing, a key, a click) that times out may still land: the
+  result is **failed** and *unconfirmed*, and nothing more is typed or
+  brought forward. The tick's other app sends wait, and no app send (a
+  remote one included) types until Open Computer Use answers that call late,
+  however long it takes: computer use shows as not ready ("an earlier input
+  call has not finished; typing paused until it answers") and the
+  paused-nudge alert tells you. If its engine exits first, nothing can prove
+  the input stopped, so typing stays paused for 30 min, across restarts.
+- A Codex thread the app labels by its first message is verified by that
+  label only after the link moved the app onto it; already open, it is
+  **blocked** (another thread can show the same first message).
 - Only Conductor (`com.conductor.app`) and the Codex app (`com.openai.codex`).
   No clipboard, no paste, no app launch, no pointer moves.
-- Text typed before a failed check is cleared only when it is provably ours.
+- Typed text is never erased: a select-all and delete could take your edits
+  with it. Text typed before a failed check stays as a draft (a retry sends
+  exactly it), and the result says to check it.
 - Before and after screenshots go to `<dataDir>/fleet/logs/ui/` (0600, newest
   200 kept). Their paths are on the action record.
 - Blocked means nothing was typed: no attempt spent, retried next scan.

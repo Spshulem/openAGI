@@ -80,9 +80,10 @@ function addThread(ctx, spec) {
   const {
     id, lines = null, mtimeAgo = 30 * MIN, updatedAgo = mtimeAgo, cwd = ctx.repoDir, archived = 0,
     threadSource = "user", source = "vscode", branch = "spencer/feature", origin = "git@github.com:buildbetter-app/buildbetter.git",
-    name = null, title = "Fix the thing", firstUserMessage = "fix it", originator = null
+    name = null, title = "Fix the thing", firstUserMessage = "fix it", originator = null, segment = null
   } = spec;
-  const rollout = path.join(ctx.codexHome, "sessions", "2026", "09", "25", `rollout-2026-09-25T10-00-00-${id}.jsonl`);
+  // segment: a continuation rollout, named <thread id>_<segment id>.
+  const rollout = path.join(ctx.codexHome, "sessions", "2026", "09", "25", `rollout-2026-09-25T10-00-00-${id}${segment ? `_${segment}` : ""}.jsonl`);
   if (lines) {
     fs.writeFileSync(rollout, `${[ev.meta(id, cwd), ...lines].map((line) => JSON.stringify(line)).join("\n")}\n`);
     const at = new Date(NOW - mtimeAgo);
@@ -124,6 +125,38 @@ test("only sidebar threads count as sharing a title", async (t) => {
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "", stderr: "" }) }));
   assert.notEqual(map["t-a"].meta.codexTitleShared, true, "an exec run and a subagent are not twins");
   assert.equal(map["t-b"].meta.codexTitleShared, true);
+});
+
+test("a named thread carries its first-message title, shared when any sidebar thread could show it", async (t) => {
+  const ctx = makeHome(t);
+  const lines = [ev.complete("x0", 20 * MIN, "done")];
+  addThread(ctx, { id: "t-audit", name: "Audit OpenAI model versions", title: "<environment_context>x</environment_context> OpenAI just launched their GPT-6 models so for all of our Luna, Soul, and Terra agents", lines });
+  addThread(ctx, { id: "t-intruder", name: "Intruder", title: "continue", lines });
+  addThread(ctx, { id: "t-same", name: "Fix uploads", title: "fix  uploads", lines });
+  addThread(ctx, { id: "t-unnamed", title: "Plan the billing export", lines });
+  // Another thread's name, or another thread's first message, can be the label on screen.
+  addThread(ctx, { id: "t-a", name: "Rename bucket", title: "Plan the billing export", lines });
+  addThread(ctx, { id: "t-b", name: "Ship reports", title: "Review the pricing page copy", lines });
+  addThread(ctx, { id: "t-old", updatedAgo: 60 * 24 * 60 * MIN, name: "Old one", title: "Review the pricing page copy" });
+  // Not in the Codex sidebar: never a twin.
+  addThread(ctx, { id: "t-c", name: "Draft launch post", title: "Write the changelog entry", lines });
+  addThread(ctx, { id: "t-exec", name: "Sweep", title: "Write the changelog entry", source: "exec", lines });
+  addThread(ctx, { id: "t-arch", archived: 1, name: "Archived", title: "Write the changelog entry" });
+  addThread(ctx, { id: "t-review", name: "Guardian", title: "Write the changelog entry", threadSource: "guardian_review", lines });
+  addThread(ctx, { id: "t-beat", title: "Write the changelog entry", firstUserMessage: "<heartbeat> <automation_id>x</automation_id>", lines });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "", stderr: "" }) }));
+  assert.equal(map["t-audit"].meta.firstMessageTitle, "OpenAI just launched their GPT-6 models so for all of our Luna, Soul, and Terra agents");
+  assert.notEqual(map["t-audit"].meta.codexFirstMessageShared, true);
+  assert.equal(map["t-intruder"].meta.firstMessageTitle, "continue");
+  assert.equal(map["t-same"].meta.firstMessageTitle, null, "same as the name");
+  assert.equal(map["t-unnamed"].meta.firstMessageTitle, null, "no name: the title is already the label");
+  assert.equal(map["t-a"].meta.codexFirstMessageShared, true, "another thread's name");
+  assert.equal(map["t-b"].meta.codexFirstMessageShared, true, "another thread's first message, even outside the lookback");
+  assert.notEqual(map["t-c"].meta.codexFirstMessageShared, true, "exec, archived, review and heartbeat threads are not in the sidebar");
+  const target = uiTargetFor(map["t-a"]);
+  assert.equal(target.altTitle, "Plan the billing export");
+  assert.equal(target.altTitleShared, true);
+  assert.deepEqual(uiIdentity(map["t-a"], target, [map["t-a"]]).altTokens, []);
 });
 
 test("listCodexThreads classifies running, stalled, aborted, error, and idle threads", async (t) => {
@@ -699,4 +732,33 @@ test("ciphertext titles need base64 traits; long slash paths stay readable", () 
     assert.equal(asked(title).text, title);
     assert.equal(asked(title).sealed, undefined, title);
   }
+});
+
+// Live 2026-09-30: the app labels a thread by its request, without the
+// in-app browser block or files list, markdown rendered; a continuation
+// rollout by that segment's first request, which the catalog lacks.
+test("first-message labels are read as the app shows them, and a name another thread's label can show is shared", async (t) => {
+  const ctx = makeHome(t);
+  const lines = [ev.complete("x0", 20 * MIN, "done")];
+  const browser = "<in-app-browser-context source=\"ambient-ui-state\">\nThis block is automatically supplied ambient UI state, not part of the user's request.\n# In app browser:\n- Current URL: https://github.com/buildbetter-app/buildbetter/pull/5768\n</in-app-browser-context>";
+  addThread(ctx, { id: "t-plain", name: "Ship usage export", title: "this wont impact more users that dont use the success stuff correct?", lines });
+  addThread(ctx, { id: "t-foleon", name: "Foleon (2)", title: `${browser}\n\n## My request:\nthis wont impact more users that dont use the success stuff correct?`, lines });
+  addThread(ctx, { id: "t-files", name: "Upload transcripts", title: "# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n\n## My request:\nI'm pretty sure we don't allow people to upload transcripts", lines });
+  addThread(ctx, { id: "t-blocks", name: "Two blocks", title: "<environment_context>\n<cwd>/x</cwd>\n</environment_context>\n<in-app-browser-context source=\"ambient-ui-state\">\nCurrent URL: https://github.com/x\n</in-app-browser-context>\nship the onboarding checklist today", lines });
+  addThread(ctx, { id: "t-legacy", name: "Fix CI imports", title: "# Files mentioned by the user:\n\n## a.png: /tmp/a.png\n## My request for Codex:\nplease fix the lint job on main", lines });
+  addThread(ctx, { id: "t-md", name: "Posthog scope", title: "[posthog/posthog](https://github.com/posthog/posthog) Let me just scope out **the funnels**", lines });
+  addThread(ctx, { id: "t-cont", name: "Build Jev speed demo", title: "Can you pull? I'm trying to do a demo, just pure demo mode", segment: "01a0cc96-8d86-7603-9d51-c26c28e0bfbb", lines });
+  // A name that another thread's first message can show instead.
+  addThread(ctx, { id: "t-named", name: "Plan the billing export", title: "Draft the rollout", lines });
+  addThread(ctx, { id: "t-labels", name: "Rename bucket", title: "Plan the billing export", lines });
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "", stderr: "" }) }));
+  assert.equal(map["t-foleon"].meta.firstMessageTitle, "this wont impact more users that dont use the success stuff correct?");
+  assert.equal(map["t-plain"].meta.codexFirstMessageShared, true, "the same request with the in-app browser open");
+  assert.equal(map["t-files"].meta.firstMessageTitle, "I'm pretty sure we don't allow people to upload transcripts");
+  assert.equal(map["t-blocks"].meta.firstMessageTitle, "ship the onboarding checklist today", "every context block is dropped");
+  assert.equal(map["t-legacy"].meta.firstMessageTitle, "please fix the lint job on main", "the older 'My request for Codex' header");
+  assert.equal(map["t-md"].meta.firstMessageTitle, "posthog/posthog Let me just scope out the funnels");
+  assert.equal(map["t-cont"].meta.firstMessageTitle, null, "a continuation segment's label is not in the catalog");
+  assert.equal(map["t-named"].meta.codexTitleShared, true);
+  assert.equal(uiIdentity(map["t-named"], uiTargetFor(map["t-named"]), [map["t-named"]]).shared, true);
 });

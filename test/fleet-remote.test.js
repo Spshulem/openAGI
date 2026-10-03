@@ -64,6 +64,25 @@ test('offline node retains last state and cannot falsely confirm an answer', asy
   assert.match(remote.getState().lastError, /unavailable/);
 });
 
+test('requests that type into an app outlast a whole UI delivery; reads keep the short timeout', async t => {
+  const { remote, calls } = fixture(t);
+  await remote.refresh();
+  await remote.answerQuestion('fq_one', 'feature');
+  const [read, answer] = calls.map(c => c[4].timeoutMs);
+  assert.equal(read, 120000);
+  // Both caps count from the request's start: its probes, the lock wait and
+  // earlier sends in it are inside them, typing too. What can run past the
+  // first cap fits in the cleanup: the probe still running at it (frontApp:
+  // two commands, each with its kill grace) or readiness (two commands and
+  // the permission check). Clearing (two reads when nothing ran over) and
+  // restoring the owner's app only run in what is left (see fleet-ui-delivery).
+  const command = DEFAULTS.uiStepTimeoutMs + DEFAULTS.uiKillGraceMs;
+  assert.ok(DEFAULTS.uiCleanupMs >= 2 * command + DEFAULTS.uiStepTimeoutMs, 'a probe or readiness running at the deadline');
+  assert.ok(DEFAULTS.uiCleanupMs >= 2 * DEFAULTS.uiReadTimeoutMs, 'two reads of clearing');
+  assert.ok(answer >= DEFAULTS.uiDeliveryTimeoutMs + DEFAULTS.uiCleanupMs, 'delivery and its cleanup, from the request start');
+  assert.ok(answer <= 5 * 60 * 1000, 'within the broker ceiling');
+});
+
 test('dismissing a mirrored question on the glasses closes it on the computer', async t => {
   const { remote, runtime, dir, state, calls } = fixture(t);
   runtime.fleetSupervisor = remote;
@@ -148,6 +167,37 @@ test("the Mac capability forwards the owner's send and validates it", async () =
   assert.equal(badKey.response.status, 400);
   const empty = await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: " " } });
   assert.equal(empty.response.status, 400);
+});
+
+test("a send queued 200 s before this Mac picked it up keeps the broker's deadline, not a fresh 5 min", async () => {
+  const seen = [];
+  const supervisor = {
+    getState: () => ({ mode: "propose", questions: [{ id: "fq_one", options: ["feature"] }], actions: [{ id: "fa_one" }], snapshot: null, settings: {} }),
+    sendOwnerMessage: async (_key, _message, options) => { seen.push(["send", options]); return { delivery: { status: "sent" } }; },
+    answerQuestion: async (_id, _answer, options) => { seen.push(["answer", options]); return { question: null, delivery: { status: "sent" } }; },
+    sendProposed: async (_id, options) => { seen.push(["action", options]); return { action: null, delivery: { status: "sent" } }; }
+  };
+  const capability = createFleetCapability(supervisor);
+  // node-control's dispatch: expiresAt is 300 s from createdAt, 200 s of it spent queued.
+  const createdAt = Date.now() - 200_000;
+  const expiresAt = new Date(createdAt + 5 * 60 * 1000).toISOString();
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: "Push it." } }, { expiresAt });
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/questions/fq_one", body: { answer: "feature" } }, { expiresAt });
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/actions/fa_one/send" }, { expiresAt });
+  assert.deepEqual(seen, [["send", { deadlineAt: Date.parse(expiresAt) }], ["answer", { deadlineAt: Date.parse(expiresAt) }], ["action", { deadlineAt: Date.parse(expiresAt) }]]);
+  assert.ok(Date.parse(expiresAt) - Date.now() <= 100_000, "about 100 s left, not a fresh 5 min");
+  // A local call (no broker) has no deadline.
+  await capability.invoke("request", { method: "POST", path: "/fleet/api/send", body: { threadKey: "codex:abc-1", message: "Push it." } });
+  assert.deepEqual(seen.at(-1), ["send", { deadlineAt: null }]);
+});
+
+test("a Scan now through the broker ticks without app sends; the Mac's own page scans as before", async () => {
+  const ticks = [];
+  const supervisor = { getState: () => ({ mode: "auto", questions: [], actions: [], snapshot: null, settings: {} }), tick: async (options) => { ticks.push(options); return null; } };
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  assert.equal((await createFleetCapability(supervisor).invoke("request", { method: "POST", path: "/fleet/api/scan" }, { expiresAt })).response.status, 200);
+  assert.equal((await createFleetRoute({ supervisor })("POST", "/fleet/api/scan", null, async () => ({}))).status, 200);
+  assert.deepEqual(ticks, [{ reason: "owner-scan", deferUi: true }, { reason: "owner-scan" }]);
 });
 
 test('a question reopened on the computer brings back its mirrored copy, so G2 does not ping again', async t => {

@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { resolveFleetConfig } from "../src/fleet/contracts.js";
+import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { MESSAGE_PREFIX, buildRelayPrompt, createExecutor, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
-import { createUiLock } from "../src/fleet/ui-delivery.js";
+import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-exec-"));
@@ -148,6 +148,29 @@ test("dry-run checks preconditions but never calls run", async (t) => {
   assert.equal(calls.length, 0);
   assert.deepEqual(executor.inFlight(), []);
   assert.deepEqual(store.actions(), []);
+});
+
+test("a remote caller's deadline bounds non-UI sends: no relay it cannot finish, no background resume after it", async (t) => {
+  const { cwd, calls, executor } = setup(t, { results: [{ code: 0, stdout: "DONE\n" }, { code: 0, stdout: "done" }] });
+  const peer = claudeThread(cwd, { live: { peerName: "cairo-1f", pid: 4242, status: "idle" } });
+  // 30 s left after the trip back: too little for a relay.
+  const short = await executor.deliver({ thread: peer, message: "hi", route: "peer-relay", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 30_000 });
+  assert.equal(short.status, "blocked");
+  assert.equal(short.detail, "no time left in this request to deliver; not sent, retry");
+  // Past the deadline: no background resume starts either.
+  const late = await executor.deliver({ thread: codexThread(cwd), message: "retry", route: "codex-exec", playbook: "owner-answer", deadlineAt: Date.now() - 1 });
+  assert.equal(late.status, "blocked");
+  assert.equal(calls.length, 0, "nothing started");
+  assert.deepEqual(executor.inFlight(), []);
+  // 100 s left: the relay runs, bounded by them less the kill grace.
+  const bounded = await executor.deliver({ thread: peer, message: "hi", route: "peer-relay", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 100_000 });
+  assert.equal(bounded.status, "sent", bounded.detail);
+  assert.ok(calls[0].timeoutMs <= 100_000 - DEFAULTS.uiKillGraceMs && calls[0].timeoutMs > 90_000, String(calls[0].timeoutMs));
+  // Before the deadline a background resume starts (its turn is not bounded by it).
+  const resumed = await executor.deliver({ thread: codexThread(cwd), message: "retry", route: "codex-exec", playbook: "owner-answer", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 1_000 });
+  assert.equal(resumed.status, "sent");
+  assert.equal(calls.length, 2);
+  await executor.whenIdle();
 });
 
 test("peer-relay mirrors the g2 relay contract and succeeds on DONE", async (t) => {
@@ -448,6 +471,15 @@ test("computer-use types through the UI driver: one line, no CLI, final result, 
   assert.equal(calls.length, 0, "never runs codex or claude");
   assert.equal(requests.length, 1);
   assert.equal(requests[0].text, `${MESSAGE_PREFIX}Ready to merge? CI red: lint. Fix it.`);
+  assert.ok(requests[0].spentMs >= 0 && requests[0].spentMs < 1000, "the caller's time, lock wait added");
+  // A caller's request time carries through to the driver.
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "Second note.", route: "computer-use", playbook: "owner-answer", spentMs: 60_000 });
+  assert.ok(requests[1].spentMs >= 60_000);
+  assert.equal(requests[1].deadlineAt, null, "a local caller has no broker deadline");
+  // A remote caller's broker deadline (its queue time included) reaches the driver.
+  const deadlineAt = Date.now() + 100_000;
+  await executor.deliver({ thread: conductorUiThread(cwd), message: "Third note.", route: "computer-use", playbook: "owner-message", deadlineAt });
+  assert.equal(requests[2].deadlineAt, deadlineAt);
   assert.equal(requests[0].target.deepLink, "conductor://workspace?id=w-madrid&session=s1");
   assert.deepEqual(requests[0].identity.tokens, ["madrid"]);
   assert.equal(requests[0].previousUnconfirmed, false);

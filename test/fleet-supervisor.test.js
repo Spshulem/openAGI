@@ -5,6 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetSupervisor, groupQuestions } from "../src/fleet/supervisor.js";
+import { createFleetCapability } from "../src/fleet/remote.js";
+import { createFleetRoute } from "../src/fleet/routes.js";
+import { DEADLINE_MARGIN_MS, restartMaxMs } from "../src/fleet/ui-delivery.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-09-26T12:00:00.000Z");
@@ -1194,11 +1197,15 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   let running = 0;
   let most = 0;
   const routes = [];
+  const spent = [];
+  const deadlines = [];
   const executor = {
     deliver: async (args) => {
       running += 1;
       most = Math.max(most, running);
       routes.push(args.route);
+      spent.push(args.spentMs);
+      deadlines.push(args.deadlineAt);
       await new Promise((resolve) => setTimeout(resolve, 5));
       running -= 1;
       return { status: "sent", route: args.route, detail: "typed into Codex", actionId: null };
@@ -1210,11 +1217,126 @@ test("a grouped resume types into one app thread at a time", async (t) => {
   await supervisor.tick({ reason: "test" });
   const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
   assert.ok(group);
-  const result = await supervisor.answerQuestion(group.id, "added");
+  const deadlineAt = Date.now() + 100_000;
+  const result = await supervisor.answerQuestion(group.id, "added", { deadlineAt });
   assert.equal(result.delivery.status, "sent");
   assert.equal(result.question.status, "answered");
   assert.deepEqual(routes, ["computer-use", "computer-use", "computer-use"]);
+  assert.deepEqual(deadlines, [deadlineAt, deadlineAt, deadlineAt], "a remote caller's deadline reaches every send");
   assert.equal(most, 1);
+  // Each send counts its time from the owner's request, earlier sends included,
+  // so the whole request stays inside the broker's 5 min.
+  assert.ok(spent.every(Number.isFinite), String(spent));
+  // Ms wall-clock readings: each 5 ms send can read as less, but it grows.
+  assert.ok(spent[1] > spent[0] && spent[2] > spent[1], String(spent));
+});
+
+test("a grouped resume starts no member past the caller's deadline: the rest are reported not sent", async (t) => {
+  const capped = ["t1", "t2", "t3"].map((id) => makeThread({
+    key: `codex:${id}`, id, title: `Fix ${id}`, cwd: `/work/${id}`, agentStatus: "error", writerLocked: true, meta: { originator: "Codex Desktop" },
+    error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() }
+  }));
+  const delivered = [];
+  const executor = {
+    // The first send uses up what the broker had left.
+    deliver: async (args) => {
+      delivered.push(args.thread.key);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return { status: "sent", route: args.route, detail: "typed into Codex", actionId: null };
+    },
+    inFlight: () => [],
+    whenIdle: async () => {}
+  };
+  const { supervisor } = fixture(t, { delivery: "computer-use", threads: capped, deps: { executor, uiDriver: readyDriver() } });
+  await supervisor.tick({ reason: "test" });
+  const group = supervisor.getState().questions.find((q) => q.dedupeKey === "limit:group");
+  assert.ok(group);
+  const result = await supervisor.answerQuestion(group.id, "added", { deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 30 });
+  assert.equal(delivered.length, 1, "no member started after the deadline");
+  assert.equal(result.delivery.status, "blocked");
+  assert.equal(result.delivery.detail, "1 resumed, 0 not reachable, 2 not sent (out of time); open the thread and retry if needed");
+  assert.equal(result.question.status, "open", "still actionable");
+});
+
+test("a Scan now through the node broker types into no app: those wait for the next tick, CLI sends still go", async (t) => {
+  let now = NOW;
+  const app = makeThread();
+  const cli = makeThread({ key: "claude:c1", kind: "claude", id: "c1", cwd: "/work/c1", branch: "spencer/other", prRefs: [], agentStatus: "stalled", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN), live: { peerName: "cli-1", pid: 9, status: "idle" } });
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [app, cli], now: () => now, deps: { uiDriver: readyDriver() } });
+  const capability = createFleetCapability(supervisor);
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  const scanned = await capability.invoke("request", { method: "POST", path: "/fleet/api/scan" }, { expiresAt });
+  assert.equal(scanned.response.status, 200);
+  assert.deepEqual(delivered.map((d) => d.route), ["peer-relay"], "the CLI send goes; the app send waits");
+  const row = scanned.state.snapshot.threads.find((r) => r.key === app.key);
+  assert.match(row.decision.reason, /deferred: remote scan$/);
+  // The next scheduled tick types it.
+  now += 5 * MIN;
+  await supervisor.tick({ reason: "interval" });
+  assert.deepEqual(delivered.map((d) => d.route), ["peer-relay", "computer-use"]);
+  // A local Scan now (the Mac's own page) types as before.
+  const local = fixture(t, { mode: "auto", delivery: "computer-use-first", threads: [app], deps: { uiDriver: readyDriver() } });
+  await createFleetRoute({ supervisor: local.supervisor })("POST", "/fleet/api/scan", null, async () => ({}));
+  assert.deepEqual(local.delivered.map((d) => d.route), ["computer-use"]);
+});
+
+test("a Scan now arriving mid-tick defers app sends only if every scan waiting on it came through the broker", async (t) => {
+  for (const [callers, routes] of [[["remote"], []], [["remote", "local"], ["computer-use"]], [["local", "remote"], ["computer-use"]]]) {
+    let release = null;
+    const gate = new Promise((resolve) => { release = resolve; });
+    let reads = 0;
+    // The running tick sees no thread (it sends nothing); the follow-up does.
+    const listCodexThreads = async () => { reads += 1; if (reads === 1) { await gate; return []; } return [makeThread()]; };
+    const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", deps: { uiDriver: readyDriver(), listCodexThreads } });
+    const first = supervisor.tick({ reason: "interval" });
+    const waiting = callers.map((caller) => supervisor.tick({ reason: "owner-scan", ...(caller === "remote" ? { deferUi: true } : {}) }));
+    release();
+    await first;
+    await Promise.all(waiting);
+    assert.deepEqual(delivered.map((d) => d.route), routes, callers.join(","));
+  }
+});
+
+test("an answer blocked because the Mac could not tell the front app is kept, not handed back", async (t) => {
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const executor = { deliver: async (args) => ({ status: "blocked", route: args.route, detail: "front app unknown", actionId: null }), inFlight: () => [], whenIdle: async () => {} };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], deps: { executor, uiDriver: readyDriver() } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  const result = await supervisor.answerQuestion(q.id, "yes");
+  assert.equal(result.delivery.status, "queued");
+  assert.match(result.delivery.detail, /front app unknown/);
+});
+
+test("a kept answer waits out a Scan now through the node broker when it would be typed", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const asking = makeThread({ writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: "Merge?", options: ["yes", "no"] } } });
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [asking], now: () => now, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const q = supervisor.getState().questions.find((x) => x.kind === "agent-ask");
+  assert.equal((await supervisor.answerQuestion(q.id, "yes")).delivery.status, "queued");
+  ready = true;
+  now += 5 * MIN;
+  await createFleetCapability(supervisor).invoke("request", { method: "POST", path: "/fleet/api/scan" });
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 0);
+  assert.equal(supervisor.store.queuedAnswers().length, 1);
+  now += 5 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((d) => d.playbook === "owner-answer").length, 1);
+});
+
+test("a remote send with no time left skips the readiness probe and waits", async (t) => {
+  let probes = 0;
+  const driver = { readiness: async () => { probes += 1; return { ready: true, detail: null }; } };
+  const { supervisor, delivered } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [makeThread({ meta: { originator: "Codex Desktop" } })], deps: { uiDriver: driver } });
+  await supervisor.tick();
+  const before = { probes, sent: delivered.length };
+  const result = await supervisor.sendOwnerMessage("codex:t1", "Rebase on main.", { deadlineAt: Date.now() + DEADLINE_MARGIN_MS - 1 });
+  assert.equal(result.delivery.status, "blocked");
+  assert.equal(probes, before.probes, "no readiness probe past the deadline");
+  assert.equal(delivered.length, before.sent);
 });
 
 test("the owner's own message to a thread goes through the supervisor's delivery", async (t) => {
@@ -1225,6 +1347,10 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal(delivered.length, 1);
   assert.equal(delivered[0].message, "Rebase on main.");
   assert.equal(delivered[0].playbook, "owner-message");
+  assert.ok(delivered[0].spentMs >= 0, "its probes count toward the request's time");
+  assert.equal(delivered[0].deadlineAt, null);
+  await supervisor.sendOwnerMessage("codex:t1", "Rebase again.", { deadlineAt: 1234 });
+  assert.equal(delivered[1].deadlineAt, 1234, "a remote caller's deadline reaches the send");
   assert.equal((await supervisor.sendOwnerMessage("codex:missing", "hi")).delivery.status, "blocked");
   assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
 });
@@ -1825,6 +1951,25 @@ test("after an account switch, the owner's playbook restarts Conductor once, the
   assert.ok(supervisor.getState().actions.some((action) => action.kind === "restart" && action.status === "done"));
 });
 
+test("a remote answer too close to its deadline does not start a restart", async (t) => {
+  const restarter = fakeRestarter();
+  const threads = [cappedTab("s1")];
+  const { supervisor, delivered, dataDir } = fixture(t, { mode: "auto", delivery: "computer-use", threads, deps: { uiDriver: readyDriver(), appRestarter: restarter } });
+  ownerPlaybook(dataDir, "account-switched", "---\nid: account-switched\nrestart_apps: conductor\n---\nretry\n");
+  await supervisor.tick();
+  const before = delivered.length;
+  const q = supervisor.store.upsertQuestion({ kind: "limit", dedupeKey: "cap", title: "Capped. Add acct?", options: ["wait", "added"], threadKeys: ["conductor:s1"] });
+  const result = await supervisor.answerQuestion(q.id, "added", { deadlineAt: Date.now() + restartMaxMs() });
+  assert.equal(result.delivery.status, "blocked");
+  assert.match(result.delivery.detail, /no time left in this request to restart Conductor/);
+  assert.deepEqual(restarter.calls, []);
+  assert.equal(delivered.length, before);
+  assert.equal(supervisor.store.question(q.id).status, "open");
+  // With room for the restart, it goes ahead.
+  const again = await supervisor.answerQuestion(q.id, "added", { deadlineAt: Date.now() + restartMaxMs() + DEADLINE_MARGIN_MS + 60_000 });
+  assert.deepEqual(restarter.calls, ["conductor"], again.delivery?.detail);
+});
+
 test("no restart while another Conductor chat is running, or when the bundled playbook asks for none", async (t) => {
   const restarter = fakeRestarter();
   const running = makeThread({ key: "conductor:busy", kind: "conductor", id: "busy", workspace: "busy", cwd: "/work/busy", agentStatus: "running", meta: uiMeta("busy") });
@@ -1884,6 +2029,28 @@ test("threads that cannot be reached never starve a stopped one: blocked tries u
   assert.equal(delivered.length, 1 + Math.min(busy.length, DEFAULTS.maxSendsPerTick * 2 - 1));
 });
 
+test("a computer-use send that times out defers the tick's other app sends", async (t) => {
+  const many = Array.from({ length: 3 }, (_, i) => makeThread({ key: `codex:u${i}`, id: `u${i}`, cwd: `/work/u${i}`, title: `Thread ${i}`, writerLocked: true, meta: { originator: "Codex Desktop" } }));
+  for (const detail of ["Open Computer Use timed out after 45s on get_app_state; nothing typed", "Open Computer Use stopped, timed out, or disconnected; delivery is unconfirmed.; nothing typed", "delivery timed out; nothing typed",
+    // An input call that may still be running in the shared app agent, and a send refused until it has settled.
+    "Open Computer Use timed out on input; unconfirmed: check the thread before retrying",
+    "Open Computer Use timed out on input earlier; waiting for it to finish; nothing typed"]) {
+    const delivered = [];
+    const executor = { deliver: async (args) => { delivered.push(args); return { status: "failed", route: args.route, detail, actionId: null }; }, inFlight: () => [], whenIdle: async () => {} };
+    const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: many, deps: { executor, uiDriver: readyDriver() } });
+    const snapshot = await supervisor.tick({ reason: "test" });
+    assert.equal(delivered.length, 1, detail);
+    assert.equal(delivered[0].route, "computer-use");
+    assert.equal(snapshot.threads.filter((row) => /deferred: Open Computer Use stalled/.test(row.decision?.reason ?? "")).length, 2);
+  }
+  // Any other failure lets the rest go on.
+  const delivered = [];
+  const executor = { deliver: async (args) => { delivered.push(args); return { status: "failed", route: args.route, detail: "could not focus the composer; nothing typed", actionId: null }; }, inFlight: () => [], whenIdle: async () => {} };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: many, deps: { executor, uiDriver: readyDriver() } });
+  await supervisor.tick({ reason: "test" });
+  assert.equal(delivered.length, 3);
+});
+
 test("sends past the cap are marked deferred, not dropped silently", async (t) => {
   const many = Array.from({ length: DEFAULTS.maxSendsPerTick + 2 }, (_, i) => makeThread({ key: `codex:m${i}`, id: `m${i}`, cwd: `/work/m${i}` }));
   const { supervisor, delivered } = fixture(t, { mode: "auto", threads: many });
@@ -1925,10 +2092,15 @@ test("the owner at the keyboard or a running turn does not count as a failed sen
   const store = new (await import("../src/fleet/store.js")).FleetStore({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "fleet-ledger-")), now: () => NOW });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "owner using Codex" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "turn running (Stop is visible)" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "waiting for idle: Codex must be in front to type" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "screen saver on" });
   assert.equal(store.ledgerFor("codex:a").undelivered, null);
+  // A presence probe that keeps failing is a failure the owner should hear about.
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "front app unknown" });
+  store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "presence check too slow" });
   store.recordNudge("codex:a", { playbook: "resume", status: "blocked", detail: "could not verify thread: \"x\" is not the open thread" });
   store.recordNudge("codex:a", { playbook: "resume", status: "failed", detail: "Open Computer Use stopped, timed out, or disconnected" });
-  assert.equal(store.ledgerFor("codex:a").undelivered.count, 2);
+  assert.equal(store.ledgerFor("codex:a").undelivered.count, 4);
   store.recordNudge("codex:a", { playbook: "resume", status: "sent" });
   assert.equal(store.ledgerFor("codex:a").undelivered, null);
 });
@@ -2325,6 +2497,28 @@ test("a kept answer past its day goes back to the owner even while its source ca
   await supervisor.tick();
   assert.equal(supervisor.store.question(q.id).deliveredAnswer, "dropped");
   assert.equal(supervisor.store.queuedAnswers().length, 0);
+});
+
+test("a kept answer whose send stalls Open Computer Use stops the tick's other typing", async (t) => {
+  let now = NOW;
+  let ready = false;
+  const asking = Array.from({ length: 3 }, (_, i) => makeThread({ key: `codex:k${i}`, id: `k${i}`, cwd: `/work/k${i}`, title: `Ask ${i}`, writerLocked: true, meta: { originator: "Codex Desktop", pendingQuestion: { text: `Merge ${i}?`, options: ["yes", "no"] } } }));
+  const stopped = makeThread({ key: "codex:dead", id: "dead", cwd: "/work/dead", title: "Stopped", writerLocked: true, agentStatus: "stalled", prRefs: [], lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN), meta: { originator: "Codex Desktop" } });
+  const delivered = [];
+  const executor = { deliver: async (args) => { delivered.push(args); return { status: "failed", route: args.route, detail: "Open Computer Use timed out after 45s on get_app_state; nothing typed", actionId: null }; }, inFlight: () => [], whenIdle: async () => {} };
+  const driver = { readiness: async () => (ready ? { ready: true, detail: null } : { ready: false, detail: "screen locked" }) };
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", threads: [...asking, stopped], now: () => now, deps: { uiDriver: driver, executor } });
+  await supervisor.tick();
+  for (const q of supervisor.getState().questions.filter((x) => x.kind === "agent-ask")) await supervisor.answerQuestion(q.id, "yes");
+  assert.equal(supervisor.store.queuedAnswers().length, 3);
+  delivered.length = 0;
+  ready = true;
+  now += 5 * MIN;
+  const snapshot = await supervisor.tick();
+  assert.equal(delivered.length, 1, "one stalled send, then nothing else types this tick");
+  assert.equal(delivered[0].playbook, "owner-answer");
+  assert.equal(supervisor.store.queuedAnswers().length, 3, "the others wait for the next tick");
+  assert.ok(snapshot.threads.some((row) => row.key === "codex:dead" && /deferred: Open Computer Use stalled/.test(row.decision?.reason ?? "")));
 });
 
 test("kept answers share the tick's send cap; the rest wait for the next tick", async (t) => {
