@@ -45,6 +45,8 @@ const RESTORE_KEY_SLACK_MS = 2000;
 const PRESENCE_FRESH_MS = 3000;
 // Frontmost while the screen saver runs or the login window shows.
 const SCREEN_SAVER_APPS = new Set(["com.apple.ScreenSaver.Engine", "com.apple.loginwindow"]);
+// OCU calls that act on the app (reads do not).
+const INPUT_TOOLS = new Set(["click", "type_text", "press_key", "set_value", "scroll", "drag", "perform_secondary_action"]);
 // Unsent text is never erased (see step 8 of the delivery).
 const LEFT_AS_DRAFT = "our text is left as a draft, check it";
 const PERMISSION_OK_TTL_MS = 10 * MIN;
@@ -760,6 +762,9 @@ export function createUiDriver({
     }
     if (now() - pending.keyEnd > RESTORE_PENDING_MS) { pendingRestore = null; return; }
     try {
+      // open -b launches an app that quit meanwhile; never that. Probed
+      // first: it can be slow, and the snapshot below must be the last word.
+      if ((await presence.appRunning(pending.frontBefore)) !== true) { pendingRestore = null; return; }
       // The same idle, front app, idle snapshot as ownerReason.
       const taken = now();
       const idleBefore = await presence.idleMs();
@@ -772,7 +777,7 @@ export function createUiDriver({
       if (idle === null || front !== pending.bundleId || now() - idle > pending.keyEnd + RESTORE_KEY_SLACK_MS) { pendingRestore = null; return; }
       if (!ownerAway(idle)) return;
       pendingRestore = null;
-      if ((await presence.appRunning(pending.frontBefore)) === true) await presence.activate(pending.frontBefore);
+      await presence.activate(pending.frontBefore);
     } catch { /* tried again at the next check */ }
   }
 
@@ -904,15 +909,32 @@ export function createUiDriver({
   // no more input after it.
   async function act(ctx, name, args, signal, { timeoutMs = limits.uiReadTimeoutMs } = {}) {
     if (ctx.inputInFlight) throw new StepError("an input call timed out");
+    const input = INPUT_TOOLS.has(name);
+    if (input) {
+      // The owner may have started an OpenAGI computer-use session since
+      // readiness: never input alongside it.
+      let active = [];
+      try { active = activeSessions() ?? []; } catch { active = []; }
+      if (active.length) throw new StepError("an OpenAGI computer-use session is active");
+    }
+    // Held, and on disk, before the call goes out: a restart while it is
+    // pending must find it. Released once it is known to have ended.
+    let settle = null;
+    if (input) inputLatch.hold(new Promise((resolve) => { settle = resolve; }));
     const start = now();
     let result;
     try {
       result = await ctx.transport.call(name, args, signal, { timeoutMs: within(ctx, timeoutMs) });
+      settle?.({ completed: true });
     } catch (error) {
       if (error?.inFlight) {
         ctx.inputInFlight = true;
         ctx.inputSettled = error.settled;
-        inputLatch.hold(error.settled);
+        if (settle) Promise.resolve(error.settled).then(settle, () => settle({ completed: false }));
+        else inputLatch.hold(error.settled);
+      } else {
+        // Answered with an error: it ran its course.
+        settle?.({ completed: true });
       }
       throw error;
     } finally {

@@ -1728,6 +1728,34 @@ test("the in-flight pause is on disk at once, so a restart before the answer kee
   assert.equal(fs.existsSync(path.join(dir, "other.json")), false);
 });
 
+test("an OpenAGI computer-use session started mid-delivery stops the fleet before any input", async (t) => {
+  let checks = 0;
+  const app = fakeApp();
+  app.focused = false;
+  const f = setup(t, { app, driverOptions: { activeSessions: () => (checks++ > 0 ? [{ id: "owner-session" }] : []) } });
+  const result = await f.driver.deliver(f.request());
+  assert.notEqual(result.status, "sent");
+  assert.match(result.detail, /an OpenAGI computer-use session is active/);
+  assert.deepEqual(f.calls().filter((call) => ["click", "type_text", "press_key"].includes(call.name)), []);
+});
+
+test("an input call holds the latch, on disk, from before it goes out until it answers", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-latch-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "ui-input-orphaned.json");
+  const latch = createInputLatch();
+  latch.persistTo(file);
+  let seen = null;
+  const app = fakeApp({ onType: (text) => { seen = { held: latch.held, onDisk: fs.existsSync(file) }; return text; } });
+  const f = setup(t, { app, driverOptions: { inputLatch: latch } });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent", result.detail);
+  assert.deepEqual(seen, { held: true, onDisk: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(latch.held, false);
+  assert.equal(fs.existsSync(file), false);
+});
+
 test("a request that already spent its time before the send types nothing", async (t) => {
   const f = setup(t);
   const result = await f.driver.deliver(f.request({ spentMs: DEFAULTS.uiDeliveryTimeoutMs }));
