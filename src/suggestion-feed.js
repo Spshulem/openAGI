@@ -71,20 +71,46 @@ function readMinedCandidates(runtime, status) {
   return readDirNormalized(dir, status);
 }
 
+// Parsed suggestion files by path, kept while their size and mtime hold.
+// The miners leave a file per candidate (1,100+ on a long-lived install),
+// and every brief, overlay poll and triage pass lists them all: reading each
+// one again on the event loop each time stalled the daemon past its health
+// check (13 s of synchronous reads in a 12 s profile, 2026-10-03).
+const fileCache = new Map();
+
 function readDirNormalized(dir, status, forceSource = null) {
   let names;
   try { names = fs.readdirSync(dir); } catch { return []; }
   const out = [];
+  const seen = new Set();
   for (const f of names) {
     if (!f.endsWith(".json")) continue;
-    const raw = readJsonFile(path.join(dir, f), null);
-    if (!raw) continue;
-    const envelope = normalize(raw, path.join(dir, f), forceSource);
+    const file = path.join(dir, f);
+    seen.add(file);
+    const envelope = cachedEnvelope(file, forceSource);
     if (!envelope) continue;
     if (status && envelope.status !== status) continue;
     out.push(envelope);
   }
+  // Files gone from this directory leave the cache with it.
+  for (const file of fileCache.keys()) {
+    if (path.dirname(file) === dir && !seen.has(file)) fileCache.delete(file);
+  }
   return out;
+}
+
+function cachedEnvelope(file, forceSource) {
+  let stat;
+  try { stat = fs.statSync(file); } catch { fileCache.delete(file); return null; }
+  const hit = fileCache.get(file);
+  // A copy: callers may annotate what they get back.
+  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size && hit.forceSource === forceSource) return { ...hit.envelope };
+  const raw = readJsonFile(file, null);
+  const envelope = raw ? normalize(raw, file, forceSource) : null;
+  // A half-written file is read again next time, not cached as empty.
+  if (envelope) fileCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, forceSource, envelope: { ...envelope } });
+  else fileCache.delete(file);
+  return envelope;
 }
 
 // Map any source's candidate JSON onto the common envelope. Returns null
