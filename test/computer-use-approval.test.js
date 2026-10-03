@@ -8,6 +8,7 @@ import { registerComputerUseTools } from "../src/integrations/computer-use.js";
 import { ToolRegistry } from "../src/tool-registry.js";
 import { PendingActionStore } from "../src/pending-actions.js";
 import { ComputerUseLog } from "../src/computer-use-log.js";
+import { NodeRegistry } from "../src/node-registry.js";
 
 async function until(predicate, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -19,7 +20,7 @@ async function until(predicate, timeoutMs = 2_000) {
   throw new Error("timed out waiting for approval continuation");
 }
 
-async function appWithComputerUse({ dataDir: suppliedDataDir = null, generate = null } = {}) {
+async function appWithComputerUse({ dataDir: suppliedDataDir = null, generate = null, nodeRegistry = undefined, authToken = "" } = {}) {
   const dataDir = suppliedDataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-approval-"));
   const runtime = createDurableRuntime({ dataDir });
   registerComputerUseTools(runtime.tools, runtime);
@@ -43,8 +44,9 @@ async function appWithComputerUse({ dataDir: suppliedDataDir = null, generate = 
   const app = createHostedInterface(runtime, {
     host: "127.0.0.1",
     port: 0,
-    authToken: "",
+    authToken,
     dataDir,
+    ...(nodeRegistry ? { nodeRegistry } : {}),
     tickerMs: 60_000,
     nodeControlEnabled: true,
     computerExecutor: {
@@ -777,6 +779,53 @@ test("a delayed denial cannot report success after approval already claimed exec
     assert.equal(deny.status, 409, "deny must not claim success after execution starts");
     assert.equal(approve.status, 200);
     assert.equal(runtime.pendingActions.get(id).status, "approved");
+  } finally {
+    await app.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("a paired phone's own instruction starts computer use at once, journaled as the owner's", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-computer-owner-"));
+  const nodeRegistry = new NodeRegistry({ dir: path.join(dataDir, "nodes") });
+  const phone = { id: "mobile:owner-phone", token: "p".repeat(43) };
+  nodeRegistry.enroll(phone.id, phone.token, { platform: "mobile", name: "Pixel" });
+  const outcomes = [];
+  const { runtime, app, base } = await appWithComputerUse({
+    dataDir, nodeRegistry, authToken: "owner-token",
+    async generate(request) {
+      outcomes.push(await request.toolRegistry.invoke("start_computer_use_session", { goal: "Click Approve in Codex" }, request.context));
+      return { id: "r", text: "Started.", provider: "test", model: "test-model", toolCalls: [] };
+    }
+  });
+  try {
+    const response = await fetch(`${base}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${phone.token}`, "x-openagi-node-id": phone.id },
+      body: JSON.stringify({ text: "use my computer and click approve in codex", thread: "agent" })
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    assert.equal(outcomes[0].ok, true);
+    assert.equal(outcomes[0].result.goal, "Click Approve in Codex");
+    const active = runtime.computerUseLog.activeSessionFor("devices:agent:main");
+    assert.ok(active, "the session is active without any approval surface");
+    assert.equal(active.approvedBy, "owner:phone");
+    const record = runtime.pendingActions.list().find((action) => action.toolName === "start_computer_use_session");
+    assert.equal(record.status, "approved");
+    assert.equal(record.decidedBy, "owner:phone");
+    assert.equal(active.approvalActionId, record.id);
+    assert.equal(runtime.pendingActions.list({ status: "pending" }).length, 0);
+
+    // The same words from a node that is not the owner's still queue.
+    nodeRegistry.enroll("bridge-node", "b".repeat(43), { platform: "openagi", name: "Bridge" });
+    outcomes.length = 0;
+    const bridged = await fetch(`${base}/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${"b".repeat(43)}`, "x-openagi-node-id": "bridge-node" },
+      body: JSON.stringify({ text: "use my computer and click approve in codex" })
+    });
+    assert.equal(bridged.status, 200);
+    assert.equal(outcomes[0].result.status, "awaiting_confirmation");
   } finally {
     await app.close();
     fs.rmSync(dataDir, { recursive: true, force: true });

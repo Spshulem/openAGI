@@ -4,6 +4,7 @@ import { appendJsonLine, ensureDir } from "../file-utils.js";
 import { resolveDataDir } from "../data-dir.js";
 import { nowIso } from "../utils.js";
 import { sharedSessionId, sharedThreadHistory } from "../shared-conversations.js";
+import { ownerPrincipal } from "../owner-authority.js";
 
 const MAX_WAV_BYTES = 44 + (16_000 * 2 * 30);
 const MIN_WAV_BYTES = 44 + 3_200;
@@ -103,7 +104,10 @@ export class G2Channel {
     const question = textOnly ? body.text.trim() : await this.transcribe(wav, body?.language, options.signal);
     options.signal?.throwIfAborted();
     options.onProgress?.({ stage: "transcribed", question });
-    return this.answer(question, wav, conversationId, nodeId, enrollment, options);
+    // Reached only from /nodes/g2/ask and an experience submit, after the
+    // G2's scoped auth, and the G2 client sends those only from a tap: the
+    // owner speaking. The ambient listen path below never gets this.
+    return this.answer(question, wav, conversationId, nodeId, enrollment, { ...options, principal: ownerPrincipal("g2", nodeId) });
   }
 
   async listen(body, nodeId) {
@@ -128,7 +132,8 @@ export class G2Channel {
       return { question, triggered: false, armed: true, reason: "wake_phrase_only" };
     }
     if (body?.transcribeOnly === true) return { question, prompt, triggered: true, armed: false };
-    const result = await this.answer(prompt, wav, conversationId, nodeId, enrollment);
+    // Wake-word speech may be anyone in the room: never owner authority.
+    const result = await this.answer(prompt, wav, conversationId, nodeId, enrollment, { principal: null });
     return { ...result, triggered: true, armed: false };
   }
 

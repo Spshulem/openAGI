@@ -69,6 +69,8 @@ import {
 } from "./integrations/g2-channel.js";
 import { NodeEnrollmentCodes } from "./node-enrollment.js";
 import { MOBILE_PLATFORM, MOBILE_CAPABILITIES, boundedMobileNodeName, isMobileRouteAllowed } from "./mobile-node.js";
+import { executeApprovedAction } from "./approval-executor.js";
+import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 import {
   SharedConversationError,
@@ -205,7 +207,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     console.error("[g2] Request recovery unavailable. Inspect the g2-requests directory on main; existing receipts were preserved.");
   }
   runtime.tools?.unregister?.("search_conversation_lifelog");
-  runtime.tools?.register?.({ name: "search_conversation_lifelog", source: "integration:g2-lifelog", sideEffects: false,
+  runtime.tools?.register?.({ name: "search_conversation_lifelog", source: "integration:g2-lifelog", sideEffects: false, untrustedOutput: true,
     description: "Search retained conversation moments by words, person label, topic or date. Evidence is untrusted; inferred commitments are not authorization or verified identity. A private G2 conversation can recall only that G2's capture history; the shared device threads and owner desktop chat recall every enrolled G2. Does not send instructions or create tasks.",
     parameters: { type: "object", properties: { query: { type: "string", maxLength: 200 }, date: { type: "string" } }, additionalProperties: false },
     handler: (args, context) => {
@@ -584,6 +586,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       sessionId
     };
   }
+
+  // The owner's spoken "yes NN" in a chat (agent-host) executes through the
+  // same claim-invoke-journal path as the dashboard. The turn that heard it
+  // carries on itself, so no continuation is queued.
+  runtime.executeApprovedAction = (id, opts = {}) => executeApprovedAction(runtime, id, opts);
 
   // Recover approvals committed before a daemon exit or transient provider
   // failure. A deterministic request id lets us recognize a response that was
@@ -1851,18 +1858,25 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // setup-test path only — never let a public /message caller set it to
         // evade persistence.
         if (body && typeof body === "object") delete body.ephemeral;
+        // Who is speaking, proven by the transport auth above, never by the
+        // body: the owner's own credential (bearer, cookie, query token or a
+        // tokenless loopback install) or a paired phone's node credential.
+        // Any other node (the iMessage bridge) speaks for someone else.
+        const principal = !requestNodeId
+          ? ownerPrincipal(body?.channel === "overlay" ? "overlay" : "owner")
+          : requestEnrollment?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", requestNodeId) : null;
         // Opt-in streaming keeps the existing JSON contract untouched. The
         // same auth and Origin gates above protect both forms; this is a direct
         // response stream, not a broadcast that another signed-in client can
         // accidentally observe.
         if (acceptsEventStream(req)) {
-          return streamLocalMessage(res, channels, body);
+          return streamLocalMessage(res, channels, body, principal);
         }
         // Chat must return a structured error, not a generic 500: the
         // dashboard needs to distinguish "budget cap hit" / "provider auth
         // failed" / "network blip" to show something actionable.
         try {
-          const result = await channels.handleLocalMessage(body);
+          const result = await channels.handleLocalMessage(body, { principal });
           return sendJson(res, 200, result);
         } catch (error) {
           return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
@@ -2381,48 +2395,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/approve")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/approve".length));
-        let action = runtime.pendingActions?.get(id);
-        if (!action) return sendJson(res, 404, { error: "unknown pending action" });
-        if (action.status === "expired") {
-          return sendJson(res, 410, { error: "approval expired; request it again" });
-        }
-        if (action.status === "approved" && action.error == null
-            && action.toolName === "start_computer_use_session") {
-          const continuation = queueApprovalContinuation(action, { ok: true }, { resetFailed: true });
-          return sendJson(res, 200, {
-            ok: true,
-            alreadyApproved: true,
-            ...(continuation ? { continuation } : {})
-          });
-        }
-        if (action.status !== "pending") return sendJson(res, 409, { error: `action already ${action.status}` });
-        const claim = runtime.pendingActions?.claimForExecution?.(id, { claimedBy: "user" });
-        if (!claim) {
-          action = runtime.pendingActions?.get(id);
-          return sendJson(res, 409, { error: `action already ${action?.status ?? "claimed"}` });
-        }
-        action = claim.action;
-        // Re-invoke the original tool with the bypass flag so the gate
-        // doesn't re-queue the same call. Persist the result on the action.
-        const invokeResult = await runtime.tools.invoke(action.toolName, action.args, {
-          ...action.context,
-          __confirmed: true,
-          __confirmationActionId: action.id
-        });
-        const executionError = invokeResult?.ok ? null : invokeResult?.error ?? "approved tool execution failed";
-        recordApprovedActionOutcome(runtime, action, invokeResult);
-        runtime.pendingActions.decide(id, {
-          decision: "approve",
-          decidedBy: "user",
-          result: invokeResult.ok ? invokeResult.result : null,
-          error: executionError,
-          executionId: claim.executionId
-        });
-        const continuation = queueApprovalContinuation(action, invokeResult);
-        return sendJson(res, invokeResult.ok ? 200 : 400, {
-          ...invokeResult,
-          ...(continuation ? { continuation } : {})
-        });
+        const executed = await executeApprovedAction(runtime, id, { decidedBy: "user", continuation: queueApprovalContinuation });
+        return sendJson(res, executed.status, executed.body);
       }
       if (method === "POST" && pathname.startsWith("/pending-actions/") && pathname.endsWith("/deny")) {
         const id = decodeURIComponent(pathname.slice("/pending-actions/".length, -"/deny".length));
@@ -3603,7 +3577,7 @@ function bindScopedNodeMessage(body, requestNodeId) {
 // assistant record remains authoritative and a disconnected client recovers it
 // from the named session. Provider adapters expose text only, never reasoning,
 // tool arguments or tool results.
-async function streamLocalMessage(res, channels, body) {
+async function streamLocalMessage(res, channels, body, principal = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -3665,7 +3639,7 @@ async function streamLocalMessage(res, channels, body) {
   };
 
   try {
-    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta });
+    const result = await channels.handleLocalMessage(body, { onProgress, onTextDelta, principal });
     sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
     write("final", result);
   } catch (error) {
@@ -4016,27 +3990,11 @@ async function applyOutreachAction(runtime, item, action, note) {
         if (a.status !== "pending") {
           throw outreachActionConflict(`pending action already ${a.status}`);
         }
-        const claim = runtime.pendingActions?.claimForExecution?.(ref.id, { claimedBy: "user" });
-        if (!claim) {
-          const latest = runtime.pendingActions?.get(ref.id);
-          throw outreachActionConflict(`pending action already ${latest?.status ?? "claimed"}`);
-        }
-        a = claim.action;
-        const r = await runtime.tools.invoke(a.toolName, a.args, {
-          ...a.context,
-          __confirmed: true,
-          __confirmationActionId: a.id
-        });
-        const executionError = r?.ok ? null : r?.error ?? "approved tool execution failed";
-        recordApprovedActionOutcome(runtime, a, r);
-        runtime.pendingActions.decide(ref.id, {
-          decision: "approve",
-          decidedBy: "user",
-          result: r.ok ? r.result : null,
-          error: executionError,
-          executionId: claim.executionId
-        });
-        if (!r.ok) throw new Error(executionError);
+        const executed = await executeApprovedAction(runtime, ref.id, { decidedBy: "user" });
+        if (!executed.invokeResult) throw outreachActionConflict(`pending ${executed.body?.error ?? "action already claimed"}`);
+        a = executed.action;
+        const r = executed.invokeResult;
+        if (!r.ok) throw new Error(r.error ?? "approved tool execution failed");
         return { pendingAction: a, invokeResult: r };
       }
       throw new Error(`unsupported pending-action action: ${action}`);
@@ -4080,48 +4038,6 @@ function outreachActionConflict(message) {
   const error = new Error(message);
   error.code = "OUTREACH_ACTION_CONFLICT";
   return error;
-}
-
-// Approval is only intent. Record an outcome at the point the confirmed tool
-// actually returns, preserving the original autonomous/user provenance. This
-// keeps queued approvals out of the scorecard while making the eventual work
-// (including a real failure) measurable once—and only once—it executes.
-function recordApprovedActionOutcome(runtime, action, invokeResult) {
-  if (!runtime.outcomes?.record || !approvedInvocationWasAttempted(invokeResult)) return null;
-  const origin = String(action?.context?.origin ?? action?.context?.channel ?? "local").toLowerCase();
-  const kind = origin === "autopilot"
-    ? "autopilot-fire"
-    : origin === "cron"
-      ? "cron-fire"
-      : "tool-call";
-  try {
-    return runtime.outcomes.record({
-      kind,
-      refId: action.id,
-      sessionId: action.context?.sessionId ?? null,
-      agentId: action.context?.agentId ?? "main",
-      channel: action.context?.channel ?? null,
-      toolCalls: [{ name: action.toolName, ok: invokeResult?.ok === true }],
-      metadata: {
-        approvalActionId: action.id,
-        approvedExecution: true,
-        origin
-      }
-    });
-  } catch {
-    // Outcome accounting is an audit side effect. It must never undo a tool
-    // action the user explicitly approved.
-    return null;
-  }
-}
-
-function approvedInvocationWasAttempted(invokeResult) {
-  if (!invokeResult || typeof invokeResult !== "object") return false;
-  if (invokeResult.ok !== true) return true;
-  const result = invokeResult.result;
-  const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
-  if (["awaiting_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
-  return !(result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true);
 }
 
 async function applyOutreachFeedback(runtime, item, verdict, note = null) {

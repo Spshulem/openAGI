@@ -619,7 +619,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       }
       const session = runtime.computerUseLog.startSession({
         goal: args.goal,
-        approvedBy: "user",
+        approvedBy: typeof context.__approvedBy === "string" ? context.__approvedBy : "user",
         approvalActionId: context.__confirmationActionId ?? null,
         sourceSessionId: context.sessionId,
         targetNodeId: args.nodeId,
@@ -657,6 +657,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
   registry.register({
     name: "computer_screenshot",
     sideEffects: false,
+    untrustedOutput: true,
     description: "Read the current screen state. A connected computer-use node returns a live image; observation-only mode returns the most recent OCR text + active app from the local observation store.",
     parameters: {
       type: "object",

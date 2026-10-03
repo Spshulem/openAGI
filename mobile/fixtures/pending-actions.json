@@ -11,6 +11,8 @@
       "summary": "Send the weekly digest to the team",
       "reason": "Drafted from your Friday routine",
       "dedupeKey": null,
+      "mode": "queue",
+      "confirmCode": "42",
       "status": "pending",
       "createdAt": "2026-09-24T05:31:34.834Z",
       "expiresAt": null,

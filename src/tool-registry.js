@@ -1,6 +1,8 @@
 import { createId, nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { scheduledPromptSpec, sameScheduledPrompt } from "./scheduled-prompt.js";
+import { intentCovers, isOwnerPrincipal } from "./owner-authority.js";
+import { argsDigest } from "./pending-actions.js";
 
 // Stable, locale-independent order. Copies rather than sorting in place so a
 // caller's array (and the registry's own values) are never reordered underneath
@@ -60,6 +62,14 @@ export class ToolRegistry {
       // read-only tools; 'ask' turns divert side-effecting calls to the
       // approval queue.
       sideEffects: tool.sideEffects !== false,
+      // Output carries text someone other than the owner wrote (an agent's
+      // transcript, a web page, an MCP server, a screen). Once a turn has
+      // read it, a gated call runs on the owner's word only when the owner's
+      // own text asked for that kind of action (see ToolRegistry.ownerInvoke).
+      untrustedOutput: tool.untrustedOutput === true || (tool.source ?? "internal") === "mcp",
+      // Optional fn(args, context) -> false | true | string. Truthy makes even
+      // an owner instruction ask for the spoken code; a string says why.
+      ownerConfirm: typeof tool.ownerConfirm === "function" ? tool.ownerConfirm : null,
       metadata: tool.metadata ?? {}
     };
     this.tools.set(normalized.name, normalized);
@@ -89,6 +99,7 @@ export class ToolRegistry {
       scrutinyConfirmationRequired,
       prepareApprovalArgs,
       approvalDedupeKey,
+      ownerConfirm,
       ...rest
     }) => rest);
     return readOnly ? all.filter((tool) => !tool.sideEffects) : all;
@@ -222,6 +233,10 @@ export class ToolRegistry {
     if ((toolConfirm || scrutinyConfirm) && !context?.__confirmed && this.pendingActions) {
       const summary = tool.summarize ? safeSummarize(tool.summarize, invocationArgs) : `Run ${name}`;
       const dedupeKey = safeApprovalDedupeKey(tool.approvalDedupeKey, invocationArgs, context);
+      const ttlMs = toolConfirm ? tool.approvalTtlMs : null;
+      if (isOwnerPrincipal(context?.__owner)) {
+        return this.ownerInvoke(tool, invocationArgs, context, { summary, dedupeKey, ttlMs });
+      }
       const action = this.pendingActions.enqueue({
         toolName: name,
         args: invocationArgs,
@@ -229,25 +244,112 @@ export class ToolRegistry {
         summary,
         reason: context.__reason ?? null,
         dedupeKey,
-        ttlMs: toolConfirm ? tool.approvalTtlMs : null
+        ttlMs
       });
+      const code = action.confirmCode;
       return {
         ok: true,
         result: {
           status: "awaiting_confirmation",
           actionId: action.id,
+          ...(code ? { code } : {}),
           summary: action.summary,
-          message: `Queued for human approval. Open the dashboard's Approvals tab, or the Computer Use page for a computer-use request.`
+          message: code
+            ? `Queued for the owner's approval (code ${code}): phone Inbox, dashboard Approvals, or the owner says 'yes ${code}' in any OpenAGI chat.`
+            : "Queued for the owner's approval: phone Inbox or dashboard Approvals."
         }
       };
     }
+    return this.runHandler(tool, invocationArgs, context);
+  }
+
+  async runHandler(tool, args, context) {
     try {
-      const result = await tool.handler(invocationArgs, context);
+      const result = await tool.handler(args, context);
+      // Tool results are data: they can only ever taint the turn, never
+      // write any other part of the server-built context.
+      if (tool.untrustedOutput && context?.__turn && typeof context.__turn === "object") context.__turn.untrusted = true;
       return { ok: true, result };
     } catch (error) {
-      return { ok: false, error: error.message ?? String(error) };
+      return { ok: false, error: error?.message ?? String(error) };
     }
   }
+
+  // A gated call on the authenticated owner's turn. The owner's instruction is
+  // the approval: it runs now and is journaled as owner-approved. It asks for
+  // the spoken code instead only when the turn read untrusted text and the
+  // owner's own words do not name this kind of action (an injected "click
+  // Approve" must not ride on "what's the latest?"), or the tool insists.
+  async ownerInvoke(tool, args, context, { summary, dedupeKey, ttlMs }) {
+    const owner = context.__owner;
+    const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
+    const tainted = turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
+    const insist = safeOwnerConfirm(tool.ownerConfirm, args, context);
+    const chatKey = dedupeKey ?? argsDigest(tool.name, args);
+    if (tainted || insist) {
+      const action = this.pendingActions.enqueue({
+        toolName: tool.name, args, context, summary, reason: context.__reason ?? null,
+        dedupeKey: chatKey, ttlMs, announce: false, mode: "chat"
+      });
+      const what = spokenSummary(summary ?? action.summary);
+      const why = typeof insist === "string" && insist ? `; ${insist.slice(0, 200)}` : "";
+      return {
+        ok: true,
+        result: {
+          status: "awaiting_owner_confirmation",
+          actionId: action.id,
+          code: action.confirmCode,
+          summary: action.summary,
+          say: `Say 'yes ${action.confirmCode}' to ${what}${why}.`
+        }
+      };
+    }
+    const claim = this.pendingActions.recordOwnerApproved({
+      toolName: tool.name, args, context, summary, reason: context.__reason ?? null,
+      dedupeKey: chatKey, approvedBy: `owner:${owner.via}`
+    });
+    if (!claim) return { ok: false, error: "Could not record the owner's approval; nothing was run." };
+    const outcome = await this.runHandler(tool, args, {
+      ...context,
+      // The handler's view only. The turn's own context keeps no __confirmed,
+      // so the next gated call is judged on its own.
+      __turn: turn,
+      __confirmed: true,
+      __confirmationActionId: claim.action.id,
+      __approvedBy: `owner:${owner.via}`
+    });
+    this.pendingActions.decide(claim.action.id, {
+      decision: "approve",
+      decidedBy: `owner:${owner.via}`,
+      result: outcome.ok ? outcome.result : null,
+      error: outcome.ok ? null : outcome.error,
+      executionId: claim.executionId
+    });
+    // The owner's instruction ran what an earlier code card in this chat
+    // asked for: that card must not run it a second time.
+    for (const card of this.pendingActions.list({ status: "pending" })) {
+      if (card.mode === "chat" && card.toolName === tool.name && card.dedupeKey === chatKey
+          && card.context?.sessionId === (context.sessionId ?? null)) {
+        this.pendingActions.decide(card.id, { decision: "deny", decidedBy: "system", error: "superseded: the owner's instruction ran it" });
+      }
+    }
+    return outcome;
+  }
+}
+
+function safeOwnerConfirm(fn, args, context) {
+  if (typeof fn !== "function") return false;
+  try {
+    const value = fn(args ?? {}, context ?? {});
+    return typeof value === "string" ? value || true : Boolean(value);
+  } catch {
+    return true;
+  }
+}
+
+function spokenSummary(summary) {
+  const line = String(summary ?? "").split("\n")[0].trim();
+  return (line.length > 120 ? `${line.slice(0, 117)}...` : line) || "run it";
 }
 
 function safeSummarize(fn, args) {
@@ -643,6 +745,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "run_mcp_tool",
+    untrustedOutput: true,
     description: "Invoke a tool on a connected MCP server. Use this for any MCP tool that isn't available as a direct function (large servers like PostHog are reached this way). Call list_mcp_tools first if unsure of the exact server/tool name.",
     parameters: {
       type: "object",

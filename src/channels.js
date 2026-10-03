@@ -42,7 +42,10 @@ export class ChannelManager {
       // values into the host. The streamed /message transport uses this to
       // keep a slow tool-using turn visibly alive.
       onProgress: options.onProgress,
-      onTextDelta: options.onTextDelta
+      onTextDelta: options.onTextDelta,
+      // Minted by the transport after its auth (owner-authority.js); a body
+      // field can never become one.
+      principal: options.principal ?? null
     });
   }
 

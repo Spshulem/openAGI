@@ -1,0 +1,77 @@
+// Owner authority primitives: the unforgeable principal, the spoken confirm
+// matcher, and the intent families a tainted turn checks.
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  authorityRecord, intentCovers, intentFamilies, isOwnerPrincipal, matchConfirmation, ownerAuthorityEnabled,
+  ownerIntentText, ownerPrincipal
+} from "../src/owner-authority.js";
+
+test("only a minted principal passes; copies, JSON and replays never do", () => {
+  const real = ownerPrincipal("g2", "node-1");
+  assert.equal(isOwnerPrincipal(real), true);
+  assert.equal(Object.isFrozen(real), true);
+  assert.deepEqual(authorityRecord(real), { kind: "owner", via: "g2", nodeId: "node-1" });
+  // Same shape, not the same object.
+  assert.equal(isOwnerPrincipal({ kind: "owner", via: "g2", nodeId: "node-1" }), false);
+  assert.equal(isOwnerPrincipal({ ...real }), false);
+  assert.equal(isOwnerPrincipal(JSON.parse(JSON.stringify(real))), false);
+  assert.equal(isOwnerPrincipal(structuredClone(real)), false);
+  assert.equal(isOwnerPrincipal(authorityRecord(real)), false);
+  for (const value of [null, undefined, "owner", true, 1, []]) assert.equal(isOwnerPrincipal(value), false);
+  assert.equal(authorityRecord({ kind: "owner", via: "phone" }), null);
+  assert.throws(() => ownerPrincipal("telegram"), /unknown owner transport/);
+});
+
+test("the kill switch turns every principal off", () => {
+  const real = ownerPrincipal("owner");
+  assert.equal(isOwnerPrincipal(real, { OPENAGI_OWNER_AUTHORITY: "off" }), false);
+  assert.equal(isOwnerPrincipal(real, { OPENAGI_OWNER_AUTHORITY: "on" }), true);
+  assert.equal(ownerAuthorityEnabled({}), true);
+  assert.equal(ownerAuthorityEnabled({ OPENAGI_OWNER_AUTHORITY: "OFF" }), false);
+});
+
+test("spoken confirms match whole assent or refusal, with an optional code", () => {
+  const yes = [
+    ["yes", null], ["Yes.", null], ["yeah", null], ["ok", null], ["approve", null], ["approved", null],
+    ["do it", null], ["go ahead", null], ["send it", null], ["click approve", null], ["Yes please", null],
+    ["Yes. Please approve that", null], ["yes, do it now", null], ["Yes 42", "42"], ["approve 17 please", "17"],
+    ["42 yes", "42"], ["confirm code 305", "305"], ["Go ahead!", null], ["click allow", null]
+  ];
+  for (const [text, code] of yes) assert.deepEqual(matchConfirmation(text), { decision: "approve", code }, text);
+  const no = [["no", null], ["No 42", "42"], ["cancel", null], ["don't", null], ["do not allow", null], ["deny 88", "88"], ["nope.", null]];
+  for (const [text, code] of no) assert.deepEqual(matchConfirmation(text), { decision: "deny", code }, text);
+});
+
+test("bystander sentences, mixed answers and long text are not confirms", () => {
+  for (const text of [
+    "yes I think we should wait", "approve the PR on GitHub", "can you approve that?", "no idea what that is",
+    "what's the latest?", "yes no", "yes 42 17", "approve 4", "approve 4242", "ok so the build is red", "",
+    "please", "it", `yes ${"please ".repeat(30)}`
+  ]) assert.equal(matchConfirmation(text), null, text);
+});
+
+test("intent families cover only their own tools", () => {
+  assert.deepEqual(intentFamilies("click approve for me"), ["approve", "computer"]);
+  assert.equal(intentCovers("Click Approve on the Codex prompt", "fleet_click"), true);
+  assert.equal(intentCovers("tell the openAGI thread to rebase", "fleet_send_message"), true);
+  assert.equal(intentCovers("restart conductor", "fleet_app"), true);
+  assert.equal(intentCovers("use my computer to check the screen", "start_computer_use_session"), true);
+  assert.equal(intentCovers("start a codex agent to fix it", "start_coding_agent"), true);
+  // What a tainted turn must not get without the code.
+  assert.equal(intentCovers("what's the latest?", "fleet_click"), false);
+  assert.equal(intentCovers("what's the latest?", "fleet_send_message"), false);
+  assert.equal(intentCovers("summarize thread 4", "fleet_app"), false);
+  // A gated tool outside every family always needs the code.
+  assert.equal(intentCovers("send it, approve it, restart it", "schedule_message"), false);
+});
+
+test("a bare yes carries the previous assistant message as intent", () => {
+  const messages = [
+    { role: "user", content: "what needs me?" },
+    { role: "assistant", content: "Codex asks to run tests. Want me to click Allow?" }
+  ];
+  assert.match(ownerIntentText("yes", messages), /click Allow/);
+  assert.equal(ownerIntentText("restart conductor", messages), "restart conductor");
+  assert.equal(ownerIntentText("yes", []), "yes");
+});

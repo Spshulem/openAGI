@@ -14,6 +14,7 @@ export function registerWebSearchTools(runtime, opts = {}) {
   runtime.tools.register({
     name: "web_search",
     sideEffects: false,
+    untrustedOutput: true,
     description: "Search the live web. Returns a list of results (title, url, snippet, and often page content). Picks a configured provider automatically; pass `provider` to force one.",
     parameters: {
       type: "object",
@@ -58,6 +59,7 @@ export function registerWebSearchTools(runtime, opts = {}) {
   runtime.tools.register({
     name: "fetch_url",
     sideEffects: false,
+    untrustedOutput: true,
     description: "Fetch the contents of a web page as markdown/text. Uses Firecrawl when configured, otherwise a plain fetch.",
     parameters: {
       type: "object",

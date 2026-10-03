@@ -107,8 +107,30 @@ test("without a thread a phone message stays node-scoped exactly as before", asy
   const plain = await (await ctx.as(PHONE_A, "/message", { method: "POST", body: { text: "hi" } })).json();
   assert.equal(plain.session.id, `node:${nodeNamespace}:${cli}:main`);
   const stored = ctx.store.getSession(plain.session.id).messages[0];
-  assert.deepEqual(stored.metadata, { sourceNodeId: PHONE_A.id });
+  // A paired phone is the owner: the server records it, for audit only.
+  assert.deepEqual(stored.metadata, { sourceNodeId: PHONE_A.id, authority: { kind: "owner", via: "phone", nodeId: PHONE_A.id } });
   assert.equal(ctx.store.getSession("devices:agent:main").messages.length, 0);
+});
+
+test("owner authority: phone and G2 tap are the owner, a generic node is not, and a body cannot claim it", async (t) => {
+  const ctx = await boot(t);
+  await ctx.as(PHONE_A, "/message", { method: "POST", body: { text: "from the phone", thread: "supervisor" } });
+  await g2Submit(ctx, "from the glasses", { thread: "supervisor" });
+  const users = ctx.store.getSession("devices:supervisor:main").messages.filter((m) => m.role === "user");
+  assert.deepEqual(users.map((m) => m.metadata.authority), [
+    { kind: "owner", via: "phone", nodeId: PHONE_A.id },
+    { kind: "owner", via: "g2", nodeId: G2.id }
+  ]);
+  const generic = await (await ctx.as(GENERIC, "/message", { method: "POST", body: { text: "from the bridge" } })).json();
+  assert.equal(ctx.store.getSession(generic.session.id).messages[0].metadata.authority, undefined);
+  // The owner's own client cannot pick another transport (or forge one for a
+  // generic node): the stored record is always the server's.
+  const owner = await (await fetch(ctx.url + "/message", {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${OWNER}` },
+    body: JSON.stringify({ text: "hello", sessionId: "owner-desk", metadata: { authority: { kind: "owner", via: "g2", nodeId: "forged" } } })
+  })).json();
+  assert.deepEqual(ctx.store.getSession(owner.session.id).messages[0].metadata.authority, { kind: "owner", via: "owner", nodeId: null });
 });
 
 test("thread is validated and reserved for paired phones", async (t) => {

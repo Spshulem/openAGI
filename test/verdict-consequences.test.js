@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ToolRegistry, createDefaultRuntime } from "../src/index.js";
 import { AgentHost } from "../src/agent-host.js";
+import { ownerPrincipal } from "../src/owner-authority.js";
 
 function makeRegistry() {
   const calls = [];
@@ -172,4 +173,21 @@ test("'none' policy (ignore verdict) hard-blocks EVERY tool at invoke, even read
     assert.match(r.error, /ignore.*permits no tools/i);
   }
   assert.equal(ran.length, 0, "no handler runs under an ignore verdict — even read-only");
+});
+
+test("an owner turn gets full tools on ask, watch and ignore; the verdict is still recorded", async () => {
+  for (const verdict of ["ask", "watch", "ignore"]) {
+    const { host, captured } = makeHost(verdict);
+    const principal = ownerPrincipal("phone", "mobile:1");
+    const result = await host.handleMessage({ text: "send the thing", channel: "node", from: "u" }, { principal });
+    assert.equal(result.output.scrutiny.action, verdict, `${verdict}: verdict kept`);
+    assert.deepEqual((captured.tools ?? []).map((t) => t.name).sort(), ["lookup_thing", "send_thing"], `${verdict}: full tools`);
+    assert.equal(captured.context.__scrutinyPolicy, null, `${verdict}: no scrutiny gate`);
+    assert.equal(captured.context.__owner, principal);
+    assert.deepEqual(captured.context.__turn, { untrusted: false, intent: "send the thing" });
+    assert.equal(captured.context.__reason, "owner instruction via phone");
+    assert.match(captured.turnContext, /Current decision: act \(owner instruction\)/);
+    assert.match(captured.turnContext, /Authenticated owner via phone\. Gated tools run when called\. Never say you lack permission/);
+    assert.doesNotMatch(captured.turnContext, /This turn:/);
+  }
 });
