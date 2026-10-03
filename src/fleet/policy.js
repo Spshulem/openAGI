@@ -316,6 +316,20 @@ function agentAskIntent(ctx) {
   const { classified, thread } = ctx;
   const ask = classified.ask ?? {};
   if (thread.meta?.blockedOnOwner === true) {
+    // A card the supervisor read on screen: its own buttons are the options,
+    // and a tap clicks that button (supervisor.answerQuestion). A new card is
+    // a new question (its stateId is in the key).
+    const card = thread.meta?.prompt;
+    if (Array.isArray(card?.buttons) && card.buttons.length && card.stateId && uiTargetFor(thread)) {
+      return {
+        type: "ask", reason: "blocked on a permission prompt",
+        question: {
+          ...question(ctx, `${ctx.facts.label}: waiting on a prompt. Answer?`, `${ctx.facts.label}: ${card.text || ask.text || "Blocked on a permission prompt."}`,
+            [...card.buttons.slice(0, 3), "later"], `prompt:${thread.key}:${card.stateId}`, "prompt"),
+          meta: { promptStateId: card.stateId }
+        }
+      };
+    }
     // Only a click in the session clears it, so the answer is not relayed.
     return {
       type: "ask", reason: "blocked on a permission prompt",

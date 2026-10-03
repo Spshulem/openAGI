@@ -377,3 +377,23 @@ test('a question the review closes never reaches the main or the glasses, and re
   await remote.refresh();
   assert.deepEqual(outreach.list().map(item => item.sourceRef.id), [closed.id]);
 });
+
+test('main reads screens, clicks and controls apps on the Mac through the broker with the delivery ceiling', async t => {
+  const { remote, calls } = fixture(t);
+  const seen = [];
+  const mac = {
+    getState: () => ({ mode: 'auto', enabled: true, snapshot: { threads: [] }, questions: [], actions: [] }),
+    screenThread: async (key) => { seen.push(['screen', key]); return { status: 'read', detail: 'read Codex', screen: { prompt: null } }; },
+    clickThread: async (key, label, options) => { seen.push(['click', key, label, options.stateId]); return { delivery: { status: 'sent', detail: 'clicked' }, prompt: null }; },
+    appAction: async (app, action, options) => { seen.push(['app', app, action, options.expectRunning]); return { ok: true, detail: 'restarted Conductor' }; }
+  };
+  const capability = createFleetCapability(mac);
+  remote.runtime.nodeCapabilities.dispatch = async (...args) => { calls.push(args); return capability.invoke(args[2], args[3]); };
+  assert.equal((await remote.screenThread('codex:t1')).status, 'read');
+  assert.equal((await remote.clickThread('codex:t1', 'Allow once', { stateId: '0123456789abcdef' })).delivery.status, 'sent');
+  assert.equal((await remote.appAction('conductor', 'restart', { expectRunning: ['conductor:s1'] })).ok, true);
+  assert.deepEqual(seen, [['screen', 'codex:t1'], ['click', 'codex:t1', 'Allow once', '0123456789abcdef'], ['app', 'conductor', 'restart', ['conductor:s1']]]);
+  const timeouts = calls.slice(-3).map((call) => call[4].timeoutMs);
+  assert.deepEqual(timeouts, [120000, 300000, 300000], 'a screen read is a request; a click and an app action wait like a send');
+  await assert.rejects(() => capability.invoke('request', { method: 'POST', path: '/fleet/api/apps/finder/open' }), /Unsupported fleet request/);
+});

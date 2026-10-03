@@ -262,3 +262,31 @@ test("a supervisor method that throws becomes a 500 JSON body", async () => {
   assert.equal(result.status, 500);
   assert.equal(typeof result.body.error, "string");
 });
+
+test("screen, click and app routes validate their input and reach the supervisor", async () => {
+  const supervisor = fakeSupervisor();
+  supervisor.screenThread = async (key, options) => { supervisor.calls.push(["screenThread", key, options.deadlineAt]); return { status: "read", detail: "read Codex", screen: { prompt: null } }; };
+  supervisor.clickThread = async (key, label, options) => { supervisor.calls.push(["clickThread", key, label, options.stateId]); return { delivery: { status: "sent", detail: `clicked ${label}` }, prompt: null }; };
+  supervisor.appAction = async (app, action, options) => { supervisor.calls.push(["appAction", app, action, options.expectRunning]); return { ok: true, detail: "restarted Conductor" }; };
+  const route = createFleetRoute({ supervisor });
+  const post = (path, body) => route("POST", path, null, async () => body);
+  const screen = await post("/fleet/api/screen", { threadKey: "codex:t1" });
+  assert.equal(screen.status, 200);
+  assert.equal(screen.body.status, "read");
+  assert.equal((await post("/fleet/api/screen", { threadKey: "../etc" })).status, 400);
+  const clicked = await post("/fleet/api/click", { threadKey: "codex:t1", label: "Allow once", stateId: "0123456789abcdef" });
+  assert.equal(clicked.body.delivery.status, "sent");
+  assert.equal((await post("/fleet/api/click", { threadKey: "codex:t1", label: "" })).status, 400);
+  assert.equal((await post("/fleet/api/click", { threadKey: "codex:t1", label: "Allow", stateId: "x" })).status, 400);
+  const restarted = await post("/fleet/api/apps/conductor/restart", { expectRunning: ["conductor:s1", "../bad", 7] });
+  assert.equal(restarted.status, 200);
+  assert.equal(restarted.body.result.ok, true);
+  assert.equal((await post("/fleet/api/apps/finder/quit", {})).status, 404);
+  assert.equal((await post("/fleet/api/apps/codex/kill", {})).status, 404);
+  assert.equal((await route("GET", "/fleet/api/screen", null, async () => ({}))).status, 405);
+  assert.deepEqual(supervisor.calls.filter((call) => call[0] !== "getState"), [
+    ["screenThread", "codex:t1", null],
+    ["clickThread", "codex:t1", "Allow once", "0123456789abcdef"],
+    ["appAction", "conductor", "restart", ["conductor:s1"]]
+  ]);
+});
