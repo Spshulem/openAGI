@@ -20,6 +20,27 @@ function engineEnvironment({ appAgentProxy = false, agentNamespace = null } = {}
 export const OCU_CLOSE_GRACE_MS = 30_000;
 // Calls that only read. Any other tool is input.
 const READ_TOOLS = new Set(["get_app_state", "list_apps"]);
+const OCU_TEXT_MAX = 200;
+
+// What Open Computer Use said about a failure ("Apple event error -10005:
+// cgWindowNotFound"), so a caller can tell one failure kind from another.
+// Bounded, single-line, with token-like strings removed; never logged here.
+export function redactedOcuText(value) {
+  return String(value ?? "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\b(?:sk|pk|rk|ghp|gho|ghs|github_pat|xox[abpr])[-_][\w-]{6,}/gi, "[redacted]")
+    .replace(/\b(?:bearer|token|key|secret|password)\s*[:=]?\s*\S+/gi, "[redacted]")
+    .replace(/[A-Za-z0-9+/_=-]{32,}/g, "[redacted]")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+    .slice(0, OCU_TEXT_MAX);
+}
+
+function contentText(result) {
+  return (Array.isArray(result?.content) ? result.content : [])
+    .filter((item) => item?.type === "text" && typeof item.text === "string").map((item) => item.text).join(" ");
+}
 
 export function readOcuPermissions(command, run = execFile, { appAgentProxy = false, agentNamespace = null, timeoutMs = 3000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -81,8 +102,10 @@ export class OcuTransport {
         if (!current) continue;
         const pending = this.pending.get(value.id);
         if (!pending) continue;
-        if (value.error || !Object.hasOwn(value, "result")) pending.reject(new Error("Open Computer Use rejected the request."));
-        else pending.resolve(value.result);
+        if (value.error || !Object.hasOwn(value, "result")) {
+          pending.reject(Object.assign(new Error("Open Computer Use rejected the request."),
+            { ocuText: redactedOcuText(value.error?.message ?? "") }));
+        } else pending.resolve(value.result);
       }
     });
     child.on("error", () => { if (this.proc === child) this.close(); });
@@ -130,7 +153,8 @@ export class OcuTransport {
     await this.connect(signal);
     const result = await this.request("tools/call", { name, arguments: args }, signal, timeoutMs);
     if (result?.isError !== false || !Array.isArray(result.content)) {
-      throw new Error("Open Computer Use could not complete the action. Check its permissions and take a new screenshot; do not retry blindly.");
+      throw Object.assign(new Error("Open Computer Use could not complete the action. Check its permissions and take a new screenshot; do not retry blindly."),
+        { ocuText: redactedOcuText(contentText(result)) });
     }
     return result;
   }

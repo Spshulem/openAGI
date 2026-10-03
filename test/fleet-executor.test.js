@@ -597,3 +597,16 @@ test("computer-use passes every known thread so shared titles block as ambiguous
   await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use" });
   assert.equal(requests[0].identity.ambiguous, true);
 });
+
+test("a blocked app send carries the permission card and the failure kind back to the supervisor", async (t) => {
+  const prompt = { text: "Run npm test?", buttons: ["Allow once", "Deny"], stateId: "0123456789abcdef" };
+  const { cwd, executor } = uiSetup(t, { results: [
+    { status: "blocked", detail: "permission prompt visible: open it", prompt },
+    { status: "blocked", detail: "can't read Conductor", code: "appUnreadable" }
+  ] });
+  const carded = await executor.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use" });
+  assert.equal(carded.status, "blocked");
+  assert.deepEqual(carded.prompt, prompt);
+  const unreadable = await executor.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use" });
+  assert.equal(unreadable.code, "appUnreadable");
+});
