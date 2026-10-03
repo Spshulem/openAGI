@@ -13,7 +13,7 @@ export function createFleetCapability(supervisor) {
     // inside it.
     async invoke(operation, payload, { expiresAt = null } = {}) {
       if (operation !== 'request' || !payload || typeof payload.path !== 'string'
-          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|apps\/(conductor|codex)\/(open|quit|restart)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
+          || !/^\/fleet\/api\/(state|scan|mode|send|screen|click|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send)$/.test(payload.path)
           || !['GET', 'POST'].includes(payload.method)) throw new Error('Unsupported fleet request');
       const deadlineAt = Date.parse(expiresAt ?? '');
       const response = await route(payload.method, payload.path, new URL(payload.path, 'http://localhost'), async () => payload.body ?? {},
@@ -106,6 +106,9 @@ export class RemoteFleetSupervisor {
   async clickThread(threadKey, label, { stateId = null } = {}) {
     const body = await this.request('POST', '/fleet/api/click', { threadKey, label, ...(stateId ? { stateId } : {}) });
     return { delivery: body.delivery ?? null, prompt: body.prompt ?? null };
+  }
+  async runningInApp(app) {
+    return (await this.request('GET', `/fleet/api/apps/${app}/running`)).running ?? null;
   }
   async appAction(app, action, { expectRunning = [] } = {}) {
     return (await this.request('POST', `/fleet/api/apps/${app}/${action}`, { expectRunning })).result;

@@ -284,6 +284,10 @@ test("screen, click and app routes validate their input and reach the supervisor
   assert.equal((await post("/fleet/api/apps/finder/quit", {})).status, 404);
   assert.equal((await post("/fleet/api/apps/codex/kill", {})).status, 404);
   assert.equal((await route("GET", "/fleet/api/screen", null, async () => ({}))).status, 405);
+  supervisor.runningInApp = async (app) => (app === "codex" ? [{ key: "codex:t1", name: "billing" }] : null);
+  assert.deepEqual((await route("GET", "/fleet/api/apps/codex/running", null, async () => ({}))).body.running, [{ key: "codex:t1", name: "billing" }]);
+  assert.equal((await route("GET", "/fleet/api/apps/conductor/running", null, async () => ({}))).status, 503, "unreadable is not idle");
+  assert.equal((await post("/fleet/api/apps/codex/running", {})).status, 405);
   assert.deepEqual(supervisor.calls.filter((call) => call[0] !== "getState"), [
     ["screenThread", "codex:t1", null],
     ["clickThread", "codex:t1", "Allow once", "0123456789abcdef"],

@@ -2767,6 +2767,20 @@ test("quit and restart re-read running chats first: a turn started after the las
   assert.deepEqual(supervisor.store.appRestart("conductor").threadKeys, ["conductor:a"], "the fresh turn gets its resume");
 });
 
+test("the chats a quit or restart would stop are read live, out-of-scope chats included", async (t) => {
+  const appController = { restart: async () => ({ ok: true, detail: "restarted Conductor" }) };
+  let a = makeThread({ key: "conductor:a", kind: "conductor", id: "a", workspace: "a", agentStatus: "idle", prRefs: [], meta: uiMeta("a") });
+  const b = makeThread({ key: "conductor:b", kind: "conductor", id: "b", workspace: "b", agentStatus: "running", prRefs: [], excluded: "no-repo", meta: uiMeta("b") });
+  const { supervisor } = fixture(t, { prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver(), appController,
+    listCodexThreads: async () => [], listConductorThreads: async () => [a, b] } });
+  await supervisor.tick();
+  assert.equal((supervisor.getState().snapshot.threads ?? []).some((row) => row.key === "conductor:b"), false, "the scan leaves b out");
+  a = { ...a, agentStatus: "running" };
+  const running = await supervisor.runningInApp("conductor");
+  assert.deepEqual(running.map((row) => row.key).sort(), ["conductor:a", "conductor:b"]);
+  assert.equal((await supervisor.appAction("conductor", "restart", { expectRunning: running.map((row) => row.key) })).ok, true);
+});
+
 test("a Conductor tab and the Codex thread it hosts get one resume after a restart", async (t) => {
   let now = NOW;
   const delivered = [];

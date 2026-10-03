@@ -385,7 +385,8 @@ test('main reads screens, clicks and controls apps on the Mac through the broker
     getState: () => ({ mode: 'auto', enabled: true, snapshot: { threads: [] }, questions: [], actions: [] }),
     screenThread: async (key) => { seen.push(['screen', key]); return { status: 'read', detail: 'read Codex', screen: { prompt: null } }; },
     clickThread: async (key, label, options) => { seen.push(['click', key, label, options.stateId]); return { delivery: { status: 'sent', detail: 'clicked' }, prompt: null }; },
-    appAction: async (app, action, options) => { seen.push(['app', app, action, options.expectRunning]); return { ok: true, detail: 'restarted Conductor' }; }
+    appAction: async (app, action, options) => { seen.push(['app', app, action, options.expectRunning]); return { ok: true, detail: 'restarted Conductor' }; },
+    runningInApp: async (app) => [{ key: `${app}:s1`, name: 'madrid' }]
   };
   const capability = createFleetCapability(mac);
   remote.runtime.nodeCapabilities.dispatch = async (...args) => { calls.push(args); return capability.invoke(args[2], args[3]); };
@@ -396,4 +397,6 @@ test('main reads screens, clicks and controls apps on the Mac through the broker
   const timeouts = calls.slice(-3).map((call) => call[4].timeoutMs);
   assert.deepEqual(timeouts, [120000, 300000, 300000], 'a screen read is a request; a click and an app action wait like a send');
   await assert.rejects(() => capability.invoke('request', { method: 'POST', path: '/fleet/api/apps/finder/open' }), /Unsupported fleet request/);
+  // The chats a restart would stop, read live on the Mac.
+  assert.deepEqual(await remote.runningInApp('conductor'), [{ key: 'conductor:s1', name: 'madrid' }]);
 });

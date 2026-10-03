@@ -299,6 +299,22 @@ test("fleet_screen reads (untrusted), fleet_click clicks the pinned label, fleet
   }
 });
 
+test("fleet_app pins the live running chats, not the last scan's", async () => {
+  // The scan saw nothing running; a turn started since, and a chat the scan
+  // leaves out, are named and approved once instead of refused until the next scan.
+  const supervisor = {
+    ...fakeSupervisor({ snapshot: { at: "2026-09-26T11:00:00.000Z", counts: {}, threads: [row({ key: "codex:x", app: "codex", agentStatus: "idle" })], infra: {}, sourceErrors: {} } }),
+    runningInApp: async (app) => (app === "codex" ? [{ key: "codex:x", name: "billing" }, { key: "codex:y", name: "scratch" }] : []),
+    appAction: async () => ({ ok: true })
+  };
+  const tools = registry(supervisor);
+  const prepared = await tools.get("fleet_app").prepareApprovalArgs({ app: "codex", action: "restart" }, {});
+  assert.deepEqual(prepared.running, [{ key: "codex:x", name: "billing" }, { key: "codex:y", name: "scratch" }]);
+  // Live read unavailable: the last scan's list.
+  supervisor.runningInApp = async () => { throw new Error("offline"); };
+  assert.deepEqual((await tools.get("fleet_app").prepareApprovalArgs({ app: "codex", action: "quit" }, {})).running, []);
+});
+
 test("fleet_click pins the card the scan saw when no stateId is given, refuses a card button with no card known, and leaves Resume unpinned", () => {
   const card = { text: "Run npm test?", buttons: ["Approve", "Deny"], stateId: "0123456789abcdef" };
   const supervisor = {

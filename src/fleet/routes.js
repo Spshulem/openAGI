@@ -152,6 +152,15 @@ export function createFleetRoute({ supervisor } = {}) {
         const result = await supervisor.clickThread(threadKey, label, { ...sendOptions, stateId });
         return ok({ delivery: result?.delivery ?? null, prompt: result?.prompt ?? null, state: state() });
       }
+      // The chats a quit or restart would stop right now, read live.
+      if (parts.length === 3 && parts[0] === "apps" && parts[2] === "running") {
+        if (method !== "GET") return fail(405, "Use GET.");
+        if (!APPS.has(parts[1])) return fail(404, "Unknown fleet route.");
+        if (typeof supervisor.runningInApp !== "function") return fail(503, "App control is not available.");
+        const running = await supervisor.runningInApp(parts[1]);
+        if (!running) return fail(503, "Could not read which chats are running.");
+        return ok({ running, state: state() });
+      }
       // Open, quit or restart Conductor or the Codex app. expectRunning: the
       // chats the caller approved stopping.
       if (parts.length === 3 && parts[0] === "apps") {

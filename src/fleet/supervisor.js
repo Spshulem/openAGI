@@ -741,6 +741,14 @@ export class FleetSupervisor {
     return [...byKey.values()].filter((thread) => thread?.agentStatus === "running" && uiTargetFor(thread)?.app === app);
   }
 
+  // The chats a quit or restart would stop, as the owner is asked to approve
+  // them: the same live read appAction checks, chats the scan leaves out
+  // (no repo, past the cap) included. null when a source failed.
+  async runningInApp(app) {
+    const live = await this.liveRunningIn(app);
+    return live ? live.map((thread) => ({ key: thread.key, name: thread.workspace || thread.title || thread.key })) : null;
+  }
+
   // The owner's open, quit or restart of one app. Quit and restart stop every
   // turn running in it: expectRunning is the chats the owner approved
   // stopping, and any other running chat blocks it. The stopped chats are

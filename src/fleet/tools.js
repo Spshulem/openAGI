@@ -243,16 +243,26 @@ function fleetClickTarget(supervisor, args = {}) {
 
 const RESUME_LABELS = new Set(["resume goal", "retry", "resume"]);
 
-// Pins the chats a quit or restart would stop, from the latest scan.
-function fleetAppTarget(supervisor, args = {}) {
+// Pins the chats a quit or restart would stop. Read live, the way appAction
+// checks them, so a turn started since the last scan, or a chat the scan
+// leaves out, is named once here instead of refusing every ask until the
+// next scan. The last scan only when the live read is unavailable.
+async function fleetAppTarget(supervisor, args = {}) {
   const app = typeof args?.app === "string" ? args.app.trim().toLowerCase() : "";
   const action = typeof args?.action === "string" ? args.action.trim().toLowerCase() : "";
   if (!Object.hasOwn(APPS, app)) throw new Error("App must be conductor or codex.");
   if (!["open", "quit", "restart"].includes(action)) throw new Error("Action must be open, quit or restart.");
-  const running = (readState(supervisor).snapshot?.threads ?? [])
-    .filter((row) => row?.key && row.app === app && row.agentStatus === "running")
-    .slice(0, 20)
-    .map((row) => ({ key: row.key, name: clip(row.workspace || row.title || row.key, 60) }));
+  if (action === "open") return { app, action, running: [] };
+  let live = null;
+  if (typeof supervisor.runningInApp === "function") {
+    try { live = await supervisor.runningInApp(app); } catch { live = null; }
+  }
+  const rows = Array.isArray(live) ? live : (readState(supervisor).snapshot?.threads ?? [])
+    .filter((row) => row?.app === app && row.agentStatus === "running");
+  const running = rows
+    .filter((row) => typeof row?.key === "string" && row.key)
+    .slice(0, 50)
+    .map((row) => ({ key: row.key, name: clip(row.name || row.workspace || row.title || row.key, 60) }));
   return { app, action, running };
 }
 
