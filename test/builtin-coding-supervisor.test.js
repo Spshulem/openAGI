@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { execFileSync } from "node:child_process";
 import { BuiltinCodingSupervisor, codingArguments, codingChildEnv, trustedWorkspacePaths } from "../src/builtin-coding-supervisor.js";
+import { REPAIR_PREAMBLE } from "../src/coding-supervisor.js";
 
 function fixture(t, options = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "coding-builtin-"));
@@ -29,6 +31,24 @@ function finish(child, text = "Fixture done") {
   child.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }) + "\n");
   child.stdout.write('{"type":"turn.completed"}\n'); child.emit("close", 0);
 }
+
+test("a repair brief branches from the workspace's own default branch", t => {
+  const f = fixture(t);
+  const git = (...args) => execFileSync("git", ["-C", f.project, ...args], { stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" } });
+  const brief = `${REPAIR_PREAMBLE}\n\nBrief: Fix\nDo the fix.`;
+  // Not a usable repository: the safe default.
+  assert.match(f.prepare(brief).message, /^OpenAGI repair brief\. Rules for this session:\n- Start a new branch from origin\/main \(git fetch first\)\./);
+  fs.rmSync(path.join(f.project, ".git"), { recursive: true, force: true });
+  git("init", "--quiet");
+  git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--quiet", "--allow-empty", "-m", "init");
+  git("update-ref", "refs/remotes/origin/master", "HEAD");
+  assert.match(f.prepare(brief).message, /from origin\/master \(git fetch first\)/, "origin has master, not main");
+  git("update-ref", "refs/remotes/origin/trunk", "HEAD");
+  git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk");
+  const prepared = f.prepare(brief);
+  assert.match(prepared.message, /from origin\/trunk \(git fetch first\)/, "what origin/HEAD names");
+  assert.equal(prepared.message.includes("{"), false);
+});
 
 test("fresh install requires explicit workspace setup and exposes no credentials", t => {
   const f = fixture(t);

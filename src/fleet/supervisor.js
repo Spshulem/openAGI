@@ -716,6 +716,31 @@ export class FleetSupervisor {
     return this._appController;
   }
 
+  // The chats running in an app right now, read fresh from the sources that
+  // can show it (Codex and Conductor). A thread the last scan saw that this
+  // read does not list (a full page) keeps its last state. null when a
+  // source failed: unknown is not idle.
+  async liveRunningIn(app) {
+    const config = { ...this.config, mode: this.mode };
+    const d = this.deps;
+    const now = this.now();
+    let peers = new Map();
+    try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch { /* peers only label sessions */ }
+    let fresh;
+    try {
+      const [codexThreads, conductorThreads] = await Promise.all([
+        withTimeout(Promise.resolve().then(() => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now, run: d.run ?? runCommand })), SOURCE_TIMEOUT_MS, "codex"),
+        withTimeout(Promise.resolve().then(() => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now, peers })), SOURCE_TIMEOUT_MS, "conductor")
+      ]);
+      fresh = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: [], conductor: conductorThreads ?? [] }));
+    } catch {
+      return null;
+    }
+    const byKey = new Map([...this.lastThreads].filter(([, thread]) => thread?.kind === "codex" || thread?.kind === "conductor"));
+    for (const thread of fresh) byKey.set(thread.key, thread);
+    return [...byKey.values()].filter((thread) => thread?.agentStatus === "running" && uiTargetFor(thread)?.app === app);
+  }
+
   // The owner's open, quit or restart of one app. Quit and restart stop every
   // turn running in it: expectRunning is the chats the owner approved
   // stopping, and any other running chat blocks it. The stopped chats are
@@ -723,8 +748,13 @@ export class FleetSupervisor {
   async appAction(app, action, { expectRunning = null, deadlineAt = null } = {}) {
     const spec = UI_APPS[app];
     if (!spec || !APP_ACTIONS.has(action)) return { ok: false, app, action, detail: "Use open, quit or restart for conductor or codex." };
-    const running = [...this.lastThreads.values()].filter((thread) => thread?.agentStatus === "running" && uiTargetFor(thread)?.app === app);
+    let running = [...this.lastThreads.values()].filter((thread) => thread?.agentStatus === "running" && uiTargetFor(thread)?.app === app);
     if (action !== "open") {
+      // The last scan can be minutes old: re-read the app's chats now, so a
+      // turn started since then is counted too.
+      const live = await this.liveRunningIn(app);
+      if (!live) return { ok: false, app, action, running: running.map((thread) => thread.key), detail: `could not read which chats are running in ${spec.name}; a ${action} could stop one. Ask again.` };
+      running = live;
       const approved = new Set(Array.isArray(expectRunning) ? expectRunning : []);
       const unapproved = running.filter((thread) => !approved.has(thread.key));
       if (unapproved.length) {
@@ -884,9 +914,14 @@ export class FleetSupervisor {
       const at = Date.parse(record.at ?? "");
       if (!Number.isFinite(at) || started - at > APP_RESTART_KEEP_MS) { this.store.setAppRestart(app, null); continue; }
       const done = new Set(record.done ?? []);
+      // A Conductor session and the Codex thread it hosts are one chat on
+      // screen: it gets one resume, and every key showing it is settled.
+      const targetOf = (key) => uiTargetFor(byKey.get(key))?.targetKey ?? null;
+      const resumed = new Set([...done].map(targetOf).filter(Boolean));
       for (const key of record.threadKeys ?? []) {
         if (done.has(key) || sourceUnknown([key])) continue;
         const thread = byKey.get(key);
+        if (resumed.has(targetOf(key))) { done.add(key); continue; }
         const ownerSince = thread && Date.parse(thread.lastUserAt ?? "") > at && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
         if (!thread || ownerSince) { done.add(key); continue; }
         if (thread.agentStatus === "running") {
@@ -907,8 +942,9 @@ export class FleetSupervisor {
         out.sent += 1;
         out.threads.add(key);
         const uiKey = uiTargetFor(thread)?.targetKey;
-        if (uiKey) out.uiKeys.add(uiKey);
+        if (uiKey) { out.uiKeys.add(uiKey); resumed.add(uiKey); }
       }
+      for (const key of record.threadKeys ?? []) if (resumed.has(targetOf(key))) done.add(key);
       const left = (record.threadKeys ?? []).filter((key) => !done.has(key));
       this.store.setAppRestart(app, left.length ? { ...record, done: [...done] } : null);
     }

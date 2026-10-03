@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { ensureDir, readJsonFile, writeJsonAtomic } from "./file-utils.js";
 import { resolveDataDir } from "./data-dir.js";
-import { BuiltinCodingSupervisor } from "./builtin-coding-supervisor.js";
+import { BuiltinCodingSupervisor, REPAIR_BASE_TOKEN } from "./builtin-coding-supervisor.js";
 
 const ATTENTION = new Set(["waiting", "stuck", "failed", "interrupted"]);
 const STATES = new Set([...ATTENTION, "working", "idle"]);
@@ -16,7 +16,8 @@ const CODING_CAPABILITY = "coding-supervisor";
 // brief, whatever the brief says.
 export const REPAIR_PREAMBLE = [
   "OpenAGI repair brief. Rules for this session:",
-  "- Start a new branch from origin/main (git fetch first).",
+  // The coding node puts in the workspace's default branch (prepare).
+  `- Start a new branch from origin/${REPAIR_BASE_TOKEN} (git fetch first).`,
   "- Use Node 22 and run tests one file at a time: node --test --test-concurrency=1 test/<file>.test.js.",
   "- Commit, push the branch, and open a pull request with gh pr create. Report the PR URL.",
   "- Never merge, release, deploy or restart services, and never read or write ~/.openagi."
@@ -468,7 +469,7 @@ export function registerCodingSupervisorTools(registry, supervisor) {
     description: "Start an OpenAGI-managed coding CLI in an owner-selected Git workspace. Runs on the owner's instruction; from anyone else it waits for the owner's approval. Codex is read-only and Claude keeps manual permissions unless the coding node marks the workspace trusted. Never claim acceptance means task completion. Use list_coding_workspaces for exact workspace IDs.",
     parameters: { type: "object", properties: { provider: targetSchema.provider, workspaceId: { type: "string" },
       message: { type: "string", maxLength: 16000, description: "The instruction. 4000 characters at most unless the workspace is trusted on its node (16000)." },
-      draftId: { type: "string", description: "A saved draft on this main to send as a repair brief, after OpenAGI's fixed repair rules (new branch from origin/main, Node 22 tests one file at a time, commit, push, gh pr create; never merge, release, restart or touch ~/.openagi). Replaces message." },
+      draftId: { type: "string", description: "A saved draft on this main to send as a repair brief, after OpenAGI's fixed repair rules (new branch from the repository's default branch, Node 22 tests one file at a time, commit, push, gh pr create; never merge, release, restart or touch ~/.openagi). Replaces message." },
       model: { type: "string" }, effort: { type: "string", enum: ["low", "medium", "high"] } },
     required: ["provider", "workspaceId"], additionalProperties: false },
     prepareApprovalArgs: async args => {

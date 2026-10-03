@@ -144,6 +144,20 @@ test("an owner instruction supersedes the identical code card in its chat", asyn
   assert.equal(h.store.get(other.result.actionId).status, "pending", "a different card is left alone");
 });
 
+test("the same held request from two owner chats is two cards, one per chat", async (t) => {
+  const h = harness(t);
+  const first = h.ownerContext("g2", "what's new?");
+  first.__turn.untrusted = true;
+  const second = { ...h.ownerContext("phone", "what's new?"), sessionId: "phone:main" };
+  second.__turn.untrusted = true;
+  const a = await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, first);
+  const again = await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, first);
+  const b = await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, second);
+  assert.equal(again.result.actionId, a.result.actionId, "the same chat reuses its card");
+  assert.notEqual(b.result.actionId, a.result.actionId);
+  assert.equal(h.store.get(b.result.actionId).context.sessionId, "phone:main");
+});
+
 test("after a restart the journal replays as data, never as authority", async (t) => {
   const h = harness(t);
   await h.registry.invoke("fleet_click", { key: "codex:1", label: "Allow" }, h.ownerContext());

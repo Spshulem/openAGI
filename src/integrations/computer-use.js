@@ -499,9 +499,11 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         .filter((action) => action.toolName === "start_computer_use_session" && action.context?.sessionId === context.sessionId) ?? [];
       const discoveredNodes = runtime.nodeCapabilities?.list?.("computer-use")?.map?.((entry) => {
         const capability = entry.capabilities?.find?.((candidate) => candidate.id === "computer-use") ?? null;
+        // No node name: a node reports its own, so it is text the owner did
+        // not write, and this output is read as trusted. start resolves the
+        // name the owner says.
         return {
           nodeId: entry.nodeId,
-          name: entry.name ?? null,
           ready: capability?.ready === true,
           operations: Array.isArray(capability?.operations) ? capability.operations : []
         };
@@ -513,7 +515,6 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       const availableNodes = explicitStatus
         ? [{
             nodeId: "explicit",
-            name: null,
             ready: Boolean(explicitProbe?.reachable && explicitProbe.inputAvailable
               && explicitProbe.operations.includes("session.start")),
             operations: explicitProbe?.operations ?? []
@@ -521,9 +522,9 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
         : discoveredNodes;
       return {
         active: Boolean(active),
+        // No goal either: it can quote text a tool read. The chat has it.
         session: active ? {
           id: active.id,
-          goal: active.goal,
           startedAt: active.startedAt
         } : null,
         awaitingApproval: pending.length > 0,
@@ -545,7 +546,7 @@ export function registerComputerUseTools(registry, runtime, { fetchImpl = global
       type: "object",
       properties: {
         goal: { type: "string", description: "What the user is trying to accomplish, in one sentence. Will be shown verbatim in the approval card." },
-        node: { type: "string", description: "Optional node name or id. Use a value returned by computer_use_status when the user names a specific Mac." },
+        node: { type: "string", description: "Optional node name or id. When the user names a specific Mac, pass that name, or a nodeId returned by computer_use_status." },
         nodeId: { type: "string", description: "Immutable node id resolved before approval. Do not invent this value." },
         nodeName: { type: "string", description: "Display name resolved before approval. Do not invent this value." }
       },

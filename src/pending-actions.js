@@ -69,7 +69,7 @@ export class PendingActionStore {
     const cardMode = ["queue", "chat", "owner"].includes(mode) ? mode : "queue";
     const boundedDedupeKey = typeof dedupeKey === "string" && dedupeKey
       ? dedupeKey.slice(0, 500)
-      : cardMode === "chat" ? argsDigest(toolName, args) : null;
+      : cardMode === "chat" ? argsDigest(toolName, args, context?.sessionId) : null;
     if (boundedDedupeKey && _reuse) {
       const existing = this.list({ status: "pending" }).find((candidate) =>
         candidate.toolName === toolName && candidate.dedupeKey === boundedDedupeKey
@@ -429,8 +429,10 @@ function serializableContext(ctx) {
   };
 }
 
-export function argsDigest(toolName, args) {
+// Scoped to the originating chat: the same request from two owner chats is
+// two cards, each bound to its own chat's context.
+export function argsDigest(toolName, args, sessionId = null) {
   let serialized;
-  try { serialized = JSON.stringify([toolName, args ?? {}]); } catch { serialized = String(toolName); }
+  try { serialized = JSON.stringify([toolName, args ?? {}, sessionId ?? null]); } catch { serialized = `${toolName}:${sessionId ?? ""}`; }
   return `chat:${crypto.createHash("sha256").update(serialized).digest("hex").slice(0, 32)}`;
 }

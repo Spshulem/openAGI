@@ -2740,6 +2740,56 @@ test("Conductor unreadable for a while: one restart question, a restart that pin
   assert.equal(supervisor.getState().questions.filter((q) => q.dedupeKey === "infra:unreadable:conductor").length, 0, "a good restart clears the question");
 });
 
+test("quit and restart re-read running chats first: a turn started after the last scan blocks them", async (t) => {
+  const restarts = [];
+  const appController = { restart: async (app) => { restarts.push(app); return { ok: true, detail: "restarted Conductor" }; }, quit: async (app) => { restarts.push(`quit:${app}`); return { ok: true, detail: "quit Conductor" }; } };
+  let a = makeThread({ key: "conductor:a", kind: "conductor", id: "a", workspace: "a", agentStatus: "idle", prRefs: [], meta: uiMeta("a") });
+  let failing = false;
+  const { supervisor } = fixture(t, { prs: new Map(), delivery: "computer-use", deps: { uiDriver: readyDriver(), appController,
+    listCodexThreads: async () => [], listConductorThreads: async () => { if (failing) throw new Error("db locked"); return [a]; } } });
+  await supervisor.tick();
+  a = { ...a, agentStatus: "running" };
+  for (const action of ["restart", "quit"]) {
+    const refused = await supervisor.appAction("conductor", action, { expectRunning: [] });
+    assert.equal(refused.ok, false, action);
+    assert.match(refused.detail, /1 more chats running in Conductor than approved/);
+  }
+  assert.deepEqual(restarts, []);
+  failing = true;
+  const unknown = await supervisor.appAction("conductor", "restart", { expectRunning: ["conductor:a"] });
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.detail, /could not read which chats are running in Conductor/);
+  assert.deepEqual(restarts, []);
+  failing = false;
+  const ran = await supervisor.appAction("conductor", "restart", { expectRunning: ["conductor:a"] });
+  assert.equal(ran.ok, true);
+  assert.deepEqual(ran.running, ["conductor:a"]);
+  assert.deepEqual(supervisor.store.appRestart("conductor").threadKeys, ["conductor:a"], "the fresh turn gets its resume");
+});
+
+test("a Conductor tab and the Codex thread it hosts get one resume after a restart", async (t) => {
+  let now = NOW;
+  const delivered = [];
+  const executor = { deliver: async (args) => { delivered.push(args); return { status: "sent", route: args.route, detail: "ok" }; }, inFlight: () => [], whenIdle: async () => {} };
+  const appController = { restart: async () => ({ ok: true, detail: "restarted Conductor" }) };
+  let tab = makeThread({ key: "conductor:s9", kind: "conductor", id: "s9", claudeSessionId: "t9", workspace: "madrid", cwd: "/work/s9", agentStatus: "running", prRefs: [], meta: uiMeta("s9") });
+  let hosted = makeThread({ key: "codex:t9", id: "t9", cwd: "/work/t9", agentStatus: "running", prRefs: [], meta: { originator: "codex_sdk_ts" } });
+  const { supervisor } = fixture(t, { prs: new Map(), now: () => now, delivery: "computer-use", deps: { uiDriver: readyDriver(), executor, appController,
+    listCodexThreads: async () => [hosted], listConductorThreads: async () => [tab] } });
+  await supervisor.tick();
+  assert.equal((await supervisor.appAction("conductor", "restart", { expectRunning: ["conductor:s9", "codex:t9"] })).ok, true);
+  assert.deepEqual([...supervisor.store.appRestart("conductor").threadKeys].sort(), ["codex:t9", "conductor:s9"]);
+  tab = { ...tab, agentStatus: "idle" };
+  hosted = { ...hosted, agentStatus: "idle" };
+  now += 2 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((args) => args.playbook === "app-restarted").length, 1, "one resume per chat on screen");
+  assert.equal(supervisor.store.appRestart("conductor"), null, "both keys settled");
+  now += 20 * MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((args) => args.playbook === "app-restarted").length, 1);
+});
+
 test("a turn the restart killed still reads running for a while: its resume waits, then goes once it reads idle", async (t) => {
   let now = NOW;
   const delivered = [];

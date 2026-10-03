@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { readJsonFile, writeJsonAtomic, ensureDir } from "./file-utils.js";
 
@@ -19,6 +19,27 @@ const MAX_MESSAGE = 4000;
 const TRUSTED_MAX_RUN_MS = 2 * 60 * 60_000;
 const TRUSTED_MAX_MESSAGE = 16_000;
 const TRUSTED_CLAUDE_TOOLS = "Bash(git:*),Bash(gh:*),Bash(node:*),Bash(npm:*)";
+
+// A repair brief says where to branch from with this token; prepare puts in
+// the workspace's own default branch: what origin/HEAD names, else main or
+// master if origin has it, else main.
+export const REPAIR_BASE_TOKEN = "{repository-default-branch}";
+const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/;
+export function repositoryDefaultBranch(cwd, run = spawnSync) {
+  const git = (...args) => {
+    try {
+      const result = run("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] });
+      return result?.status === 0 ? String(result.stdout ?? "").trim() : null;
+    } catch { return null; }
+  };
+  const head = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD");
+  const name = head?.startsWith("origin/") ? head.slice("origin/".length) : null;
+  if (name && BRANCH.test(name) && !name.includes("..")) return name;
+  for (const candidate of ["main", "master"]) {
+    if (git("show-ref", "--verify", "--quiet", `refs/remotes/origin/${candidate}`) !== null) return candidate;
+  }
+  return "main";
+}
 
 // A trusted session also needs the owner's own CLI logins and Git push key.
 export function codingChildEnv(env = process.env, { trusted = false } = {}) {
@@ -152,8 +173,10 @@ export class BuiltinCodingSupervisor {
     if (!this.findExecutable(args.provider)) throw new Error("Install and sign in to the selected coding CLI first.");
     codingArguments(args.provider, args);
     const max = this.maxMessage(workspace);
-    if (typeof args.message !== "string" || !args.message.trim() || args.message.length > max || args.message.includes("\0")) throw new Error(`Enter an instruction of 1–${max} characters.`);
-    return { provider: args.provider, workspaceId: workspace.id, project: workspace.path, message: args.message,
+    const message = typeof args.message === "string" && args.message.includes(REPAIR_BASE_TOKEN)
+      ? args.message.replaceAll(REPAIR_BASE_TOKEN, repositoryDefaultBranch(workspace.path)) : args.message;
+    if (typeof message !== "string" || !message.trim() || message.length > max || message.includes("\0")) throw new Error(`Enter an instruction of 1–${max} characters.`);
+    return { provider: args.provider, workspaceId: workspace.id, project: workspace.path, message,
       model: args.model || null, effort: args.effort || null, sessionId: crypto.randomUUID(), preparedAt: Date.now() };
   }
 

@@ -65,14 +65,18 @@ export const INTENT_FAMILIES = Object.freeze({
     nouns: /\b(computer|screen|mac|desktop|window|browser|safari|chrome|firefox|finder|website|site|web ?page|tab|app)\b/i,
     tools: ["start_computer_use_session"]
   },
+  // Coding needs coding phrasing, not just a verb: a dispatch verb right
+  // before a coding agent ("have codex fix", "spin up a coding agent") or a
+  // repair verb aimed at code ("fix the failing tests", "repair PR 12"), so
+  // "get the latest news" or "watch the game" never launch an agent.
   coding: {
-    verbs: "start|launch|kick off|spin up|fire up|get|have|put|fix|repair|implement|build|debug|refactor|watch|monitor",
+    pattern: String.raw`(?:(?:start|launch|kick off|spin up|fire up|get|have|put|watch|monitor)\s+(?:(?:a|an|the|my|another|new|up)\s+)*(?:codex|claude|cursor|coding agents?|agents?)\b|(?:fix|repair|implement|build|debug|refactor)\s+(?:[\w'#-]+\s+){0,3}?(?:bugs?|tests?|build|ci|prs?|pull requests?|branch|repo|repository|code|codebase|crash|error|regression|feature)\b)`,
     tools: ["start_coding_agent", "watch_coding_agent"]
   }
 });
 
 const FAMILY_PATTERNS = new Map(Object.entries(INTENT_FAMILIES).map(([name, family]) =>
-  [name, new RegExp(`${LEAD}(?:${family.verbs})\\b`, "i")]));
+  [name, new RegExp(`${LEAD}${family.pattern ?? `(?:${family.verbs})\\b`}`, "i")]));
 
 export function intentFamilies(text) {
   const value = String(text ?? "");

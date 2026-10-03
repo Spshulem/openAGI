@@ -291,7 +291,7 @@ export class ToolRegistry {
     const turn = context.__turn && typeof context.__turn === "object" ? context.__turn : {};
     const tainted = turn.untrusted === true && !intentCovers(turn.intent ?? "", tool.name);
     const insist = safeOwnerConfirm(tool.ownerConfirm, args, context);
-    const chatKey = dedupeKey ?? argsDigest(tool.name, args);
+    const chatKey = dedupeKey ?? argsDigest(tool.name, args, context.sessionId);
     if (tainted || insist) {
       const action = this.pendingActions.enqueue({
         toolName: tool.name, args, context, summary, reason: context.__reason ?? null,

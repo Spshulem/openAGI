@@ -943,7 +943,7 @@ function toolCallWasAttempted(call) {
   if (!call?.result || typeof call.result !== "object") return false;
   const result = call.result?.result;
   const status = typeof result?.status === "string" ? result.status.toLowerCase() : null;
-  if (["awaiting_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
+  if (["awaiting_confirmation", "awaiting_owner_confirmation", "skipped", "no-op", "noop"].includes(status)) return false;
   if (result?.skipped === true || result?.noop === true || result?.noOp === true || result?.alreadyActive === true) return false;
   return true;
 }

@@ -75,6 +75,14 @@ test("intent families cover only their own tools", () => {
   assert.equal(intentCovers("any new texts?", "fleet_click"), false);
   assert.equal(intentCovers("summarize this", "start_computer_use_session"), false);
   assert.equal(intentCovers("open the PR", "start_computer_use_session"), false, "computer needs a computer noun");
+  // Coding needs coding phrasing: generic verbs alone never launch an agent.
+  for (const text of ["have claude fix the login bug", "spin up a coding agent", "fix the failing tests", "repair PR 140", "watch codex"]) {
+    assert.equal(intentCovers(text, "start_coding_agent") || intentCovers(text, "watch_coding_agent"), true, text);
+  }
+  for (const text of ["get the latest news", "watch the game", "monitor the stock price", "put it on my calendar", "have a look at my email", "fix it", "build me a website"]) {
+    assert.equal(intentCovers(text, "start_coding_agent"), false, text);
+    assert.equal(intentCovers(text, "watch_coding_agent"), false, text);
+  }
   // A gated tool outside every family always needs the code.
   assert.equal(intentCovers("send it, approve it, restart it", "schedule_message"), false);
 });
