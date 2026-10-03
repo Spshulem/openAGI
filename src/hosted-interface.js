@@ -524,6 +524,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           continuationAttempt: continuation.attempts
         }
       }, {
+        continuationOf: action.id,
         // A failed continuation may be replayed only while every tool reached
         // so far is explicitly read-only. Screenshots and status probes are
         // safe to repeat after a transport failure; clicks, typing, scrolling,
@@ -598,9 +599,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   }
 
   // The owner's spoken "yes NN" in a chat (agent-host) executes through the
-  // same claim-invoke-journal path as the dashboard. The turn that heard it
-  // carries on itself, so no continuation is queued.
+  // same claim-invoke-journal path as the dashboard. A card from the chat
+  // that heard it needs no continuation (that turn carries on); a card raised
+  // in another chat resumes that chat, as a dashboard approval does.
   runtime.executeApprovedAction = (id, opts = {}) => executeApprovedAction(runtime, id, opts);
+  runtime.queueApprovalContinuation = queueApprovalContinuation;
 
   // Recover approvals committed before a daemon exit or transient provider
   // failure. A deterministic request id lets us recognize a response that was
@@ -612,7 +615,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       queueApprovalContinuation(action, { ok: true });
     }
     for (const action of runtime.pendingActions?.list?.() ?? []) {
-      if (action.toolName === "start_computer_use_session"
+      // Not an owner-mode record: the owner's own turn ran it and went on.
+      if (action.toolName === "start_computer_use_session" && action.mode !== "owner"
           && action.status === "approved" && action.error == null && !action.continuation) {
         queueApprovalContinuation(action, { ok: true });
       }
@@ -644,7 +648,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return Boolean(readNodeConfig(dataDir)?.remote);
   };
   const codingNodeProvider = () => {
-    codingNode ??= options.codingNodeCapability ?? createCodingNodeCapability({
+    // This Mac's own supervisor when it is local (the store its Integrations
+    // page configures); a separate one only when this Mac itself dispatches
+    // coding work to another node.
+    const local = runtime.codingSupervisor && !runtime.codingSupervisor.remote && runtime.codingSupervisor.builtin
+      ? runtime.codingSupervisor : null;
+    codingNode ??= options.codingNodeCapability ?? createCodingNodeCapability(local ? { shared: local } : {
       dataDir: path.join(dataDir, "coding-node"),
       backendDir: getServiceEnv().OPENAGI_CODING_SUPERVISOR_DIR || undefined
     });
@@ -656,7 +665,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const trusted = setup.workspaces.filter((workspace) => workspace.trusted).length;
           detail = setup.workspaces.length
             ? `${setup.workspaces.length} coding workspaces${trusted ? ` (${trusted} trusted)` : ""}`
-            : "No coding workspaces chosen on this computer yet";
+            : "No coding workspaces chosen on this computer yet: open OpenAGI's Integrations page on this Mac and choose at least one Git workspace for coding agents";
         } catch { /* the capability's own detail */ }
         // Ready even with no workspaces, so the main can configure some.
         return { ok: true, service: "coding", capability: { ...codingNode.capability, ready: true, detail } };
@@ -1907,9 +1916,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // Who is speaking, proven by the transport auth above, never by the
         // body: the owner's own credential (bearer, cookie, query token or a
         // tokenless loopback install) or a paired phone's node credential.
-        // Any other node (the iMessage bridge) speaks for someone else.
+        // Any other node speaks for someone else. So does a relay that holds
+        // the owner's credential but forwards other people's text: the
+        // iMessage bridge aimed at its own local daemon ("imessage:<handle>"),
+        // and any other namespaced sender ("telegram:", "outreach:", "node:").
+        // (A node's own body was rebound to "node:<id>" above; its credential
+        // decides.)
         const principal = !requestNodeId
-          ? ownerPrincipal(body?.channel === "overlay" ? "overlay" : "owner")
+          ? (relayedSender(body?.from) ? null : ownerPrincipal(body?.channel === "overlay" ? "overlay" : "owner"))
           : requestEnrollment?.platform === MOBILE_PLATFORM ? ownerPrincipal("phone", requestNodeId) : null;
         // Opt-in streaming keeps the existing JSON contract untouched. The
         // same auth and Origin gates above protect both forms; this is a direct
@@ -3624,6 +3638,13 @@ function bindScopedNodeMessage(body, requestNodeId) {
 // assistant record remains authoritative and a disconnected client recovers it
 // from the named session. Provider adapters expose text only, never reasoning,
 // tool arguments or tool results.
+// A "<namespace>:<id>" sender is a relay of someone else's words (the iMessage
+// bridge, Telegram, outreach, a node). Owner clients send plain names
+// ("user", "cli", "browser", "mobile-supervisor") or none.
+export function relayedSender(from) {
+  return typeof from === "string" && /^[a-z][a-z0-9_-]*:/i.test(from.trim());
+}
+
 async function streamLocalMessage(res, channels, body, principal = null) {
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",

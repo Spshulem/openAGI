@@ -231,8 +231,17 @@ function fleetClickTarget(supervisor, args = {}) {
   if (stateId && !/^[0-9a-f]{16}$/.test(stateId)) throw new Error("Pass the stateId fleet_screen returned.");
   const row = (readState(supervisor).snapshot?.threads ?? []).find((item) => item?.key === key);
   if (!row) throw new Error(`No fleet thread with key "${clip(key, KEY_MAX)}". Call fleet_status for the current keys.`);
-  return { key, label, ...(stateId ? { stateId } : {}), name: clip(row.workspace || row.title || key, 80) };
+  // A card button is clicked only on the card the owner was shown: pin the
+  // stateId the call gave, else the one the last scan saw. Resume and Retry
+  // are plain buttons with no card to pin.
+  const resume = RESUME_LABELS.has(label.toLowerCase());
+  const rowStateId = typeof row.prompt?.stateId === "string" && /^[0-9a-f]{16}$/.test(row.prompt.stateId) ? row.prompt.stateId : null;
+  const pinned = stateId ?? (resume ? null : rowStateId);
+  if (!pinned && !resume) throw new Error("No permission card is known for this thread yet. Call fleet_screen and pass the stateId it returns.");
+  return { key, label, ...(pinned ? { stateId: pinned } : {}), name: clip(row.workspace || row.title || key, 80) };
 }
+
+const RESUME_LABELS = new Set(["resume goal", "retry", "resume"]);
 
 // Pins the chats a quit or restart would stop, from the latest scan.
 function fleetAppTarget(supervisor, args = {}) {
@@ -275,6 +284,14 @@ function fleetAnswerTarget(supervisor, args = {}) {
 function deliveryReceipt(result) {
   const delivery = result?.delivery ?? null;
   const status = delivery?.status ?? "unknown";
-  if (status !== "sent" && !result?.question) throw new Error(`Not delivered (${status}): ${clip(delivery?.detail ?? "no detail", 200)}`);
+  if (status !== "sent" && !result?.question) {
+    // A card in the way: name its buttons and stateId, so the owner can
+    // answer it from here (fleet_click) instead of going to the app.
+    const card = delivery?.prompt && Array.isArray(delivery.prompt.buttons) ? delivery.prompt : null;
+    const waiting = card
+      ? `; a card is waiting${card.text ? ` ("${clip(card.text, 160)}")` : ""} with buttons ${card.buttons.map((label) => `"${clip(label, 40)}"`).join(", ")}${card.stateId ? ` (stateId ${card.stateId})` : ""}: fleet_click can answer it, then send again`
+      : "";
+    throw new Error(`Not delivered (${status}): ${clip(delivery?.detail ?? "no detail", 200)}${waiting}`);
+  }
   return { status, route: delivery?.route ?? null, detail: clip(delivery?.detail ?? "", 200) };
 }

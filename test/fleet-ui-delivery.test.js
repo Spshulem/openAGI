@@ -2060,3 +2060,44 @@ test("the app controller opens in the background, quits without force, and guard
   assert.deepEqual(await using.quit("codex"), { ok: false, detail: "you are using Codex" });
   assert.equal((await apps.open("finder")).ok, false);
 });
+
+test("the typing guard still blocks every card the old detector blocked, shortcut hints included", async (t) => {
+  const cards = [
+    [["Yes, allow", "Do not allow"], true],
+    [["Approve"], false],
+    [["Allow for session", "Deny"], true],
+    [["Approve once", "Deny"], true],
+    [["Approve and run", "Reject"], true],
+    [["Allow once ⌘↩", "Deny (esc)"], true]
+  ];
+  for (const [buttons, clickable] of cards) {
+    const f = setup(t, { app: fakeApp({ prompt: true, promptButtons: buttons }) });
+    const result = await f.driver.deliver(f.request());
+    assert.equal(result.status, "blocked", buttons.join("|"));
+    assert.match(result.detail, /^permission prompt visible/, buttons.join("|"));
+    assert.deepEqual(typed(f.calls()), [], buttons.join("|"));
+    if (clickable) {
+      assert.deepEqual(result.prompt.buttons, buttons.map((label) => label.replace(/\s*(?:⌘↩|\(esc\))$/u, "")), "a full card comes back without shortcut hints");
+    } else {
+      assert.equal(result.prompt, undefined, "a lone button blocks typing but is no card fleet_click answers");
+      assert.match(result.detail, /\(Approve\): answer it first/);
+    }
+  }
+});
+
+test("a card button with a shortcut hint is clicked by its plain label", async (t) => {
+  const f = setup(t, { app: fakeApp({ prompt: true, promptButtons: ["Allow once ⌘↩", "Deny (esc)"] }), probe: fakeProbe({ front: "com.conductor.app", idle: 2_000 }) });
+  const { screen } = await f.driver.inspect(f.request());
+  assert.deepEqual(screen.prompt.buttons, ["Allow once", "Deny"]);
+  const result = await f.driver.clickLabel(f.request({ label: "Allow once", stateId: screen.prompt.stateId }));
+  assert.equal(result.status, "sent", result.detail);
+  assert.equal(f.app.clicked, "Allow once ⌘↩");
+});
+
+test("a background read with navigate off never deep links to another thread", async (t) => {
+  const f = setup(t, { app: fakeApp({ selected: "cairo" }) });
+  const read = await f.driver.inspect(f.request({ navigate: false }));
+  assert.equal(read.status, "blocked");
+  assert.match(read.detail, /shows another thread; not moving it/);
+  assert.deepEqual(f.probe.opened, []);
+});

@@ -16,6 +16,8 @@ import { authorityRecord } from "./owner-authority.js";
 // Persistence: same JSONL+snapshot pattern as TaskStore so a daemon crash
 // mid-action-queue doesn't lose anything.
 
+const CODE_RETIRE_MS = 24 * 60 * 60_000;
+
 export class PendingActionStore {
   constructor({ dir, now = () => Date.now(), randomInt = crypto.randomInt } = {}) {
     this.dir = dir ?? path.join(resolveDataDir(), "pending-actions");
@@ -137,10 +139,17 @@ export class PendingActionStore {
   }
 
   _newCode(requested) {
-    const taken = new Set(this.list({ status: "pending" }).map((action) => action.confirmCode).filter(Boolean));
+    // A code stays retired for a day after its card was made, whatever became
+    // of the card: an owner who heard "yes 42" an hour ago must never approve
+    // a newer, unrelated card by saying it late.
+    const since = this.now() - CODE_RETIRE_MS;
+    const taken = new Set([...this.actions.values()]
+      .filter((action) => action.status === "pending" || Date.parse(action.createdAt ?? "") >= since)
+      .map((action) => action.confirmCode).filter(Boolean));
     if (requested && /^\d{2,3}$/.test(requested) && !taken.has(requested)) return requested;
-    // Two digits are easy to say; past 90 open cards there are too few left.
-    const [low, high] = taken.size > 90 ? [100, 1000] : [10, 100];
+    // Two digits are easy to say; once most are in use or retired, three.
+    const shortTaken = [...taken].filter((code) => code.length === 2).length;
+    const [low, high] = shortTaken >= 80 ? [100, 1000] : [10, 100];
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const code = String(this.randomInt(low, high));
       if (!taken.has(code)) return code;
@@ -236,10 +245,23 @@ export class PendingActionStore {
     return continuation;
   }
 
+  // The turn that approved it went on itself (an owner instruction, or the
+  // owner's "yes NN" in the chat that asked): nothing to resume, now or
+  // after a restart.
+  continuationNotNeeded(id) {
+    const action = this.actions.get(id);
+    if (!action || action.status !== "approved" || action.continuation) return action?.continuation ?? null;
+    action.continuation = { status: "not-needed", updatedAt: new Date(this.now()).toISOString() };
+    this._appendJournal({ op: "continuation", id, continuation: action.continuation });
+    return action.continuation;
+  }
+
   recoverableContinuations({ toolName } = {}) {
     return [...this.actions.values()].filter((action) =>
       action.status === "approved"
       && action.error == null
+      // An owner-mode record ran inside the owner's own turn.
+      && action.mode !== "owner"
       && (!toolName || action.toolName === toolName)
       && action.context?.sessionId
       && (!action.continuation || ["pending", "failed", "delivering"].includes(action.continuation.status))

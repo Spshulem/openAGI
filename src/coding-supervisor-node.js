@@ -5,7 +5,11 @@ const OPERATIONS = ['setup', 'configure', 'list', 'inspect', 'prepare-start', 's
 
 // Only consumed by an enrolled node's outbound authenticated worker. There is
 // no inbound server, owner token, shell command, or model-selected backend path.
-export function createCodingNodeCapability({ dataDir, backendDir, stateFile, builtinOptions, externalCall } = {}) {
+// shared: this Mac's own local CodingSupervisor (runtime.codingSupervisor).
+// When given, the node serves it, so the workspaces chosen in this Mac's
+// Integrations page are the ones its main sees, and one store means one
+// writer per workspace. It is not stopped here; its runtime owns it.
+export function createCodingNodeCapability({ dataDir, backendDir, stateFile, builtinOptions, externalCall, shared = null } = {}) {
   let supervisor;
   const external = externalCall ?? (backendDir ? (request, options) => runSupervisorAdapter(request, { backendDir, stateFile, ...options }) : null);
   const call = async (request, options) => {
@@ -51,7 +55,7 @@ export function createCodingNodeCapability({ dataDir, backendDir, stateFile, bui
     if (!external) throw new Error('The coding session is not managed by this node.');
     return external(request, options);
   };
-  supervisor = new CodingSupervisor({ dataDir, remoteNodeId: null, call, builtinOptions });
+  supervisor = shared ?? new CodingSupervisor({ dataDir, remoteNodeId: null, call, builtinOptions });
   return {
     supervisor,
     capability: { id: CODING_CAPABILITY, ready: true, operations: OPERATIONS, detail: 'Approval-gated coding supervisor; active desktop writers remain protected' },
@@ -70,6 +74,6 @@ export function createCodingNodeCapability({ dataDir, backendDir, stateFile, bui
       if (command.operation === 'reply') return supervisor.reply(args);
       throw new Error('Unsupported coding operation.');
     },
-    stop() { supervisor.stop(); }
+    stop() { if (!shared) supervisor.stop(); }
   };
 }

@@ -132,8 +132,16 @@ const STOP_LABEL = /^(stop|stop generating|stop response|stop agent|interrupt|ca
 // A permission or approval card: at least two of these exact labels side by
 // side, one of them positive. "Approve for me" (Codex's permission-mode
 // menu) and a lone "Run" in a transcript are not one.
-const PROMPT_BUTTONS = new Set(["allow", "allow once", "always allow", "allow for this session", "approve", "deny", "don't allow", "reject", "yes", "no", "run"]);
-const POSITIVE_PROMPT_BUTTONS = new Set(["allow", "allow once", "always allow", "allow for this session", "approve", "yes", "run"]);
+const POSITIVE_PROMPT_BUTTONS = new Set(["allow", "allow once", "always allow", "allow for this session", "allow for session", "yes, allow",
+  "approve", "approve once", "approve and run", "always approve", "accept", "yes", "run"]);
+const PROMPT_BUTTONS = new Set([...POSITIVE_PROMPT_BUTTONS, "deny", "don't allow", "do not allow", "reject", "decline", "no"]);
+// The guard that stops typing is wider: any one of these on its own, as a
+// plain own-page button, means a card may be waiting (the old detector's
+// vocabulary, matched exactly so "Approve for me" is not one). Generic
+// "yes", "no" and "run" count only as part of a card above.
+const GUARD_PROMPT_BUTTONS = new Set([...PROMPT_BUTTONS].filter((label) => !["yes", "no", "run", "accept", "decline"].includes(label)));
+// Shortcut hints a button label can carry: "Allow once ⌘↩", "Deny (esc)", "Yes [y]".
+const SHORTCUT_SUFFIX = /(?:\s*(?:[\u2318\u2325\u21e7\u2303\u21a9\u21b5\u23ce\u238b\u232b\ufe0e]+|[([][^()[\]]{1,6}[)\]]))+$/u;
 // Pop-ups and menus hold choices for settings, never a card's answer.
 const MENU_ROLES = /^(pop up button|menu button|menu|menu item|menu bar item|combo box)$/;
 const PROMPT_TEXT_MAX = 300;
@@ -260,9 +268,22 @@ export function hasStopButton(state) {
   return (state?.elements ?? []).some((element) => BUTTON_ROLE.test(element.role) && STOP_LABEL.test(buttonLabel(element)));
 }
 
+// A card button's label without a trailing shortcut hint ("Allow once ⌘↩").
+function cardLabel(element) {
+  return cleanChoice(buttonLabel(element));
+}
+
+function cleanChoice(text) {
+  return normalizeUiText(text).replace(SHORTCUT_SUFFIX, "").trim();
+}
+
 // Lowercased label for matching card buttons ("Don’t Allow" -> "don't allow").
 function choiceLabel(element) {
-  return buttonLabel(element).toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/[.!:\u2026]+$/, "").trim();
+  return choiceText(buttonLabel(element));
+}
+
+function choiceText(text) {
+  return cleanChoice(text).toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/[.!:\u2026]+$/, "").trim();
 }
 
 // A plain own-page button: not a pop-up or menu, not inside one, not in an
@@ -317,7 +338,7 @@ function findPrompt(state, bundleId = state?.bundleId) {
     found = { card, buttons };
   }
   if (!found) return null;
-  const labels = [...new Set(found.buttons.map(buttonLabel))];
+  const labels = [...new Set(found.buttons.map(cardLabel))];
   const text = cardText(state, found.card);
   const stateId = crypto.createHash("sha256").update(JSON.stringify([bundleId ?? null, text, labels])).digest("hex").slice(0, 16);
   return { ...found, text, labels, stateId };
@@ -330,8 +351,28 @@ export function promptButtons(state, bundleId = state?.bundleId) {
   return found ? { text: found.text, buttons: found.labels, stateId: found.stateId } : null;
 }
 
-export function hasPermissionPrompt(state) {
-  return promptButtons(state) !== null;
+// The guard before typing: a full card, or any one plain own-page button
+// with a permission label. Wider than what fleet_click may click.
+export function hasPermissionPrompt(state, bundleId = state?.bundleId) {
+  return promptButtons(state, bundleId) !== null || guardLabels(state, bundleId).length > 0;
+}
+
+function guardLabels(state, bundleId = state?.bundleId) {
+  return [...new Set(ownPlainButtons(state, bundleId).filter((element) => GUARD_PROMPT_BUTTONS.has(choiceLabel(element))).map(cardLabel))];
+}
+
+// What blocks a send: { prompt } when it is a card fleet_click can answer,
+// { labels } when only the wider guard saw one, or null.
+function promptBlock(state, bundleId) {
+  const prompt = promptButtons(state, bundleId);
+  if (prompt) return { prompt };
+  const labels = guardLabels(state, bundleId);
+  return labels.length ? { labels } : null;
+}
+
+function promptBlockDetail(block, lead) {
+  return block.prompt ? `${lead}: answer it first (fleet_click), then send again`
+    : `${lead} (${block.labels.join(", ")}): answer it first`;
 }
 
 // Own-page Resume / Retry buttons, by exact label.
@@ -1181,7 +1222,7 @@ export function createUiDriver({
   // needed) proceeds with the owner at the keyboard while the thread is
   // already on screen; the deep link, which moves the app, still waits for
   // them to be away. Returns { blocked } or { state }.
-  async function openThread(ctx, signal, { needFront }) {
+  async function openThread(ctx, signal, { needFront, navigate = true }) {
     const { target, identity = { tokens: [] } } = ctx.request;
     const blocked = (detail) => ({ blocked: outcome(ctx, "blocked", detail) });
 
@@ -1230,6 +1271,8 @@ export function createUiDriver({
     // that way can show it. It counts only once a link moved the app onto it.
     if (verified.byAlt) return blocked("could not verify thread: only its first message is shown, which another thread can show too; open another thread");
     if (!verified.ok) {
+      // A background read that may not move the app (Propose mode).
+      if (!navigate) return blocked(`${target.name} shows another thread; not moving it`);
       // The link switches the owner's app to another thread: never under them.
       if (!needFront && ownerHere) return blocked(`owner at the keyboard: ${target.name} shows another thread; open it there`);
       const back = await ownerCheck(ctx, target);
@@ -1288,8 +1331,8 @@ export function createUiDriver({
     if (hasStopButton(state)) return outcome(ctx, "blocked", "turn running (Stop is visible)");
     // The card's buttons go back with the block, so the owner can answer it
     // from anywhere (fleet_click) instead of opening the app.
-    const prompt = promptButtons(state, target.bundleId);
-    if (prompt) return outcome(ctx, "blocked", "permission prompt visible: open it", { prompt });
+    const shown = promptBlock(state, target.bundleId);
+    if (shown) return outcome(ctx, "blocked", promptBlockDetail(shown, "permission prompt visible"), shown.prompt ? { prompt: shown.prompt } : {});
     const needle = text.slice(0, SUPERVISOR_PREFIX.length + 1 + CONFIRM_CHARS);
     const copies = transcriptCount(state, text);
     if (request.previousUnconfirmed) {
@@ -1366,11 +1409,11 @@ export function createUiDriver({
       keep(ctx, "after", state);
       return outcome(ctx, "failed", `text mismatch, not sent; ${LEFT_AS_DRAFT}`);
     }
-    const raised = promptButtons(state, target.bundleId);
+    const raised = promptBlock(state, target.bundleId);
     const changed = hasStopButton(state) ? "turn started before send"
       : raised ? "permission prompt appeared before send"
       : null;
-    if (changed) return outcome(ctx, "blocked", `${changed}; ${LEFT_AS_DRAFT}`, raised ? { prompt: raised } : {});
+    if (changed) return outcome(ctx, "blocked", `${changed}; ${LEFT_AS_DRAFT}`, raised?.prompt ? { prompt: raised.prompt } : {});
 
     // 9. Send: the Send button, else Return in the focused composer. Out of
     // time before either: still "typed", nothing sent.
@@ -1400,9 +1443,9 @@ export function createUiDriver({
       // have started a turn or raised a prompt.
       const composer = composerIn(ctx, state).composer;
       if (!composer || !isComposerFocused(state, composer) || !verifyIdentity(state, identity).ok) return outcome(ctx, "blocked", `send not pressed: the composer lost focus or the thread changed; ${LEFT_AS_DRAFT}`);
-      const card = promptButtons(state, target.bundleId);
+      const card = promptBlock(state, target.bundleId);
       const started = hasStopButton(state) ? "turn started before send" : card ? "permission prompt appeared before send" : null;
-      if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`, card ? { prompt: card } : {});
+      if (started) return outcome(ctx, "blocked", `${started}; ${LEFT_AS_DRAFT}`, card?.prompt ? { prompt: card.prompt } : {});
       const away = await ownerCheck(ctx, target);
       if (away) return outcome(ctx, "blocked", `${away}; ${LEFT_AS_DRAFT}`);
       await press(ctx, "Return", signal);
@@ -1463,7 +1506,7 @@ export function createUiDriver({
     return locked(() => run(request, async (ctx, signal) => {
       const target = request.target;
       if (!target?.bundleId || !ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", "no app the fleet reads shows this thread");
-      const opened = await openThread(ctx, signal, { needFront: false });
+      const opened = await openThread(ctx, signal, { needFront: false, navigate: request.navigate !== false });
       if (opened.blocked) return opened.blocked;
       keep(ctx, "screen", opened.state);
       return outcome(ctx, "read", `read ${target.name}`, { screen: screenSummary(opened.state, target.bundleId) });
@@ -1475,12 +1518,12 @@ export function createUiDriver({
   // Resume goal / Retry / Resume button. Anything else is refused with the
   // labels that are clickable.
   function clickChoice(state, label, stateId, bundleId) {
-    const want = normalizeUiText(label).toLowerCase().replace(/[\u2018\u2019]/g, "'");
+    const want = choiceText(label);
     const prompt = findPrompt(state, bundleId);
     const resumes = resumeButtons(state, bundleId);
     const clickable = [...new Set([...(prompt?.labels ?? []), ...resumes.map(buttonLabel)])];
     const refuse = (detail, status = "failed") => ({ status, detail, prompt: prompt ? { text: prompt.text, buttons: prompt.labels, stateId: prompt.stateId } : null });
-    if (prompt && prompt.labels.some((shown) => shown.toLowerCase().replace(/[\u2018\u2019]/g, "'") === want)) {
+    if (prompt && prompt.labels.some((shown) => choiceText(shown) === want)) {
       if (stateId && stateId !== prompt.stateId) return refuse("prompt changed; read again", "blocked");
       const matches = prompt.buttons.filter((element) => choiceLabel(element) === want);
       if (matches.length !== 1) return refuse(`"${label}" is on ${matches.length} buttons; not clicking`);

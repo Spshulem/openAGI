@@ -202,7 +202,10 @@ export class CodingSupervisor {
   }
 
   setup() {
-    return this.remote ? this.request({ operation: "setup" }).then(value => ({ ...value, remote: true, nodeId: this.activeNodeId || this.remoteNodeId, external: false }))
+    return this.remote ? this.request({ operation: "setup" }).then(value => ({ ...value, remote: true, nodeId: this.activeNodeId || this.remoteNodeId, external: false,
+      // Nothing to start in yet: say where the owner chooses one.
+      ...(Array.isArray(value?.workspaces) && !value.workspaces.length
+        ? { hint: `No coding workspaces are chosen on ${this.nodeName(this.activeNodeId || this.remoteNodeId)}. Fix: on that Mac, open OpenAGI's Integrations page and choose at least one Git workspace for coding agents.` } : {}) }))
       : { ...this.builtin.setup(), external: this.external };
   }
   async prepareStart(args) {

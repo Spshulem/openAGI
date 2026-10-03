@@ -184,7 +184,7 @@ function checkPreconditions(thread, route, message, config) {
     // turn is not. The UI re-checks for a Stop button before typing.
     if (!uiTargetFor(thread)) return "no app shows this thread: open it";
     if (thread.agentStatus === "running") return "turn running";
-    if (thread.meta?.blockedOnOwner === true) return "waiting on a permission prompt: open it";
+    if (thread.meta?.blockedOnOwner === true) return "waiting on a permission prompt: answer it first (fleet_screen shows its buttons, fleet_click answers it)";
   }
   if (route === "codex-exec") {
     if (thread.kind !== "codex") return "codex-exec needs a codex thread";

@@ -52,26 +52,42 @@ test("bystander sentences, mixed answers and long text are not confirms", () => 
 });
 
 test("intent families cover only their own tools", () => {
-  assert.deepEqual(intentFamilies("click approve for me"), ["approve", "computer"]);
+  assert.deepEqual(intentFamilies("click approve for me"), ["approve"]);
   assert.equal(intentCovers("Click Approve on the Codex prompt", "fleet_click"), true);
   assert.equal(intentCovers("tell the openAGI thread to rebase", "fleet_send_message"), true);
   assert.equal(intentCovers("restart conductor", "fleet_app"), true);
+  assert.equal(intentCovers("can you restart Conductor?", "fleet_app"), true);
+  assert.equal(intentCovers("I need you to restart Codex", "fleet_app"), true);
   assert.equal(intentCovers("use my computer to check the screen", "start_computer_use_session"), true);
+  assert.equal(intentCovers("open Safari and check my Gmail", "start_computer_use_session"), true);
   assert.equal(intentCovers("start a codex agent to fix it", "start_coding_agent"), true);
   // What a tainted turn must not get without the code.
   assert.equal(intentCovers("what's the latest?", "fleet_click"), false);
   assert.equal(intentCovers("what's the latest?", "fleet_send_message"), false);
   assert.equal(intentCovers("summarize thread 4", "fleet_app"), false);
+  // Nouns and questions name no action.
+  assert.equal(intentCovers("What is the Claude agent doing?", "start_coding_agent"), false);
+  assert.equal(intentCovers("what did codex say?", "fleet_send_message"), false);
+  assert.equal(intentCovers("what did codex say?", "reply_to_coding_agent"), false);
+  assert.equal(intentCovers("tell me what amman is doing", "fleet_send_message"), false);
+  assert.equal(intentCovers("did you restart conductor?", "fleet_app"), false);
+  assert.equal(intentCovers("don't restart conductor", "fleet_app"), false);
+  assert.equal(intentCovers("any new texts?", "fleet_click"), false);
+  assert.equal(intentCovers("summarize this", "start_computer_use_session"), false);
+  assert.equal(intentCovers("open the PR", "start_computer_use_session"), false, "computer needs a computer noun");
   // A gated tool outside every family always needs the code.
   assert.equal(intentCovers("send it, approve it, restart it", "schedule_message"), false);
 });
 
-test("a bare yes carries the previous assistant message as intent", () => {
+test("intent is the owner's own words only, never the previous assistant message", () => {
   const messages = [
     { role: "user", content: "what needs me?" },
     { role: "assistant", content: "Codex asks to run tests. Want me to click Allow?" }
   ];
-  assert.match(ownerIntentText("yes", messages), /click Allow/);
+  assert.equal(ownerIntentText("yes", messages), "yes");
   assert.equal(ownerIntentText("restart conductor", messages), "restart conductor");
-  assert.equal(ownerIntentText("yes", []), "yes");
+});
+
+test("an acknowledgement is not assent", () => {
+  for (const text of ["ok thanks", "ok thank you", "thanks", "yes thank you"]) assert.equal(matchConfirmation(text), null, text);
 });

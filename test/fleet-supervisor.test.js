@@ -2613,10 +2613,11 @@ test("a thread waiting on a permission card: one screen read, its buttons as opt
     clickLabel: async (request) => { clicks.push(request); return { status: "sent", detail: "clicked Allow once in Conductor" }; }
   };
   const waiting = makeThread({ key: "conductor:s1", kind: "conductor", id: "s1", workspace: "s1", cwd: "/work/s1", agentStatus: "waiting", prRefs: [], meta: { ...uiMeta("s1"), blockedOnOwner: true } });
-  const { supervisor } = fixture(t, { threads: [waiting], prs: new Map(), delivery: "computer-use", deps: { uiDriver: driver } });
+  const { supervisor } = fixture(t, { threads: [waiting], prs: new Map(), mode: "propose", delivery: "computer-use", deps: { uiDriver: driver } });
   await supervisor.tick();
   assert.equal(reads.length, 1, "one read for the card's labels");
   assert.equal(reads[0].target.app, "conductor");
+  assert.equal(reads[0].navigate, false, "Propose reads only a thread already on screen");
   const question = supervisor.getState().questions.find((q) => q.kind === "prompt");
   assert.deepEqual(question.options, ["Allow once", "Deny", "later"]);
   assert.equal(question.dedupeKey, "prompt:conductor:s1:0123456789abcdef");
@@ -2643,12 +2644,41 @@ test("a click the app refuses leaves the prompt question open", async (t) => {
     clickLabel: async () => ({ status: "blocked", detail: "prompt changed; read again" })
   };
   const waiting = makeThread({ key: "conductor:s1", kind: "conductor", id: "s1", workspace: "s1", agentStatus: "waiting", prRefs: [], meta: { ...uiMeta("s1"), blockedOnOwner: true } });
-  const { supervisor } = fixture(t, { threads: [waiting], prs: new Map(), delivery: "computer-use", deps: { uiDriver: driver } });
+  const { supervisor } = fixture(t, { threads: [waiting], prs: new Map(), mode: "propose", delivery: "computer-use", deps: { uiDriver: driver } });
   await supervisor.tick();
   const question = supervisor.getState().questions.find((q) => q.kind === "prompt");
   const result = await supervisor.answerQuestion(question.id, "Allow");
   assert.equal(result.delivery.status, "blocked");
   assert.equal(supervisor.store.question(question.id).status, "open");
+});
+
+test("tick screen reads: none in Observe, and a read that finds no card is not repeated until the thread moves", async (t) => {
+  let now = NOW;
+  const reads = [];
+  const driver = {
+    readiness: async () => ({ ready: true, detail: null }),
+    inspect: async (request) => { reads.push(request); return { status: "read", detail: "read Conductor", screen: { prompt: null, running: false, resume: [], draft: false, text: "Should I push?" } }; }
+  };
+  let waiting = makeThread({ key: "conductor:s1", kind: "conductor", id: "s1", workspace: "s1", cwd: "/work/s1", agentStatus: "waiting", prRefs: [], meta: { ...uiMeta("s1"), blockedOnOwner: true } });
+  const observed = fixture(t, { threads: [waiting], prs: new Map(), delivery: "computer-use", deps: { uiDriver: driver } });
+  for (let tick = 0; tick < 4; tick += 1) await observed.supervisor.tick();
+  assert.equal(reads.length, 0, "Observe drives no app, reads included");
+
+  const threads = [waiting];
+  const { supervisor } = fixture(t, { threads, prs: new Map(), mode: "propose", now: () => now, delivery: "computer-use",
+    deps: { uiDriver: driver, listConductorThreads: async () => threads } });
+  for (let tick = 0; tick < 3; tick += 1) { await supervisor.tick(); now += 5 * MIN; }
+  assert.equal(reads.length, 1, "no card found: not read again while the thread has not moved");
+  now += 20 * MIN;
+  await supervisor.tick();
+  assert.equal(reads.length, 2, "after the backoff, one more read");
+  now += 20 * MIN;
+  await supervisor.tick();
+  assert.equal(reads.length, 2, "the backoff doubles for a thread still unmoved");
+  waiting = { ...waiting, lastAgentAt: new Date(now).toISOString() };
+  threads[0] = waiting;
+  await supervisor.tick();
+  assert.equal(reads.length, 3, "a thread that moved is read again");
 });
 
 test("Conductor unreadable for a while: one restart question, a restart that pins its chats, then each stopped chat resumes once", async (t) => {
@@ -2708,6 +2738,32 @@ test("Conductor unreadable for a while: one restart question, a restart that pin
   await supervisor.tick();
   assert.equal(delivered.filter((args) => args.playbook === "app-restarted").length, 1, "once");
   assert.equal(supervisor.getState().questions.filter((q) => q.dedupeKey === "infra:unreadable:conductor").length, 0, "a good restart clears the question");
+});
+
+test("a turn the restart killed still reads running for a while: its resume waits, then goes once it reads idle", async (t) => {
+  let now = NOW;
+  const delivered = [];
+  const executor = { deliver: async (args) => { delivered.push(args); return { status: "sent", route: args.route, detail: "ok" }; }, inFlight: () => [], whenIdle: async () => {} };
+  const appController = { restart: async () => ({ ok: true, detail: "restarted Codex" }) };
+  const before = new Date(NOW - MIN).toISOString();
+  let a = makeThread({ key: "conductor:a", kind: "conductor", id: "a", workspace: "a", agentStatus: "running", prRefs: [], lastAgentAt: before, meta: uiMeta("a") });
+  let b = makeThread({ key: "conductor:b", kind: "conductor", id: "b", workspace: "b", agentStatus: "running", prRefs: [], lastAgentAt: before, meta: uiMeta("b") });
+  const { supervisor } = fixture(t, { prs: new Map(), now: () => now, delivery: "computer-use", deps: { uiDriver: readyDriver(), executor, appController,
+    listCodexThreads: async () => [], listConductorThreads: async () => [a, b] } });
+  await supervisor.tick();
+  assert.equal((await supervisor.appAction("conductor", "restart", { expectRunning: ["conductor:a", "conductor:b"] })).ok, true);
+  now += MIN;
+  await supervisor.tick();
+  assert.equal(delivered.filter((args) => args.playbook === "app-restarted").length, 0, "still reads running: wait");
+  assert.ok(supervisor.store.appRestart("conductor"), "the record is kept");
+  // b really runs again (the agent wrote after the restart); a's stale turn ends.
+  a = { ...a, agentStatus: "idle" };
+  b = { ...b, lastAgentAt: new Date(now).toISOString() };
+  now += 15 * MIN;
+  await supervisor.tick();
+  const resumed = delivered.filter((args) => args.playbook === "app-restarted").map((args) => args.thread.key);
+  assert.deepEqual(resumed, ["conductor:a"]);
+  assert.equal(supervisor.store.appRestart("conductor"), null, "both settled");
 });
 
 test("a chat the owner wrote to after the restart, or running again, gets no resume; a quit resumes only after the fleet opens the app", async (t) => {

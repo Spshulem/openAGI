@@ -39,32 +39,46 @@ export function authorityRecord(principal) {
 // Intent families. A tainted turn (an untrusted tool result was read) still
 // runs a gated tool without a code when the owner's own words name its family.
 
+// Each family is a set of command verbs said as a command: at the start of a
+// sentence or clause, or after a lead-in ("please", "and", "can you", "I need
+// you to"). Nouns ("codex", "agent") and question verbs ("say", "what did")
+// never count, so "what is the Claude agent doing?" or "what did codex say?"
+// names no action. A family with nouns also needs one of them somewhere in
+// the text ("open Safari", not just "open").
+const LEAD = String.raw`(?:^|[.,;:!?\n]|\b(?:and|then|please|pls|now|also|just|ok|okay|yes|yeah|yep|so|let's|lets|go ahead and|(?:can|could|would|will) you|(?:want|need) you to)\b)\s*(?:(?:please|just|now|also)\s+)*`;
+
 export const INTENT_FAMILIES = Object.freeze({
   approve: {
-    pattern: /\b(approve|approved|click|press|tap|hit|allow|accept|confirm|answer|choose|pick|select|resume|retry)\b/i,
+    verbs: "click|press|tap|hit|approve|allow|accept|confirm|choose|pick|select|resume|retry|deny|reject|decline|answer",
     tools: ["fleet_click", "fleet_answer_question"]
   },
   message: {
-    pattern: /\b(send|tell|message|reply|respond|say|ask|nudge|write|answer)\b/i,
+    verbs: "send|tell(?!\\s+(?:me|us)\\b)|reply|respond|nudge|write|message|ask|ping|answer",
     tools: ["fleet_send_message", "reply_to_coding_agent"]
   },
   app: {
-    pattern: /\b(open|close|quit|restart|relaunch|reopen|launch|reboot)\b/i,
+    verbs: "open|close|quit|restart|relaunch|reopen|launch|reboot|start",
     tools: ["fleet_app"]
   },
   computer: {
-    pattern: /\b(computer|screen|mac|desktop|click|type|window|browser|computer use)\b/i,
+    verbs: "use|open|click|type|check|look|go|navigate|drive|control|take|show|read|scroll|switch|browse|press|fill|find|search|log",
+    nouns: /\b(computer|screen|mac|desktop|window|browser|safari|chrome|firefox|finder|website|site|web ?page|tab|app)\b/i,
     tools: ["start_computer_use_session"]
   },
   coding: {
-    pattern: /\b(start|run|launch|kick off|spin up|fix|repair|implement|code|coding|agent|watch|monitor|codex|claude)\b/i,
+    verbs: "start|launch|kick off|spin up|fire up|get|have|put|fix|repair|implement|build|debug|refactor|watch|monitor",
     tools: ["start_coding_agent", "watch_coding_agent"]
   }
 });
 
+const FAMILY_PATTERNS = new Map(Object.entries(INTENT_FAMILIES).map(([name, family]) =>
+  [name, new RegExp(`${LEAD}(?:${family.verbs})\\b`, "i")]));
+
 export function intentFamilies(text) {
   const value = String(text ?? "");
-  return Object.entries(INTENT_FAMILIES).filter(([, family]) => family.pattern.test(value)).map(([name]) => name);
+  return Object.entries(INTENT_FAMILIES)
+    .filter(([name, family]) => FAMILY_PATTERNS.get(name).test(value) && (!family.nouns || family.nouns.test(value)))
+    .map(([name]) => name);
 }
 
 // True only when one of the families the owner's text names covers the tool.
@@ -73,13 +87,11 @@ export function intentCovers(intent, toolName) {
   return intentFamilies(intent).some((name) => INTENT_FAMILIES[name].tools.includes(toolName));
 }
 
-// The owner's text, plus the previous assistant message when the text is only
-// an assent ("yes" carries the meaning of what it answers).
-export function ownerIntentText(text, messages = []) {
-  const own = String(text ?? "").trim();
-  if (!matchConfirmation(own)) return own;
-  const previous = [...(messages ?? [])].reverse().find((message) => message?.role === "assistant" && typeof message.content === "string");
-  return previous ? `${own}\n${previous.content.slice(0, 2000)}` : own;
+// The intent a tainted turn is judged on: the owner's own words only. The
+// previous assistant message is never added, since it can quote text a tool
+// read; a bare "yes" confirms a card through its code (confirmSpoken).
+export function ownerIntentText(text) {
+  return String(text ?? "").trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -95,7 +107,7 @@ const YES_PHRASES = [
 const NO_PHRASES = [
   "do not allow", "don't allow", "dont allow", "do not", "don't", "dont", "no", "nope", "cancel", "deny", "denied", "reject", "stop"
 ].map((phrase) => phrase.split(" "));
-const FILLER = new Set(["please", "it", "that", "this", "for", "me", "now", "then", "and", "just", "the", "one", "code", "number", "thanks", "thank", "you"]);
+const FILLER = new Set(["please", "it", "that", "this", "for", "me", "now", "then", "and", "just", "the", "one", "code", "number"]);
 
 function consume(words, index, phrases) {
   for (const phrase of phrases) {

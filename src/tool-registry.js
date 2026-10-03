@@ -62,11 +62,14 @@ export class ToolRegistry {
       // read-only tools; 'ask' turns divert side-effecting calls to the
       // approval queue.
       sideEffects: tool.sideEffects !== false,
-      // Output carries text someone other than the owner wrote (an agent's
-      // transcript, a web page, an MCP server, a screen). Once a turn has
-      // read it, a gated call runs on the owner's word only when the owner's
-      // own text asked for that kind of action (see ToolRegistry.ownerInvoke).
-      untrustedOutput: tool.untrustedOutput === true || (tool.source ?? "internal") === "mcp",
+      // Output may carry text someone other than the owner wrote (an agent's
+      // transcript, a web page, an iMessage, a calendar invite, memory, an
+      // MCP server, a screen). Once a turn has read it, a gated call runs on
+      // the owner's word only when the owner's own text asked for that kind
+      // of action (see ToolRegistry.ownerInvoke). Every tool counts as
+      // untrusted unless it declares trustedOutput: true (system facts only,
+      // such as a status or a budget), so a new reader can never be missed.
+      untrustedOutput: tool.untrustedOutput === true || tool.trustedOutput !== true || (tool.source ?? "internal") === "mcp",
       // Optional fn(args, context) -> false | true | string. Truthy makes even
       // an owner instruction ask for the spoken code; a string says why.
       ownerConfirm: typeof tool.ownerConfirm === "function" ? tool.ownerConfirm : null,
@@ -268,9 +271,12 @@ export class ToolRegistry {
       const result = await tool.handler(args, context);
       // Tool results are data: they can only ever taint the turn, never
       // write any other part of the server-built context.
-      if (tool.untrustedOutput && context?.__turn && typeof context.__turn === "object") context.__turn.untrusted = true;
+      taintTurn(tool, context);
       return { ok: true, result };
     } catch (error) {
+      // An error's text (an MCP error.message, a fetch failure) can be
+      // written by the far side as well.
+      taintTurn(tool, context);
       return { ok: false, error: error?.message ?? String(error) };
     }
   }
@@ -335,6 +341,10 @@ export class ToolRegistry {
     }
     return outcome;
   }
+}
+
+function taintTurn(tool, context) {
+  if (tool.untrustedOutput && context?.__turn && typeof context.__turn === "object") context.__turn.untrusted = true;
 }
 
 function safeOwnerConfirm(fn, args, context) {
@@ -573,6 +583,7 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "recall_spend",
     sideEffects: false,
+    trustedOutput: true,
     description: "Summarize LLM credit (USD) usage: how much has been spent, on what activity/model, and the costliest recent calls. Use to answer questions about cost/credits/budget — e.g. 'why did I spend $4 today?'.",
     parameters: {
       type: "object",
@@ -697,7 +708,7 @@ export function registerCoreTools(registry, runtime) {
     sideEffects: true,
     summarize: (args) =>
       `Replay skill '${args.name}' on the Mac${args.dryRun ? " (dry run — logs only)" : " (AppleScript/keyboard control)"}`,
-    description: "Trigger a skill's structured replay steps (open_app, keyboard_shortcut, type, applescript, etc.) on the user's Mac. Use only for skills with a `replay:` block in their SKILL.md. Set dryRun:true to log actions without executing — recommended for first-time use. THIS REQUIRES USER APPROVAL — calls return {status:'awaiting_confirmation'} and run only after the user approves via the dashboard's Approvals tab.",
+    description: "Trigger a skill's structured replay steps (open_app, keyboard_shortcut, type, applescript, etc.) on the user's Mac. Use only for skills with a `replay:` block in their SKILL.md. Set dryRun:true to log actions without executing — recommended for first-time use. Runs on the owner's own instruction. From anyone else it returns {status:'awaiting_confirmation'} with a code and runs once the owner approves (by saying the code in any OpenAGI chat, the phone Inbox, or the dashboard's Approvals tab).",
     parameters: {
       type: "object",
       properties: {
@@ -877,6 +888,7 @@ export function registerCoreTools(registry, runtime) {
   registry.register({
     name: "get_budget",
     sideEffects: false,
+    trustedOutput: true,
     description: "Get today's LLM spend, daily limit, calls, and token counts. Returns 14 days of history.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => runtime.budget?.status?.() ?? { error: "no budget" }

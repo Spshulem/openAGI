@@ -6,7 +6,7 @@ import { deriveSpecialistScope, measureAxes, REMEMBER_RE, SCHEDULE_RE, SPECIALIZ
 import { findSuggestion } from "./suggestion-feed.js";
 import { classifyAgentFailure, logAgentFailure } from "./agent-failure.js";
 import { agentTurnTask } from "./model-router.js";
-import { authorityRecord, intentFamilies, isOwnerPrincipal, matchConfirmation, ownerIntentText } from "./owner-authority.js";
+import { authorityRecord, isOwnerPrincipal, matchConfirmation, ownerIntentText } from "./owner-authority.js";
 import { executeApprovedAction } from "./approval-executor.js";
 
 // Internal tools every specialist gets regardless of scope: its own memory
@@ -227,7 +227,15 @@ export class AgentHost {
     // raised since the owner last spoke; none or several fall through to the
     // model. Placed before the hop bound below: a confirmed computer-use
     // start gives this same turn its extended bound.
-    const turnState = principal ? { untrusted: false, intent: ownerIntentText(text, sessionBefore.messages.slice(0, -1)) } : null;
+    // The turn starts tainted when anything in front of the model was written
+    // by someone else: memory hits and principles (they hold captured
+    // iMessages and other chats), on-screen OCR, the overlay's window text, a
+    // brief, or earlier messages in this chat that were not the owner's own
+    // clean turns (a shared thread holds wake-word turns and tool reads).
+    const contextUntrusted = Boolean(memoryHitsForModel.length || intuitions.length
+      || ambientContext?.snippets?.length || metadata.screenContext || briefContext)
+      || !cleanOwnerHistory(sessionBefore.messages.slice(0, -1));
+    const turnState = principal ? { untrusted: contextUntrusted, intent: ownerIntentText(text) } : null;
     let confirmation = null;
     if (principal && !ephemeral) {
       const spoken = matchConfirmation(text);
@@ -244,13 +252,12 @@ export class AgentHost {
     // provider is forced to stop. Extend the bound only while this exact chat
     // owns an active, user-approved computer session; ordinary chat and the
     // approval-requesting turn keep the lower global default.
-    // An owner instruction that names computer work may start the session
-    // and drive it within this same turn.
-    const ownerComputerTurn = Boolean(principal) && this.runtime.tools?.has?.("start_computer_use_session") === true
-      && intentFamilies(text).includes("computer");
-    const computerUseToolHops = this.runtime.computerUseLog?.activeSessionFor?.(sessionId) || ownerComputerTurn
+    // A session this turn starts (on the owner's word, or a "yes NN" heard
+    // above) raises the bound from that round on.
+    const computerUseHopsNow = () => (this.runtime.computerUseLog?.activeSessionFor?.(sessionId)
       ? boundedComputerUseToolHops(process.env.OPENAGI_COMPUTER_MAX_TOOL_HOPS)
-      : undefined;
+      : undefined);
+    const computerUseToolHops = computerUseHopsNow();
     const modelResult = await this.modelProvider.generate({
       input: text,
       agent,
@@ -258,6 +265,7 @@ export class AgentHost {
       // local/iMessage/G2 without becoming foreground chat on the main model.
       task: agentTurnTask(input),
       maxToolHops: computerUseToolHops,
+      extendToolHops: computerUseHopsNow,
       scrutiny: output.scrutiny,
       memoryHits: memoryHitsForModel,
       messages: sessionBefore.messages,
@@ -305,7 +313,9 @@ export class AgentHost {
         __allowedTools: allowedToolNames,
         // Server-built per turn. The model controls only tool names and args;
         // tool results are data and can only taint __turn (ToolRegistry).
-        ...(principal ? { __owner: principal, __turn: turnState } : {})
+        ...(principal ? { __owner: principal, __turn: turnState } : {}),
+        // Set only by the approval-continuation transport (an action id).
+        ...(typeof options.continuationOf === "string" && options.continuationOf ? { __continuationOf: options.continuationOf } : {})
       }
     });
 
@@ -374,6 +384,9 @@ export class AgentHost {
             outputId: output.id,
             outcomeId: outcomeRecord?.id ?? null,
             ...(requestId ? { requestId } : {}),
+            // An owner turn that read nothing untrusted: the next owner turn
+            // may count this reply as clean history.
+            ...(turnState ? { ownerTurn: { untrusted: turnState.untrusted === true } } : {}),
             toolCalls: (modelResult.toolCalls ?? []).map((call) => ({
               name: call.name,
               arguments: durableToolArguments(toolRegistry, call),
@@ -498,14 +511,21 @@ export class AgentHost {
       const decided = store.decide(action.id, { decision: "deny", decidedBy, error: "denied by the owner in chat" });
       return { ...receipt, status: decided?.status === "denied" ? "denied; nothing was run" : `already ${decided?.status ?? "gone"}` };
     }
+    // A card raised in this chat: this turn carries on with the result. One
+    // raised in another chat resumes that chat (a computer-use lease is bound
+    // to it), as a dashboard approval does.
+    const sameChat = action.context?.sessionId === sessionId;
+    const queueContinuation = typeof this.runtime.queueApprovalContinuation === "function" ? this.runtime.queueApprovalContinuation : null;
     let executed;
     try {
+      const options = { decidedBy, ...(!sameChat && queueContinuation ? { continuation: queueContinuation } : {}) };
       executed = typeof this.runtime.executeApprovedAction === "function"
-        ? await this.runtime.executeApprovedAction(action.id, { decidedBy })
-        : await executeApprovedAction(this.runtime, action.id, { decidedBy });
+        ? await this.runtime.executeApprovedAction(action.id, options)
+        : await executeApprovedAction(this.runtime, action.id, options);
     } catch (error) {
       return { ...receipt, status: "failed", error: String(error?.message ?? error).slice(0, 300) };
     }
+    if (sameChat && executed?.invokeResult?.ok) store.continuationNotNeeded?.(action.id);
     const invoked = executed?.invokeResult;
     if (!invoked) return { ...receipt, status: `not run: ${String(executed?.body?.error ?? "unavailable").slice(0, 200)}` };
     return {
@@ -943,6 +963,16 @@ function durableToolArguments(registry, call) {
       : { redacted: true };
   }
   return out;
+}
+
+// True when every earlier message the model sees is the owner's own words or
+// a reply to an owner turn that read nothing untrusted. Server-written
+// metadata only: authority is rewritten on every user message, and ownerTurn
+// is set only on assistant replies.
+function cleanOwnerHistory(messages = []) {
+  return (messages ?? []).slice(-12).every((message) => (message?.role === "user"
+    ? message.metadata?.authority?.kind === "owner"
+    : message?.role === "assistant" && message.metadata?.ownerTurn?.untrusted === false));
 }
 
 function boundedJson(value, limit) {

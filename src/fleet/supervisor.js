@@ -121,6 +121,11 @@ const SEND_FIRST = new Set(["resume", "infra-recovered"]);
 
 // The label single questions use, so a group never names a thread by its
 // session id or title (a first prompt, an automation prompt).
+// What changes when a thread moves: its newest agent or owner text and state.
+function activityMark(thread) {
+  return [thread?.lastAgentAt ?? null, thread?.lastUserAt ?? null, thread?.lastActivityAt ?? null, thread?.agentStatus ?? null].join("|");
+}
+
 function threadLabel(thread) {
   if (!thread) return "?";
   const ref = thread.prRefs?.[0] ?? "";
@@ -241,6 +246,10 @@ const APP_RESTARTED_DELIVERY = "The owner restarted {app}, which stopped this ch
 // A permission card read on screen holds until the thread moves past it.
 const PROMPT_TTL_MS = 6 * 60 * MIN;
 const PROMPT_ACTIVITY_SLACK_MS = 5_000;
+// A tick's screen read that found no card waits this long (doubling per
+// repeat, up to the max) before the same unmoved thread is read again.
+const CARDLESS_READ_MS = 15 * MIN;
+const CARDLESS_READ_MAX_MS = 2 * 60 * MIN;
 // Open Computer Use unable to read an app (cgWindowNotFound): asked about
 // once it failed this often, over this many ticks and this long, with no
 // good read since.
@@ -280,6 +289,8 @@ export class FleetSupervisor {
     this.prompts = new Map();
     // app -> { since, hits: [{ at, tick }] }: reads Open Computer Use failed.
     this.unreadable = new Map();
+    // threadKey -> { mark, at, count }: tick reads that found no card.
+    this.cardlessReads = new Map();
     this.tickCount = 0;
     this.lastDelivery = { mode: this.config.delivery ?? "cli", ready: null, detail: null, checkedAt: null };
     this._reviewRunner = null;
@@ -762,13 +773,14 @@ export class FleetSupervisor {
 
   // What one thread's screen shows: its permission card (buttons, stateId),
   // whether a turn runs, Resume buttons, the transcript's tail. No input.
-  async screenThread(threadKey, { deadlineAt = null, thread = null, threads = null } = {}) {
+  // navigate: false reads only a thread already on screen (no deep link).
+  async screenThread(threadKey, { deadlineAt = null, thread = null, threads = null, navigate = true } = {}) {
     const found = this.uiThread(threadKey, thread, threads);
     if (found.error) return { status: "blocked", detail: found.error, screen: null };
     if (typeof found.driver.inspect !== "function") return { status: "blocked", detail: "screen reads unavailable on this Mac", screen: null };
     let result;
     try {
-      result = await found.driver.inspect({ target: found.target, identity: found.identity, evidenceName: `screen-${found.thread.kind}-${String(found.thread.id).slice(0, 8)}-${this.now()}`, deadlineAt });
+      result = await found.driver.inspect({ target: found.target, identity: found.identity, evidenceName: `screen-${found.thread.kind}-${String(found.thread.id).slice(0, 8)}-${this.now()}`, deadlineAt, navigate });
     } catch (error) {
       result = { status: "failed", detail: clampText(redactSecrets(`computer use failed: ${error?.message ?? error}`), 200) };
     }
@@ -810,6 +822,15 @@ export class FleetSupervisor {
     if (["sent", "read"].includes(result.status) || card || READ_THE_APP.test(String(result.detail ?? ""))) this.unreadable.delete(target.app);
     if (card?.stateId && Array.isArray(card.buttons)) this.prompts.set(thread.key, { text: clampText(card.text ?? "", 300), buttons: card.buttons.slice(0, 6), stateId: card.stateId, at });
     else if (["sent", "read"].includes(result.status)) this.prompts.delete(thread.key);
+  }
+
+  // A read of this thread found no card, the thread has not moved since, and
+  // its backoff (15 min, doubling to 2 h) has not run out.
+  cardlessReadFresh(thread, at = this.now()) {
+    const entry = this.cardlessReads.get(thread?.key);
+    if (!entry) return false;
+    if (entry.mark !== activityMark(thread)) { this.cardlessReads.delete(thread.key); return false; }
+    return at - entry.at < Math.min(CARDLESS_READ_MAX_MS, CARDLESS_READ_MS * 2 ** Math.max(0, entry.count - 1));
   }
 
   // The card a thread is waiting on, while the thread has not moved past it.
@@ -867,7 +888,15 @@ export class FleetSupervisor {
         if (done.has(key) || sourceUnknown([key])) continue;
         const thread = byKey.get(key);
         const ownerSince = thread && Date.parse(thread.lastUserAt ?? "") > at && !String(thread.lastUserText ?? "").startsWith(SUPERVISOR_PREFIX);
-        if (!thread || ownerSince || thread.agentStatus === "running") { done.add(key); continue; }
+        if (!thread || ownerSince) { done.add(key); continue; }
+        if (thread.agentStatus === "running") {
+          // Running again only if the agent wrote after the restart. A turn the
+          // restart killed still reads "running" for a while (Codex's rollout
+          // window, Conductor's hung "working"): wait for it, do not drop it.
+          // (Agent text only: a relaunch can touch the rollout file.)
+          if ((Date.parse(thread.lastAgentAt ?? "") || 0) > at) done.add(key);
+          continue;
+        }
         const route = chooseRoute(thread, "auto", deliveryState);
         if (!route || (deferUi && route === "computer-use")) continue;
         const delivery = await this.executor.deliver({ thread, message: renderTemplate(body, { app: UI_APPS[app]?.name ?? app }), route, playbook: "app-restarted" });
@@ -1001,7 +1030,8 @@ export class FleetSupervisor {
     this.store.recordNudge(thread.key, { playbook: "owner-message", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
-    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null, ...(delivery.prompt ? { prompt: delivery.prompt } : {}) } };
+    const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
+    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) } };
   }
 
   applyOverride(question, answer) {
@@ -1105,10 +1135,20 @@ export class FleetSupervisor {
     const delivery = await this.probeDelivery();
     // One thread waiting on a permission card whose buttons are not known
     // yet gets one screen read per tick, so its question offers them.
-    if (!deferUi && delivery.ready === true && typeof this.uiDriver?.inspect === "function") {
-      const waiting = inScope.find((thread) => thread.meta?.blockedOnOwner === true && !mutedKeys.has(thread.key) && uiTargetFor(thread) && !this.livePrompt(thread));
+    // Never in Observe (it drives nothing); in Propose only a thread already
+    // on screen is read (no deep link moves the app). A read that found no
+    // card is not repeated until the thread moves, then with backoff.
+    if (!deferUi && this.mode !== "observe" && delivery.ready === true && typeof this.uiDriver?.inspect === "function") {
+      const waiting = inScope.find((thread) => thread.meta?.blockedOnOwner === true && !mutedKeys.has(thread.key) && uiTargetFor(thread)
+        && !this.livePrompt(thread) && !this.cardlessReadFresh(thread, started));
       if (waiting) {
-        try { await this.screenThread(waiting.key, { thread: waiting, threads }); } catch { /* a read is best-effort */ }
+        try { await this.screenThread(waiting.key, { thread: waiting, threads, navigate: this.mode === "auto" }); } catch { /* a read is best-effort */ }
+        if (this.livePrompt(waiting)) this.cardlessReads.delete(waiting.key);
+        else {
+          const last = this.cardlessReads.get(waiting.key);
+          const mark = activityMark(waiting);
+          this.cardlessReads.set(waiting.key, { mark, at: started, count: last?.mark === mark ? last.count + 1 : 1 });
+        }
       }
     }
     // A card seen on screen: the thread waits on the owner, and its buttons

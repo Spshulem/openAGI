@@ -135,9 +135,17 @@ test('a paired install advertises its coding node by default; OPENAGI_CODING_NOD
       if (expected) {
         const capability = local.capabilities[0];
         assert.equal(capability.ready, true, 'ready, so its main can choose workspaces');
-        assert.equal(capability.detail, 'No coding workspaces chosen on this computer yet');
+        assert.match(capability.detail, /^No coding workspaces chosen on this computer yet: open OpenAGI's Integrations page on this Mac/);
         const listed = await runtime.nodeCapabilities.dispatch(local.nodeId, 'coding-supervisor', 'list', { operation: 'list' });
         assert.deepEqual(listed.sessions, [], 'inert with no workspaces');
+        // The node serves this Mac's own supervisor: the workspaces its
+        // Integrations page chose are the ones the main sees.
+        const marker = { workspaces: [{ id: 'openAGI', trusted: true }], providers: [] };
+        runtime.codingSupervisor.builtin.setup = () => marker;
+        assert.deepEqual(await runtime.nodeCapabilities.dispatch(local.nodeId, 'coding-supervisor', 'setup', { operation: 'setup' }), marker);
+        await runtime.nodeCapabilities.refresh();
+        const refreshed = runtime.nodeCapabilities.list('coding-supervisor').find((entry) => entry.local);
+        assert.equal(refreshed.capabilities[0].detail, '1 coding workspaces (1 trusted)');
       }
     } finally {
       await app.close();

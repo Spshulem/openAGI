@@ -298,3 +298,31 @@ test("fleet_screen reads (untrusted), fleet_click clicks the pinned label, fleet
     return { app: "conductor", action: "restart", running: [{ key: "conductor:s1", name: "madrid" }, { key: "conductor:s2", name: "amman" }] };
   }
 });
+
+test("fleet_click pins the card the scan saw when no stateId is given, refuses a card button with no card known, and leaves Resume unpinned", () => {
+  const card = { text: "Run npm test?", buttons: ["Approve", "Deny"], stateId: "0123456789abcdef" };
+  const supervisor = {
+    ...fakeSupervisor({ snapshot: { at: "2026-09-26T11:00:00.000Z", counts: {}, threads: [
+      row({ key: "codex:t1", app: "codex", agentStatus: "waiting", prompt: card }),
+      row({ key: "codex:t2", app: "codex", agentStatus: "idle" })
+    ], infra: {}, sourceErrors: {} } }),
+    clickThread: async () => ({ delivery: { status: "sent" } })
+  };
+  const click = registry(supervisor).get("fleet_click");
+  assert.equal(click.prepareApprovalArgs({ key: "codex:t1", label: "Approve" }).stateId, card.stateId, "the seen card is pinned");
+  assert.equal(click.prepareApprovalArgs({ key: "codex:t1", label: "Approve", stateId: "fedcba9876543210" }).stateId, "fedcba9876543210", "a fresher read wins");
+  assert.throws(() => click.prepareApprovalArgs({ key: "codex:t2", label: "Approve" }), /No permission card is known.*fleet_screen/);
+  assert.equal(click.prepareApprovalArgs({ key: "codex:t2", label: "Resume goal" }).stateId, undefined, "Resume has no card");
+});
+
+test("a send blocked by a card names its buttons and stateId so it can be answered from here", async () => {
+  const supervisor = {
+    ...fakeSupervisor({ snapshot: { at: "2026-09-26T11:00:00.000Z", counts: {}, threads: [row({ workspace: "apia" })], infra: {}, sourceErrors: {} } }),
+    sendOwnerMessage: async () => ({ delivery: { status: "blocked", route: "computer-use", detail: "permission prompt visible: answer it first (fleet_click), then send again",
+      prompt: { text: "Run npm test?", buttons: ["Allow once", "Deny"], stateId: "0123456789abcdef" } } })
+  };
+  const send = registry(supervisor).get("fleet_send_message");
+  const target = send.prepareApprovalArgs({ key: "codex:t1", message: "continue" });
+  await assert.rejects(send.handler(target, { __confirmed: true }),
+    /Not delivered \(blocked\): permission prompt visible: answer it first \(fleet_click\), then send again; a card is waiting \("Run npm test\?"\) with buttons "Allow once", "Deny" \(stateId 0123456789abcdef\): fleet_click can answer it/);
+});
