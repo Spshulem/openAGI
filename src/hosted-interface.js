@@ -50,7 +50,7 @@ import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
-import { NodeControlBroker, createNodeControlWorker, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
+import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
   createImessageBridgeRuntime,
@@ -142,12 +142,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         entry.capabilities?.some?.((capability) => capability.id === capabilityId && capability.ready)
       ));
       const rawSelector = selector.nodeId ?? selector.nodeName ?? null;
-      if (typeof rawSelector !== "string" || !rawSelector.trim()) return candidates.length === 1 ? candidates[0] : null;
-      const value = rawSelector.trim().toLowerCase();
-      const byId = candidates.find((entry) => entry.nodeId.toLowerCase() === value);
-      if (byId) return byId;
-      const named = candidates.filter((entry) => typeof entry.name === "string" && entry.name.toLowerCase() === value);
-      return named.length === 1 ? named[0] : null;
+      return matchNodeSelector(candidates, typeof rawSelector === "string" ? rawSelector.slice(0, 200) : null);
     },
     async refresh() {
       localCapabilityCache = await localNodeCapabilities().catch(() => []);

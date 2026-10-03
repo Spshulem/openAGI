@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createNodeControlWorker, NodeControlBroker, sanitizeNodeCapabilities } from "../src/node-control.js";
+import { createNodeControlWorker, NodeControlBroker, sanitizeNodeCapabilities, matchNodeSelector } from "../src/node-control.js";
 import { NodeRegistry } from "../src/node-registry.js";
 
 const capability = () => [{
@@ -633,4 +633,21 @@ test("a long poll that returns empty at once backs off instead of spinning", asy
   await new Promise((resolve) => setTimeout(resolve, 600));
   await worker.stop();
   assert.ok(polls >= 1 && polls <= 4, `polled ${polls} times in 600 ms`);
+});
+
+test("a loose node name picks a node only when exactly one ready node matches", () => {
+  const pro = { nodeId: "6f1c", name: "Spencers-MacBook-Pro" };
+  const studio = { nodeId: "9a2e", name: "Studio Mac" };
+  const nodes = [pro, studio];
+  assert.equal(matchNodeSelector(nodes, "6F1C"), pro, "exact id");
+  assert.equal(matchNodeSelector(nodes, "studio mac"), studio, "exact name");
+  assert.equal(matchNodeSelector(nodes, "MacBook"), pro);
+  assert.equal(matchNodeSelector(nodes, "my macbook pro"), pro);
+  assert.equal(matchNodeSelector(nodes, "Spencer's MacBook"), pro);
+  assert.equal(matchNodeSelector(nodes, "studio"), studio);
+  assert.equal(matchNodeSelector(nodes, "mac"), null, "two match: never the first");
+  assert.equal(matchNodeSelector(nodes, "my computer"), null);
+  assert.equal(matchNodeSelector(nodes, "imac"), null);
+  assert.equal(matchNodeSelector(nodes, null), null, "no selector with two nodes");
+  assert.equal(matchNodeSelector([pro], null), pro);
 });
