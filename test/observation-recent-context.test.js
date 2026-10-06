@@ -45,3 +45,34 @@ test("opening an older store links existing frames to their OCR text", { skip: !
   assert.deepEqual(ctx.snippets.map((s) => s.text), ["legacy frame text"]);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("OCR delivered later for an already recorded frame shows up", { skip: !hasSqlite }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-recent-enrich-"));
+  const store = new ObservationStore({ dir });
+  await store.record([{ kind: "frame", frameId: "f-late", at: minutesAgo(1), app: "Conductor", window: "amman" }]);
+  await store.record([{ kind: "frame", frameId: "f-late", at: minutesAgo(1), app: "Conductor", window: "amman", ocrText: "ocr arrived later" }]);
+  const ctx = await store.getRecentContext({ minutes: 10 });
+  assert.deepEqual(ctx.snippets.map((s) => s.text), ["ocr arrived later"]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("an upgrade whose backfill fails leaves no column, so the next start retries it", { skip: !hasSqlite }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-recent-retry-"));
+  const store = new ObservationStore({ dir });
+  await store.record([{ kind: "frame", frameId: "retry-1", at: minutesAgo(2), app: "Codex", window: "review", ocrText: "linked after retry" }]);
+  store.db.exec("ALTER TABLE frames DROP COLUMN text_rowid");
+  const prepare = store.db.prepare.bind(store.db);
+  store.db.prepare = (sql) => {
+    if (sql.startsWith("UPDATE frames SET text_rowid")) throw new Error("interrupted");
+    return prepare(sql);
+  };
+  assert.throws(() => store.migrate(), /interrupted/);
+  store.db.prepare = prepare;
+  const cols = store.db.prepare("PRAGMA table_info(frames)").all().map((c) => c.name);
+  assert.equal(cols.includes("text_rowid"), false);
+
+  store.migrate();
+  const ctx = await store.getRecentContext({ minutes: 10 });
+  assert.deepEqual(ctx.snippets.map((s) => s.text), ["linked after retry"]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

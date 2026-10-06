@@ -151,15 +151,17 @@ export class ObservationStore {
     // text row; on a large corpus that blocked the event loop for seconds.
     const frameCols = this.db.prepare("PRAGMA table_info(frames)").all().map((c) => c.name);
     if (!frameCols.includes("text_rowid")) {
-      this.db.exec("ALTER TABLE frames ADD COLUMN text_rowid INTEGER");
-      // Link only the newest texts: the recent-context digest reads minutes,
-      // and FTS rowids follow insert order, so this tail scan stays cheap.
-      const tail = this.db.prepare(
-        "SELECT rowid, kind, ref FROM texts ORDER BY rowid DESC LIMIT ?"
-      ).all(RECENT_TEXT_BACKFILL).filter((row) => row.kind === "frame");
-      const link = this.db.prepare("UPDATE frames SET text_rowid = ? WHERE frame_uid = ? AND text_rowid IS NULL");
+      // One transaction with the column: an interrupted upgrade leaves no
+      // column behind, so the next start runs the backfill again.
       this.db.exec("BEGIN");
       try {
+        this.db.exec("ALTER TABLE frames ADD COLUMN text_rowid INTEGER");
+        // Link only the newest texts: the recent-context digest reads minutes,
+        // and FTS rowids follow insert order, so this tail scan stays cheap.
+        const tail = this.db.prepare(
+          "SELECT rowid, kind, ref FROM texts ORDER BY rowid DESC LIMIT ?"
+        ).all(RECENT_TEXT_BACKFILL).filter((row) => row.kind === "frame");
+        const link = this.db.prepare("UPDATE frames SET text_rowid = ? WHERE frame_uid = ? AND text_rowid IS NULL");
         for (const row of tail) link.run(row.rowid, row.ref);
         this.db.exec("COMMIT");
       } catch (error) {
@@ -188,6 +190,9 @@ export class ObservationStore {
     const insertText = this.db.prepare(
       `INSERT INTO texts (kind, ref, at, app, window, text) VALUES (?, ?, ?, ?, ?, ?)`
     );
+    const linkFrameText = this.db.prepare(
+      "UPDATE frames SET text_rowid = ? WHERE frame_uid = ? AND text_rowid IS NULL"
+    );
 
     let count = 0;
     this.db.exec("BEGIN");
@@ -201,7 +206,9 @@ export class ObservationStore {
         } else if (o.kind === "frame" || o.kind === "frame-summary") {
           const uid = o.frameId ? String(o.frameId) : createId("frm");
           const text = o.ocrText ? insertText.run("frame", uid, o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.ocrText) : null;
-          insertFrame.run(uid, o.at ?? nowIso(), o.app ?? null, o.window ?? null, o.thumbnail ?? null, typeof o.confidence === "number" ? o.confidence : null, machineId, text ? text.lastInsertRowid : null);
+          const frame = insertFrame.run(uid, o.at ?? nowIso(), o.app ?? null, o.window ?? null, o.thumbnail ?? null, typeof o.confidence === "number" ? o.confidence : null, machineId, text ? text.lastInsertRowid : null);
+          // OCR that arrives for a frame recorded earlier without it.
+          if (text && !frame.changes) linkFrameText.run(text.lastInsertRowid, uid);
         } else if (o.kind === "transcript") {
           // Long-form text (e.g. a BuildBetter call transcript) recorded so it's
           // searchable via the same FTS path as OCR/activity (and thus recall_activity).
