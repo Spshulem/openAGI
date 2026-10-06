@@ -23,6 +23,12 @@ subdirectory takes precedence for that subtree.
 - Keep changes focused. Do not reformat or rename unrelated code.
 - Preserve the Node core and web dashboard unless the task explicitly requires
   a cross-platform contract change.
+- Product/readiness claims must distinguish the intended OpenAGI experience
+  (always-on daemon, local dashboard/setup, memory, opt-in observation,
+  proactive suggestions, and companion surfaces) from the thin `openagi chat`
+  CLI. A passing daemon/provider/CLI smoke does not qualify the full
+  Hermes-like user experience; dashboard, companion, notification, observation,
+  workflow-miner, channel, and tool-effect paths need their own evidence.
 - Use conventional commit messages. Never commit credentials, tokens, private
   configuration, local evidence, installed releases, caches, or files under a
   local `workspace/` directory.

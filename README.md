@@ -101,6 +101,18 @@ If you want the long form on why these (and not, say, "more parameters") get you
 
 One command. Then leave it running. The proactive part needs time to watch.
 
+### Intended operating mode
+
+`openagi chat` is a thin CLI client for quick prompts, smoke tests, and remote
+control. It is not the primary product experience. The intended daily-driver
+shape is an always-on daemon at `127.0.0.1:43210`, the local web dashboard and
+setup wizard, persistent memory under `~/.openagi/`, opt-in observation, and
+proactive suggestions that surface after the agent has enough conversation or
+activity evidence. A release can therefore pass daemon/provider/CLI checks while
+still requiring separate dashboard, companion, notification, observation, and
+workflow-miner qualification before it should be described as the full
+Hermes-like user experience.
+
 **Linux / Raspberry Pi / SBC:**
 ```bash
 curl -fsSL openagi.sh | sh
