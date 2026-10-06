@@ -295,7 +295,7 @@ export class ToolRegistry {
     if (tainted || insist) {
       const action = this.pendingActions.enqueue({
         toolName: tool.name, args, context, summary, reason: context.__reason ?? null,
-        dedupeKey: chatKey, ttlMs, announce: false, mode: "chat"
+        dedupeKey: chatKey, ttlMs, announce: false, mode: "chat", ownerIntent: turn.intent ?? null
       });
       const what = spokenSummary(summary ?? action.summary);
       const why = typeof insist === "string" && insist ? `; ${insist.slice(0, 200)}` : "";

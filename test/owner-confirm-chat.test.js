@@ -32,7 +32,7 @@ function harness(t) {
     generate: async (request) => { turns.push(request); return { text: "ok", provider: "stub", model: "stub", toolCalls: [] }; } } });
   const say = (text, sessionId = "chat-a", principal = ownerPrincipal("g2", "g2-1")) =>
     host.handleMessage({ text, sessionId, channel: "g2", from: "node:g2" }, { principal });
-  const card = (sessionId, label) => pendingActions.enqueue({ toolName: "fleet_click", args: { label }, context: { sessionId }, summary: `Click ${label}`, mode: "chat", announce: false });
+  const card = (sessionId, label, ownerIntent = null) => pendingActions.enqueue({ toolName: "fleet_click", args: { label }, context: { sessionId }, summary: `Click ${label}`, mode: "chat", announce: false, ownerIntent });
   return { pendingActions, ran, turns, say, card, host };
 }
 
@@ -147,6 +147,29 @@ test("a bare yes on this chat's own card needs no continuation later", async (t)
   assert.equal(action.status, "approved");
   assert.equal(action.continuation?.status, "not-needed");
   assert.deepEqual(h.pendingActions.recoverableContinuations(), []);
+});
+
+test("a confirmed card's follow-up steps are judged on the instruction it was raised under", async (t) => {
+  const h = harness(t);
+  const instruction = "Restart Conductor, then resume the chats it stopped";
+  const raised = h.card("chat-d", "Quit", instruction);
+  await h.say(`yes ${raised.confirmCode}`, "chat-d");
+  assert.equal(h.turns.at(-1).context.__turn.intent, instruction);
+  assert.match(h.turns.at(-1).turnContext, /It was one step of the owner's instruction: "Restart Conductor, then resume the chats it stopped"\. Carry on/);
+  assert.doesNotMatch(h.turns.at(-1).turnContext, /"instruction"/, "the receipt itself does not repeat it");
+  assert.equal(h.pendingActions.ownerIntentFor(raised.id), null, "dropped once decided");
+
+  // Another chat's card, a refusal, or a card raised with no instruction keep "yes NN" as the intent.
+  const other = h.card("chat-e", "Allow", instruction);
+  await h.say(`yes ${other.confirmCode}`, "chat-f");
+  assert.equal(h.turns.at(-1).context.__turn.intent, `yes ${other.confirmCode}`);
+  const refused = h.card("chat-d", "Deny", instruction);
+  await h.say(`no ${refused.confirmCode}`, "chat-d");
+  assert.equal(h.turns.at(-1).context.__turn.intent, `no ${refused.confirmCode}`);
+  const plain = h.card("chat-d", "Run");
+  await h.say(`yes ${plain.confirmCode}`, "chat-d");
+  assert.equal(h.turns.at(-1).context.__turn.intent, `yes ${plain.confirmCode}`);
+  assert.doesNotMatch(h.turns.at(-1).turnContext, /Carry on/);
 });
 
 test("a computer session started mid-turn raises the provider's hop bound from that round on", async () => {

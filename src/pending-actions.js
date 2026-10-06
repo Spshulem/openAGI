@@ -25,6 +25,9 @@ export class PendingActionStore {
     this.randomInt = randomInt;
     ensureDir(this.dir);
     this.actions = new Map();
+    // The owner's own words behind each chat card, in memory only (never
+    // journaled): a confirmed card's follow-up steps are judged on them.
+    this.ownerIntents = new Map();
     this.events = null;
     // Recovery and expiry happen while the durable runtime is constructed,
     // before createHostedInterface owns/binds the live event bus. Hold those
@@ -65,7 +68,7 @@ export class PendingActionStore {
   // mode: "queue" waits for an approval surface; "chat" waits for the owner
   // to say "yes NN" in an OpenAGI chat; "owner" is a record of a call the
   // owner's own instruction ran. Every card gets a short spoken code.
-  enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null, announce = true, mode = "queue", confirmCode = true, _reuse = true }) {
+  enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null, announce = true, mode = "queue", confirmCode = true, ownerIntent = null, _reuse = true }) {
     const cardMode = ["queue", "chat", "owner"].includes(mode) ? mode : "queue";
     const boundedDedupeKey = typeof dedupeKey === "string" && dedupeKey
       ? dedupeKey.slice(0, 500)
@@ -100,6 +103,7 @@ export class PendingActionStore {
       error: null
     };
     this.actions.set(action.id, action);
+    if (cardMode === "chat" && typeof ownerIntent === "string" && ownerIntent.trim()) this.ownerIntents.set(action.id, ownerIntent.trim().slice(0, 2000));
     this._appendJournal({ op: "enqueue", action });
     if (announce) this.events?.emit?.("pending-action", {
       id: action.id,
@@ -119,6 +123,11 @@ export class PendingActionStore {
   recordOwnerApproved({ toolName, args, context, summary, reason, dedupeKey, approvedBy }) {
     const action = this.enqueue({ toolName, args, context, summary, reason, dedupeKey, announce: false, mode: "owner", confirmCode: false, _reuse: false });
     return this.claimForExecution(action.id, { claimedBy: approvedBy ?? "owner" });
+  }
+
+  // The owner instruction a pending chat card was raised under, if any.
+  ownerIntentFor(id) {
+    return this.ownerIntents.get(id) ?? null;
   }
 
   // The pending card a spoken "yes NN" names, in any session.
@@ -186,6 +195,7 @@ export class PendingActionStore {
       && executionId === action.executionId;
     if (action.status !== "pending" && !finishingClaim) return action;
     action.status = decision === "approve" ? "approved" : "denied";
+    this.ownerIntents.delete(id);
     action.decidedAt = new Date(this.now()).toISOString();
     action.decidedBy = decidedBy ?? "user";
     if (result !== undefined) action.result = result;
@@ -344,6 +354,7 @@ export class PendingActionStore {
       const expiresAt = Date.parse(action.expiresAt);
       if (!Number.isFinite(expiresAt) || atMs < expiresAt) continue;
       action.status = "expired";
+      this.ownerIntents.delete(action.id);
       action.decidedAt = decidedAt;
       action.decidedBy = "system";
       action.error = "Approval expired before it was used.";
