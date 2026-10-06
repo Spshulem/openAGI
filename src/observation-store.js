@@ -24,6 +24,8 @@ import { resolveDataDir } from "./data-dir.js";
 const TRANSCRIPT_SEARCH_TEXT_CAP = 1000;
 const WINDOW_SEARCH_TEXT_CAP = 2000;
 const WINDOW_SEARCH_LIMIT = 100;
+// Text rows scanned when linking existing frames to their OCR text on upgrade.
+const RECENT_TEXT_BACKFILL = 5000;
 const WINDOW_TEXT_KINDS = new Set(["activity", "frame"]);
 const SEARCH_KINDS = new Set(["activity", "frame", "transcript"]);
 
@@ -144,6 +146,27 @@ export class ObservationStore {
         this.db.exec(`ALTER TABLE ${table} ADD COLUMN source_machine_id TEXT`);
       }
     }
+    // frames.text_rowid points at the frame's OCR row in the FTS table. `ref`
+    // is UNINDEXED there, so looking a frame's text up by ref scans every
+    // text row; on a large corpus that blocked the event loop for seconds.
+    const frameCols = this.db.prepare("PRAGMA table_info(frames)").all().map((c) => c.name);
+    if (!frameCols.includes("text_rowid")) {
+      this.db.exec("ALTER TABLE frames ADD COLUMN text_rowid INTEGER");
+      // Link only the newest texts: the recent-context digest reads minutes,
+      // and FTS rowids follow insert order, so this tail scan stays cheap.
+      const tail = this.db.prepare(
+        "SELECT rowid, kind, ref FROM texts ORDER BY rowid DESC LIMIT ?"
+      ).all(RECENT_TEXT_BACKFILL).filter((row) => row.kind === "frame");
+      const link = this.db.prepare("UPDATE frames SET text_rowid = ? WHERE frame_uid = ? AND text_rowid IS NULL");
+      this.db.exec("BEGIN");
+      try {
+        for (const row of tail) link.run(row.rowid, row.ref);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
   }
 
   async record(observations, meta = {}) {
@@ -160,7 +183,7 @@ export class ObservationStore {
       `INSERT INTO activity (at, app, window, event, metadata, source_machine_id) VALUES (?, ?, ?, ?, ?, ?)`
     );
     const insertFrame = this.db.prepare(
-      `INSERT OR IGNORE INTO frames (frame_uid, captured_at, app, window, thumbnail_path, confidence, source_machine_id) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT OR IGNORE INTO frames (frame_uid, captured_at, app, window, thumbnail_path, confidence, source_machine_id, text_rowid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const insertText = this.db.prepare(
       `INSERT INTO texts (kind, ref, at, app, window, text) VALUES (?, ?, ?, ?, ?, ?)`
@@ -177,8 +200,8 @@ export class ObservationStore {
           if (o.window) insertText.run("activity", String(inserted.lastInsertRowid), o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.window);
         } else if (o.kind === "frame" || o.kind === "frame-summary") {
           const uid = o.frameId ? String(o.frameId) : createId("frm");
-          insertFrame.run(uid, o.at ?? nowIso(), o.app ?? null, o.window ?? null, o.thumbnail ?? null, typeof o.confidence === "number" ? o.confidence : null, machineId);
-          if (o.ocrText) insertText.run("frame", uid, o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.ocrText);
+          const text = o.ocrText ? insertText.run("frame", uid, o.at ?? nowIso(), o.app ?? "", o.window ?? "", o.ocrText) : null;
+          insertFrame.run(uid, o.at ?? nowIso(), o.app ?? null, o.window ?? null, o.thumbnail ?? null, typeof o.confidence === "number" ? o.confidence : null, machineId, text ? text.lastInsertRowid : null);
         } else if (o.kind === "transcript") {
           // Long-form text (e.g. a BuildBetter call transcript) recorded so it's
           // searchable via the same FTS path as OCR/activity (and thus recall_activity).
@@ -430,10 +453,11 @@ export class ObservationStore {
     ).all(sinceIso);
 
     const frames = this.db.prepare(
-      `SELECT frame_uid, app, window, captured_at,
-         (SELECT text FROM texts WHERE ref = frames.frame_uid AND kind = 'frame') AS text
-       FROM frames WHERE captured_at >= ?
-       ORDER BY captured_at DESC LIMIT ?`
+      `SELECT f.frame_uid, f.app, f.window, f.captured_at, t.text
+       FROM frames f
+       LEFT JOIN texts t ON t.rowid = f.text_rowid AND t.kind = 'frame' AND t.ref = f.frame_uid
+       WHERE f.captured_at >= ?
+       ORDER BY f.captured_at DESC LIMIT ?`
     ).all(sinceIso, maxSnippets * 3);
 
     const snippets = [];
