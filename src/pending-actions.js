@@ -17,6 +17,8 @@ import { authorityRecord } from "./owner-authority.js";
 // mid-action-queue doesn't lose anything.
 
 const CODE_RETIRE_MS = 24 * 60 * 60_000;
+// The /message route's own text cap.
+const OWNER_INTENT_MAX = 64 * 1024;
 
 export class PendingActionStore {
   constructor({ dir, now = () => Date.now(), randomInt = crypto.randomInt } = {}) {
@@ -77,7 +79,11 @@ export class PendingActionStore {
       const existing = this.list({ status: "pending" }).find((candidate) =>
         candidate.toolName === toolName && candidate.dedupeKey === boundedDedupeKey
       );
-      if (existing) return existing;
+      if (existing) {
+        // The owner's latest words for the same request are the ones a confirm carries.
+        if (existing.mode === "chat") this._noteOwnerIntent(existing.id, ownerIntent);
+        return existing;
+      }
     }
     const createdMs = this.now();
     const createdAt = new Date(createdMs).toISOString();
@@ -103,7 +109,7 @@ export class PendingActionStore {
       error: null
     };
     this.actions.set(action.id, action);
-    if (cardMode === "chat" && typeof ownerIntent === "string" && ownerIntent.trim()) this.ownerIntents.set(action.id, ownerIntent.trim().slice(0, 2000));
+    if (cardMode === "chat") this._noteOwnerIntent(action.id, ownerIntent);
     this._appendJournal({ op: "enqueue", action });
     if (announce) this.events?.emit?.("pending-action", {
       id: action.id,
@@ -128,6 +134,12 @@ export class PendingActionStore {
   // The owner instruction a pending chat card was raised under, if any.
   ownerIntentFor(id) {
     return this.ownerIntents.get(id) ?? null;
+  }
+
+  // Whole, as the message route bounded it: the actionable part of a pasted
+  // instruction is often at its end.
+  _noteOwnerIntent(id, ownerIntent) {
+    if (typeof ownerIntent === "string" && ownerIntent.trim()) this.ownerIntents.set(id, ownerIntent.trim().slice(0, OWNER_INTENT_MAX));
   }
 
   // The pending card a spoken "yes NN" names, in any session.

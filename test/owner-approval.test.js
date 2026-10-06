@@ -118,6 +118,9 @@ test("a code card keeps the owner's words it was raised under, in memory only", 
   assert.doesNotMatch(journal, /resume the chats/, "never journaled");
   const queued = await h.registry.invoke("fleet_click", { key: "codex:9", label: "Allow" }, { sessionId: "s9", channel: "node" });
   assert.equal(h.store.ownerIntentFor(queued.result.actionId), null, "a non-owner card has none");
+  const again = await h.registry.invoke("fleet_app", { app: "conductor", action: "restart" }, h.ownerContext("phone", `${"context ".repeat(400)}restart conductor, then send amman: continue`));
+  assert.equal(again.result.actionId, held.result.actionId, "the same request reuses its card");
+  assert.match(h.store.ownerIntentFor(held.result.actionId), /then send amman: continue$/, "with the owner's latest words, whole");
   h.store.decide(held.result.actionId, { decision: "deny", decidedBy: "owner:phone" });
   assert.equal(h.store.ownerIntentFor(held.result.actionId), null);
 });
