@@ -17,6 +17,8 @@ import { authorityRecord } from "./owner-authority.js";
 // mid-action-queue doesn't lose anything.
 
 const CODE_RETIRE_MS = 24 * 60 * 60_000;
+// The /message route's own text cap.
+const OWNER_INTENT_MAX = 64 * 1024;
 
 export class PendingActionStore {
   constructor({ dir, now = () => Date.now(), randomInt = crypto.randomInt } = {}) {
@@ -25,6 +27,9 @@ export class PendingActionStore {
     this.randomInt = randomInt;
     ensureDir(this.dir);
     this.actions = new Map();
+    // The owner's own words behind each chat card, in memory only (never
+    // journaled): a confirmed card's follow-up steps are judged on them.
+    this.ownerIntents = new Map();
     this.events = null;
     // Recovery and expiry happen while the durable runtime is constructed,
     // before createHostedInterface owns/binds the live event bus. Hold those
@@ -65,7 +70,7 @@ export class PendingActionStore {
   // mode: "queue" waits for an approval surface; "chat" waits for the owner
   // to say "yes NN" in an OpenAGI chat; "owner" is a record of a call the
   // owner's own instruction ran. Every card gets a short spoken code.
-  enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null, announce = true, mode = "queue", confirmCode = true, _reuse = true }) {
+  enqueue({ toolName, args, context, summary, reason, dedupeKey, ttlMs = null, announce = true, mode = "queue", confirmCode = true, ownerIntent = null, _reuse = true }) {
     const cardMode = ["queue", "chat", "owner"].includes(mode) ? mode : "queue";
     const boundedDedupeKey = typeof dedupeKey === "string" && dedupeKey
       ? dedupeKey.slice(0, 500)
@@ -74,7 +79,11 @@ export class PendingActionStore {
       const existing = this.list({ status: "pending" }).find((candidate) =>
         candidate.toolName === toolName && candidate.dedupeKey === boundedDedupeKey
       );
-      if (existing) return existing;
+      if (existing) {
+        // The owner's latest words for the same request are the ones a confirm carries.
+        if (existing.mode === "chat") this._noteOwnerIntent(existing.id, ownerIntent);
+        return existing;
+      }
     }
     const createdMs = this.now();
     const createdAt = new Date(createdMs).toISOString();
@@ -100,6 +109,7 @@ export class PendingActionStore {
       error: null
     };
     this.actions.set(action.id, action);
+    if (cardMode === "chat") this._noteOwnerIntent(action.id, ownerIntent);
     this._appendJournal({ op: "enqueue", action });
     if (announce) this.events?.emit?.("pending-action", {
       id: action.id,
@@ -119,6 +129,17 @@ export class PendingActionStore {
   recordOwnerApproved({ toolName, args, context, summary, reason, dedupeKey, approvedBy }) {
     const action = this.enqueue({ toolName, args, context, summary, reason, dedupeKey, announce: false, mode: "owner", confirmCode: false, _reuse: false });
     return this.claimForExecution(action.id, { claimedBy: approvedBy ?? "owner" });
+  }
+
+  // The owner instruction a pending chat card was raised under, if any.
+  ownerIntentFor(id) {
+    return this.ownerIntents.get(id) ?? null;
+  }
+
+  // Whole, as the message route bounded it: the actionable part of a pasted
+  // instruction is often at its end.
+  _noteOwnerIntent(id, ownerIntent) {
+    if (typeof ownerIntent === "string" && ownerIntent.trim()) this.ownerIntents.set(id, ownerIntent.trim().slice(0, OWNER_INTENT_MAX));
   }
 
   // The pending card a spoken "yes NN" names, in any session.
@@ -186,6 +207,7 @@ export class PendingActionStore {
       && executionId === action.executionId;
     if (action.status !== "pending" && !finishingClaim) return action;
     action.status = decision === "approve" ? "approved" : "denied";
+    this.ownerIntents.delete(id);
     action.decidedAt = new Date(this.now()).toISOString();
     action.decidedBy = decidedBy ?? "user";
     if (result !== undefined) action.result = result;
@@ -344,6 +366,7 @@ export class PendingActionStore {
       const expiresAt = Date.parse(action.expiresAt);
       if (!Number.isFinite(expiresAt) || atMs < expiresAt) continue;
       action.status = "expired";
+      this.ownerIntents.delete(action.id);
       action.decidedAt = decidedAt;
       action.decidedBy = "system";
       action.error = "Approval expired before it was used.";

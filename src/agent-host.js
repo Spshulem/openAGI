@@ -243,6 +243,10 @@ export class AgentHost {
         const previousUser = sessionBefore.messages.slice(0, -1).findLast((message) => message?.role === "user");
         confirmation = await this.confirmSpoken(spoken, { sessionId, sinceIso: previousUser?.createdAt ?? null, principal });
         if (confirmation?.untrusted) turnState.untrusted = true;
+        // "yes 13" names no action itself: the rest of this turn is judged on
+        // the owner instruction the card was raised under, so its next step
+        // (reopen, resume, send) runs without a second code.
+        if (confirmation?.instruction) turnState.intent = confirmation.instruction;
       }
     }
 
@@ -506,6 +510,7 @@ export class AgentHost {
       action = candidates[0];
     }
     const decidedBy = `owner:${principal.via}`;
+    const instruction = spoken.decision === "approve" && action.context?.sessionId === sessionId ? store.ownerIntentFor?.(action.id) ?? null : null;
     const receipt = { code: action.confirmCode ?? spoken.code ?? null, decision: spoken.decision, actionId: action.id, tool: action.toolName, summary: String(action.summary ?? "").slice(0, 300) };
     if (spoken.decision === "deny") {
       const decided = store.decide(action.id, { decision: "deny", decidedBy, error: "denied by the owner in chat" });
@@ -532,6 +537,7 @@ export class AgentHost {
       ...receipt,
       status: invoked.ok ? "done" : "failed",
       ...(invoked.ok ? { result: boundedJson(invoked.result, 2_000) } : { error: String(invoked.error ?? "failed").slice(0, 300) }),
+      ...(instruction ? { instruction } : {}),
       untrusted: this.runtime.tools?.get?.(action.toolName)?.untrustedOutput === true
     };
   }
@@ -638,8 +644,9 @@ The runtime may prepend a [context] block to the latest user turn. Its safety-po
       if (guidance) sections.push(guidance.trimEnd());
     }
     if (confirmation) {
-      const { untrusted, ...shown } = confirmation;
+      const { untrusted, instruction, ...shown } = confirmation;
       sections.push(`Owner confirmation, already handled by OpenAGI before this reply (report it plainly; do not call the tool again): ${JSON.stringify(shown)}`);
+      if (instruction && shown.status === "done") sections.push(`It was one step of the owner's instruction: ${JSON.stringify(instruction)}. Carry on with the steps of it still left.`);
     }
     if (output.scrutiny.reasons?.length) {
       sections.push(`Reasons:\n${output.scrutiny.reasons.map((reason) => `- ${reason}`).join("\n")}`);
