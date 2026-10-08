@@ -87,8 +87,22 @@ const NEED_YOU_PATTERNS = [
   /\byour call\b/i,
   /\bwhich (?:one|option|do you|would you)\b/i,
   /\bplease confirm\b/i,
-  /\b(?:blocked|waiting) on you\b/i
+  /\b(?:blocked|waiting) on you\b/i,
+  /\byou must do\b/i,
+  /\bstill need your\b/i,
+  /^\s*(?:\*\*)?blocked(?:\*\*)?:(?:\*\*)?\s*(?!none\b|nothing\b|no\b|n\/a\b|-)\S/im
 ];
+
+// The agent ended its turn saying it will keep going ("Next: ...", "I'll
+// merge once checks pass", "Running the full audit"): nothing will wake it
+// but a nudge. Only its last few sentences count.
+export const PROMISED_WORK_PATTERNS = Object.freeze([
+  /\bI(?:'ll| will| am going to|'m going to)\s+(?!(?:wait|stop|leave|hold|pause|let you|report back when you)\b)\w/i,
+  /\b(?:next|next up|then|after that)\s*:\s*\S/i,
+  /^(?:now\s+)?(?:running|starting|kicking off|re-?running)\s+(?:the|a|an|full|my|all|both)\b/i,
+  /\bonce (?:they|it|checks?|CI|the (?:checks?|runs?|build|verify)) (?:pass(?:es)?|land|finish(?:es)?|complete)/i,
+  /\b(?:continuing|moving on to|working on the next)\b/i
+]);
 
 // Reports that mention "you" but ask for nothing.
 const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b/i;
@@ -259,8 +273,14 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
     if (readiness.blockers.length) return result("pr-not-ready", readiness.blockers.join("; "), { blockers: readiness.blockers });
     return result("ready-needs-human", readiness.onlyHumanLeft ? "only a human approval left" : "ready; merge is the owner's");
   }
-  if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`);
-  return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR");
+  // A turn that ended on an error no infra kind explains (a tool crash, a
+  // dropped stream) with no open PR to judge it by is mid-work: it gets a
+  // resume, not silence.
+  if (thread.agentStatus === "error" && !deliberateStop(thread)) return result("stopped", "turn ended on an error");
+  // The agent spoke last and stopped: did it say it would keep going?
+  const idle = text ? { promised: promisedWork(text) } : null;
+  if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`, idle ? { idle } : {});
+  return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR", idle ? { idle } : {});
 }
 
 // A PR merged or closed after the agent asked has answered the ask, but only
@@ -361,6 +381,15 @@ function waitSignal(thread, text, now) {
     return { source: "text", taskKind: null, ageMs: msSince(thread.lastAgentAt ?? thread.lastActivityAt, now), reason: "ended turn to wait on CI or verify" };
   }
   return null;
+}
+
+// An offer ("If you want, I'll...") is not a promise.
+const CONDITIONAL = /^(?:if|when you|should you|let me know|happy to|want me to)\b/i;
+
+function promisedWork(text) {
+  return splitSentences(text).slice(-3)
+    .map((sentence) => sentence.replace(/^[-*>#\s]+|\*\*/g, "").trim())
+    .some((sentence) => !CONDITIONAL.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)));
 }
 
 function oldestTask(tasks) {

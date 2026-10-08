@@ -170,6 +170,11 @@ function intentFor(ctx) {
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
     case "stopped": return nudge("resume", classified.reason);
+    // It said it would keep going ("Next: ...", "merging once they pass"),
+    // then its turn ended: nothing wakes it but a nudge. A finished report
+    // is left alone.
+    case "idle-no-pr":
+    case "done": return classified.idle?.promised ? nudge("idle-report", "said it would keep going, then stopped") : { type: "none", reason: classified.reason };
     default: return { type: "none", reason: classified.reason };
   }
 }
@@ -279,6 +284,10 @@ function waitingIntent(ctx) {
   if (ciDone) return nudge("ci-finished", "CI finished on head");
   if (pr?.state === "OPEN" && !ci.state && age >= limits.waitingTaskMaxMs) return nudge("merge-ready", "no CI on head after waiting");
   if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
+  // The PR it is tracked by already merged or closed, so the CI it waits on
+  // is another PR's; or the wait has outlived any CI run. Ask where it is.
+  if (pr && pr.state !== "OPEN" && age >= limits.waitingTaskMaxMs) return statusCheck("CI on a PR this thread does not track", age);
+  if (age >= limits.silentTurnMs) return statusCheck("CI or a verify", age);
   return { type: "wait", reason: pr ? "CI still running" : wait.reason ?? "waiting" };
 }
 

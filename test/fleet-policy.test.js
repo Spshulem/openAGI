@@ -191,6 +191,54 @@ test("row: an agent silent an hour on a background wait is asked for a status", 
   assert.match(idle.message, /a background task/);
 });
 
+test("row: an agent that said it would keep going and stopped gets idle-report", () => {
+  // bullard: "Running the full audit: ..." and then nothing for hours.
+  const promised = makeThread({ prRefs: [], lastAgentText: "Running the full audit: PEEC, the Answer Pages, YouTube, Reddit, and the blog.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const nudged = run(promised, { pr: null }).decision;
+  assert.equal(nudged.state, "idle-no-pr");
+  assert.equal(nudged.action, "nudge");
+  assert.equal(nudged.playbook, "idle-report");
+  assert.match(nudged.message, /Continue with that next step now/);
+  // cape-town: its tracked PR merged, but it said merging starts once checks pass.
+  const merged = makePr({ state: "MERGED" });
+  const afterMerge = run(makeThread({ lastAgentText: "All five full checks are running. Merging in order starts once they pass.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) }), { pr: merged }).decision;
+  assert.equal(afterMerge.state, "done");
+  assert.equal(afterMerge.playbook, "idle-report");
+  // Not before the idle window, not on a finished report, not on an offer,
+  // and not after the owner spoke last.
+  assert.equal(run(makeThread({ ...promised, lastAgentAt: ago(5 * MIN), lastActivityAt: ago(5 * MIN) }), { pr: null }).decision.action, "wait");
+  for (const text of ["Done. The report is attached; nothing else is needed.", "If you want, I'll also add dark mode."]) {
+    const left = run(makeThread({ prRefs: [], lastAgentText: text }), { pr: null }).decision;
+    assert.equal(left.action, "none", text);
+  }
+  const ownerLast = run(makeThread({ ...promised, lastUserText: "hold on", lastUserAt: ago(20 * MIN) }), { pr: null }).decision;
+  assert.equal(ownerLast.action, "none");
+  // Twice per progress mark, an hour apart, then it stops without pinging the owner.
+  const ledger = { lastNudgeAt: ago(70 * MIN), attemptsWithoutProgress: 2 };
+  const stopped = run(promised, { pr: null, ledger }).decision;
+  assert.notEqual(stopped.action, "nudge");
+});
+
+test("row: an agent that ended its turn on an error with no open PR is resumed", () => {
+  const crashed = run(makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text: "stream dropped", resetAt: null } }), { pr: null }).decision;
+  assert.equal(crashed.state, "stopped");
+  assert.equal(crashed.playbook, "resume");
+});
+
+test("row: a text wait that outlives any CI run gets a status check", () => {
+  const waiting = { lastAgentText: "Opened PR #327. GitHub CI is running; I'll report when it lands.", lastAgentAt: ago(90 * MIN), lastActivityAt: ago(90 * MIN), lastUserAt: ago(120 * MIN) };
+  // Tracked by a PR that already merged: the CI it waits on is another PR's.
+  const stale = run(makeThread(waiting), { pr: makePr({ state: "MERGED" }) }).decision;
+  assert.equal(stale.playbook, "status-check");
+  assert.match(stale.message, /CI on a PR this thread does not track/);
+  // An open PR still pending after an hour.
+  const pending = run(makeThread(waiting), { pr: makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } }) }).decision;
+  assert.equal(pending.playbook, "status-check");
+  // Under an hour it waits.
+  const fresh = run(makeThread({ ...waiting, lastAgentAt: ago(20 * MIN), lastActivityAt: ago(20 * MIN) }), { pr: makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } }) }).decision;
+  assert.equal(fresh.action, "wait");
+});
+
 test("row: local-verify gets the no-local-verify nudge right away", () => {
   const thread = makeThread({ lastAgentAt: ago(MIN), lastActivityAt: ago(MIN) });
   const infra = { localVerify: [{ pid: 9, command: "pnpm verify:pr", cwd: "/work/madrid", ageSec: 400, threadKey: "conductor:s1" }] };

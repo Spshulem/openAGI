@@ -88,8 +88,12 @@ function summarizeTail(rowsNewestFirst) {
     // System rows (commands_changed and other state broadcasts) also land
     // on idle tabs; only turn rows are activity.
     if (event.type !== "system") summary.lastAt = latestIso(summary.lastAt, at);
-    // Every SDK turn opens with system/init.
-    if (event.type === "system" && event.subtype === "init") summary.turnStartedAt = at;
+    // Every SDK turn opens with system/init. A new turn after an unanswered
+    // AskUserQuestion means the agent moved on without the pick.
+    if (event.type === "system" && event.subtype === "init") {
+      summary.turnStartedAt = at;
+      summary.pendingAsk = null;
+    }
     else if (event.type === "assistant" && !event.parent_tool_use_id) {
       if (typeof event.message?.model === "string") summary.model = event.message.model;
       const ask = askUserQuestion(event, at);

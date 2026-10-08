@@ -144,6 +144,10 @@ test("classifyThread: infra errors, codex-lb log errors, and BuildBot3-down text
   assert.equal(limit.infraKind, "session-limit");
   // "other" errors are not infra: the PR state decides.
   assert.equal(classify(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } })).state, "ready-needs-human");
+  // With no open PR to judge it by, a turn that ended on an error gets a resume.
+  const crashed = classify(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: null });
+  assert.equal(crashed.state, "stopped");
+  assert.equal(crashed.reason, "turn ended on an error");
   const codex = makeThread({ key: "codex:x1", kind: "codex", id: "x1", agentStatus: "stalled" });
   const infra = { lb: { healthy: false, recentErrors: [{ kind: "connection", count: 12, lastAt: ago(MIN), threadIds: ["x1"] }] } };
   const lb = classify(codex, { infra });
