@@ -1237,6 +1237,20 @@ test("the app holding secure input is named in the not-ready reason", async () =
   assert.deepEqual(await driver.readiness(), { ready: false, detail: "secure input is on: BuildBetter Staging has a password field focused" });
 });
 
+// The driver's own presence probe runs the command runner it was given. A
+// delivery helper that shared its name once shadowed it, so every live
+// readiness read "screen state unknown" and no nudge was ever typed.
+test("readiness probes the screen with the driver's command runner, not a probe stub", async () => {
+  const calls = [];
+  const run = async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    return { code: 0, stdout: '"IOConsoleLocked" = No\n"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserNameKey"="shooby"})' };
+  };
+  const driver = createUiDriver({ config: { bins: { ocu: "/fake/ocu", ioreg: "/usr/sbin/ioreg" }, limits: { ...DEFAULTS } }, run, binaryReady: () => true, computerUseEnabled: () => true, permissionProbe: async () => ({ accessibility: true, screenRecording: true }) });
+  assert.deepEqual(await driver.readiness(), { ready: true, detail: null });
+  assert.ok(calls.includes("/usr/sbin/ioreg -n Root -d1"), calls.join("; "));
+});
+
 // HIDIdleTime as the Mac keeps it: only the owner's input and posted keys
 // reset it; accessibility clicks and an AX value set (OCU's typing into a
 // settable composer) do not.

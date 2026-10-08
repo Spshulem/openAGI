@@ -993,12 +993,12 @@ export function createUiDriver({
 
   // request: { text, target, identity, previousUnconfirmed, evidenceName }
   async function deliver(request = {}) {
-    return run(request, (ctx, signal) => steps(request, signal, ctx));
+    return runRequest(request, (ctx, signal) => steps(request, signal, ctx));
   }
 
   // Every request's one budget and its cleanup: the owner's app goes back
   // and the transport closes whatever happened.
-  async function run(request, body) {
+  async function runRequest(request, body) {
     const text = flattenMessage(request.text);
     // type_text is one call that can outlast a normal step on a long message.
     const typingMs = Math.ceil(text.length * TYPING_MS_PER_CHAR);
@@ -1506,7 +1506,7 @@ export function createUiDriver({
   // input; the thread already on screen is read even with the owner at the
   // keyboard. request: { target, identity, evidenceName, deadlineAt }
   async function inspect(request = {}) {
-    return locked(() => run(request, async (ctx, signal) => {
+    return locked(() => runRequest(request, async (ctx, signal) => {
       const target = request.target;
       if (!target?.bundleId || !ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", "no app the fleet reads shows this thread");
       const opened = await openThread(ctx, signal, { needFront: false, navigate: request.navigate !== false });
@@ -1547,7 +1547,7 @@ export function createUiDriver({
   // accessibility (no foreground, no pointer), then re-reads until the card
   // is gone. request: { target, identity, label, stateId, evidenceName, deadlineAt }
   async function clickLabel(request = {}) {
-    return locked(() => run(request, async (ctx, signal) => {
+    return locked(() => runRequest(request, async (ctx, signal) => {
       const target = request.target;
       if (!target?.bundleId || !ALLOWED_BUNDLES.has(target.bundleId)) return outcome(ctx, "blocked", "no app the fleet drives shows this thread");
       if (!normalizeUiText(request.label)) return outcome(ctx, "blocked", "no label to click");
