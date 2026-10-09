@@ -123,7 +123,7 @@ function ok(stdout) {
 test("buildPrQuery batches refs by repository with safe aliases", () => {
   const query = buildPrQuery([
     { repo: BBAPP, number: 6878 }, { repo: "Spshulem/openAGI", number: 108 }, { repo: BBAPP, number: 6849 }
-  ]);
+  ], config({ requiredChecks: { [BBAPP]: [] } }));
   assert.match(query, /r0: repository\(owner:"buildbetter-app",name:"buildbetter"\)\{ p6878: pullRequest\(number:6878\)\{\.\.\.P\} p6849: pullRequest\(number:6849\)\{\.\.\.P\} \}/);
   assert.match(query, /r1: repository\(owner:"Spshulem",name:"openAGI"\)\{ p108: pullRequest\(number:108\)\{\.\.\.P\} \}/);
   assert.match(query, /comments\(last:30\)\{pageInfo\{hasPreviousPage\} nodes\{author\{login\} body createdAt\}\}/);
@@ -487,7 +487,7 @@ test("the BuildBot3 full run is the required check on BuildBetter PR heads", asy
     return response;
   };
   const gateOf = async (response, cfg = config()) => (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`).gates;
-  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }];
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state }];
   assert.deepEqual(await gateOf(statusOn("SUCCESS")), gate("SUCCESS"));
   assert.deepEqual(await gateOf(statusOn("ERROR")), gate("FAILURE"));
   assert.deepEqual(await gateOf(statusOn("PENDING")), gate("PENDING"));
@@ -502,4 +502,38 @@ test("the BuildBot3 full run is the required check on BuildBetter PR heads", asy
   const custom = config({ requiredChecks: { [BBAPP]: ["verification"] } });
   assert.deepEqual(await gateOf(statusOn("SUCCESS"), custom), [{ name: "verification", label: "verification", state: "FAILURE" }]);
   assert.match(buildPrQuery([{ repo: BBAPP, number: 6878 }]), /contexts\(first:100\)/);
+});
+
+test("the required check is read by name, not only from the first 100 rollup contexts", async () => {
+  const query = buildPrQuery([{ repo: BBAPP, number: 6878 }, { repo: "Spshulem/openAGI", number: 108 }], config());
+  assert.match(query, /p6878: pullRequest\(number:6878\)\{\.\.\.P gateCommit: commits\(last:1\)/);
+  assert.match(query, /status\{g0: context\(name:"BuildBot3 full verification"\)/);
+  assert.match(query, /checkRuns\(last:1,filterBy:\{checkName:"BuildBot3 full verification"\}\)/);
+  assert.match(query, /p108: pullRequest\(number:108\)\{\.\.\.P\}/);
+  // A quote in a configured name stays inside the string literal.
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 1 }], config({ requiredChecks: { [BBAPP]: ['a"b'] } })), /context\(name:"a\\"b"\)/);
+
+  // 100 other contexts fill the rollup page; the gate is past it.
+  const crowded = () => {
+    const response = capturedResponse();
+    const pr = response.data.r0.p6878;
+    pr.commits.nodes[0].commit.statusCheckRollup.contexts.nodes = Array.from({ length: 100 }, (_, i) => ({ __typename: "StatusContext", context: `lint-${i}`, state: "SUCCESS" }));
+    pr.commits.nodes[0].commit.statusCheckRollup.state = "SUCCESS";
+    return response;
+  };
+  const gateOf = async (response, cfg = config()) => (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`).gates;
+  const status = crowded();
+  status.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: HEAD_6878, status: { g0: { __typename: "StatusContext", context: "BuildBot3 full verification", state: "SUCCESS" } }, checkSuites: { nodes: [] } } }] };
+  assert.deepEqual((await gateOf(status)).map((gate) => gate.state), ["SUCCESS"]);
+  // A required check run, found through its suite.
+  const checkRun = crowded();
+  checkRun.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: HEAD_6878, status: null, checkSuites: { nodes: [
+    { g0: { nodes: [] } },
+    { g0: { nodes: [{ __typename: "CheckRun", name: "deploy", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-09-26T07:38:29Z" }] } }
+  ] } } }] };
+  assert.deepEqual((await gateOf(checkRun, config({ requiredChecks: { [BBAPP]: ["deploy"] } }))).map((gate) => gate.state), ["FAILURE"]);
+  // A lookup on an older commit is not the head's.
+  const stale = crowded();
+  stale.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: "1".repeat(40), status: { g0: { __typename: "StatusContext", context: "BuildBot3 full verification", state: "SUCCESS" } } } }] };
+  assert.deepEqual((await gateOf(stale)).map((gate) => gate.state), [null]);
 });

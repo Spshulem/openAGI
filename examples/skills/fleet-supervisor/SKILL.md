@@ -56,7 +56,7 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 
 Readiness blockers: `CI red: <names>`, `CI running`, `no CI on head`, `unpushed commits`, `local head differs`, `<n> open threads`, `merge conflicts`, `Codex review not on head`, `UI QA missing`, `draft`.
 
-A repo with required checks (config `requiredChecks`, repo -> check names; buildbetter-app/buildbetter requires the `BuildBot3 full verification` status) gates on them instead of `no CI on head`: `BuildBot3 full run missing`, `... failed`, `... pending`. Other green or skipped checks never make it ready; other red or running ones still block.
+A repo with required checks (config `requiredChecks`, repo -> check names; buildbetter-app/buildbetter requires the `BuildBot3 full verification` status) gates on them instead of `no CI on head`: `BuildBot3 full run missing`, `... failed`, `... pending`, `... skipped`. A skipped or neutral one wakes a waiting agent with `merge-ready`. Each is read by name on the head, not only from the first 100 checks. Other green or skipped checks never make it ready; other red or running ones still block.
 
 ## Limits
 
@@ -92,7 +92,7 @@ When BuildBot3 or codex-lb comes back, every thread blocked on it gets `infra-re
 
 Wording lives in `playbooks/<id>.md`: `resume`, `merge-ready`, `ci-finished`, `no-local-verify`, `in-scope-yes`, `bb3-slow-agent`, `infra-recovered`, `manager-bb3`, `manager-lb`, `status-check`.
 Frontmatter: `id`, `cooldown_min`, `max_attempts`, `ask` (owner question after max attempts; empty = never ping).
-Placeholders: `{pr}`, `{head}`, `{blockers}`, `{blocker}`, `{ci}`, `{reset}`, `{thread}`, `{repo}`, `{label}`, `{attempts}`, `{what}`, `{problems}`.
+Placeholders: `{pr}`, `{head}`, `{blockers}`, `{blocker}`, `{ci}`, `{reset}`, `{thread}`, `{repo}`, `{label}`, `{mergeGate}` (the repo's required checks, else hosted CI), `{attempts}`, `{what}`, `{problems}`. Unknown placeholders render empty.
 Override: copy a file to `<dataDir>/skills/fleet-supervisor/playbooks/<id>.md`.
 
 ## Never

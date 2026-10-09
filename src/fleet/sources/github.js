@@ -31,7 +31,7 @@ export const DEFAULT_UI_PATH_PREFIXES = Object.freeze({
 // hosted PR verification is paused; its gate is the BuildBot3 full run, which
 // posts this commit status.
 export const DEFAULT_REQUIRED_CHECKS = Object.freeze({
-  "buildbetter-app/buildbetter": Object.freeze([Object.freeze({ name: "BuildBot3 full verification", label: "BuildBot3 full run" })])
+  "buildbetter-app/buildbetter": Object.freeze([Object.freeze({ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr" })])
 });
 
 const PR_FRAGMENT = [
@@ -43,9 +43,19 @@ const PR_FRAGMENT = [
   " files(first:100){pageInfo{hasNextPage} nodes{path}} }"
 ].join("");
 
+// The rollup reads only its first 100 contexts, so a repo's required checks
+// are also looked up by name on the last commit: the commit status directly,
+// a check run through the first 20 check suites.
+function gateSelection(required) {
+  if (!required.length) return "";
+  const statuses = required.map(({ name }, i) => `g${i}: context(name:${JSON.stringify(name)}){__typename context state}`).join(" ");
+  const runs = required.map(({ name }, i) => `g${i}: checkRuns(last:1,filterBy:{checkName:${JSON.stringify(name)}}){nodes{__typename name status conclusion startedAt completedAt}}`).join(" ");
+  return ` gateCommit: commits(last:1){nodes{commit{oid status{${statuses}} checkSuites(first:20){nodes{${runs}}}}}}`;
+}
+
 // refs: [{repo, number}] already validated by parsePrRef, so owner and name
 // only contain [A-Za-z0-9_.-] and are safe inside GraphQL string literals.
-export function buildPrQuery(refs) {
+export function buildPrQuery(refs, config = null) {
   const byRepo = new Map();
   for (const { repo, number } of refs) {
     if (!byRepo.has(repo)) byRepo.set(repo, []);
@@ -53,7 +63,8 @@ export function buildPrQuery(refs) {
   }
   const repos = [...byRepo].map(([repo, numbers], index) => {
     const [owner, name] = repo.split("/");
-    const pulls = numbers.map((number) => `p${number}: pullRequest(number:${number}){...P}`).join(" ");
+    const gates = gateSelection(requiredChecksFor(repo, config));
+    const pulls = numbers.map((number) => `p${number}: pullRequest(number:${number}){...P${gates}}`).join(" ");
     return `r${index}: repository(owner:"${owner}",name:"${name}"){ ${pulls} }`;
   });
   return `${PR_FRAGMENT}\nquery { rateLimit{cost remaining}\n${repos.join("\n")} }`;
@@ -128,15 +139,25 @@ function checkState(node) {
 
 function requiredChecksFor(repo, config) {
   const list = config?.requiredChecks?.[repo] ?? DEFAULT_REQUIRED_CHECKS[repo] ?? [];
-  return list.map((check) => typeof check === "string" ? { name: check, label: check } : { name: check?.name, label: check?.label || check?.name })
+  return list.map((check) => typeof check === "string" ? { name: check, label: check } : { name: check?.name, label: check?.label || check?.name, how: check?.how })
     .filter((check) => check.name);
 }
 
-// The repo's required checks on the exact head: [{name, label, state}].
-function gatesFor(commit, headOid, required) {
+// The repo's required checks on the exact head: [{name, label, how?, state}].
+// how, when set, is the command that produces the check. gateCommit holds
+// the by-name lookups (gateSelection); the newest of those and the rollup's
+// entry wins.
+function gatesFor(commit, headOid, required, gateCommit) {
   if (!required.length) return [];
   const latest = latestChecks(commit, headOid);
-  return required.map(({ name, label }) => ({ name, label, state: checkState(latest?.get(name)) }));
+  const direct = gateCommit && (!headOid || gateCommit.oid === headOid) ? gateCommit : null;
+  return required.map(({ name, label, how }, i) => {
+    const found = [latest?.get(name), direct?.status?.[`g${i}`],
+      ...(direct?.checkSuites?.nodes ?? []).flatMap((suite) => suite?.[`g${i}`]?.nodes ?? [])]
+      .filter((node) => node && (node.name ?? node.context) === name);
+    const node = found.reduce((best, next) => !best || checkStamp(next) >= checkStamp(best) ? next : best, null);
+    return { name, label, ...(typeof how === "string" && how ? { how } : {}), state: checkState(node) };
+  });
 }
 
 // The Codex bot keeps one summary comment per PR and edits it in place:
@@ -191,7 +212,7 @@ export function normalizePr(repo, node, config) {
     mergeable: node.mergeable ?? null,
     reviewDecision: node.reviewDecision ?? null,
     ci: summarizeChecks(node.commits?.nodes?.[0]?.commit ?? null, headOid),
-    gates: gatesFor(node.commits?.nodes?.[0]?.commit ?? null, headOid, requiredChecksFor(repo, config)),
+    gates: gatesFor(node.commits?.nodes?.[0]?.commit ?? null, headOid, requiredChecksFor(repo, config), node.gateCommit?.nodes?.[0]?.commit ?? null),
     unresolvedThreads: (node.reviewThreads?.nodes ?? []).filter((thread) => thread && !thread.isResolved).length,
     // More than 100 threads: unread pages may hold unresolved ones.
     threadsTruncated: node.reviewThreads?.pageInfo?.hasNextPage === true,
@@ -213,7 +234,7 @@ async function fetchBatch(batch, config, run, out, unread) {
   const miss = (refs) => { for (const ref of refs) unread?.add(prRefKey(ref.repo, ref.number)); };
   let result;
   try {
-    result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrQuery(batch)}`], { timeoutMs: GH_TIMEOUT_MS });
+    result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildPrQuery(batch, config)}`], { timeoutMs: GH_TIMEOUT_MS });
   } catch {
     miss(batch);
     return;

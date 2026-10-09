@@ -306,6 +306,13 @@ function waitingIntent(ctx) {
   }
   // The agent ended its turn to wait and nothing will wake it but us.
   if (ciDone) return nudge("ci-finished", "CI finished on head");
+  // A required check that finished without a pass (skipped, neutral) will
+  // not change on its own; once hosted CI settles, hand it back.
+  const settled = gates.find((gate) => gate.state && gate.state !== "PENDING" && !CI_DONE.has(gate.state));
+  const hostedRunning = Boolean(ci.pending?.length) || ci.state === "PENDING" || ci.state === "EXPECTED";
+  if (pr?.state === "OPEN" && settled && !hostedRunning) {
+    return nudge("merge-ready", `${settled.label || settled.name} ${String(settled.state).toLowerCase()}`);
+  }
   const missing = gates.find((gate) => !gate.state);
   if (pr?.state === "OPEN" && (missing || (!gates.length && !ci.state)) && age >= limits.waitingTaskMaxMs) {
     return nudge("merge-ready", `${missing ? `${missing.label || missing.name} missing` : "no CI on head"} after waiting`);
@@ -859,6 +866,7 @@ function factsFor(thread, pr, classified) {
     ci: ciSummary(pr),
     blockers: blockers.map((blocker) => fact(blocker, 80)).join("; "),
     blocker: fact(blockers[0], 80),
+    mergeGate: gateFact(pr),
     thread: agentLabel(thread),
     label: pastPr ? ownerLabel(thread, null, null) : ownerLabel(thread, knownPr, pr?.repo ?? parsePrRef(prRef)?.repo),
     reset: formatTime(thread.error?.resetAt)
@@ -869,6 +877,15 @@ function prDoneBefore(pr, at) {
   if (!pr || !DONE_PR_STATES.has(pr.state)) return false;
   const doneAt = Date.parse(pr.mergedAt ?? pr.closedAt ?? "");
   return Number.isFinite(doneAt) && doneAt < Date.parse(at ?? "");
+}
+
+// What a PR must show green on its head: the repo's required checks (the
+// BuildBot3 full run for BuildBetter), else hosted CI.
+function gateFact(pr) {
+  const gates = (pr?.gates ?? []).filter((gate) => gate?.label || gate?.name);
+  if (!gates.length) return "green hosted CI";
+  const names = gates.map((gate) => `${gate.label || gate.name}${gate.how ? ` (${gate.how})` : ""}`);
+  return fact(`a green ${names.join(" and ")}`, 160);
 }
 
 // Safe for agent-bound text: one line, no markup characters, bounded.

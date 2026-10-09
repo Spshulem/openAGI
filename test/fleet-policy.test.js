@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { classifyThread } from "../src/fleet/classify.js";
 import { DEFAULTS, shortHash } from "../src/fleet/contracts.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadPlaybooks } from "../src/fleet/playbooks.js";
@@ -832,6 +835,41 @@ test("the BuildBot3 full run gates the merge ask and the CI-finished nudge", () 
   const waiting = makeThread({ lastAgentText: "Waiting on the BuildBot3 full run.", lastActivityAt: ago(10 * MIN), lastAgentAt: ago(10 * MIN), lastUserAt: ago(120 * MIN) });
   assert.notEqual(run(waiting, { pr: makePr({ gates: gate("PENDING") }) }).decision.playbook, "ci-finished");
   assert.equal(run(waiting, { pr: makePr({ gates: gate("SUCCESS") }) }).decision.playbook, "ci-finished");
+});
+
+test("merge-ready names the repo's gate, or hosted CI when it has none", () => {
+  const bb3 = [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", how: "bb-verify --full --pr", state: null }];
+  const gated = run(makeThread(), { pr: makePr({ gates: bb3 }) }).decision;
+  assert.equal(gated.playbook, "merge-ready");
+  assert.match(gated.message, /push, a green BuildBot3 full run \(bb-verify --full --pr\) on the exact head/);
+  const plain = run(makeThread(), { pr: makePr({ unresolvedThreads: 2 }) }).decision;
+  assert.equal(plain.playbook, "merge-ready");
+  assert.match(plain.message, /push, green hosted CI on the exact head/);
+  assert.doesNotMatch(plain.message, /BuildBot3 full/);
+  // A user override with an unknown var renders it empty, not as raw braces.
+  const userDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-playbooks-"));
+  fs.writeFileSync(path.join(userDir, "merge-ready.md"), "---\nid: merge-ready\nask: \"#{pr} stuck\"\n---\nGate: {mergeGate}. Other: {nope}.\n");
+  const override = loadPlaybooks({ bundledDir: BUNDLED_PLAYBOOKS_DIR, userDir });
+  fs.rmSync(userDir, { recursive: true, force: true });
+  const thread = makeThread();
+  const classified = classifyThread(thread, { pr: makePr({ gates: bb3 }), localGit: cleanGit, now: NOW, config });
+  const custom = decideThread(classified, thread, { ledger: {}, playbooks: override, config, now: NOW, pr: makePr({ gates: bb3 }), mode: "auto", manager });
+  assert.equal(custom.message, "Gate: a green BuildBot3 full run (bb-verify --full --pr). Other: .");
+});
+
+test("a waiter is woken when the required check finishes skipped or neutral", () => {
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }];
+  const waiting = makeThread({ lastAgentText: "Waiting on the BuildBot3 full run.", lastActivityAt: ago(20 * MIN), lastAgentAt: ago(20 * MIN), lastUserAt: ago(120 * MIN) });
+  for (const state of ["SKIPPED", "NEUTRAL"]) {
+    const { decision } = run(waiting, { pr: makePr({ gates: gate(state) }) });
+    assert.equal(decision.action, "nudge", state);
+    assert.equal(decision.playbook, "merge-ready", state);
+    assert.match(decision.reason, new RegExp(`BuildBot3 full run ${state.toLowerCase()}`));
+  }
+  // Hosted CI still running: keep waiting for it.
+  const running = run(waiting, { pr: makePr({ gates: gate("SKIPPED"), ci: { state: "PENDING", failing: [], pending: ["build"] } }) }).decision;
+  assert.equal(running.action, "wait");
+  assert.equal(running.playbook ?? null, null);
 });
 
 test("local git the supervisor could not read waits instead of asking to merge or nudging", () => {
