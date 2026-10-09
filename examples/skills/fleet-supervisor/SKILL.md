@@ -46,7 +46,7 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 | codex-lb | escalate to manager; `infra-recovered` when LB healthy | manager offline, or LB down 1 h+ |
 | logged out / disk full | nothing | at once, one line |
 | waiting-ci | watch; when CI ends on the head, `ci-finished` | never |
-| waiting-ci too long | bb-quick over 15 min or needed full verify over 30 min: escalate to manager. Unneeded full verify: `bb3-slow-agent`. Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
+| waiting-ci too long | bb-quick over 15 min or full verify over 30 min: escalate to manager (the full run is the merge gate; never told to drop it). Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
 | local-verify | `no-local-verify` | never |
 | asked-in-scope | `in-scope-yes` | never |
 | needs-human | nothing | one caveman question with buttons |

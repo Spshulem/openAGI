@@ -148,11 +148,12 @@ test("row: waiting-ci past its threshold escalates to the BuildBot3 manager", ()
   assert.equal(offline.question.title, "BB3 jammed. Manager offline. Open Remote dev setup?");
   const limited = run(thread, { mgr: { ...manager, error: { kind: "session-limit", text: "x", resetAt: null } } }).decision;
   assert.equal(limited.action, "ask-user");
-  // A full verify the PR does not need gets the owner's "bb-quick, push, hosted CI" line instead.
+  // A slow full run is the merge gate: it goes to the manager, and the agent
+  // is never told to drop it for hosted CI.
   const full = makeThread({ agentStatus: "waiting", openTasks: [{ ...quick, description: "bb-verify --full --pr 6522", startedAt: ago(40 * MIN) }] });
   const slow = run(full).decision;
-  assert.equal(slow.action, "nudge");
-  assert.equal(slow.playbook, "bb3-slow-agent");
+  assert.equal(slow.action, "escalate-manager");
+  assert.notEqual(slow.playbook, "bb3-slow-agent");
 });
 
 test("row: a Conductor wait on a non-verify task is idle after 45 min", () => {

@@ -273,15 +273,14 @@ function waitingIntent(ctx) {
   const age = wait.ageMs ?? 0;
   const ci = pr?.ci ?? {};
   const ciDone = pr?.state === "OPEN" && CI_DONE.has(ci.state) && !ci.pending?.length;
-  const ciFailing = Boolean(pr) && (CI_FAILING.has(ci.state) || Boolean(ci.failing?.length));
   // A verify behind a blocked gate or a hung watcher never wakes its agent,
   // and the manager may not get through either: past this long with no word
   // from the agent, it is asked for a status itself.
   const quietMs = msSince(latest(thread.lastAgentAt, thread.lastActivityAt), now);
   const silent = wait.source === "task" && age >= limits.silentTurnMs && quietMs !== null && quietMs >= limits.silentTurnMs;
   if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs) {
-    // Full runs are only for reproducing a hosted CI failure.
-    if (!ciFailing) return nudge("bb3-slow-agent", `full verify ${minutes(age)}m; hosted CI not failing`, { immediate: true, vars: { age: minutes(age) } });
+    // The full BuildBot3 run is the merge gate (hosted CI is paused): a slow
+    // one goes to the manager, never a nudge to drop it.
     if (silent) return statusCheck("bb-verify --full", quietMs);
     return escalateIntent(ctx, "bb-verify --full", age);
   }
@@ -341,8 +340,7 @@ function escalatedWait(classified, pr, limits) {
   if (classified?.state !== "waiting-ci") return null;
   const wait = classified.wait ?? {};
   const age = wait.ageMs ?? 0;
-  const ciFailing = Boolean(pr) && (CI_FAILING.has(pr.ci?.state) || Boolean(pr.ci?.failing?.length));
-  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs && ciFailing) return { what: "bb-verify --full", age };
+  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs) return { what: "bb-verify --full", age };
   if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) return { what: "bb-quick", age };
   return null;
 }

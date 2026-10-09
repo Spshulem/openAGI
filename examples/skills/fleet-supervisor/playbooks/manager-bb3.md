@@ -9,4 +9,4 @@ Gate: {gate}. Queue: {queue}. Load: {load}. Timers dead: {timers}.
 Slow runs: {runs}.
 {waiting}
 Not asking you to kill other agents' runs or previews without your usual checks.
-Reply: ETA, which runs to cancel, or "use hosted CI". I will relay it to the agents.
+Reply: ETA, or which runs to cancel. I will relay it to the agents.
