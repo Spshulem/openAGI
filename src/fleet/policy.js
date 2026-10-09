@@ -158,6 +158,9 @@ function makeContext(classified, thread, options) {
   };
 }
 
+const DAY_MS = 24 * 60 * MIN;
+const IDLE_REPORT_DAILY_MAX = 2;
+
 function intentFor(ctx) {
   const { classified } = ctx;
   switch (classified.state) {
@@ -170,8 +173,28 @@ function intentFor(ctx) {
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
     case "stopped": return nudge("resume", classified.reason);
+    // It said it would keep going ("Next: ...", "merging once they pass"),
+    // then its turn ended: nothing wakes it but a nudge. A finished report
+    // is left alone.
+    case "idle-no-pr":
+    case "done": return idleIntent(ctx);
     default: return { type: "none", reason: classified.reason };
   }
+}
+
+function idleIntent(ctx) {
+  const { classified, thread, ledger, limits, now } = ctx;
+  if (!classified.idle?.promised) return { type: "none", reason: classified.reason };
+  // Fresh stops only: an old thread's last words are history. Measured from
+  // the words, not activity (a delivered nudge is activity too).
+  const quietMs = msSince(thread.lastAgentAt, now);
+  if (quietMs === null || quietMs > limits.idleReportMaxAgeMs) return { type: "none", reason: classified.reason };
+  // A daily cap, whatever its progress mark says: a shared checkout's head
+  // moves with other agents' commits.
+  // Deliveries only: a send blocked while the owner types is no nudge.
+  const sentToday = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "idle-report" && entry.status === "sent" && now - Date.parse(entry.at) < DAY_MS).length;
+  if (sentToday >= IDLE_REPORT_DAILY_MAX) return { type: "none", reason: `${classified.reason}; idle-report sent ${sentToday} times today` };
+  return nudge("idle-report", "said it would keep going, then stopped");
 }
 
 function nudge(playbook, reason, extra = {}) {
@@ -279,8 +302,18 @@ function waitingIntent(ctx) {
   if (ciDone) return nudge("ci-finished", "CI finished on head");
   if (pr?.state === "OPEN" && !ci.state && age >= limits.waitingTaskMaxMs) return nudge("merge-ready", "no CI on head after waiting");
   if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
+  // The PR it is tracked by already merged or closed, so the CI it waits on
+  // is another PR's (it opened a new one): ask where it is, once the usual
+  // idle window passed. Not a note that nothing is left ("Merged. CI runs on
+  // main; nothing needed from you").
+  const text = String(thread.lastAgentText ?? "");
+  if (pr && pr.state !== "OPEN" && age >= limits.idleBeforeNudgeMs && !POST_MERGE_NOTE.test(text)) {
+    return statusCheck("CI on a PR this thread does not track", age);
+  }
   return { type: "wait", reason: pr ? "CI still running" : wait.reason ?? "waiting" };
 }
+
+const POST_MERGE_NOTE = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bno action (?:needed|required)\b|\bnothing (?:else|more|left)\b/i;
 
 function statusCheck(what, quietMs) {
   const quiet = minutes(quietMs);
@@ -542,7 +575,9 @@ function ownerActiveUntil(thread, limits, now) {
 const WORKED_MS = 10 * MIN;
 function progressMarkFor(classified, thread, ledger) {
   const mark = classified.readiness?.progressMark ?? { head: null, unresolved: null };
-  if (classified.state !== "stopped") return mark;
+  // A promised stop counts the agent's own work since the last nudge too:
+  // research has no head to move.
+  if (classified.state !== "stopped" && !classified.idle?.promised) return mark;
   const nudgedAt = Date.parse(ledger?.lastNudgeAt ?? "");
   const agentAt = Date.parse(thread.lastAgentAt ?? "");
   const worked = Number.isFinite(nudgedAt) && Number.isFinite(agentAt) && agentAt - nudgedAt >= WORKED_MS

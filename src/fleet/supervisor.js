@@ -1327,7 +1327,13 @@ export class FleetSupervisor {
     // Unseen branches precede expired negative results, then oldest first.
     const candidates = [...inScope].sort((a, b) => (this.branchLookups.get(`${a.repo}:${a.branch}`)?.at ?? -Infinity) - (this.branchLookups.get(`${b.repo}:${b.branch}`)?.at ?? -Infinity));
     for (const thread of candidates) {
-      if (thread.prRefs?.length || !thread.repo || !thread.branch || TRUNK_BRANCHES.has(thread.branch)) continue;
+      // prLookedUp: this thread's PR is known to be none (nothing to look up,
+      // or GitHub answered no PR). Policy judges no-PR threads only then.
+      if (thread.prRefs?.length) continue;
+      // No branch, or a trunk one: no PR to find. A missing repo (git could
+      // not be read) leaves it unknown.
+      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { thread.prLookedUp = true; continue; }
+      if (!thread.repo) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
       // PR, so a new head is a new lookup.
@@ -1339,6 +1345,10 @@ export class FleetSupervisor {
       // thread past this tick's lookup budget: the last answer beats none.
       if (fresh && (head === null || cached.head === head || lookups >= MAX_BRANCH_LOOKUPS)) {
         if (cached.ref) thread.prRefs = [cached.ref];
+        // No PR for this same head only (both unknown counts as the same):
+        // a git failure after a known head, or a spent budget with a newer
+        // head, leaves the answer unknown.
+        else if (cached.head === head) thread.prLookedUp = true;
         continue;
       }
       if (lookups >= MAX_BRANCH_LOOKUPS) continue;
@@ -1347,6 +1357,7 @@ export class FleetSupervisor {
         const ref = await withTimeout(Promise.resolve(find(thread.repo, thread.branch, config, { run, head, cwd: head ? thread.cwd : null })), 20_000, "pr lookup");
         this.branchLookups.set(cacheKey, { ref: ref ?? null, at: now, head });
         if (ref) thread.prRefs = [ref];
+        else thread.prLookedUp = true;
       } catch (error) {
         sourceErrors.prLookup = clampText(error?.message, 200);
         if (cached?.ref) thread.prRefs = [cached.ref];

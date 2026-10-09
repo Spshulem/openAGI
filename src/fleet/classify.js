@@ -87,11 +87,27 @@ const NEED_YOU_PATTERNS = [
   /\byour call\b/i,
   /\bwhich (?:one|option|do you|would you)\b/i,
   /\bplease confirm\b/i,
-  /\b(?:blocked|waiting) on you\b/i
+  /\b(?:blocked|waiting) on you\b/i,
+  /\byou must do\b(?![\W_]{0,8}(?:none|nothing|n\/a)\b)/i,
+  /(?<!\b(?:not|no longer|never)\s+)\bstill need your\b/i,
+  /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bblocked on\W{0,3}(?:you|your|the owner)\b/i
 ];
 
+// The agent ended its turn saying it will keep going ("Next: wire the
+// settings page", "I'll open the PR after the tests"): nothing will wake it
+// but a nudge. Only its last few sentences count, each at its start, and
+// never one waiting on the owner or naming an owner-only step (see
+// promisedWork): real finals like "Say go and I'll publish" or "Next:
+// promote to production" must never read as a promise.
+export const PROMISED_WORK_PATTERNS = Object.freeze([
+  /^I(?:'ll| will| am going to|'m going to)\s+(?!(?:be|keep|only|never|not|also|wait|stop|leave|hold|pause|stand|let|report back when you|check back|circle back)\b)\w/i,
+  /^(?:next(?:\s+steps?|\s+up)?|then|after that)\s*:\s*(?!(?:none|nothing|n\/a|nope|no(?:thing)? (?:more|else|left)|you|your|owner)\b)[a-z]/i,
+  /^(?:now\s+)?(?:running|starting|kicking off|re-?running)\s+(?:the|a|an|full|my|all|both)\b/i,
+  /^(?:continuing|moving on to)\b/i
+]);
+
 // Reports that mention "you" but ask for nothing.
-const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b/i;
+const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b|\bnothing (?:that )?you (?:must|need to|have to) do\b/i;
 const CHOICE_WORDS = /\bwhich\b|\bpick\b|\bchoose\b|\boption\b|\bor\b/i;
 
 const BB3_DOWN_PATTERNS = [
@@ -243,7 +259,10 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // A laptop verify often shows up as a background-task wait. It is the
   // violation, not a CI wait, so it must not be swallowed by waiting-ci.
   const localVerify = matchLocalVerify(thread, infra);
-  const wait = localVerify ? null : waitSignal(thread, text, now);
+  let wait = localVerify ? null : waitSignal(thread, text, now);
+  // "CI is pending. Blocked on your approval.": an explicit owner ask beats
+  // a wait the agent only wrote down.
+  if (wait?.source === "text" && detectAsk(text)?.kind === "needs-human" && !prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? ""))) wait = null;
   if (wait) return result("waiting-ci", wait.reason, { wait, infraKind: wait.taskKind ? "bb3" : null });
   if (localVerify) {
     return result("local-verify", "heavy verification on the laptop", {
@@ -259,8 +278,14 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
     if (readiness.blockers.length) return result("pr-not-ready", readiness.blockers.join("; "), { blockers: readiness.blockers });
     return result("ready-needs-human", readiness.onlyHumanLeft ? "only a human approval left" : "ready; merge is the owner's");
   }
-  if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`);
-  return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR");
+  // The agent spoke last and stopped: did it say it would keep going? Only
+  // when its PR is known: none (looked up, or nothing to look up), or merged
+  // (a closed one was dropped). An unread or not-yet-looked-up PR decides
+  // nothing.
+  const prKnown = pr ? pr.state === "MERGED" : !thread.prRefs?.length && (!thread.branch || thread.prLookedUp === true);
+  const idle = text && prKnown && thread.agentStatus !== "error" ? { promised: promisedWork(text) } : null;
+  if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`, idle ? { idle } : {});
+  return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR", idle ? { idle } : {});
 }
 
 // A PR merged or closed after the agent asked has answered the ask, but only
@@ -361,6 +386,44 @@ function waitSignal(thread, text, now) {
     return { source: "text", taskKind: null, ageMs: msSince(thread.lastAgentAt ?? thread.lastActivityAt, now), reason: "ended turn to wait on CI or verify" };
   }
   return null;
+}
+
+// The owner holds a step, anywhere in the message: an offer, a go, a pick,
+// an approval, a login, anything addressed to "you".
+const OWNER_GATE = /\byou(?:r|rs|rself)?\b|\b(?:tell|ping|let|show|send|give) me\b|\bsay\s+(?:["\u201c'*]|go\b|yes\b|continue\b|the word\b)|\bI need\b|\bplease\b|\b(?:once|after|when|until) (?:he|she|they|the owner|spencer)\b|\b(?:pick|choose)\b|\b(?:name|confirm|approve)\s+(?:them|one|it|which)\b|\bdecisions?\b|(?:^|\n)[\W_]*(?:do|action|owner|todo|to-do)[\W_]*:/i;
+// An offer ("If you want, I'll...") is not a promise.
+const CONDITIONAL = /^(?:if|when|should|let me know|happy to|want me to)\b/i;
+// Steps that leave the agent's own branch: never pushed by a nudge.
+// Past tense ("PR #123 merged. Next: update the docs") reports a step done.
+const OWNER_STEP = /\b(?:merg(?:e|es|ing)|releas(?:e|es|ing)|deploy(?:s|ing|ment)?|publish(?:es|ing)?|promot(?:e|es|ing)|ship(?:s|ping)?|upload(?:s|ing)?|e-?mail(?:s|ing)?|post(?:s|ing)? (?:it|this|them|to)|send (?:it|this|them|the|an?)|customers?|invoic(?:e|es|ing)|tag(?:ging)? (?:a |the )?(?:release|version))\b/i;
+// A report, not a plan: test results, finished work, a bug description.
+const REPORTED = /\b(?:pass(?:ed|es|ing)?|fail(?:ed|s|ing)?|green|red|done|complete[d]?|finished|merged|broken|bugs?|crash(?:es|ed)?|(?:is|are|was|were|does|do|can|wo)n't|(?:is|are|does) not)\b|\d+\/\d+/i;
+
+// The last three sentences, as written: tables and bare links are skipped.
+function closingSentences(text) {
+  return splitSentences(String(text).replace(/[\u2018\u2019]/g, "'"))
+    .map((sentence) => sentence.replace(/^[-*>#\d.)\s]+|\*\*|__|`/g, "").trim())
+    .filter((sentence) => sentence && !/^\|/.test(sentence) && !/^\[[^\]]*\]\([^)]*\)\W*$/.test(sentence))
+    .slice(-3);
+}
+
+// One of the closing sentences promises more of the agent's own work; no
+// closing sentence is a question; and nothing in the message waits on the
+// owner or names an owner-only step.
+function promisedWork(text) {
+  const plain = String(text).replace(/[\u2018\u2019]/g, "'");
+  if (OWNER_GATE.test(plain) || OWNER_STEP.test(plain) || OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(plain))) return false;
+  const closing = closingSentences(plain);
+  if (closing.some((sentence) => /\?\W*$/.test(sentence))) return false;
+  // "I'll investigate why CI is failing": in a promise, status words name
+  // the work. A later report closes it ("I'll run the tests. Done.").
+  let open = false;
+  for (const sentence of closing) {
+    if (CONDITIONAL.test(sentence)) continue;
+    if (PROMISED_WORK_PATTERNS[0].test(sentence) || (!REPORTED.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)))) open = true;
+    else if (REPORTED.test(sentence)) open = false;
+  }
+  return open;
 }
 
 function oldestTask(tasks) {

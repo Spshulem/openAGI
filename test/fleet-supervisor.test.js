@@ -869,6 +869,37 @@ test("cached PR refs survive a git failure and a spent lookup budget", async (t)
   assert.ok((await supervisor.tick()).threads.every((row) => row.pr), "past the lookup budget the cached ref stays");
 });
 
+test("a no-PR thread counts as having no PR only once GitHub answered", async (t) => {
+  // Past the lookup budget, or on a failed lookup, a branch's PR is unknown:
+  // policy must not read the thread as PR-less (idle-report, error paths).
+  const ids = Array.from({ length: 10 }, (_, i) => `n${i}`);
+  const seen = [];
+  const threads = ids.map((id) => makeThread({ key: `codex:${id}`, id, cwd: `/work/${id}`, branch: `spencer/${id}`, prRefs: [] }));
+  const supervisor = { skip: {}, deps: { findPrForBranch: async (repo, branch) => { seen.push(branch); if (branch === "spencer/n1") throw new Error("gh timed out"); return null; } }, branchLookups: new Map(), now: () => NOW };
+  const sourceErrors = {};
+  await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, threads, new Map(), {}, null, sourceErrors);
+  const looked = threads.filter((thread) => thread.prLookedUp === true).map((thread) => thread.id);
+  assert.equal(seen.length, 8, "lookup budget");
+  assert.ok(!looked.includes("n1"), "a failed lookup is unknown");
+  assert.ok(looked.length === 7 && !looked.includes("n8") && !looked.includes("n9"), "past the budget is unknown");
+  // Nothing to look up (trunk, no branch) is known to have no PR.
+  const trunk = [makeThread({ key: "codex:m", id: "m", branch: "main", prRefs: [] }), makeThread({ key: "codex:z", id: "z", branch: null, prRefs: [] })];
+  await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, trunk, new Map(), {}, null, sourceErrors);
+  assert.ok(trunk.every((thread) => thread.prLookedUp === true));
+  const noRepo = [makeThread({ key: "codex:r", id: "r", repo: null, branch: "spencer/r", prRefs: [] })];
+  await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, noRepo, new Map(), {}, null, sourceErrors);
+  assert.notEqual(noRepo[0].prLookedUp, true, "an unreadable repo leaves the PR unknown");
+  // A cached "no PR" counts only for the head it was answered for.
+  const HEAD2 = "b".repeat(40);
+  const cachedSup = { skip: {}, deps: { findPrForBranch: async () => null }, branchLookups: new Map([["acme/app:spencer/c", { ref: null, at: NOW, head: HEAD2 }]]), now: () => NOW };
+  const same = [makeThread({ key: "codex:c", id: "c", cwd: "/work/c", branch: "spencer/c", prRefs: [] })];
+  await FleetSupervisor.prototype.resolvePrRefs.call(cachedSup, same, new Map([["/work/c", { head: HEAD2, branch: "spencer/c" }]]), {}, null, sourceErrors);
+  assert.equal(same[0].prLookedUp, true);
+  const gitFailed = [makeThread({ key: "codex:c", id: "c", cwd: "/work/c", branch: "spencer/c", prRefs: [] })];
+  await FleetSupervisor.prototype.resolvePrRefs.call(cachedSup, gitFailed, new Map(), {}, null, sourceErrors);
+  assert.notEqual(gitFailed[0].prLookedUp, true, "git failed: the cached answer was for a known head");
+});
+
 test("a failed source never splits its open group into a second question", async (t) => {
   let broken = false;
   const capped = (id, kind) => makeThread({ key: `${kind}:${id}`, kind, id, cwd: `/work/${id}`, agentStatus: "error", error: { kind: "session-limit", text: "You've hit your weekly limit", resetAt: new Date(NOW + 30 * 60 * MIN).toISOString() } });

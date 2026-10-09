@@ -55,6 +55,8 @@ export const DEFAULTS = Object.freeze({
   // No transcript row this long: a Conductor "working" turn is hung, and a
   // wait on a background task gets the agent asked for a status.
   silentTurnMs: 60 * MIN,
+  // An idle-report nudge only for a turn that stopped within this long.
+  idleReportMaxAgeMs: 6 * 60 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
   lbErrorFreshMs: 15 * MIN,
   managerEscalationCooldownMs: 60 * MIN,

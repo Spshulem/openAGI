@@ -412,4 +412,16 @@ test("a pending AskUserQuestion is the owner's question; its answer clears it", 
   again.close();
   threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
   assert.equal(threads["s-idle"].meta.pendingQuestion, null);
+
+  // Unanswered, then a new turn starts (brussels #7394): the agent moved on.
+  const later = new DatabaseSync(file);
+  addMessage(later, "s-idle", "assistant", ask("toolu_ask2"), iso(2 * MIN));
+  later.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.ok(threads["s-idle"].meta.pendingQuestion, "asked again");
+  const moved = new DatabaseSync(file);
+  addMessage(moved, "s-idle", "assistant", { type: "system", subtype: "init", session_id: "s-idle" }, iso(1 * MIN));
+  moved.close();
+  threads = byId(await listConductorThreads(makeConfig(home), { now: NOW }));
+  assert.equal(threads["s-idle"].meta.pendingQuestion, null);
 });
