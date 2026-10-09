@@ -179,7 +179,14 @@ export class IMessagePollerSource {
       // First-run bootstrap: avoid dumping years of historical self-texts
       // into Today. Without this, sinceRowid=0 means "import everything",
       // which is almost never what the user wants.
-      if (!state.initialized) {
+      // Older successful checkpoints omitted initialized when advancing the
+      // cursor. Resume those checkpoints instead of skipping pending messages
+      // with a second forward-only bootstrap. Explicit false still means new.
+      const legacyCheckpoint = state.initialized === undefined
+        && Number.isSafeInteger(state.lastRowid) && state.lastRowid >= 0
+        && typeof state.lastSyncedAt === "string"
+        && Number.isFinite(Date.parse(state.lastSyncedAt));
+      if (!state.initialized && !legacyCheckpoint) {
         const seedRowid = this._computeBootstrapRowid(db);
         state = { lastRowid: seedRowid, initialized: true, bootstrappedAt: new Date().toISOString() };
         this._saveState(state);
@@ -257,7 +264,7 @@ export class IMessagePollerSource {
       }
 
       if (highestRowid > sinceRowid) {
-        this._saveState({ lastRowid: highestRowid, lastSyncedAt: now.toISOString() });
+        this._saveState({ ...state, initialized: true, lastRowid: highestRowid, lastSyncedAt: now.toISOString() });
       }
       this.lastSyncedAt = now.toISOString();
       this.lastError = null;
