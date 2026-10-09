@@ -187,10 +187,13 @@ export class CronScheduler {
     // Mid-run marker hook: FileBackedCronScheduler persists a
     // { runningJobId, startedAt } note so a daemon death mid-job is
     // visible on the next boot. No-op on the in-memory scheduler.
-    this.noteJobStart?.(job);
     let result;
     let timer = null;
     try {
+      // Marker persistence can fail before dispatch (for example, full disk).
+      // Keep it inside the cleanup boundary so the overlap guard is released
+      // and the run is terminal even when no handler or timer was started.
+      this.noteJobStart?.(job);
       const raced = await Promise.race([
         handler(job),
         new Promise((resolve) => {
