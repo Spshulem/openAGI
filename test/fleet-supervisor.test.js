@@ -2984,8 +2984,14 @@ test("a presence-blocked app send arms the idle watcher; a watcher scan skips th
   supervisor.deps.executor.deliver = async (args) => ({ ...(await inner(args)), status: "blocked", detail: "owner using Conductor" });
   supervisor._executor = null;
   assert.equal(supervisor.idleWorkAt ?? null, null);
+  await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "computer-use", playbook: "owner-message" });
+  assert.equal(supervisor.idleWorkAt ?? null, null, "the owner's own message is not kept: nothing to wait for");
   await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "computer-use", playbook: "resume" });
   assert.ok(Number.isFinite(supervisor.idleWorkAt));
+  // A later block counts from then, not from the first one.
+  supervisor.idleWorkAt = 1;
+  await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "computer-use", playbook: "resume" });
+  assert.equal(supervisor.idleWorkAt, supervisor.now());
   let reviewed = 0;
   supervisor.reviewOpenQuestions = async () => { reviewed += 1; return new Set(); };
   await supervisor.tick({ reason: "owner-away" });

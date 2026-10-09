@@ -342,14 +342,16 @@ export class FleetSupervisor {
         ui: this.uiDriver, knownThreads: () => [...this.lastThreads.values()]
       });
       // An app send that waited only on the owner's presence arms the idle
-      // watcher (idleCheck); everything else is the executor's own.
+      // watcher (idleCheck), from its latest block; everything else is the
+      // executor's own. The owner's own message is not kept for a later scan
+      // (its caller gets the block), so it arms nothing.
       // (A frozen executor, like the scan CLI's, stays the one that decides.)
       const wrapped = Object.create(executor);
       Object.defineProperty(wrapped, "deliver", {
         enumerable: true, writable: true,
         value: async (args) => {
           const result = await executor.deliver(args);
-          if (isPresenceBlock(result)) this.idleWorkAt ??= this.now();
+          if (isPresenceBlock(result) && args?.playbook !== "owner-message") this.idleWorkAt = this.now();
           return result;
         }
       });
