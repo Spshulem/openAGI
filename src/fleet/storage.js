@@ -47,6 +47,7 @@ const YIELD_WINDOW = 5;
 const YIELD_MIN_SHARE = 0.1;
 const RULE_HOLD_MS = DAY;
 const RM_TIMEOUT_MS = 30 * MIN;
+const TARGET_MAX_SHARE = 0.5;
 
 const TITLES = {
   // SD trash counts at any age, so not "Old".
@@ -530,6 +531,15 @@ export class StorageManager {
     this.state.backoff[p] = { until: this.now() + wait, n };
   }
 
+  // Free space a pass works toward, never more than TARGET_MAX_SHARE of the
+  // volume: a 128 GB disk can never reach a 150 GB target, and a pass would
+  // delete everything trying.
+  targetBytes(volumeId) {
+    const want = (volumeId === "data" ? this.settings.targetFreeGb : this.settings.sdLowGb) * GB;
+    const total = this.volume(volumeId)?.totalBytes;
+    return Number.isFinite(total) && total > 0 ? Math.min(want, total * TARGET_MAX_SHARE) : want;
+  }
+
   ruleHeld(rule, volumeId, now = this.now()) {
     return Number(this.state.ruleHolds?.[`${rule}:${volumeId}`] ?? 0) > now;
   }
@@ -543,7 +553,7 @@ export class StorageManager {
     if (!items.length) return { volume: volumeId, none: "no safe candidates" };
     const ctx = await this.verifyContext();
     if (!ctx) return { volume: volumeId, none: "could not read open files", error: true };
-    const target = (volumeId === "data" ? this.settings.targetFreeGb : this.settings.sdLowGb) * GB;
+    const target = this.targetBytes(volumeId);
     const before = await this.freeBytes(volumeId);
     if (before === null) return { volume: volumeId, none: "could not read free space", error: true };
     const tally = { done: 0, skipped: 0, failed: 0 };
@@ -624,11 +634,12 @@ export class StorageManager {
     return ruleRoots(item.rule, this.paths).some((root) => source.isInside(p, root));
   }
 
-  async idleSince(dir, ctx, idleMs, options = {}) {
+  // worktree: also HEAD's reflog and the top of its build dirs.
+  async idleSince(dir, ctx, idleMs, { worktree = false, ...options } = {}) {
     const key = `${dir}\u0000${idleMs}`;
     if (!ctx.idle.has(key)) {
       const now = this.now();
-      const walk = await source.newestMtime(dir, { stopAfterMs: now - idleMs, ...options });
+      const walk = await (worktree ? source.worktreeNewest : source.newestMtime)(dir, { stopAfterMs: now - idleMs, ...options });
       ctx.idle.set(key, walk.complete && now - walk.newest >= idleMs);
     }
     return ctx.idle.get(key);
@@ -667,7 +678,7 @@ export class StorageManager {
           && !(await this.idleSince(item.path, ctx, AGES.derivedIdleMs, { dirsOnly: true, skipBuild: false, maxDepth: 4 }))) return no("used recently");
         break;
       case "build": {
-        if (!(await this.idleSince(item.worktree, ctx, AGES.buildIdleMs))) return no("worktree used recently");
+        if (!(await this.idleSince(item.worktree, ctx, AGES.buildIdleMs, { worktree: true }))) return no("worktree used recently");
         const ignored = await source.gitIgnored(item.worktree, [item.path], this.config, this.run).catch(() => new Set());
         if (!ignored.has(item.path)) return no("not git-ignored");
         break;
@@ -677,7 +688,7 @@ export class StorageManager {
         if (!use.ok) return no("thread catalogs unreadable");
         if (source.usedByThread(item.path, use)) return no("a thread uses it");
         const archived = item.archived && use.archived?.has(item.path);
-        if (!archived && !(await this.idleSince(item.path, ctx, AGES.worktreeIdleMs))) return no("used recently");
+        if (!archived && !(await this.idleSince(item.path, ctx, AGES.worktreeIdleMs, { worktree: true }))) return no("used recently");
         // Archived ones may be recent: nothing may have changed since the scan.
         if (archived && !(await this.unchangedSince(item))) return no("changed since the scan");
         const git = await source.gitState(item.path, this.config, this.run);
@@ -688,7 +699,7 @@ export class StorageManager {
       case "archive":
         if (age < AGES.archiveMs) return no("changed recently");
         if (st.isFile() && now - st.atimeMs < AGES.archiveMs) return no("opened recently");
-        if (st.isDirectory() && !(await this.idleSince(item.path, ctx, AGES.archiveMs, { skipBuild: false }))) return no("changed recently");
+        if (st.isDirectory() && !(await this.idleSince(item.path, ctx, AGES.archiveMs, { skipBuild: false, atime: true }))) return no("changed or opened recently");
         break;
       default: return no("unknown rule");
     }
@@ -755,28 +766,44 @@ export class StorageManager {
     this.save();
   }
 
+  // The card is read again first (state.json can still trust a card that
+  // was swapped while the supervisor was down): nothing on the SD is
+  // removed unless the card mounted now is the known one.
   async cleanTombstones() {
+    const sdOk = await this.refreshVolumes().then(() => this.sdOk(), () => false);
+    const paths = this.paths;
     for (const tomb of [...(this.state.tombstones ?? [])]) {
       if (!path.basename(tomb).startsWith(TOMBSTONE_PREFIX)) { this.dropTombstone(tomb); continue; }
+      if (source.volumeOf(tomb, paths) === "sd" && !sdOk) continue;
       if ((await this.rmTree(tomb)).ok) this.dropTombstone(tomb);
     }
-    await this.cleanCopies();
+    await this.cleanCopies(sdOk);
   }
 
   // An archive copy cut off by a restart or stop(): a copy whose original
-  // is not yet its symlink is removed (the original was never touched).
-  // A copy whose original already became its symlink is kept (and gets its
-  // manifest line if the restart beat it).
-  async cleanCopies() {
+  // is not yet its symlink is removed, after the original is put back if
+  // the swap had moved it aside (entry.tomb). A copy whose original already
+  // became its symlink is kept (and gets its manifest line if the restart
+  // beat it); the moved-aside original is then removed.
+  async cleanCopies(sdOk) {
     const paths = this.paths;
+    const there = (p) => fsp.lstat(p).then(() => true, () => false);
     for (const entry of [...(this.state.copying ?? [])]) {
       const linked = await fsp.readlink(entry.from).then((to) => to === entry.to, () => false);
+      const tomb = entry.tomb && path.basename(entry.tomb).startsWith(TOMBSTONE_PREFIX) && await there(entry.tomb) ? entry.tomb : null;
       if (linked) {
         const listed = await fsp.readFile(this.archivePath, "utf8").then((text) => text.includes(JSON.stringify(entry.to)), () => false);
         if (!listed) { try { appendJsonLine(this.archivePath, { from: entry.from, to: entry.to, bytes: null, entries: null, at: entry.at }); } catch { /* next pass */ } }
-      } else if (source.isInside(entry.to, paths.archiveDir)) {
+        if (tomb) {
+          this.state.tombstones = [...(this.state.tombstones ?? []), tomb];
+          if ((await this.rmTree(tomb)).ok) this.dropTombstone(tomb);
+        }
+      } else {
+        // The original first: something else at its path, or a failed
+        // rename, keeps both it and the copy until the next pass.
+        if (tomb && (await there(entry.from) || !(await fsp.rename(tomb, entry.from).then(() => true, () => false)))) continue;
         // The card away or rm failing: try again next pass.
-        if (!this.sdOk() || !(await this.rmTree(entry.to)).ok) continue;
+        if (source.isInside(entry.to, paths.archiveDir) && (!sdOk || !(await this.rmTree(entry.to)).ok)) continue;
       }
       this.state.copying = (this.state.copying ?? []).filter((row) => row !== entry);
       this.save();
@@ -787,7 +814,8 @@ export class StorageManager {
     if (!this.sdOk()) return null;
     const now = this.now();
     const items = (this.candidates ?? [])
-      .filter((item) => item.rule === "archive" && item.volume === "data" && (!item.installer || this.held(item.path, now)) && !this.backedOff(item.path, now))
+      // An installer is asked about; one the owner kept stays where it is.
+      .filter((item) => item.rule === "archive" && item.volume === "data" && !item.installer && !this.backedOff(item.path, now))
       .sort((a, b) => b.bytes - a.bytes);
     if (!items.length) return null;
     const ctx = await this.verifyContext();
@@ -799,7 +827,7 @@ export class StorageManager {
     for (const item of items) {
       if (this.stopped || this.getMode() !== "auto") break;
       const free = await this.freeBytes("data");
-      if (free === null || free >= this.settings.targetFreeGb * GB) break;
+      if (free === null || free >= this.targetBytes("data")) break;
       const result = await this.archiveItem(item, ctx);
       this.journal({ op: result.ok ? "archive" : result.failed ? "fail" : "skip", rule: "archive", path: item.path, to: result.to ?? null, reason: result.reason ?? null });
       tally[result.ok ? "done" : result.failed ? "failed" : "skipped"] += 1;
@@ -848,11 +876,16 @@ export class StorageManager {
       if (source.openUnder(ctx.open, item.path)) return fail("opened during the copy", dest);
       if (this.getMode() !== "auto") return fail("left Auto", dest);
       const tomb = path.join(path.dirname(item.path), `${TOMBSTONE_PREFIX}${randomUUID().slice(0, 8)}`);
+      // Recorded before the rename: a restart mid-swap puts the original back.
+      record.tomb = tomb;
+      this.save();
       try { await fsp.rename(item.path, tomb); } catch (error) { return fail(`could not move the original: ${error?.message ?? error}`, dest); }
       try {
         await fsp.symlink(dest, item.path);
       } catch (error) {
-        await fsp.rename(tomb, item.path).catch(() => {});
+        const back = await fsp.rename(tomb, item.path).then(() => true, () => false);
+        // Not back: the record and the copy stay, the next pass retries.
+        if (!back) return { ok: false, failed: true, reason: clampText(`could not leave a link or put the original back: ${error?.message ?? error}`, 160) };
         return fail(`could not leave a link: ${error?.message ?? error}`, dest);
       }
       try { appendJsonLine(this.archivePath, { from: item.path, to: dest, bytes: before.bytes, entries: before.entries, at: iso(this.now()) }); } catch { /* the journal has it too */ }

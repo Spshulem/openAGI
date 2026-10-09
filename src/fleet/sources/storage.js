@@ -33,6 +33,7 @@ export const ARCHIVE_MIN_BYTES = 100 * MB;
 export const WORKTREE_TTL_MS = 6 * HOUR;
 const WALK_MAX_ENTRIES = 200_000;
 const BUILD_WALK_DEPTH = 4;
+const BUILD_TOP_DEPTH = 2;
 const GIT_TIMEOUT_MS = 30_000;
 // du on the SD card is much slower (one cold worktree took 103 s).
 const DU_TIMEOUT_MS = 90_000;
@@ -274,14 +275,18 @@ export async function sizeOf(p, config, run = runCommand, { timeoutMs = DU_TIMEO
   if (!st.isDirectory()) return Math.max(Number(st.blocks ?? 0) * 512, 0);
   const result = await run(config.bins.du, ["-skx", p], { timeoutMs });
   const kb = Number(/^(\d+)/.exec(String(result?.stdout ?? "").trim())?.[1]);
-  if (!Number.isFinite(kb) || result?.timedOut) throw new Error(`du failed for ${path.basename(p)}`);
+  // A du that failed part way (unreadable subfolder, killed) can still print
+  // a total: too small, so it is not used.
+  if (!Number.isFinite(kb) || result?.code !== 0 || result.timedOut || result.error) throw new Error(`du failed for ${path.basename(p)}`);
   return kb * 1024;
 }
 
 // Newest mtime under root, skipping .git and build dirs. Stops early once a
 // file newer than stopAfterMs shows up. complete false: unknown, not idle;
 // timedOut: the scan ran out of time (its task result is not kept).
-export async function newestMtime(root, { stopAfterMs = Infinity, deadline = Infinity, clock = Date.now, skipBuild = true, dirsOnly = false, maxDepth = Infinity } = {}) {
+// atime: a file read counts too (dir atimes move on every listing, so not
+// theirs).
+export async function newestMtime(root, { stopAfterMs = Infinity, deadline = Infinity, clock = Date.now, skipBuild = true, dirsOnly = false, maxDepth = Infinity, atime = false } = {}) {
   const stack = [[root, 0]];
   let newest = 0;
   let seen = 0;
@@ -303,7 +308,10 @@ export async function newestMtime(root, { stopAfterMs = Infinity, deadline = Inf
     }
     for (let i = 0; i < stat.length; i += 256) {
       const rows = await Promise.all(stat.slice(i, i + 256).map((file) => fsp.lstat(file).catch(() => null)));
-      for (const row of rows) if (row && row.mtimeMs > newest) newest = row.mtimeMs;
+      for (const row of rows) {
+        const at = row && (atime && row.isFile() ? Math.max(row.mtimeMs, row.atimeMs) : row.mtimeMs);
+        if (at > newest) newest = at;
+      }
     }
     if (newest > stopAfterMs) return { newest, complete: false, recent: true };
   }
@@ -564,19 +572,55 @@ async function findBuildDirs(wt) {
   return out;
 }
 
+// The newest mtime in the top BUILD_TOP_DEPTH levels of each build dir
+// (files and dirs, the dirs themselves too): an install or build rewrites
+// what sits there (.modules.yaml, .package-lock.json, BUILD_ID,
+// target/debug) without touching the source.
+async function buildNewest(dirs, { deadline = Infinity, clock = Date.now } = {}) {
+  let newest = 0;
+  let seen = 0;
+  const bump = (row) => { if (row && row.mtimeMs > newest) newest = row.mtimeMs; };
+  for (const dir of dirs) bump(await fsp.lstat(dir).catch(() => null));
+  const stack = dirs.map((dir) => [dir, 0]);
+  while (stack.length) {
+    if (clock() > deadline) return { newest, complete: false, timedOut: true };
+    if (seen > WALK_MAX_ENTRIES) return { newest, complete: false };
+    const [dir, depth] = stack.pop();
+    let list;
+    try { list = await fsp.readdir(dir, { withFileTypes: true }); } catch { return { newest, complete: false }; }
+    seen += list.length;
+    for (let i = 0; i < list.length; i += 256) {
+      const batch = list.slice(i, i + 256);
+      const rows = await Promise.all(batch.map((entry) => fsp.lstat(path.join(dir, entry.name)).catch(() => null)));
+      rows.forEach(bump);
+      for (const entry of batch) if (entry.isDirectory() && depth + 1 < BUILD_TOP_DEPTH) stack.push([path.join(dir, entry.name), depth + 1]);
+    }
+  }
+  return { newest, complete: true };
+}
+
+// When a worktree last changed: its files (not .git or build dirs), HEAD's
+// reflog (commits and checkouts that touch no file), and the top of its build
+// dirs (a fresh install or build). { newest, complete, timedOut, builds }.
+export async function worktreeNewest(wt, { stopAfterMs = Infinity, deadline = Infinity, clock = Date.now } = {}) {
+  const walk = await newestMtime(wt, { stopAfterMs, deadline, clock });
+  if (!walk.complete) return { ...walk, builds: null };
+  const gitdir = await gitDirOf(wt);
+  const reflog = gitdir ? await fsp.lstat(path.join(gitdir, "logs", "HEAD")).then((row) => row.mtimeMs).catch(() => 0) : 0;
+  const builds = await findBuildDirs(wt);
+  const top = await buildNewest(builds, { deadline, clock });
+  return { newest: Math.max(walk.newest, reflog, top.newest), complete: top.complete, timedOut: top.timedOut, builds };
+}
+
 async function scanWorktree(wt, ctx) {
   const out = [];
   const st = await fsp.lstat(wt);
   // In use now: nothing here is idle (re-checked after the TTL).
   if (!st.isDirectory() || openUnder(ctx.open, wt) || busyIn(wt, ctx.busyCwds)) return out;
-  const idle = outOfTime(await newestMtime(wt, { stopAfterMs: ctx.now - AGES.buildIdleMs, deadline: ctx.deadline, clock: ctx.clock }));
-  // HEAD's reflog moves on commits and checkouts that touch no file.
-  const gitdir = await gitDirOf(wt);
-  const reflog = gitdir ? await fsp.lstat(path.join(gitdir, "logs", "HEAD")).then((row) => row.mtimeMs).catch(() => 0) : 0;
-  const newest = Math.max(idle.newest, reflog);
-  const idleFor = idle.complete ? ctx.now - newest : 0;
+  const idle = outOfTime(await worktreeNewest(wt, { stopAfterMs: ctx.now - AGES.buildIdleMs, deadline: ctx.deadline, clock: ctx.clock }));
+  const idleFor = idle.complete ? ctx.now - idle.newest : 0;
   if (idleFor >= AGES.buildIdleMs) {
-    const builds = await findBuildDirs(wt);
+    const builds = idle.builds;
     spend(ctx);
     const ignored = await gitIgnored(wt, builds, ctx.config, ctx.run);
     for (const dir of builds) {
@@ -634,7 +678,7 @@ async function scanDownloads(dir, ctx, { archive }) {
     const bytes = await sizeFor(p, st, ctx);
     if (bytes < (ctx.config.storage.archiveMinBytes ?? ARCHIVE_MIN_BYTES)) continue;
     if (st.isDirectory()) {
-      const inner = outOfTime(await newestMtime(p, { stopAfterMs: ctx.now - AGES.archiveMs, deadline: ctx.deadline, clock: ctx.clock, skipBuild: false }));
+      const inner = outOfTime(await newestMtime(p, { stopAfterMs: ctx.now - AGES.archiveMs, deadline: ctx.deadline, clock: ctx.clock, skipBuild: false, atime: true }));
       if (!inner.complete) continue;
     }
     out.push(candidate("archive", p, st, bytes, ctx, { installer }));
@@ -735,7 +779,9 @@ export async function scanStorage(config, deps = {}, { budgetMs = config.storage
       return true;
     }
   };
-  for (const task of tasks.filter((row) => row.every)) await runTask(task, { first: true, deadline: clock() + budgetMs });
+  // The cheap tasks share the scan's budget too: past it no du starts, and a
+  // task cut short keeps its last result (sizes measured so far are cached).
+  for (const task of tasks.filter((row) => row.every)) await runTask(task, { first: false, deadline });
   const ring = tasks.filter((row) => !row.every);
   const start = ring.length ? (cache.cursor ?? 0) % ring.length : 0;
   let index = 0;

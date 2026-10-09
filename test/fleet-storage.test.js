@@ -8,7 +8,7 @@ import { resolveFleetConfig, runCommand } from "../src/fleet/contracts.js";
 import { StorageManager, deleteOption } from "../src/fleet/storage.js";
 import { FleetStore } from "../src/fleet/store.js";
 import { FleetSupervisor } from "../src/fleet/supervisor.js";
-import { GB, gitState, openUnder, readThreadUse, readVolumes, scanStorage, storagePaths } from "../src/fleet/sources/storage.js";
+import { GB, gitState, openUnder, readThreadUse, readVolumes, scanStorage, sizeOf, storagePaths } from "../src/fleet/sources/storage.js";
 
 // Git in these fixtures must not read the owner's global config (a global
 // excludes file would ignore node_modules everywhere).
@@ -71,7 +71,7 @@ function setup(t, { mode = "observe", dataGb = 40, sdGb = 500, sdMounted = true,
   for (const dir of [home, sd, dataDir, path.join(home, "Downloads"), path.join(home, "Dev", "worktrees")]) fs.mkdirSync(dir, { recursive: true });
   write(path.join(sd, ".codex-xtra-volume-identity"), `volume_uuid=${UUID}\nvolume_name=Xtra\n`);
   const env = {
-    root, home, sd, dataDir, mode, open: new Set(), procs: new Set(["launchd", "zsh"]), free: { data: dataGb * GB, sd: sdGb * GB }, lsofFails: false, statfsFails: false, sdMounted, busy: [], clock: now,
+    root, home, sd, dataDir, mode, open: new Set(), procs: new Set(["launchd", "zsh"]), free: { data: dataGb * GB, sd: sdGb * GB }, total: { data: 2000 * GB, sd: 2000 * GB }, lsofFails: false, statfsFails: false, sdMounted, busy: [], clock: now,
     // Hooks: lsof calls (and a gate to hold them), after each lsof read, each
     // rm (the tree removed), du results by path, and the budget clock.
     lsofCalls: 0, lsofGate: null, afterLsof: null, onRm: null, duFails: new Set(), duKb: new Map(), dittoCalls: [], clockFn: Date.now
@@ -108,7 +108,7 @@ function setup(t, { mode = "observe", dataGb = 40, sdGb = 500, sdMounted = true,
     run: env.run,
     statfs: async (mount) => {
       if (env.statfsFails) throw new Error("statfs broke");
-      return { bsize: 1, blocks: 2000 * GB, bavail: mount === sd ? env.free.sd : env.free.data };
+      return { bsize: 1, blocks: mount === sd ? env.total.sd : env.total.data, bavail: mount === sd ? env.free.sd : env.free.data };
     },
     isMount: async (mount) => (mount === sd ? env.sdMounted : true),
     clock: () => env.clockFn(),
@@ -1126,4 +1126,157 @@ test("scans are due hourly, every 15 min while low; one at a time; the tick neve
 
 test("deleteOption names the count and size", () => {
   assert.equal(deleteOption({ items: [{}, {}], bytes: 46.3 * GB }), "Delete 2 (46 GB)");
+});
+
+// ─── review fixes: swap recovery, budgets, idleness, caps ────────────────
+
+test("a restart mid-swap puts the original back before its copy is removed", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const big = write(path.join(env.home, "Downloads", "a.mov"), "v".repeat(10_000));
+  age(big, 40 * DAY);
+  env.deps.ditto = async (src, dest) => { fs.cpSync(src, dest); return { ok: true }; };
+  const realSymlink = fs.promises.symlink;
+  t.after(() => { fs.promises.symlink = realSymlink; });
+  let reached;
+  const swapped = new Promise((resolve) => { reached = resolve; });
+  // The process "exits" between the rename and the symlink: it never returns.
+  fs.promises.symlink = () => { reached(); return new Promise(() => {}); };
+  const first = env.manager();
+  first.requestScan();
+  await swapped;
+  fs.promises.symlink = realSymlink;
+  first.stop();
+  const copy = path.join(env.sd, "OpenAGI-Archive", "Downloads", "a.mov");
+  assert.equal(exists(big), false, "the original is moved aside");
+  assert.equal(exists(copy), true);
+  const restarted = env.manager();
+  await restarted.cleanTombstones();
+  assert.equal(fs.lstatSync(big).isSymbolicLink(), false);
+  assert.equal(fs.readFileSync(big, "utf8"), "v".repeat(10_000), "the original is back");
+  assert.equal(exists(copy), false);
+  assert.deepEqual(restarted.state.copying, []);
+  assert.ok(!fs.readdirSync(path.join(env.home, "Downloads")).some((name) => name.startsWith(".fleet-deleting-")));
+
+  // Linked before the restart, original still moved aside: it is removed.
+  const linkedCopy = write(path.join(env.sd, "OpenAGI-Archive", "Downloads", "b.mov"), "b");
+  const link = path.join(env.home, "Downloads", "b.mov");
+  fs.symlinkSync(linkedCopy, link);
+  const tomb = write(path.join(env.home, "Downloads", ".fleet-deleting-0000beef"), "b");
+  restarted.state.copying = [{ from: link, to: linkedCopy, at: "y", tomb }];
+  await restarted.cleanTombstones();
+  assert.equal(exists(tomb), false);
+  assert.equal(fs.readlinkSync(link), linkedCopy);
+  assert.deepEqual(restarted.state.tombstones, []);
+});
+
+test("recovery reads the card again: a different card at the same path is not touched", async (t) => {
+  const env = setup(t);
+  const first = env.manager();
+  await first.refreshVolumes();
+  // While the supervisor was down the card was swapped.
+  write(path.join(env.sd, ".codex-xtra-volume-identity"), "volume_uuid=11111111-2222-3333-4444-555555555555\n");
+  const theirs = write(path.join(env.sd, "OpenAGI-Archive", "Downloads", "a.mov"), "theirs");
+  const original = write(path.join(env.home, "Downloads", "a.mov"), "whole");
+  const sdTomb = write(path.join(env.sd, ".Trashes", "501", ".fleet-deleting-abcd1234"), "x");
+  first.state.copying = [{ from: original, to: theirs, at: "x" }];
+  first.state.tombstones = [sdTomb];
+  first.save();
+  const restarted = env.manager();
+  assert.equal(restarted.sdOk(), true, "state.json still trusts the old card");
+  await restarted.autoPasses();
+  assert.equal(fs.readFileSync(theirs, "utf8"), "theirs");
+  assert.equal(exists(sdTomb), true);
+  assert.equal(restarted.state.copying.length, 1, "kept for when the known card is back");
+});
+
+test("the cheap tasks keep to the scan budget: no du starts past it", async (t) => {
+  const env = setup(t);
+  // SD Trash: a du per folder, no walk (its deadline would stop it anyway).
+  for (const name of ["a", "b", "c", "d", "e"]) write(path.join(env.sd, ".Trashes", "501", name, "x.mov"));
+  let fake = 0;
+  let du = 0;
+  env.clockFn = () => fake;
+  env.onDu = () => { du += 1; fake += 100_000; };
+  const cache = { cursor: 0, tasks: {} };
+  const first = await scanStorage(env.config, env.deps, { budgetMs: 120_000, cache });
+  assert.equal(du, 2, "stopped once past the budget");
+  assert.ok(first.errors.some((error) => error.startsWith("sd-trash: out of time")), first.errors.join("; "));
+  // Sizes measured so far are kept: each scan goes further.
+  fake = 0;
+  await scanStorage(env.config, env.deps, { budgetMs: 120_000, cache });
+  assert.equal(du, 4);
+  fake = 0;
+  const third = await scanStorage(env.config, env.deps, { budgetMs: 120_000, cache });
+  assert.equal(du, 5);
+  assert.equal(third.candidates.filter((item) => item.rule === "trash").length, 5);
+});
+
+test("a fresh install or build in an idle worktree keeps its output, at scan and at delete", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const wt = makeWorktree(env, path.join(env.home, "Dev", "worktrees", "rebuilt"), { idleDays: 20 });
+  const nm = path.join(wt, "node_modules");
+  const manager = env.manager();
+  assert.equal(await manager.scanOnce(), true);
+  assert.ok(manager.candidates.some((item) => item.path === nm), "idle: a candidate");
+  // A build rewrites a file in place: only that file's mtime moves.
+  fs.writeFileSync(path.join(nm, "pkg", "index.js"), "rebuilt");
+  await manager.autoPasses();
+  assert.equal(exists(nm), true, "not deleted right after the build");
+  const scanned = await scanStorage(env.config, env.deps, { budgetMs: 60_000 });
+  assert.ok(!scanned.candidates.some((item) => item.rule === "build"), "not a candidate");
+});
+
+test("an installer the owner kept is not moved to the SD card", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const [dmg] = installers(env, ["tool.dmg"]);
+  let copies = 0;
+  env.deps.ditto = async (src, dest) => { copies += 1; fs.cpSync(src, dest); return { ok: true }; };
+  const manager = env.manager();
+  manager.state.holds = { [dmg]: Date.now() + 30 * DAY };
+  await manager.requestScan();
+  assert.equal(copies, 0);
+  assert.equal(fs.lstatSync(dmg).isSymbolicLink(), false);
+});
+
+test("a volume smaller than its target is cleaned to half its size, not emptied", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  env.total.data = 128 * GB;
+  const parts = ["a", "b", "c"].map((name) => write(path.join(env.home, "Downloads", `${name}.part`)));
+  for (const file of parts) age(file, 8 * DAY);
+  env.onRm = () => { env.free.data += 20 * GB; };
+  await env.manager().requestScan();
+  assert.equal(parts.filter(exists).length, 1, "stopped at 64 GB free (target 150 GB)");
+
+  const sd = setup(t, { mode: "auto", dataGb: 200, sdGb: 15 });
+  sd.total.sd = 40 * GB;
+  const sdParts = ["a", "b", "c"].map((name) => write(path.join(sd.sd, "Downloads", `${name}.part`)));
+  for (const file of sdParts) age(file, 8 * DAY);
+  sd.onRm = () => { sd.free.sd += 5 * GB; };
+  await sd.manager().requestScan();
+  assert.equal(sdParts.filter(exists).length, 2, "stopped at 20 GB free (sdLowGb 50)");
+});
+
+test("a Downloads folder with a file read recently is not archived", async (t) => {
+  const env = setup(t);
+  const dir = path.join(env.home, "Downloads", "photos");
+  const file = write(path.join(dir, "a.jpg"), "a".repeat(5000));
+  age(dir, 40 * DAY);
+  fs.utimesSync(file, new Date(), new Date(Date.now() - 40 * DAY));
+  const result = await scanStorage(env.config, env.deps, { budgetMs: 60_000 });
+  assert.ok(!result.candidates.some((item) => item.path === dir), "not a candidate");
+  const manager = env.manager();
+  await manager.refreshVolumes();
+  const st = fs.lstatSync(dir);
+  const ctx = { open: [], procs: new Set(), at: Date.now(), idle: new Map(), use: null, useAt: 0 };
+  const check = await manager.verify({ rule: "archive", path: dir, bytes: 8192, volume: "data", dev: st.dev, ino: st.ino }, ctx);
+  assert.equal(check.reason, "changed or opened recently");
+});
+
+test("a du that exits nonzero is not a size, even with a total printed", async (t) => {
+  const env = setup(t);
+  const dir = path.join(env.home, "Downloads", "d");
+  write(path.join(dir, "x"));
+  const partial = async () => ({ code: 1, stdout: `8\t${dir}\n`, stderr: "du: x: Permission denied", timedOut: false, error: null });
+  await assert.rejects(sizeOf(dir, env.config, partial), /du failed/);
+  assert.equal(await sizeOf(dir, env.config, async () => ({ code: 0, stdout: `8\t${dir}\n` })), 8192);
 });
