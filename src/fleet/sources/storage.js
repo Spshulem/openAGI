@@ -537,6 +537,18 @@ async function sizeFor(p, st, ctx) {
   return bytes;
 }
 
+// sizeFor for one candidate of many: one item du cannot read (a root-owned
+// folder in the Trash) is skipped with a note, not the whole rule.
+async function sizeOrSkip(p, st, ctx) {
+  try {
+    return await sizeFor(p, st, ctx);
+  } catch (error) {
+    if (error instanceof OutOfTime) throw error;
+    ctx.notes?.push(`${path.basename(p)}: ${String(error?.message ?? error).slice(0, 80)}`);
+    return null;
+  }
+}
+
 async function scanGitTemp(gitdir, ctx) {
   const out = [];
   const objects = path.join(gitdir, "objects");
@@ -547,7 +559,8 @@ async function scanGitTemp(gitdir, ctx) {
       const p = path.join(dir, entry.name);
       const st = await fsp.lstat(p).catch(() => null);
       if (!st || ctx.now - st.mtimeMs < AGES.gitTempMs) continue;
-      out.push(candidate("git-temp", p, st, await sizeFor(p, st, ctx), ctx));
+      const bytes = await sizeOrSkip(p, st, ctx);
+      if (bytes !== null) out.push(candidate("git-temp", p, st, bytes, ctx));
     }
   }
   return out;
@@ -627,7 +640,8 @@ async function scanWorktree(wt, ctx) {
       if (!ignored.has(dir)) continue;
       const row = await fsp.lstat(dir).catch(() => null);
       if (!row?.isDirectory()) continue;
-      out.push(candidate("build", dir, row, await sizeFor(dir, row, ctx), ctx, { worktree: wt }));
+      const bytes = await sizeOrSkip(dir, row, ctx);
+      if (bytes !== null) out.push(candidate("build", dir, row, bytes, ctx, { worktree: wt }));
     }
   }
   const archived = ctx.use.ok && ctx.use.archived.has(wt);
@@ -667,16 +681,18 @@ async function scanDownloads(dir, ctx, { archive }) {
     if (!st) continue;
     const age = ctx.now - st.mtimeMs;
     if (PARTIAL.test(entry.name)) {
-      if (age >= AGES.partialMs) out.push(candidate("partial", p, st, await sizeFor(p, st, ctx), ctx));
+      const bytes = age >= AGES.partialMs ? await sizeOrSkip(p, st, ctx) : null;
+      if (bytes !== null) out.push(candidate("partial", p, st, bytes, ctx));
       continue;
     }
     if (!archive) continue;
     const installer = st.isFile() && INSTALLER.test(entry.name);
-    if (installer && age >= AGES.installerMs) out.push(candidate("installers", p, st, await sizeFor(p, st, ctx), ctx));
+    const installerBytes = installer && age >= AGES.installerMs ? await sizeOrSkip(p, st, ctx) : null;
+    if (installerBytes !== null) out.push(candidate("installers", p, st, installerBytes, ctx));
     if (age < AGES.archiveMs) continue;
     if (st.isFile() && ctx.now - st.atimeMs < AGES.archiveMs) continue;
-    const bytes = await sizeFor(p, st, ctx);
-    if (bytes < (ctx.config.storage.archiveMinBytes ?? ARCHIVE_MIN_BYTES)) continue;
+    const bytes = await sizeOrSkip(p, st, ctx);
+    if (bytes === null || bytes < (ctx.config.storage.archiveMinBytes ?? ARCHIVE_MIN_BYTES)) continue;
     if (st.isDirectory()) {
       const inner = outOfTime(await newestMtime(p, { stopAfterMs: ctx.now - AGES.archiveMs, deadline: ctx.deadline, clock: ctx.clock, skipBuild: false, atime: true }));
       if (!inner.complete) continue;
@@ -694,7 +710,8 @@ async function scanTrash(dir, ctx, { anyAge }) {
     const st = await fsp.lstat(p).catch(() => null);
     // ctime moves when an item is put in the Trash.
     if (!st || (!anyAge && ctx.now - st.ctimeMs < AGES.trashMs)) continue;
-    out.push(candidate("trash", p, st, await sizeFor(p, st, ctx), ctx));
+    const bytes = await sizeOrSkip(p, st, ctx);
+    if (bytes !== null) out.push(candidate("trash", p, st, bytes, ctx));
   }
   return out;
 }
@@ -705,7 +722,8 @@ async function scanToolTemp(ctx) {
     if (entry.isSymbolicLink()) continue;
     const p = path.join(ctx.paths.rustupTmp, entry.name);
     const st = await fsp.lstat(p).catch(() => null);
-    if (st) out.push(candidate("tool-temp", p, st, await sizeFor(p, st, ctx), ctx));
+    const bytes = st ? await sizeOrSkip(p, st, ctx) : null;
+    if (bytes !== null) out.push(candidate("tool-temp", p, st, bytes, ctx));
   }
   for (const root of ctx.paths.derivedData) {
     for (const entry of await entries(root)) {
@@ -716,7 +734,8 @@ async function scanToolTemp(ctx) {
       // Builds create files, so dir mtimes show the last one.
       const idle = outOfTime(await newestMtime(p, { stopAfterMs: ctx.now - AGES.derivedIdleMs, deadline: ctx.deadline, clock: ctx.clock, dirsOnly: true, skipBuild: false, maxDepth: 4 }));
       if (!idle.complete || ctx.now - Math.max(idle.newest, st.mtimeMs) < AGES.derivedIdleMs) continue;
-      out.push(candidate("tool-temp", p, st, await sizeFor(p, st, ctx), ctx));
+      const bytes = await sizeOrSkip(p, st, ctx);
+      if (bytes !== null) out.push(candidate("tool-temp", p, st, bytes, ctx));
     }
   }
   return out;

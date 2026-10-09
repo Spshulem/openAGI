@@ -1169,6 +1169,24 @@ test("a restart mid-swap puts the original back before its copy is removed", asy
   assert.deepEqual(restarted.state.tombstones, []);
 });
 
+test("a swap record that cannot be saved (disk full) leaves the original in place", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const big = write(path.join(env.home, "Downloads", "a.mov"), "v".repeat(10_000));
+  age(big, 40 * DAY);
+  env.deps.ditto = async (src, dest) => { fs.cpSync(src, dest); return { ok: true }; };
+  const manager = env.manager();
+  const save = manager.save.bind(manager);
+  manager.save = () => {
+    save();
+    if ((manager.state.copying ?? []).some((row) => row.tomb)) manager.lastWriteError = "ENOSPC: no space left on device";
+  };
+  await manager.requestScan();
+  await manager.idle();
+  assert.equal(fs.lstatSync(big).isSymbolicLink(), false);
+  assert.equal(fs.readFileSync(big, "utf8"), "v".repeat(10_000));
+  assert.ok(!fs.readdirSync(path.join(env.home, "Downloads")).some((name) => name.startsWith(".fleet-deleting-")));
+});
+
 test("recovery reads the card again: a different card at the same path is not touched", async (t) => {
   const env = setup(t);
   const first = env.manager();
@@ -1270,6 +1288,17 @@ test("a Downloads folder with a file read recently is not archived", async (t) =
   const ctx = { open: [], procs: new Set(), at: Date.now(), idle: new Map(), use: null, useAt: 0 };
   const check = await manager.verify({ rule: "archive", path: dir, bytes: 8192, volume: "data", dev: st.dev, ino: st.ino }, ctx);
   assert.equal(check.reason, "changed or opened recently");
+});
+
+test("one item du cannot read is skipped, not the rule's other items", async (t) => {
+  const env = setup(t);
+  const items = ["a", "b", "c"].map((name) => path.join(env.sd, ".Trashes", "501", name));
+  for (const dir of items) write(path.join(dir, "x"));
+  env.duFails.add(items[1]);
+  const result = await scanStorage(env.config, env.deps, { budgetMs: 60_000 });
+  const paths = result.candidates.map((item) => item.path);
+  assert.ok(paths.includes(items[0]) && paths.includes(items[2]));
+  assert.ok(!paths.includes(items[1]));
 });
 
 test("a du that exits nonzero is not a size, even with a total printed", async (t) => {

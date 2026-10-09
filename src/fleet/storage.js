@@ -879,6 +879,8 @@ export class StorageManager {
       // Recorded before the rename: a restart mid-swap puts the original back.
       record.tomb = tomb;
       this.save();
+      // Not saved (a full disk): a restart could not find the original.
+      if (this.lastWriteError) return fail(`could not save the swap record: ${this.lastWriteError}`, dest);
       try { await fsp.rename(item.path, tomb); } catch (error) { return fail(`could not move the original: ${error?.message ?? error}`, dest); }
       try {
         await fsp.symlink(dest, item.path);
