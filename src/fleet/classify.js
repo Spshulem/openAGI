@@ -197,7 +197,20 @@ export function prReadiness(pr, localGit) {
   else if (sameBranch && local.head === pr.headOid && Object.hasOwn(local, "dirty") && local.dirty === null) blockers.push("local git unknown");
 
   const ci = pr.ci ?? {};
-  if (CI_RED.has(ci.state) || ci.failing?.length) blockers.push(`CI red: ${ciNames(ci.failing)}`);
+  const gates = Array.isArray(pr.gates) ? pr.gates : [];
+  if (gates.length) {
+    // The repo's required checks are the gate: other checks green or
+    // skipped prove nothing, but a red or running one still blocks.
+    for (const gate of gates) {
+      const blocker = gateBlocker(gate);
+      if (blocker) blockers.push(blocker);
+    }
+    const gateNames = new Set(gates.map((gate) => gate.name));
+    const failing = (ci.failing ?? []).filter((name) => !gateNames.has(name));
+    const pending = (ci.pending ?? []).filter((name) => !gateNames.has(name));
+    if (failing.length || (CI_RED.has(ci.state) && !ci.failing?.length)) blockers.push(`CI red: ${ciNames(failing)}`);
+    else if (pending.length || (CI_RUNNING.has(ci.state) && !ci.pending?.length)) blockers.push("CI running");
+  } else if (CI_RED.has(ci.state) || ci.failing?.length) blockers.push(`CI red: ${ciNames(ci.failing)}`);
   else if (CI_RUNNING.has(ci.state)) blockers.push("CI running");
   else if (!ci.state) blockers.push("no CI on head");
 
@@ -215,6 +228,15 @@ export function prReadiness(pr, localGit) {
 
   const onlyHumanLeft = blockers.length === 0 && (pr.reviewDecision === "REVIEW_REQUIRED" || pr.mergeState === "BLOCKED");
   return { ready: blockers.length === 0 && !onlyHumanLeft, blockers, onlyHumanLeft, progressMark };
+}
+
+// "BuildBot3 full run missing" / "... failed" / "... pending" / "... skipped".
+function gateBlocker(gate) {
+  const label = gate.label || gate.name;
+  if (gate.state === "SUCCESS") return null;
+  if (!gate.state) return `${label} missing`;
+  if (gate.state === "FAILURE") return `${label} failed`;
+  return `${label} ${String(gate.state).toLowerCase()}`;
 }
 
 function ciNames(failing) {

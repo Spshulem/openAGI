@@ -818,6 +818,22 @@ test("a stopped CI waiter with no checks on head resumes after the wait threshol
   assert.equal(decision.playbook, "merge-ready");
 });
 
+test("the BuildBot3 full run gates the merge ask and the CI-finished nudge", () => {
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }];
+  // Green hosted checks but no full run: work for the agent, not a merge ask.
+  const missing = run(makeThread(), { pr: makePr({ gates: gate(null) }) }).decision;
+  assert.equal(missing.action, "nudge");
+  assert.equal(missing.playbook, "merge-ready");
+  assert.match(missing.message, /BuildBot3 full run missing/);
+  // A full run still going: wait, like hosted CI running.
+  assert.equal(run(makeThread(), { pr: makePr({ gates: gate("PENDING") }) }).decision.action, "wait");
+  assert.equal(run(makeThread(), { pr: makePr({ gates: gate("SUCCESS") }) }).decision.action, "ask-user");
+  // An agent waiting on the full run is not told CI finished because hosted checks did.
+  const waiting = makeThread({ lastAgentText: "Waiting on the BuildBot3 full run.", lastActivityAt: ago(10 * MIN), lastAgentAt: ago(10 * MIN), lastUserAt: ago(120 * MIN) });
+  assert.notEqual(run(waiting, { pr: makePr({ gates: gate("PENDING") }) }).decision.playbook, "ci-finished");
+  assert.equal(run(waiting, { pr: makePr({ gates: gate("SUCCESS") }) }).decision.playbook, "ci-finished");
+});
+
 test("local git the supervisor could not read waits instead of asking to merge or nudging", () => {
   const { decision } = run(makeThread(), { localGit: { unreadable: true } });
   assert.equal(decision.action, "wait");

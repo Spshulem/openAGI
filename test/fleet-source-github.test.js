@@ -129,7 +129,7 @@ test("buildPrQuery batches refs by repository with safe aliases", () => {
   assert.match(query, /comments\(last:30\)\{pageInfo\{hasPreviousPage\} nodes\{author\{login\} body createdAt\}\}/);
   assert.match(query, /files\(first:100\)\{pageInfo\{hasNextPage\} nodes\{path\}\}/);
   assert.match(query, /reviewThreads\(first:100\)\{totalCount pageInfo\{hasNextPage\}/);
-  assert.match(query, /statusCheckRollup\{state contexts\(first:30\)/);
+  assert.match(query, /statusCheckRollup\{state contexts\(first:100\)/);
   assert.match(query, /reviewThreads\(first:100\)/);
   assert.match(query, /createdAt updatedAt mergedAt closedAt/);
 });
@@ -477,4 +477,29 @@ test("a file list cut at 100 never waives UI QA", () => {
   const pr = normalizePr(BBAPP, node, config());
   assert.equal(pr.qa.required, true);
   assert.equal(pr.threadsTruncated, true);
+});
+
+test("the BuildBot3 full run is the required check on BuildBetter PR heads", async () => {
+  const statusOn = (state) => {
+    const response = capturedResponse();
+    const nodes = response.data.r0.p6878.commits.nodes[0].commit.statusCheckRollup.contexts.nodes;
+    if (state) nodes.push({ __typename: "StatusContext", context: "BuildBot3 full verification", state });
+    return response;
+  };
+  const gateOf = async (response, cfg = config()) => (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: fakeRun(() => ok(response)).run })).get(`${BBAPP}#6878`).gates;
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }];
+  assert.deepEqual(await gateOf(statusOn("SUCCESS")), gate("SUCCESS"));
+  assert.deepEqual(await gateOf(statusOn("ERROR")), gate("FAILURE"));
+  assert.deepEqual(await gateOf(statusOn("PENDING")), gate("PENDING"));
+  assert.deepEqual(await gateOf(statusOn(null)), gate(null));
+  // A green run on an older commit is not on the head.
+  const stale = statusOn("SUCCESS");
+  stale.data.r0.p6878.commits.nodes[0].commit.oid = "1336362a18000000000000000000000000000000";
+  assert.deepEqual(await gateOf(stale), gate(null));
+  // Other repos keep no gate unless configured.
+  const prs = await fetchPrStates([`${BBAPP}#6878`, "Spshulem/openAGI#108"], config(), { run: fakeRun(() => ok(capturedResponse())).run });
+  assert.deepEqual(prs.get("Spshulem/openAGI#108").gates, []);
+  const custom = config({ requiredChecks: { [BBAPP]: ["verification"] } });
+  assert.deepEqual(await gateOf(statusOn("SUCCESS"), custom), [{ name: "verification", label: "verification", state: "FAILURE" }]);
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 6878 }]), /contexts\(first:100\)/);
 });

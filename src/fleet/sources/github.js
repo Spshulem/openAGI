@@ -27,9 +27,16 @@ export const DEFAULT_UI_PATH_PREFIXES = Object.freeze({
   ])
 });
 
+// Checks that must pass on the exact head before a PR is ready. BuildBetter's
+// hosted PR verification is paused; its gate is the BuildBot3 full run, which
+// posts this commit status.
+export const DEFAULT_REQUIRED_CHECKS = Object.freeze({
+  "buildbetter-app/buildbetter": Object.freeze([Object.freeze({ name: "BuildBot3 full verification", label: "BuildBot3 full run" })])
+});
+
 const PR_FRAGMENT = [
   "fragment P on PullRequest { number url title state isDraft headRefName headRefOid baseRefName mergeStateStatus mergeable reviewDecision createdAt updatedAt mergedAt closedAt",
-  " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:30){nodes{__typename",
+  " commits(last:1){nodes{commit{oid committedDate statusCheckRollup{state contexts(first:100){nodes{__typename",
   " ... on CheckRun{name status conclusion startedAt completedAt detailsUrl} ... on StatusContext{context state}}}}}}}",
   " reviewThreads(first:100){totalCount pageInfo{hasNextPage} nodes{isResolved isOutdated comments(last:1){nodes{author{login}}}}}",
   " comments(last:30){pageInfo{hasPreviousPage} nodes{author{login} body createdAt}}",
@@ -69,11 +76,13 @@ function checkStamp(node) {
   return Date.parse(node?.startedAt ?? node?.completedAt ?? "") || 0;
 }
 
-function summarizeChecks(commit, headOid) {
+// The newest run of each check on the head, or null when the head's CI is
+// unknown.
+function latestChecks(commit, headOid) {
   const rollup = commit?.statusCheckRollup ?? null;
   // A last commit that is not the head means GitHub has not caught up; the
   // head's CI is unknown rather than whatever the older commit reported.
-  if (!rollup || (headOid && commit.oid && commit.oid !== headOid)) return { state: null, failing: [], pending: [] };
+  if (!rollup || (headOid && commit.oid && commit.oid !== headOid)) return null;
   const latest = new Map();
   for (const node of rollup.contexts?.nodes ?? []) {
     const name = node?.name ?? node?.context;
@@ -81,6 +90,13 @@ function summarizeChecks(commit, headOid) {
     const previous = latest.get(name);
     if (!previous || checkStamp(node) >= checkStamp(previous)) latest.set(name, node);
   }
+  return latest;
+}
+
+function summarizeChecks(commit, headOid) {
+  const latest = latestChecks(commit, headOid);
+  if (!latest) return { state: null, failing: [], pending: [] };
+  const rollup = commit.statusCheckRollup;
   const failing = [];
   const pending = [];
   for (const [name, node] of latest) {
@@ -94,6 +110,33 @@ function summarizeChecks(commit, headOid) {
     }
   }
   return { state: rollup.state ?? null, failing, pending };
+}
+
+// One check's result: SUCCESS, FAILURE, PENDING, another conclusion
+// (SKIPPED, NEUTRAL), or null when it never ran on the head.
+function checkState(node) {
+  if (!node) return null;
+  if (node.__typename === "StatusContext") {
+    if (FAILED_STATUSES.has(node.state)) return "FAILURE";
+    if (PENDING_STATUSES.has(node.state)) return "PENDING";
+    return node.state ?? null;
+  }
+  if (node.status && node.status !== "COMPLETED") return "PENDING";
+  if (FAILED_CONCLUSIONS.has(node.conclusion)) return "FAILURE";
+  return node.conclusion ?? null;
+}
+
+function requiredChecksFor(repo, config) {
+  const list = config?.requiredChecks?.[repo] ?? DEFAULT_REQUIRED_CHECKS[repo] ?? [];
+  return list.map((check) => typeof check === "string" ? { name: check, label: check } : { name: check?.name, label: check?.label || check?.name })
+    .filter((check) => check.name);
+}
+
+// The repo's required checks on the exact head: [{name, label, state}].
+function gatesFor(commit, headOid, required) {
+  if (!required.length) return [];
+  const latest = latestChecks(commit, headOid);
+  return required.map(({ name, label }) => ({ name, label, state: checkState(latest?.get(name)) }));
 }
 
 // The Codex bot keeps one summary comment per PR and edits it in place:
@@ -148,6 +191,7 @@ export function normalizePr(repo, node, config) {
     mergeable: node.mergeable ?? null,
     reviewDecision: node.reviewDecision ?? null,
     ci: summarizeChecks(node.commits?.nodes?.[0]?.commit ?? null, headOid),
+    gates: gatesFor(node.commits?.nodes?.[0]?.commit ?? null, headOid, requiredChecksFor(repo, config)),
     unresolvedThreads: (node.reviewThreads?.nodes ?? []).filter((thread) => thread && !thread.isResolved).length,
     // More than 100 threads: unread pages may hold unresolved ones.
     threadsTruncated: node.reviewThreads?.pageInfo?.hasNextPage === true,

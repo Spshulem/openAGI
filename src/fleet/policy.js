@@ -26,6 +26,9 @@ const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // Blockers only GitHub (or a later git read) can clear; nudging the agent
 // does nothing for them.
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
+// "CI running", or a required check still running ("BuildBot3 full run pending").
+const ciRunning = (blocker) => blocker === "CI running" || / pending$/.test(blocker);
+const passive = (blocker) => PASSIVE_BLOCKERS.has(blocker) || ciRunning(blocker);
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
 const KIND_NAMES = { codex: "Codex", claude: "Claude", conductor: "Conductor" };
@@ -272,7 +275,9 @@ function waitingIntent(ctx) {
   const wait = classified.wait ?? {};
   const age = wait.ageMs ?? 0;
   const ci = pr?.ci ?? {};
-  const ciDone = pr?.state === "OPEN" && CI_DONE.has(ci.state) && !ci.pending?.length;
+  // A required check (the BuildBot3 full run) still to come means CI is not done.
+  const gates = pr?.gates ?? [];
+  const ciDone = pr?.state === "OPEN" && CI_DONE.has(ci.state) && !ci.pending?.length && gates.every((gate) => CI_DONE.has(gate.state));
   // A verify behind a blocked gate or a hung watcher never wakes its agent,
   // and the manager may not get through either: past this long with no word
   // from the agent, it is asked for a status itself.
@@ -293,7 +298,7 @@ function waitingIntent(ctx) {
     if (wait.taskKind || age < limits.waitingTaskMaxMs) return { type: "wait", reason: wait.reason ?? "waiting on a background task" };
     if (ciDone) return nudge("ci-finished", "CI done; task still waiting", { immediate: true });
     const blockers = classified.readiness?.blockers ?? [];
-    if (pr?.state === "OPEN" && blockers.length && !blockers.includes("CI running")) {
+    if (pr?.state === "OPEN" && blockers.length && !blockers.some(ciRunning)) {
       return nudge("merge-ready", `waiting ${minutes(age)}m; not ready: ${blockers.join("; ")}`, { immediate: true });
     }
     if (silent) return statusCheck("a background task", quietMs);
@@ -301,7 +306,10 @@ function waitingIntent(ctx) {
   }
   // The agent ended its turn to wait and nothing will wake it but us.
   if (ciDone) return nudge("ci-finished", "CI finished on head");
-  if (pr?.state === "OPEN" && !ci.state && age >= limits.waitingTaskMaxMs) return nudge("merge-ready", "no CI on head after waiting");
+  const missing = gates.find((gate) => !gate.state);
+  if (pr?.state === "OPEN" && (missing || (!gates.length && !ci.state)) && age >= limits.waitingTaskMaxMs) {
+    return nudge("merge-ready", `${missing ? `${missing.label || missing.name} missing` : "no CI on head"} after waiting`);
+  }
   if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
   // The PR it is tracked by already merged or closed, so the CI it waits on
   // is another PR's (it opened a new one): ask where it is, once the usual
@@ -389,7 +397,7 @@ function agentAskIntent(ctx) {
 function prIntent(ctx) {
   const { classified, thread } = ctx;
   const blockers = classified.blockers ?? [];
-  if (blockers.length && blockers.every((blocker) => PASSIVE_BLOCKERS.has(blocker))) {
+  if (blockers.length && blockers.every(passive)) {
     return { type: "wait", reason: blockers.includes("CI running") ? "CI running on head" : `waiting: ${blockers.join("; ")}` };
   }
   const playbook = RESUME_STATUSES.has(thread.agentStatus) ? "resume" : "merge-ready";

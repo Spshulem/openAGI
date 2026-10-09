@@ -56,6 +56,8 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 
 Readiness blockers: `CI red: <names>`, `CI running`, `no CI on head`, `unpushed commits`, `local head differs`, `<n> open threads`, `merge conflicts`, `Codex review not on head`, `UI QA missing`, `draft`.
 
+A repo with required checks (config `requiredChecks`, repo -> check names; buildbetter-app/buildbetter requires the `BuildBot3 full verification` status) gates on them instead of `no CI on head`: `BuildBot3 full run missing`, `... failed`, `... pending`. Other green or skipped checks never make it ready; other red or running ones still block.
+
 ## Limits
 
 - 15 min idle before a nudge (limits, local verify, and infra recovery skip this wait).

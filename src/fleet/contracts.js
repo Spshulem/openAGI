@@ -224,6 +224,10 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // repo -> UI path prefixes that make visual QA required; github.js has
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},
+    // repo -> checks that must pass on the exact head before a PR is ready
+    // (names, or {name, label}); github.js requires the BuildBot3 full run
+    // for buildbetter-app/buildbetter.
+    requiredChecks: overrides.requiredChecks ?? {},
     delivery: DELIVERY_MODES.includes(overrides.delivery) ? overrides.delivery : parseDeliveryMode(env.OPENAGI_FLEET_DELIVERY),
     // Off unless listed: OPENAGI_FLEET_BACKGROUND_ROUTES=codex-exec,peer-relay.
     backgroundRoutes: Array.isArray(overrides.backgroundRoutes) ? parseBackgroundRoutes(overrides.backgroundRoutes.join(",")) : parseBackgroundRoutes(env.OPENAGI_FLEET_BACKGROUND_ROUTES),

@@ -97,6 +97,21 @@ test("a green, mergeable PR that GitHub reports BEHIND is not ready", () => {
   assert.deepEqual(prReadiness(makePr({ mergeState: "DIRTY", mergeable: "CONFLICTING" }), cleanGit).blockers, ["merge conflicts"]);
 });
 
+test("prReadiness gates on the repo's required check, not on hosted CI", () => {
+  const gate = (state) => [{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state }];
+  const blockersOf = (prOver) => prReadiness(makePr(prOver), cleanGit).blockers;
+  // Unrelated green checks are no proof the full run passed.
+  assert.deepEqual(blockersOf({ gates: gate(null) }), ["BuildBot3 full run missing"]);
+  assert.deepEqual(blockersOf({ gates: gate("FAILURE"), ci: { state: "FAILURE", failing: ["BuildBot3 full verification"], pending: [] } }), ["BuildBot3 full run failed"]);
+  assert.deepEqual(blockersOf({ gates: gate("PENDING"), ci: { state: "PENDING", failing: [], pending: ["BuildBot3 full verification"] } }), ["BuildBot3 full run pending"]);
+  assert.deepEqual(blockersOf({ gates: gate("SKIPPED") }), ["BuildBot3 full run skipped"]);
+  // A green full run with only skipped hosted checks is ready.
+  assert.equal(prReadiness(makePr({ gates: gate("SUCCESS") }), cleanGit).ready, true);
+  // Other red or running checks still block.
+  assert.deepEqual(blockersOf({ gates: gate("SUCCESS"), ci: { state: "FAILURE", failing: ["lint"], pending: [] } }), ["CI red: lint"]);
+  assert.deepEqual(blockersOf({ gates: gate("SUCCESS"), ci: { state: "PENDING", failing: [], pending: ["Cursor Bugbot"] } }), ["CI running"]);
+});
+
 test("prReadiness separates ready, only-human-left, and progress marks", () => {
   const ready = prReadiness(makePr(), cleanGit);
   assert.equal(ready.ready, true);
