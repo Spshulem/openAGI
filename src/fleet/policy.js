@@ -302,16 +302,17 @@ function waitingIntent(ctx) {
   if (pr?.state === "OPEN" && !ci.state && age >= limits.waitingTaskMaxMs) return nudge("merge-ready", "no CI on head after waiting");
   if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
   // The PR it is tracked by already merged or closed, so the CI it waits on
-  // is another PR's (it opened a new one): ask where it is. Not a post-merge
-  // note ("Merged. CI is running on main; nothing needed from you").
+  // is another PR's (it opened a new one): ask where it is, once the usual
+  // idle window passed. Not a note that nothing is left ("Merged. CI runs on
+  // main; nothing needed from you").
   const text = String(thread.lastAgentText ?? "");
-  if (pr && pr.state !== "OPEN" && age >= limits.waitingTaskMaxMs && !POST_MERGE_NOTE.test(text)) {
+  if (pr && pr.state !== "OPEN" && age >= limits.idleBeforeNudgeMs && !POST_MERGE_NOTE.test(text)) {
     return statusCheck("CI on a PR this thread does not track", age);
   }
   return { type: "wait", reason: pr ? "CI still running" : wait.reason ?? "waiting" };
 }
 
-const POST_MERGE_NOTE = /\bmerged\b|\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bno action (?:needed|required)\b/i;
+const POST_MERGE_NOTE = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bno action (?:needed|required)\b|\bnothing (?:else|more|left)\b/i;
 
 function statusCheck(what, quietMs) {
   const quiet = minutes(quietMs);
@@ -573,7 +574,9 @@ function ownerActiveUntil(thread, limits, now) {
 const WORKED_MS = 10 * MIN;
 function progressMarkFor(classified, thread, ledger) {
   const mark = classified.readiness?.progressMark ?? { head: null, unresolved: null };
-  if (classified.state !== "stopped") return mark;
+  // A promised stop counts the agent's own work since the last nudge too:
+  // research has no head to move.
+  if (classified.state !== "stopped" && !classified.idle?.promised) return mark;
   const nudgedAt = Date.parse(ledger?.lastNudgeAt ?? "");
   const agentAt = Date.parse(thread.lastAgentAt ?? "");
   const worked = Number.isFinite(nudgedAt) && Number.isFinite(agentAt) && agentAt - nudgedAt >= WORKED_MS

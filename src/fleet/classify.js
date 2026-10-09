@@ -89,8 +89,8 @@ const NEED_YOU_PATTERNS = [
   /\bplease confirm\b/i,
   /\b(?:blocked|waiting) on you\b/i,
   /\byou must do\b(?![\W_]{0,8}(?:none|nothing|n\/a)\b)/i,
-  /\bstill need your\b/i,
-  /\bblocked on\W{0,3}(?:you|your|the owner)\b/i
+  /(?<!\b(?:not|no longer|never)\s+)\bstill need your\b/i,
+  /(?<!\b(?:not|no longer|never|nothing(?: here)?(?: is)?|isn't|is not|aren't|are not)\s+(?:\w+\s+){0,2})\bblocked on\W{0,3}(?:you|your|the owner)\b/i
 ];
 
 // The agent ended its turn saying it will keep going ("Next: wire the
@@ -107,7 +107,7 @@ export const PROMISED_WORK_PATTERNS = Object.freeze([
 ]);
 
 // Reports that mention "you" but ask for nothing.
-const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b|\bnothing (?:that )?you (?:must|need to|have to) do\b|\b(?:nothing|not|isn't|is not|no longer|never)\b[^.?!\n]{0,30}\bblocked on\b/i;
+const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b|\bnothing (?:that )?you (?:must|need to|have to) do\b/i;
 const CHOICE_WORDS = /\bwhich\b|\bpick\b|\bchoose\b|\boption\b|\bor\b/i;
 
 const BB3_DOWN_PATTERNS = [
@@ -391,7 +391,8 @@ const OWNER_GATE = /\byou(?:r|rs|rself)?\b|\b(?:tell|ping|let|show|send|give) me
 // An offer ("If you want, I'll...") is not a promise.
 const CONDITIONAL = /^(?:if|when|should|let me know|happy to|want me to)\b/i;
 // Steps that leave the agent's own branch: never pushed by a nudge.
-const OWNER_STEP = /\b(?:merg(?:e|es|ed|ing)|releas(?:e|es|ed|ing)|deploy\w*|publish\w*|promot\w*|ship(?:s|ping)?|upload\w*|e-?mail\w*|post(?:s|ing)? (?:it|this|them|to)|send (?:it|this|them|the|an?)|customers?|invoice\w*|tag(?:ging)? (?:a |the )?(?:release|version))\b/i;
+// Past tense ("PR #123 merged. Next: update the docs") reports a step done.
+const OWNER_STEP = /\b(?:merg(?:e|es|ing)|releas(?:e|es|ing)|deploy(?:s|ing|ment)?|publish(?:es|ing)?|promot(?:e|es|ing)|ship(?:s|ping)?|upload(?:s|ing)?|e-?mail(?:s|ing)?|post(?:s|ing)? (?:it|this|them|to)|send (?:it|this|them|the|an?)|customers?|invoic(?:e|es|ing)|tag(?:ging)? (?:a |the )?(?:release|version))\b/i;
 // A report, not a plan: test results, finished work, a bug description.
 const REPORTED = /\b(?:pass(?:ed|es|ing)?|fail(?:ed|s|ing)?|green|red|done|complete[d]?|finished|merged|broken|bugs?|crash(?:es|ed)?|(?:is|are|was|were|does|do|can|wo)n't|(?:is|are|does) not)\b|\d+\/\d+/i;
 
@@ -411,7 +412,9 @@ function promisedWork(text) {
   if (OWNER_GATE.test(plain) || OWNER_STEP.test(plain) || OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(plain))) return false;
   const closing = closingSentences(plain);
   if (closing.some((sentence) => /\?\W*$/.test(sentence))) return false;
-  return closing.some((sentence) => !CONDITIONAL.test(sentence) && !REPORTED.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)));
+  // "I'll investigate why CI is failing": in a promise, status words name the work.
+  return closing.some((sentence) => !CONDITIONAL.test(sentence)
+    && (PROMISED_WORK_PATTERNS[0].test(sentence) || (!REPORTED.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)))));
 }
 
 function oldestTask(tasks) {

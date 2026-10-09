@@ -1342,7 +1342,10 @@ export class FleetSupervisor {
       // thread past this tick's lookup budget: the last answer beats none.
       if (fresh && (head === null || cached.head === head || lookups >= MAX_BRANCH_LOOKUPS)) {
         if (cached.ref) thread.prRefs = [cached.ref];
-        else thread.prLookedUp = true;
+        // No PR for this same head only (both unknown counts as the same):
+        // a git failure after a known head, or a spent budget with a newer
+        // head, leaves the answer unknown.
+        else if (cached.head === head) thread.prLookedUp = true;
         continue;
       }
       if (lookups >= MAX_BRANCH_LOOKUPS) continue;

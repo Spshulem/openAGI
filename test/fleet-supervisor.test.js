@@ -886,6 +886,15 @@ test("a no-PR thread counts as having no PR only once GitHub answered", async (t
   const trunk = [makeThread({ key: "codex:m", id: "m", branch: "main", prRefs: [] }), makeThread({ key: "codex:z", id: "z", branch: null, prRefs: [] })];
   await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, trunk, new Map(), {}, null, sourceErrors);
   assert.ok(trunk.every((thread) => thread.prLookedUp === true));
+  // A cached "no PR" counts only for the head it was answered for.
+  const HEAD2 = "b".repeat(40);
+  const cachedSup = { skip: {}, deps: { findPrForBranch: async () => null }, branchLookups: new Map([["acme/app:spencer/c", { ref: null, at: NOW, head: HEAD2 }]]), now: () => NOW };
+  const same = [makeThread({ key: "codex:c", id: "c", cwd: "/work/c", branch: "spencer/c", prRefs: [] })];
+  await FleetSupervisor.prototype.resolvePrRefs.call(cachedSup, same, new Map([["/work/c", { head: HEAD2, branch: "spencer/c" }]]), {}, null, sourceErrors);
+  assert.equal(same[0].prLookedUp, true);
+  const gitFailed = [makeThread({ key: "codex:c", id: "c", cwd: "/work/c", branch: "spencer/c", prRefs: [] })];
+  await FleetSupervisor.prototype.resolvePrRefs.call(cachedSup, gitFailed, new Map(), {}, null, sourceErrors);
+  assert.notEqual(gitFailed[0].prLookedUp, true, "git failed: the cached answer was for a known head");
 });
 
 test("a failed source never splits its open group into a second question", async (t) => {

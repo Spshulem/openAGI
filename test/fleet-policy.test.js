@@ -199,6 +199,11 @@ test("row: an agent that said it would keep going and stopped gets idle-report",
   assert.equal(nudged.action, "nudge");
   assert.equal(nudged.playbook, "idle-report");
   assert.match(nudged.message, /continue it now\. If it needs the owner, stop/);
+  // A promise that names the problem it will look into, and a merge reported
+  // as done before the next step, still count.
+  for (const text of ["I'll investigate why CI is failing.", "PR #123 merged. Next: update the docs."]) {
+    assert.equal(run(makeThread({ prRefs: [], prLookedUp: true, lastAgentText: text }), { pr: null }).decision.playbook, "idle-report", text);
+  }
   // After its PR merged, own follow-up work it promised still counts.
   const merged = makePr({ state: "MERGED" });
   const afterMerge = run(makeThread({ lastAgentText: "The import scan is still running. I'll act on its results.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) }), { pr: merged }).decision;
@@ -263,6 +268,9 @@ test("row: a text wait that outlives any CI run gets a status check", () => {
   // wakes it), keep waiting.
   const note = run(makeThread({ ...waiting, lastAgentText: "Merged #6522. CI is running on main; nothing needed from you." }), { pr: makePr({ state: "MERGED" }) }).decision;
   assert.equal(note.action, "wait");
+  // A merge report that starts a new wait is still asked.
+  const next = run(makeThread({ ...waiting, lastAgentText: "Merged #6522. Opened #6523; CI is running and I'll report when it lands.", lastAgentAt: ago(20 * MIN), lastActivityAt: ago(20 * MIN) }), { pr: makePr({ state: "MERGED" }) }).decision;
+  assert.equal(next.playbook, "status-check");
   const pending = run(makeThread(waiting), { pr: makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } }) }).decision;
   assert.equal(pending.action, "wait");
 });
