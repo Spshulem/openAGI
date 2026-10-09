@@ -19,6 +19,18 @@ const RELAY_TIMEOUT_MS = 180_000;
 // A relay cut short can still have delivered (then a retry duplicates it),
 // so one is not started for a remote caller with less time than this left.
 const RELAY_MIN_MS = 60_000;
+// The send-time re-read of a chat before a background relay, at most.
+const REFRESH_MAX_MS = 20_000;
+// A remote caller with less left than this gets no background fallback: its
+// checks (a lock read, at most 10 s) and the launch must fit.
+const FALLBACK_MIN_MS = 15_000;
+
+// Settles with promise, or rejects once ms pass.
+function within(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 // A resumed turn can run for an hour (CI waits, bb-quick). Only the child we
 // spawned is ever killed, and only after this ceiling.
 const BACKGROUND_TIMEOUT_MS = 2 * 60 * 60 * 1000;
@@ -445,11 +457,14 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   // The background route a presence-blocked app send takes, re-checked at
   // send time: the scan's lock, peer and chat reads are up to a tick old.
   // Anything unreadable now means no background route.
-  async function fallbackRoute(thread, target) {
+  async function fallbackRoute(thread, target, deadlineAt) {
     const route = backgroundRouteFor(thread, config);
     if (!route) return null;
     // An earlier app send may sit in that composer unconfirmed.
     if (unconfirmed.has(target.targetKey)) return null;
+    // A remote caller's deadline bounds the checks too, not only the send.
+    const left = Number.isFinite(deadlineAt) ? deadlineAt - DEADLINE_MARGIN_MS - Date.now() : Infinity;
+    if (left < (route === "peer-relay" ? RELAY_MIN_MS + FALLBACK_MIN_MS : FALLBACK_MIN_MS)) return null;
     if (route === "codex-exec") {
       // A lock file a crash left behind holds nothing: who holds it decides,
       // as in the scan.
@@ -463,12 +478,14 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     try { peers = readLivePeers(config); } catch { return null; }
     const peer = [thread.claudeSessionId, thread.id].map((id) => id && peers?.get(id)).find(Boolean);
     if (!peer?.peerName || peer.status !== "idle" || peer.waitingFor) return null;
-    // The chat as it is now: no new pick, prompt, turn or message since the scan.
+    // The chat as it is now: no new pick, prompt, turn or message since the
+    // scan, and still the same idle peer.
     let fresh = null;
-    try { fresh = await refreshThread(thread); } catch { return null; }
+    try { fresh = await within(Promise.resolve().then(() => refreshThread(thread)), Math.min(REFRESH_MAX_MS, left - RELAY_MIN_MS)); } catch { return null; }
     if (!fresh || fresh.agentStatus === "running" || fresh.meta?.blockedOnOwner === true || fresh.meta?.pendingQuestion) return null;
     if ((Date.parse(fresh.lastActivityAt ?? "") || 0) > (Date.parse(thread.lastActivityAt ?? "") || 0)) return null;
-    return { route, live: { ...thread.live, peerName: peer.peerName, pid: peer.pid, status: peer.status } };
+    if (!fresh.live?.peerName || fresh.live.pid !== peer.pid || fresh.live.status !== "idle") return null;
+    return { route, live: { ...thread.live, peerName: fresh.live.peerName, pid: fresh.live.pid, status: fresh.live.status } };
   }
 
   async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null } = {}) {
@@ -509,7 +526,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       // The owner is at the Mac: a route that does not take the screen, if
       // the owner allowed one for this thread. Otherwise it waits for idle.
       if (!isPresenceBlock(result)) return result;
-      const fallback = await fallbackRoute(thread, step.target);
+      const fallback = await fallbackRoute(thread, step.target, deadlineAt);
       if (!fallback) return result;
       const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };
       return deliver({ thread: { ...thread, live: via.live }, message, route: via.route, actionId: result.actionId ?? actionId, playbook, spentMs, deadlineAt, fallbackFrom: result.detail });

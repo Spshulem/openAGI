@@ -2968,6 +2968,14 @@ test("a scheduled scan during an idle-watcher scan runs after it, with the revie
   assert.equal(supervisor.tick({ reason: "interval" }), first);
   await first;
   assert.deepEqual(reasons, ["owner-away", "interval", "interval"]);
+  // Stopped meanwhile: the follow-up never scans.
+  supervisor._tick = async (reason) => { reasons.push(reason); if (reason === "owner-away") await new Promise((resolve) => { release = resolve; }); return {}; };
+  supervisor.tick({ reason: "owner-away" });
+  const queued = supervisor.tick({ reason: "interval" });
+  supervisor.stop();
+  release();
+  assert.equal(await queued, null);
+  assert.deepEqual(reasons, ["owner-away", "interval", "interval", "owner-away"]);
 });
 
 test("a presence-blocked app send arms the idle watcher; a watcher scan skips the review", async (t) => {

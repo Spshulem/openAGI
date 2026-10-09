@@ -690,7 +690,9 @@ test("a Conductor chat goes by peer relay to its live peer only when that peer i
   const tab = (cwd) => conductorUiThread(cwd, { claudeSessionId: "cs1", live: { peerName: "old-1", pid: 5, status: "idle" } });
   const atConductor = () => [{ status: "blocked", detail: "owner using Conductor" }];
   const fresh = new Map([["cs1", { peerName: "new-2", pid: 6, status: "idle", waitingFor: null }]]);
-  const relayed = fallbackSetup(t, { results: atConductor(), peers: fresh, relay: [{ stdout: "DONE" }] });
+  // The re-read chat carries its peer as read now.
+  const now = async (thread) => ({ ...thread, live: { peerName: "new-2", pid: 6, status: "idle" } });
+  const relayed = fallbackSetup(t, { results: atConductor(), peers: fresh, relay: [{ stdout: "DONE" }], refresh: now });
   const result = await relayed.executor.deliver({ thread: tab(relayed.cwd), message: "continue", route: "computer-use" });
   assert.equal(result.status, "sent");
   assert.equal(result.route, "peer-relay");
@@ -702,7 +704,7 @@ test("a Conductor chat goes by peer relay to its live peer only when that peer i
     ["peer gone", new Map(), {}],
     ["an open pick in the chat", fresh, { meta: { ...conductorUiThread("x").meta, pendingQuestion: { text: "Which one?" } } }]
   ]) {
-    const { cwd, calls, executor } = fallbackSetup(t, { results: atConductor(), peers });
+    const { cwd, calls, executor } = fallbackSetup(t, { results: atConductor(), peers, refresh: now });
     const blocked = await executor.deliver({ thread: { ...tab(cwd), ...extra }, message: "continue", route: "computer-use" });
     assert.equal(blocked.status, "blocked", label);
     assert.equal(calls.length, 0, label);
@@ -710,9 +712,11 @@ test("a Conductor chat goes by peer relay to its live peer only when that peer i
   // The chat is read again at send time: a pick, a turn or a message since
   // the scan, or a chat that cannot be read, means no relay.
   for (const [label, refresh] of [
-    ["a pick asked since the scan", async (thread) => ({ ...thread, meta: { ...thread.meta, pendingQuestion: { text: "Which one?" } } })],
-    ["a turn started", async (thread) => ({ ...thread, agentStatus: "running" })],
-    ["a message since the scan", async (thread) => ({ ...thread, lastActivityAt: "2026-10-08T12:05:00Z" })],
+    ["a pick asked since the scan", async (thread) => ({ ...(await now(thread)), meta: { ...thread.meta, pendingQuestion: { text: "Which one?" } } })],
+    ["a turn started", async (thread) => ({ ...(await now(thread)), agentStatus: "running" })],
+    ["a message since the scan", async (thread) => ({ ...(await now(thread)), lastActivityAt: "2026-10-08T12:05:00Z" })],
+    ["its peer busy by the second read", async (thread) => ({ ...thread, live: { peerName: "new-2", pid: 6, status: "busy" } })],
+    ["another process by the second read", async (thread) => ({ ...thread, live: { peerName: "new-3", pid: 7, status: "idle" } })],
     ["unreadable", async () => { throw new Error("SQLITE_BUSY"); }],
     ["gone", async () => null]
   ]) {
@@ -740,4 +744,13 @@ test("background route helpers: the presence block and the per-thread route", ()
   assert.equal(backgroundRouteFor(live, config), null, "peer-relay not allowed");
   assert.equal(backgroundRouteFor(live, { backgroundRoutes: ["peer-relay"] }), "peer-relay");
   assert.equal(backgroundRouteFor({ ...live, kind: "claude", live: null }, { backgroundRoutes: ["peer-relay", "claude-resume"] }), null, "never claude-resume");
+});
+
+test("a remote send near its deadline takes no background route", async (t) => {
+  withoutLbKey(t);
+  const { cwd, calls, executor } = fallbackSetup(t, { results: ownerAtCodex() });
+  const result = await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use", deadlineAt: Date.now() + DEADLINE_MARGIN_MS + 5_000 });
+  assert.equal(result.status, "blocked");
+  assert.equal(result.detail, "owner using Codex");
+  assert.equal(calls.length, 0);
 });

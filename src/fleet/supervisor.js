@@ -462,6 +462,7 @@ export class FleetSupervisor {
   }
 
   stop() {
+    this.stops = (this.stops ?? 0) + 1;
     if (this.timer) clearInterval(this.timer);
     if (this.kickTimer) clearTimeout(this.kickTimer);
     if (this.idleTimer) clearInterval(this.idleTimer);
@@ -511,8 +512,13 @@ export class FleetSupervisor {
     }
     // A scheduled scan arriving during an idle-watcher scan (which skips the
     // review) runs after it, so new questions are not held a whole interval.
+    // Not after stop(): it would scan (and send) after shutdown.
     if (this.running && reason === "interval" && this.runningReason === "owner-away") {
-      this.reviewFollowUp ??= this.running.catch(() => {}).then(() => { this.reviewFollowUp = null; return this.tick({ reason }); });
+      const stops = this.stops;
+      this.reviewFollowUp ??= this.running.catch(() => {}).then(() => {
+        this.reviewFollowUp = null;
+        return this.stops === stops ? this.tick({ reason }) : null;
+      });
       return this.reviewFollowUp;
     }
     if (this.running) return this.running;
