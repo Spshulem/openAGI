@@ -693,6 +693,23 @@ test("F5: stale LB log rows do not keep the LB down", () => {
   assert.equal(infraHealth({ bb3: bb3Base, lb: stale }, { config: { limits: noFresh }, now: NOW }).lb.down, false);
 });
 
+test("one dropped stream in one chat does not page the LB manager", () => {
+  // 2026-10-09: "1x connection" escalated while the LB probe said healthy=yes.
+  const lb = (errors, healthy = true) => ({ healthy, detail: "200", watchLine: null, recentErrors: errors });
+  const err = (kind, count, threadIds = ["x1"]) => ({ kind, count, lastAt: ago(2 * MIN), threadIds });
+  const health = (errors, healthy) => infraHealth({ bb3: bb3Base, lb: lb(errors, healthy) }, { config, now: NOW }).lb;
+  const single = health([err("connection", 1)]);
+  assert.deepEqual(single.problems, []);
+  assert.equal(single.down, false);
+  assert.equal(single.up, true);
+  assert.deepEqual(health([err("connection", 3)]).problems, ["3x connection"]);
+  assert.deepEqual(health([err("unavailable", 1, ["x1", "x2"])]).problems, ["1x unavailable"]);
+  // Deterministic failures are never noise, and a failing probe corroborates.
+  assert.deepEqual(health([err("no-accounts", 1)]).problems, ["1x no-accounts"]);
+  assert.equal(health([err("connection", 1)], false).down, true);
+  assert.ok(health([err("connection", 1)], false).problems.includes("1x connection"));
+});
+
 test("F5: recovery resumes threads remembered as blocked after their log rows expire", () => {
   // The aborted turn has no error; its only lb signal (the log row) is gone.
   const aborted = makeThread({ key: "codex:x1", kind: "codex", id: "x1", live: null, agentStatus: "aborted", prRefs: [], error: null, lastUserAt: ago(3 * 60 * MIN) });

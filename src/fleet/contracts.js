@@ -59,6 +59,9 @@ export const DEFAULTS = Object.freeze({
   idleReportMaxAgeMs: 6 * 60 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
   lbErrorFreshMs: 15 * MIN,
+  // Connection/unavailable errors seen in chats alarm only at this count (or
+  // across two threads); one dropped stream is routine.
+  lbTransientErrorMin: 3,
   managerEscalationCooldownMs: 60 * MIN,
   // An idle thread with no delivery route waits this long before the owner
   // is asked to open it.

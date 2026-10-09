@@ -27,6 +27,11 @@ const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // does nothing for them.
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
+// A single dropped stream or timeout in one chat is routine, not an outage: on
+// 2026-10-09 "1x connection" escalated "Codex LB needs a look" while the LB's
+// own probe said healthy=yes. These kinds alarm only when corroborated.
+const LB_TRANSIENT_KINDS = new Set(["connection", "unavailable"]);
+const LB_TRANSIENT_MIN = 3;
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };
 const KIND_NAMES = { codex: "Codex", claude: "Claude", conductor: "Conductor" };
 // Thread-level and infra-level escalations of one incident share a cooldown.
@@ -611,6 +616,14 @@ function lastPlaybookAt(ledger, playbookId) {
 
 // Shared by decideInfra and the supervisor (which records `down` per tick
 // with store.setInfraDown so the next tick can see a recovery).
+// Transient kinds need several hits or more than one thread, unless the LB's
+// own probe already says it is unhealthy. no-accounts and auth are never noise.
+function corroborated(entry, lb, limits) {
+  if (!LB_TRANSIENT_KINDS.has(entry.kind) || lb?.healthy === false) return true;
+  const min = limits.lbTransientErrorMin ?? LB_TRANSIENT_MIN;
+  return Number(entry.count) >= min || (entry.threadIds?.length ?? 0) >= 2;
+}
+
 export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
   const limits = limitsOf(config);
   const bb3 = infra?.bb3 ?? null;
@@ -630,7 +643,8 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
   // The log window is an hour; only recent rows say the LB is down now.
   const freshMs = limits.lbErrorFreshMs ?? LB_ERROR_FRESH_MS;
   const lbErrors = (lb?.recentErrors ?? []).filter((entry) => LB_ALARM_KINDS.has(entry.kind) && Number(entry.count) > 0
-    && isFresh(entry.lastAt, freshMs, now));
+    && isFresh(entry.lastAt, freshMs, now)
+    && corroborated(entry, lb, limits));
   const lbProblems = [];
   if (lb?.healthy === false) lbProblems.push(`LB unhealthy${lb.detail ? ` (${fact(lb.detail, 80)})` : ""}`);
   for (const entry of lbErrors) lbProblems.push(`${Number(entry.count)}x ${entry.kind}`);
