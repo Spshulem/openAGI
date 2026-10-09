@@ -205,8 +205,10 @@ export class MemorySystem {
         const hits = item.tags.filter((t) => queryTags.has(String(t).toLowerCase())).length;
         if (hits > 0) dangerBoost = 0.25 * (item.dangerLevel ?? 0);
       }
-      // Principle boost: distilled principles get a small edge in long-tier recall.
-      const principleBoost = item.kind === "principle" ? 0.1 : 0;
+      // Rank relevant principles higher, but never use the kind alone as
+      // evidence of relevance: false hits also gain strength and recall credit.
+      // Explicit risk-tag matches remain valid even without lexical overlap.
+      const principleBoost = item.kind === "principle" && (textScore > 0 || dangerBoost > 0) ? 0.1 : 0;
       // Corrections outrank whatever they replaced; fidelity finally feeds the
       // ranking ("the hourglass on the spider"): specific-fidelity items edge
       // out generic ones when both match. Gated on a real text match so
