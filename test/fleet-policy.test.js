@@ -693,6 +693,16 @@ test("F5: stale LB log rows do not keep the LB down", () => {
   assert.equal(infraHealth({ bb3: bb3Base, lb: stale }, { config: { limits: noFresh }, now: NOW }).lb.down, false);
 });
 
+test("queued full runs are not counted as slow", () => {
+  const runs = [
+    { kind: "full", pr: 1, ageSec: 80 * 60, queued: false },
+    { kind: "full", pr: 2, ageSec: 120 * 60, queued: true },
+    { kind: "full", pr: 3, ageSec: 40 * 60, queued: false }
+  ];
+  const health = infraHealth({ bb3: { ...bb3Base, runs }, lb: lbOk }, { config, now: NOW });
+  assert.deepEqual(health.bb3.slow.full.map((run) => run.pr), [1]);
+});
+
 test("one dropped stream in one chat does not page the LB manager", () => {
   // 2026-10-09: "1x connection" escalated while the LB probe said healthy=yes.
   const lb = (errors, healthy = true) => ({ healthy, detail: "200", watchLine: null, recentErrors: errors });

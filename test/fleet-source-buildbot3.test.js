@@ -363,3 +363,30 @@ test("an SSH probe cut off after the first marker is unknown, never reachable", 
   assert.equal(bb3.gate.state, "blocked", "the last known gate state carries over");
   assert.ok(bb3.error);
 });
+
+test("queued full runs are aged and judged apart from running ones", () => {
+  // ps etimes counts the wait in the queue; only the slot holder is running.
+  const text = [
+    "@@ps",
+    "  100     1  2400 python3 /home/dev/bin/bb-verify --full --pr 7321",
+    "  200     1  1800 python3 /home/dev/bin/bb-verify --full --pr 7447",
+    "  300     1  9000 python3 /home/dev/bin/bb-verify --full --pr 7210",
+    "@@out", "@@slots",
+    "100 2200",
+    "300 900000",
+    "@@full", "2", "@@quick", "0", "@@gate", "{}", "@@load", "1 1 1 1/1 1", "@@timers", "@@end"
+  ].join("\n");
+  const runs = Object.fromEntries(parseBb3Probe(text, NOW).runs.map((run) => [run.pr, run]));
+  assert.equal(runs[7321].queued, false);
+  assert.equal(runs[7321].ageSec, 2200);
+  assert.equal(runs[7447].queued, true);
+  // A record older than its process belongs to a recycled pid.
+  assert.equal(runs[7210].queued, true);
+});
+
+test("an older probe without a slots section keeps process ages", () => {
+  const text = ["@@ps", "  100     1  2400 python3 /home/dev/bin/bb-verify --full --pr 7321", "@@out", "@@end"].join("\n");
+  const [run] = parseBb3Probe(text, NOW).runs;
+  assert.equal(run.queued, undefined);
+  assert.equal(run.ageSec, 2400);
+});

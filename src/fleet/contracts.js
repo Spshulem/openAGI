@@ -50,6 +50,10 @@ export const DEFAULTS = Object.freeze({
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
+  // A run holding a BuildBot3 slot is slow only past this. Runs take 17-35 min
+  // (2026-10-09) and bb-verify kills one at 90; the 30-min thread-wait limit
+  // paged the BB3 manager about normal runs.
+  fullRunSlowMs: 75 * MIN,
   quickVerifyEscalateMs: 15 * MIN,
   waitingTaskMaxMs: 45 * MIN,
   // No transcript row this long: a Conductor "working" turn is hung, and a

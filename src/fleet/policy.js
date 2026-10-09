@@ -636,7 +636,7 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
   if (bb3?.gate?.state === "blocked" && gateMs !== null && gateMs >= limits.gateBlockedEscalateMs) {
     bb3Problems.push(`gate blocked ${minutes(gateMs)}m${bb3.gate.reason ? ` (${clampText(bb3.gate.reason, 80)})` : ""}`);
   }
-  if (slow.full.length) bb3Problems.push(`${slow.full.length} full verify >${minutes(limits.fullVerifyEscalateMs)}m`);
+  if (slow.full.length) bb3Problems.push(`${slow.full.length} full verify >${minutes(fullRunSlow(limits))}m`);
   if (slow.quick.length) bb3Problems.push(`${slow.quick.length} bb-quick >${minutes(limits.quickVerifyEscalateMs)}m`);
   if (bb3?.timersDead?.length) bb3Problems.push(`timers dead: ${bb3.timersDead.map((name) => fact(name, 40)).join(", ")}`);
 
@@ -792,12 +792,15 @@ function infraDecision(key, patch) {
   };
 }
 
+const fullRunSlow = (limits) => limits.fullRunSlowMs ?? 75 * MIN;
+
 function slowRuns(bb3, limits) {
   const runs = Array.isArray(bb3?.runs) ? bb3.runs : [];
   const ageMs = (run) => Number(run?.ageSec) * 1000;
   const oldestFirst = (a, b) => ageMs(b) - ageMs(a);
   return {
-    full: runs.filter((run) => run?.kind === "full" && ageMs(run) >= limits.fullVerifyEscalateMs).sort(oldestFirst),
+    // Queued runs are waiting their turn, not slow.
+    full: runs.filter((run) => run?.kind === "full" && !run.queued && ageMs(run) >= fullRunSlow(limits)).sort(oldestFirst),
     quick: runs.filter((run) => run?.kind === "quick" && ageMs(run) >= limits.quickVerifyEscalateMs).sort(oldestFirst)
   };
 }

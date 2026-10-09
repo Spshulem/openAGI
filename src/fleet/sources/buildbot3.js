@@ -22,6 +22,10 @@ export const BB3_PROBE_SCRIPT = [
   'ls "$HOME/.bb-ci/quick/queue" 2>/dev/null | wc -l',
   'echo "@@full"',
   'ls "$HOME/.bb-ci/canonical-verification/queue" 2>/dev/null | wc -l',
+  // Runs holding a verification slot, aged from admission. A process's own age
+  // includes its wait in the queue, which read as "slow" for every queued run.
+  'echo "@@slots"',
+  `python3 -c 'import glob,json,os,time;[print(d["pid"],int(time.time()-d["created_at"])) for d in (json.load(open(f)) for f in glob.glob(os.path.expanduser("~/.bb-ci/canonical-verification/run-*/ownership.json"))) if d.get("state")=="running" and d.get("pid") and d.get("created_at")]' 2>/dev/null`,
   'echo "@@gate"',
   'cat "$HOME/.bb-ci/gate-status.json" 2>/dev/null',
   "echo",
@@ -173,7 +177,19 @@ function describeRun(leaf, chain, targets) {
 
 // Wrappers (bash -c, timeout) and the python process they start all match;
 // each run is reported once, as the deepest matching process.
-function collectRuns(processes, targets) {
+// pid -> seconds since admission, from bb-verify's own run records. null when
+// the probe had no slots section (an older probe), so ages fall back to ps.
+function parseSlots(lines) {
+  if (!lines) return null;
+  const slots = new Map();
+  for (const line of lines) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (match) slots.set(Number(match[1]), Number(match[2]));
+  }
+  return slots;
+}
+
+function collectRuns(processes, targets, slots = null) {
   const hasMatchingChild = new Set();
   for (const proc of processes.values()) if (processes.has(proc.ppid)) hasMatchingChild.add(proc.ppid);
   const runs = [];
@@ -187,7 +203,15 @@ function collectRuns(processes, targets) {
       seen.add(parent.pid);
       parent = processes.get(parent.ppid);
     }
-    runs.push(describeRun(leaf, chain, targets));
+    const run = describeRun(leaf, chain, targets);
+    if (slots && run.kind === "full") {
+      // A full run without a running record is still waiting for a slot. A
+      // record older than the process is a stale one whose pid was reused.
+      const admitted = slots.get(leaf.pid);
+      run.queued = admitted === undefined || admitted > leaf.ageSec + 60;
+      if (!run.queued) run.ageSec = admitted;
+    }
+    runs.push(run);
   }
   return runs.sort((a, b) => b.ageSec - a.ageSec || a.pid - b.pid);
 }
@@ -216,7 +240,7 @@ export function parseBb3Probe(text, now = Date.now()) {
     fullQueue: parseCount(sections.get("full")),
     quickQueue: parseCount(sections.get("quick")),
     load: parseLoad(sections.get("load")),
-    runs: collectRuns(parseProcesses(sections.get("ps")), parseStdoutTargets(sections.get("out"))),
+    runs: collectRuns(parseProcesses(sections.get("ps")), parseStdoutTargets(sections.get("out")), parseSlots(sections.get("slots"))),
     timersDead: parseTimersDead((sections.get("timers") ?? []).join("\n")),
     error: sections.has("end") ? null : "probe output incomplete"
   };
