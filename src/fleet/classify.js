@@ -88,7 +88,7 @@ const NEED_YOU_PATTERNS = [
   /\bwhich (?:one|option|do you|would you)\b/i,
   /\bplease confirm\b/i,
   /\b(?:blocked|waiting) on you\b/i,
-  /\byou must do\b(?!\W{0,3}(?:none|nothing)\b)/i,
+  /\byou must do\b(?![\W_]{0,8}(?:none|nothing|n\/a)\b)/i,
   /\bstill need your\b/i,
   /\bblocked on\W{0,3}(?:you|your|the owner)\b/i
 ];
@@ -107,7 +107,7 @@ export const PROMISED_WORK_PATTERNS = Object.freeze([
 ]);
 
 // Reports that mention "you" but ask for nothing.
-const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b|\bnothing (?:that )?you (?:must|need to|have to) do\b/i;
+const NOT_ASK = /\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bnothing needs you\b|\bno action (?:needed|required)\b|\byou\W{0,3}nothing\b|\bnothing (?:that )?you (?:must|need to|have to) do\b|\b(?:nothing|not|isn't|is not|no longer|never)\b[^.?!\n]{0,30}\bblocked on\b/i;
 const CHOICE_WORDS = /\bwhich\b|\bpick\b|\bchoose\b|\boption\b|\bor\b/i;
 
 const BB3_DOWN_PATTERNS = [
@@ -118,9 +118,6 @@ const BB3_DOWN_PATTERNS = [
 const BLOCKED_ON_OWNER_ASK = Object.freeze({ topic: "approval", text: "Blocked on a permission prompt or dialog.", options: Object.freeze(["opened", "later"]) });
 
 const STOPPED = new Set(["aborted", "stalled", "error"]);
-// Errors a resume only repeats: a missing workspace, a lost session, a full
-// context window, a failed login.
-const UNRECOVERABLE_ERROR = /workspace directory missing|no conversation found|prompt is too long|context (?:window|length|limit)|failed to authenticate|credit balance/i;
 const PR_DONE = new Set(["MERGED", "CLOSED"]);
 const CI_RED = new Set(["FAILURE", "ERROR"]);
 const CI_RUNNING = new Set(["PENDING", "EXPECTED"]);
@@ -278,17 +275,12 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
     if (readiness.blockers.length) return result("pr-not-ready", readiness.blockers.join("; "), { blockers: readiness.blockers });
     return result("ready-needs-human", readiness.onlyHumanLeft ? "only a human approval left" : "ready; merge is the owner's");
   }
-  // A PR this thread links that could not be read: judge nothing by it.
-  const prKnown = Boolean(pr) || !thread.prRefs?.length;
-  // A turn that ended on an error no infra kind explains (a tool crash, a
-  // dropped stream), on a thread with no PR at all, is mid-work: it gets a
-  // resume, not silence. Errors a resume repeats stay with the owner.
-  if (thread.agentStatus === "error" && !pr && prKnown && !UNRECOVERABLE_ERROR.test(String(thread.error?.text ?? ""))) {
-    return result("stopped", "turn ended on an error");
-  }
   // The agent spoke last and stopped: did it say it would keep going? Only
-  // with no PR, or after its PR merged (a closed one was dropped).
-  const idle = text && prKnown && (!pr || pr.state === "MERGED") ? { promised: promisedWork(text) } : null;
+  // when its PR is known: none (looked up, or nothing to look up), or merged
+  // (a closed one was dropped). An unread or not-yet-looked-up PR decides
+  // nothing.
+  const prKnown = pr ? pr.state === "MERGED" : !thread.prRefs?.length && (!thread.branch || thread.prLookedUp === true);
+  const idle = text && prKnown && thread.agentStatus !== "error" ? { promised: promisedWork(text) } : null;
   if (pr && PR_DONE.has(pr.state)) return result("done", `PR ${pr.state.toLowerCase()}`, idle ? { idle } : {});
   return result("idle-no-pr", thread.prRefs?.length ? "PR state unknown" : "no PR", idle ? { idle } : {});
 }
@@ -393,8 +385,11 @@ function waitSignal(thread, text, now) {
   return null;
 }
 
-// The owner holds the next step: an offer, a go, a pick, an approval.
-const OWNER_GATE = /^(?:if|when you|should you|let me know|happy to|want me to|you)\b|\byou(?:r)?\b|\b(?:tell|ping|let|show|send|give) me\b|\bsay\s+(?:["\u201c'*]|go\b|yes\b|the word\b)|\bI need\b|\b(?:once|after|when|until) (?:he|she|they|the owner|spencer)\b|\b(?:pick|choose)\b|\b(?:name|confirm|approve)\s+(?:them|one|it|which)\b/i;
+// The owner holds a step, anywhere in the message: an offer, a go, a pick,
+// an approval, a login, anything addressed to "you".
+const OWNER_GATE = /\byou(?:r|rs|rself)?\b|\b(?:tell|ping|let|show|send|give) me\b|\bsay\s+(?:["\u201c'*]|go\b|yes\b|continue\b|the word\b)|\bI need\b|\bplease\b|\b(?:once|after|when|until) (?:he|she|they|the owner|spencer)\b|\b(?:pick|choose)\b|\b(?:name|confirm|approve)\s+(?:them|one|it|which)\b|\bdecisions?\b|(?:^|\n)[\W_]*(?:do|action|owner|todo|to-do)[\W_]*:/i;
+// An offer ("If you want, I'll...") is not a promise.
+const CONDITIONAL = /^(?:if|when|should|let me know|happy to|want me to)\b/i;
 // Steps that leave the agent's own branch: never pushed by a nudge.
 const OWNER_STEP = /\b(?:merg(?:e|es|ed|ing)|releas(?:e|es|ed|ing)|deploy\w*|publish\w*|promot\w*|ship(?:s|ping)?|upload\w*|e-?mail\w*|post(?:s|ing)? (?:it|this|them|to)|send (?:it|this|them|the|an?)|customers?|invoice\w*|tag(?:ging)? (?:a |the )?(?:release|version))\b/i;
 // A report, not a plan: test results, finished work, a bug description.
@@ -408,12 +403,15 @@ function closingSentences(text) {
     .slice(-3);
 }
 
-// One of the closing sentences promises more of the agent's own work, and
-// none of them waits on the owner or names an owner-only step.
+// One of the closing sentences promises more of the agent's own work; no
+// closing sentence is a question; and nothing in the message waits on the
+// owner or names an owner-only step.
 function promisedWork(text) {
-  const closing = closingSentences(text);
-  if (closing.some((sentence) => OWNER_GATE.test(sentence) || OWNER_STEP.test(sentence) || OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(sentence)))) return false;
-  return closing.some((sentence) => !REPORTED.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)));
+  const plain = String(text).replace(/[\u2018\u2019]/g, "'");
+  if (OWNER_GATE.test(plain) || OWNER_STEP.test(plain) || OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(plain))) return false;
+  const closing = closingSentences(plain);
+  if (closing.some((sentence) => /\?\W*$/.test(sentence))) return false;
+  return closing.some((sentence) => !CONDITIONAL.test(sentence) && !REPORTED.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)));
 }
 
 function oldestTask(tasks) {

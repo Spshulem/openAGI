@@ -193,7 +193,7 @@ test("row: an agent silent an hour on a background wait is asked for a status", 
 
 test("row: an agent that said it would keep going and stopped gets idle-report", () => {
   // bullard: "Running the full audit: ..." and then nothing for hours.
-  const promised = makeThread({ prRefs: [], lastAgentText: "Running the full audit: PEEC, the Answer Pages, YouTube, Reddit, and the blog.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
+  const promised = makeThread({ prRefs: [], prLookedUp: true, lastAgentText: "Running the full audit: PEEC, the Answer Pages, YouTube, Reddit, and the blog.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) });
   const nudged = run(promised, { pr: null }).decision;
   assert.equal(nudged.state, "idle-no-pr");
   assert.equal(nudged.action, "nudge");
@@ -213,22 +213,30 @@ test("row: an agent that said it would keep going and stopped gets idle-report",
     "Both are in their pre-push checks. Next: push, CI, merge, release, then add Hayden.",
     "**You:** bring BuildBot3 back, then tell me. I'll run the full verification there.",
     "Final review is in:\n- Back loses the screen filter.\n- Starting a replay at a negative time isn't blocked.",
-    "Status: PR merged, CI green. Next: nothing. Blocked on: nothing."
+    "Status: PR merged, CI green. Next: nothing. Blocked on: nothing.",
+    "1. Asking Slack for upload permission isn't behind the flag. OK? Next: a live test in the test workspace. Go?",
+    "Your Mac disk is now completely full. Free some space and say \"continue\". I'll clean them up when the work finishes.",
+    "The mini is locked. Please unlock it and leave its desktop visible. I'll then enable Automation and rerun the test."
   ]) {
-    const held = run(makeThread({ prRefs: [], lastAgentText: text }), { pr: null }).decision;
+    const held = run(makeThread({ prRefs: [], prLookedUp: true, lastAgentText: text }), { pr: null }).decision;
     assert.notEqual(held.playbook, "idle-report", text);
   }
+  // A branch whose PR lookup has not answered yet decides nothing.
+  assert.equal(run(makeThread({ ...promised, prLookedUp: undefined }), { pr: null }).decision.action, "none");
   // A PR the owner closed is not resumed, and neither is a stop from yesterday.
   assert.equal(run(makeThread({ lastAgentText: "I'll act on the scan results next." }), { pr: makePr({ state: "CLOSED" }) }).decision.action, "none");
   assert.equal(run(makeThread({ ...promised, lastAgentAt: ago(8 * 60 * MIN), lastActivityAt: ago(8 * 60 * MIN) }), { pr: null }).decision.action, "none");
-  // Twice a day at most, whatever the progress mark says.
+  // Twice a day at most, whatever the progress mark says; blocked sends
+  // (the owner was typing) do not count.
   const today = { nudges: [ago(3 * 60 * MIN), ago(2 * 60 * MIN)].map((at) => ({ at, playbook: "idle-report", route: "computer-use", status: "sent" })) };
   assert.equal(run(promised, { pr: null, ledger: today }).decision.action, "none");
+  const blocked = { nudges: [1, 2, 3].map((n) => ({ at: ago(n * 5 * MIN), playbook: "idle-report", route: "computer-use", status: "blocked" })) };
+  assert.equal(run(promised, { pr: null, ledger: blocked }).decision.playbook, "idle-report");
   // Not before the idle window, not on a finished report, not on an offer,
   // and not after the owner spoke last.
   assert.equal(run(makeThread({ ...promised, lastAgentAt: ago(5 * MIN), lastActivityAt: ago(5 * MIN) }), { pr: null }).decision.action, "wait");
   for (const text of ["Done. The report is attached; nothing else is needed.", "If you want, I'll also add dark mode."]) {
-    const left = run(makeThread({ prRefs: [], lastAgentText: text }), { pr: null }).decision;
+    const left = run(makeThread({ prRefs: [], prLookedUp: true, lastAgentText: text }), { pr: null }).decision;
     assert.equal(left.action, "none", text);
   }
   const ownerLast = run(makeThread({ ...promised, lastUserText: "hold on", lastUserAt: ago(20 * MIN) }), { pr: null }).decision;
@@ -239,19 +247,10 @@ test("row: an agent that said it would keep going and stopped gets idle-report",
   assert.notEqual(stopped.action, "nudge");
 });
 
-test("row: an agent that ended its turn on an error with no PR is resumed, a few times a day", () => {
-  const thread = makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text: "stream dropped", resetAt: null } });
-  const crashed = run(thread, { pr: null }).decision;
-  assert.equal(crashed.state, "stopped");
-  assert.equal(crashed.playbook, "resume");
-  const resumed = { nudges: [3, 2, 1].map((h) => ({ at: ago(h * 60 * MIN), playbook: "resume", route: "computer-use", status: "sent" })) };
-  assert.equal(run(thread, { pr: null, ledger: resumed }).decision.action, "none");
-  // Errors a resume repeats, and threads whose PR is merged, closed or unreadable, are left alone.
-  for (const text of ["Workspace directory missing: /w/missoula", "Failed to authenticate: OAuth session expired", "Prompt is too long", "No conversation found with session ID x"]) {
-    assert.equal(run(makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text, resetAt: null } }), { pr: null }).decision.action, "none", text);
-  }
-  assert.equal(run(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: makePr({ state: "MERGED" }) }).decision.state, "done");
-  assert.equal(run(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: null }).decision.action, "none", "PR linked but unreadable");
+test("row: a turn that ended on an unexplained error is not resumed", () => {
+  // Credits, model and limit texts are not classified yet: a resume repeats them.
+  const crashed = run(makeThread({ prRefs: [], prLookedUp: true, agentStatus: "error", error: { kind: "other", text: "Fable 5 requires usage credits.", resetAt: null } }), { pr: null }).decision;
+  assert.equal(crashed.action, "none");
 });
 
 test("row: a text wait that outlives any CI run gets a status check", () => {

@@ -144,10 +144,6 @@ test("classifyThread: infra errors, codex-lb log errors, and BuildBot3-down text
   assert.equal(limit.infraKind, "session-limit");
   // "other" errors are not infra: the PR state decides.
   assert.equal(classify(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } })).state, "ready-needs-human");
-  // With no PR at all, a turn that ended on an error gets a resume.
-  const crashed = classify(makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: null });
-  assert.equal(crashed.state, "stopped");
-  assert.equal(crashed.reason, "turn ended on an error");
   const codex = makeThread({ key: "codex:x1", kind: "codex", id: "x1", agentStatus: "stalled" });
   const infra = { lb: { healthy: false, recentErrors: [{ kind: "connection", count: 12, lastAt: ago(MIN), threadIds: ["x1"] }] } };
   const lb = classify(codex, { infra });
@@ -161,7 +157,7 @@ test("classifyThread: infra errors, codex-lb log errors, and BuildBot3-down text
 test("classifyThread: owner to-dos and blockers reach the owner; their negations do not", () => {
   const asks = ["**You must do:** tell me which PR this is.", "I still need your OK on the schema change.", "Pushed. Blocked on: your approval for the deploy."];
   for (const text of asks) assert.equal(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
-  for (const text of ["Report written. Nothing you must do.", "You must do: none.", "Pushed the fix. Blocked on: nothing."]) {
+  for (const text of ["Report written. Nothing you must do.", "You must do: none.", "**You must do:** nothing.", "Pushed the fix. Blocked on: nothing.", "Nothing here is blocked on your domain decision."]) {
     assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
   }
 });

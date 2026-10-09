@@ -160,7 +160,6 @@ function makeContext(classified, thread, options) {
 
 const DAY_MS = 24 * 60 * MIN;
 const IDLE_REPORT_DAILY_MAX = 2;
-const ERROR_RESUME_DAILY_MAX = 3;
 
 function intentFor(ctx) {
   const { classified } = ctx;
@@ -173,7 +172,7 @@ function intentFor(ctx) {
     case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
-    case "stopped": return stoppedIntent(ctx);
+    case "stopped": return nudge("resume", classified.reason);
     // It said it would keep going ("Next: ...", "merging once they pass"),
     // then its turn ended: nothing wakes it but a nudge. A finished report
     // is left alone.
@@ -181,17 +180,6 @@ function intentFor(ctx) {
     case "done": return idleIntent(ctx);
     default: return { type: "none", reason: classified.reason };
   }
-}
-
-// A crash-ended turn gets a few resumes a day at most: one that flips
-// between crashing and idling resets its progress mark each time.
-function stoppedIntent(ctx) {
-  const { classified, ledger, now } = ctx;
-  if (classified.reason === "turn ended on an error") {
-    const resumes = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "resume" && now - Date.parse(entry.at) < DAY_MS).length;
-    if (resumes >= ERROR_RESUME_DAILY_MAX) return { type: "none", reason: `${classified.reason}; resumed ${resumes} times today` };
-  }
-  return nudge("resume", classified.reason);
 }
 
 function idleIntent(ctx) {
@@ -202,7 +190,8 @@ function idleIntent(ctx) {
   if (quietMs === null || quietMs > limits.idleReportMaxAgeMs) return { type: "none", reason: classified.reason };
   // A daily cap, whatever its progress mark says: a shared checkout's head
   // moves with other agents' commits.
-  const sentToday = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "idle-report" && now - Date.parse(entry.at) < DAY_MS).length;
+  // Deliveries only: a send blocked while the owner types is no nudge.
+  const sentToday = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "idle-report" && entry.status === "sent" && now - Date.parse(entry.at) < DAY_MS).length;
   if (sentToday >= IDLE_REPORT_DAILY_MAX) return { type: "none", reason: `${classified.reason}; idle-report sent ${sentToday} times today` };
   return nudge("idle-report", "said it would keep going, then stopped");
 }
