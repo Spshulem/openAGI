@@ -144,8 +144,8 @@ test("classifyThread: infra errors, codex-lb log errors, and BuildBot3-down text
   assert.equal(limit.infraKind, "session-limit");
   // "other" errors are not infra: the PR state decides.
   assert.equal(classify(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } })).state, "ready-needs-human");
-  // With no open PR to judge it by, a turn that ended on an error gets a resume.
-  const crashed = classify(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: null });
+  // With no PR at all, a turn that ended on an error gets a resume.
+  const crashed = classify(makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: null });
   assert.equal(crashed.state, "stopped");
   assert.equal(crashed.reason, "turn ended on an error");
   const codex = makeThread({ key: "codex:x1", kind: "codex", id: "x1", agentStatus: "stalled" });
@@ -156,6 +156,14 @@ test("classifyThread: infra errors, codex-lb log errors, and BuildBot3-down text
   const bb3 = classify(makeThread({ lastAgentText: "BuildBot3 is unreachable: SSH and ping both time out. I'll retry when it is back." }));
   assert.equal(bb3.state, "infra-blocked");
   assert.equal(bb3.infraKind, "bb3");
+});
+
+test("classifyThread: owner to-dos and blockers reach the owner; their negations do not", () => {
+  const asks = ["**You must do:** tell me which PR this is.", "I still need your OK on the schema change.", "Pushed. Blocked on: your approval for the deploy."];
+  for (const text of asks) assert.equal(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
+  for (const text of ["Report written. Nothing you must do.", "You must do: none.", "Pushed the fix. Blocked on: nothing."]) {
+    assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
+  }
 });
 
 test("classifyThread: waiting on CI from a background task or from the agent's last words", () => {

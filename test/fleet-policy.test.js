@@ -198,12 +198,32 @@ test("row: an agent that said it would keep going and stopped gets idle-report",
   assert.equal(nudged.state, "idle-no-pr");
   assert.equal(nudged.action, "nudge");
   assert.equal(nudged.playbook, "idle-report");
-  assert.match(nudged.message, /Continue with that next step now/);
-  // cape-town: its tracked PR merged, but it said merging starts once checks pass.
+  assert.match(nudged.message, /continue it now\. If it needs the owner, stop/);
+  // After its PR merged, own follow-up work it promised still counts.
   const merged = makePr({ state: "MERGED" });
-  const afterMerge = run(makeThread({ lastAgentText: "All five full checks are running. Merging in order starts once they pass.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) }), { pr: merged }).decision;
+  const afterMerge = run(makeThread({ lastAgentText: "The import scan is still running. I'll act on its results.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) }), { pr: merged }).decision;
   assert.equal(afterMerge.state, "done");
   assert.equal(afterMerge.playbook, "idle-report");
+  // Never toward an owner's step or past an owner's go (real finals).
+  for (const text of [
+    "All five full checks are running. Merging in order starts once they pass, then the staging release and QA.",
+    "4. Staging deploy running\n5. Next: promote to production/v1.198.0",
+    "Bring the Studio window to the front and say \"go\". I'll paste the SEO description and publish it.",
+    "Once you approve, I'll merge it.",
+    "Both are in their pre-push checks. Next: push, CI, merge, release, then add Hayden.",
+    "**You:** bring BuildBot3 back, then tell me. I'll run the full verification there.",
+    "Final review is in:\n- Back loses the screen filter.\n- Starting a replay at a negative time isn't blocked.",
+    "Status: PR merged, CI green. Next: nothing. Blocked on: nothing."
+  ]) {
+    const held = run(makeThread({ prRefs: [], lastAgentText: text }), { pr: null }).decision;
+    assert.notEqual(held.playbook, "idle-report", text);
+  }
+  // A PR the owner closed is not resumed, and neither is a stop from yesterday.
+  assert.equal(run(makeThread({ lastAgentText: "I'll act on the scan results next." }), { pr: makePr({ state: "CLOSED" }) }).decision.action, "none");
+  assert.equal(run(makeThread({ ...promised, lastAgentAt: ago(8 * 60 * MIN), lastActivityAt: ago(8 * 60 * MIN) }), { pr: null }).decision.action, "none");
+  // Twice a day at most, whatever the progress mark says.
+  const today = { nudges: [ago(3 * 60 * MIN), ago(2 * 60 * MIN)].map((at) => ({ at, playbook: "idle-report", route: "computer-use", status: "sent" })) };
+  assert.equal(run(promised, { pr: null, ledger: today }).decision.action, "none");
   // Not before the idle window, not on a finished report, not on an offer,
   // and not after the owner spoke last.
   assert.equal(run(makeThread({ ...promised, lastAgentAt: ago(5 * MIN), lastActivityAt: ago(5 * MIN) }), { pr: null }).decision.action, "wait");
@@ -219,10 +239,19 @@ test("row: an agent that said it would keep going and stopped gets idle-report",
   assert.notEqual(stopped.action, "nudge");
 });
 
-test("row: an agent that ended its turn on an error with no open PR is resumed", () => {
-  const crashed = run(makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text: "stream dropped", resetAt: null } }), { pr: null }).decision;
+test("row: an agent that ended its turn on an error with no PR is resumed, a few times a day", () => {
+  const thread = makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text: "stream dropped", resetAt: null } });
+  const crashed = run(thread, { pr: null }).decision;
   assert.equal(crashed.state, "stopped");
   assert.equal(crashed.playbook, "resume");
+  const resumed = { nudges: [3, 2, 1].map((h) => ({ at: ago(h * 60 * MIN), playbook: "resume", route: "computer-use", status: "sent" })) };
+  assert.equal(run(thread, { pr: null, ledger: resumed }).decision.action, "none");
+  // Errors a resume repeats, and threads whose PR is merged, closed or unreadable, are left alone.
+  for (const text of ["Workspace directory missing: /w/missoula", "Failed to authenticate: OAuth session expired", "Prompt is too long", "No conversation found with session ID x"]) {
+    assert.equal(run(makeThread({ prRefs: [], agentStatus: "error", error: { kind: "other", text, resetAt: null } }), { pr: null }).decision.action, "none", text);
+  }
+  assert.equal(run(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: makePr({ state: "MERGED" }) }).decision.state, "done");
+  assert.equal(run(makeThread({ agentStatus: "error", error: { kind: "other", text: "boom", resetAt: null } }), { pr: null }).decision.action, "none", "PR linked but unreadable");
 });
 
 test("row: a text wait that outlives any CI run gets a status check", () => {
@@ -231,12 +260,12 @@ test("row: a text wait that outlives any CI run gets a status check", () => {
   const stale = run(makeThread(waiting), { pr: makePr({ state: "MERGED" }) }).decision;
   assert.equal(stale.playbook, "status-check");
   assert.match(stale.message, /CI on a PR this thread does not track/);
-  // An open PR still pending after an hour.
+  // A post-merge note, and an open PR whose CI is still pending (ci-finished
+  // wakes it), keep waiting.
+  const note = run(makeThread({ ...waiting, lastAgentText: "Merged #6522. CI is running on main; nothing needed from you." }), { pr: makePr({ state: "MERGED" }) }).decision;
+  assert.equal(note.action, "wait");
   const pending = run(makeThread(waiting), { pr: makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } }) }).decision;
-  assert.equal(pending.playbook, "status-check");
-  // Under an hour it waits.
-  const fresh = run(makeThread({ ...waiting, lastAgentAt: ago(20 * MIN), lastActivityAt: ago(20 * MIN) }), { pr: makePr({ ci: { state: "PENDING", failing: [], pending: ["verification"] } }) }).decision;
-  assert.equal(fresh.action, "wait");
+  assert.equal(pending.action, "wait");
 });
 
 test("row: local-verify gets the no-local-verify nudge right away", () => {

@@ -158,6 +158,10 @@ function makeContext(classified, thread, options) {
   };
 }
 
+const DAY_MS = 24 * 60 * MIN;
+const IDLE_REPORT_DAILY_MAX = 2;
+const ERROR_RESUME_DAILY_MAX = 3;
+
 function intentFor(ctx) {
   const { classified } = ctx;
   switch (classified.state) {
@@ -169,14 +173,38 @@ function intentFor(ctx) {
     case "asked-in-scope": return isManager(ctx) ? agentAskIntent(ctx) : nudge("in-scope-yes", "agent asked to do an in-scope step");
     case "pr-not-ready": return prIntent(ctx);
     case "ready-needs-human": return readyIntent(ctx);
-    case "stopped": return nudge("resume", classified.reason);
+    case "stopped": return stoppedIntent(ctx);
     // It said it would keep going ("Next: ...", "merging once they pass"),
     // then its turn ended: nothing wakes it but a nudge. A finished report
     // is left alone.
     case "idle-no-pr":
-    case "done": return classified.idle?.promised ? nudge("idle-report", "said it would keep going, then stopped") : { type: "none", reason: classified.reason };
+    case "done": return idleIntent(ctx);
     default: return { type: "none", reason: classified.reason };
   }
+}
+
+// A crash-ended turn gets a few resumes a day at most: one that flips
+// between crashing and idling resets its progress mark each time.
+function stoppedIntent(ctx) {
+  const { classified, ledger, now } = ctx;
+  if (classified.reason === "turn ended on an error") {
+    const resumes = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "resume" && now - Date.parse(entry.at) < DAY_MS).length;
+    if (resumes >= ERROR_RESUME_DAILY_MAX) return { type: "none", reason: `${classified.reason}; resumed ${resumes} times today` };
+  }
+  return nudge("resume", classified.reason);
+}
+
+function idleIntent(ctx) {
+  const { classified, thread, ledger, limits, now } = ctx;
+  if (!classified.idle?.promised) return { type: "none", reason: classified.reason };
+  // Fresh stops only: an old thread's last words are history.
+  const quietMs = msSince(latest(thread.lastAgentAt, thread.lastActivityAt), now);
+  if (quietMs === null || quietMs > limits.idleReportMaxAgeMs) return { type: "none", reason: classified.reason };
+  // A daily cap, whatever its progress mark says: a shared checkout's head
+  // moves with other agents' commits.
+  const sentToday = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "idle-report" && now - Date.parse(entry.at) < DAY_MS).length;
+  if (sentToday >= IDLE_REPORT_DAILY_MAX) return { type: "none", reason: `${classified.reason}; idle-report sent ${sentToday} times today` };
+  return nudge("idle-report", "said it would keep going, then stopped");
 }
 
 function nudge(playbook, reason, extra = {}) {
@@ -285,11 +313,16 @@ function waitingIntent(ctx) {
   if (pr?.state === "OPEN" && !ci.state && age >= limits.waitingTaskMaxMs) return nudge("merge-ready", "no CI on head after waiting");
   if (!pr && age >= limits.waitingTaskMaxMs) return nudge("resume", `waited ${minutes(age)}m with nothing visible`);
   // The PR it is tracked by already merged or closed, so the CI it waits on
-  // is another PR's; or the wait has outlived any CI run. Ask where it is.
-  if (pr && pr.state !== "OPEN" && age >= limits.waitingTaskMaxMs) return statusCheck("CI on a PR this thread does not track", age);
-  if (age >= limits.silentTurnMs) return statusCheck("CI or a verify", age);
+  // is another PR's (it opened a new one): ask where it is. Not a post-merge
+  // note ("Merged. CI is running on main; nothing needed from you").
+  const text = String(thread.lastAgentText ?? "");
+  if (pr && pr.state !== "OPEN" && age >= limits.waitingTaskMaxMs && !POST_MERGE_NOTE.test(text)) {
+    return statusCheck("CI on a PR this thread does not track", age);
+  }
   return { type: "wait", reason: pr ? "CI still running" : wait.reason ?? "waiting" };
 }
+
+const POST_MERGE_NOTE = /\bmerged\b|\bnothing\b[^.?!\n]{0,25}\b(?:from|for) you\b|\bno action (?:needed|required)\b/i;
 
 function statusCheck(what, quietMs) {
   const quiet = minutes(quietMs);
