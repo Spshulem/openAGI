@@ -822,8 +822,13 @@ export class StorageManager {
         // The original first: something else at its path, or a failed
         // rename, keeps both it and the copy until the next pass.
         if (tomb && (await there(entry.from) || !(await fsp.rename(tomb, entry.from).then(() => true, () => false)))) continue;
-        // The card away or rm failing: try again next pass.
-        if (source.isInside(entry.to, paths.archiveDir) && (!sdOk || !(await this.rmTree(entry.to)).ok)) continue;
+        // The card away or rm failing: try again next pass. A copy whose
+        // inode was recorded is removed only if it is still that copy.
+        if (source.isInside(entry.to, paths.archiveDir)) {
+          if (!sdOk) continue;
+          const at = await fsp.lstat(entry.to).catch(() => null);
+          if (at && (!Number.isFinite(entry.ino) || at.ino === entry.ino) && !(await this.rmTree(entry.to)).ok) continue;
+        }
       }
       this.state.copying = (this.state.copying ?? []).filter((row) => row !== entry);
       this.save();
@@ -881,6 +886,8 @@ export class StorageManager {
       // A relative link to something outside would point elsewhere from the
       // card: such a folder stays where it is.
       if (before.outsideLinks) return no("has a relative link outside it");
+      // The card read just before the copy starts: the record's path is on it.
+      if (!(await this.refreshVolumes().then(() => this.sdOk(), () => false))) return no("SD card not verified");
       await fsp.mkdir(paths.archiveDir, { recursive: true });
       dest = await uniqueDest(paths.archiveDir, path.basename(item.path));
       // Recorded before the copy: a restart mid-copy leaves no orphan.
@@ -891,6 +898,9 @@ export class StorageManager {
       if (!copy.ok) return fail(`copy failed: ${copy.detail ?? "ditto"}`, dest);
       const after = await source.treeTotals(dest).catch(() => null);
       if (!after || after.bytes !== before.bytes || after.entries !== before.entries) return fail("copy check failed (bytes or file count)", dest);
+      // Recovery removes only this copy, not whatever sits at its path later.
+      const made = await fsp.lstat(dest).catch(() => null);
+      if (made) { record.ino = made.ino; this.save(); }
       // The copy can take a long time: anything written or opened meanwhile
       // keeps the original.
       const again = await source.treeTotals(item.path).catch(() => null);
@@ -899,9 +909,13 @@ export class StorageManager {
       if (source.openUnder(ctx.open, item.path)) return fail("opened during the copy", dest);
       if (this.getMode() !== "auto") return fail("left Auto", dest);
       // The card is read again: one swapped during the copy must not get the
-      // link. Its copy and record stay for when the known card is back.
+      // link. The copy may be on that other card, so nothing is removed: the
+      // record goes, the original stays.
       if (!(await this.refreshVolumes().then(() => this.sdOk(), () => false))) {
-        return { ok: false, failed: true, reason: "SD card not verified after the copy" };
+        this.state.copying = (this.state.copying ?? []).filter((row) => row !== record);
+        record = null;
+        this.save();
+        return { ok: false, failed: true, reason: clampText(`SD card not verified after the copy; copy left at ${dest}`, 160) };
       }
       const tomb = path.join(path.dirname(item.path), `${TOMBSTONE_PREFIX}${randomUUID().slice(0, 8)}`);
       // Recorded before the rename: a restart mid-swap puts the original back.

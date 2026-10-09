@@ -1341,8 +1341,28 @@ test("archive: a card swapped during the copy does not get the link", async (t) 
   await manager.requestScan();
   assert.equal(fs.lstatSync(big).isSymbolicLink(), false);
   assert.equal(fs.readFileSync(big, "utf8"), "v".repeat(10_000));
-  assert.equal(manager.state.copying.length, 1, "the copy waits for the known card");
+  // The copy may be on the other card: nothing is removed, the record goes.
+  const copy = path.join(env.sd, "OpenAGI-Archive", "Downloads", "a.mov");
+  assert.deepEqual(manager.state.copying, []);
   assert.ok(!fs.readdirSync(path.join(env.home, "Downloads")).some((name) => name.startsWith(".fleet-deleting-")));
+  write(path.join(env.sd, ".codex-xtra-volume-identity"), `volume_uuid=${UUID}\nvolume_name=Xtra\n`);
+  await manager.cleanTombstones();
+  assert.equal(exists(copy), true, "whatever sits at that path on the known card stays");
+});
+
+test("recovery removes a recorded copy only while it is still that copy", async (t) => {
+  const env = setup(t);
+  const manager = env.manager();
+  await manager.refreshVolumes();
+  const from = path.join(env.home, "Downloads", "a.mov");
+  const copy = write(path.join(env.sd, "OpenAGI-Archive", "Downloads", "a.mov"), "someone else's");
+  manager.state.copying = [{ from, to: copy, at: "x", ino: fs.lstatSync(copy).ino + 1 }];
+  await manager.cleanTombstones();
+  assert.equal(exists(copy), true, "another file at that path");
+  assert.deepEqual(manager.state.copying, []);
+  manager.state.copying = [{ from, to: copy, at: "x", ino: fs.lstatSync(copy).ino }];
+  await manager.cleanTombstones();
+  assert.equal(exists(copy), false, "the copy it made");
 });
 
 test("a rebuilt file deep in a build dir keeps it, at scan and at delete", async (t) => {
