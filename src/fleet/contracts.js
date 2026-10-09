@@ -157,7 +157,8 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     du: pick(["/usr/bin/du"], "du"),
     df: pick(["/bin/df"], "df"),
     ditto: pick(["/usr/bin/ditto"], "ditto"),
-    diskutil: pick(["/usr/sbin/diskutil"], "diskutil")
+    diskutil: pick(["/usr/sbin/diskutil"], "diskutil"),
+    rm: pick(["/bin/rm"], "rm")
   };
 }
 

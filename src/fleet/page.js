@@ -484,8 +484,10 @@ details.thread>summary{padding:0}
       var name = v.id === 'sd' ? 'SD card' : 'Disk';
       if (v.mounted === false) { pill(box, name, 'not mounted', 'dim'); return; }
       var free = typeof v.freeGb === 'number' ? v.freeGb : null;
-      var low = v.id === 'sd' ? 50 : 100;
-      var tone = free === null ? 'dim' : (v.id !== 'sd' && free < 15 ? 'hot' : (free < low ? 'warn' : 'good'));
+      // low and critical come from the manager's live thresholds.
+      var low = typeof v.low === 'boolean' ? v.low : free !== null && free < (v.id === 'sd' ? 50 : 100);
+      var critical = typeof v.critical === 'boolean' ? v.critical : v.id !== 'sd' && free !== null && free < 15;
+      var tone = free === null ? 'dim' : (critical ? 'hot' : (low ? 'warn' : 'good'));
       var text = free === null ? 'unknown' : Math.round(free) + ' GB free';
       if (v.id === 'sd' && v.identityOk === false) text += ', unverified';
       pill(box, name, text, tone);

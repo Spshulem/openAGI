@@ -598,6 +598,12 @@ export class FleetSupervisor {
   dismissQuestion(id) {
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
+    // A storage ask comes back every tick, and a dismissal holds while it is
+    // asked: one dismiss would mute it for good. It counts as Later (24 h).
+    if (question.kind === "storage" && (question.options ?? []).includes("Later")) {
+      this.resolveOutreach(question, "Later", "acted");
+      return this.store.answerQuestion(id, "Later");
+    }
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
     return this.store.dismissQuestion(id);
@@ -1362,7 +1368,8 @@ export class FleetSupervisor {
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
-    const storageUnknown = storageOn && Boolean(sourceErrors.storage);
+    // A failed disk read, or an SD card mounted but unreadable, is unknown.
+    const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
     const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi, skipReview: reason === "owner-away", storageUnknown });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 

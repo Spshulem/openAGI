@@ -20,7 +20,9 @@ export const ASK_RULES = ["trash", "worktrees", "installers"];
 export const TOMBSTONE_PREFIX = ".fleet-deleting-";
 const GIT_TEMP = /^tmp_(pack|idx|rev|obj)_/;
 const PARTIAL = /\.(part|crdownload|download)$/i;
-const INSTALLER = /\.(dmg|pkg|iso|zip)$/i;
+// No .zip: a zip may be the owner's own (taxes-2024.zip); old ones are moved
+// to the SD card instead of asked about as installers.
+const INSTALLER = /\.(dmg|pkg|iso)$/i;
 // Rule ages.
 export const AGES = Object.freeze({
   gitTempMs: 2 * HOUR, buildIdleMs: 14 * DAY, partialMs: 7 * DAY, derivedIdleMs: 14 * DAY,
@@ -32,7 +34,11 @@ export const WORKTREE_TTL_MS = 6 * HOUR;
 const WALK_MAX_ENTRIES = 200_000;
 const BUILD_WALK_DEPTH = 4;
 const GIT_TIMEOUT_MS = 30_000;
+// du on the SD card is much slower (one cold worktree took 103 s).
 const DU_TIMEOUT_MS = 90_000;
+const SD_DU_TIMEOUT_MS = 300_000;
+// A cached folder size (same inode and mtime) is reused this long.
+const SIZE_TTL_MS = 7 * DAY;
 const RUSTUP_PROCS = new Set(["rustup", "cargo", "rustc"]);
 const XCODE_PROCS = new Set(["xcodebuild", "XCBBuildService", "Xcode"]);
 
@@ -194,11 +200,25 @@ function real(p) {
   try { return fs.realpathSync(p); } catch { return p; }
 }
 
-// { ok, archived: Set, active: [paths], codex: [cwds] }. ok false when a
-// catalog exists but could not be read: then no worktree counts as unused.
+// Each path as stored and resolved (a ~/.codex/worktrees cwd is a symlink
+// into the SD card), deduped, resolved once (async): thousands of threads
+// share a few hundred cwds.
+async function withRealPaths(list) {
+  const raw = [...new Set(list)];
+  const out = new Set(raw);
+  for (let i = 0; i < raw.length; i += 64) {
+    const real = await Promise.all(raw.slice(i, i + 64).map((p) => fsp.realpath(p).catch(() => p)));
+    for (const p of real) out.add(p);
+  }
+  return [...out];
+}
+
+// { ok, archived: Set, paths: [dirs in use] }. ok false when a catalog
+// exists but could not be read: then no worktree counts as unused.
 export async function readThreadUse(paths, deps = {}) {
   if (deps.readThreadUse) return deps.readThreadUse(paths);
-  const out = { ok: true, archived: new Set(), active: [], codex: [] };
+  const out = { ok: true, archived: new Set(), paths: [] };
+  const used = [];
   if (fs.existsSync(paths.conductorDb)) {
     const db = await openReadOnlyDb(paths.conductorDb);
     if (!db) return { ...out, ok: false };
@@ -208,7 +228,7 @@ export async function readThreadUse(paths, deps = {}) {
         const dir = row.workspace_path || (row.root_path && row.directory_name ? path.join(row.root_path, ".conductor", row.directory_name) : null);
         if (!dir) continue;
         if (row.state === "archived") out.archived.add(dir);
-        else out.active.push(dir);
+        else used.push(dir);
       }
     } catch {
       return { ...out, ok: false };
@@ -222,25 +242,23 @@ export async function readThreadUse(paths, deps = {}) {
     try {
       const columns = new Set(db.prepare("PRAGMA table_info(threads)").all().map((row) => row.name));
       const where = columns.has("archived") ? " WHERE COALESCE(archived, 0) = 0" : "";
-      for (const row of db.prepare(`SELECT cwd FROM threads${where}`).all()) if (row.cwd) out.codex.push(String(row.cwd));
+      for (const row of db.prepare(`SELECT DISTINCT cwd FROM threads${where}`).all()) if (row.cwd) used.push(String(row.cwd));
     } catch {
       return { ...out, ok: false };
     } finally {
       try { db.close(); } catch { /* ignore */ }
     }
   }
+  out.paths = await withRealPaths(used);
   return out;
 }
 
 // An unarchived Conductor workspace or Codex thread sits in (or above) dir.
+// String checks only: readThreadUse resolved the paths already.
 export function usedByThread(dir, use) {
-  if (!use?.ok) return true;
+  if (!use?.ok || !Array.isArray(use.paths)) return true;
   const target = real(dir);
-  const hits = (p) => {
-    const r = real(p);
-    return [p, r].some((x) => x === dir || x === target || isInside(x, dir) || isInside(x, target) || isInside(dir, x) || isInside(target, x));
-  };
-  return use.active.some(hits) || use.codex.some(hits);
+  return use.paths.some((x) => x === dir || x === target || isInside(x, dir) || isInside(x, target) || isInside(dir, x) || isInside(target, x));
 }
 
 export function busyIn(dir, busyCwds = []) {
@@ -251,10 +269,10 @@ export function busyIn(dir, busyCwds = []) {
 
 // Allocated bytes: du for a dir (one filesystem, links not followed), the
 // file's blocks otherwise. Clones and hard links make this an upper bound.
-export async function sizeOf(p, config, run = runCommand) {
+export async function sizeOf(p, config, run = runCommand, { timeoutMs = DU_TIMEOUT_MS } = {}) {
   const st = await fsp.lstat(p);
   if (!st.isDirectory()) return Math.max(Number(st.blocks ?? 0) * 512, 0);
-  const result = await run(config.bins.du, ["-skx", p], { timeoutMs: DU_TIMEOUT_MS });
+  const result = await run(config.bins.du, ["-skx", p], { timeoutMs });
   const kb = Number(/^(\d+)/.exec(String(result?.stdout ?? "").trim())?.[1]);
   if (!Number.isFinite(kb) || result?.timedOut) throw new Error(`du failed for ${path.basename(p)}`);
   return kb * 1024;
@@ -292,23 +310,27 @@ export async function newestMtime(root, { stopAfterMs = Infinity, deadline = Inf
   return { newest, complete: true };
 }
 
-// Totals for a copy check: regular-file bytes and entry count.
+// Totals for a copy check: regular-file bytes, entry count, and the newest
+// mtime (a same-size edit or a new file moves it).
 export async function treeTotals(root) {
   const st = await fsp.lstat(root);
-  if (!st.isDirectory()) return { bytes: st.isFile() ? st.size : 0, entries: 1 };
+  if (!st.isDirectory()) return { bytes: st.isFile() ? st.size : 0, entries: 1, newest: st.mtimeMs };
   let bytes = 0;
   let entries = 1;
+  let newest = st.mtimeMs;
   const stack = [root];
   while (stack.length) {
     const dir = stack.pop();
     for (const entry of await fsp.readdir(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       entries += 1;
+      const row = await fsp.lstat(full);
+      if (row.mtimeMs > newest) newest = row.mtimeMs;
       if (entry.isDirectory()) stack.push(full);
-      else if (entry.isFile()) bytes += (await fsp.lstat(full)).size;
+      else if (entry.isFile()) bytes += row.size;
     }
   }
-  return { bytes, entries };
+  return { bytes, entries, newest };
 }
 
 // ─── git ─────────────────────────────────────────────────────────────────
@@ -332,8 +354,53 @@ export async function commonGitDir(dir) {
   return common ? path.resolve(gitdir, common) : gitdir;
 }
 
-// { clean, pushed } for a worktree; null fields when git could not tell.
-export async function gitState(dir, config, run = runCommand) {
+// A full clone (.git is a dir) holds more than HEAD: its other branches, its
+// stash, and the objects of any linked worktree it hosts. null when none of
+// that is at risk, else why. (A linked worktree's branches and stash live in
+// its main repo, which is not deleted.)
+async function cloneExtras(dir, config, run) {
+  const dotGit = path.join(dir, ".git");
+  const st = await fsp.lstat(dotGit).catch(() => null);
+  if (!st?.isDirectory()) return null;
+  const linked = await fsp.readdir(path.join(dotGit, "worktrees")).catch((error) => (error?.code === "ENOENT" ? [] : null));
+  if (linked === null) return "linked worktrees unreadable";
+  if (linked.length) return "hosts linked worktrees";
+  const stash = await git(config, run, dir, ["rev-parse", "--verify", "--quiet", "refs/stash"]);
+  if (stash?.code === 0) return "has a stash";
+  if (stash?.code !== 1 || stash.timedOut) return "git unreadable";
+  const local = await git(config, run, dir, ["rev-list", "--count", "--branches", "--not", "--remotes"]);
+  const count = Number(String(local?.stdout ?? "").trim());
+  if (local?.code !== 0 || local.timedOut || !Number.isFinite(count)) return "git unreadable";
+  return count > 0 ? "has unpushed branches" : null;
+}
+
+// A .git anywhere below dir (a nested clone or worktree, often in an ignored
+// folder its parent's git status never shows). Build dirs are skipped. true
+// when found or when the walk could not finish.
+export async function nestedGit(dir, { deadline = Infinity, clock = Date.now } = {}) {
+  const stack = [dir];
+  let seen = 0;
+  while (stack.length) {
+    if (clock() > deadline || seen > WALK_MAX_ENTRIES) return true;
+    const current = stack.pop();
+    let list;
+    try { list = await fsp.readdir(current, { withFileTypes: true }); } catch { return true; }
+    seen += list.length;
+    for (const entry of list) {
+      if (entry.name === ".git") {
+        if (current !== dir) return true;
+        continue;
+      }
+      if (entry.isDirectory() && !BUILD_DIRS.has(entry.name)) stack.push(path.join(current, entry.name));
+    }
+  }
+  return false;
+}
+
+// { clean, pushed, detail } for a worktree; null fields when git could not
+// tell. pushed covers every local branch, the stash and hosted worktrees of
+// a full clone, and nested repos (see cloneExtras, nestedGit).
+export async function gitState(dir, config, run = runCommand, walk = {}) {
   const status = await git(config, run, dir, ["status", "--porcelain=v1", "--untracked-files=normal"]);
   const clean = status?.code === 0 && !status.timedOut ? String(status.stdout ?? "").trim() === "" : null;
   let pushed = null;
@@ -349,7 +416,11 @@ export async function gitState(dir, config, run = runCommand) {
       if (merged?.code === 1) { pushed = false; break; }
     }
   }
-  return { clean, pushed };
+  if (clean !== true || pushed !== true) return { clean, pushed, detail: null };
+  const extra = await cloneExtras(dir, config, run);
+  if (extra) return { clean, pushed: extra === "git unreadable" ? null : false, detail: extra };
+  if (await nestedGit(dir, walk)) return { clean, pushed: false, detail: "has a nested repo" };
+  return { clean, pushed, detail: null };
 }
 
 // The subset of paths (inside dir) git ignores.
@@ -415,17 +486,47 @@ async function entries(dir) {
   }
 }
 
-function candidate(rule, p, st, bytes, paths, extra = {}) {
-  return { rule, path: p, bytes, volume: volumeOf(p, paths), dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, ...extra };
+// seenAt: when the scan saw it (Delete checks nothing changed since).
+function candidate(rule, p, st, bytes, ctx, extra = {}) {
+  return { rule, path: p, bytes, volume: volumeOf(p, ctx.paths), dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, seenAt: ctx.now, ...extra };
 }
 
 // ─── scan tasks ──────────────────────────────────────────────────────────
 
+class OutOfTime extends Error {
+  constructor() { super("out of time"); }
+}
+
 // A walk cut short by the clock proves nothing: the task fails and keeps
 // its last result.
 function outOfTime(walk) {
-  if (walk.timedOut) throw new Error("out of time");
+  if (walk.timedOut) throw new OutOfTime();
   return walk;
+}
+
+// Before each du or git call: past the scan's budget, the task stops (it
+// runs first in the next scan). The scan's first task always finishes, so
+// a slow one cannot block the ring.
+function spend(ctx) {
+  if (!ctx.first && ctx.clock() > ctx.scanDeadline) throw new OutOfTime();
+}
+
+export function duTimeoutMs(p, paths) {
+  return volumeOf(p, paths) === "sd" ? SD_DU_TIMEOUT_MS : DU_TIMEOUT_MS;
+}
+
+// A file's blocks, or du of a dir, reused while the dir keeps its inode and
+// mtime (an idle worktree's node_modules is not measured again each lap).
+// An estimate: Delete measures again.
+async function sizeFor(p, st, ctx) {
+  if (!st.isDirectory()) return Math.max(Number(st.blocks ?? 0) * 512, 0);
+  const sizes = ctx.sizes ?? {};
+  const hit = sizes[p];
+  if (hit && hit.dev === st.dev && hit.ino === st.ino && hit.mtimeMs === st.mtimeMs && ctx.now - hit.at < SIZE_TTL_MS) return hit.bytes;
+  spend(ctx);
+  const bytes = await sizeOf(p, ctx.config, ctx.run, { timeoutMs: duTimeoutMs(p, ctx.paths) });
+  sizes[p] = { dev: st.dev, ino: st.ino, mtimeMs: st.mtimeMs, bytes, at: ctx.now };
+  return bytes;
 }
 
 async function scanGitTemp(gitdir, ctx) {
@@ -438,7 +539,7 @@ async function scanGitTemp(gitdir, ctx) {
       const p = path.join(dir, entry.name);
       const st = await fsp.lstat(p).catch(() => null);
       if (!st || ctx.now - st.mtimeMs < AGES.gitTempMs) continue;
-      out.push(candidate("git-temp", p, st, await sizeOf(p, ctx.config, ctx.run), ctx.paths));
+      out.push(candidate("git-temp", p, st, await sizeFor(p, st, ctx), ctx));
     }
   }
   return out;
@@ -476,19 +577,28 @@ async function scanWorktree(wt, ctx) {
   const idleFor = idle.complete ? ctx.now - newest : 0;
   if (idleFor >= AGES.buildIdleMs) {
     const builds = await findBuildDirs(wt);
+    spend(ctx);
     const ignored = await gitIgnored(wt, builds, ctx.config, ctx.run);
     for (const dir of builds) {
       if (!ignored.has(dir)) continue;
       const row = await fsp.lstat(dir).catch(() => null);
       if (!row?.isDirectory()) continue;
-      out.push(candidate("build", dir, row, await sizeOf(dir, ctx.config, ctx.run), ctx.paths, { worktree: wt }));
+      out.push(candidate("build", dir, row, await sizeFor(dir, row, ctx), ctx, { worktree: wt }));
     }
   }
   const archived = ctx.use.ok && ctx.use.archived.has(wt);
   if (ctx.use.ok && (archived || idleFor >= AGES.worktreeIdleMs) && !usedByThread(wt, ctx.use)) {
-    const state = await gitState(wt, ctx.config, ctx.run);
+    spend(ctx);
+    const state = await gitState(wt, ctx.config, ctx.run, { deadline: ctx.deadline, clock: ctx.clock });
     if (state.clean === true && state.pushed === true) {
-      out.push(candidate("worktrees", wt, st, await sizeOf(wt, ctx.config, ctx.run), ctx.paths, { worktree: wt, archived }));
+      // Best effort: a du that times out (big SD worktrees) skips the offer
+      // this lap but keeps the build output found above.
+      let bytes = null;
+      try { bytes = await sizeFor(wt, st, ctx); } catch (error) {
+        if (error instanceof OutOfTime) throw error;
+        ctx.notes?.push(`${path.basename(wt)}: ${String(error?.message ?? error).slice(0, 80)}`);
+      }
+      if (bytes !== null) out.push(candidate("worktrees", wt, st, bytes, ctx, { worktree: wt, archived }));
     }
   }
   return out;
@@ -513,21 +623,21 @@ async function scanDownloads(dir, ctx, { archive }) {
     if (!st) continue;
     const age = ctx.now - st.mtimeMs;
     if (PARTIAL.test(entry.name)) {
-      if (age >= AGES.partialMs) out.push(candidate("partial", p, st, await sizeOf(p, ctx.config, ctx.run), ctx.paths));
+      if (age >= AGES.partialMs) out.push(candidate("partial", p, st, await sizeFor(p, st, ctx), ctx));
       continue;
     }
     if (!archive) continue;
     const installer = st.isFile() && INSTALLER.test(entry.name);
-    if (installer && age >= AGES.installerMs) out.push(candidate("installers", p, st, await sizeOf(p, ctx.config, ctx.run), ctx.paths));
+    if (installer && age >= AGES.installerMs) out.push(candidate("installers", p, st, await sizeFor(p, st, ctx), ctx));
     if (age < AGES.archiveMs) continue;
     if (st.isFile() && ctx.now - st.atimeMs < AGES.archiveMs) continue;
-    const bytes = await sizeOf(p, ctx.config, ctx.run);
+    const bytes = await sizeFor(p, st, ctx);
     if (bytes < (ctx.config.storage.archiveMinBytes ?? ARCHIVE_MIN_BYTES)) continue;
     if (st.isDirectory()) {
       const inner = outOfTime(await newestMtime(p, { stopAfterMs: ctx.now - AGES.archiveMs, deadline: ctx.deadline, clock: ctx.clock, skipBuild: false }));
       if (!inner.complete) continue;
     }
-    out.push(candidate("archive", p, st, bytes, ctx.paths, { installer }));
+    out.push(candidate("archive", p, st, bytes, ctx, { installer }));
   }
   return out;
 }
@@ -540,7 +650,7 @@ async function scanTrash(dir, ctx, { anyAge }) {
     const st = await fsp.lstat(p).catch(() => null);
     // ctime moves when an item is put in the Trash.
     if (!st || (!anyAge && ctx.now - st.ctimeMs < AGES.trashMs)) continue;
-    out.push(candidate("trash", p, st, await sizeOf(p, ctx.config, ctx.run), ctx.paths));
+    out.push(candidate("trash", p, st, await sizeFor(p, st, ctx), ctx));
   }
   return out;
 }
@@ -551,7 +661,7 @@ async function scanToolTemp(ctx) {
     if (entry.isSymbolicLink()) continue;
     const p = path.join(ctx.paths.rustupTmp, entry.name);
     const st = await fsp.lstat(p).catch(() => null);
-    if (st) out.push(candidate("tool-temp", p, st, await sizeOf(p, ctx.config, ctx.run), ctx.paths));
+    if (st) out.push(candidate("tool-temp", p, st, await sizeFor(p, st, ctx), ctx));
   }
   for (const root of ctx.paths.derivedData) {
     for (const entry of await entries(root)) {
@@ -562,7 +672,7 @@ async function scanToolTemp(ctx) {
       // Builds create files, so dir mtimes show the last one.
       const idle = outOfTime(await newestMtime(p, { stopAfterMs: ctx.now - AGES.derivedIdleMs, deadline: ctx.deadline, clock: ctx.clock, dirsOnly: true, skipBuild: false, maxDepth: 4 }));
       if (!idle.complete || ctx.now - Math.max(idle.newest, st.mtimeMs) < AGES.derivedIdleMs) continue;
-      out.push(candidate("tool-temp", p, st, await sizeOf(p, ctx.config, ctx.run), ctx.paths));
+      out.push(candidate("tool-temp", p, st, await sizeFor(p, st, ctx), ctx));
     }
   }
   return out;
@@ -570,25 +680,29 @@ async function scanToolTemp(ctx) {
 
 // ─── the scan ────────────────────────────────────────────────────────────
 
+// every: cheap, high-yield tasks run each scan; the rest share a ring.
 async function listTasks(paths) {
   const worktrees = await listWorktrees(paths);
   const gitdirs = await listGitDirs(paths, worktrees);
   return [
-    { key: "downloads", run: (ctx) => scanDownloads(paths.downloads, ctx, { archive: true }) },
-    { key: "sd-downloads", run: (ctx) => scanDownloads(paths.sdDownloads, ctx, { archive: false }) },
-    { key: "trash", run: (ctx) => scanTrash(paths.trash, ctx, { anyAge: false }) },
-    { key: "sd-trash", run: (ctx) => scanTrash(paths.sdTrash, ctx, { anyAge: true }) },
-    { key: "tool-temp", run: (ctx) => scanToolTemp(ctx) },
+    { key: "downloads", every: true, run: (ctx) => scanDownloads(paths.downloads, ctx, { archive: true }) },
+    { key: "sd-downloads", every: true, run: (ctx) => scanDownloads(paths.sdDownloads, ctx, { archive: false }) },
+    { key: "trash", every: true, run: (ctx) => scanTrash(paths.trash, ctx, { anyAge: false }) },
+    { key: "sd-trash", every: true, run: (ctx) => scanTrash(paths.sdTrash, ctx, { anyAge: true }) },
+    { key: "tool-temp", every: true, run: (ctx) => scanToolTemp(ctx) },
     ...gitdirs.map((dir) => ({ key: `git:${dir}`, run: (ctx) => scanGitTemp(dir, ctx) })),
     ...worktrees.map((dir) => ({ key: `wt:${dir}`, ttlMs: WORKTREE_TTL_MS, run: (ctx) => scanWorktree(dir, ctx) }))
   ];
 }
 
-// One scan within budgetMs. Tasks run round-robin from where the last scan
-// stopped; a task not reached, or one that failed, keeps its last result
-// (re-verified before any action). Throws when the open-file or process
-// snapshot fails: the caller keeps its old plans and deletes nothing.
-// cache: { cursor, tasks: { key: { at, candidates } } } (updated in place).
+// One scan within budgetMs. The cheap tasks run every scan; the rest run
+// round-robin from where the last scan stopped. Past the budget no du or
+// git call starts (only the first ring task always finishes). A task not
+// reached, or one that failed, keeps its last result (re-verified before
+// any action); a worktree that failed waits out its TTL. Throws when the
+// open-file or process snapshot fails: the caller keeps its old plans and
+// deletes nothing.
+// cache: { cursor, tasks: { key: { at, candidates } }, sizes } (in place).
 export async function scanStorage(config, deps = {}, { budgetMs = config.storage.scanBudgetMs, cache = { cursor: 0, tasks: {} }, busyCwds = [] } = {}) {
   const run = deps.run ?? runCommand;
   const clock = deps.clock ?? Date.now;
@@ -600,31 +714,54 @@ export async function scanStorage(config, deps = {}, { budgetMs = config.storage
   const procs = await readProcessNames(config, run);
   const use = await readThreadUse(paths, deps).catch(() => ({ ok: false, archived: new Set(), active: [], codex: [] }));
   const tasks = await listTasks(paths);
-  const ctx = { config, run, paths, now, clock, deadline, use, open, busyCwds };
   cache.tasks ??= {};
+  if (!isObject(cache.sizes)) cache.sizes = {};
   const errors = [];
+  const ctx = { config, run, paths, now, clock, scanDeadline: deadline, use, open, busyCwds, sizes: cache.sizes, notes: errors };
   let ran = 0;
-  const start = tasks.length ? (cache.cursor ?? 0) % tasks.length : 0;
-  let index = 0;
-  for (; index < tasks.length; index += 1) {
-    if (clock() > deadline) break;
-    const task = tasks[(start + index) % tasks.length];
+  // false only when the budget cut the task short.
+  const runTask = async (task, options) => {
     const cached = cache.tasks[task.key];
-    if (task.ttlMs && cached && now - cached.at < task.ttlMs) continue;
     try {
-      // Each task may use up to one budget; no new task starts past it.
-      cache.tasks[task.key] = { at: now, candidates: await task.run({ ...ctx, deadline: clock() + budgetMs }) };
+      cache.tasks[task.key] = { at: now, candidates: await task.run({ ...ctx, ...options }) };
       ran += 1;
+      return true;
     } catch (error) {
       errors.push(`${task.key}: ${String(error?.message ?? error).slice(0, 120)}`);
+      if (error instanceof OutOfTime) return false;
+      // A worktree that failed (git or du broke) is not tried again until
+      // its TTL ends; its last result stays.
+      if (task.ttlMs) cache.tasks[task.key] = { candidates: [], ...cached, at: now, failed: true };
+      return true;
     }
+  };
+  for (const task of tasks.filter((row) => row.every)) await runTask(task, { first: true, deadline: clock() + budgetMs });
+  const ring = tasks.filter((row) => !row.every);
+  const start = ring.length ? (cache.cursor ?? 0) % ring.length : 0;
+  let index = 0;
+  let first = true;
+  for (; index < ring.length; index += 1) {
+    if (!first && clock() > deadline) break;
+    const task = ring[(start + index) % ring.length];
+    const cached = cache.tasks[task.key];
+    if (task.ttlMs && cached && now - cached.at < task.ttlMs) continue;
+    // The first task may use one full budget; later ones only what is left.
+    const finished = await runTask(task, { first, deadline: first ? clock() + budgetMs : deadline });
+    // Cut short: the next scan starts with it.
+    if (!finished && !first) break;
+    first = false;
   }
-  cache.cursor = tasks.length ? (start + index) % tasks.length : 0;
+  cache.cursor = ring.length ? (start + index) % ring.length : 0;
   const keys = new Set(tasks.map((task) => task.key));
   for (const key of Object.keys(cache.tasks)) if (!keys.has(key)) delete cache.tasks[key];
+  for (const [p, row] of Object.entries(cache.sizes)) if (!(now - Number(row?.at) < SIZE_TTL_MS)) delete cache.sizes[p];
   // Open, busy or tool-locked items drop out of this scan's list (the
   // cache keeps them for the next).
   const candidates = Object.values(cache.tasks).flatMap((entry) => entry.candidates ?? [])
     .filter((item) => !openUnder(open, item.worktree ?? item.path) && !busyIn(item.worktree ?? item.path, busyCwds) && !toolBusy(item, paths, procs));
-  return { at: now, complete: index >= tasks.length, ran, errors, candidates, durationMs: clock() - startedAt };
+  return { at: now, complete: index >= ring.length, ran, errors, candidates, durationMs: clock() - startedAt };
+}
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

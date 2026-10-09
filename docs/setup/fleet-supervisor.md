@@ -162,6 +162,10 @@ and only until 150 GB free). All regenerable:
 - `~/.rustup/tmp/*` (no rustup or cargo running) and Xcode DerivedData folders
   idle 14 days (no xcodebuild running).
 
+If the last five deletes of a kind freed (by `df`) under a tenth of their size
+(pnpm clones and hard links), that kind stops on that disk for a day. A delete
+or move that failed waits a day (doubling) before it is tried again.
+
 Agent worktrees: `~/Dev/bbapp/.conductor/*`, `~/Dev/bbapp/.worktrees/*`,
 `~/Dev/bbapp-worktrees/*`, `~/Dev/worktrees/*`, `~/conductor/workspaces/*/*`,
 `/Volumes/Xtra/codex-worktrees/*`. Symlinks are never followed.
@@ -173,28 +177,31 @@ open in any app. Each is copied with `ditto` to
 count), then the original is replaced by a symlink to the copy. A failed copy
 is removed and the original kept. Never when the card is missing, is not the
 card first seen (its `.codex-xtra-volume-identity` marker or VolumeUUID), or
-would keep less than 30 GB free. Old installers are asked about instead.
+would keep less than 30 GB free, or when anything under the item changed or
+was opened during the copy. Old installers are asked about instead.
 
 **Asked first, never automatic.** One question per kind, only while that disk is
 low, with the exact items pinned:
 
 | Ask | Items |
 |---|---|
-| Old Trash | `~/.Trash` items trashed 30+ days ago, and the SD card's trash |
-| Finished worktrees | archived Conductor workspaces whose folder is left, or worktrees idle 30 days that no open Codex/Conductor thread uses. Only with nothing uncommitted and nothing unpushed (or merged into `origin/main`) |
-| Old installers | `.dmg`, `.pkg`, `.iso`, `.zip` in `~/Downloads`, 30+ days old |
+| Trash | `~/.Trash` items trashed 30+ days ago, and the SD card's trash (any age) |
+| Finished worktrees | archived Conductor workspaces whose folder is left, or worktrees idle 30 days that no open Codex/Conductor thread uses. Only with nothing uncommitted and nothing unpushed (or merged into `origin/main`). A full clone also needs every local branch pushed, no stash, no linked worktree it hosts, and no repo nested inside |
+| Old installers | `.dmg`, `.pkg`, `.iso` in `~/Downloads`, 30+ days old (a `.zip` may be yours: it is moved, not asked about) |
 
-Buttons: **Delete N GB** checks every pinned item again (still there, same
-file, not a symlink, not in use, still idle, still clean and pushed, not much
-bigger) and deletes only those that pass, in the background. **Keep** leaves
-those items out of asks for 30 days. **Later** asks again in 24 h.
+While a question is open its list is pinned: items can drop out, none are
+added. Buttons: **Delete N (X GB)** checks every pinned item again (still
+there, same file, not a symlink, not in use right now, still idle, still clean
+and pushed) and deletes only those that pass, in the background. A card for an
+older list (another count) cannot answer a newer one. **Keep** leaves those
+items out of asks for 30 days. **Later**, or dismissing it, asks again in 24 h.
 Below 15 GB free one more ask comes: **Disk almost full: N GB left** with
 **Clean safe now** (runs the safe cleanup at once, any mode) and **Later**.
 Your answers act in every mode; Observe and Propose only log what Auto would
 clean or move (**Doing**, `storage-safe`).
 
 Freed space is measured with `df` before and after (pnpm clones make folder
-sizes overstate it). Each pass is one line in **Doing**; every item is
+sizes overstate it). Trees are removed with `/bin/rm -rf` in its own process. Each pass is one line in **Doing**; every item is
 journaled in `~/.openagi/fleet/storage/journal.jsonl`.
 
 **Restore an archived item.** Moves are listed in
