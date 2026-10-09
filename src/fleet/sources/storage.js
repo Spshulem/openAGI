@@ -32,8 +32,9 @@ export const ARCHIVE_MIN_BYTES = 100 * MB;
 // A worktree's scan result (idle walk, sizes, git) is reused this long.
 export const WORKTREE_TTL_MS = 6 * HOUR;
 const WALK_MAX_ENTRIES = 200_000;
+// node_modules can hold far more files than a source tree.
+const BUILD_MAX_ENTRIES = 2_000_000;
 const BUILD_WALK_DEPTH = 4;
-const BUILD_TOP_DEPTH = 2;
 const GIT_TIMEOUT_MS = 30_000;
 // du on the SD card is much slower (one cold worktree took 103 s).
 const DU_TIMEOUT_MS = 90_000;
@@ -319,13 +320,15 @@ export async function newestMtime(root, { stopAfterMs = Infinity, deadline = Inf
 }
 
 // Totals for a copy check: regular-file bytes, entry count, and the newest
-// mtime (a same-size edit or a new file moves it).
+// mtime (a same-size edit or a new file moves it). outsideLinks: relative
+// symlinks that point outside root (they would resolve elsewhere once moved).
 export async function treeTotals(root) {
   const st = await fsp.lstat(root);
-  if (!st.isDirectory()) return { bytes: st.isFile() ? st.size : 0, entries: 1, newest: st.mtimeMs };
+  if (!st.isDirectory()) return { bytes: st.isFile() ? st.size : 0, entries: 1, newest: st.mtimeMs, outsideLinks: 0 };
   let bytes = 0;
   let entries = 1;
   let newest = st.mtimeMs;
+  let outsideLinks = 0;
   const stack = [root];
   while (stack.length) {
     const dir = stack.pop();
@@ -336,9 +339,14 @@ export async function treeTotals(root) {
       if (row.mtimeMs > newest) newest = row.mtimeMs;
       if (entry.isDirectory()) stack.push(full);
       else if (entry.isFile()) bytes += row.size;
+      else if (row.isSymbolicLink()) {
+        const to = await fsp.readlink(full);
+        const at = path.resolve(dir, to);
+        if (!path.isAbsolute(to) && at !== root && !isInside(at, root)) outsideLinks += 1;
+      }
     }
   }
-  return { bytes, entries, newest };
+  return { bytes, entries, newest, outsideLinks };
 }
 
 // ─── git ─────────────────────────────────────────────────────────────────
@@ -362,8 +370,9 @@ export async function commonGitDir(dir) {
   return common ? path.resolve(gitdir, common) : gitdir;
 }
 
-// A full clone (.git is a dir) holds more than HEAD: its other branches, its
-// stash, and the objects of any linked worktree it hosts. null when none of
+// A full clone (.git is a dir) holds more than HEAD: its other branches,
+// tags, notes and other local refs, its stash, and the objects of any linked
+// worktree it hosts. null when none of
 // that is at risk, else why. (A linked worktree's branches and stash live in
 // its main repo, which is not deleted.)
 async function cloneExtras(dir, config, run) {
@@ -379,7 +388,12 @@ async function cloneExtras(dir, config, run) {
   const local = await git(config, run, dir, ["rev-list", "--count", "--branches", "--not", "--remotes"]);
   const count = Number(String(local?.stdout ?? "").trim());
   if (local?.code !== 0 || local.timedOut || !Number.isFinite(count)) return "git unreadable";
-  return count > 0 ? "has unpushed branches" : null;
+  if (count > 0) return "has unpushed branches";
+  // Every other local ref (tags, notes, anything under refs/).
+  const refs = await git(config, run, dir, ["rev-list", "--count", "--exclude=refs/remotes/*", "--all", "--not", "--remotes"]);
+  const other = Number(String(refs?.stdout ?? "").trim());
+  if (refs?.code !== 0 || refs.timedOut || !Number.isFinite(other)) return "git unreadable";
+  return other > 0 ? "has unpushed tags or other refs" : null;
 }
 
 // A .git anywhere below dir (a nested clone or worktree, often in an ignored
@@ -406,7 +420,7 @@ export async function nestedGit(dir, { deadline = Infinity, clock = Date.now } =
 }
 
 // { clean, pushed, detail } for a worktree; null fields when git could not
-// tell. pushed covers every local branch, the stash and hosted worktrees of
+// tell. pushed covers every local ref, the stash and hosted worktrees of
 // a full clone, and nested repos (see cloneExtras, nestedGit).
 export async function gitState(dir, config, run = runCommand, walk = {}) {
   const status = await git(config, run, dir, ["status", "--porcelain=v1", "--untracked-files=normal"]);
@@ -585,20 +599,22 @@ async function findBuildDirs(wt) {
   return out;
 }
 
-// The newest mtime in the top BUILD_TOP_DEPTH levels of each build dir
-// (files and dirs, the dirs themselves too): an install or build rewrites
-// what sits there (.modules.yaml, .package-lock.json, BUILD_ID,
-// target/debug) without touching the source.
-async function buildNewest(dirs, { deadline = Infinity, clock = Date.now } = {}) {
+// The newest mtime of everything in each build dir (files and dirs, the
+// dirs themselves too): a build rewrites files in place at any depth
+// (target/debug/deps/app) without touching the source or any dir's mtime.
+// Stops early once something newer than stopAfterMs shows up; complete
+// false (out of time, too many entries, unreadable): not idle.
+async function buildNewest(dirs, { stopAfterMs = Infinity, deadline = Infinity, clock = Date.now } = {}) {
   let newest = 0;
   let seen = 0;
   const bump = (row) => { if (row && row.mtimeMs > newest) newest = row.mtimeMs; };
   for (const dir of dirs) bump(await fsp.lstat(dir).catch(() => null));
-  const stack = dirs.map((dir) => [dir, 0]);
+  const stack = [...dirs];
   while (stack.length) {
     if (clock() > deadline) return { newest, complete: false, timedOut: true };
-    if (seen > WALK_MAX_ENTRIES) return { newest, complete: false };
-    const [dir, depth] = stack.pop();
+    if (seen > BUILD_MAX_ENTRIES) return { newest, complete: false };
+    if (newest > stopAfterMs) return { newest, complete: false, recent: true };
+    const dir = stack.pop();
     let list;
     try { list = await fsp.readdir(dir, { withFileTypes: true }); } catch { return { newest, complete: false }; }
     seen += list.length;
@@ -606,22 +622,23 @@ async function buildNewest(dirs, { deadline = Infinity, clock = Date.now } = {})
       const batch = list.slice(i, i + 256);
       const rows = await Promise.all(batch.map((entry) => fsp.lstat(path.join(dir, entry.name)).catch(() => null)));
       rows.forEach(bump);
-      for (const entry of batch) if (entry.isDirectory() && depth + 1 < BUILD_TOP_DEPTH) stack.push([path.join(dir, entry.name), depth + 1]);
+      for (const entry of batch) if (entry.isDirectory()) stack.push(path.join(dir, entry.name));
     }
   }
+  if (newest > stopAfterMs) return { newest, complete: false, recent: true };
   return { newest, complete: true };
 }
 
 // When a worktree last changed: its files (not .git or build dirs), HEAD's
-// reflog (commits and checkouts that touch no file), and the top of its build
-// dirs (a fresh install or build). { newest, complete, timedOut, builds }.
+// reflog (commits and checkouts that touch no file), and everything in its
+// build dirs (a fresh install or build). { newest, complete, timedOut, builds }.
 export async function worktreeNewest(wt, { stopAfterMs = Infinity, deadline = Infinity, clock = Date.now } = {}) {
   const walk = await newestMtime(wt, { stopAfterMs, deadline, clock });
   if (!walk.complete) return { ...walk, builds: null };
   const gitdir = await gitDirOf(wt);
   const reflog = gitdir ? await fsp.lstat(path.join(gitdir, "logs", "HEAD")).then((row) => row.mtimeMs).catch(() => 0) : 0;
   const builds = await findBuildDirs(wt);
-  const top = await buildNewest(builds, { deadline, clock });
+  const top = await buildNewest(builds, { stopAfterMs, deadline, clock });
   return { newest: Math.max(walk.newest, reflog, top.newest), complete: top.complete, timedOut: top.timedOut, builds };
 }
 
@@ -681,7 +698,10 @@ async function scanDownloads(dir, ctx, { archive }) {
     if (!st) continue;
     const age = ctx.now - st.mtimeMs;
     if (PARTIAL.test(entry.name)) {
-      const bytes = age >= AGES.partialMs ? await sizeOrSkip(p, st, ctx) : null;
+      // A resumed download (a Safari .download folder) rewrites files inside.
+      let old = age >= AGES.partialMs;
+      if (old && st.isDirectory()) old = outOfTime(await newestMtime(p, { stopAfterMs: ctx.now - AGES.partialMs, deadline: ctx.deadline, clock: ctx.clock, skipBuild: false })).complete;
+      const bytes = old ? await sizeOrSkip(p, st, ctx) : null;
       if (bytes !== null) out.push(candidate("partial", p, st, bytes, ctx));
       continue;
     }

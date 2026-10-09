@@ -1309,3 +1309,154 @@ test("a du that exits nonzero is not a size, even with a total printed", async (
   await assert.rejects(sizeOf(dir, env.config, partial), /du failed/);
   assert.equal(await sizeOf(dir, env.config, async () => ({ code: 0, stdout: `8\t${dir}\n` })), 8192);
 });
+
+// ─── review fixes, round 3 ───────────────────────────────────────────────
+
+test("a delete record that cannot be saved (disk full) leaves the item in place", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const part = write(path.join(env.home, "Downloads", "a.part"));
+  age(part, 8 * DAY);
+  const manager = env.manager();
+  const save = manager.save.bind(manager);
+  manager.save = () => {
+    save();
+    if ((manager.state.tombstones ?? []).length) manager.lastWriteError = "ENOSPC: no space left on device";
+  };
+  await manager.requestScan();
+  assert.equal(fs.readFileSync(part, "utf8").length, 4096);
+  assert.ok(!fs.readdirSync(path.join(env.home, "Downloads")).some((name) => name.startsWith(".fleet-deleting-")));
+  assert.match(fs.readFileSync(path.join(env.dataDir, "fleet", "storage", "journal.jsonl"), "utf8"), /could not save the delete record/);
+});
+
+test("archive: a card swapped during the copy does not get the link", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const big = write(path.join(env.home, "Downloads", "a.mov"), "v".repeat(10_000));
+  age(big, 40 * DAY);
+  env.deps.ditto = async (src, dest) => {
+    fs.cpSync(src, dest);
+    write(path.join(env.sd, ".codex-xtra-volume-identity"), "volume_uuid=11111111-2222-3333-4444-555555555555\n");
+    return { ok: true };
+  };
+  const manager = env.manager();
+  await manager.requestScan();
+  assert.equal(fs.lstatSync(big).isSymbolicLink(), false);
+  assert.equal(fs.readFileSync(big, "utf8"), "v".repeat(10_000));
+  assert.equal(manager.state.copying.length, 1, "the copy waits for the known card");
+  assert.ok(!fs.readdirSync(path.join(env.home, "Downloads")).some((name) => name.startsWith(".fleet-deleting-")));
+});
+
+test("a rebuilt file deep in a build dir keeps it, at scan and at delete", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const wt = makeWorktree(env, path.join(env.home, "Dev", "worktrees", "deep"), { idleDays: 20 });
+  const nm = path.join(wt, "node_modules");
+  const deep = write(path.join(nm, "pkg", "lib", "dist", "index.js"));
+  age(wt, 20 * DAY);
+  const manager = env.manager();
+  assert.equal(await manager.scanOnce(), true);
+  assert.ok(manager.candidates.some((item) => item.path === nm), "idle: a candidate");
+  // Rewritten in place: no dir's mtime moves.
+  fs.writeFileSync(deep, "rebuilt");
+  await manager.autoPasses();
+  assert.equal(exists(nm), true, "not deleted right after the build");
+  const scanned = await scanStorage(env.config, env.deps, { budgetMs: 60_000 });
+  assert.ok(!scanned.candidates.some((item) => item.rule === "build"), "not a candidate");
+});
+
+test("archive: a folder with a relative link outside it stays where it is", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const downloads = path.join(env.home, "Downloads");
+  const escaping = path.join(downloads, "project");
+  write(path.join(escaping, "a.txt"), "a".repeat(5000));
+  write(path.join(downloads, "shared", "s.txt"), "s".repeat(5000));
+  fs.symlinkSync("../shared", path.join(escaping, "data"));
+  const inner = path.join(downloads, "photos");
+  write(path.join(inner, "sub", "b.jpg"), "b".repeat(5000));
+  fs.symlinkSync("sub/b.jpg", path.join(inner, "latest.jpg"));
+  for (const dir of [escaping, inner, path.join(downloads, "shared")]) age(dir, 40 * DAY);
+  const old = new Date(Date.now() - 40 * DAY);
+  for (const link of [path.join(escaping, "data"), path.join(inner, "latest.jpg")]) fs.lutimesSync(link, old, old);
+  for (const dir of [escaping, inner]) fs.utimesSync(dir, old, old);
+  env.deps.ditto = async (src, dest) => { fs.cpSync(src, dest, { recursive: true, verbatimSymlinks: true }); return { ok: true }; };
+  const manager = env.manager();
+  await manager.requestScan();
+  assert.equal(fs.lstatSync(escaping).isSymbolicLink(), false, "a link outside it");
+  assert.equal(fs.readFileSync(path.join(escaping, "data", "s.txt"), "utf8").length, 5000);
+  assert.equal(fs.lstatSync(inner).isSymbolicLink(), true, "a link inside it is fine");
+  assert.equal(fs.readFileSync(path.join(inner, "latest.jpg"), "utf8").length, 5000);
+  assert.match(fs.readFileSync(path.join(env.dataDir, "fleet", "storage", "journal.jsonl"), "utf8"), /has a relative link outside it/);
+});
+
+test("an approved Delete that cannot read open files is recorded and asked again", async (t) => {
+  const env = setup(t);
+  const clock = { now: Date.now() };
+  const supervisor = supervisorFor(t, env, clock);
+  const [dmg] = installers(env, ["a.dmg"]);
+  await supervisor.storage.requestScan();
+  await supervisor.tick({ reason: "test" });
+  const [question] = storageQuestions(supervisor);
+  env.lsofFails = true;
+  await supervisor.answerQuestion(question.id, question.options[0]);
+  await supervisor.storage.idle();
+  await new Promise((resolve) => setImmediate(resolve));
+  const action = supervisor.store.actions(10).find((row) => row.playbook === "storage-installers");
+  assert.equal(action.status, "failed");
+  assert.match(action.reason, /not done, could not read open files/);
+  assert.equal(supervisor.store.question(question.id).status, "open");
+  assert.equal(exists(dmg), true);
+});
+
+test("a full clone with a local-only tag or notes is not offered", async (t) => {
+  const env = setup(t);
+  const roots = path.join(env.home, "Dev", "worktrees");
+  const tagged = makeWorktree(env, path.join(roots, "tagged"));
+  git(tagged, "checkout", "-q", "-b", "gone");
+  commitFile(tagged, "tagged.txt");
+  git(tagged, "tag", "keep-me");
+  git(tagged, "checkout", "-q", "main");
+  git(tagged, "branch", "-q", "-D", "gone");
+  const noted = makeWorktree(env, path.join(roots, "noted"));
+  git(noted, "notes", "add", "-m", "only here", "HEAD");
+  for (const dir of [tagged, noted]) age(dir, 40 * DAY);
+  for (const dir of [tagged, noted]) assert.deepEqual(await gitState(dir, env.config), { clean: true, pushed: false, detail: "has unpushed tags or other refs" }, dir);
+  const result = await scanStorage(env.config, env.deps, { budgetMs: 60_000 });
+  assert.deepEqual(result.candidates.filter((item) => item.rule === "worktrees"), []);
+});
+
+test("a partial download folder with a file written recently is kept, at scan and at delete", async (t) => {
+  const env = setup(t, { mode: "auto" });
+  const bundle = path.join(env.home, "Downloads", "movie.mp4.download");
+  const inner = write(path.join(bundle, "movie.mp4"));
+  age(bundle, 8 * DAY);
+  const manager = env.manager();
+  assert.equal(await manager.scanOnce(), true);
+  assert.ok(manager.candidates.some((item) => item.path === bundle), "old: a candidate");
+  // Resumed: the file inside is rewritten, the folder's mtime stays.
+  fs.writeFileSync(inner, "resumed");
+  await manager.autoPasses();
+  assert.equal(exists(inner), true, "not deleted while resuming");
+  const scanned = await scanStorage(env.config, env.deps, { budgetMs: 60_000 });
+  assert.ok(!scanned.candidates.some((item) => item.path === bundle), "not a candidate");
+});
+
+test("a planned line is retired once the disk recovers or nothing is left", async (t) => {
+  for (const variant of ["recovered", "gone"]) {
+    const env = setup(t, { mode: "observe" });
+    const part = write(path.join(env.home, "Downloads", "a.part"));
+    age(part, 8 * DAY);
+    const manager = env.manager();
+    await manager.requestScan();
+    const planned = env.store.actions(10).find((row) => row.status === "planned");
+    assert.ok(planned, variant);
+    if (variant === "recovered") env.free.data = 500 * GB;
+    else fs.rmSync(part);
+    await manager.requestScan();
+    const rows = env.store.actions(10).filter((row) => row.playbook === "storage-safe");
+    assert.deepEqual(rows.map((row) => row.status), ["stale"], variant);
+    assert.equal(manager.state.plannedActionId, null, variant);
+    // The same plan coming back is a new line.
+    if (variant === "recovered") env.free.data = 40 * GB;
+    else age(write(part), 8 * DAY);
+    await manager.requestScan();
+    assert.equal(env.store.actions(10).filter((row) => row.status === "planned").length, 1, variant);
+  }
+});

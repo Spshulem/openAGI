@@ -435,8 +435,10 @@ export class StorageManager {
     if (await this.freeBytes("data") === null) return [{ volume: "data", none: "could not read free space", error: true }];
     const dataLow = force || this.isLow("data");
     const sdLow = this.isLow("sd") && this.sdOk();
-    if (!dataLow && !sdLow) return [];
+    if (!dataLow && !sdLow) { this.retirePlanned(); return []; }
     if (!force && this.getMode() !== "auto") { this.recordPlanned(); return []; }
+    // Auto acts itself: no "would" line.
+    if (!force) this.retirePlanned();
     const out = [];
     if (dataLow) out.push(await this.safePass("data", { force }));
     if (sdLow) out.push(await this.safePass("sd", { force }));
@@ -458,8 +460,8 @@ export class StorageManager {
 
   // An owner's instruction that could not run: a failed Doing line, and its
   // question back in front of them.
-  ownerNotDone(questionId, answer, why) {
-    this.store?.recordAction({ kind: "storage", playbook: "storage-safe", threadKey: KEY_PREFIX, status: "failed", reason: clampText(`owner: ${answer}: not done, ${why}`, 300) });
+  ownerNotDone(questionId, answer, why, playbook = "storage-safe") {
+    this.store?.recordAction({ kind: "storage", playbook, threadKey: KEY_PREFIX, status: "failed", reason: clampText(`owner: ${answer}: not done, ${why}`, 300) });
     // After the answer is recorded (the supervisor closes the question
     // right after the reply), so the reopen is not overwritten.
     if (questionId) setImmediate(() => { try { this.store?.reopenQuestion(questionId, [], { answer, asked: true }); } catch { /* best-effort */ } });
@@ -470,7 +472,7 @@ export class StorageManager {
     const low = ["data", "sd"].filter((id) => this.isLow(id));
     const safe = (this.candidates ?? []).filter((item) => SAFE_RULES.has(item.rule) && low.includes(item.volume));
     const moves = low.includes("data") && this.sdOk() ? (this.candidates ?? []).filter((item) => item.rule === "archive" && !item.installer) : [];
-    if (!safe.length && !moves.length) return;
+    if (!safe.length && !moves.length) { this.retirePlanned(); return; }
     const digest = shortHash([...safe, ...moves].map((item) => item.path).sort().join("\n"));
     if (digest === this.state.plannedDigest) return;
     this.state.plannedDigest = digest;
@@ -482,6 +484,16 @@ export class StorageManager {
       reason: clampText(`Auto would delete ${safe.length} safe items (up to ${bytes(safe)})${moves.length ? ` and move ${moves.length} Downloads items (${bytes(moves)}) to the SD card` : ""}`, 300)
     });
     this.state.plannedActionId = action?.id ?? null;
+    this.save();
+  }
+
+  // Nothing planned any more (the disk recovered, the items went): the last
+  // "would" line is closed instead of staying in Doing.
+  retirePlanned() {
+    if (!this.state.plannedActionId && !this.state.plannedDigest) return;
+    if (this.state.plannedActionId) { try { this.store?.updateAction(this.state.plannedActionId, { status: "stale" }); } catch { /* gone */ } }
+    this.state.plannedActionId = null;
+    this.state.plannedDigest = null;
     this.save();
   }
 
@@ -668,7 +680,10 @@ export class StorageManager {
     const age = now - st.mtimeMs;
     switch (item.rule) {
       case "git-temp": if (age < AGES.gitTempMs) return no("too new"); break;
-      case "partial": if (age < AGES.partialMs) return no("too new"); break;
+      case "partial":
+        if (age < AGES.partialMs) return no("too new");
+        if (st.isDirectory() && !(await this.idleSince(item.path, ctx, AGES.partialMs, { skipBuild: false }))) return no("changed recently");
+        break;
       case "installers": if (age < AGES.installerMs) return no("too new"); break;
       case "trash":
         if (source.isInside(item.path, paths.trash) && now - st.ctimeMs < AGES.trashMs) return no("trashed recently");
@@ -735,6 +750,11 @@ export class StorageManager {
     const tomb = path.join(path.dirname(item.path), `${TOMBSTONE_PREFIX}${randomUUID().slice(0, 8)}`);
     this.state.tombstones = [...(this.state.tombstones ?? []), tomb];
     this.save();
+    // Not saved (a full disk): a crash mid-rm would leave it hidden for good.
+    if (this.lastWriteError) {
+      this.state.tombstones = this.state.tombstones.filter((entry) => entry !== tomb);
+      return { ok: false, detail: clampText(`could not save the delete record: ${this.lastWriteError}`, 160) };
+    }
     try {
       await fsp.rename(item.path, tomb);
     } catch (error) {
@@ -857,13 +877,16 @@ export class StorageManager {
     };
     let dest = null;
     try {
+      const before = await source.treeTotals(item.path);
+      // A relative link to something outside would point elsewhere from the
+      // card: such a folder stays where it is.
+      if (before.outsideLinks) return no("has a relative link outside it");
       await fsp.mkdir(paths.archiveDir, { recursive: true });
       dest = await uniqueDest(paths.archiveDir, path.basename(item.path));
       // Recorded before the copy: a restart mid-copy leaves no orphan.
       record = { from: item.path, to: dest, at: iso(this.now()) };
       this.state.copying = [...(this.state.copying ?? []), record];
       this.save();
-      const before = await source.treeTotals(item.path);
       const copy = await this.copy(item.path, dest, check.bytes, before.entries);
       if (!copy.ok) return fail(`copy failed: ${copy.detail ?? "ditto"}`, dest);
       const after = await source.treeTotals(dest).catch(() => null);
@@ -875,6 +898,11 @@ export class StorageManager {
       if (!(await this.refreshContext(ctx, { force: true }))) return fail("could not read open files", dest);
       if (source.openUnder(ctx.open, item.path)) return fail("opened during the copy", dest);
       if (this.getMode() !== "auto") return fail("left Auto", dest);
+      // The card is read again: one swapped during the copy must not get the
+      // link. Its copy and record stay for when the known card is back.
+      if (!(await this.refreshVolumes().then(() => this.sdOk(), () => false))) {
+        return { ok: false, failed: true, reason: "SD card not verified after the copy" };
+      }
       const tomb = path.join(path.dirname(item.path), `${TOMBSTONE_PREFIX}${randomUUID().slice(0, 8)}`);
       // Recorded before the rename: a restart mid-swap puts the original back.
       record.tomb = tomb;
@@ -938,18 +966,19 @@ export class StorageManager {
     }
     if (String(answer).startsWith("Delete")) {
       if (answer !== deleteOption(plan)) return reply("blocked", "The list changed. Look at the new question.");
-      this.enqueue(() => this.deletePlan(plan), () => this.ownerNotDone(question.id ?? null, answer, "the supervisor stopped first")).catch(() => {});
+      this.enqueue(() => this.deletePlan(plan, { questionId: question.id ?? null, answer }), () => this.ownerNotDone(question.id ?? null, answer, "the supervisor stopped first")).catch(() => {});
       return reply("sent", `Deleting ${plan.items.length} items in the background. Each is checked again first.`);
     }
     return reply("blocked", "Pick one of the options.");
   }
 
   // The owner said Delete: only the pinned items, each re-verified now.
-  async deletePlan(plan) {
+  // questionId: a Delete that cannot start asks again.
+  async deletePlan(plan, { questionId = null, answer = deleteOption(plan) } = {}) {
     const ctx = await this.verifyContext();
     const label = `owner OK'd ${plan.rule}`;
     if (!ctx) {
-      this.store?.recordAction({ kind: "storage", playbook: `storage-${plan.rule}`, threadKey: KEY_PREFIX, status: "failed", reason: `${label}: could not read open files; nothing deleted` });
+      this.ownerNotDone(questionId, answer, "could not read open files; nothing deleted", `storage-${plan.rule}`);
       return null;
     }
     const volumes = [...new Set(plan.items.map((item) => item.volume))];
