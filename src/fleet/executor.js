@@ -8,7 +8,8 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { readWriterLocks } from "./sources/codex.js";
 import { classifyErrorText } from "./errors.js";
 import { DEADLINE_MARGIN_MS, UI_LOCK, flattenMessage, uiIdentity } from "./ui-delivery.js";
 
@@ -181,8 +182,9 @@ export function isPresenceBlock(delivery) {
 
 // The non-UI route a presence-blocked app send may take instead, if the owner
 // allowed it (config.backgroundRoutes) and it cannot fork or queue unseen:
-// codex-exec only for a Codex thread no app holds and Conductor did not
-// start; peer-relay only for an idle live Claude session with no open pick.
+// codex-exec only for a Codex thread no app holds (no writer, so nothing
+// moved it since the scan) and Conductor did not start; peer-relay only for
+// a Conductor chat whose live Claude session is idle, with no open pick.
 export function backgroundRouteFor(thread, config) {
   const allowed = config?.backgroundRoutes ?? [];
   if (!allowed.length || !thread || thread.archived || thread.agentStatus === "running" || thread.meta?.blockedOnOwner === true) return null;
@@ -190,7 +192,7 @@ export function backgroundRouteFor(thread, config) {
     if (!allowed.includes("codex-exec") || thread.writerLocked || !thread.cwd || thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return null;
     return "codex-exec";
   }
-  if (allowed.includes("peer-relay") && thread.live?.peerName && thread.live?.pid && thread.live.status === "idle" && !thread.meta?.pendingQuestion) return "peer-relay";
+  if (thread.kind === "conductor" && allowed.includes("peer-relay") && thread.live?.peerName && thread.live?.pid && thread.live.status === "idle" && !thread.meta?.pendingQuestion) return "peer-relay";
   return null;
 }
 
@@ -229,7 +231,9 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
 
 // ui: createUiDriver() result ({ deliver }); knownThreads: () => every thread
 // the supervisor saw, to spot shared titles; uiLock: one UI send at a time.
-export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK } = {}) {
+// refreshThread: (thread) => the same thread read again now, or null; a
+// background route after a presence block needs it for Conductor chats.
+export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, refreshThread = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK } = {}) {
   const runner = run ?? runCommand;
   // An injected run (tests, dry harnesses) also serves the background routes.
   const background = spawnBackground ?? (run ? run : spawnWithTail);
@@ -439,22 +443,31 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   };
 
   // The background route a presence-blocked app send takes, re-checked at
-  // send time: the scan's lock and peer reads are up to a tick old.
-  function fallbackRoute(thread, target) {
+  // send time: the scan's lock, peer and chat reads are up to a tick old.
+  // Anything unreadable now means no background route.
+  async function fallbackRoute(thread, target) {
     const route = backgroundRouteFor(thread, config);
     if (!route) return null;
     // An earlier app send may sit in that composer unconfirmed.
     if (unconfirmed.has(target.targetKey)) return null;
     if (route === "codex-exec") {
+      // A lock file a crash left behind holds nothing: who holds it decides,
+      // as in the scan.
       if (!paths.codexHome) return null;
-      try { if (fs.existsSync(path.join(paths.codexHome, "thread-writer-locks", `${thread.id}.lock`))) return null; } catch { return null; }
-      return route;
+      let locked;
+      try { locked = await readWriterLocks(config, [thread.id], { run: runner, isPidAlive }); } catch { return null; }
+      return locked.has(thread.id) ? null : route;
     }
-    if (!readLivePeers) return null;
+    if (!readLivePeers || !refreshThread) return null;
     let peers = null;
     try { peers = readLivePeers(config); } catch { return null; }
     const peer = [thread.claudeSessionId, thread.id].map((id) => id && peers?.get(id)).find(Boolean);
     if (!peer?.peerName || peer.status !== "idle" || peer.waitingFor) return null;
+    // The chat as it is now: no new pick, prompt, turn or message since the scan.
+    let fresh = null;
+    try { fresh = await refreshThread(thread); } catch { return null; }
+    if (!fresh || fresh.agentStatus === "running" || fresh.meta?.blockedOnOwner === true || fresh.meta?.pendingQuestion) return null;
+    if ((Date.parse(fresh.lastActivityAt ?? "") || 0) > (Date.parse(thread.lastActivityAt ?? "") || 0)) return null;
     return { route, live: { ...thread.live, peerName: peer.peerName, pid: peer.pid, status: peer.status } };
   }
 
@@ -496,10 +509,10 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       // The owner is at the Mac: a route that does not take the screen, if
       // the owner allowed one for this thread. Otherwise it waits for idle.
       if (!isPresenceBlock(result)) return result;
-      const fallback = fallbackRoute(thread, step.target);
+      const fallback = await fallbackRoute(thread, step.target);
       if (!fallback) return result;
-      const viaThread = typeof fallback === "object" ? { ...thread, live: fallback.live } : thread;
-      return deliver({ thread: viaThread, message, route: typeof fallback === "object" ? fallback.route : fallback, actionId: result.actionId ?? actionId, playbook, spentMs, deadlineAt, fallbackFrom: result.detail });
+      const via = typeof fallback === "object" ? fallback : { route: fallback, live: thread.live };
+      return deliver({ thread: { ...thread, live: via.live }, message, route: via.route, actionId: result.actionId ?? actionId, playbook, spentMs, deadlineAt, fallbackFrom: result.detail });
     }
     // A remote caller (deadlineAt) reports failure at its deadline: nothing
     // starts after it, and a relay gets only what is left, less the trip back

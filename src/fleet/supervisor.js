@@ -338,6 +338,7 @@ export class FleetSupervisor {
     if (!this._executor) {
       const executor = this.deps.executor ?? createExecutor({
         config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers,
+        refreshThread: (thread) => this.refreshThread(thread),
         ui: this.uiDriver, knownThreads: () => [...this.lastThreads.values()]
       });
       // An app send that waited only on the owner's presence arms the idle
@@ -485,6 +486,8 @@ export class FleetSupervisor {
     this.idleChecking = true;
     let idle = null;
     try { idle = await driver.idleMs(); } catch { idle = null; } finally { this.idleChecking = false; }
+    // Stopped while reading: no scan after shutdown.
+    if (!this.idleTimer) return false;
     const ownerIdleMs = { ...DEFAULTS, ...(this.config.limits ?? {}) }.uiOwnerIdleMs;
     const leadMs = Math.max(0, Math.min(Number.isFinite(this.awayLeadMs) ? this.awayLeadMs : IDLE_LEAD_MS, ownerIdleMs - IDLE_KICK_MIN_MS));
     if (!Number.isFinite(idle) || idle < ownerIdleMs - leadMs || this.running) return false;
@@ -506,7 +509,14 @@ export class FleetSupervisor {
       this.forcedFollowUp ??= this.running.catch(() => {}).then(() => { this.forcedFollowUp = null; return this.tick({ reason, deferUi: this.followUpDefersUi }); });
       return this.forcedFollowUp;
     }
+    // A scheduled scan arriving during an idle-watcher scan (which skips the
+    // review) runs after it, so new questions are not held a whole interval.
+    if (this.running && reason === "interval" && this.runningReason === "owner-away") {
+      this.reviewFollowUp ??= this.running.catch(() => {}).then(() => { this.reviewFollowUp = null; return this.tick({ reason }); });
+      return this.reviewFollowUp;
+    }
     if (this.running) return this.running;
+    this.runningReason = reason;
     this.running = this._tick(reason, { deferUi })
       .then((snapshot) => { this.lastError = null; return snapshot; })
       .catch((error) => {
@@ -632,9 +642,10 @@ export class FleetSupervisor {
       // (a relay or background resume would still land, and a retry repeat it).
       if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt - DEADLINE_MARGIN_MS) { late += 1; continue; }
       const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
-      if (route === "computer-use") this.noteUiResult(thread, delivery);
+      // A send that fell back to a background route says nothing about the app.
+      if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
       if (uiKey) typedInto.set(uiKey, delivery.status === "sent");
-      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
       if (delivery.status === "sent") {
         sent += 1;
         this.store.markQuestionDelivered(question.id, key);
@@ -713,8 +724,8 @@ export class FleetSupervisor {
       if (tries >= budget * 2) continue;
       tries += 1;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
-      if (route === "computer-use") this.noteUiResult(thread, delivery);
-      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
+      if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
       if (route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) contacted.uiStalled = true;
       if (delivery.status !== "sent") continue;
       contacted.sent += 1;
@@ -772,6 +783,18 @@ export class FleetSupervisor {
   // can show it (Codex and Conductor). A thread the last scan saw that this
   // read does not list (a full page) keeps its last state. null when a
   // source failed: unknown is not idle.
+  // One Conductor chat read again now (a background send re-checks it).
+  async refreshThread(thread) {
+    if (thread?.kind !== "conductor") return null;
+    const config = { ...this.config, mode: this.mode };
+    const d = this.deps;
+    let peers = new Map();
+    try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch { /* peers only label sessions */ }
+    const read = Promise.resolve().then(() => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: this.now(), peers, only: [thread.id] }));
+    const fresh = await withTimeout(read, SOURCE_TIMEOUT_MS, "conductor");
+    return (fresh ?? []).find((entry) => entry.key === thread.key) ?? null;
+  }
+
   async liveRunningIn(app) {
     const config = { ...this.config, mode: this.mode };
     const d = this.deps;
@@ -995,8 +1018,8 @@ export class FleetSupervisor {
         const route = chooseRoute(thread, "auto", deliveryState);
         if (!route || (deferUi && route === "computer-use")) continue;
         const delivery = await this.executor.deliver({ thread, message: renderTemplate(body, { app: UI_APPS[app]?.name ?? app }), route, playbook: "app-restarted" });
-        if (route === "computer-use") this.noteUiResult(thread, delivery);
-        this.store.recordNudge(thread.key, { playbook: "app-restarted", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+        if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+        this.store.recordNudge(thread.key, { playbook: "app-restarted", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
         if (delivery.status !== "sent") continue;
         done.add(key);
         out.sent += 1;
@@ -1056,10 +1079,10 @@ export class FleetSupervisor {
           delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
         } else {
           delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
-          if (route === "computer-use") this.noteUiResult(thread, delivery);
+          if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
           if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
           // Starts the cooldown but does not spend the no-progress nudge budget.
-          this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+          this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
         }
         // The owner decided; only the typing has to wait (secure input, a
         // locked screen, the owner at the keyboard). Keep the answer and send
@@ -1122,8 +1145,8 @@ export class FleetSupervisor {
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt });
-    if (route === "computer-use") this.noteUiResult(thread, delivery);
-    this.store.recordNudge(thread.key, { playbook: "owner-message", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+    this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
@@ -1151,7 +1174,7 @@ export class FleetSupervisor {
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
     const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
-    if (action.route === "computer-use") this.noteUiResult(thread, delivery);
+    if ((delivery.route ?? action.route) === "computer-use") this.noteUiResult(thread, delivery);
     this.recordSend(action, delivery);
     return { action: this.store.action(actionId), delivery };
   }
@@ -1583,7 +1606,7 @@ export class FleetSupervisor {
       tries += 1;
       attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
-      if (decision.route === "computer-use") this.noteUiResult(target, delivery);
+      if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
       if (delivery.status !== "blocked") sends += 1;
       if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });

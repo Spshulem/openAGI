@@ -1386,6 +1386,16 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
 });
 
+test("the ledger keeps the route a send actually took, not the one it was asked for", async (t) => {
+  const { supervisor } = fixture(t, { threads: [makeThread()], delivery: "computer-use", deps: { uiDriver: readyDriver() } });
+  await supervisor.tick();
+  // The app send waited on the owner and went by a background route instead.
+  supervisor.deps.executor.deliver = async (args) => ({ status: "sent", route: "codex-exec", detail: "started in background", actionId: null, asked: args.route });
+  supervisor._executor = null;
+  await supervisor.sendOwnerMessage("codex:t1", "Rebase on main.");
+  assert.equal(supervisor.store.ledgerFor("codex:t1").nudges.at(-1).route, "codex-exec");
+});
+
 test("a question whose thread left the scan closes itself", async (t) => {
   let threads = [makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } })];
   const { supervisor } = fixture(t, { deps: { listCodexThreads: async () => threads } });
@@ -2892,7 +2902,7 @@ test("the idle watcher reads idle only while sends wait on the owner, then start
   const ticks = [];
   let idle = 0;
   const watcher = {
-    mode: "auto", running: null, config: { tickMs: 5 * 60_000, limits: {} }, now: () => now,
+    mode: "auto", running: null, idleTimer: 1, config: { tickMs: 5 * 60_000, limits: {} }, now: () => now,
     uiDriver: { idleMs: async () => { reads.push(now); return idle; } },
     tick: async (options) => { ticks.push(options); }
   };
@@ -2932,6 +2942,32 @@ test("the idle watcher reads idle only while sends wait on the owner, then start
   now += 11 * 60_000;
   assert.equal(await check(), false);
   assert.equal(watcher.idleWorkAt, null, "older than two ticks: the next scheduled scan decides");
+  // Stopped while the idle read was in flight: no scan after shutdown.
+  watcher.idleWorkAt = now;
+  watcher.uiDriver = { idleMs: async () => { watcher.idleTimer = null; return 600_000; } };
+  const before = ticks.length;
+  assert.equal(await check(), false);
+  assert.equal(ticks.length, before);
+});
+
+test("a scheduled scan during an idle-watcher scan runs after it, with the review", async (t) => {
+  const { supervisor } = fixture(t, { mode: "auto" });
+  const reasons = [];
+  let release;
+  supervisor._tick = async (reason) => { reasons.push(reason); if (reason === "owner-away") await new Promise((resolve) => { release = resolve; }); return {}; };
+  const away = supervisor.tick({ reason: "owner-away" });
+  const interval = supervisor.tick({ reason: "interval" });
+  assert.notEqual(interval, away);
+  assert.equal(supervisor.tick({ reason: "interval" }), interval, "one follow-up, however many intervals");
+  release();
+  await interval;
+  assert.deepEqual(reasons, ["owner-away", "interval"]);
+  // An interval during a normal scan still joins it.
+  supervisor._tick = async (reason) => { reasons.push(reason); return {}; };
+  const first = supervisor.tick({ reason: "interval" });
+  assert.equal(supervisor.tick({ reason: "interval" }), first);
+  await first;
+  assert.deepEqual(reasons, ["owner-away", "interval", "interval"]);
 });
 
 test("a presence-blocked app send arms the idle watcher; a watcher scan skips the review", async (t) => {

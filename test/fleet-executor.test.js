@@ -613,7 +613,7 @@ test("a blocked app send carries the permission card and the failure kind back t
 
 // --- background routes while the owner is at the Mac -------------------------
 
-function fallbackSetup(t, { results = [], routes = ["codex-exec", "peer-relay"], peers = new Map(), relay = [] } = {}) {
+function fallbackSetup(t, { results = [], routes = ["codex-exec", "peer-relay"], peers = new Map(), relay = [], refresh = async (thread) => thread } = {}) {
   const base = setup(t, { results: relay });
   const config = { ...base.config, delivery: "computer-use", backgroundRoutes: routes };
   const requests = [];
@@ -623,7 +623,7 @@ function fallbackSetup(t, { results = [], routes = ["codex-exec", "peer-relay"],
       return { status: "sent", detail: "typed", ...(results.shift() ?? {}) };
     }
   };
-  const executor = createExecutor({ config, run: base.run, store: base.store, logDir: path.join(base.home, "fleet", "logs"), ui, uiLock: createUiLock(), readLivePeers: () => peers });
+  const executor = createExecutor({ config, run: base.run, store: base.store, logDir: path.join(base.home, "fleet", "logs"), ui, uiLock: createUiLock(), readLivePeers: () => peers, refreshThread: refresh });
   return { ...base, config, executor, requests };
 }
 
@@ -665,12 +665,25 @@ test("no background route unless allowed, safe and the block was only the owner'
     assert.equal(result.status, "blocked", label);
     assert.equal(calls.length, 0, label);
   }
-  // A writer lock taken since the scan is read at send time.
-  const locked = fallbackSetup(t, { results: ownerAtCodex() });
-  fs.mkdirSync(path.join(locked.home, ".codex", "thread-writer-locks"), { recursive: true });
-  fs.writeFileSync(path.join(locked.home, ".codex", "thread-writer-locks", "t1.lock"), "");
-  assert.equal((await locked.executor.deliver({ thread: thread(locked.cwd), message: "continue", route: "computer-use" })).status, "blocked");
-  assert.equal(locked.calls.length, 0);
+  // A writer lock taken since the scan is read at send time: who holds it
+  // decides, so a lock file a crash left behind holds nothing.
+  const lockFile = (home) => {
+    fs.mkdirSync(path.join(home, ".codex", "thread-writer-locks"), { recursive: true });
+    const file = path.join(home, ".codex", "thread-writer-locks", "t1.lock");
+    fs.writeFileSync(file, "");
+    return file;
+  };
+  const held = fallbackSetup(t, { results: ownerAtCodex() });
+  const file = lockFile(held.home);
+  held.calls.length = 0;
+  const heldRun = createExecutor({ config: held.config, run: async (cmd, args) => { held.calls.push({ cmd, args }); return { code: 0, stdout: `p${process.pid}\nn${file}\n` }; }, store: held.store, ui: { deliver: async () => ownerAtCodex()[0] }, uiLock: createUiLock() });
+  assert.equal((await heldRun.deliver({ thread: thread(held.cwd), message: "continue", route: "computer-use" })).status, "blocked");
+  assert.deepEqual(held.calls.map((call) => call.cmd), [held.config.bins.lsof], "only the lock read ran");
+  const stale = fallbackSetup(t, { results: ownerAtCodex(), relay: [{ code: 1, stdout: "" }] });
+  lockFile(stale.home);
+  assert.equal((await stale.executor.deliver({ thread: thread(stale.cwd), message: "continue", route: "computer-use" })).route, "codex-exec");
+  assert.deepEqual(stale.calls.map((call) => call.cmd), [stale.config.bins.lsof, "/abs/codex"]);
+  await stale.executor.whenIdle();
 });
 
 test("a Conductor chat goes by peer relay to its live peer only when that peer is idle now", async (t) => {
@@ -690,6 +703,21 @@ test("a Conductor chat goes by peer relay to its live peer only when that peer i
     ["an open pick in the chat", fresh, { meta: { ...conductorUiThread("x").meta, pendingQuestion: { text: "Which one?" } } }]
   ]) {
     const { cwd, calls, executor } = fallbackSetup(t, { results: atConductor(), peers });
+    const blocked = await executor.deliver({ thread: { ...tab(cwd), ...extra }, message: "continue", route: "computer-use" });
+    assert.equal(blocked.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+  // The chat is read again at send time: a pick, a turn or a message since
+  // the scan, or a chat that cannot be read, means no relay.
+  for (const [label, refresh] of [
+    ["a pick asked since the scan", async (thread) => ({ ...thread, meta: { ...thread.meta, pendingQuestion: { text: "Which one?" } } })],
+    ["a turn started", async (thread) => ({ ...thread, agentStatus: "running" })],
+    ["a message since the scan", async (thread) => ({ ...thread, lastActivityAt: "2026-10-08T12:05:00Z" })],
+    ["unreadable", async () => { throw new Error("SQLITE_BUSY"); }],
+    ["gone", async () => null]
+  ]) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results: atConductor(), peers: fresh, refresh });
+    const extra = { lastActivityAt: "2026-10-08T12:00:00Z" };
     const blocked = await executor.deliver({ thread: { ...tab(cwd), ...extra }, message: "continue", route: "computer-use" });
     assert.equal(blocked.status, "blocked", label);
     assert.equal(calls.length, 0, label);
