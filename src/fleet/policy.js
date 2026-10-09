@@ -4,7 +4,7 @@
 // untrusted and may carry instructions, so it never goes into a message
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
-import { DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
+import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
 import { deliberateStop } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
 
@@ -70,7 +70,9 @@ export function chooseRoute(thread, mode, delivery = null) {
     // Computer-use only: never a CLI, whatever the thread offers.
     if (ui.mode === "computer-use") return null;
   }
-  if (thread.kind === "codex") return thread.writerLocked || !thread.cwd ? null : "codex-exec";
+  // A Codex thread Conductor started (its own Codex agent) resumed behind
+  // Conductor forks it, the same as claude-resume would.
+  if (thread.kind === "codex") return thread.writerLocked || !thread.cwd || thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR ? null : "codex-exec";
   if (thread.live?.peerName && thread.live?.pid) return "peer-relay";
   // claude -p --resume behind Conductor's back forks the transcript and
   // never shows in its UI, so Conductor-hosted threads never get it.

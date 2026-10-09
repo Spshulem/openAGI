@@ -8,9 +8,9 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
-import { createExecutor } from "./executor.js";
+import { createExecutor, isPresenceBlock } from "./executor.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
@@ -30,6 +30,13 @@ const GIT_CONCURRENCY = 8;
 const MAX_BRANCH_LOOKUPS = 8;
 const BRANCH_LOOKUP_TTL_MS = 30 * MIN;
 const START_DELAY_MS = 5_000;
+// The idle watcher: a scan starts once the owner has been away long enough
+// that its sends begin about when typing is allowed, at most once a minute,
+// and never earlier than this much idle.
+const IDLE_KICK_GAP_MS = 60_000;
+const IDLE_KICK_MIN_MS = 30_000;
+// Until one has run, an idle-watcher scan is taken to reach its sends this fast.
+const IDLE_LEAD_MS = 45_000;
 const MUTE_MS = 24 * 60 * MIN;
 const SENDING = new Set(["nudge", "escalate-manager"]);
 const OPEN_ACTION = new Set(["planned", "proposed"]);
@@ -328,11 +335,28 @@ export class FleetSupervisor {
   }
 
   get executor() {
-    if (this.deps.executor) return this.deps.executor;
-    this._executor ??= createExecutor({
-      config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers,
-      ui: this.uiDriver, knownThreads: () => [...this.lastThreads.values()]
-    });
+    if (!this._executor) {
+      const executor = this.deps.executor ?? createExecutor({
+        config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers,
+        refreshThread: (thread) => this.refreshThread(thread),
+        ui: this.uiDriver, knownThreads: () => [...this.lastThreads.values()]
+      });
+      // An app send that waited only on the owner's presence arms the idle
+      // watcher (idleCheck), from its latest block; everything else is the
+      // executor's own. The owner's own message is not kept for a later scan
+      // (its caller gets the block), so it arms nothing.
+      // (A frozen executor, like the scan CLI's, stays the one that decides.)
+      const wrapped = Object.create(executor);
+      Object.defineProperty(wrapped, "deliver", {
+        enumerable: true, writable: true,
+        value: async (args) => {
+          const result = await executor.deliver(args);
+          if (isPresenceBlock(result) && args?.playbook !== "owner-message") this.idleWorkAt = this.now();
+          return result;
+        }
+      });
+      this._executor = wrapped;
+    }
     return this._executor;
   }
 
@@ -432,14 +456,48 @@ export class FleetSupervisor {
     this.timer.unref?.();
     this.kickTimer = setTimeout(() => fire("start"), START_DELAY_MS);
     this.kickTimer.unref?.();
+    if (this.config.idleDrain?.enabled && (this.config.delivery ?? "cli") !== "cli") {
+      this.idleTimer = setInterval(() => { this.idleCheck().catch(() => { /* next poll */ }); }, this.config.idleDrain.pollMs ?? 15_000);
+      this.idleTimer.unref?.();
+    }
     return true;
   }
 
   stop() {
+    this.stops = (this.stops ?? 0) + 1;
     if (this.timer) clearInterval(this.timer);
     if (this.kickTimer) clearTimeout(this.kickTimer);
+    if (this.idleTimer) clearInterval(this.idleTimer);
     this.timer = null;
     this.kickTimer = null;
+    this.idleTimer = null;
+  }
+
+  // App sends that waited only because the owner was at the Mac go out soon
+  // after they step away, not at the next scheduled scan: one cheap idle
+  // read (ioreg) per poll while such sends wait, then one scan, started so
+  // its sends begin about when the owner has been away long enough to type.
+  // The scan re-decides everything; nothing is replayed from the old one.
+  async idleCheck() {
+    if (!this.idleWorkAt || this.running || this.idleChecking || this.mode !== "auto") return false;
+    const now = this.now();
+    // Stale: the next scheduled scan decides again, and re-arms if needed.
+    if (now - this.idleWorkAt > 2 * this.config.tickMs) { this.idleWorkAt = null; return false; }
+    if (this.lastIdleKickAt && now - this.lastIdleKickAt < IDLE_KICK_GAP_MS) return false;
+    const driver = this.uiDriver;
+    if (typeof driver?.idleMs !== "function") return false;
+    this.idleChecking = true;
+    let idle = null;
+    try { idle = await driver.idleMs(); } catch { idle = null; } finally { this.idleChecking = false; }
+    // Stopped while reading: no scan after shutdown.
+    if (!this.idleTimer) return false;
+    const ownerIdleMs = { ...DEFAULTS, ...(this.config.limits ?? {}) }.uiOwnerIdleMs;
+    const leadMs = Math.max(0, Math.min(Number.isFinite(this.awayLeadMs) ? this.awayLeadMs : IDLE_LEAD_MS, ownerIdleMs - IDLE_KICK_MIN_MS));
+    if (!Number.isFinite(idle) || idle < ownerIdleMs - leadMs || this.running) return false;
+    this.lastIdleKickAt = now;
+    this.idleWorkAt = null;
+    this.tick({ reason: "owner-away" }).catch(() => { /* recorded in lastError */ });
+    return true;
   }
 
   // deferUi: a scan that came through the node broker, which stops waiting
@@ -454,7 +512,19 @@ export class FleetSupervisor {
       this.forcedFollowUp ??= this.running.catch(() => {}).then(() => { this.forcedFollowUp = null; return this.tick({ reason, deferUi: this.followUpDefersUi }); });
       return this.forcedFollowUp;
     }
+    // A scheduled scan arriving during an idle-watcher scan (which skips the
+    // review) runs after it, so new questions are not held a whole interval.
+    // Not after stop(): it would scan (and send) after shutdown.
+    if (this.running && reason === "interval" && this.runningReason === "owner-away") {
+      const stops = this.stops;
+      this.reviewFollowUp ??= this.running.catch(() => {}).then(() => {
+        this.reviewFollowUp = null;
+        return this.stops === stops ? this.tick({ reason }) : null;
+      });
+      return this.reviewFollowUp;
+    }
     if (this.running) return this.running;
+    this.runningReason = reason;
     this.running = this._tick(reason, { deferUi })
       .then((snapshot) => { this.lastError = null; return snapshot; })
       .catch((error) => {
@@ -580,9 +650,10 @@ export class FleetSupervisor {
       // (a relay or background resume would still land, and a retry repeat it).
       if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt - DEADLINE_MARGIN_MS) { late += 1; continue; }
       const delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
-      if (route === "computer-use") this.noteUiResult(thread, delivery);
+      // A send that fell back to a background route says nothing about the app.
+      if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
       if (uiKey) typedInto.set(uiKey, delivery.status === "sent");
-      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
       if (delivery.status === "sent") {
         sent += 1;
         this.store.markQuestionDelivered(question.id, key);
@@ -661,8 +732,8 @@ export class FleetSupervisor {
       if (tries >= budget * 2) continue;
       tries += 1;
       const delivery = await this.executor.deliver({ thread, message: pending.message, route, playbook: "owner-answer" });
-      if (route === "computer-use") this.noteUiResult(thread, delivery);
-      this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
+      if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+      this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status, detail: delivery.detail ?? null });
       if (route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) contacted.uiStalled = true;
       if (delivery.status !== "sent") continue;
       contacted.sent += 1;
@@ -720,6 +791,18 @@ export class FleetSupervisor {
   // can show it (Codex and Conductor). A thread the last scan saw that this
   // read does not list (a full page) keeps its last state. null when a
   // source failed: unknown is not idle.
+  // One Conductor chat read again now (a background send re-checks it).
+  async refreshThread(thread) {
+    if (thread?.kind !== "conductor") return null;
+    const config = { ...this.config, mode: this.mode };
+    const d = this.deps;
+    let peers = new Map();
+    try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch { /* peers only label sessions */ }
+    const read = Promise.resolve().then(() => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: this.now(), peers, only: [thread.id] }));
+    const fresh = await withTimeout(read, SOURCE_TIMEOUT_MS, "conductor");
+    return (fresh ?? []).find((entry) => entry.key === thread.key) ?? null;
+  }
+
   async liveRunningIn(app) {
     const config = { ...this.config, mode: this.mode };
     const d = this.deps;
@@ -943,8 +1026,8 @@ export class FleetSupervisor {
         const route = chooseRoute(thread, "auto", deliveryState);
         if (!route || (deferUi && route === "computer-use")) continue;
         const delivery = await this.executor.deliver({ thread, message: renderTemplate(body, { app: UI_APPS[app]?.name ?? app }), route, playbook: "app-restarted" });
-        if (route === "computer-use") this.noteUiResult(thread, delivery);
-        this.store.recordNudge(thread.key, { playbook: "app-restarted", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+        if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+        this.store.recordNudge(thread.key, { playbook: "app-restarted", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
         if (delivery.status !== "sent") continue;
         done.add(key);
         out.sent += 1;
@@ -1004,10 +1087,10 @@ export class FleetSupervisor {
           delivery = { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) };
         } else {
           delivery = await this.executor.deliver({ thread, message, route, playbook: "owner-answer", spentMs: Date.now() - startedAt, deadlineAt });
-          if (route === "computer-use") this.noteUiResult(thread, delivery);
+          if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
           if (delivery.done) settling.push(delivery.done.then((reached) => (reached ? null : thread.key)));
           // Starts the cooldown but does not spend the no-progress nudge budget.
-          this.store.recordNudge(thread.key, { playbook: "owner-answer", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+          this.store.recordNudge(thread.key, { playbook: "owner-answer", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
         }
         // The owner decided; only the typing has to wait (secure input, a
         // locked screen, the owner at the keyboard). Keep the answer and send
@@ -1070,8 +1153,8 @@ export class FleetSupervisor {
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
     if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
     const delivery = await this.executor.deliver({ thread, message: text, route, playbook: "owner-message", spentMs: Date.now() - startedAt, deadlineAt });
-    if (route === "computer-use") this.noteUiResult(thread, delivery);
-    this.store.recordNudge(thread.key, { playbook: "owner-message", route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
+    if ((delivery.route ?? route) === "computer-use") this.noteUiResult(thread, delivery);
+    this.store.recordNudge(thread.key, { playbook: "owner-message", route: delivery.route ?? route, status: delivery.status === "sent" ? "owner-answer" : delivery.status });
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
@@ -1099,7 +1182,7 @@ export class FleetSupervisor {
       return { action: updated, delivery: { status: "blocked", route: action.route, detail: updated?.detail ?? null } };
     }
     const delivery = await this.executor.deliver({ thread, message: action.message, route: action.route, playbook: action.playbook, actionId, deadlineAt });
-    if (action.route === "computer-use") this.noteUiResult(thread, delivery);
+    if ((delivery.route ?? action.route) === "computer-use") this.noteUiResult(thread, delivery);
     this.recordSend(action, delivery);
     return { action: this.store.action(actionId), delivery };
   }
@@ -1114,7 +1197,9 @@ export class FleetSupervisor {
     const status = action.kind === "escalate-manager" && delivery.status === "sent" ? "escalated" : delivery.status;
     const thread = this.lastThreads.get(action.threadKey);
     const threadActivityAt = thread ? (thread.lastAgentAt && Date.parse(thread.lastAgentAt) > Date.parse(thread.lastActivityAt ?? "") ? thread.lastAgentAt : thread.lastActivityAt) : null;
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
+    // The route that actually ran: a presence-blocked app send may have gone
+    // by a background route instead.
+    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
     // back that one attempt. Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
@@ -1252,7 +1337,7 @@ export class FleetSupervisor {
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi, skipReview: reason === "owner-away" });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1396,7 +1481,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false, skipReview = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1443,7 +1528,9 @@ export class FleetSupervisor {
     this.awaitingReview = this.config.review?.enabled ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id))) : new Set();
     let unsettled = new Set();
     try {
-      unsettled = await this.reviewOpenQuestions({ asked, byKey, items });
+      // A scan the idle watcher started is for sends: the review waits for
+      // the next scheduled one, and new questions stay held until then.
+      unsettled = skipReview ? new Set(this.awaitingReview) : await this.reviewOpenQuestions({ asked, byKey, items });
     } finally {
       // A new one the review did not get to (the batch cap, a deferred
       // close) waits for the next review; a failed review lets all out.
@@ -1457,6 +1544,9 @@ export class FleetSupervisor {
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
+    // How long an idle-watcher scan takes to reach its sends: the watcher
+    // starts the next one that much before the owner is away long enough.
+    if (skipReview) this.awayLeadMs = this.now() - started;
     // A thread that just got the owner's answer gets no automatic nudge too.
     const answeredNow = await this.deliverQueuedAnswers({
       byKey, started, cappedKinds, asked, sourceUnknown: fromFailedSource, budget: config.limits.maxSendsPerTick, deferUi,
@@ -1524,7 +1614,7 @@ export class FleetSupervisor {
       tries += 1;
       attempted.add(decision.threadKey);
       const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
-      if (decision.route === "computer-use") this.noteUiResult(target, delivery);
+      if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
       if (delivery.status !== "blocked") sends += 1;
       if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
       if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });

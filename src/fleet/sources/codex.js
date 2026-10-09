@@ -522,7 +522,7 @@ function readPrAttachments(db, ids) {
 // Lock files are 0-byte flock targets with no pid inside, so the holder
 // comes from one batched lsof. Codex removes them on release; when lsof
 // cannot answer, a present lock file is treated as held.
-async function readWriterLocks(config, ids, { run, isPidAlive }) {
+export async function readWriterLocks(config, ids, { run, isPidAlive }) {
   const dir = path.join(config.paths.codexHome, "thread-writer-locks");
   let names;
   try {

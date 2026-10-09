@@ -311,10 +311,12 @@ export async function listConductorThreads(config, options = {}) {
     const ref = String(config.managerRef ?? "").trim();
     const rows = db.prepare(SESSIONS_SQL).all().map((row) => ({ row, updatedMs: Date.parse(dbTimeToIso(row.updated_at) ?? "") }));
     const newestFirst = (a, b) => (b.updatedMs || 0) - (a.updatedMs || 0) || String(a.row.id).localeCompare(String(b.row.id));
-    const recent = rows.filter((entry) => entry.updatedMs >= cutoff).sort(newestFirst).slice(0, config.limits.maxThreads);
+    // options.only: just these sessions (a send-time re-read), whatever their age.
+    const only = Array.isArray(options.only) ? new Set(options.only) : null;
+    const recent = rows.filter((entry) => (only ? only.has(entry.row.id) : entry.updatedMs >= cutoff)).sort(newestFirst).slice(0, config.limits.maxThreads);
     const picked = new Set(recent.map((entry) => entry.row.id));
     // The BuildBot3 manager stays visible for escalation even when it is quiet.
-    const manager = rows
+    const manager = only ? [] : rows
       .filter((entry) => !picked.has(entry.row.id)
         && matchesRef(ref, { id: entry.row.id, claudeSessionId: entry.row.claude_session_id, workspace: entry.row.directory_name }))
       .sort(newestFirst)

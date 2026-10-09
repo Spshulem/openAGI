@@ -1386,6 +1386,16 @@ test("the owner's own message to a thread goes through the supervisor's delivery
   assert.equal((await supervisor.sendOwnerMessage("codex:t1", "   ")).delivery.status, "blocked");
 });
 
+test("the ledger keeps the route a send actually took, not the one it was asked for", async (t) => {
+  const { supervisor } = fixture(t, { threads: [makeThread()], delivery: "computer-use", deps: { uiDriver: readyDriver() } });
+  await supervisor.tick();
+  // The app send waited on the owner and went by a background route instead.
+  supervisor.deps.executor.deliver = async (args) => ({ status: "sent", route: "codex-exec", detail: "started in background", actionId: null, asked: args.route });
+  supervisor._executor = null;
+  await supervisor.sendOwnerMessage("codex:t1", "Rebase on main.");
+  assert.equal(supervisor.store.ledgerFor("codex:t1").nudges.at(-1).route, "codex-exec");
+});
+
 test("a question whose thread left the scan closes itself", async (t) => {
   let threads = [makeThread({ meta: { pendingQuestion: { text: "Which plan?", options: ["Starter", "Business"] } } })];
   const { supervisor } = fixture(t, { deps: { listCodexThreads: async () => threads } });
@@ -2882,4 +2892,111 @@ test("a chat the owner wrote to after the restart, or running again, gets no res
   await supervisor.tick();
   const resumed = delivered.filter((args) => args.playbook === "app-restarted").map((args) => args.thread.key);
   assert.deepEqual(resumed, ["conductor:a"], "b: the owner wrote since");
+});
+
+// --- idle watcher ---------------------------------------------------------------
+
+test("the idle watcher reads idle only while sends wait on the owner, then starts one sends-only scan", async () => {
+  let now = Date.parse("2026-10-08T12:00:00Z");
+  const reads = [];
+  const ticks = [];
+  let idle = 0;
+  const watcher = {
+    mode: "auto", running: null, idleTimer: 1, config: { tickMs: 5 * 60_000, limits: {} }, now: () => now,
+    uiDriver: { idleMs: async () => { reads.push(now); return idle; } },
+    tick: async (options) => { ticks.push(options); }
+  };
+  const check = () => FleetSupervisor.prototype.idleCheck.call(watcher);
+  assert.equal(await check(), false);
+  assert.equal(reads.length, 0, "nothing waits: no idle read at all");
+  watcher.idleWorkAt = now;
+  idle = 30_000;
+  assert.equal(await check(), false, "the owner is still around");
+  assert.equal(reads.length, 1);
+  // The first scan is taken to reach its sends in 45 s: it starts at 75 s idle.
+  idle = 76_000;
+  assert.equal(await check(), true);
+  assert.deepEqual(ticks, [{ reason: "owner-away" }]);
+  assert.equal(watcher.idleWorkAt, null);
+  // Re-armed by another presence block: not again within a minute.
+  watcher.idleWorkAt = now;
+  now += 30_000;
+  assert.equal(await check(), false);
+  assert.equal(reads.length, 2, "the one-minute gap needs no read");
+  // A measured lead moves the start; a scan already running is never doubled.
+  now += 60_000;
+  watcher.awayLeadMs = 20_000;
+  idle = 90_000;
+  assert.equal(await check(), false, "with a 20 s lead it waits for 100 s idle");
+  watcher.running = Promise.resolve();
+  idle = 110_000;
+  assert.equal(await check(), false);
+  watcher.running = null;
+  assert.equal(await check(), true);
+  // Not in Auto, or a stale wait from long ago: nothing.
+  watcher.idleWorkAt = now;
+  now += 120_000;
+  watcher.mode = "propose";
+  assert.equal(await check(), false);
+  watcher.mode = "auto";
+  now += 11 * 60_000;
+  assert.equal(await check(), false);
+  assert.equal(watcher.idleWorkAt, null, "older than two ticks: the next scheduled scan decides");
+  // Stopped while the idle read was in flight: no scan after shutdown.
+  watcher.idleWorkAt = now;
+  watcher.uiDriver = { idleMs: async () => { watcher.idleTimer = null; return 600_000; } };
+  const before = ticks.length;
+  assert.equal(await check(), false);
+  assert.equal(ticks.length, before);
+});
+
+test("a scheduled scan during an idle-watcher scan runs after it, with the review", async (t) => {
+  const { supervisor } = fixture(t, { mode: "auto" });
+  const reasons = [];
+  let release;
+  supervisor._tick = async (reason) => { reasons.push(reason); if (reason === "owner-away") await new Promise((resolve) => { release = resolve; }); return {}; };
+  const away = supervisor.tick({ reason: "owner-away" });
+  const interval = supervisor.tick({ reason: "interval" });
+  assert.notEqual(interval, away);
+  assert.equal(supervisor.tick({ reason: "interval" }), interval, "one follow-up, however many intervals");
+  release();
+  await interval;
+  assert.deepEqual(reasons, ["owner-away", "interval"]);
+  // An interval during a normal scan still joins it.
+  supervisor._tick = async (reason) => { reasons.push(reason); return {}; };
+  const first = supervisor.tick({ reason: "interval" });
+  assert.equal(supervisor.tick({ reason: "interval" }), first);
+  await first;
+  assert.deepEqual(reasons, ["owner-away", "interval", "interval"]);
+  // Stopped meanwhile: the follow-up never scans.
+  supervisor._tick = async (reason) => { reasons.push(reason); if (reason === "owner-away") await new Promise((resolve) => { release = resolve; }); return {}; };
+  supervisor.tick({ reason: "owner-away" });
+  const queued = supervisor.tick({ reason: "interval" });
+  supervisor.stop();
+  release();
+  assert.equal(await queued, null);
+  assert.deepEqual(reasons, ["owner-away", "interval", "interval", "owner-away"]);
+});
+
+test("a presence-blocked app send arms the idle watcher; a watcher scan skips the review", async (t) => {
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", deliverStatus: "blocked", deps: { uiDriver: readyDriver() } });
+  const inner = supervisor.deps.executor.deliver;
+  supervisor.deps.executor.deliver = async (args) => ({ ...(await inner(args)), status: "blocked", detail: "owner using Conductor" });
+  supervisor._executor = null;
+  assert.equal(supervisor.idleWorkAt ?? null, null);
+  await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "computer-use", playbook: "owner-message" });
+  assert.equal(supervisor.idleWorkAt ?? null, null, "the owner's own message is not kept: nothing to wait for");
+  await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "computer-use", playbook: "resume" });
+  assert.ok(Number.isFinite(supervisor.idleWorkAt));
+  // A later block counts from then, not from the first one.
+  supervisor.idleWorkAt = 1;
+  await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "computer-use", playbook: "resume" });
+  assert.equal(supervisor.idleWorkAt, supervisor.now());
+  let reviewed = 0;
+  supervisor.reviewOpenQuestions = async () => { reviewed += 1; return new Set(); };
+  await supervisor.tick({ reason: "owner-away" });
+  assert.equal(reviewed, 0);
+  assert.ok(Number.isFinite(supervisor.awayLeadMs));
+  await supervisor.tick({ reason: "interval" });
+  assert.equal(reviewed, 1);
 });

@@ -71,6 +71,9 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_RELAY_MODEL` | `claude-haiku-4-5-20251001` | Model for the `claude -p` relay to live Claude/Conductor sessions |
 | `OPENAGI_FLEET_DELIVERY` | `cli` | `cli`, `computer-use`, `computer-use-first`. See [Computer-use delivery](#computer-use-delivery) |
 | `OPENAGI_FLEET_OCU_PATH` | `open-computer-use` on `PATH` | Open Computer Use binary for computer-use delivery |
+| `OPENAGI_FLEET_BACKGROUND_ROUTES` | none | `codex-exec`, `peer-relay`, or both: routes an app send may take while you are at the Mac. See [While you work](#while-you-work) |
+| `OPENAGI_FLEET_IDLE_DRAIN` | on | `0` turns off the [idle watcher](#while-you-work) |
+| `OPENAGI_FLEET_IDLE_POLL_MS` | `15000` | How often the idle watcher reads idle time while sends wait |
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
 | `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
 | `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
@@ -243,6 +246,26 @@ Safety rules:
 - Before and after screenshots go to `<dataDir>/fleet/logs/ui/` (0600, newest
   200 kept). Their paths are on the action record.
 - Blocked means nothing was typed: no attempt spent, retried next scan.
+
+### While you work
+
+An app send that waits only because you are at the Mac (`owner using <App>`
+or `waiting for idle`) is not left for the next 5-min scan:
+
+- **Idle watcher** (on by default). While such a send waits, the supervisor
+  reads your idle time every 15 s (one `ioreg` call, no screen read). Once
+  you have been away long enough, it starts one scan timed so its sends begin
+  at about 2 min idle. That scan decides everything fresh and skips the
+  needs-you review (the next scheduled scan runs it). At most one a minute.
+- **Background routes** (off until listed in `OPENAGI_FLEET_BACKGROUND_ROUTES`).
+  The send goes now, without the screen, instead of waiting:
+  - `codex-exec`: a Codex thread no app holds open (no writer lock, read again
+    at send time) and that Conductor did not start.
+  - `peer-relay`: a Conductor chat whose live Claude session is idle right
+    now, with no open pick in the chat.
+  Never `claude-resume`, never a thread with a running turn or a permission
+  prompt, and never after an app send that may have left text in the composer.
+  The action record keeps `fallbackFrom` (why the app send waited).
 
 
 - Non-live Conductor sessions: no CLI delivery route. You get "open it" after
