@@ -50,6 +50,10 @@ export const DEFAULTS = Object.freeze({
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
+  // A run holding a BuildBot3 slot is slow only past this. Runs take 17-35 min
+  // (2026-10-09) and bb-verify kills one at 90; the 30-min thread-wait limit
+  // paged the BB3 manager about normal runs.
+  fullRunSlowMs: 75 * MIN,
   quickVerifyEscalateMs: 15 * MIN,
   waitingTaskMaxMs: 45 * MIN,
   // No transcript row this long: a Conductor "working" turn is hung, and a
@@ -59,6 +63,9 @@ export const DEFAULTS = Object.freeze({
   idleReportMaxAgeMs: 6 * 60 * MIN,
   gateBlockedEscalateMs: 30 * MIN,
   lbErrorFreshMs: 15 * MIN,
+  // Connection/unavailable errors seen in chats alarm only at this count (or
+  // across two threads); one dropped stream is routine.
+  lbTransientErrorMin: 3,
   managerEscalationCooldownMs: 60 * MIN,
   // An idle thread with no delivery route waits this long before the owner
   // is asked to open it.
@@ -589,10 +596,12 @@ export async function openReadOnlyDb(filePath) {
  * @typedef {Object} FleetInfra
  * @property {{reachable: boolean|null, checkedAt: string|null, gate: {state: string|null, reason: string|null, since: string|null},
  *   fullQueue: number|null, quickQueue: number|null, load: number[]|null,
- *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null}[],
- *   timersDead: string[], error: string|null}} bb3
+ *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null,
+ *     queued?: boolean}[],
+ *   timersDead: string[], error: string|null}} bb3   a full run is queued while it waits for a slot; once admitted its ageSec is from admission
  * @property {{healthy: boolean|null, detail: string|null, watchLine: string|null,
- *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[]}[]}} lb
+ *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[],
+ *     freshCount?: number, freshThreadIds?: string[]}[]}} lb   fresh*: the rows inside lbErrorFreshMs
  * @property {{pid: number, command: string, cwd: string|null, ageSec: number, threadKey: string|null}[]} localVerify
  */
 

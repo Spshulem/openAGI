@@ -22,6 +22,23 @@ export const BB3_PROBE_SCRIPT = [
   'ls "$HOME/.bb-ci/quick/queue" 2>/dev/null | wc -l',
   'echo "@@full"',
   'ls "$HOME/.bb-ci/canonical-verification/queue" 2>/dev/null | wc -l',
+  // Runs holding a verification slot, aged from admission. A process's own age
+  // includes its wait in the queue, which read as "slow" for every queued run.
+  // A run checking out its workspace ("starting") already holds its slot. A
+  // record that vanishes or will not parse is skipped; "@@slots-ok" says the
+  // scan finished, so a crashed or cut-off scan is never read as "no slots".
+  'echo "@@slots"',
+  "python3 -c '",
+  "import glob, json, os, time",
+  'for f in glob.glob(os.path.expanduser("~/.bb-ci/canonical-verification/run-*/ownership.json")):',
+  "    try:",
+  "        d = json.load(open(f))",
+  '        if d.get("state") in ("starting", "running") and d.get("pid") and d.get("created_at"):',
+  '            print(int(d["pid"]), int(time.time() - d["created_at"]))',
+  "    except Exception:",
+  "        pass",
+  'print("@@slots-ok")',
+  "' 2>/dev/null",
   'echo "@@gate"',
   'cat "$HOME/.bb-ci/gate-status.json" 2>/dev/null',
   "echo",
@@ -171,9 +188,22 @@ function describeRun(leaf, chain, targets) {
   };
 }
 
+// pid -> every seconds-since-admission seen for it in bb-verify's run records
+// (a stale record can share a reused pid). null when the scan did not finish
+// or the probe had no slots section (an older probe), so ages fall back to ps.
+function parseSlots(lines) {
+  if (!lines?.some((line) => line.trim() === "@@slots-ok")) return null;
+  const slots = new Map();
+  for (const line of lines) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (match) slots.set(Number(match[1]), [...(slots.get(Number(match[1])) ?? []), Number(match[2])]);
+  }
+  return slots;
+}
+
 // Wrappers (bash -c, timeout) and the python process they start all match;
 // each run is reported once, as the deepest matching process.
-function collectRuns(processes, targets) {
+function collectRuns(processes, targets, slots = null) {
   const hasMatchingChild = new Set();
   for (const proc of processes.values()) if (processes.has(proc.ppid)) hasMatchingChild.add(proc.ppid);
   const runs = [];
@@ -187,7 +217,16 @@ function collectRuns(processes, targets) {
       seen.add(parent.pid);
       parent = processes.get(parent.ppid);
     }
-    runs.push(describeRun(leaf, chain, targets));
+    const run = describeRun(leaf, chain, targets);
+    if (slots && run.kind === "full") {
+      // A full run without a running record is still waiting for a slot. A
+      // record older than the process is a stale one whose pid was reused;
+      // the newest record that fits the process is the live one.
+      const plausible = (slots.get(leaf.pid) ?? []).filter((age) => age <= leaf.ageSec + 60);
+      run.queued = !plausible.length;
+      if (!run.queued) run.ageSec = Math.min(...plausible);
+    }
+    runs.push(run);
   }
   return runs.sort((a, b) => b.ageSec - a.ageSec || a.pid - b.pid);
 }
@@ -216,7 +255,7 @@ export function parseBb3Probe(text, now = Date.now()) {
     fullQueue: parseCount(sections.get("full")),
     quickQueue: parseCount(sections.get("quick")),
     load: parseLoad(sections.get("load")),
-    runs: collectRuns(parseProcesses(sections.get("ps")), parseStdoutTargets(sections.get("out"))),
+    runs: collectRuns(parseProcesses(sections.get("ps")), parseStdoutTargets(sections.get("out")), parseSlots(sections.get("slots"))),
     timersDead: parseTimersDead((sections.get("timers") ?? []).join("\n")),
     error: sections.has("end") ? null : "probe output incomplete"
   };
