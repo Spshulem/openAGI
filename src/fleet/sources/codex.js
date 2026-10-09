@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
-  SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
+  DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isPidAlive as defaultIsPidAlive, openReadOnlyDb, parseJsonLines, parsePrRef, prRefKey, readTail, redactSecrets, repoFromRemote,
   CONDUCTOR_CODEX_ORIGINATOR, runCommand, shortHash, threadKey, toIso
 } from "../contracts.js";
 import { asksOwner } from "../classify.js";
@@ -632,6 +632,9 @@ function retryThreadId(row) {
 export async function readCodexLbErrors(config, options = {}) {
   const now = options.now ?? Date.now();
   const windowMs = options.windowMs ?? LB_WINDOW_MS;
+  // The policy corroborates a transient error with rows from this window
+  // only; an hour's total would count errors long since recovered from.
+  const freshSec = (now - (config.limits?.lbErrorFreshMs ?? DEFAULTS.lbErrorFreshMs)) / 1000;
   const file = path.join(config.paths.codexHome, "logs_2.sqlite");
   // No log database is no errors; one that exists but cannot be read is
   // unknown, so the LB is never declared recovered on missing evidence.
@@ -648,14 +651,23 @@ export async function readCodexLbErrors(config, options = {}) {
   const groups = new Map();
   for (const row of rows) {
     const kind = classifyLbError(row.feedback_log_body);
-    const group = groups.get(kind) ?? { kind, count: 0, lastAtSec: 0, threadIds: new Set() };
+    const group = groups.get(kind) ?? { kind, count: 0, lastAtSec: 0, threadIds: new Set(), freshCount: 0, freshThreadIds: new Set() };
+    const ts = Number(row.ts) || 0;
     group.count += 1;
-    group.lastAtSec = Math.max(group.lastAtSec, Number(row.ts) || 0);
+    group.lastAtSec = Math.max(group.lastAtSec, ts);
     const id = retryThreadId(row);
     if (id) group.threadIds.add(id);
+    // A row with no readable time cannot be aged out, as in the policy.
+    if (!ts || ts >= freshSec) {
+      group.freshCount += 1;
+      if (id) group.freshThreadIds.add(id);
+    }
     groups.set(kind, group);
   }
   return [...groups.values()]
     .sort((a, b) => b.count - a.count || b.lastAtSec - a.lastAtSec)
-    .map((group) => ({ kind: group.kind, count: group.count, lastAt: group.lastAtSec ? toIso(group.lastAtSec) : null, threadIds: [...group.threadIds] }));
+    .map((group) => ({
+      kind: group.kind, count: group.count, lastAt: group.lastAtSec ? toIso(group.lastAtSec) : null, threadIds: [...group.threadIds],
+      freshCount: group.freshCount, freshThreadIds: [...group.freshThreadIds]
+    }));
 }

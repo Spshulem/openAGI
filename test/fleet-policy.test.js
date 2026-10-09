@@ -720,6 +720,57 @@ test("one dropped stream in one chat does not page the LB manager", () => {
   assert.ok(health([err("connection", 1)], false).problems.includes("1x connection"));
 });
 
+test("LB corroboration counts only the fresh window, across transient kinds together", () => {
+  const lb = (errors) => ({ healthy: true, detail: "200", watchLine: null, recentErrors: errors });
+  const err = (kind, count, threadIds, freshCount, freshThreadIds) => ({ kind, count, lastAt: ago(2 * MIN), threadIds, freshCount, freshThreadIds });
+  const problems = (errors) => infraHealth({ bb3: bb3Base, lb: lb(errors) }, { config, now: NOW }).lb.problems;
+  // Two 50-minute-old errors (one in another thread) and one fresh one: one fresh error.
+  assert.deepEqual(problems([err("connection", 3, ["x1", "x2"], 1, ["x1"])]), []);
+  assert.deepEqual(problems([err("connection", 3, ["x1"], 3, ["x1"])]), ["3x connection"]);
+  // A fresh connection in one chat and a fresh unavailable in another corroborate each other.
+  assert.deepEqual(problems([err("connection", 1, ["x1"], 1, ["x1"]), err("unavailable", 1, ["x2"], 1, ["x2"])]), ["1x connection", "1x unavailable"]);
+  assert.deepEqual(problems([err("connection", 2, ["x1"], 2, ["x1"]), err("unavailable", 1, ["x1"], 1, ["x1"])]), ["2x connection", "1x unavailable"]);
+  assert.deepEqual(problems([err("connection", 1, ["x1"], 1, ["x1"]), err("unavailable", 1, ["x1"], 1, ["x1"])]), []);
+  // Deterministic kinds neither need nor lend corroboration.
+  assert.deepEqual(problems([err("connection", 1, ["x1"], 1, ["x1"]), err("auth", 1, ["x2"], 1, ["x2"])]), ["1x auth"]);
+});
+
+test("a thread's full verify is judged by its BuildBot3 run's admission, not its task age", () => {
+  const failing = makePr({ ci: { state: "FAILURE", failing: ["verification"], pending: [] } });
+  const task = { id: "t1", description: "bb-verify --full --pr 6522", kind: "local_bash", startedAt: ago(40 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [task] });
+  const withRuns = (runs) => ({ bb3: { ...bb3Base, runs }, lb: lbOk, localVerify: [] });
+  const full = (pr, ageMin, queued) => ({ pid: pr, kind: "full", pr, head: null, ageSec: ageMin * 60, owner: null, queued });
+  const decide = (runs) => run(thread, { pr: failing, infra: withRuns(runs) }).decision;
+  // Unmatched (no run, or another PR's): the 30-min task age still escalates.
+  assert.equal(decide([]).action, "escalate-manager");
+  assert.equal(decide([full(7000, 10, false)]).action, "escalate-manager");
+  // Queued, or admitted under fullRunSlowMs: waiting its turn, not slow.
+  assert.equal(decide([full(6522, 40, true)]).action, "wait");
+  assert.equal(decide([full(6522, 32, false)]).action, "wait");
+  assert.equal(decide([full(6522, 30, false), full(6522, 90, true)]).action, "wait");
+  const slow = decide([full(6522, 80, false)]);
+  assert.equal(slow.action, "escalate-manager");
+  assert.match(slow.reason, /bb-verify --full 80m/);
+  // Still queued past fullRunSlowMs: the queue is stuck, not busy.
+  const stuck = makeThread({ agentStatus: "waiting", openTasks: [{ ...task, startedAt: ago(80 * MIN) }] });
+  const stuckDecision = run(stuck, { pr: failing, infra: withRuns([full(6522, 80, true)]) }).decision;
+  assert.equal(stuckDecision.action, "escalate-manager");
+  assert.match(stuckDecision.reason, /bb-verify --full 80m/);
+
+  // The infra escalation's waiting lines follow the same rule.
+  const blocked = (runs) => ({ ...withRuns(runs), bb3: { ...bb3Base, runs, gate: { state: "blocked", reason: "disk", since: ago(40 * MIN) } } });
+  const lines = (runs) => {
+    const infra = blocked(runs);
+    const classified = classifyThread(thread, { pr: failing, localGit: cleanGit, infra, now: NOW, config });
+    const decisions = decideInfra(infra, { ledger: {}, playbooks, config, now: NOW, threads: [{ thread, classified, pr: failing, ledger: {} }], manager, mode: "auto" });
+    return decisions.find((d) => d.threadKey === "infra:bb3" && d.action === "escalate-manager").message;
+  };
+  assert.doesNotMatch(lines([full(6522, 40, true)]), /Waiting: .*#6522/);
+  assert.match(lines([full(6522, 80, false)]), /Waiting: .*#6522.*bb-verify --full 80m/);
+  assert.match(lines([]), /Waiting: .*#6522.*bb-verify --full 40m/);
+});
+
 test("F5: recovery resumes threads remembered as blocked after their log rows expire", () => {
   // The aborted turn has no error; its only lb signal (the log row) is gone.
   const aborted = makeThread({ key: "codex:x1", kind: "codex", id: "x1", live: null, agentStatus: "aborted", prRefs: [], error: null, lastUserAt: ago(3 * 60 * MIN) });

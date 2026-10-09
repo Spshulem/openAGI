@@ -596,10 +596,12 @@ export async function openReadOnlyDb(filePath) {
  * @typedef {Object} FleetInfra
  * @property {{reachable: boolean|null, checkedAt: string|null, gate: {state: string|null, reason: string|null, since: string|null},
  *   fullQueue: number|null, quickQueue: number|null, load: number[]|null,
- *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null}[],
- *   timersDead: string[], error: string|null}} bb3
+ *   runs: {pid: number, kind: "full"|"quick", pr: number|null, head: string|null, ageSec: number, owner: string|null,
+ *     queued?: boolean}[],
+ *   timersDead: string[], error: string|null}} bb3   a full run is queued while it waits for a slot; once admitted its ageSec is from admission
  * @property {{healthy: boolean|null, detail: string|null, watchLine: string|null,
- *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[]}[]}} lb
+ *   recentErrors: {kind: string, count: number, lastAt: string|null, threadIds: string[],
+ *     freshCount?: number, freshThreadIds?: string[]}[]}} lb   fresh*: the rows inside lbErrorFreshMs
  * @property {{pid: number, command: string, cwd: string|null, ageSec: number, threadKey: string|null}[]} localVerify
  */
 

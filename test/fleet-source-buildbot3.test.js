@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import {
   BB3_PROBE_SCRIPT, checkLb, ownerFromLog, parseBb3Probe, parseTimersDead, probeBuildBot3, readLocalWatchState
@@ -374,6 +378,7 @@ test("queued full runs are aged and judged apart from running ones", () => {
     "@@out", "@@slots",
     "100 2200",
     "300 900000",
+    "@@slots-ok",
     "@@full", "2", "@@quick", "0", "@@gate", "{}", "@@load", "1 1 1 1/1 1", "@@timers", "@@end"
   ].join("\n");
   const runs = Object.fromEntries(parseBb3Probe(text, NOW).runs.map((run) => [run.pr, run]));
@@ -389,4 +394,70 @@ test("an older probe without a slots section keeps process ages", () => {
   const [run] = parseBb3Probe(text, NOW).runs;
   assert.equal(run.queued, undefined);
   assert.equal(run.ageSec, 2400);
+});
+
+test("a slot scan that did not finish keeps process ages", () => {
+  // Rows printed before the scan crashed are not the whole slot list.
+  const text = [
+    "@@ps",
+    "  100     1  2400 python3 /home/dev/bin/bb-verify --full --pr 7321",
+    "  200     1  9000 python3 /home/dev/bin/bb-verify --full --pr 7210",
+    "@@out", "@@slots", "100 2200", "@@gate", "{}", "@@end"
+  ].join("\n");
+  const runs = Object.fromEntries(parseBb3Probe(text, NOW).runs.map((run) => [run.pr, run]));
+  assert.equal(runs[7321].queued, undefined);
+  assert.equal(runs[7321].ageSec, 2400);
+  assert.equal(runs[7210].queued, undefined);
+  assert.equal(runs[7210].ageSec, 9000);
+});
+
+test("a stale record sharing a reused pid does not hide the live one", () => {
+  for (const rows of [["100 900000", "100 2200"], ["100 2200", "100 900000"]]) {
+    const text = [
+      "@@ps", "  100     1  2400 python3 /home/dev/bin/bb-verify --full --pr 7321",
+      "@@out", "@@slots", ...rows, "@@slots-ok", "@@end"
+    ].join("\n");
+    const [run] = parseBb3Probe(text, NOW).runs;
+    assert.equal(run.queued, false, rows.join(", "));
+    assert.equal(run.ageSec, 2200, rows.join(", "));
+  }
+});
+
+const hasPython = spawnSync("python3", ["-c", ""]).status === 0;
+
+test("the slot scan skips unreadable records and says when it finished", { skip: !hasPython && "no python3" }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-bb3-slots-"));
+  try {
+    const record = (name, body) => {
+      const dir = path.join(home, ".bb-ci/canonical-verification", name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "ownership.json"), body);
+    };
+    const createdAt = Date.now() / 1000 - 600;
+    record("run-a", "{\"state\": \"run");
+    record("run-b", "[1, 2]");
+    record("run-c", JSON.stringify({ state: "running", pid: 4242, created_at: createdAt }));
+    record("run-d", JSON.stringify({ state: "finished", pid: 4343, created_at: createdAt }));
+    record("run-e", JSON.stringify({ state: "starting", pid: 4444, created_at: createdAt }));
+    const lines = BB3_PROBE_SCRIPT.split("\n");
+    const scan = lines.slice(lines.indexOf('echo "@@slots"'), lines.indexOf('echo "@@gate"')).join("\n");
+    const result = spawnSync("bash", ["-c", scan], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const text = [
+      "@@ps",
+      "  4242     1  700 python3 /home/dev/bin/bb-verify --full --pr 7321",
+      "  4343     1  700 python3 /home/dev/bin/bb-verify --full --pr 7322",
+      "  4444     1  700 python3 /home/dev/bin/bb-verify --full --pr 7323",
+      "@@out", result.stdout, "@@end"
+    ].join("\n");
+    const runs = Object.fromEntries(parseBb3Probe(text, NOW).runs.map((run) => [run.pr, run]));
+    // A setup that hangs holds its slot too, so it must still read as slow.
+    for (const pr of [7321, 7323]) {
+      assert.equal(runs[pr].queued, false, String(pr));
+      assert.ok(runs[pr].ageSec >= 600 && runs[pr].ageSec < 660, String(runs[pr].ageSec));
+    }
+    assert.equal(runs[7322].queued, true);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });

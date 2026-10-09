@@ -288,7 +288,8 @@ function waitingIntent(ctx) {
     // Full runs are only for reproducing a hosted CI failure.
     if (!ciFailing) return nudge("bb3-slow-agent", `full verify ${minutes(age)}m; hosted CI not failing`, { immediate: true, vars: { age: minutes(age) } });
     if (silent) return statusCheck("bb-verify --full", quietMs);
-    return escalateIntent(ctx, "bb-verify --full", age);
+    const slowMs = slowFullWait(age, pr, ctx.infra?.bb3, limits);
+    if (slowMs !== null) return escalateIntent(ctx, "bb-verify --full", slowMs);
   }
   if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) {
     return silent ? statusCheck("bb-quick", quietMs) : escalateIntent(ctx, "bb-quick", age);
@@ -342,12 +343,13 @@ function waitingLine(facts, what, age) {
 }
 
 // The verify wait waitingIntent escalates to the manager, or null.
-function escalatedWait(classified, pr, limits) {
+function escalatedWait(classified, pr, limits, bb3) {
   if (classified?.state !== "waiting-ci") return null;
   const wait = classified.wait ?? {};
   const age = wait.ageMs ?? 0;
   const ciFailing = Boolean(pr) && (CI_FAILING.has(pr.ci?.state) || Boolean(pr.ci?.failing?.length));
-  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs && ciFailing) return { what: "bb-verify --full", age };
+  const slowMs = wait.taskKind === "full" && ciFailing ? slowFullWait(age, pr, bb3, limits) : null;
+  if (slowMs !== null) return { what: "bb-verify --full", age: slowMs };
   if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) return { what: "bb-quick", age };
   return null;
 }
@@ -616,12 +618,15 @@ function lastPlaybookAt(ledger, playbookId) {
 
 // Shared by decideInfra and the supervisor (which records `down` per tick
 // with store.setInfraDown so the next tick can see a recovery).
-// Transient kinds need several hits or more than one thread, unless the LB's
-// own probe already says it is unhealthy. no-accounts and auth are never noise.
-function corroborated(entry, lb, limits) {
-  if (!LB_TRANSIENT_KINDS.has(entry.kind) || lb?.healthy === false) return true;
-  const min = limits.lbTransientErrorMin ?? LB_TRANSIENT_MIN;
-  return Number(entry.count) >= min || (entry.threadIds?.length ?? 0) >= 2;
+// Transient kinds, taken together, need several hits or more than one thread
+// inside the fresh window, unless the LB's own probe already says it is
+// unhealthy. no-accounts and auth are never noise.
+function transientCorroborated(entries, lb, limits) {
+  if (lb?.healthy === false) return true;
+  // An entry without fresh counts (an older reader) counts its hour.
+  const count = entries.reduce((sum, entry) => sum + Number(entry.freshCount ?? entry.count), 0);
+  const threads = new Set(entries.flatMap((entry) => entry.freshThreadIds ?? entry.threadIds ?? []));
+  return count >= (limits.lbTransientErrorMin ?? LB_TRANSIENT_MIN) || threads.size >= 2;
 }
 
 export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
@@ -642,9 +647,11 @@ export function infraHealth(infra, { config = null, now = Date.now() } = {}) {
 
   // The log window is an hour; only recent rows say the LB is down now.
   const freshMs = limits.lbErrorFreshMs ?? LB_ERROR_FRESH_MS;
-  const lbErrors = (lb?.recentErrors ?? []).filter((entry) => LB_ALARM_KINDS.has(entry.kind) && Number(entry.count) > 0
-    && isFresh(entry.lastAt, freshMs, now)
-    && corroborated(entry, lb, limits));
+  const freshErrors = (lb?.recentErrors ?? []).filter((entry) => LB_ALARM_KINDS.has(entry.kind) && Number(entry.count) > 0
+    && isFresh(entry.lastAt, freshMs, now));
+  const transient = freshErrors.filter((entry) => LB_TRANSIENT_KINDS.has(entry.kind));
+  const keepTransient = transientCorroborated(transient, lb, limits);
+  const lbErrors = freshErrors.filter((entry) => keepTransient || !LB_TRANSIENT_KINDS.has(entry.kind));
   const lbProblems = [];
   if (lb?.healthy === false) lbProblems.push(`LB unhealthy${lb.detail ? ` (${fact(lb.detail, 80)})` : ""}`);
   for (const entry of lbErrors) lbProblems.push(`${Number(entry.count)}x ${entry.kind}`);
@@ -730,7 +737,7 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   if (cooledAt && Date.parse(cooledAt) > now) return { ...base, action: "wait", reason: `escalated; ${base.reason}`, notBefore: cooledAt };
   const busy = managerBusy(manager, limits, now);
   if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
-  const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
+  const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits, infra?.bb3) } : lbVars(infra?.lb, problems);
   const route = managerRoute(manager, mode, limits, now, delivery);
   const waitUi = route || !manager || managerDown(manager, now) ? null : uiBlockedReason(manager, delivery);
   if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}`, uiBlocked: true };
@@ -748,10 +755,10 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
 
 // Only one escalation per manager per tick carries the news, so it names
 // every thread whose verify wait would have escalated on its own.
-function waitingLines(threads, limits) {
+function waitingLines(threads, limits, bb3) {
   const lines = [];
   for (const item of threads ?? []) {
-    const slow = item?.thread && escalatedWait(item.classified, item.pr ?? null, limits);
+    const slow = item?.thread && escalatedWait(item.classified, item.pr ?? null, limits, bb3);
     if (slow) lines.push(waitingLine(factsFor(item.thread, item.pr ?? null, item.classified), slow.what, slow.age));
   }
   const extra = lines.length > 4 ? ` +${lines.length - 4} more waiting.` : "";
@@ -793,16 +800,32 @@ function infraDecision(key, patch) {
 }
 
 const fullRunSlow = (limits) => limits.fullRunSlowMs ?? 75 * MIN;
+// Queued runs are waiting their turn, not slow.
+const slowFullRun = (run, limits) => run?.kind === "full" && !run.queued && Number(run.ageSec) * 1000 >= fullRunSlow(limits);
 
 function slowRuns(bb3, limits) {
   const runs = Array.isArray(bb3?.runs) ? bb3.runs : [];
   const ageMs = (run) => Number(run?.ageSec) * 1000;
   const oldestFirst = (a, b) => ageMs(b) - ageMs(a);
   return {
-    // Queued runs are waiting their turn, not slow.
-    full: runs.filter((run) => run?.kind === "full" && !run.queued && ageMs(run) >= fullRunSlow(limits)).sort(oldestFirst),
+    full: runs.filter((run) => slowFullRun(run, limits)).sort(oldestFirst),
     quick: runs.filter((run) => run?.kind === "quick" && ageMs(run) >= limits.quickVerifyEscalateMs).sort(oldestFirst)
   };
+}
+
+// How long a thread's full verify has waited, once that is long enough to
+// escalate, else null. Its BuildBot3 run, found by PR, is judged as slowRuns
+// judges it (an admitted one outranks a queued retry); with no run found, the
+// background task's age against fullVerifyEscalateMs stands. One still queued
+// past fullRunSlowMs means the slots are not turning over.
+function slowFullWait(age, pr, bb3, limits) {
+  if (age < limits.fullVerifyEscalateMs) return null;
+  const number = Number(pr?.number);
+  const runs = number && Array.isArray(bb3?.runs) ? bb3.runs.filter((run) => run?.kind === "full" && Number(run.pr) === number) : [];
+  const run = runs.find((item) => !item.queued) ?? runs[0];
+  if (!run) return age;
+  if (run.queued) return age >= fullRunSlow(limits) ? age : null;
+  return slowFullRun(run, limits) ? Number(run.ageSec) * 1000 : null;
 }
 
 function bb3Vars(bb3, problems, limits) {

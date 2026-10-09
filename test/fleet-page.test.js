@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import vm from "node:vm";
 import { fleetPage } from "../src/fleet/page.js";
+import { DEFAULTS } from "../src/fleet/contracts.js";
 
 function pageScript() {
   const scripts = [...fleetPage.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
@@ -368,4 +369,32 @@ test("an open question shows why the supervisor kept it, with the full reason on
   assert.ok(note.title.startsWith(long), "full reason on hover");
   assert.match(note.title, /reviewed /);
   assert.equal(cards[1].textContent.includes("Supervisor:"), false, "no review, no line");
+});
+
+test("Oldest run skips queued runs and uses policy's slow limits", async () => {
+  assert.doesNotMatch(fleetPage, /FLEET_(?:FULL|QUICK)_SLOW_SEC/, "limits filled in");
+  const fullSlowSec = DEFAULTS.fullRunSlowMs / 1000;
+  const oldestPill = async (runs) => {
+    const state = sampleState();
+    state.snapshot.infra.bb3.runs = runs;
+    const page = boot({ state });
+    await settle();
+    const pill = findAll(page.el("infraStrip"), (e) => e.className === "pill" && e.textContent.startsWith("Oldest run"))[0];
+    return { text: pill.textContent, tone: pill.children[0].className };
+  };
+  const full = (pr, ageSec, queued) => ({ pid: pr, kind: "full", pr, head: "abc", ageSec, owner: null, queued });
+  // Hours in the queue, and a 40-min admitted run past the old 30-min line.
+  let pill = await oldestPill([full(1, 4 * 3600, true), full(2, 40 * 60, false)]);
+  assert.match(pill.text, /#2$/, "the queued run is not the oldest");
+  assert.equal(pill.tone, "dim", "under fullRunSlowMs is not slow");
+  pill = await oldestPill([full(3, fullSlowSec, false)]);
+  assert.equal(pill.tone, "warn", "slow from fullRunSlowMs");
+  pill = await oldestPill([full(4, 4 * 3600, true)]);
+  assert.match(pill.text, /none$/, "only queued runs: none running");
+  const quick = { pid: 5, kind: "quick", pr: 5, head: "abc", ageSec: DEFAULTS.quickVerifyEscalateMs / 1000, owner: null };
+  pill = await oldestPill([quick]);
+  assert.equal(pill.tone, "warn", "quick runs keep quickVerifyEscalateMs");
+  pill = await oldestPill([full(2, 40 * 60, false), quick, null]);
+  assert.match(pill.text, /#5$/, "an older full run under its limit does not hide a slow quick run");
+  assert.equal(pill.tone, "warn");
 });

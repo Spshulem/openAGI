@@ -436,6 +436,29 @@ test("readCodexLbErrors groups responses_retry rows by kind inside the window", 
   assert.ok(!JSON.stringify(groups).includes("sk-svcac"));
 });
 
+test("readCodexLbErrors counts the fresh window apart from the hour", async (t) => {
+  const { config, retry } = makeLogsDb(t);
+  retry(50 * MIN, "Connection failed: error sending request retry_delay=5s", "th-1");
+  retry(45 * MIN, "Connection failed: error sending request retry_delay=5s", "th-2");
+  retry(2 * MIN, "Connection failed: error sending request retry_delay=5s", "th-1");
+  const [connection] = await readCodexLbErrors(config, { now: NOW, windowMs: 60 * MIN });
+  assert.equal(connection.count, 3);
+  assert.deepEqual(connection.threadIds.sort(), ["th-1", "th-2"]);
+  assert.equal(connection.freshCount, 1);
+  assert.deepEqual(connection.freshThreadIds, ["th-1"]);
+  // The fresh window is the lbErrorFreshMs limit.
+  const wide = { ...config, limits: { ...config.limits, lbErrorFreshMs: 46 * MIN } };
+  const [widened] = await readCodexLbErrors(wide, { now: NOW, windowMs: 60 * MIN });
+  assert.equal(widened.freshCount, 2);
+  assert.deepEqual(widened.freshThreadIds.sort(), ["th-1", "th-2"]);
+  // A row with no readable time counts as fresh, never as recovered.
+  const { config: odd, insert } = makeLogsDb(t);
+  insert.run("garbage", "WARN", "codex_core::responses_retry", "error=Connection failed: error sending request", "th-3");
+  const [unknown] = await readCodexLbErrors(odd, { now: NOW, windowMs: 60 * MIN });
+  assert.equal(unknown.freshCount, 1);
+  assert.deepEqual(unknown.freshThreadIds, ["th-3"]);
+});
+
 test("readCodexLbErrors degrades to [] without a log database", async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-codex-nolog-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
