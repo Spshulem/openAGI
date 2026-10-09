@@ -117,6 +117,7 @@ function sampleState(overrides = {}) {
         lb: { healthy: false, detail: "503", watchLine: null, recentErrors: [] },
         localVerify: [{ pid: 9, command: "pnpm build", cwd: "/x", ageSec: 60, threadKey: "codex:a" }]
       },
+      storage: { volumes: [{ id: "data", freeGb: 37.4, totalGb: 1858, mounted: true, identityOk: true }, { id: "sd", freeGb: 63, totalGb: 1863, mounted: true, identityOk: false }], lastFreed: { gb: 8.2, at: new Date().toISOString(), what: "safe cleanup" }, pendingAsks: 1 },
       sourceErrors: { github: evil }
     },
     questions: [
@@ -195,6 +196,8 @@ test("page renders state with text only and neutralises unsafe links", async () 
   assert.ok(fleet.textContent.includes("PR not ready"));
   assert.ok(page.el("infraStrip").textContent.includes("blocked"));
   assert.ok(page.el("infraStrip").textContent.includes("github"));
+  assert.ok(page.el("infraStrip").textContent.includes("37 GB free"), "disk free on the infra strip");
+  assert.ok(page.el("infraStrip").textContent.includes("63 GB free, unverified"));
   const doing = page.el("doingList");
   assert.equal(findAll(doing, (e) => e.tagName === "BUTTON" && e.textContent === "Send").length, 1, "Send only on proposed");
   assert.equal(page.el("mode-propose").getAttribute("aria-pressed"), "true");

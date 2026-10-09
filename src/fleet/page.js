@@ -478,6 +478,19 @@ details.thread>summary{padding:0}
     pill(box, 'LB', lbHealthy === true ? 'ok' : (lbHealthy === false ? 'down' : 'unknown'), lbHealthy === true ? 'good' : (lbHealthy === false ? 'hot' : 'dim'));
     var local = Array.isArray(infra.localVerify) ? infra.localVerify.length : 0;
     pill(box, 'Laptop verify', String(local), local ? 'warn' : 'dim');
+    var storage = snap.storage || null;
+    var vols = storage && Array.isArray(storage.volumes) ? storage.volumes : [];
+    vols.forEach(function (v) {
+      var name = v.id === 'sd' ? 'SD card' : 'Disk';
+      if (v.mounted === false) { pill(box, name, 'not mounted', 'dim'); return; }
+      var free = typeof v.freeGb === 'number' ? v.freeGb : null;
+      var low = v.id === 'sd' ? 50 : 100;
+      var tone = free === null ? 'dim' : (v.id !== 'sd' && free < 15 ? 'hot' : (free < low ? 'warn' : 'good'));
+      var text = free === null ? 'unknown' : Math.round(free) + ' GB free';
+      if (v.id === 'sd' && v.identityOk === false) text += ', unverified';
+      pill(box, name, text, tone);
+    });
+    if (storage && storage.lastFreed && typeof storage.lastFreed.gb === 'number') pill(box, 'Freed', storage.lastFreed.gb + ' GB ' + ago(storage.lastFreed.at), 'dim');
     var errors = snap.sourceErrors || {};
     Object.keys(errors).forEach(function (source) {
       pill(box, source, clip(errors[source], 120), 'hot');
