@@ -171,6 +171,16 @@ export function resolveOcuPath(env = process.env, { exists = fs.existsSync, real
   return exists(native) ? path.normalize(native) : real;
 }
 
+// Non-UI routes a computer-use send may fall back to while the owner is at
+// the Mac (so nothing takes the screen). claude-resume is never one: it
+// forks a session behind Conductor.
+export const BACKGROUND_ROUTES = Object.freeze(["codex-exec", "peer-relay"]);
+
+export function parseBackgroundRoutes(value) {
+  const names = String(value ?? "").split(/[\s,]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+  return [...new Set(names.filter((name) => BACKGROUND_ROUTES.includes(name)))];
+}
+
 export function parseDeliveryMode(value) {
   const text = String(value ?? "").trim().toLowerCase();
   return DELIVERY_MODES.includes(text) ? text : "cli";
@@ -215,6 +225,14 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // a built-in default for buildbetter-app/buildbetter.
     uiPathPrefixes: overrides.uiPathPrefixes ?? {},
     delivery: DELIVERY_MODES.includes(overrides.delivery) ? overrides.delivery : parseDeliveryMode(env.OPENAGI_FLEET_DELIVERY),
+    // Off unless listed: OPENAGI_FLEET_BACKGROUND_ROUTES=codex-exec,peer-relay.
+    backgroundRoutes: Array.isArray(overrides.backgroundRoutes) ? parseBackgroundRoutes(overrides.backgroundRoutes.join(",")) : parseBackgroundRoutes(env.OPENAGI_FLEET_BACKGROUND_ROUTES),
+    // The watcher that sends app deliveries soon after the owner steps away,
+    // instead of at the next scheduled scan. On unless OPENAGI_FLEET_IDLE_DRAIN=0.
+    idleDrain: {
+      enabled: overrides.idleDrain?.enabled ?? !envOff(env.OPENAGI_FLEET_IDLE_DRAIN),
+      pollMs: overrides.idleDrain?.pollMs ?? envNumber(env.OPENAGI_FLEET_IDLE_POLL_MS, 15_000)
+    },
     // The supervisor's review of its own needs-you list: on with the
     // supervisor unless OPENAGI_FLEET_REVIEW=0.
     review: {

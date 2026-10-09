@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { classifyErrorText } from "./errors.js";
 import { DEADLINE_MARGIN_MS, UI_LOCK, flattenMessage, uiIdentity } from "./ui-delivery.js";
 
@@ -170,7 +170,31 @@ function isSelf(thread, config) {
   return [thread.id, thread.claudeSessionId].some((id) => id && self.includes(id));
 }
 
-function checkPreconditions(thread, route, message, config) {
+// An app send blocked only because the owner is at the Mac. A send that left
+// our text in the composer ("...; our text is left as a draft") is not one:
+// a second route would duplicate it.
+export const PRESENCE_BLOCK = /^(?:owner using [^;]+|waiting for idle: [^;]+)$/;
+
+export function isPresenceBlock(delivery) {
+  return delivery?.status === "blocked" && PRESENCE_BLOCK.test(String(delivery.detail ?? ""));
+}
+
+// The non-UI route a presence-blocked app send may take instead, if the owner
+// allowed it (config.backgroundRoutes) and it cannot fork or queue unseen:
+// codex-exec only for a Codex thread no app holds and Conductor did not
+// start; peer-relay only for an idle live Claude session with no open pick.
+export function backgroundRouteFor(thread, config) {
+  const allowed = config?.backgroundRoutes ?? [];
+  if (!allowed.length || !thread || thread.archived || thread.agentStatus === "running" || thread.meta?.blockedOnOwner === true) return null;
+  if (thread.kind === "codex") {
+    if (!allowed.includes("codex-exec") || thread.writerLocked || !thread.cwd || thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return null;
+    return "codex-exec";
+  }
+  if (allowed.includes("peer-relay") && thread.live?.peerName && thread.live?.pid && thread.live.status === "idle" && !thread.meta?.pendingQuestion) return "peer-relay";
+  return null;
+}
+
+function checkPreconditions(thread, route, message, config, fallback = false) {
   if (!thread?.key) return "no thread";
   if (!ROUTES.includes(route)) return "no delivery route";
   if (!String(message ?? "").trim()) return "empty message";
@@ -178,7 +202,7 @@ function checkPreconditions(thread, route, message, config) {
   if (thread.archived) return "archived";
   // On a computer-use-only Mac no send ever runs a CLI, whatever an older
   // proposal or caller asked for.
-  if (config?.delivery === "computer-use" && route !== "computer-use") return "computer-use delivery only: CLI routes are off";
+  if (config?.delivery === "computer-use" && route !== "computer-use" && !(fallback && config.backgroundRoutes?.includes(route))) return "computer-use delivery only: CLI routes are off";
   if (route === "computer-use") {
     // A Codex writer lock held by the desktop app is expected here; a running
     // turn is not. The UI re-checks for a Stop button before typing.
@@ -189,6 +213,7 @@ function checkPreconditions(thread, route, message, config) {
   if (route === "codex-exec") {
     if (thread.kind !== "codex") return "codex-exec needs a codex thread";
     if (thread.writerLocked) return "writer-locked: the thread is open in another Codex writer";
+    if (thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return "conductor-owned: open it in Conductor";
     if (!isDirectory(thread.cwd)) return "cwd missing";
   }
   if (route === "peer-relay" && !thread.live?.peerName) return "no live peer";
@@ -413,12 +438,32 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     return sent;
   };
 
-  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null } = {}) {
+  // The background route a presence-blocked app send takes, re-checked at
+  // send time: the scan's lock and peer reads are up to a tick old.
+  function fallbackRoute(thread, target) {
+    const route = backgroundRouteFor(thread, config);
+    if (!route) return null;
+    // An earlier app send may sit in that composer unconfirmed.
+    if (unconfirmed.has(target.targetKey)) return null;
+    if (route === "codex-exec") {
+      if (!paths.codexHome) return null;
+      try { if (fs.existsSync(path.join(paths.codexHome, "thread-writer-locks", `${thread.id}.lock`))) return null; } catch { return null; }
+      return route;
+    }
+    if (!readLivePeers) return null;
+    let peers = null;
+    try { peers = readLivePeers(config); } catch { return null; }
+    const peer = [thread.claudeSessionId, thread.id].map((id) => id && peers?.get(id)).find(Boolean);
+    if (!peer?.peerName || peer.status !== "idle" || peer.waitingFor) return null;
+    return { route, live: { ...thread.live, peerName: peer.peerName, pid: peer.pid, status: peer.status } };
+  }
+
+  async function deliver({ thread, message, route, dryRun = false, actionId = null, playbook = null, spentMs = 0, deadlineAt = null, fallbackFrom = null } = {}) {
     const blocked = (detail) => {
       if (actionId) journal(actionId, { status: "blocked", detail });
       return { status: "blocked", route: ROUTES.includes(route) ? route : null, detail, actionId };
     };
-    const reason = checkPreconditions(thread, route, message, config);
+    const reason = checkPreconditions(thread, route, message, config, Boolean(fallbackFrom));
     if (reason) return blocked(reason);
     // The scan's liveness is a snapshot; a session opened since then would fork.
     if (route === "claude-resume" && readLivePeers) {
@@ -433,7 +478,7 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     const step = plan(thread, route, text);
     if (dryRun) return { status: "dry-run", route, detail: step.ui ? `would ${step.describe}` : `would run ${step.describe}`, actionId };
 
-    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text) };
+    const base = { threadKey: thread.key, route, playbook, messageHash: shortHash(text), ...(fallbackFrom ? { fallbackFrom } : {}) };
     if (step.ui) {
       if (!ui?.deliver) return blocked("computer use unavailable on this Mac");
       // One Conductor session can be reached through two fleet threads (its
@@ -441,12 +486,20 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
       if (active.has(step.target.targetKey)) return blocked("in flight: a send to this thread has not finished");
       active.add(thread.key);
       active.add(step.target.targetKey);
+      let result;
       try {
-        return await typeInApp(thread, step, base, actionId, text, spentMs, deadlineAt);
+        result = await typeInApp(thread, step, base, actionId, text, spentMs, deadlineAt);
       } finally {
         active.delete(thread.key);
         active.delete(step.target.targetKey);
       }
+      // The owner is at the Mac: a route that does not take the screen, if
+      // the owner allowed one for this thread. Otherwise it waits for idle.
+      if (!isPresenceBlock(result)) return result;
+      const fallback = fallbackRoute(thread, step.target);
+      if (!fallback) return result;
+      const viaThread = typeof fallback === "object" ? { ...thread, live: fallback.live } : thread;
+      return deliver({ thread: viaThread, message, route: typeof fallback === "object" ? fallback.route : fallback, actionId: result.actionId ?? actionId, playbook, spentMs, deadlineAt, fallbackFrom: result.detail });
     }
     // A remote caller (deadlineAt) reports failure at its deadline: nothing
     // starts after it, and a relay gets only what is left, less the trip back

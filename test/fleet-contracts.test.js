@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  ROUTES, UI_APPS, clampTail, clampText, isPidAlive, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
+  ROUTES, UI_APPS, clampTail, clampText, isPidAlive, parseBackgroundRoutes, parseDeliveryMode, parseEnvText, parsePrRef, prRefKey, readTail, redactSecrets,
   repoFromRemote, resolveFleetConfig, resolveOcuPath, runCommand, toIso, uiTargetFor
 } from "../src/fleet/contracts.js";
 
@@ -138,4 +138,17 @@ test("uiTargetFor maps threads to the app that shows them, or none", () => {
   assert.equal(uiTargetFor({ key: "codex:t2", kind: "codex", id: "t2", meta: { originator: "codex_sdk_ts" } }), null);
   assert.equal(uiTargetFor({ key: "claude:c1", kind: "claude", id: "c1", meta: { entrypoint: "cli" } }), null, "terminal Claude: no app");
   assert.equal(uiTargetFor(null), null);
+});
+
+test("background routes are off unless listed, and never include claude-resume; the idle watcher is on unless turned off", () => {
+  assert.deepEqual(parseBackgroundRoutes("codex-exec, peer-relay claude-resume bogus codex-exec"), ["codex-exec", "peer-relay"]);
+  assert.deepEqual(parseBackgroundRoutes(""), []);
+  assert.deepEqual(parseBackgroundRoutes("off"), []);
+  const plain = resolveFleetConfig({}, { home: "/home/fixture" });
+  assert.deepEqual(plain.backgroundRoutes, []);
+  assert.deepEqual(plain.idleDrain, { enabled: true, pollMs: 15_000 });
+  const set = resolveFleetConfig({ OPENAGI_FLEET_BACKGROUND_ROUTES: "codex-exec", OPENAGI_FLEET_IDLE_DRAIN: "0", OPENAGI_FLEET_IDLE_POLL_MS: "5000" }, { home: "/home/fixture" });
+  assert.deepEqual(set.backgroundRoutes, ["codex-exec"]);
+  assert.deepEqual(set.idleDrain, { enabled: false, pollMs: 5000 });
+  assert.deepEqual(resolveFleetConfig({}, { home: "/home/fixture", backgroundRoutes: ["claude-resume", "peer-relay"] }).backgroundRoutes, ["peer-relay"]);
 });

@@ -2883,3 +2883,70 @@ test("a chat the owner wrote to after the restart, or running again, gets no res
   const resumed = delivered.filter((args) => args.playbook === "app-restarted").map((args) => args.thread.key);
   assert.deepEqual(resumed, ["conductor:a"], "b: the owner wrote since");
 });
+
+// --- idle watcher ---------------------------------------------------------------
+
+test("the idle watcher reads idle only while sends wait on the owner, then starts one sends-only scan", async () => {
+  let now = Date.parse("2026-10-08T12:00:00Z");
+  const reads = [];
+  const ticks = [];
+  let idle = 0;
+  const watcher = {
+    mode: "auto", running: null, config: { tickMs: 5 * 60_000, limits: {} }, now: () => now,
+    uiDriver: { idleMs: async () => { reads.push(now); return idle; } },
+    tick: async (options) => { ticks.push(options); }
+  };
+  const check = () => FleetSupervisor.prototype.idleCheck.call(watcher);
+  assert.equal(await check(), false);
+  assert.equal(reads.length, 0, "nothing waits: no idle read at all");
+  watcher.idleWorkAt = now;
+  idle = 30_000;
+  assert.equal(await check(), false, "the owner is still around");
+  assert.equal(reads.length, 1);
+  // The first scan is taken to reach its sends in 45 s: it starts at 75 s idle.
+  idle = 76_000;
+  assert.equal(await check(), true);
+  assert.deepEqual(ticks, [{ reason: "owner-away" }]);
+  assert.equal(watcher.idleWorkAt, null);
+  // Re-armed by another presence block: not again within a minute.
+  watcher.idleWorkAt = now;
+  now += 30_000;
+  assert.equal(await check(), false);
+  assert.equal(reads.length, 2, "the one-minute gap needs no read");
+  // A measured lead moves the start; a scan already running is never doubled.
+  now += 60_000;
+  watcher.awayLeadMs = 20_000;
+  idle = 90_000;
+  assert.equal(await check(), false, "with a 20 s lead it waits for 100 s idle");
+  watcher.running = Promise.resolve();
+  idle = 110_000;
+  assert.equal(await check(), false);
+  watcher.running = null;
+  assert.equal(await check(), true);
+  // Not in Auto, or a stale wait from long ago: nothing.
+  watcher.idleWorkAt = now;
+  now += 120_000;
+  watcher.mode = "propose";
+  assert.equal(await check(), false);
+  watcher.mode = "auto";
+  now += 11 * 60_000;
+  assert.equal(await check(), false);
+  assert.equal(watcher.idleWorkAt, null, "older than two ticks: the next scheduled scan decides");
+});
+
+test("a presence-blocked app send arms the idle watcher; a watcher scan skips the review", async (t) => {
+  const { supervisor } = fixture(t, { mode: "auto", delivery: "computer-use", deliverStatus: "blocked", deps: { uiDriver: readyDriver() } });
+  const inner = supervisor.deps.executor.deliver;
+  supervisor.deps.executor.deliver = async (args) => ({ ...(await inner(args)), status: "blocked", detail: "owner using Conductor" });
+  supervisor._executor = null;
+  assert.equal(supervisor.idleWorkAt ?? null, null);
+  await supervisor.executor.deliver({ thread: makeThread(), message: "go", route: "computer-use", playbook: "resume" });
+  assert.ok(Number.isFinite(supervisor.idleWorkAt));
+  let reviewed = 0;
+  supervisor.reviewOpenQuestions = async () => { reviewed += 1; return new Set(); };
+  await supervisor.tick({ reason: "owner-away" });
+  assert.equal(reviewed, 0);
+  assert.ok(Number.isFinite(supervisor.awayLeadMs));
+  await supervisor.tick({ reason: "interval" });
+  assert.equal(reviewed, 1);
+});

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig } from "../src/fleet/contracts.js";
 import { FleetStore } from "../src/fleet/store.js";
-import { MESSAGE_PREFIX, buildRelayPrompt, createExecutor, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
+import { MESSAGE_PREFIX, backgroundRouteFor, buildRelayPrompt, createExecutor, isPresenceBlock, spawnWithTail, summariseRelayFailure } from "../src/fleet/executor.js";
 import { DEADLINE_MARGIN_MS, createUiLock } from "../src/fleet/ui-delivery.js";
 
 function setup(t, { results = [], hold = false } = {}) {
@@ -609,4 +609,107 @@ test("a blocked app send carries the permission card and the failure kind back t
   assert.deepEqual(carded.prompt, prompt);
   const unreadable = await executor.deliver({ thread: conductorUiThread(cwd), message: "continue", route: "computer-use" });
   assert.equal(unreadable.code, "appUnreadable");
+});
+
+// --- background routes while the owner is at the Mac -------------------------
+
+function fallbackSetup(t, { results = [], routes = ["codex-exec", "peer-relay"], peers = new Map(), relay = [] } = {}) {
+  const base = setup(t, { results: relay });
+  const config = { ...base.config, delivery: "computer-use", backgroundRoutes: routes };
+  const requests = [];
+  const ui = {
+    async deliver(request) {
+      requests.push(request);
+      return { status: "sent", detail: "typed", ...(results.shift() ?? {}) };
+    }
+  };
+  const executor = createExecutor({ config, run: base.run, store: base.store, logDir: path.join(base.home, "fleet", "logs"), ui, uiLock: createUiLock(), readLivePeers: () => peers });
+  return { ...base, config, executor, requests };
+}
+
+const ownerAtCodex = () => [{ status: "blocked", detail: "owner using Codex", evidence: undefined }];
+
+test("an app send blocked only by the owner's presence goes by an allowed background route", async (t) => {
+  withoutLbKey(t);
+  const { cwd, calls, store, executor, requests } = fallbackSetup(t, { results: ownerAtCodex() });
+  const result = await executor.deliver({ thread: codexThread(cwd, { title: "Fix uploads", agentStatus: "idle" }), message: "continue", route: "computer-use", playbook: "idle-report" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "codex-exec");
+  assert.equal(requests.length, 1, "the app was tried first");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(0, 3), ["exec", "resume", "t1"]);
+  await executor.whenIdle();
+  const action = store.action(result.actionId);
+  assert.equal(action.route, "codex-exec");
+  assert.equal(action.fallbackFrom, "owner using Codex");
+  // Waiting for idle is the same block.
+  const waiting = fallbackSetup(t, { results: [{ status: "blocked", detail: "waiting for idle: Codex must be in front to type" }] });
+  assert.equal((await waiting.executor.deliver({ thread: codexThread(waiting.cwd, { title: "Fix uploads" }), message: "continue", route: "computer-use" })).route, "codex-exec");
+  await waiting.executor.whenIdle();
+});
+
+test("no background route unless allowed, safe and the block was only the owner's presence", async (t) => {
+  withoutLbKey(t);
+  const thread = (cwd, extra = {}) => codexThread(cwd, { title: "Fix uploads", agentStatus: "idle", ...extra });
+  const cases = [
+    ["not allowed", { routes: [] }, {}],
+    ["a draft left in the composer", { results: [{ status: "blocked", detail: "owner using Codex; our text is left as a draft" }] }, {}],
+    ["another app send running", { results: [{ status: "blocked", detail: "busy: another app delivery is running; retry" }] }, {}],
+    ["writer-locked in the scan", {}, { writerLocked: true }],
+    ["started by Conductor", {}, { meta: { originator: "codex_sdk_ts" } }],
+    ["waiting on a permission prompt", {}, { meta: { blockedOnOwner: true } }]
+  ];
+  for (const [label, options, extra] of cases) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results: ownerAtCodex(), ...options });
+    const result = await executor.deliver({ thread: thread(cwd, extra), message: "continue", route: "computer-use" });
+    assert.equal(result.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+  // A writer lock taken since the scan is read at send time.
+  const locked = fallbackSetup(t, { results: ownerAtCodex() });
+  fs.mkdirSync(path.join(locked.home, ".codex", "thread-writer-locks"), { recursive: true });
+  fs.writeFileSync(path.join(locked.home, ".codex", "thread-writer-locks", "t1.lock"), "");
+  assert.equal((await locked.executor.deliver({ thread: thread(locked.cwd), message: "continue", route: "computer-use" })).status, "blocked");
+  assert.equal(locked.calls.length, 0);
+});
+
+test("a Conductor chat goes by peer relay to its live peer only when that peer is idle now", async (t) => {
+  const tab = (cwd) => conductorUiThread(cwd, { claudeSessionId: "cs1", live: { peerName: "old-1", pid: 5, status: "idle" } });
+  const atConductor = () => [{ status: "blocked", detail: "owner using Conductor" }];
+  const fresh = new Map([["cs1", { peerName: "new-2", pid: 6, status: "idle", waitingFor: null }]]);
+  const relayed = fallbackSetup(t, { results: atConductor(), peers: fresh, relay: [{ stdout: "DONE" }] });
+  const result = await relayed.executor.deliver({ thread: tab(relayed.cwd), message: "continue", route: "computer-use" });
+  assert.equal(result.status, "sent");
+  assert.equal(result.route, "peer-relay");
+  assert.equal(relayed.calls.length, 1);
+  assert.match(relayed.calls[0].args[1], /new-2/, "relays to the peer's name now, not the scan's");
+  for (const [label, peers, extra] of [
+    ["peer busy", new Map([["cs1", { peerName: "new-2", pid: 6, status: "busy" }]]), {}],
+    ["peer waiting on a prompt", new Map([["cs1", { peerName: "new-2", pid: 6, status: "idle", waitingFor: "permission" }]]), {}],
+    ["peer gone", new Map(), {}],
+    ["an open pick in the chat", fresh, { meta: { ...conductorUiThread("x").meta, pendingQuestion: { text: "Which one?" } } }]
+  ]) {
+    const { cwd, calls, executor } = fallbackSetup(t, { results: atConductor(), peers });
+    const blocked = await executor.deliver({ thread: { ...tab(cwd), ...extra }, message: "continue", route: "computer-use" });
+    assert.equal(blocked.status, "blocked", label);
+    assert.equal(calls.length, 0, label);
+  }
+});
+
+test("background route helpers: the presence block and the per-thread route", () => {
+  assert.equal(isPresenceBlock({ status: "blocked", detail: "owner using Codex" }), true);
+  assert.equal(isPresenceBlock({ status: "blocked", detail: "waiting for idle: Conductor must be in front to type" }), true);
+  for (const delivery of [{ status: "failed", detail: "owner using Codex" }, { status: "blocked", detail: "owner using Codex; our text is left as a draft" }, { status: "blocked", detail: "frontmost app changed" }, null]) {
+    assert.equal(isPresenceBlock(delivery), false, JSON.stringify(delivery));
+  }
+  const config = { backgroundRoutes: ["codex-exec"] };
+  const codex = { kind: "codex", id: "t1", cwd: "/w", meta: {} };
+  assert.equal(backgroundRouteFor(codex, config), "codex-exec");
+  assert.equal(backgroundRouteFor({ ...codex, cwd: null }, config), null);
+  assert.equal(backgroundRouteFor({ ...codex, agentStatus: "running" }, config), null);
+  assert.equal(backgroundRouteFor(codex, { backgroundRoutes: ["peer-relay"] }), null);
+  const live = { kind: "conductor", id: "s1", meta: {}, live: { peerName: "p", pid: 1, status: "idle" } };
+  assert.equal(backgroundRouteFor(live, config), null, "peer-relay not allowed");
+  assert.equal(backgroundRouteFor(live, { backgroundRoutes: ["peer-relay"] }), "peer-relay");
+  assert.equal(backgroundRouteFor({ ...live, kind: "claude", live: null }, { backgroundRoutes: ["peer-relay", "claude-resume"] }), null, "never claude-resume");
 });

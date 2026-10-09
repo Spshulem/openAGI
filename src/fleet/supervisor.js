@@ -8,9 +8,9 @@
 
 import path from "node:path";
 import { resolveDataDir } from "../data-dir.js";
-import { MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
+import { DEFAULTS, MODES, SUPERVISOR_PREFIX, UI_APPS, clampTail, clampText, linkUiHosts, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, uiTargetFor } from "./contracts.js";
 import { classifyThread, mergeThreads, threadHealth } from "./classify.js";
-import { createExecutor } from "./executor.js";
+import { createExecutor, isPresenceBlock } from "./executor.js";
 import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
@@ -30,6 +30,13 @@ const GIT_CONCURRENCY = 8;
 const MAX_BRANCH_LOOKUPS = 8;
 const BRANCH_LOOKUP_TTL_MS = 30 * MIN;
 const START_DELAY_MS = 5_000;
+// The idle watcher: a scan starts once the owner has been away long enough
+// that its sends begin about when typing is allowed, at most once a minute,
+// and never earlier than this much idle.
+const IDLE_KICK_GAP_MS = 60_000;
+const IDLE_KICK_MIN_MS = 30_000;
+// Until one has run, an idle-watcher scan is taken to reach its sends this fast.
+const IDLE_LEAD_MS = 45_000;
 const MUTE_MS = 24 * 60 * MIN;
 const SENDING = new Set(["nudge", "escalate-manager"]);
 const OPEN_ACTION = new Set(["planned", "proposed"]);
@@ -328,11 +335,25 @@ export class FleetSupervisor {
   }
 
   get executor() {
-    if (this.deps.executor) return this.deps.executor;
-    this._executor ??= createExecutor({
-      config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers,
-      ui: this.uiDriver, knownThreads: () => [...this.lastThreads.values()]
-    });
+    if (!this._executor) {
+      const executor = this.deps.executor ?? createExecutor({
+        config: this.config, run: this.deps.run, store: this.store, readLivePeers: this.deps.readLivePeers ?? claude.readLivePeers,
+        ui: this.uiDriver, knownThreads: () => [...this.lastThreads.values()]
+      });
+      // An app send that waited only on the owner's presence arms the idle
+      // watcher (idleCheck); everything else is the executor's own.
+      // (A frozen executor, like the scan CLI's, stays the one that decides.)
+      const wrapped = Object.create(executor);
+      Object.defineProperty(wrapped, "deliver", {
+        enumerable: true, writable: true,
+        value: async (args) => {
+          const result = await executor.deliver(args);
+          if (isPresenceBlock(result)) this.idleWorkAt ??= this.now();
+          return result;
+        }
+      });
+      this._executor = wrapped;
+    }
     return this._executor;
   }
 
@@ -432,14 +453,45 @@ export class FleetSupervisor {
     this.timer.unref?.();
     this.kickTimer = setTimeout(() => fire("start"), START_DELAY_MS);
     this.kickTimer.unref?.();
+    if (this.config.idleDrain?.enabled && (this.config.delivery ?? "cli") !== "cli") {
+      this.idleTimer = setInterval(() => { this.idleCheck().catch(() => { /* next poll */ }); }, this.config.idleDrain.pollMs ?? 15_000);
+      this.idleTimer.unref?.();
+    }
     return true;
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     if (this.kickTimer) clearTimeout(this.kickTimer);
+    if (this.idleTimer) clearInterval(this.idleTimer);
     this.timer = null;
     this.kickTimer = null;
+    this.idleTimer = null;
+  }
+
+  // App sends that waited only because the owner was at the Mac go out soon
+  // after they step away, not at the next scheduled scan: one cheap idle
+  // read (ioreg) per poll while such sends wait, then one scan, started so
+  // its sends begin about when the owner has been away long enough to type.
+  // The scan re-decides everything; nothing is replayed from the old one.
+  async idleCheck() {
+    if (!this.idleWorkAt || this.running || this.idleChecking || this.mode !== "auto") return false;
+    const now = this.now();
+    // Stale: the next scheduled scan decides again, and re-arms if needed.
+    if (now - this.idleWorkAt > 2 * this.config.tickMs) { this.idleWorkAt = null; return false; }
+    if (this.lastIdleKickAt && now - this.lastIdleKickAt < IDLE_KICK_GAP_MS) return false;
+    const driver = this.uiDriver;
+    if (typeof driver?.idleMs !== "function") return false;
+    this.idleChecking = true;
+    let idle = null;
+    try { idle = await driver.idleMs(); } catch { idle = null; } finally { this.idleChecking = false; }
+    const ownerIdleMs = { ...DEFAULTS, ...(this.config.limits ?? {}) }.uiOwnerIdleMs;
+    const leadMs = Math.max(0, Math.min(Number.isFinite(this.awayLeadMs) ? this.awayLeadMs : IDLE_LEAD_MS, ownerIdleMs - IDLE_KICK_MIN_MS));
+    if (!Number.isFinite(idle) || idle < ownerIdleMs - leadMs || this.running) return false;
+    this.lastIdleKickAt = now;
+    this.idleWorkAt = null;
+    this.tick({ reason: "owner-away" }).catch(() => { /* recorded in lastError */ });
+    return true;
   }
 
   // deferUi: a scan that came through the node broker, which stops waiting
@@ -1114,7 +1166,9 @@ export class FleetSupervisor {
     const status = action.kind === "escalate-manager" && delivery.status === "sent" ? "escalated" : delivery.status;
     const thread = this.lastThreads.get(action.threadKey);
     const threadActivityAt = thread ? (thread.lastAgentAt && Date.parse(thread.lastAgentAt) > Date.parse(thread.lastActivityAt ?? "") ? thread.lastAgentAt : thread.lastActivityAt) : null;
-    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
+    // The route that actually ran: a presence-blocked app send may have gone
+    // by a background route instead.
+    this.store.recordNudge(action.threadKey, { at, playbook: action.playbook, route: delivery.route ?? action.route, status, detail: delivery.detail ?? null, threadActivityAt }, action.progressMark);
     // A counted nudge whose background child never reached the agent gives
     // back that one attempt. Owner answers and escalations counted none.
     if (status === "sent" && delivery.done) {
@@ -1252,7 +1306,7 @@ export class FleetSupervisor {
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi });
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi, skipReview: reason === "owner-away" });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
@@ -1396,7 +1450,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false, skipReview = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1443,7 +1497,9 @@ export class FleetSupervisor {
     this.awaitingReview = this.config.review?.enabled ? new Set(toNotify.map(({ id }) => id).filter((id) => !shownBefore.has(id))) : new Set();
     let unsettled = new Set();
     try {
-      unsettled = await this.reviewOpenQuestions({ asked, byKey, items });
+      // A scan the idle watcher started is for sends: the review waits for
+      // the next scheduled one, and new questions stay held until then.
+      unsettled = skipReview ? new Set(this.awaitingReview) : await this.reviewOpenQuestions({ asked, byKey, items });
     } finally {
       // A new one the review did not get to (the batch cap, a deferred
       // close) waits for the next review; a failed review lets all out.
@@ -1457,6 +1513,9 @@ export class FleetSupervisor {
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
     }
 
+    // How long an idle-watcher scan takes to reach its sends: the watcher
+    // starts the next one that much before the owner is away long enough.
+    if (skipReview) this.awayLeadMs = this.now() - started;
     // A thread that just got the owner's answer gets no automatic nudge too.
     const answeredNow = await this.deliverQueuedAnswers({
       byKey, started, cappedKinds, asked, sourceUnknown: fromFailedSource, budget: config.limits.maxSendsPerTick, deferUi,

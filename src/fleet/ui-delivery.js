@@ -1580,5 +1580,7 @@ export function createUiDriver({
   // back to the CLI for a thread whose app is closed.
   const appRunning = (bundleId) => presence.appRunning(bundleId);
 
-  return { readiness, deliver, inspect, clickLabel, appRunning };
+  // One ioreg read for the idle watcher: never readiness, never OCU.
+  const idleMs = () => presence.idleMs();
+  return { readiness, deliver, inspect, clickLabel, appRunning, idleMs };
 }
