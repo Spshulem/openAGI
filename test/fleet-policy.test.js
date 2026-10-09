@@ -204,6 +204,10 @@ test("row: an agent that said it would keep going and stopped gets idle-report",
   for (const text of ["I'll investigate why CI is failing.", "PR #123 merged. Next: update the docs."]) {
     assert.equal(run(makeThread({ prRefs: [], prLookedUp: true, lastAgentText: text }), { pr: null }).decision.playbook, "idle-report", text);
   }
+  // A later report closes an earlier promise.
+  assert.equal(run(makeThread({ prRefs: [], prLookedUp: true, lastAgentText: "I'll run the tests now. Done. All tests passed." }), { pr: null }).decision.action, "none");
+  // An old promise stays old even after our own nudge counts as activity.
+  assert.equal(run(makeThread({ ...promised, lastAgentAt: ago(7 * 60 * MIN), lastActivityAt: ago(20 * MIN) }), { pr: null }).decision.action, "none");
   // After its PR merged, own follow-up work it promised still counts.
   const merged = makePr({ state: "MERGED" });
   const afterMerge = run(makeThread({ lastAgentText: "The import scan is still running. I'll act on its results.", lastAgentAt: ago(40 * MIN), lastActivityAt: ago(40 * MIN) }), { pr: merged }).decision;

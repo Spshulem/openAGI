@@ -886,6 +886,9 @@ test("a no-PR thread counts as having no PR only once GitHub answered", async (t
   const trunk = [makeThread({ key: "codex:m", id: "m", branch: "main", prRefs: [] }), makeThread({ key: "codex:z", id: "z", branch: null, prRefs: [] })];
   await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, trunk, new Map(), {}, null, sourceErrors);
   assert.ok(trunk.every((thread) => thread.prLookedUp === true));
+  const noRepo = [makeThread({ key: "codex:r", id: "r", repo: null, branch: "spencer/r", prRefs: [] })];
+  await FleetSupervisor.prototype.resolvePrRefs.call(supervisor, noRepo, new Map(), {}, null, sourceErrors);
+  assert.notEqual(noRepo[0].prLookedUp, true, "an unreadable repo leaves the PR unknown");
   // A cached "no PR" counts only for the head it was answered for.
   const HEAD2 = "b".repeat(40);
   const cachedSup = { skip: {}, deps: { findPrForBranch: async () => null }, branchLookups: new Map([["acme/app:spencer/c", { ref: null, at: NOW, head: HEAD2 }]]), now: () => NOW };

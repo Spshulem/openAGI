@@ -1330,7 +1330,10 @@ export class FleetSupervisor {
       // prLookedUp: this thread's PR is known to be none (nothing to look up,
       // or GitHub answered no PR). Policy judges no-PR threads only then.
       if (thread.prRefs?.length) continue;
-      if (!thread.repo || !thread.branch || TRUNK_BRANCHES.has(thread.branch)) { thread.prLookedUp = true; continue; }
+      // No branch, or a trunk one: no PR to find. A missing repo (git could
+      // not be read) leaves it unknown.
+      if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { thread.prLookedUp = true; continue; }
+      if (!thread.repo) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
       // PR, so a new head is a new lookup.

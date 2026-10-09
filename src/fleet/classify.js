@@ -259,7 +259,10 @@ export function classifyThread(thread, { pr = null, localGit = null, infra = nul
   // A laptop verify often shows up as a background-task wait. It is the
   // violation, not a CI wait, so it must not be swallowed by waiting-ci.
   const localVerify = matchLocalVerify(thread, infra);
-  const wait = localVerify ? null : waitSignal(thread, text, now);
+  let wait = localVerify ? null : waitSignal(thread, text, now);
+  // "CI is pending. Blocked on your approval.": an explicit owner ask beats
+  // a wait the agent only wrote down.
+  if (wait?.source === "text" && detectAsk(text)?.kind === "needs-human" && !prSettledAfter(pr, Date.parse(thread.lastAgentAt ?? ""))) wait = null;
   if (wait) return result("waiting-ci", wait.reason, { wait, infraKind: wait.taskKind ? "bb3" : null });
   if (localVerify) {
     return result("local-verify", "heavy verification on the laptop", {
@@ -412,9 +415,15 @@ function promisedWork(text) {
   if (OWNER_GATE.test(plain) || OWNER_STEP.test(plain) || OUT_OF_SCOPE_PATTERNS.some(({ pattern }) => pattern.test(plain))) return false;
   const closing = closingSentences(plain);
   if (closing.some((sentence) => /\?\W*$/.test(sentence))) return false;
-  // "I'll investigate why CI is failing": in a promise, status words name the work.
-  return closing.some((sentence) => !CONDITIONAL.test(sentence)
-    && (PROMISED_WORK_PATTERNS[0].test(sentence) || (!REPORTED.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)))));
+  // "I'll investigate why CI is failing": in a promise, status words name
+  // the work. A later report closes it ("I'll run the tests. Done.").
+  let open = false;
+  for (const sentence of closing) {
+    if (CONDITIONAL.test(sentence)) continue;
+    if (PROMISED_WORK_PATTERNS[0].test(sentence) || (!REPORTED.test(sentence) && PROMISED_WORK_PATTERNS.some((pattern) => pattern.test(sentence)))) open = true;
+    else if (REPORTED.test(sentence)) open = false;
+  }
+  return open;
 }
 
 function oldestTask(tasks) {

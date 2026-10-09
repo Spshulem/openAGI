@@ -185,8 +185,9 @@ function intentFor(ctx) {
 function idleIntent(ctx) {
   const { classified, thread, ledger, limits, now } = ctx;
   if (!classified.idle?.promised) return { type: "none", reason: classified.reason };
-  // Fresh stops only: an old thread's last words are history.
-  const quietMs = msSince(latest(thread.lastAgentAt, thread.lastActivityAt), now);
+  // Fresh stops only: an old thread's last words are history. Measured from
+  // the words, not activity (a delivered nudge is activity too).
+  const quietMs = msSince(thread.lastAgentAt, now);
   if (quietMs === null || quietMs > limits.idleReportMaxAgeMs) return { type: "none", reason: classified.reason };
   // A daily cap, whatever its progress mark says: a shared checkout's head
   // moves with other agents' commits.

@@ -158,6 +158,7 @@ test("classifyThread: owner to-dos and blockers reach the owner; their negations
   const asks = ["**You must do:** tell me which PR this is.", "I still need your OK on the schema change.", "Pushed. Blocked on: your approval for the deploy."];
   for (const text of asks) assert.equal(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
   assert.equal(classify(makeThread({ lastAgentText: "Nothing is blocked on CI; I still need your approval." }), { pr: null }).state, "needs-human", "a cleared blocker beside a real ask");
+  assert.equal(classify(makeThread({ lastAgentText: "CI is pending. Blocked on your approval." }), { pr: makePr({ ci: { state: "PENDING", failing: [], pending: ["verify"] } }) }).state, "needs-human", "an owner ask beats a written wait");
   for (const text of ["Report written. Nothing you must do.", "You must do: none.", "**You must do:** nothing.", "Pushed the fix. Blocked on: nothing.", "Nothing here is blocked on your domain decision.", "No longer blocked on your approval."]) {
     assert.notEqual(classify(makeThread({ lastAgentText: text }), { pr: null }).state, "needs-human", text);
   }
