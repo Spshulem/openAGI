@@ -151,12 +151,19 @@ test("row: waiting-ci past its threshold escalates to the BuildBot3 manager", ()
   assert.equal(offline.question.title, "BB3 jammed. Manager offline. Open Remote dev setup?");
   const limited = run(thread, { mgr: { ...manager, error: { kind: "session-limit", text: "x", resetAt: null } } }).decision;
   assert.equal(limited.action, "ask-user");
-  // A slow full run is the merge gate: it goes to the manager, and the agent
+  // A slow full run where it is the merge gate goes to the manager; the agent
   // is never told to drop it for hosted CI.
   const full = makeThread({ agentStatus: "waiting", openTasks: [{ ...quick, description: "bb-verify --full --pr 6522", startedAt: ago(40 * MIN) }] });
-  const slow = run(full).decision;
-  assert.equal(slow.action, "escalate-manager");
-  assert.notEqual(slow.playbook, "bb3-slow-agent");
+  // Where hosted CI is the gate (acme/app has no required check), a full run
+  // with CI not failing is still told to stop.
+  const ungated = run(full).decision;
+  assert.equal(ungated.action, "nudge");
+  assert.equal(ungated.playbook, "bb3-slow-agent");
+  const bb = "buildbetter-app/buildbetter";
+  const gatedThread = { ...full, repo: bb, prRefs: [`${bb}#6522`] };
+  const gated = run(gatedThread, { pr: makePr({ ref: `${bb}#6522`, repo: bb }) }).decision;
+  assert.equal(gated.action, "escalate-manager");
+  assert.notEqual(gated.playbook, "bb3-slow-agent");
 });
 
 test("row: a Conductor wait on a non-verify task is idle after 45 min", () => {

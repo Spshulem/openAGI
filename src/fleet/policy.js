@@ -7,6 +7,7 @@
 import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, msSince, parsePrRef, redactSecrets, shortHash, uiTargetFor } from "./contracts.js";
 import { deliberateStop } from "./classify.js";
 import { renderTemplate } from "./playbooks.js";
+import { requiredChecksFor } from "./sources/github.js";
 
 const MIN = 60_000;
 const HOUR = 60 * MIN;
@@ -155,7 +156,7 @@ function makeContext(classified, thread, options) {
   const limits = limitsOf(config);
   const delivery = options.delivery ?? config?.delivery ?? null;
   return {
-    classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery,
+    classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery, config,
     mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
     progressMark: progressMarkFor(classified, thread, ledger),
@@ -270,6 +271,17 @@ function backoffIntent(ctx, errorAt, kind) {
   return nudge("resume", `${kind}; retry ${attempts + 1}`, { immediate: true });
 }
 
+// The repo's merge gate includes a required check (the BuildBot3 full run).
+function fullRunGated(pr, thread, config) {
+  if (pr?.gates?.length) return true;
+  const repo = pr?.repo ?? thread?.repo ?? null;
+  return Boolean(repo && requiredChecksFor(repo, config).length);
+}
+
+function ciFailing(pr) {
+  return Boolean(pr) && (CI_FAILING.has(pr.ci?.state) || Boolean(pr.ci?.failing?.length));
+}
+
 function waitingIntent(ctx) {
   const { classified, pr, limits, thread, now } = ctx;
   const wait = classified.wait ?? {};
@@ -284,8 +296,10 @@ function waitingIntent(ctx) {
   const quietMs = msSince(latest(thread.lastAgentAt, thread.lastActivityAt), now);
   const silent = wait.source === "task" && age >= limits.silentTurnMs && quietMs !== null && quietMs >= limits.silentTurnMs;
   if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs) {
-    // The full BuildBot3 run is the merge gate (hosted CI is paused): a slow
-    // one goes to the manager, never a nudge to drop it.
+    // Where the full BuildBot3 run is the merge gate, a slow one goes to the
+    // manager, never a nudge to drop it. Elsewhere hosted CI is the gate: a
+    // full run only reproduces a hosted CI failure.
+    if (!fullRunGated(pr, thread, ctx.config) && !ciFailing(pr)) return nudge("bb3-slow-agent", `full verify ${minutes(age)}m; hosted CI not failing`, { immediate: true, vars: { age: minutes(age) } });
     if (silent) return statusCheck("bb-verify --full", quietMs);
     return escalateIntent(ctx, "bb-verify --full", age);
   }
@@ -351,11 +365,11 @@ function waitingLine(facts, what, age) {
 }
 
 // The verify wait waitingIntent escalates to the manager, or null.
-function escalatedWait(classified, pr, limits) {
+function escalatedWait(classified, pr, limits, thread = null, config = null) {
   if (classified?.state !== "waiting-ci") return null;
   const wait = classified.wait ?? {};
   const age = wait.ageMs ?? 0;
-  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs) return { what: "bb-verify --full", age };
+  if (wait.taskKind === "full" && age >= limits.fullVerifyEscalateMs && (fullRunGated(pr, thread, config) || ciFailing(pr))) return { what: "bb-verify --full", age };
   if (wait.taskKind === "quick" && age >= limits.quickVerifyEscalateMs) return { what: "bb-quick", age };
   return null;
 }
@@ -695,7 +709,7 @@ export function decideInfra(infra, options = {}) {
       decisions.push(infraDecision(key, { action: "wait", reason: "BuildBot3 SSH failed once", blockers: state.problems }));
       continue;
     }
-    decisions.push(escalateInfra(kind, state.problems, { infra, ledger, playbooks, limits, now, manager, mode, threads, delivery }));
+    decisions.push(escalateInfra(kind, state.problems, { infra, ledger, playbooks, limits, now, manager, mode, threads, delivery, config }));
     const downSince = readLedger(ledger, "infraDownSince", kind);
     const downMs = msSince(downSince, now);
     if (state.down && downMs !== null && downMs >= LONG_DOWN_MS) {
@@ -718,7 +732,7 @@ export function decideInfra(infra, options = {}) {
   return decisions;
 }
 
-function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, manager, mode, threads, delivery = null }) {
+function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, manager, mode, threads, delivery = null, config = null }) {
   const key = `infra:${kind}`;
   const playbookId = kind === "bb3" ? "manager-bb3" : "manager-lb";
   const base = infraDecision(key, { playbook: playbookId, reason: problems.join("; "), blockers: problems, targetKey: manager?.key ?? null });
@@ -729,7 +743,7 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
   if (cooledAt && Date.parse(cooledAt) > now) return { ...base, action: "wait", reason: `escalated; ${base.reason}`, notBefore: cooledAt };
   const busy = managerBusy(manager, limits, now);
   if (busy) return { ...base, action: "wait", reason: `${busy.reason}; ${base.reason}`, notBefore: busy.notBefore };
-  const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits) } : lbVars(infra?.lb, problems);
+  const vars = kind === "bb3" ? { ...bb3Vars(infra?.bb3, problems, limits), waiting: waitingLines(threads, limits, config) } : lbVars(infra?.lb, problems);
   const route = managerRoute(manager, mode, limits, now, delivery);
   const waitUi = route || !manager || managerDown(manager, now) ? null : uiBlockedReason(manager, delivery);
   if (waitUi) return { ...base, action: "wait", reason: `${waitUi}; ${base.reason}`, uiBlocked: true };
@@ -747,10 +761,10 @@ function escalateInfra(kind, problems, { infra, ledger, playbooks, limits, now, 
 
 // Only one escalation per manager per tick carries the news, so it names
 // every thread whose verify wait would have escalated on its own.
-function waitingLines(threads, limits) {
+function waitingLines(threads, limits, config = null) {
   const lines = [];
   for (const item of threads ?? []) {
-    const slow = item?.thread && escalatedWait(item.classified, item.pr ?? null, limits);
+    const slow = item?.thread && escalatedWait(item.classified, item.pr ?? null, limits, item.thread, config);
     if (slow) lines.push(waitingLine(factsFor(item.thread, item.pr ?? null, item.classified), slow.what, slow.age));
   }
   const extra = lines.length > 4 ? ` +${lines.length - 4} more waiting.` : "";

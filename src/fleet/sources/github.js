@@ -137,7 +137,7 @@ function checkState(node) {
   return node.conclusion ?? null;
 }
 
-function requiredChecksFor(repo, config) {
+export function requiredChecksFor(repo, config) {
   const list = config?.requiredChecks?.[repo] ?? DEFAULT_REQUIRED_CHECKS[repo] ?? [];
   return list.map((check) => typeof check === "string" ? { name: check, label: check } : { name: check?.name, label: check?.label || check?.name, how: check?.how })
     .filter((check) => check.name);
