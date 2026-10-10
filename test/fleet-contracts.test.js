@@ -122,6 +122,18 @@ test("resolveOcuPath: explicit path, else open-computer-use on PATH, preferring 
   const viaNvm = { exists: (file) => nvmFiles.has(file), realpath: (file) => file, execPath: "/Applications/OpenAGI.app/node/bin/node", home: "/h", readdir: () => ["v9.0.0", "v22.21.1", ".cache"] };
   assert.equal(resolveOcuPath({ PATH: "/usr/bin:/bin" }, viaNvm), "/h/.nvm/versions/node/v22.21.1/bin/open-computer-use");
   assert.equal(resolveOcuPath({ PATH: "/usr/bin:/bin" }, { ...viaNvm, readdir: () => { throw new Error("ENOENT"); } }), null);
+  // The configured home is the one searched, not the process user's.
+  const configHome = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "ocu-home-")));
+  const installed = path.join(configHome, ".nvm", "versions", "node", "v22.0.0", "bin", "open-computer-use");
+  fs.mkdirSync(path.dirname(installed), { recursive: true });
+  fs.writeFileSync(installed, "");
+  try {
+    assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, { home: configHome, execPath: "/nowhere/node" }), installed);
+  } finally {
+    fs.rmSync(configHome, { recursive: true, force: true });
+  }
+  // pnpm's generated launcher is never picked.
+  assert.equal(resolveOcuPath({ PATH: "/usr/bin" }, { ...viaNvm, readdir: () => [], exists: (file) => file === "/h/Library/pnpm/open-computer-use" }), null);
   // Without the bundled app, the resolved launcher itself.
   files.delete(native);
   assert.equal(resolveOcuPath({ PATH: "/nvm/bin" }, options), launcher);

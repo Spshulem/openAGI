@@ -179,7 +179,9 @@ export function resolveOcuPath(env = process.env, { exists = fs.existsSync, real
     `/opt/homebrew/bin/${OCU_NAME}`,
     `/usr/local/bin/${OCU_NAME}`,
     ...nvm,
-    ...[".volta/bin", ".npm-global/bin", ".local/bin", "Library/pnpm", ".bun/bin"].map((dir) => path.join(home, dir, OCU_NAME))
+    // pnpm's global bin is a generated shell launcher (needs node on PATH,
+    // and does not lead to the native engine), so it is not searched.
+    ...[".volta/bin", ".npm-global/bin", ".local/bin", ".bun/bin"].map((dir) => path.join(home, dir, OCU_NAME))
   ];
   const found = candidates.find((candidate) => path.isAbsolute(candidate) && exists(candidate));
   if (!found) return explicit || null;
@@ -261,7 +263,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
-    bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env), ...(overrides.bins ?? {}) }
+    bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
   };
 }
 
