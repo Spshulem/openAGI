@@ -77,6 +77,13 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_REVIEW` | on with the supervisor | `0` turns off the [review of the needs-you list](#the-supervisor-reviews-its-own-list) |
 | `OPENAGI_FLEET_REVIEW_MODEL` | `claude-sonnet-5` | Model for that review (owner-confirmed) |
 | `OPENAGI_FLEET_REVIEW_MS` | `1800000` | Re-review an unchanged open question after this long (30 min), backing off to 4x while nothing changes |
+| `OPENAGI_FLEET_STORAGE` | on with the supervisor | `0` turns off the [storage manager](#storage) |
+| `OPENAGI_FLEET_STORAGE_SD` | `/Volumes/Xtra` | The SD card the storage manager archives to |
+| `OPENAGI_FLEET_STORAGE_LOW_GB` | `100` | Mac free space below this starts safe cleanup and archiving |
+| `OPENAGI_FLEET_STORAGE_TARGET_GB` | `150` | Cleanup stops once the Mac has this much free |
+| `OPENAGI_FLEET_STORAGE_CRITICAL_GB` | `15` | Below this, one "Disk almost full" ask |
+| `OPENAGI_FLEET_STORAGE_SD_LOW_GB` | `50` | SD free space below this starts safe cleanup there |
+| `OPENAGI_FLEET_STORAGE_SD_RESERVE_GB` | `30` | An archive move never leaves the SD card with less |
 
 `OPENAGI_PUBLIC_URL`, when set, makes phone pushes deep-link to `/fleet?q=<id>`.
 
@@ -122,7 +129,8 @@ To keep these files in version control, make `~/.openagi/skills` its own private
 
 ## Safety limits
 
-- Read-only everywhere except sending templated text to a thread.
+- Read-only everywhere except sending templated text to a thread, and the
+  storage cleanup below.
 - Every message starts with `[OpenAGI supervisor]` and is journaled.
 - 15 min idle before a nudge. 12 min between nudges to one thread.
 - 3 nudges without progress (no new head, no thread resolved), then it asks you.
@@ -130,7 +138,85 @@ To keep these files in version control, make `~/.openagi/skills` its own private
 - Never nudges its own session. Never resends `continue` before a limit resets.
 - One manager escalation per incident per hour.
 - Never kills processes, merges PRs, changes permissions, or answers out-of-scope questions.
+- Deletes files only through the [storage manager](#storage) rules, and asks
+  first for anything not clearly regenerable.
 - Agent text is untrusted: shown as plain text, never forwarded to other agents.
+
+## Storage
+
+Watches free space on the Mac (`/System/Volumes/Data`) and the SD card
+(`/Volumes/Xtra`). Free space is read every scan (cheap). A deeper scan for
+things to clean runs on its own timer: hourly, every 15 min while a disk is low,
+at most ~2 min each, one at a time. Results show on the **Infra** strip.
+
+**Deleted on its own** (Auto only, only while that disk is below 100 GB free,
+and only until 150 GB free). All regenerable:
+
+- git temp files (`tmp_pack_*`, `tmp_idx_*`, `tmp_rev_*`, `tmp_obj_*`) older
+  than 2 h, in `~/conductor/repos/*` and the repos behind agent worktrees.
+- build output (`node_modules`, `.next`, `.turbo`, `target` next to a
+  `Cargo.toml`) in agent worktrees with no file changed in 14 days, no process
+  inside, no running agent turn, and git ignoring the dir.
+- partial downloads (`*.part`, `*.crdownload`, `*.download`) older than 7 days
+  in `~/Downloads` and the SD card's `Downloads`.
+- `~/.rustup/tmp/*` (no rustup or cargo running) and Xcode DerivedData folders
+  idle 14 days (no xcodebuild running).
+
+If the last five deletes of a kind freed (by `df`) under a tenth of their size
+(pnpm clones and hard links), that kind stops on that disk for a day. A delete
+or move that failed waits a day (doubling) before it is tried again.
+
+Agent worktrees: `~/Dev/bbapp/.conductor/*`, `~/Dev/bbapp/.worktrees/*`,
+`~/Dev/bbapp-worktrees/*`, `~/Dev/worktrees/*`, `~/conductor/workspaces/*/*`,
+`/Volumes/Xtra/codex-worktrees/*`. Symlinks are never followed.
+
+**Moved to the SD card** (Auto only, Mac below 100 GB free): top-level
+`~/Downloads` items of 100 MB or more, unchanged and unopened for 30 days, not
+open in any app. Each is copied with `ditto` to
+`/Volumes/Xtra/OpenAGI-Archive/Downloads/<name>`, checked (bytes and file
+count), then the original is replaced by a symlink to the copy. A failed copy
+is removed and the original kept. Never when the card is missing, is not the
+card first seen (its `.codex-xtra-volume-identity` marker or VolumeUUID), or
+would keep less than 30 GB free, or when anything under the item changed or
+was opened during the copy. Old installers are asked about instead.
+
+**Asked first, never automatic.** One question per kind, only while that disk is
+low, with the exact items pinned:
+
+| Ask | Items |
+|---|---|
+| Trash | `~/.Trash` items trashed 30+ days ago, and the SD card's trash (any age) |
+| Finished worktrees | archived Conductor workspaces whose folder is left, or worktrees idle 30 days that no open Codex/Conductor thread uses. Only with nothing uncommitted and nothing unpushed (or merged into `origin/main`). A full clone also needs every local branch pushed, no stash, no linked worktree it hosts, and no repo nested inside |
+| Old installers | `.dmg`, `.pkg`, `.iso` in `~/Downloads`, 30+ days old (a `.zip` may be yours: it is moved, not asked about) |
+
+While a question is open its list is pinned: items can drop out, none are
+added. Buttons: **Delete N (X GB)** checks every pinned item again (still
+there, same file, not a symlink, not in use right now, still idle, still clean
+and pushed) and deletes only those that pass, in the background. A card for an
+older list (another count) cannot answer a newer one. **Keep** leaves those
+items out of asks for 30 days. **Later**, or dismissing it, asks again in 24 h.
+Below 15 GB free one more ask comes: **Disk almost full: N GB left** with
+**Clean safe now** (runs the safe cleanup at once, any mode) and **Later**.
+Your answers act in every mode; Observe and Propose only log what Auto would
+clean or move (**Doing**, `storage-safe`).
+
+Freed space is measured with `df` before and after (pnpm clones make folder
+sizes overstate it). Trees are removed with `/bin/rm -rf` in its own process. Each pass is one line in **Doing**; every item is
+journaled in `~/.openagi/fleet/storage/journal.jsonl`.
+
+**Restore an archived item.** Moves are listed in
+`~/.openagi/fleet/storage/archive.jsonl` (`from`, `to`, `bytes`). With the SD
+card mounted:
+
+```sh
+rm "<from>"                    # the symlink only
+ditto "<to>" "<from>" && rm -rf "<to>"
+```
+
+Deleted worktrees leave their git metadata; `git worktree prune` in the main
+repo tidies it once the SD card is mounted.
+
+**Turn it off:** `OPENAGI_FLEET_STORAGE=0` in `~/.openagi/.env`, then restart.
 
 ## Phone app
 

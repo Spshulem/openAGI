@@ -15,6 +15,7 @@ import { createNotifier } from "./notify.js";
 import { BUNDLED_PLAYBOOKS_DIR, loadOwnerNotes, loadPlaybooks, renderTemplate, userPlaybooksDir } from "./playbooks.js";
 import { chooseRoute, decideInfra, decideThread, dedupeDecisions, infraHealth, ownerLabel } from "./policy.js";
 import { createReviewRunner, reviewContext, reviewFingerprint, reviewQuestions } from "./review.js";
+import { StorageManager } from "./storage.js";
 import { FleetStore } from "./store.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import * as buildbot3 from "./sources/buildbot3.js";
@@ -98,7 +99,7 @@ const GROUPED_KINDS = Object.freeze({
   // while the set of failing threads changes under it.
   deliver: { dedupeKey: "deliver:group", options: ["done", "skip"], match: ["done", "skip"], minSize: 1, title: (n) => `${n} stopped. Nudges can't get through. Nudge ${n === 1 ? "it" : "them"}?`, body: (labels) => `Sends keep failing: ${labels}.` }
 });
-const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused"]);
+const SELF_FINDING_KINDS = new Set(["open", "deliver", "stuck", "paused", "storage"]);
 // The owner's Scan now reviews at most this many batches (15 questions each).
 const FORCED_REVIEW_ROUNDS = 4;
 const GROUP_MAX = 50;
@@ -334,6 +335,17 @@ export class FleetSupervisor {
     return this.forceMode ?? this.store.mode ?? this.config.mode;
   }
 
+  // Disk space (storage.js): its scans run on their own timer; the tick only
+  // reads free space and the cached plans. deps.storage: test doubles.
+  get storage() {
+    this._storage ??= new StorageManager({
+      config: this.config, dir: path.join(this.store.dir, "storage"), store: this.store, deps: this.deps.storage ?? {},
+      getMode: () => this.mode, now: () => this.now(),
+      busyCwds: () => [...this.lastThreads.values()].filter((thread) => thread?.agentStatus === "running" && thread.cwd).map((thread) => thread.cwd)
+    });
+    return this._storage;
+  }
+
   get executor() {
     if (!this._executor) {
       const executor = this.deps.executor ?? createExecutor({
@@ -460,6 +472,7 @@ export class FleetSupervisor {
       this.idleTimer = setInterval(() => { this.idleCheck().catch(() => { /* next poll */ }); }, this.config.idleDrain.pollMs ?? 15_000);
       this.idleTimer.unref?.();
     }
+    if (this.config.storage?.enabled) this.storage.start();
     return true;
   }
 
@@ -471,6 +484,7 @@ export class FleetSupervisor {
     this.timer = null;
     this.kickTimer = null;
     this.idleTimer = null;
+    this._storage?.stop();
   }
 
   // App sends that waited only because the owner was at the Mac go out soon
@@ -584,6 +598,12 @@ export class FleetSupervisor {
   dismissQuestion(id) {
     const question = this.store.question(id);
     if (!question || question.status !== "open") return null;
+    // A storage ask comes back every tick, and a dismissal holds while it is
+    // asked: one dismiss would mute it for good. It counts as Later (24 h).
+    if (question.kind === "storage" && (question.options ?? []).includes("Later")) {
+      this.resolveOutreach(question, "Later", "acted");
+      return this.store.answerQuestion(id, "Later");
+    }
     this.applyOverride(question, "dismiss");
     this.resolveOutreach(question, "dismiss", "dismissed");
     return this.store.dismissQuestion(id);
@@ -1069,6 +1089,12 @@ export class FleetSupervisor {
         delivery = { status: result.ok ? "sent" : "blocked", route: null, detail: result.detail };
         if (!result.ok) return { question: this.store.question(id), delivery };
       }
+      // Storage: Delete / Keep / Later / Clean safe now. Deletes run in the
+      // background after each pinned item is checked again.
+      if (question.kind === "storage") {
+        delivery = await this.storage.answer(question, answer);
+        if (delivery.status !== "sent") return { question: this.store.question(id), delivery };
+      }
       if (question.kind === "limit" && answer === "added") {
         // The owner's own copy of this playbook says what their apps need
         // after an account switch (a restart, a plain "retry").
@@ -1228,6 +1254,7 @@ export class FleetSupervisor {
     let peers = new Map();
     try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch (error) { sourceErrors.peers = clampText(error?.message, 200); }
 
+    const storageOn = Boolean(this.config.storage?.enabled);
     const [codexThreads, claudeThreads, conductorThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
       guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run }), []),
       guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
@@ -1235,7 +1262,9 @@ export class FleetSupervisor {
       guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
       guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
       this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
-      guard("lb", () => (d.checkLb ?? buildbot3.checkLb)(config, { fetchImpl: d.fetchImpl, now: started }), null)
+      guard("lb", () => (d.checkLb ?? buildbot3.checkLb)(config, { fetchImpl: d.fetchImpl, now: started }), null),
+      // Free space only (statfs); a failed read keeps the last one.
+      storageOn ? guard("storage", () => this.storage.refreshVolumes(), null) : null
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
@@ -1319,6 +1348,8 @@ export class FleetSupervisor {
     const paused = pausedDeliveryDecision(delivery, this.uiBlockedSince, started);
     if (paused) infraDecisions.push(paused);
     infraDecisions.push(...this.unreadableDecisions(started, threads));
+    // Asked again every tick from the stored plans, so they stay open.
+    if (storageOn) infraDecisions.push(...this.storage.decisions());
     const health = infraHealth(infra, { config, now: started });
     if (bb3) store.setInfraDown("bb3", health.bb3.down);
     if (lb) store.setInfraDown("lb", health.lb.down);
@@ -1337,11 +1368,13 @@ export class FleetSupervisor {
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(["codex", "claude", "conductor"].filter((kind) => threads.filter((thread) => thread.kind === kind).length >= config.limits.maxThreads));
-    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi, skipReview: reason === "owner-away" });
+    // A failed disk read, or an SD card mounted but unreadable, is unknown.
+    const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
+    const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, unknownKinds, cappedKinds, deferUi, skipReview: reason === "owner-away", storageUnknown });
     this.trackInfraBlocked(health, items, blockedKeys, { recovering: infraDecisions, attempted, unknownKinds, mode, now: started });
 
     const finished = this.now();
-    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery });
+    const snapshot = this.buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery, storage: storageOn ? this.storage.summary() : null });
     store.recordSnapshot(snapshot);
     this.lastTickAt = snapshot.at;
     try { this.runtime?.events?.emit?.("fleet", { at: snapshot.at, reason, counts: snapshot.counts }); } catch { /* listeners never break a tick */ }
@@ -1481,7 +1514,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false, skipReview = false }) {
+  async act(decisions, { mode, byKey, manager, started, config, items = [], unknownKinds = new Set(), cappedKinds = new Set(), deferUi = false, skipReview = false, storageUnknown = false }) {
     const store = this.store;
     const fromFailedSource = (keys) => keys.some((key) => unknownKinds.has(String(key ?? "").split(":")[0]));
     // A thread whose git read or PR fetch failed this tick is unknown too: its
@@ -1623,14 +1656,17 @@ export class FleetSupervisor {
     }
 
     // A planned/proposed action the policy no longer wants is stale.
+    // (Storage records its own plans; they are not tick decisions.)
     for (const action of openActions) {
-      if (!seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
+      if (action.kind !== "storage" && !seenActions.has(action.id) && !unknown([action.threadKey])) store.updateAction(action.id, { status: "stale" });
     }
     // A question whose condition is gone closes itself once its thread was
     // decided again this tick without asking.
     for (const question of store.openQuestions()) {
       if (asked.has(question.dedupeKey)) continue;
       if (unknown(question.threadKeys ?? [question.threadKey])) continue;
+      // A failed disk read is unknown: its questions wait for a good one.
+      if (storageUnknown && String(question.dedupeKey ?? "").startsWith("infra:storage:")) continue;
       const decided = question.threadKey ? decisions.find((decision) => decision.threadKey === question.threadKey) : null;
       const supervisorOwned = !question.threadKey && /^(infra:|limit:group|open:group|deliver:group)/.test(String(question.dedupeKey ?? ""));
       // Its thread left the scan (aged out of the lookback) or is now out of
@@ -1755,7 +1791,7 @@ export class FleetSupervisor {
     });
   }
 
-  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null }) {
+  buildSnapshot({ reason, started, finished, mode, threads, inScope, items, decisions, infra, sourceErrors, manager, delivery = null, storage = null }) {
     const byState = {};
     const decisionFor = effectiveDecisions(decisions);
     const rows = items.map(({ thread, classified, pr }) => {
@@ -1809,6 +1845,7 @@ export class FleetSupervisor {
       threads: rows,
       infra,
       infraDecisions,
+      storage,
       sourceErrors
     };
   }

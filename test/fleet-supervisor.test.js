@@ -45,7 +45,8 @@ function fixture(t, { threads = [makeThread()], prs = null, mode = "observe", de
     whenIdle: async () => {}
   };
   const notifier = { notifyQuestion: async (q) => { notified.push(q); return { outreachId: null, pushed: false, skipped: "push-off" }; } };
-  const config = resolveFleetConfig(env, { home: dataDir, mode, limits: { ...DEFAULTS, ...limits }, managerRef: "none", ...(delivery ? { delivery } : {}), ...(review ? { review } : {}) });
+  // Storage stays off unless a test asks: it would read the real disks.
+  const config = resolveFleetConfig({ OPENAGI_FLEET_STORAGE: "0", ...env }, { home: dataDir, mode, limits: { ...DEFAULTS, ...limits }, managerRef: "none", ...(delivery ? { delivery } : {}), ...(review ? { review } : {}) });
   const prMap = prs ?? new Map([["acme/app#7", makePr()]]);
   const supervisor = new FleetSupervisor({
     dataDir,
@@ -1959,6 +1960,7 @@ test("OPENAGI_FLEET_REVIEW=0 turns the review off; it is on with the supervisor"
   await enabled.supervisor.tick();
   assert.equal(on.calls.length, 1);
   assert.equal(enabled.supervisor.getState().settings.review.enabled, true);
+  assert.equal(enabled.supervisor.config.storage.enabled, false, "never reads the real disks");
 });
 
 // ─── the owner's private playbooks: account switch ─────────────────────────

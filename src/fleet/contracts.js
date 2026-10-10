@@ -121,6 +121,15 @@ export const DEFAULT_REVIEW_MODEL = "claude-sonnet-5";
 export const DEFAULT_REVIEW_MS = 30 * MIN;
 // Sonnet took about 3 minutes on 13 questions, mostly thinking.
 export const DEFAULT_REVIEW_TIMEOUT_MS = 360_000;
+// Storage manager: the Mac's data volume and the SD card (sizes in GB of 2^30).
+export const DEFAULT_DATA_MOUNT = "/System/Volumes/Data";
+export const DEFAULT_SD_MOUNT = "/Volumes/Xtra";
+export const STORAGE_DEFAULTS = Object.freeze({
+  lowGb: 100, targetFreeGb: 150, criticalGb: 15, sdLowGb: 50, sdReserveGb: 30,
+  // A plan smaller than this is not worth a question.
+  askMinGb: 1,
+  scanMs: 60 * MIN, scanLowMs: 15 * MIN, scanBudgetMs: 120_000
+});
 
 export function defaultPaths(home = os.homedir()) {
   return {
@@ -151,7 +160,12 @@ export function defaultBinaries(home = os.homedir(), exists = fs.existsSync) {
     lsof: pick(["/usr/sbin/lsof"], "lsof"),
     lsappinfo: pick(["/usr/bin/lsappinfo"], "lsappinfo"),
     ioreg: pick(["/usr/sbin/ioreg"], "ioreg"),
-    open: pick(["/usr/bin/open"], "open")
+    open: pick(["/usr/bin/open"], "open"),
+    du: pick(["/usr/bin/du"], "du"),
+    df: pick(["/bin/df"], "df"),
+    ditto: pick(["/usr/bin/ditto"], "ditto"),
+    diskutil: pick(["/usr/sbin/diskutil"], "diskutil"),
+    rm: pick(["/bin/rm"], "rm")
   };
 }
 
@@ -260,6 +274,20 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
       model: overrides.review?.model ?? (String(env.OPENAGI_FLEET_REVIEW_MODEL ?? "").trim() || DEFAULT_REVIEW_MODEL),
       intervalMs: overrides.review?.intervalMs ?? envNumber(env.OPENAGI_FLEET_REVIEW_MS, DEFAULT_REVIEW_MS),
       timeoutMs: overrides.review?.timeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
+    },
+    // Disk space: safe cleanup, archive to the SD card, and asks. On with
+    // the supervisor unless OPENAGI_FLEET_STORAGE=0.
+    storage: {
+      ...STORAGE_DEFAULTS,
+      lowGb: envNumber(env.OPENAGI_FLEET_STORAGE_LOW_GB, STORAGE_DEFAULTS.lowGb),
+      targetFreeGb: envNumber(env.OPENAGI_FLEET_STORAGE_TARGET_GB, STORAGE_DEFAULTS.targetFreeGb),
+      criticalGb: envNumber(env.OPENAGI_FLEET_STORAGE_CRITICAL_GB, STORAGE_DEFAULTS.criticalGb),
+      sdLowGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_LOW_GB, STORAGE_DEFAULTS.sdLowGb),
+      sdReserveGb: envNumber(env.OPENAGI_FLEET_STORAGE_SD_RESERVE_GB, STORAGE_DEFAULTS.sdReserveGb),
+      dataMount: DEFAULT_DATA_MOUNT,
+      sdMount: String(env.OPENAGI_FLEET_STORAGE_SD ?? "").trim() || DEFAULT_SD_MOUNT,
+      ...(overrides.storage ?? {}),
+      enabled: overrides.storage?.enabled ?? (Boolean(enabled) && !envOff(env.OPENAGI_FLEET_STORAGE))
     },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
