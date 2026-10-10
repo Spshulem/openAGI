@@ -30,7 +30,7 @@ broadened. Listing/read access is distinct from safe delivery into an owning app
 23 focused supervisor/adapter tests and 65 client tests across 14 files passed.
 The isolated remote client build passed `tsc --noEmit`, Vite packaging, and the
 packaged secret scan. Version 0.4.2 was packaged with no personal origin arguments
-and downloaded to `/Users/shooby/Downloads/agents-0.4.2.ehpk` (68,569 bytes).
+and downloaded to `/Users/you/Downloads/agents-0.4.2.ehpk` (68,569 bytes).
 Physical glasses installation and gesture acceptance remain unverified; the
 bundle has not been uploaded or installed. These changes are not committed or
 pushed in this turn.

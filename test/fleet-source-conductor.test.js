@@ -250,15 +250,15 @@ test("findManagerSession matches id, Claude session id, or workspace name", () =
     thread("r1", { workspace: "remote-dev", lastActivityAt: iso(5 * MIN) }),
     thread("r2", { workspace: "remote-dev", lastActivityAt: iso(50 * MIN), live: { peerName: "remote-dev-d4", pid: 1, status: "idle" } }),
     thread("r3", { workspace: "remote-dev", lastActivityAt: iso(1 * MIN) }),
-    { ...thread("0056f770-e054-484b-a712-4cc036dacf6f"), kind: "claude", key: "claude:0056f770-e054-484b-a712-4cc036dacf6f" },
-    thread("0056f770-e054-484b-a712-4cc036dacf6f")
+    { ...thread("00000000-0000-4000-8000-000000000001"), kind: "claude", key: "claude:00000000-0000-4000-8000-000000000001" },
+    thread("00000000-0000-4000-8000-000000000001")
   ];
   const find = (managerRef) => findManagerSession(resolveFleetConfig({}, { home: "/h", managerRef }), threads);
   assert.equal(find("a").id, "a");
   assert.equal(find("claude-b").id, "b");
   // A live tab wins over a newer offline one.
   assert.equal(find("remote-dev").id, "r2");
-  assert.equal(find("0056f770").kind, "conductor");
+  assert.equal(find("00000000").kind, "conductor");
   assert.equal(find("missing"), null);
   assert.equal(findManagerSession(resolveFleetConfig({}, { home: "/h", managerRef: "" }), threads), null);
   assert.equal(find("0056"), null, "short prefixes never match");

@@ -18,9 +18,9 @@
 **One deliberate spec clarification:** the tool must be read-only. In this repo the registry defaults `sideEffects` to TRUE ("a tool must explicitly declare sideEffects: false to count as read-only", src/tool-registry.js:26-31), and scrutiny 'watch' turns hard-block side-effecting tools (src/tool-registry.js:146-151). Therefore the registration MUST include `sideEffects: false` (exactly like `recall` at src/tool-registry.js:234 and `list_sessions` at src/tool-registry.js:427) — omitting the flag would mark it side-effecting and block it on watch turns.
 
 **Acceptance criteria:**
-- `node --test test/session-index.test.js` (run from /Users/shooby/Dev/openAGI) reports fail 0 with 6 tests passing.
-- `npm test` (full suite, from /Users/shooby/Dev/openAGI) reports fail 0.
-- `node -e "import('/Users/shooby/Dev/openAGI/src/index.js').then(m => { const t = new m.ToolRegistry(); m.registerCoreTools(t, {}); const tool = t.get('search_sessions'); console.log(Boolean(tool), tool.sideEffects, tool.needsConfirmation); })"` prints `true false false`.
+- `node --test test/session-index.test.js` (run from /Users/you/Dev/openAGI) reports fail 0 with 6 tests passing.
+- `npm test` (full suite, from /Users/you/Dev/openAGI) reports fail 0.
+- `node -e "import('/Users/you/Dev/openAGI/src/index.js').then(m => { const t = new m.ToolRegistry(); m.registerCoreTools(t, {}); const tool = t.get('search_sessions'); console.log(Boolean(tool), tool.sideEffects, tool.needsConfirmation); })"` prints `true false false`.
 - A runtime built with `createDefaultRuntime(...)` exposes `runtime.sessionIndex` (a `SessionIndex`), and a chat turn through `agentHost.handleMessage` makes the user and assistant messages findable via `runtime.sessionIndex.search(...)` (proven by test "agent host indexes persisted chat turns; ephemeral turns are excluded").
 - On a data dir that already has transcripts but no index DB, boot backfills the index (proven by test "boot backfills an empty index from existing transcripts").
 - Every snippet returned by `SessionIndex.search()` is ≤ 160 characters (proven by test "search snippets are capped at 160 chars").
@@ -95,7 +95,7 @@ test("session index round-trips: indexMessage then search finds the message", as
 });
 ```
 
-2. [ ] Run it and confirm the exact failure. Command (from /Users/shooby/Dev/openAGI): `node --test test/session-index.test.js` — expected failure: the file errors at import time with `SyntaxError: The requested module '../src/index.js' does not provide an export named 'SessionIndex'` and the summary reports fail ≥ 1.
+2. [ ] Run it and confirm the exact failure. Command (from /Users/you/Dev/openAGI): `node --test test/session-index.test.js` — expected failure: the file errors at import time with `SyntaxError: The requested module '../src/index.js' does not provide an export named 'SessionIndex'` and the summary reports fail ≥ 1.
 
 3. [ ] Create `src/session-index.js` with exactly this content (mirrors the node:sqlite + FTS5 + JSONL-fallback pattern of src/observation-store.js; no snippet cap yet — Cycle B adds it test-first):
 
@@ -252,7 +252,7 @@ export { SessionIndex } from "./session-index.js";
 
 5. [ ] Run `node --test test/session-index.test.js` — expect the round-trip test to pass and the summary to report fail 0 (wording varies by Node version: `ℹ fail 0` or `# fail 0`).
 
-6. [ ] Run the full suite: `npm test` (from /Users/shooby/Dev/openAGI) — expect fail 0.
+6. [ ] Run the full suite: `npm test` (from /Users/you/Dev/openAGI) — expect fail 0.
 
 7. [ ] Commit: `git add src/session-index.js src/index.js test/session-index.test.js && git commit -m "feat(session-index): FTS5 index over chat transcripts with indexMessage and search"`
 
@@ -684,7 +684,7 @@ with:
 
 29. [ ] Run `npm test` — expect fail 0 (test/verdict-consequences.test.js asserts sideEffects flags on specific named core tools, and test/tool-registry-cap.test.js builds its own registries of synthetic tools — neither asserts a total core-tool count, so the added registration cannot break them).
 
-30. [ ] Verify the acceptance-criteria one-liner prints `true false false`: `node -e "import('/Users/shooby/Dev/openAGI/src/index.js').then(m => { const t = new m.ToolRegistry(); m.registerCoreTools(t, {}); const tool = t.get('search_sessions'); console.log(Boolean(tool), tool.sideEffects, tool.needsConfirmation); })"`
+30. [ ] Verify the acceptance-criteria one-liner prints `true false false`: `node -e "import('/Users/you/Dev/openAGI/src/index.js').then(m => { const t = new m.ToolRegistry(); m.registerCoreTools(t, {}); const tool = t.get('search_sessions'); console.log(Boolean(tool), tool.sideEffects, tool.needsConfirmation); })"`
 
 31. [ ] Commit: `git add src/tool-registry.js test/session-index.test.js && git commit -m "feat(tools): search_sessions read-only tool over past conversations"`
 
@@ -811,7 +811,7 @@ test("pairing the same chat twice does not duplicate the allowlist entry", () =>
 });
 ```
 
-2. [ ] Run it and confirm the expected failure: `node --test test/telegram-pairing.test.js` — expect the file to fail to load with `Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/Users/shooby/Dev/openAGI/src/telegram-pairing.js'` (node reports the file itself as 1 failing test — `# tests 1`, `# fail 1` — and exits non-zero).
+2. [ ] Run it and confirm the expected failure: `node --test test/telegram-pairing.test.js` — expect the file to fail to load with `Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/Users/you/Dev/openAGI/src/telegram-pairing.js'` (node reports the file itself as 1 failing test — `# tests 1`, `# fail 1` — and exits non-zero).
 
 3. [ ] Create `src/telegram-pairing.js` with exactly this content:
 
@@ -1671,12 +1671,12 @@ test("denied replay_skill never executes", async () => {
 2. [ ] Run the new test and confirm it fails for the right reason:
 
 ```
-cd /Users/shooby/Dev/openAGI && node --test test/replay-skill-gate.test.js
+cd /Users/you/Dev/openAGI && node --test test/replay-skill-gate.test.js
 ```
 
 Expected failure: test 1 fails with `AssertionError` — `replay_skill must be confirmation-gated` (actual `false`, expected `true`); test 2 fails with `AssertionError` on `call must divert, not run` (actual `diverted.result.status` is `"completed"` from the stub, expected `"awaiting_confirmation"`). Test 3 fails similarly. If instead you see `Cannot find module`, fix the import path before proceeding — do not change assertions.
 
-3. [ ] Minimal implementation. In `/Users/shooby/Dev/openAGI/src/tool-registry.js`, edit the `replay_skill` registration (currently at lines 453-455). Before (quote exactly — this is the real current code):
+3. [ ] Minimal implementation. In `/Users/you/Dev/openAGI/src/tool-registry.js`, edit the `replay_skill` registration (currently at lines 453-455). Before (quote exactly — this is the real current code):
 
 ```js
   registry.register({
@@ -1705,7 +1705,7 @@ Do not touch the `parameters`, `handler`, or anything else in this registration,
 4. [ ] Run the new test again and confirm all three pass:
 
 ```
-cd /Users/shooby/Dev/openAGI && node --test test/replay-skill-gate.test.js
+cd /Users/you/Dev/openAGI && node --test test/replay-skill-gate.test.js
 ```
 
 Expected output ends with `# pass 3` / `# fail 0`.
@@ -1713,7 +1713,7 @@ Expected output ends with `# pass 3` / `# fail 0`.
 5. [ ] Run the full suite and confirm no regressions:
 
 ```
-cd /Users/shooby/Dev/openAGI && npm test
+cd /Users/you/Dev/openAGI && npm test
 ```
 
 Expected: `# fail 0`. Pay attention to `test/verdict-consequences.test.js` and `test/tool-registry-cap.test.js` — both exercise `ToolRegistry` and must still pass (neither asserts anything about `replay_skill`'s flags, so they will).
@@ -1721,13 +1721,13 @@ Expected: `# fail 0`. Pay attention to `test/verdict-consequences.test.js` and `
 6. [ ] Commit the gate change:
 
 ```
-cd /Users/shooby/Dev/openAGI && git add src/tool-registry.js test/replay-skill-gate.test.js && git commit -m "fix(tools): gate replay_skill behind the pending-actions confirmation queue"
+cd /Users/you/Dev/openAGI && git add src/tool-registry.js test/replay-skill-gate.test.js && git commit -m "fix(tools): gate replay_skill behind the pending-actions confirmation queue"
 ```
 
 7. [ ] Audit-and-report step — **NO code changes in this step, report only.** Enumerate every registered tool whose handler performs writes/sends/executes but lacks explicit gate flags. Registration sites to cover (all of them):
 
 ```
-cd /Users/shooby/Dev/openAGI && grep -n "registry.register({" src/tool-registry.js
+cd /Users/you/Dev/openAGI && grep -n "registry.register({" src/tool-registry.js
 grep -rn "\.register({" src/integrations/*.js
 grep -rn "needsConfirmation" src/*.js src/integrations/*.js
 grep -rn "sideEffects" src/*.js src/integrations/*.js
@@ -1736,7 +1736,7 @@ grep -rniE "send|deliver|write|create|save|schedule|applescript|osascript|exec|p
 
 For each tool found, read its handler and classify: does it mutate state or send anything (memory writes, task/cron mutations, outbound messages, env/file writes, process control, external API calls)? Record whether `sideEffects` is explicit (`true`/`false`) or defaulted (absent → `true` per src/tool-registry.js:31), and whether `needsConfirmation` is set. Remember MCP tools (source `"mcp"`, registered by src/mcp-registry.js) all default to side-effecting with no confirmation — note that as a single row/class, do not enumerate individual MCP tools.
 
-8. [ ] Write the report to `/Users/shooby/Dev/openAGI/docs/superpowers/plans/2026-07-05-openagi-gap-remediation/tool-gate-audit.md` with exactly this structure (fill the table from step 7's findings; the rows shown are known-correct seed examples — verify and keep them, then add the rest):
+8. [ ] Write the report to `/Users/you/Dev/openAGI/docs/superpowers/plans/2026-07-05-openagi-gap-remediation/tool-gate-audit.md` with exactly this structure (fill the table from step 7's findings; the rows shown are known-correct seed examples — verify and keep them, then add the rest):
 
 ```markdown
 # Tool confirmation-gate audit — 2026-07-05 (Task E3)
@@ -1770,5 +1770,5 @@ Do NOT add `needsConfirmation` or `sideEffects` to any tool other than `replay_s
 9. [ ] Commit the report:
 
 ```
-cd /Users/shooby/Dev/openAGI && git add docs/superpowers/plans/2026-07-05-openagi-gap-remediation/tool-gate-audit.md && git commit -m "docs(security): tool confirmation-gate audit report for E3 review"
+cd /Users/you/Dev/openAGI && git add docs/superpowers/plans/2026-07-05-openagi-gap-remediation/tool-gate-audit.md && git commit -m "docs(security): tool confirmation-gate audit report for E3 review"
 ```

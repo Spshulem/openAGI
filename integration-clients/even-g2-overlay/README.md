@@ -371,9 +371,9 @@ for status semantics, recovery commands, and persistent-operation instructions.
 
 The work spans three repositories and should be delivered as separate, ordered pull requests:
 
-- `/Users/shooby/Dev/g2`: Even Hub TypeScript plugin.
-- `/Users/shooby/Dev/bbapp`: BuildBetter authentication, APIs, durable media ingestion, Ask adapter, database, workers, and device management.
-- `/Users/shooby/Dev/bb-recorder`: existing claim-bound publisher for no-bot desktop transcript events; the backend now activates its dormant relay contract.
+- `/Users/you/Dev/g2`: Even Hub TypeScript plugin.
+- `/Users/you/Dev/bbapp`: BuildBetter authentication, APIs, durable media ingestion, Ask adapter, database, workers, and device management.
+- `/Users/you/Dev/bb-recorder`: existing claim-bound publisher for no-bot desktop transcript events; the backend now activates its dormant relay contract.
 
 Do not try to make one atomic cross-repository release. The backend contracts land dark first, then the G2 client is distributed against the feature-gated backend. No BB Recorder source change is required for the relay because its publisher and follower were already implemented behind server-advertised capabilities.
 

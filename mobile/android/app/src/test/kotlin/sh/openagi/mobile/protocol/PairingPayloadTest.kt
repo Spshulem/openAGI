@@ -54,7 +54,7 @@ class PairingPayloadTest {
 
     @Test
     fun aLinkNamingTheDaemonWeAreAlreadyOnIsNotASwitch() {
-        val server = "https://distiller-a270.tailfc2f1c.ts.net:8443"
+        val server = "https://distiller.tail1234.ts.net:8443"
         assertTrue(PairingPayload.namesSameDaemon(server, server))
         // Cosmetic differences a link can pick up on the way in -- a trailing
         // slash, a shouted host -- still name the same machine.
@@ -64,10 +64,10 @@ class PairingPayloadTest {
 
     @Test
     fun aLinkNamingAnotherDaemonIsASwitch() {
-        val distiller = "https://distiller-a270.tailfc2f1c.ts.net:8443"
-        assertFalse(PairingPayload.namesSameDaemon(distiller, "http://100.88.188.87:43311"))
+        val distiller = "https://distiller.tail1234.ts.net:8443"
+        assertFalse(PairingPayload.namesSameDaemon(distiller, "http://192.0.2.20:43311"))
         // Same host, different port is a different daemon -- a scratch build
         // on a spare port is the whole reason the switch prompt exists.
-        assertFalse(PairingPayload.namesSameDaemon(distiller, "https://distiller-a270.tailfc2f1c.ts.net:9443"))
+        assertFalse(PairingPayload.namesSameDaemon(distiller, "https://distiller.tail1234.ts.net:9443"))
     }
 }

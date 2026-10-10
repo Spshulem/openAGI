@@ -17,11 +17,11 @@
 
 **Acceptance criteria:**
 - `ls src/vocabulary-curator.js src/scrutiny-judge.js` → both "No such file or directory".
-- `grep -rn "vocabulary-curator\|VocabularyCurator\|runtime.vocabulary\|renderVocab" /Users/shooby/Dev/openAGI/src /Users/shooby/Dev/openAGI/test` → no output.
-- `grep -rn "scrutiny-judge\|ScrutinyJudge\|scrutinyJudge" /Users/shooby/Dev/openAGI/src /Users/shooby/Dev/openAGI/test` → no output.
-- `grep -rln "Twilio\|twilio\|SmsChannel" /Users/shooby/Dev/openAGI/src /Users/shooby/Dev/openAGI/test` → prints only `/Users/shooby/Dev/openAGI/src/setup-wizard.js` (intentionally untouched, see step 26 note).
+- `grep -rn "vocabulary-curator\|VocabularyCurator\|runtime.vocabulary\|renderVocab" /Users/you/Dev/openAGI/src /Users/you/Dev/openAGI/test` → no output.
+- `grep -rn "scrutiny-judge\|ScrutinyJudge\|scrutinyJudge" /Users/you/Dev/openAGI/src /Users/you/Dev/openAGI/test` → no output.
+- `grep -rln "Twilio\|twilio\|SmsChannel" /Users/you/Dev/openAGI/src /Users/you/Dev/openAGI/test` → prints only `/Users/you/Dev/openAGI/src/setup-wizard.js` (intentionally untouched, see step 26 note).
 - `node --test test/harsh-review-threshold.test.js` → all 6 tests pass.
-- `cd /Users/shooby/Dev/openAGI && npm test` → exit code 0, summary line `# fail 0`, after **each** of the five commits.
+- `cd /Users/you/Dev/openAGI && npm test` → exit code 0, summary line `# fail 0`, after **each** of the five commits.
 - `node -e "import('./src/abi-runtime.js').then(m => { const r = m.createDefaultRuntime(); console.log(JSON.stringify(r.cron.listJobs().find(j => j.id === 'weekly-harsh-review').input.scrutinyOverrides)); })"` run from the repo root prints `{"act":0.85}`.
 - `git log --oneline -5` shows five commits, one per part below.
 
@@ -59,7 +59,7 @@
   - Module-level constant `HARSH_REVIEW_SCRUTINY_OVERRIDES = { act: 0.85 }` in src/abi-runtime.js (module-private; not exported).
   - The `weekly-harsh-review` cron job's `input` gains `scrutinyOverrides: { act: 0.85 }`.
 
-General rules for every step: work in /Users/shooby/Dev/openAGI on branch main. Never read file contents under ~/.openagi (live personal data); the repo-local .openagi is a stale snapshot — touch neither. src/hosted-interface.js's dashboard code lives inside a Node template literal: the `\`` and `\${` escapes you see below are literal characters in the file — reproduce them byte-for-byte, and never add comments containing a raw backtick or `${` there.
+General rules for every step: work in /Users/you/Dev/openAGI on branch main. Never read file contents under ~/.openagi (live personal data); the repo-local .openagi is a stale snapshot — touch neither. src/hosted-interface.js's dashboard code lives inside a Node template literal: the `\`` and `\${` escapes you see below are literal characters in the file — reproduce them byte-for-byte, and never add comments containing a raw backtick or `${` there.
 
 ---
 

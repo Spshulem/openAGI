@@ -50,9 +50,9 @@ export const DEFAULTS = Object.freeze({
   // Leave a thread alone if the owner typed into it this recently.
   ownerRecentMs: 10 * MIN,
   fullVerifyEscalateMs: 30 * MIN,
-  // A run holding a BuildBot3 slot is slow only past this. Runs take 17-35 min
-  // (2026-10-09) and bb-verify kills one at 90; the 30-min thread-wait limit
-  // paged the BB3 manager about normal runs.
+  // A run holding a verification slot is slow only past this: normal runs
+  // finish well inside it, and the verifier kills one at 90 min. The 30-min
+  // thread-wait limit above would page about normal runs.
   fullRunSlowMs: 75 * MIN,
   quickVerifyEscalateMs: 15 * MIN,
   waitingTaskMaxMs: 45 * MIN,
@@ -111,9 +111,14 @@ export const DEFAULTS = Object.freeze({
   uiPollMs: 500
 });
 
-export const DEFAULT_BB3_HOST = "dev@100.99.3.113";
-export const DEFAULT_LB_URL = "http://100.99.3.113:2455";
-export const DEFAULT_MANAGER_REF = "0056f770-e054-484b-a712-4cc036dacf6f";
+// Deployment-specific targets have no built-in value: set them with
+// OPENAGI_FLEET_BB3_HOST (ssh destination of the build box),
+// OPENAGI_FLEET_LB_URL (base URL of the Codex load balancer) and
+// OPENAGI_FLEET_BB3_MANAGER (the session that manages the box). A source whose
+// target is unset reports itself as not configured rather than guessing.
+export const DEFAULT_BB3_HOST = null;
+export const DEFAULT_LB_URL = null;
+export const DEFAULT_MANAGER_REF = null;
 export const DEFAULT_RELAY_MODEL = "claude-haiku-4-5-20251001";
 // Model for the review of the needs-you list, chosen by the owner on
 // 2026-09-29 after the eval; OPENAGI_FLEET_REVIEW_MODEL overrides.

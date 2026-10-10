@@ -1,8 +1,8 @@
 RUNNING vs DORMANT — ground truth report
 
 ## Key finding: two data dirs
-- Repo-local `/Users/shooby/Dev/openAGI/.openagi` is a STALE dev-run artifact (last touched 2026-05-07/06-02, stale pid).
-- The LIVE instance is the packaged Mac app `/Users/shooby/Dev/openAGI/build/OpenAGI.app` (PID 26204 + bundled node PID 26246 running `Contents/Resources/openAGI/examples/hosted-server.js`, both started Fri Jul 3 15:13 2026), writing to `~/.openagi` (confirmed via lsof: node holds `/Users/shooby/.openagi/observations/index.db`). `curl 127.0.0.1:43210/health` responds (keys: firstRun,ok,status). `~/.openagi/node.json` (keys: remote,token) matches memory note that this Mac is a node paired to a Distiller main at 100.73.29.88:43210.
+- Repo-local `/Users/you/Dev/openAGI/.openagi` is a STALE dev-run artifact (last touched 2026-05-07/06-02, stale pid).
+- The LIVE instance is the packaged Mac app `/Users/you/Dev/openAGI/build/OpenAGI.app` (PID 26204 + bundled node PID 26246 running `Contents/Resources/openAGI/examples/hosted-server.js`, both started Fri Jul 3 15:13 2026), writing to `~/.openagi` (confirmed via lsof: node holds `/Users/you/.openagi/observations/index.db`). `curl 127.0.0.1:43210/health` responds (keys: firstRun,ok,status). `~/.openagi/node.json` (keys: remote,token) matches memory note that this Mac is a node paired to a Distiller main at 192.0.2.30:43210.
 
 ## (1) Repo `.openagi` (stale dev copy) — files / size / newest
 - memory 2 / 668K / 2026-05-07; observations 1 (index.db) / 260K / 2026-06-02; vectors 1 / 1.3M / 2026-06-02; agents 5 / 44K / 2026-05-07; agent-host 14 / 260K / 2026-05-07; cron 1 / 8K / 2026-05-07; outcomes 3 / 12M / 2026-06-02; channels 1 / 4K / 2026-05-06; budget 1 / 4K / 2026-05-07.
@@ -25,7 +25,7 @@ RUNNING vs DORMANT — ground truth report
 Recent work is almost entirely the **proactive-outreach** feature (spec c2814e2/b68fcbf through merge c032568 and follow-up fixes ccd51aa, 34fc638): durable OutreachStore with cursor index, OutreachMapper (events→durable items), DigestComposer with quiet hours, stalled-task surfacing, HTTP endpoints (GET /outreach/feed, /digest; POST /:id/act with idempotency, /:id/reply, /outreach/config), SSE broadcast, and a Mac consumer (notifications with inline actions, overlay list, tray badge, SSE reconnect fixes). Before that: daemon crash guard for MCP connect failures (c099bce), Mac release-build fix (4f0ca3f), operational-runbook/skills docs (d1d67a3, 82ecab1), autopilot gating to only spend model calls on queued work (36840a1), tool-count cap fix "256 tools broke every call" (384be44), and a computer-use run (screenshot vision feedback 9f6757e, coord scaling 4d7cb2f, TCC-free geometry 2c93acc).
 
 ## (4) Tests
-- `/Users/shooby/Dev/openAGI/test`: 46 entries, 46 `*.test.js` files. Runner: `"test": "node --test"` (package.json, openagi v0.0.6). Coverage names map to the live subsystems: 6 outreach tests, MCP/OAuth, iMessage bridge/extractor, memory, budget/credit ledger, autopilot gate, computer-server, model-router, proactive-suggestion-flow, migrate, onboarding, self-update.
+- `/Users/you/Dev/openAGI/test`: 46 entries, 46 `*.test.js` files. Runner: `"test": "node --test"` (package.json, openagi v0.0.6). Coverage names map to the live subsystems: 6 outreach tests, MCP/OAuth, iMessage bridge/extractor, memory, budget/credit ledger, autopilot gate, computer-server, model-router, proactive-suggestion-flow, migrate, onboarding, self-update.
 
 ## Conclusion — live vs dormant
 - **Live (daily writes as of 2026-07-04/05):** observation capture (742M SQLite FTS store), memory + vectors, outcomes, agents/agent-host, cron, budget ledger, proactive suggestion engine (314 files, 71 this week), and the new outreach store — all fed by the packaged Mac app + bundled node server on :43210, operating as a paired node of a remote Distiller main.

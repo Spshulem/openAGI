@@ -930,7 +930,7 @@ test("presence probes parse lsappinfo and ioreg output", async () => {
   assert.equal(parseBundleIdLine('[ NULL ]  ASN:0x0-0x16016: (in front) \n    bundleID="com.google.Chrome"\n'), "com.google.Chrome");
   assert.equal(parseIdleMs('  |   "HIDIdleTime" = 659028416\n'), 659);
   assert.equal(parseIdleMs("nothing"), null);
-  const unlocked = '"IOConsoleLocked" = No\n"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserNameKey"="shooby"})';
+  const unlocked = '"IOConsoleLocked" = No\n"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserNameKey"="you"})';
   assert.deepEqual(parseConsoleSession(unlocked), { locked: false, secureInput: false, secureInputPid: null, onConsole: true });
   const locked = '"IOConsoleUsers" = ({"CGSSessionScreenIsLocked"=Yes,"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionSecureInputPID"=812})';
   assert.deepEqual(parseConsoleSession(locked), { locked: true, secureInput: true, secureInputPid: 812, onConsole: true });
@@ -1244,7 +1244,7 @@ test("readiness probes the screen with the driver's command runner, not a probe 
   const calls = [];
   const run = async (cmd, args) => {
     calls.push([cmd, ...args].join(" "));
-    return { code: 0, stdout: '"IOConsoleLocked" = No\n"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserNameKey"="shooby"})' };
+    return { code: 0, stdout: '"IOConsoleLocked" = No\n"IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserNameKey"="you"})' };
   };
   const driver = createUiDriver({ config: { bins: { ocu: "/fake/ocu", ioreg: "/usr/sbin/ioreg" }, limits: { ...DEFAULTS } }, run, binaryReady: () => true, computerUseEnabled: () => true, permissionProbe: async () => ({ accessibility: true, screenRecording: true }) });
   assert.deepEqual(await driver.readiness(), { ready: true, detail: null });

@@ -169,7 +169,7 @@ The rest of the former `tick` body (the catchup check and the `this.cron.runDue(
 
 5. [ ] Run `node --test test/cron-overlap-guard.test.js`. Expect all 3 tests to pass (`# tests 3`, `# fail 0`).
 
-6. [ ] Run `npm test` from `/Users/shooby/Dev/openAGI`. Expect zero failures (the guard is transparent to every existing `await runtime.tick(...)` test because sequential awaited ticks never see the flag set).
+6. [ ] Run `npm test` from `/Users/you/Dev/openAGI`. Expect zero failures (the guard is transparent to every existing `await runtime.tick(...)` test because sequential awaited ticks never see the flag set).
 
 7. [ ] Commit:
 ```
@@ -824,7 +824,7 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 - The test asserts `body.system[0].text` is byte-identical across two consecutive Anthropic `generate()` calls that carry *different* `memoryHits`, and that `body.system[0].cache_control` equals `{ type: "ephemeral" }`.
 - The test asserts the OpenAI request body's `instructions` string is byte-identical across two calls with different memory hits and that the serialized body contains no `cache_control` key.
 - The test asserts the memory-hit content appears verbatim inside a `[context]`-delimited block at the start of the latest user message on both provider paths.
-- `grep -c "slice(-12)" /Users/shooby/Dev/openAGI/src/model-provider.js` still prints `2` (sliding window untouched).
+- `grep -c "slice(-12)" /Users/you/Dev/openAGI/src/model-provider.js` still prints `2` (sliding window untouched).
 - `npm test` passes with 0 failures from the repo root.
 - Manual A/B (steps 15-19): the memory codeword seeded in run A surfaces in run B's recall replies, and in run B `GET /budget` shows `tokens.cacheRead > 0` after the second message of the session.
 **Files:**
@@ -851,12 +851,12 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 
 1. [ ] Record the pre-change commit SHA for the later A/B comparison (run A executes from a worktree pinned here):
    ```bash
-   git -C /Users/shooby/Dev/openAGI rev-parse HEAD > /private/tmp/claude-501/-Users-shooby-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad/ab-base-sha.txt
-   cat /private/tmp/claude-501/-Users-shooby-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad/ab-base-sha.txt
+   git -C /Users/you/Dev/openAGI rev-parse HEAD > /private/tmp/claude-501/-Users-you-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad/ab-base-sha.txt
+   cat /private/tmp/claude-501/-Users-you-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad/ab-base-sha.txt
    ```
    Expected: one 40-char hex SHA printed.
 
-2. [ ] Write the failing test file. Create `/Users/shooby/Dev/openAGI/test/prompt-cache-stability.test.js` with exactly this content:
+2. [ ] Write the failing test file. Create `/Users/you/Dev/openAGI/test/prompt-cache-stability.test.js` with exactly this content:
    ```js
    // Prompt-cache stability: the system prompt must be byte-identical across
    // turns (so the Anthropic cache_control prefix actually hits), and everything
@@ -973,11 +973,11 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 
 3. [ ] Run the new test and confirm it fails for the right reason:
    ```bash
-   cd /Users/shooby/Dev/openAGI && node --test test/prompt-cache-stability.test.js
+   cd /Users/you/Dev/openAGI && node --test test/prompt-cache-stability.test.js
    ```
    Expected failure: `SyntaxError: The requested module '../src/model-provider.js' does not provide an export named 'buildTurnContext'` (the whole file errors; 0 tests pass).
 
-4. [ ] Edit `/Users/shooby/Dev/openAGI/src/model-provider.js` — replace `buildDefaultInstructions` and add `buildTurnContext`. Replace this exact current code (lines 338-363):
+4. [ ] Edit `/Users/you/Dev/openAGI/src/model-provider.js` — replace `buildDefaultInstructions` and add `buildTurnContext`. Replace this exact current code (lines 338-363):
    ```js
    export function buildDefaultInstructions({ agent, scrutiny, memoryHits }) {
      const memory = (memoryHits ?? [])
@@ -1055,7 +1055,7 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
    }
    ```
 
-5. [ ] Edit `/Users/shooby/Dev/openAGI/src/model-provider.js` — OpenAI path. Two narrow edits.
+5. [ ] Edit `/Users/you/Dev/openAGI/src/model-provider.js` — OpenAI path. Two narrow edits.
    Edit 5a — replace the exact line 79:
    ```js
    async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, tools = [], toolRegistry, context = {}, model: modelOverride, tier, task }) {
@@ -1099,7 +1099,7 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
        const baseInstructions = instructions ?? buildDefaultInstructions({ agent });
    ```
 
-6. [ ] Edit `/Users/shooby/Dev/openAGI/src/model-provider.js` — Anthropic path. Two narrow edits.
+6. [ ] Edit `/Users/you/Dev/openAGI/src/model-provider.js` — Anthropic path. Two narrow edits.
    Edit 6a — replace the exact line 222:
    ```js
    async generate({ input, instructions, messages = [], memoryHits = [], scrutiny, agent, toolRegistry, context = {}, model: modelOverride, tier, task }) {
@@ -1153,20 +1153,20 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 
 7. [ ] Run the new test file — all 6 tests must pass:
    ```bash
-   cd /Users/shooby/Dev/openAGI && node --test test/prompt-cache-stability.test.js
+   cd /Users/you/Dev/openAGI && node --test test/prompt-cache-stability.test.js
    ```
    Expected: `pass 6`, `fail 0`.
 
 8. [ ] Run the full suite (agent-host still sends its old combined instructions this commit — that is fine: no test inspects the user-message content of chat turns, and the fallback returns "" for all batch callers):
    ```bash
-   cd /Users/shooby/Dev/openAGI && npm test
+   cd /Users/you/Dev/openAGI && npm test
    ```
    Expected: 0 failures. Then commit:
    ```bash
-   cd /Users/shooby/Dev/openAGI && git add src/model-provider.js test/prompt-cache-stability.test.js && git commit -m "fix(model-provider): keep the cached system prompt byte-stable; per-turn memory and scrutiny ride the user turn" && git push
+   cd /Users/you/Dev/openAGI && git add src/model-provider.js test/prompt-cache-stability.test.js && git commit -m "fix(model-provider): keep the cached system prompt byte-stable; per-turn memory and scrutiny ride the user turn" && git push
    ```
 
-9. [ ] Append the agent-host failing test to `/Users/shooby/Dev/openAGI/test/prompt-cache-stability.test.js` (add at end of file, after the last test):
+9. [ ] Append the agent-host failing test to `/Users/you/Dev/openAGI/test/prompt-cache-stability.test.js` (add at end of file, after the last test):
    ```js
    test("agent-host: instructionsForAgent is static and turnContextForAgent carries the per-turn state", async () => {
      const { AgentHost } = await import("../src/agent-host.js");
@@ -1195,7 +1195,7 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
    });
    ```
 
-10. [ ] Update `/Users/shooby/Dev/openAGI/test/verdict-consequences.test.js` to expect the guidance in the turn context. Two narrow edits.
+10. [ ] Update `/Users/you/Dev/openAGI/test/verdict-consequences.test.js` to expect the guidance in the turn context. Two narrow edits.
     Edit 10a — replace this exact current code (lines 104-109):
     ```js
           generate: async (args) => {
@@ -1231,11 +1231,11 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 
 11. [ ] Run both test files and confirm the new failures:
     ```bash
-    cd /Users/shooby/Dev/openAGI && node --test test/prompt-cache-stability.test.js test/verdict-consequences.test.js
+    cd /Users/you/Dev/openAGI && node --test test/prompt-cache-stability.test.js test/verdict-consequences.test.js
     ```
     Expected failures: the appended agent-host test fails with `TypeError: Cannot read properties of undefined (reading 'scrutiny')` — the old `instructionsForAgent(agent, output, ...)` dereferences `output.scrutiny.action` and the test passes no `output` (it never even reaches the missing `turnContextForAgent`); the verdict test fails on `captured.turnContext` being `undefined` (assert.match rejects a non-string). The 6 provider tests still pass.
 
-12. [ ] Edit `/Users/shooby/Dev/openAGI/src/agent-host.js` — split the prompt in `handleMessage`. Replace this exact current code (lines 133-152, up to and including `toolRegistry,`):
+12. [ ] Edit `/Users/you/Dev/openAGI/src/agent-host.js` — split the prompt in `handleMessage`. Replace this exact current code (lines 133-152, up to and including `toolRegistry,`):
     ```js
         const modelResult = await this.modelProvider.generate({
           input: text,
@@ -1288,7 +1288,7 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
           toolRegistry,
     ```
 
-13. [ ] Edit `/Users/shooby/Dev/openAGI/src/agent-host.js` — replace the whole `instructionsForAgent` method (current lines 299-336, quoted in full below) with the static version plus the new `turnContextForAgent` method. Replace this exact current code:
+13. [ ] Edit `/Users/you/Dev/openAGI/src/agent-host.js` — replace the whole `instructionsForAgent` method (current lines 299-336, quoted in full below) with the static version plus the new `turnContextForAgent` method. Replace this exact current code:
     ```js
       instructionsForAgent(agent, output, intuitions = [], ambientContext = null, screenContext = null) {
         const intuitionBlock = intuitions.length > 0
@@ -1393,31 +1393,31 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 
 14. [ ] Run the targeted tests, then the full suite:
     ```bash
-    cd /Users/shooby/Dev/openAGI && node --test test/prompt-cache-stability.test.js test/verdict-consequences.test.js test/persona.test.js test/agent-host-screen-context.test.js
+    cd /Users/you/Dev/openAGI && node --test test/prompt-cache-stability.test.js test/verdict-consequences.test.js test/persona.test.js test/agent-host-screen-context.test.js
     ```
     Expected: all pass (prompt-cache-stability now reports `pass 7`; persona passes because the extra positional arg is ignored; screen-context passes because `formatScreenContextBlock` is unchanged). Then:
     ```bash
-    cd /Users/shooby/Dev/openAGI && npm test
+    cd /Users/you/Dev/openAGI && npm test
     ```
     Expected: 0 failures. Also verify the sliding window is untouched:
     ```bash
-    grep -c "slice(-12)" /Users/shooby/Dev/openAGI/src/model-provider.js
+    grep -c "slice(-12)" /Users/you/Dev/openAGI/src/model-provider.js
     ```
     Expected output: `2`. Then commit:
     ```bash
-    cd /Users/shooby/Dev/openAGI && git add src/agent-host.js test/prompt-cache-stability.test.js test/verdict-consequences.test.js && git commit -m "fix(agent-host): split static instructions from per-turn context so the provider prompt cache hits" && git push
+    cd /Users/you/Dev/openAGI && git add src/agent-host.js test/prompt-cache-stability.test.js test/verdict-consequences.test.js && git commit -m "fix(agent-host): split static instructions from per-turn context so the provider prompt cache hits" && git push
     ```
 
 15. [ ] Manual A/B verification — setup. This checks that moving memory/scrutiny context from system to user position did not break memory recall, and that cache reads now occur. Requires a real `ANTHROPIC_API_KEY` exported in the shell. If `printenv ANTHROPIC_API_KEY` prints nothing, STOP this step, ask Spencer to export one, and do not read it out of ~/.openagi/.env (personal data dir). Create scratch data dirs and a worktree pinned to the pre-change SHA from step 1 (the repo has zero npm dependencies, so the worktree runs standalone):
     ```bash
-    SCRATCH=/private/tmp/claude-501/-Users-shooby-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
+    SCRATCH=/private/tmp/claude-501/-Users-you-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
     mkdir -p "$SCRATCH/ab-data-before" "$SCRATCH/ab-data-after"
-    git -C /Users/shooby/Dev/openAGI worktree add "$SCRATCH/ab-base" "$(cat $SCRATCH/ab-base-sha.txt)"
+    git -C /Users/you/Dev/openAGI worktree add "$SCRATCH/ab-base" "$(cat $SCRATCH/ab-base-sha.txt)"
     ```
 
 16. [ ] Run A (pre-change code). Start the old daemon on a throwaway port/data dir, send 3 fixed prompts in one session, capture replies, then stop it (killing this PID is a background dev process we started — allowed):
     ```bash
-    SCRATCH=/private/tmp/claude-501/-Users-shooby-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
+    SCRATCH=/private/tmp/claude-501/-Users-you-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
     OPENAGI_DATA_DIR="$SCRATCH/ab-data-before" PORT=43998 node "$SCRATCH/ab-base/examples/hosted-server.js" > "$SCRATCH/ab-before-server.log" 2>&1 &
     echo $! > "$SCRATCH/ab-before-pid.txt"; sleep 3
     curl -s -X POST http://127.0.0.1:43998/message -H 'content-type: application/json' -d '{"sessionId":"ab-test","text":"Remember: the AB cache test codeword is heliotrope-42."}' > "$SCRATCH/ab-before-1.json"
@@ -1431,8 +1431,8 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 
 17. [ ] Run B (post-change code). Same 3 prompts against the new code with a fresh data dir:
     ```bash
-    SCRATCH=/private/tmp/claude-501/-Users-shooby-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
-    OPENAGI_DATA_DIR="$SCRATCH/ab-data-after" PORT=43999 node /Users/shooby/Dev/openAGI/examples/hosted-server.js > "$SCRATCH/ab-after-server.log" 2>&1 &
+    SCRATCH=/private/tmp/claude-501/-Users-you-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
+    OPENAGI_DATA_DIR="$SCRATCH/ab-data-after" PORT=43999 node /Users/you/Dev/openAGI/examples/hosted-server.js > "$SCRATCH/ab-after-server.log" 2>&1 &
     echo $! > "$SCRATCH/ab-after-pid.txt"; sleep 3
     curl -s -X POST http://127.0.0.1:43999/message -H 'content-type: application/json' -d '{"sessionId":"ab-test","text":"Remember: the AB cache test codeword is heliotrope-42."}' > "$SCRATCH/ab-after-1.json"
     curl -s -X POST http://127.0.0.1:43999/message -H 'content-type: application/json' -d '{"sessionId":"ab-test","text":"What is the AB cache test codeword?"}' > "$SCRATCH/ab-after-2.json"
@@ -1445,17 +1445,17 @@ git commit -m "feat(cron): persist mid-run marker, emit cron-interrupted on boot
 
 18. [ ] Compare A vs B and record the verdict. Expected equivalence: reply *wording* will differ (different sampling, different prompt position), but (a) the codeword fact must surface in the recall replies of BOTH runs — that proves memory context moved to the user turn is still consumed by the model — and (b) cache behavior must improve in B:
     ```bash
-    SCRATCH=/private/tmp/claude-501/-Users-shooby-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
+    SCRATCH=/private/tmp/claude-501/-Users-you-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad
     python3 -c "import json; b=json.load(open('$SCRATCH/ab-before-budget.json')); a=json.load(open('$SCRATCH/ab-after-budget.json')); print('before cacheRead:', b['tokens']['cacheRead'], 'after cacheRead:', a['tokens']['cacheRead'])"
     ```
     Expected: `after cacheRead` is greater than 0 (turns 2 and 3 read the cached tools+system prefix written by turn 1); `before cacheRead` is 0 or near 0 (the per-turn system text broke the prefix). If `after cacheRead` is 0, the split has a bug — diff `system[0].text` between two consecutive requests by adding a temporary `console.error(JSON.stringify(body.system))` in `postMessages`, re-run, find the varying substring, and move that substring into `turnContextForAgent`; remove the temporary line before committing anything.
 
 19. [ ] Clean up the A/B worktree (removal of the worktree checkout only — it contains no uncommitted work; the scratch data dirs are left for the OS to reap):
     ```bash
-    git -C /Users/shooby/Dev/openAGI worktree remove /private/tmp/claude-501/-Users-shooby-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad/ab-base
+    git -C /Users/you/Dev/openAGI worktree remove /private/tmp/claude-501/-Users-you-Dev-openAGI/ab270c9b-cb07-44b2-8bf1-ed0a3e4e1270/scratchpad/ab-base
     ```
     Then re-run the full suite one last time and confirm the tree is clean except for nothing (both commits already pushed):
     ```bash
-    cd /Users/shooby/Dev/openAGI && npm test && git status --short
+    cd /Users/you/Dev/openAGI && npm test && git status --short
     ```
     Expected: 0 test failures; `git status --short` prints nothing.

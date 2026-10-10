@@ -276,6 +276,8 @@ function withGateSince(bb3, previous) {
 }
 
 export async function probeBuildBot3(config, { run = runCommand, now = Date.now(), previous = null } = {}) {
+  // Unknown, not unreachable: an unset host must never read as an outage.
+  if (!String(config?.bb3Host ?? "").trim()) return { ...emptyBb3(now, "not configured"), reachable: null };
   let result;
   try {
     result = await run(config.bins.ssh, [
@@ -313,7 +315,9 @@ function fetchFailure(error, aborted, timeoutMs) {
 export async function checkLb(config, {
   fetchImpl = globalThis.fetch, now = Date.now(), readFile = (file) => readTail(file, 16 * 1024), timeoutMs = LB_TIMEOUT_MS
 } = {}) {
-  const url = `${String(config.lbUrl ?? "").replace(/\/+$/, "")}/health`;
+  const base = String(config.lbUrl ?? "").trim().replace(/\/+$/, "");
+  if (!base) return { healthy: null, detail: "not configured", watchLine: null, checkedAt: toIso(now) };
+  const url = `${base}/health`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("timed out")), timeoutMs);
   let healthy;

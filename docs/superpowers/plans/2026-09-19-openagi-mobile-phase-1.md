@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Repo: `/Users/shooby/Dev/openAGI`. Mobile code lives in `mobile/ios/` and `mobile/android/`; shared protocol doc in `mobile/PROTOCOL.md`.
+- Repo: `/Users/you/Dev/openAGI`. Mobile code lives in `mobile/ios/` and `mobile/android/`; shared protocol doc in `mobile/PROTOCOL.md`.
 - Daemon tests run with `npm test` (`node --test`), one file per behaviour under `test/`, ESM imports only, no test framework dependencies.
 - No new npm runtime dependencies. The daemon's only dependency is `ws`.
 - iOS takes **no** third-party dependencies: Foundation, SwiftUI, WidgetKit, AppIntents, Security. Nothing else. No SPM packages, no CocoaPods.
@@ -198,7 +198,7 @@ test("node names are bounded and never empty", () => {
 
 - [ ] **Step 2: Run the test and watch it fail**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/mobile-node-scope.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/mobile-node-scope.test.js`
 Expected: FAIL — `Cannot find module '../src/mobile-node.js'`.
 
 - [ ] **Step 3: Write the implementation**
@@ -272,7 +272,7 @@ export function boundedMobileNodeName(value) {
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/mobile-node-scope.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/mobile-node-scope.test.js`
 Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Wire the allowlist into the auth gate**
@@ -338,7 +338,7 @@ authenticates the same way a node-client route does:
 
 - [ ] **Step 6: Run the whole daemon suite for regressions**
 
-Run: `cd /Users/shooby/Dev/openAGI && npm test 2>&1 | tail -25`
+Run: `cd /Users/you/Dev/openAGI && npm test 2>&1 | tail -25`
 Expected: the same pass/fail counts as before this task — in particular every
 `g2`, `node-`, and `auth` test still passes. Investigate any new failure before
 continuing; a broken G2 gate here is a security regression, not a flake.
@@ -346,7 +346,7 @@ continuing; a broken G2 gate here is a security regression, not a flake.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add src/mobile-node.js test/mobile-node-scope.test.js src/hosted-interface.js
 git commit -m "feat: add a mobile node platform with an explicit route allowlist"
 ```
@@ -512,7 +512,7 @@ test("the phone credential opens allowlisted routes and nothing else", async () 
 
 - [ ] **Step 2: Run the test and watch it fail**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/mobile-enrollment.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/mobile-enrollment.test.js`
 Expected: FAIL — the first test gets `400 platform must be even_g2`.
 
 - [ ] **Step 3: Generalise the two enrollment routes**
@@ -575,19 +575,19 @@ with no browser Origin problem, so it gets no CORS relaxation.
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/mobile-enrollment.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/mobile-enrollment.test.js`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Prove the G2 path is untouched**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/*g2*.test.js test/node-*.test.js 2>&1 | tail -15`
+Run: `cd /Users/you/Dev/openAGI && node --test test/*g2*.test.js test/node-*.test.js 2>&1 | tail -15`
 Expected: PASS. If any G2 enrollment test fails, the generalisation changed the
 wearable's contract — fix it rather than updating the G2 test.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add src/hosted-interface.js test/mobile-enrollment.test.js
 git commit -m "feat: enroll phones through the existing node code exchange"
 ```
@@ -735,7 +735,7 @@ test("the ETag ignores generatedAt so a quiet daemon keeps answering 304", async
 
 - [ ] **Step 2: Run the test and watch it fail**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/mobile-summary-route.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/mobile-summary-route.test.js`
 Expected: FAIL — `/mobile/summary` returns 404.
 
 - [ ] **Step 3: Write the payload builder**
@@ -840,7 +840,7 @@ and add this handler immediately before the `GET /brief/today` handler at line 1
 
 - [ ] **Step 5: Run the test and watch it pass**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/mobile-summary-route.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/mobile-summary-route.test.js`
 Expected: PASS, 6 tests. If the ordering test fails, check `runtime.tasks.list`
 default ordering rather than loosening the assertion — the widget's value is
 that the most important thing is on top.
@@ -848,7 +848,7 @@ that the most important thing is on top.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add src/mobile-summary.js test/mobile-summary-route.test.js src/hosted-interface.js
 git commit -m "feat: add a single-round-trip mobile summary endpoint"
 ```
@@ -934,7 +934,7 @@ test("the code must be six digits", () => {
 
 - [ ] **Step 2: Run the test and watch it fail**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/pair-phone.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/pair-phone.test.js`
 Expected: FAIL — `Cannot find module '../src/pair-phone.js'`.
 
 - [ ] **Step 3: Write the module**
@@ -1002,7 +1002,7 @@ export function buildPairingUrl({ baseUrl, code, platform }) {
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/pair-phone.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/pair-phone.test.js`
 Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Add the CLI subcommand**
@@ -1078,7 +1078,7 @@ usage text next to the existing `pair` entry.
 Against a loopback-bound daemon:
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 OPENAGI_URL=http://127.0.0.1:43210 node bin/openagi.js pair-phone --platform ios
 ```
 
@@ -1091,7 +1091,7 @@ machine on the tailnet.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add src/pair-phone.js test/pair-phone.test.js bin/openagi.js
 git commit -m "feat: add openagi pair-phone for mobile node enrollment"
 ```
@@ -1170,7 +1170,7 @@ console.log(`wrote fixtures to ${outDir}`);
 
 - [ ] **Step 2: Generate the fixtures**
 
-Run: `cd /Users/shooby/Dev/openAGI && node scripts/generate-mobile-fixtures.mjs`
+Run: `cd /Users/you/Dev/openAGI && node scripts/generate-mobile-fixtures.mjs`
 Expected: five files under `mobile/fixtures/`. Open
 `mobile/fixtures/summary-populated.json` and confirm `today` has two entries with
 `"Ship the widget"` first and `overdue: true` on `"Renew the domain"`.
@@ -1215,7 +1215,7 @@ test("the summary fixture still matches what the daemon produces", async () => {
 
 - [ ] **Step 4: Run it**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test test/mobile-fixtures-current.test.js`
+Run: `cd /Users/you/Dev/openAGI && node --test test/mobile-fixtures-current.test.js`
 Expected: PASS. If it fails, regenerate the fixtures (Step 2) and re-run both
 platforms' client tests — a shape change is a client-breaking change.
 
@@ -1240,7 +1240,7 @@ half of it.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/PROTOCOL.md mobile/fixtures scripts/generate-mobile-fixtures.mjs test/mobile-fixtures-current.test.js
 git commit -m "docs: write the mobile client protocol and generate shared fixtures"
 ```
@@ -1402,7 +1402,7 @@ final class SummaryDecodingTests: XCTestCase {
 - [ ] **Step 3: Generate the project and watch the test fail**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/ios
+cd /Users/you/Dev/openAGI/mobile/ios
 xcodegen generate
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcodebuild test \
   -project OpenAGI.xcodeproj -scheme OpenAGI \
@@ -1541,7 +1541,7 @@ the standard XML plist skeleton (`<dict/>` body); XcodeGen fills the rest.
 - [ ] **Step 5: Run the test and watch it pass**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/ios && xcodegen generate
+cd /Users/you/Dev/openAGI/mobile/ios && xcodegen generate
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcodebuild test \
   -project OpenAGI.xcodeproj -scheme OpenAGI \
   -destination 'platform=iOS Simulator,name=iPhone 18 Pro' 2>&1 | tail -20
@@ -1552,7 +1552,7 @@ Expected: `** TEST SUCCEEDED **`, 5 tests.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/ios
 git commit -m "feat(ios): add the project skeleton and fixture-backed protocol models"
 ```
@@ -1724,7 +1724,7 @@ final class DaemonClientTests: XCTestCase {
 - [ ] **Step 2: Run and watch both fail**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/ios && xcodegen generate
+cd /Users/you/Dev/openAGI/mobile/ios && xcodegen generate
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcodebuild test \
   -project OpenAGI.xcodeproj -scheme OpenAGI \
   -destination 'platform=iOS Simulator,name=iPhone 18 Pro' 2>&1 | tail -20
@@ -1890,7 +1890,7 @@ Same `xcodebuild test` command as Step 2. Expected: `** TEST SUCCEEDED **`, 14 t
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/ios
 git commit -m "feat(ios): add the daemon client and its cleartext host allowlist"
 ```
@@ -2229,7 +2229,7 @@ Same `xcodebuild test` command. Expected: `** TEST SUCCEEDED **`, 23 tests total
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/ios
 git commit -m "feat(ios): add the shared snapshot store and offline outbound queue"
 ```
@@ -2450,7 +2450,7 @@ Same `xcodebuild test` command. Expected: `** TEST SUCCEEDED **`, 28 tests total
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/ios
 git commit -m "feat(ios): pair, store credentials in the keychain, and refresh"
 ```
@@ -2554,7 +2554,7 @@ Same `xcodebuild test` command. Expected: `** TEST SUCCEEDED **`, 33 tests total
 - [ ] **Step 6: Verify on a simulator by hand**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/ios && xcodegen generate
+cd /Users/you/Dev/openAGI/mobile/ios && xcodegen generate
 DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcodebuild build \
   -project OpenAGI.xcodeproj -scheme OpenAGI \
   -destination 'platform=iOS Simulator,name=iPhone 18 Pro' 2>&1 | tail -5
@@ -2568,7 +2568,7 @@ the task shows `completed` in `openagi` on the desktop.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/ios
 git commit -m "feat(ios): add the today widget with in-place task completion"
 ```
@@ -2609,8 +2609,8 @@ There is no `gradle` on `PATH`, so run the cached distribution once to generate
 the wrapper, then never touch it again:
 
 ```bash
-mkdir -p /Users/shooby/Dev/openAGI/mobile/android
-cd /Users/shooby/Dev/openAGI/mobile/android
+mkdir -p /Users/you/Dev/openAGI/mobile/android
+cd /Users/you/Dev/openAGI/mobile/android
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   ~/.gradle/wrapper/dists/gradle-8.14.3-bin/*/gradle-8.14.3/bin/gradle \
   wrapper --gradle-version 8.14.3 --distribution-type bin
@@ -2904,7 +2904,7 @@ class SummaryDecodingTest {
 - [ ] **Step 4: Run the test and watch it fail**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/android
+cd /Users/you/Dev/openAGI/mobile/android
 ANDROID_HOME="$HOME/Library/Android/sdk" \
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   ./gradlew :app:testDebugUnitTest 2>&1 | tail -30
@@ -3048,7 +3048,7 @@ class MainActivity : ComponentActivity() {
 - [ ] **Step 6: Run the test and watch it pass**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/android
+cd /Users/you/Dev/openAGI/mobile/android
 ANDROID_HOME="$HOME/Library/Android/sdk" \
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   ./gradlew :app:testDebugUnitTest 2>&1 | tail -20
@@ -3059,7 +3059,7 @@ Expected: `BUILD SUCCESSFUL`, 5 tests.
 - [ ] **Step 7: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/android
 git commit -m "feat(android): add the gradle skeleton and fixture-backed protocol models"
 ```
@@ -3344,7 +3344,7 @@ Add the coroutines test dependency to `mobile/android/app/build.gradle.kts`:
 - [ ] **Step 2: Run and watch them fail**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/android
+cd /Users/you/Dev/openAGI/mobile/android
 ANDROID_HOME="$HOME/Library/Android/sdk" \
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   ./gradlew :app:testDebugUnitTest 2>&1 | tail -30
@@ -3560,7 +3560,7 @@ Same `./gradlew :app:testDebugUnitTest` command. Expected: `BUILD SUCCESSFUL`,
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/android
 git commit -m "feat(android): add the daemon client and its cleartext host allowlist"
 ```
@@ -3898,7 +3898,7 @@ Same `./gradlew :app:testDebugUnitTest` command. Expected: `BUILD SUCCESSFUL`,
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/android
 git commit -m "feat(android): add the snapshot store and offline outbound queue"
 ```
@@ -4260,7 +4260,7 @@ Same `./gradlew :app:testDebugUnitTest` command. Expected: `BUILD SUCCESSFUL`,
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/android
 git commit -m "feat(android): pair, store credentials encrypted, and refresh on a worker"
 ```
@@ -4508,7 +4508,7 @@ Same `./gradlew :app:testDebugUnitTest` command. Expected: `BUILD SUCCESSFUL`,
 - [ ] **Step 7: Build the APK and check it by hand**
 
 ```bash
-cd /Users/shooby/Dev/openAGI/mobile/android
+cd /Users/you/Dev/openAGI/mobile/android
 ANDROID_HOME="$HOME/Library/Android/sdk" \
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   ./gradlew :app:assembleDebug 2>&1 | tail -10
@@ -4522,7 +4522,7 @@ desktop shows it `completed`.
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/android
 git commit -m "feat(android): add the glance today widget with in-place completion"
 ```
@@ -4547,7 +4547,7 @@ individually tested; this task is the one that proves the pieces meet.
 - [ ] **Step 1: Bind the daemon somewhere a phone can reach it**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 export OPENAGI_AUTH_TOKEN="$(node -e 'console.log(require("crypto").randomBytes(32).toString("base64url"))')"
 echo "token: $OPENAGI_AUTH_TOKEN"
 OPENAGI_BIND=0.0.0.0 node bin/openagi.js start
@@ -4561,7 +4561,7 @@ check working, not a bug to route around.
 - [ ] **Step 2: Run the whole Node test suite**
 
 ```bash
-cd /Users/shooby/Dev/openAGI && npm test 2>&1 | tail -20
+cd /Users/you/Dev/openAGI && npm test 2>&1 | tail -20
 ```
 
 Expected: PASS, including the five new files from Tasks 1–5 and no regressions
@@ -4570,7 +4570,7 @@ in the existing 141.
 - [ ] **Step 3: Pair the iPhone and complete a task from the home screen**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 node bin/openagi.js pair-phone --platform ios --url http://<tailnet-host>:43210
 ```
 
@@ -4649,7 +4649,7 @@ In the root `README.md`, add one line under the existing feature list pointing a
 - [ ] **Step 9: Commit**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 git add mobile/README.md README.md docs/superpowers/specs/2026-09-19-openagi-mobile-apps-design.md
 git commit -m "docs: record the phase 1 mobile end-to-end pass and how to run it"
 ```
