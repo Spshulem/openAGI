@@ -161,14 +161,25 @@ const OCU_NATIVE = ["dist", "Open Computer Use.app", "Contents", "MacOS", "OpenC
 // The standalone Open Computer Use binary the fleet drives apps with. The npm
 // "open-computer-use" command is a node launcher: a launchd PATH may lack
 // node, and killing the launcher would orphan the engine, so the bundled
-// native executable next to it is used instead when present.
-export function resolveOcuPath(env = process.env, { exists = fs.existsSync, realpath = fs.realpathSync, execPath = process.execPath } = {}) {
+// native executable next to it is used instead when present. The app starts
+// the daemon with its own node and a bare PATH (after a reboot, say), so the
+// usual per-user install dirs are searched too, newest nvm node first.
+export function resolveOcuPath(env = process.env, { exists = fs.existsSync, realpath = fs.realpathSync, execPath = process.execPath, readdir = fs.readdirSync, home = env?.HOME || os.homedir() } = {}) {
   const explicit = String(env?.OPENAGI_FLEET_OCU_PATH ?? "").trim();
+  let nvm = [];
+  try {
+    const versions = path.join(home, ".nvm", "versions", "node");
+    nvm = readdir(versions).filter((name) => /^v\d/.test(name))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
+      .map((name) => path.join(versions, name, "bin", OCU_NAME));
+  } catch { /* no nvm */ }
   const candidates = explicit ? [explicit] : [
     ...String(env?.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, OCU_NAME)),
     path.join(path.dirname(execPath), OCU_NAME),
     `/opt/homebrew/bin/${OCU_NAME}`,
-    `/usr/local/bin/${OCU_NAME}`
+    `/usr/local/bin/${OCU_NAME}`,
+    ...nvm,
+    ...[".volta/bin", ".npm-global/bin", ".local/bin", "Library/pnpm", ".bun/bin"].map((dir) => path.join(home, dir, OCU_NAME))
   ];
   const found = candidates.find((candidate) => path.isAbsolute(candidate) && exists(candidate));
   if (!found) return explicit || null;
