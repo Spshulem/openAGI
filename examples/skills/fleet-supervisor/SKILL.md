@@ -46,7 +46,7 @@ Out of scope = named human approval, `--admin`, merging to main, production, pas
 | codex-lb | escalate to manager; `infra-recovered` when LB healthy | manager offline, or LB down 1 h+ |
 | logged out / disk full | nothing | at once, one line |
 | waiting-ci | watch; when CI ends on the head, `ci-finished` | never |
-| waiting-ci too long | bb-quick over 15 min, or a full verify over 30 min where it is the merge gate (a required check, e.g. buildbetter-app/buildbetter) or hosted CI is failing: escalate to manager; never told to drop a gating run. Elsewhere a full verify over 30 min with hosted CI not failing: `bb3-slow-agent`. Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
+| waiting-ci too long | bb-quick over 15 min, or a full verify over 30 min where it is the merge gate (a required check that is the full run itself, e.g. buildbetter-app/buildbetter) or hosted CI is failing: escalate to manager; never told to drop a gating run. Elsewhere a full verify over 30 min with hosted CI not failing: `bb3-slow-agent`. Agent silent 1 h+: `status-check` | manager offline; 3 status checks |
 | local-verify | `no-local-verify` | never |
 | asked-in-scope | `in-scope-yes` | never |
 | needs-human | nothing | one caveman question with buttons |

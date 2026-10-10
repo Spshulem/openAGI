@@ -160,7 +160,7 @@ function makeContext(classified, thread, options) {
     mutedKeys: keySet(options.mutedKeys),
     ledger: ledger ?? {},
     progressMark: progressMarkFor(classified, thread, ledger),
-    facts: factsFor(thread, pr, classified)
+    facts: factsFor(thread, pr, classified, config)
   };
 }
 
@@ -271,11 +271,16 @@ function backoffIntent(ctx, errorAt, kind) {
   return nudge("resume", `${kind}; retry ${attempts + 1}`, { immediate: true });
 }
 
-// The repo's merge gate includes a required check (the BuildBot3 full run).
+// The repo's merge gate is the BuildBot3 full run itself: a required check
+// named for it, or one produced by bb-verify --full. Another required check
+// (deploy, lint) leaves hosted CI as the gate for a slow full run.
+const FULL_RUN_CHECK = "BuildBot3 full verification";
+const FULL_RUN_HOW = /\bbb-verify\b.*--full\b/;
+
 function fullRunGated(pr, thread, config) {
-  if (pr?.gates?.length) return true;
   const repo = pr?.repo ?? thread?.repo ?? null;
-  return Boolean(repo && requiredChecksFor(repo, config).length);
+  const gates = pr?.gates?.length ? pr.gates : repo ? requiredChecksFor(repo, config) : [];
+  return gates.some((gate) => gate?.name === FULL_RUN_CHECK || FULL_RUN_HOW.test(String(gate?.how ?? "")));
 }
 
 function ciFailing(pr) {
@@ -863,7 +868,7 @@ export function dedupeDecisions(decisions) {
 // ---------------------------------------------------------------------------
 // Facts and text helpers
 
-function factsFor(thread, pr, classified) {
+function factsFor(thread, pr, classified, config = null) {
   const blockers = (classified.blockers?.length ? classified.blockers : classified.readiness?.blockers) ?? [];
   const prRef = pr?.ref ?? thread.prRefs?.[0] ?? "";
   const prNumber = pr?.number ?? Number(/#(\d+)$/.exec(prRef)?.[1]);
@@ -880,7 +885,7 @@ function factsFor(thread, pr, classified) {
     ci: ciSummary(pr),
     blockers: blockers.map((blocker) => fact(blocker, 80)).join("; "),
     blocker: fact(blockers[0], 80),
-    mergeGate: gateFact(pr),
+    mergeGate: gateFact(pr, pr?.repo ?? thread.repo, config),
     thread: agentLabel(thread),
     label: pastPr ? ownerLabel(thread, null, null) : ownerLabel(thread, knownPr, pr?.repo ?? parsePrRef(prRef)?.repo),
     reset: formatTime(thread.error?.resetAt)
@@ -894,9 +899,10 @@ function prDoneBefore(pr, at) {
 }
 
 // What a PR must show green on its head: the repo's required checks (the
-// BuildBot3 full run for BuildBetter), else hosted CI.
-function gateFact(pr) {
-  const gates = (pr?.gates ?? []).filter((gate) => gate?.label || gate?.name);
+// BuildBot3 full run for BuildBetter), else hosted CI. Without a PR read,
+// the repo's configured checks stand in.
+function gateFact(pr, repo = null, config = null) {
+  const gates = (pr?.gates ?? (repo ? requiredChecksFor(repo, config) : [])).filter((gate) => gate?.label || gate?.name);
   if (!gates.length) return "green hosted CI";
   const names = gates.map((gate) => `${gate.label || gate.name}${gate.how ? ` (${gate.how})` : ""}`);
   return fact(`a green ${names.join(" and ")}`, 160);

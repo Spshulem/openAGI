@@ -537,3 +537,46 @@ test("the required check is read by name, not only from the first 100 rollup con
   stale.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: "1".repeat(40), status: { g0: { __typename: "StatusContext", context: "BuildBot3 full verification", state: "SUCCESS" } } } }] };
   assert.deepEqual((await gateOf(stale)).map((gate) => gate.state), [null]);
 });
+
+test("a required check run past the first 20 check suites is paged in, bounded", async () => {
+  const cfg = config({ requiredChecks: { [BBAPP]: ["deploy"] } });
+  assert.match(buildPrQuery([{ repo: BBAPP, number: 6878 }], cfg), /checkSuites\(first:20\)\{pageInfo\{hasNextPage endCursor\}/);
+  const empty = (n) => Array.from({ length: n }, () => ({ g0: { nodes: [] } }));
+  const deploy = { g0: { nodes: [{ __typename: "CheckRun", name: "deploy", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-09-26T07:38:29Z" }] } };
+  const batch = (hasNextPage = true) => {
+    const response = capturedResponse();
+    response.data.r0.p6878.gateCommit = { nodes: [{ commit: { oid: HEAD_6878, status: null, checkSuites: { pageInfo: { hasNextPage, endCursor: "c20" }, nodes: empty(20) } } }] };
+    return response;
+  };
+  const page = (nodes, hasNextPage, endCursor) => ({ data: { repository: { object: { checkSuites: { pageInfo: { hasNextPage, endCursor }, nodes } } } } });
+
+  // The run sits in suite 30: one follow-up page finds it.
+  let pages = fakeRun((cmd, args, options, n) => ok(n === 1 ? batch() : page([...empty(9), deploy], true, "c60")));
+  let pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.gates.map((gate) => gate.state), ["SUCCESS"]);
+  assert.equal(pages.calls.length, 2);
+  assert.match(pages.calls[1].args.at(-1), /object\(oid:"95720cc5[0-9a-f]+"\)\{ \.\.\. on Commit \{ checkSuites\(first:40,after:"c20"\)/);
+
+  // Never found: paging stops at 100 suites (two follow-ups), still missing.
+  pages = fakeRun((cmd, args, options, n) => ok(n === 1 ? batch() : page(empty(40), true, `c${n}`)));
+  pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.gates.map((gate) => gate.state), [null]);
+  assert.equal(pages.calls.length, 3);
+
+  // No more suites, or the gate already found: no follow-up.
+  pages = fakeRun(() => ok(batch(false)));
+  await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run });
+  assert.equal(pages.calls.length, 1);
+  const found = batch();
+  found.data.r0.p6878.gateCommit.nodes[0].commit.checkSuites.nodes[3] = deploy;
+  pages = fakeRun(() => ok(found));
+  await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run });
+  assert.equal(pages.calls.length, 1);
+
+  // A failed follow-up keeps the PR, gate missing.
+  pages = fakeRun((cmd, args, options, n) => { if (n === 1) return ok(batch()); throw new Error("gh: 502"); });
+  const unread = new Set();
+  pr = (await fetchPrStates([`${BBAPP}#6878`], cfg, { run: pages.run, unread })).get(`${BBAPP}#6878`);
+  assert.deepEqual(pr.gates.map((gate) => gate.state), [null]);
+  assert.equal(unread.size, 0);
+});

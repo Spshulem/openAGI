@@ -45,12 +45,51 @@ const PR_FRAGMENT = [
 
 // The rollup reads only its first 100 contexts, so a repo's required checks
 // are also looked up by name on the last commit: the commit status directly,
-// a check run through the first 20 check suites.
+// a check run through its check suites. The batch reads the first 20 suites;
+// a gate still missing pages on (gateSuitePages), up to MAX_GATE_SUITES.
+const FIRST_GATE_SUITES = 20;
+const MORE_GATE_SUITES = 40;
+const MAX_GATE_SUITES = 100;
+
+function gateRunSelection(required) {
+  return required.map(({ name }, i) => `g${i}: checkRuns(last:1,filterBy:{checkName:${JSON.stringify(name)}}){nodes{__typename name status conclusion startedAt completedAt}}`).join(" ");
+}
+
 function gateSelection(required) {
   if (!required.length) return "";
   const statuses = required.map(({ name }, i) => `g${i}: context(name:${JSON.stringify(name)}){__typename context state}`).join(" ");
-  const runs = required.map(({ name }, i) => `g${i}: checkRuns(last:1,filterBy:{checkName:${JSON.stringify(name)}}){nodes{__typename name status conclusion startedAt completedAt}}`).join(" ");
-  return ` gateCommit: commits(last:1){nodes{commit{oid status{${statuses}} checkSuites(first:20){nodes{${runs}}}}}}`;
+  return ` gateCommit: commits(last:1){nodes{commit{oid status{${statuses}} checkSuites(first:${FIRST_GATE_SUITES}){pageInfo{hasNextPage endCursor} nodes{${gateRunSelection(required)}}}}}}`;
+}
+
+export function buildGateSuitesQuery(repo, oid, after, required) {
+  const [owner, name] = repo.split("/");
+  return `query { rateLimit{cost remaining} repository(owner:"${owner}",name:"${name}"){ object(oid:${JSON.stringify(oid)}){ ... on Commit { checkSuites(first:${MORE_GATE_SUITES},after:${JSON.stringify(after)}){pageInfo{hasNextPage endCursor} nodes{${gateRunSelection(required)}}} } } } }`;
+}
+
+// Pages the head's remaining check suites while a required check is still
+// missing, so a check run past the first page is not read as never run.
+// Bounded to MAX_GATE_SUITES suites; a failed page leaves the gate missing.
+async function gateSuitePages(repo, node, config, run) {
+  const required = requiredChecksFor(repo, config);
+  const gateCommit = node.gateCommit?.nodes?.[0]?.commit;
+  const suites = gateCommit?.checkSuites;
+  if (!required.length || !suites?.pageInfo?.hasNextPage || !/^[0-9a-f]{40}$/i.test(String(gateCommit.oid ?? ""))) return;
+  const gates = () => gatesFor(node.commits?.nodes?.[0]?.commit ?? null, node.headRefOid ?? "", required, gateCommit);
+  let page = suites.pageInfo;
+  let read = suites.nodes?.length ?? 0;
+  while (page?.hasNextPage && page.endCursor && read < MAX_GATE_SUITES && gates().some((gate) => gate.state === null)) {
+    let result;
+    try {
+      result = await run(config.bins.gh, ["api", "graphql", "-f", `query=${buildGateSuitesQuery(repo, gateCommit.oid, page.endCursor, required)}`], { timeoutMs: GH_TIMEOUT_MS });
+    } catch {
+      return;
+    }
+    const more = parseJson(result?.stdout)?.data?.repository?.object?.checkSuites;
+    if (!more || !Array.isArray(more.nodes)) return;
+    suites.nodes = [...(suites.nodes ?? []), ...more.nodes];
+    read += more.nodes.length;
+    page = more.pageInfo;
+  }
 }
 
 // refs: [{repo, number}] already validated by parsePrRef, so owner and name
@@ -254,6 +293,8 @@ async function fetchBatch(batch, config, run, out, unread) {
     if (!repoNode || typeof repoNode !== "object") { miss([ref]); continue; }
     const node = repoNode[`p${ref.number}`];
     if (!node || typeof node !== "object") continue;
+    // A failed suite page leaves the gate as read from the batch.
+    try { await gateSuitePages(ref.repo, node, config, run); } catch { /* keep the batch read */ }
     try {
       const pr = normalizePr(ref.repo, node, config);
       out.set(pr.ref, pr);

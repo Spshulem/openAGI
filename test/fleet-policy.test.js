@@ -1020,3 +1020,39 @@ test("a permission card read on screen: its buttons (up to three) plus later, on
     live: { peerName: "p9", pid: 9, status: "waiting" }, meta: { blockedOnOwner: true, prompt: card } });
   assert.deepEqual(run(terminal, { pr: makePr() }).decision.question.options, ["opened", "later"]);
 });
+
+test("only a full-run gate keeps a slow full verify from the bb3-slow-agent nudge", () => {
+  const quick = { id: "t1", kind: "local_bash", description: "bb-verify --full --pr 6522", startedAt: ago(40 * MIN) };
+  const thread = makeThread({ agentStatus: "waiting", openTasks: [quick] });
+  const decide = (gates, requiredChecks) => {
+    const cfg = { ...config, requiredChecks };
+    const pr = makePr({ gates });
+    const classified = classifyThread(thread, { pr, localGit: cleanGit, now: NOW, config: cfg });
+    return decideThread(classified, thread, { playbooks, config: cfg, now: NOW, pr, mode: "auto", manager });
+  };
+  // A required deploy or lint check is not the full run: hosted CI still gates.
+  const deploy = decide([{ name: "deploy", label: "deploy", state: "PENDING" }], { "acme/app": ["deploy"] });
+  assert.equal(deploy.playbook, "bb3-slow-agent");
+  const configuredOnly = decide([], { "acme/app": ["lint"] });
+  assert.equal(configuredOnly.playbook, "bb3-slow-agent");
+  // The full run by name, or by the command that produces it, is the gate.
+  const named = decide([{ name: "BuildBot3 full verification", label: "BuildBot3 full run", state: "PENDING" }], {});
+  assert.equal(named.action, "escalate-manager");
+  const byHow = decide([{ name: "full", label: "full", how: "bb-verify --full --pr", state: "PENDING" }], {});
+  assert.equal(byHow.action, "escalate-manager");
+});
+
+test("the no-local-verify nudge names the repo's own merge gate", () => {
+  const infra = { localVerify: [{ pid: 9, command: "pnpm verify:pr", cwd: "/work/madrid", ageSec: 400, threadKey: "conductor:s1" }] };
+  const fresh = { lastAgentAt: ago(MIN), lastActivityAt: ago(MIN) };
+  // Hosted CI gates an ungated repo; no full run is called its gate.
+  const ungated = run(makeThread(fresh), { infra }).decision;
+  assert.equal(ungated.playbook, "no-local-verify");
+  assert.match(ungated.message, /merge gate is green hosted CI on the exact head/);
+  assert.doesNotMatch(ungated.message, /--full/);
+  // BuildBetter's gate is the full run, even before a PR is read.
+  const bb = "buildbetter-app/buildbetter";
+  const gated = run(makeThread({ ...fresh, repo: bb, prRefs: [] }), { infra, pr: null }).decision;
+  assert.equal(gated.playbook, "no-local-verify");
+  assert.match(gated.message, /merge gate is a green BuildBot3 full run \(bb-verify --full --pr\) on the exact head/);
+});
