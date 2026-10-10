@@ -214,6 +214,19 @@ export function parseAppState(result) {
     element.parent = stack[stack.length - 1] ?? null;
     stack.push(element);
   }
+  // OCU prints a filled editable's text as "text" rows inside it, with no
+  // "Value:" (and the app's placeholder ahead of it on the row itself). Those
+  // rows are the editable's value, not editables of their own.
+  for (const element of elements) {
+    if (element.role !== "text") continue;
+    const owner = ancestors(element).find((node) => EDITABLE_ROLES.has(node.role));
+    if (!owner) continue;
+    element.inner = true;
+    (owner.innerText ??= []).push(element.label);
+  }
+  for (const element of elements) {
+    if (element.innerText && element.fields.value === undefined) element.value = element.innerText.join("\n");
+  }
   const focusedMatch = /The focused UI element is\s+(\d+)\b/.exec(text);
   return {
     bundleId: header?.[1] ?? null,
@@ -233,6 +246,7 @@ function ancestors(element) {
 }
 
 function isEditable(element) {
+  if (element.inner) return false;
   if (EDITABLE_ROLES.has(element.role)) return true;
   return element.flags.includes("settable") && /text/.test(element.role) && !/search|secure/.test(element.role);
 }
@@ -416,6 +430,29 @@ export function looksLikeOurs(value, text) {
   return have.startsWith(ours.slice(0, Math.min(ours.length, SUPERVISOR_PREFIX.length + 10)));
 }
 
+// Empty for sure: no value, no inner text, and the row shows nothing or only
+// the placeholder (Codex prints it twice: label and value). Anything else may
+// be the owner's draft, which setting the value would erase.
+export function composerEmpty(composer) {
+  if (!composer || normalizeUiText(composer.value) || composer.innerText?.length) return false;
+  const shown = normalizeUiText(String(composer.label ?? "").replace(/\\n/g, " "));
+  if (!shown) return true;
+  const words = shown.split(" ");
+  const half = words.length / 2;
+  return Number.isInteger(half) && words.slice(0, half).join(" ") === words.slice(half).join(" ");
+}
+
+// An earlier attempt typed with keys left the app's placeholder in front of
+// our text ("Ask to make changes…[OpenAGI supervisor] …"): still exactly ours
+// after that prefix, and the prefix is what the row shows first.
+export function placeholderJunk(composer, text) {
+  const have = normalizeUiText(composer?.value);
+  const ours = normalizeUiText(text);
+  if (!have || !ours || have === ours || !have.endsWith(ours)) return false;
+  const prefix = have.slice(0, have.length - ours.length).trim();
+  return prefix.length > 0 && prefix.length <= 80 && !prefix.includes(SUPERVISOR_PREFIX.trim()) && normalizeUiText(composer.label).startsWith(prefix);
+}
+
 // Only OCU's focus line counts; it prints one only for the frontmost app.
 export function isComposerFocused(state, composer) {
   return Boolean(composer) && state?.focusedId === composer.id;
@@ -426,7 +463,7 @@ export function isComposerFocused(state, composer) {
 export function transcriptCount(state, needle, composer = null) {
   const want = normalizeUiText(needle).toLowerCase();
   if (!want) return 0;
-  return (state?.elements ?? []).filter((element) => element !== composer && element.id !== composer?.id && !isEditable(element)
+  return (state?.elements ?? []).filter((element) => element !== composer && element.id !== composer?.id && !isEditable(element) && !element.inner
     && normalizeUiText(`${element.label} ${element.value}`).toLowerCase().includes(want)).length;
 }
 
@@ -1355,10 +1392,14 @@ export function createUiDriver({
     let found = composerIn(ctx, state);
     if (!found.composer) return outcome(ctx, "blocked", found.reason);
     const leftover = normalizeUiText(found.composer.value) === normalizeUiText(text);
-    if (normalizeUiText(found.composer.value) && !leftover) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
+    // Our text behind the placeholder an earlier keyboard attempt left: set
+    // back to exactly our text.
+    const junk = !leftover && placeholderJunk(found.composer, text);
+    if (!leftover && !junk && !composerEmpty(found.composer)) return outcome(ctx, "blocked", "draft in composer: not overwriting it");
     const beforeCount = transcriptCount(state, needle, found.composer);
     keep(ctx, "before", state);
-    const holds = (composer) => normalizeUiText(composer.value) === (leftover ? normalizeUiText(text) : "");
+    const expected = leftover ? normalizeUiText(text) : junk ? normalizeUiText(found.composer.value) : null;
+    const holds = (composer) => (expected === null ? composerEmpty(composer) : normalizeUiText(composer.value) === expected);
 
     // 6. Focus the composer with an accessibility click; OCU reports focus
     // only for the frontmost app, so that is checked first.
@@ -1390,7 +1431,10 @@ export function createUiDriver({
     const beforeTyping = await ownerCheck(ctx, target);
     if (beforeTyping) return outcome(ctx, "blocked", beforeTyping);
     ctx.phase = "typing";
-    if (!leftover) await act(ctx, "type_text", { app: target.bundleId, text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs });
+    // The composer's value is set, not typed key by key: typing into an empty
+    // composer can keep the app's placeholder as text in front of ours.
+    // Setting it is safe only because it holds nothing (or only our text).
+    if (!leftover) await act(ctx, "set_value", { app: target.bundleId, element_index: found.composer.id, value: text }, signal, { timeoutMs: limits.uiReadTimeoutMs + ctx.typingMs });
     ctx.phase = "typed";
 
     // 8. Same thread, and the composer holds exactly our text.

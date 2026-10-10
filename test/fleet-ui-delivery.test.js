@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
-  createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
+  composerEmpty, createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, placeholderJunk, transcriptCount, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
   conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController
 } from "../src/fleet/ui-delivery.js";
 
@@ -51,7 +51,7 @@ function fakeApp(overrides = {}) {
     if (app.heading) lines.push(`  5 heading ${app.heading}`);
     app.transcript.forEach((text, index) => lines.push(`  ${20 + index} static text ${text}`));
     lines.push("  60 group composer");
-    lines.push(`    61 text entry area (settable, string)${app.composer ? ` Value: ${app.composer}` : ""}`);
+    lines.push(`    61 text entry area (settable, string)${app.composerLabel ? ` ${app.composerLabel}` : ""}${app.composer ? ` Value: ${app.composer}` : ""}`);
     if (app.sendButton) lines.push("  62 button Send");
     if (app.stop) lines.push("  63 button Stop");
     if (app.prompt) {
@@ -116,6 +116,11 @@ function fakeTransport(app, { failOn = null, failError = null, latency = null, a
       if (name === "type_text") {
         if (!app.frontmost || app.focused !== "61") throw new Error("type_text requires a focused editable text element");
         app.composer += app.onType ? app.onType(args.text) : args.text;
+        return { isError: false, content: [] };
+      }
+      if (name === "set_value") {
+        if (String(args.element_index) !== "61") throw new Error("set_value: not the composer");
+        app.composer = app.onType ? app.onType(args.value) : args.value;
         return { isError: false, content: [] };
       }
       if (name === "press_key") {
@@ -189,14 +194,14 @@ function setup(t, { app = fakeApp(), probe = fakeProbe(), transportOptions = {},
 }
 
 const names = (calls) => calls.map((call) => call.name);
-const typed = (calls) => calls.filter((call) => call.name === "type_text").map((call) => call.args.text);
+const typed = (calls) => calls.filter((call) => call.name === "set_value").map((call) => call.args.value);
 
 test("happy path: verify, bring forward, focus, type one line, check, send, confirm, put the owner's app back", async (t) => {
   const f = setup(t);
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "sent", result.detail);
   assert.match(result.detail, /typed into Conductor/);
-  assert.deepEqual(names(f.calls()), ["get_app_state", "get_app_state", "click", "get_app_state", "type_text", "get_app_state", "click", "get_app_state"]);
+  assert.deepEqual(names(f.calls()), ["get_app_state", "get_app_state", "click", "get_app_state", "set_value", "get_app_state", "click", "get_app_state"]);
   const [read, , focus, , , , send] = f.calls();
   assert.equal(read.args.max_tree_nodes, 3000);
   assert.deepEqual(f.probe.activated, ["com.conductor.app", "com.google.Chrome"], "brought forward, then the owner's app restored");
@@ -544,6 +549,64 @@ test("a shared Codex title goes on only through the id link, from another open t
   assert.equal(active.status, "blocked");
   assert.match(active.detail, /^waiting for idle: Codex must be in front/);
   assert.equal(h.transports.length, 0);
+});
+
+// Real Open Computer Use rows (0.3.5), as read from Conductor and Codex.
+const CONDUCTOR_PLACEHOLDER = "Ask to make changes, @mention files, run /commands";
+const conductorComposer = (inner) => [
+  "App=com.conductor.app (pid 1)",
+  'Window: "Conductor", App: Conductor.',
+  "0 standard window Conductor",
+  "\t1 scroll area",
+  `\t\t2 HTML content Tauri + React + Typescript, URL: ${CONDUCTOR_URL}`,
+  "\t\t\t175 container composer",
+  inner === null
+    ? "\t\t\t\t176 text entry area (settable, string) Secondary Actions: Show Writing Tools"
+    : `\t\t\t\t176 text entry area (settable, string) ${CONDUCTOR_PLACEHOLDER} ${inner}, Secondary Actions: Show Writing Tools\n\t\t\t\t\t177 text (settable, string) ${inner}`,
+  "\t\t\t268 container",
+  "\t\t\t\t269 text entry area (settable, string) Terminal input, Secondary Actions: Show Writing Tools"
+].join("\n");
+
+test("a filled composer's text is its inner text row: one composer, its value, never ambiguous", () => {
+  const empty = findComposer(stateOf(conductorComposer(null))).composer;
+  assert.equal(empty.id, "176");
+  assert.equal(composerEmpty(empty), true);
+  const filled = findComposer(stateOf(conductorComposer(MESSAGE)));
+  assert.equal(filled.reason, null, "the inner text row is not a second text area");
+  assert.equal(filled.composer.id, "176");
+  assert.equal(filled.composer.value, MESSAGE);
+  assert.equal(composerEmpty(filled.composer), false);
+  assert.equal(placeholderJunk(filled.composer, MESSAGE), false, "exactly ours is a leftover, not junk");
+  // An earlier keyboard attempt left the placeholder in front of our text.
+  const junk = findComposer(stateOf(conductorComposer(`${CONDUCTOR_PLACEHOLDER}${MESSAGE}`))).composer;
+  assert.equal(placeholderJunk(junk, MESSAGE), true);
+  // The owner's draft is neither empty nor ours.
+  const draft = findComposer(stateOf(conductorComposer("half-written owner note"))).composer;
+  assert.equal(composerEmpty(draft), false);
+  assert.equal(placeholderJunk(draft, MESSAGE), false);
+  assert.equal(placeholderJunk(findComposer(stateOf(conductorComposer(`my note ${MESSAGE}`))).composer, MESSAGE), false, "owner text in front is not a placeholder");
+  // Our inner text is not a transcript copy.
+  assert.equal(transcriptCount(stateOf(conductorComposer(MESSAGE)), MESSAGE), 0);
+  // Codex prints an empty composer's placeholder twice; anything else on the
+  // row, with no inner text, may be a draft.
+  const codex = (row) => findComposer(stateOf(`App=com.openai.codex (pid 9)\n0 standard window Codex\n  1 group\n    2 text entry area (settable, string) ${row}`)).composer;
+  assert.equal(composerEmpty(codex("Do anything Do anything\\n")), true);
+  assert.equal(composerEmpty(codex("Work with Codex Work with Codex")), true);
+  assert.equal(composerEmpty(codex("Work with Codex half a note")), false);
+});
+
+test("our text behind a placeholder left by an earlier attempt is set back to exactly ours and sent", async (t) => {
+  const f = setup(t, { app: fakeApp({ composerLabel: CONDUCTOR_PLACEHOLDER, composer: `${CONDUCTOR_PLACEHOLDER}${MESSAGE}` }) });
+  const result = await f.driver.deliver(f.request());
+  assert.equal(result.status, "sent");
+  assert.deepEqual(typed(f.calls()), [MESSAGE]);
+  assert.equal(f.app.transcript.at(-1), MESSAGE);
+  // Something unreadable on the row with no value: may be the owner's.
+  const g = setup(t, { app: fakeApp({ composerLabel: "Work with Codex half a note" }) });
+  const kept = await g.driver.deliver(g.request());
+  assert.equal(kept.status, "blocked");
+  assert.match(kept.detail, /draft in composer/);
+  assert.deepEqual(typed(g.calls()), []);
 });
 
 test("a draft in the composer is never overwritten", async (t) => {
@@ -1032,7 +1095,7 @@ test("Codex: owner away opens codex://threads/<id> with no prefill, then verifie
   // a fresh snapshot, so it gets a read's budget; typing gets more.
   const reads = f.calls().filter((call) => call.name === "get_app_state");
   assert.ok(reads.every((call) => call.args.max_tree_nodes === 6000 && call.options.timeoutMs === DEFAULTS.uiReadTimeoutMs));
-  assert.equal(f.calls().find((call) => call.name === "type_text").options.timeoutMs, DEFAULTS.uiReadTimeoutMs + Math.ceil(MESSAGE.length * 25));
+  assert.equal(f.calls().find((call) => call.name === "set_value").options.timeoutMs, DEFAULTS.uiReadTimeoutMs + Math.ceil(MESSAGE.length * 25));
   assert.ok(f.calls().filter((call) => call.name === "click").every((call) => call.options.timeoutMs === DEFAULTS.uiReadTimeoutMs));
   assert.equal(f.transports[0].options.timeoutMs, DEFAULTS.uiStepTimeoutMs);
 });
@@ -1378,7 +1441,7 @@ test("Codex-slow clicks and keys get a read's budget, not a step's", async (t) =
   const target = uiTargetFor(thread);
   const result = await f.driver.deliver({ text: MESSAGE, target, identity: uiIdentity(thread, target, [thread]), evidenceName: "fa_codex" });
   assert.equal(result.status, "sent", result.detail);
-  assert.deepEqual(names(f.calls()).filter((name) => name !== "get_app_state"), ["click", "type_text", "press_key"]);
+  assert.deepEqual(names(f.calls()).filter((name) => name !== "get_app_state"), ["click", "set_value", "press_key"]);
 });
 
 // Live 2026-09-30: Codex labelled thread 01a0cae7 ("Audit OpenAI model
@@ -1567,19 +1630,19 @@ test("a delivery cut off after typing ends, clearing and restore included, insid
     const took = Date.now() - start;
     assert.equal(result.status, "failed");
     assert.match(result.detail, /^delivery timed out; not sent/);
-    assert.deepEqual(engines.flatMap((engine) => engine.calls).filter((call) => call.name === "type_text").length, 1);
+    assert.deepEqual(engines.flatMap((engine) => engine.calls).filter((call) => call.name === "set_value").length, 1);
     assert.ok(took <= limits.uiDeliveryTimeoutMs + limits.uiCleanupMs - spentMs + 150, `${spentMs}: ${took} ms`);
   }
 });
 
 test("an input call that times out may still land: unconfirmed, nothing cleared, typed, or brought forward after it", async (t) => {
-  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 10 * 60_000 : 0) } });
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "set_value" ? 10 * 60_000 : 0) } });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.status, "failed");
   assert.equal(result.detail, "Open Computer Use timed out on input; unconfirmed: check the thread before retrying");
   assert.equal(result.unconfirmed, true);
   assert.equal(f.transports.length, 1, "no fresh engine to clear with");
-  assert.equal(names(f.calls()).at(-1), "type_text", "no call after it");
+  assert.equal(names(f.calls()).at(-1), "set_value", "no call after it");
   assert.deepEqual(f.probe.activated, ["com.conductor.app"], "the owner's app is not put back under running input");
   // A Send click that times out: no Return after it.
   const g = setup(t, { transportOptions: { latency: (name, args) => (name === "click" && args.element_index === "62" ? 10 * 60_000 : 0) } });
@@ -1594,7 +1657,7 @@ test("an input call that times out may still land: unconfirmed, nothing cleared,
 
 test("the owner's input during a slow typing call, or as a failed one ends, is theirs", async (t) => {
   const clock = {};
-  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 20_000 : 0), advance: (ms) => clock.advance(ms) } });
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "set_value" ? 20_000 : 0), advance: (ms) => clock.advance(ms) } });
   clock.advance = f.advance;
   const hid = hidClock(f);
   // Typing takes 20 s (an AX value set: no HID event); the owner clicks 10 s
@@ -1606,7 +1669,7 @@ test("the owner's input during a slow typing call, or as a failed one ends, is t
   assert.deepEqual(f.probe.activated, ["com.conductor.app"], "their app is not swapped in over them");
   // A key or typing call that failed marks nothing as the fleet's.
   let ghid = null;
-  const g = setup(t, { transportOptions: { failOn: (name) => { if (name !== "type_text") return false; ghid.touch(); return true; } } });
+  const g = setup(t, { transportOptions: { failOn: (name) => { if (name !== "set_value") return false; ghid.touch(); return true; } } });
   ghid = hidClock(g);
   const failed = await g.driver.deliver(g.request());
   assert.equal(failed.status, "failed");
@@ -1615,7 +1678,7 @@ test("the owner's input during a slow typing call, or as a failed one ends, is t
 
 test("a Return send is input like any other: the owner's app waits for real idle, as does the next send", async (t) => {
   // Codex: the key lands, then a 12 s snapshot. Typing sets the value (no HID).
-  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" || name === "press_key" ? 12_000 : 0), advance: (ms) => f.advance(ms) } });
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "set_value" || name === "press_key" ? 12_000 : 0), advance: (ms) => f.advance(ms) } });
   const hid = hidClock(f, { keysReset: false });
   f.app.sendButton = false;
   f.app.onKey = () => { hid.at = f.now() - 12_000; };
@@ -1631,7 +1694,7 @@ test("a Return send is input like any other: the owner's app waits for real idle
 
 test("after an input call times out, nothing types until its late answer shows it finished, however long that takes", async (t) => {
   let slow = true;
-  const f = setup(t, { transportOptions: { latency: (name) => (slow && name === "type_text" ? 10 * 60_000 : 0) } });
+  const f = setup(t, { transportOptions: { latency: (name) => (slow && name === "set_value" ? 10 * 60_000 : 0) } });
   assert.deepEqual(await f.driver.readiness(), { ready: true, detail: null });
   const first = await f.driver.deliver(f.request());
   assert.equal(first.detail, "Open Computer Use timed out on input; unconfirmed: check the thread before retrying");
@@ -1662,7 +1725,7 @@ test("the input latch is process-wide, and an engine that exits before the late 
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, "ui-input-orphaned.json");
   latch.persistTo(file);
-  const f = setup(t, { transportOptions: { latency: (name) => (name === "type_text" ? 10 * 60_000 : 0) }, driverOptions: { inputLatch: latch } });
+  const f = setup(t, { transportOptions: { latency: (name) => (name === "set_value" ? 10 * 60_000 : 0) }, driverOptions: { inputLatch: latch } });
   const g = setup(t, { driverOptions: { inputLatch: latch } });
   await f.driver.deliver(f.request());
   // Another driver (another thread's delivery) sharing the latch types nothing.
@@ -1730,7 +1793,7 @@ test("the owner back during the deferred restore's front-app probe: nothing swit
 
 test("an input that timed out after the app came forward: the owner's app goes back only once it answers done", async (t) => {
   let slow = true;
-  const f = setup(t, { transportOptions: { latency: (name) => (slow && name === "type_text" ? 10 * 60_000 : 0) } });
+  const f = setup(t, { transportOptions: { latency: (name) => (slow && name === "set_value" ? 10 * 60_000 : 0) } });
   const result = await f.driver.deliver(f.request());
   assert.equal(result.unconfirmed, true);
   assert.deepEqual(f.probe.activated, ["com.conductor.app"], "nothing moves while it may land");
@@ -1774,7 +1837,7 @@ test("an OpenAGI computer-use session started mid-delivery stops the fleet befor
   const result = await f.driver.deliver(f.request());
   assert.notEqual(result.status, "sent");
   assert.match(result.detail, /an OpenAGI computer-use session is active/);
-  assert.deepEqual(f.calls().filter((call) => ["click", "type_text", "press_key"].includes(call.name)), []);
+  assert.deepEqual(f.calls().filter((call) => ["click", "set_value", "press_key"].includes(call.name)), []);
 });
 
 test("an input call holds the latch, on disk, from before it goes out until it answers", async (t) => {
