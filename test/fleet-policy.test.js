@@ -704,7 +704,7 @@ test("queued full runs are not counted as slow", () => {
 });
 
 test("one dropped stream in one chat does not page the LB manager", () => {
-  // 2026-10-09: "1x connection" escalated while the LB probe said healthy=yes.
+  // One dropped stream must not page while the LB probe says healthy.
   const lb = (errors, healthy = true) => ({ healthy, detail: "200", watchLine: null, recentErrors: errors });
   const err = (kind, count, threadIds = ["x1"]) => ({ kind, count, lastAt: ago(2 * MIN), threadIds });
   const health = (errors, healthy) => infraHealth({ bb3: bb3Base, lb: lb(errors, healthy) }, { config, now: NOW }).lb;

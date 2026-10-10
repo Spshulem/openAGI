@@ -14,14 +14,14 @@ Main history covers the 200 most recently updated active conversations for this 
 - Implementation and package input: `f176f8962ae052182e1760bdc3548505e0425996`.
 - Backend verified head: `2487564857eddfcec421c9d91d378170f17439a4`; its only change after packaging makes the cancellation test fixture explicitly CommonJS. Client and runtime source are identical to package input.
 - Package ID: `sh.agents.even.g2`; manifest version: `0.4.18`; Even SDK: `0.0.15`; minimum Even app: `2.2.6`.
-- Artifact: `/Users/shooby/Downloads/OpenAGI-Agent-0.4.18-f176f89.ehpk`, 95,823 bytes.
+- Artifact: `/Users/you/Downloads/OpenAGI-Agent-0.4.18-f176f89.ehpk`, 95,823 bytes.
 - SHA-256: `b57b7d72f68a8e393e2b748e8b9e40805d3f56860d9530875eef499c1986b99a`.
 - Generic package: no personal main URL or provider key supplied to packaging. Frozen lockfile and shared-source provenance are checked in.
 
 ## Automated evidence
 
 - Production verification ran on BuildBot3 from committed `git archive` source, in an owned temporary directory, with Node `22.21.1`, pnpm `10.24.0`, `npm ci --ignore-scripts` and `pnpm install --frozen-lockfile`.
-- Full backend suite: **1,181 passed, zero failed, one skipped**, 1,182 total. Full output retained locally at `/Users/shooby/Downloads/OpenAGI-G2-0.4.18-backend-test.log`.
+- Full backend suite: **1,181 passed, zero failed, one skipped**, 1,182 total. Full output retained locally at `/Users/you/Downloads/OpenAGI-G2-0.4.18-backend-test.log`.
 - Client suite: **197 passed**, 19 test files; TypeScript and ESLint passed both locally and remotely.
 - Production TypeScript/Vite build, Even packaging, 2 MiB bundle ceiling and packaged-secret scan: passed. Uncompressed production assets: 296,995 bytes.
 - Focused local backend G2/auth/history/restart/cancellation/storage/retention checks: **29 passed**, also exercised by the full remote suite.

@@ -146,7 +146,7 @@ test("NodeRegistry persists across instances (file-backed)", () => {
 Run: `node --test test/node-registry.test.js`
 Expected: fails to even start — `Error [ERR_MODULE_NOT_FOUND]: Cannot find module '.../src/node-registry.js'`
 
-- [ ] **Step 3: Write the implementation.** Create `/Users/shooby/Dev/openAGI/src/node-registry.js` with exactly this content:
+- [ ] **Step 3: Write the implementation.** Create `/Users/you/Dev/openAGI/src/node-registry.js` with exactly this content:
 
 ```js
 // src/node-registry.js
@@ -259,7 +259,7 @@ git commit -m "feat(nodes): self-identity + file-backed node registry with onlin
   - `POST /nodes/heartbeat` → `200 { ok: true }` on a well-formed body, `400 { error: "..." }` if `nodeId`, `name`, or `role` is missing.
   - Both routes require auth exactly like every other non-public route (they are NOT added to `isPublicRoute` in `src/auth.js` — the pairing token already required for the CLI's own remote calls is what authenticates a heartbeat).
 
-- [ ] **Step 1: Write the failing test file.** Create `/Users/shooby/Dev/openAGI/test/node-routes.test.js` with exactly this content:
+- [ ] **Step 1: Write the failing test file.** Create `/Users/you/Dev/openAGI/test/node-routes.test.js` with exactly this content:
 
 ```js
 // test/node-routes.test.js
@@ -398,7 +398,7 @@ test("GET /nodes on a paired instance with no cache yet returns an empty-but-val
 Run: `node --test test/node-routes.test.js`
 Expected: every test fails with a 404 (`assert.equal(res.status, 200)` gets `404`) since neither route exists yet.
 
-- [ ] **Step 3: Add the imports.** In `/Users/shooby/Dev/openAGI/src/hosted-interface.js`, find this exact block near the top of the file:
+- [ ] **Step 3: Add the imports.** In `/Users/you/Dev/openAGI/src/hosted-interface.js`, find this exact block near the top of the file:
 
 ```js
 import { ChannelManager } from "./channels.js";
@@ -566,7 +566,7 @@ git commit -m "feat(nodes): GET /nodes and POST /nodes/heartbeat - main serves d
 - Consumes: `readNodeConfig(dataDir)` from `src/cli-client.js`; `readOrCreateIdentity(dataDir)` from `src/node-registry.js` (both already wired in Task 2); global `fetch`.
 - Produces: `options.heartbeatIntervalMs` (test seam, default `30_000`) and `options.getPublicUrl` are consumed inside the interval callback. No new exported function — this is an internal interval inside `createHostedInterface`, matching the existing ticker's shape exactly so there's one clear place that owns "background timers this server runs."
 
-- [ ] **Step 1: Write the failing test file.** Create `/Users/shooby/Dev/openAGI/test/node-heartbeat-sender.test.js` with exactly this content:
+- [ ] **Step 1: Write the failing test file.** Create `/Users/you/Dev/openAGI/test/node-heartbeat-sender.test.js` with exactly this content:
 
 ```js
 // test/node-heartbeat-sender.test.js

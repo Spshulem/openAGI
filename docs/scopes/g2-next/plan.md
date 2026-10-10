@@ -2,7 +2,7 @@
 
 ## Technical context and safety gates
 
-Worktree: `/Users/shooby/Dev/openagi-pr101-rollout`, branch `codex/g2-experience-redesign`. Baseline: `08b80e194d3643ae1e9ca20a69c17d8560996648` (0.4.17 code plus approved scope).
+Worktree: `/Users/you/Dev/openagi-pr101-rollout`, branch `codex/g2-experience-redesign`. Baseline: `08b80e194d3643ae1e9ca20a69c17d8560996648` (0.4.17 code plus approved scope).
 
 Use existing TypeScript/DOM/Vite/Even SDK client and Node hosted interface. No new frontend framework, model worker, database service, public auth bypass, or automatic provider selection. Project constitution/template files are absent at the inspected standard locations; this plan follows the existing architecture and supplied safety instructions. BuildBetter customer artifacts are not applicable: evidence is the user's G2 feedback and linked source scope.
 

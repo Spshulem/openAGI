@@ -415,7 +415,7 @@ test("readCodexLbErrors groups responses_retry rows by kind inside the window", 
   retry(3 * MIN, "stream disconnected before completion: failed to send websocket request: Connection closed normally", "th-2");
   retry(10 * MIN, "stream disconnected before completion: No available accounts. Service is operating in degraded mode: all upstream accounts are unavailable", "th-3");
   retry(12 * MIN, "unexpected status 401 Unauthorized: Incorrect API key provided: sk-svcac***fvMA", "th-4");
-  retry(13 * MIN, "unexpected status 503 Service Unavailable: Server is draining, url: http://100.99.3.113:2455/backend-api/codex/responses", "th-5");
+  retry(13 * MIN, "unexpected status 503 Service Unavailable: Server is draining, url: http://192.0.2.10:2455/backend-api/codex/responses", "th-5");
   retry(14 * MIN, "You've hit your usage limit. Try again at 9:25 AM.", "th-6");
   retry(15 * MIN, "something odd happened", null);
   retry(3 * 60 * MIN, "Connection failed: error sending request retry_delay=60s", "th-old");

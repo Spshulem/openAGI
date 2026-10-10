@@ -10,7 +10,7 @@ No live service or installed glasses app has been changed.
 
 The two historical working-tree checkpoints are local safety copies, not new verified releases. Ignored environment files, private runtime state, dependencies and generated artifacts were not staged.
 
-Preserved 0.4.17 artifact: `/Users/shooby/Downloads/OpenAGI-Agent-0.4.17-2507228.ehpk`.
+Preserved 0.4.17 artifact: `/Users/you/Downloads/OpenAGI-Agent-0.4.17-2507228.ehpk`.
 SHA-256: `374c0cff1c557d939cee29566e9bc34b4ae46caed842c51cf42885e0ef1e0e7b`.
 
 For source comparison, use `git diff 08b80e194d3643ae1e9ca20a69c17d8560996648..codex/g2-experience-redesign`. Create a separate worktree at that immutable commit if needed; never hard-reset a working checkout. Reinstallation of the retained client is a separate device operation requiring explicit user action/authorization.

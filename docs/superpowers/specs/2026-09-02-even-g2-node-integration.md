@@ -54,7 +54,7 @@ the matching node id; token-only lookup is limited to the two G2 voice routes.
 - No background or phone-lock listening. Continuous foreground capture is
   available only after explicit opt-in and remains a physical-device release gate.
 - No model key, OpenAGI owner token, or arbitrary OpenAGI capability on G2.
-- No changes to the non-Git `/Users/shooby/Dev/g2` workspace in this PR. The
+- No changes to the non-Git `/Users/you/Dev/g2` workspace in this PR. The
   verified overlay is retained in `integration-clients/even-g2-overlay/` until
   a writable Git-backed G2 repository is supplied.
 - Simulator/build verification does not prove physical BLE continuity,

@@ -786,7 +786,7 @@ approximate them.
 Regenerate all five with:
 
 ```
-cd /Users/shooby/Dev/openAGI && node scripts/generate-mobile-fixtures.mjs
+cd /Users/you/Dev/openAGI && node scripts/generate-mobile-fixtures.mjs
 ```
 
 `enroll-exchange.json`'s `nodeToken` is an obviously synthetic 43-character

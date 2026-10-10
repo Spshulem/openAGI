@@ -24,11 +24,11 @@
 
 **Acceptance criteria:**
 - `node --test test/outcome-quality.test.js` exits 0 with 4 passing tests.
-- `scoreFromToolCalls` is exported from both `src/outcome-store.js` and `src/index.js` (check: `node -e "import('./src/index.js').then(m => console.log(typeof m.scoreFromToolCalls))"` run from `/Users/shooby/Dev/openAGI` prints `function`).
+- `scoreFromToolCalls` is exported from both `src/outcome-store.js` and `src/index.js` (check: `node -e "import('./src/index.js').then(m => console.log(typeof m.scoreFromToolCalls))"` run from `/Users/you/Dev/openAGI` prints `function`).
 - `resolveSweep` resolves a fresh `cron-fire`/`autopilot-fire` with: all calls ok → 0.7, some failed → 0.45, ALL failed → 0.1; a quiet fire older than 1h still → 0.5; unanswered `sent-message` still → 0.4; all with source `"system-inferred"` (verified by the new tests plus the pre-existing test at test/abi-runtime.test.js:386 still passing).
 - A `SkillRegistry.run` whose provider result contains only failed tool calls resolves its outcome at 0.1 with source `"skill-completed"`; a tool-free completion still resolves 0.7 (verified by the new skills test).
 - `git diff main -- src/skill-replay.js` is empty.
-- `npm test` (full suite, run from `/Users/shooby/Dev/openAGI`) exits 0.
+- `npm test` (full suite, run from `/Users/you/Dev/openAGI`) exits 0.
 
 **Files:**
 - Modify: src/outcome-store.js:144 (doc comment), src/outcome-store.js:167-177 (cron/autopilot branch), src/outcome-store.js:235 (append helper after class)
@@ -52,7 +52,7 @@
 
 **Steps**
 
-1. [ ] Create the test file with the pure-function table test and the two sweep tests (the skills test is added later in step 7). Write `/Users/shooby/Dev/openAGI/test/outcome-quality.test.js` with exactly this content:
+1. [ ] Create the test file with the pure-function table test and the two sweep tests (the skills test is added later in step 7). Write `/Users/you/Dev/openAGI/test/outcome-quality.test.js` with exactly this content:
 
 ```js
 import assert from "node:assert/strict";
@@ -130,12 +130,12 @@ test("resolveSweep still scores a quiet old cron fire 0.5", () => {
 2. [ ] Run the new test file and confirm it fails on the missing export:
 
 ```
-cd /Users/shooby/Dev/openAGI && node --test test/outcome-quality.test.js
+cd /Users/you/Dev/openAGI && node --test test/outcome-quality.test.js
 ```
 
 Expected failure: the file fails to load with `SyntaxError: The requested module '../src/outcome-store.js' does not provide an export named 'scoreFromToolCalls'` and the runner reports `# fail 1` (the whole file counts as one failure). Do not proceed until you see exactly this class of error.
 
-3. [ ] Add the exported pure helper to `/Users/shooby/Dev/openAGI/src/outcome-store.js`. Insert it AFTER the closing brace of the `OutcomeStore` class and BEFORE `function clampScore(s) {`. The current code at that boundary (lines 235-237) reads exactly:
+3. [ ] Add the exported pure helper to `/Users/you/Dev/openAGI/src/outcome-store.js`. Insert it AFTER the closing brace of the `OutcomeStore` class and BEFORE `function clampScore(s) {`. The current code at that boundary (lines 235-237) reads exactly:
 
 ```js
 }
@@ -171,12 +171,12 @@ function clampScore(s) {
 4. [ ] Run the test file again:
 
 ```
-cd /Users/shooby/Dev/openAGI && node --test test/outcome-quality.test.js
+cd /Users/you/Dev/openAGI && node --test test/outcome-quality.test.js
 ```
 
 Expected: the pure-function test and the quiet-cron test pass; the sweep-grading test FAILS with `AssertionError [ERR_ASSERTION]` on `all-failed fire scores 0.1` showing `0.7 !== 0.1` (resolveSweep still hardcodes 0.7). Runner reports `# pass 2` / `# fail 1`.
 
-5. [ ] Wire the helper into `resolveSweep` in `/Users/shooby/Dev/openAGI/src/outcome-store.js`. Two narrow edits.
+5. [ ] Wire the helper into `resolveSweep` in `/Users/you/Dev/openAGI/src/outcome-store.js`. Two narrow edits.
 
 Edit 5a — update the stale doc comment. Current line 144 reads exactly:
 
@@ -215,7 +215,7 @@ Replace with:
 
 (No import is needed — `scoreFromToolCalls` is defined in this same file. The `sent-message` 0.4 branch, the quiet 0.5 branch, and the timeout branch are NOT touched.)
 
-6. [ ] Re-export the helper from `/Users/shooby/Dev/openAGI/src/index.js`. Current line 30 reads exactly:
+6. [ ] Re-export the helper from `/Users/you/Dev/openAGI/src/index.js`. Current line 30 reads exactly:
 
 ```js
 export { OutcomeStore } from "./outcome-store.js";
@@ -230,13 +230,13 @@ export { OutcomeStore, scoreFromToolCalls } from "./outcome-store.js";
 Then run the test file and the full suite; both must pass:
 
 ```
-cd /Users/shooby/Dev/openAGI && node --test test/outcome-quality.test.js
+cd /Users/you/Dev/openAGI && node --test test/outcome-quality.test.js
 ```
 
 Expected: `# tests 3` … `# pass 3` … `# fail 0`.
 
 ```
-cd /Users/shooby/Dev/openAGI && npm test
+cd /Users/you/Dev/openAGI && npm test
 ```
 
 Expected: exit code 0, `# fail 0` (the pre-existing sweep test at test/abi-runtime.test.js:386 uses an all-ok tool call, which still scores 0.7, so it stays green).
@@ -244,16 +244,16 @@ Expected: exit code 0, `# fail 0` (the pre-existing sweep test at test/abi-runti
 Verify no accidental edits, then commit:
 
 ```
-cd /Users/shooby/Dev/openAGI && git diff --name-only
+cd /Users/you/Dev/openAGI && git diff --name-only
 ```
 
 Expected: `src/index.js` and `src/outcome-store.js` appear, and `src/skill-replay.js` does NOT. The new test file is untracked at this point, so it shows in `git status` but not in `git diff --name-only`. Note: the working tree has a pre-existing, unrelated deletion of `.buildbetter/manifest.json`, so that path may also appear — ignore it, and do NOT stage, commit, or restore it. Then:
 
 ```
-cd /Users/shooby/Dev/openAGI && git add src/outcome-store.js src/index.js test/outcome-quality.test.js && git commit -m "feat(outcomes): grade sweep resolutions by per-call ok flags via scoreFromToolCalls" && git push
+cd /Users/you/Dev/openAGI && git add src/outcome-store.js src/index.js test/outcome-quality.test.js && git commit -m "feat(outcomes): grade sweep resolutions by per-call ok flags via scoreFromToolCalls" && git push
 ```
 
-7. [ ] Add the skills test. Append the following to the END of `/Users/shooby/Dev/openAGI/test/outcome-quality.test.js` (after the last existing test), including the extra import: first change the existing import line at the top of the file. Current line 6 reads exactly:
+7. [ ] Add the skills test. Append the following to the END of `/Users/you/Dev/openAGI/test/outcome-quality.test.js` (after the last existing test), including the extra import: first change the existing import line at the top of the file. Current line 6 reads exactly:
 
 ```js
 import { OutcomeStore, scoreFromToolCalls } from "../src/outcome-store.js";
@@ -320,12 +320,12 @@ test("skill run grades completion by tool-call results; tool-free run keeps 0.7"
 8. [ ] Run the test file and confirm only the new skills test fails:
 
 ```
-cd /Users/shooby/Dev/openAGI && node --test test/outcome-quality.test.js
+cd /Users/you/Dev/openAGI && node --test test/outcome-quality.test.js
 ```
 
 Expected: `# pass 3` / `# fail 1`, with the failure in "skill run grades completion by tool-call results; tool-free run keeps 0.7" showing `AssertionError [ERR_ASSERTION]: 0.7 !== 0.1` (skills.js still resolves a flat 0.7).
 
-9. [ ] Fix `/Users/shooby/Dev/openAGI/src/skills.js`. Two narrow edits.
+9. [ ] Fix `/Users/you/Dev/openAGI/src/skills.js`. Two narrow edits.
 
 Edit 9a — add the import. Current lines 1-3 read exactly:
 
@@ -376,13 +376,13 @@ Replace with:
 10. [ ] Run the test file, then the full suite:
 
 ```
-cd /Users/shooby/Dev/openAGI && node --test test/outcome-quality.test.js
+cd /Users/you/Dev/openAGI && node --test test/outcome-quality.test.js
 ```
 
 Expected: `# tests 4` … `# pass 4` … `# fail 0`.
 
 ```
-cd /Users/shooby/Dev/openAGI && npm test
+cd /Users/you/Dev/openAGI && npm test
 ```
 
 Expected: exit code 0, `# fail 0`.
@@ -390,13 +390,13 @@ Expected: exit code 0, `# fail 0`.
 11. [ ] Verify skill-replay.js is untouched, then commit and push:
 
 ```
-cd /Users/shooby/Dev/openAGI && git diff --name-only
+cd /Users/you/Dev/openAGI && git diff --name-only
 ```
 
 Expected: `src/skills.js` and `test/outcome-quality.test.js` appear (the test file is tracked after the step 6 commit, so its step 7 changes show here); `src/skill-replay.js` must NOT appear. As in step 6, the pre-existing `.buildbetter/manifest.json` deletion may also be listed — ignore it and do not stage it. Then:
 
 ```
-cd /Users/shooby/Dev/openAGI && git add src/skills.js test/outcome-quality.test.js && git commit -m "fix(skills): grade skill completions by tool-call results instead of flat 0.7" && git push
+cd /Users/you/Dev/openAGI && git add src/skills.js test/outcome-quality.test.js && git commit -m "fix(skills): grade skill completions by tool-call results instead of flat 0.7" && git push
 ```
 
 **Explicitly out of scope for this task:** `src/skill-replay.js:115` (already graded 0.0/0.5/0.9 — verified, do not modify); any LLM-based usefulness judging (spec abi-completion.md:29 sanctions layering that later); the never-firing user-followup tone path (separate gap); backfilling or re-scoring existing live outcomes in `~/.openagi/outcomes` (historical 0.7 rows are left as-is).
@@ -1236,9 +1236,9 @@ test("variance guard lets varied dims auto-apply, including with one flat dim", 
 });
 ```
 
-2. [ ] **Run it and confirm it fails for the right reason.** Command: `cd /Users/shooby/Dev/openAGI && node --test test/scrutiny-fitter-variance.test.js`. Expected: both tests fail — test 1 with `AssertionError` message `guard must veto auto-apply` (actual `true`, expected `false`), test 2 with `Expected values to be strictly equal:` `undefined !== null` (because `result.varianceGuard` does not exist yet). If they fail with an import error instead, stop and fix the test file.
+2. [ ] **Run it and confirm it fails for the right reason.** Command: `cd /Users/you/Dev/openAGI && node --test test/scrutiny-fitter-variance.test.js`. Expected: both tests fail — test 1 with `AssertionError` message `guard must veto auto-apply` (actual `true`, expected `false`), test 2 with `Expected values to be strictly equal:` `undefined !== null` (because `result.varianceGuard` does not exist yet). If they fail with an import error instead, stop and fix the test file.
 
-3. [ ] **Add the variance-floor constant.** In `/Users/shooby/Dev/openAGI/src/scrutiny-fitter.js`, replace:
+3. [ ] **Add the variance-floor constant.** In `/Users/you/Dev/openAGI/src/scrutiny-fitter.js`, replace:
 
 ```js
 const DEFAULT_MIN_SAMPLES = 50;
@@ -1377,7 +1377,7 @@ with this complete replacement:
   }
 ```
 
-5. [ ] **Add the two helper functions.** Still in `/Users/shooby/Dev/openAGI/src/scrutiny-fitter.js`, replace:
+5. [ ] **Add the two helper functions.** Still in `/Users/you/Dev/openAGI/src/scrutiny-fitter.js`, replace:
 
 ```js
 function clampDelta(value, maxDelta) {
@@ -1420,7 +1420,7 @@ function stddev(xs) {
 }
 ```
 
-6. [ ] **Fix the one existing test that seeds all-constant dims and expects auto-apply.** In `/Users/shooby/Dev/openAGI/test/abi-runtime.test.js` (the test `"scrutiny fitter judge signal averages with correlation deltas"` at line 748), replace:
+6. [ ] **Fix the one existing test that seeds all-constant dims and expects auto-apply.** In `/Users/you/Dev/openAGI/test/abi-runtime.test.js` (the test `"scrutiny fitter judge signal averages with correlation deltas"` at line 748), replace:
 
 ```js
 test("scrutiny fitter judge signal averages with correlation deltas", () => {
@@ -1454,11 +1454,11 @@ test("scrutiny fitter judge signal averages with correlation deltas", () => {
 
 (Constant quality 0.7 makes `pearson` return 0 — its denominator is 0 — so correlation deltas are all 0 and the test's judge-signal assertion is unchanged in meaning. Do NOT touch the test at line 717, `"manually applying a staged warmup proposal persists the same way"` — it stages via warmup, so the guard doesn't change its behavior.)
 
-7. [ ] **Run the new test.** `cd /Users/shooby/Dev/openAGI && node --test test/scrutiny-fitter-variance.test.js`. Expected: `# pass 2`, `# fail 0`.
+7. [ ] **Run the new test.** `cd /Users/you/Dev/openAGI && node --test test/scrutiny-fitter-variance.test.js`. Expected: `# pass 2`, `# fail 0`.
 
-8. [ ] **Run the full suite.** `cd /Users/shooby/Dev/openAGI && npm test`. Expected: exit code 0 with `# fail 0`. If `abi-runtime.test.js` fails on a fitter test, re-check step 6 was applied exactly.
+8. [ ] **Run the full suite.** `cd /Users/you/Dev/openAGI && npm test`. Expected: exit code 0 with `# fail 0`. If `abi-runtime.test.js` fails on a fitter test, re-check step 6 was applied exactly.
 
-9. [ ] **Commit the guard.** `cd /Users/shooby/Dev/openAGI && git add src/scrutiny-fitter.js test/scrutiny-fitter-variance.test.js test/abi-runtime.test.js && git commit -m "fix(scrutiny): variance guard skips weight auto-apply when 2+ training dims are near-constant" && git push`
+9. [ ] **Commit the guard.** `cd /Users/you/Dev/openAGI && git add src/scrutiny-fitter.js test/scrutiny-fitter-variance.test.js test/abi-runtime.test.js && git commit -m "fix(scrutiny): variance guard skips weight auto-apply when 2+ training dims are near-constant" && git push`
 
 10. [ ] **Write the failing purge-migration test.** Create `test/purge-outcomes.test.js` with exactly this content:
 
@@ -1582,9 +1582,9 @@ test("missing snapshot is a safe no-op", () => {
 });
 ```
 
-11. [ ] **Run it and confirm the failure.** `cd /Users/shooby/Dev/openAGI && node --test test/purge-outcomes.test.js`. Expected failure: `SyntaxError: The requested module '../src/migrate.js' does not provide an export named 'isPoisonedOutcome'` (the whole file fails to load — that is the expected red state).
+11. [ ] **Run it and confirm the failure.** `cd /Users/you/Dev/openAGI && node --test test/purge-outcomes.test.js`. Expected failure: `SyntaxError: The requested module '../src/migrate.js' does not provide an export named 'isPoisonedOutcome'` (the whole file fails to load — that is the expected red state).
 
-12. [ ] **Add imports to src/migrate.js.** Replace (top of `/Users/shooby/Dev/openAGI/src/migrate.js`):
+12. [ ] **Add imports to src/migrate.js.** Replace (top of `/Users/you/Dev/openAGI/src/migrate.js`):
 
 ```js
 import fs from "node:fs";
@@ -1677,9 +1677,9 @@ export function purgePoisonedOutcomes({
 }
 ```
 
-14. [ ] **Run the purge test.** `cd /Users/shooby/Dev/openAGI && node --test test/purge-outcomes.test.js`. Expected: `# pass 5`, `# fail 0`.
+14. [ ] **Run the purge test.** `cd /Users/you/Dev/openAGI && node --test test/purge-outcomes.test.js`. Expected: `# pass 5`, `# fail 0`.
 
-15. [ ] **Wire the CLI command (function).** In `/Users/shooby/Dev/openAGI/bin/openagi.js`, replace:
+15. [ ] **Wire the CLI command (function).** In `/Users/you/Dev/openAGI/bin/openagi.js`, replace:
 
 ```js
 async function cmdImessageServer(flags) {
@@ -1732,14 +1732,14 @@ with:
                               from the outcomes snapshot (backs up first)
 ```
 
-17. [ ] **Smoke-test the CLI against a scratch dir (NOT the live data dir).** Command: `cd /Users/shooby/Dev/openAGI && OPENAGI_DATA_DIR=$(mktemp -d) node bin/openagi.js purge-outcomes --dry-run`. Expected output includes `purge-outcomes: no snapshot at` and the yellow dry-run note. (resolveDataDir memoizes per process, so the env var fully isolates this run.)
+17. [ ] **Smoke-test the CLI against a scratch dir (NOT the live data dir).** Command: `cd /Users/you/Dev/openAGI && OPENAGI_DATA_DIR=$(mktemp -d) node bin/openagi.js purge-outcomes --dry-run`. Expected output includes `purge-outcomes: no snapshot at` and the yellow dry-run note. (resolveDataDir memoizes per process, so the env var fully isolates this run.)
 
-18. [ ] **Run the full suite.** `cd /Users/shooby/Dev/openAGI && npm test`. Expected: exit 0, `# fail 0`.
+18. [ ] **Run the full suite.** `cd /Users/you/Dev/openAGI && npm test`. Expected: exit 0, `# fail 0`.
 
-19. [ ] **Commit the migration.** `cd /Users/shooby/Dev/openAGI && git add src/migrate.js bin/openagi.js test/purge-outcomes.test.js && git commit -m "feat(migrate): purge-outcomes removes poisoned Jun 7-16 old-format outcomes with pre-mutation backup and dry-run" && git push`
+19. [ ] **Commit the migration.** `cd /Users/you/Dev/openAGI && git add src/migrate.js bin/openagi.js test/purge-outcomes.test.js && git commit -m "feat(migrate): purge-outcomes removes poisoned Jun 7-16 old-format outcomes with pre-mutation backup and dry-run" && git push`
 
-20. [ ] **Live dry run (safe — prints counts only, reads nothing personal aloud).** Command: `cd /Users/shooby/Dev/openAGI && node bin/openagi.js purge-outcomes --dry-run`. This targets `~/.openagi` (the live data dir; the repo-local `.openagi` is a stale dev snapshot and is NOT touched because resolveDataDir never uses cwd). Capture the two count lines (`total`, `removed=`, `kept=`). Do NOT open, cat, or quote the snapshot file itself — the counts printed by the command are the only thing you report.
+20. [ ] **Live dry run (safe — prints counts only, reads nothing personal aloud).** Command: `cd /Users/you/Dev/openAGI && node bin/openagi.js purge-outcomes --dry-run`. This targets `~/.openagi` (the live data dir; the repo-local `.openagi` is a stale dev snapshot and is NOT touched because resolveDataDir never uses cwd). Capture the two count lines (`total`, `removed=`, `kept=`). Do NOT open, cat, or quote the snapshot file itself — the counts printed by the command are the only thing you report.
 
 21. [ ] **STOP — get Spencer's explicit approval.** Show Spencer the dry-run counts (expected ballpark from the verified dossier: ~1394 removed out of ~2000). Ask two things: (a) explicit go-ahead to purge, and (b) that HE stops the OpenAGI daemon / Mac app himself first — the daemon holds outcomes in memory and would overwrite the cleaned snapshot on its next persist. Do not kill any process yourself, and do not proceed without his confirmation. If the removed count is wildly different from ~1394 (e.g. 0, or nearly all rows), stop and report instead of running the purge.
 
-22. [ ] **Live real run (only after step 21 approval and daemon stopped).** Command: `cd /Users/shooby/Dev/openAGI && node bin/openagi.js purge-outcomes`. Then verify the backup exists by listing filenames only: `ls ~/.openagi/outcomes/`. Report to Spencer: removed/kept counts, the backup file path, and ask him to restart the daemon/Mac app. Also tell him: the paired Distiller main (100.73.29.88) runs its own daemon with its own `~/.openagi` — if its snapshot has the same poisoned window, he can run the same `openagi purge-outcomes --dry-run` / real-run sequence there after pulling this commit. Note for him: the next weekly `scrutiny-fit` cron will now train only on current-format rows (the ~524 post-June-17 rows exceed the fitter's minSamples of 50), and the new variance guard will refuse auto-apply while 2+ of those dims remain near-constant — expect `[scrutiny-fitter] variance guard:` lines in the daemon log until upstream axis measurement improves.
+22. [ ] **Live real run (only after step 21 approval and daemon stopped).** Command: `cd /Users/you/Dev/openAGI && node bin/openagi.js purge-outcomes`. Then verify the backup exists by listing filenames only: `ls ~/.openagi/outcomes/`. Report to Spencer: removed/kept counts, the backup file path, and ask him to restart the daemon/Mac app. Also tell him: the paired Distiller main (192.0.2.30) runs its own daemon with its own `~/.openagi` — if its snapshot has the same poisoned window, he can run the same `openagi purge-outcomes --dry-run` / real-run sequence there after pulling this commit. Note for him: the next weekly `scrutiny-fit` cron will now train only on current-format rows (the ~524 post-June-17 rows exceed the fitter's minSamples of 50), and the new variance guard will refuse auto-apply while 2+ of those dims remain near-constant — expect `[scrutiny-fitter] variance guard:` lines in the daemon log until upstream axis measurement improves.

@@ -43,7 +43,7 @@ About 40–45% of what the owner types is automatable. The rest is real decision
 | D2 | Autonomy | `observe`: classify + plan, send nothing | `OPENAGI_FLEET_MODE=propose` (one-tap send) or `auto` (send templated in-scope nudges automatically), or the page toggle |
 | D3 | Phone ping | Off | `OPENAGI_FLEET_PUSH=buzzkit` (uses the already-paired `~/.claude/buzz/endpoint`). Quiet hours 22:00–08:00 local, ≤3 pings/hour, needs-you items only |
 | D4 | Models | None in the loop. Relay to live Claude/Conductor peers uses `claude -p --model claude-haiku-4-5-20251001` (same as the g2 relay) | `OPENAGI_FLEET_RELAY_MODEL` |
-| D5 | BuildBot3 manager | Conductor session `0056f770-…` "Remote dev setup" (workspace `remote-dev`), reached when live | `OPENAGI_FLEET_BB3_MANAGER` (session id or workspace name) |
+| D5 | BuildBot3 manager | a Conductor session (set by OPENAGI_FLEET_BB3_MANAGER) "Remote dev setup" (workspace `remote-dev`), reached when live | `OPENAGI_FLEET_BB3_MANAGER` (session id or workspace name) |
 | D6 | Scope | Threads active in the last 48 h that have a git repo and a branch or PR. Excludes subagents, automations, sidechains, relay dirs, the supervisor itself | `OPENAGI_FLEET_LOOKBACK_HOURS` |
 | D7 | Enabled | Off until `OPENAGI_FLEET_SUPERVISOR=1`. The `/fleet` page and a manual "Scan now" work regardless | env |
 

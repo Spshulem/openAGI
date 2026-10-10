@@ -27,9 +27,9 @@ const DONE_PR_STATES = new Set(["MERGED", "CLOSED"]);
 // does nothing for them.
 const PASSIVE_BLOCKERS = new Set(["CI running", "Codex review not on head", "mergeability unknown", "local git unknown"]);
 const LB_ALARM_KINDS = new Set(["no-accounts", "auth", "connection", "unavailable"]);
-// A single dropped stream or timeout in one chat is routine, not an outage: on
-// 2026-10-09 "1x connection" escalated "Codex LB needs a look" while the LB's
-// own probe said healthy=yes. These kinds alarm only when corroborated.
+// A single dropped stream or timeout in one chat is routine, not an outage,
+// even more so while the LB's own probe says it is healthy. These kinds alarm
+// only when corroborated.
 const LB_TRANSIENT_KINDS = new Set(["connection", "unavailable"]);
 const LB_TRANSIENT_MIN = 3;
 const INFRA_NAMES = { bb3: "BuildBot3", lb: "Codex LB" };

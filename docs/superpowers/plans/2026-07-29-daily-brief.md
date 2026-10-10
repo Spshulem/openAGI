@@ -89,7 +89,7 @@ In `mac/Sources/OpenAGI/AppState.swift`, replace the two functions under `// MAR
 
 - [ ] **Step 2: Build**
 
-Run: `cd /Users/shooby/Dev/openAGI/mac && swift build -c release --product OpenAGI 2>&1 | tail -5`
+Run: `cd /Users/you/Dev/openAGI/mac && swift build -c release --product OpenAGI 2>&1 | tail -5`
 Expected: `Build of product 'OpenAGI' complete!`
 
 - [ ] **Step 3: Commit**
@@ -131,7 +131,7 @@ Replace with:
 
 - [ ] **Step 2: Build**
 
-Run: `cd /Users/shooby/Dev/openAGI/mac && swift build -c release --product OpenAGI 2>&1 | tail -3`
+Run: `cd /Users/you/Dev/openAGI/mac && swift build -c release --product OpenAGI 2>&1 | tail -3`
 Expected: `Build of product 'OpenAGI' complete!`
 
 - [ ] **Step 3: Commit**
@@ -1267,14 +1267,14 @@ In `mac/Sources/OpenAGI/AppState.swift`:
 
 - [ ] **Step 7: Build**
 
-Run: `cd /Users/shooby/Dev/openAGI/mac && swift build -c release --product OpenAGI 2>&1 | tail -20`
+Run: `cd /Users/you/Dev/openAGI/mac && swift build -c release --product OpenAGI 2>&1 | tail -20`
 Expected: `Build of product 'OpenAGI' complete!`
 
 Fix any compile errors before continuing. Do NOT proceed with a failing build.
 
 - [ ] **Step 8: Full server suite still green**
 
-Run: `cd /Users/shooby/Dev/openAGI && node --test 2>&1 | tail -6`
+Run: `cd /Users/you/Dev/openAGI && node --test 2>&1 | tail -6`
 Expected: `# fail 0`
 
 - [ ] **Step 9: Commit**
@@ -1297,7 +1297,7 @@ git commit -m "feat(brief): ranked, inline-actionable brief section in the Quick
 The running daemon serves the OLD code until it is restarted, so first check the source-level server directly by booting a scratch instance:
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 OPENAGI_DATA_DIR=$(mktemp -d) PORT=43299 node examples/hosted-server.js &
 sleep 3
 curl -s "http://127.0.0.1:43299/brief/today" | head -c 800
@@ -1309,7 +1309,7 @@ Expected: a JSON object with `items`, `older`, `generatedAt`, `planCachedAt`, `d
 - [ ] **Step 2: Verify against the developer's REAL data**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 TOKEN=$(grep '^OPENAGI_AUTH_TOKEN=' ~/.openagi/.env | cut -d= -f2)
 OPENAGI_DATA_DIR="$HOME/.openagi" PORT=43299 OPENAGI_AUTH_TOKEN="$TOKEN" node examples/hosted-server.js > /tmp/brief-verify.log 2>&1 &
 sleep 6
@@ -1329,11 +1329,11 @@ Record the actual output in the final report. If any expectation fails, fix it b
 - [ ] **Step 3: Rebuild the app bundle**
 
 ```bash
-cd /Users/shooby/Dev/openAGI
+cd /Users/you/Dev/openAGI
 SIGN_IDENTITY="OpenAGI Local Signing" npm run build-mac-app 2>&1 | tail -6
 ```
 
-Expected: `▶ Done. /Users/shooby/Dev/openAGI/build/OpenAGI.app`
+Expected: `▶ Done. /Users/you/Dev/openAGI/build/OpenAGI.app`
 
 - [ ] **Step 4: Report, do not restart**
 

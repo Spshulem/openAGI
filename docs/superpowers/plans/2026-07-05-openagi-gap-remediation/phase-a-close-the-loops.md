@@ -474,9 +474,9 @@ export function composeDigest(store, config, { now = new Date() } = {}) {
 
 #### Steps
 
-1. [ ] Confirm a green baseline. Run `npm test` from /Users/shooby/Dev/openAGI. Expect exit code 0 and `# fail 0` in the summary. If anything fails before you change code, STOP and report — do not proceed on a red baseline.
+1. [ ] Confirm a green baseline. Run `npm test` from /Users/you/Dev/openAGI. Expect exit code 0 and `# fail 0` in the summary. If anything fails before you change code, STOP and report — do not proceed on a red baseline.
 
-2. [ ] Write the failing tests for supersede-GC and evict-GC. Create the file `/Users/shooby/Dev/openAGI/test/principle-vector-gc.test.js` with exactly this content:
+2. [ ] Write the failing tests for supersede-GC and evict-GC. Create the file `/Users/you/Dev/openAGI/test/principle-vector-gc.test.js` with exactly this content:
 
 ```js
 // G10 remediation: principle vectors must be garbage-collected when their
@@ -542,7 +542,7 @@ test("cap eviction deletes the evicted item's principle vector", async () => {
 
 3. [ ] Run the new test file: `node --test test/principle-vector-gc.test.js`. Expect BOTH tests to fail with `TypeError: memory.bindVectorStore is not a function` (summary shows `# fail 2`). If they fail with a different error, fix the test file until the failure is exactly this missing method.
 
-4. [ ] Implement the vector binding on MemorySystem. In `/Users/shooby/Dev/openAGI/src/memory-system.js`, find this exact text (constructor, lines 17-19):
+4. [ ] Implement the vector binding on MemorySystem. In `/Users/you/Dev/openAGI/src/memory-system.js`, find this exact text (constructor, lines 17-19):
 
 ```js
     this.items = new Map();
@@ -592,7 +592,7 @@ and replace it with:
   remember(observation, context = {}) {
 ```
 
-5. [ ] Wire GC into `correct()`. In `/Users/shooby/Dev/openAGI/src/memory-system.js`, find this exact text (lines 172-175):
+5. [ ] Wire GC into `correct()`. In `/Users/you/Dev/openAGI/src/memory-system.js`, find this exact text (lines 172-175):
 
 ```js
     const at = nowIso();
@@ -611,7 +611,7 @@ and replace it with:
     }
 ```
 
-6. [ ] Wire GC into `enforceLimits()`. In `/Users/shooby/Dev/openAGI/src/memory-system.js`, find this exact text (lines 306-307):
+6. [ ] Wire GC into `enforceLimits()`. In `/Users/you/Dev/openAGI/src/memory-system.js`, find this exact text (lines 306-307):
 
 ```js
       .slice(0, Math.max(0, tierItems.length - limit))
@@ -628,7 +628,7 @@ and replace it with:
       });
 ```
 
-7. [ ] Bind memory to the vector store at runtime construction (least-invasive wiring: `AbiRuntime` constructs memory at src/abi-runtime.js:127, before the vector store at line 161, so a post-construction setter matching the existing `propagation.bindVectorStore` style is the right shape — do NOT add a constructor option). In `/Users/shooby/Dev/openAGI/src/abi-runtime.js`, find this exact text (line 162):
+7. [ ] Bind memory to the vector store at runtime construction (least-invasive wiring: `AbiRuntime` constructs memory at src/abi-runtime.js:127, before the vector store at line 161, so a post-construction setter matching the existing `propagation.bindVectorStore` style is the right shape — do NOT add a constructor option). In `/Users/you/Dev/openAGI/src/abi-runtime.js`, find this exact text (line 162):
 
 ```js
     if (typeof this.propagation.bindVectorStore === "function") this.propagation.bindVectorStore(this.vectorStore);
@@ -648,7 +648,7 @@ Note: `FileBackedMemorySystem` (src/file-backed-memory-system.js) extends `Memor
 8. [ ] Run `node --test test/principle-vector-gc.test.js`. Expect both tests to pass (`# pass 2`, `# fail 0`). Then run the full suite: `npm test` — expect exit code 0, `# fail 0`. Then commit:
 `git add src/memory-system.js src/abi-runtime.js test/principle-vector-gc.test.js && git commit -m "fix(memory): delete principle vectors when items are superseded or cap-evicted (G10)"`
 
-9. [ ] Write the failing reconcile tests. Append exactly this to the END of `/Users/shooby/Dev/openAGI/test/principle-vector-gc.test.js`:
+9. [ ] Write the failing reconcile tests. Append exactly this to the END of `/Users/you/Dev/openAGI/test/principle-vector-gc.test.js`:
 
 ```js
 test("reconcilePrincipleVectors removes orphaned and superseded vectors, keeps live ones", async () => {
@@ -692,7 +692,7 @@ test("createDurableRuntime reconciles orphaned principle vectors at boot", async
 
 10. [ ] Run `node --test test/principle-vector-gc.test.js`. Expect the first two tests to still pass and the two new tests to fail: `TypeError: runtime.reconcilePrincipleVectors is not a function` (summary `# pass 2`, `# fail 2`).
 
-11. [ ] Implement the reconcile method on `AbiRuntime`. Placement decision (already made — do not revisit): the method lives on `AbiRuntime` so tests and any entry point can call it, and the automatic invocation goes in `createDurableRuntime` (src/abi-runtime.js:1059+), NOT in `src/migrate.js` (that file is an OpenClaw/Hermes install importer, unrelated to boot) and NOT in `src/boot.js` (which just calls `createDurableRuntime` at src/boot.js:87 — putting it in `createDurableRuntime` covers `openagi serve`, the hosted example, and the CLI identically, and both `FileBackedMemorySystem.load()` and the `VectorStore` snapshot load run inside their constructors, so both stores are fully live by then). In `/Users/shooby/Dev/openAGI/src/abi-runtime.js`, find this exact text (the start of `AbiRuntime.status()`, ~line 1007):
+11. [ ] Implement the reconcile method on `AbiRuntime`. Placement decision (already made — do not revisit): the method lives on `AbiRuntime` so tests and any entry point can call it, and the automatic invocation goes in `createDurableRuntime` (src/abi-runtime.js:1059+), NOT in `src/migrate.js` (that file is an OpenClaw/Hermes install importer, unrelated to boot) and NOT in `src/boot.js` (which just calls `createDurableRuntime` at src/boot.js:87 — putting it in `createDurableRuntime` covers `openagi serve`, the hosted example, and the CLI identically, and both `FileBackedMemorySystem.load()` and the `VectorStore` snapshot load run inside their constructors, so both stores are fully live by then). In `/Users/you/Dev/openAGI/src/abi-runtime.js`, find this exact text (the start of `AbiRuntime.status()`, ~line 1007):
 
 ```js
   status() {
@@ -730,7 +730,7 @@ and replace it with:
       context: this.context,
 ```
 
-12. [ ] Invoke it at durable boot. In `/Users/shooby/Dev/openAGI/src/abi-runtime.js`, find this exact text (line 1096, inside `createDurableRuntime`):
+12. [ ] Invoke it at durable boot. In `/Users/you/Dev/openAGI/src/abi-runtime.js`, find this exact text (line 1096, inside `createDurableRuntime`):
 
 ```js
   applyPersona(runtime, dataDir);
@@ -748,7 +748,7 @@ and replace it with:
 13. [ ] Run `node --test test/principle-vector-gc.test.js` — expect `# pass 4`, `# fail 0`. Run `npm test` — expect exit code 0, `# fail 0`. Commit:
 `git add src/abi-runtime.js test/principle-vector-gc.test.js && git commit -m "fix(memory): reconcile orphaned and superseded principle vectors at boot (G10)"`
 
-14. [ ] Write the failing inject-time-filter tests. First, in `/Users/shooby/Dev/openAGI/test/principle-vector-gc.test.js`, find this exact text:
+14. [ ] Write the failing inject-time-filter tests. First, in `/Users/you/Dev/openAGI/test/principle-vector-gc.test.js`, find this exact text:
 
 ```js
 import { AgentHost } from "../src/agent-host.js";
@@ -855,7 +855,7 @@ test("handleMessage injects live principles but never quarantined ones", async (
 
 15. [ ] Run `node --test test/principle-vector-gc.test.js`. Expect the ENTIRE file to fail to load with `SyntaxError: The requested module '../src/agent-host.js' does not provide an export named 'filterPrincipleHits'` (this is the red state — none of the 6 tests run).
 
-16. [ ] Implement the filter. In `/Users/shooby/Dev/openAGI/src/agent-host.js`, find this exact text (module-level, ~line 370, the comment above `verdictGuidance`):
+16. [ ] Implement the filter. In `/Users/you/Dev/openAGI/src/agent-host.js`, find this exact text (module-level, ~line 370, the comment above `verdictGuidance`):
 
 ```js
 // What each scrutiny verdict means for THIS turn — matches the enforcement
@@ -887,7 +887,7 @@ export function filterPrincipleHits(hits, memory, { limit = 3, now = Date.now() 
 // What each scrutiny verdict means for THIS turn — matches the enforcement
 ```
 
-17. [ ] Wire the filter into the turn path. In `/Users/shooby/Dev/openAGI/src/agent-host.js`, find this exact text (lines 115-120):
+17. [ ] Wire the filter into the turn path. In `/Users/you/Dev/openAGI/src/agent-host.js`, find this exact text (lines 115-120):
 
 ```js
     let intuitions = [];
@@ -924,7 +924,7 @@ and replace it with:
 ### Task A3: Capture client mode — decision gate + Option A runbook (point the eyes at the chosen brain)
 **Week:** 1 · **Size:** S · **Depends on:** none
 **User story:** As Spencer (the openAGI owner), I want exactly one brain (main) receiving my ambient capture stream, so that the Distiller main and the Mac's local daemon stop accumulating divergent memories ("two-brain cancerous multiplication").
-**Why (evidence):** Gap G6 (confirmed): `mac/Sources/OpenAGI/Capture/CaptureBridge.swift:38` POSTs capture to hardcoded `http://127.0.0.1:43210/observations` under a `TODO(roadmap/remote-capture)` (lines 33–37), and `mac/Sources/OpenAGI/AppState.swift:14` hardcodes the same base URL, while the live `~/.openagi/node.json` pairs this Mac to a remote Distiller main at `100.73.29.88:43210`. The pairing is honored only by the CLI (`src/cli-client.js:62-66`); no `sourceMachineId` exists anywhere in `src/`, `mac/`, or `test/`. The same app already has remote-main plumbing for outreach (`AppState.outreachRemoteURL` → `OutreachConsumer`, `AppState.swift:31-44`), so proactive decisions arrive from a brain that cannot see the screen.
+**Why (evidence):** Gap G6 (confirmed): `mac/Sources/OpenAGI/Capture/CaptureBridge.swift:38` POSTs capture to hardcoded `http://127.0.0.1:43210/observations` under a `TODO(roadmap/remote-capture)` (lines 33–37), and `mac/Sources/OpenAGI/AppState.swift:14` hardcodes the same base URL, while the live `~/.openagi/node.json` pairs this Mac to a remote Distiller main at `192.0.2.30:43210`. The pairing is honored only by the CLI (`src/cli-client.js:62-66`); no `sourceMachineId` exists anywhere in `src/`, `mac/`, or `test/`. The same app already has remote-main plumbing for outreach (`AppState.outreachRemoteURL` → `OutreachConsumer`, `AppState.swift:31-44`), so proactive decisions arrive from a brain that cannot see the screen.
 
 ⚠️ **DECISION GATE — STOP AND ASK SPENCER BEFORE ANY IMPLEMENTATION.** Present exactly these two options and wait for his answer:
 
@@ -1036,7 +1036,7 @@ openagi pair http://<distiller-host>:43210 --token "<the main's OPENAGI_AUTH_TOK
 **Why (evidence):** G6: the capture target is hardcoded at `mac/Sources/OpenAGI/Capture/CaptureBridge.swift:38` (`http://127.0.0.1:43210/observations`) under `TODO(roadmap/remote-capture)` at lines 33–37, which itself says the fix is "a settings field + UserDefaults". The outreach feature already ships this exact pattern (`AppState.swift:31-44`: UserDefaults-persisted `outreachRemoteURL`/`outreachToken` + a setter) — mirror it.
 
 **Acceptance criteria:**
-- `swift build --package-path /Users/shooby/Dev/openAGI/mac` exits 0 printing `Build complete!`.
+- `swift build --package-path /Users/you/Dev/openAGI/mac` exits 0 printing `Build complete!`.
 - With UserDefaults key `daemonBaseURL` unset, capture batches still POST to `http://127.0.0.1:43210/observations` (verified via local `/observations/stats` counts rising).
 - With `daemonBaseURL` set to the Distiller URL and `daemonToken` set to the main's token, batches land on the remote main (verified via the remote `/observations/stats` counts rising) and stop landing locally.
 
@@ -1143,12 +1143,12 @@ After:
     return AppState.shared.authToken()
   }
 ```
-4. [ ] Build: `swift build --package-path /Users/shooby/Dev/openAGI/mac`. Expected: dependency fetch (Sparkle) on first run, then `Build complete!` and exit code 0. If it fails, the error will name the exact file/line — fix only that and rebuild.
+4. [ ] Build: `swift build --package-path /Users/you/Dev/openAGI/mac`. Expected: dependency fetch (Sparkle) on first run, then `Build complete!` and exit code 0. If it fails, the error will name the exact file/line — fix only that and rebuild.
 5. [ ] Manual verification (with Spencer — packaged app required, because the UserDefaults domain belongs to the app bundle and screen-capture permissions are bound to it):
    - a. Confirm the defaults domain: `defaults domains | tr ',' '\n' | grep -i openagi` → expected to print `app.openagi.daemon` (the domain outreach already uses; if a different openagi domain prints, substitute it in every command below).
    - b. Build the app: `./scripts/build-mac-app.sh` from the repo root → produces `build/OpenAGI.app`. Ask Spencer to quit the running OpenAGI menubar app and launch the new build (do not kill the app yourself).
    - c. Default (unset) behavior: ensure `defaults read app.openagi.daemon daemonBaseURL` errors with "does not exist". Run `curl -s -H "Authorization: Bearer <token Spencer reads from ~/.openagi/.env>" http://127.0.0.1:43210/observations/stats`, note the `activity` count, wait ~60s of normal Mac use, re-run: count rises. Capture still lands locally.
-   - d. Remote behavior: `defaults write app.openagi.daemon daemonBaseURL "http://100.73.29.88:43210"` and `defaults write app.openagi.daemon daemonToken "<the Distiller main's OPENAGI_AUTH_TOKEN, supplied by Spencer>"`; Spencer relaunches the app. On the remote: `curl -s -H "Authorization: Bearer <remote token>" http://100.73.29.88:43210/observations/stats` → `activity` count rises within ~60s, while the local count from step c stops rising. (If the tailnet TCP connection is dead, a local VPN is the usual cause — see memory note — have Spencer check NordVPN/PairVPN before debugging the code.)
+   - d. Remote behavior: `defaults write app.openagi.daemon daemonBaseURL "http://192.0.2.30:43210"` and `defaults write app.openagi.daemon daemonToken "<the Distiller main's OPENAGI_AUTH_TOKEN, supplied by Spencer>"`; Spencer relaunches the app. On the remote: `curl -s -H "Authorization: Bearer <remote token>" http://192.0.2.30:43210/observations/stats` → `activity` count rises within ~60s, while the local count from step c stops rising. (If the tailnet TCP connection is dead, a local VPN is the usual cause — see memory note — have Spencer check NordVPN/PairVPN before debugging the code.)
    - e. Leave the defaults in whichever state Spencer wants as the end state (remote, for Option B).
 6. [ ] Commit: `git add mac/Sources/OpenAGI/AppState.swift mac/Sources/OpenAGI/Capture/CaptureBridge.swift && git commit -m "feat(mac/capture): configurable daemon base URL and token for the capture bridge"` then `git push`.
 
@@ -1161,7 +1161,7 @@ After:
 
 **Acceptance criteria:**
 - `node --test test/observation-machine.test.js` passes (4 tests).
-- `npm test` passes from `/Users/shooby/Dev/openAGI`.
+- `npm test` passes from `/Users/you/Dev/openAGI`.
 - Opening a database created with the pre-change schema does not throw and gains `source_machine_id` columns on `activity` and `frames` (covered by the migration test).
 - `POST /observations` with body `{"sourceMachineId":"...","observations":[...]}` stores the id (covered by the endpoint test).
 
@@ -1470,7 +1470,7 @@ After:
       }
 ```
 7. [ ] Run `node --test test/observation-machine.test.js`. Expected: `# pass 4`, `# fail 0`.
-8. [ ] Run the full suite: `npm test` from `/Users/shooby/Dev/openAGI`. Expected: exit 0, no failures (watch `test/observation-transcript.test.js` and `test/buildbetter-transcripts.test.js` in particular — they share this store and must stay green).
+8. [ ] Run the full suite: `npm test` from `/Users/you/Dev/openAGI`. Expected: exit 0, no failures (watch `test/observation-transcript.test.js` and `test/buildbetter-transcripts.test.js` in particular — they share this store and must stay green).
 9. [ ] Commit: `git add src/observation-store.js src/hosted-interface.js test/observation-machine.test.js && git commit -m "feat(observations): source_machine_id column, batch passthrough, machine-filtered search"` then `git push`.
 
 ---
@@ -1481,7 +1481,7 @@ After:
 **Why (evidence):** G6: "There is no sourceMachineId in src/, mac/, or test/." The batch envelope built at `mac/Sources/OpenAGI/Capture/CaptureBridge.swift:51` is `["observations": payload]` with no origin field.
 
 **Acceptance criteria:**
-- `swift build --package-path /Users/shooby/Dev/openAGI/mac` prints `Build complete!`.
+- `swift build --package-path /Users/you/Dev/openAGI/mac` prints `Build complete!`.
 - After launching the packaged app once, `defaults read app.openagi.daemon sourceMachineId` prints a UUID, and it is identical across relaunches.
 - On the receiving daemon, the count `SELECT COUNT(*) FROM activity WHERE source_machine_id IS NOT NULL` rises after the app pushes a batch (counts only — never read row content from the live store).
 
@@ -1532,7 +1532,7 @@ After:
       "sourceMachineId": AppState.sourceMachineId()
     ]
 ```
-4. [ ] Build: `swift build --package-path /Users/shooby/Dev/openAGI/mac`. Expected: `Build complete!`, exit 0.
+4. [ ] Build: `swift build --package-path /Users/you/Dev/openAGI/mac`. Expected: `Build complete!`, exit 0.
 5. [ ] Manual verification (with Spencer; requires the A3.2 daemon code running on whichever daemon receives capture — for the remote Distiller main that means Spencer pulls this branch there and restarts its daemon first):
    - a. Rebuild and relaunch the packaged app (`./scripts/build-mac-app.sh`, Spencer quits the old app and opens `build/OpenAGI.app`).
    - b. `defaults read app.openagi.daemon sourceMachineId` → prints one UUID. Relaunch the app, re-run → the SAME UUID.
@@ -1548,7 +1548,7 @@ After:
 
 **Acceptance criteria:**
 - `node --test test/recall-activity-machine.test.js` passes (2 tests).
-- `npm test` passes from `/Users/shooby/Dev/openAGI`.
+- `npm test` passes from `/Users/you/Dev/openAGI`.
 - `GET /observations/search?machine=<id>` returns only rows recorded with that machine id.
 
 **Files:**
@@ -1676,5 +1676,5 @@ After:
       }
 ```
 5. [ ] Run `node --test test/recall-activity-machine.test.js`. Expected: `# pass 2`, `# fail 0`.
-6. [ ] Run the full suite: `npm test` from `/Users/shooby/Dev/openAGI`. Expected: exit 0, no failures.
+6. [ ] Run the full suite: `npm test` from `/Users/you/Dev/openAGI`. Expected: exit 0, no failures.
 7. [ ] Commit: `git add src/tool-registry.js src/hosted-interface.js test/recall-activity-machine.test.js && git commit -m "feat(tools): machine filter on recall_activity and the observations search endpoint"` then `git push`.

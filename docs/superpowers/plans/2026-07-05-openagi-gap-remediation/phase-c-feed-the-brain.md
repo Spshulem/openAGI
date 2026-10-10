@@ -19,10 +19,10 @@
 
 **Acceptance criteria:**
 - `node --test test/ambient-digest.test.js` reports 3 passing tests, 0 failing.
-- `npm test` (full suite, run from /Users/shooby/Dev/openAGI) reports no new failures relative to the baseline recorded in step 1.
+- `npm test` (full suite, run from /Users/you/Dev/openAGI) reports no new failures relative to the baseline recorded in step 1.
 - `node -e "import('./src/index.js').then(async (m) => { const r = m.createDefaultRuntime(); console.log(r.cron.listJobs().map((j) => j.id).includes('ambient-digest')); process.exit(0); })"` prints `true`.
-- `grep -c "ambient-capture" /Users/shooby/Dev/openAGI/src/abi-runtime.js` prints a number ≥ 1 (the taskType now exists in src/).
-- `grep -n "model-provider\|handleMessage\|ocrText\|texts" /Users/shooby/Dev/openAGI/src/ambient-digest.js` prints nothing (no LLM, no OCR access — deterministic module).
+- `grep -c "ambient-capture" /Users/you/Dev/openAGI/src/abi-runtime.js` prints a number ≥ 1 (the taskType now exists in src/).
+- `grep -n "model-provider\|handleMessage\|ocrText\|texts" /Users/you/Dev/openAGI/src/ambient-digest.js` prints nothing (no LLM, no OCR access — deterministic module).
 - The privacy test (seeded OCR marker string never appears in the digest JSON) passes as part of the test file.
 
 **Files:**
@@ -39,7 +39,7 @@
 - Produces: `export async function buildAmbientDigest({ observations, sinceMs, nowMs }) -> Promise<null | { domain: string, summary: string, stats: { windowStart, windowEnd, focusEvents, distinctApps, topApps: Array<{app, count}>, topWindowTokens: string[] } }>` and `export function slugifyApp(app) -> string` (src/ambient-digest.js; `buildAmbientDigest` re-exported from src/index.js).
 - Produces: `AbiRuntime.runAmbientDigest({ now }) -> Promise<{skipped, reason} | {fired: 1, domain, action, repetition}>`, `AbiRuntime.countAmbientMemories(domain, nowMs) -> number`, default cron job id `"ambient-digest"` with task `"ambient-digest"` (hourly), and signals with `source: "ambient-digest"`, `taskType: "ambient-capture"`, `domain: "app-<slug>"`. Later tasks may rely on the taskType string `"ambient-capture"` and the domain prefix `"app-"`.
 
-**Steps** (run all commands from /Users/shooby/Dev/openAGI):
+**Steps** (run all commands from /Users/you/Dev/openAGI):
 
 1. [ ] Record the baseline: run `npm test`. Expected: summary counters end with `# fail 0`. If any test fails BEFORE you change anything, write down its name — later steps must not add new failures beyond that pre-existing list.
 
@@ -458,9 +458,9 @@ with:
 **User story:** As Spencer (the openAGI owner), I want the seven scrutiny axes measured from each message and the runtime's own stores instead of hardcoded constants, so that the scrutiny verdict reflects the actual signal, the fitter trains on inputs that vary, and specialization candidates carry content-derived scopes that mint genuinely different specialists.
 **Why (evidence):** G4 (confirmed-partial): `messageToSignal` (src/agent-host.js:261-297) hardcodes specificity=0.65, confidence=0.7, and flips risk 0.35/0.75, repetition 0.35/0.82, novelty 0.4/0.65 on keyword regexes — across 524 live current-pipeline outcomes, risk was 0.35 in 100% of rows and the evidence dimension a single constant 0.697, so the fitter's correlation for it is permanently zero. G2 (confirmed): every internal signal hardcodes domain "general" and one of two taskTypes; the propagation dedupe signature is hash(workflowId, domain, taskType, goal) (src/propagation-controller.js:177-184), so all internal signals collapse to exactly 2 signatures and the live install has exactly 2 catch-all specialists; the content-scoping fields `specialistScope`/`goal`/`successMetric` exist (src/propagation-controller.js:98-104) but no producer ever sets them.
 **Acceptance criteria:**
-- `cd /Users/shooby/Dev/openAGI && node --test test/signal-axes.test.js` passes (7 tests, 0 fail).
-- `cd /Users/shooby/Dev/openAGI && node --test test/message-to-signal-axes.test.js` passes (2 tests, 0 fail).
-- `cd /Users/shooby/Dev/openAGI && npm test` passes with no regressions (existing agent-host tests test/verdict-consequences.test.js and test/specialist-bounds.test.js construct stub runtimes without `vectorStore` and with `outcomes: null`, while test/ephemeral-turn.test.js runs handleMessage on createDefaultRuntime — the new code must tolerate both).
+- `cd /Users/you/Dev/openAGI && node --test test/signal-axes.test.js` passes (7 tests, 0 fail).
+- `cd /Users/you/Dev/openAGI && node --test test/message-to-signal-axes.test.js` passes (2 tests, 0 fail).
+- `cd /Users/you/Dev/openAGI && npm test` passes with no regressions (existing agent-host tests test/verdict-consequences.test.js and test/specialist-bounds.test.js construct stub runtimes without `vectorStore` and with `outcomes: null`, while test/ephemeral-turn.test.js runs handleMessage on createDefaultRuntime — the new code must tolerate both).
 - `measureAxes` performs zero LLM calls: only vector-store cosine search (existing embedder), a read-only pass over the memory `items` Map, and `outcomeStore.recent()` — verify by reading src/signal-axes.js: it imports only from ./utils.js.
 - Two chat messages with different content produce different `specificity`, `risk`, and `confidence` on their signals (asserted by test/message-to-signal-axes.test.js).
 - For taskType "specialization-candidate", the signal carries `specialistScope`, `successMetric` = "outcome quality >= 0.6 over next 10 activations", and a scope-derived `goal`; two candidates with different content words produce different `PropagationController.signature()` hashes (asserted by test).
@@ -494,7 +494,7 @@ Design notes the executor must not "fix" differently:
 
 Steps:
 
-1. [ ] Write the failing axis test. Create `/Users/shooby/Dev/openAGI/test/signal-axes.test.js` with exactly this content:
+1. [ ] Write the failing axis test. Create `/Users/you/Dev/openAGI/test/signal-axes.test.js` with exactly this content:
 
 ```js
 // C2: scrutiny axes are measured from the message + runtime stores, not
@@ -583,10 +583,10 @@ test("helpers: countProperNouns and contentWords behave as specified", () => {
 ```
 
 2. [ ] Run the new test and confirm it fails because the module does not exist:
-`cd /Users/shooby/Dev/openAGI && node --test test/signal-axes.test.js`
-Expected: exit code 1 with `Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/Users/shooby/Dev/openAGI/src/signal-axes.js' imported from /Users/shooby/Dev/openAGI/test/signal-axes.test.js` and a summary containing `# fail 1`.
+`cd /Users/you/Dev/openAGI && node --test test/signal-axes.test.js`
+Expected: exit code 1 with `Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/Users/you/Dev/openAGI/src/signal-axes.js' imported from /Users/you/Dev/openAGI/test/signal-axes.test.js` and a summary containing `# fail 1`.
 
-3. [ ] Create `/Users/shooby/Dev/openAGI/src/signal-axes.js` with exactly this content:
+3. [ ] Create `/Users/you/Dev/openAGI/src/signal-axes.js` with exactly this content:
 
 ```js
 import { clamp, tokenize, tokenOverlapScore } from "./utils.js";
@@ -755,7 +755,7 @@ export async function measureAxes({ text, memorySystem = null, vectorStore = nul
 }
 ```
 
-4. [ ] Export the module from the package index. In `/Users/shooby/Dev/openAGI/src/index.js`, apply this edit (current line 47 is the last line of the file):
+4. [ ] Export the module from the package index. In `/Users/you/Dev/openAGI/src/index.js`, apply this edit (current line 47 is the last line of the file):
 
 Before:
 ```js
@@ -769,17 +769,17 @@ export { contentWords, countProperNouns, deriveSpecialistScope, measureAxes, mea
 ```
 
 5. [ ] Run the axis test again:
-`cd /Users/shooby/Dev/openAGI && node --test test/signal-axes.test.js`
+`cd /Users/you/Dev/openAGI && node --test test/signal-axes.test.js`
 Expected: `# pass 7`, `# fail 0`, exit code 0.
 
 6. [ ] Run the full suite to prove nothing regressed:
-`cd /Users/shooby/Dev/openAGI && npm test`
+`cd /Users/you/Dev/openAGI && npm test`
 Expected: all test files pass, `# fail 0`.
 
 7. [ ] Commit the module:
-`cd /Users/shooby/Dev/openAGI && git add src/signal-axes.js src/index.js test/signal-axes.test.js && git commit -m "feat(scrutiny): measured signal axes module - novelty, repetition, risk, impact, specificity, confidence (G4)"`
+`cd /Users/you/Dev/openAGI && git add src/signal-axes.js src/index.js test/signal-axes.test.js && git commit -m "feat(scrutiny): measured signal axes module - novelty, repetition, risk, impact, specificity, confidence (G4)"`
 
-8. [ ] Write the failing integration test. Create `/Users/shooby/Dev/openAGI/test/message-to-signal-axes.test.js` with exactly this content:
+8. [ ] Write the failing integration test. Create `/Users/you/Dev/openAGI/test/message-to-signal-axes.test.js` with exactly this content:
 
 ```js
 // C2: messageToSignal carries measured axes (not constants) and derives a
@@ -857,10 +857,10 @@ test("specialization candidates carry scope, metric, and a signature-differentia
 ```
 
 9. [ ] Run it and confirm it fails against the current constants:
-`cd /Users/shooby/Dev/openAGI && node --test test/message-to-signal-axes.test.js`
+`cd /Users/you/Dev/openAGI && node --test test/message-to-signal-axes.test.js`
 Expected: exit code 1, `# fail 2`. Test 1 fails at the first assertion with `AssertionError [ERR_ASSERTION]` (specificity is the constant `0.65` for both messages, so `notEqual(0.65, 0.65)` throws). Test 2 fails with `TypeError: Cannot read properties of undefined (reading 'includes')` (no `specialistScope` is set today).
 
-10. [ ] Wire measured axes into agent-host. Apply these four edits to `/Users/shooby/Dev/openAGI/src/agent-host.js`.
+10. [ ] Wire measured axes into agent-host. Apply these four edits to `/Users/you/Dev/openAGI/src/agent-host.js`.
 
 Edit 10a — imports. Before (lines 3-4):
 ```js
@@ -1005,16 +1005,16 @@ After (complete replacement function):
 ```
 
 11. [ ] Run the integration test:
-`cd /Users/shooby/Dev/openAGI && node --test test/message-to-signal-axes.test.js`
+`cd /Users/you/Dev/openAGI && node --test test/message-to-signal-axes.test.js`
 Expected: `# pass 2`, `# fail 0`, exit code 0.
 
 12. [ ] Run the full suite (existing handleMessage tests exercise the awaited path with stub runtimes lacking vectorStore/outcomes, and with createDefaultRuntime):
-`cd /Users/shooby/Dev/openAGI && npm test`
+`cd /Users/you/Dev/openAGI && npm test`
 Expected: all test files pass, `# fail 0`. If test/ephemeral-turn.test.js or test/verdict-consequences.test.js fails here, the guards in measureAxes (`typeof vectorStore?.search === "function"`, `memorySystem?.items instanceof Map`, `typeof outcomeStore?.recent === "function"`) were altered — restore them exactly as written in step 3.
 
 13. [ ] Run the axis test once more to confirm both new files pass together:
-`cd /Users/shooby/Dev/openAGI && node --test test/signal-axes.test.js test/message-to-signal-axes.test.js`
+`cd /Users/you/Dev/openAGI && node --test test/signal-axes.test.js test/message-to-signal-axes.test.js`
 Expected: `# pass 9`, `# fail 0`.
 
 14. [ ] Commit the integration:
-`cd /Users/shooby/Dev/openAGI && git add src/agent-host.js test/message-to-signal-axes.test.js && git commit -m "feat(scrutiny): messageToSignal measures axes and derives per-scope specialist signatures (G4, G2)"`
+`cd /Users/you/Dev/openAGI && git add src/agent-host.js test/message-to-signal-axes.test.js && git commit -m "feat(scrutiny): messageToSignal measures axes and derives per-scope specialist signatures (G4, G2)"`
