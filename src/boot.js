@@ -4,6 +4,7 @@ import { createDurableRuntime, createHostedInterface } from "./index.js";
 import { checkBindSafety } from "./auth.js";
 import { hardenDataDir, loadEnvFile } from "./file-utils.js";
 import { resolveDataDir, _resetDataDirCache } from "./data-dir.js";
+import { installMobileSpawnGuard, isMobileProfile } from "./mobile-profile.js";
 
 // Read a single var from an env file WITHOUT importing the rest of its keys.
 function peekEnvVar(file, key) {
@@ -175,6 +176,8 @@ export async function startServer({ host, port } = {}) {
     process.exit(1);
   }
 
+  // Phone daemon: refuse every child_process launch with a clear error.
+  if (isMobileProfile()) installMobileSpawnGuard();
   const runtime = createDurableRuntime({ dataDir });
   const app = createHostedInterface(runtime, { host: resolvedHost, port: resolvedPort });
   const address = await app.listen();

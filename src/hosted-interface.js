@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
+import { attachDeviceModelRelay } from "./device-model-relay.js";
 import { attachVoiceRelay } from "./voice/relay.js";
 import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
@@ -20,7 +21,8 @@ import { createFleetRoute } from "./fleet/routes.js";
 import { createFleetCapability } from "./fleet/remote.js";
 import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
-import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
+import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
+import { applyPersona, personaPath } from "./persona.js";
 import { createRequire } from "node:module";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
@@ -78,6 +80,7 @@ import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 import { MobilePushStore, validatePushRegistration } from "./mobile-push-store.js";
 import { MobilePush } from "./mobile-push.js";
+import { isMobileProfile, mobileRefusedUpgrades, mobileRouteRefusal } from "./mobile-profile.js";
 import {
   SharedConversationError,
   isSharedThread,
@@ -93,6 +96,8 @@ import {
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 43210;
+  // OPENAGI_PROFILE=mobile: phone daemon; see src/mobile-profile.js.
+  const mobileProfile = isMobileProfile();
   // Read these dynamically so the setup wizard can update them mid-flight.
   const getAuthToken = () => options.authToken ?? process.env.OPENAGI_AUTH_TOKEN ?? null;
   const getPublicUrl = () => options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null;
@@ -708,6 +713,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
+    if (mobileProfile) return providers;
     if (codingNodeEnabledHere()) {
       providers.set(CODING_CAPABILITY, codingNodeProvider());
       if (process.platform === "darwin") providers.set("self-fix", selfFixProvider);
@@ -752,7 +758,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return localCapabilityCache;
   };
   const ensureImessageBridge = () => {
-    if (closing) return imessageBridgeRuntime;
+    if (closing || mobileProfile) return imessageBridgeRuntime;
     imessageBridgeRuntime ??= options.imessageBridgeRuntime
       ?? createImessageBridgeRuntime({
         dataDir,
@@ -963,6 +969,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         if (auth.setCookie) extraCookies.push(buildSetCookie(getAuthToken()));
       }
+      const mobileRefusal = mobileProfile ? mobileRouteRefusal(pathname) : null;
+      if (mobileRefusal) return sendJson(res, 409, mobileRefusal);
 
       // Sign-in: server-side cookie set, then redirect. Works without JS.
       // Public route — the token in the body IS the credential.
@@ -1001,6 +1009,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
         } catch { /* swallow */ }
         return sendJson(res, 200, result);
+      }
+      // The phone app's first run names the agent and says what it should
+      // help with. Same persona.md the desktop reads at boot; applied live.
+      if (method === "POST" && pathname === "/persona") {
+        const body = await readJsonLimited(req, 8 * 1024).catch(() => null);
+        const name = typeof body?.name === "string" ? body.name.replace(/[\x00-\x1f\x7f#]/g, "").trim().slice(0, 60) : "";
+        const focus = typeof body?.focus === "string" ? body.focus.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim().slice(0, 600) : "";
+        if (!name) return sendJson(res, 400, { error: "name_required", message: "Give your agent a name." });
+        writeTextAtomic(personaPath(dataDir), `# ${name}\n\nName: ${name}\n${focus ? `\nWhat I help with: ${focus}\n` : ""}`);
+        const applied = applyPersona(runtime, dataDir);
+        return sendJson(res, 200, { name: applied?.name ?? name, focus });
       }
       if (method === "POST" && pathname === "/setup/test") {
         const body = await readJson(req);
@@ -3506,7 +3525,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // into one Realtime session per device; the OpenAI key stays here.
   const voiceSessions = options.voiceSessionFactory ?? createVoiceSessionFactory({ runtime });
   const voiceRelay = attachVoiceRelay({ nodeRegistry, getAuthToken, createSession: (params, io) => voiceSessions.create(params, io) });
-  const speechRelay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channels?.g2, upgrades: [voiceRelay] });
+  // WS /device/model: the phone app's native model bridge (phone-only mode).
+  const deviceModelRelay = attachDeviceModelRelay({ getAuthToken });
+  const speechRelay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channels?.g2, upgrades: mobileProfile ? [...mobileRefusedUpgrades(), deviceModelRelay] : [voiceRelay, deviceModelRelay] });
   const app = {
     runtime,
     channels,
@@ -3522,7 +3543,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve) => {
         server.listen(port, host, () => {
           channels?.start();
-          runtime.codingSupervisor?.start();
+          if (!mobileProfile) runtime.codingSupervisor?.start();
           runtime.fleetSupervisor?.start();
           mobilePush?.start();
           if (tickerMs > 0) {
@@ -3615,6 +3636,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve, reject) => {
         speechRelay.close();
         voiceRelay.close();
+        deviceModelRelay.close();
         approvalContinuationsClosing = true;
         for (const timer of approvalContinuationTimers) clearTimeout(timer);
         approvalContinuationTimers.clear();

@@ -1,5 +1,6 @@
 import { ModelRouter } from "./model-router.js";
 import { ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
+import { OnDeviceModelProvider } from "./on-device-provider.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
 // than these ceilings, but explicit limits keep a broken or hostile compatible
@@ -750,8 +751,10 @@ export function createModelProvider(options = {}) {
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
 
-  // Explicit preference wins. anthropic | openai | auto (default).
+  // Explicit preference wins. anthropic | openai | on-device | auto (default).
   const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
+  // Phone-only mode: the phone's own model, reached through the app's bridge.
+  if (preference === "on-device") return new OnDeviceModelProvider(options.onDevice ?? {});
   if (preference === "openai" && openai.isConfigured()) return openai;
   if (preference === "anthropic" && anthropic.isConfigured()) return anthropic;
 
