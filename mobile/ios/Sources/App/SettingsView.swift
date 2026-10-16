@@ -47,13 +47,26 @@ struct SettingsView: View {
                 .listRowBackground(Theme.canvas)
                 .listRowSeparator(.hidden)
 
+                Text("Workspace")
+                    .font(Theme.Typography.section)
+                    .foregroundStyle(Theme.ink)
+                    .padding(.horizontal, Theme.gutter)
+                    .padding(.top, Theme.Spacing.x4)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
+                WorkspaceSection()
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
+
                 // Onboarding's second step: the agent starts on this iPhone
                 // and can be pointed at a server later, and back again.
                 if model.isOnPhone {
                     if let backup = AppSession.shared.serverBackup {
                         SecondaryTextButton(title: "Switch back to \(backup.server.host ?? "the server")") {
-                            model.detach()
-                            AppSession.shared.switchBackToServer()
+                            Task { await switchBack() }
                         }
                         .padding(.horizontal, Theme.gutter)
                         .listRowInsets(EdgeInsets())
@@ -94,6 +107,11 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
             .background(Theme.canvas)
             .disabled(isWorking)
+            .alert("Still on this iPhone", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(switchError ?? "")
+            }
             .confirmationDialog("Revoke this phone?", isPresented: $showingRevokeConfirmation, titleVisibility: .visible) {
                 Button("Revoke", role: .destructive) { Task { await revoke() } }
                 Button("Cancel", role: .cancel) {}
@@ -137,6 +155,20 @@ struct SettingsView: View {
         isWorking = true
         defer { isWorking = false }
         await model.refreshToday()
+    }
+
+    @State private var switchError: String?
+
+    private func switchBack() async {
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            model.detach()
+            _ = try await AppSession.shared.switchBackToServer()
+        } catch {
+            model.startEventStream()
+            switchError = "Can't reach your Mac yet. Your work stays on this iPhone until it can."
+        }
     }
 
     private func revoke() async {

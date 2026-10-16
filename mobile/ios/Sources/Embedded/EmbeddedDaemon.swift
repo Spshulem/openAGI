@@ -167,14 +167,23 @@ final class EmbeddedDaemon {
     // enrollment and the agent's persona, which a node credential can't reach.
     @discardableResult
     func ownerRequest(path: String, body: [String: Any]) async throws -> [String: Any] {
+        let data = try await ownerRaw(path: path, method: "POST", body: try JSONSerialization.data(withJSONObject: body))
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    // The same, with a raw body and response: the offline copy passes the
+    // Mac's snapshot through untouched.
+    func ownerRaw(path: String, method: String, body: Data? = nil, timeout: TimeInterval = 15) async throws -> Data {
         let port = try await start()
         guard let secrets = EmbeddedSecrets.load() else { throw DaemonError.unauthorized }
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 15
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpMethod = method
+        request.timeoutInterval = timeout
         request.setValue("Bearer \(secrets.ownerToken)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+        }
         let data: Data
         let response: URLResponse
         do {
@@ -184,7 +193,7 @@ final class EmbeddedDaemon {
         }
         guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
         switch http.statusCode {
-        case 200...299: return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        case 200...299: return data
         case 401, 403: throw DaemonError.unauthorized
         default: throw DaemonError.server(http.statusCode)
         }

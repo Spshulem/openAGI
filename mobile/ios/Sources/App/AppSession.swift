@@ -84,10 +84,27 @@ final class AppSession {
         }
     }
 
-    func switchBackToServer() {
-        guard let backup = serverBackup else { return chooseServer() }
-        try? backup.save()
+    // Back to the Mac. What was added here while away goes to it first; if
+    // the Mac still can't be reached, this throws and nothing switches.
+    func switchBackToServer() async throws -> Int {
+        guard let backup = serverBackup else {
+            chooseServer()
+            return 0
+        }
+        let client = DaemonClient(server: backup.server, nodeID: backup.nodeID, token: backup.token)
+        let sent = try await OfflineCopy.shared.sendOfflineWork(to: client)
+        try backup.save()
         paired()
+        Task { await OfflineCopy.shared.sync(from: client, force: true) }
+        return sent
+    }
+
+    // The Mac is unreachable: continue on this iPhone with the offline copy.
+    // No onboarding here: the phone agent takes the Mac agent's name and
+    // instructions from the offline copy.
+    func continueOnPhone() {
+        if let current = Credentials.load(), !current.isEmbedded { try? current.save(to: .server) }
+        Task { await startPhone() }
     }
 
     // Launch (and "Use this iPhone"): bring the embedded daemon up and point

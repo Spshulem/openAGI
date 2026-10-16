@@ -98,6 +98,7 @@ struct PhoneSetupView: View {
         case starting
         case startFailed(String)
         case name
+        case brain
         case notifications
     }
 
@@ -108,6 +109,7 @@ struct PhoneSetupView: View {
     @State private var focus = ""
     @State private var isWorking = false
     @State private var errorText: String?
+    @State private var showingModelSettings = false
 
     var body: some View {
         NavigationStack {
@@ -118,6 +120,7 @@ struct PhoneSetupView: View {
                     case .starting: startingStep
                     case .startFailed(let message): failedStep(message)
                     case .name: nameStep
+                    case .brain: brainStep
                     case .notifications: notificationsStep
                     }
                 }
@@ -129,6 +132,19 @@ struct PhoneSetupView: View {
                     ToolbarItem(placement: .cancellationAction) {
                         Button("Back") { session.goBack() }
                     }
+                }
+            }
+            .sheet(isPresented: $showingModelSettings, onDismiss: { step = .notifications }) {
+                if let credentials {
+                    NavigationStack {
+                        ModelSettingsView()
+                            .toolbar {
+                                ToolbarItem(placement: .confirmationAction) {
+                                    Button("Done") { showingModelSettings = false }
+                                }
+                            }
+                    }
+                    .environment(AppModel(credentials: credentials))
                 }
             }
         }
@@ -150,13 +166,9 @@ struct PhoneSetupView: View {
             PrimaryButton(title: "Open Settings") { openSettings() }
             SecondaryTextButton(title: "Check again") { modelStatus = OnDeviceModelStatus.current() }
         case .unsupported:
-            statusLine("This iPhone can't run OpenAGI's model on its own. It needs iOS 26 and an iPhone 15 Pro or newer.", color: Theme.alert)
-            PrimaryButton(title: "Connect to a server instead") { session.chooseServer() }
-            #if DEBUG
-            // Lets the rest of setup run on a simulator; chat answers then
-            // explain the model is unavailable.
-            SecondaryTextButton(title: "Continue without a model (debug)") { start() }
-            #endif
+            statusLine("This iPhone can't run Apple's on-device model. OpenAGI can still run here with a Claude or OpenAI key, or your ChatGPT plan.", color: Theme.caution)
+            PrimaryButton(title: "Continue with a key or ChatGPT") { start() }
+            SecondaryTextButton(title: "Connect to a server instead") { session.chooseServer() }
         }
     }
 
@@ -193,6 +205,14 @@ struct PhoneSetupView: View {
             .disabled(isWorking || name.trimmingCharacters(in: .whitespaces).isEmpty)
     }
 
+    // Optional: a cloud model makes the agent much more capable (all tools
+    // and skills); without one it uses this iPhone's model.
+    @ViewBuilder private var brainStep: some View {
+        header("Make it smarter", "Add a Claude or OpenAI key, or sign in with ChatGPT, for an agent that can use skills and every tool. Without internet it falls back to this iPhone's model.")
+        PrimaryButton(title: "Add a key or sign in") { showingModelSettings = true }
+        SecondaryTextButton(title: modelStatus == .available ? "Use this iPhone's model for now" : "Skip for now") { step = .notifications }
+    }
+
     @ViewBuilder private var notificationsStep: some View {
         header("Stay in the loop", "Your plan arrives at 8 in the morning and a recap at 6 in the evening.")
         PrimaryButton(title: "Turn on notifications") { requestNotifications() }
@@ -223,7 +243,7 @@ struct PhoneSetupView: View {
                     "name": name.trimmingCharacters(in: .whitespacesAndNewlines),
                     "focus": focus.trimmingCharacters(in: .whitespacesAndNewlines)
                 ])
-                step = .notifications
+                step = .brain
             } catch {
                 errorText = "Couldn't save that. Try again."
             }

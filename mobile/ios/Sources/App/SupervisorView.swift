@@ -36,6 +36,31 @@ struct SupervisorView: View {
     @State private var applied = 0
 
     var body: some View {
+        // The supervisor watches coding agents, CI and builds on a Mac. The
+        // agent on this iPhone has none of those to watch.
+        if model.isOnPhone {
+            NavigationStack {
+                VStack(alignment: .leading, spacing: Theme.Spacing.x4) {
+                    ScreenHeader(title: "Supervisor", host: model.hostLabel, ageMinutes: 0, refreshFailed: false)
+                        .padding(.horizontal, -Theme.gutter)
+                    Text("Supervisor watches the coding agents, pull requests and builds on your Mac.")
+                        .font(Theme.Typography.body)
+                        .foregroundStyle(Theme.ink)
+                    Text("Connect a Mac in Settings to use it. Your agent on this iPhone keeps working either way.")
+                        .font(Theme.Typography.secondary)
+                        .foregroundStyle(Theme.muted)
+                    Spacer()
+                }
+                .padding(.horizontal, Theme.gutter)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.canvas)
+            }
+        } else {
+            fleetBody
+        }
+    }
+
+    private var fleetBody: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Spacing.x6) {

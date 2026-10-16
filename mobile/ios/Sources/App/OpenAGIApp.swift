@@ -98,6 +98,8 @@ struct OpenAGIApp: App {
         }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         Task { _ = await RefreshCoordinator(client: client).refresh() }
+        // Keep the offline copy of the Mac agent fresh (throttled).
+        if !credentials.isEmbedded { Task { await OfflineCopy.shared.sync(from: client) } }
         Task { await PushRegistrar.shared.sync() }
         Task { await SupervisorAnswerSender.clearClosedAlerts(client: client) }
     }
@@ -128,7 +130,11 @@ struct OpenAGIApp: App {
             }
             let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
             let outcome = await RefreshCoordinator(client: client).refresh()
-            if credentials.isEmbedded { await DailyDigestNotifier.refresh(client: client) }
+            if credentials.isEmbedded {
+                await DailyDigestNotifier.refresh(client: client)
+            } else if outcome != .offline && outcome != .unauthorized {
+                await OfflineCopy.shared.sync(from: client)
+            }
             // A push registration that failed earlier retries here too.
             await PushRegistrar.shared.sync()
             switch outcome {
