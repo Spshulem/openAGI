@@ -59,10 +59,8 @@ struct OfflineBanner: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            model.detach()
-            _ = try await AppSession.shared.switchBackToServer()
+            _ = try await AppSession.shared.switchBackToServer(detaching: model)
         } catch {
-            model.startEventStream()
             errorText = "Can't reach your Mac yet. Your work stays on this iPhone until it can."
         }
     }

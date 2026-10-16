@@ -86,13 +86,19 @@ final class AppSession {
 
     // Back to the Mac. What was added here while away goes to it first; if
     // the Mac still can't be reached, this throws and nothing switches.
-    func switchBackToServer() async throws -> Int {
+    // The current screen's model is detached only once the Mac has the work,
+    // so a failed attempt leaves the iPhone agent exactly as it was.
+    func switchBackToServer(detaching current: AppModel? = nil) async throws -> Int {
         guard let backup = serverBackup else {
+            current?.detach()
             chooseServer()
             return 0
         }
         let client = DaemonClient(server: backup.server, nodeID: backup.nodeID, token: backup.token)
         let sent = try await OfflineCopy.shared.sendOfflineWork(to: client)
+        current?.detach()
+        // The Mac's own queued work, parked when the app left it.
+        try? OutboundQueue.parkedForServer().move(to: OutboundQueue())
         try backup.save()
         paired()
         Task { await OfflineCopy.shared.sync(from: client, force: true) }
@@ -121,8 +127,11 @@ final class AppSession {
     }
 
     func paired() {
-        // The active credential is now the server's; no copy is needed.
+        // The active credential is now the server's; no copy is needed, and
+        // any parked work has been restored (switch back) or belongs to a
+        // server this phone no longer uses (a new pairing).
         Credentials.clear(.server)
+        try? OutboundQueue.parkedForServer().clear()
         // A Mac or server sends its own plan and recap.
         DailyDigestNotifier.cancelAll()
         AppMode.current = .server
@@ -139,6 +148,7 @@ final class AppSession {
             Task { await startPhone() }
         } else {
             Credentials.clear(.server)
+            try? OutboundQueue.parkedForServer().clear()
             AppMode.current = nil
             mode = nil
             phase = .welcome

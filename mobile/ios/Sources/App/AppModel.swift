@@ -182,12 +182,20 @@ final class AppModel {
     // Leaves this daemon without revoking: switching between the agent on
     // this iPhone and a server keeps both credentials, but nothing cached
     // from one may show up as the other's.
+    //
+    // Leaving a Mac for the iPhone agent parks the Mac's queued work (task
+    // completions made while it was unreachable) instead of dropping it;
+    // switching back restores it.
     func detach() {
         stopEventStream()
         agentChat.forget()
         supervisorChat.forget()
         try? SnapshotStore().delete()
-        try? OutboundQueue().clear()
+        if credentials.isEmbedded {
+            try? OutboundQueue().clear()
+        } else {
+            try? OutboundQueue().move(to: .parkedForServer())
+        }
     }
 }
 

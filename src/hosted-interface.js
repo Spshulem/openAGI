@@ -24,7 +24,7 @@ import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
 import { applyPersona, personaPath } from "./persona.js";
 import { deleteSkill, listSkills, readSkill, writeSkill } from "./skill-files.js";
-import { handleChatGPTAuthRoute, status as chatgptStatus } from "./chatgpt-auth.js";
+import { handleChatGPTAuthRoute, onChatGPTSignedOut, status as chatgptStatus } from "./chatgpt-auth.js";
 import { createRequire } from "node:module";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
@@ -82,7 +82,7 @@ import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 import { MobilePushStore, validatePushRegistration } from "./mobile-push-store.js";
 import { MobilePush } from "./mobile-push.js";
-import { isMobileProfile, mobileRefusedUpgrades, mobileRouteRefusal } from "./mobile-profile.js";
+import { isMobileProfile, mobileDisabledCronJobs, mobileRefusedUpgrades, mobileRouteRefusal } from "./mobile-profile.js";
 import {
   SharedConversationError,
   isSharedThread,
@@ -117,6 +117,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     const { createModelProvider } = await import("./model-provider.js");
     if (runtime.agentHost) runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
   };
+  // Sign-out (or a refused token refresh) must drop the ChatGPT provider,
+  // or every turn keeps failing with "sign-in needed".
+  const stopSignedOutListener = onChatGPTSignedOut(() => { rebuildModelProvider().catch(() => {}); });
   const modelSettings = () => {
     const active = runtime.agentHost?.modelProvider;
     const inner = active?.primary ?? active;
@@ -2240,8 +2243,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (jobMatch && method === "POST") {
         const body = await readJsonLimited(req, 4 * 1024).catch(() => null);
         if (typeof body?.enabled !== "boolean") return sendJson(res, 400, { error: "enabled_required" });
+        // Jobs the phone profile turns off can't run on a phone.
+        if (body.enabled && mobileProfile && mobileDisabledCronJobs().has(jobMatch[1])) {
+          return sendJson(res, 409, { error: "not_available_on_phone", message: "This job needs a Mac." });
+        }
         try {
-          const job = runtime.cron.updateJob(jobMatch[1], { enabled: body.enabled });
+          // enableJob (not updateJob) recomputes nextRunAt, so turning a job
+          // back on schedules its next run instead of firing it at once.
+          const job = runtime.cron.enableJob(jobMatch[1], body.enabled);
           return sendJson(res, 200, { id: job.id, enabled: job.enabled !== false });
         } catch (error) {
           return sendJson(res, 404, { error: "not_found", message: error.message });
@@ -2256,6 +2265,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const body = await readJsonLimited(req, 16 * 1024).catch(() => null);
           if (!body || typeof body !== "object") return sendJson(res, 400, { error: "invalid_body" });
           const preference = body.preference === undefined ? undefined : String(body.preference).toLowerCase();
+          if (preference === "on-device" && !mobileProfile) {
+            return sendJson(res, 400, { error: "invalid_preference", message: "The on-device model only runs inside the phone app." });
+          }
           if (preference !== undefined && !MODEL_PREFERENCES.includes(preference)) {
             return sendJson(res, 400, { error: "invalid_preference", allowed: MODEL_PREFERENCES });
           }
@@ -3811,6 +3823,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         speechRelay.close();
         voiceRelay.close();
         deviceModelRelay.close();
+        stopSignedOutListener();
         approvalContinuationsClosing = true;
         for (const timer of approvalContinuationTimers) clearTimeout(timer);
         approvalContinuationTimers.clear();

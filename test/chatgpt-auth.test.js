@@ -422,3 +422,17 @@ test("returnTo openagi: callback redirects to the app on success and failure", a
   assert.equal(plain.status, 400);
   assert.match(plain.headers["content-type"], /text\/html/);
 });
+
+test("listeners hear when the ChatGPT tokens go away", async () => {
+  const { onChatGPTSignedOut, signOut } = await import("../src/chatgpt-auth.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-chatgpt-out-"));
+  let heard = 0;
+  const stop = onChatGPTSignedOut(() => { heard += 1; });
+  try {
+    await signOut({ dataDir: dir, fetchImpl: async () => new Response("{}", { status: 200 }) });
+    assert.equal(heard, 1);
+  } finally {
+    stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

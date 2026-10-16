@@ -485,8 +485,19 @@ async function refreshTokens({ dataDir, record, fetchImpl, now }) {
   return next.accessToken;
 }
 
+// Called whenever the tokens go away (sign-out, or a refresh the server
+// refused), so the daemon can stop using the ChatGPT provider.
+const signedOutListeners = new Set();
+export function onChatGPTSignedOut(listener) {
+  signedOutListeners.add(listener);
+  return () => signedOutListeners.delete(listener);
+}
+
 function clearTokens(dataDir) {
   fs.rmSync(chatgptAuthPath(dataDir), { force: true });
+  for (const listener of signedOutListeners) {
+    try { listener(dataDir); } catch { /* a listener can't block sign-out */ }
+  }
 }
 
 // ─── Sign-out and status ─────────────────────────────────────────────────

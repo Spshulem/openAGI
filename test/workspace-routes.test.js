@@ -59,6 +59,8 @@ test("model settings: keys are saved to .env, applied live, and never returned",
   assert.doesNotMatch(fs.readFileSync(path.join(dir, ".env"), "utf8"), /ANTHROPIC_API_KEY/);
 
   assert.equal((await call("POST", "/settings/models", { preference: "gemini" })).status, 400);
+  // The on-device model only exists inside the phone app.
+  assert.equal((await call("POST", "/settings/models", { preference: "on-device" })).status, 400);
   assert.equal((await call("POST", "/settings/models", { openaiKey: "has space" })).status, 400);
 });
 
@@ -104,6 +106,12 @@ test("workspace: scheduled jobs list and toggle", async (t) => {
   assert.ok(job);
   const off = await call("POST", "/workspace/jobs/daily-plan-morning", { enabled: false });
   assert.deepEqual(off.body, { id: "daily-plan-morning", enabled: false });
+  // Turning it back on schedules the next run; it must not fire right away.
+  const on = await call("POST", "/workspace/jobs/daily-plan-morning", { enabled: true });
+  assert.equal(on.body.enabled, true);
+  const rescheduled = (await call("GET", "/workspace/jobs")).body.jobs.find((entry) => entry.id === "daily-plan-morning");
+  assert.ok(new Date(rescheduled.nextRunAt).getTime() > Date.now());
+  await call("POST", "/workspace/jobs/daily-plan-morning", { enabled: false });
   assert.equal((await call("GET", "/workspace/jobs")).body.jobs.find((entry) => entry.id === "daily-plan-morning").enabled, false);
   assert.equal((await call("POST", "/workspace/jobs/nope", { enabled: true })).status, 404);
   assert.equal((await call("POST", "/workspace/jobs/daily-plan-morning", {})).status, 400);
