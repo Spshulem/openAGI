@@ -50,6 +50,16 @@ struct SettingsView: View {
                 // Onboarding's second step: the agent starts on this iPhone
                 // and can be pointed at a server later, and back again.
                 if model.isOnPhone {
+                    if let backup = AppSession.shared.serverBackup {
+                        SecondaryTextButton(title: "Switch back to \(backup.server.host ?? "the server")") {
+                            model.detach()
+                            AppSession.shared.switchBackToServer()
+                        }
+                        .padding(.horizontal, Theme.gutter)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
+                    }
                     SecondaryTextButton(title: "Connect to a server") {
                         model.detach()
                         AppSession.shared.chooseServer()
@@ -59,10 +69,10 @@ struct SettingsView: View {
                     .listRowBackground(Theme.canvas)
                     .listRowSeparator(.hidden)
                 } else {
-                    if AppSession.shared.hasPhoneAgent {
-                        SecondaryTextButton(title: "Use the agent on this iPhone") {
+                    if AppSession.shared.canRunOnPhone {
+                        SecondaryTextButton(title: AppSession.shared.hasPhoneAgent ? "Use the agent on this iPhone" : "Try the agent on this iPhone") {
                             model.detach()
-                            Task { await AppSession.shared.startPhone() }
+                            AppSession.shared.tryPhone()
                         }
                         .padding(.horizontal, Theme.gutter)
                         .listRowInsets(EdgeInsets())
