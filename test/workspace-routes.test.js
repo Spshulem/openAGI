@@ -121,3 +121,33 @@ test("a phone node may reach the workspace and model settings routes, nothing br
     ["PUT", "/workspace/skills/UPPER"], ["DELETE", "/workspace/jobs/x"], ["POST", "/cron"]
   ]) assert.equal(isMobileRouteAllowed(method, route), false, `${method} ${route}`);
 });
+
+test("offline copy over HTTP: Mac snapshot imports on the phone; offline work flows back once", async (t) => {
+  const mac = await withApp(t);
+  await mac.call("PUT", "/workspace/persona", { markdown: "# Pip\n\nName: Pip" });
+  const snapshot = await mac.call("GET", "/mobile/mirror");
+  assert.equal(snapshot.status, 200);
+  assert.equal(snapshot.body.version, 1);
+
+  const phone = await withApp(t);
+  const imported = await phone.call("POST", "/mirror/import", snapshot.body);
+  assert.equal(imported.status, 200);
+  assert.match((await phone.call("GET", "/workspace/persona")).body.markdown, /Pip/);
+
+  const offline = await phone.call("GET", "/mirror/offline");
+  assert.equal(offline.status, 200);
+  const sent = await mac.call("POST", "/mobile/offline-import", offline.body);
+  assert.equal(sent.status, 200);
+  assert.equal((await phone.call("POST", "/mirror/offline/sent", offline.body)).status, 200);
+
+  assert.equal((await phone.call("POST", "/mirror/import", { version: 99 })).status, 400);
+});
+
+test("phone node: offline copy and ChatGPT routes allowed; phone-side import stays owner-only", () => {
+  for (const [method, route] of [["GET", "/mobile/mirror"], ["POST", "/mobile/offline-import"], ["POST", "/auth/chatgpt/start"], ["GET", "/auth/chatgpt/status"], ["POST", "/auth/chatgpt/signout"]]) {
+    assert.equal(isMobileRouteAllowed(method, route), true, `${method} ${route}`);
+  }
+  for (const [method, route] of [["POST", "/mirror/import"], ["GET", "/mirror/offline"], ["POST", "/mirror/offline/sent"]]) {
+    assert.equal(isMobileRouteAllowed(method, route), false, `${method} ${route}`);
+  }
+});

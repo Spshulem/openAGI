@@ -24,6 +24,7 @@ import { resolveDataDir } from "./data-dir.js";
 import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
 import { applyPersona, personaPath } from "./persona.js";
 import { deleteSkill, listSkills, readSkill, writeSkill } from "./skill-files.js";
+import { handleChatGPTAuthRoute, status as chatgptStatus } from "./chatgpt-auth.js";
 import { createRequire } from "node:module";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
@@ -129,7 +130,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       providers: {
         anthropic: { configured: Boolean(process.env.ANTHROPIC_API_KEY), model: process.env.ANTHROPIC_MODEL ?? null },
         openai: { configured: Boolean(process.env.OPENAI_API_KEY), model: process.env.OPENAI_MODEL ?? null },
-        onDevice: { available: isMobileProfile(), connected: Boolean(deviceModelHub?.info) }
+        onDevice: { available: isMobileProfile(), connected: Boolean(deviceModelHub?.info) },
+        chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })()
       }
     };
   };
@@ -2149,6 +2151,40 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, result);
       }
 
+      // Sign in with ChatGPT (src/chatgpt-auth.js). The browser callback is
+      // public (see isPublicRoute); start/status/signout need the owner or
+      // the phone node.
+      if (pathname.startsWith("/auth/") && await handleChatGPTAuthRoute({
+        method, pathname, url, req, res, dataDir, sendJson, readJson,
+        onSignedIn: () => rebuildModelProvider()
+      })) return;
+      // Offline copy of this agent for the phone
+      // (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
+      // On the Mac: a phone pulls a snapshot and sends back what it did
+      // offline, as additions only. On the phone: the app (owner token)
+      // imports the snapshot and reads what to send back.
+      if (["/mobile/mirror", "/mobile/offline-import", "/mirror/import", "/mirror/offline", "/mirror/offline/sent"].includes(pathname)) {
+        const mirror = await import("./mirror.js");
+        try {
+          if (method === "GET" && pathname === "/mobile/mirror") return sendJson(res, 200, mirror.buildMirrorSnapshot(runtime, { dataDir }));
+          if (method === "POST" && pathname === "/mobile/offline-import") {
+            const body = await readJsonLimited(req, MIRROR_BODY_LIMIT);
+            const fromNodeId = mobileNodeRoute && nodeScopedAuth ? requestNodeId : "owner";
+            return sendJson(res, 200, mirror.importOfflineWork(runtime, body, { dataDir, fromNodeId }));
+          }
+          if (method === "POST" && pathname === "/mirror/import") {
+            return sendJson(res, 200, mirror.importMirrorSnapshot(runtime, await readJsonLimited(req, MIRROR_BODY_LIMIT), { dataDir }));
+          }
+          if (method === "GET" && pathname === "/mirror/offline") return sendJson(res, 200, mirror.listOfflineWork(runtime, { dataDir }));
+          if (method === "POST" && pathname === "/mirror/offline/sent") {
+            return sendJson(res, 200, mirror.markOfflineWorkSent(runtime, { dataDir, work: await readJsonLimited(req, MIRROR_BODY_LIMIT) }));
+          }
+        } catch (error) {
+          if (error?.message === "request body too large") return sendJson(res, 413, { error: "mirror_too_large" });
+          if (error?.status) return sendJson(res, error.status, { error: error.code ?? "mirror_error", message: error.message });
+          throw error;
+        }
+      }
       // The phone app's workspace screens: instructions, skills, and what's
       // scheduled. Owner token or a mobile node.
       if (pathname === "/workspace/persona" && method === "GET") {
@@ -4380,13 +4416,15 @@ function readJson(req) {
   });
 }
 
-const MODEL_PREFERENCES = ["auto", "anthropic", "openai", "on-device"];
+const MODEL_PREFERENCES = ["auto", "anthropic", "openai", "chatgpt", "on-device"];
+const MIRROR_BODY_LIMIT = 6 * 1024 * 1024;
 
 function providerKind(provider) {
   const name = provider?.constructor?.name ?? "";
   if (name === "AnthropicProvider") return "anthropic";
   if (name === "OpenAIResponsesProvider") return "openai";
   if (name === "OnDeviceModelProvider") return "on-device";
+  if (name === "ChatGPTPlanProvider") return "chatgpt";
   if (name === "DeterministicModelProvider") return "none";
   return name || null;
 }

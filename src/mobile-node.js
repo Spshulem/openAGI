@@ -93,7 +93,14 @@ const EXACT = new Set([
   "GET /workspace/persona",
   "PUT /workspace/persona",
   "GET /workspace/skills",
-  "GET /workspace/jobs"
+  "GET /workspace/jobs",
+  // The phone's offline copy of this agent, and what it did offline.
+  "GET /mobile/mirror",
+  "POST /mobile/offline-import",
+  // Sign in with ChatGPT on the daemon in this app (phone-only mode).
+  "POST /auth/chatgpt/start",
+  "GET /auth/chatgpt/status",
+  "POST /auth/chatgpt/signout"
 ]);
 
 const PATTERNS = [
