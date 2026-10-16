@@ -72,7 +72,11 @@ final class PushRegistrar {
         SupervisorCategories.register(SupervisorCategories.base())
         // Not awaited: whatever the answer, the device token is asked for. A
         // Live Activity started by push needs no notification permission.
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        // The answer changes `alerts`, so it is reported once given; the sync
+        // below runs before the owner has tapped Allow.
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
+            Task { @MainActor in await PushRegistrar.shared.sync() }
+        }
         UIApplication.shared.registerForRemoteNotifications()
         observeStartTokens()
         observeActivities()
