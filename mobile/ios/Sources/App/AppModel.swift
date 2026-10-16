@@ -70,8 +70,14 @@ final class AppModel {
 
     var statusLine: String {
         if case .unauthorized = lastOutcome { return "Needs re-pairing" }
-        return credentials.server.host ?? credentials.server.absoluteString
+        return isOnPhone ? hostLabel : credentials.server.host ?? credentials.server.absoluteString
     }
+
+    // Phone-only mode: the daemon is the one embedded in this app.
+    var isOnPhone: Bool { credentials.isEmbedded }
+
+    // The connection line names where the agent runs.
+    var hostLabel: String { isOnPhone ? "This iPhone" : credentials.server.host ?? "" }
 
     var ageMinutes: Int { snapshot?.ageInMinutes() ?? 0 }
     var refreshFailed: Bool {
@@ -169,6 +175,17 @@ final class AppModel {
         agentChat.forget()
         supervisorChat.forget()
         Credentials.clear()
+        try? SnapshotStore().delete()
+        try? OutboundQueue().clear()
+    }
+
+    // Leaves this daemon without revoking: switching between the agent on
+    // this iPhone and a server keeps both credentials, but nothing cached
+    // from one may show up as the other's.
+    func detach() {
+        stopEventStream()
+        agentChat.forget()
+        supervisorChat.forget()
         try? SnapshotStore().delete()
         try? OutboundQueue().clear()
     }

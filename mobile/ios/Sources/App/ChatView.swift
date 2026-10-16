@@ -73,7 +73,7 @@ struct ChatConversationView: View {
             }
             HStack(spacing: Theme.Spacing.x1) {
                 ConnectionDot(state: model.isStreamConnected ? .fresh : .stale)
-                Text(model.credentials.server.host ?? "")
+                Text(model.hostLabel)
                     .font(Theme.Typography.dataMono)
                     .foregroundStyle(Theme.muted)
                 Text("·").font(Theme.Typography.caption).foregroundStyle(Theme.muted)

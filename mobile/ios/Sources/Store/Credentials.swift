@@ -89,6 +89,9 @@ public struct Credentials: Sendable, Equatable {
         return Credentials(server: server, nodeID: nodeID, token: token)
     }
 
+    // The daemon embedded in this app (phone-only mode) rather than a Mac.
+    public var isEmbedded: Bool { server.host == "127.0.0.1" }
+
     public static func clear() {
         SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,

@@ -11,7 +11,7 @@ struct TodayView: View {
     var body: some View {
         NavigationStack {
             List {
-                ScreenHeader(title: "Today", host: model.credentials.server.host ?? "",
+                ScreenHeader(title: "Today", host: model.hostLabel,
                             ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
 
                 let visible = model.snapshot?.visibleToday ?? []

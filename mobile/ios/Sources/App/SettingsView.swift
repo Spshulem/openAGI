@@ -1,6 +1,6 @@
 import SwiftUI
 
-// mobile/FEATURES.md's Settings tab: the connection (host, node id, last
+// mobile/FEATURES.md's Settings tab: where the agent runs (this iPhone, or a server), the connection (host, node id, last
 // synced — host and id in mono), refresh now, revoke (confirmation
 // required), and a build version so a bug report can name one. Never
 // renders the token — only the server and node id are shown, matching the
@@ -16,13 +16,19 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                ScreenHeader(title: "Settings", host: model.credentials.server.host ?? "",
+                ScreenHeader(title: "Settings", host: model.hostLabel,
                             ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
 
                 RowGroup {
-                    labeledRow(label: "Server", value: model.credentials.server.absoluteString, mono: true)
-                    RowHairline()
-                    labeledRow(label: "Node ID", value: model.credentials.nodeID, mono: true)
+                    if model.isOnPhone {
+                        labeledRow(label: "Runs on", value: "This iPhone", mono: false)
+                        RowHairline()
+                        labeledRow(label: "Model", value: Self.modelLabel, mono: false)
+                    } else {
+                        labeledRow(label: "Server", value: model.credentials.server.absoluteString, mono: true)
+                        RowHairline()
+                        labeledRow(label: "Node ID", value: model.credentials.nodeID, mono: true)
+                    }
                     RowHairline()
                     labeledRow(label: "Build", value: Self.buildVersion, mono: false)
                 }
@@ -41,14 +47,38 @@ struct SettingsView: View {
                 .listRowBackground(Theme.canvas)
                 .listRowSeparator(.hidden)
 
-                DestructiveTextButton(title: "Revoke this phone") {
-                    showingRevokeConfirmation = true
+                // Onboarding's second step: the agent starts on this iPhone
+                // and can be pointed at a server later, and back again.
+                if model.isOnPhone {
+                    SecondaryTextButton(title: "Connect to a server") {
+                        model.detach()
+                        AppSession.shared.chooseServer()
+                    }
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
+                } else {
+                    if AppSession.shared.hasPhoneAgent {
+                        SecondaryTextButton(title: "Use the agent on this iPhone") {
+                            model.detach()
+                            Task { await AppSession.shared.startPhone() }
+                        }
+                        .padding(.horizontal, Theme.gutter)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
+                    }
+
+                    DestructiveTextButton(title: "Revoke this phone") {
+                        showingRevokeConfirmation = true
+                    }
+                    .disabled(isWorking)
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
                 }
-                .disabled(isWorking)
-                .padding(.horizontal, Theme.gutter)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Theme.canvas)
-                .listRowSeparator(.hidden)
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
@@ -76,6 +106,15 @@ struct SettingsView: View {
         }
         .padding(.horizontal, Theme.Spacing.x4)
         .frame(minHeight: Theme.rowMinHeight)
+    }
+
+    private static var modelLabel: String {
+        switch OnDeviceModelStatus.current() {
+        case .available: return "Apple Intelligence"
+        case .downloading: return "Downloading"
+        case .notEnabled: return "Apple Intelligence is off"
+        case .unsupported: return "Not available"
+        }
     }
 
     private static var buildVersion: String {

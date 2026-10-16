@@ -39,7 +39,7 @@ struct SupervisorView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Spacing.x6) {
-                    ScreenHeader(title: "Supervisor", host: model.credentials.server.host ?? "",
+                    ScreenHeader(title: "Supervisor", host: model.hostLabel,
                                  ageMinutes: syncedAgeMinutes, refreshFailed: lastLoadFailed)
                         .padding(.horizontal, -Theme.gutter)
                     content
