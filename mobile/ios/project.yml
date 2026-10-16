@@ -34,10 +34,22 @@ settings:
     # Developer Team is the only environment that actually proves it. See
     # mobile/ios/Tests/CredentialsTests.swift and mobile/README.md's manual
     # checklist.
+    #
+    # Supervisor push (APNs alerts + push-to-start Live Activities) needs a
+    # real Apple Developer Team: set DEVELOPMENT_TEAM, enable Push
+    # Notifications on the sh.openagi.OpenAGI App ID, and sign with a profile.
+    # The aps-environment entitlement below is declared unconditionally:
+    # ad-hoc ("-") Simulator builds still build and run with it, and without
+    # a team the app simply never completes push registration (it fails
+    # quietly and the rest of the app is unaffected). See mobile/README.md's
+    # "Supervisor push (iOS)" section.
     CODE_SIGNING_ALLOWED: "YES"
     CODE_SIGN_IDENTITY: "-"
     CODE_SIGNING_REQUIRED: "YES"
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    # App Group ids are global across Apple teams; a team that cannot
+    # register this one overrides it (xcodebuild OPENAGI_APP_GROUP=...).
+    OPENAGI_APP_GROUP: group.sh.openagi.mobile
 targets:
   OpenAGI:
     type: application
@@ -48,6 +60,7 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI
+        OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         UILaunchScreen: {}
         CFBundleURLTypes:
           - CFBundleURLName: sh.openagi.pair
@@ -60,14 +73,25 @@ targets:
               NSExceptionAllowsInsecureHTTPLoads: true
         NSLocalNetworkUsageDescription: OpenAGI talks to the daemon on your own machine.
         BGTaskSchedulerPermittedIdentifiers: [sh.openagi.refresh]
-        UIBackgroundModes: [fetch]
+        UIBackgroundModes: [fetch, remote-notification]
+        NSSupportsLiveActivities: true
+        # Self-hosted push relay; empty means https://push.openagi.sh.
+        OpenAGIPushRelay: $(OPENAGI_PUSH_RELAY)
     entitlements:
       path: Sources/OpenAGI.entitlements
       properties:
-        com.apple.security.application-groups: [group.sh.openagi.mobile]
+        com.apple.security.application-groups: [$(OPENAGI_APP_GROUP)]
         keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
+        # Archive/export rewrites this to "production" from the
+        # distribution profile.
+        aps-environment: development
+    settings:
+      base:
+        OPENAGI_PUSH_RELAY: ""
     dependencies:
       - target: OpenAGIWidget
+        embed: true
+      - target: OpenAGINotify
         embed: true
   OpenAGIWidget:
     type: app-extension
@@ -84,12 +108,41 @@ targets:
       path: Widget/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI Today
+        OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     entitlements:
       path: Widget/OpenAGIWidget.entitlements
       properties:
-        com.apple.security.application-groups: [group.sh.openagi.mobile]
+        com.apple.security.application-groups: [$(OPENAGI_APP_GROUP)]
+        keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
+  # Notification Service Extension: decrypts a supervisor alert and adds its
+  # answer buttons. Shares the keychain group (push key) with the app and
+  # widget; compiles only the push files it needs.
+  OpenAGINotify:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Notify
+      - path: Sources/Protocol/PushEnvelope.swift
+      - path: Sources/Protocol/SupervisorPushContent.swift
+      - path: Sources/Store/PushKeyStore.swift
+      - path: Sources/Notifications/SupervisorCategories.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: sh.openagi.OpenAGI.OpenAGINotify
+    info:
+      path: Notify/Info.plist
+      properties:
+        CFBundleDisplayName: OpenAGI Notify
+        OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    entitlements:
+      path: Notify/OpenAGINotify.entitlements
+      properties:
+        com.apple.security.application-groups: [$(OPENAGI_APP_GROUP)]
         keychain-access-groups: [$(AppIdentifierPrefix)sh.openagi.mobile]
   OpenAGITests:
     type: bundle.unit-test

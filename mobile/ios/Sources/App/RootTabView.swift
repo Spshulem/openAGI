@@ -98,6 +98,12 @@ struct RootTabView: View {
             model.startEventStream()
             await model.refreshInboxCounts()
         }
+        .task { await PushRegistrar.shared.start() }
+        .onChange(of: PushRouter.shared.wantsSupervisor, initial: true) { _, wants in
+            guard wants else { return }
+            model.selectedTab = .supervisor
+            PushRouter.shared.wantsSupervisor = false
+        }
         .task(id: incomingPairing?.serverURL) {
             if incomingMatchesCurrent { onDismissIncomingPairing() }
         }

@@ -76,6 +76,8 @@ import { createSelfFixCapability } from "./self-fix/runner.js";
 import { CODING_CAPABILITY, createCodingNodeCapability } from "./coding-supervisor-node.js";
 import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
+import { MobilePushStore, validatePushRegistration } from "./mobile-push-store.js";
+import { MobilePush } from "./mobile-push.js";
 import {
   SharedConversationError,
   isSharedThread,
@@ -323,6 +325,28 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // Proactive outreach mapper subscribes here: it was constructed before the
   // bus existed, so we late-bind the same bus now (mirrors bindEvents above).
   if (runtime.bindOutreachEvents) runtime.bindOutreachEvents(runtime.events);
+
+  // Paired iPhones' push registrations (POST /mobile/push), and the sender
+  // that turns fleet changes into sealed Live Activity updates and alerts.
+  // Registrations are stored even with sending off, so turning it on later
+  // needs no re-pairing.
+  const mobilePushStore = new MobilePushStore({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
+  const mobilePush = runtime.fleetSupervisor && process.env.OPENAGI_PUSH !== "0"
+    ? new MobilePush({
+        store: mobilePushStore,
+        supervisor: runtime.fleetSupervisor,
+        events: runtime.events,
+        relayUrl: process.env.OPENAGI_PUSH_RELAY || undefined,
+        ...(options.pushFetch ? { fetch: options.pushFetch } : {})
+      })
+    : null;
+  // A revoked phone must stop receiving pushes; revocation must not fail on it.
+  const forgetMobilePush = (nodeId) => {
+    mobilePush?.forget(nodeId);
+    try { mobilePushStore.remove(nodeId); } catch (error) {
+      console.warn(`[openagi] could not remove ${nodeId}'s push registration: ${error.message}`);
+    }
+  };
 
   // Mid-run boot note: if the previous process died while a cron job handler
   // was executing, the file-backed scheduler kept a { runningJobId, startedAt }
@@ -1115,6 +1139,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         nodeControlBroker.removeNode(nodeId, "node credential was revoked by the main owner");
         nodeRegistry.revoke(nodeId);
+        forgetMobilePush(nodeId);
         g2Requests?.sweep();
         return sendJson(res, 200, { ok: true, nodeId, revoked: true });
       }
@@ -1374,6 +1399,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         nodeControlBroker.removeNode(requestNodeId, "node credential was revoked");
         nodeRegistry.revoke(requestNodeId);
+        forgetMobilePush(requestNodeId);
         g2Requests?.sweep();
         return sendJson(res, 200, { ok: true, revoked: true });
       }
@@ -1649,6 +1675,23 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return res.end();
         }
         return sendJson(res, 200, payload);
+      }
+      // A paired phone's push registration. The phone's own credential only:
+      // the owner token carries no phone to push to.
+      if ((method === "POST" || method === "DELETE") && pathname === "/mobile/push") {
+        if (requestEnrollment?.platform !== MOBILE_PLATFORM || !nodeScopedAuth) {
+          return sendJson(res, 403, { error: "push registration is for paired phones" });
+        }
+        if (method === "DELETE") {
+          forgetMobilePush(requestNodeId);
+          return sendJson(res, 200, { ok: true });
+        }
+        const checked = validatePushRegistration(await readJsonLimited(req, 4 * 1024).catch(() => null));
+        if (!checked.ok) return sendJson(res, 400, { error: checked.error });
+        const record = mobilePushStore.put(requestNodeId, checked.value);
+        mobilePush?.registrationChanged(requestNodeId);
+        // renew: the relay refused this same pass; the phone should mint a new one.
+        return sendJson(res, 200, { ok: true, renew: record.renew === true });
       }
       if (method === "GET" && pathname === "/brief/today") {
         const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "5", 10);
@@ -3481,6 +3524,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           channels?.start();
           runtime.codingSupervisor?.start();
           runtime.fleetSupervisor?.start();
+          mobilePush?.start();
           if (tickerMs > 0) {
             tickerHandle = setInterval(() => {
               runtime.tick().catch(() => { /* swallow */ });
@@ -3583,6 +3627,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         codingNode?.stop?.();
         selfFixNode?.stop?.();
         runtime.fleetSupervisor?.stop();
+        mobilePush?.stop();
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});

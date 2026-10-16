@@ -213,6 +213,8 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/mobile/summary` | §4 |
+| POST | `/mobile/push` | iOS push registration, §7.1 |
+| DELETE | `/mobile/push` | remove it, §7.1 |
 | GET | `/tasks` | list, with `?queue=&bucket=&status=&limit=` |
 | POST | `/tasks` | create a task |
 | GET | `/tasks/:id` | one task |
@@ -643,9 +645,54 @@ notification/badge on `pending-action` and `clarification-created`; and
 consider `task-reminder` a candidate for a local push notification.
 
 `GET /events` is only practical while the app is foregrounded/backgrounded
-with an active connection (no APNs/FCM push bridge exists in this phase) —
-polling `GET /mobile/summary` on the heartbeat cadence below is the
-foreground-independent fallback for widgets.
+with an active connection. With the app closed, iOS gets the supervisor's
+Live Activity and question alerts over the encrypted push relay (§7.1);
+there is no FCM bridge, and polling `GET /mobile/summary` on the heartbeat
+cadence below stays the fallback for widgets.
+
+### 7.1 Push registration (`POST /mobile/push`, iOS)
+
+```
+POST /mobile/push
+Content-Type: application/json
+Authorization: Bearer <nodeToken>
+X-OpenAGI-Node-ID: <nodeId>
+
+{"pass": "p1.<...>", "key": "<base64url, 32 bytes, no padding>", "env": "sandbox"}
+```
+
+- `pass`: what the relay's `POST /v1/register` returned. Must start with
+  `p1.`, at most 2000 chars. Opaque to the daemon.
+- `key`: the phone's envelope key, base64url without padding, exactly 32
+  bytes. Never sent to the relay.
+- `env`: `sandbox` or `production`.
+- `activities` (optional boolean, default `true`): `false` means alerts only;
+  the daemon never sends a Live Activity start, update or end for this phone.
+  A relay `400 no_live_activity` (a pass registered without a push-to-start
+  token) has the same effect for that pass.
+- `alerts` (optional boolean, default `true`): the phone's notification
+  permission. `false` means no alerts are sent and no question is marked
+  alerted, so turning it back on (re-POST, same pass is fine) alerts the
+  questions still open.
+
+Response `{"ok": true, "renew": false}`; a bad body is `400 {"error": "..."}`.
+`renew: true` means the relay refused this same pass (`bad_pass`,
+`pass_expired` or `pass_revoked`) and the daemon sends nothing with it: mint
+a new pass and POST that (a new pass clears it). Only a paired
+phone's own credential may call it (the owner token gets `403`). The daemon
+keeps one record per phone in `<dataDir>/nodes/push.json` (0600), replacing
+the prior one. Re-POST it on every foreground and background refresh:
+re-POSTing the same `pass` keeps the daemon's record of the Live Activity it
+started and the questions already alerted; a different `pass` resets the
+activity only (the next change starts a new one) and still never re-alerts.
+The started activity is persisted, so a daemon restart updates it rather
+than starting a second one.
+`DELETE /mobile/push` (no body) removes it, and so does revoking the phone
+(§9). Envelope format, plaintexts and relay API:
+`docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md`. The daemon
+sends only when it runs the fleet supervisor and `OPENAGI_PUSH` is not `0`;
+`OPENAGI_PUSH_RELAY` overrides the relay URL (default
+`https://push.openagi.sh`).
 
 ## 8. Heartbeat
 

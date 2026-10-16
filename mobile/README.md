@@ -144,6 +144,57 @@ To try it:
 
 With the switch off, the 15-minute background refresh is the only check.
 
+## Supervisor push (iOS)
+
+iOS cannot keep a live connection in the background, so supervisor alerts
+and the lock-screen Live Activity come by push: daemon → relay (`relay/`,
+a Cloudflare Worker holding the APNs key) → APNs → phone. Everything is
+sealed end to end with a key the phone makes and gives only to its own
+daemon; the relay sees ciphertext. Spec:
+`docs/superpowers/specs/2026-10-15-ios-supervisor-push-design.md`.
+
+Setup (owner, once):
+
+1. **Team.** Set `DEVELOPMENT_TEAM` in `mobile/ios/project.yml`, enable
+   Push Notifications, App Groups (`group.sh.openagi.mobile`) and Keychain
+   Sharing on the `sh.openagi.OpenAGI` App ID and its two extensions
+   (`.OpenAGIWidget`, `.OpenAGINotify`), and sign with a real profile
+   (replace `CODE_SIGN_IDENTITY: "-"` for device builds). The default ad-hoc
+   build still runs on Simulator; push just never registers.
+2. **APNs key.** Create an APNs auth key (.p8) and note its key ID.
+3. **Relay.** Deploy `relay/` and `wrangler secret put` `APNS_KEY_P8`,
+   `APNS_KEY_ID`, `APNS_TEAM_ID`, `PASS_KEY`. The app uses
+   `https://push.openagi.sh`; a self-hosted relay goes in the
+   `OPENAGI_PUSH_RELAY` build setting (Info.plist key `OpenAGIPushRelay`),
+   **and** the daemon must set its `OPENAGI_PUSH_RELAY` env to the same URL.
+   A pass only opens at the relay that issued it, so a mismatch makes every
+   send fail with `bad_pass`.
+   Debug builds register as `sandbox`, Release (TestFlight, App Store) as
+   `production`.
+
+Manual device checklist (needs the setup above and a real iPhone):
+
+- [ ] Pair; allow notifications. The daemon's `<dataDir>/nodes/push.json`
+      gains this node's record within a few seconds.
+- [ ] Kill the app. Start a coding thread; a "Supervisor" Live Activity
+      appears on the lock screen within seconds, with counts and rows.
+- [ ] Change a thread's state; the row updates (about 20 s at most). End
+      every thread; the activity ends about 2 minutes later.
+- [ ] With the phone **locked**, the activity still shows rows, not
+      "Open OpenAGI to refresh" (proves the widget reads the key while
+      locked).
+- [ ] Raise a question: the alert shows the real title, body and one button
+      per option (long-press). Tap one; the alert clears and the question
+      closes on the daemon. Tap Dismiss on another; it is dismissed.
+- [ ] Turn the daemon off, tap an answer: a "Not sent" notice replaces the
+      alert; tapping it opens the Supervisor tab.
+- [ ] Turn Live Activities off for OpenAGI (Settings), reopen the app:
+      `push.json` shows `activities: false`; alerts still arrive.
+- [ ] Delete `push.json` on the daemon, foreground the app: the record comes
+      back with the same pass (no new relay registration).
+- [ ] Settings → Revoke: the activity ends, alerts clear, `push.json` loses
+      the record.
+
 ## The protocol and the fixtures
 
 `mobile/PROTOCOL.md` is the one written contract both apps implement —

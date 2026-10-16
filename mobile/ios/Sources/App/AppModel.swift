@@ -162,6 +162,8 @@ final class AppModel {
     // MARK: - Revoke
 
     func revoke() async {
+        // Before the revoke: the DELETE needs the credential it invalidates.
+        await PushRegistrar.shared.forget(client: client)
         try? await client.revoke()
         stopEventStream()
         agentChat.forget()
