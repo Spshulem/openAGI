@@ -7,7 +7,7 @@ import WidgetKit
 // e.g. Today's "N waiting on you" row jumping to Inbox, per DESIGN.md's
 // "Screens must not be mostly empty" section -- without needing a callback
 // threaded down through every intermediate view.
-enum AppTab: Hashable {
+nonisolated enum AppTab: Hashable, Sendable {
     case today, tasks, inbox, chat, supervisor
 }
 

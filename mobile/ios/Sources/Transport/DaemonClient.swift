@@ -90,6 +90,19 @@ public actor DaemonClient {
         return .fresh(summary, etag: http.value(forHTTPHeaderField: "ETag"))
     }
 
+    // The morning plan and evening recap, for phone-only mode's local
+    // notifications (a Mac sends its own).
+    public func dailyPlan() async throws -> DailyPlanDigest {
+        let request = try authorizedRequest(path: "/plan/daily", method: "GET", queryItems: [URLQueryItem(name: "llm", value: "0")])
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(DailyPlanDigest.self, from: data)
+    }
+
+    public func dailyRecap() async throws -> DailyRecapDigest {
+        let (data, _) = try await perform(try authorizedRequest(path: "/recap/daily", method: "GET"))
+        return try Self.decodeJSON(DailyRecapDigest.self, from: data)
+    }
+
     public func complete(taskID: String) async throws {
         var request = try authorizedRequest(path: "/tasks/\(taskID)/complete", method: "POST")
         request.httpBody = Data(#"{"completedVia":"mobile"}"#.utf8)

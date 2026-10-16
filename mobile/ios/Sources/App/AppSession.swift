@@ -106,6 +106,8 @@ final class AppSession {
     func paired() {
         // The active credential is now the server's; no copy is needed.
         Credentials.clear(.server)
+        // A Mac or server sends its own plan and recap.
+        DailyDigestNotifier.cancelAll()
         AppMode.current = .server
         mode = .server
         initialTab = .today
@@ -134,7 +136,13 @@ enum PhoneAgent {
         let credentials = try await EmbeddedDaemon.shared.localCredentials()
         try credentials.save()
         await connectModel()
+        Task { await refreshDigests(credentials) }
         return credentials
+    }
+
+    static func refreshDigests(_ credentials: Credentials) async {
+        let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+        await DailyDigestNotifier.refresh(client: client)
     }
 
     // Called at bring-up and on every return to the foreground: iOS drops

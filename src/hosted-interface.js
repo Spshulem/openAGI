@@ -3315,7 +3315,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const { computeDailyPlan, renderDailyPlanMarkdown, listQueuedPlanActions } = await import("./daily-planner.js");
         const dateParam = url.searchParams.get("date");
         const date = dateParam ? new Date(dateParam + "T12:00:00") : new Date();
-        const plan = await computeDailyPlan(runtime, { date });
+        // ?llm=0 skips the model: the phone app refreshes its plan
+        // notification often, and each synthesis would run the phone's model.
+        const plan = await computeDailyPlan(runtime, { date, useLLM: url.searchParams.get("llm") !== "0" });
         plan.queuedActions = listQueuedPlanActions(runtime, plan.dateISO);
         return sendJson(res, 200, { plan, markdown: renderDailyPlanMarkdown(plan) });
       }

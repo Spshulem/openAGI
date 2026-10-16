@@ -38,3 +38,19 @@ test("POST /persona writes persona.md and renames the main agent live; requires 
   assert.match(text, /What I help with: Groceries and errands/);
   assert.equal(runtime.agentHost?.store.getAgent?.("main")?.name ?? "Pip evil", "Pip evil");
 });
+
+test("GET /plan/daily?llm=0 builds the plan without the model", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-plan-"));
+  const runtime = createDurableRuntime({ dataDir: dir });
+  let modelCalls = 0;
+  runtime.modelProvider = { generate: async () => { modelCalls += 1; return { text: "{}" }; } };
+  const app = createHostedInterface(runtime, { host: "127.0.0.1", port: 0, tickerMs: 0, dataDir: dir, authToken: "owner" });
+  const listened = await app.listen();
+  t.after(async () => { await app.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const base = listened.url ?? `http://127.0.0.1:${listened.port}`;
+  const res = await fetch(`${base}/plan/daily?llm=0`, { headers: { authorization: "Bearer owner" } });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.plan.synthesized, false);
+  assert.equal(modelCalls, 0);
+});

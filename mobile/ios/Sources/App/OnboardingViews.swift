@@ -194,7 +194,7 @@ struct PhoneSetupView: View {
     }
 
     @ViewBuilder private var notificationsStep: some View {
-        header("Stay in the loop", "Your morning plan, evening recap, and reminders arrive as notifications.")
+        header("Stay in the loop", "Your plan arrives at 8 in the morning and a recap at 6 in the evening.")
         PrimaryButton(title: "Turn on notifications") { requestNotifications() }
         SecondaryTextButton(title: "Not now") { finish() }
     }
@@ -233,6 +233,7 @@ struct PhoneSetupView: View {
     private func requestNotifications() {
         Task {
             _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
+            if let credentials { await PhoneAgent.refreshDigests(credentials) }
             finish()
         }
     }

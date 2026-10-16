@@ -90,7 +90,12 @@ struct OpenAGIApp: App {
     private func refreshNow() {
         guard case .ready(let credentials) = session.phase else { return }
         // iOS drops the model bridge's socket while the app is suspended.
-        if credentials.isEmbedded { Task { await PhoneAgent.connectModel() } }
+        if credentials.isEmbedded {
+            Task {
+                await PhoneAgent.connectModel()
+                await PhoneAgent.refreshDigests(credentials)
+            }
+        }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         Task { _ = await RefreshCoordinator(client: client).refresh() }
         Task { await PushRegistrar.shared.sync() }
@@ -123,6 +128,7 @@ struct OpenAGIApp: App {
             }
             let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
             let outcome = await RefreshCoordinator(client: client).refresh()
+            if credentials.isEmbedded { await DailyDigestNotifier.refresh(client: client) }
             // A push registration that failed earlier retries here too.
             await PushRegistrar.shared.sync()
             switch outcome {

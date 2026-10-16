@@ -119,6 +119,11 @@ struct RootTabView: View {
             model.selectedTab = .supervisor
             PushRouter.shared.wantsSupervisor = false
         }
+        .onChange(of: PushRouter.shared.wantsTab, initial: true) { _, tab in
+            guard let tab else { return }
+            model.selectedTab = tab
+            PushRouter.shared.wantsTab = nil
+        }
         .task(id: incomingPairing?.serverURL) {
             if incomingMatchesCurrent { onDismissIncomingPairing() }
         }
