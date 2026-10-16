@@ -85,12 +85,24 @@ const EXACT = new Set([
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
-  "GET /lifelog/moments"
+  "GET /lifelog/moments",
+  // Phone workspace (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
+  "GET /settings/models",
+  "POST /settings/models",
+  "POST /settings/models/test",
+  "GET /workspace/persona",
+  "PUT /workspace/persona",
+  "GET /workspace/skills",
+  "GET /workspace/jobs"
 ]);
 
 const PATTERNS = [
   { method: "GET", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
+  { method: "GET", re: /^\/workspace\/skills\/[a-z0-9][a-z0-9-]{0,62}$/ },
+  { method: "PUT", re: /^\/workspace\/skills\/[a-z0-9][a-z0-9-]{0,62}$/ },
+  { method: "DELETE", re: /^\/workspace\/skills\/[a-z0-9][a-z0-9-]{0,62}$/ },
+  { method: "POST", re: /^\/workspace\/jobs\/[A-Za-z0-9_.:-]{1,120}$/ },
   { method: "GET", re: new RegExp(`^/tasks/${ID}$`) },
   { method: "PATCH", re: new RegExp(`^/tasks/${ID}$`) },
   { method: "DELETE", re: new RegExp(`^/tasks/${ID}$`) },

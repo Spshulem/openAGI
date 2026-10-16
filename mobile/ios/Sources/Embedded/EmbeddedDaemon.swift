@@ -107,7 +107,6 @@ final class EmbeddedDaemon {
         setenv("PORT", String(port), 1)
         setenv("OPENAGI_TIME_ZONE", TimeZone.current.identifier, 1)
         setenv("TZ", TimeZone.current.identifier, 1)
-        setenv("OPENAGI_PROVIDER", "on-device", 0)
         FileManager.default.changeCurrentDirectoryPath(daemonRoot)
 
         let argv = NodeArguments(["node", "--jitless", entryPath])
