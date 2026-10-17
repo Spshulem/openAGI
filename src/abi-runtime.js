@@ -61,7 +61,7 @@ import { SkillRegistry } from "./skills.js";
 import { registerCoreTools, ToolRegistry } from "./tool-registry.js";
 import { registerDefaultWorkflows, WorkflowRegistry } from "./workflow-registry.js";
 import { applyPersona } from "./persona.js";
-import { createId, nowIso } from "./utils.js";
+import { createId, nowIso, summarizeText } from "./utils.js";
 
 const AUTOPILOT_DEFAULT_PROMPT = `Autopilot pulse. Look at what's recent — sessions, memory, scheduled jobs, MCP tools you have access to.
 Decide if anything needs action right now: a follow-up to send, a memory to record, a schedule to set, a check to run.
@@ -605,8 +605,15 @@ export class AbiRuntime {
   }
 
   processSignal(signal, options = {}) {
+    // Use the same evidence for pre-decision recall and subsequent storage.
+    // Accepted JSON bodies must not collapse to "[object Object]" in queries.
+    const body = signal.content != null && typeof signal.content === "object"
+      ? JSON.stringify(signal.content)
+      : signal.content;
     const workflow = this.workflows.select(signal);
-    const memoryHits = this.memory.retrieve(`${signal.summary} ${signal.content} ${signal.tags?.join(" ") ?? ""}`, {
+    const memoryHits = this.memory.retrieve([signal.summary, body, ...(signal.tags ?? [])]
+      .filter((part) => part != null && part !== "")
+      .join(" "), {
       limit: 6,
       scope: options.scope
     });
@@ -653,7 +660,18 @@ export class AbiRuntime {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
-          content: `${signal.summary}\nDecision: ${scrutiny.action}\nReasons: ${scrutiny.reasons.join(" ")}`,
+          // Put body evidence first so a long summary cannot consume its
+          // compression budget. Normalization may use the summary as the
+          // body fallback; compare using the same normalization and length
+          // limit as integration summaries. Chat summaries can also be a
+          // shorter body prefix; omit that repetition to retain diagnostics.
+          // Preserve the full body regardless of the comparison.
+          content: [body, (
+            summarizeText(body, Infinity).startsWith(summarizeText(signal.summary, Infinity)) ||
+            summarizeText(body, 500) === summarizeText(signal.summary, 500)
+          ) ? null : signal.summary, `Decision: ${scrutiny.action}`, `Reasons: ${scrutiny.reasons.join(" ")}`]
+            .filter((part) => part != null && part !== "")
+            .join("\n"),
           tags: ["signal", signal.domain, signal.taskType, ...(signal.tags ?? [])],
           novelty: signal.novelty,
           risk: signal.risk,
