@@ -1,0 +1,49 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createDurableRuntime } from "../src/abi-runtime.js";
+import { createHostedInterface } from "../src/hosted-interface.js";
+import { GoogleClient } from "../src/integrations/google.js";
+import { HashBagEmbedder } from "../src/embeddings.js";
+
+test("hosted companion routes enforce owner auth and CSRF while webhooks self-authenticate", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "companion-routes-"));
+  const previous = process.env.OPENAGI_AUTH_TOKEN;
+  process.env.OPENAGI_AUTH_TOKEN = "owner-fixture-token";
+  const env = { SENDBLUE_API_KEY: "fixture-key", SENDBLUE_API_SECRET: "fixture-secret", SENDBLUE_WEBHOOK_SECRET: "fixture-hook", SENDBLUE_FROM_NUMBER: "+15555550100", GOOGLE_CLIENT_ID: "client-fixture", GOOGLE_CLIENT_SECRET: "secret-fixture" };
+  const runtime = createDurableRuntime({ dataDir: dir, autoConnectMcp: false, skills: false,
+    modelProvider: { isConfigured: () => true, async generate() { return { text: "Partner fixture answer" }; } }, vectorStoreOptions: { embedder: new HashBagEmbedder() } });
+  runtime.google = new GoogleClient({ env, fetchImpl: () => { throw Error("no live Google calls"); } });
+  let sends = 0;
+  const app = createHostedInterface(runtime, { dataDir: dir, host: "127.0.0.1", port: 0, tickerMs: 0, companionEnv: env, sendblueFetch: async () => { sends++; return Response.json({ status: "QUEUED", message_handle: "sent-fixture" }); } });
+  t.after(async () => {
+    await app.close();
+    await runtime.sessionIndex?.rebuildPromise;
+    runtime.observations?.db?.close(); runtime.vectorStore?.db?.close(); runtime.sessionIndex?.db?.close();
+    if (previous === undefined) delete process.env.OPENAGI_AUTH_TOKEN; else process.env.OPENAGI_AUTH_TOKEN = previous;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const { url } = await app.listen();
+  const owner = { authorization: "Bearer owner-fixture-token", "content-type": "application/json" };
+  for (const route of ["/connections", "/connections/config"]) assert.equal((await fetch(url + route, { redirect: "manual" })).status, 401);
+  assert.equal((await fetch(url + "/sharing/contacts", { method: "POST", headers: { ...owner, origin: "https://stranger.example" }, body: JSON.stringify({ number: "+15555550101" }) })).status, 403);
+  assert.equal((await fetch(url + "/sharing/contacts", { method: "POST", headers: owner, body: JSON.stringify({ number: "+15555550101", name: "Fixture partner" }) })).status, 200);
+  const status = await (await fetch(url + "/connections/config", { headers: owner })).json();
+  assert.equal(status.sharing.contacts.length, 1);
+  assert.equal(JSON.stringify(status).includes("fixture-secret"), false);
+  assert.equal((await fetch(url + "/channels/sendblue/webhook", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 401);
+  const body = { is_outbound: false, from_number: "+15555550101", to_number: "+15555550100", message_handle: "message-fixture", content: "Hi" };
+  const response = await fetch(url + "/channels/sendblue/webhook", { method: "POST", headers: { "content-type": "application/json", "sb-signing-secret": "fixture-hook" }, body: JSON.stringify(body) });
+  assert.equal(response.status, 200); assert.equal((await response.json()).accepted, true); assert.equal(sends, 1);
+  assert.equal(runtime.agentHost.store.listSessions().length, 0);
+  assert.equal((await fetch(url + "/webhooks/pebble", { method: "POST", body: "unsigned" })).status, 401);
+  assert.equal((await fetch(url + "/integrations/google/callback?state=forged&code=fixture")).status, 400);
+  assert.equal(runtime.google.flows.size, 0);
+  const page = await (await fetch(url + "/connections", { headers: owner })).text();
+  assert.match(page, /Partner messaging/); assert.match(page, /Connect Google/); assert.match(page, /Pebble Index/);
+  assert.doesNotThrow(() => new Function(page.match(/<script>([\s\S]*?)<\/script>/)[1]));
+  const connected = await (await fetch(url + "/integrations/status", { headers: owner })).json();
+  for (const id of ["google", "sendblue", "pebble-index"]) assert.equal(connected.integrations.some(item => item.id === id), true);
+});

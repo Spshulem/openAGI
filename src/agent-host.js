@@ -153,6 +153,7 @@ export class AgentHost {
     const output = this.runtime.processSignal(signal, {
       scope: isSpecialist ? `specialist:${agent.id}` : "main",
       parentSpecialistId: isSpecialist ? agent.id : null,
+      allowPropagation: !options.subagentDepth,
       ephemeral
     });
 
@@ -188,6 +189,12 @@ export class AgentHost {
       const scoped = agent.metadata?.specialist?.allowedTools ?? [];
       allowedToolNames = [...new Set([...SPECIALIST_CORE_TOOLS, ...scoped])];
       tools = tools.filter((tool) => allowedToolNames.includes(tool.name));
+    }
+    // Transport-owned delegation bounds apply to every provider, including
+    // providers that rebuild their advertised list from the full registry.
+    if (Array.isArray(options.toolAllowlist)) {
+      allowedToolNames = options.toolAllowlist.filter(name => !allowedToolNames || allowedToolNames.includes(name));
+      tools = tools.filter(tool => allowedToolNames.includes(tool.name));
     }
 
     // Lava intuition (C2): top principles from the vector store inserted into
@@ -315,6 +322,7 @@ export class AgentHost {
         __reason: principal ? `owner instruction via ${principal.via}`
           : toolPolicy === "confirm" ? `scrutiny verdict 'ask' (score ${output.scrutiny.score.toFixed(2)})` : null,
         __allowedTools: allowedToolNames,
+        __subagentDepth: options.subagentDepth ?? 0,
         // Server-built per turn. The model controls only tool names and args;
         // tool results are data and can only taint __turn (ToolRegistry).
         ...(principal ? { __owner: principal, __turn: turnState } : {}),

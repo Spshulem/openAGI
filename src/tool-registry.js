@@ -536,11 +536,11 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "send_message",
-    description: "Proactively send a message to a user via a channel (telegram or local). Use during autopilot pulses or when you decide to reach out unprompted. Returns delivery status.",
+    description: "Send a message via telegram, local, sendblue or sendblue-group. Sendblue recipients/groups must be owner-approved in Connections. API acceptance does not prove device delivery.",
     parameters: {
       type: "object",
       properties: {
-        channel: { type: "string", enum: ["telegram", "local"], description: "Channel to deliver via." },
+        channel: { type: "string", enum: ["telegram", "local", "sendblue", "sendblue-group"], description: "Channel to deliver via." },
         target: { type: "string", description: "Channel target — chat id for Telegram." },
         text: { type: "string", description: "Message body. Keep it short and useful." }
       },

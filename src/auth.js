@@ -57,7 +57,10 @@ export function isPublicRoute(pathname) {
     pathname === "/sign-in" ||
     pathname === "/nodes/enroll/exchange" ||
     pathname === "/channels/telegram/webhook" ||
-    pathname === "/webhooks/buildbetter"
+    pathname === "/webhooks/buildbetter" ||
+    pathname === "/channels/sendblue/webhook" ||
+    pathname === "/webhooks/pebble" ||
+    pathname === "/integrations/google/callback"
   );
 }
 

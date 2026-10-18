@@ -21,6 +21,8 @@ import { registerIMessagePoller } from "./integrations/imessage-poller.js";
 import { registerBuildBetterTaskSource } from "./integrations/buildbetter-tasks.js";
 import { registerCalendarIntegration } from "./integrations/calendar.js";
 import { registerWebSearchTools } from "./integrations/web-search.js";
+import { GoogleClient, registerGoogleTools } from "./integrations/google.js";
+import { registerSubagentTools } from "./subagent-tools.js";
 import { VocaleoClient, registerVocaleoTools } from "./integrations/vocaleo.js";
 import { registerImessageSearchTool } from "./integrations/imessage-search-tool.js";
 import { createEmbedder } from "./embeddings.js";
@@ -546,6 +548,7 @@ export class AbiRuntime {
         intervalMs: 60 * 60 * 1000
       });
       registerCoreTools(this.tools, this);
+      registerSubagentTools(this.tools, this);
       registerCodingSupervisorTools(this.tools, this.codingSupervisor);
       // Read-only fleet_status / fleet_thread. this.fleetSupervisor is
       // constructed above, before this block runs.
@@ -575,6 +578,8 @@ export class AbiRuntime {
       // Calendar via secret ICS feed — env-gated on CALENDAR_ICS_URL.
       // Feeds reconciliation ("did the meeting happen?") + daily planner.
       registerCalendarIntegration(this);
+      this.google = options.googleClient ?? new GoogleClient();
+      registerGoogleTools(this.tools, this.google);
       // Linear is env-gated — silently no-ops if LINEAR_API_KEY isn't set.
       registerLinearTaskSource(this);
       // BuildBetter is env-gated too. Needs BUILDBETTER_API_KEY plus either
@@ -621,7 +626,7 @@ export class AbiRuntime {
     const parentSpecialistId = options.parentSpecialistId ?? null;
     const propagationDecision = this.propagation.shouldPropagate({ signal, scrutiny, memoryHits, parentSpecialistId });
     const propagated =
-      propagationDecision.decision && scrutiny.action !== "ignore"
+      options.allowPropagation !== false && propagationDecision.decision && scrutiny.action !== "ignore"
         ? this.propagation.propagate({
             signal,
             workflow,

@@ -34,6 +34,7 @@ import {
   verifyBuildBetterWebhook
 } from "./auth.js";
 import { ChannelManager } from "./channels.js";
+import { createCompanionRoutes } from "./companion-routes.js";
 import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
 import {
@@ -114,11 +115,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       ? new ChannelManager({
           agentHost: runtime.agentHost,
           runtime,
-          dir: options.channelsDir,
+          dir: options.channelsDir ?? path.join(dataDir, "channels"),
           telegramToken: options.telegramToken,
+          env: options.companionEnv,
+          sendblueFetch: options.sendblueFetch,
           nodeRegistry
         })
       : null);
+  const companionRoutes = createCompanionRoutes({ runtime, dataDir, getChannels: () => channels, env: options.companionEnv,
+    getOrigin: () => getPublicUrl() ? new URL(getPublicUrl()).origin : `http://127.0.0.1:${server.address()?.port ?? port}` });
   const nodeControlBroker = options.nodeControlBroker ?? new NodeControlBroker(options.nodeControlOptions);
   const localIdentity = readOrCreateIdentity(dataDir);
   let localCapabilityCache = [];
@@ -1713,6 +1718,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         console.log(`[openagi] telegram pairing code ${issued.code} (valid 10 min, single use) — send "/pair ${issued.code}" to the bot`);
         return sendJson(res, 200, issued);
       }
+      if (await companionRoutes(req, res, url)) return;
       if (method === "GET" && pathname === "/tools") return sendJson(res, 200, runtime.tools.list());
 
       if (method === "GET" && pathname === "/events") return handleSse(req, res, sseClients);
@@ -2617,6 +2623,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           };
         };
         const integrations = [
+          { id: "google", name: "Gmail & Google Calendar", description: "Read mail and events; authorize drafts, sends and invitations.", paths: [{ kind: "connection", label: "Google OAuth", configured: Boolean(runtime.google?.status().configured), detail: "Connect your account and manage its consent in Connections." }] },
+          { id: "sendblue", name: "Partner messaging", description: "Dedicated agent iMessage/SMS number with separate partner and group memory.", paths: [{ kind: "connection", label: "Sendblue", configured: Boolean(channels?.sendblue?.status().configured), detail: "Configure the number, webhook and approved contacts in Connections." }] },
+          { id: "pebble-index", name: "Pebble Index", description: "Signed voice memos into memory and reminder tasks.", paths: [{ kind: "connection", label: "Index 01 webhook", configured: Boolean(process.env.PEBBLE_WEBHOOK_SECRET), detail: "Configure the signed transcription webhook in Connections." }] },
           {
             id: "linear",
             name: "Linear",
@@ -7396,6 +7405,7 @@ async function renderChannels() {
   main.innerHTML = \`
     <div class="pane">
       <h2>Channels</h2>
+      <p><a href="/connections">Partner messaging, Gmail, Google Calendar &amp; Pebble setup →</a></p>
       \${tunnelBlock}
       <div class="grid two" style="margin-top:12px;">
         <div class="card"><div class="name">Local · \${ch.local?.mode ?? ""}</div><div class="desc">Browser HTTP + SSE.</div></div>
@@ -8064,7 +8074,9 @@ async function renderIntegrations() {
       : '<span class="badge muted">non-MCP</span>';
     let actions = "";
     let editForm = "";
-    if (p.kind === "api" && p.envKeys?.length > 0) {
+    if (p.kind === "connection") {
+      actions = '<a href="/connections">Open Connections →</a>';
+    } else if (p.kind === "api" && p.envKeys?.length > 0) {
       const formId = \`form-\${it.id}-\${p.kind}\`;
       const editLabel = p.configured ? "Edit credentials" : "+ Add credentials";
       actions = \`<button class="edit-creds-btn" data-form-id="\${formId}" style="font-size:11px; padding:3px 8px;">\${editLabel}</button>\`;
