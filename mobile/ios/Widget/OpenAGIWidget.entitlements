@@ -4,7 +4,7 @@
 <dict>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.sh.openagi.mobile</string>
+		<string>$(OPENAGI_APP_GROUP)</string>
 	</array>
 	<key>keychain-access-groups</key>
 	<array>

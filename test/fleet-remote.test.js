@@ -514,3 +514,24 @@ test('remote Antigravity thread requests reach the supervisor with the broker de
     await assert.rejects(capability.invoke('request', { method: 'GET', path: '/fleet/api/threads/' + key }), /Unsupported fleet request/);
   }
 });
+
+test('a remote refresh emits "fleet" once per new snapshot or question set, not when unchanged', async t => {
+  const { remote, runtime, state } = fixture(t);
+  const emitted = [];
+  runtime.events = { emit: (name, data) => emitted.push([name, data]) };
+  state.snapshot = { at: '2026-10-15T12:00:00.000Z', threads: [], counts: { threads: 0 } };
+  await remote.refresh();
+  assert.deepEqual(emitted, [['fleet', { at: '2026-10-15T12:00:00.000Z', reason: 'remote-refresh', counts: { threads: 0 } }]]);
+  await remote.refresh();
+  assert.equal(emitted.length, 1);
+  state.questions = [];
+  await remote.refresh();
+  assert.equal(emitted.length, 2);
+  state.snapshot = { ...state.snapshot, at: '2026-10-15T12:01:00.000Z' };
+  await remote.refresh();
+  await remote.refresh();
+  assert.equal(emitted.length, 3);
+  runtime.events = { emit: () => { throw new Error('listener'); } };
+  state.questions = [{ id: 'fq_two', title: 'x', options: [] }];
+  await remote.refresh();
+});

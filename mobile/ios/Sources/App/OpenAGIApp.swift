@@ -5,6 +5,8 @@ import SwiftUI
 struct OpenAGIApp: App {
     static let refreshTaskIdentifier = "sh.openagi.refresh"
 
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     @State private var credentials: Credentials?
     @State private var pendingPairing: PairingPayload?
     @Environment(\.scenePhase) private var scenePhase
@@ -49,6 +51,11 @@ struct OpenAGIApp: App {
                 }
             }
             .onOpenURL { url in
+                // The Live Activity's tap target.
+                if url.scheme == "openagi", url.host == "supervisor" {
+                    PushRouter.shared.openSupervisor()
+                    return
+                }
                 guard let payload = PairingPayload(url: url) else { return }
                 pendingPairing = payload
             }
@@ -69,6 +76,8 @@ struct OpenAGIApp: App {
         guard let credentials else { return }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         Task { _ = await RefreshCoordinator(client: client).refresh() }
+        Task { await PushRegistrar.shared.sync() }
+        Task { await SupervisorAnswerSender.clearClosedAlerts(client: client) }
     }
 
     // MARK: - Background refresh
@@ -92,6 +101,8 @@ struct OpenAGIApp: App {
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         let refreshTask = Task {
             let outcome = await RefreshCoordinator(client: client).refresh()
+            // A push registration that failed earlier retries here too.
+            await PushRegistrar.shared.sync()
             switch outcome {
             case .updated, .unchanged:
                 task.setTaskCompleted(success: true)
