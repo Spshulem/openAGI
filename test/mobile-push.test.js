@@ -502,6 +502,67 @@ test("alerts: false sends no alerts and marks nothing notified; turning it on al
   assert.deepEqual(h.sent.map((s) => s.collapseId), ["fq1"]);
 });
 
+test("closed questions are pruned while alerts are disabled so reopening alerts again", async (t) => {
+  const h = harness(t, { questions: [question("fq1")] });
+  t.after(() => h.push.stop());
+  await h.push.flush();
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox", alerts: false });
+  h.state.questions = [];
+  await h.push.flush();
+  assert.deepEqual(h.store.get(NODE).notified, []);
+  h.state.questions = [question("fq1")];
+  await h.push.flush();
+  assert.equal(h.sent.length, 1, "disabled alerts neither send nor mark a reopened question");
+  h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox", alerts: true });
+  await h.push.flush();
+  assert.deepEqual(h.sent.map((s) => s.collapseId), ["fq1", "fq1"]);
+});
+
+test("a close and reopen inside the debounce window alerts again", async (t) => {
+  const h = harness(t, { questions: [question("fq1")] });
+  t.after(() => h.push.stop());
+  await h.push.flush();
+  h.state.questions = [];
+  h.events.emit("fleet");
+  h.state.questions = [question("fq1")];
+  h.events.emit("fleet");
+  assert.equal(h.sent.length, 1, "delivery remains debounced");
+  await h.advance(PUSH_TIMING.debounceMs);
+  assert.deepEqual(h.sent.map((s) => s.collapseId), ["fq1", "fq1"]);
+});
+
+test("failed activity starts and updates retry on a quiet fleet", async (t) => {
+  for (const failure of [new Error("network down"), { __status: 429, ok: false }, { __status: 503, ok: false }]) {
+    await t.test(failure instanceof Error ? "network" : String(failure.__status), async (t) => {
+      const h = harness(t, { threads: [thread("codex:a", "working")] });
+      t.after(() => h.push.stop());
+      h.setReply(() => failure);
+      await h.push.flush();
+      assert.equal(h.store.get(NODE).activity, null);
+      await h.advance(30 * SEC - 1);
+      assert.deepEqual(h.types(), ["activity-start"]);
+      h.setReply(() => ({ ok: true }));
+      await h.advance(1);
+      assert.deepEqual(h.types(), ["activity-start", "activity-start"]);
+      assert.ok(h.store.get(NODE).activity);
+      await h.advance(30 * SEC);
+      h.state.snapshot.threads[0].title = "Changed while the relay is down";
+      h.setReply(() => failure);
+      await h.push.flush();
+      assert.equal(h.types().at(-1), "activity-update");
+      const before = h.sent.length;
+      await h.advance(30 * SEC - 1);
+      assert.equal(h.sent.length, before);
+      h.setReply(() => ({ ok: true }));
+      await h.advance(1);
+      assert.equal(h.sent.length, before + 1);
+      assert.equal(h.open(h.sent.at(-1)).rows[0].title, "Changed while the relay is down");
+      await h.push.flush();
+      assert.equal(h.sent.length, before + 1, "successful retry commits the content hash");
+    });
+  }
+});
+
 test("a gone for an old pass does not delete the phone's new registration", async (t) => {
   const h = harness(t, { questions: [question("fq1")] });
   h.setReply((body) => {

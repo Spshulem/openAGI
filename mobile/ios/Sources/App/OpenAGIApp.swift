@@ -99,19 +99,40 @@ struct OpenAGIApp: App {
             return
         }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+        let completion = BackgroundRefreshCompletion { success in task.setTaskCompleted(success: success) }
         let refreshTask = Task {
             let outcome = await RefreshCoordinator(client: client).refresh()
+            guard !Task.isCancelled else { completion.finish(success: false); return }
             // A push registration that failed earlier retries here too.
             await PushRegistrar.shared.sync()
+            guard !Task.isCancelled else { completion.finish(success: false); return }
             switch outcome {
             case .updated, .unchanged:
-                task.setTaskCompleted(success: true)
+                completion.finish(success: true)
             case .unauthorized, .offline:
-                task.setTaskCompleted(success: false)
+                completion.finish(success: false)
             }
         }
         task.expirationHandler = {
             refreshTask.cancel()
+            completion.finish(success: false)
         }
+    }
+}
+
+// Expiration and the async work can race. Report completion once, including
+// immediately on expiration rather than after a cancelled network call exits.
+final class BackgroundRefreshCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completion: (@Sendable (Bool) -> Void)?
+
+    init(_ completion: @escaping @Sendable (Bool) -> Void) { self.completion = completion }
+
+    func finish(success: Bool) {
+        let callback = lock.withLock {
+            defer { completion = nil }
+            return completion
+        }
+        callback?(success)
     }
 }

@@ -28,5 +28,41 @@ jobs:
             -scheme OpenAGI \
             -configuration Debug \
             -destination "platform=iOS Simulator,id=$simulator_id" \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
+            -resultBundlePath "$RUNNER_TEMP/OpenAGI-tests.xcresult" \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_ALLOWED=YES
+      - name: Package simulator app
+        run: |
+          ditto -c -k --keepParent \
+            "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app" \
+            "$RUNNER_TEMP/OpenAGI-simulator.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-simulator-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/OpenAGI-simulator.zip
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OpenAGI-test-results-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/OpenAGI-tests.xcresult
+          retention-days: 7
+      - name: Build device app for local signing and QA
+        working-directory: mobile/ios
+        run: |
+          xcodebuild build \
+            -project OpenAGI.xcodeproj \
+            -scheme OpenAGI \
+            -configuration Debug \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios-device" \
+            CODE_SIGNING_ALLOWED=NO
+          ditto -c -k --keepParent \
+            "$RUNNER_TEMP/openagi-ios-device/Build/Products/Debug-iphoneos/OpenAGI.app" \
+            "$RUNNER_TEMP/OpenAGI-device-unsigned.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-device-unsigned-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/OpenAGI-device-unsigned.zip
+          retention-days: 7

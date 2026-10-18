@@ -1,6 +1,7 @@
 import UIKit
 import UserNotifications
 import XCTest
+import os
 @testable import OpenAGI
 
 // The HTTP side of push: what a button tap sends to the daemon, how its
@@ -365,6 +366,79 @@ final class SupervisorPushRequestTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedRenewalSaveDoesNotStartAnotherDaemonRequest() async throws {
+        let suite = "push-renew-test-\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.set("device", forKey: "push.deviceToken")
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            Credentials.clear(); PushPassStore.clear(); PushKeyStore.clear()
+        }
+        try Credentials(server: URL(string: "https://daemon.example.com")!, nodeID: "mobile:renew", token: "token").save()
+        let signature = PushRegistrar.signature(deviceToken: "device", startToken: nil, env: PushRegistrar.env,
+                                                 relay: PushRelayClient.configuredURL())
+        XCTAssertTrue(PushPassStore.save(.init(pass: "p1.fresh.pass", signature: signature, mintedAt: Date())))
+        let requests = OSAllocatedUnfairLock(initialState: 0)
+        StubProtocol.handler = { request in
+            requests.withLock { $0 += 1 }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    Data(#"{"ok":true,"renew":true}"#.utf8))
+        }
+        var writes = 0
+        let session = stubSession
+        defer { session.invalidateAndCancel() }
+        let registrar = PushRegistrar(defaults: defaults, session: session, savePass: { _ in writes += 1; return false })
+        let finished = expectation(description: "failed persistence stops immediate renewal")
+        let syncing = Task { await registrar.sync(); finished.fulfill() }
+        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 2)
+        syncing.cancel()
+        XCTAssertEqual(result, .completed)
+        XCTAssertEqual(writes, 1)
+        XCTAssertEqual(requests.withLock { $0 }, 1)
+        XCTAssertNotNil(PushPassStore.load()?.mintedAt, "the durable previous record remains intact")
+    }
+
+    @MainActor
+    func testBackgroundCancellationStopsAnAwaitedPushRegistration() async throws {
+        let suite = "push-cancel-test-\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.set("device", forKey: "push.deviceToken")
+        let started = expectation(description: "relay registration started")
+        let stopped = expectation(description: "relay registration cancelled")
+        let finished = expectation(description: "background synchronization returned")
+        SuspendedPushSyncProtocol.started = started
+        SuspendedPushSyncProtocol.stopped = stopped
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SuspendedPushSyncProtocol.self]
+        let session = URLSession(configuration: config)
+        defer {
+            session.invalidateAndCancel()
+            defaults.removePersistentDomain(forName: suite)
+            Credentials.clear(); PushPassStore.clear(); PushKeyStore.clear()
+            SuspendedPushSyncProtocol.started = nil; SuspendedPushSyncProtocol.stopped = nil
+        }
+        PushPassStore.clear()
+        try Credentials(server: URL(string: "https://daemon.example.com")!, nodeID: "mobile:cancel", token: "token").save()
+        let registrar = PushRegistrar(defaults: defaults, session: session)
+        let refreshing = Task { await registrar.sync(); finished.fulfill() }
+        let entered = await XCTWaiter.fulfillment(of: [started], timeout: 2)
+        refreshing.cancel()
+        XCTAssertEqual(entered, .completed)
+        let cancelled = await XCTWaiter.fulfillment(of: [stopped, finished], timeout: 2)
+        XCTAssertEqual(cancelled, .completed)
+        XCTAssertNil(PushPassStore.load(), "cancelled registration cannot persist or post a pass")
+    }
+
+    func testBackgroundRefreshExpirationCompletesOnlyOnce() {
+        let outcomes = OSAllocatedUnfairLock(initialState: [Bool]())
+        let completion = BackgroundRefreshCompletion { success in outcomes.withLock { $0.append(success) } }
+        completion.finish(success: false)
+        completion.finish(success: true)
+        completion.finish(success: false)
+        XCTAssertEqual(outcomes.withLock { $0 }, [false])
+    }
+
+    @MainActor
     func testForgettingDoesNotWaitForUnresponsivePushCleanup() async throws {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [UnresponsivePushCleanupProtocol.self]
@@ -449,6 +523,15 @@ private final class UnresponsivePushCleanupProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+private final class SuspendedPushSyncProtocol: URLProtocol {
+    nonisolated(unsafe) static var started: XCTestExpectation?
+    nonisolated(unsafe) static var stopped: XCTestExpectation?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() { Self.started?.fulfill() }
+    override func stopLoading() { Self.stopped?.fulfill() }
 }
 
 // The push key runs through the real keychain in the xctest host, same as

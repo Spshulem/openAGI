@@ -62,6 +62,8 @@ final class PushRegistrar {
     }
 
     private let defaults: UserDefaults
+    private let session: URLSession
+    private let savePass: (PushPassStore.Stored) -> Bool
     private var startTokenTask: Task<Void, Never>?
     private var activityTask: Task<Void, Never>?
     // Order this process first saw each activity in; the newest one is kept.
@@ -76,8 +78,11 @@ final class PushRegistrar {
     // them in that window.
     private var forgottenNodeIDs: Set<String> = []
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, session: URLSession = .shared,
+         savePass: @escaping (PushPassStore.Stored) -> Bool = PushPassStore.save) {
         self.defaults = defaults
+        self.session = session
+        self.savePass = savePass
     }
 
     // Called once a pairing exists (RootTabView appears). Safe to call again.
@@ -157,9 +162,14 @@ final class PushRegistrar {
     // Overlapping calls fold into one follow-up run instead of racing two
     // relay registrations.
     func sync() async {
+        guard !Task.isCancelled else { return }
         if let running = syncTask {
             syncAgain = true
-            await running.value
+            await withTaskCancellationHandler {
+                await running.value
+            } onCancel: {
+                running.cancel()
+            }
             return
         }
         let task = Task { [weak self] in
@@ -170,23 +180,27 @@ final class PushRegistrar {
             } while self.syncAgain && !Task.isCancelled
         }
         syncTask = task
-        await task.value
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
         syncTask = nil
     }
 
     private func syncOnce() async {
         let started = generation
-        guard let credentials = Credentials.load(), !forgottenNodeIDs.contains(credentials.nodeID) else { return }
+        guard !Task.isCancelled, let credentials = Credentials.load(), !forgottenNodeIDs.contains(credentials.nodeID) else { return }
         // Checked after every await: forget() may have run meanwhile.
         func stillCurrent() -> Bool {
-            Self.isCurrent(started: started, now: generation, startedNodeID: credentials.nodeID,
+            !Task.isCancelled && Self.isCurrent(started: started, now: generation, startedNodeID: credentials.nodeID,
                            currentNodeID: Credentials.load()?.nodeID, forgotten: forgottenNodeIDs)
         }
         let deviceToken = defaults.string(forKey: Keys.deviceToken)
         // Live Activities switched off in Settings: register as alerts-only
         // rather than hand the relay a token that can start nothing.
         let startToken = ActivityAuthorizationInfo().areActivitiesEnabled ? defaults.string(forKey: Keys.startToken) : nil
-        let relay = PushRelayClient()
+        let relay = PushRelayClient(session: session)
         let signature = deviceToken.map {
             Self.signature(deviceToken: $0, startToken: startToken, env: Self.env, relay: relay.base)
         }
@@ -219,7 +233,7 @@ final class PushRegistrar {
             // Saved before the daemon step, so a failed POST retries with it.
             // Not durable means the next run mints yet another channel, so the
             // fresh one is retired and nothing is posted.
-            guard PushPassStore.save(current) else {
+            guard savePass(current) else {
                 try? await relay.unregister(pass: fresh)
                 return
             }
@@ -229,14 +243,14 @@ final class PushRegistrar {
         // Re-read every sync: turning notifications on later flips it.
         let alerts = Self.alertsAllowed(await Self.notificationAuthorization())
         guard stillCurrent(), let key = try? PushKeyStore.loadOrCreate() else { return }
-        let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+        let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token, session: session)
         // Activities on the lock screen now belong to the pass being retired;
         // taken before the daemon learns the new pass and can start another.
         if current.retire != nil, current.retiringActivityIDs == nil {
             // Persist the snapshot before the daemon can start a new activity.
             // A retry, including after relaunch, must never end that new one.
             current.retiringActivityIDs = Activity<SupervisorActivityAttributes>.activities.map(\.id)
-            guard PushPassStore.save(current) else { return }
+            guard savePass(current) else { return }
         }
         let oldActivityIDs = Set(current.retiringActivityIDs ?? [])
         // A failure here is retried on the next sync with the same pass.
@@ -253,13 +267,13 @@ final class PushRegistrar {
             guard stillCurrent() else { return }
             current.retire = nil
             current.retiringActivityIDs = nil
-            guard PushPassStore.save(current) else { return }
+            guard savePass(current) else { return }
         }
         if Self.shouldRenew(daemonSaysRenew: result.renew, justMinted: minted) {
             // Persisted as "too old", so the next run (now, or after a kill)
             // mints a fresh pass.
             current.mintedAt = nil
-            PushPassStore.save(current)
+            guard savePass(current) else { return }
             syncAgain = true
         }
     }

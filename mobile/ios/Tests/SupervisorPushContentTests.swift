@@ -113,6 +113,31 @@ final class SupervisorPushContentTests: XCTestCase {
         XCTAssertEqual(replaced.map(\.identifier), ["SUPERVISOR_QUESTION"])
     }
 
+    func testConcurrentAlertRegistrationsKeepEveryOptionCategoryBeforeDelivery() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let center = UNUserNotificationCenter.current()
+        defer {
+            center.setNotificationCategories([])
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let identifiers = Set((0..<8).map { "sq.concurrent.\($0)" })
+        let registered = expectation(description: "all concurrent categories registered")
+        registered.expectedFulfillmentCount = identifiers.count
+        for identifier in identifiers {
+            let category = UNNotificationCategory(identifier: identifier, actions: [], intentIdentifiers: [])
+            SupervisorCategories.register(category, center: center, coordinationDirectory: directory) { registered.fulfill() }
+        }
+        let registration = await XCTWaiter.fulfillment(of: [registered], timeout: 5)
+        XCTAssertEqual(registration, .completed)
+        let verified = expectation(description: "all categories retained before their notifications are delivered")
+        center.getNotificationCategories { categories in
+            XCTAssertTrue(identifiers.isSubset(of: Set(categories.map(\.identifier))))
+            verified.fulfill()
+        }
+        let verification = await XCTWaiter.fulfillment(of: [verified], timeout: 2)
+        XCTAssertEqual(verification, .completed)
+    }
+
     // MARK: - Tap → action
 
     private let defaultID = UNNotificationDefaultActionIdentifier

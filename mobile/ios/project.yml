@@ -131,6 +131,7 @@ targets:
       - path: Sources/Protocol/PushEnvelope.swift
       - path: Sources/Protocol/SupervisorPushContent.swift
       - path: Sources/Store/PushKeyStore.swift
+      - path: Sources/Store/SharedContainer.swift
       - path: Sources/Notifications/SupervisorCategories.swift
     settings:
       base:
@@ -139,6 +140,7 @@ targets:
       path: Notify/Info.plist
       properties:
         CFBundleDisplayName: OpenAGI Notify
+        OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service

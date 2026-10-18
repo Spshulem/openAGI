@@ -1,0 +1,28 @@
+name: Push relay
+
+on:
+  pull_request:
+    paths:
+      - "relay/**"
+      - ".github/workflows/push-relay.yml"
+  push:
+    branches: [main]
+    paths:
+      - "relay/**"
+      - ".github/workflows/push-relay.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - run: npm test
+        working-directory: relay
