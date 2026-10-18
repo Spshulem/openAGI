@@ -1,3 +1,4 @@
+import { redactFailureDiagnostic } from "./agent-failure.js";
 import { ModelRouter } from "./model-router.js";
 import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 import { OnDeviceModelProvider } from "./on-device-provider.js";
@@ -270,7 +271,7 @@ export class OpenAIResponsesProvider {
     if (!response || needsFinalAnswer) {
       const hop = maxToolHops + 1;
       notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop, maxToolHops: hop });
-      contextWindow.fit(conversationInput, { fixedChars: fixedChars + FINAL_ANSWER_INSTRUCTION.length });
+      contextWindow.fit(conversationInput, { fixedChars: baseInstructions.length + 2 + FINAL_ANSWER_INSTRUCTION.length });
       const body = {
         model,
         instructions: `${baseInstructions}\n\n${FINAL_ANSWER_INSTRUCTION}`,
@@ -913,6 +914,7 @@ function shareTurnSpend(context) {
 }
 
 const STOP_PROGRESS_MAX = 12;
+const STOP_MESSAGE_MAX = 3800;
 
 // The stop text is what agent-host saves as the assistant turn, and history
 // keeps only role and content. Listing the tools already run (and the ones
@@ -921,28 +923,46 @@ const STOP_PROGRESS_MAX = 12;
 // what happened before the stop.
 export function turnSpendStopMessage(turnUsd, limit, { toolCalls = [], unrunCalls = [] } = {}) {
   const lines = [`I stopped this turn at $${turnUsd.toFixed(2)} of model spend (the per-turn limit is $${limit.toFixed(2)}).`];
-  const done = toolCalls.map((call) => `${call.name} (${toolCallStatus(call.result)})`);
-  if (done.length > 0) lines.push(`Done so far: ${collapseRepeats(done).join(", ")}.`);
-  if (unrunCalls.length > 0) lines.push(`Not run yet: ${collapseRepeats(unrunCalls).join(", ")}.`);
+  const done = toolCalls.map((call) => `${String(call.name).slice(0, 80)} (${toolCallStatus(call.result)})`);
+  if (done.length > 0) lines.push(`Done so far: ${collapseRepeats(done).join(", ").slice(0, 600)}.`);
+  if (unrunCalls.length > 0) lines.push(`Not run yet: ${collapseRepeats(unrunCalls.map((name) => String(name).slice(0, 80))).join(", ").slice(0, 600)}.`);
+  const continuation = `Say "continue" and I'll keep going.`;
   if (toolCalls.length > 0) {
     lines.push("Completed tool progress (do not repeat successful side effects):");
-    for (const call of toolCalls.slice(-STOP_PROGRESS_MAX)) {
-      lines.push(JSON.stringify({ tool: call.name, arguments: progressSummary(call.arguments), result: progressSummary(call.result) }));
+    // Reserve the continuation and omission notice, then fit the newest
+    // receipts first. The entire saved/delivered reply fits Telegram too.
+    let remaining = STOP_MESSAGE_MAX - lines.join("\n").length - continuation.length - 150;
+    const receipts = [];
+    for (const call of toolCalls.slice(-STOP_PROGRESS_MAX).reverse()) {
+      const receipt = JSON.stringify({ tool: String(call.name).slice(0, 80), arguments: boundedProgress(call.arguments), result: boundedProgress(call.result) });
+      if (receipt.length + 1 > remaining) continue;
+      receipts.unshift(receipt);
+      remaining -= receipt.length + 1;
     }
-    if (toolCalls.length > STOP_PROGRESS_MAX) lines.push(`${toolCalls.length - STOP_PROGRESS_MAX} earlier calls omitted; check their state before repeating them.`);
+    lines.push(...receipts);
+    if (toolCalls.length > receipts.length) lines.push(`${toolCalls.length - receipts.length} call receipts omitted; check their state before repeating them.`);
   }
-  lines.push(`Say "continue" and I'll keep going.`);
+  lines.push(continuation);
   return lines.join(lines.length > 2 ? "\n" : " ");
 }
 
 function progressSummary(value, depth = 0) {
-  if (typeof value === "string") return value.length > 200 ? `${value.slice(0, 200)} [truncated]` : value;
+  if (typeof value === "string") {
+    const safe = redactFailureDiagnostic(value);
+    return safe.length > 200 ? `${safe.slice(0, 200)} [truncated]` : safe;
+  }
   if (value == null || typeof value !== "object") return value;
   if (depth >= 3) return "[truncated]";
   if (Array.isArray(value)) return value.slice(0, 5).map((item) => progressSummary(item, depth + 1));
   return Object.fromEntries(Object.entries(value).slice(0, 8).map(([key, item]) => [key,
-    /image|base64|dataurl/i.test(key) ? "[omitted]" : progressSummary(item, depth + 1)
+    /image|base64|dataurl|api.?key|token|secret|password|authorization|credential|cookie|^env$|headers?|^args$|command|stdin/i.test(key) ? "[omitted]" : progressSummary(item, depth + 1)
   ]));
+}
+
+function boundedProgress(value) {
+  const safe = progressSummary(value);
+  const serialized = JSON.stringify(safe);
+  return serialized?.length > 350 ? `${serialized.slice(0, 330)} [truncated]` : safe;
 }
 
 function toolCallStatus(invocation) {

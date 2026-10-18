@@ -5,7 +5,7 @@ const PUBLIC_FAILURES = Object.freeze({
   "provider-timeout": "The model provider timed out. Check its connection and try again.",
   "provider-empty-response": "The model returned no answer after retrying. Please try again.",
   "provider-unavailable": "The model provider is unavailable. Check its connection and try again.",
-  "input-limit": "This request exceeds the configured input limit. Shorten your message or increase OPENAGI_MAX_INPUT_TOKENS in Settings.",
+  "input-limit": "This request exceeds the configured input limit. Shorten your message, or increase OPENAGI_MAX_INPUT_TOKENS in your .env file and restart the daemon.",
   "agent-error": "The agent couldn't complete that request. Check the local daemon log for details."
 });
 

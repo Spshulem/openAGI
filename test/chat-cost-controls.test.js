@@ -427,6 +427,33 @@ test("spend stops retain bounded arguments and results without screenshot payloa
   assert.ok(text.length < 1500);
 });
 
+test("spend-stop receipts omit configuration credentials and fit the delivered message limit", () => {
+  const credential = "credential-fixture-must-stay-private";
+  const text = turnSpendStopMessage(2.5, 2, { toolCalls: Array.from({ length: 12 }, (_, i) => ({
+    name: "connect_catalog_mcp", arguments: { id: `server-${i}`, apiKey: credential, config: { password: credential, env: { CUSTOM: credential }, args: ["--key", credential], headers: { Authorization: credential } } },
+    result: { ok: true, result: { id: `receipt-${i}`, token: credential, nested: Array.from({ length: 8 }, () => ({ data: "x".repeat(2000) })) } }
+  })) });
+  assert.doesNotMatch(text, new RegExp(credential));
+  assert.ok(text.length <= 3800, `reply grew to ${text.length} characters`);
+  assert.match(text, /receipt-11/);
+  assert.ok(text.endsWith('Say "continue" and I\'ll keep going.'));
+});
+
+test("OpenAI's final reply excludes unsent tool schemas from its input cap", async () => {
+  const provider = new OpenAIResponsesProvider({ apiKey: "test", maxInputTokens: 500, maxToolHops: 1 });
+  const bodies = [];
+  provider.postResponses = async (body) => {
+    bodies.push(structuredClone(body));
+    return bodies.length === 1 ? callResponse(1) : { id: "done", output_text: "finished", output: [] };
+  };
+  const result = await provider.generate({ input: "go", instructions: "short", turnContext: "", agent,
+    tools: [{ ...toolSchema[0], description: "x".repeat(1200) }], toolRegistry: { invoke: async () => ({ ok: true, result: "r".repeat(900) }) } });
+  assert.equal(result.text, "finished");
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[1].tools, undefined);
+  assert.ok(bodies[1].instructions.length + bodies[1].input.reduce((sum, item) => sum + itemChars(item), 0) <= 2000);
+});
+
 test("turn spend stop message is plain and says how to continue", () => {
   assert.equal(
     turnSpendStopMessage(2.137, 2),
