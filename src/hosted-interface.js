@@ -34,7 +34,7 @@ import {
   verifyBuildBetterWebhook
 } from "./auth.js";
 import { ChannelManager } from "./channels.js";
-import { createCompanionRoutes } from "./companion-routes.js";
+import { createCompanionRoutes, connectionsPage } from "./companion-routes.js";
 import { inferToneScore } from "./outcome-store.js";
 import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
 import {
@@ -1717,6 +1717,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const issued = channels.telegram.pairing.generateCode();
         console.log(`[openagi] telegram pairing code ${issued.code} (valid 10 min, single use) — send "/pair ${issued.code}" to the bot`);
         return sendJson(res, 200, issued);
+      }
+      if (method === "GET" && pathname === "/connections") {
+        res.setHeader("Cache-Control", "no-store");
+        return sendHtml(res, 200, connectionsPage(), extraCookies);
       }
       if (await companionRoutes(req, res, url)) return;
       if (method === "GET" && pathname === "/tools") return sendJson(res, 200, runtime.tools.list());

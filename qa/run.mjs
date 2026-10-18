@@ -25,7 +25,7 @@ for (const [id, area] of selected) {
   const started = Date.now();
   try {
     const result = await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, ["--test", "--test-concurrency=1", ...area.tests], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(process.execPath, ["--test", "--test-reporter=tap", "--test-concurrency=1", ...area.tests], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
       let log = "";
       child.stdout.on("data", chunk => { log += chunk; });
       child.stderr.on("data", chunk => { log += chunk; });

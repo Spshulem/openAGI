@@ -55,16 +55,23 @@ export class SendblueChannel {
       writeJsonAtomic(receiptPath, receipt);
     }
     if (!this.sharing.canReceive(message.number, message.groupId)) return { ignored: true, reason: "not-allowlisted" };
+    // Local rejection has no ambiguous external effect. Keep the saved reply
+    // retryable until all synchronous preflight checks have passed.
+    this.validateMessage(message.groupId || message.number, receipt.reply, { group: Boolean(message.groupId) });
     writeJsonAtomic(receiptPath, { ...receipt, sendStarted: true });
     await this.sendMessage(message.groupId || message.number, receipt.reply, { group: Boolean(message.groupId) });
     writeJsonAtomic(receiptPath, { accepted: true, at: new Date().toISOString() });
     return { accepted: true };
   }
 
-  async sendMessage(target, text, { group = false } = {}) {
+  validateMessage(target, text, { group = false } = {}) {
     if (!this.sharing.canSend(target, group)) throw new Error("Recipient is not approved for sharing.");
     if (!this.status().configured) throw new Error("Configure Sendblue API credentials and the agent's number first.");
     if (typeof text !== "string" || !text.trim() || text.length > 16000) throw new Error("Message must be 1–16000 characters.");
+  }
+
+  async sendMessage(target, text, { group = false } = {}) {
+    this.validateMessage(target, text, { group });
     const response = await this.fetchImpl(`https://api.sendblue.co/api/${group ? "send-group-message" : "send-message"}`, {
       method: "POST", signal: AbortSignal.timeout(30000), redirect: "error",
       headers: { "content-type": "application/json", "sb-api-key-id": this.env.SENDBLUE_API_KEY, "sb-api-secret-key": this.env.SENDBLUE_API_SECRET },

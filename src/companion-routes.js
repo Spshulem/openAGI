@@ -25,7 +25,7 @@ export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin
   if (runtime.google) runtime.google.saveCredentials = values => saveEnv({ dataDir, values });
   return async (req, res, url) => {
     const { pathname } = url, method = req.method;
-    const known = ["/connections", "/connections/config", "/sharing/contacts", "/sharing/groups", "/sharing/revoke", "/integrations/google/connect", "/integrations/google/callback", "/integrations/google/disconnect", "/channels/sendblue/webhook", "/webhooks/pebble"];
+    const known = ["/connections/config", "/sharing/contacts", "/sharing/groups", "/sharing/revoke", "/integrations/google/connect", "/integrations/google/callback", "/integrations/google/disconnect", "/channels/sendblue/webhook", "/webhooks/pebble"];
     if (!known.includes(pathname)) return false;
     const channels = getChannels();
     try {
@@ -43,9 +43,6 @@ export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin
         if (!runtime.google) { json(res, 503, { error: "google_unavailable" }); return true; }
         await runtime.google.finish(Object.fromEntries(url.searchParams));
         res.writeHead(303, { location: "/connections", "cache-control": "no-store", "referrer-policy": "no-referrer" }); res.end(); return true;
-      }
-      if (pathname === "/connections" && method === "GET") {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer" }); res.end(connectionsPage()); return true;
       }
       if (pathname === "/connections/config" && method === "GET") {
         json(res, 200, { configured: Object.fromEntries(CONFIG_KEYS.map(key => [key, Boolean(env[key])])), google: runtime.google?.status() ?? { configured: false }, sendblue: channels?.sendblue?.status() ?? { configured: false }, pebble: index.status(), sharing: channels?.sharing?.status() ?? { contacts: [], groups: [] }, origin: getOrigin() }); return true;

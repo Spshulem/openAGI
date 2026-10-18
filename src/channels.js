@@ -14,7 +14,7 @@ export class ChannelManager {
     this.dir = options.dir ?? path.join(resolveDataDir(), "channels");
     ensureDir(this.dir);
     this.eventsPath = path.join(this.dir, "events.jsonl");
-    this.sharing = options.sharing ?? new PartnerSharing({ dir: path.join(this.dir, "sharing"), modelProvider: this.agentHost?.modelProvider });
+    this.sharing = options.sharing ?? new PartnerSharing({ dir: path.join(this.dir, "sharing"), getModelProvider: () => this.agentHost?.modelProvider });
     this.sendblue = options.sendblue ?? new SendblueChannel({ sharing: this.sharing, dir: path.join(this.dir, "sendblue"), env: options.env, fetchImpl: options.sendblueFetch });
     this.telegram = new TelegramChannel({
       agentHost: this.agentHost,

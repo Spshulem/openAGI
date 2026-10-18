@@ -44,6 +44,29 @@ test("ambiguous sends are held for review rather than automatically repeated", a
   assert.equal(retry.requiresReview, true);
   assert.equal(f.turns, 1); assert.equal(sends, 1);
 });
+
+test("missing credentials leave the saved reply retryable after configuration and restart", async t => {
+  let sends = 0;
+  const f = fixture(t, async () => { sends++; return Response.json({ status: "QUEUED" }); });
+  delete f.channel.env.SENDBLUE_API_KEY;
+  await assert.rejects(f.channel.handleWebhook(f.body), /Configure Sendblue/);
+  assert.equal(sends, 0);
+  const receiptPath = path.join(f.channel.dir, fs.readdirSync(f.channel.dir)[0]);
+  assert.equal(JSON.parse(fs.readFileSync(receiptPath)).sendStarted, undefined);
+  f.channel.env.SENDBLUE_API_KEY = "repaired-fixture-key";
+  const restarted = new SendblueChannel({ sharing: f.sharing, dir: f.channel.dir, env: f.channel.env, fetchImpl: f.channel.fetchImpl });
+  assert.equal((await restarted.handleWebhook(f.body)).accepted, true);
+  assert.equal(f.turns, 1); assert.equal(sends, 1);
+});
+
+test("oversized replies never mark a send as ambiguous or issue an HTTP request", async t => {
+  const f = fixture(t, () => { throw Error("must not send"); });
+  f.sharing.modelProvider.generate = async () => ({ text: "x".repeat(16001) });
+  await assert.rejects(f.channel.handleWebhook(f.body), /1–16000/);
+  await assert.rejects(f.channel.handleWebhook(f.body), /1–16000/);
+  const receiptPath = path.join(f.channel.dir, fs.readdirSync(f.channel.dir)[0]);
+  assert.equal(JSON.parse(fs.readFileSync(receiptPath)).sendStarted, undefined);
+});
 test("group replies require an approved group and approved membership", async t => {
   const sends = [];
   const f = fixture(t, async (url, init) => { sends.push({ url, body: JSON.parse(init.body) }); return Response.json({ status: "QUEUED" }); });

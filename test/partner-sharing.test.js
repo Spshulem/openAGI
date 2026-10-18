@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PartnerSharing } from "../src/partner-sharing.js";
+import { ChannelManager } from "../src/channels.js";
 
 function fixture(t, provider) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "partner-sharing-"));
@@ -68,4 +69,29 @@ test("turns serialize per conversation and revocation stops queued turns", async
   await first;
   assert.equal((await second).ignored, true);
   assert.equal(calls, 1);
+});
+
+test("partner turns follow the owner's current provider and budget after a switch", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "partner-provider-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const agentHost = { modelProvider: null };
+  const channels = new ChannelManager({ dir, agentHost });
+  channels.sharing.addContact({ number: "+15555550101" });
+  const message = { number: "+15555550101", text: "Hello" };
+  await assert.rejects(channels.sharing.respond(message), /not configured/);
+  const budgets = [];
+  for (const name of ["first", "second"]) {
+    agentHost.modelProvider = {
+      budgetGuard: { check() { budgets.push(name); } },
+      async generate(args) {
+        assert.deepEqual(args.tools.map(tool => tool.name).sort(), ["recall", "remember"]);
+        assert.equal(args.context.runtime, undefined);
+        return { text: name };
+      }
+    };
+    assert.equal((await channels.sharing.respond(message)).reply, name);
+  }
+  assert.deepEqual(budgets, ["first", "second"]);
+  agentHost.modelProvider.budgetGuard.check = () => { throw Error("budget exhausted"); };
+  await assert.rejects(channels.sharing.respond(message), /budget exhausted/);
 });
