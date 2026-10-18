@@ -1,11 +1,6 @@
 import SwiftUI
 
-// DESIGN.md's one deliberately spent animation budget: "The control fills
-// with `live`, a checkmark draws, the row's text dims, and the row collapses
-// out of the list over ~260ms. That is the only animation the app performs
-// that a person did not directly cause." Everything else in this app is
-// static by design; this one control is where all of that restraint gets
-// spent.
+// A native symbol button with a full-sized touch target.
 struct CompletionControl: View {
     let isDone: Bool
     let taskTitle: String
@@ -13,24 +8,13 @@ struct CompletionControl: View {
 
     var body: some View {
         Button(action: action) {
-            ZStack {
-                Circle()
-                    .strokeBorder(isDone ? Theme.live : Theme.muted, lineWidth: 1.5)
-                Circle()
-                    .fill(isDone ? Theme.live : Color.clear)
-                if isDone {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.white)
-                        .transition(.scale.combined(with: .opacity))
-                }
-            }
-            .frame(width: 22, height: 22)
-            .frame(width: Theme.completionControlSize, height: Theme.completionControlSize)
-            .contentShape(Rectangle())
+            Image(systemName: isDone ? "checkmark.circle.fill" : "circle")
+                .font(.title2)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(minWidth: 44, minHeight: 44)
         }
-        .buttonStyle(.plain)
-        .animation(.easeOut(duration: 0.2), value: isDone)
+        .buttonStyle(.borderless)
+        .tint(isDone ? .blue : .secondary)
         .sensoryFeedback(.success, trigger: isDone)
         .accessibilityLabel("Complete \(taskTitle)")
     }
@@ -73,70 +57,55 @@ struct TaskRow: View {
                 .disabled(isBusy || isDone)
             }
         }
-        .padding(.horizontal, Theme.Spacing.x4)
-        .frame(minHeight: Theme.rowMinHeight)
+        .frame(minHeight: 44)
     }
 }
 
-// DESIGN.md: "Primary button. Filled `live`, white text, radius 10, 50 tall,
-// full width."
+// Native button styles inherit iOS sizing, focus, pressed states and materials.
 struct PrimaryButton: View {
     let title: String
     var isLoading: Bool = false
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            ZStack {
-                if isLoading {
-                    ProgressView().tint(.white)
-                } else {
-                    Text(title)
-                        .font(Theme.Typography.body.weight(.semibold))
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: 50)
+        if #available(iOS 26, *) {
+            button.buttonStyle(.glassProminent).controlSize(.large)
+        } else {
+            button.buttonStyle(.borderedProminent).controlSize(.large)
         }
-        .background(Theme.live)
-        .foregroundStyle(.white)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var button: some View {
+        Button(action: action) {
+            HStack {
+                Spacer()
+                if isLoading { ProgressView() } else { Text(title) }
+                Spacer()
+            }
+        }
+        .disabled(isLoading)
     }
 }
 
-// DESIGN.md: "Destructive. Text only, `alert`. Never a filled red button —
-// revoke is rare and should not look like the primary path."
 struct DestructiveTextButton: View {
     let title: String
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.alert)
-                .frame(maxWidth: .infinity)
-                .frame(height: 50)
-        }
+        Button(title, role: .destructive, action: action)
+            .buttonStyle(.borderless)
+            .frame(maxWidth: .infinity, minHeight: 44)
     }
 }
 
-// Same idea as `DestructiveTextButton` but for a quiet non-destructive
-// secondary action -- a screen with a Save/Complete/Delete stack should
-// still only spend one bold filled button, per DESIGN.md's "spend the
-// boldness in one place."
 struct SecondaryTextButton: View {
     let title: String
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            Text(title)
-                .font(Theme.Typography.body.weight(.medium))
-                .foregroundStyle(Theme.live)
-                .frame(maxWidth: .infinity)
-                .frame(height: 50)
-        }
+        Button(title, action: action)
+            .buttonStyle(.borderless)
+            .frame(maxWidth: .infinity, minHeight: 44)
     }
 }
 
@@ -163,5 +132,24 @@ struct ScreenHeader: View {
         .listRowInsets(EdgeInsets())
         .listRowBackground(Theme.canvas)
         .listRowSeparator(.hidden)
+    }
+}
+
+// Connection state describes data refresh, independently of the fleet stream.
+struct AgentConnectionRow: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.hostLabel).font(.subheadline)
+                Text(model.dataStatus).font(.caption).foregroundStyle(.secondary)
+            }
+        } icon: {
+            Image(systemName: model.isOnPhone ? "iphone" : "server.rack")
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("agent-connection")
     }
 }

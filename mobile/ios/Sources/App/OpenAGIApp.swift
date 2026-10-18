@@ -24,47 +24,21 @@ struct OpenAGIApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                switch session.phase {
-                case .welcome:
-                    WelcomeView()
-                case .phoneSetup:
-                    PhoneSetupView()
-                case .phoneStarting:
-                    PhoneStartingView(failure: nil)
-                        .task { await session.startPhone() }
-                case .phoneFailed(let message):
-                    PhoneStartingView(failure: message)
-                case .pairing:
-                    // `.id` forces a fresh PairingView (and fresh @State) whenever a
-                    // new deep link arrives; SwiftUI would otherwise keep the
-                    // already-appeared view's state and ignore a later prefill.
-                    PairingView(
-                        prefillServer: pendingPairing?.serverURL,
-                        prefillCode: pendingPairing?.code,
-                        onCancel: { session.goBack() },
-                        onPaired: {
-                            // Spent. Left set, it would reach RootTabView as an
-                            // "incoming" link and immediately ask to switch away
-                            // from the pairing it just made.
-                            pendingPairing = nil
-                            session.paired()
-                        }
-                    )
-                    .id(pendingPairing?.code ?? "")
-                case .ready(let credentials):
-                    RootTabView(
-                        credentials: credentials,
-                        initialTab: session.initialTab,
-                        incomingPairing: pendingPairing,
-                        onDismissIncomingPairing: { pendingPairing = nil },
-                        onRevoked: { session.revoked() }
-                    )
-                    // A different daemon is a different model, stream and cache.
-                    .id(credentials.server.absoluteString + credentials.nodeID)
+                #if DEBUG
+                if UITestProtocol.isEnabled {
+                    UITestRoot()
+                } else {
+                    sessionContent
                 }
+                #else
+                sessionContent
+                #endif
             }
             .environment(session)
             .onOpenURL { url in
+                #if DEBUG
+                if UITestProtocol.isEnabled { return }
+                #endif
                 // The Live Activity's tap target.
                 if url.scheme == "openagi", url.host == "supervisor" {
                     PushRouter.shared.openSupervisor()
@@ -75,6 +49,9 @@ struct OpenAGIApp: App {
                 if session.phase == .welcome { session.chooseServer() }
             }
             .onChange(of: scenePhase) { _, newPhase in
+                #if DEBUG
+                if UITestProtocol.isEnabled { return }
+                #endif
                 switch newPhase {
                 case .active:
                     refreshNow()
@@ -84,6 +61,48 @@ struct OpenAGIApp: App {
                     break
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var sessionContent: some View {
+        switch session.phase {
+        case .welcome:
+            WelcomeView()
+        case .phoneSetup:
+            PhoneSetupView()
+        case .phoneStarting:
+            PhoneStartingView(failure: nil)
+                .task { await session.startPhone() }
+        case .phoneFailed(let message):
+            PhoneStartingView(failure: message)
+        case .pairing:
+            // `.id` forces a fresh PairingView (and fresh @State) whenever a
+            // new deep link arrives; SwiftUI would otherwise keep the
+            // already-appeared view's state and ignore a later prefill.
+            PairingView(
+                prefillServer: pendingPairing?.serverURL,
+                prefillCode: pendingPairing?.code,
+                onCancel: { session.goBack() },
+                onPaired: {
+                    // Spent. Left set, it would reach RootTabView as an
+                    // "incoming" link and immediately ask to switch away
+                    // from the pairing it just made.
+                    pendingPairing = nil
+                    session.paired()
+                }
+            )
+            .id(pendingPairing?.code ?? "")
+        case .ready(let credentials):
+            RootTabView(
+                credentials: credentials,
+                initialTab: session.initialTab,
+                incomingPairing: pendingPairing,
+                onDismissIncomingPairing: { pendingPairing = nil },
+                onRevoked: { session.revoked() }
+            )
+            // A different daemon is a different model, stream and cache.
+            .id(credentials.server.absoluteString + credentials.nodeID)
         }
     }
 

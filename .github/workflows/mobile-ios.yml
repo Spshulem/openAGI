@@ -19,7 +19,7 @@ permissions:
 jobs:
   test:
     runs-on: xcode-27
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # 27.1 links the native Duo vertical bars and reserved-region APIs.
@@ -49,6 +49,8 @@ jobs:
           runtime_id=$(python3 -c 'import json,sys; print(next(r["identifier"] for r in json.load(open(sys.argv[1]))["runtimes"] if r.get("isAvailable") and r["version"].split(".")[:2] == ["27", "1"]))' "$RUNNER_TEMP/openagi-runtimes.json")
           device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"] == "iPhone Duo"))')
           simulator_id=$(xcrun simctl create "OpenAGI Duo CI" "$device_type" "$runtime_id")
+          echo "OPENAGI_DUO_SIM=$simulator_id" >> "$GITHUB_ENV"
+          echo "OPENAGI_IOS_RUNTIME=$runtime_id" >> "$GITHUB_ENV"
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
@@ -56,6 +58,24 @@ jobs:
             -destination "platform=iOS Simulator,id=$simulator_id" \
             -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
             -resultBundlePath "$RUNNER_TEMP/OpenAGI-tests.xcresult" \
+            -parallel-testing-enabled NO \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_ALLOWED=YES
+      - name: Test native iPhone navigation and controls
+        working-directory: mobile/ios
+        run: |
+          device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"] == "iPhone 17 Pro Max"))')
+          simulator_id=$(xcrun simctl create "OpenAGI iPhone UI CI" "$device_type" "$OPENAGI_IOS_RUNTIME")
+          echo "OPENAGI_PHONE_SIM=$simulator_id" >> "$GITHUB_ENV"
+          xcodebuild test \
+            -project OpenAGI.xcodeproj \
+            -scheme OpenAGI \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$simulator_id" \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
+            -resultBundlePath "$RUNNER_TEMP/OpenAGI-iPhone-UI.xcresult" \
+            -only-testing:OpenAGIUITests \
+            -parallel-testing-enabled NO \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_ALLOWED=YES
       - name: Verify simulator runtime was bundled
@@ -76,6 +96,22 @@ jobs:
           name: OpenAGI-test-results-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/OpenAGI-tests.xcresult
           retention-days: 7
+      - name: Export synthetic UI screenshots
+        if: always()
+        run: |
+          for result in "$RUNNER_TEMP/OpenAGI-tests.xcresult" "$RUNNER_TEMP/OpenAGI-iPhone-UI.xcresult"; do
+            if [ -d "$result" ]; then
+              xcrun xcresulttool export attachments --path "$result" --output-path "$RUNNER_TEMP/openagi-ui-screenshots/$(basename "$result" .xcresult)"
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: OpenAGI-native-UI-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/OpenAGI-iPhone-UI.xcresult
+            ${{ runner.temp }}/openagi-ui-screenshots
+          retention-days: 7
       - name: Build device app for local signing and QA
         working-directory: mobile/ios
         run: |
@@ -95,3 +131,12 @@ jobs:
           name: OpenAGI-device-unsigned-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/OpenAGI-device-unsigned.zip
           retention-days: 7
+      - name: Remove owned QA simulators
+        if: always()
+        run: |
+          for simulator_id in "$OPENAGI_DUO_SIM" "$OPENAGI_PHONE_SIM"; do
+            if [ -n "$simulator_id" ]; then
+              xcrun simctl shutdown "$simulator_id" || true
+              xcrun simctl delete "$simulator_id"
+            fi
+          done

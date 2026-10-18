@@ -83,6 +83,16 @@ final class AppModel {
     // The connection line names where the agent runs.
     var hostLabel: String { isOnPhone ? "This iPhone" : credentials.server.host ?? "" }
 
+    // An attached fleet event stream does not establish that task data loaded.
+    var dataStatus: String {
+        switch lastOutcome {
+        case .updated, .unchanged: "Synced"
+        case .unauthorized: "Needs re-pairing"
+        case .offline: snapshot == nil ? "Couldn't load data" : "Showing saved data"
+        case nil: "Not synced yet"
+        }
+    }
+
     var ageMinutes: Int { snapshot?.ageInMinutes() ?? 0 }
     var refreshFailed: Bool {
         if case .offline = lastOutcome { return true }

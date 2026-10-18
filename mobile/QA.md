@@ -91,3 +91,29 @@ CI runs Android geometry regressions and four emulator UI tests with synthetic c
 - [ ] In book and tabletop states, confirm no text or controls cross the hinge; repeat in RTL and with a keyboard open.
 - [ ] Resize into narrow split-screen and short landscape windows, then reopen the full display; confirm all destinations and pairing controls remain reachable.
 - [ ] On iPhone Duo, check outer, inner flat, book, tabletop, and 50/50 Split View; verify side controls and camera safe areas, and retain a half-written draft through each transition.
+
+### iOS native navigation and controls
+
+The `OpenAGIUITests` target runs the real SwiftUI screens against isolated,
+synthetic transport responses on iPhone 17 Pro Max and Duo simulators. Its
+screenshots and result bundles are attached to the iOS workflow. Test mode is
+Debug-only, uses a temporary store and a synthetic credential, and intercepts
+its transport requests instead of contacting a real daemon.
+
+- Settings uses a system Form. Model, Instructions, Skills and Scheduled are
+  separate navigation rows; each pushes one screen and Back returns to Settings.
+  There should be one system disclosure indicator per row.
+- Select a model with the native provider picker, return to Model, and test it.
+- Open individual Tasks, approvals and questions; Back returns to their list.
+- Chat shows earlier shared history. Its system text field and Liquid Glass
+  Send button remain reachable above the keyboard. A draft survives tab changes.
+- Check default and accessibility text sizes in light and dark appearance.
+- An empty Today still links to outstanding Inbox items. Authentication errors
+  show re-pairing guidance instead of successful empty data.
+- On the physical phone, enroll on the data-owning main and verify real Today,
+  Tasks, Inbox and shared chat separately from Supervisor fleet connectivity.
+  Synthetic UI tests do not establish real pairing or provider acceptance.
+
+Apple guidance: [Materials](https://developer.apple.com/design/human-interface-guidelines/materials)
+and [adopting Liquid Glass](https://developer.apple.com/documentation/technologyoverviews/adopting-liquid-glass).
+Glass is used for controls; message content uses standard content surfaces.

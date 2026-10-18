@@ -1,76 +1,80 @@
 import SwiftUI
 
-// mobile/FEATURES.md's Tasks tab: "The full manager, not a filtered view."
-// Sectioned by bucket, create/edit/delete, complete from any row, filtered
-// by queue (yours or the agent's).
 struct TasksView: View {
     @Environment(AppModel.self) private var model
-
     @State private var queue: TaskQueue = .user
     @State private var tasksByBucket: [TaskBucket: [TaskRecord]] = [:]
     @State private var isLoading = false
+    @State private var hasLoaded = false
     @State private var errorHeadline: String?
     @State private var showingNewTask = false
-    @AppStorage("collapsedTaskBuckets") private var collapsedBucketsRaw = ""
-
-    private var collapsedBuckets: Set<String> {
-        Set(collapsedBucketsRaw.split(separator: ",").map(String.init))
-    }
 
     var body: some View {
         NavigationStack {
             List {
-                ScreenHeader(title: "Tasks", host: model.hostLabel,
-                            ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
-
-                Picker("Queue", selection: $queue) {
-                    ForEach(TaskQueue.allCases) { Text($0.label).tag($0) }
+                Section {
+                    AgentConnectionRow()
+                    Picker("Queue", selection: $queue) {
+                        ForEach(TaskQueue.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("tasks-queue")
                 }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, Theme.gutter)
-                .padding(.bottom, Theme.Spacing.x2)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Theme.canvas)
-                .listRowSeparator(.hidden)
-
                 if let errorHeadline {
-                    Text(errorHeadline)
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.alert)
-                        .padding(.horizontal, Theme.gutter)
-                        .listRowInsets(EdgeInsets())
-                        .listRowBackground(Theme.canvas)
-                        .listRowSeparator(.hidden)
+                    Section {
+                        Label(errorHeadline, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                        Button("Retry") { Task { await load() } }
+                    }
                 }
-
-                // DESIGN.md's "Screens must not be mostly empty" section:
-                // "bucket sections are always present in order; an empty
-                // bucket shows a one-line `muted` 'Nothing here' rather than
-                // vanishing, so the structure of the week is legible even
-                // when parts of it are empty." That replaces the single
-                // whole-screen "No tasks yet" empty state this used to show
-                // when every bucket was empty -- seven visible buckets, each
-                // legibly empty, is exactly what that section asks for
-                // instead of one centred sentence over a blank screen.
+                if tasksByBucket.values.allSatisfy(\.isEmpty) && errorHeadline == nil {
+                    Section {
+                        if isLoading || !hasLoaded {
+                            ProgressView("Loading tasks…").frame(maxWidth: .infinity)
+                        } else {
+                            ContentUnavailableView("No tasks in this list", systemImage: "checklist",
+                                description: Text("Try the other queue, or check the connected server in Settings. New tasks appear here when you or your agent add them."))
+                                .accessibilityIdentifier("tasks-empty")
+                        }
+                    }
+                }
                 ForEach(TaskBucket.allCases) { bucket in
-                    bucketSection(bucket, tasks: tasksByBucket[bucket] ?? [])
+                    if let tasks = tasksByBucket[bucket], !tasks.isEmpty {
+                        Section(bucket.label) {
+                            ForEach(tasks) { task in
+                                NavigationLink {
+                                    TaskDetailView(task: task, onChanged: {
+                                        await load()
+                                        model.bumpTasksGeneration()
+                                    })
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(task.title).foregroundStyle(.primary)
+                                        if isOverdue(task) {
+                                            Text("Overdue").font(.caption).foregroundStyle(.red)
+                                        }
+                                    }
+                                }
+                                .accessibilityIdentifier("tasks-task-\(task.id)")
+                                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                    if !["completed", "cancelled"].contains(task.status) {
+                                        Button("Complete", systemImage: "checkmark") {
+                                            Task { await complete(task) }
+                                        }
+                                        .tint(.blue)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .background(Theme.canvas)
+            .navigationTitle("Tasks")
             .refreshable { await load() }
-            .task { await load() }
-            .task(id: queue) { await load() }
-            .task(id: model.tasksGeneration) { await load() }
+            .task(id: "\(queue.rawValue)-\(model.tasksGeneration)") { await load() }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showingNewTask = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .accessibilityLabel("New task")
+                    Button("New task", systemImage: "plus") { showingNewTask = true }
                 }
             }
             .sheet(isPresented: $showingNewTask) {
@@ -83,88 +87,14 @@ struct TasksView: View {
         }
     }
 
-    private func bucketSection(_ bucket: TaskBucket, tasks: [TaskRecord]) -> some View {
-        let isCollapsed = collapsedBuckets.contains(bucket.rawValue)
-        return Section {
-            if !isCollapsed {
-                if tasks.isEmpty {
-                    Text("Nothing here")
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.muted)
-                        .padding(.horizontal, Theme.gutter + Theme.Spacing.x4)
-                        .padding(.bottom, Theme.Spacing.x2)
-                        .listRowInsets(EdgeInsets())
-                        .listRowBackground(Theme.canvas)
-                        .listRowSeparator(.hidden)
-                } else {
-                    RowGroup {
-                        ForEach(Array(tasks.enumerated()), id: \.element.id) { index, task in
-                            NavigationLink {
-                                TaskDetailView(task: task, onChanged: {
-                                    await load()
-                                    model.bumpTasksGeneration()
-                                })
-                            } label: {
-                                TaskRow(title: task.title,
-                                       secondaryText: secondaryText(for: task, in: bucket),
-                                       secondaryIsAlert: isOverdue(task),
-                                       isBusy: isLoading,
-                                       onComplete: ["completed", "cancelled"].contains(task.status) ? nil : { Task { await complete(task) } })
-                            }
-                            .buttonStyle(.plain)
-                            if index < tasks.count - 1 { RowHairline() }
-                        }
-                    }
-                    .padding(.horizontal, Theme.gutter)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Theme.canvas)
-                    .listRowSeparator(.hidden)
-                }
-            }
-        } header: {
-            Button {
-                toggleCollapsed(bucket)
-            } label: {
-                HStack {
-                    Text(bucket.label)
-                        .font(Theme.Typography.section)
-                        .foregroundStyle(Theme.ink)
-                    Text("\(tasks.count)")
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.muted)
-                    Spacer()
-                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .foregroundStyle(Theme.muted)
-                }
-                .padding(.horizontal, Theme.gutter)
-                .padding(.top, Theme.Spacing.x4)
-                .padding(.bottom, Theme.Spacing.x2)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("\(bucket.label), \(tasks.count) tasks, \(isCollapsed ? "collapsed" : "expanded")")
-            .listRowInsets(EdgeInsets())
-            .textCase(nil)
-        }
-    }
-
-    private func toggleCollapsed(_ bucket: TaskBucket) {
-        var set = collapsedBuckets
-        if set.contains(bucket.rawValue) { set.remove(bucket.rawValue) } else { set.insert(bucket.rawValue) }
-        collapsedBucketsRaw = set.joined(separator: ",")
-    }
-
     private func isOverdue(_ task: TaskRecord) -> Bool {
-        guard let due = task.dueDate, task.status != "completed" else { return false }
+        guard let due = task.dueDate, !["completed", "cancelled"].contains(task.status) else { return false }
         return due < Date()
-    }
-
-    private func secondaryText(for task: TaskRecord, in bucket: TaskBucket) -> String? {
-        isOverdue(task) ? "Overdue" : nil
     }
 
     private func complete(_ task: TaskRecord) async {
         do {
-            _ = try await model.client.complete(taskID: task.id)
+            try await model.client.complete(taskID: task.id)
             WidgetReload.reloadToday()
             await load()
             model.bumpTasksGeneration()
@@ -178,18 +108,16 @@ struct TasksView: View {
         defer { isLoading = false }
         do {
             let tasks = try await model.client.tasks(queue: queue.rawValue, limit: Int.max)
-            var grouped: [TaskBucket: [TaskRecord]] = [:]
-            for task in tasks {
-                let bucket = TaskBucket(rawValue: task.bucket) ?? .someday
-                grouped[bucket, default: []].append(task)
-            }
-            for key in grouped.keys {
-                grouped[key]?.sort { $0.priority > $1.priority }
-            }
-            tasksByBucket = grouped
+            guard !Task.isCancelled else { return }
+            tasksByBucket = Dictionary(grouping: tasks) { TaskBucket(rawValue: $0.bucket) ?? .someday }
+                .mapValues { $0.sorted { $0.priority > $1.priority } }
             errorHeadline = nil
+            hasLoaded = true
         } catch {
-            errorHeadline = "Can't reach OpenAGI."
+            guard !Task.isCancelled else { return }
+            errorHeadline = (error as? DaemonError) == .unauthorized
+                ? "Pairing needs attention. Connect to your agent again in Settings."
+                : "Couldn't load tasks from this server."
         }
     }
 }

@@ -1,34 +1,26 @@
 import SwiftUI
 
-// The whole of mobile/DESIGN.md's palette and type scale, in one place, so
-// every screen (and the widget, which compiles this same file into its own
-// target — see project.yml) draws from the same six colours and the same
-// scale rather than each screen inventing its own.
-//
-// Only Foundation/SwiftUI/UIKit here — this file compiles into the widget
-// extension target too, which must not pull in networking or app-only
-// frameworks.
+// System semantic colors and text styles follow iOS appearance, contrast and
+// Dynamic Type settings. The app and widget share these native tokens.
 public enum Theme {
     // MARK: - Colour
 
     // Screen background.
-    public static let canvas = Color(light: 0xF1F3F2, dark: 0x0E1211)
+    public static let canvas = Color(uiColor: .systemGroupedBackground)
     // Rows, cards, fields.
-    public static let surface = Color(light: 0xFFFFFF, dark: 0x171C1A)
+    public static let surface = Color(uiColor: .secondarySystemGroupedBackground)
     // Primary text.
-    public static let ink = Color(light: 0x13171A, dark: 0xECEFED)
+    public static let ink = Color.primary
     // Secondary text, hairlines' labels.
-    public static let muted = Color(light: 0x5C6763, dark: 0x93A09A)
+    public static let muted = Color.secondary
     // Connected, complete, confirm.
-    public static let live = Color(light: 0x0E6F4E, dark: 0x4BC48D)
+    public static let live = Color.blue
     // Overdue, deny, unreachable.
-    public static let alert = Color(light: 0xA32C22, dark: 0xF08A7E)
+    public static let alert = Color.red
     // Row-group separators.
-    public static let edge = Color(light: 0xE2E6E4, dark: 0x262D2A)
-    // One exception to the six: the Supervisor's yellow health dot, a third
-    // status hue between `live` and `alert` (mobile/FEATURES.md's
-    // Supervisor section). 4.5:1 on `surface` in both modes, fixed like them.
-    public static let caution = Color(light: 0x8A5A00, dark: 0xE8B64C)
+    public static let edge = Color(uiColor: .separator)
+    // The Supervisor's intermediate health state.
+    public static let caution = Color.orange
 
     // MARK: - Layout
 
@@ -55,19 +47,16 @@ public enum Theme {
 
     // MARK: - Type
 
-    // System faces used deliberately: SF Pro on iOS. Sizes/weights below are
-    // DESIGN.md's scale; each is exposed as a `Font` built with `.system` so
-    // Dynamic Type still scales every one of these relative to the user's
-    // chosen text size.
+    // Semantic text styles scale with Dynamic Type, including accessibility sizes.
     public enum Typography {
-        public static let screenTitle = Font.system(size: 34, weight: .semibold)
-        public static let section = Font.system(size: 20, weight: .semibold)
-        public static let body = Font.system(size: 17, weight: .regular)
-        public static let secondary = Font.system(size: 15, weight: .regular)
-        public static let caption = Font.system(size: 13, weight: .regular)
+        public static let screenTitle = Font.largeTitle.bold()
+        public static let section = Font.title3.weight(.semibold)
+        public static let body = Font.body
+        public static let secondary = Font.subheadline
+        public static let caption = Font.caption
         // Monospace is reserved for machine identifiers: host, pairing code, ids.
-        public static let dataMono = Font.system(size: 13, weight: .regular, design: .monospaced)
-        public static let codeEntryMono = Font.system(size: 28, weight: .medium, design: .monospaced)
+        public static let dataMono = Font.caption.monospaced()
+        public static let codeEntryMono = Font.title2.monospaced()
     }
 
     // Tracking for the pairing code field specifically — DESIGN.md calls for

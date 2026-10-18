@@ -167,10 +167,20 @@ targets:
         BUNDLE_LOADER: $(TEST_HOST)
     info:
       path: Tests/Info.plist
+  OpenAGIUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: OpenAGI
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
 schemes:
   OpenAGI:
     build:
       targets:
         OpenAGI: all
     test:
-      targets: [OpenAGITests]
+      targets: [OpenAGITests, OpenAGIUITests]

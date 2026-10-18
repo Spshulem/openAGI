@@ -1,113 +1,114 @@
 import SwiftUI
 
-// mobile/FEATURES.md's Settings tab: where the agent runs (this iPhone, or a server), the connection (host, node id, last
-// synced — host and id in mono), refresh now, revoke (confirmation
-// required), and a build version so a bug report can name one. Never
-// renders the token — only the server and node id are shown, matching the
-// rest of the app's rule that the token stays in the Keychain and nowhere
-// else, including this screen.
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
     let onRevoked: () -> Void
 
+    @State private var path: [WorkspaceDestination] = []
     @State private var isWorking = false
     @State private var showingRevokeConfirmation = false
+    @State private var switchError: String?
 
     var body: some View {
-        NavigationStack {
-            List {
-                ScreenHeader(title: "Settings", host: model.hostLabel,
-                            ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
-
-                RowGroup {
-                    if model.isOnPhone {
-                        labeledRow(label: "Runs on", value: "This iPhone", mono: false)
-                        RowHairline()
-                        labeledRow(label: "Model", value: Self.modelLabel, mono: false)
-                    } else {
-                        labeledRow(label: "Server", value: model.credentials.server.absoluteString, mono: true)
-                        RowHairline()
-                        labeledRow(label: "Node ID", value: model.credentials.nodeID, mono: true)
-                    }
-                    RowHairline()
-                    labeledRow(label: "Build", value: Self.buildVersion, mono: false)
-                }
-                .padding(.horizontal, Theme.gutter)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Theme.canvas)
-                .listRowSeparator(.hidden)
-
-                PrimaryButton(title: "Refresh now", isLoading: isWorking) {
-                    Task { await refresh() }
-                }
-                .disabled(isWorking)
-                .padding(.horizontal, Theme.gutter)
-                .padding(.top, Theme.Spacing.x4)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Theme.canvas)
-                .listRowSeparator(.hidden)
-
-                Text("Workspace")
-                    .font(Theme.Typography.section)
-                    .foregroundStyle(Theme.ink)
-                    .padding(.horizontal, Theme.gutter)
-                    .padding(.top, Theme.Spacing.x4)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Theme.canvas)
-                    .listRowSeparator(.hidden)
-                WorkspaceSection()
-                    .padding(.horizontal, Theme.gutter)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Theme.canvas)
-                    .listRowSeparator(.hidden)
-
-                // Onboarding's second step: the agent starts on this iPhone
-                // and can be pointed at a server later, and back again.
-                if model.isOnPhone {
-                    if let backup = AppSession.shared.serverBackup {
-                        SecondaryTextButton(title: "Switch back to \(backup.server.host ?? "the server")") {
-                            Task { await switchBack() }
+        NavigationStack(path: $path) {
+            Form {
+                Section {
+                    LabeledContent("Runs on", value: model.isOnPhone ? "This iPhone" : "Server")
+                    if !model.isOnPhone {
+                        LabeledContent("Server") {
+                            Text(model.credentials.server.absoluteString)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .multilineTextAlignment(.trailing)
                         }
-                        .padding(.horizontal, Theme.gutter)
-                        .listRowInsets(EdgeInsets())
-                        .listRowBackground(Theme.canvas)
-                        .listRowSeparator(.hidden)
                     }
-                    SecondaryTextButton(title: "Connect to a server") {
-                        model.detach()
-                        AppSession.shared.chooseServer()
-                    }
-                    .padding(.horizontal, Theme.gutter)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Theme.canvas)
-                    .listRowSeparator(.hidden)
-                } else {
-                    if AppSession.shared.canRunOnPhone {
-                        SecondaryTextButton(title: AppSession.shared.hasPhoneAgent ? "Use the agent on this iPhone" : "Try the agent on this iPhone") {
-                            model.detach()
-                            AppSession.shared.tryPhone()
+                    LabeledContent("Data", value: model.dataStatus)
+                        .accessibilityIdentifier("settings-data-status")
+                    if let fetchedAt = model.snapshot?.fetchedAt {
+                        LabeledContent("Last synced") {
+                            Text(fetchedAt, style: .relative)
                         }
-                        .padding(.horizontal, Theme.gutter)
-                        .listRowInsets(EdgeInsets())
-                        .listRowBackground(Theme.canvas)
-                        .listRowSeparator(.hidden)
                     }
-
-                    DestructiveTextButton(title: "Revoke this phone") {
-                        showingRevokeConfirmation = true
+                    Button {
+                        Task { await refresh() }
+                    } label: {
+                        HStack {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                            Spacer()
+                            if isWorking { ProgressView() }
+                        }
                     }
                     .disabled(isWorking)
-                    .padding(.horizontal, Theme.gutter)
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Theme.canvas)
-                    .listRowSeparator(.hidden)
+                } header: {
+                    Text("Connection")
+                } footer: {
+                    if !model.isOnPhone {
+                        Text("Tasks, Inbox and chat history come from this server. Supervisor can also show activity from other machines in its fleet.")
+                    }
+                }
+
+                WorkspaceSection()
+
+                Section("Agent location") {
+                    if model.isOnPhone {
+                        if let backup = AppSession.shared.serverBackup {
+                            Button("Switch back to \(backup.server.host ?? "the server")") {
+                                Task { await switchBack() }
+                            }
+                        }
+                        Button("Connect to a server", systemImage: "server.rack", action: connectToServer)
+                    } else {
+                        Button("Connect to a different server", systemImage: "server.rack", action: connectToServer)
+                            .accessibilityIdentifier("settings-change-server")
+                        if AppSession.shared.canRunOnPhone {
+                            Button(AppSession.shared.hasPhoneAgent ? "Use the agent on this iPhone" : "Try the agent on this iPhone", systemImage: "iphone") {
+                                dismiss()
+                                model.detach()
+                                AppSession.shared.tryPhone()
+                            }
+                        }
+                    }
+                }
+
+                Section("About") {
+                    LabeledContent("Version", value: Self.buildVersion)
+                    if !model.isOnPhone {
+                        LabeledContent("Phone ID") {
+                            Text(model.credentials.nodeID)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+
+                if !model.isOnPhone {
+                    Section {
+                        Button("Revoke this phone", role: .destructive) {
+                            showingRevokeConfirmation = true
+                        }
+                    }
                 }
             }
-            .listStyle(.plain)
-            .scrollContentBackground(.hidden)
-            .background(Theme.canvas)
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: WorkspaceDestination.self) { destination in
+                switch destination {
+                case .model: ModelSettingsView()
+                case .instructions: InstructionsView()
+                case .skills: SkillsView()
+                case .scheduled: ScheduledJobsView()
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done", systemImage: "checkmark") { dismiss() }
+                        .accessibilityIdentifier("settings-done")
+                }
+            }
             .disabled(isWorking)
-            .alert("Still on this iPhone", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
+            .alert("Couldn't switch agents", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(switchError ?? "")
@@ -121,43 +122,23 @@ struct SettingsView: View {
         }
     }
 
-    private func labeledRow(label: String, value: String, mono: Bool) -> some View {
-        HStack(alignment: .top) {
-            Text(label)
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.muted)
-            Spacer(minLength: Theme.Spacing.x4)
-            Text(value)
-                .font(mono ? Theme.Typography.dataMono : Theme.Typography.body)
-                .foregroundStyle(Theme.ink)
-                .multilineTextAlignment(.trailing)
-        }
-        .padding(.horizontal, Theme.Spacing.x4)
-        .frame(minHeight: Theme.rowMinHeight)
-    }
-
-    private static var modelLabel: String {
-        switch OnDeviceModelStatus.current() {
-        case .available: return "Apple Intelligence"
-        case .downloading: return "Downloading"
-        case .notEnabled: return "Apple Intelligence is off"
-        case .unsupported: return "Not available"
-        }
-    }
-
     private static var buildVersion: String {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         return "\(version) (\(build))"
     }
 
+    private func connectToServer() {
+        dismiss()
+        model.detach()
+        AppSession.shared.chooseServer()
+    }
+
     private func refresh() async {
         isWorking = true
         defer { isWorking = false }
-        await model.refreshToday()
+        await model.refreshData()
     }
-
-    @State private var switchError: String?
 
     private func switchBack() async {
         isWorking = true
@@ -165,7 +146,7 @@ struct SettingsView: View {
         do {
             _ = try await AppSession.shared.switchBackToServer(detaching: model)
         } catch {
-            switchError = "Can't reach your Mac yet. Your work stays on this iPhone until it can."
+            switchError = "Can't reach your server yet. Your work stays on this iPhone until it can."
         }
     }
 

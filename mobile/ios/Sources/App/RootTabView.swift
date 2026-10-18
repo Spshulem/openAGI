@@ -16,6 +16,7 @@ struct RootTabView: View {
     let incomingPairing: PairingPayload?
     let onDismissIncomingPairing: () -> Void
     private let currentHost: String
+    private let runsBackgroundServices: Bool
 
     init(
         credentials: Credentials,
@@ -31,7 +32,19 @@ struct RootTabView: View {
         self.onDismissIncomingPairing = onDismissIncomingPairing
         self.onRevoked = onRevoked
         self.currentHost = credentials.server.host ?? credentials.server.absoluteString
+        self.runsBackgroundServices = true
     }
+
+    #if DEBUG
+    init(testingModel: AppModel) {
+        _model = State(initialValue: testingModel)
+        incomingPairing = nil
+        onDismissIncomingPairing = {}
+        onRevoked = {}
+        currentHost = testingModel.hostLabel
+        runsBackgroundServices = false
+    }
+    #endif
 
     private var switchAlertShown: Binding<Bool> {
         Binding(
@@ -76,11 +89,6 @@ struct RootTabView: View {
             }
         }
         .tabViewStyle(.sidebarAdaptable)
-        // Every control that reaches for a system accent (the tab bar's
-        // selected state, a Picker's menu label, a Toggle, a Slider) should
-        // land on the app's own `live` token rather than the generic system
-        // blue -- DESIGN.md's palette is "six values per mode, nothing
-        // else."
         .tint(Theme.live)
         .environment(model)
         .alert("Switch to another OpenAGI?", isPresented: switchAlertShown) {
@@ -112,7 +120,7 @@ struct RootTabView: View {
             }
         }
         .task {
-            model.startEventStream()
+            if runsBackgroundServices { model.startEventStream() }
             await model.refreshInboxCounts()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -120,7 +128,7 @@ struct RootTabView: View {
                 Task { await model.refreshData() }
             }
         }
-        .task { await PushRegistrar.shared.start() }
+        .task { if runsBackgroundServices { await PushRegistrar.shared.start() } }
         .onChange(of: PushRouter.shared.wantsSupervisor, initial: true) { _, wants in
             guard wants else { return }
             model.selectedTab = .supervisor
@@ -135,7 +143,7 @@ struct RootTabView: View {
             if incomingMatchesCurrent { onDismissIncomingPairing() }
         }
         // Cancelled with the view, so it stops once this pairing is revoked.
-        .task { await RefreshCoordinator.sendHeartbeats(client: model.client) }
+        .task { if runsBackgroundServices { await RefreshCoordinator.sendHeartbeats(client: model.client) } }
         .onDisappear { model.stopEventStream() }
     }
 }

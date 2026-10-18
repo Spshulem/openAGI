@@ -8,6 +8,9 @@ import UserNotifications
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        #if DEBUG
+        if UITestProtocol.isEnabled { return true }
+        #endif
         UNUserNotificationCenter.current().delegate = self
         // A paired phone refreshes its token every launch (Apple's advice:
         // tokens can change). Permission is asked later, by PushRegistrar.
