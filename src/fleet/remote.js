@@ -229,7 +229,11 @@ export class RemoteFleetSupervisor {
     }
     const items = outreach.list();
     for (const q of this.getState().questions) {
-      const shown = { title: q.title, summary: q.card || q.body, actions: [...(q.options ?? []), "dismiss"] };
+      // Compact outreach clients cannot show the full deletion warning.
+      // Keep storage decisions in the main app where that warning is visible.
+      const shown = q.kind === 'storage'
+        ? { title: q.title, summary: 'Storage cleanup can permanently delete files. Review the full warning and choose in the main app.', actions: ['dismiss'] }
+        : { title: q.title, summary: q.card || q.body, actions: [...(q.options ?? []), "dismiss"] };
       // A question the computer closed on a blip and reopened keeps its id:
       // its old copy comes back, so the glasses do not ping for it again.
       const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;

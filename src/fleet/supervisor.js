@@ -901,7 +901,7 @@ export class FleetSupervisor {
       answerIn: inApp ? "agent app" : "here",
       openChat,
       ...(chats.length ? { chats } : {}),
-      risky: Boolean(question.mergeAsk) || (["agent-ask", "agent-card", "ready"].includes(question.kind) && RISKY_ASK.test(text))
+      risky: Boolean(question.mergeAsk) || question.kind === "storage" || (["agent-ask", "agent-card", "ready"].includes(question.kind) && RISKY_ASK.test(text))
     };
   }
 

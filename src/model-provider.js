@@ -1,5 +1,6 @@
+import { redactFailureDiagnostic } from "./agent-failure.js";
 import { ModelRouter } from "./model-router.js";
-import { ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
+import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
@@ -146,7 +147,8 @@ export class OpenAIResponsesProvider {
     let needsFinalAnswer = false;
     for (let hop = 0; hop < maxToolHops; hop += 1) {
       notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop: hop + 1, maxToolHops });
-      contextWindow.fit(conversationInput, { fixedChars });
+      const inputStop = fitOrStop(contextWindow, conversationInput, { fixedChars }, { provider: "openai", model, id: response?.id, toolCalls });
+      if (inputStop) return inputStop;
       const body = {
         model,
         instructions: baseInstructions,
@@ -220,7 +222,7 @@ export class OpenAIResponsesProvider {
         notifyProgress(onProgress, { stage: "tool", provider: "openai", model, hop: hop + 1, tool: call.name });
         const parsedArgs = safeParseJson(call.arguments) ?? {};
         const invocation = await (toolRegistry?.invoke?.(call.name, parsedArgs, toolContext) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
-        toolCalls.push({ name: call.name, arguments: parsedArgs, result: invocation });
+        toolCalls.push(recordedToolCall(call.name, parsedArgs, invocation, toolRegistry));
         const result = invocation.ok ? invocation.result : { error: invocation.error };
         // A tool that returns a screenshot (computer_screenshot) carries the PNG
         // as base64. function_call_output is text-only, so the model can't see
@@ -272,7 +274,8 @@ export class OpenAIResponsesProvider {
     if (!response || needsFinalAnswer) {
       const hop = maxToolHops + 1;
       notifyProgress(onProgress, { stage: "model", provider: "openai", model, hop, maxToolHops: hop });
-      contextWindow.fit(conversationInput, { fixedChars: fixedChars + FINAL_ANSWER_INSTRUCTION.length });
+      const inputStop = fitOrStop(contextWindow, conversationInput, { fixedChars: baseInstructions.length + 2 + FINAL_ANSWER_INSTRUCTION.length }, { provider: "openai", model, id: response?.id, toolCalls });
+      if (inputStop) return inputStop;
       const body = {
         model,
         instructions: `${baseInstructions}\n\n${FINAL_ANSWER_INSTRUCTION}`,
@@ -417,6 +420,7 @@ export class AnthropicProvider {
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;
     this.turnUsdLimit = turnUsdLimit(options.turnUsdLimit);
+    this.maxInputTokens = options.maxInputTokens ?? maxInputTokensFromEnv();
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.streamLimits = normalizeSseLimits(options.streamLimits);
     this.router = options.router ?? new ModelRouter({ envPrefix: "ANTHROPIC", baseModel: this.model });
@@ -450,11 +454,12 @@ export class AnthropicProvider {
     ];
 
     const contextBlock = turnContext ?? buildTurnContext({ scrutiny, memoryHits });
+    const contextWindow = new AnthropicToolLoopContext({ maxInputTokens: this.maxInputTokens });
     const convo = [
-      ...messages.slice(-12).map((m) => ({
+      ...messages.slice(-12).map((m) => contextWindow.mark({
         role: m.role === "assistant" ? "assistant" : "user",
         content: m.content
-      })),
+      }, { kind: "history" })),
       { role: "user", content: contextBlock ? `${contextBlock}\n\n${input}` : input }
     ];
 
@@ -467,6 +472,8 @@ export class AnthropicProvider {
 
     for (let hop = 0; hop < maxToolHops; hop += 1) {
       notifyProgress(onProgress, { stage: "model", provider: "anthropic", model, hop: hop + 1, maxToolHops });
+      const inputStop = fitOrStop(contextWindow, convo, { fixedChars: JSON.stringify(system).length + JSON.stringify(tools).length }, { provider: "anthropic", model, id: response?.id, toolCalls });
+      if (inputStop) return inputStop;
       const body = {
         model,
         max_tokens: this.maxTokens,
@@ -520,7 +527,7 @@ export class AnthropicProvider {
         }
         notifyProgress(onProgress, { stage: "tool", provider: "anthropic", model, hop: hop + 1, tool: use.name });
         const invocation = await (toolRegistry?.invoke?.(use.name, use.input ?? {}, toolContext) ?? Promise.resolve({ ok: false, error: "no toolRegistry" }));
-        toolCalls.push({ name: use.name, arguments: use.input, result: invocation });
+        toolCalls.push(recordedToolCall(use.name, use.input, invocation, toolRegistry));
         const result = invocation.ok ? invocation.result : { error: invocation.error };
         const image = invocation.ok ? toolResultImage(result) : null;
         const content = image
@@ -539,12 +546,12 @@ export class AnthropicProvider {
               }
             ]
           : clipToolOutput(JSON.stringify(result), use.name);
-        toolResults.push({
+        toolResults.push(contextWindow.mark({
           type: "tool_result",
           tool_use_id: use.id,
           content,
           is_error: !invocation.ok
-        });
+        }, { kind: "output", tool: use.name, hop }));
       }
       convo.push({ role: "user", content: toolResults });
       if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
@@ -568,6 +575,8 @@ export class AnthropicProvider {
         system: [...system, { type: "text", text: FINAL_ANSWER_INSTRUCTION }],
         messages: convo
       };
+      const inputStop = fitOrStop(contextWindow, convo, { fixedChars: JSON.stringify(body.system).length }, { provider: "anthropic", model, id: response?.id, toolCalls });
+      if (inputStop) return inputStop;
       let firstVisibleDelta = true;
       const emitText = typeof onTextDelta === "function"
         ? (text) => {
@@ -911,24 +920,80 @@ function shareTurnSpend(context) {
 }
 
 const STOP_PROGRESS_MAX = 12;
+const STOP_MESSAGE_MAX = 3800;
 
 // The stop text is what agent-host saves as the assistant turn, and history
 // keeps only role and content. Listing the tools already run (and the ones
 // the model asked for but did not get) lets a "continue" pick up from there
 // instead of redoing the same reads and side effects, and tells the owner
 // what happened before the stop.
-export function turnSpendStopMessage(turnUsd, limit, { toolCalls = [], unrunCalls = [] } = {}) {
-  const lines = [`I stopped this turn at $${turnUsd.toFixed(2)} of model spend (the per-turn limit is $${limit.toFixed(2)}).`];
-  const done = toolCalls.map((call) => `${call.name} (${toolCallStatus(call.result)})`);
-  if (done.length > 0) lines.push(`Done so far: ${collapseRepeats(done).join(", ")}.`);
-  if (unrunCalls.length > 0) lines.push(`Not run yet: ${collapseRepeats(unrunCalls).join(", ")}.`);
-  lines.push(`Say "continue" and I'll keep going.`);
+export function turnSpendStopMessage(turnUsd, limit, { toolCalls = [], unrunCalls = [], stopReason = null } = {}) {
+  const lines = [stopReason ?? `I stopped this turn at $${turnUsd.toFixed(2)} of model spend (the per-turn limit is $${limit.toFixed(2)}).`];
+  const done = toolCalls.map((call) => `${String(call.name).slice(0, 80)} (${toolCallStatus(call.result)})`);
+  if (done.length > 0) lines.push(`Done so far: ${collapseRepeats(done).join(", ").slice(0, 600)}.`);
+  if (unrunCalls.length > 0) lines.push(`Not run yet: ${collapseRepeats(unrunCalls.map((name) => String(name).slice(0, 80))).join(", ").slice(0, 600)}.`);
+  const continuation = `Say "continue" and I'll keep going.`;
+  if (toolCalls.length > 0) {
+    lines.push("Completed tool progress (do not repeat successful side effects):");
+    // Reserve the continuation and omission notice, then fit the newest
+    // receipts first. The entire saved/delivered reply fits Telegram too.
+    let remaining = STOP_MESSAGE_MAX - lines.join("\n").length - continuation.length - 150;
+    const receipts = [];
+    for (const call of toolCalls.slice(-STOP_PROGRESS_MAX).reverse()) {
+      const sensitive = Array.isArray(call.sensitiveArguments) && call.sensitiveArguments.length > 0;
+      const receipt = JSON.stringify({ tool: String(call.name).slice(0, 80),
+        arguments: sensitive ? "[omitted: sensitive tool input]" : boundedProgress(call.arguments),
+        result: sensitive ? { status: toolCallStatus(call.result) } : boundedProgress(call.result) });
+      if (receipt.length + 1 > remaining) continue;
+      receipts.unshift(receipt);
+      remaining -= receipt.length + 1;
+    }
+    lines.push(...receipts);
+    if (toolCalls.length > receipts.length) lines.push(`${toolCalls.length - receipts.length} call receipts omitted; check their state before repeating them.`);
+  }
+  lines.push(continuation);
   return lines.join(lines.length > 2 ? "\n" : " ");
+}
+
+function progressSummary(value, depth = 0) {
+  if (typeof value === "string") {
+    const safe = redactFailureDiagnostic(value);
+    return safe.length > 200 ? `${safe.slice(0, 200)} [truncated]` : safe;
+  }
+  if (value == null || typeof value !== "object") return value;
+  if (depth >= 3) return "[truncated]";
+  if (Array.isArray(value)) return value.slice(0, 5).map((item) => progressSummary(item, depth + 1));
+  return Object.fromEntries(Object.entries(value).slice(0, 8).map(([key, item]) => [key,
+    /image|base64|dataurl|api.?key|token|secret|password|authorization|credential|cookie|^env$|headers?|^args$|command|stdin/i.test(key) ? "[omitted]" : progressSummary(item, depth + 1)
+  ]));
+}
+
+function boundedProgress(value) {
+  const safe = progressSummary(value);
+  const serialized = JSON.stringify(safe);
+  return serialized?.length > 350 ? `${serialized.slice(0, 330)} [truncated]` : safe;
 }
 
 function toolCallStatus(invocation) {
   if (!invocation?.ok) return "failed";
   return invocation.result?.status === "awaiting_confirmation" ? "awaiting approval" : "ok";
+}
+
+function recordedToolCall(name, args, result, registry) {
+  const sensitiveArguments = registry?.get?.(name)?.metadata?.sensitiveArguments;
+  return { name, arguments: args, result,
+    ...(Array.isArray(sensitiveArguments) && sensitiveArguments.length ? { sensitiveArguments: [...sensitiveArguments] } : {}) };
+}
+
+function fitOrStop(window, input, options, progress) {
+  try { window.fit(input, options); }
+  catch (error) {
+    if (error.code !== "INPUT_CONTEXT_TOO_LARGE" || !progress.toolCalls.length) throw error;
+    return { ...progress, stoppedAtInputLimit: true,
+      text: turnSpendStopMessage(0, 0, { toolCalls: progress.toolCalls,
+        stopReason: 'I stopped before the next model call because its input exceeds OPENAGI_MAX_INPUT_TOKENS. Shorten the context or edit that value in .env and restart before continuing.' }) };
+  }
+  return null;
 }
 
 // "fleet_screen (ok), fleet_screen (ok)" -> "fleet_screen (ok) x2", in order,

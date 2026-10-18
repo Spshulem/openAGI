@@ -6,7 +6,7 @@ import fs from "node:fs";
 import { classifyErrorText } from "../errors.js";
 import {
   SUPERVISOR_PREFIX, clampTail, clampTailLines, clampText, cleanCardItem, isPidAlive as defaultIsPidAlive, isSupervisorOwnPrompt, openReadOnlyDb, prRefKey,
-  redactSecrets, repoFromRemote, threadKey, toIso
+  liveCardItems, redactSecrets, repoFromRemote, threadKey, toIso
 } from "../contracts.js";
 import { liveTasks, peerBlockedOnOwner, readLivePeers } from "./claude.js";
 
@@ -408,11 +408,9 @@ function askOutlivedBy(ask, peer) {
   return !(Number.isFinite(since) && Date.parse(ask.at ?? "") < since);
 }
 
-function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id", prompts = firstPrompts, dbFile = "" }) {
-  const { limits } = config;
+function readCardState(db, row, { limits, now, peers, turnColumn }) {
   const rows = readRecentMessages(db, row.id, turnColumn);
   const summary = summarizeTail(rows);
-  summary.firstUserText = firstPromptOf(db, row.id, rows, summary, prompts, `${dbFile}\n${row.id}`);
   const claudeSessionId = row.claude_session_id || null;
   const peer = peers.get(claudeSessionId ?? row.id) ?? peers.get(row.id) ?? null;
   // An errored session lost its card, so it reads as stopped instead. Only a
@@ -435,6 +433,13 @@ function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null
     asks = asks.filter((ask) => askOutlivedBy(ask, peer));
   }
   const card = cardOf(asks, limits);
+  return { rows, summary, claudeSessionId, peer, asks, card };
+}
+
+function buildThread(db, row, { config, now, peers, sinceIso, stale, tabs = null, turnColumn = "NULL AS turn_id", prompts = firstPrompts, dbFile = "", cardState = null }) {
+  const { limits } = config;
+  const { rows, summary, claudeSessionId, peer, asks, card } = cardState ?? readCardState(db, row, { limits, now, peers, turnColumn });
+  summary.firstUserText = firstPromptOf(db, row.id, rows, summary, prompts, `${dbFile}\n${row.id}`);
   // The agent's own call first, as before cards (executor and older readers).
   const pendingAsk = asks.find((ask) => !ask.subagent) ?? asks[0] ?? null;
   // A process on a permission prompt or dialog is mid-turn, whatever the last result said.
@@ -548,7 +553,8 @@ export async function listConductorThreads(config, options = {}) {
     const newestFirst = (a, b) => (b.updatedMs || 0) - (a.updatedMs || 0) || String(a.row.id).localeCompare(String(b.row.id));
     // options.only: just these sessions (a send-time re-read), whatever their age.
     const only = Array.isArray(options.only) ? new Set(options.only) : null;
-    const recent = rows.filter((entry) => (only ? only.has(entry.row.id) : entry.updatedMs >= cutoff)).sort(newestFirst).slice(0, config.limits.maxThreads);
+    const ranked = rows.filter((entry) => (only ? only.has(entry.row.id) : entry.updatedMs >= cutoff)).sort(newestFirst);
+    const recent = ranked.slice(0, config.limits.maxThreads);
     const picked = new Set(recent.map((entry) => entry.row.id));
     // The BuildBot3 manager stays visible for escalation even when it is quiet.
     const manager = only ? [] : rows
@@ -567,6 +573,24 @@ export async function listConductorThreads(config, options = {}) {
         // partial catalog would close questions from sessions we failed to read.
         threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn, prompts: options.firstPrompts ?? firstPrompts, dbFile: file }));
       }
+    }
+    // The catalog cap bounds ordinary rows, not questions that still need
+    // the owner. Check the remaining sessions inside the same lookback,
+    // using the existing current-turn/card-liveness checks. A later answer
+    // removes the overflow row again; stale managers are not read twice.
+    const included = new Map(threads.map((thread) => [thread.id, thread]));
+    if (!only) for (const { row } of ranked.slice(config.limits.maxThreads)) {
+      const existing = included.get(row.id);
+      if (existing) {
+        if (existing.excluded === "stale" && liveCardItems(existing.meta?.pendingCard, now).length) existing.excluded = null;
+        continue;
+      }
+      if (CARD_DEAD_STATUSES.has(row.status)) continue;
+      // Probe cards first: ordinary overflow sessions do not read tasks,
+      // first-prompt history or created PRs on every Fleet tick.
+      const cardState = readCardState(db, row, { limits: config.limits, now, peers, turnColumn });
+      if (!liveCardItems(cardState.card, now).length) continue;
+      threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale: false, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn, prompts: options.firstPrompts ?? firstPrompts, dbFile: file, cardState }));
     }
     return threads;
   } finally {
