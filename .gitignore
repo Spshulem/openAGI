@@ -28,6 +28,7 @@ output/
 *.ipa
 *.apk
 *.p8
+qa/results/
 .claude/
 
 # Mac SwiftPM build artifacts

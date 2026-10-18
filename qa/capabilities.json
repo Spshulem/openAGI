@@ -1,0 +1,12 @@
+{
+  "sharing": { "label": "Partner messaging and security", "tests": ["test/partner-sharing.test.js", "test/sendblue.test.js", "test/messaging-providers.test.js", "test/companion-routes.test.js", "test/telegram-pairing.test.js", "test/telegram-channel-gate.test.js"] },
+  "google": { "label": "Gmail and Google Calendar", "tests": ["test/google-integration.test.js"] },
+  "pebble": { "label": "Pebble signed voice-memo ingestion", "tests": ["test/pebble-webhook.test.js"] },
+  "routines": { "label": "Schedules, retries and overlap guards", "tests": ["test/scheduled-prompt-safety.test.js", "test/cron-overlap-guard.test.js", "test/cron-manual-run.test.js"] },
+  "subagents": { "label": "Bounded delegation and propagation", "tests": ["test/subagent-tools.test.js", "test/specialist-bounds.test.js"] },
+  "skills_mcp": { "label": "Skills, MCP and OAuth", "tests": ["test/replay-skill-gate.test.js", "test/mcp-oauth-lifecycle.test.js", "test/sec-mcp-argv.test.js"] },
+  "web": { "label": "Web search, Exa and page fetching", "tests": ["test/web-search-tools.test.js", "test/web-search-providers.test.js"] },
+  "computer": { "label": "Computer use and permission boundaries", "tests": ["test/computer-use-approval.test.js", "test/open-computer-use.test.js", "test/computer-use-readiness.test.js"] },
+  "voice": { "label": "OpenAI realtime voice and relay", "tests": ["test/voice-broker.test.js", "test/voice-relay.test.js", "test/voice-smoke.test.js"] },
+  "memory_interfaces": { "label": "Memory and shared device conversations", "tests": ["test/memory-corrections.test.js", "test/memory-maintenance.test.js", "test/shared-conversations.test.js", "test/data-dir.test.js", "test/env-persistence.test.js"] }
+}

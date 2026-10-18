@@ -4,6 +4,7 @@ import { ensureDir, writeTextAtomic } from "./file-utils.js";
 import { generateToken } from "./auth.js";
 import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
 import { resolveDataDir } from "./data-dir.js";
+import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
 // configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
@@ -15,7 +16,9 @@ const WIZARD_FIELDS = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
   "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT",
   "OPENAGI_AUTH_TOKEN",
-  "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER",
+  "SENDBLUE_API_KEY", "SENDBLUE_API_SECRET", "SENDBLUE_FROM_NUMBER", "SENDBLUE_WEBHOOK_SECRET",
+  ...MESSAGING_CONFIG_KEYS,
+  "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "PEBBLE_WEBHOOK_SECRET",
   "VOCALEO_API_KEY", "VOCALEO_ACCOUNT_ID", "VOCALEO_PHONE_NUMBER",
   "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_POLLING",
   "RIZE_API_KEY",
@@ -268,11 +271,13 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
       <p class="sub">Channels are how messages get to/from you. (Data sources — where tasks come from — live in step 5.)</p>
 
       <details>
-        <summary>Twilio SMS — text the agent and get texts back</summary>
+        <summary>Sendblue — give the agent its own iMessage / SMS number</summary>
         <div style="padding-top:10px;" class="grid">
-          <div><label>TWILIO_ACCOUNT_SID${saved("TWILIO_ACCOUNT_SID")}</label><input type="text" name="TWILIO_ACCOUNT_SID" placeholder="AC..."></div>
-          <div><label>TWILIO_AUTH_TOKEN${saved("TWILIO_AUTH_TOKEN")}</label><input type="password" name="TWILIO_AUTH_TOKEN" autocomplete="off"></div>
-          <div><label>TWILIO_FROM_NUMBER${saved("TWILIO_FROM_NUMBER")}</label><input type="text" name="TWILIO_FROM_NUMBER" placeholder="+15551234567"></div>
+          <div><label>API key${saved("SENDBLUE_API_KEY")}</label><input type="password" name="SENDBLUE_API_KEY" autocomplete="off"></div>
+          <div><label>API secret${saved("SENDBLUE_API_SECRET")}</label><input type="password" name="SENDBLUE_API_SECRET" autocomplete="off"></div>
+          <div><label>Agent number${saved("SENDBLUE_FROM_NUMBER")}</label><input type="text" name="SENDBLUE_FROM_NUMBER" placeholder="+15551234567"></div>
+          <div><label>Webhook secret${saved("SENDBLUE_WEBHOOK_SECRET")}</label><input type="password" name="SENDBLUE_WEBHOOK_SECRET" autocomplete="off"></div>
+          <p>After setup, open Channels → Connections to approve contacts and groups.</p>
         </div>
       </details>
 
@@ -382,7 +387,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
     <div class="step">
       <h2>7 / 8 · public access</h2>
       <h3>Tunnel <span class="sub">required for SMS/Telegram webhooks</span></h3>
-      <p>If you want Twilio or Telegram webhooks to reach this machine, expose it via a tunnel. <code>cloudflared</code> on macOS: <code>brew install cloudflared</code>; on Linux: <a href="https://pkg.cloudflare.com/index.html" target="_blank" rel="noopener">pkg.cloudflare.com</a>.</p>
+      <p>If you want Sendblue, Pebble or Telegram webhooks to reach this machine, expose it via a tunnel. <code>cloudflared</code> on macOS: <code>brew install cloudflared</code>; on Linux: <a href="https://pkg.cloudflare.com/index.html" target="_blank" rel="noopener">pkg.cloudflare.com</a>.</p>
       <p>Then run <code>npm run tunnel</code> in another terminal and paste the URL it prints below.</p>
       <label>OPENAGI_PUBLIC_URL <span class="sub">leave blank to skip</span></label>
       <input type="text" name="OPENAGI_PUBLIC_URL" placeholder="https://abcd.trycloudflare.com" value="${val("OPENAGI_PUBLIC_URL")}">
@@ -529,7 +534,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
         (mcpResults.some((r) => !r.ok) ? '\\n<span class="err">Failed:</span> ' + mcpResults.filter((r) => !r.ok).map((r) => r.catalogId + " (" + r.error + ")").join(", ") : "");
       const target = checkedMcps.length > 0 ? "/?tab=integrations" : "/";
 
-      // Bounce the daemon so existing integrations (Linear/BuildBetter/Twilio
+      // Bounce the daemon so existing integrations (Linear/BuildBetter/Sendblue
       // etc) re-read their .env values. The Mac app's DaemonController auto-
       // respawns. For bare-metal users running 'npm run serve', they'll need
       // to relaunch — we surface a fallback message after a generous timeout.

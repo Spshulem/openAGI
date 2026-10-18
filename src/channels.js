@@ -4,6 +4,9 @@ import { nowIso } from "./utils.js";
 import { resolveDataDir } from "./data-dir.js";
 import { TelegramPairing } from "./telegram-pairing.js";
 import { G2Channel } from "./integrations/g2-channel.js";
+import { PartnerSharing } from "./partner-sharing.js";
+import { SendblueChannel } from "./integrations/sendblue.js";
+import { TEXT_CHANNELS } from "./integrations/messaging.js";
 
 export class ChannelManager {
   constructor(options = {}) {
@@ -12,6 +15,11 @@ export class ChannelManager {
     this.dir = options.dir ?? path.join(resolveDataDir(), "channels");
     ensureDir(this.dir);
     this.eventsPath = path.join(this.dir, "events.jsonl");
+    this.sharing = options.sharing ?? new PartnerSharing({ dir: path.join(this.dir, "sharing"), getModelProvider: () => this.agentHost?.modelProvider });
+    this.sendblue = options.sendblue ?? new SendblueChannel({ sharing: this.sharing, dir: path.join(this.dir, "sendblue"), env: options.env, fetchImpl: options.sendblueFetch });
+    for (const [provider, Channel] of Object.entries(TEXT_CHANNELS)) {
+      this[provider] = options[provider] ?? new Channel({ sharing: this.sharing, dir: path.join(this.dir, provider), env: options.env, fetchImpl: options.messagingFetch });
+    }
     this.telegram = new TelegramChannel({
       agentHost: this.agentHost,
       dir: path.join(this.dir, "telegram"),
@@ -61,6 +69,10 @@ export class ChannelManager {
     appendJsonLine(this.eventsPath, { at: nowIso(), op: "deliver", channel, target, text: String(text).slice(0, 400) });
     let result;
     if (channel === "telegram") result = await this.telegram.sendMessage(target, text);
+    else if (channel === "sendblue") result = await this.sendblue.sendMessage(target, text);
+    else if (channel === "sendblue-group") result = await this.sendblue.sendMessage(target, text, { group: true });
+    else if (Object.hasOwn(TEXT_CHANNELS, channel)) result = await this[channel].sendMessage(target, text);
+    else if (channel === "linq-group") result = await this.linq.sendMessage(target, text, { group: true });
     else if (channel === "local" || channel === "cron") {
       result = { delivered: false, reason: `channel ${channel} has no outbound transport (read from /sessions or stream /events)` };
     } else {
@@ -77,19 +89,23 @@ export class ChannelManager {
   }
 
   start() {
+    for (const provider of Object.keys(TEXT_CHANNELS)) this[provider].start();
     if (process.env.TELEGRAM_POLLING === "1") {
       this.telegram.startPolling();
     }
   }
 
-  stop() {
+  async stop() {
     this.telegram.stopPolling();
+    await Promise.all(Object.keys(TEXT_CHANNELS).map(provider => this[provider].stop()));
   }
 
   status() {
     return {
       local: { enabled: true, mode: "http+sse" },
       telegram: this.telegram.status(),
+      sendblue: this.sendblue.status(),
+      ...Object.fromEntries(Object.keys(TEXT_CHANNELS).map(provider => [provider, this[provider].status()])),
       g2: this.g2.status()
     };
   }

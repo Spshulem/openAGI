@@ -84,7 +84,7 @@ The highlighted rows are the bet — Scrutiny, tiered Memory, Propagation, the c
 | Your data stays local (bar prompts to your LLM) |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
 | Bring your own LLM                             | ✅ any  |   ✅ 200+    |     ✅      |     ✅ 23+      |    —     |     —     |
 | Persistent memory across sessions              | ✅ tiered | ✅ FTS5     | ✅ markdown |    ✅ durable   | limited  | limited   |
-| Multi-channel (SMS / Telegram / HTTP)          |   ✅    |      ✅       |     ✅      |  dashboard only |    —     |     —     |
+| Multi-channel (Sendblue / Telegram / HTTP)          |   ✅    |      ✅       |     ✅      |  dashboard only |    —     |     —     |
 | MCP server support                             |   ✅    |      ✅       |     ✅      |       ✅        |   some   |     —     |
 | Skills system                                  |   ✅    |      ✅       |     ✅      |    ✅ reviewed  |    —     |     —     |
 | Cron / scheduled tasks                         |   ✅    |      ✅       |     ✅      |       ✅        |    —     |     —     |
@@ -220,6 +220,11 @@ For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the O
 | **MCP execution** | Register stdio or HTTP+OAuth MCP servers in `.openagi/mcp.json` (or via the UI). On connect, every tool the server advertises becomes a callable agent tool (`mcp_<server>_<tool>`). |
 | **Cron prompts** | The agent can call `schedule_message({prompt, delaySeconds | intervalSeconds | dailyAt, channel, target})`. When the job fires, the daemon runs the prompt and routes the reply to the originating channel (Telegram, local). |
 | **Telegram** | Webhook (`/channels/telegram/webhook`) or long polling (`TELEGRAM_POLLING=1`). |
+| **Partner sharing** | `/connections` — dedicated Sendblue, Linq, Twilio, Telnyx or Surge number; approved contacts, Sendblue/Linq groups, isolated conversation memory. |
+| **Gmail + Google Calendar** | `/connections` — Google OAuth, inbox search/read, approved drafts/sends and event creation. |
+| **Pebble Index** | Signed multipart `/webhooks/pebble` — voice memos into memory and reminder tasks. |
+| **On-demand subagents** | `run_subagent` — bounded read-only delegation; use existing scheduled prompts for daily routines. |
+| **Capability QA** | `npm run qa:capabilities` — ten offline capability areas plus [live test prompts](qa/scenarios.json). |
 | **Even Realities G2 node** | Enroll from the Nodes tab, speak through the glasses microphone, and read OpenAGI's answer on the display. G2 gets a constrained, revocable node credential; question audio is transcribed transiently and is not saved. [Setup guide](docs/setup/even-g2.md). |
 | **Mobile apps (iOS + Android)** | Pair a phone as a node and get today's tasks on a home-screen widget with tap-to-complete — local/Tailscale only, no cloud relay. [`mobile/README.md`](mobile/README.md). |
 | **Persistent state** | All under `.openagi/`: memory (JSONL audit + atomic snapshot), cron jobs, agent/session store, specialist workspaces, MCP logs. |
@@ -432,7 +437,7 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'
 
 Webhooks self-validate instead:
 
-- **Twilio:** when `TWILIO_AUTH_TOKEN` and `OPENAGI_PUBLIC_URL` are set, the daemon verifies the `X-Twilio-Signature` HMAC against the incoming form body.
+- **Sendblue / Pebble:** receive webhooks fail closed without their configured secret/signature. Partner contacts and groups require owner approval; partner memories and tools are isolated. See [Connections setup](docs/setup/partner-and-integrations.md).
 - **Telegram:** set `TELEGRAM_WEBHOOK_SECRET` and pass the same value as `secret_token` to `setWebhook` — the daemon checks the `X-Telegram-Bot-Api-Secret-Token` header.
 
 Additional defenses:
@@ -466,9 +471,13 @@ Additional defenses:
 | POST   | `/mcp/call`                       | `{server, tool, args}`                 |
 | POST   | `/observations`                   | Activity batch from Mac capture        |
 | GET    | `/observations/search`            | Full-text search of observed activity  |
-| POST   | `/channels/twilio/webhook`        | Twilio inbound SMS                     |
+| POST   | `/channels/sendblue/webhook`      | Approved partner iMessage / SMS         |
+| POST   | `/channels/linq/webhook`          | Signed Linq V3 partner text             |
+| POST   | `/channels/twilio/webhook`        | Signed form-encoded partner SMS         |
+| POST   | `/channels/telnyx/webhook`        | Signed Telnyx partner text              |
+| POST   | `/channels/surge/webhook`         | Signed Surge partner text               |
 | POST   | `/channels/telegram/webhook`      | Telegram inbound                       |
-| POST   | `/channels/sms/send`              | Twilio outbound (`{to, text}`)         |
+| POST   | `/webhooks/pebble`                | Signed Index 01 voice-memo ingestion    |
 | POST   | `/tick`                           | Manually run due cron jobs             |
 
 ---
@@ -539,7 +548,7 @@ src/
   agent-host.js               turn loop, threads tool registry into model provider
   agent-store.js              persistent agents and sessions
   auth.js                     bearer/cookie auth + CSRF (cross-origin POST guard)
-  channels.js                 local + Telegram + Twilio (SMS) channels
+  channels.js                 local + Telegram + Sendblue partner channels
   cron-scheduler.js           interval/dailyAt jobs (incl. the "prompt" job type)
   directional-adaptive-scrutiny.js  decision layer
   hosted-interface.js         HTTP server, SSE, chat UI
