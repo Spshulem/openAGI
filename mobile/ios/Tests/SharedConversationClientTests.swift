@@ -152,6 +152,90 @@ final class SharedConversationClientTests: XCTestCase {
 
     // MARK: - ChatConversation
 
+    private let newestPage = #"{"thread":"agent","messages":[{"id":"m3","role":"user","text":"Recent question","at":"2026-09-28T15:40:00Z"},{"id":"m4","role":"assistant","text":"Recent reply","at":"2026-09-28T15:40:05Z"}],"nextBefore":"m3"}"#
+    private let earlierPage = #"{"thread":"agent","messages":[{"id":"m1","role":"user","text":"Earlier question","at":"2026-09-27T15:40:00Z"},{"id":"m2","role":"assistant","text":"Earlier reply","at":"2026-09-27T15:40:05Z"}],"nextBefore":null}"#
+
+    @MainActor
+    func testLoadEarlierPagesPreservesRecentHistoryAndStaysExhaustedAfterRefresh() async throws {
+        let store = ChatHistoryStore(thread: "agent", directory: directory)
+        let conversation = ChatConversation(thread: .agent, client: makeClient(), store: store, nodeID: "mobile:fixture")
+        stub(["/conversations/agent/messages": (200, newestPage)])
+        await conversation.refresh()
+        let recentIDs = conversation.messages.map(\.id)
+        XCTAssertEqual(conversation.nextBefore, "m3")
+
+        stub(["/conversations/agent/messages": (200, earlierPage)])
+        await conversation.loadOlder()
+        let query = URLComponents(url: try request(path: "/conversations/agent/messages").url!, resolvingAgainstBaseURL: false)?.queryItems
+        XCTAssertEqual(query?.first(where: { $0.name == "before" })?.value, "m3")
+        XCTAssertEqual(conversation.messages.map(\.serverID), ["m1", "m2", "m3", "m4"])
+        XCTAssertEqual(Array(conversation.messages.suffix(2)).map(\.id), recentIDs)
+        XCTAssertNil(conversation.nextBefore)
+        XCTAssertFalse(conversation.isLoadingOlder)
+        XCTAssertEqual(store.load(nodeID: "mobile:fixture").map(\.serverID), ["m1", "m2", "m3", "m4"])
+
+        stub(["/conversations/agent/messages": (200, newestPage)])
+        await conversation.refresh()
+        XCTAssertEqual(conversation.messages.map(\.serverID), ["m1", "m2", "m3", "m4"])
+        XCTAssertNil(conversation.nextBefore)
+        let count = Self.requests.count
+        await conversation.loadOlder()
+        XCTAssertEqual(Self.requests.count, count)
+    }
+
+    @MainActor
+    func testEarlierPageFailureKeepsHistoryAndCursorForRetry() async {
+        let conversation = ChatConversation(thread: .agent, client: makeClient(),
+            store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:fixture")
+        stub(["/conversations/agent/messages": (200, newestPage)])
+        await conversation.refresh()
+        let messages = conversation.messages
+        stub(["/conversations/agent/messages": (503, #"{"error":"temporarily unavailable"}"#)])
+        await conversation.loadOlder()
+        XCTAssertEqual(conversation.messages, messages)
+        XCTAssertEqual(conversation.nextBefore, "m3")
+        XCTAssertNotNil(conversation.olderHistoryError)
+        XCTAssertFalse(conversation.isLoadingOlder)
+
+        stub(["/conversations/agent/messages": (200, earlierPage)])
+        await conversation.loadOlder()
+        XCTAssertNil(conversation.olderHistoryError)
+        XCTAssertEqual(conversation.messages.count, 4)
+    }
+
+    @MainActor
+    func testRelaunchPagesFromTheOldestCachedServerMessage() async {
+        let store = ChatHistoryStore(thread: "agent", directory: directory)
+        store.save(nodeID: "mobile:fixture", entries: [
+            SavedChatEntry(id: UUID(), serverID: "m1", role: "user", at: Date(timeIntervalSince1970: 1), text: "Earlier question")
+        ])
+        let conversation = ChatConversation(thread: .agent, client: makeClient(), store: store, nodeID: "mobile:fixture")
+        stub(["/conversations/agent/messages": (200, newestPage)])
+        await conversation.refresh()
+        XCTAssertEqual(conversation.nextBefore, "m1")
+        XCTAssertEqual(conversation.messages.map(\.serverID), ["m1", "m3", "m4"])
+    }
+
+    @MainActor
+    func testHistoryFailuresAreDistinctFromAnEmptyConversationAndKeepSavedMessages() async {
+        let conversation = ChatConversation(thread: .agent, client: makeClient(),
+            store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:fixture")
+        stub(["/conversations/agent/messages": (200, newestPage)])
+        await conversation.refresh()
+        let messages = conversation.messages
+        stub(["/conversations/agent/messages": (401, "{}")])
+        await conversation.refresh()
+        XCTAssertEqual(conversation.historyStatus, .needsPairing)
+        XCTAssertEqual(conversation.messages, messages)
+        XCTAssertFalse(conversation.isRefreshingHistory)
+
+        stub(["/conversations/agent/messages": (503, "{}")])
+        await conversation.refresh()
+        XCTAssertEqual(conversation.historyStatus, .offline)
+        XCTAssertEqual(conversation.messages, messages)
+        XCTAssertFalse(conversation.isRefreshingHistory)
+    }
+
     @MainActor
     func testChatSendsIntoTheAgentThreadAndPersists() async throws {
         stub(["/message": (200, replyStream), "/conversations/agent/messages": (404, "{}")])

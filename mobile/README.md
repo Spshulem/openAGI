@@ -47,6 +47,23 @@ enter (or arrive with) the server and code, and the phone exchanges the
 code for its own permanent node credential — a random token it generates
 itself, never one the daemon hands back.
 
+### Connected, but Tasks or Chat are empty
+
+Pair the phone to the **main that owns your data**. A separate test daemon
+has its own task and conversation stores, even when its Supervisor shows
+the same fleet activity. Check the server in the app's Settings and run
+`openagi pair-phone --platform ios` (or `android`) on the correct main to
+generate a fresh pairing link. An upstream-paired desktop node cannot issue
+the main's phone enrollment codes.
+
+Tasks has separate user and agent queues. Today shows user tasks in today's
+bucket; Inbox shows pending actions and task clarifications. Fleet Supervisor
+questions are a separate surface. Chat and Ask supervisor show their shared
+device conversations on that main, with **Load earlier messages** on iOS
+when more history is available. Owner dashboard and individual coding-agent
+session histories remain separate. A history request that fails is shown
+with a retry action rather than as an empty conversation.
+
 ## Reachability: the rule that will trip you up
 
 **Cleartext `http://` only works when the daemon's host is a Tailscale

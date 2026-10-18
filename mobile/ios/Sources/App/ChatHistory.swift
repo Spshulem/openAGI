@@ -89,6 +89,18 @@ enum ChatHistoryMerge {
     // line match the daemon's copy of it.
     static let clockSlack: TimeInterval = 5 * 60
 
+    // An earlier page must not run through the latest-page reconciliation:
+    // that would discard the newer server-backed messages already on screen.
+    static func prependOlder(local: [ChatMessage], server: [ConversationMessage]) -> [ChatMessage] {
+        var seen = Set(local.compactMap(\.serverID))
+        let older = server.compactMap { item -> ChatMessage? in
+            guard seen.insert(item.id).inserted else { return nil }
+            return ChatMessage(role: role(item.role), text: item.text, timestamp: item.at,
+                               serverID: item.id, sourceNodeId: item.sourceNodeId, sourceName: item.sourceName)
+        }
+        return older + local
+    }
+
     static func merge(local: [ChatMessage], server: [ConversationMessage]) -> [ChatMessage] {
         guard let oldest = server.first?.at, let newest = server.last?.at else { return local }
         let serverIDs = Set(server.map(\.id))

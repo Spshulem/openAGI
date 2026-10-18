@@ -22,6 +22,7 @@ final class ChatConversation {
         // cache still shows; the header says how to get the shared history.
         case needsUpdate
         case offline
+        case needsPairing
     }
 
     let thread: ConversationThread
@@ -30,6 +31,10 @@ final class ChatConversation {
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
     private(set) var historyStatus: HistoryStatus = .unknown
+    private(set) var isRefreshingHistory = false
+    private(set) var isLoadingOlder = false
+    private(set) var olderHistoryError: String?
+    private(set) var nextBefore: String?
 
     private let client: DaemonClient
     private let store: ChatHistoryStore
@@ -39,6 +44,8 @@ final class ChatConversation {
     // refresh must not replace it.
     private var refreshIssued = 0
     private var refreshApplied = 0
+    private var activeRefreshes = 0
+    private var didLoadOlder = false
     private var forgotten = false
 
     init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String) {
@@ -145,6 +152,12 @@ final class ChatConversation {
 
     func refresh() async {
         guard !forgotten else { return }
+        activeRefreshes += 1
+        isRefreshingHistory = true
+        defer {
+            activeRefreshes -= 1
+            isRefreshingHistory = activeRefreshes > 0
+        }
         refreshIssued += 1
         let sequence = refreshIssued
         do {
@@ -157,14 +170,42 @@ final class ChatConversation {
                 messages = merged
                 persist()
             }
+            if !didLoadOlder {
+                // The saved cache can reach further back than the latest page.
+                nextBefore = page.nextBefore.map { cursor in
+                    messages.first(where: { $0.serverID != nil })?.serverID ?? cursor
+                }
+            }
         } catch DaemonError.notFound {
-            guard sequence > refreshApplied else { return }
+            guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .needsUpdate
+        } catch DaemonError.unauthorized {
+            guard sequence > refreshApplied, !forgotten else { return }
+            refreshApplied = sequence
+            historyStatus = .needsPairing
         } catch {
-            guard sequence > refreshApplied else { return }
+            guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .offline
+        }
+    }
+
+    func loadOlder() async {
+        guard !forgotten, !isLoadingOlder, let cursor = nextBefore else { return }
+        isLoadingOlder = true
+        olderHistoryError = nil
+        defer { isLoadingOlder = false }
+        do {
+            let page = try await client.conversationMessages(thread: thread, before: cursor)
+            guard !forgotten else { return }
+            messages = ChatHistoryMerge.prependOlder(local: messages, server: page.messages)
+            nextBefore = page.nextBefore
+            didLoadOlder = true
+            persist()
+        } catch {
+            guard !forgotten else { return }
+            olderHistoryError = "Couldn't load earlier messages. Try again."
         }
     }
 
@@ -183,6 +224,8 @@ final class ChatConversation {
         draft = ""
         forgotten = true
         messages = []
+        nextBefore = nil
+        olderHistoryError = nil
         store.delete()
     }
 }

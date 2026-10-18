@@ -113,6 +113,16 @@ struct ChatConversationView: View {
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
             }
+            if conversation.historyStatus == .offline || conversation.historyStatus == .needsPairing {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(conversation.historyStatus == .needsPairing
+                         ? "Chat needs re-pairing. Connect to your main again in Settings."
+                         : "Couldn't load chat history. Check your connection; saved messages are still available.")
+                    Button("Retry") { Task { await conversation.refresh() } }
+                        .disabled(conversation.isRefreshingHistory)
+                }
+                .font(.caption)
+            }
         }
         .padding(.horizontal, Theme.gutter)
         .padding(.top, Theme.Spacing.x2)
@@ -125,8 +135,28 @@ struct ChatConversationView: View {
             ZStack(alignment: .bottom) {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        if messages.isEmpty {
-                            EmptyStateView(headline: "Say something.", detail: emptyDetail)
+                        if conversation.nextBefore != nil {
+                            VStack(spacing: 8) {
+                                Button("Load earlier messages") {
+                                    Task { await conversation.loadOlder() }
+                                }
+                                .disabled(conversation.isLoadingOlder)
+                                if conversation.isLoadingOlder { ProgressView("Loading earlier messages…") }
+                                if let error = conversation.olderHistoryError {
+                                    Text(error).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.bottom)
+                        }
+                        if messages.isEmpty && conversation.historyStatus == .unknown {
+                            ProgressView("Loading chat history…")
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, Theme.Spacing.x8)
+                        } else if messages.isEmpty && (conversation.historyStatus == .synced || conversation.historyStatus == .needsUpdate) {
+                            EmptyStateView(headline: conversation.historyStatus == .synced
+                                           ? "No messages on this server yet." : "No saved messages on this phone.",
+                                           detail: emptyDetail + " Older conversations stay on the server where they happened. Check your connected server in Settings if you expected them here.")
                                 .padding(.top, Theme.Spacing.x8)
                             if !starters.isEmpty { starterButtons }
                         }
@@ -141,11 +171,15 @@ struct ChatConversationView: View {
                 } action: { _, atBottom in
                     isPinnedToBottom = atBottom
                 }
-                .onChange(of: messages) { _, _ in
-                    if isPinnedToBottom { scrollToLatest(proxy) }
+                .onChange(of: messages) { old, new in
+                    if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
+                        // Keep the message the reader was looking at in place
+                        // when an earlier page is inserted above it.
+                        proxy.scrollTo(first, anchor: .top)
+                    } else if isPinnedToBottom { scrollToLatest(proxy) }
                 }
                 .onAppear { scrollToLatest(proxy) }
-                .scrollDismissesKeyboard(.immediately)
+                .scrollDismissesKeyboard(.interactively)
 
                 if !isPinnedToBottom && !messages.isEmpty {
                     jumpToLatestButton(proxy)
@@ -235,30 +269,31 @@ struct ChatConversationView: View {
         return HStack(alignment: .bottom, spacing: Theme.Spacing.x2) {
             TextField(placeholder, text: $conversation.draft, axis: .vertical)
                 .focused($composerFocused)
-                .font(Theme.Typography.body)
+                .font(.body)
+                .textFieldStyle(.roundedBorder)
                 .lineLimit(1...5)
-                .padding(.horizontal, Theme.Spacing.x3)
-                .padding(.vertical, Theme.Spacing.x2)
-                .background(Theme.surface)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.rowGroupRadius, style: .continuous))
-            Button {
-                let text = conversation.draft
-                conversation.draft = ""
-                isPinnedToBottom = true
-                Task { await conversation.send(text) }
-            } label: {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(canSend ? Theme.live : Theme.muted)
-                    .clipShape(Circle())
-            }
-            .disabled(!canSend)
-            .accessibilityLabel("Send")
+                .submitLabel(.send)
+                .onSubmit { sendDraft() }
+                .accessibilityIdentifier("chat-composer")
+            Button("Send", systemImage: "arrow.up", action: sendDraft)
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.circle)
+                .controlSize(.large)
+                .disabled(!canSend)
+                .accessibilityIdentifier("chat-send")
         }
-        .padding(Theme.gutter)
-        .background(Theme.canvas)
+        .padding(.horizontal, Theme.gutter)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private func sendDraft() {
+        guard canSend else { return }
+        let text = conversation.draft
+        conversation.draft = ""
+        isPinnedToBottom = true
+        Task { await conversation.send(text) }
     }
 
     private var canSend: Bool {

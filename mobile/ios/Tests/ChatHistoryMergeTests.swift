@@ -19,6 +19,21 @@ final class ChatHistoryMergeTests: XCTestCase {
         XCTAssertEqual(ChatHistoryMerge.merge(local: local, server: []), local)
     }
 
+    func testEarlierPageKeepsNewerMessagesTheirIdentityAndUnfinishedReply() {
+        let recent = ChatMessage(role: .user, text: "Recent question", timestamp: at(60), serverID: "m3")
+        let streaming = ChatMessage(role: .assistant, text: "Working…", isStreaming: true, timestamp: at(61))
+        let merged = ChatHistoryMerge.prependOlder(local: [recent, streaming], server: [
+            server("m1", .user, "Earlier question", 0, source: "g2:fixture"),
+            server("m2", .assistant, "Earlier reply", 5),
+            server("m2", .assistant, "Earlier reply", 5),
+            server("m3", .user, "Recent question", 60),
+        ])
+        XCTAssertEqual(merged.map(\.text), ["Earlier question", "Earlier reply", "Recent question", "Working…"])
+        XCTAssertEqual(Array(merged.suffix(2)), [recent, streaming])
+        XCTAssertEqual(merged.first?.sourceNodeId, "g2:fixture")
+        XCTAssertEqual(ChatHistoryMerge.prependOlder(local: merged, server: []), merged)
+    }
+
     func testFreshPhoneTakesTheServerThreadIncludingOtherDevicesLines() {
         let merged = ChatHistoryMerge.merge(local: [], server: [
             server("m1", .user, "From the glasses", 0, source: "g2:1"),
