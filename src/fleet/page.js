@@ -406,6 +406,18 @@ a.btn.primary{color:var(--ink)}
   function askText(q, parent) {
     if (q.risky) el('p', 'risk', 'Risky: read all of it before you answer.', parent);
     if (q.body) el('p', null, q.body, parent);
+    var plan = q.meta && q.meta.plan;
+    if (plan) {
+      el('span', 'chip', plan.label, parent);
+      el('p', null, plan.nextAction, parent);
+      el('p', 'note', 'Success check: ' + plan.acceptance, parent);
+      if (plan.issueDraft) {
+        var draft = el('details', null, null, parent);
+        el('summary', null, 'Local issue draft — nothing submitted', draft);
+        el('p', null, plan.issueDraft.title, draft);
+        el('pre', null, plan.issueDraft.body, draft);
+      }
+    }
     if (typeof q.askContext === 'string' && q.askContext && q.askContext !== q.body) {
       el('p', 'k', 'The agent wrote:', parent);
       el('blockquote', q.risky ? 'quote' : 'quote clamp', q.askContext, parent);
@@ -495,7 +507,7 @@ a.btn.primary{color:var(--ink)}
     buttons.forEach(function (b) { b.disabled = true; });
     try {
       var r = await api('/fleet/api/questions/' + encodeURIComponent(q.id), body);
-      var note = body.dismiss ? { text: 'Dismissed.', bad: false } : deliveryNote(r && r.delivery, 'Answered.');
+      var note = body.answer === 'Review plan' ? { text: 'Plan shown on the card. No action taken.', bad: false } : body.dismiss ? { text: 'Dismissed.', bad: false } : deliveryNote(r && r.delivery, 'Answered.');
       if (r && r.state) render(r.state); else await load();
       say(note.text, note.bad);
     } catch (e) {

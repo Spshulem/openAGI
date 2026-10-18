@@ -962,12 +962,12 @@ export class FleetSupervisor {
   async respondSuggestion(id, choice, options) {
     const questions = this.store.openQuestions().filter((q) => q.kind === "suggestion" && q.meta?.suggestionId === id);
     const result = await this.suggestionManager.respond(id, choice, options);
-    if (result) for (const q of questions) this.resolveOutreach(q, choice, "acted");
+    if (result && String(choice).toLowerCase() !== "review plan") for (const q of questions) this.resolveOutreach(q, choice, "acted");
     return result;
   }
 
   diagnose(options = {}) {
-    return runDiagnosis({ store: this.store, dataDir: this.dataDir, now: this.now(), storageConfig: this.config.storage,
+    return runDiagnosis({ store: this.store, dataDir: this.dataDir, now: this.now(), storageConfig: this.config.storage, runtime: this.config.selfFix?.runtimeImprovements ? this.runtime : null,
       state: { ...this.store.state, lastError: this.lastError, lastReview: this.lastReview }, options, models: this.suggestionManager });
   }
 

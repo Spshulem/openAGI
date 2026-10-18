@@ -111,8 +111,8 @@ export function registerVoiceTools(registry, supervisor) {
   if (typeof supervisor.respondSuggestion === "function") registry.register({ name: "suggestion_respond", source: SOURCE,
     needsConfirmation: true,
     confirmationRequired: (args) => String(args?.choice ?? "").toLowerCase() === "fix it",
-    description: "Respond to a suggestion: Fix it queues self_fix_start with the same caps (owner merges), Not now snoozes seven days, Never blocks its fingerprint. Read back title, area and caps before confirming Fix it.",
-    parameters: { type: "object", properties: { suggestionId: { type: "string", maxLength: 80 }, choice: { type: "string", enum: ["fix it", "not now", "never"] } }, required: ["suggestionId", "choice"], additionalProperties: false },
+    description: "Respond to a suggestion: Review plan returns the local remedy, next step and acceptance without acting. Only code remedies allow Fix it, which queues self_fix_start with the same caps (owner merges), Not now snoozes seven days, Never blocks its fingerprint. Read back title, area and caps before confirming Fix it.",
+    parameters: { type: "object", properties: { suggestionId: { type: "string", maxLength: 80 }, choice: { type: "string", enum: ["fix it", "review plan", "not now", "never"] } }, required: ["suggestionId", "choice"], additionalProperties: false },
     prepareApprovalArgs: async (args) => {
       const s = (await supervisor.suggestions()).find((s) => s.id === args.suggestionId && s.status === "open");
       if (!s) throw new Error("No open suggestion with that id.");

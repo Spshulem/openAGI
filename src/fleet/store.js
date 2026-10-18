@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
+import { REMEDIES, suggestionPlan } from "./remedies.js";
 import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
@@ -83,13 +84,18 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-// Only short strings and lists of them; never an agent's free text.
+// Short metadata plus a bounded, typed improvement plan; no arbitrary objects.
 function questionMeta(meta) {
   if (!isObject(meta)) return null;
   const out = {};
   for (const [key, value] of Object.entries(meta).slice(0, 8)) {
     if (typeof value === "string") out[key] = value.slice(0, 120);
     else if (Array.isArray(value)) out[key] = value.filter((item) => typeof item === "string").slice(0, 20).map((item) => item.slice(0, 200));
+  }
+  if (isObject(meta.plan) && REMEDIES.includes(meta.plan.remedy)) {
+    out.plan = suggestionPlan({ remedy: meta.plan.remedy,
+      nextAction: redactSecrets(clampText(meta.plan.nextAction, 2000)),
+      acceptance: redactSecrets(clampText(meta.plan.acceptance, 2000)) });
   }
   return Object.keys(out).length ? out : null;
 }

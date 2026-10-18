@@ -324,6 +324,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     selfSessionIds,
     selfFix: {
       ...DEFAULTS.selfFix,
+      runtimeImprovements: envFlag(env.OPENAGI_RUNTIME_IMPROVEMENTS),
       mode: envOff(env.OPENAGI_FLEET_SELF_FIX) ? "off" : (["off", "propose", "auto"].includes(env.OPENAGI_FLEET_SELF_FIX) ? env.OPENAGI_FLEET_SELF_FIX : "propose"),
       dailyCap: Math.min(3, envNumber(env.OPENAGI_FLEET_SELF_FIX_DAILY_CAP, 3)),
       wallMs: Math.min(DEFAULTS.selfFix.wallMs, envNumber(env.OPENAGI_FLEET_SELF_FIX_WALL_MS, DEFAULTS.selfFix.wallMs)),

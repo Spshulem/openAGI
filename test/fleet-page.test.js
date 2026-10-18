@@ -715,3 +715,18 @@ test("Antigravity thread details show how to open the conversation as plain text
   assert.ok(page.el("fleetList").textContent.includes(note));
   assert.equal(findAll(page.el("fleetList"), (e) => e.tagName === "IMG").length, 0);
 });
+
+test("improvement plans render as text with no coding option for setup and reviewing leaves the card open", async () => {
+  const state = sampleState({ questions: [{ id: 'fq_plan', kind: 'suggestion', title: 'Setup needed', body: 'Budget exhausted', status: 'open',
+    options: ['Review plan', 'Not now', 'Never'], meta: { plan: { label: 'Setup needed', nextAction: '<img src=x> Review the budget window', acceptance: 'Requested turn succeeds' } } }] });
+  const f = boot({ state });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(f.el('needsList').textContent, /<img src=x> Review the budget window/);
+  assert.match(f.el('needsList').textContent, /Success check: Requested turn succeeds/);
+  assert.ok(!f.el('needsList').all().some(e => e.tagName === 'IMG'));
+  assert.ok(!f.el('needsList').all().some(e => e.tagName === 'BUTTON' && e.textContent === 'Fix it'));
+  const review = f.el('needsList').all().find(e => e.tagName === 'BUTTON' && e.textContent === 'Review plan');
+  await review.click();
+  assert.deepEqual(f.requests.find(r => r.method === 'POST').body, { answer: 'Review plan' });
+  assert.match(f.el('status').textContent, /No action taken/);
+});

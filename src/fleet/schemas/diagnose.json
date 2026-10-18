@@ -1,15 +1,72 @@
 {
   "type": "object",
   "properties": {
-    "anomalyId": { "type": "string" },
-    "area": { "type": "string", "enum": ["policy", "classify", "ui-delivery", "judge", "review", "sources", "page", "voice", "self-fix"] },
-    "rootCause": { "type": "string" },
-    "evidenceActionIds": { "type": "array", "items": { "type": "string" } },
-    "proposedFix": { "type": "string" },
-    "acceptance": { "type": "string" },
-    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-    "minutesSavedPerDay": { "type": "number", "minimum": 0 }
+    "anomalyId": {
+      "type": "string"
+    },
+    "area": {
+      "type": "string",
+      "enum": [
+        "policy",
+        "classify",
+        "ui-delivery",
+        "judge",
+        "review",
+        "sources",
+        "page",
+        "voice",
+        "self-fix"
+      ]
+    },
+    "rootCause": {
+      "type": "string"
+    },
+    "evidenceActionIds": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "proposedFix": {
+      "type": "string"
+    },
+    "acceptance": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "minutesSavedPerDay": {
+      "type": "number",
+      "minimum": 0
+    },
+    "remedy": {
+      "type": "string",
+      "enum": [
+        "skill",
+        "clarification",
+        "setup",
+        "code",
+        "feature"
+      ]
+    },
+    "nextAction": {
+      "type": "string"
+    }
   },
-  "required": ["anomalyId", "area", "rootCause", "evidenceActionIds", "proposedFix", "acceptance", "confidence", "minutesSavedPerDay"],
+  "required": [
+    "anomalyId",
+    "area",
+    "rootCause",
+    "evidenceActionIds",
+    "proposedFix",
+    "acceptance",
+    "confidence",
+    "minutesSavedPerDay",
+    "remedy",
+    "nextAction"
+  ],
   "additionalProperties": false
 }
