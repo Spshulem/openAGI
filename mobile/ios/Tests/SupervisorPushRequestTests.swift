@@ -387,7 +387,9 @@ final class SupervisorPushRequestTests: XCTestCase {
         var writes = 0
         let session = stubSession
         defer { session.invalidateAndCancel() }
-        let registrar = PushRegistrar(defaults: defaults, session: session, savePass: { _ in writes += 1; return false })
+        let registrar = PushRegistrar(defaults: defaults, session: session,
+                                      savePass: { _ in writes += 1; return false },
+                                      authorizationStatus: { .authorized })
         let finished = expectation(description: "failed persistence stops immediate renewal")
         let syncing = Task { await registrar.sync(); finished.fulfill() }
         let result = await XCTWaiter.fulfillment(of: [finished], timeout: 2)

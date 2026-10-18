@@ -64,6 +64,7 @@ final class PushRegistrar {
     private let defaults: UserDefaults
     private let session: URLSession
     private let savePass: (PushPassStore.Stored) -> Bool
+    private let authorizationStatus: () async -> UNAuthorizationStatus
     private var startTokenTask: Task<Void, Never>?
     private var activityTask: Task<Void, Never>?
     // Order this process first saw each activity in; the newest one is kept.
@@ -79,10 +80,12 @@ final class PushRegistrar {
     private var forgottenNodeIDs: Set<String> = []
 
     init(defaults: UserDefaults = .standard, session: URLSession = .shared,
-         savePass: @escaping (PushPassStore.Stored) -> Bool = PushPassStore.save) {
+         savePass: @escaping (PushPassStore.Stored) -> Bool = PushPassStore.save,
+         authorizationStatus: @escaping () async -> UNAuthorizationStatus = PushRegistrar.notificationAuthorization) {
         self.defaults = defaults
         self.session = session
         self.savePass = savePass
+        self.authorizationStatus = authorizationStatus
     }
 
     // Called once a pairing exists (RootTabView appears). Safe to call again.
@@ -243,7 +246,7 @@ final class PushRegistrar {
         }
 
         // Re-read every sync: turning notifications on later flips it.
-        let alerts = Self.alertsAllowed(await Self.notificationAuthorization())
+        let alerts = Self.alertsAllowed(await authorizationStatus())
         guard stillCurrent(), let key = try? PushKeyStore.loadOrCreate() else { return }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token, session: session)
         // Activities on the lock screen now belong to the pass being retired;
@@ -340,7 +343,7 @@ final class PushRegistrar {
     }
 
     // Completion-handler API: only the Sendable status leaves the callback.
-    nonisolated private static func notificationAuthorization() async -> UNAuthorizationStatus {
+    nonisolated static func notificationAuthorization() async -> UNAuthorizationStatus {
         await withCheckedContinuation { (continuation: CheckedContinuation<UNAuthorizationStatus, Never>) in
             UNUserNotificationCenter.current().getNotificationSettings { settings in
                 continuation.resume(returning: settings.authorizationStatus)

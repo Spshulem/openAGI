@@ -115,9 +115,8 @@ final class SupervisorPushContentTests: XCTestCase {
 
     func testConcurrentAlertRegistrationsKeepEveryOptionCategoryBeforeDelivery() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        let center = UNUserNotificationCenter.current()
+        let center = StubSupervisorNotificationCenter()
         defer {
-            center.setNotificationCategories([])
             try? FileManager.default.removeItem(at: directory)
         }
         let identifiers = Set((0..<8).map { "sq.concurrent.\($0)" })
@@ -171,5 +170,26 @@ final class SupervisorPushContentTests: XCTestCase {
         for (k, v) in alert.userInfo { userInfo[k] = v }
         XCTAssertEqual(SupervisorAnswerAction.from(actionIdentifier: "answer.1", defaultActionIdentifier: defaultID, userInfo: userInfo),
                        .answer(questionId: "fq9", answer: "Hold"))
+    }
+}
+
+// Asynchronous, ordered operations mirror the center without depending on
+// the simulator notification daemon. SupervisorCategories still uses its
+// real file lock and shared registration journal in the concurrency test.
+private final class StubSupervisorNotificationCenter: SupervisorNotificationCenter, @unchecked Sendable {
+    private let queue = DispatchQueue(label: "test.supervisor-notification-center")
+    private var categories: Set<UNNotificationCategory> = []
+
+    func getNotificationCategories(completionHandler: @escaping @Sendable (Set<UNNotificationCategory>) -> Void) {
+        queue.async { completionHandler(self.categories) }
+    }
+
+    func getDeliveredNotifications(completionHandler: @escaping @Sendable ([UNNotification]) -> Void) {
+        queue.async { completionHandler([]) }
+    }
+
+    func setNotificationCategories(_ categories: Set<UNNotificationCategory>) {
+        let box = UncheckedSendableBox(value: categories)
+        queue.async { self.categories = box.value }
     }
 }

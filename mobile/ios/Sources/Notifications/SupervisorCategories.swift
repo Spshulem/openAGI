@@ -2,6 +2,16 @@ import Foundation
 import UserNotifications
 import Darwin
 
+// Keep notification-service IPC outside the registration/locking tests.
+// The app and extension use the system center by default.
+protocol SupervisorNotificationCenter {
+    func getNotificationCategories(completionHandler: @escaping @Sendable (Set<UNNotificationCategory>) -> Void)
+    func getDeliveredNotifications(completionHandler: @escaping @Sendable ([UNNotification]) -> Void)
+    func setNotificationCategories(_ categories: Set<UNNotificationCategory>)
+}
+
+extension UNUserNotificationCenter: SupervisorNotificationCenter {}
+
 // Notification categories for supervisor alerts, shared by the app and the
 // notification service extension (project.yml compiles this file into
 // both). `setNotificationCategories` replaces the whole set, so every write
@@ -45,7 +55,7 @@ enum SupervisorCategories {
     // UserNotifications object ever crosses an isolation boundary (Swift 6.1
     // strict concurrency rejects that). `completion` runs once the write has
     // landed.
-    static func register(_ category: UNNotificationCategory, center: UNUserNotificationCenter = .current(),
+    static func register(_ category: UNNotificationCategory, center: any SupervisorNotificationCenter = UNUserNotificationCenter.current(),
                          coordinationDirectory: URL = SharedContainer.url.appending(path: "push-categories"),
                          completion: @escaping @Sendable () -> Void = {}) {
         let box = UncheckedSendableBox(value: (category: category, center: center))
