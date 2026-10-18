@@ -23,7 +23,7 @@ Only message text is imported; media-only messages and delivery/status callbacks
 3. In Connections, save the API key, API secret, agent phone number in E.164 format, and a random webhook secret. Blank fields keep existing credentials. Values are saved privately in the configured data directory's `.env` with mode `0600`.
 4. Register the displayed `/channels/sendblue/webhook` URL as Sendblue's **receive** webhook. Configure the same secret there; Sendblue sends it in the `sb-signing-secret` header. See [Sendblue webhook security](https://docs.sendblue.com/security/) and [payload contract](https://docs.sendblue.com/getting-started/webhooks/).
 5. Add your partner's exact phone number under approved contacts. They text the agent's number and can ask it to remember facts. Their conversation and explicit saved facts persist across restarts.
-6. For a group, add the agent number in Messages, obtain the exact group ID from Sendblue, approve that group in Connections, and approve each participant's number. Incoming group messages with an unapproved participant are ignored. Check membership whenever the group changes.
+6. For a group, add the agent number in Messages, obtain the exact group ID from Sendblue, approve that group in Connections, and approve each participant's number. Incoming group messages with an unapproved participant are ignored. OpenAGI checks complete current membership before every group reply or proactive send, and blocks delivery if membership cannot be verified or includes an unapproved number or email handle. Approve new participants in Connections before retrying.
 
 ### Linq
 
@@ -74,7 +74,7 @@ The receiver verifies the version, timestamp window, delivery ID and HMAC over t
 
 Try: “Every day at 09:00, find unread invoice emails, run my invoice-review skill, and summarize what needs attention. Ask before sending anything.” The existing `schedule_message` tool persists a `prompt` job. The daemon must be running, and `dailyAt` uses its timezone. Review the job in Cron, then use its manual run control for acceptance. Duplicate routines reuse the existing job and do not resume paused copies. Scheduled prompts cannot recursively schedule more prompts.
 
-`run_subagent` starts one bounded child task and waits for its result. Choose up to 20 existing read-only tools; its default is the available subset of `recall`, `web_search` and `fetch_url`. It cannot exceed its parent's allowlist, mutate tasks, send messages, control a computer, or create more subagents. At most three children run concurrently, and the same provider/daily budget covers their model calls. The main routine can run reviewed skills itself using the existing skill tools.
+`run_subagent` starts one bounded child task and waits for its result. Choose up to 20 existing read-only tools; its default is the available subset of `recall`, `web_search` and `fetch_url`. The child receives the supplied task without automatic owner memories, principles, screen context or briefs, and does not save its turns into shared memory. Granting `recall`, including through the default tool set, lets it search owner memory; omit that tool or use `tools: []` to keep memory unavailable. It cannot exceed its parent's allowlist, mutate tasks, send messages, control a computer, or create more subagents. At most three children run concurrently, and the same provider/daily budget covers their model calls. The main routine can run reviewed skills itself using the existing skill tools.
 
 ## Voice, web search, computer use and other phone providers
 

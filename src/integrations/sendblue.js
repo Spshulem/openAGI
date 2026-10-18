@@ -56,10 +56,11 @@ export class SendblueChannel {
     }
     if (!this.sharing.canReceive(message.number, message.groupId)) return { ignored: true, reason: "not-allowlisted" };
     // Local rejection has no ambiguous external effect. Keep the saved reply
-    // retryable until all synchronous preflight checks have passed.
-    this.validateMessage(message.groupId || message.number, receipt.reply, { group: Boolean(message.groupId) });
+    // retryable until local validation and read-only membership checks pass.
+    const prepared = await this.prepareMessage(message.groupId || message.number, receipt.reply, { group: Boolean(message.groupId) });
+    if (!this.sharing.canReceive(message.number, message.groupId)) return { ignored: true, reason: "not-allowlisted" };
     writeJsonAtomic(receiptPath, { ...receipt, sendStarted: true });
-    await this.sendMessage(message.groupId || message.number, receipt.reply, { group: Boolean(message.groupId) });
+    await this.sendPrepared(prepared);
     writeJsonAtomic(receiptPath, { accepted: true, at: new Date().toISOString() });
     return { accepted: true };
   }
@@ -70,8 +71,36 @@ export class SendblueChannel {
     if (typeof text !== "string" || !text.trim() || text.length > 16000) throw new Error("Message must be 1–16000 characters.");
   }
 
-  async sendMessage(target, text, { group = false } = {}) {
+  async approvedGroup(groupId) {
+    const response = await this.fetchImpl(`https://api.sendblue.co/api/v2/groups/${encodeURIComponent(groupId)}`, {
+      method: "GET", signal: AbortSignal.timeout(10000), redirect: "error",
+      headers: { "sb-api-key-id": this.env.SENDBLUE_API_KEY, "sb-api-secret-key": this.env.SENDBLUE_API_SECRET }
+    });
+    if (!response.ok) throw new Error("Could not verify Sendblue group membership.");
+    const result = await response.json(), data = result.data;
+    // Use the complete participant records: participant_numbers omits
+    // email-only members, who have never been approved for phone sharing.
+    if (result.status !== "OK" || !data || data.group_id !== groupId && data.worker_group_id !== groupId
+      || !Array.isArray(data.participants) || !data.participants.length) return false;
+    const members = data.participants.map(participant => participant?.handle ?? participant?.phone);
+    const allowed = member => member === this.env.SENDBLUE_FROM_NUMBER || this.sharing.canSend(member);
+    return members.some(member => member !== this.env.SENDBLUE_FROM_NUMBER) && members.every(allowed)
+      && (data.participant_numbers === undefined || Array.isArray(data.participant_numbers) && data.participant_numbers.every(allowed));
+  }
+
+  async prepareMessage(target, text, { group = false } = {}) {
     this.validateMessage(target, text, { group });
+    if (group && !await this.approvedGroup(target)) throw new Error("Sendblue group membership is not approved.");
+    // Approval or credentials can change during the read-only lookup.
+    this.validateMessage(target, text, { group });
+    return { target, text, group };
+  }
+
+  async sendMessage(target, text, options = {}) {
+    return this.sendPrepared(await this.prepareMessage(target, text, options));
+  }
+
+  async sendPrepared({ target, text, group }) {
     const response = await this.fetchImpl(`https://api.sendblue.co/api/${group ? "send-group-message" : "send-message"}`, {
       method: "POST", signal: AbortSignal.timeout(30000), redirect: "error",
       headers: { "content-type": "application/json", "sb-api-key-id": this.env.SENDBLUE_API_KEY, "sb-api-secret-key": this.env.SENDBLUE_API_SECRET },

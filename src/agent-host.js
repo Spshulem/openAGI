@@ -48,6 +48,9 @@ export class AgentHost {
     const reportProgress = progressReporter(options.onProgress);
     const reportTextDelta = textDeltaReporter(options.onTextDelta);
     const channel = input.channel ?? "local";
+    // Delegation may grant explicit read tools, but the bounded task must not
+    // inherit the owner's memory, principles, screen or brief implicitly.
+    const isolatedContext = options.isolatedContext === true;
     const from = input.from ?? "user";
     let agentId = input.agentId ?? "main";
     const text = String(input.text ?? input.message ?? "").trim();
@@ -55,8 +58,9 @@ export class AgentHost {
     // A brief selection is a reference, not client-authored prompt text. Resolve
     // it against the live store before it reaches the model, and persist only
     // the normalized form so the dashboard handoff keeps the same context.
-    const briefContext = resolveBriefContext(this.runtime, input.metadata?.briefContext);
+    const briefContext = isolatedContext ? null : resolveBriefContext(this.runtime, input.metadata?.briefContext);
     const metadata = { ...(input.metadata ?? {}) };
+    if (isolatedContext) delete metadata.screenContext;
     // A request id is transport correlation data, not arbitrary conversation
     // metadata. Bound and normalize it once so the user and terminal assistant
     // records carry the same safe value even when two clients use one session.
@@ -148,13 +152,14 @@ export class AgentHost {
       try { this.runtime.outcomes?.resolveByUserFollowup?.(sessionId, text); } catch { /* best effort */ }
     }
 
-    const signal = await this.messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides: input.scrutinyOverrides ?? null });
+    const signal = await this.messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides: input.scrutinyOverrides ?? null, isolatedContext });
     const isSpecialist = agent.role === "specialist";
     const output = this.runtime.processSignal(signal, {
       scope: isSpecialist ? `specialist:${agent.id}` : "main",
       parentSpecialistId: isSpecialist ? agent.id : null,
       allowPropagation: !options.subagentDepth,
-      ephemeral
+      ephemeral,
+      isolatedContext
     });
 
     if (output.propagation?.specialist) {
@@ -200,7 +205,7 @@ export class AgentHost {
     // Lava intuition (C2): top principles from the vector store inserted into
     // the prompt as soft hints — distinct from explicit memoryHits.
     let intuitions = [];
-    if (this.runtime.vectorStore) {
+    if (!isolatedContext && this.runtime.vectorStore) {
       try {
         const rawHits = await this.runtime.vectorStore.search("principle", text, { limit: 10, minScore: 0.1 });
         intuitions = filterPrincipleHits(rawHits, this.runtime.memory, { limit: 3 });
@@ -214,13 +219,13 @@ export class AgentHost {
     // failures fall through silently so chat keeps working without capture.
     let ambientContext = null;
     // A bounded delegate receives the supplied task, not the owner's OCR.
-    if (channel !== "autopilot" && channel !== "cron" && channel !== "subagent" && this.runtime.observations?.getRecentContext) {
+    if (!isolatedContext && channel !== "autopilot" && channel !== "cron" && channel !== "subagent" && this.runtime.observations?.getRecentContext) {
       try {
         ambientContext = await this.runtime.observations.getRecentContext({ minutes: 10, maxChars: 1500, maxSnippets: 6 });
       } catch { /* swallow */ }
     }
 
-    const memoryHitsForModel = output.customContext.map((entry) => ({
+    const memoryHitsForModel = (isolatedContext ? [] : output.customContext).map((entry) => ({
       score: entry.score,
       item: {
         id: entry.id,
@@ -415,7 +420,7 @@ export class AgentHost {
       this.runtime.sessionIndex.indexMessage(sessionId, agentId, sessionAfter.messages.at(-1)).catch(() => {});
     }
 
-    if (!ephemeral) {
+    if (!ephemeral && !isolatedContext) {
       try { this.runtime.memory.remember(
         {
           source: "agent-host",
@@ -551,7 +556,7 @@ export class AgentHost {
     };
   }
 
-  async messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides = null }) {
+  async messageToSignal({ text, channel, from, agent, sessionId, metadata, scrutinyOverrides = null, isolatedContext = false }) {
     const lower = text.toLowerCase();
     const asksToRemember = REMEMBER_RE.test(lower);
     const asksToSchedule = SCHEDULE_RE.test(lower);
@@ -562,9 +567,9 @@ export class AgentHost {
     // degrade to the previous keyword values (see src/signal-axes.js).
     const axes = await measureAxes({
       text,
-      memorySystem: this.runtime.memory ?? null,
-      vectorStore: this.runtime.vectorStore ?? null,
-      outcomeStore: this.runtime.outcomes ?? null
+      memorySystem: isolatedContext ? null : this.runtime.memory ?? null,
+      vectorStore: isolatedContext ? null : this.runtime.vectorStore ?? null,
+      outcomeStore: isolatedContext ? null : this.runtime.outcomes ?? null
     });
 
     const taskType = asksToSpecialize ? "specialization-candidate" : "adaptation-review";

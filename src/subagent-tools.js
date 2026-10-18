@@ -25,7 +25,7 @@ export function registerSubagentTools(registry, runtime) {
           systemPrompt: "Complete only the supplied task. Use the allowed read-only tools. Return findings with evidence and uncertainties; never claim to have changed external state.",
           metadata: { specialist: { allowedTools: requested } } });
         const result = await runtime.agentHost.handleMessage({ text: args.task, agentId: id, sessionId: id, channel: "subagent", from: "main", routeTo: false }, {
-          signal: context.signal, toolAllowlist: requested, subagentDepth: 1
+          signal: context.signal, toolAllowlist: requested, subagentDepth: 1, isolatedContext: true
         });
         return { agentId: id, sessionId: result.session?.id ?? id, reply: result.reply };
       } finally { running.delete(id); }

@@ -41,7 +41,7 @@ export class LinqChannel extends PartnerTextChannel {
     // identity and reuses an existing chat with this from/to participant set.
     return jsonPost(`https://api.linqapp.com/api/partner/v3/${group ? `chats/${encodeURIComponent(target)}/messages` : "chats"}`, this.env.LINQ_API_TOKEN, group ? { parts } : { from: this.line(), to: [target], message: { parts } });
   }
-  acceptanceId(result) { return result.message?.id; }
+  acceptanceId(result) { return result.chat?.message?.id ?? result.message?.id; }
 }
 
 export class TwilioChannel extends PartnerTextChannel {

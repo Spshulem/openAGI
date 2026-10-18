@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { ToolRegistry } from "../src/tool-registry.js";
 import { AgentHost } from "../src/agent-host.js";
 import { registerSubagentTools } from "../src/subagent-tools.js";
+import { AbiRuntime } from "../src/abi-runtime.js";
+import { MemorySystem } from "../src/memory-system.js";
 
 function fixture() {
   const registry = new ToolRegistry();
@@ -22,7 +24,7 @@ function fixture() {
     assert.equal((await registry.invoke("send_message", {}, args.context)).ok, false);
     assert.equal((await registry.invoke("remember", {}, args.context)).ok, false);
     assert.equal((await registry.invoke("run_subagent", { task: "nested" }, args.context)).ok, false);
-    assert.equal((await registry.invoke("web_search", {}, args.context)).ok, true);
+    assert.equal((await registry.invoke("web_search", {}, args.context)).ok, args.context.__allowedTools.includes("web_search"));
     return { text: "Fixture findings with a source: https://example.com", toolCalls: [] };
   } } });
   registerSubagentTools(registry, runtime);
@@ -53,4 +55,33 @@ test("bounded delegation does not read or include the owner's ambient screen con
   assert.equal(reads, 0);
   assert.equal(f.captured.turnContext.includes("PRIVATE_SCREEN_FIXTURE"), false);
   assert.equal(f.captured.turnContext.includes("Private app"), false);
+});
+
+test("delegation with no tools reads no owner memory or principles and creates no shared memories", async () => {
+  const f = fixture();
+  const memory = new MemorySystem();
+  const item = memory.remember({ content: "fixture research PRIVATE_OWNER_MEMORY_FIXTURE", scope: "main" }, { strength: 0.9 });
+  // Ordinary specialist retrieval deliberately includes main memory. The
+  // bounded delegate must opt out rather than relying on its unique scope.
+  assert.equal(memory.retrieve("fixture research", { scope: "specialist:delegate-fixture" })[0].item.id, item.id);
+  let memoryReads = 0, memoryWrites = 0, vectorReads = 0;
+  const retrieve = memory.retrieve.bind(memory), remember = memory.remember.bind(memory);
+  memory.retrieve = (...args) => { memoryReads++; return retrieve(...args); };
+  memory.remember = (...args) => { memoryWrites++; return remember(...args); };
+  Object.assign(f.runtime, {
+    memory,
+    vectorStore: { async search() { vectorReads++; return [{ id: item.id, text: "PRIVATE_OWNER_PRINCIPLE_FIXTURE", score: 1 }]; } },
+    workflows: { select: () => null },
+    scrutiny: { evaluate: ({ memories }) => ({ action: "act", score: 0.6, reasons: memories.map(hit => hit.item.content), dimensions: { novelty: 0.4, risk: 0.3, repetition: 0.3 } }) },
+    propagation: { shouldPropagate: () => ({ decision: false }) },
+    outputs: [], feedback: [],
+    processSignal: (...args) => AbiRuntime.prototype.processSignal.call(f.runtime, ...args)
+  });
+  const result = await f.registry.invoke("run_subagent", { task: "fixture research", tools: [] }, {});
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(f.captured.tools, []);
+  assert.deepEqual(f.captured.memoryHits, []);
+  assert.equal(f.captured.turnContext.includes("PRIVATE_OWNER_"), false);
+  assert.equal(memoryReads, 0); assert.equal(memoryWrites, 0); assert.equal(vectorReads, 0);
+  assert.equal(memory.items.size, 1);
 });

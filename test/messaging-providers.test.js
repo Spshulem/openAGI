@@ -62,6 +62,10 @@ for (const provider of Object.keys(TEXT_CHANNELS)) {
     await f.channel.drain();
     assert.equal(f.turns, 1); assert.equal(f.sends.length, 1);
     assert.equal(f.channel.status().pending, 0);
+    const receipt = JSON.parse(fs.readFileSync(path.join(f.channel.dir, fs.readdirSync(f.channel.dir).find(name => name.endsWith(".json")))));
+    assert.equal(receipt.accepted, true);
+    assert.equal(receipt.messageId, "accepted-fixture");
+    assert.equal(receipt.sendStarted, undefined);
     const request = f.sends[0];
     const sent = provider === "twilio" ? Object.fromEntries(new URLSearchParams(request.body)) : JSON.parse(request.body);
     assert.equal(sent[provider === "twilio" ? "From" : "from"], agentNumber);
@@ -151,7 +155,7 @@ test("Linq groups require a provider-specific approval and all current participa
   const members = [{ handle: agentNumber, is_me: true, status: "active" }, { handle: partnerNumber, is_me: false, status: "active" }];
   let sends = 0;
   const f = fixture(t, "linq", { fetchImpl: async (url, init) => {
-    if (init.method === "POST") { sends++; assert.match(url, /chats\/chat-fixture\/messages$/); return acceptedResponse("linq"); }
+    if (init.method === "POST") { sends++; assert.match(url, /chats\/chat-fixture\/messages$/); return acceptedResponse("linq", { group: true }); }
     return Response.json({ id: "chat-fixture", is_group: true, handles: members });
   } });
   const body = inbound("linq"); body.data.chat.is_group = true;
@@ -165,6 +169,8 @@ test("Linq groups require a provider-specific approval and all current participa
   body.data.id = "approved-message";
   f.channel.handleWebhook(body); await f.channel.drain();
   assert.equal(f.turns, 1); assert.equal(sends, 1);
+  assert.equal(f.channel.status().pending, 0);
+  assert.equal(f.channel.status().requiresReview, 0);
   members[2].status = "active";
   await assert.rejects(f.channel.sendMessage("chat-fixture", "private", { group: true }), /membership/);
   assert.equal(sends, 1);
@@ -176,7 +182,7 @@ test("Linq rechecks group membership after the model, before sending any facts",
   const f = fixture(t, "linq", { generate: async () => {
     members.push({ handle: "+15555550999", is_me: false }); return { text: "Group-only fact" };
   }, fetchImpl: async (_url, init) => {
-    if (init.method === "POST") { sends++; return acceptedResponse("linq"); }
+    if (init.method === "POST") { sends++; return acceptedResponse("linq", { group: true }); }
     reads++; return Response.json({ id: "chat-fixture", is_group: true, handles: members });
   } });
   f.sharing.addGroup({ groupId: "chat-fixture", provider: "linq" });

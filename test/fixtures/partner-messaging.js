@@ -28,4 +28,8 @@ export function signedHeaders(provider, raw, { env = messagingEnv(), url = "http
   if (provider === "telnyx") return { "content-type": "application/json", "telnyx-timestamp": timestamp, "telnyx-signature-ed25519": sign(null, Buffer.concat([Buffer.from(`${timestamp}|`), raw]), keys.privateKey).toString("base64") };
   return { "content-type": "application/json", "webhook-id": "delivery-fixture", "webhook-timestamp": timestamp, "webhook-signature": `v1,${createHmac("sha256", Buffer.from(env[`${provider.toUpperCase()}_WEBHOOK_SECRET`].slice(6), "base64")).update(`delivery-fixture.${timestamp}.`).update(raw).digest("base64")}` };
 }
-export const acceptedResponse = provider => Response.json(provider === "linq" ? { message: { id: "accepted-fixture" } } : provider === "twilio" ? { sid: "accepted-fixture", error_code: null } : provider === "telnyx" ? { data: { id: "accepted-fixture" } } : { id: "accepted-fixture" });
+export function acceptedResponse(provider, { group = false } = {}) {
+  // Linq POST /v3/chats wraps the message in chat; group /messages does not.
+  if (provider === "linq") return Response.json(group ? { message: { id: "accepted-fixture" } } : { chat: { id: "chat-fixture", message: { id: "accepted-fixture" } } });
+  return Response.json(provider === "twilio" ? { sid: "accepted-fixture", error_code: null } : provider === "telnyx" ? { data: { id: "accepted-fixture" } } : { id: "accepted-fixture" });
+}

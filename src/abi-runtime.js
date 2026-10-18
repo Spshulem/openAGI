@@ -617,7 +617,7 @@ export class AbiRuntime {
 
   processSignal(signal, options = {}) {
     const workflow = this.workflows.select(signal);
-    const memoryHits = this.memory.retrieve(`${signal.summary} ${signal.content} ${signal.tags?.join(" ") ?? ""}`, {
+    const memoryHits = options.isolatedContext ? [] : this.memory.retrieve(`${signal.summary} ${signal.content} ${signal.tags?.join(" ") ?? ""}`, {
       limit: 6,
       scope: options.scope
     });
@@ -660,7 +660,7 @@ export class AbiRuntime {
         summary: signal.summary,
         score: scrutiny.score
       });
-    } else if (!options.ephemeral) {
+    } else if (!options.ephemeral && !options.isolatedContext) {
       memoryItem = this.memory.remember(
         {
           source: signal.source,
