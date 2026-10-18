@@ -86,9 +86,11 @@ enum AppMode: String, Sendable {
         set { UserDefaults.standard.set(newValue?.rawValue, forKey: key) }
     }
 
-    // What to do at launch: an explicit choice wins; an existing pairing from
-    // before this mode existed means server.
-    static func resolved(hasCredentials: Bool) -> AppMode? {
-        current ?? (hasCredentials ? .server : nil)
+    // A local credential can become active before onboarding finishes (or
+    // before its mode is saved). It always needs the embedded daemon started.
+    // Existing remote pairings from before this mode existed mean server.
+    static func resolved(credentials: Credentials?, storedMode: AppMode? = current) -> AppMode? {
+        if credentials?.isEmbedded == true { return .onPhone }
+        return storedMode ?? (credentials != nil ? .server : nil)
     }
 }

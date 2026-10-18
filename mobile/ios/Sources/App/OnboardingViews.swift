@@ -28,7 +28,7 @@ struct WelcomeView: View {
                 ChoiceCard(
                     title: "On this iPhone",
                     detail: session.canRunOnPhone
-                        ? "Private and free. Uses this iPhone's own AI model. No account, and nothing you say leaves the phone."
+                        ? "Use Apple Intelligence on supported iPhones, or connect a cloud model. No server needed."
                         : "This build doesn't include the on-phone runtime.",
                     badge: "Recommended",
                     enabled: session.canRunOnPhone
@@ -134,7 +134,7 @@ struct PhoneSetupView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showingModelSettings, onDismiss: { step = .notifications }) {
+            .sheet(isPresented: $showingModelSettings, onDismiss: checkModelReadiness) {
                 if let credentials {
                     NavigationStack {
                         ModelSettingsView()
@@ -153,7 +153,7 @@ struct PhoneSetupView: View {
     // MARK: Steps
 
     @ViewBuilder private var modelStep: some View {
-        header("Check this iPhone", "OpenAGI thinks with the AI model built into iOS, so it works offline and nothing leaves the phone.")
+        header("Check this iPhone", "Use the AI model built into iOS for private, offline replies on supported iPhones, or connect a cloud model.")
         switch modelStatus {
         case .available:
             statusLine("Apple Intelligence is ready.", color: Theme.live)
@@ -205,12 +205,21 @@ struct PhoneSetupView: View {
             .disabled(isWorking || name.trimmingCharacters(in: .whitespaces).isEmpty)
     }
 
-    // Optional: a cloud model makes the agent much more capable (all tools
-    // and skills); without one it uses this iPhone's model.
+    // A cloud model is optional only when this iPhone has a local model.
     @ViewBuilder private var brainStep: some View {
-        header("Make it smarter", "Add a Claude or OpenAI key, or sign in with ChatGPT, for an agent that can use skills and every tool. Without internet it falls back to this iPhone's model.")
-        PrimaryButton(title: "Add a key or sign in") { showingModelSettings = true }
-        SecondaryTextButton(title: modelStatus == .available ? "Use this iPhone's model for now" : "Skip for now") { step = .notifications }
+        header(modelStatus == .available ? "Make it smarter" : "Connect a model",
+               modelStatus == .available
+                ? "Add a Claude or OpenAI key, or sign in with ChatGPT, for an agent that can use skills and every tool. Without internet it falls back to this iPhone's model."
+                : "This iPhone needs a Claude or OpenAI key, or ChatGPT sign-in, to reply. Cloud models require an internet connection.")
+        if let errorText { statusLine(errorText, color: Theme.alert) }
+        PrimaryButton(title: "Add a key or sign in", isLoading: isWorking) {
+            errorText = nil
+            showingModelSettings = true
+        }
+        .disabled(isWorking)
+        if modelStatus == .available {
+            SecondaryTextButton(title: "Use this iPhone's model for now") { step = .notifications }
+        }
     }
 
     @ViewBuilder private var notificationsStep: some View {
@@ -220,6 +229,29 @@ struct PhoneSetupView: View {
     }
 
     // MARK: Actions
+
+    private func checkModelReadiness() {
+        guard modelStatus != .available else {
+            step = .notifications
+            return
+        }
+        guard let credentials else { return }
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+                let settings = try await client.modelSettings()
+                guard settings.hasUsableCloudModel else {
+                    errorText = "Add a key or finish ChatGPT sign-in, then select that provider to continue."
+                    return
+                }
+                step = .notifications
+            } catch {
+                errorText = "Couldn't check the model. Open model settings and try again."
+            }
+        }
+    }
 
     private func start() {
         step = .starting

@@ -13,6 +13,28 @@ final class WorkspaceProtocolTests: XCTestCase {
         XCTAssertEqual(settings.active.offlineFallback, true)
         XCTAssertTrue(settings.providers.anthropic.configured)
         XCTAssertNil(settings.providers.chatgpt)
+        XCTAssertTrue(settings.hasUsableCloudModel)
+    }
+
+    func testOnboardingRequiresTheActiveCloudProviderToBeConfigured() {
+        let configured = ModelSettings.KeyProvider(configured: true, model: nil)
+        let missing = ModelSettings.KeyProvider(configured: false, model: nil)
+        func settings(_ provider: String?, anthropic: ModelSettings.KeyProvider = .init(configured: false, model: nil),
+                      openai: ModelSettings.KeyProvider = .init(configured: false, model: nil),
+                      signedIn: Bool? = nil) -> ModelSettings {
+            ModelSettings(preference: "auto", active: .init(provider: provider, model: nil, offlineFallback: false),
+                          providers: .init(anthropic: anthropic, openai: openai, onDevice: nil,
+                                           chatgpt: signedIn.map { .init(signedIn: $0, email: nil) }))
+        }
+        XCTAssertTrue(settings("openai", openai: configured).hasUsableCloudModel)
+        XCTAssertTrue(settings("chatgpt", signedIn: true).hasUsableCloudModel)
+        XCTAssertFalse(settings("anthropic", anthropic: missing, openai: configured).hasUsableCloudModel)
+        XCTAssertFalse(settings("openai", anthropic: configured).hasUsableCloudModel)
+        XCTAssertFalse(settings("chatgpt", signedIn: false).hasUsableCloudModel)
+        XCTAssertFalse(settings("chatgpt").hasUsableCloudModel)
+        XCTAssertFalse(settings("on-device", openai: configured).hasUsableCloudModel)
+        XCTAssertFalse(settings("none").hasUsableCloudModel)
+        XCTAssertFalse(settings(nil).hasUsableCloudModel)
     }
 
     func testUpdateOmitsUnsetFields() throws {

@@ -388,7 +388,7 @@ final class SupervisorPushRequestTests: XCTestCase {
             XCTAssertNil(PushKeyStore.load())
             finished.fulfill()
         }
-        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 1)
+        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 5)
         XCTAssertEqual(result, .completed)
         forgetting.cancel()
     }

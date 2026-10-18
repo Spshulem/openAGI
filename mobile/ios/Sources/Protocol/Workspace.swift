@@ -31,6 +31,17 @@ public struct ModelSettings: Decodable, Sendable, Equatable {
     public let preference: String
     public let active: Active
     public let providers: Providers
+
+    // A stored key for a different provider does not make the selected model
+    // usable. Phones without a local model need an active cloud provider.
+    public var hasUsableCloudModel: Bool {
+        switch active.provider {
+        case "anthropic": providers.anthropic.configured
+        case "openai": providers.openai.configured
+        case "chatgpt": providers.chatgpt?.signedIn == true
+        default: false
+        }
+    }
 }
 
 public struct ModelSettingsUpdate: Encodable, Sendable, Equatable {

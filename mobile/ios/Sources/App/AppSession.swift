@@ -28,7 +28,7 @@ final class AppSession {
 
     init() {
         let credentials = Credentials.load()
-        let mode = AppMode.resolved(hasCredentials: credentials != nil)
+        let mode = AppMode.resolved(credentials: credentials)
         self.mode = mode
         switch mode {
         case .onPhone?: phase = .phoneStarting
@@ -162,6 +162,7 @@ enum PhoneAgent {
     static func bringUp() async throws -> Credentials {
         let credentials = try await EmbeddedDaemon.shared.localCredentials()
         try credentials.save()
+        AppMode.current = .onPhone
         await connectModel()
         Task { await refreshDigests(credentials) }
         return credentials
