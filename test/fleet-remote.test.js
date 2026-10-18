@@ -54,6 +54,22 @@ test('mirrored questions reach the existing G2 feed and close after an owner ans
   assert.equal(g2.feed(node).length, 0);
 });
 
+test('remote outreach omits actions needing text or a plan view on creation and refresh', async t => {
+  const { remote, runtime, state } = fixture(t);
+  const options = ['Answer question', 'Review plan', 'Not now', 'Never'];
+  state.questions[0].options = options;
+  await remote.refresh();
+  const item = runtime.outreach.list()[0];
+  assert.deepEqual(item.actions, ['Not now', 'Never', 'dismiss']);
+  assert.deepEqual(remote.getState().questions[0].options, options, 'main and voice retain every action');
+
+  runtime.outreach.update(item.id, { actions: [...options, 'dismiss'] });
+  await remote.refresh();
+  assert.deepEqual(runtime.outreach.get(item.id).actions, ['Not now', 'Never', 'dismiss']);
+  assert.equal(runtime.outreach.list().length, 1);
+  assert.equal(remote.getState().questions.length, 1);
+});
+
 test('compact remote clients require main-app review for destructive storage decisions', async t => {
   const { remote, runtime, state, dir, calls } = fixture(t);
   await remote.refresh(); // Also updates an existing mirror when its risk changes.

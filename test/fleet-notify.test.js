@@ -208,3 +208,21 @@ test("a reworded question updates its open outreach copy in place, with no secon
   assert.deepEqual(events, ["outreach", "outreach-updated"]);
   assert.equal(fetches.length, 1);
 });
+
+test("compact outreach omits actions needing text or a plan view on creation and refresh", async (t) => {
+  const { home, config, store } = setup(t);
+  const outreach = new OutreachStore({ dir: path.join(home, "outreach") });
+  const notifier = createNotifier({ config, store, runtime: { outreach }, now: () => NOON });
+  const options = ["Answer question", "Review plan", "Not now", "Never"];
+  const question = store.upsertQuestion({ dedupeKey: "clarification", title: "Which behavior?", options });
+  const { outreachId } = await notifier.notifyQuestion(question);
+  assert.deepEqual(outreach.get(outreachId).actions, ["Not now", "Never", "dismiss"]);
+  assert.deepEqual(store.question(question.id).options, options, "the main interface keeps every action");
+
+  // Refresh also repairs an existing mirror created before the filter existed.
+  outreach.update(outreachId, { actions: [...options, "dismiss"] });
+  await notifier.notifyQuestion(question);
+  assert.deepEqual(outreach.get(outreachId).actions, ["Not now", "Never", "dismiss"]);
+  assert.equal(outreach.list().length, 1);
+  assert.equal(store.question(question.id).status, "open");
+});
