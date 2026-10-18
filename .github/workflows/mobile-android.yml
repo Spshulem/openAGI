@@ -71,9 +71,11 @@ jobs:
         with:
           api-level: 35
           arch: x86_64
-          profile: pixel_fold
+          # Postures are injected by the tests; use an SDK-bundled profile
+          # with a large display rather than a vendor-specific AVD name.
+          profile: pixel
           disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -skin 2208x1840
           script: |
             cd mobile/android
             ./gradlew --no-daemon --max-workers=2 connectedDebugAndroidTest
