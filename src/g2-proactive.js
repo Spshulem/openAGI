@@ -317,7 +317,10 @@ export class G2Proactive {
           : i.needsDecision ? "approvals" : /task/.test(kind) ? "tasks" : "discoveries";
         // A supervisor question carries its fixed choices so the glasses can
         // answer it; the answer goes through answerFleet, never free text.
-        const options = fleet ? (Array.isArray(i.actions) ? i.actions : []).filter(a => typeof a === "string" && a && a !== "dismiss").map(a => clean(a, 40)).slice(0, 4) : [];
+        // Clarification text and non-resolving plans use the main UI/voice
+        // paths; glasses only support fixed choices that complete an answer.
+        const options = fleet ? (Array.isArray(i.actions) ? i.actions : []).filter(a => typeof a === "string" && a
+          && !["dismiss", "answer question", "review plan"].includes(a.toLowerCase())).map(a => clean(a, 40)).slice(0, 4) : [];
         if (selected.has(category) || (fleet && n.settings.supervisorOnly)) items.push({ id: i.id, title: clean(i.title, 160), summary: clean(i.summary, coding ? 1000 : 400), category,
           important: i.needsDecision === true || coding, at: Date.parse(i.createdAt) || this.now(), action: fleet && options.length ? "answer-fleet" : "review-on-main",
           ...(fleet ? { supervisor: true, options, questionId: i.sourceRef.id, ...(threadKey ? { threadKey } : {}) } : {}),

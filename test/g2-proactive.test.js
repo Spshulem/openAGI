@@ -305,6 +305,23 @@ test("supervisor questions carry their choices and Supervisor mode keeps only th
   assert.deepEqual(call({ op: "feed" }).items.map(i => i.id), []);
 });
 
+test('G2 omits clarification and plan actions that require the main interface', async t => {
+  const f = fixture(t);
+  f.call({ op: 'configure', settings: { enabled: true } });
+  f.outreach.push({ id: 'synthetic-finding', status: 'unseen', createdAt: new Date(f.now()).toISOString(),
+    sourceRef: { kind: 'fleet', id: 'fq_clarification' }, title: 'Clarify the workflow', needsDecision: true,
+    actions: ['Answer question', 'Review plan', 'Not now', 'Never', 'dismiss'] });
+  const item = f.call({ op: 'feed' }).items[0];
+  assert.deepEqual(item.options, ['Not now', 'Never']);
+  for (const answer of ['Answer question', 'Review plan']) {
+    await assert.rejects(f.store.answerFleet('one', { id: item.id, answer }), /choices/);
+  }
+  f.outreach[0].actions = ['Answer question', 'Review plan', 'dismiss'];
+  const review = f.call({ op: 'feed' }).items[0];
+  assert.deepEqual(review.options, []);
+  assert.equal(review.action, 'review-on-main');
+});
+
 test("answering a supervisor question from the glasses uses its fixed choices", async (t) => {
   const { store, runtime, call, outreach, now } = fixture(t);
   outreach.push({ id: "o-fleet", status: "unseen", createdAt: new Date(now()).toISOString(), sourceRef: { kind: "fleet", id: "fq_1" }, title: "Which plan?", summary: "", needsDecision: true, actions: ["Starter", "Business", "dismiss"] });

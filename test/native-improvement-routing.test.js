@@ -221,3 +221,41 @@ test('voice answers reach a remote clarification without a coding approval or qu
   assert.equal(f.store.suggestions()[0].status, 'open');
   assert.equal(f.calls.fixes, 0);
 });
+
+test('reconsidered native findings keep their fingerprint across publication order and restart', async t => {
+  const f = fixture(t);
+  const runtime = { cron: { listJobs: () => [{ id: 'synthetic-job', enabled: true, lastError: 'synthetic failure' }] } };
+  const native = (await runDiagnosis({ store: f.store, dataDir: f.dir, now: NOW, models: f.manager, runtime })).suggestions[0];
+  await f.manager.publish([native]);
+  const original = f.store.suggestions()[0];
+  await f.manager.respond(original.id, 'Answer question', { clarification: 'It requires setup.' });
+  f.manager.models.explain = async input => ({ ...seed, area: 'sources', remedy: 'setup', rootCause: 'Different synthetic root cause', anomalyId: input.anomalies[0].id });
+  const reconsidered = await f.manager.propose({ anomalies: [] });
+  await f.manager.publish([...reconsidered, { ...native, score: -1 }]);
+  assert.equal(f.store.suggestions().length, 1);
+  assert.equal(f.store.suggestions()[0].fingerprint, original.fingerprint);
+  f.manager.store = new FleetStore({ dir: f.store.dir, now: () => NOW });
+  await f.manager.publish([native]);
+  assert.equal(f.manager.store.suggestions().length, 1);
+});
+
+test('a bounded clarification batch processes later answers even when the first explanation fails', async t => {
+  const f = fixture(t);
+  for (const metric of ['first', 'second', 'third']) {
+    await f.manager.publish([{ ...seed, metric, remedy: 'clarification', fingerprint: metric, score: 1 }]);
+    const saved = f.store.suggestions().find(s => s.metric === metric);
+    await f.manager.respond(saved.id, 'Answer question', { clarification: metric });
+  }
+  const calls = [];
+  f.manager.models.explain = async input => {
+    const answer = input.clarifications[0].answer;
+    calls.push(answer);
+    if (answer === 'first') throw new Error('synthetic explanation unavailable');
+    return { ...seed, remedy: 'setup', anomalyId: input.anomalies[0].id };
+  };
+  await f.manager.publish(await f.manager.propose({ anomalies: [] }));
+  assert.deepEqual(calls, ['first', 'second', 'third']);
+  assert.equal(f.store.suggestions().find(s => s.metric === 'first').clarification.reconsideredAt, undefined);
+  for (const metric of ['second', 'third']) assert.ok(f.store.suggestions().find(s => s.metric === metric).clarification.reconsideredAt);
+  assert.equal(f.calls.fixes, 0);
+});

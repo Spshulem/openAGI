@@ -125,34 +125,48 @@ export class SuggestionManager {
 
   get mode() { return this.config.selfFix?.mode ?? "propose"; }
 
-  async propose(report) {
-    if (this.mode === "off") return [];
-    const records = this.store.suggestions();
-    // Revisit the same unresolved finding using the owner's new evidence,
-    // even if its original anomaly disappeared or all proposal slots are full.
-    const pending = records.find(s => s.status === "open" && remedyOf(s) === "clarification"
-      && s.clarification?.answer && !s.clarification.reconsideredAt
-      && (!report.area || report.area === s.area));
-    if (!pending && (!report.anomalies.length || records.filter(s => s.status === "open").length >= 3)) return [];
-    const covered = records.filter((s) => ["open", "fix-queued", "never"].includes(s.status)
-      || (s.status === "snoozed" && Date.parse(s.snoozedUntil) > this.now()));
-    const anomalies = pending ? [{ id: `clarification:${pending.id}`, metric: pending.metric, area: pending.area,
-      eventsPerDay: pending.eventsPerDay ?? 1, evidenceActionIds: pending.evidence?.actionIds ?? [], feedbackIds: pending.evidence?.feedbackIds ?? [] }]
-      : report.anomalies.filter((a) => !covered.some((s) => s.metric === a.metric && s.area === a.area));
-    if (!anomalies.length) return [];
-    const clarification = pending ? { suggestionId: pending.id, answer: pending.clarification.answer, answeredAt: pending.clarification.answeredAt,
-      question: pending.nextAction ?? pending.proposedFix, rootCause: pending.rootCause } : null;
+  async explainCandidate(report, anomalies, clarifications = []) {
     const explanation = validateExplanation(await this.models.explain({ anomalies, metrics: report.metrics, evidence: report.evidence,
-      ...(clarification ? { clarifications: [clarification] } : {}) }));
+      ...(clarifications.length ? { clarifications } : {}) }));
     const anomaly = anomalies.find((a) => a.id === explanation.anomalyId && a.area === explanation.area);
     if (!anomaly) throw new Error("Diagnosis output has no matching anomaly.");
     const evidenceIds = new Set(anomaly.evidenceActionIds);
     const candidate = { ...explanation, metric: anomaly.metric, eventsPerDay: anomaly.eventsPerDay,
       evidence: { actionIds: explanation.evidenceActionIds.filter((id) => evidenceIds.has(id)), feedbackIds: anomaly.feedbackIds ?? [] },
       score: anomaly.eventsPerDay * explanation.minutesSavedPerDay * explanation.confidence };
-    candidate.fingerprint = suggestionFingerprint(candidate);
-    if (pending) return [{ ...candidate, reconsideration: { suggestionId: pending.id,
-      answer: pending.clarification.answer, answeredAt: pending.clarification.answeredAt } }];
+    return { ...candidate, fingerprint: suggestionFingerprint(candidate) };
+  }
+
+  async propose(report) {
+    if (this.mode === "off") return [];
+    const records = this.store.suggestions();
+    // Revisit the same unresolved finding using the owner's new evidence,
+    // even if its original anomaly disappeared or all proposal slots are full.
+    const pending = records.filter(s => s.status === "open" && remedyOf(s) === "clarification"
+      && s.clarification?.answer && !s.clarification.reconsideredAt
+      && (!report.area || report.area === s.area)).slice(0, 3);
+    if (pending.length) {
+      const candidates = [];
+      let failure;
+      for (const s of pending) {
+        try {
+          const anomaly = { id: `clarification:${s.id}`, metric: s.metric, area: s.area, eventsPerDay: s.eventsPerDay ?? 1,
+            evidenceActionIds: s.evidence?.actionIds ?? [], feedbackIds: s.evidence?.feedbackIds ?? [] };
+          const candidate = await this.explainCandidate(report, [anomaly], [{ suggestionId: s.id, answer: s.clarification.answer,
+            answeredAt: s.clarification.answeredAt, question: s.nextAction ?? s.proposedFix, rootCause: s.rootCause }]);
+          candidates.push({ ...candidate, reconsideration: { suggestionId: s.id,
+            answer: s.clarification.answer, answeredAt: s.clarification.answeredAt } });
+        } catch (error) { failure = error; } // One unavailable explanation cannot starve the other answers.
+      }
+      if (!candidates.length && failure) throw failure;
+      return candidates;
+    }
+    if (!report.anomalies.length || records.filter(s => s.status === "open").length >= 3) return [];
+    const covered = records.filter((s) => ["open", "fix-queued", "never"].includes(s.status)
+      || (s.status === "snoozed" && Date.parse(s.snoozedUntil) > this.now()));
+    const anomalies = report.anomalies.filter((a) => !covered.some((s) => s.metric === a.metric && s.area === a.area));
+    if (!anomalies.length) return [];
+    const candidate = await this.explainCandidate(report, anomalies);
     if (records.some((s) => s.fingerprint === candidate.fingerprint)) return [];
     const compare = records.filter((s) => ["open", "fix-queued", "never"].includes(s.status) || Date.parse(s.updatedAt) >= this.now() - 7 * DAY_MS);
     const fixes = this.store.fixes().filter((f) => ACTIVE_FIX.has(f.state));
@@ -171,6 +185,7 @@ export class SuggestionManager {
           || current.clarification?.answeredAt !== reconsideration.answeredAt || current.clarification.reconsideredAt) continue;
         const at = new Date(this.now()).toISOString();
         this.store.saveSuggestion({ ...current, ...update, id: current.id, status: "open", plan: suggestionPlan(update),
+          ...(current.source === "runtime" ? { fingerprint: current.fingerprint } : {}),
           clarification: { ...current.clarification, reconsideredAt: at }, updatedAt: at });
         continue;
       }
