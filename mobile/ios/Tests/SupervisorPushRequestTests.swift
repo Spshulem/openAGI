@@ -364,6 +364,35 @@ final class SupervisorPushRequestTests: XCTestCase {
                        "re-paired to another node")
     }
 
+    @MainActor
+    func testForgettingDoesNotWaitForUnresponsivePushCleanup() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [UnresponsivePushCleanupProtocol.self]
+        let session = URLSession(configuration: config)
+        defer {
+            session.invalidateAndCancel()
+            PushPassStore.clear()
+            PushKeyStore.clear()
+        }
+        _ = try PushKeyStore.loadOrCreate()
+        XCTAssertTrue(PushPassStore.save(.init(pass: "p1.current.pass", signature: "s",
+                                               retire: "p1.old.pass")))
+        let client = DaemonClient(server: URL(string: "https://daemon.example.com")!, nodeID: "mobile:old",
+                                  token: "old-token", session: session)
+        let relay = PushRelayClient(base: URL(string: "https://push.example.com")!, session: session)
+        let registrar = PushRegistrar()
+        let finished = expectation(description: "local cleanup lets credential revocation continue")
+        let forgetting = Task {
+            await registrar.forget(client: client, relay: relay)
+            XCTAssertNil(PushPassStore.load())
+            XCTAssertNil(PushKeyStore.load())
+            finished.fulfill()
+        }
+        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 1)
+        XCTAssertEqual(result, .completed)
+        forgetting.cancel()
+    }
+
     // MARK: - Background assertion
 
     @MainActor
@@ -406,6 +435,20 @@ final class SupervisorPushRequestTests: XCTestCase {
     func testHexToken() {
         XCTAssertEqual(Data([0x00, 0xAB, 0x0F]).hexString, "00ab0f")
     }
+}
+
+// The daemon answers, but relay cleanup stays pending until cancellation.
+private final class UnresponsivePushCleanupProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard request.url?.host == "daemon.example.com" else { return }
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"ok":true}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
 
 // The push key runs through the real keychain in the xctest host, same as

@@ -266,12 +266,10 @@ final class PushRegistrar {
         }
     }
 
-    // Forget pairing: tell the daemon to stop pushing (best effort; a revoke
-    // removes the record daemon-side too), retire the pass at the relay, end
-    // any Live Activity, clear the shade and drop the key so nothing sealed
-    // for this pairing opens again. Tokens are kept: they belong to the
-    // phone, not the pairing.
-    func forget(client: DaemonClient) async {
+    // Clear local push state before returning to credential revocation.
+    // Network cleanup is best effort and must not delay that revocation.
+    // Tokens are kept: they belong to the phone, not the pairing.
+    func forget(client: DaemonClient, relay: PushRelayClient = PushRelayClient()) async {
         generation += 1
         if let nodeID = Credentials.load()?.nodeID { forgottenNodeIDs.insert(nodeID) }
         // Cancel and wait out an in-flight sync, so it cannot save a pass or
@@ -280,18 +278,22 @@ final class PushRegistrar {
             running.cancel()
             await running.value
         }
-        try? await client.unregisterPush()
-        if let stored = PushPassStore.load() {
-            PushPassStore.clear()
-            let relay = PushRelayClient()
-            try? await relay.unregister(pass: stored.pass)
-            if let retire = stored.retire { try? await relay.unregister(pass: retire) }
-        }
+        let stored = PushPassStore.load()
+        PushPassStore.clear()
         PushKeyStore.clear()
         await Self.endActivities(ids: nil)
         let center = UNUserNotificationCenter.current()
         center.removeAllDeliveredNotifications()
         center.removeAllPendingNotificationRequests()
+        // Capture only this pairing's client and passes. A later pairing is
+        // independent even if the relay is unavailable until its timeout.
+        Task {
+            try? await client.unregisterPush()
+            if let stored {
+                try? await relay.unregister(pass: stored.pass)
+                if let retire = stored.retire { try? await relay.unregister(pass: retire) }
+            }
+        }
     }
 
     // MARK: - Pure decisions (pinned by tests)

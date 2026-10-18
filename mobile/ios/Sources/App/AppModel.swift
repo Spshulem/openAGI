@@ -168,7 +168,8 @@ final class AppModel {
     // MARK: - Revoke
 
     func revoke() async {
-        // Before the revoke: the DELETE needs the credential it invalidates.
+        // Local push state goes first; best-effort relay cleanup runs apart
+        // from the credential revocation so a relay outage cannot delay it.
         await PushRegistrar.shared.forget(client: client)
         try? await client.revoke()
         stopEventStream()
