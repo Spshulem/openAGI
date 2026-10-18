@@ -53,12 +53,36 @@ final class OfflineCopy {
     @discardableResult
     func sendOfflineWork(to client: DaemonClient) async throws -> Int {
         guard isAvailable, EmbeddedSecrets.load() != nil else { return 0 }
-        let work = try await EmbeddedDaemon.shared.ownerRaw(path: "/mirror/offline", method: "GET")
-        let count = Self.itemCount(work)
-        guard count > 0 else { return 0 }
-        try await client.sendOfflineWork(work)
-        _ = try await EmbeddedDaemon.shared.ownerRaw(path: "/mirror/offline/sent", method: "POST", body: work)
-        return count
+        return try await Self.sendPages(
+            next: { try await EmbeddedDaemon.shared.ownerRaw(path: "/mirror/offline", method: "GET") },
+            upload: { try await client.sendOfflineWork($0) },
+            markSent: { _ = try await EmbeddedDaemon.shared.ownerRaw(path: "/mirror/offline/sent", method: "POST", body: $0) }
+        )
+    }
+
+    // Acknowledging a page removes it from the next listing. Drain every
+    // page before the caller reports success or switches to the server.
+    static func sendPages(next: () async throws -> Data,
+                          upload: (Data) async throws -> Void,
+                          markSent: (Data) async throws -> Void) async throws -> Int {
+        var total = 0
+        while true {
+            try Task.checkCancellation()
+            let work = try await next()
+            guard let object = try JSONSerialization.jsonObject(with: work) as? [String: Any] else {
+                throw DaemonError.malformedResponse
+            }
+            let truncated = object["truncated"] as? Bool ?? false
+            let count = itemCount(work)
+            if count == 0 {
+                guard !truncated else { throw DaemonError.malformedResponse }
+                return total
+            }
+            try await upload(work)
+            try await markSent(work)
+            total += count
+            if !truncated { return total }
+        }
     }
 
     static func itemCount(_ work: Data) -> Int {

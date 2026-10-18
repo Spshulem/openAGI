@@ -32,9 +32,10 @@ if [[ "${CODE_SIGNING_ALLOWED:-NO}" == "YES" ]]; then
 fi
 
 # The daemon: src/, the mobile entry, package.json (ESM "type" and version),
-# and ws. Tests, docs, and the desktop bins stay out.
-mkdir -p "$daemon/bin" "$daemon/node_modules"
+# built-in skills, and ws. Tests, docs, and the desktop bins stay out.
+mkdir -p "$daemon/bin" "$daemon/node_modules" "$daemon/examples"
 rsync -a --delete --exclude '.DS_Store' "$repo/src/" "$daemon/src/"
+rsync -a --delete --exclude '.DS_Store' "$repo/examples/skills" "$daemon/examples/"
 cp "$repo/bin/mobile-entry.mjs" "$daemon/bin/"
 cp "$repo/package.json" "$daemon/"
 if [[ ! -d "$repo/node_modules/ws" ]]; then
