@@ -369,8 +369,11 @@ final class SupervisorPushRequestTests: XCTestCase {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [UnresponsivePushCleanupProtocol.self]
         let session = URLSession(configuration: config)
+        let cleanupFinished = expectation(description: "both captured passes finish retiring")
+        cleanupFinished.expectedFulfillmentCount = 2
+        UnresponsivePushCleanupProtocol.prepare { cleanupFinished.fulfill() }
         defer {
-            session.invalidateAndCancel()
+            UnresponsivePushCleanupProtocol.release()
             PushPassStore.clear()
             PushKeyStore.clear()
         }
@@ -390,7 +393,13 @@ final class SupervisorPushRequestTests: XCTestCase {
         }
         let result = await XCTWaiter.fulfillment(of: [finished], timeout: 5)
         XCTAssertEqual(result, .completed)
-        forgetting.cancel()
+        // Keep the relay blocked until the local-cleanup assertion is made,
+        // then drain both requests before invalidating their session.
+        UnresponsivePushCleanupProtocol.release()
+        await forgetting.value
+        let cleanupResult = await XCTWaiter.fulfillment(of: [cleanupFinished], timeout: 5)
+        XCTAssertEqual(cleanupResult, .completed)
+        if cleanupResult == .completed { session.finishTasksAndInvalidate() }
     }
 
     // MARK: - Background assertion
@@ -437,16 +446,39 @@ final class SupervisorPushRequestTests: XCTestCase {
     }
 }
 
-// The daemon answers, but relay cleanup stays pending until cancellation.
+// The daemon answers, but relay cleanup stays pending until the test releases it.
 private final class UnresponsivePushCleanupProtocol: URLProtocol {
+    private static let condition = NSCondition()
+    nonisolated(unsafe) private static var released = false
+    nonisolated(unsafe) private static var onRelayResponse: (@Sendable () -> Void)?
+
+    static func prepare(onRelayResponse: @escaping @Sendable () -> Void) {
+        condition.lock()
+        released = false
+        Self.onRelayResponse = onRelayResponse
+        condition.unlock()
+    }
+
+    static func release() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        guard request.url?.host == "daemon.example.com" else { return }
+        let isRelay = request.url?.host != "daemon.example.com"
+        Self.condition.lock()
+        while isRelay && !Self.released { Self.condition.wait() }
+        let onResponse = isRelay ? Self.onRelayResponse : nil
+        Self.condition.unlock()
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(#"{"ok":true}"#.utf8))
         client?.urlProtocolDidFinishLoading(self)
+        onResponse?()
     }
     override func stopLoading() {}
 }
