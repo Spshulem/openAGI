@@ -41,3 +41,16 @@ test("subagents cannot expand parent scope, choose mutating tools, or accept unb
   const f = fixture();
   for (const [args, context] of [[{ task: "read", tools: ["send_message"] }, {}], [{ task: "read", tools: ["web_search"] }, { __allowedTools: [] }], [{ task: "nested" }, { __subagentDepth: 1 }], [{ task: "x".repeat(4001) }, {}]]) assert.equal((await f.registry.invoke("run_subagent", args, context)).ok, false);
 });
+test("bounded delegation does not read or include the owner's ambient screen context", async () => {
+  const f = fixture();
+  let reads = 0;
+  f.runtime.observations = { async getRecentContext() {
+    reads++;
+    return { apps: [{ app: "Private app", n: 1 }], snippets: [{ app: "Private app", text: "PRIVATE_SCREEN_FIXTURE", at: "2026-10-18T00:00:00Z" }] };
+  } };
+  const result = await f.registry.invoke("run_subagent", { task: "Research the supplied public fixture", tools: ["web_search"] }, { sessionId: "owner-fixture" });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(reads, 0);
+  assert.equal(f.captured.turnContext.includes("PRIVATE_SCREEN_FIXTURE"), false);
+  assert.equal(f.captured.turnContext.includes("Private app"), false);
+});

@@ -12,7 +12,7 @@ import { MESSAGING_CONFIG_KEYS } from "../src/integrations/messaging-config.js";
 
 test("hosted companion routes enforce owner auth and CSRF while webhooks self-authenticate", async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "companion-routes-"));
-  const previous = process.env.OPENAGI_AUTH_TOKEN, previousPublicUrl = process.env.OPENAGI_PUBLIC_URL;
+  const previous = process.env.OPENAGI_AUTH_TOKEN, previousPublicUrl = process.env.OPENAGI_PUBLIC_URL, previousGoogleRefresh = process.env.GOOGLE_REFRESH_TOKEN;
   const previousMessaging = Object.fromEntries(MESSAGING_CONFIG_KEYS.map(key => [key, process.env[key]]));
   delete process.env.OPENAGI_PUBLIC_URL;
   process.env.OPENAGI_AUTH_TOKEN = "owner-fixture-token";
@@ -31,6 +31,7 @@ test("hosted companion routes enforce owner auth and CSRF while webhooks self-au
     runtime.observations?.db?.close(); runtime.vectorStore?.db?.close(); runtime.sessionIndex?.db?.close();
     if (previous === undefined) delete process.env.OPENAGI_AUTH_TOKEN; else process.env.OPENAGI_AUTH_TOKEN = previous;
     if (previousPublicUrl === undefined) delete process.env.OPENAGI_PUBLIC_URL; else process.env.OPENAGI_PUBLIC_URL = previousPublicUrl;
+    if (previousGoogleRefresh === undefined) delete process.env.GOOGLE_REFRESH_TOKEN; else process.env.GOOGLE_REFRESH_TOKEN = previousGoogleRefresh;
     for (const [key, value] of Object.entries(previousMessaging)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
     fs.rmSync(dir, { recursive: true, force: true });
   });
@@ -83,6 +84,11 @@ test("hosted companion routes enforce owner auth and CSRF while webhooks self-au
   const refreshed = await (await fetch(url + "/connections/config", { headers: owner })).json();
   assert.equal(refreshed.configured.TWILIO_AUTH_TOKEN, true);
   assert.equal(JSON.stringify(refreshed).includes(env.TWILIO_AUTH_TOKEN), false);
+  env.GOOGLE_REFRESH_TOKEN = "disconnect-fixture-refresh";
+  assert.equal(runtime.google.status().configured, true);
+  assert.equal((await fetch(url + "/integrations/google/disconnect", { method: "POST", headers: owner, body: "{}" })).status, 200);
+  assert.equal(runtime.google.status().configured, false);
+  assert.equal(env.GOOGLE_REFRESH_TOKEN, undefined);
   assert.equal((await fetch(url + "/webhooks/pebble", { method: "POST", body: "unsigned" })).status, 401);
   assert.equal((await fetch(url + "/integrations/google/callback?state=forged&code=fixture")).status, 400);
   assert.equal(runtime.google.flows.size, 0);

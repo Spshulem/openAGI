@@ -8,9 +8,16 @@ const email = value => typeof value === "string" && /^[^\s<>@,;]+@[^\s<>@,;]+\.[
 export class GoogleClient {
   constructor({ env = process.env, fetchImpl = globalThis.fetch, saveCredentials, now = Date.now } = {}) {
     this.env = env; this.fetchImpl = fetchImpl; this.saveCredentials = saveCredentials; this.now = now;
-    this.flows = new Map(); this.access = null; this.refreshing = null;
+    this.flows = new Map(); this.access = null; this.refreshing = null; this.credentialVersion = 0;
   }
   status() { return { configured: Boolean(this.env.GOOGLE_CLIENT_ID && this.env.GOOGLE_CLIENT_SECRET && this.env.GOOGLE_REFRESH_TOKEN), clientConfigured: Boolean(this.env.GOOGLE_CLIENT_ID && this.env.GOOGLE_CLIENT_SECRET) }; }
+  credentialKey() { return JSON.stringify([this.credentialVersion, this.env.GOOGLE_CLIENT_ID, this.env.GOOGLE_CLIENT_SECRET, this.env.GOOGLE_REFRESH_TOKEN]); }
+  credentialsChanged() {
+    this.credentialVersion++;
+    this.access = null;
+    this.refreshing = null;
+    this.flows.clear();
+  }
 
   begin(redirectUri) {
     if (!this.status().clientConfigured) throw new Error("Save a Google OAuth client ID and secret first.");
@@ -20,7 +27,7 @@ export class GoogleClient {
     for (const [state, flow] of this.flows) if (flow.expires < this.now()) this.flows.delete(state);
     if (this.flows.size >= 10) throw new Error("Too many outstanding sign-ins. Wait ten minutes and try again.");
     const state = randomBytes(32).toString("base64url"), verifier = randomBytes(32).toString("base64url");
-    this.flows.set(state, { verifier, redirectUri, expires: this.now() + 600000 });
+    this.flows.set(state, { verifier, redirectUri, credentials: this.credentialKey(), expires: this.now() + 600000 });
     const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     url.search = new URLSearchParams({ client_id: this.env.GOOGLE_CLIENT_ID, redirect_uri: redirectUri, response_type: "code", scope: SCOPES.join(" "), access_type: "offline", prompt: "consent", state, code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" }).toString();
     return { url: url.href, redirectUri };
@@ -31,19 +38,22 @@ export class GoogleClient {
     if (!flow || flow.expires < this.now()) throw new Error("Google sign-in expired or its state is invalid. Start again from Connections.");
     this.flows.delete(state);
     if (error || !code) throw new Error("Google sign-in was not approved. Start again from Connections.");
+    if (flow.credentials !== this.credentialKey()) throw new Error("Google credentials changed. Start sign-in again from Connections.");
     const token = await this.tokenRequest({ code, redirect_uri: flow.redirectUri, code_verifier: flow.verifier, grant_type: "authorization_code" });
+    if (flow.credentials !== this.credentialKey()) throw new Error("Google credentials changed. Start sign-in again from Connections.");
     if (!token.refresh_token) throw new Error("Google did not return an offline token. Revoke the app grant in Google and connect again.");
     if (token.scope && SCOPES.some(scope => !token.scope.split(" ").includes(scope))) throw new Error("Approve all requested Gmail and Calendar scopes, then reconnect.");
     if (!this.saveCredentials) throw new Error("Google credential storage is not configured.");
     await this.saveCredentials({ GOOGLE_REFRESH_TOKEN: token.refresh_token });
     this.env.GOOGLE_REFRESH_TOKEN = token.refresh_token;
+    this.credentialsChanged();
     this.cacheToken(token);
     return { connected: true };
   }
 
-  cacheToken(token) {
+  cacheToken(token, credentials = this.credentialKey()) {
     if (typeof token.access_token !== "string" || !token.access_token) throw new Error("Google returned no access token.");
-    this.access = { value: token.access_token, expires: this.now() + Math.max(0, (Number(token.expires_in) || 3600) - 60) * 1000, refreshToken: this.env.GOOGLE_REFRESH_TOKEN };
+    this.access = { value: token.access_token, expires: this.now() + Math.max(0, (Number(token.expires_in) || 3600) - 60) * 1000, credentials };
   }
   async tokenRequest(fields) {
     const response = await this.fetchImpl("https://oauth2.googleapis.com/token", {
@@ -56,13 +66,24 @@ export class GoogleClient {
   }
   async accessToken() {
     if (!this.status().configured) throw new Error("Connect Gmail and Google Calendar in Connections first.");
-    if (this.access?.expires > this.now() && this.access.refreshToken === this.env.GOOGLE_REFRESH_TOKEN) return this.access.value;
-    if (!this.refreshing) this.refreshing = this.tokenRequest({ refresh_token: this.env.GOOGLE_REFRESH_TOKEN, grant_type: "refresh_token" }).then(token => { this.cacheToken(token); return this.access.value; }).finally(() => { this.refreshing = null; });
+    const credentials = this.credentialKey();
+    if (this.access?.expires > this.now() && this.access.credentials === credentials) return this.access.value;
+    if (!this.refreshing || this.refreshCredentials !== credentials) {
+      const refreshing = this.tokenRequest({ refresh_token: this.env.GOOGLE_REFRESH_TOKEN, grant_type: "refresh_token" }).then(token => {
+        if (this.credentialKey() !== credentials) throw new Error("Google credentials changed. Retry the action with the current account.");
+        this.cacheToken(token, credentials);
+        return this.access.value;
+      }).finally(() => { if (this.refreshing === refreshing) this.refreshing = null; });
+      this.refreshCredentials = credentials;
+      this.refreshing = refreshing;
+    }
     return this.refreshing;
   }
   async request(service, resource, { method = "GET", body, query } = {}) {
     if (!["gmail", "calendar"].includes(service)) throw new Error("Unsupported Google service.");
+    const credentials = this.credentialKey();
     const token = await this.accessToken();
+    if (this.credentialKey() !== credentials) throw new Error("Google credentials changed. Retry the action with the current account.");
     const url = new URL(service === "gmail" ? `https://gmail.googleapis.com/gmail/v1/users/me/${resource}` : `https://www.googleapis.com/calendar/v3/${resource}`);
     if (query) url.search = new URLSearchParams(Object.entries(query).filter(([, v]) => v !== undefined)).toString();
     const response = await this.fetchImpl(url.href, { method, redirect: "error", signal: AbortSignal.timeout(30000), headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, ...(body ? { body: JSON.stringify(body) } : {}) });

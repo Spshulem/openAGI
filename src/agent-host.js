@@ -213,7 +213,8 @@ export class AgentHost {
     // user is actually doing, not just what they typed. Best-effort —
     // failures fall through silently so chat keeps working without capture.
     let ambientContext = null;
-    if (channel !== "autopilot" && channel !== "cron" && this.runtime.observations?.getRecentContext) {
+    // A bounded delegate receives the supplied task, not the owner's OCR.
+    if (channel !== "autopilot" && channel !== "cron" && channel !== "subagent" && this.runtime.observations?.getRecentContext) {
       try {
         ambientContext = await this.runtime.observations.getRecentContext({ minutes: 10, maxChars: 1500, maxSnippets: 6 });
       } catch { /* swallow */ }

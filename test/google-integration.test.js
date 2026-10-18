@@ -36,6 +36,59 @@ test("concurrent Google reads share one refresh; writes are never retried", asyn
   await assert.rejects(client.request("gmail", "messages/send", { method: "POST", body: {} }), error => !error.message.includes("fixture-secret") && /Check Gmail/.test(error.message));
   assert.equal(writes, 1);
 });
+test("a superseded refresh cannot overwrite a reconnected account or authorize its pending write", async () => {
+  let releaseOld, oldStarted, writes = 0;
+  const started = new Promise(resolve => { oldStarted = resolve; });
+  const oldResponse = new Promise(resolve => { releaseOld = resolve; });
+  const settings = env();
+  const client = new GoogleClient({ env: settings, saveCredentials() {}, fetchImpl: async (url, init) => {
+    if (String(url).includes("oauth2")) {
+      if (init.body.get("grant_type") === "refresh_token") { oldStarted(); return oldResponse; }
+      return Response.json({ access_token: "new-account-access", refresh_token: "new-account-refresh", expires_in: 3600 });
+    }
+    writes++;
+    assert.equal(init.headers.authorization, "Bearer new-account-access");
+    return Response.json({ id: "new-account-message" });
+  } });
+  const pendingWrite = assert.rejects(client.request("gmail", "messages/send", { method: "POST", body: {} }), /credentials changed/i);
+  await started;
+  const state = new URL(client.begin("https://fixture.example/integrations/google/callback").url).searchParams.get("state");
+  await client.finish({ state, code: "new-account-code" });
+  releaseOld(Response.json({ access_token: "old-account-access", expires_in: 3600 }));
+  await pendingWrite;
+  assert.equal(writes, 0);
+  assert.equal(await client.accessToken(), "new-account-access");
+  await client.request("gmail", "messages/send", { method: "POST", body: {} });
+  assert.equal(writes, 1);
+});
+test("new credentials start their own refresh and obsolete completion cannot clear it", async () => {
+  const releases = [], requests = [], settings = env();
+  const client = new GoogleClient({ env: settings, fetchImpl: async (_url, init) => {
+    requests.push(init.body.get("refresh_token"));
+    return new Promise(resolve => releases.push(resolve));
+  } });
+  const obsolete = assert.rejects(client.accessToken(), /credentials changed/i);
+  settings.GOOGLE_REFRESH_TOKEN = "current-account-refresh";
+  const current = client.accessToken();
+  releases[0](Response.json({ access_token: "obsolete-access", expires_in: 3600 }));
+  await obsolete;
+  const alsoCurrent = client.accessToken();
+  assert.deepEqual(requests, ["fixture-refresh", "current-account-refresh"]);
+  releases[1](Response.json({ access_token: "current-access", expires_in: 3600 }));
+  assert.deepEqual(await Promise.all([current, alsoCurrent]), ["current-access", "current-access"]);
+});
+test("credential invalidation rejects an old refresh even when the same grant is reconnected", async () => {
+  const releases = [];
+  const client = new GoogleClient({ env: env(), fetchImpl: async () => new Promise(resolve => releases.push(resolve)) });
+  const obsolete = assert.rejects(client.accessToken(), /credentials changed/i);
+  client.credentialsChanged();
+  const current = client.accessToken();
+  releases[0](Response.json({ access_token: "obsolete-access", expires_in: 3600 }));
+  await obsolete;
+  releases[1](Response.json({ access_token: "current-access", expires_in: 3600 }));
+  assert.equal(await current, "current-access");
+  assert.equal(await client.accessToken(), "current-access");
+});
 test("email drafts remain drafts, sends queue for approval, and approved sends use exact content", async () => {
   const calls = [], queued = [];
   const registry = new ToolRegistry();

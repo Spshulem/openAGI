@@ -78,7 +78,7 @@ export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin
         const result = saveEnv({ dataDir, values });
         for (const [key, value] of Object.entries(values)) if (value.trim()) env[key] = value.trim();
         for (const { id } of MESSAGING_PROVIDERS) channels?.[id]?.start();
-        if (runtime.google) runtime.google.access = null;
+        if (Object.keys(values).some(key => key.startsWith("GOOGLE_") && values[key].trim())) runtime.google?.credentialsChanged();
         json(res, 200, { saved: result.keys }); return true;
       }
       if (pathname === "/sharing/retry" && method === "POST") {
@@ -91,7 +91,7 @@ export function createCompanionRoutes({ runtime, dataDir, getChannels, getOrigin
       }
       if (pathname === "/integrations/google/disconnect" && method === "POST") {
         saveEnv({ dataDir, values: {}, clear: ["GOOGLE_REFRESH_TOKEN"] });
-        if (runtime.google) { runtime.google.access = null; runtime.google.flows.clear(); }
+        if (runtime.google) { delete runtime.google.env.GOOGLE_REFRESH_TOKEN; runtime.google.credentialsChanged(); }
         json(res, 200, { disconnected: true, note: "Local credentials removed. Revoke the app in your Google account to revoke the server-side grant." }); return true;
       }
       if (method === "POST" && ["/sharing/contacts", "/sharing/groups", "/sharing/revoke"].includes(pathname)) {
