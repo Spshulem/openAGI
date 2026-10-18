@@ -5,6 +5,7 @@ const PUBLIC_FAILURES = Object.freeze({
   "provider-timeout": "The model provider timed out. Check its connection and try again.",
   "provider-empty-response": "The model returned no answer after retrying. Please try again.",
   "provider-unavailable": "The model provider is unavailable. Check its connection and try again.",
+  "input-limit": "This request exceeds the configured input limit. Shorten your message or increase OPENAGI_MAX_INPUT_TOKENS in Settings.",
   "agent-error": "The agent couldn't complete that request. Check the local daemon log for details."
 });
 
@@ -19,6 +20,7 @@ export function classifyAgentFailure(error) {
   const message = safeErrorMessage(error);
   const detail = `${code} ${name} ${message}`;
 
+  if (code === "INPUT_CONTEXT_TOO_LARGE") return { code: "input-limit", message: PUBLIC_FAILURES["input-limit"] };
   if (code === "BUDGET_EXCEEDED" || /\b(?:daily )?budget\b|spend cap/i.test(detail)) {
     return { code: "budget", message: PUBLIC_FAILURES.budget };
   }

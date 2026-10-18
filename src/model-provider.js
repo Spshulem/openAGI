@@ -1,5 +1,5 @@
 import { ModelRouter } from "./model-router.js";
-import { ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
+import { AnthropicToolLoopContext, ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
 import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
@@ -415,6 +415,7 @@ export class AnthropicProvider {
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;
     this.turnUsdLimit = turnUsdLimit(options.turnUsdLimit);
+    this.maxInputTokens = options.maxInputTokens ?? maxInputTokensFromEnv();
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.streamLimits = normalizeSseLimits(options.streamLimits);
     this.router = options.router ?? new ModelRouter({ envPrefix: "ANTHROPIC", baseModel: this.model });
@@ -448,11 +449,12 @@ export class AnthropicProvider {
     ];
 
     const contextBlock = turnContext ?? buildTurnContext({ scrutiny, memoryHits });
+    const contextWindow = new AnthropicToolLoopContext({ maxInputTokens: this.maxInputTokens });
     const convo = [
-      ...messages.slice(-12).map((m) => ({
+      ...messages.slice(-12).map((m) => contextWindow.mark({
         role: m.role === "assistant" ? "assistant" : "user",
         content: m.content
-      })),
+      }, { kind: "history" })),
       { role: "user", content: contextBlock ? `${contextBlock}\n\n${input}` : input }
     ];
 
@@ -465,6 +467,7 @@ export class AnthropicProvider {
 
     for (let hop = 0; hop < maxToolHops; hop += 1) {
       notifyProgress(onProgress, { stage: "model", provider: "anthropic", model, hop: hop + 1, maxToolHops });
+      contextWindow.fit(convo, { fixedChars: JSON.stringify(system).length + JSON.stringify(tools).length });
       const body = {
         model,
         max_tokens: this.maxTokens,
@@ -537,12 +540,12 @@ export class AnthropicProvider {
               }
             ]
           : clipToolOutput(JSON.stringify(result), use.name);
-        toolResults.push({
+        toolResults.push(contextWindow.mark({
           type: "tool_result",
           tool_use_id: use.id,
           content,
           is_error: !invocation.ok
-        });
+        }, { kind: "output", tool: use.name, hop }));
       }
       convo.push({ role: "user", content: toolResults });
       if (this.turnUsdLimit > 0 && turnSpend.usd >= this.turnUsdLimit) {
@@ -566,6 +569,7 @@ export class AnthropicProvider {
         system: [...system, { type: "text", text: FINAL_ANSWER_INSTRUCTION }],
         messages: convo
       };
+      contextWindow.fit(convo, { fixedChars: JSON.stringify(body.system).length });
       let firstVisibleDelta = true;
       const emitText = typeof onTextDelta === "function"
         ? (text) => {
@@ -920,8 +924,25 @@ export function turnSpendStopMessage(turnUsd, limit, { toolCalls = [], unrunCall
   const done = toolCalls.map((call) => `${call.name} (${toolCallStatus(call.result)})`);
   if (done.length > 0) lines.push(`Done so far: ${collapseRepeats(done).join(", ")}.`);
   if (unrunCalls.length > 0) lines.push(`Not run yet: ${collapseRepeats(unrunCalls).join(", ")}.`);
+  if (toolCalls.length > 0) {
+    lines.push("Completed tool progress (do not repeat successful side effects):");
+    for (const call of toolCalls.slice(-STOP_PROGRESS_MAX)) {
+      lines.push(JSON.stringify({ tool: call.name, arguments: progressSummary(call.arguments), result: progressSummary(call.result) }));
+    }
+    if (toolCalls.length > STOP_PROGRESS_MAX) lines.push(`${toolCalls.length - STOP_PROGRESS_MAX} earlier calls omitted; check their state before repeating them.`);
+  }
   lines.push(`Say "continue" and I'll keep going.`);
   return lines.join(lines.length > 2 ? "\n" : " ");
+}
+
+function progressSummary(value, depth = 0) {
+  if (typeof value === "string") return value.length > 200 ? `${value.slice(0, 200)} [truncated]` : value;
+  if (value == null || typeof value !== "object") return value;
+  if (depth >= 3) return "[truncated]";
+  if (Array.isArray(value)) return value.slice(0, 5).map((item) => progressSummary(item, depth + 1));
+  return Object.fromEntries(Object.entries(value).slice(0, 8).map(([key, item]) => [key,
+    /image|base64|dataurl/i.test(key) ? "[omitted]" : progressSummary(item, depth + 1)
+  ]));
 }
 
 function toolCallStatus(invocation) {

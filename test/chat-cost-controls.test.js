@@ -12,6 +12,7 @@ import { CreditLedger } from "../src/credit-ledger.js";
 import { ModelRouter, renderModelPlan } from "../src/model-router.js";
 import { AnthropicProvider, OpenAIResponsesProvider, turnSpendStopMessage } from "../src/model-provider.js";
 import { itemChars } from "../src/context-trim.js";
+import { classifyAgentFailure } from "../src/agent-failure.js";
 import { SkillRegistry } from "../src/skills.js";
 
 function tmpGuard() {
@@ -344,16 +345,86 @@ test("turn spend stop text lists the tools already run and the ones not run, so 
   };
   const toolRegistry = { invoke: async (name) => (name === "computer_click" ? { ok: false, error: "denied" } : { ok: true, result: {} }) };
   const result = await provider.generate({ input: "fix it", agent, messages: [], tools: toolSchema, toolRegistry });
-  assert.equal(result.text, [
+  assert.ok(result.text.startsWith([
     "I stopped this turn at $3.00 of model spend (the per-turn limit is $2.00).",
     "Done so far: fleet_screen (ok) x2, computer_click (failed).",
-    "Not run yet: fleet_thread.",
-    'Say "continue" and I\'ll keep going.'
-  ].join("\n"));
+    "Not run yet: fleet_thread."
+  ].join("\n")));
+  assert.match(result.text, /"tool":"computer_click","arguments":\{\},"result":\{"ok":false,"error":"denied"\}/);
+  assert.ok(result.text.endsWith('Say "continue" and I\'ll keep going.'));
   assert.match(
     turnSpendStopMessage(2.5, 2, { toolCalls: [{ name: "send", result: { ok: true, result: { status: "awaiting_confirmation" } } }] }),
     /Done so far: send \(awaiting approval\)\./
   );
+});
+
+test("both providers reject oversized protected input before any paid request", async () => {
+  for (const Provider of [OpenAIResponsesProvider, AnthropicProvider]) {
+    for (const streaming of [false, true]) {
+      for (const field of ["input", "instructions", "schema"]) {
+        let paidCalls = 0;
+        const provider = new Provider({ apiKey: "test", maxInputTokens: 100, fetchImpl: async () => { paidCalls += 1; throw new Error("must not send"); } });
+        const schema = [{ type: "function", name: "tool", description: "x".repeat(1000) }];
+        await assert.rejects(provider.generate({
+          input: field === "input" ? "x".repeat(1000) : "go",
+          instructions: field === "instructions" ? "x".repeat(1000) : "short",
+          turnContext: "", agent,
+          tools: field === "schema" ? schema : [],
+          toolRegistry: { toAnthropicTools: () => field === "schema" ? schema : [] },
+          ...(streaming ? { onTextDelta() {} } : {})
+        }), (error) => error.code === "INPUT_CONTEXT_TOO_LARGE" && classifyAgentFailure(error).code === "input-limit");
+        assert.equal(paidCalls, 0);
+      }
+    }
+  }
+});
+
+test("Anthropic caps long tool loops, preserves every tool pair, and trims old screenshots", async () => {
+  for (const screenshots of [false, true]) {
+    const bodies = [];
+    const provider = new AnthropicProvider({ apiKey: "test", maxInputTokens: 5000, maxToolHops: 10, turnUsdLimit: 0 });
+    provider.postMessages = async (body) => {
+      bodies.push(structuredClone(body));
+      const hop = bodies.length;
+      return { id: `r${hop}`, content: hop > 8 ? [{ type: "text", text: "done" }] : [{ type: "tool_use", id: `t${hop}`, name: "big_tool", input: {} }] };
+    };
+    const toolRegistry = {
+      toAnthropicTools: () => [],
+      invoke: async () => ({ ok: true, result: screenshots ? { image: "a".repeat(100_000), format: "png" } : { data: "x".repeat(8000) } })
+    };
+    await provider.generate({ input: "latest ask", instructions: "static", turnContext: "", agent,
+      messages: Array.from({ length: 6 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `old ${i} ${"h".repeat(4000)}` })), toolRegistry });
+    for (const body of bodies) {
+      assert.ok(body.messages.some((message) => message.content === "latest ask"));
+      const uses = body.messages.flatMap((message) => Array.isArray(message.content) ? message.content.filter((block) => block.type === "tool_use").map((block) => block.id) : []);
+      const results = body.messages.flatMap((message) => Array.isArray(message.content) ? message.content.filter((block) => block.type === "tool_result") : []);
+      assert.deepEqual(results.map((block) => block.tool_use_id), uses);
+      const chars = JSON.stringify(body.system).length + 2 + body.messages.reduce((sum, message) => sum + (Array.isArray(message.content) && message.content[0]?.type === "tool_result" ? message.content.reduce((n, block) => n + itemChars(block), 0) : itemChars(message)), 0);
+      assert.ok(chars <= 20_000, `request exceeds cap: ${chars}`);
+    }
+    const results = bodies.at(-1).messages.flatMap((message) => Array.isArray(message.content) ? message.content.filter((block) => block.type === "tool_result") : []);
+    assert.match(results[0].content, /^\[tool output trimmed:/);
+    assert.equal(typeof results.at(-1).content, screenshots ? "object" : "string");
+  }
+});
+
+test("final no-tools calls obey the input cap on both providers", async () => {
+  for (const Provider of [OpenAIResponsesProvider, AnthropicProvider]) {
+    const provider = new Provider({ apiKey: "test", maxInputTokens: 35, maxToolHops: 1 });
+    let calls = 0;
+    provider.postResponses = provider.postMessages = async () => { calls += 1; return { id: "empty", output: [], content: [] }; };
+    await assert.rejects(provider.generate({ input: "go", instructions: "short", turnContext: "", agent }), { code: "INPUT_CONTEXT_TOO_LARGE" });
+    assert.equal(calls, 1, "the final summary must not exceed the cap");
+  }
+});
+
+test("spend stops retain bounded arguments and results without screenshot payloads", () => {
+  const text = turnSpendStopMessage(2.5, 2, { toolCalls: [{ name: "send_message", arguments: { to: "test-recipient", body: "x".repeat(20_000) }, result: { ok: true, result: { id: "receipt-123", status: "sent", imageBase64: "private-image-payload" } } }] });
+  assert.match(text, /"to":"test-recipient"/);
+  assert.match(text, /receipt-123/);
+  assert.match(text, /do not repeat successful side effects/);
+  assert.doesNotMatch(text, /private-image-payload/);
+  assert.ok(text.length < 1500);
 });
 
 test("turn spend stop message is plain and says how to continue", () => {
