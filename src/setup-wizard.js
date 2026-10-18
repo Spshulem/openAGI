@@ -5,6 +5,7 @@ import { generateToken } from "./auth.js";
 import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
 import { resolveDataDir } from "./data-dir.js";
 import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
+import { renderModelSetup } from "./model-setup-ui.js";
 import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
@@ -14,6 +15,7 @@ import { validateOpenAIKey } from "./provider-credentials.js";
 
 const WIZARD_FIELDS = [
   "OPENAGI_PROVIDER",
+  "OPENAGI_LOCAL_BASE_URL", "OPENAGI_LOCAL_MODEL", "OPENAGI_LOCAL_API_KEY",
   "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
   "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "OPENAI_BASE_URL",
   "OPENAGI_AUTH_TOKEN",
@@ -124,7 +126,11 @@ function parseEnvText(text) {
   return out;
 }
 
-export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
+export function renderWizard(options = {}) {
+  return renderModelSetup({ ...options, proposedToken: options.proposedToken || options.existingEnv?.OPENAGI_AUTH_TOKEN?.trim() || generateToken(32) });
+}
+
+export function renderAdvancedWizard({ proposedToken, existingEnv = {} } = {}) {
   // Re-running /setup must NOT rotate the auth token: every save used to
   // overwrite OPENAGI_AUTH_TOKEN with a fresh value because the hidden field
   // always submitted. Keep the existing token when there is one.
@@ -216,9 +222,10 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
     <div class="step">
       <h2>1 / 8</h2>
       <h3>Welcome</h3>
-      <p>OpenAGI is an always-on local agent: chat, scheduled prompts, MCP tools, SMS/Telegram channels, automatic task tracking from your calls/issues/notes.<br>
-      Everything runs on this machine. State stays in <code>${escapeHtml(envFilePath().replace(/\\/g, "/"))}</code>.</p>
-      <p>This wizard takes ~3 minutes. You can change anything later by re-running <code>/setup</code> or via the <code>Integrations</code> tab.</p>
+      <p>Give your agent a model, then choose something useful to do together: remember your preferences, monitor coding agents, understand your screen, or connect your devices.</p>
+      <p><strong>Start small:</strong> complete Model and Dashboard login below, then choose <strong>Save now</strong>. Everything else is optional. The next screen offers a guided chat for your goal.</p>
+      <p>State stays on this host in <code>${escapeHtml(envFilePath().replace(/\\/g, "/"))}</code>. Requests and selected context go to your configured model provider and connected services. Screen capture and computer control require separate setup and permissions.</p>
+      <p>Change settings later at <code>/setup</code> or in <code>Integrations</code>. <a href="https://github.com/Spshulem/openAGI/blob/main/docs/INSTALL.md" target="_blank" rel="noopener noreferrer">Install and troubleshoot</a>.</p>
       <p><strong>Using Even G2?</strong> Finish setup on your main computer, then open <a href="/g2/connect" target="_blank" rel="noopener">Connect glasses</a> for a single-use connection card and speech-readiness guidance. Your glasses never need your owner token.</p>
     </div>
 
@@ -257,7 +264,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
 
     <div class="step">
       <h2>3 / 8 · auth</h2>
-      <h3>Bearer token</h3>
+      <h3>Dashboard login</h3>
       <p>${hasExistingToken
         ? "This is your <strong>existing</strong> dashboard token — saving keeps it unchanged. Regenerate only if you want to rotate it (other signed-in browsers will need the new one)."
         : "This is the password for your dashboard. Save it now — you'll need it to log in. We auto-generated a strong one for you, or paste your own."}</p>
@@ -540,7 +547,7 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
         '\\n\\n<span class="ok">MCPs registered:</span> ' +
         mcpResults.filter((r) => r.ok).map((r) => r.name ?? r.catalogId).join(", ") +
         (mcpResults.some((r) => !r.ok) ? '\\n<span class="err">Failed:</span> ' + mcpResults.filter((r) => !r.ok).map((r) => r.catalogId + " (" + r.error + ")").join(", ") : "");
-      const target = checkedMcps.length > 0 ? "/?tab=integrations" : "/";
+      const target = checkedMcps.length ? "/?tab=integrations" : "/?tab=get-started";
 
       // Bounce the daemon so existing integrations (Linear/BuildBetter/Sendblue
       // etc) re-read their .env values. The Mac app's DaemonController auto-

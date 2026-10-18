@@ -136,7 +136,7 @@ export class ToolLoopContext {
     if (info.kind === "image" || item.type === "tool_result") {
       item.content = trimmedToolStub(info.tool, before);
     } else {
-      item.output = trimmedToolStub(info.tool, before);
+      item[info.contentKey ?? "output"] = trimmedToolStub(info.tool, before);
     }
     info.stubbed = true;
     return before - itemChars(item);
@@ -166,7 +166,7 @@ export function itemChars(item) {
   if (typeof item.content === "string") return item.content.length;
   if (Array.isArray(item.content)) {
     return item.content.reduce((sum, part) => {
-      if (part?.type === "input_image" || part?.type === "image") return sum + IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN;
+      if (["input_image", "image", "image_url"].includes(part?.type)) return sum + IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN;
       if (typeof part?.text === "string") return sum + part.text.length;
       return sum + JSON.stringify(part ?? "").length;
     }, 0);

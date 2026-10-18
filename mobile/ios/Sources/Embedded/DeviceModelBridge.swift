@@ -17,10 +17,15 @@ actor DeviceModelBridge {
     private var socket: URLSessionWebSocketTask?
     private var receiveLoop: Task<Void, Never>?
     private var running: [String: Task<Void, Never>] = [:]
-    private var target: (port: Int, ownerToken: String, backend: any DeviceModelBackend)?
+    private var target: (port: Int, ownerToken: String, backend: any DeviceModelBackend, availability: String)?
 
-    func connect(port: Int, ownerToken: String, backend: any DeviceModelBackend) {
-        target = (port, ownerToken, backend)
+    func connect(port: Int, ownerToken: String, backend: any DeviceModelBackend, availability: String = "available") {
+        let previous = target
+        target = (port, ownerToken, backend, availability)
+        if let previous, previous.port != port || previous.ownerToken != ownerToken || previous.availability != availability {
+            socket?.cancel(with: .goingAway, reason: nil)
+            socket = nil
+        }
         if let socket, socket.state == .running { return }
         open()
     }
@@ -47,7 +52,7 @@ actor DeviceModelBridge {
         receiveLoop?.cancel()
         receiveLoop = Task { [weak self] in
             let context = await backend.contextSize()
-            try? await task.send(.data(DeviceModelOutbound.hello(model: backend.modelName, contextSize: context)))
+            try? await task.send(.data(DeviceModelOutbound.hello(model: backend.modelName, contextSize: context, availability: target.availability)))
             while !Task.isCancelled {
                 guard let message = try? await task.receive() else { break }
                 let data: Data

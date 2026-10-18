@@ -1,10 +1,23 @@
 # Releasing OpenAGI
 
-OpenAGI ships in three forms, each released by tagging `vX.Y.Z` on `main`:
+OpenAGI ships in four forms, released by tagging `vX.Y.Z` on `main`:
 
 1. **Docker image** — `ghcr.io/spshulem/openagi:vX.Y.Z` + `:latest`. Built by [`docker.yml`](../.github/workflows/docker.yml). No special setup — uses `GITHUB_TOKEN`.
 2. **macOS native `.app`** — codesigned + notarized + Sparkle-signed `.dmg` uploaded to the GitHub Release. Built by [`release-mac.yml`](../.github/workflows/release-mac.yml). **Requires the secrets below.**
-3. **Source install** — `git clone` + `npm run serve`. Always available, no release process.
+3. **Windows / Linux portable runtime** — `OpenAGI-Windows-x64.zip`, `OpenAGI-Linux-x64.tar.gz`, and `OpenAGI-Linux-arm64.tar.gz`, each with Node.js, production dependencies, licenses, a launcher, and a `.sha256` checksum. Built by [`runtime-downloads.yml`](../.github/workflows/runtime-downloads.yml), called after the Mac release publishes. No signing secrets needed. This is the browser/CLI runtime, not a Windows/Linux native capture app.
+4. **Source install** — `git clone` + `npm run serve`, or the source archives on each release.
+
+The portable workflow tests all three runner architectures on PRs and uploads
+seven-day test artifacts. On a tag release it verifies that the commit belongs
+to `origin/main` and the tag matches `package.json`, then publishes downloads
+only after all three packages pass. The Mac workflow calls it explicitly:
+release events created with `GITHUB_TOKEN` do not trigger another workflow.
+Packaging uses an explicit source allowlist and a clean `npm ci --omit=dev`;
+never archive an operator checkout, `.env`, or the agent's state directory.
+
+Keep [install availability](INSTALL.md#downloads) accurate. A successful PR
+artifact is not a public GitHub release asset. Do not create a tag or overwrite
+an older release merely to advertise download links.
 
 After this guide is finished once, releasing is `git tag -a v0.0.2 -m "..." && git push origin v0.0.2`.
 
@@ -86,12 +99,14 @@ git tag -a v0.0.2 -m "v0.0.2 — short summary"
 git push origin v0.0.2
 ```
 
-Two GitHub Actions workflows run in parallel:
+The Docker and Mac workflows start from the tag. The Mac workflow then calls
+the portable-download workflow after publishing its assets:
 
 | Workflow | Output | Time |
 |---|---|---|
 | `docker.yml` | `ghcr.io/spshulem/openagi:v0.0.2` + `:latest` (multi-arch) | ~5 min |
 | `release-mac.yml` | `OpenAGI-0.0.2.dmg` + `appcast.xml` on the GitHub Release | ~15–25 min (notarization is the slow part) |
+| `runtime-downloads.yml` (called by Mac release) | Windows x64 ZIP, Linux x64/arm64 tarballs, and checksums on the same release | ~3–10 min after the Mac assets publish |
 
 When `release-mac.yml` finishes, the `.dmg` is at `https://github.com/Spshulem/openAGI/releases/download/v0.0.2/OpenAGI-0.0.2.dmg` and the appcast at `…/appcast.xml`. Existing installs see the update next time Sparkle polls (default daily).
 

@@ -33,7 +33,8 @@ final class DeviceModelProtocolTests: XCTestCase {
             return object
         }
         XCTAssertEqual(try object(DeviceModelOutbound.hello(model: "m", contextSize: 4096)),
-                       ["type": .string("hello"), "model": .string("m"), "contextSize": .number(4096)])
+                       ["type": .string("hello"), "model": .string("m"), "contextSize": .number(4096),
+                        "availability": .string("available")])
         XCTAssertEqual(try object(DeviceModelOutbound.result(id: "g", .text("Hi"))),
                        ["type": .string("result"), "id": .string("g"), "text": .string("Hi")])
         let call = DeviceToolCall(name: "recall", arguments: .object(["query": .string("tea")]))

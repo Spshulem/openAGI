@@ -3,7 +3,7 @@
 // exposes firstRun so the Mac app can walk a fresh install to the wizard.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { renderWizard, isFirstRun } from "../src/setup-wizard.js";
+import { renderWizard, renderAdvancedWizard, isFirstRun } from "../src/setup-wizard.js";
 import { createDefaultRuntime, createHostedInterface } from "../src/index.js";
 
 test("fresh wizard generates a token and uses defaults", () => {
@@ -14,8 +14,8 @@ test("fresh wizard generates a token and uses defaults", () => {
   assert.ok(!html.includes("✓ saved"), "no saved markers on a fresh install");
 });
 
-test("re-run wizard keeps the existing auth token instead of rotating it", () => {
-  const html = renderWizard({
+test("advanced settings keep the existing auth token instead of rotating it", () => {
+  const html = renderAdvancedWizard({
     existingEnv: {
       OPENAGI_AUTH_TOKEN: "tok_existing_abc123",
       OPENAGI_PROVIDER: "anthropic",
@@ -38,8 +38,8 @@ test("re-run wizard keeps the existing auth token instead of rotating it", () =>
   assert.ok(savedMarkers.length >= 2, "ANTHROPIC_API_KEY and LINEAR_API_KEY show saved markers");
 });
 
-test("quick-save path exists after the auth step", () => {
-  const html = renderWizard({ existingEnv: {} });
+test("advanced settings keep the quick-save path", () => {
+  const html = renderAdvancedWizard({ existingEnv: {} });
   assert.match(html, /Save now — set up the rest later/);
   assert.match(html, /minimum viable setup/);
 });

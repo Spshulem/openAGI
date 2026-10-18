@@ -1,28 +1,28 @@
 # OpenAGI mobile (iOS + Android)
 
-Phase 1 turns a phone into a first-class OpenAGI node: pair it once, and a
-home-screen widget shows today's tasks with tap-to-complete. That's the
-whole surface. There is no chat, no approvals, no voice, and no daily
-brief on the phone yet — those are Phase 2 and Phase 3. What Phase 1 ships:
+Connect a phone to your main OpenAGI host for tasks, shared agent chat,
+approvals, and the fleet supervisor. The iOS SwiftUI and Android Compose apps
+have separate codebases; see [the mobile feature surface](FEATURES.md) for the
+current navigation and capabilities. Widgets show a cached task snapshot.
 
-- A Swift/SwiftUI iOS app (bundle `sh.openagi.OpenAGI`) and a Kotlin/Compose
-  Android app (package `sh.openagi.mobile`), built from two completely
-  separate codebases that never share code.
-- A WidgetKit widget (iOS) and a Glance widget (Android) that render
-  today's bucket and complete a task with one tap, entirely from a local
-  on-device snapshot.
-- A new `mobile` node platform on the daemon, scoped by an explicit route
-  allowlist, plus `GET /mobile/summary` — one round trip for a widget
-  refresh, with an ETag so an unchanged poll costs almost nothing.
-- The `openagi pair-phone` CLI command, which mints a one-time code and
-  prints both a manual server/code pair and an `openagi://pair` deep link.
+Android also supports Supervisor voice. The iOS source includes an offline
+workspace, a phone-agent mode on compatible Apple Intelligence devices, and
+optional encrypted Supervisor push alerts and a Live Activity.
 
-**What this deliberately does not do.** The phone reaches the daemon
-directly over your own Tailscale tailnet or LAN — never through a hosted
-relay, a push-notification service, or any OpenAGI-operated server. If your
-daemon is asleep, off-network, or the phone has no path to it, the widget
-just shows itself as stale or unreachable. That is the tradeoff of staying
-local-first, and Phase 1 does not paper over it.
+**App availability:** this repository includes source and build instructions.
+There is no public App Store, TestFlight, or Play Store download link advertised
+here. Install an available build of the app before pairing. iOS also has an
+optional embedded-runtime mode described below; a build needs its runtime and
+compatible on-device model to use it.
+
+Start with [installation](../docs/INSTALL.md) and the
+[guided first-use flows](../docs/GETTING_STARTED.md). After pairing, you can ask
+in agent chat: "Help me get started with OpenAGI, one question at a time."
+
+The phone needs a route to its main over your private network or authenticated
+HTTPS. If that host is asleep or unreachable, remote features will be unavailable;
+widgets show the age of their last snapshot. Push-notification options depend
+on the platform and configuration; they do not replace reachability for chat.
 
 ## Pairing a phone
 

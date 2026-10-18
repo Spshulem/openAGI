@@ -527,10 +527,10 @@ A barge invalidates the interrupted readback.
 `node scripts/voice-smoke.mjs` checks the live API with the key in
 `~/.openagi/.env`.
 
-Voice adds `fleet_walkthrough`, `voice_focus`, `fleet_diagnose` (counts for
-now), `feedback_record` and `self_fix_list/start/revise/stop`. Self-fix
-requests are stored on the coding Mac (`/fleet/api/fixes`); the runner that
-works them ships later.
+Voice adds `fleet_walkthrough`, `voice_focus`, `fleet_diagnose`,
+`feedback_record` and `self_fix_list/start/revise/stop`. Diagnosis reports
+fleet health metrics and anomalies. Self-fix requests use `/fleet/api/fixes`
+and the configured [self-fix runner](#self-fix-runner) below.
 
 ## One supervisor shared by main, Android and G2
 

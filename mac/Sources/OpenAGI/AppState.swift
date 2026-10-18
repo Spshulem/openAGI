@@ -205,6 +205,13 @@ final class AppState: ObservableObject {
       status = computeStatus(h)
       reachability = .serving
       daemonManagedExternally = await DaemonController.shared.listenerOwnership() == .external
+      // The native model is optional and stays behind the owner-authenticated
+      // loopback bridge already used by the iPhone app.
+      if let token = authToken(), !token.isEmpty {
+        let availability = OnDeviceModelStatus.current()
+        await DeviceModelBridge.shared.connect(port: 43210, ownerToken: token,
+          backend: OnDeviceModelStatus.backend(), availability: availability.availabilityName)
+      }
       providerName = h.status?.agentHost?.provider ?? "—"
       providerConfigured = h.status?.agentHost?.providerConfigured
       memoryShort = h.status?.memory?.short ?? 0
@@ -237,7 +244,7 @@ final class AppState: ObservableObject {
         // launch with a notification only; don't grab a window from someone
         // who may be running deterministic-only on purpose.
         offeredSetupThisLaunch = true
-        notify(title: "OpenAGI needs a model key", body: "The agent is running without an LLM. Tap to finish setup.", path: "/setup")
+        notify(title: "Connect a model to OpenAGI", body: "Choose an API model, Apple Intelligence, or a local model server.", path: "/setup")
       }
     } catch {
       status = .down

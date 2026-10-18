@@ -10,7 +10,7 @@ import { vocaleoUi } from "../src/vocaleo-ui.js";
 import { ToolRegistry } from "../src/tool-registry.js";
 import { PendingActionStore } from "../src/pending-actions.js";
 import { createDurableRuntime, createHostedInterface, IntegrationRegistry } from "../src/index.js";
-import { renderWizard } from "../src/setup-wizard.js";
+import { renderAdvancedWizard } from "../src/setup-wizard.js";
 
 const ownerPhone = "+14155550123";
 const account = { account_id: "account_fixture", balance_cents: 1000, price_cents_per_minute: 11,
@@ -224,9 +224,9 @@ test("authenticated HTTP setup and approval flow uses the real hosted routes", a
   assert.equal(runtime.tools.has("vocaleo_start_call"), false);
 });
 
-test("setup discovery and browser code render without exposing credentials", () => {
+test("advanced setup discovery and browser code render without exposing credentials", () => {
   new vm.Script(vocaleoUi);
-  const html = renderWizard({ existingEnv: { VOCALEO_API_KEY: "vok_must_not_render" } });
+  const html = renderAdvancedWizard({ existingEnv: { VOCALEO_API_KEY: "vok_must_not_render" } });
   assert.match(html, /Integrations → Vocaleo/);
   assert.doesNotMatch(html, /vok_must_not_render/);
 });

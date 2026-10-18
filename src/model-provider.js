@@ -5,6 +5,7 @@ import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
 import { isMobileProfile } from "./mobile-profile.js";
+import { LocalModelProvider } from "./local-model-provider.js";
 import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
@@ -765,7 +766,7 @@ export function createModelProvider(options = {}) {
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
 
-  // Explicit preference wins. anthropic | openai | chatgpt | on-device | auto (default).
+  // Explicit preference wins. anthropic | openai | chatgpt | local | on-device | auto (default).
   const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
   // Phone-only mode (the daemon inside the phone app): with nothing
   // configured the agent thinks with the phone's own model, and a cloud model
@@ -773,6 +774,8 @@ export function createModelProvider(options = {}) {
   const mobile = options.mobile ?? isMobileProfile();
   const onDevice = () => new OnDeviceModelProvider(options.onDevice ?? {});
   const cloud = (provider) => (mobile ? new OfflineFallbackProvider(provider, onDevice()) : provider);
+  // An explicit local choice must never silently send the prompt to a cloud model.
+  if (preference === "local") return new LocalModelProvider(options.local ?? {});
   if (preference === "on-device") return onDevice();
   if (preference === "openai" && openai.isConfigured()) return cloud(openai);
   if (preference === "anthropic" && anthropic.isConfigured()) return cloud(anthropic);
@@ -781,11 +784,13 @@ export function createModelProvider(options = {}) {
   if (preference === "chatgpt" && chatgpt.isConfigured()) return cloud(chatgpt);
 
   // auto: anthropic first if configured, then openai, then ChatGPT sign-in,
-  // then on-device on a phone, then deterministic.
+  // then on-device on a phone, then a configured local server, then deterministic.
   if (anthropic.isConfigured()) return cloud(anthropic);
   if (openai.isConfigured()) return cloud(openai);
   if (chatgpt.isConfigured()) return cloud(chatgpt);
   if (mobile) return onDevice();
+  const local = new LocalModelProvider(options.local ?? {});
+  if (local.isConfigured()) return local;
   return new DeterministicModelProvider();
 }
 
@@ -878,7 +883,7 @@ function safeParseJson(value) {
 // Screenshot tools share one provider-neutral result shape. Attach those
 // bytes as a native vision block; leaving base64 inside JSON would make the
 // screen opaque to the model and prevent grounded follow-up clicks.
-function toolResultImage(result) {
+export function toolResultImage(result) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
   if (typeof result.image !== "string" || !result.image) return null;
   const rawFormat = String(result.format ?? "").toLowerCase();
