@@ -82,7 +82,8 @@ final class PushRegistrar {
 
     // Called once a pairing exists (RootTabView appears). Safe to call again.
     func start() async {
-        guard Credentials.load() != nil else { return }
+        // Phone-only mode has no push service: nothing leaves the phone.
+        guard let credentials = Credentials.load(), !credentials.isEmbedded else { return }
         SupervisorCategories.register(SupervisorCategories.base())
         // Not awaited: whatever the answer, the device token is asked for. A
         // Live Activity started by push needs no notification permission.
@@ -157,6 +158,7 @@ final class PushRegistrar {
     // Overlapping calls fold into one follow-up run instead of racing two
     // relay registrations.
     func sync() async {
+        if Credentials.load()?.isEmbedded == true { return }
         if let running = syncTask {
             syncAgain = true
             await running.value

@@ -36,8 +36,15 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                                                  defaultActionIdentifier: UNNotificationDefaultActionIdentifier,
                                                  userInfo: response.notification.request.content.userInfo)
         let notificationID = response.notification.request.identifier
+        let digestTab = DailyDigestNotifier.tab(for: response.notification.request.content.userInfo)
         let done = UncheckedSendableBox(value: completionHandler)
         Task { @MainActor in
+            // Phone-only mode's morning plan and evening recap.
+            if let digestTab {
+                PushRouter.shared.wantsTab = digestTab
+                done.value()
+                return
+            }
             switch action {
             case .open?:
                 PushRouter.shared.openSupervisor()
@@ -58,6 +65,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 final class PushRouter {
     static let shared = PushRouter()
     var wantsSupervisor = false
+    // Any other tab a notification tap asks for.
+    var wantsTab: AppTab?
 
     func openSupervisor() { wantsSupervisor = true }
 }

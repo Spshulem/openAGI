@@ -221,8 +221,13 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
       <div class="grid">
         <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="auto" ${providerChecked("auto")}> Auto · use whichever has a key (Anthropic preferred)</label>
         <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="anthropic" ${providerChecked("anthropic")}> Anthropic · Claude Sonnet 4.6</label>
-        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai" ${providerChecked("openai")}> OpenAI · ChatGPT (GPT-5)</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="openai" ${providerChecked("openai")}> OpenAI · API key (GPT-5)</label>
+        <label class="opt"><input type="radio" name="OPENAGI_PROVIDER" value="chatgpt" ${providerChecked("chatgpt")}> ChatGPT · your Plus or Pro plan, no API key</label>
       </div>
+
+      <h3 style="margin-top:14px;">Sign in with ChatGPT</h3>
+      <p>Runs OpenAGI on your ChatGPT plan instead of an API key, up to the weekly limit you choose when you sign in.</p>
+      <button type="button" id="chatgpt-signin" onclick="fetch('/auth/chatgpt/start',{method:'POST',headers:{'content-type':'application/json'},body:'{}'}).then(function(r){return r.json();}).then(function(j){if(j.authorizeUrl){window.open(j.authorizeUrl,'_blank');document.getElementById('chatgpt-signin').textContent='Finish signing in, then pick ChatGPT above';}else{alert(j.message||'Sign-in could not start.');}}).catch(function(){alert('Sign-in could not start.');});">Sign in with ChatGPT</button>
 
       <h3 style="margin-top:14px;">Anthropic key</h3>
       <p>Get one at <a href="https://console.anthropic.com/" target="_blank" rel="noopener">console.anthropic.com</a>.</p>

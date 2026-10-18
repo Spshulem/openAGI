@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 public enum HostAllowlist {
     // Cleartext is fine over WireGuard and on a home LAN, and nowhere else.
@@ -12,7 +13,13 @@ public enum HostAllowlist {
         // scheme — refused unconditionally, per mobile/PROTOCOL.md §10. This must
         // run before the https branch below, or https://127.0.0.1 would sail
         // through on "https is always allowed" alone.
-        if isLoopback(host) { throw DaemonError.unreachableHost(host) }
+        if isLoopback(host) {
+            // Phone-only mode: the daemon runs inside this app, on loopback.
+            // Allowed only for that daemon's own port, and only while it runs.
+            guard scheme == "http", host == "127.0.0.1", let port = url.port,
+                  port == EmbeddedLoopback.port else { throw DaemonError.unreachableHost(host) }
+            return try Self.origin(of: url)
+        }
         let origin = try Self.origin(of: url)
         if scheme == "https" { return origin }
         guard scheme == "http" else { throw DaemonError.unreachableHost(url.absoluteString) }
@@ -83,5 +90,17 @@ public enum HostAllowlist {
         case (172, 16...31): return true
         default: return false   // 100.64-127 (CGNAT) is refused above, not allowed here.
         }
+    }
+}
+
+// The port of the daemon embedded in this app, set once it is up in
+// phone-only mode and cleared otherwise. HostAllowlist's one loopback
+// exemption reads it; nothing else may open loopback.
+public enum EmbeddedLoopback {
+    private static let lock = OSAllocatedUnfairLock<Int?>(initialState: nil)
+
+    public static var port: Int? {
+        get { lock.withLock { $0 } }
+        set { lock.withLock { $0 = newValue } }
     }
 }

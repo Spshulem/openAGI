@@ -82,4 +82,20 @@ final class OutboundQueueTests: XCTestCase {
         }
         XCTAssertEqual(queue.all().count, iterations, "a concurrent read-modify-write must not drop an enqueue")
     }
+
+    // Leaving a Mac for the iPhone agent parks its queued completions; going
+    // back restores them, without duplicating one queued in both places.
+    func testParkAndRestoreMovesEveryOpOnce() throws {
+        let main = OutboundQueue(directory: dir)
+        let parked = OutboundQueue.parkedForServer(directory: dir)
+        try main.enqueue(PendingOp(kind: .completeTask("a")))
+        try main.enqueue(PendingOp(kind: .completeTask("b")))
+        try main.move(to: parked)
+        XCTAssertTrue(main.all().isEmpty)
+        XCTAssertEqual(parked.all().map(\.kind), [.completeTask("a"), .completeTask("b")])
+        try main.enqueue(PendingOp(kind: .completeTask("a")))
+        try parked.move(to: main)
+        XCTAssertTrue(parked.all().isEmpty)
+        XCTAssertEqual(main.all().map(\.kind), [.completeTask("a"), .completeTask("b")])
+    }
 }

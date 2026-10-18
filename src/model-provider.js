@@ -1,5 +1,9 @@
 import { ModelRouter } from "./model-router.js";
 import { ToolLoopContext, clipToolOutput, maxInputTokensFromEnv } from "./context-trim.js";
+import { OnDeviceModelProvider } from "./on-device-provider.js";
+import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
+import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
+import { isMobileProfile } from "./mobile-profile.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
 // than these ceilings, but explicit limits keep a broken or hostile compatible
@@ -750,14 +754,27 @@ export function createModelProvider(options = {}) {
   const anthropic = new AnthropicProvider({ ...(options.anthropic ?? {}), budgetGuard });
   const openai = new OpenAIResponsesProvider({ ...(options.openai ?? {}), budgetGuard });
 
-  // Explicit preference wins. anthropic | openai | auto (default).
+  // Explicit preference wins. anthropic | openai | chatgpt | on-device | auto (default).
   const preference = (options.preferred ?? process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase();
-  if (preference === "openai" && openai.isConfigured()) return openai;
-  if (preference === "anthropic" && anthropic.isConfigured()) return anthropic;
+  // Phone-only mode (the daemon inside the phone app): with nothing
+  // configured the agent thinks with the phone's own model, and a cloud model
+  // falls back to it when the network is gone.
+  const mobile = options.mobile ?? isMobileProfile();
+  const onDevice = () => new OnDeviceModelProvider(options.onDevice ?? {});
+  const cloud = (provider) => (mobile ? new OfflineFallbackProvider(provider, onDevice()) : provider);
+  if (preference === "on-device") return onDevice();
+  if (preference === "openai" && openai.isConfigured()) return cloud(openai);
+  if (preference === "anthropic" && anthropic.isConfigured()) return cloud(anthropic);
+  // Sign in with ChatGPT: billed to the owner's plan, so no budget guard.
+  const chatgpt = new ChatGPTPlanProvider({ ...(options.chatgpt ?? {}) });
+  if (preference === "chatgpt" && chatgpt.isConfigured()) return cloud(chatgpt);
 
-  // auto: anthropic first if configured, then openai, then deterministic.
-  if (anthropic.isConfigured()) return anthropic;
-  if (openai.isConfigured()) return openai;
+  // auto: anthropic first if configured, then openai, then ChatGPT sign-in,
+  // then on-device on a phone, then deterministic.
+  if (anthropic.isConfigured()) return cloud(anthropic);
+  if (openai.isConfigured()) return cloud(openai);
+  if (chatgpt.isConfigured()) return cloud(chatgpt);
+  if (mobile) return onDevice();
   return new DeterministicModelProvider();
 }
 

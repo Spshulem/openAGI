@@ -11,8 +11,17 @@ struct TodayView: View {
     var body: some View {
         NavigationStack {
             List {
-                ScreenHeader(title: "Today", host: model.credentials.server.host ?? "",
+                ScreenHeader(title: "Today", host: model.hostLabel,
                             ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
+
+                if OfflineBanner.isShown(for: model) {
+                    OfflineBanner()
+                        .padding(.horizontal, Theme.gutter)
+                        .padding(.bottom, Theme.Spacing.x2)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
+                }
 
                 let visible = model.snapshot?.visibleToday ?? []
                 if visible.isEmpty {
