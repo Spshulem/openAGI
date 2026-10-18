@@ -91,14 +91,20 @@ enum ChatHistoryMerge {
 
     // An earlier page must not run through the latest-page reconciliation:
     // that would discard the newer server-backed messages already on screen.
-    static func prependOlder(local: [ChatMessage], server: [ConversationMessage]) -> [ChatMessage] {
+    static func prependOlder(local: [ChatMessage], server: [ConversationMessage], before cursor: String) -> [ChatMessage] {
         var seen = Set(local.compactMap(\.serverID))
-        let older = server.compactMap { item -> ChatMessage? in
-            guard seen.insert(item.id).inserted else { return nil }
-            return ChatMessage(role: role(item.role), text: item.text, timestamp: item.at,
-                               serverID: item.id, sourceNodeId: item.sourceNodeId, sourceName: item.sourceName)
+        var result = local
+        for item in server {
+            guard seen.insert(item.id).inserted else { continue }
+            // A saved cache can include messages older than this page, with
+            // a gap between it and the latest page. Insert into that gap,
+            // keeping every existing message (including pending replies).
+            let boundary = result.firstIndex(where: { $0.serverID == cursor }) ?? result.endIndex
+            let index = result[..<boundary].firstIndex(where: { $0.timestamp > item.at }) ?? boundary
+            result.insert(ChatMessage(role: role(item.role), text: item.text, timestamp: item.at,
+                                      serverID: item.id, sourceNodeId: item.sourceNodeId, sourceName: item.sourceName), at: index)
         }
-        return older + local
+        return result
     }
 
     static func merge(local: [ChatMessage], server: [ConversationMessage]) -> [ChatMessage] {

@@ -27,11 +27,11 @@ final class ChatHistoryMergeTests: XCTestCase {
             server("m2", .assistant, "Earlier reply", 5),
             server("m2", .assistant, "Earlier reply", 5),
             server("m3", .user, "Recent question", 60),
-        ])
+        ], before: "m3")
         XCTAssertEqual(merged.map(\.text), ["Earlier question", "Earlier reply", "Recent question", "Working…"])
         XCTAssertEqual(Array(merged.suffix(2)), [recent, streaming])
         XCTAssertEqual(merged.first?.sourceNodeId, "g2:fixture")
-        XCTAssertEqual(ChatHistoryMerge.prependOlder(local: merged, server: []), merged)
+        XCTAssertEqual(ChatHistoryMerge.prependOlder(local: merged, server: [], before: "m3"), merged)
     }
 
     func testFreshPhoneTakesTheServerThreadIncludingOtherDevicesLines() {

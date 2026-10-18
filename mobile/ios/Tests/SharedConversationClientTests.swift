@@ -204,7 +204,7 @@ final class SharedConversationClientTests: XCTestCase {
     }
 
     @MainActor
-    func testRelaunchPagesFromTheOldestCachedServerMessage() async {
+    func testRelaunchFillsTheGapBetweenCachedHistoryAndTheLatestPage() async {
         let store = ChatHistoryStore(thread: "agent", directory: directory)
         store.save(nodeID: "mobile:fixture", entries: [
             SavedChatEntry(id: UUID(), serverID: "m1", role: "user", at: Date(timeIntervalSince1970: 1), text: "Earlier question")
@@ -212,8 +212,29 @@ final class SharedConversationClientTests: XCTestCase {
         let conversation = ChatConversation(thread: .agent, client: makeClient(), store: store, nodeID: "mobile:fixture")
         stub(["/conversations/agent/messages": (200, newestPage)])
         await conversation.refresh()
-        XCTAssertEqual(conversation.nextBefore, "m1")
+        XCTAssertEqual(conversation.nextBefore, "m3")
         XCTAssertEqual(conversation.messages.map(\.serverID), ["m1", "m3", "m4"])
+        let firstID = conversation.messages.first?.id
+        stub(["/conversations/agent/messages": (200, earlierPage)])
+        await conversation.loadOlder()
+        XCTAssertEqual(conversation.messages.map(\.serverID), ["m1", "m2", "m3", "m4"])
+        XCTAssertEqual(conversation.messages.first?.id, firstID)
+    }
+
+    @MainActor
+    func testARefreshAfterManyNewMessagesReopensPagingToFillTheGap() async {
+        let conversation = ChatConversation(thread: .agent, client: makeClient(),
+            store: ChatHistoryStore(thread: "agent", directory: directory), nodeID: "mobile:fixture")
+        stub(["/conversations/agent/messages": (200, newestPage)])
+        await conversation.refresh()
+        stub(["/conversations/agent/messages": (200, earlierPage)])
+        await conversation.loadOlder()
+        XCTAssertNil(conversation.nextBefore)
+
+        stub(["/conversations/agent/messages": (200, #"{"thread":"agent","messages":[{"id":"m8","role":"user","text":"Later question","at":"2026-09-30T15:40:00Z"}],"nextBefore":"m8"}"#)])
+        await conversation.refresh()
+        XCTAssertEqual(conversation.messages.map(\.serverID), ["m1", "m2", "m3", "m4", "m8"])
+        XCTAssertEqual(conversation.nextBefore, "m8")
     }
 
     @MainActor

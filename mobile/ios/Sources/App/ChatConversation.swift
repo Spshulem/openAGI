@@ -165,16 +165,20 @@ final class ChatConversation {
             guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .synced
+            let pageIDs = Set(page.messages.map(\.id))
+            let overlaps = messages.contains { message in
+                message.serverID.map(pageIDs.contains) ?? false
+            }
             let merged = ChatHistoryMerge.merge(local: messages, server: page.messages)
             if merged != messages {
                 messages = merged
                 persist()
             }
-            if !didLoadOlder {
-                // The saved cache can reach further back than the latest page.
-                nextBefore = page.nextBefore.map { cursor in
-                    messages.first(where: { $0.serverID != nil })?.serverID ?? cursor
-                }
+            if !didLoadOlder || !overlaps {
+                // Start at the returned page, not the oldest cached line:
+                // time spent offline can leave an unloaded gap in between.
+                nextBefore = page.nextBefore
+                didLoadOlder = false
             }
         } catch DaemonError.notFound {
             guard sequence > refreshApplied, !forgotten else { return }
@@ -198,8 +202,8 @@ final class ChatConversation {
         defer { isLoadingOlder = false }
         do {
             let page = try await client.conversationMessages(thread: thread, before: cursor)
-            guard !forgotten else { return }
-            messages = ChatHistoryMerge.prependOlder(local: messages, server: page.messages)
+            guard !forgotten, nextBefore == cursor else { return }
+            messages = ChatHistoryMerge.prependOlder(local: messages, server: page.messages, before: cursor)
             nextBefore = page.nextBefore
             didLoadOlder = true
             persist()
