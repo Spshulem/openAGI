@@ -5,6 +5,7 @@ import SwiftUI
 // worth interrupting someone for" — is the only piece of chrome on this bar
 // besides the tab names themselves.
 struct RootTabView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var model: AppModel
     let onRevoked: () -> Void
     // A pairing link that arrived while this phone was already paired. It
@@ -112,6 +113,11 @@ struct RootTabView: View {
         .task {
             model.startEventStream()
             await model.refreshInboxCounts()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                Task { await model.refreshData() }
+            }
         }
         .task { await PushRegistrar.shared.start() }
         .onChange(of: PushRouter.shared.wantsSupervisor, initial: true) { _, wants in

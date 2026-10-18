@@ -30,8 +30,21 @@ struct TodayView: View {
                     // the whole screen, centred." No headline sentence, no
                     // day-shape line, no Inbox row underneath it -- just the
                     // title/connection line every screen carries, and this.
-                    EmptyStateView(headline: "Nothing left today.",
-                                  detail: "New tasks appear here when OpenAGI or you add them.")
+                    Group {
+                        if model.snapshot == nil && (model.isRefreshingToday || model.lastOutcome == nil) {
+                            ProgressView("Loading today…")
+                                .frame(maxWidth: .infinity)
+                        } else if model.lastOutcome == .unauthorized {
+                            EmptyStateView(headline: "Pairing needs attention.",
+                                          detail: "Connect to your agent again from Settings.")
+                        } else if model.snapshot == nil && model.refreshFailed {
+                            EmptyStateView(headline: "Couldn't load today.",
+                                          detail: "Pull down to try again when your agent is reachable.")
+                        } else {
+                            EmptyStateView(headline: "Nothing left today.",
+                                          detail: "New tasks appear here when OpenAGI or you add them.")
+                        }
+                    }
                         .listRowInsets(EdgeInsets(top: 0, leading: Theme.gutter, bottom: 0, trailing: Theme.gutter))
                         .listRowBackground(Theme.canvas)
                         .listRowSeparator(.hidden)

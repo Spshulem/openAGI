@@ -6,6 +6,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LiveEventsTest {
+    @Test
+    fun aReconnectRefreshesTodayTasksInboxAndItsBadge() {
+        assertTrue("hello" in REFRESH_TRIGGERING_EVENTS)
+        assertTrue("hello" in INBOX_AFFECTING_EVENTS)
+    }
+
     // A "No" or a dismiss from another client emits only clarification-resolved.
     // Missing it here left the answered question actionable in Inbox and its
     // badge counting it until the app resumed.

@@ -1,0 +1,104 @@
+import XCTest
+@testable import OpenAGI
+
+final class AppModelRefreshTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        StubProtocol.failure = nil
+        StubProtocol.handler = nil
+    }
+
+    override func tearDownWithError() throws {
+        StubProtocol.failure = nil
+        StubProtocol.handler = nil
+        try FileManager.default.removeItem(at: directory)
+    }
+
+    private func fixture(_ name: String) throws -> Data {
+        try Data(contentsOf: URL(filePath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "fixtures/\(name).json"))
+    }
+
+    @MainActor
+    private func model() -> AppModel {
+        let credentials = Credentials(server: URL(string: "https://daemon.example.com")!,
+                                      nodeID: "mobile:fixture", token: "synthetic-test-token")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubProtocol.self]
+        let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID,
+                                  token: credentials.token, session: URLSession(configuration: configuration))
+        return AppModel(credentials: credentials, client: client,
+                        store: SnapshotStore(directory: directory), queue: OutboundQueue(directory: directory),
+                        chatDirectory: directory)
+    }
+
+    private func servePopulatedData(summaryStatus: Int = 200) throws {
+        let summary = try fixture("summary-populated")
+        let actions = try fixture("pending-actions")
+        let clarification = Data(#"[{"id":"clar_fixture","taskId":"task_fixture","question":"Finished?","context":"","proposedAction":"complete","confidence":null,"sources":[],"status":"pending","answer":null,"answeredAt":null,"createdAt":"2026-01-01T00:00:00Z"}]"#.utf8)
+        StubProtocol.handler = { request in
+            let status: Int
+            let data: Data
+            switch request.url?.path {
+            case "/mobile/summary":
+                status = summaryStatus
+                data = summaryStatus == 304 ? Data() : summary
+            case "/pending-actions": status = 200; data = actions
+            case "/tasks/clarifications": status = 200; data = clarification
+            default: status = 200; data = Data("{}".utf8)
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil,
+                                    headerFields: ["ETag": "fixture-etag"])!, data)
+        }
+    }
+
+    @MainActor
+    func testRefreshUpdatesTheVisibleTodayAndInvalidatesBothLists() async throws {
+        let model = model()
+        try servePopulatedData()
+        let tasksBefore = model.tasksGeneration
+        let inboxBefore = model.inboxGeneration
+
+        await model.refreshData()
+
+        XCTAssertEqual(model.snapshot?.visibleToday.count, 3)
+        XCTAssertEqual(model.inboxBadgeCount, 2)
+        XCTAssertGreaterThan(model.tasksGeneration, tasksBefore)
+        XCTAssertGreaterThan(model.inboxGeneration, inboxBefore)
+    }
+
+    @MainActor
+    func testReconnectRecoversAfterAnOfflineInitialLoad() async throws {
+        let model = model()
+        StubProtocol.failure = URLError(.notConnectedToInternet)
+        await model.refreshData()
+        XCTAssertNil(model.snapshot)
+        XCTAssertTrue(model.refreshFailed)
+
+        StubProtocol.failure = nil
+        try servePopulatedData()
+        await model.refreshData()
+
+        XCTAssertEqual(model.snapshot?.visibleToday.count, 3)
+        XCTAssertEqual(model.inboxBadgeCount, 2)
+        XCTAssertFalse(model.refreshFailed)
+    }
+
+    @MainActor
+    func testResumeLoadsABackgroundSnapshotEvenWhenTheServerReturns304() async throws {
+        let model = model()
+        let summary = try ProtocolDecoder.json.decode(MobileSummary.self, from: fixture("summary-populated"))
+        _ = try model.store.storeFresh(summary: summary, etag: "fixture-etag")
+        XCTAssertNil(model.snapshot, "A background disk write does not update the visible model")
+        try servePopulatedData(summaryStatus: 304)
+
+        await model.refreshData()
+
+        XCTAssertEqual(model.snapshot?.visibleToday.count, 3)
+        XCTAssertEqual(model.inboxBadgeCount, 2)
+    }
+}

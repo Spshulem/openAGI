@@ -42,6 +42,9 @@ isolated daemon, disposable tasks/questions and a controlled agent fixture.
       verify their saved state after relaunch.
 - [ ] On iOS and Android, pair to the isolated server; verify Today, Tasks,
       Inbox, Chat, Supervisor and Settings against the daemon's durable state.
+- [ ] Start with the server unavailable, then restore the connection without
+      relaunching or pulling to refresh. Today, Tasks, Inbox and its badge
+      must recover. Repeat after backgrounding the app and changing server data.
 - [ ] On both platforms, complete a task offline, restart, reconnect and
       confirm exactly one durable completion with `completedVia: mobile`.
 - [ ] On iOS, continue with the phone agent from an offline server copy;

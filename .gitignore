@@ -22,6 +22,12 @@ integration-clients/even-g2-overlay/coverage/
 npm-debug.log*
 .DS_Store
 logs/
+output/
+*.xcresult/
+*.xcarchive/
+*.ipa
+*.apk
+*.p8
 .claude/
 
 # Mac SwiftPM build artifacts

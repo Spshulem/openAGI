@@ -97,7 +97,8 @@ struct OpenAGIApp: App {
             }
         }
         let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
-        Task { _ = await RefreshCoordinator(client: client).refresh() }
+        // RootTabView refreshes through its AppModel so the visible tabs
+        // observe the result, rather than only updating the on-disk snapshot.
         // Keep the offline copy of the Mac agent fresh (throttled).
         if !credentials.isEmbedded { Task { await OfflineCopy.shared.sync(from: client) } }
         Task { await PushRegistrar.shared.sync() }

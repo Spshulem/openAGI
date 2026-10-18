@@ -50,17 +50,20 @@ final class AppModel {
 
     var inboxBadgeCount: Int { pendingActionsCount + clarificationsCount }
 
-    init(credentials: Credentials) {
+    init(credentials: Credentials, client: DaemonClient? = nil,
+         store: SnapshotStore = SnapshotStore(), queue: OutboundQueue = OutboundQueue(),
+         chatDirectory: URL = ChatHistoryStore.defaultDirectory) {
+        let client = client ?? DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
         self.credentials = credentials
-        self.client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
-        self.store = SnapshotStore()
-        self.queue = OutboundQueue()
+        self.client = client
+        self.store = store
+        self.queue = queue
         self.snapshot = store.load()
         self.agentChat = ChatConversation(thread: .agent, client: client,
-                                          store: ChatHistoryStore(thread: ConversationThread.agent.rawValue),
+                                          store: ChatHistoryStore(thread: ConversationThread.agent.rawValue, directory: chatDirectory),
                                           nodeID: credentials.nodeID)
         self.supervisorChat = ChatConversation(thread: .supervisor, client: client,
-                                               store: ChatHistoryStore(thread: ConversationThread.supervisor.rawValue),
+                                               store: ChatHistoryStore(thread: ConversationThread.supervisor.rawValue, directory: chatDirectory),
                                                nodeID: credentials.nodeID)
     }
 
@@ -86,6 +89,16 @@ final class AppModel {
     }
 
     // MARK: - Today
+
+    // Resume and reconnect can follow missed events or failed initial loads.
+    // Refresh the observable model as well as disk, and invalidate both lists.
+    func refreshData() async {
+        tasksGeneration += 1
+        inboxGeneration += 1
+        async let inboxRefresh: Void = refreshInboxCounts()
+        await refreshToday()
+        await inboxRefresh
+    }
 
     func refreshToday() async {
         isRefreshingToday = true
@@ -158,6 +171,7 @@ final class AppModel {
             fleetGeneration += 1
         case .hello:
             // A (re)connected stream may have missed updates while it was down.
+            Task { await refreshData() }
             Task { await agentChat.refresh() }
             Task { await supervisorChat.refresh() }
         case .unknown:

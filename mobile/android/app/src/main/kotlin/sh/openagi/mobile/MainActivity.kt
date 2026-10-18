@@ -62,6 +62,7 @@ import sh.openagi.mobile.ui.theme.OpenAGITheme
 // clarification-resolved is the only event a "No" or a dismiss from another
 // client produces; without it the answered question stays actionable here.
 internal val REFRESH_TRIGGERING_EVENTS = setOf(
+    "hello",
     "task-updated",
     "task-auto-changed",
     "pending-action",
@@ -70,7 +71,7 @@ internal val REFRESH_TRIGGERING_EVENTS = setOf(
     "clarification-resolved",
 )
 internal val INBOX_AFFECTING_EVENTS =
-    setOf("pending-action", "pending-action-resolved", "clarification-created", "clarification-resolved")
+    setOf("hello", "pending-action", "pending-action-resolved", "clarification-created", "clarification-resolved")
 
 // A shared chat thread has a new stored message (PROTOCOL.md §3.1). Returns
 // which thread, or null for any other frame or an unreadable one.
