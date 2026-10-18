@@ -8,6 +8,7 @@ import { resolveDataDir } from "./data-dir.js";
 import { assertSafePublicUrl } from "./url-guard.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { migrateCatalogRegistration } from "./mcp-catalog.js";
+import { isMobileProfile } from "./mobile-profile.js";
 
 // Whitelist of executables permitted as the `command` for stdio MCP servers.
 // Anything not in this set is rejected at registerServer().
@@ -105,11 +106,19 @@ function commandLeaf(value) {
   return String(value ?? "").trim().split("/").pop();
 }
 
+// Mobile profile: a phone cannot spawn the server process at all.
+function assertStdioAvailableHere() {
+  if (isMobileProfile()) {
+    throw new Error("stdio MCP servers are not available on phone: OpenAGI cannot start other programs there. Use an http MCP server instead.");
+  }
+}
+
 /// Reject argv shapes that turn an allowed runner into "execute this string",
 /// and docker shapes that escape the container. Throws on the first problem.
 /// Exported so the HTTP register path can fail fast BEFORE asking a human to
 /// approve a spec the registry would refuse anyway.
 export function assertSafeStdioSpec({ command, args } = {}) {
+  assertStdioAvailableHere();
   const argv = args ?? [];
   if (!Array.isArray(argv)) throw new Error("stdio MCP `args` must be an array of strings.");
   for (const a of argv) {
@@ -247,6 +256,7 @@ export class McpRegistry {
 
     // stdio command allowlist — must be a known runner.
     if (transport === "stdio") {
+      assertStdioAvailableHere();
       const cmd = server.command;
       if (!cmd) throw new Error("stdio MCP server requires a `command`.");
       const cmdLeaf = commandLeaf(cmd);

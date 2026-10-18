@@ -24,7 +24,7 @@ struct InboxView: View {
     var body: some View {
         NavigationStack {
             List {
-                ScreenHeader(title: "Inbox", host: model.credentials.server.host ?? "",
+                ScreenHeader(title: "Inbox", host: model.hostLabel,
                             ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
 
                 if isEverythingEmpty {

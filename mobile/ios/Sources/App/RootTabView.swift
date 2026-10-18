@@ -18,11 +18,14 @@ struct RootTabView: View {
 
     init(
         credentials: Credentials,
+        initialTab: AppTab = .today,
         incomingPairing: PairingPayload? = nil,
         onDismissIncomingPairing: @escaping () -> Void = {},
         onRevoked: @escaping () -> Void
     ) {
-        _model = State(initialValue: AppModel(credentials: credentials))
+        let model = AppModel(credentials: credentials)
+        model.selectedTab = initialTab
+        _model = State(initialValue: model)
         self.incomingPairing = incomingPairing
         self.onDismissIncomingPairing = onDismissIncomingPairing
         self.onRevoked = onRevoked
@@ -80,6 +83,14 @@ struct RootTabView: View {
         .environment(model)
         .alert("Switch to another OpenAGI?", isPresented: switchAlertShown) {
             Button("Switch", role: .destructive) {
+                // The agent on this iPhone is kept, not revoked: connecting to
+                // a server is the second step of onboarding, and Settings can
+                // switch back.
+                if model.isOnPhone {
+                    model.detach()
+                    AppSession.shared.chooseServer()
+                    return
+                }
                 // Revoke through the model, not locally: it owns the live
                 // event stream, which must not outlive this pairing. The
                 // incoming link stays set, so the pairing screen that appears
@@ -92,7 +103,11 @@ struct RootTabView: View {
             }
             Button("Cancel", role: .cancel) { onDismissIncomingPairing() }
         } message: {
-            Text("This phone is connected to \(currentHost). Pairing with \(incomingPairing?.serverURL.host ?? "the new address") disconnects it here.")
+            if model.isOnPhone {
+                Text("Connect this iPhone to \(incomingPairing?.serverURL.host ?? "the new address")? The agent on this iPhone is kept, and you can switch back from Settings.")
+            } else {
+                Text("This phone is connected to \(currentHost). Pairing with \(incomingPairing?.serverURL.host ?? "the new address") disconnects it here.")
+            }
         }
         .task {
             model.startEventStream()
@@ -103,6 +118,11 @@ struct RootTabView: View {
             guard wants else { return }
             model.selectedTab = .supervisor
             PushRouter.shared.wantsSupervisor = false
+        }
+        .onChange(of: PushRouter.shared.wantsTab, initial: true) { _, tab in
+            guard let tab else { return }
+            model.selectedTab = tab
+            PushRouter.shared.wantsTab = nil
         }
         .task(id: incomingPairing?.serverURL) {
             if incomingMatchesCurrent { onDismissIncomingPairing() }

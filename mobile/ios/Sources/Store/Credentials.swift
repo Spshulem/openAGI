@@ -27,7 +27,13 @@ public struct Credentials: Sendable, Equatable {
     public let token: String
 
     private static let service = "sh.openagi.mobile.node"
-    private static let account = "primary"
+    // The active credential lives in .active. Phone-only mode keeps a
+    // server's credential in .server while the app uses the agent on the
+    // iPhone, so switching back needs no new pairing.
+    public enum Slot: String, Sendable {
+        case active = "primary"
+        case server
+    }
 
     // Both entitlements files (Sources/OpenAGI.entitlements and
     // Widget/OpenAGIWidget.entitlements) declare exactly one, identical
@@ -56,14 +62,14 @@ public struct Credentials: Sendable, Equatable {
         self.token = token
     }
 
-    public func save() throws {
+    public func save(to slot: Slot = .active) throws {
         let payload = try JSONSerialization.data(withJSONObject: [
             "server": server.absoluteString, "nodeID": nodeID, "token": token
         ])
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Self.service,
-            kSecAttrAccount as String: Self.account
+            kSecAttrAccount as String: slot.rawValue
         ]
         SecItemDelete(query as CFDictionary)
         query[kSecValueData as String] = payload
@@ -72,11 +78,11 @@ public struct Credentials: Sendable, Equatable {
         guard status == errSecSuccess else { throw CredentialsError.keychain(status) }
     }
 
-    public static func load() -> Credentials? {
+    public static func load(from slot: Slot = .active) -> Credentials? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+            kSecAttrAccount as String: slot.rawValue,
             kSecReturnData as String: true
         ]
         var item: CFTypeRef?
@@ -89,11 +95,14 @@ public struct Credentials: Sendable, Equatable {
         return Credentials(server: server, nodeID: nodeID, token: token)
     }
 
-    public static func clear() {
+    // The daemon embedded in this app (phone-only mode) rather than a Mac.
+    public var isEmbedded: Bool { server.host == "127.0.0.1" }
+
+    public static func clear(_ slot: Slot = .active) {
         SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account
+            kSecAttrAccount as String: slot.rawValue
         ] as CFDictionary)
     }
 }

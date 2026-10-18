@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { attachG2SpeechRelay } from "./integrations/g2-speech-relay.js";
+import { attachDeviceModelRelay, deviceModelHub } from "./device-model-relay.js";
 import { attachVoiceRelay } from "./voice/relay.js";
 import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
@@ -20,7 +21,10 @@ import { createFleetRoute } from "./fleet/routes.js";
 import { createFleetCapability } from "./fleet/remote.js";
 import { fleetPage } from "./fleet/page.js";
 import { resolveDataDir } from "./data-dir.js";
-import { readJsonFile, writeJsonAtomic } from "./file-utils.js";
+import { readJsonFile, writeJsonAtomic, writeTextAtomic } from "./file-utils.js";
+import { applyPersona, personaPath } from "./persona.js";
+import { deleteSkill, listSkills, readSkill, writeSkill } from "./skill-files.js";
+import { handleChatGPTAuthRoute, onChatGPTSignedOut, status as chatgptStatus } from "./chatgpt-auth.js";
 import { createRequire } from "node:module";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
@@ -78,6 +82,7 @@ import { ownerPrincipal } from "./owner-authority.js";
 import { buildMobileSummary, summaryETag } from "./mobile-summary.js";
 import { MobilePushStore, validatePushRegistration } from "./mobile-push-store.js";
 import { MobilePush } from "./mobile-push.js";
+import { isMobileProfile, mobileDisabledCronJobs, mobileRefusedUpgrades, mobileRouteRefusal } from "./mobile-profile.js";
 import {
   SharedConversationError,
   isSharedThread,
@@ -93,6 +98,8 @@ import {
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 43210;
+  // OPENAGI_PROFILE=mobile: phone daemon; see src/mobile-profile.js.
+  const mobileProfile = isMobileProfile();
   // Read these dynamically so the setup wizard can update them mid-flight.
   const getAuthToken = () => options.authToken ?? process.env.OPENAGI_AUTH_TOKEN ?? null;
   const getPublicUrl = () => options.publicUrl ?? process.env.OPENAGI_PUBLIC_URL ?? null;
@@ -105,6 +112,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // process (a main + a node) would otherwise silently collide on the same
   // directory the first one resolved.
   const dataDir = options.dataDir ?? resolveDataDir();
+  // Swap the live model after a settings change; the next turn uses it.
+  const rebuildModelProvider = async () => {
+    const { createModelProvider } = await import("./model-provider.js");
+    if (runtime.agentHost) runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
+  };
+  // Sign-out (or a refused token refresh) must drop the ChatGPT provider,
+  // or every turn keeps failing with "sign-in needed".
+  const stopSignedOutListener = onChatGPTSignedOut(() => { rebuildModelProvider().catch(() => {}); });
+  const modelSettings = () => {
+    const active = runtime.agentHost?.modelProvider;
+    const inner = active?.primary ?? active;
+    return {
+      preference: (process.env.OPENAGI_PROVIDER ?? "auto").toLowerCase(),
+      active: {
+        provider: providerKind(inner),
+        model: inner?.model ?? null,
+        offlineFallback: Boolean(active?.primary)
+      },
+      providers: {
+        anthropic: { configured: Boolean(process.env.ANTHROPIC_API_KEY), model: process.env.ANTHROPIC_MODEL ?? null },
+        openai: { configured: Boolean(process.env.OPENAI_API_KEY), model: process.env.OPENAI_MODEL ?? null },
+        onDevice: { available: isMobileProfile(), connected: Boolean(deviceModelHub?.info) },
+        chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })()
+      }
+    };
+  };
   const vocaleoRoute = createVocaleoRoute({ runtime, dataDir, client: options.vocaleoClient ?? runtime.vocaleo ?? new VocaleoClient({ dataDir }) });
   const fleetRoute = createFleetRoute({ supervisor: runtime.fleetSupervisor });
   const nodeRegistry = options.nodeRegistry ?? new NodeRegistry({ dir: options.nodesDir ?? path.join(dataDir, "nodes") });
@@ -711,6 +744,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   };
   const activeNodeCapabilityProviders = () => {
     const providers = new Map();
+    if (mobileProfile) return providers;
     if (codingNodeEnabledHere()) {
       providers.set(CODING_CAPABILITY, codingNodeProvider());
       if (process.platform === "darwin") providers.set("self-fix", selfFixProvider);
@@ -755,7 +789,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     return localCapabilityCache;
   };
   const ensureImessageBridge = () => {
-    if (closing) return imessageBridgeRuntime;
+    if (closing || mobileProfile) return imessageBridgeRuntime;
     imessageBridgeRuntime ??= options.imessageBridgeRuntime
       ?? createImessageBridgeRuntime({
         dataDir,
@@ -966,6 +1000,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         }
         if (auth.setCookie) extraCookies.push(buildSetCookie(getAuthToken()));
       }
+      const mobileRefusal = mobileProfile ? mobileRouteRefusal(pathname) : null;
+      if (mobileRefusal) return sendJson(res, 409, mobileRefusal);
 
       // Sign-in: server-side cookie set, then redirect. Works without JS.
       // Public route — the token in the body IS the credential.
@@ -1004,6 +1040,17 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
         } catch { /* swallow */ }
         return sendJson(res, 200, result);
+      }
+      // The phone app's first run names the agent and says what it should
+      // help with. Same persona.md the desktop reads at boot; applied live.
+      if (method === "POST" && pathname === "/persona") {
+        const body = await readJsonLimited(req, 8 * 1024).catch(() => null);
+        const name = typeof body?.name === "string" ? body.name.replace(/[\x00-\x1f\x7f#]/g, "").trim().slice(0, 60) : "";
+        const focus = typeof body?.focus === "string" ? body.focus.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim().slice(0, 600) : "";
+        if (!name) return sendJson(res, 400, { error: "name_required", message: "Give your agent a name." });
+        writeTextAtomic(personaPath(dataDir), `# ${name}\n\nName: ${name}\n${focus ? `\nWhat I help with: ${focus}\n` : ""}`);
+        const applied = applyPersona(runtime, dataDir);
+        return sendJson(res, 200, { name: applied?.name ?? name, focus });
       }
       if (method === "POST" && pathname === "/setup/test") {
         const body = await readJson(req);
@@ -2110,6 +2157,162 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, result);
       }
 
+      // Sign in with ChatGPT (src/chatgpt-auth.js). The browser callback is
+      // public (see isPublicRoute); start/status/signout need the owner or
+      // the phone node.
+      if (pathname.startsWith("/auth/") && await handleChatGPTAuthRoute({
+        method, pathname, url, req, res, dataDir, sendJson, readJson,
+        onSignedIn: () => rebuildModelProvider()
+      })) return;
+      // Offline copy of this agent for the phone
+      // (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
+      // On the Mac: a phone pulls a snapshot and sends back what it did
+      // offline, as additions only. On the phone: the app (owner token)
+      // imports the snapshot and reads what to send back.
+      if (["/mobile/mirror", "/mobile/offline-import", "/mirror/import", "/mirror/offline", "/mirror/offline/sent"].includes(pathname)) {
+        const mirror = await import("./mirror.js");
+        try {
+          if (method === "GET" && pathname === "/mobile/mirror") return sendJson(res, 200, mirror.buildMirrorSnapshot(runtime, { dataDir }));
+          if (method === "POST" && pathname === "/mobile/offline-import") {
+            const body = await readJsonLimited(req, MIRROR_BODY_LIMIT);
+            const fromNodeId = mobileNodeRoute && nodeScopedAuth ? requestNodeId : "owner";
+            return sendJson(res, 200, mirror.importOfflineWork(runtime, body, { dataDir, fromNodeId }));
+          }
+          if (method === "POST" && pathname === "/mirror/import") {
+            return sendJson(res, 200, mirror.importMirrorSnapshot(runtime, await readJsonLimited(req, MIRROR_BODY_LIMIT), { dataDir }));
+          }
+          if (method === "GET" && pathname === "/mirror/offline") return sendJson(res, 200, mirror.listOfflineWork(runtime, { dataDir }));
+          if (method === "POST" && pathname === "/mirror/offline/sent") {
+            return sendJson(res, 200, mirror.markOfflineWorkSent(runtime, { dataDir, work: await readJsonLimited(req, MIRROR_BODY_LIMIT) }));
+          }
+        } catch (error) {
+          if (error?.message === "request body too large") return sendJson(res, 413, { error: "mirror_too_large" });
+          if (error?.status) return sendJson(res, error.status, { error: error.code ?? "mirror_error", message: error.message });
+          throw error;
+        }
+      }
+      // The phone app's workspace screens: instructions, skills, and what's
+      // scheduled. Owner token or a mobile node.
+      if (pathname === "/workspace/persona" && method === "GET") {
+        let markdown = "";
+        try { markdown = fsSync.readFileSync(personaPath(dataDir), "utf8"); } catch { /* none yet */ }
+        return sendJson(res, 200, { markdown, name: runtime.agentHost?.store?.getAgent?.("main")?.name ?? null });
+      }
+      if (pathname === "/workspace/persona" && method === "PUT") {
+        const body = await readJsonLimited(req, 64 * 1024).catch(() => null);
+        const markdown = typeof body?.markdown === "string" ? body.markdown.replace(/\r\n/g, "\n").trim() : "";
+        if (!markdown) return sendJson(res, 400, { error: "markdown_required" });
+        if (markdown.length > 40_000) return sendJson(res, 413, { error: "too_long" });
+        writeTextAtomic(personaPath(dataDir), `${markdown}\n`);
+        const applied = applyPersona(runtime, dataDir);
+        return sendJson(res, 200, { markdown, name: applied?.name ?? null });
+      }
+      if (pathname === "/workspace/skills" && method === "GET") {
+        return sendJson(res, 200, { skills: listSkills(runtime.skills, dataDir) });
+      }
+      const skillMatch = /^\/workspace\/skills\/([a-z0-9][a-z0-9-]{0,62})$/.exec(pathname);
+      if (skillMatch && ["GET", "PUT", "DELETE"].includes(method)) {
+        const name = skillMatch[1];
+        try {
+          if (method === "GET") {
+            const skill = readSkill(runtime.skills, dataDir, name);
+            return skill ? sendJson(res, 200, skill) : sendJson(res, 404, { error: "not_found" });
+          }
+          if (method === "PUT") {
+            const body = await readJsonLimited(req, 64 * 1024).catch(() => null);
+            if (!body) return sendJson(res, 400, { error: "invalid_body" });
+            const existing = runtime.skills?.skills?.get?.(name);
+            if (existing && !readSkill(runtime.skills, dataDir, name)?.editable) return sendJson(res, 409, { error: "built_in", message: "Built-in skills can't be changed. Save it under a new name." });
+            writeSkill(dataDir, name, { description: body.description, instructions: body.instructions });
+            runtime.skills?.reload?.();
+            return sendJson(res, 200, readSkill(runtime.skills, dataDir, name));
+          }
+          const removed = deleteSkill(runtime.skills, dataDir, name);
+          runtime.skills?.reload?.();
+          return sendJson(res, removed ? 200 : 404, { deleted: removed });
+        } catch (error) {
+          return sendJson(res, error.status ?? 500, { error: "skill_error", message: error.message });
+        }
+      }
+      if (pathname === "/workspace/jobs" && method === "GET") {
+        const jobs = runtime.cron.listJobs().map((job) => ({
+          id: job.id, name: job.name, enabled: job.enabled !== false, dailyAt: job.dailyAt ?? null,
+          intervalMs: job.intervalMs ?? null, nextRunAt: job.nextRunAt ?? null, lastRunAt: job.lastRunAt ?? null,
+          lastStatus: job.lastStatus ?? job.lastResult?.status ?? null
+        }));
+        return sendJson(res, 200, { jobs });
+      }
+      const jobMatch = /^\/workspace\/jobs\/([A-Za-z0-9_.:-]{1,120})$/.exec(pathname);
+      if (jobMatch && method === "POST") {
+        const body = await readJsonLimited(req, 4 * 1024).catch(() => null);
+        if (typeof body?.enabled !== "boolean") return sendJson(res, 400, { error: "enabled_required" });
+        // Jobs the phone profile turns off can't run on a phone.
+        if (body.enabled && mobileProfile && mobileDisabledCronJobs().has(jobMatch[1])) {
+          return sendJson(res, 409, { error: "not_available_on_phone", message: "This job needs a Mac." });
+        }
+        try {
+          // enableJob (not updateJob) recomputes nextRunAt, so turning a job
+          // back on schedules its next run instead of firing it at once.
+          const job = runtime.cron.enableJob(jobMatch[1], body.enabled);
+          return sendJson(res, 200, { id: job.id, enabled: job.enabled !== false });
+        } catch (error) {
+          return sendJson(res, 404, { error: "not_found", message: error.message });
+        }
+      }
+      // Model settings for the phone app and the desktop: which providers
+      // are configured (never the keys), the preference, and the active
+      // model. POST sets or clears keys and the preference, applied live.
+      if (pathname === "/settings/models" && (method === "GET" || method === "POST")) {
+        const { saveEnv } = await import("./setup-wizard.js");
+        if (method === "POST") {
+          const body = await readJsonLimited(req, 16 * 1024).catch(() => null);
+          if (!body || typeof body !== "object") return sendJson(res, 400, { error: "invalid_body" });
+          const preference = body.preference === undefined ? undefined : String(body.preference).toLowerCase();
+          if (preference === "on-device" && !mobileProfile) {
+            return sendJson(res, 400, { error: "invalid_preference", message: "The on-device model only runs inside the phone app." });
+          }
+          if (preference !== undefined && !MODEL_PREFERENCES.includes(preference)) {
+            return sendJson(res, 400, { error: "invalid_preference", allowed: MODEL_PREFERENCES });
+          }
+          const values = {};
+          const take = (field, key, max) => {
+            if (typeof body[field] !== "string") return;
+            const v = body[field].trim();
+            if (v.length > max || /\s/.test(v)) throw Object.assign(new Error(field), { status: 400 });
+            if (v) values[key] = v;
+          };
+          try {
+            take("anthropicKey", "ANTHROPIC_API_KEY", 400);
+            take("openaiKey", "OPENAI_API_KEY", 400);
+            take("anthropicModel", "ANTHROPIC_MODEL", 120);
+            take("openaiModel", "OPENAI_MODEL", 120);
+          } catch (error) {
+            return sendJson(res, 400, { error: "invalid_field", field: error.message });
+          }
+          if (preference) values.OPENAGI_PROVIDER = preference;
+          const CLEARABLE = { anthropicKey: "ANTHROPIC_API_KEY", openaiKey: "OPENAI_API_KEY", anthropicModel: "ANTHROPIC_MODEL", openaiModel: "OPENAI_MODEL" };
+          const clear = (Array.isArray(body.clear) ? body.clear : []).map((name) => CLEARABLE[name]).filter(Boolean);
+          saveEnv({ dataDir, values, clear });
+          await rebuildModelProvider();
+        }
+        return sendJson(res, 200, modelSettings());
+      }
+      // A one-line round trip through the active model, so the settings
+      // screen can say "works" or show why not.
+      if (method === "POST" && pathname === "/settings/models/test") {
+        const provider = runtime.agentHost?.modelProvider;
+        if (!provider) return sendJson(res, 503, { ok: false, error: "no_model" });
+        const started = Date.now();
+        try {
+          const result = await Promise.race([
+            provider.generate({ input: "Reply with exactly: OK", messages: [], tools: [], agent: { name: "OpenAGI" } }),
+            new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error("The model took too long to answer."), { code: "timeout" })), 30_000))
+          ]);
+          return sendJson(res, 200, { ok: true, model: result?.model ?? provider.model ?? null, text: String(result?.text ?? "").slice(0, 200), ms: Date.now() - started });
+        } catch (error) {
+          return sendJson(res, 200, { ok: false, error: error.code ?? "error", message: String(error.message ?? error).slice(0, 300) });
+        }
+      }
       if (method === "GET" && pathname === "/admin/provider") {
         const provider = runtime.agentHost?.modelProvider;
         return sendJson(res, 200, {
@@ -3299,7 +3502,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const { computeDailyPlan, renderDailyPlanMarkdown, listQueuedPlanActions } = await import("./daily-planner.js");
         const dateParam = url.searchParams.get("date");
         const date = dateParam ? new Date(dateParam + "T12:00:00") : new Date();
-        const plan = await computeDailyPlan(runtime, { date });
+        // ?llm=0 skips the model: the phone app refreshes its plan
+        // notification often, and each synthesis would run the phone's model.
+        const plan = await computeDailyPlan(runtime, { date, useLLM: url.searchParams.get("llm") !== "0" });
         plan.queuedActions = listQueuedPlanActions(runtime, plan.dateISO);
         return sendJson(res, 200, { plan, markdown: renderDailyPlanMarkdown(plan) });
       }
@@ -3509,7 +3714,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   // into one Realtime session per device; the OpenAI key stays here.
   const voiceSessions = options.voiceSessionFactory ?? createVoiceSessionFactory({ runtime });
   const voiceRelay = attachVoiceRelay({ nodeRegistry, getAuthToken, createSession: (params, io) => voiceSessions.create(params, io) });
-  const speechRelay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channels?.g2, upgrades: [voiceRelay] });
+  // WS /device/model: the phone app's native model bridge (phone-only mode).
+  const deviceModelRelay = attachDeviceModelRelay({ getAuthToken });
+  const speechRelay = attachG2SpeechRelay(server, { nodeRegistry, getChannel: () => channels?.g2, upgrades: mobileProfile ? [...mobileRefusedUpgrades(), deviceModelRelay] : [voiceRelay, deviceModelRelay] });
   const app = {
     runtime,
     channels,
@@ -3525,7 +3732,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve) => {
         server.listen(port, host, () => {
           channels?.start();
-          runtime.codingSupervisor?.start();
+          if (!mobileProfile) runtime.codingSupervisor?.start();
           runtime.fleetSupervisor?.start();
           mobilePush?.start();
           if (tickerMs > 0) {
@@ -3618,6 +3825,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       return new Promise((resolve, reject) => {
         speechRelay.close();
         voiceRelay.close();
+        deviceModelRelay.close();
+        stopSignedOutListener();
         approvalContinuationsClosing = true;
         for (const timer of approvalContinuationTimers) clearTimeout(timer);
         approvalContinuationTimers.clear();
@@ -4221,6 +4430,19 @@ function readJson(req) {
     });
     req.on("error", reject);
   });
+}
+
+const MODEL_PREFERENCES = ["auto", "anthropic", "openai", "chatgpt", "on-device"];
+const MIRROR_BODY_LIMIT = 6 * 1024 * 1024;
+
+function providerKind(provider) {
+  const name = provider?.constructor?.name ?? "";
+  if (name === "AnthropicProvider") return "anthropic";
+  if (name === "OpenAIResponsesProvider") return "openai";
+  if (name === "OnDeviceModelProvider") return "on-device";
+  if (name === "ChatGPTPlanProvider") return "chatgpt";
+  if (name === "DeterministicModelProvider") return "none";
+  return name || null;
 }
 
 function readJsonLimited(req, maxBytes) {

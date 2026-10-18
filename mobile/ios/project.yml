@@ -97,6 +97,12 @@ targets:
         embed: true
       - target: OpenAGINotify
         embed: true
+    # Phone-only mode: the embedded Node runtime and the daemon's JavaScript.
+    # A no-op when scripts/fetch-node-runtime.sh hasn't been run (CI).
+    postBuildScripts:
+      - name: Embed OpenAGI daemon
+        script: '"${PROJECT_DIR}/scripts/embed-daemon.sh"'
+        basedOnDependencyAnalysis: false
   OpenAGIWidget:
     type: app-extension
     platform: iOS

@@ -9,9 +9,15 @@ on:
 
 jobs:
   test:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - run: npm ci --omit=dev --ignore-scripts
+      - name: Fetch embedded runtime
+        run: mobile/ios/scripts/fetch-node-runtime.sh
       - name: Install XcodeGen
         run: |
           if ! command -v xcodegen >/dev/null; then brew install xcodegen; fi
@@ -25,6 +31,9 @@ jobs:
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination 'platform=iOS Simulator,name=iPhone 17' \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios" \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_ALLOWED=YES
+      - name: Verify phone-only runtime was bundled
+        run: test -f "$RUNNER_TEMP/openagi-ios/Build/Products/Debug-iphonesimulator/OpenAGI.app/Frameworks/NodeMobile.framework/NodeMobile"
