@@ -251,6 +251,11 @@ test("an older live approval card survives maxThreads until answered", async (t)
   assert.deepEqual(threads.map((thread) => thread.id), ["s-run", "s-self", "s-idle"]);
   assert.equal(threads[2].meta.pendingCard.cardId, "older-card");
   assert.equal(classifyThread(threads[2], { now: NOW, config }).state, "needs-human");
+  const managers = await listConductorThreads(makeConfig(home, { managerRef: "s-idle", limits: { maxThreads: 2 } }), { now: NOW, peers: new Map() });
+  const manager = managers.find((thread) => thread.id === "s-idle");
+  assert.equal(manager.excluded, null, "a live manager card inside lookback is promoted past the cap");
+  assert.equal(classifyThread(manager, { now: NOW, config }).state, "needs-human");
+  assert.equal(managers.filter((thread) => thread.id === "s-idle").length, 1);
 
   const answer = new DatabaseSync(file);
   addMessage(answer, "s-idle", "assistant", { type: "user", session_id: "s-idle", message: { role: "user", content: [
@@ -260,6 +265,21 @@ test("an older live approval card survives maxThreads until answered", async (t)
   assert.deepEqual((await read()).map((thread) => thread.id), ["s-run", "s-self"]);
   const explicit = await listConductorThreads(config, { now: NOW, peers: new Map(), only: ["s-idle"] });
   assert.deepEqual(explicit.map((thread) => thread.id), ["s-idle"]);
+});
+
+test("overflow acknowledgements do not bypass the catalog cap", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  db.prepare("UPDATE sessions SET status = 'working' WHERE id = 's-idle'").run();
+  addMessage(db, "s-idle", "assistant", {
+    type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "ack-card", name: "AskUserQuestion", input: {
+      questions: [{ question: "Continue?", options: ["Okay"] }]
+    } }] }
+  }, iso(5 * MIN));
+  db.close();
+  const threads = await listConductorThreads(makeConfig(home, { managerRef: "none", limits: { maxThreads: 2 } }), { now: NOW, peers: new Map() });
+  assert.deepEqual(threads.map((thread) => thread.id), ["s-run", "s-self"]);
 });
 
 test("a missing database is an empty list; a broken one throws", async (t) => {
