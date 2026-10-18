@@ -9,6 +9,11 @@ import { SuggestionManager, autoGate, runDiagnosis, suggestionFix } from '../src
 import { collectRuntimeProblems } from '../src/fleet/runtime-diagnostics.js';
 import { REMEDIES, suggestionPlan } from '../src/fleet/remedies.js';
 import { resolveFleetConfig } from '../src/fleet/contracts.js';
+import { BudgetGuard } from '../src/budget-guard.js';
+import { createFleetRoute } from '../src/fleet/routes.js';
+import { createFleetCapability, RemoteFleetSupervisor } from '../src/fleet/remote.js';
+import { registerVoiceTools } from '../src/fleet/voice-tools.js';
+import { ToolRegistry } from '../src/tool-registry.js';
 
 const NOW = new Date(2026, 9, 18, 12).getTime();
 const seed = { anomalyId: 'anomaly-0', area: 'policy', rootCause: 'Synthetic reproducible failure', proposedFix: 'Repair repeated asks', nextAction: 'Reproduce with a synthetic fixture', acceptance: 'No repeated asks', evidenceActionIds: ['a1'], confidence: 0.9, minutesSavedPerDay: 4 };
@@ -127,4 +132,92 @@ test('daily scheduler uses opt-in local collectors once and preserves unresolved
   assert.equal(f.calls.explain, 0);
   assert.equal(resolveFleetConfig({}).selfFix.runtimeImprovements, false);
   assert.equal(resolveFleetConfig({ OPENAGI_RUNTIME_IMPROVEMENTS: '1' }).selfFix.runtimeImprovements, true);
+});
+
+test('voice reservations gate diagnosis before any model call, even with an area filter', async t => {
+  const f = fixture(t);
+  const budget = new BudgetGuard({ storePath: path.join(f.dir, 'budget', 'usage.json'), dailyUsdLimit: 2 });
+  budget.setVoiceReservation('synthetic-call', 2);
+  assert.equal(budget.status().spentUsd, 0);
+  const result = await runDiagnosis({ store: f.store, dataDir: f.dir, now: NOW, options: { area: 'policy' },
+    models: { mode: 'propose', propose() { throw new Error('model must not be called'); } }, runtime: { budget } });
+  assert.equal(result.modelSkipped, 'budget-exhausted');
+  assert.equal(result.modelError, undefined);
+  assert.equal(collectRuntimeProblems({ budget }, NOW).problems[0].remedy, 'setup');
+  budget.setVoiceReservation('synthetic-call', 0);
+  assert.equal(collectRuntimeProblems({ budget }, NOW).problems.length, 0);
+});
+
+test('active cron work is not overdue but idle overdue work and failures remain visible', () => {
+  const jobs = [{ id: 'active', enabled: true, nextRunAt: new Date(NOW - 7 * 60000).toISOString() }];
+  const cron = { listJobs: () => jobs, isJobRunning: id => id === 'active' };
+  assert.equal(collectRuntimeProblems({ cron }, NOW).problems.length, 0);
+  jobs.push({ ...jobs[0], id: 'idle' });
+  assert.deepEqual(collectRuntimeProblems({ cron }, NOW).problems[0].evidence.measured, { failed: 0, overdue: 1 });
+  jobs[0].lastError = 'synthetic previous failure';
+  assert.deepEqual(collectRuntimeProblems({ cron }, NOW).problems[0].evidence.measured, { failed: 1, overdue: 1 });
+});
+
+test('clarification answers persist through the question API and are reconsidered without closing the finding', async t => {
+  const f = fixture(t);
+  f.explain({ ...seed, remedy: 'clarification' });
+  await f.manager.publish(await f.manager.propose(f.report));
+  const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.manager.config, deps: { now: () => NOW } });
+  supervisor._store = f.store;
+  supervisor._suggestionManager = f.manager;
+  const q = f.store.openQuestions()[0];
+  assert.ok(q.options.includes('Answer question'));
+  const route = createFleetRoute({ supervisor });
+  const pathname = `/fleet/api/questions/${q.id}`;
+  const request = clarification => route('POST', pathname, new URL(pathname, 'http://localhost'), async () => ({ answer: 'Answer question', clarification }));
+  assert.equal((await request('')).status, 400);
+  assert.equal((await request('x'.repeat(2001))).status, 400);
+  assert.equal((await request('It waits for owner setup.')).status, 200);
+  assert.equal(f.store.question(q.id).status, 'open');
+  const [saved] = new FleetStore({ dir: f.store.dir }).suggestions();
+  assert.equal(saved.clarification.answer, 'It waits for owner setup.');
+  assert.equal(saved.status, 'open');
+  // A full queue and absent original anomaly must not prevent reconsideration.
+  for (const metric of ['other-1', 'other-2']) f.store.saveSuggestion({ ...saved, id: metric, metric, remedy: 'setup' });
+  let explanationInput;
+  f.manager.models.explain = async input => {
+    explanationInput = input;
+    return { ...seed, remedy: 'setup', anomalyId: input.anomalies[0].id };
+  };
+  const candidates = await f.manager.propose({ anomalies: [], metrics: {}, evidence: [] });
+  assert.equal(explanationInput.clarifications[0].answer, saved.clarification.answer);
+  await f.manager.publish(candidates);
+  const updated = f.store.suggestions().find(s => s.id === saved.id);
+  assert.equal(updated.remedy, 'setup');
+  assert.ok(updated.clarification.reconsideredAt);
+  assert.equal(updated.status, 'open', 'an answer and a new plan are not verification of repair');
+  assert.equal(f.store.question(q.id).meta.plan.remedy, 'setup');
+  assert.equal(f.store.suggestions().length, 3, 'reconsider the same finding rather than create a duplicate');
+  assert.equal(f.calls.fixes, 0);
+});
+
+test('voice answers reach a remote clarification without a coding approval or queue', async t => {
+  const f = fixture(t);
+  f.explain({ ...seed, remedy: 'clarification' });
+  await f.manager.publish(await f.manager.propose(f.report));
+  const supervisor = new FleetSupervisor({ dataDir: f.dir, config: f.manager.config, deps: { now: () => NOW } });
+  supervisor._store = f.store;
+  supervisor._suggestionManager = f.manager;
+  const capability = createFleetCapability(supervisor);
+  const remote = new RemoteFleetSupervisor({ nodeId: 'synthetic-node', runtime: { nodeCapabilities: {
+    dispatch: async (_id, _capability, operation, payload) => capability.invoke(operation, payload)
+  } } });
+  const registry = new ToolRegistry();
+  registerVoiceTools(registry, remote);
+  const saved = f.store.suggestions()[0];
+  const result = await registry.invoke('suggestion_respond', { suggestionId: saved.id, choice: 'answer question', clarification: 'Synthetic owner answer' });
+  assert.equal(result.ok, true);
+  assert.equal(result.result.nonResolving, true);
+  assert.equal(f.store.suggestions()[0].clarification.answer, 'Synthetic owner answer');
+  const q = f.store.openQuestions()[0];
+  const response = await remote.answerQuestion(q.id, 'Answer question', { clarification: 'Updated owner answer' });
+  assert.equal(response.nonResolving, true);
+  assert.equal(f.store.suggestions()[0].clarification.answer, 'Updated owner answer');
+  assert.equal(f.store.suggestions()[0].status, 'open');
+  assert.equal(f.calls.fixes, 0);
 });

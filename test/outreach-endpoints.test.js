@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
+import { FleetSupervisor } from "../src/fleet/supervisor.js";
+import { resolveFleetConfig } from "../src/fleet/contracts.js";
 
 async function bootApp() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "out-ep-"));
@@ -15,6 +17,34 @@ async function bootApp() {
   const base = listened.url ?? `http://127.0.0.1:${listened.port}`;
   return { runtime, app, base, dataDir };
 }
+
+test("outreach Review plan returns guidance repeatedly while keeping the real Fleet finding open", async t => {
+  const { runtime, app, base, dataDir } = await bootApp();
+  t.after(async () => { await app.close(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  runtime.fleetSupervisor?.stop();
+  const supervisor = new FleetSupervisor({ dataDir, runtime,
+    config: resolveFleetConfig({}, { selfFix: { mode: 'propose' }, push: 'off' }) });
+  runtime.fleetSupervisor = supervisor;
+  await supervisor.suggestionManager.publish([{ remedy: 'setup', metric: 'synthetic-setup', area: 'sources',
+    rootCause: 'Synthetic setup required', proposedFix: 'Review setup', nextAction: 'Check the local setup',
+    acceptance: 'Requested turn succeeds', fingerprint: 'synthetic-setup', score: 1 }]);
+  const question = supervisor.store.openQuestions()[0];
+  const item = runtime.outreach.list().find(i => i.sourceRef?.id === question.id);
+  assert.ok(item);
+  for (let i = 0; i < 2; i++) {
+    const response = await fetch(`${base}/outreach/${item.id}/act`, { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'Review plan' }) });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.plan.nextAction, 'Check the local setup');
+    assert.equal(result.item.status, 'unseen');
+    assert.equal(result.item.decision, null);
+    assert.equal(result.item.resolvedAt, null);
+  }
+  assert.equal(supervisor.store.question(question.id).status, 'open');
+  assert.equal(supervisor.suggestions()[0].status, 'open');
+  assert.equal(supervisor.fixes().length, 0);
+});
 
 test("GET /outreach/feed?since=N returns items after the cursor", async () => {
   const { runtime, app, base } = await bootApp();

@@ -2685,6 +2685,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (applied?.pendingAction) {
             queueApprovalContinuation(applied.pendingAction, applied.invokeResult);
           }
+          if (applied?.nonResolving) return sendJson(res, 200, { item: runtime.outreach.get(id), plan: applied.plan, nonResolving: true });
           const status = action === "dismiss" ? "dismissed" : "acted";
           const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });
           return sendJson(res, 200, { item: updated });
@@ -4385,8 +4386,9 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (!runtime.clarifications.answer(ref.id, action)) throw new Error("clarification not answerable");
       return;
     case "fleet": {
-      const r = await runtime.fleetSupervisor?.answerQuestion(ref.id, action);
+      const r = await runtime.fleetSupervisor?.answerQuestion(ref.id, action, action === "Answer question" ? { clarification: note } : undefined);
       if (!r) throw new Error("fleet question not answerable");
+      if (r.nonResolving && r.plan) return { nonResolving: true, plan: r.plan };
       // Blocked, failed, or "open thread": the agent has no answer yet, so
       // the item stays actionable.
       if (r.question?.status === "open") throw outreachActionConflict(r.delivery?.detail ?? "fleet answer not delivered; the question is still open");

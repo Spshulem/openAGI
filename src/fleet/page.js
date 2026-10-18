@@ -418,6 +418,11 @@ a.btn.primary{color:var(--ink)}
         el('pre', null, plan.issueDraft.body, draft);
       }
     }
+    var clarification = q.meta && q.meta.clarification;
+    if (clarification && clarification.answer) {
+      el('p', 'note', 'Your clarification: ' + clarification.answer, parent);
+      el('p', 'note', clarification.reconsideredAt ? 'Diagnosis reconsidered your answer; the finding still needs verification.' : 'Waiting for the next diagnosis. The finding is still unresolved.', parent);
+    }
     if (typeof q.askContext === 'string' && q.askContext && q.askContext !== q.body) {
       el('p', 'k', 'The agent wrote:', parent);
       el('blockquote', q.risky ? 'quote' : 'quote clamp', q.askContext, parent);
@@ -499,6 +504,12 @@ a.btn.primary{color:var(--ink)}
   }
 
   async function decide(q, body, buttons) {
+    if (q.kind === 'suggestion' && body.answer === 'Answer question') {
+      var answer = window.prompt(q.meta && q.meta.plan ? q.meta.plan.nextAction : 'What should the diagnosis know?', q.meta && q.meta.clarification ? q.meta.clarification.answer : '');
+      if (!answer || !answer.trim()) return;
+      if (answer.length > 2000) { say('Keep your clarification within 2000 characters.', true); return; }
+      body.clarification = answer.trim();
+    }
     if (q.kind === 'self-fix' && body.answer === 'Request changes') {
       var instructions = window.prompt('What should the fixer change?');
       if (!instructions || !instructions.trim()) return;
@@ -507,7 +518,7 @@ a.btn.primary{color:var(--ink)}
     buttons.forEach(function (b) { b.disabled = true; });
     try {
       var r = await api('/fleet/api/questions/' + encodeURIComponent(q.id), body);
-      var note = body.answer === 'Review plan' ? { text: 'Plan shown on the card. No action taken.', bad: false } : body.dismiss ? { text: 'Dismissed.', bad: false } : deliveryNote(r && r.delivery, 'Answered.');
+      var note = body.answer === 'Review plan' ? { text: 'Plan shown on the card. No action taken.', bad: false } : body.answer === 'Answer question' ? { text: 'Clarification saved for the next diagnosis. The finding is still unresolved.', bad: false } : body.dismiss ? { text: 'Dismissed.', bad: false } : deliveryNote(r && r.delivery, 'Answered.');
       if (r && r.state) render(r.state); else await load();
       say(note.text, note.bad);
     } catch (e) {

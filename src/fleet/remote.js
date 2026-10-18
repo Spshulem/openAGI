@@ -121,14 +121,14 @@ export class RemoteFleetSupervisor {
   }
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { if (mode === "observe") await this.selfFixHub?.stop("all"); await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
-  async answerQuestion(id, answer) {
+  async answerQuestion(id, answer, { clarification = null } = {}) {
     if (this.selfFixHub?.store.question(id)) return this.selfFixHub.answer(id, answer);
     const card = this.state.questions.find(q => q.id === id);
     if (this.selfFixHub && card?.kind === 'suggestion' && answer === 'Fix it' && (card.options ?? []).includes(answer)) {
       const result = await this.respondSuggestion(card.meta?.suggestionId, answer);
       return { question: { ...card, status: 'answered', answer }, delivery: null, fix: result?.fix ?? null };
     }
-    return this.request('POST', `/fleet/api/questions/${id}`, { answer });
+    return this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
   }
   // replay: a dismissal that could not reach the computer is kept and sent
   // again once it is back (the glasses already dropped the question).
@@ -170,8 +170,8 @@ export class RemoteFleetSupervisor {
   async suggestions() { return (await this.request('GET', '/fleet/api/suggestions')).suggestions ?? []; }
   // Fix it queues in this main's hub (where fixes are listed, revised and
   // stopped); the computer only links the suggestion to that fix id.
-  async respondSuggestion(id, choice) {
-    if (!this.selfFixHub || String(choice ?? '').toLowerCase() !== 'fix it') return this.request('POST', `/fleet/api/suggestions/${id}`, { choice });
+  async respondSuggestion(id, choice, { clarification = null } = {}) {
+    if (!this.selfFixHub || String(choice ?? '').toLowerCase() !== 'fix it') return this.request('POST', `/fleet/api/suggestions/${id}`, { choice, ...(clarification != null ? { clarification } : {}) });
     const { suggestion } = await this.request('GET', `/fleet/api/suggestions/${id}`);
     if (suggestion.status !== 'open') return { suggestion, fix: null };
     assertFixAllowed(this.selfFixHub.store, suggestion.area, Date.now());

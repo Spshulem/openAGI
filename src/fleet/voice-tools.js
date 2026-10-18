@@ -111,8 +111,8 @@ export function registerVoiceTools(registry, supervisor) {
   if (typeof supervisor.respondSuggestion === "function") registry.register({ name: "suggestion_respond", source: SOURCE,
     needsConfirmation: true,
     confirmationRequired: (args) => String(args?.choice ?? "").toLowerCase() === "fix it",
-    description: "Respond to a suggestion: Review plan returns the local remedy, next step and acceptance without acting. Only code remedies allow Fix it, which queues self_fix_start with the same caps (owner merges), Not now snoozes seven days, Never blocks its fingerprint. Read back title, area and caps before confirming Fix it.",
-    parameters: { type: "object", properties: { suggestionId: { type: "string", maxLength: 80 }, choice: { type: "string", enum: ["fix it", "review plan", "not now", "never"] } }, required: ["suggestionId", "choice"], additionalProperties: false },
+    description: "Respond to a suggestion: Review plan returns guidance without acting. Answer question stores the owner's clarification for the next diagnosis; supply clarification with their answer, never invent one. The finding stays unresolved. Only code remedies allow Fix it, which queues self_fix_start with the same caps (owner merges). Not now snoozes seven days; Never blocks its fingerprint. Read back title, area and caps before confirming Fix it.",
+    parameters: { type: "object", properties: { suggestionId: { type: "string", maxLength: 80 }, choice: { type: "string", enum: ["fix it", "answer question", "review plan", "not now", "never"] }, clarification: { type: "string", minLength: 1, maxLength: 2000 } }, required: ["suggestionId", "choice"], additionalProperties: false },
     prepareApprovalArgs: async (args) => {
       const s = (await supervisor.suggestions()).find((s) => s.id === args.suggestionId && s.status === "open");
       if (!s) throw new Error("No open suggestion with that id.");
@@ -125,7 +125,7 @@ export function registerVoiceTools(registry, supervisor) {
         const current = (await supervisor.suggestions()).find((s) => s.id === args.suggestionId);
         if (current?.fingerprint !== args.fingerprint) throw new Error("Suggestion changed; read it back again.");
       }
-      return supervisor.respondSuggestion(args.suggestionId, args.choice);
+      return supervisor.respondSuggestion(args.suggestionId, args.choice, { clarification: args.clarification });
     } });
   if (typeof supervisor.recordFeedback === "function") registry.register({ name: "feedback_record", source: SOURCE,
     description: "Record the owner's feedback on the supervisor ('I don't like that', 'fix that', 'explain this'). Stores it only; nothing changes or runs. intent: explain, change, fix, create-pr, spawn-fixer or dismiss. target defaults to what the owner is looking at.",

@@ -132,7 +132,7 @@ function sampleState(overrides = {}) {
   };
 }
 
-function boot({ search = "", state = sampleState(), confirmResult = true } = {}) {
+function boot({ search = "", state = sampleState(), confirmResult = true, promptResult = null } = {}) {
   const elements = new Map(STATIC_IDS.map((id) => [id, new FakeElement(id.startsWith("mode-") ? "button" : "div")]));
   for (const mode of ["observe", "propose", "auto"]) elements.get("mode-" + mode).dataset.mode = mode;
   const requests = [];
@@ -156,7 +156,7 @@ function boot({ search = "", state = sampleState(), confirmResult = true } = {})
       addEventListener: (type, fn) => { (docListeners[type] ??= []).push(fn); },
       visibilityState: "visible"
     },
-    window: { matchMedia: () => ({ matches: true }) },
+    window: { matchMedia: () => ({ matches: true }), prompt: () => promptResult },
     location: { search },
     URLSearchParams,
     fetch,
@@ -729,4 +729,19 @@ test("improvement plans render as text with no coding option for setup and revie
   await review.click();
   assert.deepEqual(f.requests.find(r => r.method === 'POST').body, { answer: 'Review plan' });
   assert.match(f.el('status').textContent, /No action taken/);
+});
+
+test('clarification cards collect an answer and show its unresolved state as text', async () => {
+  const question = { id: 'fq_clarify', kind: 'suggestion', title: 'Which workflow?', status: 'open', options: ['Answer question', 'Review plan'],
+    meta: { plan: { remedy: 'clarification', label: 'Ask a question', nextAction: 'What was expected?', acceptance: 'Verified outcome' } } };
+  const f = boot({ state: sampleState({ questions: [question] }), promptResult: '<img src=x> synthetic answer' });
+  await settle();
+  const answered = structuredClone(question);
+  answered.meta.clarification = { answer: '<img src=x> synthetic answer', answeredAt: new Date().toISOString() };
+  f.responses.push({ status: 200, body: { state: sampleState({ questions: [answered] }), nonResolving: true } });
+  await f.el('needsList').all().find(e => e.tagName === 'BUTTON' && e.textContent === 'Answer question').click();
+  assert.deepEqual(f.requests.find(r => r.method === 'POST').body, { answer: 'Answer question', clarification: '<img src=x> synthetic answer' });
+  assert.match(f.el('needsList').textContent, /Your clarification: <img src=x> synthetic answer/);
+  assert.match(f.el('status').textContent, /still unresolved/);
+  assert.equal(f.el('needsList').all().some(e => e.tagName === 'IMG'), false);
 });

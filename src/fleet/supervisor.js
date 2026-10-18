@@ -962,7 +962,7 @@ export class FleetSupervisor {
   async respondSuggestion(id, choice, options) {
     const questions = this.store.openQuestions().filter((q) => q.kind === "suggestion" && q.meta?.suggestionId === id);
     const result = await this.suggestionManager.respond(id, choice, options);
-    if (result && String(choice).toLowerCase() !== "review plan") for (const q of questions) this.resolveOutreach(q, choice, "acted");
+    if (result && !result.nonResolving) for (const q of questions) this.resolveOutreach(q, choice, "acted");
     return result;
   }
 
@@ -1450,7 +1450,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async answerQuestion(id, answer, { deadlineAt = null } = {}) {
+  async answerQuestion(id, answer, { deadlineAt = null, clarification = null } = {}) {
     const startedAt = Date.now();
     if (this.answering.has(id)) return null;
     const question = this.store.question(id);
@@ -1461,8 +1461,9 @@ export class FleetSupervisor {
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
     if (question.kind === "suggestion") {
-      const result = await this.respondSuggestion(question.meta?.suggestionId, answer);
-      return result ? { question: this.store.question(id), delivery: null, fix: result.fix } : null;
+      const result = await this.respondSuggestion(question.meta?.suggestionId, answer, { clarification });
+      return result ? { question: this.store.question(id), delivery: null, fix: result.fix,
+        ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}) } : null;
     }
     // A question card is answered in the app itself. Until the supervisor
     // can click it there, "open thread" is the only answer and it relays

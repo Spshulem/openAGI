@@ -20,7 +20,8 @@ export function collectRuntimeProblems(runtime, now) {
   const jobs = read("cron", () => runtime?.cron?.listJobs?.());
   if (Array.isArray(jobs)) {
     const failed = jobs.filter(j => j.enabled && j.lastError).length;
-    const overdue = jobs.filter(j => j.enabled && j.nextRunAt && Date.parse(j.nextRunAt) < now - 5 * 60_000).length;
+    const overdue = read("cronOverdue", () => jobs.filter(j => j.enabled && j.nextRunAt && Date.parse(j.nextRunAt) < now - 5 * 60_000
+      && !runtime.cron.isJobRunning?.(j.id)).length);
     if (failed || overdue) add("cron-attention", "clarification", "Scheduled work has failures or overdue runs; the cause is not established.",
       "Inspect one affected job locally. Is it waiting on credentials, a service, or a reproducible scheduler failure? Do not restart or complete it automatically.",
       "The affected job completes successfully and its next run is fresh.", { failed, overdue });
@@ -34,7 +35,14 @@ export function collectRuntimeProblems(runtime, now) {
       "Representative retrieval finds the needed context without adding redundant evidence.", { active: quality.active, recalled: quality.recalled, medium: snapshot.medium.length });
   }
   const budget = read("budget", () => runtime?.budget?.status?.());
-  if (Number.isFinite(budget?.dailyUsdLimit) && budget.dailyUsdLimit > 0 && budget.spentUsd >= budget.dailyUsdLimit) {
+  // Match the provider's read-only gate, including active voice reservations
+  // and unrounded spend. Never charge or reserve money during diagnosis.
+  const available = read("budgetAvailability", () => {
+    if (typeof runtime?.budget?.check !== "function") return null;
+    try { runtime.budget.check(); return true; }
+    catch (error) { if (error.code === "BUDGET_EXCEEDED") return false; throw error; }
+  });
+  if (available === false || (available == null && Number.isFinite(budget?.dailyUsdLimit) && budget.spentUsd >= budget.dailyUsdLimit)) {
     add("budget-exhausted", "setup", "The configured daily provider budget is exhausted.",
       "Wait for the budget window to reset, or review the configured limit yourself. A prompt or code repair cannot authorize more spending.",
       "An owner-requested turn succeeds within the configured budget.", { exhausted: true });

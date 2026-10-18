@@ -97,6 +97,10 @@ function questionMeta(meta) {
       nextAction: redactSecrets(clampText(meta.plan.nextAction, 2000)),
       acceptance: redactSecrets(clampText(meta.plan.acceptance, 2000)) });
   }
+  if (isObject(meta.clarification) && typeof meta.clarification.answer === "string") {
+    out.clarification = { answer: redactSecrets(clampText(meta.clarification.answer, 2000)),
+      answeredAt: clampText(meta.clarification.answeredAt, 40), reconsideredAt: clampText(meta.clarification.reconsideredAt, 40) };
+  }
   return Object.keys(out).length ? out : null;
 }
 

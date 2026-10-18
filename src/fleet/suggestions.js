@@ -16,6 +16,13 @@ const DUPLICATE_SCHEMA = { type: "object", properties: { duplicate: { type: "boo
 const ACTIVE_FIX = new Set(["queued", "preflight", "brief", "worktree", "coding", "tests", "guard", "pr", "awaiting-review", "fixing-findings", "replay", "owner-ask"]);
 const clean = (value, max = 2000) => clampText(redactSecrets(value), max);
 
+function suggestionQuestion(s) {
+  const remedy = remedyOf(s);
+  return { kind: "suggestion", dedupeKey: `suggestion:${s.id}`, title: clean(s.proposedFix, 100), body: clean(s.rootCause, 220),
+    options: [...(remedy === "code" ? ["Fix it"] : remedy === "clarification" ? ["Answer question"] : []), "Review plan", "Not now", "Never"],
+    meta: { suggestionId: s.id, plan: suggestionPlan(s), clarification: s.clarification } };
+}
+
 // Built at runtime: a Node without ICU (the phone runtime) rejects \p{...}
 // as a syntax error, which would stop the whole daemon from loading. There,
 // every non-ASCII character counts as a letter; fingerprints made on a
@@ -119,14 +126,24 @@ export class SuggestionManager {
   get mode() { return this.config.selfFix?.mode ?? "propose"; }
 
   async propose(report) {
-    if (!report.anomalies.length || this.mode === "off") return [];
+    if (this.mode === "off") return [];
     const records = this.store.suggestions();
-    if (records.filter(s => s.status === "open").length >= 3) return [];
+    // Revisit the same unresolved finding using the owner's new evidence,
+    // even if its original anomaly disappeared or all proposal slots are full.
+    const pending = records.find(s => s.status === "open" && remedyOf(s) === "clarification"
+      && s.clarification?.answer && !s.clarification.reconsideredAt
+      && (!report.area || report.area === s.area));
+    if (!pending && (!report.anomalies.length || records.filter(s => s.status === "open").length >= 3)) return [];
     const covered = records.filter((s) => ["open", "fix-queued", "never"].includes(s.status)
       || (s.status === "snoozed" && Date.parse(s.snoozedUntil) > this.now()));
-    const anomalies = report.anomalies.filter((a) => !covered.some((s) => s.metric === a.metric && s.area === a.area));
+    const anomalies = pending ? [{ id: `clarification:${pending.id}`, metric: pending.metric, area: pending.area,
+      eventsPerDay: pending.eventsPerDay ?? 1, evidenceActionIds: pending.evidence?.actionIds ?? [], feedbackIds: pending.evidence?.feedbackIds ?? [] }]
+      : report.anomalies.filter((a) => !covered.some((s) => s.metric === a.metric && s.area === a.area));
     if (!anomalies.length) return [];
-    const explanation = validateExplanation(await this.models.explain({ anomalies, metrics: report.metrics, evidence: report.evidence }));
+    const clarification = pending ? { suggestionId: pending.id, answer: pending.clarification.answer, answeredAt: pending.clarification.answeredAt,
+      question: pending.nextAction ?? pending.proposedFix, rootCause: pending.rootCause } : null;
+    const explanation = validateExplanation(await this.models.explain({ anomalies, metrics: report.metrics, evidence: report.evidence,
+      ...(clarification ? { clarifications: [clarification] } : {}) }));
     const anomaly = anomalies.find((a) => a.id === explanation.anomalyId && a.area === explanation.area);
     if (!anomaly) throw new Error("Diagnosis output has no matching anomaly.");
     const evidenceIds = new Set(anomaly.evidenceActionIds);
@@ -134,6 +151,8 @@ export class SuggestionManager {
       evidence: { actionIds: explanation.evidenceActionIds.filter((id) => evidenceIds.has(id)), feedbackIds: anomaly.feedbackIds ?? [] },
       score: anomaly.eventsPerDay * explanation.minutesSavedPerDay * explanation.confidence };
     candidate.fingerprint = suggestionFingerprint(candidate);
+    if (pending) return [{ ...candidate, reconsideration: { suggestionId: pending.id,
+      answer: pending.clarification.answer, answeredAt: pending.clarification.answeredAt } }];
     if (records.some((s) => s.fingerprint === candidate.fingerprint)) return [];
     const compare = records.filter((s) => ["open", "fix-queued", "never"].includes(s.status) || Date.parse(s.updatedAt) >= this.now() - 7 * DAY_MS);
     const fixes = this.store.fixes().filter((f) => ACTIVE_FIX.has(f.state));
@@ -144,8 +163,19 @@ export class SuggestionManager {
   async publish(candidates) {
     if (this.mode === "off") return;
     for (const candidate of candidates.sort((a, b) => b.score - a.score)) {
+      if (candidate.reconsideration) {
+        const { reconsideration, ...update } = candidate;
+        const current = this.store.suggestions().find(s => s.id === reconsideration.suggestionId);
+        // The owner can answer again or snooze while the model is in flight.
+        if (current?.status !== "open" || current.clarification?.answer !== reconsideration.answer
+          || current.clarification?.answeredAt !== reconsideration.answeredAt || current.clarification.reconsideredAt) continue;
+        const at = new Date(this.now()).toISOString();
+        this.store.saveSuggestion({ ...current, ...update, id: current.id, status: "open", plan: suggestionPlan(update),
+          clarification: { ...current.clarification, reconsideredAt: at }, updatedAt: at });
+        continue;
+      }
       if (this.store.suggestions().some((s) => s.fingerprint === candidate.fingerprint)) continue;
-      if (this.store.suggestions().filter((s) => s.status === "open").length >= 3) break;
+      if (this.store.suggestions().filter((s) => s.status === "open").length >= 3) continue;
       const at = new Date(this.now()).toISOString();
       const suggestion = this.store.saveSuggestion({ ...candidate, plan: suggestionPlan(candidate), id: `sg_${randomUUID().replaceAll("-", "").slice(0, 16)}`, status: "open", createdAt: at, updatedAt: at });
       for (const id of suggestion.evidence?.feedbackIds ?? []) this.store.updateFeedback(id, { status: "triaged", suggestionId: suggestion.id });
@@ -164,13 +194,22 @@ export class SuggestionManager {
     return fix;
   }
 
-  async respond(id, choice, { auto = false, fixId = null } = {}) {
+  async respond(id, choice, { auto = false, fixId = null, clarification = null } = {}) {
     const suggestion = this.store.suggestions().find((s) => s.id === id);
     if (!suggestion) return null;
     const picked = String(choice ?? "").toLowerCase();
-    if (!["fix it", "review plan", "not now", "never"].includes(picked)) throw new Error("Pick Fix it, Review plan, Not now or Never.");
-    if (picked === "review plan") return { suggestion, fix: null, plan: suggestionPlan(suggestion) };
+    if (!["fix it", "answer question", "review plan", "not now", "never"].includes(picked)) throw new Error("Pick Fix it, Answer question, Review plan, Not now or Never.");
+    if (picked === "review plan") return { suggestion, fix: null, plan: suggestionPlan(suggestion), nonResolving: true };
     if (suggestion.status !== "open") return { suggestion, fix: null };
+    if (picked === "answer question") {
+      if (remedyOf(suggestion) !== "clarification") throw new Error("Only clarification remedies accept an answer.");
+      if (typeof clarification !== "string" || !clarification.trim() || clarification.length > 2000) throw new Error("Provide a clarification of 1 to 2000 characters.");
+      const at = new Date(this.now()).toISOString();
+      const saved = this.store.saveSuggestion({ ...suggestion,
+        clarification: { answer: clean(clarification.trim()), answeredAt: at }, updatedAt: at });
+      this.store.upsertQuestion(suggestionQuestion(saved));
+      return { suggestion: saved, fix: null, plan: suggestionPlan(saved), nonResolving: true };
+    }
     let fix = null;
     if (picked === "fix it") {
       if (this.mode === "off") throw new Error("Self-fix is off.");
@@ -196,8 +235,7 @@ export class SuggestionManager {
         else await this.respond(s.id, "Fix it", { auto: true });
         continue;
       }
-      const question = this.store.upsertQuestion({ kind: "suggestion", dedupeKey: `suggestion:${s.id}`, title: clean(s.proposedFix, 100),
-        body: clean(s.rootCause, 220), options: remedyOf(s) === "code" ? ["Fix it", "Review plan", "Not now", "Never"] : ["Review plan", "Not now", "Never"], meta: { suggestionId: s.id, plan: suggestionPlan(s) } });
+      const question = this.store.upsertQuestion(suggestionQuestion(s));
       if (question.suppressed || question.status !== "open") continue;
       const allowPush = !this.store.suggestions().some((v) => v.pushedAt && localDay(v.pushedAt) === localDay(now))
         && !isQuietHour(new Date(now), this.config.limits?.quietHours)
@@ -218,10 +256,10 @@ export async function runDiagnosis({ store, dataDir, now, state, storageConfig, 
   const ids = new Set(report.anomalies.flatMap((a) => a.evidenceActionIds.slice(-5)));
   const evidence = inputs.actions.filter((a) => ids.has(a.id)).map((a) => ({ id: a.id, kind: a.kind ?? null, route: a.route ?? null,
     status: a.status, verdict: a.verdict ?? null, reason: clean(a.reason, 300), detail: clean(a.detail, 500), exitCode: a.exitCode ?? null }));
-  const modelReport = { ...report, metrics: { ...report.metrics, health: undefined }, evidence };
+  const modelReport = { ...report, area: options.area, metrics: { ...report.metrics, health: undefined }, evidence };
   const local = native.problems.filter(p => !options.area || p.area === options.area).map(p => ({ ...p, fingerprint: suggestionFingerprint(p) }));
   if (models.mode === "off") return { ...report, suggestions: [] };
-  if (local.some(p => p.metric === "runtime:budget-exhausted")) return { ...report, suggestions: local, modelSkipped: "budget-exhausted" };
+  if (native.problems.some(p => p.metric === "runtime:budget-exhausted")) return { ...report, suggestions: local, modelSkipped: "budget-exhausted" };
   try { return { ...report, suggestions: [...local, ...await models.propose(modelReport)] }; }
   catch (error) { return { ...report, suggestions: local, modelError: clean(error?.message, 200) }; }
 }

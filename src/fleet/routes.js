@@ -65,13 +65,17 @@ export function createFleetRoute({ supervisor } = {}) {
     if (!open) return fail(404, "No open question with that id.");
     const options = Array.isArray(open.options) ? open.options : [];
     if (answer !== "dismiss" && !options.includes(answer)) return fail(400, "Pick one of the question's options.");
+    if (answer === "Answer question" && (typeof body.clarification !== "string" || !body.clarification.trim() || body.clarification.length > 2000)) {
+      return fail(400, "Provide a clarification of 1 to 2000 characters.");
+    }
     if (open.kind === "self-fix" && answer === "Request changes" && typeof body.instructions === "string") {
       const fix = await supervisor.reviseFix(open.meta?.fixId, body.instructions);
       return fix ? ok({ question: (state().questions ?? []).find((q) => q.id === id) ?? null, fix, delivery: { status: "sent", detail: "Changes sent to fixer." }, state: state() }) : fail(404, "No fix with that id.");
     }
-    const result = await supervisor.answerQuestion(id, answer, sendOptions);
+    const result = await supervisor.answerQuestion(id, answer, { ...sendOptions, ...(answer === "Answer question" ? { clarification: body.clarification } : {}) });
     if (!result) return fail(409, "Question already closed.");
-    return ok({ question: result.question ?? null, delivery: result.delivery ?? null, state: state() });
+    return ok({ question: result.question ?? null, delivery: result.delivery ?? null,
+      ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}), state: state() });
   }
 
   async function handleSend(id, sendOptions) {
@@ -108,7 +112,8 @@ export function createFleetRoute({ supervisor } = {}) {
         if (method !== "POST") return fail(405, "Use POST.");
         const body = await readObject(readBody);
         try {
-          const result = await supervisor.respondSuggestion(parts[1], body?.choice, typeof body?.fixId === "string" ? { fixId: body.fixId } : undefined);
+          const result = await supervisor.respondSuggestion(parts[1], body?.choice, {
+            ...(typeof body?.fixId === "string" ? { fixId: body.fixId } : {}), clarification: body?.clarification });
           return result ? ok(result) : fail(404, "No suggestion with that id.");
         } catch { return fail(409, "Suggestion could not be applied. Check its choice, self-fix mode, locks and daily cap."); }
       }
