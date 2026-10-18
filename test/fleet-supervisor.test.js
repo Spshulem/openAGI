@@ -4503,6 +4503,7 @@ test("risky classification reads the ask itself rather than incidental report co
   assert.equal(supervisor.questionView(question, rows).risky, false);
   assert.equal(supervisor.questionView({ ...question, title: "Deploy to production?" }, rows).risky, true);
   assert.equal(supervisor.questionView({ ...question, mergeAsk: true }, rows).risky, true);
+  assert.equal(supervisor.questionView({ kind: "storage", title: "Remove 2 old projects?", body: "These project folders will be removed.", options: ["Delete 2", "Keep", "Later"] }, rows).risky, true, "storage deletion shows the full warning before approval");
 });
 
 test("Push now never goes ahead of an open question or a muted thread, and needs a scan", async (t) => {

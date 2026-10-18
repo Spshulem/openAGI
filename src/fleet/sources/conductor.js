@@ -548,7 +548,8 @@ export async function listConductorThreads(config, options = {}) {
     const newestFirst = (a, b) => (b.updatedMs || 0) - (a.updatedMs || 0) || String(a.row.id).localeCompare(String(b.row.id));
     // options.only: just these sessions (a send-time re-read), whatever their age.
     const only = Array.isArray(options.only) ? new Set(options.only) : null;
-    const recent = rows.filter((entry) => (only ? only.has(entry.row.id) : entry.updatedMs >= cutoff)).sort(newestFirst).slice(0, config.limits.maxThreads);
+    const ranked = rows.filter((entry) => (only ? only.has(entry.row.id) : entry.updatedMs >= cutoff)).sort(newestFirst);
+    const recent = ranked.slice(0, config.limits.maxThreads);
     const picked = new Set(recent.map((entry) => entry.row.id));
     // The BuildBot3 manager stays visible for escalation even when it is quiet.
     const manager = only ? [] : rows
@@ -567,6 +568,16 @@ export async function listConductorThreads(config, options = {}) {
         // partial catalog would close questions from sessions we failed to read.
         threads.push(buildThread(db, row, { config, now, peers, sinceIso, stale, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn, prompts: options.firstPrompts ?? firstPrompts, dbFile: file }));
       }
+    }
+    // The catalog cap bounds ordinary rows, not questions that still need
+    // the owner. Check the remaining sessions inside the same lookback,
+    // using the existing current-turn/card-liveness checks. A later answer
+    // removes the overflow row again; stale managers are not read twice.
+    const included = new Set(threads.map((thread) => thread.id));
+    if (!only) for (const { row } of ranked.slice(config.limits.maxThreads)) {
+      if (included.has(row.id) || CARD_DEAD_STATUSES.has(row.status)) continue;
+      const thread = buildThread(db, row, { config, now, peers, sinceIso, stale: false, tabs: tabs.get(row.workspace_local_id) ?? null, turnColumn, prompts: options.firstPrompts ?? firstPrompts, dbFile: file });
+      if (thread.meta?.pendingCard?.items?.length) threads.push(thread);
     }
     return threads;
   } finally {
