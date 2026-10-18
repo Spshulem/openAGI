@@ -1,4 +1,5 @@
 import XCTest
+import os
 @testable import OpenAGI
 
 final class AppModelRefreshTests: XCTestCase {
@@ -100,5 +101,62 @@ final class AppModelRefreshTests: XCTestCase {
 
         XCTAssertEqual(model.snapshot?.visibleToday.count, 3)
         XCTAssertEqual(model.inboxBadgeCount, 2)
+    }
+
+    @MainActor
+    func testOverlappingResumeAndTodayRefreshSendAnOfflineCompletionOnce() async throws {
+        let model = model()
+        try model.queue.enqueue(PendingOp(kind: .completeTask("task_offline")))
+        let summary = try fixture("summary-populated")
+        let requests = OSAllocatedUnfairLock(initialState: (completions: 0, summaries: 0))
+        let completionStarted = expectation(description: "offline completion is in flight")
+        let completionRelease = DispatchSemaphore(value: 0)
+        defer { completionRelease.signal() }
+        StubProtocol.handler = { request in
+            let body: Data
+            switch request.url?.path {
+            case "/tasks/task_offline/complete":
+                let first = requests.withLock { state in
+                    state.completions += 1
+                    return state.completions == 1
+                }
+                if first {
+                    completionStarted.fulfill()
+                    _ = completionRelease.wait(timeout: .now() + 5)
+                }
+                body = Data("{}".utf8)
+            case "/mobile/summary":
+                requests.withLock { $0.summaries += 1 }
+                body = summary
+            case "/pending-actions", "/tasks/clarifications": body = Data("[]".utf8)
+            default: body = Data("{}".utf8)
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil,
+                                    headerFields: nil)!, body)
+        }
+
+        let resume = Task { await model.refreshData() }
+        let started = await XCTWaiter.fulfillment(of: [completionStarted], timeout: 2)
+        XCTAssertEqual(started, .completed)
+        let todayStarted = expectation(description: "Today joins the pending refresh")
+        let today = Task {
+            todayStarted.fulfill()
+            await model.refreshToday()
+        }
+        let overlapping = await XCTWaiter.fulfillment(of: [todayStarted], timeout: 2)
+        XCTAssertEqual(overlapping, .completed)
+        completionRelease.signal()
+        await resume.value
+        await today.value
+
+        XCTAssertEqual(requests.withLock { $0.completions }, 1)
+        XCTAssertEqual(requests.withLock { $0.summaries }, 1)
+        XCTAssertTrue(model.queue.all().isEmpty)
+        XCTAssertEqual(model.snapshot?.visibleToday.count, 3)
+        XCTAssertFalse(model.isRefreshingToday)
+
+        await model.refreshToday()
+        XCTAssertEqual(requests.withLock { $0.summaries }, 2, "A later refresh must still fetch new data")
+        XCTAssertEqual(requests.withLock { $0.completions }, 1)
     }
 }

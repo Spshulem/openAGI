@@ -47,6 +47,7 @@ final class AppModel {
     private(set) var fleetGeneration = 0
 
     private var eventStream: EventStreamController?
+    @ObservationIgnored private var todayRefresh: Task<Void, Never>?
 
     var inboxBadgeCount: Int { pendingActionsCount + clarificationsCount }
 
@@ -101,10 +102,23 @@ final class AppModel {
     }
 
     func refreshToday() async {
-        isRefreshingToday = true
-        defer { isRefreshingToday = false }
-        lastOutcome = await coordinator.refresh()
-        snapshot = store.load()
+        if let todayRefresh {
+            await todayRefresh.value
+            return
+        }
+        // Resume, reconnect and the Today view can refresh together. Share
+        // the whole operation so they cannot send the same queued completion.
+        let refresh = Task {
+            isRefreshingToday = true
+            defer {
+                isRefreshingToday = false
+                todayRefresh = nil
+            }
+            lastOutcome = await coordinator.refresh()
+            snapshot = store.load()
+        }
+        todayRefresh = refresh
+        await refresh.value
     }
 
     // Optimistic: hide the row immediately, queue the completion, then try
