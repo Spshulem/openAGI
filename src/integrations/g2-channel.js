@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { appendJsonLine, ensureDir } from "../file-utils.js";
 import { resolveDataDir } from "../data-dir.js";
 import { nowIso } from "../utils.js";
+import { validateOpenAIKey } from "../provider-credentials.js";
 import { sharedSessionId, sharedThreadHistory } from "../shared-conversations.js";
 import { ownerPrincipal } from "../owner-authority.js";
 
@@ -230,6 +231,7 @@ export class G2Channel {
 
   async transcribe(wav, language, signal) {
     if (!this.apiKey) throw new G2ChannelError("transcription_not_configured", 503, "OpenAI transcription is not configured on OpenAGI.");
+    validateOpenAIKey(this.apiKey, this.baseUrl);
     const form = new FormData();
     form.append("file", new Blob([wav], { type: "audio/wav" }), "question.wav");
     form.append("model", this.model);

@@ -79,7 +79,9 @@ export function saveEnv({ dataDir, values, clear = [] }) {
   // "don't change") — use the `clear` list to remove a key explicitly.
   const existing = parseEnvText(readExistingEnv(dataDir));
   const effective = (key) => clear.includes(key) ? "" : String(values[key] ?? "").trim() || existing[key] || process.env[key] || "";
-  validateOpenAIKey(effective("OPENAI_API_KEY"), effective("OPENAI_BASE_URL"));
+  const changingOpenAI = ["OPENAI_API_KEY", "OPENAI_BASE_URL"].some((key) => String(values[key] ?? "").trim() || clear.includes(key))
+    || ["auto", "openai"].includes(values.OPENAGI_PROVIDER);
+  if (changingOpenAI) validateOpenAIKey(effective("OPENAI_API_KEY"), effective("OPENAI_BASE_URL"));
   const incoming = {};
   for (const key of WIZARD_FIELDS) {
     if (values[key] === undefined || values[key] === null) continue;

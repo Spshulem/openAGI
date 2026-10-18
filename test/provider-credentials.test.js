@@ -7,6 +7,9 @@ import { validateOpenAIKey } from "../src/provider-credentials.js";
 import { OpenAIResponsesProvider } from "../src/model-provider.js";
 import { publicAgentFailure } from "../src/agent-failure.js";
 import { saveEnv, renderWizard } from "../src/setup-wizard.js";
+import { OpenAIEmbedder } from "../src/embeddings.js";
+import { G2Channel } from "../src/integrations/g2-channel.js";
+import { VoiceSession } from "../src/voice/broker.js";
 
 test("known mismatched keys fail before any provider request, including streaming", async () => {
   for (const streaming of [false, true]) {
@@ -17,10 +20,31 @@ test("known mismatched keys fail before any provider request, including streamin
   }
 });
 
+test("pre-model embedding searches reject mismatched credentials before fetching", async (t) => {
+  const previous = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => { requests += 1; throw new Error("must not send"); };
+  t.after(() => { globalThis.fetch = previous; });
+  const embedder = new OpenAIEmbedder({ apiKey: "sk-or-fixture", baseUrl: "https://api.openai.com/v1" });
+  await assert.rejects(embedder.embed("routing search"), { code: "PROVIDER_CONFIG_MISMATCH" });
+  await assert.rejects(embedder.embedMany(["memory", "specialists"]), { code: "PROVIDER_CONFIG_MISMATCH" });
+  assert.equal(requests, 0);
+});
+
+test("speech consumers also refuse a wrong-provider key before opening a connection", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-provider-speech-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let requests = 0;
+  const channel = new G2Channel({ dir, apiKey: "sk-or-fixture", baseUrl: "https://api.openai.com/v1", fetchImpl: async () => { requests += 1; } });
+  await assert.rejects(channel.transcribe(Buffer.alloc(44)), { code: "PROVIDER_CONFIG_MISMATCH" });
+  assert.throws(() => new VoiceSession({ apiKey: "sk-or-fixture", upstreamFactory: () => { requests += 1; } }), { code: "PROVIDER_CONFIG_MISMATCH" });
+  assert.equal(requests, 0);
+});
+
 test("setup rejects a mismatched key without changing the saved file or live credentials", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-provider-setup-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const keys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"];
+  const keys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAGI_COMPUTER_USE"];
   const previous = keys.map((key) => process.env[key]);
   t.after(() => keys.forEach((key, i) => previous[i] === undefined ? delete process.env[key] : process.env[key] = previous[i]));
   process.env.OPENAI_API_KEY = "existing-fixture";
@@ -29,6 +53,11 @@ test("setup rejects a mismatched key without changing the saved file or live cre
   assert.throws(() => saveEnv({ dataDir: dir, values: { OPENAI_API_KEY: "sk-or-fixture", OPENAI_BASE_URL: "https://api.openai.com/v1" } }), { code: "PROVIDER_CONFIG_MISMATCH" });
   assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), "OPENAI_API_KEY=existing-fixture\n");
   assert.equal(process.env.OPENAI_API_KEY, "existing-fixture");
+  fs.writeFileSync(path.join(dir, ".env"), "OPENAI_API_KEY=sk-or-fixture\nOPENAI_BASE_URL=https://api.openai.com/v1\n");
+  process.env.OPENAI_API_KEY = "sk-or-fixture";
+  assert.doesNotThrow(() => saveEnv({ dataDir: dir, values: { OPENAGI_COMPUTER_USE: "1" } }), "unrelated settings remain repairable");
+  assert.equal(process.env.OPENAGI_COMPUTER_USE, "1");
+  assert.throws(() => saveEnv({ dataDir: dir, values: { OPENAGI_PROVIDER: "openai" } }), { code: "PROVIDER_CONFIG_MISMATCH" });
   saveEnv({ dataDir: dir, values: { OPENAI_API_KEY: "sk-or-fixture", OPENAI_BASE_URL: "https://compatible.example/v1", OPENAI_MODEL: "provider/model" } });
   assert.match(fs.readFileSync(path.join(dir, ".env"), "utf8"), /OPENAI_BASE_URL=https:\/\/compatible.example\/v1/);
   assert.equal(process.env.OPENAI_MODEL, "provider/model");
