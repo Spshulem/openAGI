@@ -18,10 +18,14 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      # 27.1 links the native Duo vertical bars and reserved-region APIs.
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27.1'
       - uses: actions/setup-node@v4
         with:
           node-version: '22.21.1'
@@ -38,7 +42,7 @@ jobs:
         working-directory: mobile/ios
         run: |
           xcrun simctl list devices available -j > "$RUNNER_TEMP/openagi-simulators.json"
-          simulator_id=$(python3 -c 'import json,sys; devices=json.load(open(sys.argv[1]))["devices"]; print(next(d["udid"] for runtime, rows in sorted(devices.items(), reverse=True) if ".iOS-" in runtime for d in rows if d.get("isAvailable") and d["name"].startswith("iPhone")))' "$RUNNER_TEMP/openagi-simulators.json")
+          simulator_id=$(python3 -c 'import json,sys; devices=json.load(open(sys.argv[1]))["devices"]; candidates=[d for runtime, rows in devices.items() if ".iOS-27-1" in runtime for d in rows if d.get("isAvailable") and d["name"].startswith("iPhone")]; print(sorted(candidates, key=lambda d: (d["name"] != "iPhone Duo", d["name"]))[0]["udid"])' "$RUNNER_TEMP/openagi-simulators.json")
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \

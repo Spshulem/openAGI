@@ -75,6 +75,7 @@ struct RootTabView: View {
                 SupervisorView()
             }
         }
+        .tabViewStyle(.sidebarAdaptable)
         // Every control that reaches for a system accent (the tab bar's
         // selected state, a Picker's menu label, a Toggle, a Slider) should
         // land on the app's own `live` token rather than the generic system

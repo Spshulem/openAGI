@@ -65,3 +65,29 @@ Live Activity, shared entitlement or real Apple Intelligence acceptance.
 Physical-device checks require a connected, available device and valid
 development signing. Keep the PR draft until the applicable checks above
 have actual evidence; mark an unavailable prerequisite explicitly.
+
+## Foldable and resizable layouts
+
+Target devices are Android foldables generally, including Galaxy Z Fold 8, and iPhone Duo. Sizes are derived from the current app window rather than a model-specific screen resolution.
+
+Android follows the [Android fold-aware guidance](https://developer.android.com/develop/ui/compose/layouts/adaptive/foldables/make-your-app-fold-aware) and [Material adaptive navigation](https://developer.android.com/develop/ui/compose/layouts/adaptive/build-adaptive-navigation). Layout decisions use the current window and separating/occluding folding features, including flat dual-screen hinges. Hinge bounds are translated into each pane's coordinates after navigation and system insets.
+
+| State | Navigation | Content |
+| --- | --- | --- |
+| Compact cover screen or narrow split window | Bottom bar | One destination; chat drafts remain available when reopened |
+| Medium window | Rail when height permits | One readable content column |
+| Expanded flat window | Rail | Current work and a related chat side by side |
+| Book / vertical separating hinge | Rail when space permits | Work and chat on opposite sides of the hinge; RTL keeps the physical gap fixed |
+| Tabletop / horizontal separating hinge | Bottom bar | Work above the fold, related chat below; the Chat tab puts history above and its composer below |
+| Short landscape window | Bottom bar | One pane to preserve usable content height |
+
+Settings and pairing use a single safe region when spanning a hinge. Pairing scrolls on short windows. Resizing retains the selected tab, shared conversations, and saved Android drafts. Supervisor polling continues while its chat is visible alongside it.
+
+iOS follows [Apple's Duo guidance](https://developer.apple.com/design/human-interface-guidelines/designing-for-iphone-duo) and [adaptive layout guidance](https://developer.apple.com/videos/play/tech-talks/111463/). CI builds with the iOS 27.1 SDK so native tabs/toolbars can move to the sides. Adaptive tabs and Supervisor split navigation use system size classes and safe areas. On iOS 27.1, the chat composer uses active division reserved regions and their margins: trailing page in book posture, lower surface in tabletop. Scrolling history remains continuous in book posture. Earlier iOS versions use the same chat in one column. Drafts belong to the shared conversation, and the input keeps its view identity through layout changes.
+
+CI runs Android geometry regressions and four emulator UI tests with synthetic content, covering cover-to-expanded continuity, book, tabletop, and chat draft/focus retention. It publishes synthetic screenshots and instrumentation reports. Injected posture tests verify layouts; they do not prove a manufacturer's physical hinge reporting.
+
+- [ ] On a physical foldable, fold/unfold while reading Tasks, answering Inbox, and typing in both chat threads. Confirm the selected work, drafts, and active replies survive.
+- [ ] In book and tabletop states, confirm no text or controls cross the hinge; repeat in RTL and with a keyboard open.
+- [ ] Resize into narrow split-screen and short landscape windows, then reopen the full display; confirm all destinations and pairing controls remain reachable.
+- [ ] On iPhone Duo, check outer, inner flat, book, tabletop, and 50/50 Split View; verify side controls and camera safe areas, and retain a half-written draft through each transition.

@@ -27,6 +27,8 @@ final class ChatConversation {
     let thread: ConversationThread
     private(set) var messages: [ChatMessage]
     private(set) var isSending = false
+    // Shared by compact and expanded presentations of this conversation.
+    var draft = ""
     private(set) var historyStatus: HistoryStatus = .unknown
 
     private let client: DaemonClient
@@ -178,6 +180,7 @@ final class ChatConversation {
     // On revoke: the cache belongs to the pairing being forgotten, and a
     // reply still streaming must not write it back afterwards.
     func forget() {
+        draft = ""
         forgotten = true
         messages = []
         store.delete()

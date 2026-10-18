@@ -83,6 +83,21 @@ final class SharedConversationClientTests: XCTestCase {
         } catch { XCTFail("unexpected \(error)") }
     }
 
+    @MainActor
+    func testAConversationDraftSurvivesRefreshAndClearsWhenThePairingIsForgotten() async {
+        stub(["/conversations/supervisor/messages": (200, #"{"thread":"supervisor","messages":[],"nextBefore":null}"#)])
+        let conversation = ChatConversation(thread: .supervisor, client: makeClient(),
+            store: ChatHistoryStore(thread: "supervisor", directory: directory), nodeID: "mobile:fixture")
+        conversation.draft = "Synthetic unsent draft"
+
+        await conversation.refresh()
+
+        XCTAssertEqual(conversation.historyStatus, .synced)
+        XCTAssertEqual(conversation.draft, "Synthetic unsent draft")
+        conversation.forget()
+        XCTAssertTrue(conversation.draft.isEmpty)
+    }
+
     func testLifelogMomentsSendsDateAndQuery() async throws {
         stub(["/lifelog/moments": (200, #"{"moments":[{"id":"life-1","title":"Standup"}]}"#)])
         let moments = try await makeClient().lifelogMoments(date: "2026-09-28", query: "  ana  ")

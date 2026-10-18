@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -101,6 +100,7 @@ import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.transport.SseFrame
 import sh.openagi.mobile.ui.components.ConnectionState
+import sh.openagi.mobile.ui.components.FoldAwareChatColumn
 import sh.openagi.mobile.ui.components.ChatTopBar
 import sh.openagi.mobile.ui.components.DownArrowGlyph
 import sh.openagi.mobile.ui.components.SendArrowGlyph
@@ -388,6 +388,7 @@ fun ChatScreen(
     starters: List<String> = emptyList(),
     conversationState: ChatConversationState,
     onBack: (() -> Unit)? = null,
+    onComposerFocusChanged: (Boolean) -> Unit = {},
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
@@ -566,103 +567,107 @@ fun ChatScreen(
     // still scrolls.
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val gutter = chatGutter(maxWidth)
-        Column(modifier = Modifier.fillMaxSize()) {
-            ChatTopBar(
-                title = title,
-                connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
-                onBack = onBack,
-            )
+        FoldAwareChatColumn(messages = {
+            Column(modifier = Modifier.fillMaxSize()) {
+                ChatTopBar(
+                    title = title,
+                    connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
+                    onBack = onBack,
+                )
 
-            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                LazyColumn(
-                    state = listState,
-                    // Room under the last line for the jump button while it shows,
-                    // so it never sits on the end of a reply.
-                    contentPadding = PaddingValues(start = gutter, end = gutter, top = 4.dp, bottom = if (showJump) 12.dp + JUMP_BUTTON_SPACE else 12.dp),
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .nestedScroll(userScroll)
-                        // Touching the conversation, to scroll or to tap, puts the
-                        // keyboard away so there is room to read. Observed on the
-                        // initial pass and never consumed, so scrolling, links,
-                        // long-press copy and "Try again" all still work.
-                        .pointerInput(Unit) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                                focusManager.clearFocus()
-                                keyboard?.hide()
-                            }
-                        },
-                ) {
-                    if (showLoadOlder) {
-                        item(key = "load-older") {
-                            Text(
-                                if (loadingOlder) "Loading earlier messages…" else "Load earlier messages",
-                                style = OpenAGIType.caption,
-                                color = MaterialTheme.colorScheme.primary,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable(enabled = !loadingOlder) {
-                                        // Reading back: stay with the older lines.
-                                        userScrolledAway = true
-                                        conversationState.loadOlder(client)
-                                    }
-                                    .padding(vertical = 12.dp),
-                            )
-                        }
-                    }
-                    itemsIndexed(messages, key = { _, entry -> entry.id }) { index, entry ->
-                        val previous = messages.getOrNull(index - 1)
-                        val showDivider = MessageGrouping.needsTimestampDivider(previous?.timestamp?.epochSecond, entry.timestamp.epochSecond)
-                        val topSpacing = MessageGrouping.spacingBeforeDp(
-                            previousIsUser = previous?.let { it is ChatEntry.User },
-                            previousEpochSeconds = previous?.timestamp?.epochSecond,
-                            currentIsUser = entry is ChatEntry.User,
-                            currentEpochSeconds = entry.timestamp.epochSecond,
-                        )
-                        Column(modifier = Modifier.fillMaxWidth().padding(top = topSpacing.dp)) {
-                            if (showDivider) {
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    LazyColumn(
+                        state = listState,
+                        // Room under the last line for the jump button while it shows,
+                        // so it never sits on the end of a reply.
+                        contentPadding = PaddingValues(start = gutter, end = gutter, top = 4.dp, bottom = if (showJump) 12.dp + JUMP_BUTTON_SPACE else 12.dp),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .nestedScroll(userScroll)
+                            // Touching the conversation, to scroll or to tap, puts the
+                            // keyboard away so there is room to read. Observed on the
+                            // initial pass and never consumed, so scrolling, links,
+                            // long-press copy and "Try again" all still work.
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                    focusManager.clearFocus()
+                                    keyboard?.hide()
+                                }
+                            },
+                    ) {
+                        if (showLoadOlder) {
+                            item(key = "load-older") {
                                 Text(
-                                    formatDividerTime(entry.timestamp),
+                                    if (loadingOlder) "Loading earlier messages…" else "Load earlier messages",
                                     style = OpenAGIType.caption,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = MaterialTheme.colorScheme.primary,
                                     textAlign = TextAlign.Center,
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable(enabled = !loadingOlder) {
+                                            // Reading back: stay with the older lines.
+                                            userScrolledAway = true
+                                            conversationState.loadOlder(client)
+                                        }
+                                        .padding(vertical = 12.dp),
                                 )
                             }
-                            ChatBubble(entry, clipboard = clipboard, onRetry = { failed -> retry(failed) })
                         }
+                        itemsIndexed(messages, key = { _, entry -> entry.id }) { index, entry ->
+                            val previous = messages.getOrNull(index - 1)
+                            val showDivider = MessageGrouping.needsTimestampDivider(previous?.timestamp?.epochSecond, entry.timestamp.epochSecond)
+                            val topSpacing = MessageGrouping.spacingBeforeDp(
+                                previousIsUser = previous?.let { it is ChatEntry.User },
+                                previousEpochSeconds = previous?.timestamp?.epochSecond,
+                                currentIsUser = entry is ChatEntry.User,
+                                currentEpochSeconds = entry.timestamp.epochSecond,
+                            )
+                            Column(modifier = Modifier.fillMaxWidth().padding(top = topSpacing.dp)) {
+                                if (showDivider) {
+                                    Text(
+                                        formatDividerTime(entry.timestamp),
+                                        style = OpenAGIType.caption,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    )
+                                }
+                                ChatBubble(entry, clipboard = clipboard, onRetry = { failed -> retry(failed) })
+                            }
+                        }
+                    }
+
+                    if (messages.isEmpty() && starters.isNotEmpty()) {
+                        StarterChips(
+                            starters = starters,
+                            onPick = { start(it) },
+                            modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
+                        )
+                    }
+
+                    if (showJump) {
+                        JumpToLatestButton(
+                            onClick = {
+                                userScrolledAway = false
+                                followToEnd()
+                            },
+                            modifier = Modifier.align(Alignment.BottomEnd).padding(end = gutter, bottom = 12.dp),
+                        )
                     }
                 }
 
-                if (messages.isEmpty() && starters.isNotEmpty()) {
-                    StarterChips(
-                        starters = starters,
-                        onPick = { start(it) },
-                        modifier = Modifier.align(Alignment.BottomStart).padding(horizontal = gutter, vertical = 12.dp),
-                    )
-                }
-
-                if (showJump) {
-                    JumpToLatestButton(
-                        onClick = {
-                            userScrolledAway = false
-                            followToEnd()
-                        },
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(end = gutter, bottom = 12.dp),
-                    )
-                }
             }
-
+        }, composer = {
             Composer(
                 value = inputText,
                 onValueChange = { inputText = it },
                 enabled = inputText.isNotBlank() && !isStreaming,
                 onSend = { send() },
                 gutter = gutter,
+                onFocus = onComposerFocusChanged,
             )
-        }
+        })
     }
 }
 
@@ -873,7 +878,7 @@ internal fun composerInset(gutter: Dp): Dp = maxOf(0.dp, gutter - 4.dp)
 // never behind it, and keeps the gesture-bar inset. Its hairline turns
 // `live` while the field has focus.
 @Composable
-private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit, gutter: Dp) {
+private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit, gutter: Dp, onFocus: (Boolean) -> Unit = {}) {
     val colors = LocalOpenAGIColors.current
     val ink = MaterialTheme.colorScheme.onBackground
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
@@ -881,7 +886,6 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Bo
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .imePadding()
             .navigationBarsPadding()
             .padding(horizontal = composerInset(gutter), vertical = 8.dp),
         contentAlignment = Alignment.Center,
@@ -903,7 +907,7 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Bo
                     cursorBrush = SolidColor(colors.live),
                     minLines = 1,
                     maxLines = 6,
-                    modifier = Modifier.weight(1f).padding(vertical = 7.dp).onFocusChanged { focused = it.isFocused },
+                    modifier = Modifier.weight(1f).padding(vertical = 7.dp).onFocusChanged { focused = it.isFocused; onFocus(it.isFocused) },
                     decorationBox = { inner ->
                         Box {
                             if (value.isEmpty()) Text("Message OpenAGI", style = OpenAGIType.chatBody, color = muted)

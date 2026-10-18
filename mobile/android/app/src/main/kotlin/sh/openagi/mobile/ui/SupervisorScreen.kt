@@ -131,6 +131,7 @@ fun SupervisorScreen(
     // Held by the Activity so leaving the tab, or the phone folding, returns
     // to the open supervisor conversation rather than the dashboard.
     chatOpenState: MutableState<Boolean> = remember { mutableStateOf(false) },
+    showChatInline: Boolean = false,
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
@@ -388,8 +389,8 @@ fun SupervisorScreen(
         threadNote = null
     }
 
-    LaunchedEffect(resumeSignal, chatOpen) {
-        if (!chatOpen) refresh()
+    LaunchedEffect(resumeSignal, chatOpen, showChatInline) {
+        if (!chatOpen || showChatInline) refresh()
     }
 
     // The sheet's detail: on opening, and again with each fresh state.
@@ -401,8 +402,8 @@ fun SupervisorScreen(
     // 5s while the daemon reports a scan running, so "Scanning…" clears soon
     // after it finishes. Stops while the supervisor chat covers the list.
     val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(lifecycleOwner, chatOpen) {
-        if (chatOpen) return@LaunchedEffect
+    LaunchedEffect(lifecycleOwner, chatOpen, showChatInline) {
+        if (chatOpen && !showChatInline) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 delay(if (state?.running == true) 5_000L else 30_000L)
@@ -412,8 +413,8 @@ fun SupervisorScreen(
     }
 
     // "for 23m" keeps counting between polls: every 30s while on screen.
-    LaunchedEffect(lifecycleOwner, chatOpen) {
-        if (chatOpen) return@LaunchedEffect
+    LaunchedEffect(lifecycleOwner, chatOpen, showChatInline) {
+        if (chatOpen && !showChatInline) return@LaunchedEffect
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 now = Instant.now()
@@ -424,7 +425,7 @@ fun SupervisorScreen(
 
     LaunchedEffect(chatOpen) { if (chatOpen) { voicePermission.cancel(); voice.stop() } }
 
-    if (chatOpen) {
+    if (chatOpen && !showChatInline) {
         BackHandler { chatOpen = false }
         // The chat's own one-row top bar carries the back arrow.
         ChatScreen(

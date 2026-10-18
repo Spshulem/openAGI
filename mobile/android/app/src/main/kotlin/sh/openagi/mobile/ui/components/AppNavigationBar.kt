@@ -6,8 +6,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import sh.openagi.mobile.ui.theme.LocalOpenAGIColors
@@ -28,7 +32,7 @@ enum class AppTab(val label: String, val icon: NavIcon) {
 @Composable
 fun AppNavigationBar(selected: AppTab, inboxBadgeCount: Int, onSelect: (AppTab) -> Unit) {
     val colors = LocalOpenAGIColors.current
-    NavigationBar(containerColor = MaterialTheme.colorScheme.surface, tonalElevation = 0.dp) {
+    NavigationBar(modifier = Modifier.testTag("bottom-navigation"), containerColor = MaterialTheme.colorScheme.surface, tonalElevation = 0.dp) {
         AppTab.entries.forEach { tab ->
             val isSelected = tab == selected
             val tint = if (isSelected) colors.live else MaterialTheme.colorScheme.onSurfaceVariant
@@ -54,6 +58,28 @@ fun AppNavigationBar(selected: AppTab, inboxBadgeCount: Int, onSelect: (AppTab) 
                     unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
                     indicatorColor = MaterialTheme.colorScheme.surface,
                 ),
+            )
+        }
+    }
+}
+
+@Composable
+fun AppNavigationRail(selected: AppTab, inboxBadgeCount: Int, onSelect: (AppTab) -> Unit) {
+    val colors = LocalOpenAGIColors.current
+    NavigationRail(modifier = Modifier.testTag("navigation-rail"), containerColor = MaterialTheme.colorScheme.surface) {
+        AppTab.entries.forEach { tab ->
+            val tint = if (tab == selected) colors.live else MaterialTheme.colorScheme.onSurfaceVariant
+            NavigationRailItem(
+                selected = tab == selected,
+                onClick = { onSelect(tab) },
+                icon = {
+                    if (tab == AppTab.INBOX && inboxBadgeCount > 0) {
+                        BadgedBox(badge = { Badge(containerColor = colors.alert) { Text("$inboxBadgeCount") } }) {
+                            NavIconGlyph(tab.icon, tint)
+                        }
+                    } else NavIconGlyph(tab.icon, tint)
+                },
+                label = { Text(tab.label, style = OpenAGIType.caption, maxLines = 1, overflow = TextOverflow.Ellipsis) },
             )
         }
     }

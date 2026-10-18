@@ -43,25 +43,50 @@ struct ChatConversationView: View {
     var starters: [String] = []
     var placeholder = "Message OpenAGI"
     var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
+    var onComposerFocusChanged: (Bool) -> Void = { _ in }
 
-    @State private var draft = ""
     @State private var isPinnedToBottom = true
+    @FocusState private var composerFocused: Bool
+    @Environment(\.layoutDirection) private var layoutDirection
 
     private var messages: [ChatMessage] { conversation.messages }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            GeometryReader { geometry in
-                messageScroll(width: geometry.size.width)
+        GeometryReader { geometry in
+            ConversationLayout(division: division(in: geometry), rightToLeft: layoutDirection == .rightToLeft) {
+                VStack(spacing: 0) {
+                    header
+                    GeometryReader { messagesGeometry in
+                        messageScroll(width: messagesGeometry.size.width)
+                    }
+                }
+                .frame(maxWidth: 600)
+                .frame(maxWidth: .infinity)
+                inputBar
+                    .frame(maxWidth: 600)
+                    .frame(maxWidth: .infinity)
             }
-            inputBar
         }
         .background(Theme.canvas)
+        .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
         .task { await conversation.refresh() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await conversation.refresh() } }
         }
+    }
+
+    private func division(in geometry: GeometryProxy) -> CGRect? {
+        if #available(iOS 27.1, *) {
+            return geometry.reservedRegions(kind: .division, layoutDirectionBehavior: .fixed).first.map { region in
+                let frame = region.frame
+                let left = layoutDirection == .rightToLeft ? region.margins.trailing : region.margins.leading
+                return CGRect(x: frame.minX - left,
+                              y: frame.minY - region.margins.top,
+                              width: frame.width + region.margins.leading + region.margins.trailing,
+                              height: frame.height + region.margins.top + region.margins.bottom)
+            }
+        }
+        return nil
     }
 
     private var header: some View {
@@ -206,8 +231,10 @@ struct ChatConversationView: View {
     }
 
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: Theme.Spacing.x2) {
-            TextField(placeholder, text: $draft, axis: .vertical)
+        @Bindable var conversation = conversation
+        return HStack(alignment: .bottom, spacing: Theme.Spacing.x2) {
+            TextField(placeholder, text: $conversation.draft, axis: .vertical)
+                .focused($composerFocused)
                 .font(Theme.Typography.body)
                 .lineLimit(1...5)
                 .padding(.horizontal, Theme.Spacing.x3)
@@ -215,8 +242,8 @@ struct ChatConversationView: View {
                 .background(Theme.surface)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.rowGroupRadius, style: .continuous))
             Button {
-                let text = draft
-                draft = ""
+                let text = conversation.draft
+                conversation.draft = ""
                 isPinnedToBottom = true
                 Task { await conversation.send(text) }
             } label: {
@@ -235,7 +262,7 @@ struct ChatConversationView: View {
     }
 
     private var canSend: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !conversation.isSending
+        !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !conversation.isSending
     }
 }
 

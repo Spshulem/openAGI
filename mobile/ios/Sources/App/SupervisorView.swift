@@ -9,6 +9,7 @@ import SwiftUI
 // SupervisorScreen.kt, wording included.
 struct SupervisorView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @State private var state: FleetState?
     @State private var loadError: DaemonError?
@@ -27,7 +28,7 @@ struct SupervisorView: View {
     // another thread opened while a nudge relays, and the result is not theirs.
     @State private var actionNoteThread: String?
     @State private var openThread: FleetThread?
-    @State private var chatOpen = false
+    @State private var compactColumn = NavigationSplitViewColumn.sidebar
     // Responses can land out of order: a 30s poll sent while an answer was
     // relaying may return after it with the state from before. A poll is
     // numbered when sent, a mutation's reply when it arrives, and nothing
@@ -61,61 +62,73 @@ struct SupervisorView: View {
     }
 
     private var fleetBody: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Spacing.x6) {
-                    ScreenHeader(title: "Supervisor", host: model.hostLabel,
-                                 ageMinutes: syncedAgeMinutes, refreshFailed: lastLoadFailed)
-                        .padding(.horizontal, -Theme.gutter)
-                    content
-                }
-                .padding(.horizontal, Theme.gutter)
-                .padding(.bottom, Theme.Spacing.x6)
+        // Native split navigation follows Duo's size classes and reserved
+        // regions, while keeping the same hierarchy on the cover display.
+        NavigationSplitView(preferredCompactColumn: $compactColumn) {
+            fleetContent
+                .navigationSplitViewColumnWidth(min: 280, ideal: 420, max: 600)
+        } detail: {
+            supervisorConversation
+        }
+        .navigationSplitViewStyle(.balanced)
+    }
+
+    private var supervisorConversation: some View {
+        ChatConversationView(
+            conversation: model.supervisorChat,
+            title: "Supervisor",
+            starters: SupervisorFormat.starters,
+            placeholder: "Ask the supervisor",
+            emptyDetail: "Ask about any coding thread it watches.",
+            onComposerFocusChanged: { if $0 { compactColumn = .detail } }
+        )
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var fleetContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Spacing.x6) {
+                ScreenHeader(title: "Supervisor", host: model.hostLabel,
+                             ageMinutes: syncedAgeMinutes, refreshFailed: lastLoadFailed)
+                    .padding(.horizontal, -Theme.gutter)
+                content
             }
-            .background(Theme.canvas)
-            .refreshable { await refresh() }
-            .task(id: model.fleetGeneration) { await refresh() }
-            // Every 30s while this screen is showing; every 5s while the
-            // daemon reports a scan running, so "Scanning…" clears soon after
-            // it finishes. Cancelled with the view (another tab, or the
-            // supervisor chat pushed over it).
-            .task(id: chatOpen) {
-                guard !chatOpen else { return }
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(state?.running == true ? 5 : 30))
-                    if Task.isCancelled { break }
-                    await refresh()
-                }
+            .padding(.horizontal, Theme.gutter)
+            .padding(.bottom, Theme.Spacing.x6)
+        }
+        .background(Theme.canvas)
+        .refreshable { await refresh() }
+        .task(id: model.fleetGeneration) { await refresh() }
+        // Every 30s while this screen is showing; every 5s while the
+        // daemon reports a scan running, so "Scanning…" clears soon after
+        // it finishes. Cancelled with the view (another tab, or the
+        // supervisor chat pushed over it).
+        .task(id: compactColumn == .detail && horizontalSizeClass != .regular) {
+            guard compactColumn != .detail || horizontalSizeClass == .regular else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(state?.running == true ? 5 : 30))
+                if Task.isCancelled { break }
+                await refresh()
             }
-            .navigationDestination(isPresented: $chatOpen) {
-                ChatConversationView(
-                    conversation: model.supervisorChat,
-                    title: "Supervisor",
-                    starters: SupervisorFormat.starters,
-                    placeholder: "Ask the supervisor",
-                    emptyDetail: "Ask about any coding thread it watches."
-                )
-                .navigationBarTitleDisplayMode(.inline)
-            }
-            .sheet(item: $openThread) { opened in
-                // Follow the thread through refreshes; if a scan drops it,
-                // keep showing what was last known rather than yanking it away.
-                let thread = state?.snapshot?.threads.first(where: { $0.key == opened.key }) ?? opened
-                ThreadDetailSheet(
-                    thread: thread,
-                    proposed: state?.mode == FleetMode.propose.rawValue
-                        ? SupervisorFormat.proposed(for: thread, in: state?.actions ?? []) : [],
-                    busyActionID: busyActionID,
-                    actionNote: actionNoteThread == thread.key ? actionNote : nil,
-                    onSend: { action in Task { await send(action) } }
-                )
-            }
-            .alert("Turn on Auto?", isPresented: $confirmAuto) {
-                Button("Turn on Auto") { Task { await setMode(.auto) } }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("In Auto the supervisor sends preset nudges to your agents by itself, a few per scan, without asking first. Observe and Propose never send on their own.")
-            }
+        }
+        .sheet(item: $openThread) { opened in
+            // Follow the thread through refreshes; if a scan drops it,
+            // keep showing what was last known rather than yanking it away.
+            let thread = state?.snapshot?.threads.first(where: { $0.key == opened.key }) ?? opened
+            ThreadDetailSheet(
+                thread: thread,
+                proposed: state?.mode == FleetMode.propose.rawValue
+                    ? SupervisorFormat.proposed(for: thread, in: state?.actions ?? []) : [],
+                busyActionID: busyActionID,
+                actionNote: actionNoteThread == thread.key ? actionNote : nil,
+                onSend: { action in Task { await send(action) } }
+            )
+        }
+        .alert("Turn on Auto?", isPresented: $confirmAuto) {
+            Button("Turn on Auto") { Task { await setMode(.auto) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("In Auto the supervisor sends preset nudges to your agents by itself, a few per scan, without asking first. Observe and Propose never send on their own.")
         }
     }
 
@@ -291,7 +304,7 @@ struct SupervisorView: View {
                 CompactButton(title: isScanning ? "Scanning…" : "Scan now", filled: false, enabled: !isScanning, stretches: true) {
                     Task { await scan() }
                 }
-                CompactButton(title: "Ask supervisor", filled: true, stretches: true) { chatOpen = true }
+                CompactButton(title: "Ask supervisor", filled: true, stretches: true) { compactColumn = .detail }
             }
             .padding(.top, Theme.Spacing.x1)
         }
