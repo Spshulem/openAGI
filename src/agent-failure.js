@@ -1,6 +1,8 @@
 const PUBLIC_FAILURES = Object.freeze({
   budget: "Daily budget exceeded",
   "provider-auth": "The model provider needs attention. Check its API key in Settings.",
+  "provider-config": "This key belongs to OpenRouter. Set a Responses-compatible base URL and its model in setup, or use an OpenAI API key.",
+  "provider-region": "The model provider does not support requests from your region. Choose a provider available in your region in Settings.",
   "provider-rate-limit": "The model provider is temporarily rate-limited. Try again shortly.",
   "provider-timeout": "The model provider timed out. Check its connection and try again.",
   "provider-empty-response": "The model returned no answer after retrying. Please try again.",
@@ -19,6 +21,10 @@ export function classifyAgentFailure(error) {
   const message = safeErrorMessage(error);
   const detail = `${code} ${name} ${message}`;
 
+  if (code === "PROVIDER_CONFIG_MISMATCH") return { code: "provider-config", message: PUBLIC_FAILURES["provider-config"] };
+  if (/unsupported_country_region_territory|country,? region,? or territory not supported|(?:country|region|territory).{0,40}(?:not supported|unsupported)/i.test(detail)) {
+    return { code: "provider-region", message: PUBLIC_FAILURES["provider-region"] };
+  }
   if (code === "BUDGET_EXCEEDED" || /\b(?:daily )?budget\b|spend cap/i.test(detail)) {
     return { code: "budget", message: PUBLIC_FAILURES.budget };
   }

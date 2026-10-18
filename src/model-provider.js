@@ -4,6 +4,7 @@ import { OnDeviceModelProvider } from "./on-device-provider.js";
 import { OfflineFallbackProvider } from "./offline-fallback-provider.js";
 import { ChatGPTPlanProvider } from "./chatgpt-provider.js";
 import { isMobileProfile } from "./mobile-profile.js";
+import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Provider streams are remote input. Normal model responses are far smaller
 // than these ceilings, but explicit limits keep a broken or hostile compatible
@@ -110,6 +111,7 @@ export class OpenAIResponsesProvider {
     const model = this.resolveModel({ model: modelOverride, tier, task });
     let maxToolHops = boundedToolHops(maxToolHopsOverride, this.maxToolHops);
     if (!this.apiKey) throw new Error("OPENAI_API_KEY is not configured.");
+    validateOpenAIKey(this.apiKey, this.baseUrl);
     this.budgetGuard?.check();
 
     // Stateless tool loop — accumulates the full conversation in `input` each

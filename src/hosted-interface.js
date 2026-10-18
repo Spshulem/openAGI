@@ -1038,7 +1038,12 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "POST" && pathname === "/setup/save") {
         const body = await readJson(req);
         const dataDir = resolveDataDir();
-        const result = saveEnv({ dataDir, values: body });
+        let result;
+        try { result = saveEnv({ dataDir, values: body }); }
+        catch (error) {
+          if (error?.code === "PROVIDER_CONFIG_MISMATCH") return sendJson(res, 400, messageFailure(error, null));
+          throw error;
+        }
         try {
           const { createModelProvider } = await import("./model-provider.js");
           if (runtime.agentHost) {

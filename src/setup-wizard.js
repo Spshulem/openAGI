@@ -5,6 +5,7 @@ import { generateToken } from "./auth.js";
 import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
 import { resolveDataDir } from "./data-dir.js";
 import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
+import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
 // configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
@@ -14,7 +15,7 @@ import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
 const WIZARD_FIELDS = [
   "OPENAGI_PROVIDER",
   "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
-  "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT",
+  "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT", "OPENAI_BASE_URL",
   "OPENAGI_AUTH_TOKEN",
   "SENDBLUE_API_KEY", "SENDBLUE_API_SECRET", "SENDBLUE_FROM_NUMBER", "SENDBLUE_WEBHOOK_SECRET",
   ...MESSAGING_CONFIG_KEYS,
@@ -77,6 +78,8 @@ export function saveEnv({ dataDir, values, clear = [] }) {
   // hand-edits). Empty-string values are SKIPPED (wizard's blank-field =
   // "don't change") — use the `clear` list to remove a key explicitly.
   const existing = parseEnvText(readExistingEnv(dataDir));
+  const effective = (key) => clear.includes(key) ? "" : String(values[key] ?? "").trim() || existing[key] || process.env[key] || "";
+  validateOpenAIKey(effective("OPENAI_API_KEY"), effective("OPENAI_BASE_URL"));
   const incoming = {};
   for (const key of WIZARD_FIELDS) {
     if (values[key] === undefined || values[key] === null) continue;
@@ -239,12 +242,15 @@ export function renderWizard({ proposedToken, existingEnv = {} } = {}) {
       <label style="margin-top:8px;">Model</label>
       <input type="text" name="ANTHROPIC_MODEL" value="${val("ANTHROPIC_MODEL", "claude-sonnet-4-6")}">
 
-      <h3 style="margin-top:14px;">OpenAI / ChatGPT key</h3>
+      <h3 style="margin-top:14px;">OpenAI API key</h3>
       <p>Get one at <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">platform.openai.com</a>. Works with Zero Data Retention orgs.</p>
       <label>OPENAI_API_KEY${saved("OPENAI_API_KEY")}</label>
       <input type="password" name="OPENAI_API_KEY" placeholder="sk-proj-…" autocomplete="off">
       <label style="margin-top:8px;">Model</label>
       <input type="text" name="OPENAI_MODEL" value="${val("OPENAI_MODEL", "gpt-5")}">
+      <label style="margin-top:8px;">Responses-compatible base URL</label>
+      <input type="url" name="OPENAI_BASE_URL" value="${val("OPENAI_BASE_URL", "https://api.openai.com/v1")}">
+      <p>For a compatible service, use that service's key, base URL and model name together. Region restrictions require a provider available in your region.</p>
     </div>
 
     <div class="step">
