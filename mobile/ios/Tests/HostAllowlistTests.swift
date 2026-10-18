@@ -89,7 +89,9 @@ final class HostAllowlistTests: XCTestCase {
     // Phone-only mode: the embedded daemon's own port, over http, on
     // 127.0.0.1 only -- and only while it is running.
     func testEmbeddedDaemonPortIsTheOnlyLoopbackExemption() throws {
-        defer { EmbeddedLoopback.port = nil }
+        let previousPort = EmbeddedLoopback.port
+        defer { EmbeddedLoopback.port = previousPort }
+        EmbeddedLoopback.port = nil
         XCTAssertThrowsError(try HostAllowlist.validate(URL(string: "http://127.0.0.1:43210")!))
         EmbeddedLoopback.port = 43210
         XCTAssertEqual(try HostAllowlist.validate(URL(string: "http://127.0.0.1:43210/x")!).absoluteString, "http://127.0.0.1:43210")
