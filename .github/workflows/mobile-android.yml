@@ -77,8 +77,7 @@ jobs:
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -skin 2208x1840
           script: |
-            cd mobile/android
-            ./gradlew --no-daemon --max-workers=2 connectedDebugAndroidTest
+            ./mobile/android/gradlew -p mobile/android --no-daemon --max-workers=2 connectedDebugAndroidTest
             adb pull /sdcard/Android/data/sh.openagi.mobile/files/foldable-screenshots "$RUNNER_TEMP/foldable-screenshots"
       - uses: actions/upload-artifact@v4
         if: always()
