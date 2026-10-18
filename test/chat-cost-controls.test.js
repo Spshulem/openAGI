@@ -427,6 +427,53 @@ test("spend stops retain bounded arguments and results without screenshot payloa
   assert.ok(text.length < 1500);
 });
 
+test("both providers omit tool-declared private input and echoed results from saved stop receipts", async () => {
+  for (const Provider of [OpenAIResponsesProvider, AnthropicProvider]) {
+    const privateText = "private-typed-fixture-value";
+    const provider = new Provider({ apiKey: "test", turnUsdLimit: 2 });
+    provider.postResponses = provider.postMessages = async () => ({ id: "r1",
+      output: [{ type: "function_call", call_id: "t1", name: "computer_type", arguments: JSON.stringify({ text: privateText }) }],
+      content: [{ type: "tool_use", id: "t1", name: "computer_type", input: { text: privateText } }] });
+    const toolRegistry = {
+      get: () => ({ metadata: { sensitiveArguments: ["text"] } }),
+      invoke: async (_name, args, context) => {
+        context.__turnSpend.usd = 2; // A nested model/tool spends the remainder.
+        return { ok: true, result: { echoedText: args.text } };
+      }
+    };
+    const result = await provider.generate({ input: "type it", instructions: "short", turnContext: "", agent, toolRegistry });
+    assert.equal(result.stoppedAtUsdLimit, true);
+    assert.match(result.text, /computer_type \(ok\)/);
+    assert.match(result.text, /omitted: sensitive tool input/);
+    assert.ok(!result.text.includes(privateText));
+  }
+});
+
+test("input-limit stops preserve completed side effects in later hops and final summaries", async () => {
+  for (const Provider of [OpenAIResponsesProvider, AnthropicProvider]) {
+    for (const maxToolHops of [1, 3]) {
+      const provider = new Provider({ apiKey: "test", maxInputTokens: 200, maxToolHops, turnUsdLimit: 0 });
+      let paidCalls = 0;
+      let executions = 0;
+      provider.postResponses = provider.postMessages = async () => {
+        paidCalls += 1;
+        return { id: "r1", output: [{ type: "function_call", call_id: "t1", name: "send_message", arguments: "{}" }],
+          content: [{ type: "tool_use", id: "t1", name: "send_message", input: {} }] };
+      };
+      const toolRegistry = { invoke: async () => { executions += 1; return { ok: true, result: { id: "sent-receipt", data: "x".repeat(3000) } }; } };
+      const result = await provider.generate({ input: "send it", instructions: "short", turnContext: "", agent, toolRegistry });
+      assert.equal(result.stoppedAtInputLimit, true);
+      assert.equal(paidCalls, 1, "the over-limit next request is never paid for");
+      assert.equal(executions, 1);
+      assert.equal(result.toolCalls.length, 1);
+      assert.match(result.text, /send_message \(ok\)/);
+      assert.match(result.text, /sent-receipt/);
+      assert.match(result.text, /do not repeat successful side effects/);
+      assert.ok(result.text.length <= 3800);
+    }
+  }
+});
+
 test("spend-stop receipts omit configuration credentials and fit the delivered message limit", () => {
   const credential = "credential-fixture-must-stay-private";
   const text = turnSpendStopMessage(2.5, 2, { toolCalls: Array.from({ length: 12 }, (_, i) => ({
