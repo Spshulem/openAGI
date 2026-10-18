@@ -49,7 +49,7 @@ export class OpenAIEmbedder {
   constructor(options = {}) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
     this.model = options.model ?? process.env.OPENAGI_EMBED_MODEL ?? "text-embedding-3-small";
-    this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+    this.baseUrl = String(options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
     this.dim = options.dim ?? 1536;
     this.budgetGuard = options.budgetGuard ?? null;
     this.timeoutMs = options.timeoutMs ?? 30000;

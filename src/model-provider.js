@@ -83,7 +83,7 @@ export class OpenAIResponsesProvider {
     // because sending `reasoning` to a non-reasoning model is a 400 — an opt-in
     // key must never become a floor that breaks every other model in the table.
     this.reasoningEffort = options.reasoningEffort ?? process.env.OPENAI_REASONING_EFFORT ?? null;
-    this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+    this.baseUrl = String(options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
     this.timeoutMs = options.timeoutMs ?? 120000;
     this.maxToolHops = options.maxToolHops ?? (Number(process.env.OPENAGI_MAX_TOOL_HOPS) || 6);
     this.budgetGuard = options.budgetGuard ?? null;

@@ -65,9 +65,27 @@ test("setup rejects a mismatched key without changing the saved file or live cre
 });
 
 test("explicit compatible endpoints and ordinary OpenAI keys retain their existing path", () => {
+  assert.throws(() => validateOpenAIKey("sk-or-fixture", "https://api.openai.com./v1"), { code: "PROVIDER_CONFIG_MISMATCH" });
   assert.doesNotThrow(() => validateOpenAIKey("sk-or-fixture", "https://compatible.example/v1"));
   assert.doesNotThrow(() => validateOpenAIKey("fixture-openai", "https://api.openai.com/v1"));
   assert.match(renderWizard({ existingEnv: {} }), /name="OPENAI_BASE_URL"/);
+});
+
+test("custom base URLs with trailing slashes produce routable model and embedding requests", async (t) => {
+  const previous = globalThis.fetch;
+  t.after(() => { globalThis.fetch = previous; });
+  const urls = [];
+  const fetchImpl = async (url) => {
+    urls.push(url);
+    return { ok: true, json: async () => url.endsWith("/embeddings")
+      ? { data: [{ embedding: [1, 0] }] } : { id: "response", output_text: "done", output: [] } };
+  };
+  globalThis.fetch = fetchImpl;
+  const options = { apiKey: "fixture", baseUrl: "https://compatible.example/v1///", fetchImpl };
+  const provider = new OpenAIResponsesProvider(options);
+  assert.equal((await provider.generate({ input: "hello", instructions: "short", turnContext: "", agent: { name: "Test" } })).text, "done");
+  assert.deepEqual(await new OpenAIEmbedder(options).embed("memory"), [1, 0]);
+  assert.deepEqual(urls, ["https://compatible.example/v1/responses", "https://compatible.example/v1/embeddings"]);
 });
 
 test("region restrictions get an actionable public error without echoing provider secrets", () => {
