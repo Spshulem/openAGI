@@ -220,7 +220,7 @@ For Docker, run [Watchtower](https://containrrr.dev/watchtower/) alongside the O
 | **MCP execution** | Register stdio or HTTP+OAuth MCP servers in `.openagi/mcp.json` (or via the UI). On connect, every tool the server advertises becomes a callable agent tool (`mcp_<server>_<tool>`). |
 | **Cron prompts** | The agent can call `schedule_message({prompt, delaySeconds | intervalSeconds | dailyAt, channel, target})`. When the job fires, the daemon runs the prompt and routes the reply to the originating channel (Telegram, local). |
 | **Telegram** | Webhook (`/channels/telegram/webhook`) or long polling (`TELEGRAM_POLLING=1`). |
-| **Partner sharing** | `/connections` — dedicated Sendblue iMessage/SMS number, approved contacts/groups, isolated conversation memory. |
+| **Partner sharing** | `/connections` — dedicated Sendblue, Linq, Twilio, Telnyx or Surge number; approved contacts, Sendblue/Linq groups, isolated conversation memory. |
 | **Gmail + Google Calendar** | `/connections` — Google OAuth, inbox search/read, approved drafts/sends and event creation. |
 | **Pebble Index** | Signed multipart `/webhooks/pebble` — voice memos into memory and reminder tasks. |
 | **On-demand subagents** | `run_subagent` — bounded read-only delegation; use existing scheduled prompts for daily routines. |
@@ -472,6 +472,10 @@ Additional defenses:
 | POST   | `/observations`                   | Activity batch from Mac capture        |
 | GET    | `/observations/search`            | Full-text search of observed activity  |
 | POST   | `/channels/sendblue/webhook`      | Approved partner iMessage / SMS         |
+| POST   | `/channels/linq/webhook`          | Signed Linq V3 partner text             |
+| POST   | `/channels/twilio/webhook`        | Signed form-encoded partner SMS         |
+| POST   | `/channels/telnyx/webhook`        | Signed Telnyx partner text              |
+| POST   | `/channels/surge/webhook`         | Signed Surge partner text               |
 | POST   | `/channels/telegram/webhook`      | Telegram inbound                       |
 | POST   | `/webhooks/pebble`                | Signed Index 01 voice-memo ingestion    |
 | POST   | `/tick`                           | Manually run due cron jobs             |

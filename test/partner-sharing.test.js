@@ -71,6 +71,34 @@ test("turns serialize per conversation and revocation stops queued turns", async
   assert.equal(calls, 1);
 });
 
+test("provider namespaces isolate DMs and identical group IDs while legacy Sendblue facts remain readable", async t => {
+  const { sharing, dir } = fixture(t, { async generate(args) {
+    if (args.input === "save") await args.toolRegistry.invoke("remember", { content: `fact from ${args.context.channel}` }, args.context);
+    return { text: args.memoryHits.map(hit => hit.item.content).join() || "empty" };
+  } });
+  const message = { number: "+15555550101", text: "save" };
+  await sharing.respond(message);
+  for (const provider of ["linq", "twilio", "telnyx", "surge"]) {
+    assert.equal((await sharing.respond({ ...message, text: "recall", provider })).reply, "empty");
+    await sharing.respond({ ...message, provider });
+  }
+  sharing.addGroup({ groupId: "same-id" });
+  sharing.addGroup({ groupId: "same-id", provider: "linq" });
+  await sharing.respond({ ...message, groupId: "same-id" });
+  assert.equal((await sharing.respond({ ...message, groupId: "same-id", provider: "linq", text: "recall" })).reply, "empty");
+  sharing.revoke({ groupId: "same-id", provider: "linq" });
+  assert.equal(sharing.canReceive(message.number, "same-id", "sendblue"), true);
+  assert.equal(sharing.canReceive(message.number, "same-id", "linq"), false);
+  const restarted = new PartnerSharing({ dir, modelProvider: sharing.modelProvider });
+  assert.match((await restarted.respond({ ...message, text: "recall" })).reply, /fact from sendblue/);
+  assert.equal((await restarted.respond({ ...message, provider: "other" })).ignored, true);
+  assert.throws(() => sharing.addGroup({ groupId: "unsupported", provider: "twilio" }));
+  // Existing installations have groups with no provider field.
+  sharing.config.groups.push({ groupId: "legacy", name: "Legacy" });
+  assert.equal(sharing.canSend("legacy", true), true);
+  assert.equal(sharing.canSend("legacy", true, "linq"), false);
+});
+
 test("partner turns follow the owner's current provider and budget after a switch", async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "partner-provider-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

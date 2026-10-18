@@ -4,6 +4,7 @@ import { ensureDir, writeTextAtomic } from "./file-utils.js";
 import { generateToken } from "./auth.js";
 import { MCP_CATALOG, CATEGORIES } from "./mcp-catalog.js";
 import { resolveDataDir } from "./data-dir.js";
+import { MESSAGING_CONFIG_KEYS } from "./integrations/messaging-config.js";
 
 // Cross-platform first-run setup wizard. When the daemon detects no API keys
 // configured (no ANTHROPIC_API_KEY, no OPENAI_API_KEY) AND no auth token, every
@@ -16,6 +17,7 @@ const WIZARD_FIELDS = [
   "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_REASONING_EFFORT",
   "OPENAGI_AUTH_TOKEN",
   "SENDBLUE_API_KEY", "SENDBLUE_API_SECRET", "SENDBLUE_FROM_NUMBER", "SENDBLUE_WEBHOOK_SECRET",
+  ...MESSAGING_CONFIG_KEYS,
   "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "PEBBLE_WEBHOOK_SECRET",
   "VOCALEO_API_KEY", "VOCALEO_ACCOUNT_ID", "VOCALEO_PHONE_NUMBER",
   "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_POLLING",

@@ -119,6 +119,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           telegramToken: options.telegramToken,
           env: options.companionEnv,
           sendblueFetch: options.sendblueFetch,
+          messagingFetch: options.messagingFetch,
           nodeRegistry
         })
       : null);
@@ -2629,6 +2630,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const integrations = [
           { id: "google", name: "Gmail & Google Calendar", description: "Read mail and events; authorize drafts, sends and invitations.", paths: [{ kind: "connection", label: "Google OAuth", configured: Boolean(runtime.google?.status().configured), detail: "Connect your account and manage its consent in Connections." }] },
           { id: "sendblue", name: "Partner messaging", description: "Dedicated agent iMessage/SMS number with separate partner and group memory.", paths: [{ kind: "connection", label: "Sendblue", configured: Boolean(channels?.sendblue?.status().configured), detail: "Configure the number, webhook and approved contacts in Connections." }] },
+          ...["linq", "twilio", "telnyx", "surge"].map(id => ({ id, name: `${id[0].toUpperCase()}${id.slice(1)} partner messaging`, description: "Dedicated agent number with isolated partner conversations.", paths: [{ kind: "connection", label: id, configured: Boolean(channels?.[id]?.status().configured), detail: "Configure credentials, signed webhook and approved contacts in Connections." }] })),
           { id: "pebble-index", name: "Pebble Index", description: "Signed voice memos into memory and reminder tasks.", paths: [{ kind: "connection", label: "Index 01 webhook", configured: Boolean(process.env.PEBBLE_WEBHOOK_SECRET), detail: "Configure the signed transcription webhook in Connections." }] },
           {
             id: "linear",
@@ -3591,7 +3593,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         if (heartbeatHandle) clearInterval(heartbeatHandle);
         for (const client of sseClients) try { client.end(); } catch { /* ignore */ }
         sseClients.clear();
-        channels?.stop?.();
+        const channelsStopped = channels?.stop?.();
         runtime.codingSupervisor?.stop();
         codingNode?.stop?.();
         selfFixNode?.stop?.();
@@ -3599,7 +3601,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         imessageBridgeRuntime?.stop?.();
         runtime.tunnelWatcher?.stop?.();
         runtime.mcp?.disconnectAll?.().catch(() => {});
-        Promise.resolve(computerExecutor?.close?.())
+        Promise.resolve(channelsStopped)
+          .then(() => computerExecutor?.close?.())
           .catch(() => {})
           .then(() => stopNodeControlWorker())
           .catch(() => {})

@@ -536,11 +536,11 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "send_message",
-    description: "Send a message via telegram, local, sendblue or sendblue-group. Sendblue recipients/groups must be owner-approved in Connections. API acceptance does not prove device delivery.",
+    description: "Send text via telegram, local, sendblue, linq, twilio, telnyx or surge. Sendblue/Linq groups use sendblue-group/linq-group. Phone recipients and groups must be owner-approved in Connections. Select one provider; API acceptance does not prove device delivery.",
     parameters: {
       type: "object",
       properties: {
-        channel: { type: "string", enum: ["telegram", "local", "sendblue", "sendblue-group"], description: "Channel to deliver via." },
+        channel: { type: "string", enum: ["telegram", "local", "sendblue", "sendblue-group", "linq", "linq-group", "twilio", "telnyx", "surge"], description: "Channel to deliver via." },
         target: { type: "string", description: "Channel target — chat id for Telegram." },
         text: { type: "string", description: "Message body. Keep it short and useful." }
       },

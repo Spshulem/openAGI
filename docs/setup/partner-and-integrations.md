@@ -4,6 +4,20 @@ Open **Channels → Connections** (or `/connections`) on the main daemon. All co
 
 ## Give the agent its own number
 
+Connections supports **Sendblue, Linq, Twilio, Telnyx and Surge**. Choose a provider, provision a number in its dashboard, set a stable public HTTPS `OPENAGI_PUBLIC_URL`, keep `OPENAGI_AUTH_TOKEN` enabled, and restart the daemon after changing the public origin. OpenAGI does not buy numbers or register carrier campaigns. Availability, carrier registration, opt-outs, pricing and delivery remain with the provider.
+
+| Provider | Supported messaging | Credentials in Connections | Inbound webhook |
+| --- | --- | --- | --- |
+| Sendblue | iMessage/SMS text and approved groups | API key, API secret, agent number, receive-webhook secret | `/channels/sendblue/webhook` |
+| [Linq V3](https://docs.linqapp.com/channel/imessage/getting-started/quickstart/) | iMessage/SMS/RCS text and approved groups | API token, agent number, `whsec_` signing secret | `/channels/linq/webhook` |
+| [Twilio](https://www.twilio.com/docs/messaging/guides/webhook-request) | One-to-one SMS text | Account SID, account Auth Token, agent number | `/channels/twilio/webhook` |
+| [Telnyx](https://developers.telnyx.com/docs/messaging/messages/receiving-webhooks) | One-to-one SMS/MMS text | API key, agent number, base64 Ed25519 public key; optional messaging profile ID | `/channels/telnyx/webhook` |
+| [Surge](https://docs.surge.app/receiving) | One-to-one SMS/MMS text | API key, account ID, agent number, `whsec_` signing secret | `/channels/surge/webhook` |
+
+Only message text is imported; media-only messages and delivery/status callbacks do not start a model turn. New SMS adapters limit replies to 1,600 characters; Linq allows 10,000. The model receives that limit and oversized answers are held as failed before sending. These adapters do not add telephone calls.
+
+### Sendblue
+
 1. Create a [Sendblue account](https://docs.sendblue.com/getting-started/quickstart/) and provision a dedicated number. Account setup, availability, pricing and payment stay with Sendblue; OpenAGI does not purchase a number.
 2. Set a stable public HTTPS origin in `OPENAGI_PUBLIC_URL` and keep `OPENAGI_AUTH_TOKEN` configured. Restart the daemon after changing its public origin.
 3. In Connections, save the API key, API secret, agent phone number in E.164 format, and a random webhook secret. Blank fields keep existing credentials. Values are saved privately in the configured data directory's `.env` with mode `0600`.
@@ -11,11 +25,33 @@ Open **Channels → Connections** (or `/connections`) on the main daemon. All co
 5. Add your partner's exact phone number under approved contacts. They text the agent's number and can ask it to remember facts. Their conversation and explicit saved facts persist across restarts.
 6. For a group, add the agent number in Messages, obtain the exact group ID from Sendblue, approve that group in Connections, and approve each participant's number. Incoming group messages with an unapproved participant are ignored. Check membership whenever the group changes.
 
-Each DM and each group has separate history and saved facts. The partner host receives only `remember` and `recall` tools for that conversation. It never receives the main runtime, owner memories, screen context, email, calendar, skills or MCP tools. Group facts are visible to group participants. Revoke a contact/group in Connections to stop future replies; revocation preserves its history rather than deleting user data.
+### Linq
 
-Webhook dedupe is durable. Model output is saved before an outbound API call. API acceptance is recorded separately from device delivery. If a send result is ambiguous (for example, a connection drops after sending), the delivery receipt is held for review and retries do not automatically send another message. Inspect Sendblue's dashboard and `<dataDir>/channels/sendblue/` receipts to resolve it. Provider acceptance does not prove the phone received the message.
+Save the V3 API token and the dedicated agent number. Create a V3 webhook subscription for `message.received` with **webhook version `2026-02-03`**, then save its `whsec_` secret in Connections. The receiver requires the Standard Webhooks `webhook-id`, `webhook-timestamp` and `webhook-signature` headers; legacy V2 signing is not supported. See [subscriptions](https://docs.linqapp.com/channel/imessage/api/resources/webhook_subscriptions/). When creating the subscription through the API, select the webhook version with `?version=2026-02-03` on the subscription API request, not on the callback URL.
 
-The local Messages bridge continues to use the Mac's signed-in Apple identity. A dedicated Sendblue number provides a separate agent identity. A Mac Messages bridge does not provision a new number.
+DM sends use `POST /v3/chats` with the configured `from` line so Linq cannot automatically select another number. Linq reuses the same from/to chat. Its first-message link restriction still applies when starting a new chat. To approve an existing group, choose **Linq** in the group form and paste the exact chat ID. Approve every participant’s E.164 number. The adapter retrieves current membership before a model turn and again before sending; unknown numbers, email handles, a missing agent/sender or an unapproved group block the reply. It never overrides provider opt-outs.
+
+### Twilio
+
+Save the **Account SID and Auth Token of the account/subaccount owning the number**. Set the number’s “A message comes in” webhook to the displayed public HTTPS URL, HTTP **POST** with form encoding. Preserve the exact path, scheme and encoded query through your proxy; signature verification uses the configured public origin and original request URL, never forwarded/Host headers. All form fields participate in signature validation. JSON/bodySHA256 webhooks are not supported. OpenAGI returns empty TwiML immediately and sends the answer separately through the REST Messages API; do not configure another automatic TwiML reply.
+
+### Telnyx
+
+Activate messaging on the number and assign it to a messaging profile. Set that profile’s inbound webhook to the displayed URL. Save the API key and the account’s **base64 raw Ed25519 public key**, not a PEM/private key. An optional profile ID also restricts inbound messages and accompanies sends. Signed `message.received` requests must target only the configured agent number; group/multi-recipient payloads are ignored. The request is durably queued before acknowledgement so model latency does not exceed Telnyx’s two-second webhook deadline.
+
+### Surge
+
+Save the API key, exact `acct_…` account ID, activated number and the webhook’s `whsec_` signing secret. Subscribe the account webhook to `message.received`. Finish phone activation and any required carrier registration in Surge. The receiver verifies Standard Webhooks signatures, account ID and agent line; it accepts text from the conversation’s approved contact. Configure the final URL directly because Surge does not follow webhook redirects.
+
+### Contacts, privacy and retry behavior
+
+Add the partner’s exact E.164 number under approved contacts, then have them text the agent number. Approved contacts apply to all configured phone providers. **Each provider’s DM and each provider’s group have separate history and saved facts**, even when a number or group ID is identical. Existing Sendblue history and groups retain their original identity. The partner host receives only `remember` and `recall` tools for that conversation. It never receives the main runtime, owner memories, screen context, email, calendar, skills or MCP tools. Group facts are visible to group participants. Revoke a contact/group in Connections to stop future replies; revocation preserves its history rather than deleting user data. Group approvals and revocations apply to the selected provider.
+
+Webhook dedupe is durable. Linq, Twilio, Telnyx and Surge acknowledge after persisting an inbound item, then process it in the background. Pending/failed/review counts appear in Connections. Queued work resumes on daemon startup, configuration save or **Retry queued replies**. No automatic fallback sends through another provider. A failed model turn can be retried; a saved answer is reused when local send configuration is repaired. Shutdown drains active replies.
+
+Model output is saved before an outbound API call. API acceptance is recorded separately from device delivery. If a send result is uncertain (for example, a connection drops after sending), the receipt is held for review and retries do not automatically send another message. Inspect the provider dashboard and `<dataDir>/channels/<provider>/` receipts. The retry button never clears uncertain-send markers. After confirming the message was not accepted, the owner can explicitly send a new message; after confirming acceptance, no resend is needed. Provider acceptance does not prove the phone received the message.
+
+The local Messages bridge continues to use the Mac's signed-in Apple identity. A dedicated provider number provides a separate agent identity. A Mac Messages bridge does not provision a new number.
 
 ## Connect Gmail and Google Calendar
 

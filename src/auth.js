@@ -59,6 +59,10 @@ export function isPublicRoute(pathname) {
     pathname === "/channels/telegram/webhook" ||
     pathname === "/webhooks/buildbetter" ||
     pathname === "/channels/sendblue/webhook" ||
+    pathname === "/channels/linq/webhook" ||
+    pathname === "/channels/twilio/webhook" ||
+    pathname === "/channels/telnyx/webhook" ||
+    pathname === "/channels/surge/webhook" ||
     pathname === "/webhooks/pebble" ||
     pathname === "/integrations/google/callback"
   );

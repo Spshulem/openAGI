@@ -1,5 +1,5 @@
 {
-  "sharing": { "label": "Partner messaging and security", "tests": ["test/partner-sharing.test.js", "test/sendblue.test.js", "test/companion-routes.test.js", "test/telegram-pairing.test.js", "test/telegram-channel-gate.test.js"] },
+  "sharing": { "label": "Partner messaging and security", "tests": ["test/partner-sharing.test.js", "test/sendblue.test.js", "test/messaging-providers.test.js", "test/companion-routes.test.js", "test/telegram-pairing.test.js", "test/telegram-channel-gate.test.js"] },
   "google": { "label": "Gmail and Google Calendar", "tests": ["test/google-integration.test.js"] },
   "pebble": { "label": "Pebble signed voice-memo ingestion", "tests": ["test/pebble-webhook.test.js"] },
   "routines": { "label": "Schedules, retries and overlap guards", "tests": ["test/scheduled-prompt-safety.test.js", "test/cron-overlap-guard.test.js", "test/cron-manual-run.test.js"] },
