@@ -195,6 +195,23 @@ final class SupervisorPushRequestTests: XCTestCase {
         await assertRelayThrows(relay, .transport)
     }
 
+    func testRelayUnregisterAcceptsRetiredPassesAndRetriesTemporaryErrors() async throws {
+        let relay = PushRelayClient(base: URL(string: "https://push.example.com")!, session: stubSession)
+        for code in ["pass_expired", "pass_revoked"] {
+            respond(400, "{\"error\":\"\(code)\"}")
+            try await relay.unregister(pass: "p1.old.pass")
+        }
+        for (status, expected) in [(429, PushRelayError.server(429)), (503, .server(503))] {
+            respond(status, "temporary failure")
+            do {
+                try await relay.unregister(pass: "p1.old.pass")
+                XCTFail("Temporary unregister failures must remain retryable")
+            } catch {
+                XCTAssertEqual(error as? PushRelayError, expected)
+            }
+        }
+    }
+
     private func assertRelayThrows(_ relay: PushRelayClient, _ expected: PushRelayError, line: UInt = #line) async {
         do {
             _ = try await relay.register(deviceToken: "a", startToken: "b", env: "sandbox")

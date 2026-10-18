@@ -203,6 +203,11 @@ final class PushRegistrar {
             guard let stored else { return }
             current = stored
         case let .register(replacing):
+            // Do not overwrite an earlier retirement that still needs a retry.
+            if let older = stored?.retire, older != replacing {
+                do { try await relay.unregister(pass: older) } catch { return }
+                guard stillCurrent() else { return }
+            }
             guard let deviceToken, let signature,
                   let fresh = try? await relay.register(deviceToken: deviceToken, startToken: startToken, env: Self.env)
             else { return }
@@ -211,9 +216,7 @@ final class PushRegistrar {
                 try? await relay.unregister(pass: fresh)
                 return
             }
-            // A pass still waiting to be retired from an earlier mint goes now;
-            // the one being replaced waits until the daemon holds the new one.
-            if let older = stored?.retire, older != replacing { try? await relay.unregister(pass: older) }
+            // The replaced pass waits until the daemon holds the new one.
             current = .init(pass: fresh, signature: signature, mintedAt: Date(), retire: replacing)
             // Saved before the daemon step, so a failed POST retries with it.
             // Not durable means the next run mints yet another channel, so the
@@ -248,7 +251,7 @@ final class PushRegistrar {
             // The daemon starts afresh on the new pass and the old channel is
             // about to go, so nothing else could end these.
             if !oldActivityIDs.isEmpty { await Self.endActivities(ids: oldActivityIDs) }
-            try? await relay.unregister(pass: retire)
+            do { try await relay.unregister(pass: retire) } catch { return }
             guard stillCurrent() else { return }
             current.retire = nil
             current.retiringActivityIDs = nil

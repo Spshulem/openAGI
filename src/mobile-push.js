@@ -143,6 +143,7 @@ export class MobilePush {
     // Only startedAt is persisted (push.json); after a restart the rest is
     // rebuilt from it, and the next pass updates rather than starts.
     this.live = new Map();
+    this.generations = new Map();
     this.reported = new Set();
     this.listener = () => this.changed();
     this.subscribed = false;
@@ -193,6 +194,7 @@ export class MobilePush {
   }
 
   forget(nodeId) {
+    this.generations.set(nodeId, (this.generations.get(nodeId) ?? 0) + 1);
     this.live.delete(nodeId);
   }
 
@@ -259,23 +261,31 @@ export class MobilePush {
     const wakeBy = (due) => { if (due !== null && (wakeAt === null || due < wakeAt)) wakeAt = due; };
     for (const registration of registrations) {
       if (this.stopped) return;
+      const generation = this.generations.get(registration.nodeId) ?? 0;
+      const isCurrent = () => {
+        const current = this.store.get(registration.nodeId);
+        return !this.stopped && generation === (this.generations.get(registration.nodeId) ?? 0)
+          && current?.pass === registration.pass && current?.key === registration.key;
+      };
+      if (!isCurrent()) continue;
       // Waiting for the phone to bring a new pass (POST /mobile/push answers
       // it renew: true); nothing more is sent with this one.
       if (registration.renew) {
         this.live.delete(registration.nodeId);
         continue;
       }
-      const alerts = await this.sendAlerts(registration, questions);
+      const alerts = await this.sendAlerts(registration, questions, isCurrent);
       if (alerts.backlog) wakeBy(now + ALERT_BACKLOG_MS);
       if (alerts.stop) continue;
-      wakeBy(await this.syncActivity(registration, activity, now));
+      wakeBy(await this.syncActivity(registration, activity, now, isCurrent));
     }
     this.scheduleWake(wakeAt);
   }
 
   // stop: the registration is gone or needs a new pass. backlog: open
   // questions are left over the per-pass cap.
-  async sendAlerts(registration, questions) {
+  async sendAlerts(registration, questions, isCurrent) {
+    if (!isCurrent()) return { stop: true, backlog: false };
     // alerts: false is the phone's notification permission turned off.
     if (!questions || registration.alerts === false) return { stop: false, backlog: false };
     const open = new Set(questions.map((q) => q.id));
@@ -286,6 +296,7 @@ export class MobilePush {
     let sent = 0;
     for (const question of fresh) {
       const result = await this.send(registration, { type: "alert", sealed: this.sealAlert(registration.key, question), collapseId: question.id });
+      if (!isCurrent()) return { stop: true, backlog: false };
       if (result === "gone" || result === "renew") return { stop: true, backlog: false };
       // Retry unsent questions even if no new fleet event arrives.
       if (result !== "ok") break;
@@ -297,7 +308,8 @@ export class MobilePush {
   }
 
   // Returns when the next pass is due for this registration, or null.
-  async syncActivity(registration, activity, now) {
+  async syncActivity(registration, activity, now, isCurrent) {
+    if (!isCurrent()) return null;
     const { nodeId } = registration;
     const t = this.timing;
     if (registration.activities === false || registration.noLiveActivity) {
@@ -328,6 +340,7 @@ export class MobilePush {
     if (!live) {
       if (active === 0) return null;
       const result = await this.sendActivity(registration, "activity-start", activity, { staleAt: this.epoch(now + t.staleAfterMs) });
+      if (!isCurrent()) return null;
       if (result !== "ok") return null;
       this.live.set(nodeId, { pass: registration.pass, startedAt: now, lastHash: hash, lastSentAt: now, lastYou: activity.counts.you, idleSince: null });
       this.store.setActivity(nodeId, registration.pass, { startedAt: new Date(now).toISOString() });
@@ -336,16 +349,18 @@ export class MobilePush {
 
     if (active > 0 && now - live.startedAt >= t.restartAfterMs) {
       const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now) });
+      if (!isCurrent()) return null;
       if (ended !== "ok") return now + RETRY_MS;
       this.live.delete(nodeId);
       this.store.setActivity(nodeId, registration.pass, null);
-      return this.syncActivity(registration, activity, now);
+      return this.syncActivity(registration, activity, now, isCurrent);
     }
 
     if (active === 0) {
       live.idleSince ??= now;
       if (now - live.idleSince >= t.endAfterIdleMs) {
         const ended = await this.sendActivity(registration, "activity-end", activity, { dismissAt: this.epoch(now + t.dismissAfterMs) });
+        if (!isCurrent()) return null;
         if (ended !== "ok") return now + RETRY_MS;
         this.live.delete(nodeId);
         this.store.setActivity(nodeId, registration.pass, null);
@@ -364,6 +379,7 @@ export class MobilePush {
           staleAt: this.epoch(now + t.staleAfterMs),
           ...(rose ? { priority: 10 } : {})
         });
+        if (!isCurrent()) return null;
         if (result === "ok") Object.assign(live, { lastHash: hash, lastSentAt: now, lastYou: activity.counts.you });
       } else {
         // The trailing send: the wake pass reads the latest state then.

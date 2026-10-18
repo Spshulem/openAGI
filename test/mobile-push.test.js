@@ -43,7 +43,7 @@ function harness(t, { threads = [], questions = [] } = {}) {
   const fetch = async (url, init) => {
     const body = JSON.parse(init.body);
     sent.push({ url, ...body });
-    const r = reply(body);
+    const r = await reply(body);
     if (r instanceof Error) throw r;
     const status = r.__status ?? 200;
     return { ok: status < 300, status, json: async () => r };
@@ -577,4 +577,50 @@ test("a failed idle end retries without another fleet event", async (t) => {
   await h.advance(30 * SEC);
   assert.equal(ends(), 2);
   assert.equal(h.store.get(NODE).activity, null);
+});
+
+test("forgetting a phone invalidates alerts and starts already awaiting the relay", async (t) => {
+  for (const type of ["alert", "activity-start"]) {
+    await t.test(type, async (t) => {
+      const h = harness(t, { threads: [thread("codex:a", "working")],
+        questions: type === "alert" ? [question("fq1"), question("fq2")] : [] });
+      t.after(() => h.push.stop());
+      const entered = Promise.withResolvers();
+      const reply = Promise.withResolvers();
+      h.setReply((body) => {
+        if (body.type !== type) return { ok: true };
+        entered.resolve();
+        return reply.promise;
+      });
+      const flushing = h.push.flush();
+      await entered.promise;
+      h.push.forget(NODE);
+      h.store.remove(NODE);
+      // Even a same-pass re-registration cannot revive the old batch.
+      h.store.put(NODE, { pass: "p1.pass-one", key: h.key, env: "sandbox" });
+      reply.resolve({ ok: true });
+      await flushing;
+      assert.deepEqual(h.types(), [type]);
+      assert.equal(h.push.live.has(NODE), false);
+      assert.equal(h.store.get(NODE).activity, null);
+      assert.deepEqual(h.store.get(NODE).notified, []);
+    });
+  }
+});
+
+test("forgetting during a restart end prevents a replacement Live Activity", async (t) => {
+  const h = harness(t, { threads: [thread("codex:a", "working")] });
+  t.after(() => h.push.stop());
+  await h.push.flush();
+  const entered = Promise.withResolvers();
+  const reply = Promise.withResolvers();
+  h.setReply(() => { entered.resolve(); return reply.promise; });
+  const advancing = h.advance(PUSH_TIMING.restartAfterMs);
+  await entered.promise;
+  h.push.forget(NODE);
+  h.store.remove(NODE);
+  reply.resolve({ ok: true });
+  await advancing;
+  assert.deepEqual(h.types(), ["activity-start", "activity-end"]);
+  assert.equal(h.push.live.has(NODE), false);
 });

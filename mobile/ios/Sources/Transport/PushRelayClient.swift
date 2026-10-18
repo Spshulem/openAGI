@@ -51,7 +51,11 @@ public struct PushRelayClient: Sendable {
     // Deletes the pass's broadcast channel, if it has one. The relay answers
     // ok even when the channel is already gone.
     public func unregister(pass: String) async throws {
-        _ = try await post("/v1/unregister", body: ["pass": pass])
+        do {
+            _ = try await post("/v1/unregister", body: ["pass": pass])
+        } catch PushRelayError.rejected(let code) where code == "pass_expired" || code == "pass_revoked" {
+            // These passes can no longer send and need no further retirement.
+        }
     }
 
     private func post(_ path: String, body: [String: String]) async throws -> [String: Any]? {
