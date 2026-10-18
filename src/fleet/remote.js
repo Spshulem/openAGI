@@ -61,6 +61,7 @@ export class RemoteFleetSupervisor {
     this.pendingOutreachDecisions = new Map();
     // Glasses dismissals the computer was offline for, sent on the next refresh.
     this.pendingDismissals = new Set();
+    this.lastEmitted = null;
   }
   getState() {
     const state = structuredClone(this.state);
@@ -102,9 +103,21 @@ export class RemoteFleetSupervisor {
       this.refreshing = this.request('GET', '/fleet/api/state')
         .then(async (body) => { await this.selfFixHub?.sync().catch(() => {}); return body; })
         .then(async (body) => { await this.replayDismissals(); return body; })
+        .then((body) => { this.emitIfChanged(); return body; })
         .finally(() => { this.refreshing = null; });
     }
     return this.refreshing;
+  }
+  // The main's push sender listens for "fleet" like a local supervisor's
+  // tick. Only a new snapshot or a changed set of open questions is news.
+  emitIfChanged() {
+    try {
+      const state = this.getState();
+      const signature = JSON.stringify([state.snapshot?.at ?? null, state.questions.map(q => q.id).sort()]);
+      if (signature === this.lastEmitted) return;
+      this.lastEmitted = signature;
+      this.runtime?.events?.emit?.("fleet", { at: state.snapshot?.at ?? null, reason: "remote-refresh", counts: state.snapshot?.counts ?? null });
+    } catch { /* listeners never break a refresh */ }
   }
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { if (mode === "observe") await this.selfFixHub?.stop("all"); await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }

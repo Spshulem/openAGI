@@ -2,3 +2,4 @@ OpenAGI.xcodeproj/
 *.xcworkspace/
 DerivedData/
 build/
+Vendor/

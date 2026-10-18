@@ -1,6 +1,6 @@
 import SwiftUI
 
-// mobile/FEATURES.md's Settings tab: the connection (host, node id, last
+// mobile/FEATURES.md's Settings tab: where the agent runs (this iPhone, or a server), the connection (host, node id, last
 // synced — host and id in mono), refresh now, revoke (confirmation
 // required), and a build version so a bug report can name one. Never
 // renders the token — only the server and node id are shown, matching the
@@ -16,13 +16,19 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                ScreenHeader(title: "Settings", host: model.credentials.server.host ?? "",
+                ScreenHeader(title: "Settings", host: model.hostLabel,
                             ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
 
                 RowGroup {
-                    labeledRow(label: "Server", value: model.credentials.server.absoluteString, mono: true)
-                    RowHairline()
-                    labeledRow(label: "Node ID", value: model.credentials.nodeID, mono: true)
+                    if model.isOnPhone {
+                        labeledRow(label: "Runs on", value: "This iPhone", mono: false)
+                        RowHairline()
+                        labeledRow(label: "Model", value: Self.modelLabel, mono: false)
+                    } else {
+                        labeledRow(label: "Server", value: model.credentials.server.absoluteString, mono: true)
+                        RowHairline()
+                        labeledRow(label: "Node ID", value: model.credentials.nodeID, mono: true)
+                    }
                     RowHairline()
                     labeledRow(label: "Build", value: Self.buildVersion, mono: false)
                 }
@@ -41,19 +47,71 @@ struct SettingsView: View {
                 .listRowBackground(Theme.canvas)
                 .listRowSeparator(.hidden)
 
-                DestructiveTextButton(title: "Revoke this phone") {
-                    showingRevokeConfirmation = true
+                Text("Workspace")
+                    .font(Theme.Typography.section)
+                    .foregroundStyle(Theme.ink)
+                    .padding(.horizontal, Theme.gutter)
+                    .padding(.top, Theme.Spacing.x4)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
+                WorkspaceSection()
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
+
+                // Onboarding's second step: the agent starts on this iPhone
+                // and can be pointed at a server later, and back again.
+                if model.isOnPhone {
+                    if let backup = AppSession.shared.serverBackup {
+                        SecondaryTextButton(title: "Switch back to \(backup.server.host ?? "the server")") {
+                            Task { await switchBack() }
+                        }
+                        .padding(.horizontal, Theme.gutter)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
+                    }
+                    SecondaryTextButton(title: "Connect to a server") {
+                        model.detach()
+                        AppSession.shared.chooseServer()
+                    }
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
+                } else {
+                    if AppSession.shared.canRunOnPhone {
+                        SecondaryTextButton(title: AppSession.shared.hasPhoneAgent ? "Use the agent on this iPhone" : "Try the agent on this iPhone") {
+                            model.detach()
+                            AppSession.shared.tryPhone()
+                        }
+                        .padding(.horizontal, Theme.gutter)
+                        .listRowInsets(EdgeInsets())
+                        .listRowBackground(Theme.canvas)
+                        .listRowSeparator(.hidden)
+                    }
+
+                    DestructiveTextButton(title: "Revoke this phone") {
+                        showingRevokeConfirmation = true
+                    }
+                    .disabled(isWorking)
+                    .padding(.horizontal, Theme.gutter)
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Theme.canvas)
+                    .listRowSeparator(.hidden)
                 }
-                .disabled(isWorking)
-                .padding(.horizontal, Theme.gutter)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Theme.canvas)
-                .listRowSeparator(.hidden)
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .background(Theme.canvas)
             .disabled(isWorking)
+            .alert("Still on this iPhone", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(switchError ?? "")
+            }
             .confirmationDialog("Revoke this phone?", isPresented: $showingRevokeConfirmation, titleVisibility: .visible) {
                 Button("Revoke", role: .destructive) { Task { await revoke() } }
                 Button("Cancel", role: .cancel) {}
@@ -78,6 +136,15 @@ struct SettingsView: View {
         .frame(minHeight: Theme.rowMinHeight)
     }
 
+    private static var modelLabel: String {
+        switch OnDeviceModelStatus.current() {
+        case .available: return "Apple Intelligence"
+        case .downloading: return "Downloading"
+        case .notEnabled: return "Apple Intelligence is off"
+        case .unsupported: return "Not available"
+        }
+    }
+
     private static var buildVersion: String {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
@@ -88,6 +155,18 @@ struct SettingsView: View {
         isWorking = true
         defer { isWorking = false }
         await model.refreshToday()
+    }
+
+    @State private var switchError: String?
+
+    private func switchBack() async {
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            _ = try await AppSession.shared.switchBackToServer(detaching: model)
+        } catch {
+            switchError = "Can't reach your Mac yet. Your work stays on this iPhone until it can."
+        }
     }
 
     private func revoke() async {

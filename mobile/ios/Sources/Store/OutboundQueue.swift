@@ -22,8 +22,21 @@ public struct OutboundQueue: Sendable {
     public static let maxAttempts = 5
     private let file: URL
 
-    public init(directory: URL = SharedContainer.url) {
-        self.file = directory.appending(path: "outbox.json")
+    public init(directory: URL = SharedContainer.url, name: String = "outbox.json") {
+        self.file = directory.appending(path: name)
+    }
+
+    // Where a paired Mac's queued work waits while the app uses the agent on
+    // this iPhone; restored when it switches back.
+    public static func parkedForServer(directory: URL = SharedContainer.url) -> OutboundQueue {
+        OutboundQueue(directory: directory, name: "outbox-server-parked.json")
+    }
+
+    // Moves every op into `other` (appending, deduped by kind) and empties
+    // this queue.
+    public func move(to other: OutboundQueue) throws {
+        for op in all() { try other.enqueue(op) }
+        try clear()
     }
 
     public func all() -> [PendingOp] {

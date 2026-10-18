@@ -1,0 +1,43 @@
+name = "openagi-push"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+BUNDLE_ID = "sh.openagi.OpenAGI"
+
+# Secrets (set with `wrangler secret put <NAME>`, never commit values):
+#   APNS_KEY_P8   contents of the AuthKey_XXXX.p8 file (PKCS8 PEM)
+#   APNS_KEY_ID   10-char key ID of that .p8
+#   APNS_TEAM_ID  Apple Developer team ID
+#   PASS_KEY      32 random bytes, base64url (see README)
+
+# Rate limits. Workers rate-limit bindings only accept period = 10 or 60
+# seconds, so the spec's 120 sends/hour per pass and 20 registers/hour per IP
+# are expressed as per-minute budgets. namespace_id must be a positive integer
+# unique within your Cloudflare account; change these if they collide.
+# (Older wrangler versions without [[ratelimits]] need the same values under
+# [[unsafe.bindings]] with type = "ratelimit".)
+[[ratelimits]]
+name = "SEND_LIMITER"
+namespace_id = "4201"
+simple = { limit = 10, period = 60 }
+
+[[ratelimits]]
+name = "REGISTER_LIMITER"
+namespace_id = "4202"
+simple = { limit = 3, period = 60 }
+
+# Pass revocation (optional). Without it, a pass stays valid until its exp
+# (30 days). To enable:
+#   1. npx wrangler kv namespace create REVOKED
+#   2. paste the printed id below and uncomment
+#   3. npx wrangler deploy
+#
+# [[kv_namespaces]]
+# binding = "REVOKED"
+# id = "<id printed by step 1>"
+
+# Custom domain (uncomment once the zone is on Cloudflare):
+# routes = [
+#   { pattern = "push.openagi.sh", custom_domain = true }
+# ]

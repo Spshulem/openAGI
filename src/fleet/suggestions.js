@@ -13,8 +13,16 @@ const DUPLICATE_SCHEMA = { type: "object", properties: { duplicate: { type: "boo
 const ACTIVE_FIX = new Set(["queued", "preflight", "brief", "worktree", "coding", "tests", "guard", "pr", "awaiting-review", "fixing-findings", "replay", "owner-ask"]);
 const clean = (value, max = 2000) => clampText(redactSecrets(value), max);
 
+// Built at runtime: a Node without ICU (the phone runtime) rejects \p{...}
+// as a syntax error, which would stop the whole daemon from loading. There,
+// every non-ASCII character counts as a letter; fingerprints made on a
+// desktop are unchanged.
+const NON_WORD = (() => {
+  try { return new RegExp("[^\\p{L}\\p{N}]+", "gu"); } catch { return /[^a-z0-9\u0080-\uffff]+/g; }
+})();
+
 export function suggestionFingerprint({ metric, area, rootCause }) {
-  const normalize = (s) => String(s ?? "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const normalize = (s) => String(s ?? "").toLowerCase().replace(NON_WORD, " ").trim();
   return createHash("sha256").update([metric, area, rootCause].map(normalize).join("\n")).digest("hex").slice(0, 32);
 }
 

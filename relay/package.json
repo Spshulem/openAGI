@@ -1,0 +1,10 @@
+{
+  "name": "openagi-push-relay",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker that forwards sealed OpenAGI pushes to APNs.",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "deploy": "npx wrangler deploy"
+  }
+}

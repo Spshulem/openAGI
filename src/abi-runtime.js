@@ -60,6 +60,7 @@ import { composeDigest, deliverDigest } from "./outreach-digest.js";
 import { MemorySystem } from "./memory-system.js";
 import { PropagationController } from "./propagation-controller.js";
 import { SkillRegistry } from "./skills.js";
+import { installMobileCronFilter, isMobileProfile } from "./mobile-profile.js";
 import { registerCoreTools, ToolRegistry } from "./tool-registry.js";
 import { registerDefaultWorkflows, WorkflowRegistry } from "./workflow-registry.js";
 import { applyPersona } from "./persona.js";
@@ -262,6 +263,10 @@ export class AbiRuntime {
     this._tickInFlight = false;
     this._tickSkips = 0;
 
+    // Mobile profile: default jobs a phone cannot run are not registered
+    // (src/mobile-profile.js). Restored after integrations register below.
+    const mobileProfile = isMobileProfile();
+    const restoreCronAddJob = mobileProfile ? installMobileCronFilter(this.cron) : null;
     if (options.registerDefaults !== false) {
       this.integrations.register(createAbiIntegration());
       this.cron.addJob(createDailyAdaptationReviewJob());
@@ -549,7 +554,7 @@ export class AbiRuntime {
       });
       registerCoreTools(this.tools, this);
       registerSubagentTools(this.tools, this);
-      registerCodingSupervisorTools(this.tools, this.codingSupervisor);
+      if (!mobileProfile) registerCodingSupervisorTools(this.tools, this.codingSupervisor);
       // Read-only fleet_status / fleet_thread. this.fleetSupervisor is
       // constructed above, before this block runs.
       registerFleetTools(this.tools, this.fleetSupervisor);
@@ -558,7 +563,7 @@ export class AbiRuntime {
       // an LLM can't accidentally try to drive the user's screen. The
       // dashboard's toggle can flip this at runtime without a restart;
       // see /computer-use/toggle in hosted-interface.js.
-      if (isComputerUseEnabled()) {
+      if (!mobileProfile && isComputerUseEnabled()) {
         registerComputerUseTools(this.tools, this);
       }
     }
@@ -594,7 +599,7 @@ export class AbiRuntime {
       // IMESSAGE_ENABLED=1 + a self-handle, and macOS Full Disk Access.
       // The source attaches to runtime even when disabled so the dashboard
       // can render the toggle + permission status.
-      registerIMessagePoller(this);
+      if (!mobileProfile) registerIMessagePoller(this);
       // Web search tools (web_search / fetch_url). Always registered; web_search
       // returns a clear "no provider configured" error until a key is set.
       registerWebSearchTools(this);
@@ -602,6 +607,7 @@ export class AbiRuntime {
       // `openagi imessage-server`) is configured via OPENAGI_IMESSAGE_NODE.
       registerImessageSearchTool(this);
     }
+    restoreCronAddJob?.();
   }
 
   processIntegrationEvent(source, payload) {
