@@ -93,7 +93,7 @@ function validateExplanation(value) {
     || !Number.isFinite(value.minutesSavedPerDay) || value.minutesSavedPerDay < 0
     || !Array.isArray(value.evidenceActionIds) || value.evidenceActionIds.some((id) => typeof id !== "string")
     || ["rootCause", "proposedFix", "acceptance"].some((key) => typeof value[key] !== "string" || !value[key].trim())) throw new Error("Invalid diagnosis output.");
-  if (value.remedy != null && !REMEDIES.includes(value.remedy)) throw new Error("Invalid remedy.");
+  if (!REMEDIES.includes(value.remedy) || typeof value.nextAction !== "string" || !value.nextAction.trim()) throw new Error("Invalid remedy or next action.");
   return { ...value, remedy: value.remedy ?? "code", nextAction: clean(value.nextAction ?? value.proposedFix), rootCause: clean(value.rootCause), proposedFix: clean(value.proposedFix), acceptance: clean(value.acceptance), evidenceActionIds: value.evidenceActionIds.slice(0, 20) };
 }
 

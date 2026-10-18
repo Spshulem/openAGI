@@ -210,7 +210,7 @@ test("a journal update can recover its missing record fields from the state tail
 test("supervisor daily diagnosis is once across reloads, hourly checks persist, on-demand is read-only", async (t) => {
   const dataDir = temp(t);
   let calls = 0;
-  const deps = { now: () => NOW, diagnoseModels: { explain: async ({ anomalies }) => { calls += 1; return { anomalyId: anomalies.find((a) => a.area === "review").id, area: "review", rootCause: "Limits", proposedFix: "Use available review model", acceptance: "Reviews complete", confidence: 0.7, minutesSavedPerDay: 5, evidenceActionIds: [] }; }, duplicate: async () => false }, notifier: { notifyQuestion: async () => ({ pushed: false }) } };
+  const deps = { now: () => NOW, diagnoseModels: { explain: async ({ anomalies }) => { calls += 1; return { anomalyId: anomalies.find((a) => a.area === "review").id, area: "review", remedy: "setup", nextAction: "Review provider limits before retrying", rootCause: "Limits", proposedFix: "Use available review model", acceptance: "Reviews complete", confidence: 0.7, minutesSavedPerDay: 5, evidenceActionIds: [] }; }, duplicate: async () => false }, notifier: { notifyQuestion: async () => ({ pushed: false }) } };
   const config = resolveFleetConfig({}, { home: dataDir, selfFix: { mode: "propose" } });
   const supervisor = new FleetSupervisor({ dataDir, config, deps });
   for (const row of october13(NOW - DAY_MS).actions.filter((a) => a.kind === "review")) supervisor.store.recordAction(row);
@@ -244,7 +244,7 @@ test("diagnose models share the locked-down judge, exact models, schemas and fai
       assert.ok(schema.required.includes("anomalyId"));
       assert.match(args.at(-1), /exact anomalyId/);
     }
-    const out = args[args.indexOf("-m") + 1] === "gpt-6-luna" ? { duplicate: false } : { anomalyId: "anomaly-0", area: "review", rootCause: "Limits", proposedFix: "Retry review", acceptance: "Passes", confidence: 0.8, minutesSavedPerDay: 2, evidenceActionIds: [] };
+    const out = args[args.indexOf("-m") + 1] === "gpt-6-luna" ? { duplicate: false } : { anomalyId: "anomaly-0", area: "review", remedy: "setup", nextAction: "Review provider limits before retrying", rootCause: "Limits", proposedFix: "Retry review", acceptance: "Passes", confidence: 0.8, minutesSavedPerDay: 2, evidenceActionIds: [] };
     fs.writeFileSync(args[args.indexOf("-o") + 1], JSON.stringify(out));
     return { code: 0, stdout: "" };
   };

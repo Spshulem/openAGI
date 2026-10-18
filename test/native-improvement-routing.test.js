@@ -51,8 +51,10 @@ for (const remedy of REMEDIES) test(`${remedy} is durable and only code can star
 
 test('invalid remedy is refused before publication or coding', async t => {
   const f = fixture(t);
-  f.explain({ ...seed, remedy: 'bypass-permission' });
-  await assert.rejects(f.manager.propose(f.report), /Invalid remedy/);
+  for (const remedy of ['bypass-permission', undefined, null]) {
+    f.explain({ ...seed, remedy });
+    await assert.rejects(f.manager.propose(f.report), /Invalid remedy/);
+  }
   assert.equal(f.calls.fixes, 0);
 });
 
