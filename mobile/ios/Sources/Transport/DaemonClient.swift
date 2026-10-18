@@ -90,6 +90,19 @@ public actor DaemonClient {
         return .fresh(summary, etag: http.value(forHTTPHeaderField: "ETag"))
     }
 
+    // The morning plan and evening recap, for phone-only mode's local
+    // notifications (a Mac sends its own).
+    public func dailyPlan() async throws -> DailyPlanDigest {
+        let request = try authorizedRequest(path: "/plan/daily", method: "GET", queryItems: [URLQueryItem(name: "llm", value: "0")])
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(DailyPlanDigest.self, from: data)
+    }
+
+    public func dailyRecap() async throws -> DailyRecapDigest {
+        let (data, _) = try await perform(try authorizedRequest(path: "/recap/daily", method: "GET"))
+        return try Self.decodeJSON(DailyRecapDigest.self, from: data)
+    }
+
     public func complete(taskID: String) async throws {
         var request = try authorizedRequest(path: "/tasks/\(taskID)/complete", method: "POST")
         request.httpBody = Data(#"{"completedVia":"mobile"}"#.utf8)
@@ -619,5 +632,104 @@ public actor DaemonClient {
         case 409: throw DaemonError.conflict
         default: throw DaemonError.server(http.statusCode)
         }
+    }
+}
+
+// The phone's workspace screens. Same credential as everything else; the
+// daemon allows a phone node exactly these routes (src/mobile-node.js).
+extension DaemonClient {
+    private struct Wrapped<T: Decodable>: Decodable { let skills: T?; let jobs: T? }
+
+    public func modelSettings() async throws -> ModelSettings {
+        try await json(ModelSettings.self, path: "/settings/models", method: "GET")
+    }
+
+    public func updateModelSettings(_ update: ModelSettingsUpdate) async throws -> ModelSettings {
+        try await json(ModelSettings.self, path: "/settings/models", method: "POST", body: try ProtocolDecoder.jsonEncoder.encode(update), timeout: 20)
+    }
+
+    public func testModel() async throws -> ModelTestResult {
+        try await json(ModelTestResult.self, path: "/settings/models/test", method: "POST", body: Data("{}".utf8), timeout: 45)
+    }
+
+    public func persona() async throws -> PersonaDocument {
+        try await json(PersonaDocument.self, path: "/workspace/persona", method: "GET")
+    }
+
+    public func savePersona(markdown: String) async throws -> PersonaDocument {
+        let body = try JSONSerialization.data(withJSONObject: ["markdown": markdown])
+        return try await json(PersonaDocument.self, path: "/workspace/persona", method: "PUT", body: body)
+    }
+
+    public func skills() async throws -> [SkillSummary] {
+        try await json(Wrapped<[SkillSummary]>.self, path: "/workspace/skills", method: "GET").skills ?? []
+    }
+
+    public func skill(named name: String) async throws -> SkillDetail {
+        try await json(SkillDetail.self, path: "/workspace/skills/\(name)", method: "GET")
+    }
+
+    public func saveSkill(name: String, description: String, instructions: String) async throws -> SkillDetail {
+        let body = try JSONSerialization.data(withJSONObject: ["description": description, "instructions": instructions])
+        return try await json(SkillDetail.self, path: "/workspace/skills/\(name)", method: "PUT", body: body)
+    }
+
+    public func deleteSkill(name: String) async throws {
+        _ = try await perform(try authorizedRequest(path: "/workspace/skills/\(name)", method: "DELETE"))
+    }
+
+    public func scheduledJobs() async throws -> [ScheduledJob] {
+        try await json(Wrapped<[ScheduledJob]>.self, path: "/workspace/jobs", method: "GET").jobs ?? []
+    }
+
+    public func setJob(id: String, enabled: Bool) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["enabled": enabled])
+        var request = try authorizedRequest(path: "/workspace/jobs/\(id)", method: "POST")
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        _ = try await perform(request)
+    }
+
+    // The offline copy: a snapshot of this daemon's agent, passed to the
+    // phone's own daemon untouched, and what the phone did offline.
+    public func mirrorSnapshot() async throws -> Data {
+        var request = try authorizedRequest(path: "/mobile/mirror", method: "GET")
+        request.timeoutInterval = 60
+        return try await perform(request).0
+    }
+
+    public func sendOfflineWork(_ work: Data) async throws {
+        var request = try authorizedRequest(path: "/mobile/offline-import", method: "POST")
+        request.httpBody = work
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        _ = try await perform(request)
+    }
+
+    // Sign in with ChatGPT: the daemon owns the OAuth exchange.
+    public func startChatGPTSignIn() async throws -> URL {
+        struct Started: Decodable { let authorizeUrl: String }
+        let body = try JSONSerialization.data(withJSONObject: ["returnTo": "openagi"])
+        let started = try await json(Started.self, path: "/auth/chatgpt/start", method: "POST", body: body)
+        guard let url = URL(string: started.authorizeUrl), url.scheme == "https" else { throw DaemonError.malformedResponse }
+        return url
+    }
+
+    public func signOutChatGPT() async throws {
+        var request = try authorizedRequest(path: "/auth/chatgpt/signout", method: "POST")
+        request.httpBody = Data("{}".utf8)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        _ = try await perform(request)
+    }
+
+    private func json<T: Decodable>(_ type: T.Type, path: String, method: String, body: Data? = nil, timeout: TimeInterval? = nil) async throws -> T {
+        var request = try authorizedRequest(path: path, method: method)
+        if let body {
+            request.httpBody = body
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        if let timeout { request.timeoutInterval = timeout }
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(type, from: data)
     }
 }

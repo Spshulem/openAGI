@@ -20,7 +20,7 @@ struct TasksView: View {
     var body: some View {
         NavigationStack {
             List {
-                ScreenHeader(title: "Tasks", host: model.credentials.server.host ?? "",
+                ScreenHeader(title: "Tasks", host: model.hostLabel,
                             ageMinutes: model.ageMinutes, refreshFailed: model.refreshFailed)
 
                 Picker("Queue", selection: $queue) {

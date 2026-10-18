@@ -7,7 +7,7 @@ import WidgetKit
 // e.g. Today's "N waiting on you" row jumping to Inbox, per DESIGN.md's
 // "Screens must not be mostly empty" section -- without needing a callback
 // threaded down through every intermediate view.
-enum AppTab: Hashable {
+nonisolated enum AppTab: Hashable, Sendable {
     case today, tasks, inbox, chat, supervisor
 }
 
@@ -70,8 +70,14 @@ final class AppModel {
 
     var statusLine: String {
         if case .unauthorized = lastOutcome { return "Needs re-pairing" }
-        return credentials.server.host ?? credentials.server.absoluteString
+        return isOnPhone ? hostLabel : credentials.server.host ?? credentials.server.absoluteString
     }
+
+    // Phone-only mode: the daemon is the one embedded in this app.
+    var isOnPhone: Bool { credentials.isEmbedded }
+
+    // The connection line names where the agent runs.
+    var hostLabel: String { isOnPhone ? "This iPhone" : credentials.server.host ?? "" }
 
     var ageMinutes: Int { snapshot?.ageInMinutes() ?? 0 }
     var refreshFailed: Bool {
@@ -172,6 +178,25 @@ final class AppModel {
         Credentials.clear()
         try? SnapshotStore().delete()
         try? OutboundQueue().clear()
+    }
+
+    // Leaves this daemon without revoking: switching between the agent on
+    // this iPhone and a server keeps both credentials, but nothing cached
+    // from one may show up as the other's.
+    //
+    // Leaving a Mac for the iPhone agent parks the Mac's queued work (task
+    // completions made while it was unreachable) instead of dropping it;
+    // switching back restores it.
+    func detach() {
+        stopEventStream()
+        agentChat.forget()
+        supervisorChat.forget()
+        try? SnapshotStore().delete()
+        if credentials.isEmbedded {
+            try? OutboundQueue().clear()
+        } else {
+            try? OutboundQueue().move(to: .parkedForServer())
+        }
     }
 }
 

@@ -15,11 +15,13 @@ struct PairingView: View {
     @State private var errorHeadline: String?
     @State private var errorDetail: String?
 
+    let onCancel: (() -> Void)?
     let onPaired: () -> Void
 
-    init(prefillServer: URL? = nil, prefillCode: String? = nil, onPaired: @escaping () -> Void) {
+    init(prefillServer: URL? = nil, prefillCode: String? = nil, onCancel: (() -> Void)? = nil, onPaired: @escaping () -> Void) {
         _serverText = State(initialValue: prefillServer?.absoluteString ?? "")
         _codeText = State(initialValue: prefillCode ?? "")
+        self.onCancel = onCancel
         self.onPaired = onPaired
     }
 
@@ -28,7 +30,7 @@ struct PairingView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Spacing.x6) {
                     VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
-                        Text("Pair with OpenAGI")
+                        Text("Connect to a server")
                             .font(Theme.Typography.screenTitle)
                             .foregroundStyle(Theme.ink)
                         Text("Your daemon printed a code and its address. Enter both here.")
@@ -86,6 +88,13 @@ struct PairingView: View {
                 .padding(Theme.gutter)
             }
             .background(Theme.canvas)
+            .toolbar {
+                if let onCancel {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Back", action: onCancel).disabled(isPairing)
+                    }
+                }
+            }
         }
     }
 

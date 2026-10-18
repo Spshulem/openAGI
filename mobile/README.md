@@ -1,5 +1,10 @@
 # OpenAGI mobile (iOS + Android)
 
+The combined iOS onboarding, Supervisor push, and Android compatibility work
+is tracked in [PR #211](https://github.com/Spshulem/openAGI/pull/211).
+Use [QA.md](QA.md) for its current automated gates and device acceptance
+checklist; the phase-by-phase notes below include historical verification.
+
 Phase 1 turns a phone into a first-class OpenAGI node: pair it once, and a
 home-screen widget shows today's tasks with tap-to-complete. That's the
 whole surface. There is no chat, no approvals, no voice, and no daily
@@ -78,6 +83,24 @@ as of Phase 1) on the same destination. `DEVELOPER_DIR` is not optional —
 without it, `xcodebuild` silently resolves against whatever Xcode is
 currently the system default, which on a machine with more than one Xcode
 install is rarely the one you meant.
+
+#### Phone-only mode (agent on the iPhone)
+
+The app can run the daemon itself, on the phone's own model, with no Mac
+(docs/superpowers/specs/2026-10-15-openagi-phone-only-design.md). Before
+building, fetch the embedded Node runtime once:
+
+```
+mobile/ios/scripts/fetch-node-runtime.sh
+```
+
+It downloads a pinned nodejs-mobile build into `mobile/ios/Vendor/`
+(gitignored); a build phase copies it and the daemon's `src/` into the app.
+Without it the app builds as before and onboarding offers only "Connect to
+a server". On a simulator, port 43210 is usually your Mac's own daemon (the
+simulator shares the Mac's loopback), so the embedded daemon picks another
+port. The model is Apple Foundation Models: iOS 26+ on an Apple
+Intelligence iPhone; elsewhere, Debug builds can finish setup without one.
 
 ### Android
 

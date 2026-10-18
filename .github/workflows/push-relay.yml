@@ -4,6 +4,10 @@ on:
   pull_request:
     paths:
       - "relay/**"
+      - "mobile/**"
+      - "src/mobile-push*.js"
+      - "src/mobile-node.js"
+      - "src/hosted-interface.js"
       - ".github/workflows/push-relay.yml"
   push:
     branches: [main]
