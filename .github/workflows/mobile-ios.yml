@@ -38,6 +38,27 @@ jobs:
       - name: Generate iOS project
         working-directory: mobile/ios
         run: xcodegen generate
+      # Publish the QA build independently of simulator availability. Tests
+      # below still determine whether this job passes.
+      - name: Build device app for local signing and QA
+        working-directory: mobile/ios
+        run: |
+          xcodebuild build \
+            -project OpenAGI.xcodeproj \
+            -scheme OpenAGI \
+            -configuration Debug \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$RUNNER_TEMP/openagi-ios-device" \
+            CODE_SIGNING_ALLOWED=NO
+          test -f "$RUNNER_TEMP/openagi-ios-device/Build/Products/Debug-iphoneos/OpenAGI.app/Frameworks/NodeMobile.framework/NodeMobile"
+          ditto -c -k --keepParent \
+            "$RUNNER_TEMP/openagi-ios-device/Build/Products/Debug-iphoneos/OpenAGI.app" \
+            "$RUNNER_TEMP/OpenAGI-device-unsigned.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-device-unsigned-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/OpenAGI-device-unsigned.zip
+          retention-days: 7
       - name: Build and test iOS app
         working-directory: mobile/ios
         run: |
@@ -65,8 +86,21 @@ jobs:
       - name: Test native iPhone navigation and controls
         working-directory: mobile/ios
         run: |
+          xcrun simctl shutdown "$OPENAGI_DUO_SIM" || true
           device_type=$(xcrun simctl list devicetypes -j | python3 -c 'import json,sys; print(next(d["identifier"] for d in json.load(sys.stdin)["devicetypes"] if d["name"] == "iPhone 17 Pro Max"))')
-          simulator_id=$(xcrun simctl create "OpenAGI iPhone UI CI" "$device_type" "$OPENAGI_IOS_RUNTIME")
+          # The 27.1 runtime supports only Duo. Select a runtime that
+          # explicitly supports this ordinary iPhone, independently of Duo.
+          select_phone_runtime() {
+            python3 -c 'import json,sys; rows=json.load(open(sys.argv[1]))["runtimes"]; candidates=[r for r in rows if r.get("isAvailable") and int(r["version"].split(".")[0]) >= 27 and any(d["identifier"] == sys.argv[2] for d in r.get("supportedDeviceTypes", []))]; print(max(candidates, key=lambda r: tuple(map(int, r["version"].split("."))))["identifier"] if candidates else "")' "$RUNNER_TEMP/openagi-runtimes.json" "$device_type"
+          }
+          phone_runtime_id=$(select_phone_runtime)
+          if [ -z "$phone_runtime_id" ]; then
+            xcodebuild -downloadPlatform iOS -buildVersion 27.0
+            xcrun simctl list runtimes -j > "$RUNNER_TEMP/openagi-runtimes.json"
+            phone_runtime_id=$(select_phone_runtime)
+          fi
+          test -n "$phone_runtime_id"
+          simulator_id=$(xcrun simctl create "OpenAGI iPhone UI CI" "$device_type" "$phone_runtime_id")
           echo "OPENAGI_PHONE_SIM=$simulator_id" >> "$GITHUB_ENV"
           xcodebuild test \
             -project OpenAGI.xcodeproj \
@@ -113,25 +147,6 @@ jobs:
           path: |
             ${{ runner.temp }}/OpenAGI-iPhone-UI.xcresult
             ${{ runner.temp }}/openagi-ui-screenshots
-          retention-days: 7
-      - name: Build device app for local signing and QA
-        working-directory: mobile/ios
-        run: |
-          xcodebuild build \
-            -project OpenAGI.xcodeproj \
-            -scheme OpenAGI \
-            -configuration Debug \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath "$RUNNER_TEMP/openagi-ios-device" \
-            CODE_SIGNING_ALLOWED=NO
-          test -f "$RUNNER_TEMP/openagi-ios-device/Build/Products/Debug-iphoneos/OpenAGI.app/Frameworks/NodeMobile.framework/NodeMobile"
-          ditto -c -k --keepParent \
-            "$RUNNER_TEMP/openagi-ios-device/Build/Products/Debug-iphoneos/OpenAGI.app" \
-            "$RUNNER_TEMP/OpenAGI-device-unsigned.zip"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: OpenAGI-device-unsigned-${{ github.event.pull_request.head.sha || github.sha }}
-          path: ${{ runner.temp }}/OpenAGI-device-unsigned.zip
           retention-days: 7
       - name: Remove owned QA simulators
         if: always()
