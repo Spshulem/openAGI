@@ -123,6 +123,7 @@ struct ModelSettingsView: View {
                 ProgressView()
             }
         }
+        .accessibilityIdentifier("model-form")
         .navigationTitle("Model")
         .navigationBarTitleDisplayMode(.inline)
         .disabled(isWorking)

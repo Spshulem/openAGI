@@ -15,12 +15,36 @@ final class NativeNavigationTests: XCTestCase {
         app.descendants(matching: .any).matching(identifier: id).firstMatch
     }
 
-    private func tap(_ app: XCUIApplication, _ id: String) {
+    private func tap(_ app: XCUIApplication, _ id: String, in listID: String? = nil) {
         let target = element(app, id)
+        if let listID {
+            let list = element(app, listID)
+            XCTAssertTrue(list.waitForExistence(timeout: 5), "Missing list \(listID)")
+            // Native lists create offscreen accessibility elements lazily.
+            // Scroll the active form, rather than the presenting screen.
+            for _ in 0..<8 {
+                if target.exists && target.isHittable {
+                    target.tap()
+                    return
+                }
+                list.swipeUp()
+            }
+        }
         XCTAssertTrue(target.waitForExistence(timeout: 10), "Missing \(id)")
-        for _ in 0..<5 where !target.isHittable { app.swipeUp() }
         XCTAssertTrue(target.isHittable, "Not hittable: \(id)")
         target.tap()
+    }
+
+    private func back(_ app: XCUIApplication, from title: String, to parent: String) {
+        // Duo places its native Back button in the vertical toolbar, outside
+        // UINavigationBar. Ordinary iPhones can expose the parent title.
+        let native = element(app, "BackButton")
+        let target = native.exists ? native : app.navigationBars[title].buttons[parent]
+        XCTAssertTrue(target.waitForExistence(timeout: 5), "Missing Back from \(title)")
+        target.tap()
+        XCTAssertTrue(app.navigationBars[parent].waitForExistence(timeout: 5),
+                      "One Back from \(title) must return directly to \(parent)")
+        XCTAssertFalse(app.navigationBars[title].exists)
     }
 
     private func tab(_ app: XCUIApplication, _ title: String) {
@@ -43,13 +67,9 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         capture("native-settings", app: app)
         for (id, title) in [("model", "Model"), ("instructions", "Instructions"), ("skills", "Skills"), ("scheduled", "Scheduled")] {
-            tap(app, "settings-\(id)")
+            tap(app, "settings-\(id)", in: "settings-form")
             XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
-            let back = app.navigationBars[title].buttons["Settings"]
-            XCTAssertTrue(back.exists, "\(title) must go straight back to Settings")
-            back.tap()
-            XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
-            XCTAssertFalse(app.navigationBars[title].exists)
+            back(app, from: title, to: "Settings")
         }
         tap(app, "settings-done")
         XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 5))
@@ -58,18 +78,20 @@ final class NativeNavigationTests: XCTestCase {
     func testModelProviderSelectionSavesAndLeavesTheModelScreenUsable() {
         let app = launch()
         tap(app, "open-settings")
-        tap(app, "settings-model")
+        tap(app, "settings-model", in: "settings-form")
         tap(app, "model-provider")
         let option = app.buttons["OpenAI"]
         let openAI = option.exists ? option : app.staticTexts["OpenAI"].firstMatch
         XCTAssertTrue(openAI.waitForExistence(timeout: 5))
         openAI.tap()
-        XCTAssertTrue(app.staticTexts["OpenAI · demo-model"].waitForExistence(timeout: 10))
+        let active = element(app, "model-active")
+        let selected = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "OpenAI · demo-model"), object: active)
+        XCTAssertEqual(XCTWaiter.wait(for: [selected], timeout: 10), .completed)
         capture("native-model-selection", app: app)
-        tap(app, "model-test")
+        tap(app, "model-test", in: "model-form")
         XCTAssertTrue(app.staticTexts["Works. demo-model answered."].waitForExistence(timeout: 10))
-        app.navigationBars["Model"].buttons["Settings"].tap()
-        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
+        back(app, from: "Model", to: "Settings")
     }
 
     func testTodayAndTasksRenderDataAndEachTaskHasItsOwnNavigationRow() {
@@ -78,11 +100,10 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Review a synthetic demo"].exists)
         capture("native-today", app: app)
         tab(app, "Tasks")
-        tap(app, "tasks-task-demo-one")
+        tap(app, "tasks-task-demo-one", in: "tasks-list")
         XCTAssertTrue(app.navigationBars["Edit task"].waitForExistence(timeout: 5))
         XCTAssertEqual(app.textFields["Title"].value as? String, "Plan a synthetic demo")
-        app.navigationBars["Edit task"].buttons["Tasks"].tap()
-        XCTAssertTrue(app.navigationBars["Tasks"].waitForExistence(timeout: 5))
+        back(app, from: "Edit task", to: "Tasks")
         capture("native-tasks", app: app)
         app.segmentedControls.buttons["Agent's"].tap()
         XCTAssertTrue(app.staticTexts["Prepare a synthetic report"].waitForExistence(timeout: 10))
@@ -96,12 +117,10 @@ final class NativeNavigationTests: XCTestCase {
         capture("native-inbox", app: app)
         tap(app, "inbox-approval-approval-one")
         XCTAssertTrue(app.navigationBars["Approval"].waitForExistence(timeout: 5))
-        app.navigationBars["Approval"].buttons["Inbox"].tap()
-        XCTAssertTrue(app.navigationBars["Inbox"].waitForExistence(timeout: 5))
+        back(app, from: "Approval", to: "Inbox")
         tap(app, "inbox-question-question-one")
         XCTAssertTrue(app.navigationBars["Clarification"].waitForExistence(timeout: 5))
-        app.navigationBars["Clarification"].buttons["Inbox"].tap()
-        XCTAssertTrue(app.navigationBars["Inbox"].waitForExistence(timeout: 5))
+        back(app, from: "Clarification", to: "Inbox")
     }
 
     func testNativeComposerHistoryKeyboardDraftContinuityAndSending() {
@@ -146,9 +165,9 @@ final class NativeNavigationTests: XCTestCase {
     func testSettingsAndComposerRemainUsableInDarkModeWithAccessibilityText() {
         let app = launch(["--ui-dark", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
         tap(app, "open-settings")
-        tap(app, "settings-model")
+        tap(app, "settings-model", in: "settings-form")
         XCTAssertTrue(app.navigationBars["Model"].waitForExistence(timeout: 5))
-        app.navigationBars["Model"].buttons["Settings"].tap()
+        back(app, from: "Model", to: "Settings")
         capture("native-settings-accessibility-dark", app: app)
         tap(app, "settings-done")
         tab(app, "Chat")

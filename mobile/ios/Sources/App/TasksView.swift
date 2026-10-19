@@ -69,6 +69,7 @@ struct TasksView: View {
                     }
                 }
             }
+            .accessibilityIdentifier("tasks-list")
             .navigationTitle("Tasks")
             .refreshable { await load() }
             .task(id: "\(queue.rawValue)-\(model.tasksGeneration)") { await load() }

@@ -59,6 +59,7 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
             -resultBundlePath "$RUNNER_TEMP/OpenAGI-tests.xcresult" \
             -parallel-testing-enabled NO \
+            -collect-test-diagnostics never \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_ALLOWED=YES
       - name: Test native iPhone navigation and controls
@@ -76,6 +77,7 @@ jobs:
             -resultBundlePath "$RUNNER_TEMP/OpenAGI-iPhone-UI.xcresult" \
             -only-testing:OpenAGIUITests \
             -parallel-testing-enabled NO \
+            -collect-test-diagnostics never \
             CODE_SIGN_IDENTITY=- \
             CODE_SIGNING_ALLOWED=YES
       - name: Verify simulator runtime was bundled

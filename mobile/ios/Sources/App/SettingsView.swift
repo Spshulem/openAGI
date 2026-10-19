@@ -91,6 +91,7 @@ struct SettingsView: View {
                     }
                 }
             }
+            .accessibilityIdentifier("settings-form")
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: WorkspaceDestination.self) { destination in
