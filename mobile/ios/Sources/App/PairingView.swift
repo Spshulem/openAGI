@@ -167,6 +167,8 @@ struct PairingView: View {
             return ("This phone is already paired.", "Revoke it from Settings first, then pair again.")
         case .transport:
             return ("Can't reach OpenAGI.", "Check the address and that your phone can reach the daemon.")
+        case .mainConnection(let issue):
+            return ("Main connection needs attention", issue.message)
         case .notFound, .server, .malformedResponse, .agentHostDisabled:
             return ("Pairing failed.", "Try again.")
         }

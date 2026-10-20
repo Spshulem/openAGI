@@ -28,6 +28,18 @@ final class StubProtocol: URLProtocol {
 }
 
 final class DaemonClientTests: XCTestCase {
+    func testMainRoutingFailureIsDistinctFromRevokedPairing() async {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 502, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"error":"main-pairing-required","message":"untrusted server copy"}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().summary(ifNoneMatch: nil)
+            XCTFail("Must not decode a main failure as an empty summary")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .mainConnection(.authorizationRequired))
+        } catch { XCTFail("Unexpected error: \(error)") }
+    }
     private func makeClient() -> DaemonClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubProtocol.self]

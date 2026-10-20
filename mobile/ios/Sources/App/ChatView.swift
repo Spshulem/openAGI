@@ -333,6 +333,8 @@ enum ChatErrorCopy {
             return "OpenAGI can't reply -- no agent host is configured on this daemon. Open its dashboard and finish setup, then try again."
         case .unauthorized:
             return "Needs re-pairing -- revoke and pair again in Settings."
+        case .mainConnection(let issue):
+            return issue.message
         case .notFound, .conflict, .malformedResponse, .server, .unreachableHost, .transport:
             return "Can't reach OpenAGI. Check your connection and try again."
         }

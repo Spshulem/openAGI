@@ -53,6 +53,8 @@ import {
 } from "./node-registry.js";
 import { ServiceProbe, adoptRemoteServices, mergeServices } from "./service-nodes.js";
 import { readNodeConfig, writeNodeConfig } from "./cli-client.js";
+import { routeMainData } from "./main-data-router.js";
+import { taskIntegrationSettings, updateTaskIntegration, syncTaskIntegration } from "./task-integration-settings.js";
 import { composeBrief, dismissFocus } from "./daily-brief.js";
 import { queryReviewQueue, ReviewQueueQueryError } from "./review-queue.js";
 import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
@@ -999,6 +1001,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return res.end(JSON.stringify({ error: "forbidden", reason: origin.reason }));
         }
       }
+
+      // Shared workspace requests belong to main, including requests from a
+      // phone using this worker as its reachable gateway. Main validates the
+      // original scoped credential. Never grant this worker broader scopes.
+      if (routeMainData(req, res, url, {
+        pairing: readNodeConfig(dataDir), identity: localIdentity,
+        ownerAuthenticated: checkAuth(req, url, getAuthToken()).ok,
+        allowInsecureRemote: allowInsecureNodeRelay
+      })) return;
 
       // Auth gate. Webhooks self-validate, /health stays open, setup routes
       // bypass auth ONLY during first-run (no token exists yet).
@@ -2312,6 +2323,27 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         } catch (error) {
           return sendJson(res, error.status ?? 500, { error: "skill_error", message: error.message });
         }
+      }
+      if (pathname === "/workspace/integrations" && method === "GET") {
+        return sendJson(res, 200, { integrations: taskIntegrationSettings(runtime) });
+      }
+      const taskIntegrationMatch = /^\/workspace\/integrations\/(linear|buildbetter)(\/sync)?$/.exec(pathname);
+      if (taskIntegrationMatch) {
+        const [, id, sync] = taskIntegrationMatch;
+        if (sync && method === "POST") return sendJson(res, 200, await syncTaskIntegration(runtime, id));
+        if (!sync && ["PUT", "DELETE"].includes(method)) {
+          const body = method === "DELETE" ? {} : await readJsonLimited(req, 2048).catch(() => null);
+          if (!body || Object.keys(body).some(key => key !== "apiKey")) return sendJson(res, 400, { error: "invalid_body" });
+          try {
+            if (!updateTaskIntegration(runtime, dataDir, id, method === "DELETE" ? null : body.apiKey)) {
+              return sendJson(res, 409, { error: "integration_unavailable" });
+            }
+          } catch (error) {
+            return sendJson(res, error.status ?? 400, { error: "invalid_key" });
+          }
+          return sendJson(res, 200, { integrations: taskIntegrationSettings(runtime) });
+        }
+        return sendJson(res, 405, { error: "method_not_allowed" });
       }
       if (pathname === "/workspace/jobs" && method === "GET") {
         const jobs = runtime.cron.listJobs().map((job) => ({

@@ -89,12 +89,18 @@ final class AppModel {
         case .updated, .unchanged: "Synced"
         case .unauthorized: "Needs re-pairing"
         case .offline: snapshot == nil ? "Couldn't load data" : "Showing saved data"
+        case .mainUnavailable: "Main connection needs attention"
         case nil: "Not synced yet"
         }
     }
 
     var ageMinutes: Int { snapshot?.ageInMinutes() ?? 0 }
+    var mainConnectionIssue: MainConnectionIssue? {
+        if case .mainUnavailable(let issue) = lastOutcome { return issue }
+        return nil
+    }
     var refreshFailed: Bool {
+        if mainConnectionIssue != nil { return true }
         if case .offline = lastOutcome { return true }
         return snapshot?.lastRefreshFailedAt != nil
     }

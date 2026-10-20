@@ -19,6 +19,7 @@ struct UITestRoot: View {
 final class UITestProtocol: URLProtocol, @unchecked Sendable {
     static var isEnabled: Bool { ProcessInfo.processInfo.arguments.contains("--ui-testing") }
     private static let preference = OSAllocatedUnfairLock(initialState: "auto")
+    private static let integrationKeySaved = OSAllocatedUnfairLock(initialState: false)
     private static let date = "2026-10-18T12:00:00.000Z"
 
     @MainActor
@@ -88,6 +89,14 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             finish(object: ["markdown": "Synthetic instructions for the UI test."])
         case "/workspace/skills": finish(object: ["skills": []])
         case "/workspace/jobs": finish(object: ["jobs": []])
+        case "/workspace/integrations", "/workspace/integrations/linear":
+            if request.httpMethod == "PUT" { Self.integrationKeySaved.withLock { $0 = true } }
+            if request.httpMethod == "DELETE" { Self.integrationKeySaved.withLock { $0 = false } }
+            let saved = Self.integrationKeySaved.withLock { $0 }
+            finish(object: ["integrations": [["id": "linear", "name": "Linear", "available": true,
+                                               "configured": saved, "apiKeySaved": saved]]])
+        case "/workspace/integrations/linear/sync":
+            finish(object: ["ok": true, "created": 1, "updated": 0, "completed": 0])
         case let path where path.hasPrefix("/conversations/"):
             finish(object: ["thread": "agent", "messages": [
                 ["id": "history-one", "role": "user", "text": "Earlier synthetic question", "at": Self.date],

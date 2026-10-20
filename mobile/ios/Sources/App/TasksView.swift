@@ -116,6 +116,10 @@ struct TasksView: View {
             hasLoaded = true
         } catch {
             guard !Task.isCancelled else { return }
+            if case DaemonError.mainConnection(let issue) = error {
+                errorHeadline = issue.message
+                return
+            }
             errorHeadline = (error as? DaemonError) == .unauthorized
                 ? "Pairing needs attention. Connect to your agent again in Settings."
                 : "Couldn't load tasks from this server."

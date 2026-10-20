@@ -66,7 +66,7 @@ final class NativeNavigationTests: XCTestCase {
         tap(app, "open-settings")
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         capture("native-settings", app: app)
-        for (id, title) in [("model", "Model"), ("instructions", "Instructions"), ("skills", "Skills"), ("scheduled", "Scheduled")] {
+        for (id, title) in [("model", "Model"), ("instructions", "Instructions"), ("integrations", "Integrations"), ("skills", "Skills"), ("scheduled", "Scheduled")] {
             tap(app, "settings-\(id)", in: "settings-form")
             XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
             back(app, from: title, to: "Settings")
@@ -92,6 +92,24 @@ final class NativeNavigationTests: XCTestCase {
         tap(app, "model-test", in: "model-form")
         XCTAssertTrue(app.staticTexts["Works. demo-model answered."].waitForExistence(timeout: 10))
         back(app, from: "Model", to: "Settings")
+    }
+
+    func testNativeIntegrationCanSaveAKeyAndSyncThenReturnToSettings() {
+        let app = launch()
+        tap(app, "open-settings")
+        tap(app, "settings-integrations", in: "settings-form")
+        tap(app, "integration-linear")
+        let key = app.secureTextFields["API key"]
+        XCTAssertTrue(key.waitForExistence(timeout: 5))
+        key.tap()
+        key.typeText("synthetic-integration-key")
+        app.buttons["Save API key"].tap()
+        XCTAssertTrue(app.staticTexts["Saved. Sync tasks now to check access."].waitForExistence(timeout: 10))
+        app.buttons["Sync tasks now"].tap()
+        XCTAssertTrue(app.staticTexts["Synced. 1 new tasks."].waitForExistence(timeout: 10))
+        capture("native-integration", app: app)
+        back(app, from: "Linear", to: "Integrations")
+        back(app, from: "Integrations", to: "Settings")
     }
 
     func testTodayAndTasksRenderDataAndEachTaskHasItsOwnNavigationRow() {

@@ -11,7 +11,14 @@ struct TodayView: View {
                 Section {
                     AgentConnectionRow()
                 }
-                if OfflineBanner.isShown(for: model) {
+                if let issue = model.mainConnectionIssue {
+                    Section {
+                        Label("Main connection needs attention", systemImage: "exclamationmark.icloud")
+                        Text(issue.message).foregroundStyle(.secondary)
+                        Button("Connection Settings") { settingsShown = true }
+                        Button("Retry") { Task { await model.refreshData() } }
+                    }
+                } else if OfflineBanner.isShown(for: model) {
                     Section { OfflineBanner() }
                 }
                 if let headline = model.snapshot?.summary.brief.headline, !headline.isEmpty {
@@ -88,6 +95,10 @@ struct TodayView: View {
             } actions: {
                 Button("Connection Settings") { settingsShown = true }
             }
+        } else if model.mainConnectionIssue != nil {
+            // The connection section above explains the failure, including
+            // when an earlier snapshot has real tasks to keep displaying.
+            EmptyView()
         } else if model.snapshot == nil && model.refreshFailed {
             ContentUnavailableView {
                 Label("Couldn't load Today", systemImage: "wifi.exclamationmark")

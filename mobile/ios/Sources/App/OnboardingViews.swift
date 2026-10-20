@@ -10,81 +10,31 @@ struct WelcomeView: View {
     @Environment(AppSession.self) private var session
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Spacing.x6) {
-                VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
-                    Text("OpenAGI")
-                        .font(Theme.Typography.screenTitle)
-                        .foregroundStyle(Theme.ink)
-                    Text("Your own agent: tasks, memory, a morning plan and an evening recap.")
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.muted)
+        NavigationStack {
+            Form {
+                Section {
+                    Text("Your personal agent for chat, tasks and memory.")
                 }
-
-                Text("Where should it run?")
-                    .font(Theme.Typography.section)
-                    .foregroundStyle(Theme.ink)
-
-                ChoiceCard(
-                    title: "On this iPhone",
-                    detail: session.canRunOnPhone
-                        ? "Use Apple Intelligence on supported iPhones, or connect a cloud model. No server needed."
-                        : "This build doesn't include the on-phone runtime.",
-                    badge: "Recommended",
-                    enabled: session.canRunOnPhone
-                ) { session.choosePhone() }
-
-                ChoiceCard(
-                    title: "Connect to a server",
-                    detail: "Pair with OpenAGI on your Mac or a server. You can also do this later, from Settings.",
-                    badge: nil,
-                    enabled: true
-                ) { session.chooseServer() }
-            }
-            .padding(Theme.gutter)
-        }
-        .background(Theme.canvas)
-    }
-}
-
-private struct ChoiceCard: View {
-    let title: String
-    let detail: String
-    let badge: String?
-    let enabled: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(alignment: .top, spacing: Theme.Spacing.x3) {
-                VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
-                    HStack(spacing: Theme.Spacing.x2) {
-                        Text(title)
-                            .font(Theme.Typography.body.weight(.semibold))
-                            .foregroundStyle(Theme.ink)
-                        if let badge {
-                            Text(badge)
-                                .font(Theme.Typography.caption.weight(.medium))
-                                .foregroundStyle(Theme.live)
-                        }
-                    }
-                    Text(detail)
-                        .font(Theme.Typography.secondary)
-                        .foregroundStyle(Theme.muted)
-                        .multilineTextAlignment(.leading)
+                Section {
+                    Button("On this iPhone", systemImage: "iphone") { session.choosePhone() }
+                        .disabled(!session.canRunOnPhone)
+                        .accessibilityIdentifier("setup-on-phone")
+                } header: {
+                    Text("Start locally")
+                } footer: {
+                    Text(session.canRunOnPhone
+                         ? "Use Apple Intelligence on a supported iPhone. No account, API key or server required. Cloud models and online integrations are optional."
+                         : "This build doesn't include the on-phone runtime.")
                 }
-                Spacer(minLength: 0)
-                Image(systemName: "chevron.right")
-                    .foregroundStyle(Theme.muted)
+                Section {
+                    Button("Connect to a server", systemImage: "server.rack") { session.chooseServer() }
+                        .accessibilityIdentifier("setup-server")
+                } footer: {
+                    Text("Use an existing OpenAGI agent on your Mac or server. You can connect later in Settings.")
+                }
             }
-            .padding(Theme.Spacing.x4)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.surface)
-            .clipShape(RoundedRectangle(cornerRadius: Theme.rowGroupRadius, style: .continuous))
+            .navigationTitle("OpenAGI")
         }
-        .buttonStyle(.plain)
-        .disabled(!enabled)
-        .opacity(enabled ? 1 : 0.5)
     }
 }
 
@@ -92,6 +42,7 @@ private struct ChoiceCard: View {
 // notifications. Lands in Chat.
 struct PhoneSetupView: View {
     @Environment(AppSession.self) private var session
+    @Environment(\.scenePhase) private var scenePhase
 
     private enum Step: Equatable {
         case model
@@ -113,8 +64,7 @@ struct PhoneSetupView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Spacing.x6) {
+            Form {
                     switch step {
                     case .model: modelStep
                     case .starting: startingStep
@@ -123,10 +73,12 @@ struct PhoneSetupView: View {
                     case .brain: brainStep
                     case .notifications: notificationsStep
                     }
-                }
-                .padding(Theme.gutter)
             }
-            .background(Theme.canvas)
+            .navigationTitle("Set up your agent")
+            .navigationBarTitleDisplayMode(.inline)
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { modelStatus = OnDeviceModelStatus.current() }
+            }
             .toolbar {
                 if step == .model {
                     ToolbarItem(placement: .cancellationAction) {
@@ -161,10 +113,12 @@ struct PhoneSetupView: View {
         case .downloading:
             statusLine("Apple Intelligence is still downloading. Keep the phone on Wi-Fi and charging; this can take a while.", color: Theme.caution)
             SecondaryTextButton(title: "Check again") { modelStatus = OnDeviceModelStatus.current() }
+            Button("Use a cloud model instead") { start() }
         case .notEnabled:
             statusLine("Turn on Apple Intelligence in Settings, then come back.", color: Theme.caution)
             PrimaryButton(title: "Open Settings") { openSettings() }
             SecondaryTextButton(title: "Check again") { modelStatus = OnDeviceModelStatus.current() }
+            Button("Use a cloud model instead") { start() }
         case .unsupported:
             statusLine("This iPhone can't run Apple's on-device model. OpenAGI can still run here with a Claude or OpenAI key, or your ChatGPT plan.", color: Theme.caution)
             PrimaryButton(title: "Continue with a key or ChatGPT") { start() }
@@ -186,17 +140,13 @@ struct PhoneSetupView: View {
 
     @ViewBuilder private var nameStep: some View {
         header("Name your agent", "It'll answer to this name.")
-        RowGroup {
-            VStack(alignment: .leading, spacing: Theme.Spacing.x3) {
+        Section {
                 TextField("Name", text: $name)
                     .font(Theme.Typography.body)
                     .textInputAutocapitalization(.words)
-                Divider()
                 TextField("What do you want help with?", text: $focus, axis: .vertical)
                     .font(Theme.Typography.body)
                     .lineLimit(3...6)
-            }
-            .padding(Theme.Spacing.x4)
         }
         if let errorText {
             statusLine(errorText, color: Theme.alert)
@@ -207,23 +157,34 @@ struct PhoneSetupView: View {
 
     // A cloud model is optional only when this iPhone has a local model.
     @ViewBuilder private var brainStep: some View {
-        header(modelStatus == .available ? "Make it smarter" : "Connect a model",
+        header(modelStatus == .available ? "Choose your model" : "Connect a model",
                modelStatus == .available
-                ? "Add a Claude or OpenAI key, or sign in with ChatGPT, for an agent that can use skills and every tool. Without internet it falls back to this iPhone's model."
+                ? "Apple Intelligence can chat, remember things and manage your tasks on this iPhone. A cloud model is optional and sends your requests to that provider."
                 : "This iPhone needs a Claude or OpenAI key, or ChatGPT sign-in, to reply. Cloud models require an internet connection.")
         if let errorText { statusLine(errorText, color: Theme.alert) }
-        PrimaryButton(title: "Add a key or sign in", isLoading: isWorking) {
+        if modelStatus == .available {
+            Button {
+                selectLocalModel()
+            } label: {
+                HStack {
+                    Label("Use Apple Intelligence", systemImage: "apple.intelligence")
+                    if isWorking { Spacer(); ProgressView() }
+                }
+            }
+            .disabled(isWorking)
+            .accessibilityIdentifier("setup-use-local")
+            Text("Inference, tasks and memory stay on this device. Online integrations contact the services you choose to connect.")
+                .font(.footnote).foregroundStyle(.secondary)
+        }
+        Button("Choose a cloud model") {
             errorText = nil
             showingModelSettings = true
         }
         .disabled(isWorking)
-        if modelStatus == .available {
-            SecondaryTextButton(title: "Use this iPhone's model for now") { step = .notifications }
-        }
     }
 
     @ViewBuilder private var notificationsStep: some View {
-        header("Stay in the loop", "Your plan arrives at 8 in the morning and a recap at 6 in the evening.")
+        header("Stay in the loop", "Allow local notifications for a morning plan and evening recap. iOS controls when background refresh can run; open the app to keep them current.")
         PrimaryButton(title: "Turn on notifications") { requestNotifications() }
         SecondaryTextButton(title: "Not now") { finish() }
     }
@@ -231,10 +192,6 @@ struct PhoneSetupView: View {
     // MARK: Actions
 
     private func checkModelReadiness() {
-        guard modelStatus != .available else {
-            step = .notifications
-            return
-        }
         guard let credentials else { return }
         isWorking = true
         Task {
@@ -246,9 +203,31 @@ struct PhoneSetupView: View {
                     errorText = "Add a key or finish ChatGPT sign-in, then select that provider to continue."
                     return
                 }
+                let result = try await client.testModel()
+                guard result.ok else {
+                    errorText = result.message ?? "The selected model couldn't answer. Check its settings and try again."
+                    return
+                }
                 step = .notifications
             } catch {
                 errorText = "Couldn't check the model. Open model settings and try again."
+            }
+        }
+    }
+
+    private func selectLocalModel() {
+        guard let credentials else { return }
+        errorText = nil
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                modelStatus = OnDeviceModelStatus.current()
+                let client = DaemonClient(server: credentials.server, nodeID: credentials.nodeID, token: credentials.token)
+                try await PhoneModelSetup.useLocal(client: client, availability: modelStatus)
+                step = .notifications
+            } catch {
+                errorText = error.localizedDescription
             }
         }
     }

@@ -1,5 +1,22 @@
 import Foundation
 
+public enum MainConnectionIssue: String, Sendable, Equatable {
+    case authorizationRequired = "main-pairing-required"
+    case unavailable = "main-unavailable"
+    case routingLoop = "main-routing-loop"
+
+    public var message: String {
+        switch self {
+        case .authorizationRequired:
+            "This worker reached main, but main hasn't authorized this phone. Use your existing main-issued phone pairing in Connection Settings. Your current pairing has been kept."
+        case .unavailable:
+            "This worker can't reach main. Check the worker's main connection, then refresh. Your saved work and pairing have been kept."
+        case .routingLoop:
+            "This worker's main address points to another worker in a loop. Correct its main connection, then refresh."
+        }
+    }
+}
+
 public enum DaemonError: Error {
     case unreachableHost(String)
     case unauthorized
@@ -14,6 +31,7 @@ public enum DaemonError: Error {
     // and it is not "the server broke" -- it is a legible, expected state
     // chat's UI must say plainly rather than showing a generic server error.
     case agentHostDisabled
+    case mainConnection(MainConnectionIssue)
 }
 
 // `Error` doesn't conform to `Equatable`, so adding `.transport(Error)` above
@@ -32,6 +50,7 @@ extension DaemonError: Equatable {
         case (.malformedResponse, .malformedResponse): return true
         case (.transport, .transport): return true
         case (.agentHostDisabled, .agentHostDisabled): return true
+        case let (.mainConnection(a), .mainConnection(b)): return a == b
         default: return false
         }
     }
@@ -305,6 +324,10 @@ public actor DaemonClient {
         let (bytes, response) = try await Self.bytesCall(request, session: session)
         guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
         if !(200...299).contains(http.statusCode) {
+            if [502, 508].contains(http.statusCode) {
+                let text = (try? await Self.collectText(bytes, byteLimit: 4096)) ?? ""
+                _ = try validate(response, data: Data(text.utf8))
+            }
             // A non-2xx status here is a plain JSON error body, not an SSE
             // stream -- `validate(_:)` alone would report it as a bare
             // `.server(503)`, which is exactly what shipped as "Can't reach
@@ -519,7 +542,7 @@ public actor DaemonClient {
 
     private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let (data, response) = try await Self.networkCall(request, session: session)
-        let http = try validate(response)
+        let http = try validate(response, data: data)
         return (data, http)
     }
 
@@ -617,8 +640,13 @@ public actor DaemonClient {
     }
 
     @discardableResult
-    private func validate(_ response: URLResponse) throws -> HTTPURLResponse {
+    private func validate(_ response: URLResponse, data: Data? = nil) throws -> HTTPURLResponse {
         guard let http = response as? HTTPURLResponse else { throw DaemonError.malformedResponse }
+        if [502, 508].contains(http.statusCode), let data,
+           let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let code = body["error"] as? String, let issue = MainConnectionIssue(rawValue: code) {
+            throw DaemonError.mainConnection(issue)
+        }
         switch http.statusCode {
         case 200...299, 304: return http
         // 403 specifically means the bearer token doesn't match the
@@ -638,6 +666,25 @@ public actor DaemonClient {
 // The phone's workspace screens. Same credential as everything else; the
 // daemon allows a phone node exactly these routes (src/mobile-node.js).
 extension DaemonClient {
+    private struct IntegrationList: Decodable { let integrations: [TaskIntegration] }
+
+    public func taskIntegrations() async throws -> [TaskIntegration] {
+        try await json(IntegrationList.self, path: "/workspace/integrations", method: "GET").integrations
+    }
+
+    public func updateTaskIntegration(id: String, apiKey: String?) async throws -> [TaskIntegration] {
+        guard ["linear", "buildbetter"].contains(id) else { throw DaemonError.notFound }
+        let body = try apiKey.map { try JSONSerialization.data(withJSONObject: ["apiKey": $0]) }
+        return try await json(IntegrationList.self, path: "/workspace/integrations/\(id)",
+                              method: apiKey == nil ? "DELETE" : "PUT", body: body).integrations
+    }
+
+    public func syncTaskIntegration(id: String) async throws -> TaskIntegrationSync {
+        guard ["linear", "buildbetter"].contains(id) else { throw DaemonError.notFound }
+        return try await json(TaskIntegrationSync.self, path: "/workspace/integrations/\(id)/sync", method: "POST",
+                              body: Data("{}".utf8), timeout: 60)
+    }
+
     private struct Wrapped<T: Decodable>: Decodable { let skills: T?; let jobs: T? }
 
     public func modelSettings() async throws -> ModelSettings {

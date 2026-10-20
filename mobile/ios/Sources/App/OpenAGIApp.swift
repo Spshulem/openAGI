@@ -27,6 +27,8 @@ struct OpenAGIApp: App {
                 #if DEBUG
                 if UITestProtocol.isEnabled {
                     UITestRoot()
+                } else if ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") {
+                    LocalAgentAcceptanceView()
                 } else {
                     sessionContent
                 }
@@ -37,7 +39,7 @@ struct OpenAGIApp: App {
             .environment(session)
             .onOpenURL { url in
                 #if DEBUG
-                if UITestProtocol.isEnabled { return }
+                if UITestProtocol.isEnabled || ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") { return }
                 #endif
                 // The Live Activity's tap target.
                 if url.scheme == "openagi", url.host == "supervisor" {
@@ -50,7 +52,7 @@ struct OpenAGIApp: App {
             }
             .onChange(of: scenePhase) { _, newPhase in
                 #if DEBUG
-                if UITestProtocol.isEnabled { return }
+                if UITestProtocol.isEnabled || ProcessInfo.processInfo.arguments.contains("--local-agent-acceptance") { return }
                 #endif
                 switch newPhase {
                 case .active:
@@ -155,8 +157,11 @@ struct OpenAGIApp: App {
             guard !Task.isCancelled else { completion.finish(success: false); return }
             if credentials.isEmbedded {
                 await DailyDigestNotifier.refresh(client: client)
-            } else if outcome != .offline && outcome != .unauthorized {
-                await OfflineCopy.shared.sync(from: client)
+            } else {
+                switch outcome {
+                case .updated, .unchanged: await OfflineCopy.shared.sync(from: client)
+                default: break
+                }
             }
             guard !Task.isCancelled else { completion.finish(success: false); return }
             // A push registration that failed earlier retries here too.
@@ -165,7 +170,7 @@ struct OpenAGIApp: App {
             switch outcome {
             case .updated, .unchanged:
                 completion.finish(success: true)
-            case .unauthorized, .offline:
+            case .unauthorized, .offline, .mainUnavailable:
                 completion.finish(success: false)
             }
         }

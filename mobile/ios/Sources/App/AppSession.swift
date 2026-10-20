@@ -177,6 +177,7 @@ enum PhoneAgent {
     // the socket while the app is suspended.
     static func connectModel() async {
         guard let port = EmbeddedDaemon.shared.port, let secrets = EmbeddedSecrets.load() else { return }
-        await DeviceModelBridge.shared.connect(port: port, ownerToken: secrets.ownerToken, backend: OnDeviceModelStatus.backend())
+        await DeviceModelBridge.shared.connect(port: port, ownerToken: secrets.ownerToken,
+            backend: OnDeviceModelStatus.backend(), availability: OnDeviceModelStatus.current().availabilityName)
     }
 }

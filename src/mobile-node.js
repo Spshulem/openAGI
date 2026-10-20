@@ -94,6 +94,7 @@ const EXACT = new Set([
   "PUT /workspace/persona",
   "GET /workspace/skills",
   "GET /workspace/jobs",
+  "GET /workspace/integrations",
   // The phone's offline copy of this agent, and what it did offline.
   "GET /mobile/mirror",
   "POST /mobile/offline-import",
@@ -104,6 +105,9 @@ const EXACT = new Set([
 ]);
 
 const PATTERNS = [
+  { method: "PUT", re: /^\/workspace\/integrations\/(linear|buildbetter)$/ },
+  { method: "DELETE", re: /^\/workspace\/integrations\/(linear|buildbetter)$/ },
+  { method: "POST", re: /^\/workspace\/integrations\/(linear|buildbetter)\/sync$/ },
   { method: "GET", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
   { method: "POST", re: new RegExp(`^/fleet/api/suggestions/${ID}$`) },
   { method: "GET", re: /^\/workspace\/skills\/[a-z0-9][a-z0-9-]{0,62}$/ },

@@ -212,6 +212,7 @@ enum ApprovalError {
         case .unauthorized: return "Needs re-pairing — revoke and pair again in Settings."
         case .notFound: return "This item is gone — someone else may have already decided it."
         case .conflict: return "Already decided — probably from another device."
+        case .mainConnection(let issue): return issue.message
         default: return "Can't reach OpenAGI."
         }
     }

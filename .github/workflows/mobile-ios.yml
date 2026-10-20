@@ -72,6 +72,8 @@ jobs:
           simulator_id=$(xcrun simctl create "OpenAGI Duo CI" "$device_type" "$runtime_id")
           echo "OPENAGI_DUO_SIM=$simulator_id" >> "$GITHUB_ENV"
           echo "OPENAGI_IOS_RUNTIME=$runtime_id" >> "$GITHUB_ENV"
+          xcrun simctl boot "$simulator_id"
+          xcrun simctl bootstatus "$simulator_id" -b
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
@@ -102,6 +104,8 @@ jobs:
           test -n "$phone_runtime_id"
           simulator_id=$(xcrun simctl create "OpenAGI iPhone UI CI" "$device_type" "$phone_runtime_id")
           echo "OPENAGI_PHONE_SIM=$simulator_id" >> "$GITHUB_ENV"
+          xcrun simctl boot "$simulator_id"
+          xcrun simctl bootstatus "$simulator_id" -b
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \

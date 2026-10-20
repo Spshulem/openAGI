@@ -6,13 +6,14 @@ import SwiftUI
 // 2026-10-16-openagi-phone-workspace-design.md.
 
 enum WorkspaceDestination: String, CaseIterable, Hashable, Identifiable {
-    case model, instructions, skills, scheduled
+    case model, instructions, integrations, skills, scheduled
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .model: "Model"
         case .instructions: "Instructions"
+        case .integrations: "Integrations"
         case .skills: "Skills"
         case .scheduled: "Scheduled"
         }
@@ -21,6 +22,7 @@ enum WorkspaceDestination: String, CaseIterable, Hashable, Identifiable {
         switch self {
         case .model: "brain"
         case .instructions: "text.page"
+        case .integrations: "link"
         case .skills: "wrench.and.screwdriver"
         case .scheduled: "calendar.badge.clock"
         }
@@ -54,7 +56,7 @@ struct ModelSettingsView: View {
 
     private var choices: [(id: String, label: String)] {
         var list = [("auto", "Automatic"), ("anthropic", "Claude"), ("openai", "OpenAI"), ("chatgpt", "ChatGPT")]
-        if model.isOnPhone { list.append(("on-device", "This iPhone")) }
+        if model.isOnPhone { list.append(("on-device", "Apple Intelligence")) }
         return list
     }
 
@@ -74,7 +76,7 @@ struct ModelSettingsView: View {
                         .accessibilityIdentifier("model-active")
                 } footer: {
                     Text(model.isOnPhone
-                         ? "Automatic uses Claude or OpenAI when a key is set, and this iPhone's own model otherwise. Without internet, a cloud model falls back to this iPhone."
+                         ? "Apple Intelligence keeps model requests on this iPhone. Automatic can use saved cloud keys or ChatGPT sign-in. Cloud models send requests to that provider and can fall back to this iPhone when offline."
                          : "Automatic uses Claude when its key is set, then OpenAI.")
                 }
 

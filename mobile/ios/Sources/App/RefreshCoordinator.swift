@@ -6,6 +6,7 @@ public enum RefreshOutcome: Sendable, Equatable {
     case unchanged
     case unauthorized
     case offline
+    case mainUnavailable(MainConnectionIssue)
 }
 
 public actor RefreshCoordinator {
@@ -43,6 +44,10 @@ public actor RefreshCoordinator {
             }
         } catch DaemonError.unauthorized {
             return .unauthorized
+        } catch DaemonError.mainConnection(let issue) {
+            try? store.recordRefreshFailure()
+            reloadWidgets()
+            return .mainUnavailable(issue)
         } catch {
             // Whole-branch review finding: this outcome never reached the
             // snapshot, so the widget (which only reads what's on disk) had

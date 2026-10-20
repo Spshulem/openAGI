@@ -25,6 +25,9 @@ struct SettingsView: View {
                     }
                     LabeledContent("Data", value: model.dataStatus)
                         .accessibilityIdentifier("settings-data-status")
+                    if let issue = model.mainConnectionIssue {
+                        Text(issue.message).foregroundStyle(.secondary)
+                    }
                     if let fetchedAt = model.snapshot?.fetchedAt {
                         LabeledContent("Last synced") {
                             Text(fetchedAt, style: .relative)
@@ -44,7 +47,7 @@ struct SettingsView: View {
                     Text("Connection")
                 } footer: {
                     if !model.isOnPhone {
-                        Text("Tasks, Inbox and chat history come from this server. Supervisor can also show activity from other machines in its fleet.")
+                        Text("Tasks, Inbox, chat history and agent settings come from main through this server. Supervisor shows the coding fleet on the connected machine.")
                     }
                 }
 
@@ -98,6 +101,7 @@ struct SettingsView: View {
                 switch destination {
                 case .model: ModelSettingsView()
                 case .instructions: InstructionsView()
+                case .integrations: IntegrationsView()
                 case .skills: SkillsView()
                 case .scheduled: ScheduledJobsView()
                 }

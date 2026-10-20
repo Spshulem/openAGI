@@ -4,6 +4,16 @@ import os
 
 // Reuses `StubProtocol` from DaemonClientTests.swift (same test target).
 final class RefreshCoordinatorTests: XCTestCase {
+    func testMainAccessFailurePreservesTheSnapshotAndDoesNotRevokePairing() async throws {
+        StubProtocol.handler = response(502, body: Data(#"{"error":"main-pairing-required"}"#.utf8))
+        let store = SnapshotStore(directory: dir)
+        _ = try store.storeFresh(summary: summary(ids: ["cached-task"]), etag: "old")
+        let coordinator = RefreshCoordinator(client: makeClient(), store: store, queue: OutboundQueue(directory: dir))
+        let outcome = await coordinator.refresh()
+        XCTAssertEqual(outcome, .mainUnavailable(.authorizationRequired))
+        XCTAssertEqual(store.load()?.summary.today.first?.id, "cached-task")
+        XCTAssertNotNil(store.load()?.lastRefreshFailedAt)
+    }
     private var dir: URL!
 
     override func setUpWithError() throws {
