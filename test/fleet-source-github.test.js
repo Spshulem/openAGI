@@ -479,11 +479,12 @@ test("readLocalGit reads head, branch, upstream, ahead, and remote", async () =>
     "rev-parse --abbrev-ref @{u}": "origin/feature/ai-chat-inline-connect",
     "rev-list --count @{u}..HEAD": "2",
     "remote get-url origin": "https://github.com/buildbetter-app/buildbetter.git",
+    "rev-parse --show-toplevel": "/work/tree",
     "status --porcelain --untracked-files=normal": ""
   });
   const git = await readLocalGit("/work/tree", config(), { run });
   assert.deepEqual(git, {
-    head: HEAD_6878, branch: "feature/ai-chat-inline-connect", upstream: "origin/feature/ai-chat-inline-connect", ahead: 2, remote: BBAPP, dirty: false
+    head: HEAD_6878, branch: "feature/ai-chat-inline-connect", upstream: "origin/feature/ai-chat-inline-connect", ahead: 2, remote: BBAPP, dirty: false, root: "/work/tree"
   });
   assert.equal(calls[0].cmd, "/fake/git");
   assert.deepEqual(calls[0].args.slice(0, 2), ["-C", "/work/tree"]);
@@ -497,7 +498,7 @@ test("readLocalGit handles detached heads and missing upstreams", async () => {
     "status --porcelain --untracked-files=normal": ""
   });
   assert.deepEqual(await readLocalGit("/work/tree", config(), { run }), {
-    head: HEAD_6878, branch: null, upstream: null, ahead: null, remote: "Spshulem/openAGI", dirty: false
+    head: HEAD_6878, branch: null, upstream: null, ahead: null, remote: "Spshulem/openAGI", dirty: false, root: null
   });
 });
 

@@ -101,8 +101,9 @@ final class DaemonController {
       FileManager.default.createFile(atPath: logFile.path, contents: nil,
                                      attributes: [.posixPermissions: 0o600])
     }
-    logHandle = try? FileHandle(forWritingTo: logFile)
-    logHandle?.seekToEndOfFile()
+    let logFD = open(logFile.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o600)
+    logHandle = logFD >= 0 ? FileHandle(fileDescriptor: logFD, closeOnDealloc: true) : nil
+    if logFD >= 0 { fchmod(logFD, 0o600) }
 
     let proc = Process()
     proc.executableURL = nodeBinary
@@ -111,6 +112,7 @@ final class DaemonController {
 
     var env = ProcessInfo.processInfo.environment
     env["OPENAGI_DATA_DIR"] = dataDir.path
+    env["OPENAGI_MANAGED_DAEMON_LOG"] = "1"
     env["HOST"] = "127.0.0.1"
     env["PORT"] = "43210"
     env["OPENAGI_COMPUTER_HELPER"] = bundleResources.appendingPathComponent("OpenAGIComputerHelper").path
@@ -121,8 +123,13 @@ final class DaemonController {
     // on an app-side readability callback continuing to drain the pipes.
     proc.standardOutput = logHandle ?? FileHandle.nullDevice
     proc.standardError = logHandle ?? FileHandle.nullDevice
+    let daemonLog = logHandle
     proc.terminationHandler = { [weak self] p in
       NSLog("OpenAGI: daemon exited with \(p.terminationStatus)")
+      Self.logLifecycle("daemon-exit", to: daemonLog, fields: [
+        "pid": Int(p.processIdentifier), "status": Int(p.terminationStatus),
+        "reason": p.terminationReason == .uncaughtSignal ? "signal" : "exit"
+      ])
       DispatchQueue.main.async {
         guard let self, self.process === p else { return }
         // Release only the handle for the process that actually exited. A
@@ -133,6 +140,7 @@ final class DaemonController {
         // yield to any manual or health-poll restart that starts first.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
           guard let self, self.process == nil else { return }
+          Self.logLifecycle("daemon-respawn", to: daemonLog, fields: ["reason": "unexpected-exit"])
           self.start()
         }
       }
@@ -141,14 +149,17 @@ final class DaemonController {
     do {
       try proc.run()
       process = proc
+      Self.logLifecycle("daemon-spawn", to: daemonLog, fields: ["pid": Int(proc.processIdentifier)])
       NSLog("OpenAGI: daemon started (pid \(proc.processIdentifier))")
     } catch {
+      Self.logLifecycle("daemon-spawn-failed", to: daemonLog)
       NSLog("OpenAGI: failed to launch daemon: \(error)")
     }
   }
 
   func stop() {
     guard let proc = process else { return }
+    Self.logLifecycle("daemon-stop", to: logHandle, fields: ["pid": Int(proc.processIdentifier), "reason": "requested"])
     process = nil
     proc.terminationHandler = nil
     proc.terminate()
@@ -164,6 +175,7 @@ final class DaemonController {
   /// non-blocking stop() above so ordinary UI work never stalls.
   func stopForApplicationTermination() {
     guard let proc = process else { return }
+    Self.logLifecycle("daemon-stop", to: logHandle, fields: ["pid": Int(proc.processIdentifier), "reason": "application-quit"])
     process = nil
     proc.terminationHandler = nil
     proc.terminate()
@@ -178,6 +190,17 @@ final class DaemonController {
         Thread.sleep(forTimeInterval: 0.01)
       }
     }
+  }
+
+  private static func logLifecycle(_ event: String, to handle: FileHandle?, fields: [String: Any] = [:]) {
+    var record = fields
+    record["at"] = ISO8601DateFormatter().string(from: Date())
+    record["event"] = event
+    record["component"] = "mac-daemon-controller"
+    record["level"] = event == "daemon-spawn-failed" ? "error" : "info"
+    guard var data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+    data.append(0x0a)
+    try? handle?.write(contentsOf: data)
   }
 
   /// Bounce the daemon.

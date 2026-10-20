@@ -14,7 +14,7 @@ import { isMobileRouteAllowed } from "../src/mobile-node.js";
 import { createNotifier } from "../src/fleet/notify.js";
 
 const NOW = new Date(2026, 9, 13, 12).getTime();
-const explanation = { anomalyId: "anomaly-0", area: "policy", rootCause: "The same unanswered ask returns", proposedFix: "Keep closed asks closed", acceptance: "No repeated ask", evidenceActionIds: ["a1"], confidence: 0.85, minutesSavedPerDay: 4 };
+const explanation = { remedy: "code", nextAction: "Reproduce the repeated ask and repair its cause", anomalyId: "anomaly-0", area: "policy", rootCause: "The same unanswered ask returns", proposedFix: "Keep closed asks closed", acceptance: "No repeated ask", evidenceActionIds: ["a1"], confidence: 0.85, minutesSavedPerDay: 4 };
 const report = { anomalies: [{ id: "anomaly-0", metric: "questions-unanswered", area: "policy", eventsPerDay: 10, evidenceActionIds: ["a1"], feedbackIds: [] }] };
 function fixture(t, mode = "propose") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-suggestions-test-"));

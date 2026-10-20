@@ -228,9 +228,12 @@ struct FleetThreadSummary: Equatable {
 
   init(thread: FleetThread?, detail: FleetThreadDetail?, now: Date = Date()) {
     // The detail carries the longer excerpt.
-    let text = detail?.lastAgentText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let rowAt = thread?.lastAgentAt.flatMap(FleetWatching.parseDate)
+    let detailAt = detail?.lastAgentAt.flatMap(FleetWatching.parseDate)
+    let newerRow = rowAt.map { rowTime in detailAt.map { rowTime > $0 } ?? true } ?? false
+    let text = (newerRow ? thread?.lastAgentText : detail?.lastAgentText ?? thread?.lastAgentText)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     excerpt = text.isEmpty ? nil : Self.tail(text, Self.excerptMax)
-    excerptAge = excerpt == nil ? nil : (detail?.lastAgentAt ?? thread?.lastAgentAt).flatMap(FleetWatching.parseDate).map { Self.ago($0, now: now) }
+    excerptAge = excerpt == nil ? nil : (newerRow ? thread?.lastAgentAt : detail?.lastAgentAt ?? thread?.lastAgentAt).flatMap(FleetWatching.parseDate).map { Self.ago($0, now: now) }
 
     let row = thread ?? detail.map { FleetThread(key: $0.key, prRef: $0.pr?.ref, prURL: $0.pr?.url, watch: $0.watch) }
     let pr = thread?.pr ?? detail?.pr
@@ -250,7 +253,7 @@ struct FleetThreadSummary: Equatable {
     muted = mutedAt.map { $0 > now } ?? false
     mutedLine = muted ? mutedAt.map { "Muted until \(Self.clock($0, now: now))" } : nil
 
-    let ownerAt = detail?.lastOwnerAt ?? thread?.lastOwnerAt
+    let ownerAt = thread?.lastOwnerAt ?? detail?.lastOwnerAt
     ownerLine = ownerAt.flatMap(FleetWatching.parseDate).map { "You last wrote \(Self.ago($0, now: now))" }
   }
 

@@ -121,6 +121,11 @@ export class ToolLoopContext {
       }
     }
     stats.estimatedTokens = estimateTokens(total);
+    if (total > limitChars) {
+      const error = new Error(`Input exceeds OPENAGI_MAX_INPUT_TOKENS (${stats.estimatedTokens} estimated tokens; limit ${this.maxInputTokens}). Shorten the latest message or increase the configured input limit.`);
+      error.code = "INPUT_CONTEXT_TOO_LARGE";
+      throw error;
+    }
     return stats;
   }
 
@@ -128,13 +133,30 @@ export class ToolLoopContext {
   stub(item) {
     const info = this.meta.get(item);
     const before = itemChars(item);
-    if (info.kind === "image") {
+    if (info.kind === "image" || item.type === "tool_result") {
       item.content = trimmedToolStub(info.tool, before);
     } else {
-      item.output = trimmedToolStub(info.tool, before);
+      item[info.contentKey ?? "output"] = trimmedToolStub(info.tool, before);
     }
     info.stubbed = true;
     return before - itemChars(item);
+  }
+}
+
+// Anthropic keeps results inside user messages. Flatten only for accounting
+// and trimming, then remove dropped history messages from the wire request.
+// Tool-use blocks and their result IDs always stay paired.
+export class AnthropicToolLoopContext extends ToolLoopContext {
+  fit(messages, options = {}) {
+    const isResults = (message) => Array.isArray(message.content)
+      && message.content.length > 0
+      && message.content.every((block) => block.type === "tool_result");
+    const items = messages.flatMap((message) => isResults(message) ? message.content : [message]);
+    const stats = super.fit(items, options);
+    const kept = new Set(items);
+    const retained = messages.filter((message) => isResults(message) || kept.has(message));
+    messages.splice(0, messages.length, ...retained);
+    return stats;
   }
 }
 
@@ -144,7 +166,7 @@ export function itemChars(item) {
   if (typeof item.content === "string") return item.content.length;
   if (Array.isArray(item.content)) {
     return item.content.reduce((sum, part) => {
-      if (part?.type === "input_image") return sum + IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN;
+      if (["input_image", "image", "image_url"].includes(part?.type)) return sum + IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN;
       if (typeof part?.text === "string") return sum + part.text.length;
       return sum + JSON.stringify(part ?? "").length;
     }, 0);

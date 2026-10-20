@@ -906,7 +906,7 @@ private fun QuestionRow(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             options.forEachIndexed { index, option ->
-                CompactButton(text = option, filled = index == 0, enabled = !anyBusy, onClick = { onAnswer(option) })
+                CompactButton(text = option, filled = index == 0 && !question.risky, enabled = !anyBusy, onClick = { onAnswer(option) })
             }
             TextButton(onClick = onVoiceFocus, modifier = Modifier.heightIn(min = 44.dp)) {
                 Text("Talk about this", style = OpenAGIType.secondary, color = colors.live)

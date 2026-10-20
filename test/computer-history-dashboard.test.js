@@ -51,7 +51,9 @@ function between(source, startText, endText) {
 }
 
 test("Computer History uses measured capture status and a day-grouped, paginated timeline", () => {
-  assert.match(dashboardHtml, />Computer History<\/button>/);
+  const button = dashboardHtml.match(/<button\b[^>]*data-tab="activity"[^>]*>(.*?)<\/button>/s)?.[1];
+  assert.ok(button, "main navigation must expose computer history");
+  assert.match(button, /<span>Computer history<\/span>/);
   assert.match(dashboardHtml, /class="history-status-card"/);
   assert.match(dashboardHtml, /class="history-entry"/);
 

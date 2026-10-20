@@ -36,9 +36,10 @@ test("Nodes refresh is single-flight and runs every 30 seconds only while visibl
     /if \(state\.tab === "nodes" && !document\.hidden\) \{[\s\S]*setInterval\([\s\S]*30_000/,
     "the 30-second timer must only be created for a visible Nodes tab"
   );
-  assert.match(
-    source,
-    /async function switchTab\(tab\) \{\s*state\.tab = tab;\s*syncNodesAutoRefresh\(\);/,
-    "switching away from Nodes must tear down its timer"
-  );
+  const switchTab = source.match(/async function switchTab\(tab\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(switchTab, "tab-switching lifecycle must exist");
+  const assignment = switchTab.indexOf("state.tab = tab;");
+  const refresh = switchTab.indexOf("syncNodesAutoRefresh();");
+  assert.ok(assignment >= 0 && refresh > assignment && refresh < switchTab.indexOf("await "),
+    "switching away from Nodes must tear down its timer before awaiting another view");
 });

@@ -54,6 +54,44 @@ test('mirrored questions reach the existing G2 feed and close after an owner ans
   assert.equal(g2.feed(node).length, 0);
 });
 
+test('remote outreach omits actions needing text or a plan view on creation and refresh', async t => {
+  const { remote, runtime, state } = fixture(t);
+  const options = ['Answer question', 'Review plan', 'Not now', 'Never'];
+  state.questions[0].options = options;
+  await remote.refresh();
+  const item = runtime.outreach.list()[0];
+  assert.deepEqual(item.actions, ['Not now', 'Never', 'dismiss']);
+  assert.deepEqual(remote.getState().questions[0].options, options, 'main and voice retain every action');
+
+  runtime.outreach.update(item.id, { actions: [...options, 'dismiss'] });
+  await remote.refresh();
+  assert.deepEqual(runtime.outreach.get(item.id).actions, ['Not now', 'Never', 'dismiss']);
+  assert.equal(runtime.outreach.list().length, 1);
+  assert.equal(remote.getState().questions.length, 1);
+});
+
+test('compact remote clients require main-app review for destructive storage decisions', async t => {
+  const { remote, runtime, state, dir, calls } = fixture(t);
+  await remote.refresh(); // Also updates an existing mirror when its risk changes.
+  state.questions[0] = { ...state.questions[0], kind: 'storage', risky: true, title: 'Delete old files?', body: 'This permanently deletes files.', options: ['Delete old files', 'Keep files'] };
+  await remote.refresh();
+  const item = runtime.outreach.list()[0];
+  assert.deepEqual(item.actions, ['dismiss']);
+  assert.match(item.summary, /permanently delete files/);
+  const g2 = new G2Proactive({ dir: path.join(dir, 'g2'), runtime });
+  runtime.fleetSupervisor = remote;
+  const node = g2.node('glasses');
+  node.settings.enabled = true;
+  node.settings.categories = ['approvals'];
+  const shown = g2.feed(node)[0];
+  assert.equal(shown.action, 'review-on-main');
+  assert.deepEqual(shown.options, []);
+  const before = calls.length;
+  await assert.rejects(g2.answerFleet('glasses', { id: item.id, answer: 'Delete old files' }), /choices/);
+  assert.equal(calls.length, before, 'a crafted answer never reaches the deletion route');
+  assert.equal(remote.getState().questions.length, 1);
+});
+
 test('offline node retains last state and cannot falsely confirm an answer', async t => {
   const { remote, runtime } = fixture(t);
   await remote.refresh();

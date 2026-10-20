@@ -1,4 +1,5 @@
 import { tokenize } from "./utils.js";
+import { validateOpenAIKey } from "./provider-credentials.js";
 
 // Pluggable embedding interface. Default is a deterministic hash-bag-of-words
 // embedder so the runtime works fully offline / open-source. When OPENAI_API_KEY
@@ -48,7 +49,7 @@ export class OpenAIEmbedder {
   constructor(options = {}) {
     this.apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
     this.model = options.model ?? process.env.OPENAGI_EMBED_MODEL ?? "text-embedding-3-small";
-    this.baseUrl = options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+    this.baseUrl = String(options.baseUrl ?? process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
     this.dim = options.dim ?? 1536;
     this.budgetGuard = options.budgetGuard ?? null;
     this.timeoutMs = options.timeoutMs ?? 30000;
@@ -66,6 +67,7 @@ export class OpenAIEmbedder {
 
   async embedMany(texts) {
     if (!this.apiKey) throw new Error("OpenAI embedder requires OPENAI_API_KEY.");
+    validateOpenAIKey(this.apiKey, this.baseUrl);
     this.budgetGuard?.check();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);

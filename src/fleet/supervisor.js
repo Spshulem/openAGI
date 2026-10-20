@@ -223,7 +223,7 @@ function judgeable(decision, thread) {
 // themselves; masked, so only a change in the facts reads the chat again
 // (the cache still expires after JUDGE_CACHE_MS).
 function withoutElapsed(text) {
-  return String(text ?? "").replace(/\b\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "#");
+  return String(text ?? "").replace(/\b((?:waiting|waited|no word in|queued|elapsed|idle|silent|full verify|quick verify)\s+(?:for\s+)?)\d+(?:\.\d+)?\s?(?:ms|s|m|h|d|min|mins|minutes?|hours?|days?)\b/gi, "$1#");
 }
 
 // Every fact the judge's prompt shows besides the chat (judge.js prLines and
@@ -254,13 +254,13 @@ function replyMark(thread) {
   return shortHash(`${reply.at ?? ""}\n${reply.text}`);
 }
 
-// The judge's question is the agent's ask, keyed like the policy's own
-// (agentAskKey): on the agent message it was read from, never its wording.
-// A reread that words it differently updates the same question in place
-// (and an answer to it keeps it quiet), while a new reply may ask anew.
-export function judgeAskKey(thread, _question = null) {
+// The reply and the substantive ask identify a decision. Cosmetic titles
+// may change on a reread; body/options change what the owner is approving.
+export function judgeAskKey(thread, question = null) {
   const reply = agentReply(thread);
-  return agentAskKey(thread.key, { at: reply.at, text: reply.text });
+  const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ");
+  const ask = [normalize(question?.body), (question?.options ?? []).map(normalize).sort()];
+  return `${agentAskKey(thread.key, { at: reply.at, text: reply.text })}:${shortHash(JSON.stringify(ask))}`;
 }
 
 // A judge question that asks to merge holds like the policy's merge asks.
@@ -806,7 +806,11 @@ export class FleetSupervisor {
 
   getState() {
     const store = this.store;
-    const open = store.openQuestions().filter((question) => !this.awaitingReview.has(question.id));
+    const open = store.openQuestions().filter((question) => {
+      if (this.awaitingReview.has(question.id)) return false;
+      const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
+      return !keys.length || keys.some((key) => !store.mutedUntil(key));
+    });
     // A read can expire a question too (the /fleet page, the main's refresh)
     // while no tick runs.
     this.closeExpired();
@@ -901,7 +905,7 @@ export class FleetSupervisor {
       answerIn: inApp ? "agent app" : "here",
       openChat,
       ...(chats.length ? { chats } : {}),
-      risky: Boolean(question.mergeAsk) || (["agent-ask", "agent-card", "ready"].includes(question.kind) && RISKY_ASK.test(text))
+      risky: Boolean(question.mergeAsk) || question.kind === "storage" || (["agent-ask", "agent-card", "ready"].includes(question.kind) && RISKY_ASK.test(text))
     };
   }
 
@@ -962,12 +966,12 @@ export class FleetSupervisor {
   async respondSuggestion(id, choice, options) {
     const questions = this.store.openQuestions().filter((q) => q.kind === "suggestion" && q.meta?.suggestionId === id);
     const result = await this.suggestionManager.respond(id, choice, options);
-    if (result) for (const q of questions) this.resolveOutreach(q, choice, "acted");
+    if (result && !result.nonResolving) for (const q of questions) this.resolveOutreach(q, choice, "acted");
     return result;
   }
 
   diagnose(options = {}) {
-    return runDiagnosis({ store: this.store, dataDir: this.dataDir, now: this.now(), storageConfig: this.config.storage,
+    return runDiagnosis({ store: this.store, dataDir: this.dataDir, now: this.now(), storageConfig: this.config.storage, runtime: this.config.selfFix?.runtimeImprovements ? this.runtime : null,
       state: { ...this.store.state, lastError: this.lastError, lastReview: this.lastReview }, options, models: this.suggestionManager });
   }
 
@@ -1450,7 +1454,7 @@ export class FleetSupervisor {
     return out;
   }
 
-  async answerQuestion(id, answer, { deadlineAt = null } = {}) {
+  async answerQuestion(id, answer, { deadlineAt = null, clarification = null } = {}) {
     const startedAt = Date.now();
     if (this.answering.has(id)) return null;
     const question = this.store.question(id);
@@ -1461,8 +1465,9 @@ export class FleetSupervisor {
     // only the fixed options policy offered can reach an agent.
     if (!(question.options ?? []).includes(answer)) return null;
     if (question.kind === "suggestion") {
-      const result = await this.respondSuggestion(question.meta?.suggestionId, answer);
-      return result ? { question: this.store.question(id), delivery: null, fix: result.fix } : null;
+      const result = await this.respondSuggestion(question.meta?.suggestionId, answer, { clarification });
+      return result ? { question: this.store.question(id), delivery: null, fix: result.fix,
+        ...(result.nonResolving ? { nonResolving: true, plan: result.plan } : {}) } : null;
     }
     // A question card is answered in the app itself. Until the supervisor
     // can click it there, "open thread" is the only answer and it relays
@@ -1646,6 +1651,7 @@ export class FleetSupervisor {
       if (settled) return blocked(`not sent: ${settled}`);
       const currentAsk = this.store.openQuestions().find((question) => question.threadKey === threadKey || (question.threadKeys ?? []).includes(threadKey));
       if (currentAsk) return blocked(`waits on your answer first: ${currentAsk.title}`);
+      if (this.store.mutedUntil(threadKey)) return blocked("muted: unmute it to push");
       if (this.ownerAnswerThreads(Infinity).has(threadKey)) return blocked("your answer to it is still on its way; it goes first");
       // The owner is speaking to this thread now: an automatic nudge a scan
       // decided meanwhile is held, as for an owner answer.
@@ -2172,6 +2178,17 @@ export class FleetSupervisor {
     // Unseen branches precede expired negative results, then oldest first;
     // a thread with no PR at all before a chat whose created PRs stand in.
     const candidates = [...inScope].sort((a, b) => lastAt(a) - lastAt(b) || hasRefs(a) - hasRefs(b));
+    // A checkout several chats work in (one main clone, not a worktree each)
+    // has one branch at a time, and every chat there records it: its PR is
+    // none of theirs in particular. 21 Codex chats in one clone were all told
+    // to finish its open PR. Such a chat's PR is only one it linked itself.
+    // Counted by checkout root, so chats in two of its subfolders share it.
+    const checkoutOf = (thread) => (thread.cwd ? localGit.get(thread.cwd)?.root ?? path.resolve(thread.cwd) : null);
+    const perCheckout = new Map();
+    for (const thread of inScope) {
+      const checkout = checkoutOf(thread);
+      if (checkout) perCheckout.set(checkout, (perCheckout.get(checkout) ?? 0) + 1);
+    }
     const jobs = new Map();
     for (const thread of candidates) {
       if (thread.prRefs?.length && thread.kind !== "conductor") continue;
@@ -2179,6 +2196,7 @@ export class FleetSupervisor {
       // not be read) leaves it unknown.
       if (!thread.branch || TRUNK_BRANCHES.has(thread.branch)) { noPr(thread); continue; }
       if (!thread.repo) continue;
+      if (thread.kind !== "conductor" && perCheckout.get(checkoutOf(thread)) > 1) continue;
       const cacheKey = `${thread.repo}:${thread.branch}`;
       // The local head tells a reused branch's new work from its old closed
       // PR, so a new head is a new lookup.
@@ -2390,6 +2408,8 @@ export class FleetSupervisor {
     for (const { id, reopened } of toNotify) {
       const question = store.question(id);
       if (question?.status !== "open" || this.awaitingReview.has(id)) continue;
+      const keys = question.threadKeys ?? (question.threadKey ? [question.threadKey] : []);
+      if (keys.length && keys.every((key) => store.mutedUntil(key))) continue;
       // A blip closed it: its own outreach copy comes back, not a new one.
       if (reopened) this.reopenOutreach(question);
       try { await this.notifier.notifyQuestion(question); } catch { /* notification is best-effort */ }
@@ -2488,17 +2508,25 @@ export class FleetSupervisor {
         decision.reason = `${decision.reason}; held: owner answered`;
         continue;
       }
+      if (store.mutedUntil(decision.threadKey) || store.mutedUntil(targetKey)) {
+        decision.reason = `${decision.reason}; held: muted by owner`;
+        continue;
+      }
+      if (decision.action === "nudge" && repeatsLastSend(target, store.ledgerFor(decision.threadKey), decision.messageHash)) continue;
       if (uiKey) typedInto.add(uiKey);
       tries += 1;
       attempted.add(decision.threadKey);
       const sentAt = new Date(this.now()).toISOString();
-      const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
-      if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
-      if (delivery.status !== "blocked") sends += 1;
-      if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
-      if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
-      else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
-      this.recordSend(record, delivery, sentAt);
+      this.pushing.add(decision.threadKey);
+      try {
+        const delivery = await this.executor.deliver({ thread: target, message: decision.message, route: decision.route, playbook: decision.playbook, actionId: existing?.id ?? null });
+        if ((delivery.route ?? decision.route) === "computer-use") this.noteUiResult(target, delivery);
+        if (delivery.status !== "blocked") sends += 1;
+        if (decision.route === "computer-use" && UI_STALLED.test(String(delivery.detail ?? ""))) uiStalled = true;
+        if (!existing && !delivery.actionId) store.recordAction({ ...record, status: delivery.status, detail: delivery.detail, at });
+        else if (delivery.actionId) store.updateAction(delivery.actionId, { reason: record.reason, message: record.message, threadKey: record.threadKey, targetKey });
+        this.recordSend(record, delivery, sentAt);
+      } finally { this.pushing.delete(decision.threadKey); }
     }
 
     // A planned/proposed action the policy no longer wants is stale.

@@ -61,7 +61,7 @@ test("task suggestions are proposals by default — no silent task creation", ()
   assert.equal(onDisk.status, "pending");
 });
 
-test("OPENAGI_AUTO_TASKS=1 restores silent auto-creation", () => {
+test("OPENAGI_AUTO_TASKS=1 auto-creates tasks backed by direct owner chat", () => {
   process.env.OPENAGI_AUTO_TASKS = "1";
   try {
     const runtime = makeRuntime();
@@ -73,6 +73,7 @@ test("OPENAGI_AUTO_TASKS=1 restores silent auto-creation", () => {
       title: "Follow up on PR #42",
       rationale: "Seen open for 3 days",
       taskQueue: "user",
+      taskIntent: { state: "planned", source: "user-chat", autoCreateApproved: true },
       status: "pending"
     });
 

@@ -793,7 +793,8 @@ test("a failed agent turn is durable and broadcasts terminal state to other chat
     assert.deepEqual(await response.json(), {
       code: "provider-unavailable",
       error: "The model provider is unavailable. Check its connection and try again.",
-      sessionId: "overlay:user:main"
+      sessionId: "overlay:user:main",
+      requestId: "req-test-1"
     });
 
     const session = runtime.agentHost.store.getSession("overlay:user:main");

@@ -541,10 +541,11 @@ export async function readLocalGit(cwd, config, { run = runCommand } = {}) {
   // Inside a repo the failure is unknown local state, which blocks readiness.
   const head = await gitLine(run, config, cwd, ["rev-parse", "HEAD"]);
   if (!head) return insideRepo(cwd) ? { ...empty, unreadable: true } : empty;
-  const [branch, upstream, remoteUrl] = await Promise.all([
+  const [branch, upstream, remoteUrl, root] = await Promise.all([
     gitLine(run, config, cwd, ["rev-parse", "--abbrev-ref", "HEAD"]),
     gitLine(run, config, cwd, ["rev-parse", "--abbrev-ref", "@{u}"]),
-    gitLine(run, config, cwd, ["remote", "get-url", "origin"])
+    gitLine(run, config, cwd, ["remote", "get-url", "origin"]),
+    gitLine(run, config, cwd, ["rev-parse", "--show-toplevel"])
   ]);
   const aheadText = upstream ? await gitLine(run, config, cwd, ["rev-list", "--count", "@{u}..HEAD"]) : null;
   const ahead = aheadText !== null && /^\d+$/.test(aheadText) ? Number(aheadText) : null;
@@ -555,6 +556,8 @@ export async function readLocalGit(cwd, config, { run = runCommand } = {}) {
     upstream,
     ahead,
     remote: repoFromRemote(remoteUrl),
-    dirty
+    dirty,
+    // The checkout's root: chats in two of its subfolders share one branch.
+    root: root || null
   };
 }

@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { runStatusOf, findLanguageServer as findAntigravityServer } from "./sources/antigravity.js";
 import { readWriterLocks } from "./sources/codex.js";
 import { classifyErrorText } from "./errors.js";
@@ -251,13 +251,14 @@ export const CODEX_APP_HOLDS = "Codex holds the thread open, so codex exec canno
 // The non-UI route a presence-blocked app send may take instead, if the owner
 // allowed it (config.backgroundRoutes) and it cannot fork or queue unseen:
 // codex-exec only for a Codex thread no app holds (no writer, so nothing
-// moved it since the scan) and Conductor did not start; peer-relay only for
+// moved it since the scan) and neither Conductor nor the Codex app started;
+// peer-relay only for
 // a Conductor chat whose live Claude session is idle, with no open pick.
 export function backgroundRouteFor(thread, config) {
   const allowed = config?.backgroundRoutes ?? [];
   if (!allowed.length || !thread || thread.archived || thread.agentStatus === "running" || thread.meta?.blockedOnOwner === true) return null;
   if (thread.kind === "codex") {
-    if (!allowed.includes("codex-exec") || thread.writerLocked || !thread.cwd || thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return null;
+    if (!allowed.includes("codex-exec") || thread.writerLocked || !thread.cwd || codexExecBarred(thread)) return null;
     return "codex-exec";
   }
   if (thread.kind === "conductor" && allowed.includes("peer-relay") && thread.live?.peerName && thread.live?.pid && thread.live.status === "idle" && !thread.meta?.pendingQuestion) return "peer-relay";
@@ -289,6 +290,7 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
     if (thread.kind !== "codex") return "codex-exec needs a codex thread";
     if (thread.writerLocked) return "writer-locked: the thread is open in another Codex writer";
     if (thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR) return "conductor-owned: open it in Conductor";
+    if (codexAppOwned(thread)) return "codex-app-owned: typed into the Codex app only";
     if (!isDirectory(thread.cwd)) return "cwd missing";
   }
   if (route === "peer-relay" && !thread.live?.peerName) return "no live peer";
@@ -676,7 +678,8 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
   async function fallbackRoute(thread, target, deadlineAt, why = {}) {
     const route = backgroundRouteFor(thread, config);
     if (!route) {
-      if (thread?.kind === "codex" && thread.writerLocked) why.locked = true;
+      // The Codex app owns its threads even while it has not loaded one.
+      if (thread?.kind === "codex" && (thread.writerLocked || codexAppOwned(thread))) why.locked = true;
       return null;
     }
     // An earlier app send may sit in that composer unconfirmed.

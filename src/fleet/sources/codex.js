@@ -139,7 +139,7 @@ function readUserInput(summary, raw, at, turnId = null) {
     // before it. It is still the owner at work.
     const ids = new Set(parseCardReply(text));
     summary.cardReplies.push({ ids, order: summary.rows });
-    if (summary.pendingQuestion && ids.has(`${summary.pendingQuestion.callId}:0`)) summary.pendingQuestion = null;
+    if (summary.pendingQuestion && [...ids].some((id) => id.startsWith(`${summary.pendingQuestion.callId}:`))) summary.pendingQuestion = null;
     summary.lastUser = { text: "Answered a question card.", at };
     return;
   }
@@ -704,6 +704,8 @@ function buildThread(row, context) {
       threadSource: row.thread_source || null,
       // "codex_sdk_ts" = started by Conductor's Codex agent, shown in Conductor.
       originator: row.originator || null,
+      // "vscode" = an app's thread, "exec" = codex exec, "cli" = the Codex CLI.
+      source: row.source || null,
       // The name set in the Codex app; title is the first prompt when unset.
       catalogName: row.name ? clampText(redactSecrets(row.name), limits.titleMax) : null,
       firstMessageTitle: firstMessageTitle(row, limits),
@@ -892,7 +894,14 @@ export async function listCodexThreads(config, options = {}) {
         // The catalog query lets settings-only writes through; the last turn decides.
         if (Date.parse(thread.lastActivityAt ?? "") < cutoff) continue;
         built.push(thread);
-        cardScanned?.add(thread.key);
+        if (cardScanned) {
+          try {
+            const bytes = fs.statSync(row.rollout_path).size;
+            const indexed = history ? readHistoryCard(history, String(row.id), { bytes, rolloutPath: row.rollout_path, limits, now }) : undefined;
+            // An incomplete tail cannot establish that an older card closed.
+            if (indexed !== undefined || bytes <= context.tailBytes) cardScanned.add(thread.key);
+          } catch { /* unreadable coverage leaves the card unknown */ }
+        }
         if (!thread.excluded) inScope += 1;
       }
       if (rows.length < pageSize) break;

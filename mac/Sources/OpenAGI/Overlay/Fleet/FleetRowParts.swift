@@ -55,7 +55,7 @@ struct FleetQuestionAnswer: View {
         .font(.system(size: 11, weight: .semibold))
         .lineLimit(question.risky ? nil : 3)
         .fixedSize(horizontal: false, vertical: true)
-      if question.risky, !question.body.isEmpty {
+      if !question.body.isEmpty {
         Text(question.body).font(.system(size: 11)).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -115,7 +115,7 @@ struct FleetOptionButtons: View {
         Text(question.label(for: option)).lineLimit(1)
       }
       .controlSize(.small)
-      if index == 0 {
+      if index == 0 && !question.risky {
         button.buttonStyle(.borderedProminent)
       } else {
         button.buttonStyle(.bordered)

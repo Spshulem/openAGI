@@ -3,6 +3,8 @@ import path from "node:path";
 import { createDurableRuntime, createHostedInterface } from "./index.js";
 import { checkBindSafety } from "./auth.js";
 import { hardenDataDir, loadEnvFile } from "./file-utils.js";
+import { installDaemonLogRotation } from "./daemon-log.js";
+import { logOperationalEvent } from "./operational-log.js";
 import { resolveDataDir, _resetDataDirCache } from "./data-dir.js";
 import { installMobileSpawnGuard, isMobileProfile } from "./mobile-profile.js";
 
@@ -37,8 +39,14 @@ export function loadBootEnv() {
   if (cwdDataDir && !process.env.OPENAGI_DATA_DIR) process.env.OPENAGI_DATA_DIR = cwdDataDir;
   _resetDataDirCache();
   const dataDir = resolveDataDir();
-  loadEnvFile(path.join(dataDir, ".env")); // canonical — authoritative (first-wins)
-  loadEnvFile(".env");                       // cwd .env fills only keys the canonical didn't set
+  const shadowed = new Set();
+  const files = new Set([path.resolve(dataDir, ".env"), path.resolve(".env")]);
+  for (const file of files) loadEnvFile(file, { onShadowed: (key) => shadowed.add(key) });
+  installDaemonLogRotation(dataDir);
+  logOperationalEvent("daemon-boot");
+  for (const envKey of shadowed) {
+    logOperationalEvent("env-override-ignored", { envKey, reason: "parent-or-earlier-env" }, "warn");
+  }
   return dataDir;
 }
 
@@ -181,11 +189,13 @@ export async function startServer({ host, port } = {}) {
   const runtime = createDurableRuntime({ dataDir });
   const app = createHostedInterface(runtime, { host: resolvedHost, port: resolvedPort });
   const address = await app.listen();
+  logOperationalEvent("daemon-ready");
   let shuttingDown = false;
   const originalClose = app.close.bind(app);
   const onSignal = (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    logOperationalEvent("daemon-stopping", { reason: signal });
     const force = setTimeout(() => process.exit(1), 5_000);
     originalClose()
       .then(() => { clearTimeout(force); process.exit(0); })

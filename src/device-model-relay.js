@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
 
 // WS /device/model: the phone app's native model bridge. In phone-only mode
-// the daemon runs inside the app, and the only model it has is the phone's
+// the daemon runs inside the app, and the only model it has is the device’s
 // own (Apple Foundation Models / Gemini Nano), which only native code can
 // call. The app holds one socket here; OnDeviceModelProvider sends each
 // generation down it and waits for the answer.
@@ -54,7 +54,7 @@ export class DeviceModelHub {
   // reconnects after a background suspension before the old TCP close lands).
   attach(socket) {
     if (this.socket && this.socket !== socket) {
-      this.failPending(deviceModelError(DEVICE_MODEL_UNAVAILABLE, "The phone's model bridge reconnected."));
+      this.failPending(deviceModelError(DEVICE_MODEL_UNAVAILABLE, "The device’s model bridge reconnected."));
       try { this.socket.close(4000, "replaced"); } catch { /* already gone */ }
     }
     this.socket = socket;
@@ -63,7 +63,7 @@ export class DeviceModelHub {
     socket.on("close", () => {
       if (this.socket !== socket) return;
       this.socket = null;
-      this.failPending(deviceModelError(DEVICE_MODEL_UNAVAILABLE, "The phone's model bridge disconnected."));
+      this.failPending(deviceModelError(DEVICE_MODEL_UNAVAILABLE, "The device’s model bridge disconnected."));
     });
     socket.on("error", () => { /* close follows */ });
     for (const wake of this.waiters) wake();
@@ -76,7 +76,7 @@ export class DeviceModelHub {
     try { frame = JSON.parse(String(data)); } catch { return; }
     if (!frame || typeof frame !== "object") return;
     if (frame.type === "hello") {
-      this.info = { model: String(frame.model ?? "on-device"), contextSize: frame.contextSize };
+      this.info = { model: String(frame.model ?? "on-device"), contextSize: frame.contextSize, availability: String(frame.availability ?? (frame.model === "unavailable" ? "unsupported" : "available")) };
       return;
     }
     const entry = this.pending.get(frame.id);
@@ -88,7 +88,7 @@ export class DeviceModelHub {
     this.pending.delete(frame.id);
     entry.cleanup();
     if (frame.type === "error") {
-      entry.reject(deviceModelError(String(frame.code || "device-model-error"), String(frame.message || "The phone's model failed.")));
+      entry.reject(deviceModelError(String(frame.code || "device-model-error"), String(frame.message || "The device’s model failed.")));
     } else if (frame.type === "result") {
       entry.resolve({ text: typeof frame.text === "string" ? frame.text : "", toolCall: normalizeToolCall(frame.toolCall), usage: frame.usage ?? null });
     } else {
@@ -119,7 +119,7 @@ export class DeviceModelHub {
       const wake = () => done();
       const onAbort = () => done(signal.reason ?? deviceModelError("aborted", "Request cancelled."));
       const timer = setTimeout(() => done(deviceModelError(DEVICE_MODEL_UNAVAILABLE,
-        "The phone's on-device model isn't reachable right now. Open the OpenAGI app and try again.")), waitMs);
+        "The device’s on-device model isn't reachable right now. Open the OpenAGI app and try again.")), waitMs);
       this.waiters.add(wake);
       signal?.addEventListener?.("abort", onAbort, { once: true });
     });
@@ -141,7 +141,7 @@ export class DeviceModelHub {
         if (!this.pending.delete(id)) return;
         cleanup();
         try { socket.send(JSON.stringify({ type: "cancel", id })); } catch { /* gone */ }
-        reject(deviceModelError("device-model-timeout", "The phone's model took too long to answer."));
+        reject(deviceModelError("device-model-timeout", "The device’s model took too long to answer."));
       }, timeoutMs);
       const cleanup = () => {
         clearTimeout(timer);
@@ -154,7 +154,7 @@ export class DeviceModelHub {
       } catch (error) {
         this.pending.delete(id);
         cleanup();
-        reject(deviceModelError(DEVICE_MODEL_UNAVAILABLE, `Couldn't reach the phone's model: ${error.message}`));
+        reject(deviceModelError(DEVICE_MODEL_UNAVAILABLE, `Couldn't reach the device’s model: ${error.message}`));
       }
     });
   }

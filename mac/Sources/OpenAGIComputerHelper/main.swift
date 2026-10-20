@@ -65,8 +65,9 @@ do {
     let input = accessibility && console && !locked && !secureInput
     let screenshotReady = screen && privacyReady
     var blockers: [String] = []
-    if !screenRecording { blockers.append("grant Screen Recording to OpenAGI") }
-    if !accessibility { blockers.append("grant Accessibility to OpenAGI") }
+    let permissionContext = "for this computer helper: launch it through the signed OpenAGI app, or check the separate launcher/helper shown by macOS; restart that process after granting access"
+    if !screenRecording { blockers.append("check Screen Recording \(permissionContext)") }
+    if !accessibility { blockers.append("check Accessibility \(permissionContext)") }
     if !display { blockers.append("connect an active display") }
     if !console { blockers.append("sign in to the active console session") }
     if locked { blockers.append("unlock the screen") }

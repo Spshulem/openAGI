@@ -233,6 +233,55 @@ test("maxThreads keeps the newest sessions", async (t) => {
   assert.deepEqual(threads.map((thread) => thread.id), ["s-run", "s-self"]);
 });
 
+test("an older live approval card survives maxThreads until answered", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  db.prepare("UPDATE sessions SET status = 'working' WHERE id = 's-idle'").run();
+  addMessage(db, "s-idle", "assistant", {
+    type: "assistant", session_id: "s-idle", parent_tool_use_id: null,
+    message: { role: "assistant", content: [{ type: "tool_use", id: "older-card", name: "mcp__conductor__AskUserQuestion", input: {
+      questions: [{ question: "Which implementation?", options: ["A", "B"] }]
+    } }] }
+  }, iso(5 * MIN));
+  db.close();
+  const config = makeConfig(home, { managerRef: "none", limits: { maxThreads: 2 } });
+  const read = () => listConductorThreads(config, { now: NOW, peers: new Map() });
+  const threads = await read();
+  assert.deepEqual(threads.map((thread) => thread.id), ["s-run", "s-self", "s-idle"]);
+  assert.equal(threads[2].meta.pendingCard.cardId, "older-card");
+  assert.equal(classifyThread(threads[2], { now: NOW, config }).state, "needs-human");
+  const managers = await listConductorThreads(makeConfig(home, { managerRef: "s-idle", limits: { maxThreads: 2 } }), { now: NOW, peers: new Map() });
+  const manager = managers.find((thread) => thread.id === "s-idle");
+  assert.equal(manager.excluded, null, "a live manager card inside lookback is promoted past the cap");
+  assert.equal(classifyThread(manager, { now: NOW, config }).state, "needs-human");
+  assert.equal(managers.filter((thread) => thread.id === "s-idle").length, 1);
+
+  const answer = new DatabaseSync(file);
+  addMessage(answer, "s-idle", "assistant", { type: "user", session_id: "s-idle", message: { role: "user", content: [
+    { type: "tool_result", tool_use_id: "older-card", content: "A" }
+  ] } }, iso(MIN));
+  answer.close();
+  assert.deepEqual((await read()).map((thread) => thread.id), ["s-run", "s-self"]);
+  const explicit = await listConductorThreads(config, { now: NOW, peers: new Map(), only: ["s-idle"] });
+  assert.deepEqual(explicit.map((thread) => thread.id), ["s-idle"]);
+});
+
+test("overflow acknowledgements do not bypass the catalog cap", async (t) => {
+  const home = makeHome(t);
+  const file = seed(home);
+  const db = new DatabaseSync(file);
+  db.prepare("UPDATE sessions SET status = 'working' WHERE id = 's-idle'").run();
+  addMessage(db, "s-idle", "assistant", {
+    type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "ack-card", name: "AskUserQuestion", input: {
+      questions: [{ question: "Continue?", options: ["Okay"] }]
+    } }] }
+  }, iso(5 * MIN));
+  db.close();
+  const threads = await listConductorThreads(makeConfig(home, { managerRef: "none", limits: { maxThreads: 2 } }), { now: NOW, peers: new Map() });
+  assert.deepEqual(threads.map((thread) => thread.id), ["s-run", "s-self"]);
+});
+
 test("a missing database is an empty list; a broken one throws", async (t) => {
   const home = makeHome(t);
   assert.deepEqual(await listConductorThreads(makeConfig(home), { now: NOW }), []);

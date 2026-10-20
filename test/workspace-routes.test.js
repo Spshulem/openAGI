@@ -59,8 +59,8 @@ test("model settings: keys are saved to .env, applied live, and never returned",
   assert.doesNotMatch(fs.readFileSync(path.join(dir, ".env"), "utf8"), /ANTHROPIC_API_KEY/);
 
   assert.equal((await call("POST", "/settings/models", { preference: "gemini" })).status, 400);
-  // The on-device model only exists inside the phone app.
-  assert.equal((await call("POST", "/settings/models", { preference: "on-device" })).status, 400);
+  // Native on-device models are supported by Mac and phone apps.
+  assert.equal((await call("POST", "/settings/models", { preference: "on-device" })).status, process.platform === "darwin" ? 200 : 400);
   assert.equal((await call("POST", "/settings/models", { openaiKey: "has space" })).status, 400);
 });
 

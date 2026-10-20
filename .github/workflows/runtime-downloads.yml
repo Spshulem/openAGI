@@ -1,0 +1,114 @@
+name: Windows and Linux downloads
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'bin/**'
+      - 'examples/**'
+      - 'scripts/package-runtime.mjs'
+      - 'scripts/smoke-runtime.mjs'
+      - 'test/get-started.test.js'
+      - 'test/runtime-downloads.test.js'
+      - 'test/atomic-write.test.js'
+      - 'docs/INSTALL.md'
+      - 'docs/GETTING_STARTED.md'
+      - 'package*.json'
+      - '.github/workflows/runtime-downloads.yml'
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            name: Windows-x64
+            extension: zip
+          - runner: ubuntu-22.04
+            name: Linux-x64
+            extension: tar.gz
+          - runner: ubuntu-24.04-arm
+            name: Linux-arm64
+            extension: tar.gz
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - name: Require a matching release tag on main
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+          node -e 'if (process.env.RELEASE_TAG !== "v" + JSON.parse(require("fs").readFileSync("package.json")).version) process.exit(1)'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+          cache: npm
+      - run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Check onboarding and packaging
+        run: node --test test/get-started.test.js test/runtime-downloads.test.js test/atomic-write.test.js
+      - name: Include matching Node.js and third-party notices
+        shell: bash
+        run: curl --fail --location --retry 2 https://raw.githubusercontent.com/nodejs/node/v22.21.1/LICENSE --output "$RUNNER_TEMP/node-LICENSE"
+      - name: Package the runtime with Node.js
+        shell: bash
+        run: node scripts/package-runtime.mjs --out "$RUNNER_TEMP/openagi-runtime/OpenAGI" --node-license "$RUNNER_TEMP/node-LICENSE"
+      - name: Smoke-test the bundled executable and module graph
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/openagi-runtime/OpenAGI"
+          if [ "$RUNNER_OS" = "Windows" ]; then NODE_BINARY=./node/node.exe; else NODE_BINARY=./node/node; fi
+          "$NODE_BINARY" --input-type=module -e 'await import("./src/index.js"); await import("./src/get-started.js"); console.log("Packaged runtime loads")'
+          "$NODE_BINARY" bin/openagi.js help
+      - name: Verify real startup, setup, and dashboard on the target OS
+        shell: bash
+        run: node scripts/smoke-runtime.mjs "$RUNNER_TEMP/openagi-runtime/OpenAGI"
+      - name: Archive
+        shell: bash
+        env:
+          DOWNLOAD_NAME: OpenAGI-${{ matrix.name }}.${{ matrix.extension }}
+        run: |
+          mkdir dist-downloads
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -Command 'Compress-Archive -Path "$env:RUNNER_TEMP/openagi-runtime/OpenAGI" -DestinationPath "dist-downloads/$env:DOWNLOAD_NAME"'
+          else
+            tar -czf "dist-downloads/$DOWNLOAD_NAME" -C "$RUNNER_TEMP/openagi-runtime" OpenAGI
+          fi
+          node --input-type=module -e 'import fs from "node:fs"; import {createHash} from "node:crypto"; const p="dist-downloads/"+process.env.DOWNLOAD_NAME; fs.writeFileSync(p+".sha256", createHash("sha256").update(fs.readFileSync(p)).digest("hex")+"  "+process.env.DOWNLOAD_NAME+"\n")'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.name }}
+          path: dist-downloads/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          merge-multiple: true
+          path: downloads
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: downloads/*
+          fail_on_unmatched_files: true

@@ -87,3 +87,6 @@ Dialvalet was considered as an optional integration, but its advertised official
 Run `npm run qa:capabilities` with Node 22 or newer. Use `-- --area sharing` (or another ID in `qa/capabilities.json`) for a focused run. The harness isolates the data directory, strips inherited provider credentials, uses fixture transports, runs ten capability areas, and writes JSON plus TAP logs under ignored `qa/results/`.
 
 The [experience scenarios](../../qa/scenarios.json) include prompts, observable expected outcomes and live prerequisites. Automated fixture results prove code paths and permission boundaries. They do not prove account consent, model quality, physical-device behavior, a purchased number or delivery to another person. Complete those scenarios only against approved test accounts and recipients.
+
+For custom Obsidian MCP servers, request diagnostics and native permission reproduction,
+see [MCP and Mac setup troubleshooting](mcp-and-mac-troubleshooting.md).

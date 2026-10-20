@@ -16,6 +16,7 @@
 // plus conversation.item.truncate is acknowledged.
 
 import WebSocket from "ws";
+import { validateOpenAIKey } from "../provider-credentials.js";
 import { randomUUID } from "node:crypto";
 import { authorityRecord, matchConfirmation } from "../owner-authority.js";
 import { normalizeTarget } from "../fleet/feedback.js";
@@ -194,6 +195,7 @@ const later = (ms) => new Promise((resolve) => { const timer = setTimeout(resolv
 export class VoiceSession {
   constructor(options) {
     this.apiKey = options.apiKey;
+    validateOpenAIKey(this.apiKey, "https://api.openai.com/v1");
     this.model = options.model ?? DEFAULT_VOICE_MODEL;
     if (!this.model.startsWith("gpt-realtime") || !Object.hasOwn(REALTIME_PRICES, this.model)) throw new Error("Voice model has no known pricing.");
     this.upstreamFactory = options.upstreamFactory ?? ((url, opts) => new WebSocket(url, opts));

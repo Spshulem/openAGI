@@ -189,6 +189,9 @@ final class OverlayState: ObservableObject {
         self.detachedPhase = .stillRunning
         try? await Task.sleep(nanoseconds: UInt64(OverlayState.detachedClearDelay * 1_000_000_000))
         guard !Task.isCancelled, self.isDetached else { return }
+        if !self.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          self.error = "Response interrupted. This is a partial answer; check the saved conversation in the main app."
+        }
         self.progressStage = nil
         self.endDetached()
       }

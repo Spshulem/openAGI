@@ -69,6 +69,93 @@ function escapeHtmlSource(script) {
   return line;
 }
 
+test("browser Back and Forward restore the URL's conversation and request handoff", async () => {
+  const { script } = await boot();
+  assert.match(script, /window\.addEventListener\("popstate", restoreHistoryLocation\)/);
+  const window = { location: { search: "?tab=chat&session=A&request=request-A" } };
+  const events = [];
+  let shown = "B";
+  const restore = new Function("window", "VALID_TABS", "state", "switchTab", "openSessionDeepLink", "renderChat", `
+    ${extractFunction(script, "deepLinkSessionId")}
+    ${extractFunction(script, "deepLinkRequestId")}
+    ${extractFunction(script, "restoreHistoryLocation")}
+    return restoreHistoryLocation;
+  `)(window, new Set(["chat", "memory"]), {}, async tab => events.push(["tab", tab]), async (session, request) => {
+    shown = session;
+    events.push(["session", session, request]);
+    return true;
+  }, () => {});
+  await restore();
+  assert.equal(shown, "A");
+  assert.deepEqual(events, [["tab", "chat"], ["session", "A", "request-A"]]);
+  events.length = 0;
+  window.location.search = "?tab=memory&session=B";
+  await restore();
+  assert.deepEqual(events, [["tab", "memory"]], "a different tab ignores conversation parameters");
+  events.length = 0;
+  window.location.search = "?tab=chat&session=B";
+  await restore();
+  assert.equal(shown, "B");
+  assert.deepEqual(events, [["tab", "chat"], ["session", "B", null]]);
+});
+
+function historyHarness(script, fetchJson, switchTab = async () => {}) {
+  const state = { sessionId: "old", messages: [{ role: "user", content: "old" }], activeRequestId: "old-request", channel: "overlay", from: "user" };
+  const window = { location: { search: "?tab=chat&session=A" } };
+  const rendered = [], toasts = [];
+  const restore = new Function("window", "VALID_TABS", "state", "switchTab", "fetchJson", "refreshSessions", "renderChat", "showToast", `
+    ${extractFunction(script, "deepLinkSessionId")}
+    ${extractFunction(script, "deepLinkRequestId")}
+    ${extractFunction(script, "openSessionDeepLink")}
+    ${extractFunction(script, "restoreHistoryLocation")}
+    return restoreHistoryLocation;
+  `)(window, new Set(["chat", "memory"]), state, switchTab, fetchJson, async () => {},
+    () => rendered.push(state.sessionId), message => toasts.push(message));
+  return { state, window, restore, rendered, toasts };
+}
+
+test("overlapping history loads cannot replace the latest conversation", async () => {
+  const { script } = await boot();
+  for (const phase of ["tab", "session"]) {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const requests = [];
+    let switches = 0;
+    const h = historyHarness(script, async route => {
+      requests.push(route);
+      const id = route.split("/").at(-1);
+      if (phase === "session" && id === "A") await gate;
+      return { id, messages: [{ role: "user", content: id }] };
+    }, async () => { if (phase === "tab" && switches++ === 0) await gate; });
+    const old = h.restore();
+    await new Promise(setImmediate);
+    h.window.location.search = "?tab=chat&session=C";
+    await h.restore();
+    release();
+    await old;
+    assert.equal(h.state.sessionId, "C", phase);
+    assert.equal(h.state.messages[0].content, "C");
+    assert.deepEqual(h.rendered, ["C"], "stale work never redraws a different conversation");
+    assert.deepEqual(h.toasts, []);
+    if (phase === "tab") assert.deepEqual(requests, ["/sessions/C"]);
+  }
+});
+
+test("failed and deleted history targets leave a fresh chat instead of the old conversation", async () => {
+  const { script } = await boot();
+  for (const fetchJson of [async () => { throw new Error("offline"); }, async () => ({ id: "A", messages: [] })]) {
+    const h = historyHarness(script, fetchJson);
+    await h.restore();
+    assert.equal(h.state.sessionId, null);
+    assert.deepEqual(h.state.messages, []);
+    assert.equal(h.state.activeRequestId, null);
+    assert.equal(h.state.channel, "local");
+    assert.equal(h.state.freshChatRequested, true);
+    assert.deepEqual(h.rendered, [null]);
+    assert.equal(h.toasts.length, 1);
+  }
+});
+
 // ─── The premise: the overlay ask really does create a durable session ───────
 
 test("premise: an overlay ask persists a session and the reply names its id", async () => {

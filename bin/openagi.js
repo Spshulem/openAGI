@@ -217,9 +217,10 @@ async function cmdPairPhone(flags) {
     console.error(c(RED, "usage: openagi pair-phone --platform ios|android [--url https://host:port]"));
     return 1;
   }
-  const local = normalizeBase(flags.url ?? process.env.OPENAGI_URL ?? "http://127.0.0.1:43210");
+  const target = resolveUpdateTarget({ token: flags.token });
+  const local = normalizeBase(flags.url ?? process.env.OPENAGI_URL ?? target.url);
   const headers = { "content-type": "application/json" };
-  const ownerToken = process.env.OPENAGI_AUTH_TOKEN ?? null;
+  const ownerToken = target.token;
   if (ownerToken) headers.authorization = `Bearer ${ownerToken}`;
   let issued;
   try {

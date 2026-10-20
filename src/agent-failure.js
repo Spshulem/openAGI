@@ -1,10 +1,13 @@
 const PUBLIC_FAILURES = Object.freeze({
   budget: "Daily budget exceeded",
   "provider-auth": "The model provider needs attention. Check its API key in Settings.",
+  "provider-config": "This key belongs to OpenRouter. Set a Responses-compatible base URL and its model in setup, or use an OpenAI API key.",
+  "provider-region": "The model provider does not support requests from your region. Choose a provider available in your region in Settings.",
   "provider-rate-limit": "The model provider is temporarily rate-limited. Try again shortly.",
   "provider-timeout": "The model provider timed out. Check its connection and try again.",
   "provider-empty-response": "The model returned no answer after retrying. Please try again.",
   "provider-unavailable": "The model provider is unavailable. Check its connection and try again.",
+  "input-limit": "This request exceeds the configured input limit. Shorten your message, or increase OPENAGI_MAX_INPUT_TOKENS in your .env file and restart the daemon.",
   "agent-error": "The agent couldn't complete that request. Check the local daemon log for details."
 });
 
@@ -19,6 +22,11 @@ export function classifyAgentFailure(error) {
   const message = safeErrorMessage(error);
   const detail = `${code} ${name} ${message}`;
 
+  if (code === "INPUT_CONTEXT_TOO_LARGE") return { code: "input-limit", message: PUBLIC_FAILURES["input-limit"] };
+  if (code === "PROVIDER_CONFIG_MISMATCH") return { code: "provider-config", message: PUBLIC_FAILURES["provider-config"] };
+  if (/unsupported_country_region_territory|country,? region,? or territory not supported|(?:country|region|territory).{0,40}(?:not supported|unsupported)/i.test(detail)) {
+    return { code: "provider-region", message: PUBLIC_FAILURES["provider-region"] };
+  }
   if (code === "BUDGET_EXCEEDED" || /\b(?:daily )?budget\b|spend cap/i.test(detail)) {
     return { code: "budget", message: PUBLIC_FAILURES.budget };
   }
@@ -40,12 +48,13 @@ export function classifyAgentFailure(error) {
   return { code: "agent-error", message: PUBLIC_FAILURES["agent-error"] };
 }
 
-export function publicAgentFailure(error, sessionId = null) {
+export function publicAgentFailure(error, sessionId = null, requestId = null) {
   const failure = classifyAgentFailure(error);
   return {
     code: failure.code,
     error: failure.message,
-    sessionId: boundedString(sessionId, 500) || null
+    sessionId: boundedString(sessionId, 500) || null,
+    ...(requestId ? { requestId } : {})
   };
 }
 
@@ -60,6 +69,8 @@ export function logAgentFailure(error, context = {}) {
   const record = {
     at: new Date().toISOString(),
     event: "agent-turn-failed",
+    level: "error",
+    component: "agent",
     code: failure.code,
     sessionId: boundedString(context.sessionId, 500) || null,
     requestId: boundedString(context.requestId, 200) || null,

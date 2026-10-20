@@ -8,6 +8,7 @@ import { FleetStore } from "./store.js";
 import { THREAD_KIND_PATTERN } from './contracts.js';
 import { createFleetRoute } from './routes.js';
 import { assertFixAllowed, suggestionFix } from './suggestions.js';
+import { outreachActions } from './notify.js';
 
 const THREAD_ROUTE = new RegExp(String.raw`^\/fleet\/api\/(state|scan|mode|send|screen|click|feedback|diagnose|suggestions|suggestions\/[A-Za-z0-9_-]{1,80}|fixes|fixes\/[A-Za-z0-9_-]{1,80}\/(stop|revise)|apps\/(conductor|codex)\/(open|quit|restart|running)|questions\/[A-Za-z0-9_-]{1,80}|actions\/[A-Za-z0-9_-]{1,80}\/send|threads\/(?:${THREAD_KIND_PATTERN})(:|%3A)[A-Za-z0-9_.-]{1,120}(\/(push|mute|unmute))?)$`);
 
@@ -121,14 +122,14 @@ export class RemoteFleetSupervisor {
   }
   async tick() { await this.request('POST', '/fleet/api/scan'); return this.state.snapshot; }
   async setMode(mode) { if (mode === "observe") await this.selfFixHub?.stop("all"); await this.request('POST', '/fleet/api/mode', { mode }); return this.state.mode; }
-  async answerQuestion(id, answer) {
+  async answerQuestion(id, answer, { clarification = null } = {}) {
     if (this.selfFixHub?.store.question(id)) return this.selfFixHub.answer(id, answer);
     const card = this.state.questions.find(q => q.id === id);
     if (this.selfFixHub && card?.kind === 'suggestion' && answer === 'Fix it' && (card.options ?? []).includes(answer)) {
       const result = await this.respondSuggestion(card.meta?.suggestionId, answer);
       return { question: { ...card, status: 'answered', answer }, delivery: null, fix: result?.fix ?? null };
     }
-    return this.request('POST', `/fleet/api/questions/${id}`, { answer });
+    return this.request('POST', `/fleet/api/questions/${id}`, { answer, ...(clarification != null ? { clarification } : {}) });
   }
   // replay: a dismissal that could not reach the computer is kept and sent
   // again once it is back (the glasses already dropped the question).
@@ -170,8 +171,8 @@ export class RemoteFleetSupervisor {
   async suggestions() { return (await this.request('GET', '/fleet/api/suggestions')).suggestions ?? []; }
   // Fix it queues in this main's hub (where fixes are listed, revised and
   // stopped); the computer only links the suggestion to that fix id.
-  async respondSuggestion(id, choice) {
-    if (!this.selfFixHub || String(choice ?? '').toLowerCase() !== 'fix it') return this.request('POST', `/fleet/api/suggestions/${id}`, { choice });
+  async respondSuggestion(id, choice, { clarification = null } = {}) {
+    if (!this.selfFixHub || String(choice ?? '').toLowerCase() !== 'fix it') return this.request('POST', `/fleet/api/suggestions/${id}`, { choice, ...(clarification != null ? { clarification } : {}) });
     const { suggestion } = await this.request('GET', `/fleet/api/suggestions/${id}`);
     if (suggestion.status !== 'open') return { suggestion, fix: null };
     assertFixAllowed(this.selfFixHub.store, suggestion.area, Date.now());
@@ -229,7 +230,11 @@ export class RemoteFleetSupervisor {
     }
     const items = outreach.list();
     for (const q of this.getState().questions) {
-      const shown = { title: q.title, summary: q.card || q.body, actions: [...(q.options ?? []), "dismiss"] };
+      // Compact outreach clients cannot show the full deletion warning.
+      // Keep storage decisions in the main app where that warning is visible.
+      const shown = q.kind === 'storage'
+        ? { title: q.title, summary: 'Storage cleanup can permanently delete files. Review the full warning and choose in the main app.', actions: ['dismiss'] }
+        : { title: q.title, summary: q.card || q.body, actions: outreachActions(q.options) };
       // A question the computer closed on a blip and reopened keeps its id:
       // its old copy comes back, so the glasses do not ping for it again.
       const last = q.reopenedAt ? items.find(item => item.sourceRef?.kind === 'fleet' && item.sourceRef.id === q.id && item.sourceRef.nodeId === this.nodeId) : null;

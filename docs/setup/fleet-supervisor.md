@@ -381,8 +381,10 @@ or `waiting for idle`) is not left for the next 5-min scan:
   needs-you review (the next scheduled scan runs it). At most one a minute.
 - **Background routes** (off until listed in `OPENAGI_FLEET_BACKGROUND_ROUTES`).
   The send goes now, without the screen, instead of waiting:
-  - `codex-exec`: a Codex thread no app holds open (no writer lock, read again
-    at send time) and that Conductor did not start.
+  - `codex-exec`: a Codex thread started in the Codex CLI that no app holds
+    open (no writer lock, read again at send time). Never a
+    thread the Codex app or Conductor started: a resumed turn holds the
+    writer lock for hours, and the app then cannot open the thread.
   - `peer-relay`: a Conductor chat whose live Claude session is idle right
     now, with no open pick in the chat.
   Never `claude-resume`, never a thread with a running turn or a permission
@@ -392,8 +394,8 @@ or `waiting for idle`) is not left for the next 5-min scan:
 
 - Non-live Conductor sessions: no CLI delivery route. You get "open it" after
   90 min stuck, unless computer-use delivery is on.
-- Codex threads held open by Codex Desktop (writer lock): blocked on the CLI
-  route. Close the thread in Desktop, send by hand, or use computer-use delivery.
+- Codex threads the Codex app started: never sent through `codex exec`, even
+  with the app closed. Send by hand or use computer-use delivery.
 - Computer-use delivery reads the apps' accessibility trees. An app update can
   change them; a thread it cannot verify is blocked, never guessed.
 - Main mirroring requires an explicitly selected enrolled coding Mac; without
@@ -444,7 +446,9 @@ on; the same outreach item updates in place. The supervisor's own questions
 - A closed question stays closed while the same ask repeats, for up to 6
   hours. Then the same ask is a new question, reviewed again before it pings.
   A changed ask is a new question.
-- If the model fails or times out (6 min), questions go out as before and the
+- If the model fails, questions go out as before. With the default timeouts,
+  the Codex attempt can take 3 minutes and the Claude fallback another 6 minutes
+  (about 9 minutes total, plus process termination grace), and the
   error shows in **Doing**. It retries after 15 minutes.
 - Every decision is in **Doing** (`review`). **Cleared by supervisor** under
   **Needs you** lists every close asked in the last day, one per ask, with
@@ -527,10 +531,10 @@ A barge invalidates the interrupted readback.
 `node scripts/voice-smoke.mjs` checks the live API with the key in
 `~/.openagi/.env`.
 
-Voice adds `fleet_walkthrough`, `voice_focus`, `fleet_diagnose` (counts for
-now), `feedback_record` and `self_fix_list/start/revise/stop`. Self-fix
-requests are stored on the coding Mac (`/fleet/api/fixes`); the runner that
-works them ships later.
+Voice adds `fleet_walkthrough`, `voice_focus`, `fleet_diagnose`,
+`feedback_record` and `self_fix_list/start/revise/stop`. Diagnosis reports
+fleet health metrics and anomalies. Self-fix requests use `/fleet/api/fixes`
+and the configured [self-fix runner](#self-fix-runner) below.
 
 ## One supervisor shared by main, Android and G2
 

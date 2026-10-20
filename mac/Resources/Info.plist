@@ -28,6 +28,15 @@
   <string>14.0</string>
   <key>LSUIElement</key>
   <true/>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key>
+      <string>app.openagi.privacy</string>
+      <key>CFBundleURLSchemes</key>
+      <array><string>openagi</string></array>
+    </dict>
+  </array>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSHumanReadableCopyright</key>

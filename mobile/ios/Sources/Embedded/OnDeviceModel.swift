@@ -6,8 +6,8 @@ import FoundationModels
 import UIKit
 #endif
 
-// Whether this iPhone can run OpenAGI on its own model. Onboarding offers
-// "On this phone" only when this says so (or explains what's missing).
+// Shared by the iPhone and Mac apps. Read actual system availability;
+// OS support alone does not mean the model is enabled or downloaded.
 enum OnDeviceModelStatus: Equatable, Sendable {
     case available
     // Apple Intelligence is supported but switched off in Settings.
@@ -17,10 +17,19 @@ enum OnDeviceModelStatus: Equatable, Sendable {
     // Not an Apple Intelligence iPhone, or iOS older than 26.
     case unsupported
 
+    var availabilityName: String {
+        switch self {
+        case .available: return "available"
+        case .notEnabled: return "not-enabled"
+        case .downloading: return "downloading"
+        case .unsupported: return "unsupported"
+        }
+    }
+
     @MainActor
     static func current() -> OnDeviceModelStatus {
         #if canImport(FoundationModels)
-        if #available(iOS 26.0, *) {
+        if #available(iOS 26.0, macOS 26.0, *) {
             switch SystemLanguageModel.default.availability {
             case .available: return .available
             case .unavailable(.appleIntelligenceNotEnabled): return .notEnabled
@@ -37,7 +46,7 @@ enum OnDeviceModelStatus: Equatable, Sendable {
     @MainActor
     static func backend() -> any DeviceModelBackend {
         #if canImport(FoundationModels)
-        if #available(iOS 26.0, *), current() == .available {
+        if #available(iOS 26.0, macOS 26.0, *), current() == .available {
             return FoundationModelsBackend()
         }
         #endif
@@ -54,7 +63,7 @@ struct UnavailableModelBackend: DeviceModelBackend {
 }
 
 #if canImport(FoundationModels)
-@available(iOS 26.0, *)
+@available(iOS 26.0, macOS 26.0, *)
 struct FoundationModelsBackend: DeviceModelBackend {
     var modelName: String { "apple-foundation-models" }
 
@@ -97,7 +106,7 @@ struct FoundationModelsBackend: DeviceModelBackend {
     private static func failure(for error: LanguageModelSession.GenerationError) -> DeviceModelFailure {
         switch error {
         case .rateLimited:
-            return DeviceModelFailure(code: "device-model-throttled", message: "The iPhone is limiting on-device AI right now. Try again in a moment.")
+            return DeviceModelFailure(code: "device-model-throttled", message: "This device is limiting on-device AI right now. Try again in a moment.")
         case .exceededContextWindowSize:
             return DeviceModelFailure(code: "device-model-context", message: "That conversation is too long for the on-device model. Start a new one.")
         case .guardrailViolation:
@@ -119,13 +128,13 @@ struct FoundationModelsBackend: DeviceModelBackend {
     }
 }
 
-@available(iOS 26.0, *)
+@available(iOS 26.0, macOS 26.0, *)
 private struct ToolHandoff: Error {
     let call: DeviceToolCall
 }
 
 // One daemon tool, declared to the model from its JSON Schema.
-@available(iOS 26.0, *)
+@available(iOS 26.0, macOS 26.0, *)
 private struct HandoffTool: Tool {
     typealias Arguments = GeneratedContent
     typealias Output = String
@@ -149,7 +158,7 @@ private struct HandoffTool: Tool {
 // JSON Schema (the subset tool declarations use) to a Foundation Models
 // schema. Anything it doesn't recognize becomes a string, which the model
 // can always produce and the daemon's tool validates anyway.
-@available(iOS 26.0, *)
+@available(iOS 26.0, macOS 26.0, *)
 enum JSONSchemaMapping {
     static func schema(named name: String, from json: JSONValue) -> DynamicGenerationSchema {
         guard case .object(let object) = json else { return DynamicGenerationSchema(type: String.self) }

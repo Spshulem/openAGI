@@ -51,18 +51,36 @@ export class McpStdioClient {
   async doConnect() {
     if (!this.command) throw new Error(`MCP server ${this.name} is missing a command.`);
     if (this.logDir) ensureDir(this.logDir);
-    this.proc = spawn(this.command, this.args, {
+    const proc = this.proc = spawn(this.command, this.args, {
       env: this.buildEnv(),
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
-    this.proc.stdout.on("data", (chunk) => this.handleStdout(chunk));
-    this.proc.stderr.on("data", (chunk) => this.logStderr(chunk));
-    this.proc.on("exit", (code, signal) => this.handleExit(code, signal));
-    this.proc.on("error", (error) => {
-      this.lastError = error.message;
+    this.buffer = "";
+    proc.stdout.on("data", (chunk) => { if (this.proc === proc) this.handleStdout(chunk); });
+    proc.stderr.on("data", (chunk) => { if (this.proc === proc) this.logStderr(chunk); });
+    proc.on("exit", (code, signal) => { if (this.proc === proc) this.handleExit(code, signal); });
+    proc.on("error", (error) => {
+      if (this.proc !== proc) return;
+      const reason = error.code === "ENOENT"
+        ? "executable or working directory was not found; check the command, cwd and the app's PATH"
+        : error.code === "EACCES" ? "executable or working directory is not accessible; check permissions"
+          : "process could not start; check its command and permissions";
+      const failure = new Error(`MCP server ${this.name}: ${reason}.`);
+      failure.code = error.code;
+      this.lastError = failure.message;
+      this.connected = false;
+      for (const pending of this.pending.values()) pending.reject(failure);
+      this.pending.clear();
+    });
+    // EPIPE is emitted asynchronously when a server exits during a request.
+    // It must fail the request rather than crash the daemon.
+    proc.stdin.on("error", () => {
+      if (this.proc !== proc) return;
+      this.handleExit(null, "stdin-closed");
+      this.close();
     });
 
     try {
@@ -79,6 +97,7 @@ export class McpStdioClient {
       const list = await this.request("tools/list", {}, { timeoutMs: 60000 });
       this.tools = list?.tools ?? [];
       this.connected = true;
+      this.lastError = null;
       return { tools: this.tools, serverInfo: this.serverInfo };
     } catch (error) {
       this.lastError = error.message;

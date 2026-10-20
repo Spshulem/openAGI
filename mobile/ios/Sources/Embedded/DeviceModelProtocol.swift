@@ -64,13 +64,13 @@ struct DeviceModelFailure: Error, Sendable, Equatable {
 
     static let unavailable = DeviceModelFailure(
         code: "device-model-unavailable",
-        message: "This iPhone's on-device model isn't available right now."
+        message: "This device’s on-device model isn’t available right now."
     )
 }
 
 enum DeviceModelOutbound {
-    static func hello(model: String, contextSize: Int) -> Data {
-        encode(["type": .string("hello"), "model": .string(model), "contextSize": .number(Double(contextSize))])
+    static func hello(model: String, contextSize: Int, availability: String = "available") -> Data {
+        encode(["type": .string("hello"), "model": .string(model), "contextSize": .number(Double(contextSize)), "availability": .string(availability)])
     }
 
     static func delta(id: String, text: String) -> Data {

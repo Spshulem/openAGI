@@ -9,6 +9,7 @@ import { ToolRegistry } from "../src/tool-registry.js";
 import { PendingActionStore } from "../src/pending-actions.js";
 import { ComputerUseLog } from "../src/computer-use-log.js";
 import { NodeRegistry } from "../src/node-registry.js";
+import { navigation } from "../src/app-shell.js";
 
 async function until(predicate, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
@@ -342,7 +343,9 @@ test("daemon startup recovers a continuation interrupted after durable approval"
 
 test("dashboard exposes a durable Approvals tab and computer-use approval surface", () => {
   const source = fs.readFileSync(new URL("../src/hosted-interface.js", import.meta.url), "utf8");
-  assert.match(source, /data-tab="approvals"[^>]*>Approvals/);
+  const button = navigation.match(/<button\b[^>]*data-tab="approvals"[^>]*>(.*?)<\/button>/s)?.[1];
+  assert.ok(button, "main navigation must expose the Approvals destination");
+  assert.match(button, /<span>Approvals<\/span>/);
   assert.match(source, /async function renderApprovals\(/);
   assert.match(source, /Computer-use requests awaiting approval/);
   assert.match(source, /pending-action-resolved/);

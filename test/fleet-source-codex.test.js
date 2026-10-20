@@ -337,12 +337,12 @@ test("listCodexThreads treats locks as held when lsof cannot answer", async (t) 
 
 test("listCodexThreads redacts and clamps untrusted text", async (t) => {
   const ctx = makeHome(t);
-  const long = `token sk-ant-abcdefghijklmnopqrstuvwxyz ${"x".repeat(2000)}`;
+  const long = `token sk-ant-${"a".repeat(26)} ${"x".repeat(2000)}`;
   addThread(ctx, { id: "t-secret", name: `Title ${"y".repeat(300)}`, lines: [
     ev.user(`use CODEX_LB_API_KEY=supersecret please`, 40 * MIN), ev.started("s", 40 * MIN), ev.complete("s", 25 * MIN, long)
   ] });
   const [thread] = await listCodexThreads(ctx.config, { now: NOW, run: async () => ({ code: 1, stdout: "" }) });
-  assert.doesNotMatch(thread.lastAgentText, /abcdefghijklmnop/);
+  assert.doesNotMatch(thread.lastAgentText, /sk-ant-a/);
   assert.ok(thread.lastAgentText.length <= ctx.config.limits.excerptMax);
   assert.doesNotMatch(thread.lastUserText, /supersecret/);
   assert.ok(thread.title.length <= ctx.config.limits.titleMax);
@@ -628,6 +628,7 @@ test("listCodexThreads exposes the originator; Conductor-hosted threads type int
   const map = byId(await listCodexThreads(ctx.config, { now: NOW, run }));
   assert.equal(map["t-desktop"].meta.originator, "Codex Desktop");
   assert.equal(map["t-hosted"].meta.originator, "codex_sdk_ts");
+  assert.equal(map["t-desktop"].meta.source, "vscode", "an app's thread, even where originator is null");
 
   const desktop = uiTargetFor(map["t-desktop"]);
   assert.equal(desktop.bundleId, "com.openai.codex");
@@ -1253,6 +1254,19 @@ test("the card scan past the in-scope stop reports which threads it settled", as
   assert.ok(cardScanned.has("codex:t-00"), "rows read before the stop are settled too");
 });
 
+test("a bounded tail without its history index leaves older cards unknown", async (t) => {
+  const ctx = makeHome(t);
+  addThread(ctx, { id: "t-long", mtimeAgo: 5 * MIN, lines: [turnStart("turn-a", 30 * MIN),
+    tailCall("old-card", "Which implementation?", ["A", "B"], 20 * MIN),
+    ...Array.from({ length: 80 }, () => ev.tokens(5 * MIN))] });
+  addThread(ctx, { id: "t-short", mtimeAgo: 10 * MIN, lines: [ev.complete("done", 10 * MIN, "Finished.")] });
+  const cardScanned = new Set();
+  const map = byId(await listCodexThreads(ctx.config, { now: NOW, run: noLocks, history: null, tailBytes: 1024, cardScanned }));
+  assert.equal(map["t-long"].meta.pendingCard, null, "the older card is outside the read tail");
+  assert.equal(cardScanned.has("codex:t-long"), false, "absence from an incomplete read must not close a known question");
+  assert.equal(cardScanned.has("codex:t-short"), true, "a complete rollout can establish no open card");
+});
+
 test("history cards: supervisor rows filling the newest user rows never hide an older open ask", async (t) => {
   const ctx = makeHome(t);
   const h = makeHistory(ctx);
@@ -1314,4 +1328,12 @@ test("cards past the in-scope stop are read from the rollout tail when the histo
     // A tail read never settles a card the index could not.
     assert.ok(!cardScanned.has("codex:t-auto"));
   }
+});
+
+
+test("answering a later item clears the legacy pending question for that call", () => {
+  const ask = { timestamp: iso(9 * MIN), type: "response_item", payload: { type: "function_call", name: "request_user_input_async", call_id: "call-later", arguments: JSON.stringify({ questions: [{ title: "First?", options: ["yes"] }, { title: "Second?", options: ["no"] }] }) } };
+  const reply = ev.user(cardReply([["call-later", 1, "no"]]), 5 * MIN);
+  const summary = parseRolloutTail([ask, reply].map(JSON.stringify).join("\n"));
+  assert.equal(summary.pendingQuestion, null);
 });

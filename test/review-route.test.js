@@ -60,7 +60,9 @@ test("served dashboard recognizes and renders the Review tab", async (t) => {
   assert.match(html, /data-tab="review"/);
   assert.match(html, /async function renderReview/);
   assert.match(html, /else if \(tab === "review"\)/);
-  assert.match(html, /new Set\(\["chat","tasks","review"/);
+  const validTabs = html.match(/const VALID_TABS = new Set\((\[[^\]]*\])\)/)?.[1];
+  assert.ok(validTabs, "dashboard declares its accepted routes");
+  assert.ok(JSON.parse(validTabs).includes("review"), "Review is an accepted dashboard route");
   assert.match(html, /if \(run\.status === "ran"\)/, "only a completed manual run is celebrated");
   assert.match(
     html,

@@ -111,7 +111,7 @@ final class FleetThreadDetailTests: XCTestCase {
     XCTAssertEqual(row.prRef, "o/r#12")
 
     let summary = FleetThreadSummary(thread: row, detail: nil, now: now)
-    XCTAssertNil(summary.excerpt, "the row's unredacted text is never shown")
+    XCTAssertEqual(summary.excerpt, "Done downloading.", "the current server redacts row text before delivery")
     XCTAssertEqual(summary.prLine, "r#12 · open · CI failing: lint · 2 unresolved")
     XCTAssertEqual(summary.prLink?.absoluteString, "https://github.com/o/r/pull/12")
     XCTAssertEqual(summary.waitLine, "Stopped for 1h; the supervisor pushes it")
@@ -245,6 +245,26 @@ final class FleetThreadDetailTests: XCTestCase {
     XCTAssertEqual(reads, 2)
     XCTAssertEqual(consumer.details["codex:t"]?.lastAgentText, "After scan")
     XCTAssertFalse(consumer.detailLoading.contains("codex:t"))
+  }
+
+  func testNewerRowWinsOverCachedDetailTextAndOwnerTime() throws {
+    let detail = try XCTUnwrap(FleetThreadDetail.decodeResponse(Data("""
+      {"thread":{"key":"codex:t","lastOwnerAt":"2026-10-14T01:00:00Z",
+        "lastAgentMessage":{"text":"Old detail","at":"2026-10-14T02:00:00Z"}}}
+      """.utf8)))
+    let row = FleetThread(key: "codex:t", lastAgentAt: "2026-10-14T03:30:00Z", watch: nil,
+                          lastAgentText: "New row", lastOwnerAt: "2026-10-14T03:00:00Z")
+    let summary = FleetThreadSummary(thread: row, detail: detail, now: now)
+    XCTAssertEqual(summary.excerpt, "New row")
+    XCTAssertEqual(summary.excerptAge, "30m ago")
+    XCTAssertEqual(summary.ownerLine, "You last wrote 1h ago")
+  }
+
+  func testLegacyGroupedQuestionRetainsThreadKeys() throws {
+    let question = try decode(FleetQuestion.self, """
+      {"id":"legacy-group","threadKeys":["codex:a","claude:b"]}
+      """)
+    XCTAssertEqual(question.threadKeys, ["codex:a", "claude:b"])
   }
 
 }

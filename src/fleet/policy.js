@@ -5,7 +5,7 @@
 // another agent reads; the owner sees at most a tag-stripped 220-char excerpt.
 
 import {
-  CARD_STALE_MS, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, isMainHealthCheck, kindName, liveCardItems, msSince, parsePrRef,
+  CARD_STALE_MS, DEFAULTS, SUPERVISOR_PREFIX, clampTail, clampText, codexExecBarred, isMainHealthCheck, kindName, liveCardItems, msSince, parsePrRef,
   redactSecrets, shortHash, uiTargetFor
 } from "./contracts.js";
 import { blockedOnSection, deliberateStop, ownerStoppedNudge } from "./classify.js";
@@ -94,8 +94,9 @@ export function chooseRoute(thread, mode, delivery = null) {
     if (ui.mode === "computer-use") return null;
   }
   // A Codex thread Conductor started (its own Codex agent) resumed behind
-  // Conductor forks it, the same as claude-resume would.
-  if (thread.kind === "codex") return thread.writerLocked || !thread.cwd || thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR ? null : "codex-exec";
+  // Conductor forks it, the same as claude-resume would; one the Codex app
+  // started would be locked out of the app for the whole turn.
+  if (thread.kind === "codex") return thread.writerLocked || !thread.cwd || codexExecBarred(thread) ? null : "codex-exec";
   if (thread.live?.peerName && thread.live?.pid) return "peer-relay";
   // claude -p --resume behind Conductor's back forks the transcript and
   // never shows in its UI, so Conductor-hosted threads never get it.
@@ -670,7 +671,8 @@ function resolveNudge(ctx, intent, base) {
     // tells the owner why once it has waited a while.
     const ui = deliveryOf(ctx.delivery);
     const uiBlocked = ui.mode !== "cli" && ui.ready === false && Boolean(uiTargetFor(thread));
-    const waitUi = uiWaitReason(thread, ctx.delivery);
+    // computer-use-first too for a thread no CLI may reach (the Codex app's).
+    const waitUi = uiWaitReason(thread, ctx.delivery) ?? (codexExecBarred(thread) ? uiBlockedReason(thread, ctx.delivery) : null);
     if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
     return { ...unreachableDecision(ctx, decision), uiBlocked };
   }

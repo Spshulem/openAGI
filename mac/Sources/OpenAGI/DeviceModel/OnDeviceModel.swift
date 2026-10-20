@@ -1,0 +1,1 @@
+../../../../mobile/ios/Sources/Embedded/OnDeviceModel.swift

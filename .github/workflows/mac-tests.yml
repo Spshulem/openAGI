@@ -1,0 +1,19 @@
+name: Mac tests
+
+on:
+  pull_request:
+    paths:
+      - "mac/**"
+      - ".github/workflows/mac-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  fleet-tests:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Mac app and run Fleet and privacy-link regressions
+        run: swift test --package-path mac --filter 'Fleet|AppLink'

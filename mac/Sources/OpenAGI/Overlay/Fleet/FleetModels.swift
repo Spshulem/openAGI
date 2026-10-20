@@ -23,6 +23,7 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   /// row has its own Dismiss button, and a second one would be the same action.
   let options: [String]
   let threadKey: String?
+  let threadKeys: [String]
   let prRef: String?
   let reviewReason: String?
   let reviewCategory: String?
@@ -44,7 +45,7 @@ struct FleetQuestion: Decodable, Equatable, Identifiable {
   let askContext: String?
 
   enum CodingKeys: String, CodingKey {
-    case id, kind, title, body, options, threadKey, prRef, reviewReason, reviewCategory, pinned, createdAt
+    case id, kind, title, body, options, threadKey, threadKeys, prRef, reviewReason, reviewCategory, pinned, createdAt
     case askedAt, chatLabel, answerIn, openChat, chats, risky, askContext
   }
 
@@ -111,6 +112,7 @@ extension FleetQuestion {
     let rawOptions = (try? c.decodeIfPresent([Lossy<String>].self, forKey: .options)) ?? []
     options = rawOptions.compactMap { $0.value }.filter { !$0.isEmpty && $0 != "dismiss" }
     threadKey = try? c.decodeIfPresent(String.self, forKey: .threadKey)
+    threadKeys = ((try? c.decodeIfPresent([Lossy<String>].self, forKey: .threadKeys)) ?? []).compactMap { $0.value }
     prRef = try? c.decodeIfPresent(String.self, forKey: .prRef)
     reviewReason = try? c.decodeIfPresent(String.self, forKey: .reviewReason)
     reviewCategory = try? c.decodeIfPresent(String.self, forKey: .reviewCategory)

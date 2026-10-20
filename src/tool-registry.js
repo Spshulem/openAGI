@@ -464,7 +464,7 @@ export function registerCoreTools(registry, runtime) {
 
   registry.register({
     name: "correct_memory",
-    description: "Replace a stored memory that turned out to be WRONG. Hides the stale version from all future recall and locks in the corrected fact so the mistake never repeats. Use when the user corrects something previously stored or stated (a time, name, decision, preference) — do NOT just call remember with a second conflicting fact.",
+    description: "Replace a stored memory in your own scope that turned out to be WRONG. Shared memories remain readable, but a specialist cannot supersede them; store a local correction without an id instead. Hides the stale version from all future recall and locks in the corrected fact so the mistake never repeats. Use when the user corrects something previously stored or stated (a time, name, decision, preference) — do NOT just call remember with a second conflicting fact.",
     parameters: {
       type: "object",
       properties: {

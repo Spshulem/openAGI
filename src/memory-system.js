@@ -192,7 +192,10 @@ export class MemorySystem {
     const scored = [];
     for (const item of this.items.values()) {
       if (!tiers.has(item.tier)) continue;
-      if (scope && item.scope && item.scope !== scope && item.scope !== "main") continue;
+      if (scope) {
+        const itemScope = item.scope ?? "main";
+        if (itemScope !== scope && (options.includeShared === false || itemScope !== "main")) continue;
+      }
       // Superseded items were corrected by the user — never recall the stale
       // version (the correction itself carries the fact forward).
       if (item.metadata?.supersededBy) continue;
@@ -280,14 +283,20 @@ export class MemorySystem {
     const text = String(content ?? "").trim();
     if (!text) throw new Error("correct() requires the corrected content.");
 
+    // Shared recall grants read access, not permission to supersede another
+    // scope's evidence. Resolve legacy unscoped rows as shared main memory.
+    scope = scope ?? "main";
     const targets = [];
     if (id) {
       const item = this.items.get(id);
+      if (item && (item.scope ?? "main") !== scope) {
+        throw new Error("Cannot correct a memory outside the current scope.");
+      }
       // A prior correction CAN be re-corrected (9:00 → 9:30 → 10:00): supersede
       // even locked items, just not one already superseded.
       if (item && !item.metadata?.supersededBy) targets.push(item);
     } else if (query) {
-      const hits = this.retrieve(query, { limit: 5, scope });
+      const hits = this.retrieve(query, { limit: 5, scope, includeShared: false });
       const top = hits[0]?.score ?? 0;
       for (const { item, score } of hits) {
         // retrieve() already hides superseded items; corrections themselves are

@@ -1,3 +1,4 @@
+import { navigation, shellStyles } from "./app-shell.js";
 import http from "node:http";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -14,6 +15,7 @@ import { lifelogPage } from "./lifelog-page.js";
 import { createDefaultRuntime } from "./abi-runtime.js";
 import { codingSupervisorRoute } from "./coding-supervisor-routes.js";
 import { codingSupervisorUi } from "./coding-supervisor-ui.js";
+import { getStartedUi } from "./get-started-ui.js";
 import { VocaleoClient } from "./integrations/vocaleo.js";
 import { createVocaleoRoute } from "./vocaleo-routes.js";
 import { vocaleoUi } from "./vocaleo-ui.js";
@@ -40,7 +42,7 @@ import {
 import { ChannelManager } from "./channels.js";
 import { createCompanionRoutes, connectionsPage } from "./companion-routes.js";
 import { inferToneScore } from "./outcome-store.js";
-import { isFirstRun, renderWizard, saveEnv } from "./setup-wizard.js";
+import { isFirstRun, renderWizard, renderAdvancedWizard, saveEnv } from "./setup-wizard.js";
 import {
   NodeRegistry,
   readOrCreateIdentity,
@@ -57,6 +59,7 @@ import { safeJoinOrNull, LABEL_SEGMENT } from "./path-guard.js";
 import { assertSafeStdioSpec } from "./mcp-registry.js";
 import { summarizeRegisterMcpServer } from "./tool-registry.js";
 import { logAgentFailure, publicAgentFailure } from "./agent-failure.js";
+import { logOperationalEvent, validRequestId } from "./operational-log.js";
 import { NodeControlBroker, createNodeControlWorker, matchNodeSelector, sanitizeNodeCapabilities, pinnedRemoteOrigin } from "./node-control.js";
 import { createConfiguredComputerExecutor } from "./integrations/cua-computer-executor.js";
 import {
@@ -134,7 +137,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       providers: {
         anthropic: { configured: Boolean(process.env.ANTHROPIC_API_KEY), model: process.env.ANTHROPIC_MODEL ?? null },
         openai: { configured: Boolean(process.env.OPENAI_API_KEY), model: process.env.OPENAI_MODEL ?? null },
-        onDevice: { available: isMobileProfile(), connected: Boolean(deviceModelHub?.info) },
+        onDevice: { available: isMobileProfile() || process.platform === "darwin", connected: Boolean(deviceModelHub.connected && deviceModelHub.info && deviceModelHub.info.model !== "unavailable") },
+        local: { configured: Boolean(process.env.OPENAGI_LOCAL_MODEL), model: process.env.OPENAGI_LOCAL_MODEL ?? null, baseUrl: process.env.OPENAGI_LOCAL_BASE_URL ?? "http://localhost:11434/v1" },
         chatgpt: (() => { try { const st = chatgptStatus({ dataDir }); return { signedIn: st.signedIn, email: st.email ?? null }; } catch { return { signedIn: false, email: null }; } })()
       }
     };
@@ -506,8 +510,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   if (runtime.agentHost) {
     const original = runtime.agentHost.handleMessage.bind(runtime.agentHost);
     runtime.agentHost.handleMessage = async (input, handleOptions) => {
+      const startedAt = Date.now();
+      input = { ...input, metadata: { ...input?.metadata, requestId: validRequestId(input?.metadata?.requestId) ?? randomUUID() } };
       try {
         const result = await original(input, handleOptions);
+        logOperationalEvent("agent-turn-completed", {
+          component: "agent", requestId: input.metadata.requestId,
+          durationMs: Date.now() - startedAt,
+          provider: result.model?.provider, model: result.model?.model
+        });
         events.emit("message", {
           sessionId: result.session.id,
           requestId: boundedProgressText(input?.metadata?.requestId, 200) || null,
@@ -899,9 +910,19 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
   };
 
   const server = http.createServer(async (req, res) => {
+    const startedAt = Date.now();
+    req.openagiRequestId = randomUUID();
+    res.setHeader("x-request-id", req.openagiRequestId);
+    let logRoute = "/other";
+    res.once("close", () => logOperationalEvent("http-request", {
+      component: "http", requestId: req.openagiRequestId, method: req.method,
+      route: logRoute, status: res.statusCode, durationMs: Date.now() - startedAt,
+      reason: res.writableFinished ? "finished" : "disconnected"
+    }, "debug"));
     try {
       const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
       const pathname = url.pathname;
+      if (["/message", "/events", "/health", "/setup/test"].includes(pathname)) logRoute = pathname;
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
@@ -955,7 +976,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
       const setupActive = isFirstRun();
-      const setupRoutes = pathname === "/setup" || pathname === "/setup/save" || pathname === "/setup/test";
+      const setupRoutes = pathname === "/setup" || pathname === "/setup/save" || pathname === "/setup/test" || pathname === "/setup/status";
 
       if (isG2NodeCorsRoute(pathname)) applyG2NodeCorsHeaders(res);
       if (method === "OPTIONS" && isG2NodeCorsRoute(pathname)) {
@@ -1033,15 +1054,32 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // KEPT (a re-run used to silently rotate it on save), provider/
         // model/budget show their current values, and already-set secrets
         // get a "saved" marker instead of looking unconfigured.
-        return sendHtml(res, 200, renderWizard({ existingEnv: process.env }), extraCookies);
+        return sendHtml(res, 200, (url.searchParams.get("advanced") === "1" ? renderAdvancedWizard : renderWizard)({ existingEnv: process.env }), extraCookies);
+      }
+      if (method === "GET" && pathname === "/setup/status") {
+        return sendJson(res, 200, { onDevice: Boolean(deviceModelHub.connected && deviceModelHub.info && deviceModelHub.info.model !== "unavailable"), availability: deviceModelHub.connected ? deviceModelHub.info?.availability ?? "connecting" : "disconnected" });
       }
       if (method === "POST" && pathname === "/setup/save") {
         const body = await readJson(req);
-        const dataDir = resolveDataDir();
-        const result = saveEnv({ dataDir, values: body });
+        if (body.setupModel === true) {
+          const choice = body.OPENAGI_PROVIDER;
+          if (!["anthropic", "openai", "local", "on-device", "chatgpt"].includes(choice)) {
+            return sendJson(res, 400, { error: "Choose a model provider." });
+          }
+          const required = { anthropic: "ANTHROPIC_API_KEY", openai: "OPENAI_API_KEY", local: "OPENAGI_LOCAL_MODEL" }[choice];
+          if (required && !String(body[required] || process.env[required] || "").trim()) {
+            return sendJson(res, 400, { error: choice === "local" ? "Enter the name of an installed local model." : "Enter your API key to connect this provider." });
+          }
+        }
+        let result;
+        try { result = saveEnv({ dataDir, values: body }); }
+        catch (error) {
+          if (error?.code === "PROVIDER_CONFIG_MISMATCH") return sendJson(res, 400, messageFailure(error, null));
+          throw error;
+        }
         try {
           const { createModelProvider } = await import("./model-provider.js");
-          if (runtime.agentHost) {
+          if (runtime.agentHost && Object.keys(body).some(key => /^(OPENAGI_PROVIDER|ANTHROPIC_|OPENAI_|OPENAGI_LOCAL_)/.test(key))) {
             runtime.agentHost.modelProvider = createModelProvider({ budgetGuard: runtime.budget });
           }
         } catch { /* swallow */ }
@@ -1060,14 +1098,39 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       }
       if (method === "POST" && pathname === "/setup/test") {
         const body = await readJson(req);
-        if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
+        let provider = runtime.agentHost?.modelProvider;
+        const preference = (body.setupModel === true ? String(body.OPENAGI_PROVIDER || "") : process.env.OPENAGI_PROVIDER || "auto").toLowerCase();
+        if (body.setupModel === true) {
+          if (!["anthropic", "openai", "local", "on-device", "chatgpt"].includes(preference)) {
+            return sendJson(res, 400, { ok: false, error: "Choose a model provider." });
+          }
+          const value = key => String(body[key] ?? "").trim() || process.env[key] || undefined;
+          const { createModelProvider } = await import("./model-provider.js");
+          // Verify a candidate without changing live credentials or the provider
+          // used by existing chats and background jobs. Mobile fallback is off.
+          provider = createModelProvider({ preferred: preference, mobile: false, budgetGuard: runtime.budget,
+            anthropic: { apiKey: value("ANTHROPIC_API_KEY"), model: value("ANTHROPIC_MODEL") },
+            openai: { apiKey: value("OPENAI_API_KEY"), model: value("OPENAI_MODEL"), baseUrl: value("OPENAI_BASE_URL") },
+            local: { apiKey: value("OPENAGI_LOCAL_API_KEY"), model: value("OPENAGI_LOCAL_MODEL"), baseUrl: value("OPENAGI_LOCAL_BASE_URL") }
+          });
+        }
+        const kind = providerKind(provider?.primary ?? provider);
+        if (!provider || kind === "none" || !provider.isConfigured?.() || (preference !== "auto" && kind !== preference)) {
+          return sendJson(res, 400, { ok: false, error: "Connect the selected model before continuing. A fallback response is not a model connection." });
+        }
         try {
-          // ephemeral: the connectivity test must not seed a session, task,
-          // memory item, or outcome — it's plumbing, not conversation.
-          const turn = await channels.handleLocalMessage({ text: body.text ?? "Say hi in one short sentence.", from: "setup", ephemeral: true });
-          return sendJson(res, 200, { reply: turn.reply, model: turn.model });
+          // Test inference alone. No agent routing, tools, memory or sessions.
+          // Native setup bootstraps only dashboard auth so the local bridge
+          // can attach; model settings are saved after successful inference.
+          if (kind === "on-device") await deviceModelHub.waitForDevice(10_000);
+          const result = await provider.generate({ input: "Reply with one short greeting.", messages: [], tools: [], agent: { name: "OpenAGI" }, context: { signal: AbortSignal.timeout(30_000) } });
+          if (!String(result?.text || "").trim()) throw new Error("The model returned no answer. Try again.");
+          if (result?.provider === "deterministic" || result?.provider === "on-device" && kind !== "on-device") {
+            throw new Error("The selected model did not answer. Check its connection and try again.");
+          }
+          return sendJson(res, 200, { ok: true, reply: result.text, model: result.model || provider.model || kind });
         } catch (error) {
-          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
+          return sendJson(res, 400, { ok: false, error: "Model verification failed.", message: kind === "on-device" ? "Apple Intelligence is not ready. Open the native app on this host, enable Apple Intelligence and let its model download, then retry." : kind === "local" ? "Could not get an answer from the local server. Check that it is running, the URL ends in /v1, and the model is installed." : "The provider could not answer. Check your key, model access, billing and network, then retry." });
         }
       }
 
@@ -2029,6 +2092,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // setup-test path only — never let a public /message caller set it to
         // evade persistence.
         if (body && typeof body === "object") delete body.ephemeral;
+        if (!body || typeof body !== "object" || Array.isArray(body)) return sendJson(res, 400, { error: "message must be an object" });
+        req.openagiRequestId = validRequestId(body.metadata?.requestId) ?? req.openagiRequestId;
+        body.metadata = { ...body.metadata, requestId: req.openagiRequestId };
+        res.setHeader("x-request-id", req.openagiRequestId);
         // Who is speaking, proven by the transport auth above, never by the
         // body: the owner's own credential (bearer, cookie, query token or a
         // tokenless loopback install) or a paired phone's node credential.
@@ -2055,7 +2122,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const result = await channels.handleLocalMessage(body, { principal });
           return sendJson(res, 200, result);
         } catch (error) {
-          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null));
+          logAgentFailure(error, { sessionId: error?.openagiSessionId, requestId: req.openagiRequestId });
+          return sendJson(res, 500, messageFailure(error, error?.openagiSessionId ?? null, req.openagiRequestId));
         }
       }
 
@@ -2279,8 +2347,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const body = await readJsonLimited(req, 16 * 1024).catch(() => null);
           if (!body || typeof body !== "object") return sendJson(res, 400, { error: "invalid_body" });
           const preference = body.preference === undefined ? undefined : String(body.preference).toLowerCase();
-          if (preference === "on-device" && !mobileProfile) {
-            return sendJson(res, 400, { error: "invalid_preference", message: "The on-device model only runs inside the phone app." });
+          if (preference === "on-device" && !mobileProfile && process.platform !== "darwin") {
+            return sendJson(res, 400, { error: "invalid_preference", message: "The on-device model requires the native Mac or phone app." });
           }
           if (preference !== undefined && !MODEL_PREFERENCES.includes(preference)) {
             return sendJson(res, 400, { error: "invalid_preference", allowed: MODEL_PREFERENCES });
@@ -2312,7 +2380,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // screen can say "works" or show why not.
       if (method === "POST" && pathname === "/settings/models/test") {
         const provider = runtime.agentHost?.modelProvider;
-        if (!provider) return sendJson(res, 503, { ok: false, error: "no_model" });
+        if (!provider || providerKind(provider.primary ?? provider) === "none") return sendJson(res, 503, { ok: false, error: "no_model" });
         const started = Date.now();
         try {
           const result = await Promise.race([
@@ -2329,7 +2397,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         return sendJson(res, 200, {
           current: provider?.constructor?.name ?? null,
           model: provider?.model ?? null,
-          configured: provider?.isConfigured?.() ?? false,
+          configured: Boolean(provider?.isConfigured?.() && providerKind(provider?.primary ?? provider) !== "none"
+            && (providerKind(provider?.primary ?? provider) !== "on-device" || deviceModelHub.connected && deviceModelHub.info?.model !== "unavailable")),
           preference: process.env.OPENAGI_PROVIDER ?? "auto",
           available: {
             anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
@@ -2680,6 +2749,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           if (applied?.pendingAction) {
             queueApprovalContinuation(applied.pendingAction, applied.invokeResult);
           }
+          if (applied?.nonResolving) return sendJson(res, 200, { item: runtime.outreach.get(id), plan: applied.plan, nonResolving: true });
           const status = action === "dismiss" ? "dismissed" : "acted";
           const updated = runtime.outreach.resolve(id, { action, by: "user", note: body.note ?? null }, { status });
           return sendJson(res, 200, { item: updated });
@@ -3882,12 +3952,14 @@ function handleSse(req, res, clients) {
   });
   res.write(`event: hello\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
   clients.add(res);
+  logOperationalEvent("sse-open", { component: "http", requestId: req.openagiRequestId, route: "/events", subscribers: clients.size }, "debug");
   const heartbeat = setInterval(() => {
     try { res.write(": ping\n\n"); } catch { /* dropped */ }
   }, 15000);
   req.on("close", () => {
     clearInterval(heartbeat);
     clients.delete(res);
+    logOperationalEvent("sse-close", { component: "http", requestId: req.openagiRequestId, route: "/events", subscribers: clients.size, reason: "client-close" }, "debug");
   });
 }
 
@@ -3961,6 +4033,7 @@ async function streamLocalMessage(res, channels, body, principal = null) {
   let stage = "queued";
   let sessionId = boundedProgressText(body?.sessionId, 500) || null;
   const requestId = boundedProgressText(body?.metadata?.requestId, 200) || null;
+  logOperationalEvent("sse-open", { component: "http", requestId, route: "/message" }, "debug");
   const write = (event, data) => {
     if (!connected || res.destroyed || res.writableEnded) return false;
     try {
@@ -3979,6 +4052,7 @@ async function streamLocalMessage(res, channels, body, principal = null) {
   res.on("close", () => {
     connected = false;
     clearInterval(heartbeat);
+    logOperationalEvent("sse-close", { component: "http", requestId, route: "/message", reason: res.writableFinished ? "finished" : "disconnected" }, "debug");
   });
 
   const onProgress = (raw) => {
@@ -4014,6 +4088,7 @@ async function streamLocalMessage(res, channels, body, principal = null) {
     sessionId = boundedProgressText(result?.session?.id, 500) || sessionId;
     write("final", result);
   } catch (error) {
+    logAgentFailure(error, { sessionId: error?.openagiSessionId ?? sessionId, requestId });
     write("failure", { ...messageFailure(error, error?.openagiSessionId ?? sessionId), ...(requestId ? { requestId } : {}) });
   } finally {
     clearInterval(heartbeat);
@@ -4077,8 +4152,8 @@ function boundedProgressText(value, max) {
   return typeof value === "string" ? value.trim().slice(0, max) : "";
 }
 
-function messageFailure(error, sessionId = null) {
-  return publicAgentFailure(error, sessionId);
+function messageFailure(error, sessionId = null, requestId = null) {
+  return publicAgentFailure(error, sessionId, requestId);
 }
 
 // SEC-4: every HTML response this daemon serves gets a per-response nonce and
@@ -4380,8 +4455,9 @@ async function applyOutreachAction(runtime, item, action, note) {
       if (!runtime.clarifications.answer(ref.id, action)) throw new Error("clarification not answerable");
       return;
     case "fleet": {
-      const r = await runtime.fleetSupervisor?.answerQuestion(ref.id, action);
+      const r = await runtime.fleetSupervisor?.answerQuestion(ref.id, action, action === "Answer question" ? { clarification: note } : undefined);
       if (!r) throw new Error("fleet question not answerable");
+      if (r.nonResolving && r.plan) return { nonResolving: true, plan: r.plan };
       // Blocked, failed, or "open thread": the agent has no answer yet, so
       // the item stays actionable.
       if (r.question?.status === "open") throw outreachActionConflict(r.delivery?.detail ?? "fleet answer not delivered; the question is still open");
@@ -4448,13 +4524,14 @@ function readJson(req) {
   });
 }
 
-const MODEL_PREFERENCES = ["auto", "anthropic", "openai", "chatgpt", "on-device"];
+const MODEL_PREFERENCES = ["auto", "anthropic", "openai", "chatgpt", "on-device", "local"];
 const MIRROR_BODY_LIMIT = 6 * 1024 * 1024;
 
 function providerKind(provider) {
   const name = provider?.constructor?.name ?? "";
   if (name === "AnthropicProvider") return "anthropic";
   if (name === "OpenAIResponsesProvider") return "openai";
+  if (name === "LocalModelProvider") return "local";
   if (name === "OnDeviceModelProvider") return "on-device";
   if (name === "ChatGPTPlanProvider") return "chatgpt";
   if (name === "DeterministicModelProvider") return "none";
@@ -4513,66 +4590,6 @@ function renderApp() {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OpenAGI</title>
   <style>
-    :root {
-      color-scheme: light dark;
-      /* Legacy tokens — kept so existing inline-styled components don't
-         drift visually while we migrate them to the shadcn-vocab layer. */
-      --bg: #0e1411;
-      --panel: #161d19;
-      --panel-2: #1d2722;
-      --text: #e8efea;
-      --muted: #8da59a;
-      --line: #2a352f;
-      --accent: #6fe1b1;
-      --accent-soft: #14322a;
-      --user: #2c4338;
-      --assistant: #1d2722;
-      --warn: #f0b454;
-      --err: #f08080;
-
-      /* shadcn-vocab tokens. We've adopted the same names openclaw uses
-         (which mirror shadcn) so future tabs / components have a stable
-         palette + spacing scale to lean on. New work should reach for
-         these first; legacy components keep using the originals above
-         until they're migrated. */
-      --background: var(--bg);
-      --foreground: var(--text);
-      --card: var(--panel);
-      --card-foreground: var(--text);
-      --popover: #1a221d;
-      --popover-foreground: var(--text);
-      --primary: var(--accent);
-      --primary-foreground: #002219;
-      --secondary: var(--panel-2);
-      --secondary-foreground: var(--text);
-      --muted-bg: var(--panel-2);
-      --muted-foreground: var(--muted);
-      --accent-bg: var(--accent-soft);
-      --accent-foreground: var(--accent);
-      --destructive: #b3463a;
-      --destructive-foreground: #ffd9d4;
-      --border: var(--line);
-      --input: var(--panel-2);
-      --ring: rgba(111, 225, 177, 0.45);
-
-      /* Spacing scale (4px grid) and radius / typography — used by
-         the primitive classes below. */
-      --space-1: 4px;
-      --space-2: 8px;
-      --space-3: 12px;
-      --space-4: 16px;
-      --space-5: 24px;
-      --space-6: 32px;
-      --radius-sm: 4px;
-      --radius: 8px;
-      --radius-lg: 12px;
-      --font-size-xs: 11px;
-      --font-size-sm: 12px;
-      --font-size-base: 14px;
-      --font-size-lg: 16px;
-      --shadow-sm: 0 1px 2px rgba(0,0,0,.25);
-      --shadow: 0 4px 12px rgba(0,0,0,.30);
-    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -4592,47 +4609,6 @@ function renderApp() {
     header h1 { font-size: 14px; font-weight: 700; margin: 0; letter-spacing: 0.02em; }
     header .status { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
     header .status .status-pill { white-space: nowrap; padding: 2px 8px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line); }
-    nav { display: flex; gap: 4px; margin-left: auto; align-items: center; }
-    nav button {
-      background: transparent; border: 1px solid transparent; color: var(--muted);
-      padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
-      font-family: inherit;
-    }
-    nav button.active { color: var(--text); background: var(--panel-2); border-color: var(--line); }
-    nav button:hover { color: var(--text); }
-
-    /* "More ▾" dropdown — clusters the 11 secondary tabs (build +
-       diagnostics) so the primary nav stays under control. Hides
-       behind a click; outside-click closes. */
-    .nav-more { position: relative; }
-    .nav-more-btn {
-      background: transparent; border: 1px solid transparent; color: var(--muted);
-      padding: 6px 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
-      font-family: inherit;
-    }
-    .nav-more-btn:hover, .nav-more.open .nav-more-btn { color: var(--text); background: var(--panel-2); border-color: var(--line); }
-    .nav-more-panel {
-      position: absolute; right: 0; top: calc(100% + 6px); z-index: 50;
-      background: var(--popover); color: var(--popover-foreground);
-      border: 1px solid var(--border); border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: var(--space-2); min-width: 220px;
-      display: flex; flex-direction: column; gap: var(--space-3);
-    }
-    .nav-more-panel[hidden] { display: none; }
-    .nav-more-section { display: flex; flex-direction: column; gap: 2px; }
-    .nav-more-label {
-      font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
-      color: var(--muted-foreground); padding: 4px 8px 2px;
-    }
-    .nav-more-panel button {
-      text-align: left; padding: 6px 10px; border-radius: var(--radius-sm);
-      color: var(--text); background: transparent; border: 1px solid transparent;
-      width: 100%; font-size: 13px; cursor: pointer; font-family: inherit;
-    }
-    .nav-more-panel button:hover { background: var(--muted-bg); }
-    .nav-more-panel button.active { background: var(--accent-bg); color: var(--accent-foreground); }
-
     .body { display: grid; grid-template-columns: 280px 1fr; min-height: 0; }
     .body.no-sidebar { grid-template-columns: minmax(0, 1fr); }
     main, .pane, .card { min-width: 0; overflow-wrap: anywhere; }
@@ -5150,52 +5126,17 @@ function renderApp() {
     }
     .page-chat .page-chat-send:hover:not(:disabled) { opacity: 0.9; }
     .page-chat .page-chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
+    ${shellStyles}
   </style>
 </head>
 <body>
 <div class="app">
-  <header>
-    <h1>OpenAGI</h1>
-    <span id="status" class="status">connecting…</span>
-    <a href="/g2/connect" class="ui-btn ui-btn-secondary">Connect glasses</a>
-    <a href="/fleet" class="ui-btn ui-btn-secondary">Fleet</a>
-    <nav id="nav">
-      <!-- Primary tabs — the everyday surfaces. Keeps the nav readable
-           on narrow windows; the other 11 tabs live behind "More ▾". -->
-      <button data-tab="chat" class="active" title="Talk to your agent in natural language.">Chat</button>
-      <button data-tab="tasks" title="My tasks + agent tasks. The agent's own queue gets drained every 30 min by the autopilot pulse.">Tasks</button>
-      <button data-tab="review" title="Search and work through every open task, draft, clarification, and suggestion behind Quick Ask.">Review</button>
-      <button data-tab="approvals" id="approvalsNav" title="Agent actions that require your explicit approval before they run.">Approvals <span id="approvalsNavCount" class="badge" hidden></span></button>
-      <button data-tab="suggestions" title="Things the proactive observer noticed + agent actions awaiting your approval.">Suggestions</button>
-      <button data-tab="memory" title="Short, medium, and long-term memory. Promotion happens automatically.">Memory</button>
-      <button data-tab="integrations" title="Connect MCPs (Linear, GitHub, Stripe, …), sources (BuildBetter, Rize, inbox folder), and channels (Telegram).">Integrations</button>
-      <div class="nav-more" id="navMore">
-        <button id="navMoreBtn" class="nav-more-btn" type="button" title="Build + diagnostic tabs">More ▾</button>
-        <div class="nav-more-panel" id="navMorePanel" hidden>
-          <div class="nav-more-section">
-            <div class="nav-more-label">Build</div>
-            <button data-tab="mcp" title="Register custom MCP servers or manage already-registered ones.">MCP</button>
-            <button data-tab="skills" title="Reusable named prompts. Mined from your activity, or hand-authored.">Skills</button>
-            <button data-tab="cron" title="Scheduled prompts + the agent's autopilot pulse cron jobs.">Cron</button>
-            <button data-tab="channels" title="Telegram / webhook channels the agent can deliver through.">Channels</button>
-            <button data-tab="agents" title="Specialists the propagation controller has spawned for repeated tasks.">Agents</button>
-            <button data-tab="coding-agents" title="Inspect and coordinate Claude Code and Codex sessions through your local supervisor.">Coding Agents</button>
-            <button data-tab="nodes" title="Which machines are paired, which one is main, and who's online right now.">Nodes</button>
-          </div>
-          <div class="nav-more-section">
-            <div class="nav-more-label">Diagnostics</div>
-            <button data-tab="today" title="What you got done today — completed tasks, skills run, actions approved, time tracked, themes.">Today</button>
-            <button data-tab="activity" title="A day-by-day timeline of activity received from screen capture.">Computer History</button>
-            <button data-tab="computer-use" title="Computer use (beta) — every action the agent intended to take, with the reasoning it gave.">Computer Use</button>
-            <button data-tab="budget" title="Today's LLM spend + 14-day history.">Credits</button>
-            <button data-tab="outcomes" title="Quality scores for completed agent work, 7d + 30d rolling.">Outcomes</button>
-            <button data-tab="health" title="Memory saturation, specialist health, MCP status, upcoming cron.">Health</button>
-            <button data-tab="scrutiny" title="Directional Adaptive Scrutiny — the 7-axis scorer's calibration + recent verdicts.">Scrutiny</button>
-          </div>
-        </div>
-      </div>
-      <button id="setupBtn" title="Re-run the setup wizard or edit credentials">⚙ Setup</button>
-    </nav>
+  ${navigation}
+  <div class="workspace">
+  <header class="workspace-header">
+    <button type="button" id="menuToggle" aria-controls="appNavigation" aria-expanded="false" aria-label="Toggle navigation">☰</button>
+    <h1 id="pageTitle">Chat</h1>
+    <span id="status" class="status" aria-live="polite">Connecting…</span>
   </header>
   <div class="body">
     <aside class="sidebar" id="sidebar">
@@ -5205,7 +5146,8 @@ function renderApp() {
       </header>
       <ul id="sidebarList"></ul>
     </aside>
-    <section class="main" id="main"></section>
+    <section class="main" id="main" aria-label="Workspace"></section>
+  </div>
   </div>
 </div>
 <script>
@@ -5218,7 +5160,7 @@ const state = {
   activeRequestMissingSince: null,
   activeRequestText: "",
   activeRequestModel: "",
-  freshChatRequested: false,
+  freshChatRequested: new URLSearchParams(window.location.search).get("onboarding") === "1",
   sessions: [],
   agentId: "main",
   channel: "local",
@@ -5248,36 +5190,50 @@ const newBtn = $("newSession");
 
 document.querySelectorAll("nav button[data-tab]").forEach((btn) => {
   btn.addEventListener("click", () => {
+    const url = new URL(window.location.href);
+    for (const key of ["session", "request", "compose", "suggestion", "pending", "onboarding"]) url.searchParams.delete(key);
+    url.searchParams.set("tab", btn.dataset.tab);
+    history.pushState(null, "", url);
     switchTab(btn.dataset.tab);
-    // Close the More dropdown if the click came from inside it, so the
-    // user lands on the new tab with the panel out of the way.
-    document.getElementById("navMore")?.classList.remove("open");
-    const panel = document.getElementById("navMorePanel");
-    if (panel) panel.hidden = true;
   });
 });
-// More dropdown: toggle on click, close on outside click or Escape.
-(function initNavMore() {
-  const wrap = document.getElementById("navMore");
-  const btn = document.getElementById("navMoreBtn");
-  const panel = document.getElementById("navMorePanel");
-  if (!wrap || !btn || !panel) return;
-  function toggle(open) {
-    const next = typeof open === "boolean" ? open : panel.hidden;
-    panel.hidden = !next;
-    wrap.classList.toggle("open", next);
+function closeNavigation() {
+  $("appNavigation").classList.remove("open");
+  $("menuToggle").setAttribute("aria-expanded", "false");
+}
+$("menuToggle").onclick = () => {
+  const open = $("appNavigation").classList.toggle("open");
+  $("menuToggle").setAttribute("aria-expanded", String(open));
+};
+document.addEventListener("keydown", event => { if (event.key === "Escape") closeNavigation(); });
+document.addEventListener("click", event => {
+  if (!$("appNavigation").contains(event.target) && !$("menuToggle").contains(event.target)) closeNavigation();
+});
+async function restoreHistoryLocation() {
+  const generation = (state.historyRestorationGeneration ?? 0) + 1;
+  state.historyRestorationGeneration = generation;
+  const search = window.location.search;
+  const isCurrent = () => state.historyRestorationGeneration === generation && window.location.search === search;
+  const requestedTab = new URLSearchParams(search).get("tab");
+  const tab = VALID_TABS.has(requestedTab) ? requestedTab : "chat";
+  await switchTab(tab);
+  if (!isCurrent()) return;
+  const session = deepLinkSessionId(search);
+  if (tab === "chat" && session) {
+    const opened = await openSessionDeepLink(session, deepLinkRequestId(search), isCurrent);
+    if (!opened && isCurrent()) {
+      Object.assign(state, {
+        sessionId: null, messages: [], agentId: "main", channel: "local", from: "browser-" + Date.now(),
+        activeRequestId: null, activeRequestStage: null, activeRequestError: null,
+        activeRequestText: "", activeRequestModel: "", activeRequestMissingSince: null,
+        freshChatRequested: true, guidedFlow: null
+      });
+      renderChat();
+    }
   }
-  btn.addEventListener("click", (e) => { e.stopPropagation(); toggle(); });
-  document.addEventListener("click", (e) => {
-    if (!wrap.contains(e.target)) toggle(false);
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") toggle(false);
-  });
-})();
-document.getElementById("setupBtn")?.addEventListener("click", () => {
-  window.location.href = "/setup";
-});
+}
+window.addEventListener("popstate", restoreHistoryLocation);
+document.getElementById("setupBtn").onclick = () => { window.location.href = "/setup"; };
 
 // Small, dependency-free Markdown renderer for chat replies. It is block-aware
 // so table syntax and list markers inside fenced code remain literal. Raw HTML
@@ -5622,6 +5578,8 @@ newBtn.addEventListener("click", async () => {
     state.activeRequestError = null;
     state.activeRequestMissingSince = null;
     state.freshChatRequested = true;
+    state.guidedFlow = null;
+    state.chatDraft = "";
     state.from = "browser-" + Date.now();
     renderTab();
   } else if (state.tab === "cron") {
@@ -5655,7 +5613,17 @@ newBtn.addEventListener("click", async () => {
 });
 
 async function switchTab(tab) {
+  if (!document.querySelector('nav button[data-tab="' + CSS.escape(tab) + '"]')) tab = "chat";
+  if (state.tab === "chat" && $("input")) state.chatDraft = $("input").value;
   state.tab = tab;
+  main.dataset.tab = tab;
+  $("pageTitle").textContent = document.querySelector('nav button[data-tab="' + tab + '"] span')?.textContent || "Chat";
+  document.querySelectorAll("nav button[data-tab]").forEach(button => {
+    if (button.dataset.tab === tab) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
+  });
+  const advanced = document.querySelector('nav button[data-tab="' + tab + '"]')?.closest("details");
+  if (advanced) advanced.open = true;
+  closeNavigation();
   syncNodesAutoRefresh();
   document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   const body = document.querySelector(".body");
@@ -5678,6 +5646,9 @@ async function switchTab(tab) {
       const latest = latestInteractiveSession(state.sessions);
       if (latest) await loadSession(latest.id);
     }
+  } else if (tab === "get-started") {
+    showSidebar(false);
+    renderGettingStarted();
   } else if (tab === "cron") {
     showSidebar(true);
     sidebarTitle.textContent = "Schedules";
@@ -5767,7 +5738,10 @@ async function refreshSessions() {
   for (const s of sessions) {
     const li = document.createElement("li");
     li.className = state.sessionId === s.id ? "active" : "";
-    li.innerHTML = \`<div class="title">\${escapeHtml(s.id)}</div><div class="preview">\${escapeHtml(s.lastMessage || "")}</div>\`;
+    const label = s.title || s.lastMessage || "New conversation";
+    const updated = new Date(s.updatedAt);
+    const subtitle = Number.isNaN(updated.getTime()) ? "Saved conversation" : updated.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    li.innerHTML = \`<div class="title">\${escapeHtml(label.length > 65 ? label.slice(0, 65) + "…" : label)}</div><div class="preview">\${escapeHtml(subtitle)}</div>\`;
     li.addEventListener("click", () => loadSession(s.id));
     sidebarList.appendChild(li);
   }
@@ -5777,6 +5751,8 @@ async function refreshSessions() {
 async function loadSession(id) {
   state.sessionId = id;
   state.freshChatRequested = false;
+  state.guidedFlow = null;
+  state.chatDraft = "";
   const session = await fetchJson("/sessions/" + encodeURIComponent(id));
   // Sidebar clicks can race. If B (or + New) was selected while A's history
   // was in flight, A's late response must not overwrite B's conversation.
@@ -5836,7 +5812,7 @@ function deepLinkRequestId(search) {
 // Land the user on the conversation named by the deep link. Returns true when
 // the thread was actually loaded, false when we said so and left them on a
 // fresh chat instead.
-async function openSessionDeepLink(id, requestId = null) {
+async function openSessionDeepLink(id, requestId = null, isCurrent = () => true) {
   let session = null;
   // The popup knows the session id before it opens POST /message, specifically
   // so its handoff is available while work is running. If the user clicks in
@@ -5844,14 +5820,17 @@ async function openSessionDeepLink(id, requestId = null) {
   // named request rather than declaring its brand-new session "gone".
   const attempts = requestId ? 4 : 1;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!isCurrent()) return false;
     try {
       session = await fetchJson("/sessions/" + encodeURIComponent(id));
     } catch (err) {
+      if (!isCurrent()) return false;
       if (attempt === attempts - 1) {
         showToast("Could not open that conversation: " + err.message, false);
         return false;
       }
     }
+    if (!isCurrent()) return false;
     const candidateMessages = Array.isArray(session?.messages) ? session.messages : [];
     const requestedTurnIsPresent = !requestId || candidateMessages.some((message) => {
       const metadata = message?.metadata;
@@ -5909,6 +5888,7 @@ async function openSessionDeepLink(id, requestId = null) {
   state.channel = (messages[0] && messages[0].channel) || "local";
   state.from = (messages[0] && messages[0].from) || "browser";
   await refreshSessions();
+  if (!isCurrent()) return false;
   renderChat();
   return true;
 }
@@ -6117,6 +6097,7 @@ async function refreshActiveChatSession(id = state.sessionId, { force = false } 
 
 function renderChat() {
   main.innerHTML = \`
+    <div id="chat-model-notice" hidden></div>
     <div id="chat-deeplink" style="margin-bottom:8px;"></div>
     <div id="chat-request-status"></div>
     <div class="thread" id="thread"></div>
@@ -6135,7 +6116,10 @@ function renderChat() {
     const noSessions = (state.sessions ?? []).length === 0;
     let dismissed = false;
     try { dismissed = localStorage.getItem("openagi.welcomeDismissed") === "1"; } catch { /* ignore */ }
-    thread.innerHTML = (noSessions && !dismissed) ? renderFirstRunWelcome() : renderChatPlaceholder();
+    const guided = GET_STARTED_FLOWS.find(flow => flow.id === state.guidedFlow);
+    thread.innerHTML = guided
+      ? '<div class="chat-welcome"><div class="eyebrow">Let’s take it one step at a time</div><h2>' + escapeHtml(guided.title) + '</h2><p>' + escapeHtml(guided.description) + '</p><p style="font-size:12px;">Your starter message is ready below. Edit it or press Send to begin.</p></div>'
+      : (noSessions && !dismissed) ? renderFirstRunWelcome() : renderChatPlaceholder();
   }
   for (let i = 0; i < state.messages.length; i += 1) {
     appendMessage(state.messages[i], false, { pending: isPendingUserMessage(state.messages, i) });
@@ -6170,7 +6154,14 @@ function renderChat() {
     const thread = $("thread");
     if (thread) thread.innerHTML = renderChatPlaceholder();
   });
+  updateModelNotice();
+  document.querySelectorAll("[data-starter]").forEach(button => { button.onclick = () => startGettingStartedChat(button.dataset.starter); });
   const input = $("input");
+  input.value = state.chatDraft || "";
+  try {
+    const draft = sessionStorage.getItem("openagi.setupDraft");
+    if (draft && state.messages.length === 0) { input.value = draft; sessionStorage.removeItem("openagi.setupDraft"); }
+  } catch { /* browser storage unavailable */ }
   const composerBlocked = activeChatRequestIsPending();
   input.disabled = composerBlocked;
   $("send").disabled = composerBlocked;
@@ -6203,6 +6194,7 @@ function renderChat() {
   }
   if (!composerBlocked) input.focus();
   input.addEventListener("input", () => {
+    state.chatDraft = input.value;
     input.style.height = "auto";
     input.style.height = Math.min(200, input.scrollHeight) + "px";
   });
@@ -6214,6 +6206,7 @@ function renderChat() {
   });
   $("composer").addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (state.modelReady === false) { rememberSetupDraft(); window.location.href = "/setup"; return; }
     const text = input.value.trim();
     if (!text) return;
     const sendBtn = $("send");
@@ -6240,6 +6233,7 @@ function renderChat() {
     state.activeRequestMissingSince = null;
     state.activeRequestText = "";
     state.activeRequestModel = "";
+    state.chatDraft = "";
     input.value = "";
     input.style.height = "auto";
     const optimistic = {
@@ -6428,35 +6422,31 @@ function renderChatPlaceholder() {
 }
 
 function renderFirstRunWelcome() {
-  // First-run dashboard card. Points the user at the 4 high-value next
-  // moves so they're not staring at an empty chat input wondering what
-  // OpenAGI is for. Each card is a real link to the right tab/action,
-  // no fake content. Kept compact — this is a welcome, not a tutorial.
   return \`
-    <div class="ui-card ui-card-elev" style="margin: var(--space-4) 0; padding: var(--space-5);">
-      <h2 style="margin: 0 0 var(--space-2); font-size: 18px;">Welcome to OpenAGI 👋</h2>
-      <p class="ui-muted" style="margin: 0 0 var(--space-4);">You're set up. Here's what's worth doing first — talk to your agent any time you want, but most users start with one of these:</p>
-      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--space-3);">
-        <a class="ui-card" data-welcome-target="integrations" style="cursor:pointer; text-decoration:none; color:inherit;">
-          <div style="font-weight: 600; margin-bottom: 4px;">🔌 Connect your tools</div>
-          <div class="ui-meta">Link Linear, Notion, GitHub, Stripe, PostHog and ~20 more so the agent has real data to act on.</div>
-        </a>
-        <a class="ui-card" data-welcome-target="tasks" style="cursor:pointer; text-decoration:none; color:inherit;">
-          <div style="font-weight: 600; margin-bottom: 4px;">📋 Add what's on your plate</div>
-          <div class="ui-meta">Drop in tasks you're carrying. The agent will help you triage and remind you when they're due.</div>
-        </a>
-        <a class="ui-card" data-welcome-target="capture" style="cursor:pointer; text-decoration:none; color:inherit;">
-          <div style="font-weight: 600; margin-bottom: 4px;">👀 Enable screen capture (optional)</div>
-          <div class="ui-meta">Lets the proactive observer notice routines and propose skills. From the menu bar → Capture → Enable.</div>
-        </a>
-        <a class="ui-card" data-welcome-target="chat-self" style="cursor:pointer; text-decoration:none; color:inherit;">
-          <div style="font-weight: 600; margin-bottom: 4px;">💬 Just say hi</div>
-          <div class="ui-meta">Type "what can you do?" below. The agent will tell you what it has access to right now.</div>
-        </a>
+    <div class="chat-welcome">
+      <div class="eyebrow">A little help. A lasting teammate.</div>
+      <h2>What would you like a hand with?</h2>
+      <p>Start with something small. Your agent can remember how you work and connect to your tools when you’re ready.</p>
+      <div class="chat-starters">
+        <button type="button" data-starter="chat">Help me get my first useful result <span aria-hidden="true">↗</span></button>
+        <button type="button" data-starter="memory">Remember how I like to work <span aria-hidden="true">↗</span></button>
+        <button type="button" data-starter="agents">Help me keep up with my coding agents <span aria-hidden="true">↗</span></button>
       </div>
-      <button class="ui-btn ui-btn-ghost ui-btn-sm" id="dismissWelcome" style="margin-top: var(--space-3);">Don't show again</button>
+      <p style="font-size:12px;margin-top:24px;"><a href="/?tab=get-started">Explore what your agent can do →</a></p>
     </div>
   \`;
+}
+
+function updateModelNotice() {
+  const notice = $("chat-model-notice");
+  if (!notice) return;
+  notice.hidden = state.modelReady !== false;
+  notice.className = "model-needed";
+  notice.innerHTML = '<span>Connect a model to start chatting. Cloud keys and local models are supported.</span><a class="ui-btn ui-btn-primary" href="/setup">Connect model</a>';
+  notice.querySelector("a").onclick = rememberSetupDraft;
+}
+function rememberSetupDraft() {
+  try { sessionStorage.setItem("openagi.setupDraft", $("input")?.value || ""); } catch { /* browser storage unavailable */ }
 }
 
 // A Quick Ask turn can carry the text of the window the user was looking at
@@ -7134,6 +7124,7 @@ function openMcpComposer() {
 }
 
 ${codingSupervisorUi}
+${getStartedUi}
 ${vocaleoUi}
 
 async function renderAgents() {
@@ -10004,20 +9995,16 @@ async function refreshHealth() {
       fetchJson("/admin/provider").catch(() => null)
     ]);
     state.health = h;
-    const provider = h.status.agentHost?.provider ?? "—";
-    const model = h.status.agentHost?.providerModel ?? "";
-    const configured = h.status.agentHost?.providerConfigured;
-    const providerLabel = model ? \`\${provider} · \${model}\` : provider;
-    const budgetLabel = b ? \`$\${b.spentUsd.toFixed(2)} / $\${b.dailyUsdLimit.toFixed(2)}\` : "";
-    // Render as discrete nowrap pills so the header wraps cleanly between
-    // pieces instead of breaking mid-pill (which produced the orphaned
-    // "· $0.07 / $10.00" line in the old textContent layout).
-    const pills = [
-      \`<span class="status-pill">online</span>\`,
-      \`<span class="status-pill">\${escapeHtml(providerLabel)} \${configured ? "✓" : "(no key)"}</span>\`,
-      budgetLabel ? \`<span class="status-pill">\${escapeHtml(budgetLabel)}</span>\` : ""
-    ].filter(Boolean);
-    $("status").innerHTML = pills.join("");
+    const provider = h.status.agentHost?.provider ?? "";
+    const model = p?.model || h.status.agentHost?.providerModel || "";
+    state.modelReady = p ? p.configured : Boolean(h.status.agentHost?.providerConfigured && provider !== "DeterministicModelProvider");
+    const labels = { AnthropicProvider: "Anthropic", OpenAIResponsesProvider: "OpenAI", LocalModelProvider: "Local model", OnDeviceModelProvider: "Apple Intelligence", ChatGPTPlanProvider: "ChatGPT" };
+    const providerLabel = labels[provider] || "Model";
+    const budgetLabel = b ? \`$\${b.spentUsd.toFixed(2)} / $\${b.dailyUsdLimit.toFixed(2)} today\` : "";
+    $("status").innerHTML = state.modelReady
+      ? '<span class="status-pill">' + escapeHtml(model || providerLabel) + '</span>' + (budgetLabel ? '<span class="status-pill">' + escapeHtml(budgetLabel) + '</span>' : '')
+      : '<a class="status-pill" href="/setup">Connect a model →</a>';
+    updateModelNotice();
     if (p) renderProviderSwitch(p);
   } catch {
     $("status").innerHTML = '<span class="status-pill">offline</span>';
@@ -10056,27 +10043,21 @@ async function refreshAmbientBadge() {
   }
 }
 
-function renderProviderSwitch(p) {
-  let host = document.getElementById("providerSwitch");
-  if (!host) {
-    host = document.createElement("span");
-    host.id = "providerSwitch";
-    host.style.marginLeft = "12px";
-    host.style.fontSize = "12px";
-    document.querySelector("header .status")?.parentElement?.appendChild(host);
-  }
-  const opts = [
-    \`<option value="auto" \${p.preference === "auto" ? "selected" : ""}>auto</option>\`,
-    \`<option value="anthropic" \${p.preference === "anthropic" ? "selected" : ""} \${!p.available?.anthropic ? "disabled" : ""}>Anthropic\${p.available?.anthropic ? "" : " (no key)"}</option>\`,
-    \`<option value="openai" \${p.preference === "openai" ? "selected" : ""} \${!p.available?.openai ? "disabled" : ""}>OpenAI / ChatGPT\${p.available?.openai ? "" : " (no key)"}</option>\`
-  ].join("");
-  host.innerHTML = \`<label style="color:var(--muted);">model: <select id="providerSelect" style="background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:2px 6px;font-size:12px;">\${opts}</select></label>\`;
-  document.getElementById("providerSelect").addEventListener("change", async (e) => {
-    try {
-      await postJson("/admin/provider", { preference: e.target.value });
-      refreshHealth();
-    } catch (err) { alert("Switch failed: " + err.message); }
-  });
+
+function renderProviderSwitch(provider) {
+  const host = $("providerSwitch");
+  if (!host || document.activeElement?.id === "providerSelect") return;
+  const choices = [["auto", "Automatic"], ["anthropic", "Anthropic"], ["openai", "OpenAI / compatible"]];
+  const automaticWouldDisconnect = provider.preference === "on-device" && !provider.available?.anthropic && !provider.available?.openai;
+  if (!choices.some(([id]) => id === provider.preference)) choices.push([provider.preference, provider.model || "Current model"]);
+  host.hidden = false;
+  host.innerHTML = '<details><summary>Switch model</summary><label for="providerSelect">Saved providers</label><select id="providerSelect">' + choices.map(([id, label]) =>
+    '<option value="' + escapeHtml(id) + '"' + (provider.preference === id ? ' selected' : '') + ((id === "auto" && automaticWouldDisconnect || id !== "auto" && !provider.available?.[id] && id !== provider.preference) ? ' disabled' : '') + '>' + escapeHtml(label) + '</option>'
+  ).join('') + '</select></details>';
+  $("providerSelect").onchange = async event => {
+    try { await postJson("/admin/provider", { preference: event.target.value }); await refreshHealth(); }
+    catch (error) { showToast("Could not switch model: " + error.message, false); await refreshHealth(); }
+  };
 }
 
 const evt = new EventSource("/events");
@@ -10279,7 +10260,7 @@ setInterval(() => {
 
 // Honor ?tab=X in URL on first load — notifications + Mac tray menu deep-link
 // to specific tabs and we need to land on them. Defaults to chat.
-const VALID_TABS = new Set(["chat","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
+const VALID_TABS = new Set(["chat","get-started","tasks","review","approvals","memory","cron","skills","mcp","integrations","agents","coding-agents","nodes","channels","budget","outcomes","scrutiny","health","activity","suggestions","computer-use","today"]);
 const initialTab = (() => {
   try {
     const t = new URLSearchParams(window.location.search).get("tab");

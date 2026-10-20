@@ -21,12 +21,40 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      verify_only:
+        description: Compile and test the Mac app without signing or packaging
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'mac/**'
+      - 'mobile/ios/Sources/Embedded/DeviceModel*.swift'
+      - 'mobile/ios/Sources/Embedded/OnDeviceModel.swift'
+      - 'mobile/ios/Sources/Protocol/JSONValue.swift'
+      - '.github/workflows/release-mac.yml'
 
 permissions:
   contents: write   # so we can upload release assets
 
 jobs:
+  native-tests:
+    permissions:
+      contents: read
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and test native Mac integration
+        run: swift test --package-path mac --scratch-path "$RUNNER_TEMP/openagi-mac"
+
+  publish-runtime:
+    needs: build-and-publish
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    uses: ./.github/workflows/runtime-downloads.yml
+
   build-g2:
+    if: github.event_name != 'pull_request' && !inputs.verify_only
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -63,7 +91,9 @@ jobs:
           fail_on_unmatched_files: true
 
   build-and-publish:
-    runs-on: macos-14   # Apple Silicon, Xcode preinstalled
+    needs: native-tests
+    if: github.event_name != 'pull_request' && !inputs.verify_only
+    runs-on: macos-26   # FoundationModels requires the macOS 26 SDK.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

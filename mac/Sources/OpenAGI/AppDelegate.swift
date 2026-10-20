@@ -96,6 +96,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
   }
 
+  // Finder/Spotlight can reopen a running dockless app even when its menu-bar
+  // item is hidden by the notch. Always reveal the privacy controls there.
+  nonisolated func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    Task { @MainActor in PrivacyWindowController.shared.show() }
+    return false
+  }
+
+  nonisolated func application(_ application: NSApplication, open urls: [URL]) {
+    guard urls.contains(where: AppLink.opensPrivacy) else { return }
+    Task { @MainActor in PrivacyWindowController.shared.show() }
+  }
+
   // Tap a notification → open the dashboard, deep-linked when possible.
   nonisolated func userNotificationCenter(
     _ center: UNUserNotificationCenter,

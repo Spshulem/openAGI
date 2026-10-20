@@ -107,6 +107,7 @@ test("preconditions block delivery without running anything", async (t) => {
   const cases = [
     [{ thread: codexThread(cwd, { archived: true }), route: "codex-exec" }, /archived/],
     [{ thread: codexThread(cwd, { writerLocked: true }), route: "codex-exec" }, /writer-locked/],
+    [{ thread: codexThread(cwd, { meta: { originator: "Codex Desktop" } }), route: "codex-exec" }, /codex-app-owned/],
     [{ thread: codexThread(path.join(cwd, "gone")), route: "codex-exec" }, /cwd missing/],
     [{ thread: codexThread(null), route: "codex-exec" }, /cwd missing/],
     [{ thread: claudeThread(cwd), route: "peer-relay" }, /no live peer/],
@@ -704,6 +705,7 @@ test("no background route unless allowed, safe and the block was only the owner'
     ["another app send running", { results: [{ status: "blocked", detail: "busy: another app delivery is running; retry" }] }, {}],
     ["writer-locked in the scan", {}, { writerLocked: true }],
     ["started by Conductor", {}, { meta: { originator: "codex_sdk_ts" } }],
+    ["started in the Codex app", {}, { meta: { originator: "Codex Desktop" } }],
     ["waiting on a permission prompt", {}, { meta: { blockedOnOwner: true } }]
   ];
   for (const [label, options, extra] of cases) {
@@ -853,6 +855,7 @@ test("background route helpers: the presence block and the per-thread route", ()
   assert.equal(backgroundRouteFor({ ...codex, cwd: null }, config), null);
   assert.equal(backgroundRouteFor({ ...codex, agentStatus: "running" }, config), null);
   assert.equal(backgroundRouteFor(codex, { backgroundRoutes: ["peer-relay"] }), null);
+  assert.equal(backgroundRouteFor({ ...codex, meta: { originator: "Codex Desktop" } }, config), null, "a Codex app thread is only typed into the app");
   const live = { kind: "conductor", id: "s1", meta: {}, live: { peerName: "p", pid: 1, status: "idle" } };
   assert.equal(backgroundRouteFor(live, config), null, "peer-relay not allowed");
   assert.equal(backgroundRouteFor(live, { backgroundRoutes: ["peer-relay"] }), "peer-relay");

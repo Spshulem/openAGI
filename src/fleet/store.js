@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonLine, ensureDir, readJsonFile, writeJsonAtomic, writeTextAtomic } from "../file-utils.js";
+import { REMEDIES, suggestionPlan } from "./remedies.js";
 import { DEFAULTS, MODES, clampTail, clampText, redactSecrets } from "./contracts.js";
 import { feedbackPatch, fixRevision, normalizeFeedback, normalizeFixRequest } from "./feedback.js";
 import { ACTION_LOG_MAX, DAY_MS, foldActions } from "./diagnose.js";
@@ -83,13 +84,22 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-// Only short strings and lists of them; never an agent's free text.
+// Short metadata plus a bounded, typed improvement plan; no arbitrary objects.
 function questionMeta(meta) {
   if (!isObject(meta)) return null;
   const out = {};
   for (const [key, value] of Object.entries(meta).slice(0, 8)) {
     if (typeof value === "string") out[key] = value.slice(0, 120);
     else if (Array.isArray(value)) out[key] = value.filter((item) => typeof item === "string").slice(0, 20).map((item) => item.slice(0, 200));
+  }
+  if (isObject(meta.plan) && REMEDIES.includes(meta.plan.remedy)) {
+    out.plan = suggestionPlan({ remedy: meta.plan.remedy,
+      nextAction: redactSecrets(clampText(meta.plan.nextAction, 2000)),
+      acceptance: redactSecrets(clampText(meta.plan.acceptance, 2000)) });
+  }
+  if (isObject(meta.clarification) && typeof meta.clarification.answer === "string") {
+    out.clarification = { answer: redactSecrets(clampText(meta.clarification.answer, 2000)),
+      answeredAt: clampText(meta.clarification.answeredAt, 40), reconsideredAt: clampText(meta.clarification.reconsideredAt, 40) };
   }
   return Object.keys(out).length ? out : null;
 }
@@ -1064,6 +1074,21 @@ export class FleetStore {
   // carry mergeAsk; a structured ask's key (its own id) never changed.
   _adoptLegacyAsk(key, fields, origin) {
     if (fields.kind !== "agent-ask" || !fields.threadKey) return;
+    // A reread may refine an unanswered judge ask. Keep its card and update
+    // the decision key; an answered card keeps its old key and cannot approve
+    // changed details. Also adopts the earlier reply-only judge keys.
+    if (fields.askedBy === "judge") {
+      const replyKey = key.slice(0, key.lastIndexOf(":"));
+      const open = this.state.questions.find((q) => q.status === "open" && q.askedBy === "judge" && q.threadKey === fields.threadKey
+        && (q.dedupeKey === replyKey || String(q.dedupeKey ?? "").startsWith(`${replyKey}:`)));
+      if (open) { open.dedupeKey = key; this._save(); return; }
+      const normalize = (value) => String(value ?? "").trim().replace(/\s+/g, " ");
+      const choices = (options) => JSON.stringify((options ?? []).map(normalize).sort());
+      const closed = this.state.questions.find((q) => ["answered", "dismissed"].includes(q.status) && q.askedBy === "judge"
+        && q.threadKey === fields.threadKey && q.dedupeKey === replyKey
+        && normalize(q.body) === normalize(fields.body) && choices(q.options) === choices(fields.options));
+      if (closed) { closed.dedupeKey = key; this._save(); return; }
+    }
     const askedAt = toMs(origin.agentAskedAt, null);
     if (askedAt === null) return;
     let latest = null;

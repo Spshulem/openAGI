@@ -320,12 +320,12 @@ function tomlHeader(raw) {
   return key.parts;
 }
 
-// A top-level `key = "string"` line: { name, value }, else null.
+// A `key = "string"` line, including dotted keys: { parts, value }.
 function tomlStringEntry(raw) {
   const key = tomlKey(raw);
-  if (!key || key.parts.length !== 1 || key.rest[0] !== "=") return null;
+  if (!key || key.rest[0] !== "=") return null;
   const value = tomlString(key.rest.slice(1).trimStart());
-  return value && tomlLineEnds(value.rest) ? { name: key.parts[0], value: value.value } : null;
+  return value && tomlLineEnds(value.rest) ? { parts: key.parts, value: value.value } : null;
 }
 
 // A key part written back: bare when it can be, else a basic string.
@@ -339,25 +339,34 @@ function tomlKeyPart(part) {
 // off it reads untrusted chat text with no tools at hand.
 // Built from <codexHome>/config.toml; null when it names no provider.
 // The top-level model_provider of a Codex config.toml (quoted keys too), or null.
-export function codexModelProvider(text) {
+function activeCodexSettings(text) {
+  const top = {};
+  const profiles = new Map();
+  let table = [];
   for (const raw of String(text ?? "").split(/\r?\n/)) {
-    if (tomlHeader(raw)) break;
+    const header = tomlHeader(raw);
+    if (header) { table = raw.trim().startsWith("[[") ? null : header; continue; }
     const entry = tomlStringEntry(raw);
-    if (entry?.name === "model_provider") return entry.value;
+    if (!entry || !table) continue;
+    const full = [...table, ...entry.parts];
+    if (full.length === 1) top[full[0]] = entry.value;
+    else if (full.length === 3 && full[0] === "profiles") {
+      if (!profiles.has(full[1])) profiles.set(full[1], {});
+      profiles.get(full[1])[full[2]] = entry.value;
+    }
   }
-  return null;
+  return { ...top, ...(profiles.get(top.profile) ?? {}) };
+}
+
+export function codexModelProvider(text) {
+  return activeCodexSettings(text).model_provider ?? null;
 }
 
 export function judgeCodexConfig(text) {
   const lines = String(text ?? "").split(/\r?\n/);
-  const top = [];
-  let provider = null;
-  for (const raw of lines) {
-    if (tomlHeader(raw)) break;
-    const entry = tomlStringEntry(raw);
-    if (entry?.name === "model_provider") provider = entry.value;
-    if (entry?.name === "model_provider" || entry?.name === "model_catalog_json") top.push(`${entry.name} = ${JSON.stringify(entry.value)}`);
-  }
+  const settings = activeCodexSettings(text);
+  const provider = settings.model_provider;
+  const top = ["model_provider", "model_catalog_json"].filter((name) => settings[name]).map((name) => `${name} = ${JSON.stringify(settings[name])}`);
   if (!provider) return null;
   // The provider's table and any of its sub-tables (http_headers), headers
   // written back in one plain form. A provider set with dotted keys

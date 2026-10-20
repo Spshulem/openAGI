@@ -495,10 +495,11 @@ test("an agent's ask keeps the message it came from; a re-raised one takes the n
     dedupeKey: "ask:codex:a:h", kind: "agent-ask", threadKey: "codex:a", title: "remote-dev: asks you. Answer?", body: "Want me to make that edit?",
     options: ["yes", "no"], askContext: context, agentAskedAt: at
   });
-  const first = store.upsertQuestion(ask(`${"x".repeat(900)} Edit the pr-verification skill (token sk-ant-abcdefghijklmnopqrstuvwxyz0123456789). Want me to make that edit?`, "2026-09-26T11:50:00.000Z"));
+  const fixtureToken = "sk-ant-" + "a".repeat(64);
+  const first = store.upsertQuestion(ask(`${"x".repeat(900)} Edit the pr-verification skill (token ${fixtureToken}). Want me to make that edit?`, "2026-09-26T11:50:00.000Z"));
   assert.equal(first.askContext.length, 600);
   assert.match(first.askContext, /Want me to make that edit\?$/);
-  assert.doesNotMatch(first.askContext, /sk-ant-abcdefghij/);
+  assert.ok(!first.askContext.includes(fixtureToken));
   assert.equal(first.agentAskedAt, "2026-09-26T11:50:00.000Z");
   // The thread moved on while the ask stays open: the first context stands.
   now.advance(10 * 60 * 1000);
@@ -821,4 +822,24 @@ test("a different ask under the same generic title still gets its own push and d
   assert.equal(two.pushedAt, null, "pushed anew");
   now.advance(10 * HOUR);
   assert.deepEqual(store.openQuestions().map((q) => q.id), [one.id], "its own day, not the old one's");
+});
+
+test("unchanged answered and dismissed judge asks survive the reply-key upgrade", (t) => {
+  for (const close of ["answer", "dismiss"]) {
+    const now = clock();
+    const dir = tempDir(t);
+    const store = new FleetStore({ dir, now });
+    const base = { kind: "agent-ask", askedBy: "judge", threadKey: "codex:t", title: "Merge?", body: "CI is green.", options: ["yes", "no"], agentAskedAt: new Date(now()).toISOString() };
+    const replyKey = "ask:codex:t:aaaaaaaaaaaaaaaa";
+    const first = store.upsertQuestion({ ...base, dedupeKey: replyKey });
+    if (close === "answer") store.answerQuestion(first.id, "no");
+    else store.dismissQuestion(first.id);
+    const reloaded = new FleetStore({ dir, now });
+    const unchanged = reloaded.upsertQuestion({ ...base, dedupeKey: `${replyKey}:bbbbbbbbbbbbbbbb` });
+    assert.equal(unchanged.id, first.id);
+    assert.equal(unchanged.suppressed, true, close);
+    const changed = reloaded.upsertQuestion({ ...base, body: "CI is failing. Bypass it?", dedupeKey: `${replyKey}:cccccccccccccccc` });
+    assert.notEqual(changed.id, first.id);
+    assert.equal(changed.status, "open");
+  }
 });

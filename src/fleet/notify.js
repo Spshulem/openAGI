@@ -18,8 +18,12 @@ export function isQuietHour(date, quietHours = DEFAULTS.quietHours) {
   return start > end ? hour >= start || hour < end : hour >= start && hour < end;
 }
 
-function outreachActions(options) {
-  const actions = (Array.isArray(options) ? options : []).filter((option) => option && option !== "dismiss");
+export function outreachActions(options) {
+  // Compact outreach buttons cannot collect clarification text or render a
+  // non-resolving plan. Keep those actions in Fleet and voice.
+  const actions = (Array.isArray(options) ? options : []).filter((option) =>
+    typeof option === "string" && option
+    && !["dismiss", "answer question", "review plan"].includes(option.toLowerCase()));
   return [...new Set(actions), "dismiss"];
 }
 

@@ -108,7 +108,9 @@ test("without a thread a phone message stays node-scoped exactly as before", asy
   assert.equal(plain.session.id, `node:${nodeNamespace}:${cli}:main`);
   const stored = ctx.store.getSession(plain.session.id).messages[0];
   // A paired phone is the owner: the server records it, for audit only.
-  assert.deepEqual(stored.metadata, { sourceNodeId: PHONE_A.id, authority: { kind: "owner", via: "phone", nodeId: PHONE_A.id } });
+  const { requestId, ...provenance } = stored.metadata;
+  assert.match(requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.deepEqual(provenance, { sourceNodeId: PHONE_A.id, authority: { kind: "owner", via: "phone", nodeId: PHONE_A.id } });
   assert.equal(ctx.store.getSession("devices:agent:main").messages.length, 0);
 });
 
