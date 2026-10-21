@@ -26,7 +26,7 @@ final class StoreScreenshotTests: XCTestCase {
     func testCaptureNativeLocalAgentScreens() {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["--store-screenshots", "-AppleInterfaceStyle", "Light"]
+        app.launchArguments = ["--ui-testing", "--store-screenshots", "-AppleInterfaceStyle", "Light"]
         app.launch()
         XCTAssertTrue(app.staticTexts["Outline the new project"].waitForExistence(timeout: 15))
         capture("02-today", app: app)
@@ -52,7 +52,10 @@ final class StoreScreenshotTests: XCTestCase {
         let model = element("settings-model", app: app)
         XCTAssertTrue(model.isHittable)
         model.tap()
-        XCTAssertTrue(app.staticTexts["This iPhone's model"].waitForExistence(timeout: 10))
+        let active = element("model-active", app: app)
+        let localModel = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "This iPhone's model"), object: active)
+        XCTAssertEqual(XCTWaiter.wait(for: [localModel], timeout: 10), .completed)
         capture("06-apple-intelligence", app: app)
     }
 }

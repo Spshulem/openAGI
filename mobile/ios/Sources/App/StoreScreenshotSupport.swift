@@ -9,6 +9,9 @@ final class StoreScreenshotProtocol: URLProtocol, @unchecked Sendable {
     private static let date = ISO8601DateFormatter().string(from: Date())
 
     @MainActor static func makeModel() -> AppModel {
+        // Match a running embedded origin for HostAllowlist. This process's
+        // fixture session still intercepts every request; no socket is opened.
+        EmbeddedLoopback.port = 19999
         let directory = FileManager.default.temporaryDirectory.appending(path: "store-capture-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let credentials = Credentials(server: URL(string: "http://127.0.0.1:19999")!,
