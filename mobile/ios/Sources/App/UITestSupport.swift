@@ -17,13 +17,16 @@ struct UITestRoot: View {
 }
 
 final class UITestProtocol: URLProtocol, @unchecked Sendable {
-    static var isEnabled: Bool { ProcessInfo.processInfo.arguments.contains("--ui-testing") }
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("--ui-testing") || StoreScreenshotProtocol.isEnabled
+    }
     private static let preference = OSAllocatedUnfairLock(initialState: "auto")
     private static let integrationKeySaved = OSAllocatedUnfairLock(initialState: false)
     private static let date = "2026-10-18T12:00:00.000Z"
 
     @MainActor
     static func makeModel() -> AppModel {
+        if StoreScreenshotProtocol.isEnabled { return StoreScreenshotProtocol.makeModel() }
         let directory = FileManager.default.temporaryDirectory.appending(path: "ui-test-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let credentials = Credentials(server: URL(string: "https://daemon.example.com")!,

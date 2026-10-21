@@ -59,6 +59,11 @@ acceptance above. It restores model preference and removes its synthetic task.
   timing. Reconcile its declarations with the final archive's privacy report.
 - Screenshots from this exact build, using synthetic data, for the supported
   iPhone/Duo sizes. Review every image before upload.
+  `StoreScreenshotTests` captures the native screens with fictional local-agent
+  content using the DEBUG-only `--store-screenshots` argument. It intercepts all
+  transport requests and uses an isolated store. CI exports `store-*` attachments
+  for iPhone and Duo alongside the regression captures. These fixtures verify
+  presentation; they do not establish that local inference or tools passed.
 - External OAuth registrations and redirect URIs before claiming native
   Google/integration sign-up. No OAuth client secret may ship in the app.
 

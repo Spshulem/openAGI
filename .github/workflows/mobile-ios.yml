@@ -74,6 +74,7 @@ jobs:
           echo "OPENAGI_IOS_RUNTIME=$runtime_id" >> "$GITHUB_ENV"
           xcrun simctl boot "$simulator_id"
           xcrun simctl bootstatus "$simulator_id" -b
+          xcrun simctl status_bar "$simulator_id" override --time '9:41' --dataNetwork wifi --wifiMode active --wifiBars 3 --batteryState charged --batteryLevel 100
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
@@ -106,6 +107,7 @@ jobs:
           echo "OPENAGI_PHONE_SIM=$simulator_id" >> "$GITHUB_ENV"
           xcrun simctl boot "$simulator_id"
           xcrun simctl bootstatus "$simulator_id" -b
+          xcrun simctl status_bar "$simulator_id" override --time '9:41' --dataNetwork wifi --wifiMode active --wifiBars 3 --batteryState charged --batteryLevel 100
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
