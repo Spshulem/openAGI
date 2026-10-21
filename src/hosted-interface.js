@@ -1005,9 +1005,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // Shared workspace requests belong to main, including requests from a
       // phone using this worker as its reachable gateway. Main validates the
       // original scoped credential. Never grant this worker broader scopes.
+      const gatewayOwnerAuthenticated = checkAuth(req, url, getAuthToken()).ok;
       if (routeMainData(req, res, url, {
         pairing: readNodeConfig(dataDir), identity: localIdentity,
-        ownerAuthenticated: checkAuth(req, url, getAuthToken()).ok,
+        ownerAuthenticated: gatewayOwnerAuthenticated,
+        ownerBearerAuthenticated: Boolean(getAuthToken() && scopedBearer && checkAuth(
+          { headers: { authorization: req.headers.authorization } }, new URL("/", url), getAuthToken()
+        ).ok),
         allowInsecureRemote: allowInsecureNodeRelay
       })) return;
 

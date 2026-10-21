@@ -60,6 +60,8 @@ test("a main-enrolled phone sees main's Today, Tasks, Inbox and history through 
   const summary = await request("/mobile/summary");
   assert.equal(summary.status, 200);
   assert.equal(summary.headers.get("x-openagi-data-source"), "main");
+  assert.equal((await request("/mobile/summary", { headers: { cookie: `openagi_token=${OWNER}` } })).status, 200,
+    "a local dashboard cookie must not replace a valid main phone bearer");
   const body = await summary.json();
   assert.deepEqual(body.today.map((row) => row.title), ["Main task"]);
   assert.equal(body.pendingActions[0].summary, "Main approval");
@@ -171,9 +173,11 @@ test("local owner token is never forwarded as main authority", async (t) => {
   });
   const proxy = await server(t, (req, res) => routeMainData(req, res, new URL(req.url, "http://worker"), {
     pairing: { remote: main.url, nodeToken: WORKER.token, nodeEnrollmentConfirmed: true },
-    identity: { nodeId: WORKER.id }, ownerAuthenticated: true
+    identity: { nodeId: WORKER.id }, ownerAuthenticated: true, ownerBearerAuthenticated: true
   }));
-  assert.equal((await fetch(proxy.url + `/tasks?queue=user&token=${OWNER}`, { headers: { authorization: `Bearer ${OWNER}` } })).status, 200);
+  assert.equal((await fetch(proxy.url + `/tasks?queue=user&token=${OWNER}`, {
+    headers: { authorization: `Bearer ${OWNER}`, "x-openagi-node-id": PHONE.id }
+  })).status, 200);
 });
 
 test("only shared workspace routes forward, with their allowed methods", () => {

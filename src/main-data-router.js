@@ -21,7 +21,7 @@ function failure(res, status, error, message) {
   res.end(JSON.stringify({ error, message }));
 }
 
-export function routeMainData(req, res, url, { pairing, identity, ownerAuthenticated,
+export function routeMainData(req, res, url, { pairing, identity, ownerAuthenticated, ownerBearerAuthenticated = false,
   allowInsecureRemote = false, timeoutMs = 15_000 } = {}) {
   if (!pairing?.remote || !isMainDataRoute(req.method, url.pathname)) return false;
   if (req.headers["x-openagi-main-hop"]) {
@@ -38,7 +38,7 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
   const incomingToken = req.headers.authorization;
   const incomingID = req.headers["x-openagi-node-id"];
   const headers = { "content-type": "application/json", "x-openagi-main-hop": "1" };
-  if (typeof incomingToken === "string" && incomingToken.startsWith("Bearer ") && typeof incomingID === "string") {
+  if (!ownerBearerAuthenticated && typeof incomingToken === "string" && incomingToken.startsWith("Bearer ") && typeof incomingID === "string") {
     headers.authorization = incomingToken;
     headers["x-openagi-node-id"] = incomingID;
   } else if (ownerAuthenticated && !exchange) {
