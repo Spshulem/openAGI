@@ -219,17 +219,13 @@ class MainActivity : ComponentActivity() {
                         supervisorChatOpen = supervisorChatOpen.value,
                         onSelect = { selectedTab = it },
                         supportingPane = {
-                            val supervisor = selectedTab == AppTab.SUPERVISOR || selectedTab == AppTab.CHAT
                             ChatScreen(
                                 context = this@MainActivity, credentials = credentials,
                                 streamAttached = streamAttachedState.value,
-                                title = if (supervisor) "Supervisor" else "Chat",
-                                starters = if (supervisor) SupervisorFormat.STARTERS else emptyList(),
-                                conversationState = if (supervisor) supervisorConversation else chatConversation,
-                                onComposerFocusChanged = { if (it && selectedTab == AppTab.SUPERVISOR) supervisorChatOpen.value = true },
+                                conversationState = chatConversation,
                             )
                         },
-                    ) { hasSupportingPane ->
+                    ) { _ ->
                         when (selectedTab) {
                             AppTab.TODAY -> if (lifelogOpen) {
                                 LifelogScreen(credentials = credentials, onBack = { lifelogOpen = false })
@@ -257,7 +253,7 @@ class MainActivity : ComponentActivity() {
                                 streamAttached = streamAttachedState.value,
                                 chatConversationState = supervisorConversation,
                                 chatOpenState = supervisorChatOpen,
-                                showChatInline = hasSupportingPane,
+                                showChatInline = false,
                             )
                             AppTab.SETTINGS -> SettingsScreen(
                                 context = this@MainActivity,
@@ -310,6 +306,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // A locked/unavailable Keystore during startup is not a revocation.
+        // Retry the existing credential when the person returns/unlocks.
+        if (credentialsState.value == null) credentialsState.value = Credentials.load(this)
         resumeSignalState.intValue += 1
         // Also how alerts come back after notifications were turned on in
         // system settings, or the service was stopped from the task manager.

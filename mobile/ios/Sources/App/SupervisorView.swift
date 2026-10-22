@@ -8,6 +8,7 @@ import SwiftUI
 // daemon says so, the same rule approvals follow. Mirrors Android's
 // SupervisorScreen.kt, wording included.
 struct SupervisorView: View {
+    var showsInlineChat = true
     @Environment(AppModel.self) private var model
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -61,16 +62,26 @@ struct SupervisorView: View {
         }
     }
 
-    private var fleetBody: some View {
+    @ViewBuilder private var fleetBody: some View {
         // Native split navigation follows Duo's size classes and reserved
         // regions, while keeping the same hierarchy on the cover display.
-        NavigationSplitView(preferredCompactColumn: $compactColumn) {
-            fleetContent
-                .navigationSplitViewColumnWidth(min: 280, ideal: 420, max: 600)
-        } detail: {
-            supervisorConversation
+        if showsInlineChat {
+            NavigationSplitView(preferredCompactColumn: $compactColumn) {
+                fleetContent
+                    .navigationSplitViewColumnWidth(min: 280, ideal: 420, max: 600)
+            } detail: {
+                supervisorConversation
+            }
+            .navigationSplitViewStyle(.balanced)
+        } else {
+            NavigationStack {
+                fleetContent
+                    .navigationDestination(isPresented: Binding(
+                        get: { compactColumn == .detail },
+                        set: { compactColumn = $0 ? .detail : .sidebar }
+                    )) { supervisorConversation }
+            }
         }
-        .navigationSplitViewStyle(.balanced)
     }
 
     private var supervisorConversation: some View {

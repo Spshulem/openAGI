@@ -7,6 +7,9 @@ import { installDaemonLogRotation } from "./daemon-log.js";
 import { logOperationalEvent } from "./operational-log.js";
 import { resolveDataDir, _resetDataDirCache } from "./data-dir.js";
 import { installMobileSpawnGuard, isMobileProfile } from "./mobile-profile.js";
+import { advertiseServer, phoneDiscoveryOrigin } from "./server-discovery.js";
+import { hostname } from "node:os";
+import { readNodeConfig } from "./cli-client.js";
 
 // Read a single var from an env file WITHOUT importing the rest of its keys.
 function peekEnvVar(file, key) {
@@ -189,12 +192,18 @@ export async function startServer({ host, port } = {}) {
   const runtime = createDurableRuntime({ dataDir });
   const app = createHostedInterface(runtime, { host: resolvedHost, port: resolvedPort });
   const address = await app.listen();
+  const lanOrigin = !["127.0.0.1", "localhost", "::1"].includes(resolvedHost)
+    ? `http://${hostname().replace(/\.local$/, "")}.local:${address.port}` : null;
+  const stopDiscovery = !isMobileProfile() && process.env.OPENAGI_DISCOVERY !== "0"
+    ? advertiseServer({ url: await phoneDiscoveryOrigin(readNodeConfig(dataDir)?.remote ?? process.env.OPENAGI_PUBLIC_URL ?? lanOrigin) })
+    : () => {};
   logOperationalEvent("daemon-ready");
   let shuttingDown = false;
   const originalClose = app.close.bind(app);
   const onSignal = (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    stopDiscovery();
     logOperationalEvent("daemon-stopping", { reason: signal });
     const force = setTimeout(() => process.exit(1), 5_000);
     originalClose()
@@ -206,6 +215,7 @@ export async function startServer({ host, port } = {}) {
   process.once("SIGTERM", onTerm);
   process.once("SIGINT", onInt);
   app.close = async () => {
+    stopDiscovery();
     process.removeListener("SIGTERM", onTerm);
     process.removeListener("SIGINT", onInt);
     return await originalClose();

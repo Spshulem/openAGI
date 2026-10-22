@@ -51,7 +51,7 @@
 		</dict>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>OpenAGI talks to the daemon on your own machine.</string>
+	<string>OpenAGI finds and connects to your OpenAGI servers on your local network.</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 	<key>OpenAGIAppGroup</key>
@@ -65,5 +65,9 @@
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_openagi._tcp</string>
+	</array>
 </dict>
 </plist>

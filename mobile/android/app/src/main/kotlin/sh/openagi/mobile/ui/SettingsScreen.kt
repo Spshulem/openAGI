@@ -60,6 +60,20 @@ fun SettingsScreen(
     var isWorking by remember { mutableStateOf(false) }
     var connectionIssue by remember { mutableStateOf<String?>(null) }
     var showingFallback by remember { mutableStateOf(false) }
+    var showingDiscovery by remember { mutableStateOf(false) }
+    var discoveredAddress by remember { mutableStateOf(credentials.server) }
+    if (showingDiscovery) androidx.compose.material3.AlertDialog(
+        onDismissRequest = { showingDiscovery = false },
+        title = { Text("Find servers") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Your saved pairing stays connected to ${credentials.server}. Searching does not switch servers or share credentials.")
+                ServerDiscoverySection(credentials.server, credentials.server) { discoveredAddress = it }
+                androidx.compose.foundation.text.selection.SelectionContainer { Text(discoveredAddress) }
+            }
+        },
+        confirmButton = { androidx.compose.material3.TextButton(onClick = { showingDiscovery = false }) { Text("Done") } },
+    )
     if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
     val scope = rememberCoroutineScope()
     val client = remember(credentials) { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
@@ -128,6 +142,9 @@ fun SettingsScreen(
 
             androidx.compose.material3.OutlinedButton(onClick = { showingFallback = true }, modifier = Modifier.fillMaxWidth()) {
                 Text("Chat without server · local or hosted model")
+            }
+            androidx.compose.material3.OutlinedButton(onClick = { showingDiscovery = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Find servers / check network")
             }
             connectionIssue?.let { Text(it, style = OpenAGIType.caption) }
 

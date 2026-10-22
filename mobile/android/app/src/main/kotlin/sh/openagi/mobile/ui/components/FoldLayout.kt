@@ -12,6 +12,11 @@ internal data class PaneBounds(val left: Float, val top: Float, val right: Float
 internal data class FoldInfo(val bounds: PaneBounds, val axis: FoldAxis)
 internal data class PaneLayout(val main: PaneBounds, val supporting: PaneBounds? = null)
 
+// Chat is a destination in its own right. Never open a second conversation
+// just because the screen widened; the side conversation is explicitly pinned.
+internal fun showsSupportingChat(selected: AppTab, pinned: Boolean): Boolean =
+    pinned && selected != AppTab.CHAT && selected != AppTab.SETTINGS
+
 internal fun usesNavigationRail(width: Float, height: Float, tabletop: Boolean): Boolean =
     width >= 600f && height >= 480f && !tabletop
 
@@ -22,6 +27,7 @@ internal fun paneLayout(
     supporting: Boolean,
     expanded: Boolean,
     rtl: Boolean = false,
+    keyboardVisible: Boolean = false,
 ): PaneLayout {
     val full = PaneBounds(0f, 0f, width, height)
     if (fold != null) {
@@ -38,7 +44,7 @@ internal fun paneLayout(
             }
         }
     }
-    if (supporting && expanded && width >= 656f && height >= 480f) {
+    if (supporting && expanded && width >= 656f && (height >= 480f || keyboardVisible)) {
         val supportingWidth = maxOf(320f, (width - 16f) * 0.4f)
         val mainWidth = width - supportingWidth - 16f
         return if (rtl) PaneLayout(PaneBounds(supportingWidth + 16f, 0f, width, height), PaneBounds(0f, 0f, supportingWidth, height))

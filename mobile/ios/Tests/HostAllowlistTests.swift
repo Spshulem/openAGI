@@ -3,7 +3,7 @@ import XCTest
 
 final class HostAllowlistTests: XCTestCase {
     func testTailnetAndLanCleartextAreAllowed() throws {
-        for raw in ["http://mac.tail1234.ts.net:43210",
+        for raw in ["http://mac.tail1234.ts.net:43210", "http://mac.local:43210",
                     "http://192.168.1.20:43210",
                     "http://10.0.0.5:43210",
                     "http://172.16.4.4:43210"] {

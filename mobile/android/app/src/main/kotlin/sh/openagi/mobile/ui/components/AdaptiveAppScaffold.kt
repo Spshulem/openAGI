@@ -1,9 +1,13 @@
 package sh.openagi.mobile.ui.components
 
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.Layout
@@ -62,16 +66,28 @@ internal fun AdaptiveAppScaffold(
     content: @Composable (Boolean) -> Unit,
 ) {
     val fold = LocalFoldInfo.current
+    var chatPaneOpen by rememberSaveable { mutableStateOf(false) }
+    BackHandler(enabled = chatPaneOpen) { chatPaneOpen = false }
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        val rail = usesNavigationRail(maxWidth.value, maxHeight.value, fold?.axis == FoldAxis.HORIZONTAL)
+        val keyboardVisible = WindowInsets.isImeVisible
+        val density = LocalDensity.current
+        val workspaceHeight = maxHeight + with(density) { WindowInsets.ime.getBottom(this).toDp() }
+        val rail = usesNavigationRail(maxWidth.value, workspaceHeight.value, fold?.axis == FoldAxis.HORIZONTAL)
         val expanded = maxWidth >= 840.dp
-        val inlineSupervisor = (expanded && maxHeight >= 480.dp) || fold != null
+        val canSplit = (expanded && workspaceHeight >= 480.dp) || fold != null
+        val showChat = showsSupportingChat(selected, chatPaneOpen) && canSplit
         Row(Modifier.fillMaxSize()) {
-            if (rail) AppNavigationRail(selected, inboxBadgeCount, onSelect)
             Scaffold(
                 modifier = Modifier.weight(1f),
+                topBar = {
+                    if (!rail && canSplit && selected != AppTab.CHAT && selected != AppTab.SETTINGS) {
+                        TextButton(onClick = { chatPaneOpen = !chatPaneOpen }, modifier = Modifier.testTag("toggle-chat-pane")) {
+                            Text(if (chatPaneOpen) "Hide chat" else "Show chat")
+                        }
+                    }
+                },
                 bottomBar = {
-                    if (!rail && tabBarVisible(selected, supervisorChatOpen && !inlineSupervisor, WindowInsets.isImeVisible)) {
+                    if (!rail && tabBarVisible(selected, supervisorChatOpen, WindowInsets.isImeVisible)) {
                         AppNavigationBar(selected, inboxBadgeCount, onSelect)
                     }
                 },
@@ -89,11 +105,26 @@ internal fun AdaptiveAppScaffold(
                     val localFold = fold?.takeUnless { selected == AppTab.CHAT && it.axis == FoldAxis.HORIZONTAL }
                         ?.relativeTo(origin)
                     val panes = paneLayout(maxWidth.value, maxHeight.value, localFold,
-                        supporting = selected != AppTab.SETTINGS,
+                        supporting = showChat,
                         expanded = expanded && !(selected == AppTab.CHAT && fold?.axis == FoldAxis.HORIZONTAL),
-                        rtl = LocalLayoutDirection.current == LayoutDirection.Rtl)
-                    PaneLayoutContent(panes, main = { content(panes.supporting != null) }, supporting = supportingPane)
+                        rtl = LocalLayoutDirection.current == LayoutDirection.Rtl,
+                        keyboardVisible = keyboardVisible)
+                    PaneLayoutContent(panes, main = { content(panes.supporting != null) }, supporting = {
+                        Column(Modifier.fillMaxSize()) {
+                            TextButton(onClick = { chatPaneOpen = false }, modifier = Modifier.align(Alignment.End)
+                                .testTag("close-chat-pane")) { Text("Close chat") }
+                            Box(Modifier.weight(1f)) { supportingPane() }
+                        }
+                    })
                 }
+            }
+            if (rail) Column(Modifier.testTag("right-navigation")) {
+                if (canSplit && selected != AppTab.CHAT && selected != AppTab.SETTINGS) {
+                    TextButton(onClick = { chatPaneOpen = !chatPaneOpen }, modifier = Modifier.testTag("toggle-chat-pane")) {
+                        Text(if (chatPaneOpen) "Hide chat" else "Show chat")
+                    }
+                }
+                AppNavigationRail(selected, inboxBadgeCount, onSelect)
             }
         }
     }

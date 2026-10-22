@@ -4,6 +4,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class FoldLayoutTest {
+    @Test fun theKeyboardDoesNotRemoveAnOpenChatPane() {
+        assertNotNull(paneLayout(920f, 300f, null, true, true, keyboardVisible = true).supporting)
+        assertNull(paneLayout(920f, 300f, null, true, true).supporting)
+    }
+    @Test fun wideScreensDoNotAutomaticallyOpenAnotherConversation() {
+        AppTab.entries.forEach { assertFalse(showsSupportingChat(it, false)) }
+        assertFalse(showsSupportingChat(AppTab.CHAT, true))
+        assertFalse(showsSupportingChat(AppTab.SETTINGS, true))
+        assertTrue(showsSupportingChat(AppTab.SUPERVISOR, true))
+        assertTrue(showsSupportingChat(AppTab.TODAY, true))
+    }
     @Test fun coverScreenUsesOnePaneAndBottomNavigation() {
         assertFalse(usesNavigationRail(359f, 780f, false))
         assertNull(paneLayout(359f, 700f, null, true, false).supporting)

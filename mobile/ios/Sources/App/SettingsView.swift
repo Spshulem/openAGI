@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var showingRevokeConfirmation = false
     @State private var switchError: String?
     @State private var showingFallback = false
+    @State private var showingDiscovery = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -44,6 +45,9 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(isWorking)
+                    if !model.isOnPhone {
+                        Button("Find servers / check network", systemImage: "network") { showingDiscovery = true }
+                    }
                 } header: {
                     Text("Connection")
                 } footer: {
@@ -123,6 +127,7 @@ struct SettingsView: View {
             }
             .disabled(isWorking)
             .sheet(isPresented: $showingFallback) { FallbackChatView() }
+            .sheet(isPresented: $showingDiscovery) { ServerDiscoverySheet(server: model.credentials.server) }
             .alert("Couldn't switch agents", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {

@@ -7594,6 +7594,13 @@ async function renderNodesOnce({ showLoading = true } = {}) {
         <div class="desc" id="g2DirectTokenOut" style="margin-top:8px;"></div>
       </div>\`;
 
+  const phoneEnrollmentCard = isNode
+    ? \`<div class="card" id="phone-pairing"><div class="name">Connect a phone</div>
+       <div class="desc">Pair phones with your main server, not this worker. Open your main's dashboard, choose Nodes, then Connect a phone. No auth-token copying is needed.</div></div>\`
+    : \`<div class="card" id="phone-pairing"><div class="name">Connect a phone</div>
+       <div class="desc">Generate one code per phone. Codes last 30 minutes and work once. On iOS or Android, choose Connect to a server and enter this address and code.</div>
+       <button class="ui-btn ui-btn-sm" id="phoneEnrollBtn">Generate phone pairing code</button>
+       <div class="desc" id="phoneEnrollOut" style="margin-top:8px;"></div></div>\`;
   main.innerHTML = \`
     <div class="pane">
       <h2>Nodes</h2>
@@ -7609,6 +7616,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
         <div class="row" style="margin-top:8px;"><button id="nodesRefresh">Re-check now</button></div>
       </div>
       \${g2EnrollmentCard}
+      \${phoneEnrollmentCard}
       \${banner}
       <div class="desc" style="margin-top:12px;">
         Everything this installation talks to. <b>main</b> is the machine that holds the
@@ -7641,6 +7649,21 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     c.style.verticalAlign = "top";
   });
   document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes({ showLoading: false }));
+  document.getElementById("phoneEnrollBtn")?.addEventListener("click", async () => {
+    const button = document.getElementById("phoneEnrollBtn");
+    const out = document.getElementById("phoneEnrollOut");
+    button.disabled = true;
+    try {
+      const response = await fetch("/nodes/enrollment-code", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ platform: "mobile" })
+      });
+      const enrollment = await response.json();
+      if (!response.ok) throw new Error(enrollment.error || "Could not create a phone pairing code.");
+      out.textContent = "Server: " + (enrollment.publicUrl || location.origin) + " · Code: " + enrollment.code
+        + " · Single use, expires " + new Date(enrollment.expiresAt).toLocaleTimeString();
+    } catch (error) { out.textContent = error.message || "Could not create a phone pairing code."; }
+    finally { button.disabled = false; }
+  });
   document.getElementById("g2NodeEnrollBtn")?.addEventListener("click", async () => {
     const out = document.getElementById("g2NodeEnrollOut");
     try {

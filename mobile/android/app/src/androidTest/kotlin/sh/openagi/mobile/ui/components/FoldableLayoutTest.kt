@@ -56,7 +56,14 @@ class FoldableLayoutTest {
         compose.runOnIdle { size.value = DpSize(1000.dp, 900.dp) }
         compose.onNodeWithTag("navigation-rail").assertIsDisplayed()
         compose.onNodeWithText("Work fixture 1").assertIsDisplayed()
+        compose.onNodeWithTag("supporting-pane").assertDoesNotExist()
+        val nav = compose.onNodeWithTag("right-navigation").fetchSemanticsNode().boundsInRoot
+        val work = compose.onNodeWithTag("main-pane").fetchSemanticsNode().boundsInRoot
+        assertTrue("Navigation belongs on the right", nav.left >= work.right)
+        compose.onNodeWithTag("toggle-chat-pane").performClick()
         compose.onNodeWithText("Chat fixture").assertIsDisplayed()
+        compose.onNodeWithTag("close-chat-pane").performClick()
+        compose.onNodeWithTag("supporting-pane").assertDoesNotExist()
         screenshot("unfolded")
     }
 
@@ -64,6 +71,7 @@ class FoldableLayoutTest {
         size.value = DpSize(1000.dp, 900.dp)
         fold.value = FoldInfo(PaneBounds(490f, 0f, 510f, 900f), FoldAxis.VERTICAL)
         workspace()
+        compose.onNodeWithTag("toggle-chat-pane").performClick()
         val main = compose.onNodeWithTag("main-pane").fetchSemanticsNode().boundsInRoot
         val chat = compose.onNodeWithTag("supporting-pane").fetchSemanticsNode().boundsInRoot
         assertTrue("The hinge must separate the panes", main.right < chat.left)
@@ -75,6 +83,7 @@ class FoldableLayoutTest {
         size.value = DpSize(1000.dp, 900.dp)
         fold.value = FoldInfo(PaneBounds(0f, 440f, 1000f, 460f), FoldAxis.HORIZONTAL)
         workspace()
+        compose.onNodeWithTag("toggle-chat-pane").performClick()
         val main = compose.onNodeWithTag("main-pane").fetchSemanticsNode().boundsInRoot
         val chat = compose.onNodeWithTag("supporting-pane").fetchSemanticsNode().boundsInRoot
         assertTrue("The horizontal hinge must remain clear", main.bottom < chat.top)

@@ -5,12 +5,19 @@ import SwiftUI
 struct ChatView: View {
     @Environment(AppModel.self) private var model
     @State private var showingFallback = false
+    var onClose: (() -> Void)? = nil
 
     var body: some View {
         NavigationStack {
             ChatConversationView(conversation: model.agentChat, title: "Chat")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
+                    if let onClose {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close chat", systemImage: "xmark", action: onClose)
+                                .accessibilityIdentifier("close-chat-pane")
+                        }
+                    }
                     ToolbarItem(placement: .primaryAction) {
                         Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
                             .accessibilityIdentifier("chat-fallback")

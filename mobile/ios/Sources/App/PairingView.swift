@@ -14,12 +14,21 @@ struct PairingView: View {
     @State private var didPair = false
     @State private var errorHeadline: String?
     @State private var errorDetail: String?
+    @State private var discovery = ServerDiscovery()
+    @State private var showingFallback = false
+    private let savedServer: URL?
+    private let canResumeServer: Bool
 
     let onCancel: (() -> Void)?
     let onPaired: () -> Void
 
     init(prefillServer: URL? = nil, prefillCode: String? = nil, onCancel: (() -> Void)? = nil, onPaired: @escaping () -> Void) {
-        _serverText = State(initialValue: prefillServer?.absoluteString ?? "")
+        let backup = Credentials.load(from: .server)
+        let candidate = backup ?? Credentials.load()
+        let savedServer = candidate.flatMap { $0.isEmbedded ? nil : $0.server }
+        self.savedServer = savedServer
+        self.canResumeServer = backup != nil && prefillServer == nil
+        _serverText = State(initialValue: (prefillServer ?? savedServer)?.absoluteString ?? "")
         _codeText = State(initialValue: prefillCode ?? "")
         self.onCancel = onCancel
         self.onPaired = onPaired
@@ -33,10 +42,60 @@ struct PairingView: View {
                         Text("Connect to a server")
                             .font(Theme.Typography.screenTitle)
                             .foregroundStyle(Theme.ink)
-                        Text("Your daemon printed a code and its address. Enter both here.")
+                        Text("Find your main server, then enter its address and one-time pairing code.")
                             .font(Theme.Typography.secondary)
                             .foregroundStyle(Theme.muted)
                     }
+
+                    if let savedServer {
+                        Text("Your saved server is \(savedServer.absoluteString). Opening this screen does not remove its pairing.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if canResumeServer {
+                        Button("Return to saved server · no new code needed", systemImage: "server.rack") {
+                            Task {
+                                isPairing = true
+                                defer { isPairing = false }
+                                do {
+                                    _ = try await AppSession.shared.switchBackToServer()
+                                    onPaired()
+                                } catch {
+                                    errorHeadline = "Can't return to the saved server yet."
+                                    errorDetail = "Your pairing is still saved. Check Tailscale and the server connection, then try again."
+                                }
+                            }
+                        }
+                        .disabled(isPairing)
+                    }
+                    Button("Use a local or hosted model", systemImage: "iphone") { showingFallback = true }
+                        .buttonStyle(.bordered)
+                    Text("Apple Intelligence chat works without a server on supported iPhones with Apple Intelligence enabled.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Button(discovery.searching ? "Searching…" : "Find servers · Wi-Fi / saved Tailscale", systemImage: "network") {
+                            discovery.start(addresses: [savedServer, URL(string: serverText)].compactMap { $0 })
+                        }
+                        .disabled(discovery.searching)
+                        ForEach(discovery.servers) { server in
+                            Button { serverText = server.address.absoluteString } label: {
+                                VStack(alignment: .leading) {
+                                    Text(server.name)
+                                    Text(server.address.absoluteString).font(.caption)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        if let note = discovery.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
+                        Text("Nearby discovery uses Bonjour. Tailscale servers are checked by their saved or entered address; keep Tailscale and its DNS enabled.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("How to get a code").font(.headline)
+                        Text("On your main server's dashboard, open Nodes → Connect a phone. On Mac, use Connect a phone… in the OpenAGI menu. You can also run this command on main. A worker Mac cannot issue main-server codes. You don't need to copy an auth token.")
+                        Text("openagi pair-phone --platform ios").font(.system(.footnote, design: .monospaced)).textSelection(.enabled)
+                        Text("Codes last 30 minutes and work once. Each phone needs its own code. Enter the server address printed with the code.")
+                    }
+                    .font(.footnote)
 
                     RowGroup {
                         VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
@@ -88,6 +147,8 @@ struct PairingView: View {
                 .padding(Theme.gutter)
             }
             .background(Theme.canvas)
+            .sheet(isPresented: $showingFallback) { FallbackChatView() }
+            .onDisappear { discovery.stop() }
             .toolbar {
                 if let onCancel {
                     ToolbarItem(placement: .cancellationAction) {

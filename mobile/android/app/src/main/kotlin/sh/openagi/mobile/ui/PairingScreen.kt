@@ -13,6 +13,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,7 +49,8 @@ fun PairingScreen(
     prefill: PairingPayload?,
     onPaired: () -> Unit,
 ) {
-    var serverText by remember(prefill) { mutableStateOf(prefill?.serverUrl ?: "") }
+    val savedServer = remember { Credentials.load(context)?.server }
+    var serverText by remember(prefill) { mutableStateOf(prefill?.serverUrl ?: savedServer ?: "") }
     var codeText by remember(prefill) { mutableStateOf(prefill?.code ?: "") }
     // Enrollment consumes the one-time code before local encrypted storage.
     // Hold a successful exchange so a storage retry never enrolls a new node.
@@ -58,12 +60,24 @@ fun PairingScreen(
     // the last code's "That code didn't work" must not sit under a new one.
     var error by remember(prefill) { mutableStateOf<ErrorCopy.Message?>(null) }
     val scope = rememberCoroutineScope()
+    var showingFallback by remember { mutableStateOf(false) }
+    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
 
     Column(
         modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         Text("Pair with OpenAGI", style = OpenAGIType.screenTitle, color = MaterialTheme.colorScheme.onBackground)
+        savedServer?.let { Text("Your saved server is $it. Opening this screen does not remove its pairing.", style = OpenAGIType.secondary) }
+        OutlinedButton(onClick = { showingFallback = true }) { Text("Use a local or hosted model") }
+        Text("No server is needed for local Gemini Nano chat on a supported phone. A model download may be required.", style = OpenAGIType.secondary)
+        ServerDiscoverySection(serverText, savedServer) { serverText = it; awaitingSave = null }
+        Text("How to get a code", style = OpenAGIType.section)
+        Text("On your main server's dashboard, open Nodes → Connect a phone. On Mac, use Connect a phone… in the OpenAGI menu. You can also run the command below on main. A worker Mac cannot issue main-server codes. You don't need to copy an auth token.", style = OpenAGIType.secondary)
+        androidx.compose.foundation.text.selection.SelectionContainer {
+            Text("openagi pair-phone --platform android", style = OpenAGIType.dataMono)
+        }
+        Text("Codes last 30 minutes and work once. Each phone needs its own code. Enter the server address printed with the code.", style = OpenAGIType.secondary)
 
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Daemon address", style = OpenAGIType.secondary, color = MaterialTheme.colorScheme.onSurfaceVariant)

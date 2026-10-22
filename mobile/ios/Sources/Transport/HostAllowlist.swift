@@ -42,7 +42,7 @@ public enum HostAllowlist {
         // not domain-scoped the way ATS is) — this is the one place the two
         // clients' tables intentionally diverge, and only on iOS.
         if isCGNAT(host) { throw DaemonError.unreachableHost(host) }
-        if isPrivateOrTailscale(host) { return origin }
+        if host.hasSuffix(".local") || isPrivateOrTailscale(host) { return origin }
         throw DaemonError.unreachableHost(host)
     }
 

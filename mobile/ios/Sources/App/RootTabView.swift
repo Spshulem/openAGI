@@ -6,7 +6,9 @@ import SwiftUI
 // besides the tab names themselves.
 struct RootTabView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var model: AppModel
+    @AppStorage("workspace.chatPaneOpen") private var chatPaneOpen = false
     let onRevoked: () -> Void
     // A pairing link that arrived while this phone was already paired. It
     // used to be dropped silently: the app stayed on the old daemon, the new
@@ -69,26 +71,24 @@ struct RootTabView: View {
         // -- needed so Today's "N waiting on you" row (DESIGN.md's "Screens
         // must not be mostly empty" section) can switch this tab bar to
         // Inbox by setting `model.selectedTab` from anywhere behind it.
-        @Bindable var model = model
-        TabView(selection: $model.selectedTab) {
-            Tab("Today", systemImage: "sun.max", value: AppTab.today) {
-                TodayView(onRevoked: onRevoked)
-            }
-            Tab("Tasks", systemImage: "checklist", value: AppTab.tasks) {
-                TasksView()
-            }
-            Tab("Inbox", systemImage: "tray", value: AppTab.inbox) {
-                InboxView()
-            }
-            .badge(model.inboxBadgeCount)
-            Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) {
-                ChatView()
-            }
-            Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) {
-                SupervisorView()
+        GeometryReader { geometry in
+            if geometry.size.width >= 760 && verticalSizeClass != .compact {
+                HStack(spacing: 0) {
+                    workspaceDestination
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if chatPaneOpen && model.selectedTab != .chat {
+                        Divider()
+                        ChatView(onClose: { chatPaneOpen = false })
+                            .frame(width: max(320, (geometry.size.width - 88) * 0.42))
+                            .accessibilityIdentifier("supporting-chat-pane")
+                    }
+                    Divider()
+                    rightNavigation
+                }
+            } else {
+                compactTabs
             }
         }
-        .tabViewStyle(.sidebarAdaptable)
         .tint(Theme.live)
         .environment(model)
         .alert("Switch to another OpenAGI?", isPresented: switchAlertShown) {
@@ -145,5 +145,84 @@ struct RootTabView: View {
         // Cancelled with the view, so it stops once this pairing is revoked.
         .task { if runsBackgroundServices { await RefreshCoordinator.sendHeartbeats(client: model.client) } }
         .onDisappear { model.stopEventStream() }
+    }
+
+    @ViewBuilder private var workspaceDestination: some View {
+        switch model.selectedTab {
+        case .today: TodayView(onRevoked: onRevoked)
+        case .tasks: TasksView()
+        case .inbox: InboxView()
+        case .chat: ChatView()
+        case .supervisor: SupervisorView(showsInlineChat: false)
+        }
+    }
+
+    private var compactTabs: some View {
+        @Bindable var model = model
+        return TabView(selection: $model.selectedTab) {
+            Tab("Today", systemImage: "sun.max", value: AppTab.today) { TodayView(onRevoked: onRevoked) }
+            Tab("Tasks", systemImage: "checklist", value: AppTab.tasks) { TasksView() }
+            Tab("Inbox", systemImage: "tray", value: AppTab.inbox) { InboxView() }.badge(model.inboxBadgeCount)
+            Tab("Chat", systemImage: "bubble.left.and.bubble.right", value: AppTab.chat) { ChatView() }
+            Tab("Supervisor", systemImage: "binoculars", value: AppTab.supervisor) { SupervisorView() }
+        }
+    }
+
+    private var rightNavigation: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                ForEach([AppTab.today, .tasks, .inbox, .chat, .supervisor], id: \.self) { tab in
+                    Button { model.selectedTab = tab } label: {
+                        VStack(spacing: 5) {
+                            Image(systemName: tab.navigationSymbol).font(.title3)
+                            Text(tab.navigationTitle).font(.caption)
+                            if tab == .inbox && model.inboxBadgeCount > 0 {
+                                Text("\(model.inboxBadgeCount)").font(.caption2).bold()
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.borderless)
+                    .tint(model.selectedTab == tab ? Color.accentColor : .secondary)
+                    .accessibilityLabel(tab.navigationTitle)
+                    .accessibilityAddTraits(model.selectedTab == tab ? .isSelected : [])
+                }
+                if model.selectedTab != .chat {
+                    Divider()
+                    Button(chatPaneOpen ? "Hide chat" : "Show chat", systemImage: "sidebar.right") {
+                        chatPaneOpen.toggle()
+                    }
+                    .labelStyle(.iconOnly)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .accessibilityIdentifier("toggle-chat-pane")
+                }
+            }
+            .padding(.vertical)
+        }
+        .frame(width: 88)
+        .background(.regularMaterial)
+        .accessibilityIdentifier("right-navigation")
+    }
+}
+
+private extension AppTab {
+    var navigationTitle: String {
+        switch self {
+        case .today: "Today"
+        case .tasks: "Tasks"
+        case .inbox: "Inbox"
+        case .chat: "Chat"
+        case .supervisor: "Supervisor"
+        }
+    }
+    var navigationSymbol: String {
+        switch self {
+        case .today: "sun.max"
+        case .tasks: "checklist"
+        case .inbox: "tray"
+        case .chat: "bubble.left.and.bubble.right"
+        case .supervisor: "binoculars"
+        }
     }
 }

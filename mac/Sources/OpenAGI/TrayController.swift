@@ -224,6 +224,7 @@ struct TrayMenu: View {
       // terminal-managed listener is preserved and explained instead.
       Button(restartLabel) { restartDaemon() }
       Button("Open dashboard…") { state.openDashboard() }
+      Button("Connect a phone…") { openPhonePairing() }
       Button("Open health audit…") { state.openDashboard(path: "/?tab=health") }
       Button("Open activity log…") { state.openDashboard(path: "/?tab=activity") }
       Button("Settings…") { state.openDashboard(path: "/setup") }
@@ -282,6 +283,25 @@ struct TrayMenu: View {
     let pb = NSPasteboard.general
     pb.clearContents()
     pb.setString(token, forType: .string)
+  }
+
+  private func openPhonePairing() {
+    // A worker's owner token belongs only to this Mac. Open main without
+    // forwarding that credential; its browser session authenticates there.
+    let configURL = AppState.dataDir().appendingPathComponent("node.json")
+    if let data = try? Data(contentsOf: configURL),
+       let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let remote = config["remote"] as? String,
+       var components = URLComponents(string: remote),
+       let scheme = components.scheme, ["http", "https"].contains(scheme), components.host != nil {
+      components.user = nil
+      components.password = nil
+      components.path = "/"
+      components.queryItems = [URLQueryItem(name: "tab", value: "nodes")]
+      components.fragment = "phone-pairing"
+      if let url = components.url { NSWorkspace.shared.open(url); return }
+    }
+    state.openDashboard(path: "/?tab=nodes#phone-pairing")
   }
 
   // Updates / quit

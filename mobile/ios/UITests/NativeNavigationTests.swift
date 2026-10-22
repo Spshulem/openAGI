@@ -75,6 +75,27 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 5))
     }
 
+    func testWideNavigationIsOnTheRightAndChatCanBeClosed() {
+        let app = launch()
+        let rail = element(app, "right-navigation")
+        guard rail.waitForExistence(timeout: 3) else {
+            XCTAssertTrue(app.tabBars.buttons["Chat"].exists)
+            return
+        }
+        XCTAssertGreaterThan(rail.frame.minX, app.frame.midX)
+        let close = app.buttons["close-chat-pane"]
+        if close.exists { close.tap() }
+        tap(app, "toggle-chat-pane")
+        XCTAssertTrue(close.waitForExistence(timeout: 5))
+        tab(app, "Supervisor")
+        XCTAssertTrue(close.exists, "Pinned chat stays open while navigating")
+        close.tap()
+        XCTAssertFalse(close.exists)
+        tab(app, "Chat")
+        XCTAssertFalse(element(app, "supporting-chat-pane").exists, "Chat must not open a second conversation")
+        capture("right-navigation-chat", app: app)
+    }
+
     func testModelProviderSelectionSavesAndLeavesTheModelScreenUsable() {
         let app = launch()
         tap(app, "open-settings")

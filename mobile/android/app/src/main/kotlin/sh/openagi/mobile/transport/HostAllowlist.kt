@@ -27,7 +27,7 @@ object HostAllowlist {
         if (url.scheme == "https") return origin
         if (url.scheme != "http") throw DaemonException.UnreachableHost(raw)
         val host = url.host.lowercase()
-        if (host.endsWith(".ts.net")) return origin
+        if (host.endsWith(".ts.net") || host.endsWith(".local")) return origin
         if (isPrivateOrTailscale(host)) return origin
         throw DaemonException.UnreachableHost(host)
     }
