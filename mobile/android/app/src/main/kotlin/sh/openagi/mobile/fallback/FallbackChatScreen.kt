@@ -36,7 +36,9 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
     var options by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
     var localStatus by remember { mutableStateOf<Int?>(null) }
-    var localNote by remember { mutableStateOf("Checking local model…") }
+    var localNote by remember { mutableStateOf("Checking Gemini Nano availability…") }
+    var localProgress by remember { mutableStateOf<LocalModelProgress?>(null) }
+    var localRequest by remember { mutableIntStateOf(0) }
     var preparingLocal by remember { mutableStateOf(false) }
     var localPreparation by remember { mutableStateOf<Job?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -55,9 +57,11 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
     }
     LaunchedEffect(provider, vault) {
         loading = true
+        if (provider == FallbackProvider.LOCAL) localNote = "Checking Gemini Nano availability…"
         key = ""
         error = null
         if (vault == null) return@LaunchedEffect
+        val request = ++localRequest
         try {
             withContext(Dispatchers.IO) {
                 model = vault?.model(provider) ?: provider.defaultModel
@@ -67,16 +71,19 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
             modelDraft = model
             if (provider == FallbackProvider.LOCAL) {
                 localStatus = withTimeout(20_000) { LocalChat.status() }
+                localProgress = null
                 localNote = when (localStatus) {
                     FeatureStatus.AVAILABLE -> "Ready on this phone"
-                    FeatureStatus.DOWNLOADABLE -> "Model download needed"
-                    FeatureStatus.DOWNLOADING -> "Model is downloading. Check again shortly."
+                    FeatureStatus.DOWNLOADABLE -> "Gemini Nano needs to download before your first chat."
+                    FeatureStatus.DOWNLOADING -> "Google AICore is downloading Gemini Nano. Check to follow its progress."
                     else -> "Gemini Nano isn't supported or ready on this device. You can use a hosted provider."
                 }
             }
+        } catch (_: TimeoutCancellationException) {
+            localNote = "Google AICore is taking too long to respond. Check Gemini Nano again or choose a hosted provider."
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) { localNote = "The local model isn't available right now. Update Android System Intelligence / AICore and check again, or choose a hosted provider." }
-        finally { loading = false }
+        finally { if (request == localRequest) loading = false }
     }
     LaunchedEffect(lines.size, busy) { if (lines.isNotEmpty()) scroll.animateScrollToItem(lines.lastIndex) }
 
@@ -109,28 +116,62 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
 
     fun selectProvider(choice: FallbackProvider) {
         if (provider == choice) return
+        localRequest++
         localPreparation?.cancel()
         localPreparation = null
+        preparingLocal = false
+        localProgress = null
         loading = true
         provider = choice
     }
 
+    fun cancelLocal() {
+        localRequest++
+        localPreparation?.cancel()
+        localPreparation = null
+        preparingLocal = false
+        localProgress = null
+        localNote = "Setup stopped here. Google AICore may continue a system download; check Gemini Nano to resume."
+    }
+
     fun prepareLocal() {
+        if (preparingLocal || loading) return
+        val request = ++localRequest
         preparingLocal = true
-        localNote = "Preparing Gemini Nano… You can cancel or choose a hosted provider."
+        localProgress = null
+        localNote = "Checking Gemini Nano with Google AICore…"
         localPreparation = scope.launch {
             try {
                 val status = withTimeout(20_000) { LocalChat.status() }
                 if (status == FeatureStatus.DOWNLOADABLE || status == FeatureStatus.DOWNLOADING) {
-                    withTimeout(15 * 60_000L) { LocalChat.download { localNote = it } }
+                    localNote = "Starting Gemini Nano download…"
+                    withTimeout(15 * 60_000L) {
+                        LocalChat.download().collect { progress ->
+                            if (request == localRequest) localProgress = progress
+                        }
+                    }
+                    localProgress = null
+                    localNote = "Getting Gemini Nano ready on this phone…"
                 }
-                localStatus = withTimeout(20_000) { LocalChat.status() }
-                localNote = if (localStatus == FeatureStatus.AVAILABLE) "Ready on this phone" else "Model isn't ready. Keep Wi-Fi on and check again shortly, or choose a hosted provider."
+                val ready = withTimeout(20_000) { LocalChat.status() }
+                if (request == localRequest) {
+                    localStatus = ready
+                    localNote = if (ready == FeatureStatus.AVAILABLE) "Gemini Nano is ready on this phone" else "Gemini Nano isn't ready. Keep Wi-Fi on and check again, or choose a hosted provider."
+                }
             } catch (_: TimeoutCancellationException) {
-                localNote = "The local model isn't ready yet. Check again later or choose a hosted provider."
+                if (request == localRequest) localNote = "Gemini Nano setup timed out. Check again to resume, or choose a hosted provider."
             } catch (e: CancellationException) { throw e }
-            catch (_: Exception) { localNote = "Couldn't prepare Gemini Nano on this device. You can use a hosted provider." }
-            finally { preparingLocal = false }
+            catch (e: FallbackException) {
+                if (request == localRequest) localNote = e.message ?: "Gemini Nano couldn't download. Check Wi-Fi and try again."
+            } catch (_: Exception) {
+                if (request == localRequest) localNote = "Couldn't prepare Gemini Nano. Update Android System Intelligence / AICore and try again, or choose a hosted provider."
+            } finally {
+                if (request == localRequest) {
+                    localProgress = null
+                    preparingLocal = false
+                    localPreparation = null
+                }
+            }
         }
     }
 
@@ -148,6 +189,19 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
                         Spacer(Modifier.height(12.dp))
                         if (options) {
                             LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                if (provider == FallbackProvider.LOCAL) {
+                                    item {
+                                        LocalModelCard(
+                                            note = localNote,
+                                            progress = localProgress,
+                                            working = preparingLocal || loading,
+                                            canPrepare = !busy && !loading,
+                                            needsDownload = localStatus == FeatureStatus.DOWNLOADABLE,
+                                            onPrepare = { prepareLocal() },
+                                            onCancel = if (preparingLocal) ({ cancelLocal() }) else null,
+                                        )
+                                    }
+                                }
                                 item { Text("Choose a model", style = MaterialTheme.typography.titleMedium) }
                                 itemsIndexed(FallbackProvider.entries) { _, choice ->
                                     Row(Modifier.fillMaxWidth()) {
@@ -155,24 +209,7 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
                                         TextButton(onClick = { selectProvider(choice) }, enabled = !busy) { Text(choice.title) }
                                     }
                                 }
-                                if (provider == FallbackProvider.LOCAL) {
-                                    item { Text(localNote) }
-                                    item {
-                                        if (preparingLocal) {
-                                            Column {
-                                                LinearProgressIndicator(Modifier.fillMaxWidth())
-                                                TextButton(onClick = {
-                                                    localPreparation?.cancel()
-                                                    localNote = "You can check the local model again or choose a hosted provider."
-                                                }) { Text("Cancel preparation") }
-                                            }
-                                        } else {
-                                            OutlinedButton(enabled = !busy && !loading, onClick = { prepareLocal() }) {
-                                                Text(if (localStatus == FeatureStatus.DOWNLOADABLE) "Download local model" else "Check local model")
-                                            }
-                                        }
-                                    }
-                                } else {
+                                if (provider != FallbackProvider.LOCAL) {
                                     item { OutlinedTextField(value = modelDraft, onValueChange = { modelDraft = it }, label = { Text("Model ID") }, enabled = !busy && !loading, singleLine = true, modifier = Modifier.fillMaxWidth()) }
                                     item { OutlinedTextField(value = key, onValueChange = { key = it }, label = { Text(if (hasKey) "Replace saved API key" else "API key") }, enabled = !busy && !loading, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth()) }
                                     item {
