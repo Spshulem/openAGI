@@ -29,7 +29,7 @@ object ErrorCopy {
             "Can't reach OpenAGI.",
             "Nothing is listening at $host. Is the daemon running?",
         )
-        is DaemonException.MainUnavailable -> Message("Main connection needs attention.", "This worker can't reach the main agent. Your phone pairing is saved; reconnect the worker to main."),
+        is DaemonException.MainUnavailable -> Message("Main connection needs attention.", "This worker can't reach the main agent. Your phone pairing is saved; reconnect the worker to main.")
         is DaemonException.NotFound, is DaemonException.Malformed, is DaemonException.Server, is DaemonException.Unavailable -> Message(
             "Pairing failed.",
             "Try again, or run openagi pair-phone for a new code.",
