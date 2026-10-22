@@ -23,13 +23,17 @@ final class NativeNavigationTests: XCTestCase {
             // Native lists create offscreen accessibility elements lazily.
             // Scroll the active form, rather than the presenting screen.
             for _ in 0..<8 {
-                // Duo's vertical toolbar can leave a row hittable while its
-                // center is still clipped by the form's bottom edge. Bring
-                // the whole row into the content area before tapping it.
+                // Duo's settings rows can be hittable while their center is
+                // clipped by the form's bottom edge. Other forms keep native
+                // swipes: a coordinate drag can land in an API-key field.
                 let viewport = list.frame.insetBy(dx: 16, dy: 88)
-                if target.exists && target.isHittable && viewport.contains(target.frame) {
+                if target.exists && target.isHittable && (listID != "settings-form" || viewport.contains(target.frame)) {
                     target.tap()
                     return
+                }
+                if listID != "settings-form" {
+                    list.swipeUp()
+                    continue
                 }
                 let start = list.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.65))
                 let end = list.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.35))

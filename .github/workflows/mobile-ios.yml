@@ -123,6 +123,7 @@ jobs:
       - name: Verify simulator runtime was bundled
         run: test -f "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app/Frameworks/NodeMobile.framework/NodeMobile"
       - name: Test expanded workspace navigation
+        if: ${{ !cancelled() && env.OPENAGI_PHONE_SIM != '' }}
         working-directory: mobile/ios
         run: |
           xcrun simctl shutdown "$OPENAGI_PHONE_SIM" || true
