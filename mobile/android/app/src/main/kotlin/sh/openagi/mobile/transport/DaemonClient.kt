@@ -44,6 +44,8 @@ import sh.openagi.mobile.protocol.TasksListResponse
 import sh.openagi.mobile.protocol.UpdateTaskRequest
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.TimeUnit
 
 // nodeId is validated upstream against ^[a-zA-Z0-9:_-]{1,240}$ and cannot carry
@@ -67,6 +69,7 @@ sealed class DaemonException(message: String) : Exception(message) {
     class NotFound : DaemonException("the daemon does not know that id")
     class Conflict : DaemonException("the daemon has already moved on")
     class Server(val code: Int) : DaemonException("the daemon returned $code")
+    class MainUnavailable(val pairingRequired: Boolean) : DaemonException("the worker cannot reach the main workspace")
     class Malformed : DaemonException("the daemon returned something unreadable")
     // The fleet supervisor's routes are missing (an older daemon: 404) or the
     // daemon runs without a supervisor (503). Not a failure of the call so
@@ -502,6 +505,12 @@ class DaemonClient(
         // Named ensureOk, not check: kotlin.check already means something else,
         // and a shadowed stdlib name is a bug waiting to be misread.
         internal fun ensureOk(response: Response) {
+            if (response.code == 502 || response.code == 508) {
+                val error = runCatching { ProtocolJson.json.parseToJsonElement(response.peekBody(4096).string()).jsonObject["error"]?.jsonPrimitive?.content }.getOrNull()
+                if (error in setOf("main-pairing-required", "main-unavailable", "main-routing-loop")) {
+                    throw DaemonException.MainUnavailable(error == "main-pairing-required")
+                }
+            }
             when (response.code) {
                 in 200..299, 304 -> Unit
                 401, 403 -> throw DaemonException.Unauthorized()

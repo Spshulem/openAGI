@@ -4,11 +4,19 @@ import SwiftUI
 // on AppModel so streaming replies and drafts survive tab and fold changes.
 struct ChatView: View {
     @Environment(AppModel.self) private var model
+    @State private var showingFallback = false
 
     var body: some View {
         NavigationStack {
             ChatConversationView(conversation: model.agentChat, title: "Chat")
                 .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
+                            .accessibilityIdentifier("chat-fallback")
+                    }
+                }
+                .sheet(isPresented: $showingFallback) { FallbackChatView() }
         }
     }
 }

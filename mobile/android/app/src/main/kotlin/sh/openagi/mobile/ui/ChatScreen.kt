@@ -390,7 +390,9 @@ fun ChatScreen(
     onBack: (() -> Unit)? = null,
     onComposerFocusChanged: (Boolean) -> Unit = {},
 ) {
-    val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
+    val client = remember(credentials) { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
+    var showingFallback by remember { mutableStateOf(false) }
+    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
     val scope = rememberCoroutineScope()
     // Starts at the newest line (an index past the end is clamped to the
     // last item), so a reopened chat never flashes its oldest messages
@@ -574,6 +576,11 @@ fun ChatScreen(
                     connection = if (streamAttached || isStreaming) ConnectionState.Live(credentials.server) else ConnectionState.Reconnecting(credentials.server),
                     onBack = onBack,
                 )
+                if (title == "Chat" || !streamAttached) {
+                    androidx.compose.material3.TextButton(onClick = { showingFallback = true }, enabled = !isStreaming) {
+                        Text(if (streamAttached) "Chat without server" else "Server reconnecting · Use local or hosted chat")
+                    }
+                }
 
                 Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                     LazyColumn(
@@ -873,52 +880,20 @@ internal fun chatGutter(available: Dp): Dp = maxOf(CHAT_MIN_GUTTER, (available -
 // text inside it lines up with the messages: 12 from the edge on a phone.
 internal fun composerInset(gutter: Dp): Dp = maxOf(0.dp, gutter - 4.dp)
 
-// A rounded pill with the field and the send button inside it: one line at
-// rest, growing to six lines and then scrolling. It sits above the keyboard,
-// never behind it, and keeps the gesture-bar inset. Its hairline turns
-// `live` while the field has focus.
+// Material text entry and button semantics, including selection, TalkBack,
+// focus and keyboard behavior. The fold-aware parent owns the safe insets.
 @Composable
 private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit, gutter: Dp, onFocus: (Boolean) -> Unit = {}) {
-    val colors = LocalOpenAGIColors.current
-    val ink = MaterialTheme.colorScheme.onBackground
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    var focused by remember { mutableStateOf(false) }
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .navigationBarsPadding()
-            .padding(horizontal = composerInset(gutter), vertical = 8.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Surface(
-            color = MaterialTheme.colorScheme.surface,
-            shape = RoundedCornerShape(24.dp),
-            border = BorderStroke(1.dp, if (focused) colors.live else colors.edge),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Row(
-                modifier = Modifier.heightIn(min = 48.dp).padding(start = 16.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
-                verticalAlignment = Alignment.Bottom,
-            ) {
-                BasicTextField(
-                    value = value,
-                    onValueChange = onValueChange,
-                    textStyle = OpenAGIType.chatBody.copy(color = ink),
-                    cursorBrush = SolidColor(colors.live),
-                    minLines = 1,
-                    maxLines = 6,
-                    modifier = Modifier.weight(1f).padding(vertical = 7.dp).onFocusChanged { focused = it.isFocused; onFocus(it.isFocused) },
-                    decorationBox = { inner ->
-                        Box {
-                            if (value.isEmpty()) Text("Message OpenAGI", style = OpenAGIType.chatBody, color = muted)
-                            inner()
-                        }
-                    },
-                )
-                SendButton(enabled = enabled, onClick = onSend)
-            }
-        }
-    }
+    androidx.compose.material3.OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        placeholder = { Text("Message OpenAGI") },
+        maxLines = 6,
+        trailingIcon = { SendButton(enabled = enabled, onClick = onSend) },
+        modifier = Modifier.fillMaxWidth().navigationBarsPadding()
+            .padding(horizontal = maxOf(12.dp, composerInset(gutter)), vertical = 8.dp)
+            .onFocusChanged { onFocus(it.isFocused) },
+    )
 }
 
 // DESIGN.md: "Send is disabled and `muted` until there is non-whitespace
@@ -926,18 +901,11 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, enabled: Bo
 // arrow in `onLive` so it reads in both modes.
 @Composable
 private fun SendButton(enabled: Boolean, onClick: () -> Unit) {
-    val colors = LocalOpenAGIColors.current
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    Box(
-        modifier = Modifier
-            .padding(start = 8.dp)
-            .size(36.dp)
-            .clip(CircleShape)
-            .background(if (enabled) colors.live else muted.copy(alpha = 0.16f))
-            .clickable(enabled = enabled, onClickLabel = "Send", role = Role.Button, onClick = onClick)
-            .semantics { contentDescription = "Send" },
-        contentAlignment = Alignment.Center,
+    androidx.compose.material3.FilledIconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.semantics { contentDescription = "Send" },
     ) {
-        SendArrowGlyph(tint = if (enabled) colors.onLive else muted)
+        SendArrowGlyph(tint = if (enabled) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

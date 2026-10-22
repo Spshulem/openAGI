@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -56,8 +58,11 @@ fun SettingsScreen(
     onRevoked: () -> Unit,
 ) {
     var isWorking by remember { mutableStateOf(false) }
+    var connectionIssue by remember { mutableStateOf<String?>(null) }
+    var showingFallback by remember { mutableStateOf(false) }
+    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
     val scope = rememberCoroutineScope()
-    val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
+    val client = remember(credentials) { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val store = remember { SnapshotStore(context.filesDir) }
 
     fun connectionState(): ConnectionState {
@@ -82,7 +87,7 @@ fun SettingsScreen(
         ScreenHeader(title = "Settings", connection = connection)
 
         Column(
-            modifier = Modifier.padding(horizontal = 20.dp),
+            modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp),
         ) {
             RowGroup {
@@ -101,12 +106,17 @@ fun SettingsScreen(
                     isWorking = true
                     scope.launch {
                         try {
-                            RefreshCoordinator(
+                            val outcome = RefreshCoordinator(
                                 client,
                                 store,
                                 OutboundQueue(context.filesDir),
                                 onSnapshotChanged = { runCatching { TodayWidget().updateAll(context) } },
                             ).refresh()
+                            connectionIssue = when (outcome) {
+                                is sh.openagi.mobile.sync.RefreshOutcome.MainUnavailable -> "This worker can't access main. Your phone pairing is saved. Reconnect the worker to main and refresh."
+                                is sh.openagi.mobile.sync.RefreshOutcome.Offline -> "Can't reach your server. Check its network connection; your pairing is saved."
+                                else -> null
+                            }
                             refreshDisplayedState()
                         } finally {
                             isWorking = false
@@ -115,6 +125,11 @@ fun SettingsScreen(
                 },
                 modifier = Modifier.fillMaxWidth(),
             )
+
+            androidx.compose.material3.OutlinedButton(onClick = { showingFallback = true }, modifier = Modifier.fillMaxWidth()) {
+                Text("Chat without server · local or hosted model")
+            }
+            connectionIssue?.let { Text(it, style = OpenAGIType.caption) }
 
             RowGroup {
                 // Blocked notifications mean no pings whatever the pref says, so

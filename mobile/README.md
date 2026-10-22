@@ -81,6 +81,29 @@ against *that* address, not `127.0.0.1:43210`.
 
 ## Building and testing
 
+### Chat when the server is unavailable
+
+Both apps offer **Chat without server** from Chat and Settings. Choose the
+phone's local model or OpenAI, Claude, OpenRouter or Gemini. Hosted modes use
+your own API key, entered in a masked native field and saved in iOS Keychain
+or Android Keystore-protected storage. Keys go only to the selected provider's
+fixed HTTPS endpoint; redirects are refused. No server credential or provider
+key is exported by the daemon.
+
+This is a separate conversation on the phone. Existing server messages, memory
+and integration data are never automatically sent to a hosted provider.
+Provider usage may incur charges on your own account. The active provider and
+model are always shown. Return to the server chat to retry the saved pairing.
+Tasks, integrations, approvals and fleet controls still require the server;
+direct chat does not pretend to perform those actions.
+
+Android uses ML Kit's on-device Gemini Nano Prompt API and checks actual
+availability. **Download local model** appears when AICore reports a download
+is needed; unsupported or unready devices show that status and can use hosted
+chat. iOS uses Apple Intelligence when enabled and downloaded. Neither app
+silently changes provider or automatically resends a possibly completed server
+turn to another model.
+
 ### iOS
 
 Requires Xcode (this project builds against `Xcode-beta.app`) and

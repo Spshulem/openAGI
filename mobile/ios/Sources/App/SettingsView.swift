@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var isWorking = false
     @State private var showingRevokeConfirmation = false
     @State private var switchError: String?
+    @State private var showingFallback = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -52,6 +53,14 @@ struct SettingsView: View {
                 }
 
                 WorkspaceSection()
+
+                Section {
+                    Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
+                } header: {
+                    Text("Fallback")
+                } footer: {
+                    Text("Use Apple Intelligence on this iPhone or connect directly to a hosted model with your own securely saved API key. Your server pairing stays saved.")
+                }
 
                 Section("Agent location") {
                     if model.isOnPhone {
@@ -113,6 +122,7 @@ struct SettingsView: View {
                 }
             }
             .disabled(isWorking)
+            .sheet(isPresented: $showingFallback) { FallbackChatView() }
             .alert("Couldn't switch agents", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {

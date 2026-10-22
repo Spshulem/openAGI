@@ -74,6 +74,9 @@ fun TodayScreen(
     }
     var snapshot by remember { mutableStateOf(store.load()) }
     var completingIds by remember { mutableStateOf(setOf<String>()) }
+    var connectionIssue by remember { mutableStateOf<String?>(null) }
+    var showingFallback by remember { mutableStateOf(false) }
+    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
     val reducedMotion = rememberReducedMotion()
     val scope = rememberCoroutineScope()
 
@@ -84,7 +87,12 @@ fun TodayScreen(
     }
 
     LaunchedEffect(resumeSignal) {
-        coordinator.refresh()
+        connectionIssue = when (val result = coordinator.refresh()) {
+            is RefreshOutcome.MainUnavailable -> if (result.pairingRequired) "This worker needs authorization from main. Your phone pairing is kept. Reconnect the worker to main, then refresh."
+                else "Couldn't reach the main agent through this worker. Your saved data and pairing are kept."
+            is RefreshOutcome.Offline -> "Can't reach your server. Showing saved data."
+            else -> null
+        }
         snapshot = store.load()
     }
 
@@ -106,6 +114,12 @@ fun TodayScreen(
 
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(title = "Today", connection = connectionState(snapshot))
+        connectionIssue?.let { issue ->
+            Column(Modifier.padding(horizontal = 20.dp)) {
+                Text(issue, style = OpenAGIType.caption)
+                androidx.compose.material3.TextButton(onClick = { showingFallback = true }) { Text("Chat with a local or hosted model") }
+            }
+        }
 
         val current = snapshot
         if (current == null) {

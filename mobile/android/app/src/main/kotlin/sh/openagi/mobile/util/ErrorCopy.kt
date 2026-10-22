@@ -29,6 +29,7 @@ object ErrorCopy {
             "Can't reach OpenAGI.",
             "Nothing is listening at $host. Is the daemon running?",
         )
+        is DaemonException.MainUnavailable -> Message("Main connection needs attention.", "This worker can't reach the main agent. Your phone pairing is saved; reconnect the worker to main."),
         is DaemonException.NotFound, is DaemonException.Malformed, is DaemonException.Server, is DaemonException.Unavailable -> Message(
             "Pairing failed.",
             "Try again, or run openagi pair-phone for a new code.",
@@ -38,6 +39,11 @@ object ErrorCopy {
     // Every other screen, once already paired: fetching or mutating tasks,
     // approvals, clarifications, chat.
     fun forDaemon(error: DaemonException, host: String): Message = when (error) {
+        is DaemonException.MainUnavailable -> Message(
+            "Main connection needs attention.",
+            if (error.pairingRequired) "This worker needs authorization from main. Your phone pairing and saved data are kept. Reconnect the worker to main, then refresh."
+            else "Couldn't reach the main agent through this worker. Your phone pairing and saved data are kept. Check the main's network connection, then refresh.",
+        )
         is DaemonException.Unauthorized -> Message(
             "Needs re-pairing.",
             "Revoke and pair again in Settings.",

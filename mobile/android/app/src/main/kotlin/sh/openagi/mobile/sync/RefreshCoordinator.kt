@@ -13,6 +13,7 @@ sealed class RefreshOutcome {
     object Unchanged : RefreshOutcome()
     object Unauthorized : RefreshOutcome()
     object Offline : RefreshOutcome()
+    data class MainUnavailable(val pairingRequired: Boolean) : RefreshOutcome()
 }
 
 class RefreshCoordinator(
@@ -45,11 +46,14 @@ class RefreshCoordinator(
             }
         } catch (error: DaemonException.Unauthorized) {
             RefreshOutcome.Unauthorized
+        } catch (error: DaemonException.MainUnavailable) {
+            store.markRefreshFailed()
+            RefreshOutcome.MainUnavailable(error.pairingRequired)
         } catch (error: Exception) {
             store.markRefreshFailed()
             RefreshOutcome.Offline
         }
-        if (outcome is RefreshOutcome.Updated || outcome is RefreshOutcome.Unchanged || outcome is RefreshOutcome.Offline) {
+        if (outcome is RefreshOutcome.Updated || outcome is RefreshOutcome.Unchanged || outcome is RefreshOutcome.Offline || outcome is RefreshOutcome.MainUnavailable) {
             onSnapshotChanged()
         }
         // Best-effort: keeps the daemon's node roster showing this phone as

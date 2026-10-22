@@ -15,8 +15,8 @@ android {
         applicationId = "sh.openagi.mobile"
         minSdk = 31
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.1.5"
+        versionCode = 7
+        versionName = "0.1.6"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -65,6 +65,7 @@ kotlin {
 }
 
 dependencies {
+    implementation("com.google.mlkit:genai-prompt:1.0.0-beta4")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
