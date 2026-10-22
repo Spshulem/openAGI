@@ -21,7 +21,8 @@ final class AppModeTests: XCTestCase {
         AppMode.current = .server
         let queue = OutboundQueue(directory: directory)
         let parked = OutboundQueue.parkedForServer(directory: directory)
-        let pending = PendingOp(kind: .completeTask("offline-task"))
+        // Queue JSON stores whole-second dates; use that precision in the fixture.
+        let pending = PendingOp(kind: .completeTask("offline-task"), createdAt: Date(timeIntervalSince1970: 1_700_000_000))
         // Exercise both the legacy active credential and saved-server paths.
         for hasBackup in [false, true] {
             if hasBackup { try credentials.save(to: .server) }
