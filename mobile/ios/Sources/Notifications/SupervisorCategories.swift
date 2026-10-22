@@ -62,17 +62,16 @@ enum SupervisorCategories {
         // The app and extension can write from different processes. Acquire
         // the shared file lock on a worker, never on the caller's UI thread.
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let lease = CategoryRegistrationLease(directory: coordinationDirectory,
-                                                         adding: box.value.category.identifier) else {
-                completion()
-                return
-            }
+            let lease = CategoryRegistrationLease(directory: coordinationDirectory,
+                                                   adding: box.value.category.identifier)
             box.value.center.getNotificationCategories { existing in
                 let existingBox = UncheckedSendableBox(value: existing)
                 box.value.center.getDeliveredNotifications { delivered in
                     // A preceding extension can have finished registration
                     // just before its alert appears in the delivered list.
-                    let inUse = Set(delivered.map(\.request.content.categoryIdentifier)).union(lease.recent)
+                    // Disk coordination is best-effort. Still register the
+                    // actions if the shared container cannot be written.
+                    let inUse = Set(delivered.map(\.request.content.categoryIdentifier)).union(lease?.recent ?? [])
                     box.value.center.setNotificationCategories(
                         merged(existing: existingBox.value, adding: box.value.category, inUse: inUse))
                     // Keep the lock until the write has landed and the

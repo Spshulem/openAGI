@@ -113,6 +113,26 @@ final class SupervisorPushContentTests: XCTestCase {
         XCTAssertEqual(replaced.map(\.identifier), ["SUPERVISOR_QUESTION"])
     }
 
+    func testUnavailableCategoryCoordinationStillRegistersAnswerButtons() async throws {
+        let file = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try Data().write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let center = StubSupervisorNotificationCenter()
+        let registered = expectation(description: "fallback registration completed")
+        let action = UNNotificationAction(identifier: "answer.0", title: "Approve")
+        let category = UNNotificationCategory(identifier: "sq.fallback", actions: [action], intentIdentifiers: [])
+        SupervisorCategories.register(category, center: center, coordinationDirectory: file) { registered.fulfill() }
+        let result = await XCTWaiter.fulfillment(of: [registered], timeout: 2)
+        XCTAssertEqual(result, .completed)
+        let verified = expectation(description: "answer category registered despite unavailable directory")
+        center.getNotificationCategories { categories in
+            XCTAssertEqual(categories.first(where: { $0.identifier == "sq.fallback" })?.actions.first?.identifier, "answer.0")
+            verified.fulfill()
+        }
+        let verification = await XCTWaiter.fulfillment(of: [verified], timeout: 2)
+        XCTAssertEqual(verification, .completed)
+    }
+
     func testConcurrentAlertRegistrationsKeepEveryOptionCategoryBeforeDelivery() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let center = StubSupervisorNotificationCenter()

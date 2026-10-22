@@ -518,6 +518,46 @@ test("closed questions are pruned while alerts are disabled so reopening alerts 
   assert.deepEqual(h.sent.map((s) => s.collapseId), ["fq1", "fq1"]);
 });
 
+test("an in-flight alert never restores another question's pruned notification", async (t) => {
+  const h = harness(t, { questions: [question("closed")] });
+  await h.push.flush();
+  h.state.questions.push(question("in-flight"));
+  let release;
+  let started;
+  const sending = new Promise((resolve) => { started = resolve; });
+  h.setReply(async () => {
+    started();
+    await new Promise((resolve) => { release = resolve; });
+    return { ok: true };
+  });
+  const pass = h.push.flush();
+  await sending;
+  h.state.questions = [question("in-flight")];
+  h.push.changed();
+  assert.deepEqual(h.store.get(NODE).notified, []);
+  release();
+  await pass;
+  assert.deepEqual(h.store.get(NODE).notified, ["in-flight"]);
+  h.state.questions.push(question("closed"));
+  h.setReply(() => ({ ok: true }));
+  await h.push.flush();
+  assert.equal(h.sent.filter((send) => send.collapseId === "closed").length, 2);
+});
+
+test("remote placeholder state cannot prune persisted notifications", async (t) => {
+  const h = harness(t, { questions: [question("still-open")] });
+  await h.push.flush();
+  h.state.questionsAuthoritative = false;
+  h.state.questions = [];
+  h.push.changed();
+  await h.push.flush();
+  assert.deepEqual(h.store.get(NODE).notified, ["still-open"]);
+  h.state.questions = [question("still-open")];
+  h.state.questionsAuthoritative = true;
+  await h.push.flush();
+  assert.equal(h.sent.filter((send) => send.collapseId === "still-open").length, 1);
+});
+
 test("a close and reopen inside the debounce window alerts again", async (t) => {
   const h = harness(t, { questions: [question("fq1")] });
   t.after(() => h.push.stop());

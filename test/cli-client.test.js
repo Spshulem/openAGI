@@ -120,7 +120,7 @@ test("node config round-trips and clears, with 0600 perms", () => {
   const file = writeNodeConfig({ remote: "http://x:43210", token: "t" }, dir);
   assert.equal((fs.statSync(file).mode & 0o777), 0o600);
   assert.deepEqual(readNodeConfig(dir), {
-    remote: "http://x:43210", token: "t", nodeToken: null, nodeEnrollmentConfirmed: null
+    remote: "http://x:43210", token: "t", nodeToken: null, nodeEnrollmentConfirmed: null, ownerProxyToken: null
   });
   fs.chmodSync(file, 0o644);
   writeNodeConfig({ remote: "http://x:43210", token: "replacement" }, dir);
@@ -138,6 +138,7 @@ test("node config keeps the last complete pairing when atomic replacement fails"
     remote: "https://old-main.example.test",
     token: "old-pairing-token",
     nodeToken: "old-scoped-token",
+    ownerProxyToken: null,
     nodeEnrollmentConfirmed: true
   }, dir);
   const before = fs.readFileSync(file, "utf8");
@@ -163,6 +164,7 @@ test("node config keeps the last complete pairing when atomic replacement fails"
     remote: "https://old-main.example.test",
     token: null,
     nodeToken: "old-scoped-token",
+    ownerProxyToken: null,
     nodeEnrollmentConfirmed: true
   });
 });

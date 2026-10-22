@@ -58,6 +58,7 @@ export class RemoteFleetSupervisor {
     this.selfFixHub = dataDir ? new SelfFixHub({ runtime, store: new FleetStore({ dir: path.join(dataDir, "fleet-self-fix") }) }) : null;
     this.state = { mode: 'observe', enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
     this.refreshing = null;
+    this.questionsAuthoritative = false;
     this.timer = null;
     this.pendingOutreachDecisions = new Map();
     // Glasses dismissals the computer was offline for, sent on the next refresh.
@@ -66,6 +67,7 @@ export class RemoteFleetSupervisor {
   }
   getState() {
     const state = structuredClone(this.state);
+    state.questionsAuthoritative = this.questionsAuthoritative;
     if (this.selfFixHub) {
       state.fixes = this.selfFixHub.store.fixes();
       state.questions = [...state.questions, ...this.selfFixHub.store.openQuestions()];
@@ -88,6 +90,7 @@ export class RemoteFleetSupervisor {
       if (!result?.state || !Array.isArray(result.state.questions) || !Array.isArray(result.state.actions)) throw new Error('Invalid fleet response');
       reached = true;
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
+      this.questionsAuthoritative = true;
       this.mirrorQuestions();
       status = result.response?.status ?? null;
       if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');

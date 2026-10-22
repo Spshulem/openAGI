@@ -190,11 +190,16 @@ async function cmdPair(positional, flags) {
     }
   }
   const alreadyConfirmed = existingRemote === remote && existing?.nodeEnrollmentConfirmed === true;
-  const pairingToken = alreadyConfirmed
+  // Older workers have only the operational token. An explicit owner
+  // credential can authorize the new workspace proxy without replacing
+  // their stable node id or weakening the existing worker credential.
+  const authorizeProxy = alreadyConfirmed && !existing?.ownerProxyToken && Boolean(process.env.OPENAGI_REMOTE_TOKEN);
+  const pairingToken = alreadyConfirmed && !authorizeProxy
     ? null
     : (process.env.OPENAGI_REMOTE_TOKEN ?? (existingRemote === remote ? existing?.token : null) ?? null);
-  const file = writeNodeConfig({ remote, token: pairingToken }, dataDir);
-  console.log(c(GREEN, alreadyConfirmed ? `✓ pairing with ${remote} is already confirmed` : `✓ pairing saved for ${remote}`));
+  const file = writeNodeConfig({ remote, token: pairingToken,
+    ...(authorizeProxy ? { nodeEnrollmentConfirmed: false } : {}) }, dataDir);
+  console.log(c(GREEN, alreadyConfirmed && !authorizeProxy ? `✓ pairing with ${remote} is already confirmed` : `✓ pairing saved for ${remote}`));
 
   const local = await restartLocalDaemon({ dataDir });
   if (local.restarted) {

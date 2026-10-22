@@ -71,7 +71,15 @@ export class LinearTaskSource {
    * Poll Linear and reconcile against the OpenAGI TaskStore.
    * Returns { created, updated, completed } counts.
    */
-  async sync(opts = {}) {
+  sync(opts = {}) {
+    // Manual refreshes and cron share the same import, including the
+    // source-id snapshot used for deduplication.
+    if (this._syncPromise) return this._syncPromise;
+    this._syncPromise = this._runSync(opts).finally(() => { this._syncPromise = null; });
+    return this._syncPromise;
+  }
+
+  async _runSync(opts) {
     const result = await this._sync(opts);
     // Surfaced via /integrations/status so skip reasons are visible.
     this.lastSyncResult = { at: new Date().toISOString(), ...result };

@@ -6,7 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
-import { NodeRegistry } from "../src/node-registry.js";
+import { NodeRegistry, readOrCreateIdentity } from "../src/node-registry.js";
 import { writeNodeConfig } from "../src/cli-client.js";
 import { isMainDataRoute, routeMainData } from "../src/main-data-router.js";
 
@@ -119,6 +119,48 @@ test("routing preserves main's scopes and worker's origin gate", async (t) => {
   assert.equal(blocked.status, 403);
 });
 
+test("a main-issued phone reaches Supervisor through a worker without another enrollment", async (t) => {
+  const { main, worker, request } = await pair(t);
+  const response = await request("/fleet/api/state");
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-openagi-data-source"), "main");
+  assert.equal(worker.nodeRegistry.isEnrolled(PHONE.id), false);
+  assert.equal((await fetch(main.url + "/fleet/api/state", { headers: auth(WORKER) })).status, 401);
+});
+
+test("main grants workspace proxy authority separately from a worker's operational token", async (t) => {
+  const { main, worker, request } = await pair(t);
+  const identity = readOrCreateIdentity(worker.dataDir);
+  const proxyToken = "d".repeat(43);
+  const enrollment = { nodeId: identity.nodeId, nodeToken: WORKER.token, ownerProxyToken: proxyToken };
+  const enroll = (headers) => fetch(main.url + "/nodes/enroll", {
+    method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(enrollment)
+  });
+  assert.equal((await enroll(auth(WORKER))).status, 401, "a worker cannot grant itself broader access");
+  assert.equal((await enroll({ authorization: `Bearer ${OWNER}` })).status, 200);
+  for (const route of ["/nodes/control/poll", "/nodes/enrollment-code"]) {
+    assert.equal((await fetch(main.url + route, { method: "POST",
+      headers: { ...auth({ id: identity.nodeId, token: proxyToken }), "content-type": "application/json" },
+      body: "{}" })).status, 401, `the workspace proxy cannot access ${route}`);
+  }
+  writeNodeConfig({ remote: main.url, token: null, nodeToken: WORKER.token,
+    nodeEnrollmentConfirmed: true, ownerProxyToken: proxyToken }, worker.dataDir);
+  for (const route of ["/settings/models", "/mobile/summary"]) {
+    assert.equal((await request(route, {}, { id: "ignored-local-id", token: OWNER })).status, 200);
+    assert.equal((await request(route, {}, { id: identity.nodeId, token: WORKER.token })).status, 502);
+  }
+  const created = await request("/tasks", { method: "POST", body: JSON.stringify({ title: "Owner task", queue: "user" }) },
+    { id: "ignored-local-id", token: OWNER });
+  assert.equal(created.status, 200);
+  assert.equal(main.runtime.tasks.list().some((task) => task.title === "Owner task"), true);
+  assert.doesNotMatch(JSON.stringify(main.nodeRegistry.listEnrollments()), /ownerProxyTokenHash/);
+  assert.equal((await fetch(main.url + "/nodes/enroll", { method: "POST",
+    headers: { ...auth({ id: identity.nodeId, token: proxyToken }), "content-type": "application/json" },
+    body: JSON.stringify(enrollment) })).status, 401, "the proxy cannot mint grants");
+  main.nodeRegistry.revoke(identity.nodeId);
+  assert.equal((await request("/mobile/summary", {}, { id: "ignored", token: OWNER })).status, 502);
+});
+
 async function server(t, handler) {
   const app = http.createServer(handler);
   await new Promise((resolve) => app.listen(0, "127.0.0.1", resolve));
@@ -172,7 +214,7 @@ test("local owner token is never forwarded as main authority", async (t) => {
     res.end("{}");
   });
   const proxy = await server(t, (req, res) => routeMainData(req, res, new URL(req.url, "http://worker"), {
-    pairing: { remote: main.url, nodeToken: WORKER.token, nodeEnrollmentConfirmed: true },
+    pairing: { remote: main.url, ownerProxyToken: WORKER.token, nodeToken: "x".repeat(43), nodeEnrollmentConfirmed: true },
     identity: { nodeId: WORKER.id }, ownerAuthenticated: true, ownerBearerAuthenticated: true
   }));
   assert.equal((await fetch(proxy.url + `/tasks?queue=user&token=${OWNER}`, {
@@ -181,10 +223,10 @@ test("local owner token is never forwarded as main authority", async (t) => {
 });
 
 test("only shared workspace routes forward, with their allowed methods", () => {
-  for (const route of ["/tasks", "/mobile/summary", "/workspace/persona", "/settings/models", "/lifelog/moments"]) {
+  for (const route of ["/tasks", "/mobile/summary", "/workspace/persona", "/settings/models", "/lifelog/moments", "/fleet/api/state"]) {
     assert.equal(isMainDataRoute("GET", route), true, route);
   }
-  for (const route of ["/fleet/api/state", "/nodes", "/nodes/control/poll", "/control/restart", "/tasks/a/b", "/tasks/../control/restart"]) {
+  for (const route of ["/nodes", "/nodes/control/poll", "/control/restart", "/tasks/a/b", "/tasks/../control/restart"]) {
     assert.equal(isMainDataRoute("GET", route), false, route);
   }
   assert.equal(isMainDataRoute("DELETE", "/message"), false);

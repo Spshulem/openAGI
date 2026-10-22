@@ -30,7 +30,8 @@ export function readNodeConfig(dataDir = resolveDataDir()) {
   }
 }
 
-export function writeNodeConfig({ remote, token, nodeToken = undefined, nodeEnrollmentConfirmed = undefined }, dataDir = resolveDataDir()) {
+export function writeNodeConfig({ remote, token, nodeToken = undefined, nodeEnrollmentConfirmed = undefined,
+  ownerProxyToken = undefined }, dataDir = resolveDataDir()) {
   const file = nodeConfigPath(dataDir);
   const existing = readNodeConfig(dataDir);
   const sameRemote = sameNormalizedRemote(existing?.remote, remote);
@@ -46,6 +47,7 @@ export function writeNodeConfig({ remote, token, nodeToken = undefined, nodeEnro
     // including when `pair` is run again against the same main.
     token: nextEnrollmentConfirmed === true ? null : (token ?? null),
     nodeToken: nextNodeToken,
+    ownerProxyToken: ownerProxyToken === undefined ? (sameRemote ? existing?.ownerProxyToken ?? null : null) : ownerProxyToken,
     nodeEnrollmentConfirmed: nextEnrollmentConfirmed
   }, 0o600);
   return file;

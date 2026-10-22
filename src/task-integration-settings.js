@@ -42,8 +42,13 @@ export async function syncTaskIntegration(runtime, id) {
   if (!source?.isConfigured()) return { ok: false, message: "Add an API key or finish connecting this service first." };
   try {
     const result = await source.sync();
-    if (result.skipped) return { ok: false, message: "The service couldn't sync. Check your API key, account access and connection, then try again." };
-    return { ok: true, created: Number(result.created) || 0, updated: Number(result.updated) || 0, completed: Number(result.completed) || 0 };
+    const parts = id === "buildbetter" ? [result.signals, result.transcripts].filter(Boolean) : [result];
+    if (!parts.length || parts.some((part) => part.skipped || Number(part.failed) > 0)) {
+      return { ok: false, message: "The service couldn't finish syncing. Some items may have imported. Check your API key, account access and connection, then try again." };
+    }
+    const counts = Object.fromEntries(["created", "updated", "completed"].map((key) =>
+      [key, parts.reduce((total, part) => total + (Number(part[key]) || 0), 0)]));
+    return { ok: true, ...counts };
   } catch {
     return { ok: false, message: "The service couldn't sync. Check your API key, account access and connection, then try again." };
   }

@@ -48,6 +48,7 @@ final class AppModel {
 
     private var eventStream: EventStreamController?
     @ObservationIgnored private var todayRefresh: Task<Void, Never>?
+    private var isActive = true
 
     var inboxBadgeCount: Int { pendingActionsCount + clarificationsCount }
 
@@ -118,6 +119,7 @@ final class AppModel {
     }
 
     func refreshToday() async {
+        guard isActive else { return }
         if let todayRefresh {
             await todayRefresh.value
             return
@@ -130,7 +132,9 @@ final class AppModel {
                 isRefreshingToday = false
                 todayRefresh = nil
             }
-            lastOutcome = await coordinator.refresh()
+            let outcome = await coordinator.refresh()
+            guard isActive, !Task.isCancelled else { return }
+            lastOutcome = outcome
             snapshot = store.load()
         }
         todayRefresh = refresh
@@ -143,9 +147,11 @@ final class AppModel {
     // `refresh()`, so ticking a task off from inside the app left the home
     // screen widget showing it as still open.
     func completeToday(taskID: String) async {
+        guard isActive else { return }
         snapshot = try? store.applyOptimisticCompletion(taskID: taskID)
         try? queue.enqueue(PendingOp(kind: .completeTask(taskID)))
         await coordinator.drainQueue()
+        guard isActive, !Task.isCancelled else { return }
         snapshot = store.load()
         WidgetReload.reloadToday()
     }
@@ -156,6 +162,7 @@ final class AppModel {
         async let actions = try? client.pendingActions(status: "pending")
         async let clarifications = try? client.clarifications(status: "pending")
         let (a, c) = await (actions, clarifications)
+        guard isActive, !Task.isCancelled else { return }
         if let a { pendingActionsCount = a.count }
         if let c { clarificationsCount = c.count }
     }
@@ -212,6 +219,7 @@ final class AppModel {
     // MARK: - Revoke
 
     func revoke() async {
+        invalidateRefresh()
         // Local push state goes first; best-effort relay cleanup runs apart
         // from the credential revocation so a relay outage cannot delay it.
         await PushRegistrar.shared.forget(client: client)
@@ -220,8 +228,8 @@ final class AppModel {
         agentChat.forget()
         supervisorChat.forget()
         Credentials.clear()
-        try? SnapshotStore().delete()
-        try? OutboundQueue().clear()
+        try? store.delete()
+        try? queue.clear()
     }
 
     // Leaves this daemon without revoking: switching between the agent on
@@ -231,16 +239,23 @@ final class AppModel {
     // Leaving a Mac for the iPhone agent parks the Mac's queued work (task
     // completions made while it was unreachable) instead of dropping it;
     // switching back restores it.
-    func detach() {
+    func detach(parkedQueue: OutboundQueue = .parkedForServer()) {
+        invalidateRefresh()
         stopEventStream()
         agentChat.forget()
         supervisorChat.forget()
-        try? SnapshotStore().delete()
+        try? store.delete()
         if credentials.isEmbedded {
-            try? OutboundQueue().clear()
+            try? queue.clear()
         } else {
-            try? OutboundQueue().move(to: .parkedForServer())
+            try? queue.move(to: parkedQueue)
         }
+    }
+
+    private func invalidateRefresh() {
+        isActive = false
+        todayRefresh?.cancel()
+        stopEventStream()
     }
 }
 

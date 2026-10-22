@@ -8,10 +8,10 @@ import { isMobileRouteAllowed } from "./mobile-node.js";
 // unchanged: the main, not the worker, decides what that client may access.
 export function isMainDataRoute(method, pathname) {
   if (method === "POST" && pathname === "/nodes/enroll/exchange") return true;
-  // The coding supervisor and hardware capabilities belong to this worker.
-  // Tasks, conversations and workspace settings belong to the same main.
+  // Main authenticates the phone and selects the configured fleet computer.
+  // Hardware capabilities still belong to this worker.
   return isMobileRouteAllowed(method, pathname)
-    && !pathname.startsWith("/fleet/") && pathname !== "/nodes/speech-token";
+    && pathname !== "/nodes/speech-token";
 }
 
 function failure(res, status, error, message) {
@@ -44,8 +44,12 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
   } else if (ownerAuthenticated && !exchange) {
     // The local owner's token is NOT authority on main. Use only the saved
     // upstream enrollment, preserving every restriction main places on it.
-    const scoped = pairing.nodeEnrollmentConfirmed === true && pairing.nodeToken;
+    const scoped = pairing.nodeEnrollmentConfirmed === true && pairing.ownerProxyToken;
     const token = scoped || pairing.token;
+    if (!token) {
+      failure(res, 502, "main-pairing-required", "This worker needs owner authorization from main for workspace access. Reconnect this worker to main using the main owner's pairing token; the phone pairing has been kept.");
+      return true;
+    }
     if (token) headers.authorization = `Bearer ${token}`;
     if (scoped) headers["x-openagi-node-id"] = identity?.nodeId;
   } else if (!exchange) {

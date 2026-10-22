@@ -58,6 +58,35 @@ final class AppModelRefreshTests: XCTestCase {
     }
 
     @MainActor
+    func testDetachedRefreshCannotOverwriteTheNextPairingsSnapshot() async throws {
+        let model = model()
+        let body = try fixture("summary-populated")
+        let started = expectation(description: "old summary in flight")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        StubProtocol.handler = { request in
+            if request.url?.path == "/mobile/summary" {
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, body)
+        }
+        let refresh = Task { await model.refreshToday() }
+        let result = await XCTWaiter.fulfillment(of: [started], timeout: 2)
+        XCTAssertEqual(result, .completed)
+        model.detach(parkedQueue: .parkedForServer(directory: directory))
+        let nextSummary = try ProtocolDecoder.json.decode(MobileSummary.self, from: body)
+        _ = try model.store.storeFresh(summary: nextSummary, etag: "next-pairing")
+        release.signal()
+        await refresh.value
+        XCTAssertEqual(model.store.load()?.etag, "next-pairing")
+        XCTAssertNil(model.lastOutcome)
+        XCTAssertFalse(model.isRefreshingToday)
+        await model.refreshToday()
+        XCTAssertEqual(model.store.load()?.etag, "next-pairing")
+    }
+
+    @MainActor
     func testRefreshUpdatesTheVisibleTodayAndInvalidatesBothLists() async throws {
         let model = model()
         try servePopulatedData()

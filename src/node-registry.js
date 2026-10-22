@@ -199,7 +199,7 @@ export class NodeRegistry {
   }
 
   enroll(nodeId, token, {
-    now = Date.now(), platform = null, name = null, capabilities = []
+    now = Date.now(), platform = null, name = null, capabilities = [], ownerProxyToken = null
   } = {}) {
     if (typeof nodeId !== "string" || !/^[a-zA-Z0-9:_-]{1,240}$/.test(nodeId)) {
       throw new Error("nodeId is required and malformed");
@@ -210,6 +210,15 @@ export class NodeRegistry {
     if (typeof token !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(token)) {
       throw new Error("nodeToken must be a 32-byte base64url credential");
     }
+    if (ownerProxyToken !== null && (typeof ownerProxyToken !== "string"
+        || !/^[a-zA-Z0-9_-]{43}$/.test(ownerProxyToken) || ownerProxyToken === token)) {
+      throw new Error("ownerProxyToken must be a distinct 32-byte base64url credential");
+    }
+    // Granted only by the owner-authenticated enrollment endpoint. The
+    // operational worker token can never mint or substitute for this grant.
+    const proxyGrant = ownerProxyToken === null ? {} : {
+      ownerProxyTokenHash: crypto.createHash("sha256").update(ownerProxyToken, "utf8").digest("hex")
+    };
     const store = this._read();
     const tokenHash = crypto.createHash("sha256").update(token, "utf8").digest("hex");
     const existing = store.credentials[nodeId];
@@ -217,6 +226,10 @@ export class NodeRegistry {
       const actual = Buffer.from(tokenHash, "hex");
       const expected = Buffer.from(existing.tokenHash ?? "", "hex");
       if (actual.length === expected.length && crypto.timingSafeEqual(actual, expected)) {
+        if (ownerProxyToken !== null) {
+          Object.assign(existing, proxyGrant);
+          writeJsonAtomic(this.storePath, store);
+        }
         return { created: false };
       }
       const error = new Error("node is already enrolled; use its existing scoped credential");
@@ -231,6 +244,7 @@ export class NodeRegistry {
       : null;
     store.credentials[nodeId] = {
       tokenHash,
+      ...proxyGrant,
       createdAt: new Date(now).toISOString(),
       ...(normalizedPlatform ? { platform: normalizedPlatform } : {}),
       ...(normalizedName ? { name: normalizedName } : {}),
@@ -250,6 +264,15 @@ export class NodeRegistry {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
+  authenticateOwnerProxy(nodeId, token) {
+    if (typeof nodeId !== "string" || typeof token !== "string" || !token) return false;
+    const expected = this._read().credentials[nodeId]?.ownerProxyTokenHash;
+    if (typeof expected !== "string") return false;
+    const actual = crypto.createHash("sha256").update(token, "utf8").digest();
+    const hash = Buffer.from(expected, "hex");
+    return actual.length === hash.length && crypto.timingSafeEqual(actual, hash);
+  }
+
   enrollmentForToken(token) {
     if (typeof token !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(token)) return null;
     const actualHash = crypto.createHash("sha256").update(token, "utf8").digest("hex");
@@ -258,7 +281,7 @@ export class NodeRegistry {
     for (const [nodeId, credential] of Object.entries(store.credentials)) {
       const expected = Buffer.from(credential?.tokenHash ?? "", "hex");
       if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) continue;
-      const { tokenHash: _tokenHash, ...safe } = credential;
+      const { tokenHash: _tokenHash, ownerProxyTokenHash: _proxyHash, ...safe } = credential;
       return { nodeId, ...safe, capabilities: sanitizeNodeCapabilities(safe.capabilities) };
     }
     return null;
@@ -282,7 +305,7 @@ export class NodeRegistry {
     if (typeof nodeId !== "string" || !nodeId) return null;
     const credential = this._read().credentials[nodeId];
     if (!credential) return null;
-    const { tokenHash: _tokenHash, ...safe } = credential;
+    const { tokenHash: _tokenHash, ownerProxyTokenHash: _proxyHash, ...safe } = credential;
     return {
       nodeId,
       ...safe,
@@ -293,7 +316,7 @@ export class NodeRegistry {
   listEnrollments() {
     return Object.entries(this._read().credentials)
       .map(([nodeId, credential]) => {
-        const { tokenHash: _tokenHash, ...safe } = credential;
+        const { tokenHash: _tokenHash, ownerProxyTokenHash: _proxyHash, ...safe } = credential;
         return {
           nodeId,
           ...safe,

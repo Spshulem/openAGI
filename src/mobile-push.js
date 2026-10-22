@@ -179,7 +179,10 @@ export class MobilePush {
       // Observe closes before debouncing delivery: a close and reopen may
       // otherwise collapse into a snapshot that still contains the same ID.
       let questions;
-      try { questions = this.supervisor.getState()?.questions; }
+      try {
+        const state = this.supervisor.getState();
+        if (state?.questionsAuthoritative !== false) questions = state?.questions;
+      }
       catch (error) { this.report(`could not read supervisor state: ${error?.message ?? error}`); }
       if (Array.isArray(questions)) {
         const open = new Set(questions.filter((q) => (q?.status ?? "open") === "open").map((q) => q?.id));
@@ -266,6 +269,7 @@ export class MobilePush {
       return;
     }
     const now = this.now();
+    if (state?.questionsAuthoritative === false) return;
     const activity = buildActivity(state, new Date(now));
     const questions = Array.isArray(state?.questions)
       ? state.questions.filter((q) => typeof q?.id === "string" && q.id && (q.status ?? "open") === "open")
@@ -302,10 +306,10 @@ export class MobilePush {
     if (!questions) return { stop: false, backlog: false };
     const open = new Set(questions.map((q) => q.id));
     // Pruned to open ids, so a question that closes and reopens alerts again.
-    const notified = registration.notified.filter((id) => open.has(id));
+    const notified = this.store.get(registration.nodeId).notified.filter((id) => open.has(id));
+    this.store.setNotified(registration.nodeId, notified);
     // Permission affects delivery, not the history of questions that closed.
     if (registration.alerts === false) {
-      this.store.setNotified(registration.nodeId, notified);
       return { stop: false, backlog: false };
     }
     const unsent = [...new Map(questions.filter((q) => !notified.includes(q.id)).map((q) => [q.id, q])).values()];
@@ -317,10 +321,15 @@ export class MobilePush {
       if (result === "gone" || result === "renew") return { stop: true, backlog: false };
       // Retry unsent questions even if no new fleet event arrives.
       if (result !== "ok") break;
-      notified.push(question.id);
+      // A watched event can prune a closed question while the relay is
+      // answering. Never restore the pre-send snapshot over that pruning.
+      const current = this.store.get(registration.nodeId).notified;
+      const latest = this.supervisor.getState();
+      if (latest?.questions?.some((q) => q.id === question.id && (q.status ?? "open") === "open")) {
+        this.store.setNotified(registration.nodeId, [...new Set([...current, question.id])]);
+      }
       sent += 1;
     }
-    this.store.setNotified(registration.nodeId, notified);
     return { stop: false, backlog: unsent.length > sent };
   }
 

@@ -325,7 +325,15 @@ export class BuildBetterTaskSource {
   }
 
   // Mode-aware dispatcher invoked by the cron handler and triggerSync().
-  async sync({ now = new Date() } = {}) {
+  sync(opts = {}) {
+    // All triggers enter here, not just webhooks. Keep the entire read and
+    // import inside the same in-flight pass to prevent duplicate source IDs.
+    if (this._syncPromise) return this._syncPromise;
+    this._syncPromise = this._runSync(opts).finally(() => { this._syncPromise = null; });
+    return this._syncPromise;
+  }
+
+  async _runSync({ now = new Date() } = {}) {
     const out = {};
     if (this.ingestMode === "signals" || this.ingestMode === "both") {
       out.signals = await this.syncSignals({ now });
@@ -334,6 +342,7 @@ export class BuildBetterTaskSource {
       out.transcripts = await this.syncTranscripts({ now });
     }
     this.lastSyncResult = { at: new Date().toISOString(), ...out };
+    if (Object.values(out).every((result) => !result.skipped && !result.failed)) this.lastSyncedAt = now.toISOString();
     return out;
   }
 

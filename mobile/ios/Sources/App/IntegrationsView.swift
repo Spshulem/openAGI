@@ -105,7 +105,8 @@ private struct TaskIntegrationView: View {
         working = true
         defer { working = false }
         do {
-            let updated = try await model.client.updateTaskIntegration(id: integration.id, apiKey: removing ? nil : apiKey)
+            let updated = try await model.client.updateTaskIntegration(id: integration.id,
+                apiKey: removing ? nil : apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
             if let saved = updated.first(where: { $0.id == integration.id }) { integration = saved }
             apiKey = ""
             status = removing ? "API key removed." : "Saved. Sync tasks now to check access."
@@ -118,7 +119,11 @@ private struct TaskIntegrationView: View {
         do {
             let result = try await model.client.syncTaskIntegration(id: integration.id)
             status = result.ok ? "Synced. \(result.created ?? 0) new tasks." : (result.message ?? "Couldn't sync. Check your key and try again.")
-            if result.ok { await model.refreshData() }
+            if result.ok {
+                if let updated = try? await model.client.taskIntegrations(),
+                   let saved = updated.first(where: { $0.id == integration.id }) { integration = saved }
+                await model.refreshData()
+            }
         } catch { status = "Couldn't sync. Check your connection and try again." }
     }
 }

@@ -2,6 +2,40 @@ import XCTest
 @testable import OpenAGI
 
 final class AppModeTests: XCTestCase {
+    @MainActor
+    func testCancellingServerPairingRestoresQueuedWork() throws {
+        let previous = Credentials.load()
+        let previousBackup = Credentials.load(from: .server)
+        let previousMode = AppMode.current
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            Credentials.clear(); Credentials.clear(.server)
+            try? previous?.save(); try? previousBackup?.save(to: .server)
+            AppMode.current = previousMode
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let credentials = Credentials(server: URL(string: "https://daemon.example.com")!, nodeID: "mobile:switch", token: "synthetic-token")
+        try credentials.save()
+        Credentials.clear(.server)
+        AppMode.current = .server
+        let queue = OutboundQueue(directory: directory)
+        let parked = OutboundQueue.parkedForServer(directory: directory)
+        let pending = PendingOp(kind: .completeTask("offline-task"))
+        // Exercise both the legacy active credential and saved-server paths.
+        for hasBackup in [false, true] {
+            if hasBackup { try credentials.save(to: .server) }
+            try parked.enqueue(pending)
+            let session = AppSession()
+            session.chooseServer()
+            session.goBack(queue: queue, parkedQueue: parked)
+            XCTAssertEqual(session.phase, .ready(credentials))
+            XCTAssertEqual(queue.all(), [pending])
+            XCTAssertTrue(parked.all().isEmpty)
+            try queue.clear()
+        }
+    }
+
     func testInterruptedPhoneSetupStartsEmbeddedDaemon() {
         let local = Credentials(server: URL(string: "http://127.0.0.1:12345")!, nodeID: "mobile:local", token: "test-token")
         XCTAssertEqual(AppMode.resolved(credentials: local, storedMode: nil), .onPhone)

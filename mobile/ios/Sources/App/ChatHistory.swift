@@ -96,6 +96,16 @@ enum ChatHistoryMerge {
         var result = local
         for item in server {
             guard seen.insert(item.id).inserted else { continue }
+            if let index = result.firstIndex(where: {
+                $0.serverID == nil && !$0.isStreaming && !$0.isFailed
+                    && $0.role == role(item.role) && normalized($0.text) == normalized(item.text)
+                    && abs(item.at.timeIntervalSince($0.timestamp)) <= clockSlack
+            }) {
+                result[index] = ChatMessage(id: result[index].id, role: role(item.role), text: item.text,
+                                            timestamp: item.at, serverID: item.id,
+                                            sourceNodeId: item.sourceNodeId, sourceName: item.sourceName)
+                continue
+            }
             // A saved cache can include messages older than this page, with
             // a gap between it and the latest page. Insert into that gap,
             // keeping every existing message (including pending replies).

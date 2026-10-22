@@ -70,6 +70,7 @@ final class PushRegistrar {
     // Order this process first saw each activity in; the newest one is kept.
     private var activityFirstSeen: [String: Int] = [:]
     private var syncTask: Task<Void, Never>?
+    private var syncWaiters: Set<UUID> = []
     private var syncAgain = false
     // Bumped by forget(). A sync started under an older generation stops at
     // its next step instead of saving a pass or posting to the daemon.
@@ -168,29 +169,41 @@ final class PushRegistrar {
     func sync() async {
         guard !Task.isCancelled else { return }
         if Credentials.load()?.isEmbedded == true { return }
-        if let running = syncTask {
-            syncAgain = true
-            await withTaskCancellationHandler {
-                await running.value
-            } onCancel: {
-                running.cancel()
-            }
+        if let running = syncTask, running.isCancelled {
+            await running.value
+            await sync()
             return
         }
-        let task = Task { [weak self] in
-            guard let self else { return }
-            repeat {
-                self.syncAgain = false
-                await self.syncOnce()
-            } while self.syncAgain && !Task.isCancelled
+        let requestID = UUID()
+        syncWaiters.insert(requestID)
+        let task: Task<Void, Never>
+        if let running = syncTask {
+            syncAgain = true
+            task = running
+        } else {
+            task = Task { [weak self] in
+                guard let self else { return }
+                repeat {
+                    self.syncAgain = false
+                    await self.syncOnce()
+                } while self.syncAgain && !Task.isCancelled
+                self.syncTask = nil
+                self.syncWaiters.removeAll()
+            }
+            syncTask = task
         }
-        syncTask = task
         await withTaskCancellationHandler {
             await task.value
         } onCancel: {
-            task.cancel()
+            Task { @MainActor [weak self] in self?.cancelSyncWaiter(requestID) }
         }
-        syncTask = nil
+        syncWaiters.remove(requestID)
+    }
+
+    private func cancelSyncWaiter(_ id: UUID) {
+        guard syncWaiters.remove(id) != nil, syncWaiters.isEmpty else { return }
+        syncAgain = false
+        syncTask?.cancel()
     }
 
     private func syncOnce() async {
@@ -230,7 +243,7 @@ final class PushRegistrar {
             else { return }
             guard stillCurrent() else {
                 // Forgotten while the relay answered: retire what it made.
-                try? await relay.unregister(pass: fresh)
+                await Task { try? await relay.unregister(pass: fresh) }.value
                 return
             }
             // The replaced pass waits until the daemon holds the new one.
@@ -239,7 +252,7 @@ final class PushRegistrar {
             // Not durable means the next run mints yet another channel, so the
             // fresh one is retired and nothing is posted.
             guard savePass(current) else {
-                try? await relay.unregister(pass: fresh)
+                await Task { try? await relay.unregister(pass: fresh) }.value
                 return
             }
             minted = true

@@ -871,12 +871,15 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
     // permanently locked out of its stable node id.
     if (pairing.nodeToken && pairing.nodeEnrollmentConfirmed === true) return pairing.nodeToken;
     const nodeToken = pairing.nodeToken ?? randomBytes(32).toString("base64url");
+    const ownerProxyToken = pairing.ownerProxyToken ?? randomBytes(32).toString("base64url");
     pairing.nodeToken = nodeToken;
+    pairing.ownerProxyToken = ownerProxyToken;
     pairing.nodeEnrollmentConfirmed = false;
     writeNodeConfig({
       remote: pairing.remote,
       token: pairing.token,
       nodeToken,
+      ownerProxyToken,
       nodeEnrollmentConfirmed: false
     }, dataDir);
     const enrollmentController = new AbortController();
@@ -891,7 +894,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           "content-type": "application/json",
           ...(pairing.token ? { authorization: `Bearer ${pairing.token}` } : {})
         },
-        body: JSON.stringify({ nodeId: identity.nodeId, nodeToken }),
+        body: JSON.stringify({ nodeId: identity.nodeId, nodeToken, ownerProxyToken }),
         redirect: "manual",
         signal: enrollmentController.signal
       });
@@ -906,6 +909,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       remote: pairing.remote,
       token: null,
       nodeToken,
+      ownerProxyToken,
       nodeEnrollmentConfirmed: true
     }, dataDir);
     return nodeToken;
@@ -960,12 +964,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         || isMobileRouteAllowed(method, pathname);
       const mobileNodeRoute = requestEnrollment?.platform === MOBILE_PLATFORM
         && isMobileRouteAllowed(method, pathname);
+      const ownerProxyRoute = isMobileRouteAllowed(method, pathname)
+        && nodeRegistry.authenticateOwnerProxy(requestNodeId, scopedBearer);
       // On an authenticated main, operational node routes accept ONLY the
       // credential enrolled for this stable node id. A main-wide dashboard
       // token must never let one paired node poll another node's control queue.
-      const nodeScopedAuth = (nodeScopedRoute || nodeClientRoute || mobileNodeRoute)
+      const nodeScopedAuth = ownerProxyRoute || ((nodeScopedRoute || nodeClientRoute || mobileNodeRoute)
         ? g2NodeRouteAllowed && mobileRouteAllowed && nodeRegistry.authenticate(requestNodeId, scopedBearer)
-        : false;
+        : false);
       // Even Hub runs the G2 client in a phone webview whose Origin is not the
       // daemon's origin. Bypass only the browser-origin check, and only after
       // the request has proven its G2 scoped bearer credential (and, when
@@ -1022,7 +1028,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (!isPublicRoute(pathname) && !setupBypass) {
         const auth = nodeScopedRoute
           ? { ok: Boolean(requestNodeId && nodeScopedAuth), reason: "missing or invalid scoped node credential" }
-          : (nodeClientRoute || mobileNodeRoute) && requestNodeId
+          : (nodeClientRoute || mobileNodeRoute || ownerProxyRoute) && requestNodeId
             ? { ok: nodeScopedAuth, reason: "missing or invalid scoped node credential" }
             : checkAuth(req, url, getAuthToken());
         if (!auth.ok) {
@@ -1283,7 +1289,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           return sendJson(res, 400, { error: "nodeId and nodeToken are required" });
         }
         try {
-          const enrollment = nodeRegistry.enroll(body.nodeId, body.nodeToken);
+          const enrollment = nodeRegistry.enroll(body.nodeId, body.nodeToken, { ownerProxyToken: body.ownerProxyToken ?? null });
           return sendJson(res, 200, { nodeId: body.nodeId, enrolled: true, created: enrollment.created });
         } catch (error) {
           if (error.code === "NODE_ALREADY_ENROLLED") {

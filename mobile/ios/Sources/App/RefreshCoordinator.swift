@@ -24,6 +24,7 @@ public actor RefreshCoordinator {
     // or a refresh will hand back the state their tap was meant to change.
     public func refresh() async -> RefreshOutcome {
         await drainQueue()
+        guard !Task.isCancelled else { return .offline }
         // Whole-branch review finding: `heartbeat()` existed, was tested, and
         // was never called by anything, so a paired phone's `lastSeen` never
         // advanced past enrollment. This is the one place that covers
@@ -32,21 +33,27 @@ public actor RefreshCoordinator {
         // convenience, never something a refresh should fail over.
         _ = try? await client.heartbeat()
         do {
-            switch try await client.summary(ifNoneMatch: store.load()?.etag) {
-            case .unchanged:
-                try? store.touchFetchedAt()
-                reloadWidgets()
-                return .unchanged
-            case let .fresh(summary, etag):
-                let snapshot = try store.storeFresh(summary: summary, etag: etag)
-                reloadWidgets()
-                return .updated(snapshot)
+            let response = try await client.summary(ifNoneMatch: store.load()?.etag)
+            // Pairing transitions run on MainActor. Keep the cancellation
+            // check and disk write together there so detach cannot delete
+            // the snapshot between the check and an old response's write.
+            return try await MainActor.run {
+                try Task.checkCancellation()
+                switch response {
+                case .unchanged:
+                    try? store.touchFetchedAt()
+                    reloadWidgets()
+                    return .unchanged
+                case let .fresh(summary, etag):
+                    let snapshot = try store.storeFresh(summary: summary, etag: etag)
+                    reloadWidgets()
+                    return .updated(snapshot)
+                }
             }
         } catch DaemonError.unauthorized {
             return .unauthorized
         } catch DaemonError.mainConnection(let issue) {
-            try? store.recordRefreshFailure()
-            reloadWidgets()
+            await recordFailureUnlessCancelled()
             return .mainUnavailable(issue)
         } catch {
             // Whole-branch review finding: this outcome never reached the
@@ -54,8 +61,7 @@ public actor RefreshCoordinator {
             // no way to tell "daemon has been down for hours" from "healthy,
             // just polled recently" until the unrelated 60-minute staleness
             // threshold happened to also trip.
-            try? store.recordRefreshFailure()
-            reloadWidgets()
+            await recordFailureUnlessCancelled()
             return .offline
         }
     }
@@ -77,22 +83,34 @@ public actor RefreshCoordinator {
 
     public func drainQueue() async {
         for op in queue.all() {
+            guard !Task.isCancelled else { return }
             switch op.kind {
             case let .completeTask(taskID):
                 do {
                     try await client.complete(taskID: taskID)
+                    try Task.checkCancellation()
                     try? queue.remove(id: op.id)
                 } catch DaemonError.notFound, DaemonError.conflict {
+                    guard !Task.isCancelled else { return }
                     // The server has already moved on. Replaying cannot help.
                     try? queue.remove(id: op.id)
                 } catch {
+                    guard !Task.isCancelled else { return }
                     try? queue.recordAttempt(id: op.id)
                 }
             }
         }
     }
 
-    private func reloadWidgets() {
+    private func recordFailureUnlessCancelled() async {
+        await MainActor.run {
+            guard !Task.isCancelled else { return }
+            try? store.recordRefreshFailure()
+            reloadWidgets()
+        }
+    }
+
+    nonisolated private func reloadWidgets() {
         WidgetCenter.shared.reloadTimelines(ofKind: TodayWidgetKind.value)
     }
 }

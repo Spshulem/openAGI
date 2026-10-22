@@ -9,6 +9,17 @@ final class ChatHistoryMergeTests: XCTestCase {
 
     private func at(_ seconds: TimeInterval) -> Date { base.addingTimeInterval(seconds) }
 
+    func testOlderPagesReconcileLegacyCacheWithoutDuplicatingRepeatedMessages() {
+        let first = ChatMessage(role: .user, text: "same question", timestamp: at(0))
+        let second = ChatMessage(role: .user, text: "same question", timestamp: at(10))
+        let latest = ChatMessage(role: .assistant, text: "latest", timestamp: at(100), serverID: "cursor")
+        let page = [server("older-1", .user, "same question", 1), server("older-2", .user, "same question", 11)]
+        let merged = ChatHistoryMerge.prependOlder(local: [first, second, latest], server: page, before: "cursor")
+        XCTAssertEqual(merged.map(\.id), [first.id, second.id, latest.id])
+        XCTAssertEqual(merged.map(\.serverID), ["older-1", "older-2", "cursor"])
+        XCTAssertEqual(ChatHistoryMerge.prependOlder(local: merged, server: page, before: "cursor"), merged)
+    }
+
     private func server(_ id: String, _ role: ConversationMessage.Role, _ text: String, _ seconds: TimeInterval,
                         source: String? = nil) -> ConversationMessage {
         ConversationMessage(id: id, role: role, text: text, at: at(seconds), sourceNodeId: source, sourceName: source.map { "\($0) name" })
