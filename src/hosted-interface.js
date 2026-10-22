@@ -1,3 +1,4 @@
+import { renderLoginPage } from "./dashboard-login.js";
 import { navigation, shellStyles } from "./app-shell.js";
 import http from "node:http";
 import fsSync from "node:fs";
@@ -1038,7 +1039,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           const wantsHtml = method === "GET" && accept.includes("text/html");
           if (wantsHtml && getAuthToken()) {
             const next = pathname + url.search;
-            return sendHtml(res, 401, renderLoginPage(auth.reason ?? "auth required", next));
+            return sendHtml(res, 401, renderLoginPage(auth.reason ?? "auth required", next, { isWorker: Boolean(readNodeConfig(dataDir)?.remote) }));
           }
           res.writeHead(401, {
             "content-type": "application/json; charset=utf-8",
@@ -1059,7 +1060,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         const token = form.token ?? "";
         const next = (form.next && form.next.startsWith("/") && !form.next.startsWith("//")) ? form.next : "/";
         if (!expected || token !== expected) {
-          return sendHtml(res, 401, renderLoginPage("invalid token", next));
+          return sendHtml(res, 401, renderLoginPage("That token does not match this server. Tokens from other computers cannot sign you in here.", next, { isWorker: Boolean(readNodeConfig(dataDir)?.remote) }));
         }
         res.writeHead(302, {
           Location: next,
@@ -4246,37 +4247,6 @@ function sendHtml(res, status, value, cookies = []) {
   if (cookies.length) headers["Set-Cookie"] = cookies;
   res.writeHead(status, headers);
   res.end(html);
-}
-
-function renderLoginPage(reason, next = "/") {
-  // Sanitise the redirect target so an attacker can't bounce the user
-  // off-site after sign-in.
-  const safeNext = typeof next === "string" && next.startsWith("/") && !next.startsWith("//") ? next : "/";
-  return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>OpenAGI · auth</title>
-<style>body{font:14px/1.5 ui-sans-serif,system-ui;background:#0e1411;color:#e8efea;display:grid;place-items:center;min-height:100vh;margin:0}
-form{background:#161d19;border:1px solid #2a352f;border-radius:10px;padding:24px;width:min(420px,90vw)}
-h1{margin:0 0 4px;font-size:18px}p{color:#8da59a;margin:6px 0 16px;font-size:13px}
-input{width:100%;padding:9px 12px;background:#0e1411;color:#e8efea;border:1px solid #2a352f;border-radius:6px;font:inherit;margin-bottom:10px}
-button{background:#6fe1b1;color:#002219;border:0;padding:9px 14px;border-radius:6px;font-weight:700;cursor:pointer;width:100%}
-.err{color:#f08080;margin-bottom:10px;font-size:12px}
-.hint{color:#8da59a;font-size:12px;margin-top:14px}
-.hint code{background:#0e1411;padding:2px 5px;border-radius:3px;border:1px solid #2a352f}</style></head>
-<body><form method="POST" action="/sign-in" id="loginForm" enctype="application/x-www-form-urlencoded">
-<h1>OpenAGI</h1><p>This daemon requires authentication.</p>
-${reason ? `<div class="err">${escapeHtmlForLogin(reason)}</div>` : ""}
-<input name="token" placeholder="Bearer token" autofocus required spellcheck="false" autocapitalize="off">
-<input type="hidden" name="next" value="${escapeHtmlForLogin(safeNext)}">
-<button type="submit">Sign in</button>
-<div class="hint">Find your token in your data dir's <code>.env</code> as <code>OPENAGI_AUTH_TOKEN</code>.<br>If you're running the macOS app, click the menubar icon → <strong>Copy auth token</strong>.</div>
-</form>
-</body></html>`;
-}
-
-// SEC-4: single quotes too — this value lands in an attribute, and an
-// attribute is just as happy to be delimited by ' as by ".
-function escapeHtmlForLogin(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
 }
 
 function sendJson(res, status, value) {
