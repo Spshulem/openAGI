@@ -12,8 +12,6 @@ import okhttp3.Request
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-data class DiscoveredServer(val address: String, val name: String)
-
 // Only DNS-SD announcements and addresses supplied/saved by the person are
 // checked. No subnet sweep, tailnet credentials, pairing codes or owner tokens.
 class ServerDiscovery(context: Context) {

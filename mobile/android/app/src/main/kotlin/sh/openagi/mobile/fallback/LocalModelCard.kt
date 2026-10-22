@@ -46,17 +46,18 @@ internal fun LocalModelCard(
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Gemini Nano", style = MaterialTheme.typography.titleMedium)
             Text("On-device model · managed by Google AICore", style = MaterialTheme.typography.bodyMedium)
-            Text("Runs on this phone without an API key. Google controls the model version and download availability.", style = MaterialTheme.typography.bodySmall)
+            Text("Download Gemini Nano to this phone through Google AICore. No server or API key is needed. Google chooses the model version and which phones support it.", style = MaterialTheme.typography.bodySmall)
+            Text("After setup, replies are generated on this phone. This separate chat does not sync your server’s Today, Tasks or Inbox.", style = MaterialTheme.typography.bodySmall)
             Text(progress?.description ?: note, modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
             if (working) {
                 val fraction = progress?.fraction
                 if (fraction == null) LinearProgressIndicator(Modifier.fillMaxWidth())
                 else LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
-                Text("First setup may take several minutes. You can leave this screen or choose another provider.", style = MaterialTheme.typography.bodySmall)
+                Text("Keep an internet connection for the first download. Setup may take several minutes. You can leave or choose another provider.", style = MaterialTheme.typography.bodySmall)
                 if (onCancel != null) TextButton(onClick = onCancel) { Text("Cancel setup") }
             } else {
                 OutlinedButton(enabled = canPrepare, onClick = onPrepare) {
-                    Text(if (needsDownload) "Download Gemini Nano" else "Check Gemini Nano")
+                    Text(if (needsDownload) "Download Gemini Nano" else "Check Gemini Nano availability")
                 }
             }
         }

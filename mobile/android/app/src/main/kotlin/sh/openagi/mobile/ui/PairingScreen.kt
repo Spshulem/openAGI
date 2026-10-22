@@ -70,7 +70,7 @@ fun PairingScreen(
         Text("Pair with OpenAGI", style = OpenAGIType.screenTitle, color = MaterialTheme.colorScheme.onBackground)
         savedServer?.let { Text("Your saved server is $it. Opening this screen does not remove its pairing.", style = OpenAGIType.secondary) }
         OutlinedButton(onClick = { showingFallback = true }) { Text("Use a local or hosted model") }
-        Text("No server is needed for local Gemini Nano chat on a supported phone. A model download may be required.", style = OpenAGIType.secondary)
+        Text("Local chat uses Gemini Nano on this Android phone. The first download needs internet and Google AICore support; it does not connect to your server or sync its tasks.", style = OpenAGIType.secondary)
         ServerDiscoverySection(serverText, savedServer) { serverText = it; awaitingSave = null }
         Text("How to get a code", style = OpenAGIType.section)
         Text("On your main server's dashboard, open Nodes → Connect a phone. On Mac, use Connect a phone… in the OpenAGI menu. You can also run the command below on main. A worker Mac cannot issue main-server codes. You don't need to copy an auth token.", style = OpenAGIType.secondary)
