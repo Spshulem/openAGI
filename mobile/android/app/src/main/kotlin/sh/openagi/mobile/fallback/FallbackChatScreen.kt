@@ -16,8 +16,11 @@ import androidx.compose.ui.window.DialogProperties
 import com.google.mlkit.genai.common.FeatureStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import sh.openagi.mobile.ui.components.FoldSafeSinglePane
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -34,6 +37,8 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
     var busy by remember { mutableStateOf(false) }
     var localStatus by remember { mutableStateOf<Int?>(null) }
     var localNote by remember { mutableStateOf("Checking local model…") }
+    var preparingLocal by remember { mutableStateOf(false) }
+    var localPreparation by remember { mutableStateOf<Job?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var vault by remember { mutableStateOf<FallbackVault?>(null) }
     var loading by remember { mutableStateOf(true) }
@@ -61,7 +66,7 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
             }
             modelDraft = model
             if (provider == FallbackProvider.LOCAL) {
-                localStatus = LocalChat.status()
+                localStatus = withTimeout(20_000) { LocalChat.status() }
                 localNote = when (localStatus) {
                     FeatureStatus.AVAILABLE -> "Ready on this phone"
                     FeatureStatus.DOWNLOADABLE -> "Model download needed"
@@ -87,17 +92,45 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
         scope.launch {
             try {
                 withContext(Dispatchers.IO) { vault?.saveHistory(selectedProvider, selectedModel, lines) }
-                val result = if (selectedProvider == FallbackProvider.LOCAL) LocalChat.reply(lines)
+                val result = if (selectedProvider == FallbackProvider.LOCAL) withTimeout(90_000) { LocalChat.reply(lines) }
                 else {
                     val secret = withContext(Dispatchers.IO) { vault?.key(selectedProvider) } ?: throw FallbackException("Save your ${selectedProvider.title} API key first.")
                     FallbackTransport.reply(selectedProvider, selectedModel, secret, lines)
                 }
                 lines = lines + FallbackLine("assistant", result)
                 withContext(Dispatchers.IO) { vault?.saveHistory(selectedProvider, selectedModel, lines) }
-            } catch (e: CancellationException) { throw e }
+            } catch (_: TimeoutCancellationException) { error = "The local model took too long to reply. Your message is saved; you can retry or choose a hosted provider." }
+            catch (e: CancellationException) { throw e }
             catch (e: FallbackException) { error = e.message }
             catch (_: Exception) { error = "Couldn't finish the reply. Your message is saved. Check your connection or choose another model." }
             finally { busy = false }
+        }
+    }
+
+    fun selectProvider(choice: FallbackProvider) {
+        if (provider == choice) return
+        localPreparation?.cancel()
+        localPreparation = null
+        loading = true
+        provider = choice
+    }
+
+    fun prepareLocal() {
+        preparingLocal = true
+        localNote = "Preparing Gemini Nano… You can cancel or choose a hosted provider."
+        localPreparation = scope.launch {
+            try {
+                val status = withTimeout(20_000) { LocalChat.status() }
+                if (status == FeatureStatus.DOWNLOADABLE || status == FeatureStatus.DOWNLOADING) {
+                    withTimeout(15 * 60_000L) { LocalChat.download { localNote = it } }
+                }
+                localStatus = withTimeout(20_000) { LocalChat.status() }
+                localNote = if (localStatus == FeatureStatus.AVAILABLE) "Ready on this phone" else "Model isn't ready. Keep Wi-Fi on and check again shortly, or choose a hosted provider."
+            } catch (_: TimeoutCancellationException) {
+                localNote = "The local model isn't ready yet. Check again later or choose a hosted provider."
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { localNote = "Couldn't prepare Gemini Nano on this device. You can use a hosted provider." }
+            finally { preparingLocal = false }
         }
     }
 
@@ -118,25 +151,26 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
                                 item { Text("Choose a model", style = MaterialTheme.typography.titleMedium) }
                                 itemsIndexed(FallbackProvider.entries) { _, choice ->
                                     Row(Modifier.fillMaxWidth()) {
-                                        RadioButton(selected = provider == choice, onClick = { if (provider != choice) { loading = true; provider = choice } }, enabled = !busy)
-                                        TextButton(onClick = { if (provider != choice) { loading = true; provider = choice } }, enabled = !busy) { Text(choice.title) }
+                                        RadioButton(selected = provider == choice, onClick = { selectProvider(choice) }, enabled = !busy)
+                                        TextButton(onClick = { selectProvider(choice) }, enabled = !busy) { Text(choice.title) }
                                     }
                                 }
                                 if (provider == FallbackProvider.LOCAL) {
                                     item { Text(localNote) }
                                     item {
-                                        OutlinedButton(enabled = !busy && !loading, onClick = {
-                                            busy = true
-                                            scope.launch {
-                                                try {
-                                                    if (LocalChat.status() == FeatureStatus.DOWNLOADABLE) LocalChat.download { localNote = it }
-                                                    localStatus = LocalChat.status()
-                                                    localNote = if (localStatus == FeatureStatus.AVAILABLE) "Ready on this phone" else "Model isn't ready. Keep Wi-Fi on and check again shortly, or choose a hosted provider."
-                                                } catch (e: CancellationException) { throw e }
-                                                catch (_: Exception) { localNote = "Couldn't prepare Gemini Nano on this device. You can use a hosted provider." }
-                                                finally { busy = false }
+                                        if (preparingLocal) {
+                                            Column {
+                                                LinearProgressIndicator(Modifier.fillMaxWidth())
+                                                TextButton(onClick = {
+                                                    localPreparation?.cancel()
+                                                    localNote = "You can check the local model again or choose a hosted provider."
+                                                }) { Text("Cancel preparation") }
                                             }
-                                        }) { Text(if (localStatus == FeatureStatus.DOWNLOADABLE) "Download local model" else "Check local model") }
+                                        } else {
+                                            OutlinedButton(enabled = !busy && !loading, onClick = { prepareLocal() }) {
+                                                Text(if (localStatus == FeatureStatus.DOWNLOADABLE) "Download local model" else "Check local model")
+                                            }
+                                        }
                                     }
                                 } else {
                                     item { OutlinedTextField(value = modelDraft, onValueChange = { modelDraft = it }, label = { Text("Model ID") }, enabled = !busy && !loading, singleLine = true, modifier = Modifier.fillMaxWidth()) }
@@ -164,7 +198,7 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
                                 }
                                 item { Text("Only messages written in this separate chat go to the selected provider. Keys are encrypted on this device and sent only to that provider. Provider usage may be billed to your account. Your OpenAGI pairing and server history stay saved.", style = MaterialTheme.typography.bodySmall) }
                             }
-                            Button(modifier = Modifier.fillMaxWidth(), enabled = !busy && !loading && vault != null && (provider == FallbackProvider.LOCAL || (hasKey && modelDraft.isNotBlank())), onClick = {
+                            Button(modifier = Modifier.fillMaxWidth(), enabled = !busy && !loading && vault != null && (if (provider == FallbackProvider.LOCAL) localStatus == FeatureStatus.AVAILABLE && !preparingLocal else hasKey && modelDraft.isNotBlank()), onClick = {
                                 busy = true
                                 scope.launch {
                                     try {
