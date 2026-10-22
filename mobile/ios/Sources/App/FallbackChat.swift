@@ -87,7 +87,7 @@ enum FallbackTransport {
     static let instructions = "You are OpenAGI in direct chat mode. You can help with writing, reasoning and planning. You have no access to the user's server, tasks, integrations, files or tools. Never claim to have performed actions there."
 
     static func request(provider: FallbackProvider, model: String, key: String, lines: [FallbackLine]) throws -> URLRequest {
-        guard provider != .local, !key.isEmpty, !model.isEmpty, model.count <= 160,
+        guard provider != .local, !key.isEmpty, !key.contains("\n"), !key.contains("\r"), !model.isEmpty, model.count <= 160,
               !model.contains(where: { $0.isWhitespace }) else { throw FallbackFailure.message("Choose a model and save its API key first.") }
         let messages = lines.suffix(20).map { ["role": $0.role, "content": String($0.text.prefix(12_000))] }
         let url: URL
@@ -182,12 +182,16 @@ final class FallbackChatModel {
     var error: String?
     var sending = false
     var savedKey = false
+    init() {
+        select(FallbackProvider(rawValue: UserDefaults.standard.string(forKey: "direct-chat.provider") ?? "") ?? .local)
+    }
     private var historyURL: URL {
         let name = SHA256.hash(data: Data("\(provider.rawValue):\(model)".utf8)).map { String(format: "%02x", $0) }.joined()
         return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("direct-chat-\(name).json")
     }
     func select(_ provider: FallbackProvider) {
         self.provider = provider
+        UserDefaults.standard.set(provider.rawValue, forKey: "direct-chat.provider")
         model = UserDefaults.standard.string(forKey: "direct-chat.model.\(provider.rawValue)") ?? provider.defaultModel
         load()
     }
@@ -217,7 +221,7 @@ final class FallbackChatModel {
             save()
         } catch is CancellationError { error = "Reply stopped. Your message is saved." }
         catch let failure as FallbackFailure { error = failure.localizedDescription }
-        catch { error = "Couldn't finish the reply. Check your internet connection or choose a local model. Your message is saved." }
+        catch { self.error = "Couldn't finish the reply. Check your internet connection or choose a local model. Your message is saved." }
     }
 }
 

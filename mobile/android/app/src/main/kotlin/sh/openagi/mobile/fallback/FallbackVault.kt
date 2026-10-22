@@ -16,6 +16,7 @@ class FallbackVault(context: Context) {
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
 
     fun key(provider: FallbackProvider): String? = store.getString("key.${provider.name}", null)
+    fun provider(): FallbackProvider = runCatching { FallbackProvider.valueOf(store.getString("selected-provider", null).orEmpty()) }.getOrDefault(FallbackProvider.LOCAL)
     fun saveKey(provider: FallbackProvider, raw: String) {
         val key = raw.trim()
         if (key.isEmpty() || key.any { it == '\n' || it == '\r' }) throw FallbackException("Enter a valid API key.")
@@ -24,7 +25,7 @@ class FallbackVault(context: Context) {
     fun removeKey(provider: FallbackProvider) { if (!store.edit().remove("key.${provider.name}").commit()) throw FallbackException("Couldn't remove the saved key.") }
     fun model(provider: FallbackProvider) = store.getString("model.${provider.name}", null) ?: provider.defaultModel
     fun saveModel(provider: FallbackProvider, model: String) {
-        if (!store.edit().putString("model.${provider.name}", model).commit()) throw FallbackException("Couldn't save Chat options.")
+        if (!store.edit().putString("model.${provider.name}", model).putString("selected-provider", provider.name).commit()) throw FallbackException("Couldn't save Chat options.")
     }
     private fun historyKey(provider: FallbackProvider, model: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest("${provider.name}:$model".toByteArray()).joinToString("") { "%02x".format(it) }
