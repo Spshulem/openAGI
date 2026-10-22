@@ -23,11 +23,21 @@ final class NativeNavigationTests: XCTestCase {
             // Native lists create offscreen accessibility elements lazily.
             // Scroll the active form, rather than the presenting screen.
             for _ in 0..<8 {
-                if target.exists && target.isHittable {
+                // Duo's vertical toolbar can leave a row hittable while its
+                // center is still clipped by the form's bottom edge. Bring
+                // the whole row into the content area before tapping it.
+                let viewport = list.frame.insetBy(dx: 16, dy: 88)
+                if target.exists && target.isHittable && viewport.contains(target.frame) {
                     target.tap()
                     return
                 }
-                list.swipeUp()
+                let start = list.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.65))
+                let end = list.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: 0.35))
+                if target.exists && target.frame.midY < viewport.minY {
+                    end.press(forDuration: 0.1, thenDragTo: start)
+                } else {
+                    start.press(forDuration: 0.1, thenDragTo: end)
+                }
             }
         }
         XCTAssertTrue(target.waitForExistence(timeout: 10), "Missing \(id)")
@@ -78,10 +88,14 @@ final class NativeNavigationTests: XCTestCase {
     func testWideNavigationIsOnTheRightAndChatCanBeClosed() {
         let app = launch()
         let rail = element(app, "right-navigation")
-        guard rail.waitForExistence(timeout: 3) else {
-            XCTAssertTrue(app.tabBars.buttons["Chat"].exists)
+        guard app.frame.width >= 760 && app.frame.height >= 600 else {
+            // Compact Duo uses a native vertical tab toolbar, which XCTest
+            // exposes as buttons rather than a UITabBar.
+            tab(app, "Chat")
+            XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
             return
         }
+        XCTAssertTrue(rail.waitForExistence(timeout: 5), "Expanded windows must use right-side navigation")
         XCTAssertGreaterThan(rail.frame.minX, app.frame.midX)
         let close = app.buttons["close-chat-pane"]
         if close.exists { close.tap() }
