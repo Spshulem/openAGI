@@ -2139,8 +2139,19 @@ export class FleetSupervisor {
     const cwds = [...new Set(inScope.map((thread) => thread.cwd).filter(Boolean))];
     const read = this.deps.readLocalGit ?? github.readLocalGit;
     const results = new Map();
+    // Latest activity per worktree: new agent work invalidates its cached
+    // untracked scan. Worktrees out of scope drop out of the cache.
+    const activity = new Map();
+    for (const thread of inScope) {
+      if (thread.cwd && String(thread.lastActivityAt ?? "") > String(activity.get(thread.cwd) ?? "")) activity.set(thread.cwd, thread.lastActivityAt);
+    }
+    this.untrackedCache ??= new Map();
+    for (const cwd of this.untrackedCache.keys()) if (!cwds.includes(cwd)) this.untrackedCache.delete(cwd);
+    const now = this.now();
     try {
-      const values = await withTimeout(mapLimit(cwds, GIT_CONCURRENCY, (cwd) => read(cwd, config, { run })), SOURCE_TIMEOUT_MS, "git");
+      const values = await withTimeout(mapLimit(cwds, GIT_CONCURRENCY, (cwd) => read(cwd, config, {
+        run, cache: this.untrackedCache, activityAt: activity.get(cwd) ?? null, now
+      })), SOURCE_TIMEOUT_MS, "git");
       cwds.forEach((cwd, index) => { if (values[index]) results.set(cwd, values[index]); });
     } catch (error) {
       sourceErrors.git = clampText(error?.message, 200);

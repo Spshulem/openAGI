@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { resolveFleetConfig } from "../src/fleet/contracts.js";
 import {
-  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStateLite, fetchPrStates, findPrForBranch, normalizePr, readLocalGit
+  buildPrQuery, DEFAULT_UI_PATH_PREFIXES, fetchPrStateLite, fetchPrStates, findPrForBranch, normalizePr, readLocalGit, UNTRACKED_REUSE_MS
 } from "../src/fleet/sources/github.js";
 
 const BBAPP = "buildbetter-app/buildbetter";
@@ -522,6 +522,35 @@ test("readLocalGit reports uncommitted work, and unknown when git status fails",
   // git status did not answer: the worktree is unknown, not clean.
   const failing = gitRunner(base);
   assert.equal((await readLocalGit("/work/tree", config(), { run: failing.run })).dirty, null);
+});
+
+test("readLocalGit reuses the untracked scan while head and activity hold", async () => {
+  const base = { "rev-parse HEAD": HEAD_6878, "rev-parse --abbrev-ref HEAD": "b", "remote get-url origin": "git@github.com:Spshulem/openAGI.git" };
+  const scans = (calls) => calls.filter((call) => call.args.includes("--untracked-files=normal")).length;
+  const cache = new Map();
+  const opts = (run, extra = {}) => ({ run, cache, activityAt: "2026-10-18T10:00:00Z", now: 1_000, ...extra });
+  const first = gitRunner({ ...base, "status --porcelain --untracked-files=normal": "?? notes/new.md" });
+  assert.equal((await readLocalGit("/work/tree", config(), opts(first.run))).dirty, true);
+  assert.equal(scans(first.calls), 1);
+  // Same head and activity: only the cheap tracked read runs, the untracked answer is kept.
+  const again = gitRunner({ ...base, "status --porcelain --untracked-files=no": "" });
+  assert.equal((await readLocalGit("/work/tree", config(), opts(again.run, { now: 2_000 }))).dirty, true);
+  assert.equal(scans(again.calls), 0);
+  // A tracked edit still shows on a cached tick; a failed read is unknown.
+  const edited = gitRunner({ ...base, "status --porcelain --untracked-files=no": " M src/a.js" });
+  assert.equal((await readLocalGit("/work/tree", config(), opts(edited.run, { now: 2_000 }))).dirty, true);
+  assert.equal((await readLocalGit("/work/tree", config(), opts(gitRunner(base).run, { now: 2_000 }))).dirty, null);
+  // New activity, a new head, or an old answer each rescan.
+  for (const extra of [{ activityAt: "2026-10-18T11:00:00Z" }, { now: 1_000 + UNTRACKED_REUSE_MS }]) {
+    cache.set("/work/tree", { key: `${HEAD_6878}|2026-10-18T10:00:00Z`, at: 1_000, untracked: true });
+    const rescan = gitRunner({ ...base, "status --porcelain --untracked-files=normal": "" });
+    assert.equal((await readLocalGit("/work/tree", config(), opts(rescan.run, extra))).dirty, false);
+    assert.equal(scans(rescan.calls), 1);
+  }
+  cache.set("/work/tree", { key: `${"c".repeat(40)}|2026-10-18T10:00:00Z`, at: 1_000, untracked: true });
+  const moved = gitRunner({ ...base, "status --porcelain --untracked-files=normal": "" });
+  assert.equal((await readLocalGit("/work/tree", config(), opts(moved.run))).dirty, false);
+  assert.equal(scans(moved.calls), 1);
 });
 
 test("readLocalGit returns all null for a missing dir or a throwing runner", async () => {

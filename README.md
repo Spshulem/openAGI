@@ -573,5 +573,23 @@ content is returned. Query corrections rank only same-scope candidates, so
 shared matches cannot crowd out a specialist's own facts. Legacy memories
 without a scope belong to `main` for corrections.
 
-This protects future corrections; it does not restore previously superseded
-memories or rewrite existing data.
+Tier promotion preserves memory IDs, so saved references, correction links, and
+derived-principle lineage remain valid across promotion and restart. This protects
+future promotions; it does not reconstruct links lost by earlier versions.
+
+Nightly condensation excludes superseded facts from both model input and principle
+lineage. If a source is corrected or removed while distillation is running, the
+result is discarded; queued groups are rechecked before model dispatch as well.
+Correcting a source also supersedes its existing same-scope derived principles,
+removes their vectors, and releases surviving source notes for later condensation
+when the replacement correction is in an input tier. Direct principle corrections
+remain in long-term memory; their source notes stay consumed so a later run cannot
+recreate the obsolete conclusion without its correction. Vector deletion also
+cancels pending embedding writes, preventing retired principles from reappearing
+in semantic novelty measurements. These changes persist across restart.
+Historical rows remain available for audit;
+principles from an earlier version are invalidated when their source is corrected,
+without a bulk rewrite of existing data.
+
+No bulk migration runs automatically, and previously superseded memories are
+not restored.

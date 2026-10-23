@@ -330,10 +330,36 @@ export class MemorySystem {
       { strength: 1.0, tier: targetTier }
     );
 
+    // A principle remains evidence for recall even after its raw source was
+    // corrected. Invalidate the same-scope dependency closure as part of this
+    // correction, so stale conclusions and their vectors cannot survive it.
+    const supersededIds = new Set(targets.map((target) => target.id));
+    for (const target of targets) {
+      for (const dependent of this.items.values()) {
+        if (dependent.kind !== "principle" || dependent.metadata?.supersededBy
+          || (dependent.scope ?? "main") !== scope || supersededIds.has(dependent.id)
+          || !Array.isArray(dependent.metadata?.sources)
+          || !dependent.metadata.sources.includes(target.id)) continue;
+        supersededIds.add(dependent.id);
+        targets.push(dependent);
+      }
+    }
+
     const at = nowIso();
     for (const target of targets) {
       target.metadata = { ...target.metadata, supersededBy: corrected.id, supersededAt: at };
       this.dropPrincipleVector(target.id);
+    }
+
+    // Release evidence only when the replacement can join the next distillation.
+    // Long-tier corrections (including direct principle corrections) are not
+    // condenser inputs: requeuing their unchanged notes would recreate the old
+    // conclusion without the correction. Retain those consumption markers.
+    for (const source of this.items.values()) {
+      if (corrected.tier !== "long" && (source.scope ?? "main") === scope && !source.metadata?.supersededBy
+        && supersededIds.has(source.metadata?.condensedInto)) {
+        delete source.metadata.condensedInto;
+      }
     }
 
     return { item: corrected, superseded: targets };
@@ -677,7 +703,8 @@ export class MemorySystem {
   promote(item, tier, now) {
     const promoted = {
       ...item,
-      id: createId(`mem_${tier}`),
+      // Tier changes preserve identity: principle sources and correction links
+      // must still address this evidence after promotion and persistence.
       tier,
       content: this.compressForTier(item.content, tier, item.fidelity),
       createdAt: now,
@@ -686,7 +713,6 @@ export class MemorySystem {
       lastDecayedAt: now,
       strength: clamp(item.strength + 0.08)
     };
-    this.items.delete(item.id);
     this.items.set(promoted.id, promoted);
     this.enforceLimits(tier);
     return promoted;

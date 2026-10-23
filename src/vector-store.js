@@ -16,6 +16,7 @@ export class VectorStore {
     ensureDir(this.dir);
     const snap = readJsonFile(this.path, { version: 1, entries: [] });
     this.entries = new Map();
+    this.pendingWrites = new Map();
     for (const e of snap.entries ?? []) this.entries.set(this.key(e.namespace, e.id), e);
     this.dim = options.dim ?? this.embedder?.dim ?? 256;
   }
@@ -26,21 +27,32 @@ export class VectorStore {
 
   async upsert(namespace, id, text, payload = {}) {
     if (!this.embedder) return null;
-    let embedding;
+    const key = this.key(namespace, id);
+    const write = {};
+    this.pendingWrites.set(key, write);
     try {
-      embedding = await this.embedder.embed(text);
-    } catch (error) {
-      // Best-effort — skip on failure rather than blocking the underlying op.
-      return { error: error.message };
+      let embedding;
+      try {
+        embedding = await this.embedder.embed(text);
+      } catch (error) {
+        // Best-effort — skip embedding failure without blocking the caller.
+        return { error: error.message };
+      }
+      // Deletion cancels even a not-yet-indexed entry. A newer upsert also
+      // owns this key, so an older remote embedding cannot overwrite it.
+      if (this.pendingWrites.get(key) !== write) return null;
+      const entry = { namespace, id, text: String(text).slice(0, 600), embedding, payload, at: nowIso() };
+      this.entries.set(key, entry);
+      this.persist();
+      return entry;
+    } finally {
+      if (this.pendingWrites.get(key) === write) this.pendingWrites.delete(key);
     }
-    const entry = { namespace, id, text: String(text).slice(0, 600), embedding, payload, at: nowIso() };
-    this.entries.set(this.key(namespace, id), entry);
-    this.persist();
-    return entry;
   }
 
   delete(namespace, id) {
     const key = this.key(namespace, id);
+    this.pendingWrites.delete(key);
     const had = this.entries.delete(key);
     if (had) this.persist();
     return had;

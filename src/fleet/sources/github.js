@@ -508,16 +508,36 @@ async function gitLine(run, config, cwd, args) {
   }
 }
 
-async function gitDirty(run, config, cwd) {
+// The untracked scan walks the whole tree: seconds on a big monorepo or an
+// external volume, every tick, for every worktree. Its answer is reused
+// while the head and the thread's activity hold, up to this age; tracked
+// changes are still read fresh each time.
+export const UNTRACKED_REUSE_MS = 30 * 60_000;
+
+async function gitStatus(run, config, cwd, untracked) {
   try {
-    const result = await run(config.bins.git, ["-C", cwd, "status", "--porcelain", "--untracked-files=normal"], {
+    const result = await run(config.bins.git, ["-C", cwd, "status", "--porcelain", `--untracked-files=${untracked}`], {
       timeoutMs: GIT_TIMEOUT_MS,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }
     });
-    return result?.code === 0 ? Boolean(String(result.stdout ?? "").trim()) : null;
+    return result?.code === 0 ? String(result.stdout ?? "").trim() : null;
   } catch {
     return null;
   }
+}
+
+async function gitDirty(run, config, cwd, { head, cache, activityAt, now }) {
+  const key = `${head}|${activityAt ?? ""}`;
+  const kept = cache?.get(cwd);
+  if (kept && kept.key === key && now - kept.at < UNTRACKED_REUSE_MS) {
+    const tracked = await gitStatus(run, config, cwd, "no");
+    if (tracked === null) return null;
+    return Boolean(tracked) || kept.untracked;
+  }
+  const status = await gitStatus(run, config, cwd, "normal");
+  if (status === null) return null;
+  cache?.set(cwd, { key, at: now, untracked: status.split("\n").some((line) => line.startsWith("??")) });
+  return Boolean(status);
 }
 
 // A .git at or above dir means a failed read is git not answering, not
@@ -534,7 +554,7 @@ function insideRepo(dir) {
   }
 }
 
-export async function readLocalGit(cwd, config, { run = runCommand } = {}) {
+export async function readLocalGit(cwd, config, { run = runCommand, cache = null, activityAt = null, now = Date.now() } = {}) {
   const empty = { head: null, branch: null, upstream: null, ahead: null, remote: null, dirty: null };
   if (!cwd) return empty;
   // A missing dir, a denied volume, or a non-repo all fail here; skip the rest.
@@ -549,7 +569,7 @@ export async function readLocalGit(cwd, config, { run = runCommand } = {}) {
   ]);
   const aheadText = upstream ? await gitLine(run, config, cwd, ["rev-list", "--count", "@{u}..HEAD"]) : null;
   const ahead = aheadText !== null && /^\d+$/.test(aheadText) ? Number(aheadText) : null;
-  const dirty = await gitDirty(run, config, cwd);
+  const dirty = await gitDirty(run, config, cwd, { head, cache, activityAt, now });
   return {
     head,
     branch: branch && branch !== "HEAD" ? branch : null,

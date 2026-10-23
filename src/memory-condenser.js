@@ -44,7 +44,8 @@ export class MemoryCondenser {
       now
     }) ?? { removed: [], deferred: 0 };
     let candidates = [...this.runtime.memory.byTier("medium"), ...this.runtime.memory.byTier("short")]
-      .filter((item) => item.kind !== "principle" && !item.metadata?.condensedInto);
+      .filter((item) => item.kind !== "principle"
+        && !item.metadata?.condensedInto && !item.metadata?.supersededBy);
     if (scope) {
       candidates = candidates.filter((item) => item.scope === scope);
     } else {
@@ -56,9 +57,17 @@ export class MemoryCondenser {
     const groups = clusterByTagOverlap(candidates, this.minGroupSize).slice(0, this.maxGroupsPerRun);
     const principles = [];
 
+    const isCurrentGroup = (group) => group.every((source) => this.runtime.memory.items.get(source.id) === source
+      && !source.metadata?.supersededBy && !source.metadata?.condensedInto);
     for (const group of groups) {
+      // An earlier group's model call may have invalidated queued evidence.
+      if (!isCurrentGroup(group)) continue;
       const principle = await this.distill(group);
       if (!principle) continue;
+      // Distillation awaits a model call. Corrections or another condensation
+      // can invalidate its evidence in the meantime; never publish that stale
+      // result or mark surviving sources consumed. A later run can regroup.
+      if (!isCurrentGroup(group)) continue;
       const quarantineUntil = new Date(now.getTime() + this.quarantineDays * 86400 * 1000).toISOString();
       const tags = [...new Set(group.flatMap((m) => m.tags ?? []).concat(["principle"]))];
       if (originSpecialistId) tags.push(`legacy:${originSpecialistId}`);

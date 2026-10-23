@@ -1,0 +1,13 @@
+# Signal memory evidence
+
+Signals accepted by scrutiny retain their body first, followed by the summary and decision diagnostics in tiered memory. This preserves concrete evidence when integrations use the same summary for different events, and lets exact automated deduplication distinguish those events. Tier fidelity and existing compression limits still apply; memory is not a full event archive.
+
+Summary-only signals remain supported, including the normalization fallback that copies the summary into the body; summary/body text is compared using the same whitespace normalization and 500-character summary limit, so raw fallbacks are stored once even when the displayed summary is normalized or truncated. Chat summaries that repeat a normalized body prefix are also omitted, leaving space for decision diagnostics within the existing tier limits. Distinct summaries remain supported. The full body remains first and is not shortened for this comparison. Body-first ordering keeps long summaries from crowding concrete evidence out of compressed memories. Ignored signals and ephemeral connectivity probes are not committed to memory. The change applies to future accepted signals; missing bodies in existing memories are not reconstructed or rewritten.
+
+Structured JSON bodies (objects and arrays) are serialized before memory comparison and storage, preserving their fields and values for recall and exact deduplication. Regression fixtures isolate outcome, observation, and vector stores and explicitly use the offline hash embedder.
+
+The same serialized body is used for pre-decision memory retrieval, so facts found only in object fields or arrays can bring prior context into scrutiny and propagation decisions. Missing bodies are omitted from retrieval queries rather than introducing literal `undefined` or `null` terms.
+
+Signal memory writes use the same caller scope as pre-decision retrieval. Specialist turns retain evidence in their own specialist scope, preventing peer recall and cross-specialist exact deduplication; unscoped integration events retain the existing shared `main` default. Shared main context remains available to specialists. This applies to future writes only: previously shared rows are not automatically moved or deleted. Explicit legacy-principle promotion remains a separate condensation path.
+
+Unscoped signal processing resolves to `main` for both retrieval and storage. Integration ingestion therefore cannot pull specialist-only evidence into scrutiny, propagation, or returned context. Isolated-context turns continue to bypass memory retrieval and writes entirely.
