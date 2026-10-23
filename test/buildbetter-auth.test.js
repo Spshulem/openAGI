@@ -100,3 +100,25 @@ test("isConfigured is false with neither api key nor a cached OAuth token", () =
   // No registry at all → also false.
   assert.equal(new BuildBetterTaskSource({ apiKey: null, runtime: {} }).isConfigured(), false);
 });
+
+
+test("replacing the live key resolves the new account instead of reusing the previous identity", async (t) => {
+  const saved = process.env.BUILDBETTER_API_KEY;
+  t.after(() => { if (saved === undefined) delete process.env.BUILDBETTER_API_KEY; else process.env.BUILDBETTER_API_KEY = saved; });
+  process.env.BUILDBETTER_API_KEY = "synthetic-first";
+  const source = new BuildBetterTaskSource();
+  source.query = async () => ({ me: { person: { email: `${source.apiKey}@example.com` } } });
+  await source.ensureIdentity();
+  assert.equal(source.userEmail, "synthetic-first@example.com");
+  process.env.BUILDBETTER_API_KEY = "synthetic-second";
+  await source.ensureIdentity();
+  assert.equal(source.userEmail, "synthetic-second@example.com");
+  process.env.BUILDBETTER_API_KEY = "synthetic-org";
+  source.query = async () => ({ me: null });
+  await source.ensureIdentity();
+  assert.equal(source.userEmail, null);
+  process.env.BUILDBETTER_API_KEY = "synthetic-third";
+  source.query = async () => ({ me: { person: { email: "third@example.com" } } });
+  await source.ensureIdentity();
+  assert.equal(source.userEmail, "third@example.com");
+});

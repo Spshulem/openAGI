@@ -65,7 +65,7 @@ test("BuildBetter manual, scheduled and webhook imports share the whole pass", a
   release();
   assert.equal((await manual).ok, true);
   await Promise.all([scheduled, webhook]);
-  assert.equal(queries, 1);
+  assert.equal(queries, 2, "the webhook queues one fresh upstream snapshot after the active manual sync");
   assert.equal(rows.length, 1);
   assert.ok(source.lastSyncedAt);
   await source.sync();

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { NodeRegistry } from "../src/node-registry.js";
+import { updateTaskIntegration } from "../src/task-integration-settings.js";
 import { isMobileRouteAllowed } from "../src/mobile-node.js";
 
 test("a phone configures, syncs and removes a fixed task source without exposing keys", async (t) => {
@@ -58,4 +59,29 @@ test("a phone configures, syncs and removes a fixed task source without exposing
   assert.equal(runtime.tasks.list({ queue: "user" }).length, 1, "removing a key preserves imported tasks");
   assert.equal(isMobileRouteAllowed("PUT", "/workspace/integrations/arbitrary"), false);
   assert.equal(isMobileRouteAllowed("POST", "/integrations/connect-mcp"), false);
+});
+
+
+test("failed credential persistence leaves the running integration and saved key unchanged", (t) => {
+  const saved = process.env.LINEAR_API_KEY;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-key-write-"));
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (saved === undefined) delete process.env.LINEAR_API_KEY; else process.env.LINEAR_API_KEY = saved;
+  });
+  process.env.LINEAR_API_KEY = "synthetic-original";
+  const file = path.join(dir, ".env");
+  fs.writeFileSync(file, "LINEAR_API_KEY=synthetic-original\n");
+  const rename = fs.renameSync;
+  t.mock.method(fs, "renameSync", (from, to) => {
+    if (to === file) throw new Error("synthetic full volume");
+    return rename(from, to);
+  });
+  const runtime = { linearTaskSource: { isConfigured: () => true }, cron: { jobs: new Map() } };
+  for (const value of ["synthetic-replacement", null]) {
+    assert.throws(() => updateTaskIntegration(runtime, dir, "linear", value), /synthetic full volume/);
+    assert.equal(process.env.LINEAR_API_KEY, "synthetic-original");
+    assert.equal(fs.readFileSync(file, "utf8"), "LINEAR_API_KEY=synthetic-original\n");
+    assert.equal(runtime.cron.jobs.size, 0);
+  }
 });

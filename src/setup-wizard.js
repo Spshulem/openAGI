@@ -90,14 +90,12 @@ export function saveEnv({ dataDir, values, clear = [] }) {
     const v = String(values[key]).replace(/\n/g, " ").trim();
     if (v.length === 0) continue;
     incoming[key] = v;
-    process.env[key] = v;
   }
 
   const merged = { ...existing, ...incoming };
   for (const key of clear) {
     if (!WIZARD_FIELDS.includes(key)) continue; // still allowlisted
     delete merged[key];
-    delete process.env[key];
   }
   const lines = [
     `# Written by OpenAGI setup wizard at ${new Date().toISOString()}`,
@@ -108,6 +106,8 @@ export function saveEnv({ dataDir, values, clear = [] }) {
     lines.push(`${k}=${v}`);
   }
   writeTextAtomic(file, `${lines.join("\n")}\n`, 0o600);
+  for (const [key, value] of Object.entries(incoming)) process.env[key] = value;
+  for (const key of clear) if (WIZARD_FIELDS.includes(key)) delete process.env[key];
   return { written: file, keys: Object.keys(incoming), totalKeys: Object.keys(merged).length };
 }
 

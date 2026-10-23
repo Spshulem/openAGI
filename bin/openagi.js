@@ -19,7 +19,7 @@ import readline from "node:readline";
 import { resolveDataDir } from "../src/data-dir.js";
 import {
   resolveTarget, resolveUpdateTarget, CliClient, runDoctor, writeNodeConfig, normalizeBase,
-  readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider
+  authorizeWorkerProxy, readNodeConfig, revokeAndClearNodeConfig, restartLocalDaemon, createRefreshingNodeClientProvider
 } from "../src/cli-client.js";
 import { pinnedRemoteOrigin } from "../src/node-control.js";
 import { buildPairingUrl, assertPhoneReachable } from "../src/pair-phone.js";
@@ -197,8 +197,14 @@ async function cmdPair(positional, flags) {
   const pairingToken = alreadyConfirmed && !authorizeProxy
     ? null
     : (process.env.OPENAGI_REMOTE_TOKEN ?? (existingRemote === remote ? existing?.token : null) ?? null);
-  const file = writeNodeConfig({ remote, token: pairingToken,
-    ...(authorizeProxy ? { nodeEnrollmentConfirmed: false } : {}) }, dataDir);
+  if (authorizeProxy) {
+    const result = await authorizeWorkerProxy({ dataDir, remote, token: pairingToken, allowInsecureRemote });
+    if (!result.ok) {
+      console.error(c(RED, `✗ main refused workspace authorization (${result.status || "unreachable"}); your existing worker pairing is still active.`));
+      return 1;
+    }
+  }
+  const file = writeNodeConfig({ remote, token: alreadyConfirmed ? null : pairingToken }, dataDir);
   console.log(c(GREEN, alreadyConfirmed && !authorizeProxy ? `✓ pairing with ${remote} is already confirmed` : `✓ pairing saved for ${remote}`));
 
   const local = await restartLocalDaemon({ dataDir });

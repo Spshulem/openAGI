@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { resolveDataDir } from "./data-dir.js";
 import { pinnedRemoteOrigin } from "./node-control.js";
 import { writeJsonAtomic } from "./file-utils.js";
@@ -51,6 +52,22 @@ export function writeNodeConfig({ remote, token, nodeToken = undefined, nodeEnro
     nodeEnrollmentConfirmed: nextEnrollmentConfirmed
   }, 0o600);
   return file;
+}
+
+// Upgrade owner workspace access without taking an existing operational
+// enrollment offline. Main must accept before the saved grant is changed.
+export async function authorizeWorkerProxy({ dataDir, remote, token, allowInsecureRemote = false, fetchImpl } = {}) {
+  const existing = readNodeConfig(dataDir);
+  const nodeId = readStoredNodeId(dataDir);
+  if (!existing?.nodeEnrollmentConfirmed || !existing.nodeToken || !nodeId || !sameNormalizedRemote(existing.remote, remote)) {
+    return { ok: false, status: 0 };
+  }
+  const ownerProxyToken = randomBytes(32).toString("base64url");
+  const client = new CliClient({ url: pinnedRemoteOrigin(remote, { allowInsecureRemote }), token }, { fetchImpl, timeoutMs: 15_000 });
+  const result = await client.request("POST", "/nodes/enroll", { nodeId, nodeToken: existing.nodeToken, ownerProxyToken });
+  if (!result.ok) return { ok: false, status: result.status };
+  writeNodeConfig({ remote, token: null, nodeToken: existing.nodeToken, ownerProxyToken, nodeEnrollmentConfirmed: true }, dataDir);
+  return { ok: true, status: result.status };
 }
 
 export function clearNodeConfig(dataDir = resolveDataDir()) {

@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
-  resolveTarget, resolveUpdateTarget, normalizeBase, CliClient, runDoctor,
+  authorizeWorkerProxy, resolveTarget, resolveUpdateTarget, normalizeBase, CliClient, runDoctor,
   writeNodeConfig, readNodeConfig, clearNodeConfig, revokeAndClearNodeConfig,
   restartLocalDaemon, createRefreshingNodeClientProvider
 } from "../src/cli-client.js";
@@ -490,4 +490,34 @@ test("doctor: fully configured main passes", async () => {
   }));
   assert.equal(r.ok, true);
   assert.ok(r.checks.every((c) => c.ok));
+});
+
+
+test("a rejected proxy upgrade preserves the worker enrollment and an accepted upgrade stores only scoped authority", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-proxy-upgrade-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const remote = "https://main.example.test";
+  writeNodeConfig({ remote, token: null, nodeToken: "synthetic-worker-token", nodeEnrollmentConfirmed: true }, dir);
+  fs.writeFileSync(path.join(dir, "identity.json"), JSON.stringify({ nodeId: "stable-worker" }));
+  const before = readNodeConfig(dir);
+  let accepted = false;
+  let grant;
+  const fetchImpl = async (url, options) => {
+    assert.equal(url, remote + "/nodes/enroll");
+    assert.equal(options.redirect, "manual");
+    const body = JSON.parse(options.body);
+    assert.equal(body.nodeId, "stable-worker");
+    assert.equal(body.nodeToken, before.nodeToken);
+    grant = body.ownerProxyToken;
+    return new Response("{}", { status: accepted ? 200 : 401 });
+  };
+  const args = { dataDir: dir, remote, token: "synthetic-owner-token", fetchImpl };
+  assert.deepEqual(await authorizeWorkerProxy(args), { ok: false, status: 401 });
+  assert.deepEqual(readNodeConfig(dir), before);
+  accepted = true;
+  assert.equal((await authorizeWorkerProxy(args)).ok, true);
+  assert.equal(readNodeConfig(dir).nodeEnrollmentConfirmed, true);
+  assert.equal(readNodeConfig(dir).nodeToken, before.nodeToken);
+  assert.equal(readNodeConfig(dir).ownerProxyToken, grant);
+  assert.equal(readNodeConfig(dir).token, null);
 });

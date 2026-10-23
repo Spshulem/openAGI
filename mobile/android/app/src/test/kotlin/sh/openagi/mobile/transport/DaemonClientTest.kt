@@ -44,6 +44,17 @@ class DaemonClientTest {
     private fun fixture(name: String) = File("../../fixtures/$name.json").readText()
 
     @Test
+    fun approvalExplainsWorkerMainAuthorizationFailure() = runBlocking {
+        server.enqueue(MockResponse().setResponseCode(502).setBody("""{"error":"main-pairing-required"}"""))
+        try {
+            client().approveAction("synthetic")
+            fail("Must retain main authorization guidance")
+        } catch (error: DaemonException.MainUnavailable) {
+            assertTrue(error.pairingRequired)
+        }
+    }
+
+    @Test
     fun summarySendsCredentialsAndDecodes() = runBlocking {
         server.enqueue(MockResponse().setResponseCode(200).setHeader("ETag", "\"abc\"").setBody(fixture("summary-populated")))
         val result = client().summary(ifNoneMatch = null)

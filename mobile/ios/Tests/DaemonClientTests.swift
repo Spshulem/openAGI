@@ -40,6 +40,19 @@ final class DaemonClientTests: XCTestCase {
             XCTAssertEqual(error, .mainConnection(.authorizationRequired))
         } catch { XCTFail("Unexpected error: \(error)") }
     }
+    func testApprovalDecodesWorkerMainAuthorizationFailure() async {
+        StubProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: 502, httpVersion: nil, headerFields: nil)!,
+             Data(#"{"error":"main-pairing-required"}"#.utf8))
+        }
+        do {
+            _ = try await makeClient().approvePendingAction(id: "synthetic")
+            XCTFail("Approval must show main authorization guidance")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .mainConnection(.authorizationRequired))
+        } catch { XCTFail("Unexpected error: \(error)") }
+    }
+
     private func makeClient() -> DaemonClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubProtocol.self]

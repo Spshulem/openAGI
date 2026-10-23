@@ -21,9 +21,9 @@ struct IntegrationsView: View {
                     Button("Retry") { Task { await load() } }
                 }
             }
-            ForEach(integrations) { integration in
+            ForEach($integrations) { $integration in
                 NavigationLink {
-                    TaskIntegrationView(integration: integration)
+                    TaskIntegrationView(integration: $integration)
                 } label: {
                     LabeledContent(integration.name, value: integration.configured ? "Connected" : "Not connected")
                 }
@@ -55,7 +55,7 @@ struct IntegrationsView: View {
 
 private struct TaskIntegrationView: View {
     @Environment(AppModel.self) private var model
-    @State var integration: TaskIntegration
+    @Binding var integration: TaskIntegration
     @State private var apiKey = ""
     @State private var working = false
     @State private var status: String?

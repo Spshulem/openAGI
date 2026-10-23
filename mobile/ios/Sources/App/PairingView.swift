@@ -81,6 +81,8 @@ struct PairingView: View {
                                 VStack(alignment: .leading) {
                                     Text(server.name)
                                     Text(server.address.absoluteString).font(.caption)
+                                    Text(server.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
+                                        .font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                             .buttonStyle(.bordered)

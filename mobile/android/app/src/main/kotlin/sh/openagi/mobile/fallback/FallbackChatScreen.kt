@@ -57,17 +57,22 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
     }
     LaunchedEffect(provider, vault) {
         loading = true
+        lines = emptyList()
+        hasKey = false
         if (provider == FallbackProvider.LOCAL) localNote = "Checking Gemini Nano availability…"
         key = ""
         error = null
         if (vault == null) return@LaunchedEffect
         val request = ++localRequest
         try {
-            withContext(Dispatchers.IO) {
-                model = vault?.model(provider) ?: provider.defaultModel
-                hasKey = vault?.key(provider) != null
-                lines = vault?.history(provider, model).orEmpty()
+            val selectedProvider = provider
+            val loaded = withContext(Dispatchers.IO) {
+                val selectedModel = vault?.model(selectedProvider) ?: selectedProvider.defaultModel
+                Triple(selectedModel, vault?.key(selectedProvider) != null, vault?.history(selectedProvider, selectedModel).orEmpty())
             }
+            model = loaded.first
+            hasKey = loaded.second
+            lines = loaded.third
             modelDraft = model
             if (provider == FallbackProvider.LOCAL) {
                 localStatus = withTimeout(20_000) { LocalChat.status() }
@@ -82,7 +87,10 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
         } catch (_: TimeoutCancellationException) {
             localNote = "Google AICore is taking too long to respond. Check Gemini Nano again or choose a hosted provider."
         } catch (e: CancellationException) { throw e }
-        catch (_: Exception) { localNote = "The local model isn't available right now. Update Android System Intelligence / AICore and check again, or choose a hosted provider." }
+        catch (_: Exception) {
+            lines = emptyList()
+            error = "Couldn't load this conversation securely. No previous provider history will be sent. Try selecting the model again."
+        }
         finally { if (request == localRequest) loading = false }
     }
     LaunchedEffect(lines.size, busy) { if (lines.isNotEmpty()) scroll.animateScrollToItem(lines.lastIndex) }
@@ -122,6 +130,8 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
         preparingLocal = false
         localProgress = null
         loading = true
+        lines = emptyList()
+        hasKey = false
         provider = choice
     }
 
@@ -238,12 +248,22 @@ fun FallbackChatScreen(context: Context, onDismiss: () -> Unit) {
                             Button(modifier = Modifier.fillMaxWidth(), enabled = !busy && !loading && vault != null && (if (provider == FallbackProvider.LOCAL) localStatus == FeatureStatus.AVAILABLE && !preparingLocal else hasKey && modelDraft.isNotBlank()), onClick = {
                                 busy = true
                                 scope.launch {
+                                    lines = emptyList()
                                     try {
                                         model = if (provider == FallbackProvider.LOCAL) provider.defaultModel else modelDraft.trim()
-                                        withContext(Dispatchers.IO) { vault?.saveModel(provider, model); lines = vault?.history(provider, model).orEmpty() }
+                                        val selectedProvider = provider
+                                        val selectedModel = model
+                                        lines = withContext(Dispatchers.IO) {
+                                            vault?.saveModel(selectedProvider, selectedModel)
+                                            vault?.history(selectedProvider, selectedModel).orEmpty()
+                                        }
                                         key = ""
                                         options = false
-                                    } catch (_: Exception) { error = "Couldn't load this conversation securely." }
+                                    } catch (_: Exception) {
+                                        lines = emptyList()
+                                        hasKey = false
+                                        error = "Couldn't load this conversation securely. Try selecting the model again."
+                                    }
                                     finally { busy = false }
                                 }
                             }) { Text("Use ${provider.title}") }

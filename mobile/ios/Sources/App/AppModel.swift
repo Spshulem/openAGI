@@ -69,9 +69,7 @@ final class AppModel {
                                                nodeID: credentials.nodeID)
     }
 
-    private var coordinator: RefreshCoordinator {
-        RefreshCoordinator(client: client, store: store, queue: queue)
-    }
+    @ObservationIgnored private lazy var coordinator = RefreshCoordinator(client: client, store: store, queue: queue)
 
     var statusLine: String {
         if case .unauthorized = lastOutcome { return "Needs re-pairing" }

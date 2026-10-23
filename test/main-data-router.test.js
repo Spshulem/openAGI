@@ -232,3 +232,18 @@ test("only shared workspace routes forward, with their allowed methods", () => {
   assert.equal(isMainDataRoute("DELETE", "/message"), false);
   assert.equal(isMainDataRoute("POST", "/brief/focus/dismiss"), true);
 });
+
+
+test("forwarded fleet and transcript operations outlive the workspace read timeout", async (t) => {
+  const main = await server(t, (_req, res) => setTimeout(() => {
+    res.writeHead(200, { "content-type": "application/json" }); res.end('{"ok":true}');
+  }, 80));
+  const proxy = await server(t, (req, res) => routeMainData(req, res, new URL(req.url, "http://worker"), {
+    pairing: { remote: main.url }, ownerAuthenticated: false, timeoutMs: 10
+  }));
+  for (const route of ["/fleet/api/scan", "/fleet/api/questions/question-1", "/fleet/api/actions/action-1/send", "/fleet/api/threads/codex%3Athread-1/push", "/workspace/integrations/buildbetter/sync"]) {
+    const response = await fetch(proxy.url + route, { method: "POST", headers: auth(PHONE) });
+    assert.equal(response.status, 200, route);
+  }
+  assert.equal((await fetch(proxy.url + "/tasks", { headers: auth(PHONE) })).status, 502, "ordinary reads remain bounded");
+});

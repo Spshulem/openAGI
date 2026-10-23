@@ -13,6 +13,7 @@ public actor RefreshCoordinator {
     private let client: DaemonClient
     private let store: SnapshotStore
     private let queue: OutboundQueue
+    private var drain: Task<Void, Never>?
 
     public init(client: DaemonClient, store: SnapshotStore = SnapshotStore(), queue: OutboundQueue = OutboundQueue()) {
         self.client = client
@@ -82,6 +83,21 @@ public actor RefreshCoordinator {
     }
 
     public func drainQueue() async {
+        if let drain {
+            await drain.value
+            guard !Task.isCancelled else { return }
+            await drainQueue()
+            return
+        }
+        let task = Task {
+            await self.performDrain()
+            self.drain = nil
+        }
+        drain = task
+        await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+    }
+
+    private func performDrain() async {
         for op in queue.all() {
             guard !Task.isCancelled else { return }
             switch op.kind {

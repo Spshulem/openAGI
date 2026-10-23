@@ -19,7 +19,7 @@ permissions:
 jobs:
   test:
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       # 27.1 links the native Duo vertical bars and reserved-region APIs.
@@ -165,7 +165,7 @@ jobs:
         if: always()
         run: |
           for result in "$RUNNER_TEMP/OpenAGI-tests.xcresult" "$RUNNER_TEMP/OpenAGI-iPhone-UI.xcresult" "$RUNNER_TEMP/OpenAGI-expanded-UI.xcresult"; do
-            if [ -d "$result" ]; then
+            if [ -f "$result/Info.plist" ]; then
               xcrun xcresulttool export attachments --path "$result" --output-path "$RUNNER_TEMP/openagi-ui-screenshots/$(basename "$result" .xcresult)"
             fi
           done

@@ -188,4 +188,45 @@ final class AppModelRefreshTests: XCTestCase {
         XCTAssertEqual(requests.withLock { $0.summaries }, 2, "A later refresh must still fetch new data")
         XCTAssertEqual(requests.withLock { $0.completions }, 1)
     }
+    @MainActor
+    func testCompletionDuringRefreshDrainsBothIntentsWithoutRepostingTheFirst() async throws {
+        let model = model()
+        try model.queue.enqueue(PendingOp(kind: .completeTask("task_offline")))
+        let summary = try fixture("summary-populated")
+        let requests = OSAllocatedUnfairLock(initialState: [String: Int]())
+        let firstStarted = expectation(description: "offline completion in flight")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        StubProtocol.handler = { request in
+            let path = request.url!.path
+            if path.hasSuffix("/complete") {
+                let count = requests.withLock { state in
+                    state[path, default: 0] += 1
+                    return state[path]!
+                }
+                if path.contains("task_offline"), count == 1 {
+                    firstStarted.fulfill()
+                    _ = release.wait(timeout: .now() + 5)
+                }
+            }
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    path == "/mobile/summary" ? summary : Data("{}".utf8))
+        }
+        let refresh = Task { await model.refreshToday() }
+        let started = await XCTWaiter.fulfillment(of: [firstStarted], timeout: 2)
+        XCTAssertEqual(started, .completed)
+        let newCompletionStarted = expectation(description: "new intent joins refresh")
+        let completion = Task {
+            newCompletionStarted.fulfill()
+            await model.completeToday(taskID: "task_new")
+        }
+        _ = await XCTWaiter.fulfillment(of: [newCompletionStarted], timeout: 2)
+        release.signal()
+        await refresh.value
+        await completion.value
+        XCTAssertEqual(requests.withLock { $0["/tasks/task_offline/complete"] }, 1)
+        XCTAssertEqual(requests.withLock { $0["/tasks/task_new/complete"] }, 1)
+        XCTAssertTrue(model.queue.all().isEmpty)
+    }
+
 }

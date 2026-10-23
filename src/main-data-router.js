@@ -21,6 +21,17 @@ function failure(res, status, error, message) {
   res.end(JSON.stringify({ error, message }));
 }
 
+export function mainDataTimeout(method, pathname, timeoutMs = 15_000) {
+  if (pathname === "/message") return Math.max(timeoutMs, 300_000);
+  if (/^\/workspace\/integrations\/(linear|buildbetter)\/sync$/.test(pathname)) return Math.max(timeoutMs, 600_000);
+  if (pathname === "/settings/models/test") return Math.max(timeoutMs, 90_000);
+  if (pathname.startsWith("/fleet/api/")) {
+    const delivering = /^\/fleet\/api\/(send|click|apps\/[^/]+\/[^/]+|questions\/[^/]+|actions\/[^/]+\/send|threads\/[^/]+\/push)$/;
+    return Math.max(timeoutMs, method === "POST" && delivering.test(pathname) ? 300_000 : 120_000);
+  }
+  return timeoutMs;
+}
+
 export function routeMainData(req, res, url, { pairing, identity, ownerAuthenticated, ownerBearerAuthenticated = false,
   allowInsecureRemote = false, timeoutMs = 15_000 } = {}) {
   if (!pairing?.remote || !isMainDataRoute(req.method, url.pathname)) return false;
@@ -90,11 +101,7 @@ export function routeMainData(req, res, url, { pairing, identity, ownerAuthentic
     response.on("error", () => res.destroy());
     response.pipe(res);
   });
-  // Chat may run tools before sending a response; use the agent turn's
-  // longer budget rather than the short workspace-read timeout.
-  const slowRead = url.pathname === "/settings/models/test" || /^\/workspace\/integrations\/(linear|buildbetter)\/sync$/.test(url.pathname);
-  const readTimeout = slowRead ? Math.max(timeoutMs, 90_000) : timeoutMs;
-  upstream.setTimeout(url.pathname === "/message" ? Math.max(timeoutMs, 300_000) : readTimeout,
+  upstream.setTimeout(mainDataTimeout(req.method, url.pathname, timeoutMs),
     () => upstream.destroy(new Error("main timeout")));
   upstream.on("error", () => failure(res, 502, "main-unavailable", "Couldn't reach the main agent. Your worker's local data has not been substituted."));
   res.on("close", () => upstream.destroy());

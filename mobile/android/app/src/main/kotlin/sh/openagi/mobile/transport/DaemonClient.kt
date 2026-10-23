@@ -202,13 +202,8 @@ class DaemonClient(
         val request = authorized("/pending-actions/$id/approve").post("".toRequestBody(JSON)).build()
         try {
             client.newCall(request).execute().use { response ->
-                when (response.code) {
-                    200, 400 -> decode(response.body?.string() ?: throw DaemonException.Malformed(), ApprovalResult.serializer())
-                    401, 403 -> throw DaemonException.Unauthorized()
-                    404 -> throw DaemonException.NotFound()
-                    409 -> throw DaemonException.Conflict()
-                    else -> throw DaemonException.Server(response.code)
-                }
+                if (response.code != 400) ensureOk(response)
+                decode(response.body?.string() ?: throw DaemonException.Malformed(), ApprovalResult.serializer())
             }
         } catch (io: java.io.IOException) {
             throw DaemonException.Transport(io)

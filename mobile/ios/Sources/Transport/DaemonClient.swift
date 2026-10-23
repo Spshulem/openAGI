@@ -240,7 +240,7 @@ public actor DaemonClient {
         if (response as? HTTPURLResponse)?.statusCode == 400 {
             return try Self.decodeJSON(ApprovalOutcome.self, from: data)
         }
-        _ = try validate(response)
+        _ = try validate(response, data: data)
         return try Self.decodeJSON(ApprovalOutcome.self, from: data)
     }
 
@@ -682,7 +682,7 @@ extension DaemonClient {
     public func syncTaskIntegration(id: String) async throws -> TaskIntegrationSync {
         guard ["linear", "buildbetter"].contains(id) else { throw DaemonError.notFound }
         return try await json(TaskIntegrationSync.self, path: "/workspace/integrations/\(id)/sync", method: "POST",
-                              body: Data("{}".utf8), timeout: 60)
+                              body: Data("{}".utf8), timeout: 600)
     }
 
     private struct Wrapped<T: Decodable>: Decodable { let skills: T?; let jobs: T? }
