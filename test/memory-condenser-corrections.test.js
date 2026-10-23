@@ -129,8 +129,10 @@ test("derived invalidation follows same-scope lineage without mutating peer memo
 
 test("queued groups invalidated by an earlier model call never reach the model", async () => {
   const { memory } = fixture();
+  // Medium candidates are processed before short candidates. Keep the group
+  // invalidated by the first model call queued, independently of clock/ID order.
   const queued = ["Obsolete deployment window", "Deployment checklist", "Deployment owner"].map(content =>
-    memory.remember({ content, source: "local", tags: ["deploy", "window"] }, { tier: "medium" }));
+    memory.remember({ content, source: "local", tags: ["deploy", "window"] }, { tier: "short" }));
   const prompts = [];
   const provider = { isConfigured: () => true, async generate({ input }) {
     prompts.push(input);
