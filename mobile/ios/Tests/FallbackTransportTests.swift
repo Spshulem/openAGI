@@ -1,9 +1,27 @@
 import Foundation
+import Security
 import XCTest
 @testable import OpenAGI
 
 final class FallbackTransportTests: XCTestCase {
     private let lines = [FallbackLine(role: "user", text: "Help me plan tomorrow")]
+
+    func testKeyRemovalAcceptsDeletedAndAlreadyMissingItems() throws {
+        for status in [errSecSuccess, errSecItemNotFound] {
+            try FallbackKeyStore.remove(.openAI, delete: { query in
+                let fields = query as NSDictionary
+                XCTAssertEqual(fields[kSecAttrService] as? String, "sh.openagi.direct-provider")
+                XCTAssertEqual(fields[kSecAttrAccount] as? String, "openAI")
+                return status
+            })
+        }
+    }
+
+    func testKeyRemovalReportsKeychainAccessFailure() {
+        XCTAssertThrowsError(try FallbackKeyStore.remove(.openAI, delete: { _ in errSecInteractionNotAllowed })) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Couldn't remove the key"))
+        }
+    }
 
     func testProviderKeysUseOnlyFixedHTTPSDestinations() throws {
         let expected: [FallbackProvider: String] = [.openAI: "api.openai.com", .anthropic: "api.anthropic.com", .openRouter: "openrouter.ai", .gemini: "generativelanguage.googleapis.com"]

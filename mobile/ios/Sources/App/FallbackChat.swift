@@ -73,7 +73,12 @@ enum FallbackKeyStore {
             throw FallbackFailure.message("Couldn't update the key in this iPhone's Keychain.")
         }
     }
-    static func remove(_ provider: FallbackProvider) { SecItemDelete(query(provider) as CFDictionary) }
+    static func remove(_ provider: FallbackProvider, delete: (CFDictionary) -> OSStatus = SecItemDelete) throws {
+        let status = delete(query(provider) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw FallbackFailure.message("Couldn't remove the key from this iPhone's Keychain. The saved key is still available; try again.")
+        }
+    }
 }
 
 // No redirects, cookies or disk URL cache: a provider key can only go to the
@@ -288,7 +293,10 @@ struct FallbackChatView: View {
                         }.disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         if chat.savedKey {
                             Label("API key saved in Keychain", systemImage: "lock.shield")
-                            Button("Remove saved key", role: .destructive) { FallbackKeyStore.remove(chat.provider); chat.savedKey = false }
+                            Button("Remove saved key", role: .destructive) {
+                                do { try FallbackKeyStore.remove(chat.provider); chat.savedKey = false; chat.error = nil }
+                                catch { chat.error = error.localizedDescription }
+                            }
                         }
                     }
                 } footer: {

@@ -67,7 +67,6 @@ internal fun AdaptiveAppScaffold(
 ) {
     val fold = LocalFoldInfo.current
     var chatPaneOpen by rememberSaveable { mutableStateOf(false) }
-    BackHandler(enabled = chatPaneOpen) { chatPaneOpen = false }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val keyboardVisible = WindowInsets.isImeVisible
         val density = LocalDensity.current
@@ -76,6 +75,7 @@ internal fun AdaptiveAppScaffold(
         val expanded = maxWidth >= 840.dp
         val canSplit = (expanded && workspaceHeight >= 480.dp) || fold != null
         val showChat = showsSupportingChat(selected, chatPaneOpen) && canSplit
+        BackHandler(enabled = showChat) { chatPaneOpen = false }
         Row(Modifier.fillMaxSize()) {
             Scaffold(
                 modifier = Modifier.weight(1f),
