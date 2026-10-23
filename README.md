@@ -593,3 +593,11 @@ without a bulk rewrite of existing data.
 
 No bulk migration runs automatically, and previously superseded memories are
 not restored.
+
+### Changes to queued scheduled jobs
+
+Scheduled jobs are checked again immediately before dispatch. Disabling,
+removing, rescheduling, or replacing a queued job while an earlier scheduled
+handler runs prevents its stale definition from executing in that tick.
+Already running handlers are not cancelled; changed jobs are reconsidered
+under their current schedule on the next tick.
