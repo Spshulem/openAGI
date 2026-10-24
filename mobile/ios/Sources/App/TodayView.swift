@@ -57,6 +57,7 @@ struct TodayView: View {
             .refreshable { await model.refreshData() }
             .task { await model.refreshToday() }
             .toolbar {
+                WorkspaceChatToolbar()
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink {
                         LifelogView()

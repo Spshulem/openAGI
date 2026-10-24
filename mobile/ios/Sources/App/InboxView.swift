@@ -49,6 +49,7 @@ struct InboxView: View {
                 }
             }
             .navigationTitle("Inbox")
+            .toolbar { WorkspaceChatToolbar() }
             .refreshable { await load() }
             .task(id: model.inboxGeneration) { await load() }
         }

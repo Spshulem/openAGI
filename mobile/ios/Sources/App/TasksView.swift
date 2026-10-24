@@ -74,6 +74,7 @@ struct TasksView: View {
             .refreshable { await load() }
             .task(id: "\(queue.rawValue)-\(model.tasksGeneration)") { await load() }
             .toolbar {
+                WorkspaceChatToolbar()
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("New task", systemImage: "plus") { showingNewTask = true }
                 }

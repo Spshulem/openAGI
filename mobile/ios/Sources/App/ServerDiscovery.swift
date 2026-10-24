@@ -25,14 +25,17 @@ final class ServerDiscovery: NSObject, @preconcurrency NetServiceBrowserDelegate
     private var browserFailure: String?
     private let makeBrowser: () -> NetServiceBrowser
     private let check: @Sendable (URL) async -> Bool
+    private let resolveAddress: @Sendable (URL) async -> URL?
     private let searchWindow: Duration
 
     init(makeBrowser: @escaping () -> NetServiceBrowser = { NetServiceBrowser() },
          check: @escaping @Sendable (URL) async -> Bool = { await ServerDiscovery.reachable($0) },
+         resolveAddress: @escaping @Sendable (URL) async -> URL? = { await TailscaleServerAddress.resolve($0) },
          searchWindow: Duration = .seconds(8)) {
         self.makeBrowser = makeBrowser
         self.check = check
         self.searchWindow = searchWindow
+        self.resolveAddress = resolveAddress
         super.init()
     }
 
@@ -49,15 +52,25 @@ final class ServerDiscovery: NSObject, @preconcurrency NetServiceBrowserDelegate
         browser.searchForServices(ofType: "_openagi._tcp.", inDomain: "local.")
         search = Task {
             let check = self.check
-            await withTaskGroup(of: (URL, Bool).self) { group in
+            let resolveAddress = self.resolveAddress
+            await withTaskGroup(of: (URL, URL?, Bool).self) { group in
                 for address in Set(addresses) {
-                    guard let address = try? HostAllowlist.validate(address) else { continue }
-                    add(address, name: "Saved or entered server")
-                    group.addTask { (address, await check(address)) }
+                    // Keep a saved 100.x address visible even though ATS
+                    // requires its MagicDNS name. Resolve only that host,
+                    // off the UI thread, without sending any credentials.
+                    guard (try? HostAllowlist.validate(address)) != nil || TailscaleServerAddress.needsDNS(address) else { continue }
+                    addCandidate(address, name: "Saved or entered server")
+                    group.addTask {
+                        guard let resolved = await resolveAddress(address) else { return (address, nil, false) }
+                        return (address, resolved, await check(resolved))
+                    }
                 }
-                for await (address, reachable) in group {
+                for await (original, resolved, reachable) in group {
                     guard !Task.isCancelled, generation == run else { return }
-                    add(address, name: "Saved or entered server", reachable: reachable)
+                    if let resolved, resolved != original {
+                        servers.removeAll { $0.address == original }
+                    }
+                    addCandidate(resolved ?? original, name: "Saved or entered server", reachable: reachable)
                 }
             }
             if browserFailure == nil { try? await Task.sleep(for: searchWindow) }
@@ -66,8 +79,8 @@ final class ServerDiscovery: NSObject, @preconcurrency NetServiceBrowserDelegate
             services.forEach { $0.stop() }
             searching = false
             note = browserFailure ?? (servers.isEmpty
-                ? "No servers found. Turn on Tailscale and Use Tailscale DNS, or join the same Wi-Fi as your server. You can also enter its address below."
-                : "Check that the address matches your main server before entering its pairing code.")
+                ? "No Wi-Fi announcements found. Tailscale does not broadcast servers. In Tailscale, open the device list, select your Mac or Distiller, and copy its DNS name into Server address, then check again."
+                : "Search complete. Check the server status below. Finding a server does not change your saved pairing.")
         }
     }
 
@@ -115,6 +128,10 @@ final class ServerDiscovery: NSObject, @preconcurrency NetServiceBrowserDelegate
 
     private func add(_ url: URL, name: String, reachable: Bool? = nil) {
         guard let address = try? HostAllowlist.validate(url) else { return }
+        addCandidate(address, name: name, reachable: reachable)
+    }
+
+    private func addCandidate(_ address: URL, name: String, reachable: Bool? = nil) {
         if let index = servers.firstIndex(where: { $0.address == address }) {
             if let reachable { servers[index].reachable = reachable }
         } else if servers.count < 12 {
@@ -157,6 +174,7 @@ struct ServerDiscoverySheet: View {
     let server: URL
     @Environment(\.dismiss) private var dismiss
     @State private var discovery = ServerDiscovery()
+    @State private var addressText = ""
 
     var body: some View {
         NavigationStack {
@@ -166,21 +184,29 @@ struct ServerDiscoverySheet: View {
                     Text("Your pairing stays saved. Searching does not switch servers or share any credentials.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
+                Section("Tailscale or Wi-Fi address") {
+                    TextField("main.tail1234.ts.net:43210", text: $addressText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    Text("In Tailscale, open the device list → your Mac or Distiller → copy DNS name. OpenAGI cannot read the Tailscale app's device list. Wi-Fi discovery requires an OpenAGI announcement on the same network.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
                 Section {
                     Button(discovery.searching ? "Searching…" : "Check connection and find servers", systemImage: "network") {
-                        discovery.start(addresses: [server])
+                        discovery.start(addresses: [server, TailscaleServerAddress.parse(addressText)].compactMap { $0 })
                     }.disabled(discovery.searching)
                     if let note = discovery.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
                     ForEach(discovery.servers) { candidate in
                         VStack(alignment: .leading) {
                             Text(candidate.name)
                             Text(candidate.address.absoluteString).textSelection(.enabled)
-                            Text(candidate.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
+                            Text(candidate.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check OpenAGI, Tailscale, DNS, and access rules" } ?? "Nearby announcement or connection check pending")
                                 .font(.footnote).foregroundStyle(.secondary)
                         }
                     }
                 } footer: {
-                    Text("Finds Bonjour servers on this Wi-Fi network and checks your saved Tailscale address. Keep Tailscale and Use Tailscale DNS enabled. Nearby announcements identify candidates; a pairing code is still required to connect a new server.")
+                    Text("Keep Tailscale and Use Tailscale DNS enabled on both devices. Discovery checks only saved or entered addresses and nearby announcements; it never shares your credentials. Pair a new server from Connection Settings using a one-time code.")
                 }
             }
             .navigationTitle("Find servers")

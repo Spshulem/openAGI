@@ -36,4 +36,40 @@ final class ServerDiscoveryTests: XCTestCase {
         XCTAssertFalse(discovery.searching)
         discovery.stop()
     }
+    func testTailscaleNameCanBePastedWithoutSchemeOrPort() {
+        XCTAssertEqual(TailscaleServerAddress.parse(" main.tail1234.ts.net ")?.absoluteString,
+                       "http://main.tail1234.ts.net:43210")
+        XCTAssertEqual(TailscaleServerAddress.parse("https://main.tail1234.ts.net:443/setup")?.path, "")
+        XCTAssertNil(TailscaleServerAddress.parse("http://user:password@main.tail1234.ts.net"))
+    }
+
+    @MainActor
+    func testSavedTailscaleIPResolvesBeforeHealthCheckInsteadOfDisappearing() async {
+        let raw = URL(string: "http://100.64.0.10:43210")!
+        let dns = URL(string: "http://main.tail1234.ts.net:43210")!
+        let discovery = ServerDiscovery(makeBrowser: { QuietBrowser() }, check: { $0 == dns },
+                                        resolveAddress: { await TailscaleServerAddress.resolve($0, lookup: { _ in "main.tail1234.ts.net." }) },
+                                        searchWindow: .zero)
+        discovery.start(addresses: [raw])
+        await discovery.search?.value
+        XCTAssertEqual(discovery.servers.map(\.address), [dns])
+        XCTAssertEqual(discovery.servers.first?.reachable, true)
+    }
+
+    @MainActor
+    func testUnavailableTailscaleDNSKeepsSavedIPVisible() async {
+        let raw = URL(string: "http://100.64.0.10:43210")!
+        let discovery = ServerDiscovery(makeBrowser: { QuietBrowser() }, check: { _ in XCTFail("Do not probe a blocked raw IP"); return false },
+                                        resolveAddress: { _ in nil }, searchWindow: .zero)
+        discovery.start(addresses: [raw])
+        await discovery.search?.value
+        XCTAssertEqual(discovery.servers.first?.address, raw)
+        XCTAssertEqual(discovery.servers.first?.reachable, false)
+    }
+
+    func testReverseDNSCannotEnableCleartextOutsideTailnet() async {
+        let result = await TailscaleServerAddress.resolve(URL(string: "http://100.64.0.10:43210")!, lookup: { _ in "untrusted.example" })
+        XCTAssertNil(result)
+    }
+
 }

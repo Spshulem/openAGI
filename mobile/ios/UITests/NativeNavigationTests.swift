@@ -89,29 +89,35 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 5))
     }
 
-    func testWideNavigationIsOnTheRightAndChatCanBeClosed() {
+    func testNativeAdaptiveTabsAndOptionalChatPane() {
         let app = launch()
-        let rail = element(app, "right-navigation")
-        guard app.frame.width >= 760 && app.frame.height >= 600 else {
-            // Compact Duo uses a native vertical tab toolbar, which XCTest
-            // exposes as buttons rather than a UITabBar.
-            tab(app, "Chat")
-            XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
-            return
+        XCTAssertFalse(element(app, "right-navigation").exists, "Use the system tab container in every pose")
+        let toggle = app.buttons["toggle-chat-pane"]
+        if toggle.exists && toggle.isHittable {
+            toggle.tap()
+            let close = app.buttons["close-chat-pane"]
+            XCTAssertTrue(close.waitForExistence(timeout: 5))
+            tab(app, "Tasks")
+            XCTAssertTrue(close.waitForExistence(timeout: 5), "Pinned chat stays open while navigating")
+            close.tap()
+            XCTAssertFalse(close.exists)
         }
-        XCTAssertTrue(rail.waitForExistence(timeout: 5), "Expanded windows must use right-side navigation")
-        XCTAssertGreaterThan(rail.frame.minX, app.frame.midX)
-        let close = app.buttons["close-chat-pane"]
-        if close.exists { close.tap() }
-        tap(app, "toggle-chat-pane")
-        XCTAssertTrue(close.waitForExistence(timeout: 5))
-        tab(app, "Supervisor")
-        XCTAssertTrue(close.exists, "Pinned chat stays open while navigating")
-        close.tap()
-        XCTAssertFalse(close.exists)
         tab(app, "Chat")
+        XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
         XCTAssertFalse(element(app, "supporting-chat-pane").exists, "Chat must not open a second conversation")
-        capture("right-navigation-chat", app: app)
+        capture("native-adaptive-tabs-chat", app: app)
+    }
+
+    func testTabNavigationHistorySurvivesSwitchingTabs() {
+        let app = launch()
+        // Lifelog is a push on Today's own stack, rather than a sheet.
+        app.buttons["Lifelog"].firstMatch.tap()
+        XCTAssertTrue(app.navigationBars["Lifelog"].waitForExistence(timeout: 5))
+        tab(app, "Tasks")
+        XCTAssertTrue(app.navigationBars["Tasks"].waitForExistence(timeout: 5))
+        tab(app, "Today")
+        XCTAssertTrue(app.navigationBars["Lifelog"].waitForExistence(timeout: 5))
+        back(app, from: "Lifelog", to: "Today")
     }
 
     func testModelProviderSelectionSavesAndLeavesTheModelScreenUsable() {

@@ -108,6 +108,7 @@ struct SupervisorView: View {
             .padding(.bottom, Theme.Spacing.x6)
         }
         .background(Theme.canvas)
+        .toolbar { WorkspaceChatToolbar() }
         .refreshable { await refresh() }
         .task(id: model.fleetGeneration) { await refresh() }
         // Every 30s while this screen is showing; every 5s while the

@@ -72,8 +72,8 @@ struct PairingView: View {
                     Text("Apple Intelligence chat works without a server on supported iPhones with Apple Intelligence enabled.")
                         .font(.footnote).foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 8) {
-                        Button(discovery.searching ? "Searching…" : "Find servers · Wi-Fi / saved Tailscale", systemImage: "network") {
-                            discovery.start(addresses: [savedServer, URL(string: serverText)].compactMap { $0 })
+                        Button(discovery.searching ? "Searching…" : "Find servers · Wi-Fi / Tailscale address", systemImage: "network") {
+                            discovery.start(addresses: [savedServer, TailscaleServerAddress.parse(serverText)].compactMap { $0 })
                         }
                         .disabled(discovery.searching)
                         ForEach(discovery.servers) { server in
@@ -88,7 +88,7 @@ struct PairingView: View {
                             .buttonStyle(.bordered)
                         }
                         if let note = discovery.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
-                        Text("Nearby discovery uses Bonjour. Tailscale servers are checked by their saved or entered address; keep Tailscale and its DNS enabled.")
+                        Text("Tailscale does not broadcast servers. In Tailscale, open the device list → your Mac or Distiller → copy DNS name. Enter it below, then tap Find servers. Keep Tailscale and Use Tailscale DNS enabled on both devices.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     VStack(alignment: .leading, spacing: 8) {
@@ -164,7 +164,7 @@ struct PairingView: View {
     private func pair() async {
         errorHeadline = nil
         errorDetail = nil
-        guard let server = URL(string: serverText), server.host != nil else {
+        guard let server = TailscaleServerAddress.parse(serverText), server.host != nil else {
             errorHeadline = "That address can't be reached from a phone."
             errorDetail = "Enter the full address the daemon printed, including http:// or https://."
             return

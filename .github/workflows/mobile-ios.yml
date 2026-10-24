@@ -140,7 +140,7 @@ jobs:
             -destination "platform=iOS Simulator,id=$simulator_id" \
             -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
             -resultBundlePath "$RUNNER_TEMP/OpenAGI-expanded-UI.xcresult" \
-            -only-testing:OpenAGIUITests/NativeNavigationTests/testWideNavigationIsOnTheRightAndChatCanBeClosed \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testNativeAdaptiveTabsAndOptionalChatPane \
             -parallel-testing-enabled NO \
             -collect-test-diagnostics never \
             CODE_SIGN_IDENTITY=- \
