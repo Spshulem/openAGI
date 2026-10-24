@@ -600,4 +600,6 @@ Scheduled jobs are checked again immediately before dispatch. Disabling,
 removing, rescheduling, or replacing a queued job while an earlier scheduled
 handler runs prevents its stale definition from executing in that tick.
 Already running handlers are not cancelled; changed jobs are reconsidered
-under their current schedule on the next tick.
+under their current schedule on the next tick. Scheduler ticks accept a `Date`,
+an ISO timestamp, or epoch milliseconds and use the same normalized time for
+selection, revalidation, and run timestamps.
