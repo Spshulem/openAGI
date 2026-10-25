@@ -24,6 +24,7 @@ final class AppSession {
     private(set) var phase: Phase
     private(set) var mode: AppMode?
     private(set) var setupError: String?
+    private(set) var pairingServer: URL?
     // The tab a freshly set-up agent opens on.
     private(set) var initialTab: AppTab = .today
     @ObservationIgnored private var onboardingSource: AppModel?
@@ -80,10 +81,15 @@ final class AppSession {
         }
         phase = .phoneSetup
     }
-    func chooseServer() { setupError = nil; phase = .pairing }
+    func chooseServer(prefillServer: URL? = nil) {
+        setupError = nil
+        pairingServer = prefillServer
+        phase = .pairing
+    }
 
     // Back from pairing or phone setup to wherever the person came from.
     func goBack(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
+        pairingServer = nil
         onboardingSource = nil
         if mode == .server, let backup = serverBackup {
             try? backup.save()
@@ -178,6 +184,7 @@ final class AppSession {
     }
 
     func paired() {
+        pairingServer = nil
         // The active credential is now the server's; no copy is needed, and
         // any parked work has been restored (switch back) or belongs to a
         // server this phone no longer uses (a new pairing).

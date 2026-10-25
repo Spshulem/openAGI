@@ -11,6 +11,7 @@ struct SettingsView: View {
     @State private var switchError: String?
     @State private var showingFallback = false
     @State private var showingDiscovery = false
+    @State private var selectedDiscoveryServer: URL?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -47,6 +48,7 @@ struct SettingsView: View {
                     .disabled(isWorking)
                     if !model.isOnPhone {
                         Button("Find servers / check network", systemImage: "network") { showingDiscovery = true }
+                            .accessibilityIdentifier("settings-find-servers")
                     }
                 } header: {
                     Text("Connection")
@@ -139,7 +141,9 @@ struct SettingsView: View {
             }
             .disabled(isWorking)
             .sheet(isPresented: $showingFallback) { FallbackChatView() }
-            .sheet(isPresented: $showingDiscovery) { ServerDiscoverySheet(server: model.credentials.server) }
+            .sheet(isPresented: $showingDiscovery, onDismiss: connectSelectedServer) {
+                ServerDiscoverySheet(server: model.credentials.server) { selectedDiscoveryServer = $0 }
+            }
             .alert("Couldn't switch agents", isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: {
@@ -164,6 +168,14 @@ struct SettingsView: View {
         dismiss()
         model.detach()
         AppSession.shared.chooseServer()
+    }
+
+    private func connectSelectedServer() {
+        guard let server = selectedDiscoveryServer else { return }
+        selectedDiscoveryServer = nil
+        dismiss()
+        AppSession.shared.restartOnboarding(from: model)
+        AppSession.shared.chooseServer(prefillServer: server)
     }
 
     private func refresh() async {

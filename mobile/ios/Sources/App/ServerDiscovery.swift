@@ -32,10 +32,20 @@ final class ServerDiscovery: NSObject, @preconcurrency NetServiceBrowserDelegate
          check: @escaping @Sendable (URL) async -> Bool = { await ServerDiscovery.reachable($0) },
          resolveAddress: @escaping @Sendable (URL) async -> URL? = { await TailscaleServerAddress.resolve($0) },
          searchWindow: Duration = .seconds(8)) {
-        self.makeBrowser = makeBrowser
-        self.check = check
         self.searchWindow = searchWindow
         self.resolveAddress = resolveAddress
+        #if DEBUG
+        if UITestProtocol.isEnabled {
+            self.makeBrowser = { UITestDiscoveryBrowser() }
+            self.check = { _ in true }
+        } else {
+            self.makeBrowser = makeBrowser
+            self.check = check
+        }
+        #else
+        self.makeBrowser = makeBrowser
+        self.check = check
+        #endif
         super.init()
     }
 
@@ -163,6 +173,13 @@ final class ServerDiscovery: NSObject, @preconcurrency NetServiceBrowserDelegate
     }
 }
 
+#if DEBUG
+private final class UITestDiscoveryBrowser: NetServiceBrowser {
+    override func searchForServices(ofType type: String, inDomain domain: String) {}
+    override func stop() {}
+}
+#endif
+
 private final class DiscoveryRedirectBlocker: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -172,6 +189,7 @@ private final class DiscoveryRedirectBlocker: NSObject, URLSessionTaskDelegate {
 
 struct ServerDiscoverySheet: View {
     let server: URL
+    let onSelect: (URL) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var discovery = ServerDiscovery()
     @State private var addressText = ""
@@ -196,17 +214,25 @@ struct ServerDiscoverySheet: View {
                     Button(discovery.searching ? "Searching…" : "Check connection and find servers", systemImage: "network") {
                         discovery.start(addresses: [server, TailscaleServerAddress.parse(addressText)].compactMap { $0 })
                     }.disabled(discovery.searching)
+                    .accessibilityIdentifier("discovery-search")
                     if let note = discovery.note { Text(note).font(.footnote).foregroundStyle(.secondary) }
                     ForEach(discovery.servers) { candidate in
-                        VStack(alignment: .leading) {
-                            Text(candidate.name)
-                            Text(candidate.address.absoluteString).textSelection(.enabled)
-                            Text(candidate.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check OpenAGI, Tailscale, DNS, and access rules" } ?? "Nearby announcement or connection check pending")
-                                .font(.footnote).foregroundStyle(.secondary)
+                        Button {
+                            onSelect(candidate.address)
+                            dismiss()
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(candidate.name)
+                                Text(candidate.address.absoluteString).font(.caption)
+                                Text(candidate.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check OpenAGI, Tailscale, DNS, and access rules" } ?? "Nearby announcement or connection check pending")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                                Text("Connect to this server…").font(.footnote)
+                            }
                         }
+                        .accessibilityIdentifier("discovered-server-\(candidate.id)")
                     }
                 } footer: {
-                    Text("Keep Tailscale and Use Tailscale DNS enabled on both devices. Discovery checks only saved or entered addresses and nearby announcements; it never shares your credentials. Pair a new server from Connection Settings using a one-time code.")
+                    Text("Tap a server to open connection setup with its address filled in. Keep Tailscale and Use Tailscale DNS enabled on both devices. Searching and selecting never shares your saved credentials; a new connection requires a one-time pairing code.")
                 }
             }
             .navigationTitle("Find servers")

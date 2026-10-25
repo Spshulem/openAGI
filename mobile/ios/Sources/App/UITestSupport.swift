@@ -9,10 +9,18 @@ import os
 @MainActor
 struct UITestRoot: View {
     @State private var model = UITestProtocol.makeModel()
+    @State private var session = AppSession.shared
 
     var body: some View {
-        RootTabView(testingModel: model)
-            .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--ui-dark") ? .dark : nil)
+        Group {
+            if session.phase == .pairing {
+                PairingView(prefillServer: session.pairingServer,
+                            onCancel: { session.goBack() }, onPaired: { session.paired() })
+            } else {
+                RootTabView(testingModel: model)
+            }
+        }
+        .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--ui-dark") ? .dark : nil)
     }
 }
 
