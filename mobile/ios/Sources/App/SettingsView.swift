@@ -174,7 +174,7 @@ struct SettingsView: View {
         guard let server = selectedDiscoveryServer else { return }
         selectedDiscoveryServer = nil
         dismiss()
-        model.detach()
+        AppSession.shared.restartOnboarding(from: model)
         AppSession.shared.chooseServer(prefillServer: server)
     }
 
