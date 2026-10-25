@@ -61,8 +61,7 @@ struct SettingsView: View {
                 Section {
                     Button("Run setup again", systemImage: "arrow.counterclockwise") {
                         dismiss()
-                        model.detach()
-                        AppSession.shared.restartOnboarding()
+                        AppSession.shared.restartOnboarding(from: model)
                     }
                     .accessibilityIdentifier("settings-restart-setup")
                 } header: {

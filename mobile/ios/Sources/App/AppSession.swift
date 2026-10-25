@@ -26,6 +26,7 @@ final class AppSession {
     private(set) var setupError: String?
     // The tab a freshly set-up agent opens on.
     private(set) var initialTab: AppTab = .today
+    @ObservationIgnored private var onboardingSource: AppModel?
 
     init() {
         let credentials = Credentials.load()
@@ -49,7 +50,9 @@ final class AppSession {
 
     // Replay changes navigation only. Credentials, history and queued work
     // stay in place; goBack returns to the existing agent.
-    func restartOnboarding() {
+    func restartOnboarding(from model: AppModel? = nil) {
+        model?.suspendForOnboarding()
+        onboardingSource = model
         setupError = nil
         phase = .welcome
     }
@@ -71,6 +74,7 @@ final class AppSession {
 
     // Back from pairing or phone setup to wherever the person came from.
     func goBack(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
+        onboardingSource = nil
         if mode == .server, let backup = serverBackup {
             try? backup.save()
             try? parkedQueue.move(to: queue)
@@ -90,10 +94,23 @@ final class AppSession {
     }
 
     func finishPhoneSetup(_ credentials: Credentials) {
+        // Only a completed switch leaves the old daemon. Cancelling any
+        // earlier setup step keeps its offline snapshot, history and queue.
+        if let source = onboardingSource, !source.isOnPhone {
+            source.detach()
+        }
+        onboardingSource = nil
         AppMode.current = .onPhone
         mode = .onPhone
         initialTab = .chat
         phase = .ready(credentials)
+    }
+
+    // Enrollment has succeeded and the new credential is securely saved.
+    // Isolate the old stores before the new server's first queue drain.
+    func prepareForPairing() {
+        onboardingSource?.detach()
+        onboardingSource = nil
     }
 
     // From a server, Settings' "Try the agent on this iPhone": the server's

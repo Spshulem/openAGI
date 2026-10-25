@@ -25,7 +25,19 @@ final class AppModeTests: XCTestCase {
             Credentials.clear(.server)
             AppMode.current = mode
             let session = AppSession()
-            session.restartOnboarding()
+            let store = SnapshotStore(directory: directory)
+            let fixture = URL(filePath: #filePath)
+                .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+                .appending(path: "fixtures/summary-populated.json")
+            let summary = try ProtocolDecoder.json.decode(MobileSummary.self, from: Data(contentsOf: fixture))
+            _ = try store.storeFresh(summary: summary, etag: "offline-replay")
+            for thread in ["agent", "supervisor"] {
+                ChatHistoryStore(thread: thread, directory: directory).save(nodeID: credentials.nodeID, entries: [
+                    SavedChatEntry(id: UUID(), role: "user", at: Date(), text: "Saved \(thread) message")
+                ])
+            }
+            let model = AppModel(credentials: credentials, store: store, queue: queue, chatDirectory: directory)
+            session.restartOnboarding(from: model)
             XCTAssertEqual(session.phase, .welcome)
             XCTAssertEqual(Credentials.load(), credentials)
             XCTAssertEqual(AppMode.current, mode)
@@ -33,6 +45,11 @@ final class AppModeTests: XCTestCase {
             XCTAssertEqual(session.phase, .ready(credentials))
             XCTAssertEqual(Credentials.load(), credentials)
             XCTAssertEqual(queue.all(), [pending])
+            XCTAssertEqual(store.load()?.etag, "offline-replay")
+            for thread in ["agent", "supervisor"] {
+                XCTAssertEqual(ChatHistoryStore(thread: thread, directory: directory)
+                    .load(nodeID: credentials.nodeID).map(\.text), ["Saved \(thread) message"])
+            }
         }
     }
 

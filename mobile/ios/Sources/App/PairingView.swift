@@ -181,6 +181,7 @@ struct PairingView: View {
             )
             let credentials = Credentials(server: server, nodeID: enrollment.node.id, token: enrollment.nodeToken)
             try credentials.save()
+            AppSession.shared.prepareForPairing()
             // Kick the first refresh so the day's tasks are already on disk
             // by the time the tab bar appears; failure here is not fatal to
             // pairing itself, so it's not surfaced as a pairing error.

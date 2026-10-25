@@ -211,8 +211,10 @@ struct PhoneSetupView: View {
 
     @ViewBuilder private var notificationsStep: some View {
         header("Stay in the loop", "Allow local notifications for a morning plan and evening recap. iOS controls when background refresh can run; open the app to keep them current.")
-        PrimaryButton(title: "Turn on notifications") { requestNotifications() }
+        PrimaryButton(title: "Turn on notifications", isLoading: isWorking) { requestNotifications() }
+            .disabled(isWorking)
         SecondaryTextButton(title: "Not now") { finish() }
+            .disabled(isWorking)
     }
 
     // MARK: Actions
@@ -288,7 +290,10 @@ struct PhoneSetupView: View {
     }
 
     private func requestNotifications() {
+        guard !isWorking else { return }
+        isWorking = true
         Task {
+            defer { isWorking = false }
             _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
             if let credentials { await PhoneAgent.refreshDigests(credentials) }
             finish()
@@ -296,7 +301,7 @@ struct PhoneSetupView: View {
     }
 
     private func finish() {
-        guard let credentials else { return }
+        guard session.phase == .phoneSetup, let credentials else { return }
         session.finishPhoneSetup(credentials)
     }
 
