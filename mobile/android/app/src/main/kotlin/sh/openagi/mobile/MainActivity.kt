@@ -167,10 +167,10 @@ class MainActivity : ComponentActivity() {
                             }
                             localError?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp)) }
                             Box(Modifier.weight(1f)) { PairingScreen(
-                            context = this,
+                            context = this@MainActivity,
                             prefill = pendingPairing,
                             onPaired = {
-                                credentialsState.value = Credentials.load(this)
+                                credentialsState.value = Credentials.load(this@MainActivity)
                                 // Spent. Left set, it would reach the paired branch
                                 // below as an incoming link and immediately offer to
                                 // switch away from the pairing it just made.
