@@ -24,13 +24,14 @@ import java.util.concurrent.TimeUnit
 // Run with -e nanoAcceptance true. No keys or user messages enter the report.
 @RunWith(AndroidJUnit4::class)
 class GeminiNanoAcceptanceTest {
-    @Test fun nanoAnswersDirectlyAndThroughTheLocalDaemon() = runBlocking {
+    @Test fun nanoAnswersDirectlyAndThroughTheLocalDaemon(): Unit = runBlocking {
         assumeTrue(InstrumentationRegistry.getArguments().getString("nanoAcceptance") == "true")
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val previous = Credentials.load(context)
         val http = OkHttpClient.Builder().callTimeout(150, TimeUnit.SECONDS).build()
         try {
-            ActivityScenario.launch(MainActivity::class.java).use {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.onActivity { it.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
                 val status = withTimeout(30_000) { LocalChat.status() }
                 Log.i("OpenAGINanoAcceptance", "AICore feature status=$status")
                 val direct = withTimeout(120_000) { LocalChat.generate("Please reply with a short greeting.") }
