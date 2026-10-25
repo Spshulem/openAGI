@@ -117,7 +117,7 @@ private final class PhonePairingTransport: NSObject, URLSessionTaskDelegate, @un
 }
 
 @MainActor
-private final class PhonePairingModel: ObservableObject {
+final class PhonePairingModel: ObservableObject {
   @Published var code: PhonePairingCode?
   @Published var loading = false
   @Published var error: String?
@@ -193,7 +193,7 @@ private struct PhonePairingView: View {
       }
       Text("Each code connects one phone. Your phone remembers its connection after pairing.")
         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-    }.padding(28).frame(width: 460, alignment: .leading).fixedSize(horizontal: false, vertical: true)
+    }.padding(28).frame(maxWidth: .infinity, alignment: .leading)
   }
 }
 
@@ -204,6 +204,24 @@ final class PhonePairingWindowController: NSObject, WKNavigationDelegate {
   private var signInWindow: NSWindow?
   private let model = PhonePairingModel()
 
+  static func makeWindow(model: PhonePairingModel, signIn: @escaping () -> Void) -> NSWindow {
+    let controller = NSHostingController(rootView: ScrollView {
+      PhonePairingView(model: model, signIn: signIn)
+    })
+    // AppKit owns the window size. Driving preferred/minimum window sizing
+    // from a changing SwiftUI layout can recursively invalidate constraints
+    // on macOS 27 as the loading state becomes a code or an error.
+    controller.sizingOptions = []
+    let window = NSWindow(contentViewController: controller)
+    window.title = "OpenAGI · Connect a phone"
+    window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+    window.setContentSize(NSSize(width: 520, height: 440))
+    window.contentMinSize = NSSize(width: 360, height: 320)
+    window.isReleasedWhenClosed = false
+    window.center()
+    return window
+  }
+
   func show(state: AppState) {
     if let window, window.isVisible {
       window.makeKeyAndOrderFront(nil)
@@ -211,14 +229,7 @@ final class PhonePairingWindowController: NSObject, WKNavigationDelegate {
       return
     }
     if window == nil {
-      let controller = NSHostingController(rootView: PhonePairingView(model: model, signIn: { [weak self] in self?.signIn() }))
-      controller.sizingOptions = [.minSize, .preferredContentSize]
-      let win = NSWindow(contentViewController: controller)
-      win.title = "OpenAGI · Connect a phone"
-      win.styleMask = [.titled, .closable, .miniaturizable]
-      win.isReleasedWhenClosed = false
-      win.center()
-      window = win
+      window = Self.makeWindow(model: model, signIn: { [weak self] in self?.signIn() })
     }
     do {
       let path = AppState.dataDir().appendingPathComponent("node.json")
