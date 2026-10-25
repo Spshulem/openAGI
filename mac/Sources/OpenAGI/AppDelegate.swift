@@ -46,6 +46,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         PrivacyWindowController.shared.show()
       }
 
+      // Local launch intent reveals the same native flow as the menu item,
+      // so support can verify the packaged app even when the tray is hidden.
+      if ProcessInfo.processInfo.arguments.contains("--connect-phone") {
+        PhonePairingWindowController.shared.show(state: AppState.shared)
+      }
+
       // Start the durable outreach consumer if a remote main is configured.
       // Backfills from the persisted cursor so nothing queued while the app was
       // closed is lost.

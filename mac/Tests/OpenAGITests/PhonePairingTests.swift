@@ -2,6 +2,28 @@ import XCTest
 @testable import OpenAGI
 
 final class PhonePairingTests: XCTestCase {
+  func testBundleAllowsLocalDaemonAndPairedIPConnectionsWithoutDisablingATS() throws {
+    let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+      .deletingLastPathComponent().deletingLastPathComponent()
+    let data = try Data(contentsOf: root.appendingPathComponent("Resources/Info.plist"))
+    let info = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+    let ats = try XCTUnwrap(info["NSAppTransportSecurity"] as? [String: Any])
+    XCTAssertEqual(ats["NSAllowsLocalNetworking"] as? Bool, true)
+    XCTAssertNotEqual(ats["NSAllowsArbitraryLoads"] as? Bool, true)
+    XCTAssertNotEqual(ats["NSAllowsArbitraryLoadsInWebContent"] as? Bool, true)
+    XCTAssertFalse((info["NSLocalNetworkUsageDescription"] as? String ?? "").isEmpty)
+  }
+
+  func testTransportAndResponseFailuresHaveDistinctRecoveryMessages() {
+    let blocked = PhonePairingError.message(for: URLError(.appTransportSecurityRequiresSecureConnection))
+    XCTAssertTrue(blocked.contains("macOS blocked"))
+    XCTAssertFalse(blocked.contains("Wi-Fi"))
+    XCTAssertTrue(PhonePairingError.message(for: URLError(.serverCertificateUntrusted)).contains("certificate"))
+    XCTAssertTrue(PhonePairingError.message(for: URLError(.cannotFindHost)).contains("address"))
+    XCTAssertEqual(PhonePairingError.message(for: DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "fixture"))),
+      PhonePairingError.invalidCode.localizedDescription)
+  }
+
   func testLocalOwnerIsOnlyUsedWithoutAMain() throws {
     let connection = try PhonePairingConnection.resolve(localOwnerToken: "local-owner", nodeConfig: nil,
       savedMainURL: "https://other.example", savedMainToken: "other-owner")

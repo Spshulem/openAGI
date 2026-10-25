@@ -56,6 +56,22 @@ struct PhonePairingConnection {
 
 enum PhonePairingError: LocalizedError {
   case invalidServer, invalidCode, loopbackAddress, unauthorized, oldServer, refused
+  static func message(for error: Error) -> String {
+    if error is DecodingError { return PhonePairingError.invalidCode.localizedDescription }
+    guard let network = error as? URLError else { return PhonePairingError.refused.localizedDescription }
+    switch network.code {
+    case .appTransportSecurityRequiresSecureConnection:
+      return "macOS blocked this server’s connection. Update OpenAGI, then reopen phone pairing."
+    case .serverCertificateUntrusted, .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+         .serverCertificateNotYetValid, .secureConnectionFailed:
+      return "The server’s secure connection could not be verified. Check its address and certificate."
+    case .cannotFindHost, .dnsLookupFailed:
+      return "The main-server address could not be found. Check its address and your Wi-Fi or Tailscale connection."
+    default:
+      return "Couldn’t reach your main server. Check Wi-Fi or Tailscale and allow OpenAGI access in System Settings → Privacy & Security → Local Network, then try again."
+    }
+  }
+
   var errorDescription: String? {
     switch self {
     case .invalidServer: return "The saved main-server address is invalid. Check this Mac’s server connection."
@@ -139,7 +155,7 @@ private final class PhonePairingModel: ObservableObject {
       code = try PhonePairingCode.decode(data, connection: connection)
       needsSignIn = false
     } catch let failure as PhonePairingError { error = failure.localizedDescription }
-    catch { self.error = "Couldn’t reach your main server. Check Wi-Fi or Tailscale, then try again." }
+    catch { self.error = PhonePairingError.message(for: error) }
   }
 }
 
@@ -150,7 +166,7 @@ private struct PhonePairingView: View {
     VStack(alignment: .leading, spacing: 18) {
       Label("Connect a phone", systemImage: "iphone.and.arrow.forward").font(.title2.bold())
       Text("On your iPhone or Android phone, choose Connect to a server.")
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
       if model.loading { ProgressView("Creating a pairing code on your main server…") }
       if let code = model.code {
         TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -167,15 +183,17 @@ private struct PhonePairingView: View {
           } else { Text("This code expired. Generate a new code to continue.") }
         }
       }
-      if let error = model.error { Text(error).foregroundStyle(.secondary) }
+      if let error = model.error {
+        Text(error).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+      }
       HStack {
         if model.needsSignIn { Button("Sign in to main server", action: signIn) }
         Button(model.code == nil ? "Try again" : "Generate another code") { Task { await model.generate() } }
           .disabled(model.loading)
       }
       Text("Each code connects one phone. Your phone remembers its connection after pairing.")
-        .font(.caption).foregroundStyle(.secondary)
-    }.padding(28).frame(width: 460, alignment: .leading)
+        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }.padding(28).frame(width: 460, alignment: .leading).fixedSize(horizontal: false, vertical: true)
   }
 }
 
@@ -194,6 +212,7 @@ final class PhonePairingWindowController: NSObject, WKNavigationDelegate {
     }
     if window == nil {
       let controller = NSHostingController(rootView: PhonePairingView(model: model, signIn: { [weak self] in self?.signIn() }))
+      controller.sizingOptions = [.minSize, .preferredContentSize]
       let win = NSWindow(contentViewController: controller)
       win.title = "OpenAGI · Connect a phone"
       win.styleMask = [.titled, .closable, .miniaturizable]
