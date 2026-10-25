@@ -4,27 +4,104 @@ import SwiftUI
 // on AppModel so streaming replies and drafts survive tab and fold changes.
 struct ChatView: View {
     @Environment(AppModel.self) private var model
-    @State private var showingFallback = false
+    @State private var columns: NavigationSplitViewVisibility = .all
+    @State private var compactColumn: NavigationSplitViewColumn = .detail
+    @State private var thread: ConversationThread = .agent
+    @State private var search = ""
+    @State private var destination: ChatSheet?
+    @State private var selectedMessage: UUID?
     var onClose: (() -> Void)? = nil
 
+    private enum ChatSheet: String, Identifiable {
+        case model, settings, fallback
+        var id: String { rawValue }
+    }
+
+    private var conversation: ChatConversation {
+        thread == .agent ? model.agentChat : model.supervisorChat
+    }
+
     var body: some View {
-        NavigationStack {
-            ChatConversationView(conversation: model.agentChat, title: "Chat")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    if let onClose {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("Close chat", systemImage: "xmark", action: onClose)
-                                .accessibilityIdentifier("close-chat-pane")
+        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
+            List {
+                Section("Your conversations") {
+                    conversationRow("Agent", symbol: "bubble.left.and.bubble.right", chat: model.agentChat, thread: .agent)
+                    conversationRow("Supervisor", symbol: "binoculars", chat: model.supervisorChat, thread: .supervisor)
+                }
+                if !search.isEmpty {
+                    Section("Messages") {
+                        ForEach(conversation.messages.filter { $0.text.localizedCaseInsensitiveContains(search) }, id: \.id) { message in
+                            Button {
+                                selectedMessage = message.id
+                                compactColumn = .detail
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(message.role == .user ? "You" : "OpenAGI").font(.caption).foregroundStyle(.secondary)
+                                    Text(message.text).lineLimit(3).foregroundStyle(.primary)
+                                }
+                            }
                         }
                     }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
-                            .accessibilityIdentifier("chat-fallback")
-                    }
                 }
-                .sheet(isPresented: $showingFallback) { FallbackChatView() }
+            }
+            .listStyle(.sidebar)
+            .searchable(text: $search, prompt: "Search saved messages")
+            .navigationTitle("Conversations")
+            .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 320)
+        } detail: {
+            NavigationStack {
+                ChatConversationView(conversation: conversation, title: thread == .agent ? "Chat" : "Supervisor chat",
+                                     scrollToMessageID: selectedMessage)
+                    .toolbar {
+                        if let onClose {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Close chat", systemImage: "xmark", action: onClose)
+                                    .accessibilityIdentifier("close-chat-pane")
+                            }
+                        }
+                        ToolbarItemGroup(placement: .primaryAction) {
+                            Button("Model", systemImage: "cpu") { destination = .model }
+                                .accessibilityIdentifier("chat-model")
+                            Menu {
+                                Button("Settings", systemImage: "gearshape") { destination = .settings }
+                                if !model.isOnPhone {
+                                    Button("Chat without server", systemImage: "network.slash") { destination = .fallback }
+                                }
+                            } label: { Label("Chat options", systemImage: "ellipsis") }
+                        }
+                    }
+            }
         }
+        .sheet(item: $destination) { sheet in
+            switch sheet {
+            case .model:
+                NavigationStack {
+                    ModelSettingsView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                }
+            case .settings: SettingsView(onRevoked: { AppSession.shared.revoked() })
+            case .fallback: FallbackChatView()
+            }
+        }
+    }
+
+    private func conversationRow(_ title: String, symbol: String, chat: ChatConversation, thread target: ConversationThread) -> some View {
+        Button {
+            thread = target
+            selectedMessage = nil
+            compactColumn = .detail
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: symbol).frame(width: 22)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.body.weight(.medium)).foregroundStyle(.primary)
+                    Text(chat.messages.last?.text ?? "Start a conversation")
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+                if thread == target { Image(systemName: "checkmark").accessibilityLabel("Selected") }
+            }.padding(.vertical, 4)
+        }
+        .accessibilityIdentifier("conversation-\(target.rawValue)")
     }
 }
 
@@ -39,6 +116,7 @@ struct ChatConversationView: View {
 
     let conversation: ChatConversation
     var title: String
+    var scrollToMessageID: UUID? = nil
     var showsTitle = true
     var starters: [String] = []
     var placeholder = "Message OpenAGI"
@@ -71,7 +149,7 @@ struct ChatConversationView: View {
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
-        .task { await conversation.refresh() }
+        .task(id: conversation.thread) { await conversation.refresh() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await conversation.refresh() } }
         }
@@ -136,10 +214,7 @@ struct ChatConversationView: View {
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, Theme.Spacing.x8)
                         } else if messages.isEmpty && (conversation.historyStatus == .synced || conversation.historyStatus == .needsUpdate) {
-                            EmptyStateView(headline: conversation.historyStatus == .synced
-                                           ? "No messages on this server yet." : "No saved messages on this phone.",
-                                           detail: emptyDetail + " Older conversations stay on the server where they happened. Check your connected server in Settings if you expected them here.")
-                                .padding(.top, Theme.Spacing.x8)
+                            chatHome
                             if !starters.isEmpty { starterButtons }
                         }
                         ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
@@ -161,6 +236,12 @@ struct ChatConversationView: View {
                     } else if isPinnedToBottom { scrollToLatest(proxy) }
                 }
                 .onAppear { scrollToLatest(proxy) }
+                .onChange(of: scrollToMessageID) { _, id in
+                    if let id {
+                        isPinnedToBottom = false
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                }
                 .scrollDismissesKeyboard(.interactively)
 
                 if !isPinnedToBottom && !messages.isEmpty {
@@ -246,35 +327,50 @@ struct ChatConversationView: View {
         .id(item.message.id)
     }
 
+    private var chatHome: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Image(systemName: "sparkle").font(.largeTitle).foregroundStyle(.tint)
+            Text("What would you like to do?").font(.largeTitle.bold())
+            Text(model.isOnPhone
+                 ? "Your agent, tasks and conversations live on this iPhone."
+                 : "Plan your day, keep track of work, or ask your agent for help.")
+                .foregroundStyle(.secondary)
+            ForEach(["Help me plan my day", "Show my tasks", "Remember something for me"], id: \.self) { prompt in
+                Button { conversation.draft = prompt; composerFocused = true } label: {
+                    Label(prompt, systemImage: "arrow.up.left")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }.buttonStyle(.bordered).controlSize(.large)
+            }
+        }
+        .padding(.vertical, 40)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("chat-home")
+    }
+
     @ViewBuilder
     private var inputBar: some View {
         if #available(iOS 26, *) {
-            GlassEffectContainer(spacing: 12) {
-                HStack(alignment: .bottom, spacing: 12) {
-                    composerField
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
-                        .glassEffect(.regular, in: .rect(cornerRadius: 26))
-                    sendButton
-                        .buttonStyle(.glassProminent)
-                        .buttonBorderShape(.circle)
-                        .controlSize(.large)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            }
+            composerContents
+                .padding(16)
+                .glassEffect(.regular, in: .rect(cornerRadius: 24))
+                .padding(.horizontal, 16).padding(.vertical, 8)
         } else {
-            HStack(alignment: .bottom, spacing: 12) {
-                composerField
-                    .textFieldStyle(.roundedBorder)
-                sendButton
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.circle)
-                    .controlSize(.large)
+            composerContents.padding(16)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+                .padding(.horizontal, 16).padding(.vertical, 8)
+        }
+    }
+
+    private var composerContents: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            composerField
+            HStack {
+                Label(model.isOnPhone ? "On this iPhone" : "Connected agent", systemImage: model.isOnPhone ? "iphone" : "server.rack")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if conversation.isSending { ProgressView().accessibilityLabel("Agent is replying") }
+                sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(.bar)
         }
     }
 
@@ -395,10 +491,6 @@ private struct MessageBubbleRow: View {
         bubbleContent
             .padding(.horizontal, Theme.Spacing.x4)
             .padding(.vertical, Theme.Spacing.x3)
-            .frame(
-                maxWidth: maxContainerWidth * (message.role == .user ? 0.78 : 0.85),
-                alignment: message.role == .user ? .trailing : .leading
-            )
             .background(fill)
             .clipShape(bubbleShape)
             .contextMenu {
@@ -412,7 +504,7 @@ private struct MessageBubbleRow: View {
 
     // Messages remain in the content layer; glass belongs to the controls.
     private var fill: Color {
-        message.role == .user ? .blue : Color(uiColor: .secondarySystemBackground)
+        message.role == .user ? .accentColor : .clear
     }
 
     // DESIGN.md: "radius 18 with the bottom-trailing corner at 4" (you) /

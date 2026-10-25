@@ -1,5 +1,6 @@
 package sh.openagi.mobile.widget
 
+import sh.openagi.mobile.store.Credentials
 import android.content.Context
 import android.util.Log
 import androidx.glance.GlanceId
@@ -24,8 +25,8 @@ class CompleteTaskAction : ActionCallback {
         // filesystem, so every write here is best-effort, same as iOS's
         // `try?` on the equivalent path.
         try {
-            SnapshotStore(context.filesDir).applyOptimisticCompletion(taskId)
-            OutboundQueue(context.filesDir).enqueue(PendingOp.completeTask(taskId))
+            SnapshotStore(Credentials.workspaceDirectory(context)).applyOptimisticCompletion(taskId)
+            OutboundQueue(Credentials.workspaceDirectory(context)).enqueue(PendingOp.completeTask(taskId))
         } catch (error: Exception) {
             Log.w("CompleteTaskAction", "optimistic completion write failed: ${error.javaClass.simpleName}")
         }

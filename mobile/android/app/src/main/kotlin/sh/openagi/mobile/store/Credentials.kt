@@ -18,6 +18,8 @@ data class Credentials(val server: String, val nodeId: String, val token: String
     // everyone who handles it remembering.
     override fun toString(): String = "Credentials(server=$server, nodeId=$nodeId, token=<redacted>)"
 
+    val isEmbedded: Boolean get() = server.startsWith("http://127.0.0.1:")
+
     companion object {
         private const val FILE = "sh.openagi.mobile.credentials"
         private const val TAG = "Credentials"
@@ -45,6 +47,9 @@ data class Credentials(val server: String, val nodeId: String, val token: String
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             ) as EncryptedSharedPreferences
         }
+
+        fun workspaceDirectory(context: Context, credentials: Credentials? = load(context)): java.io.File =
+            if (credentials?.isEmbedded == true) java.io.File(context.filesDir, "phone-cache").apply { mkdirs() } else context.filesDir
 
         fun load(context: Context): Credentials? {
             val store = prefs(context) ?: return null

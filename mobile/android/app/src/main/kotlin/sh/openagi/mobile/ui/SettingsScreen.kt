@@ -56,6 +56,8 @@ fun SettingsScreen(
     context: Context,
     credentials: Credentials,
     onRevoked: () -> Unit,
+    onUsePhone: (() -> Unit)? = null,
+    onUseServer: (() -> Unit)? = null,
 ) {
     var isWorking by remember { mutableStateOf(false) }
     var connectionIssue by remember { mutableStateOf<String?>(null) }
@@ -74,10 +76,10 @@ fun SettingsScreen(
         },
         confirmButton = { androidx.compose.material3.TextButton(onClick = { showingDiscovery = false }) { Text("Done") } },
     )
-    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context) { showingFallback = false }
+    if (showingFallback) sh.openagi.mobile.fallback.FallbackChatScreen(context, localAgentMode = credentials.isEmbedded) { showingFallback = false }
     val scope = rememberCoroutineScope()
     val client = remember(credentials) { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
-    val store = remember { SnapshotStore(context.filesDir) }
+    val store = remember(credentials) { SnapshotStore(Credentials.workspaceDirectory(context, credentials)) }
 
     fun connectionState(): ConnectionState {
         val snapshot = store.load() ?: return ConnectionState.NeverSynced(credentials.server)
@@ -99,13 +101,18 @@ fun SettingsScreen(
 
     Column(modifier = Modifier.fillMaxSize()) {
         ScreenHeader(title = "Settings", connection = connection)
+        if (credentials.isEmbedded && onUseServer != null) {
+            androidx.compose.material3.TextButton(onClick = onUseServer) { Text("Use saved server / connect a server") }
+        } else if (onUsePhone != null) {
+            androidx.compose.material3.TextButton(onClick = onUsePhone) { Text("Use agent on this phone") }
+        }
 
         Column(
             modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp),
         ) {
             RowGroup {
-                SettingsRow(label = "Server", value = credentials.server)
+                SettingsRow(label = "Runs on", value = if (credentials.isEmbedded) "This phone" else credentials.server)
                 Hairline()
                 SettingsRow(label = "Node ID", value = credentials.nodeId)
                 Hairline()
@@ -123,7 +130,7 @@ fun SettingsScreen(
                             val outcome = RefreshCoordinator(
                                 client,
                                 store,
-                                OutboundQueue(context.filesDir),
+                                OutboundQueue(Credentials.workspaceDirectory(context, credentials)),
                                 onSnapshotChanged = { runCatching { TodayWidget().updateAll(context) } },
                             ).refresh()
                             connectionIssue = when (outcome) {
@@ -141,7 +148,7 @@ fun SettingsScreen(
             )
 
             androidx.compose.material3.OutlinedButton(onClick = { showingFallback = true }, modifier = Modifier.fillMaxWidth()) {
-                Text("Chat without server · local or hosted model")
+                Text(if (credentials.isEmbedded) "Gemini Nano · local model setup" else "Chat without server · local or hosted model")
             }
             androidx.compose.material3.OutlinedButton(onClick = { showingDiscovery = true }, modifier = Modifier.fillMaxWidth()) {
                 Text("Find servers / check network")

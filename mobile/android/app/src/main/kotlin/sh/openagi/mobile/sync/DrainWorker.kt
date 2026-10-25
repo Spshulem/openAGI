@@ -19,8 +19,8 @@ class DrainWorker(context: Context, params: WorkerParameters) : CoroutineWorker(
         val credentials = Credentials.load(applicationContext) ?: return Result.success()
         val coordinator = RefreshCoordinator(
             DaemonClient(credentials.server, credentials.nodeId, credentials.token),
-            SnapshotStore(applicationContext.filesDir),
-            OutboundQueue(applicationContext.filesDir),
+            SnapshotStore(Credentials.workspaceDirectory(applicationContext, credentials)),
+            OutboundQueue(Credentials.workspaceDirectory(applicationContext, credentials)),
         )
         coordinator.drainQueue()
         TodayWidget().updateAll(applicationContext)

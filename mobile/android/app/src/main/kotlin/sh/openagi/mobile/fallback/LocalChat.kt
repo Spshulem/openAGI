@@ -18,6 +18,7 @@ object LocalChat {
     suspend fun status(): Int = runner.status()
     fun download(): Flow<LocalModelProgress> = runner.download()
     suspend fun reply(lines: List<FallbackLine>): String = runner.reply(lines)
+    suspend fun generate(prompt: String): String = runner.generate(prompt)
 }
 
 internal interface LocalGenerationClient : AutoCloseable {
@@ -67,6 +68,14 @@ internal class LocalChatRunner(
             }
         } finally { model.close() }
     }.flowOn(dispatcher) // Collectors update Compose state on their own context.
+
+    suspend fun generate(prompt: String): String = withContext(dispatcher) {
+        val model = createClient()
+        try {
+            if (model.status() != FeatureStatus.AVAILABLE) throw FallbackException("Gemini Nano isn't ready on this phone.")
+            model.generate(prompt).also { if (it.isBlank()) throw FallbackException("The local model returned no text.") }
+        } finally { model.close() }
+    }
 
     suspend fun reply(lines: List<FallbackLine>): String = withContext(dispatcher) {
         val model = createClient()

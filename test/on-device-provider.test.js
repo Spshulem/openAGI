@@ -161,7 +161,8 @@ test("history is trimmed newest-first to the context budget", () => {
 test("compact system prompt keeps the persona and drops the desktop catalog", () => {
   const prompt = compactSystemPrompt({ name: "Pip", systemPrompt: "# Pip\nHelps with groceries." });
   assert.match(prompt, /Helps with groceries/);
-  assert.match(prompt, /onboarding.*one small step/);
+  assert.match(prompt, /current request/);
+  assert.match(prompt, /do not restart onboarding/);
   assert.match(prompt, /Keep keys in Settings, never chat/);
   assert.match(prompt, /normal approval gates/);
   assert.doesNotMatch(prompt, /run_mcp_tool|ABI loop/);

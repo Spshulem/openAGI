@@ -22,8 +22,8 @@ class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorke
         val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
         val coordinator = RefreshCoordinator(
             client,
-            SnapshotStore(applicationContext.filesDir),
-            OutboundQueue(applicationContext.filesDir),
+            SnapshotStore(Credentials.workspaceDirectory(applicationContext, credentials)),
+            OutboundQueue(Credentials.workspaceDirectory(applicationContext, credentials)),
         )
         coordinator.refresh()
         TodayWidget().updateAll(applicationContext)

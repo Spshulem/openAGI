@@ -52,7 +52,7 @@ class TodayWidget : GlanceAppWidget() {
         // null rather than throwing, and Credentials.load() returns null
         // rather than a token when nothing is stored, so there is no snapshot
         // shape here that can crash the widget host.
-        val snapshot = SnapshotStore(context.filesDir).load()
+        val snapshot = SnapshotStore(Credentials.workspaceDirectory(context)).load()
         val paired = Credentials.load(context) != null
         val state = WidgetState.from(snapshot, paired)
 

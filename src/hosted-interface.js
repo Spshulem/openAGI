@@ -1014,7 +1014,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // original scoped credential. Never grant this worker broader scopes.
       const gatewayOwnerAuthenticated = checkAuth(req, url, getAuthToken()).ok;
       if (routeMainData(req, res, url, {
-        pairing: readNodeConfig(dataDir), identity: localIdentity,
+        // An embedded phone owns its workspace. Even a migrated data directory
+        // with an old worker pairing must never route local tasks or decisions
+        // to a remote main. Desktop workers keep forwarding as before.
+        pairing: mobileProfile ? null : readNodeConfig(dataDir), identity: localIdentity,
         ownerAuthenticated: gatewayOwnerAuthenticated,
         ownerBearerAuthenticated: Boolean(getAuthToken() && scopedBearer && checkAuth(
           { headers: { authorization: req.headers.authorization } }, new URL("/", url), getAuthToken()
@@ -1307,7 +1310,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // shipped wearable already depends on.
         const body = await readJsonLimited(req, 4 * 1024).catch(() => ({}));
         const platform = body.platform;
-        if (readNodeConfig(dataDir)?.remote) {
+        if (!mobileProfile && readNodeConfig(dataDir)?.remote) {
           return sendJson(res, 409, {
             error: platform === MOBILE_PLATFORM
               ? "phones must be enrolled on the main OpenAGI"

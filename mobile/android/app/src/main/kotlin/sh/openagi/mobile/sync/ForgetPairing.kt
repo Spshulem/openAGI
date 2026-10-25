@@ -34,9 +34,9 @@ suspend fun forgetPairing(context: Context, credentials: Credentials) {
     }
     // Through the stores rather than deleting files directly, so each delete
     // holds the lock every writer for that file holds.
-    SnapshotStore(context.filesDir).delete()
-    OutboundQueue(context.filesDir).clear()
+    SnapshotStore(Credentials.workspaceDirectory(context, credentials)).delete()
+    OutboundQueue(Credentials.workspaceDirectory(context, credentials)).clear()
     // Saved conversations belong to the pairing being forgotten. A reply
     // still streaming for it, or a write already queued, cannot recreate them.
-    ChatHistoryStore.KEYS.forEach { ChatHistoryStore(context.filesDir, it).delete(forgetNodeId = credentials.nodeId) }
+    ChatHistoryStore.KEYS.forEach { ChatHistoryStore(Credentials.workspaceDirectory(context, credentials), it).delete(forgetNodeId = credentials.nodeId) }
 }

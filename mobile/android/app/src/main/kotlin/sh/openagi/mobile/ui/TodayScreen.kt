@@ -66,8 +66,8 @@ fun TodayScreen(
     // The read-only G2 lifelog opens from here rather than from a seventh tab.
     onOpenLifelog: () -> Unit = {},
 ) {
-    val store = remember { SnapshotStore(context.filesDir) }
-    val queue = remember { OutboundQueue(context.filesDir) }
+    val store = remember(credentials) { SnapshotStore(Credentials.workspaceDirectory(context, credentials)) }
+    val queue = remember(credentials) { OutboundQueue(Credentials.workspaceDirectory(context, credentials)) }
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val coordinator = remember {
         RefreshCoordinator(client, store, queue, onSnapshotChanged = { runCatching { TodayWidget().updateAll(context) } })
