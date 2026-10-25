@@ -1,8 +1,11 @@
 #include <jni.h>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 namespace node { int Start(int argc, char* argv[]); }
 
 // Called once on a dedicated 16 MB thread, never the UI thread. Credentials
@@ -17,6 +20,19 @@ Java_sh_openagi_mobile_embedded_EmbeddedAgent_startNode(JNIEnv* env, jobject,
         return result;
     };
     auto runtime = copy(root), directory = copy(data), secret = copy(token), timezone = copy(zone);
+    // Android discards stderr by default. Keep diagnostics in the app's
+    // private storage, never shared storage or logcat. Retain one prior log.
+    const auto logPath = directory + "/daemon.log";
+    struct stat logInfo {};
+    if (stat(logPath.c_str(), &logInfo) == 0 && logInfo.st_size > 1024 * 1024) {
+        rename(logPath.c_str(), (directory + "/daemon.previous.log").c_str());
+    }
+    const int logFd = open(logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (logFd >= 0) {
+        fchmod(logFd, 0600);
+        dup2(logFd, STDERR_FILENO);
+        close(logFd);
+    }
     setenv("OPENAGI_DATA_DIR", directory.c_str(), 1);
     setenv("OPENAGI_AUTH_TOKEN", secret.c_str(), 1);
     setenv("OPENAGI_TIME_ZONE", timezone.c_str(), 1);

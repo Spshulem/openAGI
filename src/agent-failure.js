@@ -7,6 +7,18 @@ const PUBLIC_FAILURES = Object.freeze({
   "provider-timeout": "The model provider timed out. Check its connection and try again.",
   "provider-empty-response": "The model returned no answer after retrying. Please try again.",
   "provider-unavailable": "The model provider is unavailable. Check its connection and try again.",
+  "device-model-download-required": "Download Gemini Nano in Chat options before using the phone agent.",
+  "device-model-downloading": "Gemini Nano is still downloading. Open Chat options to see its progress.",
+  "device-model-unsupported": "The on-device model isn't available on this phone. Check for system updates or choose another model in Chat options.",
+  "device-model-foreground-required": "Keep OpenAGI open and your phone unlocked while Gemini Nano replies.",
+  "device-model-busy": "Gemini Nano is busy. Wait a moment and try again with OpenAGI open.",
+  "device-model-quota": "Android has temporarily limited Gemini Nano's battery usage. Try again later or choose another model.",
+  "device-model-system-update": "Gemini Nano needs an Android or Google AICore update. Check for updates, then reopen OpenAGI.",
+  "device-model-storage": "Gemini Nano needs more free storage on this phone. Free up space, then check the model in Chat options.",
+  "device-model-input-limit": "This conversation is too long for the on-device model. Start a new chat or send a shorter message.",
+  "device-model-rejected": "Gemini Nano couldn't answer that message. Try rephrasing it.",
+  "device-model-unavailable": "The phone's on-device model isn't ready. Check it in Chat options and keep OpenAGI open while it replies.",
+  "device-model-timeout": "The phone's on-device model took too long to reply. Keep OpenAGI open and try again.",
   "input-limit": "This request exceeds the configured input limit. Shorten your message, or increase OPENAGI_MAX_INPUT_TOKENS in your .env file and restart the daemon.",
   "agent-error": "The agent couldn't complete that request. Check the local daemon log for details."
 });
@@ -21,6 +33,10 @@ export function classifyAgentFailure(error) {
   const name = safeErrorField(error, "name");
   const message = safeErrorMessage(error);
   const detail = `${code} ${name} ${message}`;
+
+  if (code.startsWith("device-model-") && Object.hasOwn(PUBLIC_FAILURES, code)) {
+    return { code, message: PUBLIC_FAILURES[code] };
+  }
 
   if (code === "INPUT_CONTEXT_TOO_LARGE") return { code: "input-limit", message: PUBLIC_FAILURES["input-limit"] };
   if (code === "PROVIDER_CONFIG_MISMATCH") return { code: "provider-config", message: PUBLIC_FAILURES["provider-config"] };

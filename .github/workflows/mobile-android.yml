@@ -35,7 +35,7 @@ jobs:
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
       - name: Test, lint, and build Android app
         working-directory: mobile/android
-        run: ./gradlew --no-daemon --max-workers=2 testDebugUnitTest lintDebug assembleDebug
+        run: ./gradlew --no-daemon --max-workers=2 testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -49,6 +49,13 @@ jobs:
         with:
           name: OpenAGI-android-debug-${{ github.event.pull_request.head.sha || github.sha }}
           path: mobile/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-android-instrumentation-${{ github.event.pull_request.head.sha || github.sha }}
+          path: mobile/android/app/build/outputs/apk/androidTest/debug/*.apk
           if-no-files-found: error
           retention-days: 7
 

@@ -126,4 +126,33 @@ class LocalChatRunnerTest {
         assertNull(LocalModelProgress(100, 100, gettingReady = true).fraction)
         assertTrue(LocalModelProgress(gettingReady = true).description.contains("getting Gemini Nano ready"))
     }
+
+    @Test fun missingAndDownloadingModelsGiveDifferentRecoveryActions() = runBlocking {
+        for ((status, expected) in listOf(
+            FeatureStatus.DOWNLOADABLE to "device-model-download-required",
+            FeatureStatus.DOWNLOADING to "device-model-downloading",
+            FeatureStatus.UNAVAILABLE to "device-model-unsupported",
+        )) {
+            val client = object : Client() {
+                override suspend fun status() = status
+                override suspend fun generate(prompt: String): String = error("Must not infer before the model is ready")
+            }
+            try {
+                LocalChatRunner(createClient = { client }).generate("Hello")
+                fail("Model readiness must be checked before inference")
+            } catch (e: LocalModelFailure) { assertEquals(expected, e.code) }
+            assertTrue(client.closed)
+        }
+    }
+
+    @Test fun cancellingInferenceIsNotReportedAsModelUnavailable() = runBlocking {
+        val client = object : Client() {
+            override suspend fun generate(prompt: String): String = throw CancellationException("Stopped")
+        }
+        try {
+            LocalChatRunner(createClient = { client }).generate("Hello")
+            fail("Cancellation must propagate")
+        } catch (e: CancellationException) { assertEquals("Stopped", e.message) }
+        assertTrue(client.closed)
+    }
 }

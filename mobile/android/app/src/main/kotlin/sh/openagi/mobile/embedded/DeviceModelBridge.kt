@@ -4,6 +4,9 @@ import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
 import okhttp3.*
 import sh.openagi.mobile.fallback.LocalChat
+import sh.openagi.mobile.fallback.localModelFailure
+import com.google.mlkit.genai.common.GenAiException
+import android.util.Log
 
 // Loopback-only, authenticated with this installation's encrypted owner key.
 // Gemini Nano chooses a tool; the daemon validates and runs it through the
@@ -32,9 +35,12 @@ internal class DeviceModelBridge(private val scope: CoroutineScope, private val 
                                 val result = DeviceModelPrompts.result(LocalChat.generate(DeviceModelPrompts.render(frame)), frame)
                                 webSocket.send(buildJsonObject { put("type", "result"); put("id", id); result.forEach { (key, value) -> put(key, value) } }.toString())
                             } catch (error: CancellationException) { throw error }
-                            catch (_: Exception) {
-                                webSocket.send(buildJsonObject { put("type", "error"); put("id", id); put("code", "device-model-unavailable")
-                                    put("message", "Gemini Nano couldn't reply. Check or download the local model in Chat options. Your tasks and history stay on this phone.") }.toString())
+                            catch (error: Exception) {
+                                val failure = localModelFailure(error)
+                                val cause = failure.cause ?: error
+                                Log.w("OpenAGIDeviceModel", "Generation failed: ${failure.code}; type=${cause.javaClass.name}; sdkCode=${(cause as? GenAiException)?.errorCode}")
+                                webSocket.send(buildJsonObject { put("type", "error"); put("id", id); put("code", failure.code)
+                                    put("message", failure.message) }.toString())
                             } finally { running.remove(id) }
                         }
                     }
