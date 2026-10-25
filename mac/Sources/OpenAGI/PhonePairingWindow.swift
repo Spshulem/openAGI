@@ -1,13 +1,190 @@
 import AppKit
+import SwiftUI
 import WebKit
 
-/// Pairing stays in a dedicated desktop window. The daemon's normal owner
-/// sign-in gate and persistent WebKit cookies authorize code generation.
+/// The Mac owner credential belongs only to loopback. A worker uses a saved
+/// owner connection for the exact main origin, never its operational node token.
+struct PhonePairingConnection {
+  let origin: URL
+  let ownerToken: String?
+
+  static func origin(_ value: String) -> URL? {
+    guard var url = URLComponents(string: value),
+          ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+          let host = url.host, !host.isEmpty, url.user == nil, url.password == nil,
+          url.query == nil, url.fragment == nil, ["", "/"].contains(url.path) else { return nil }
+    url.scheme = url.scheme?.lowercased()
+    url.host = host.lowercased()
+    if url.port == (url.scheme == "https" ? 443 : 80) { url.port = nil }
+    url.path = ""
+    return url.url
+  }
+
+  static func resolve(localOwnerToken: String?, nodeConfig: Data?, savedMainURL: String,
+                      savedMainToken: String?) throws -> Self {
+    struct NodeConfig: Decodable { let remote: String?; let token: String? }
+    let config = try nodeConfig.map { try JSONDecoder().decode(NodeConfig.self, from: $0) }
+    guard let remote = config?.remote, !remote.isEmpty else {
+      return Self(origin: URL(string: "http://127.0.0.1:43210")!, ownerToken: localOwnerToken)
+    }
+    guard let main = origin(remote) else { throw PhonePairingError.invalidServer }
+    let savedToken = origin(savedMainURL) == main ? savedMainToken : nil
+    return Self(origin: main, ownerToken: savedToken?.isEmpty == false ? savedToken : config?.token)
+  }
+
+  func request(cookies: [HTTPCookie] = []) -> URLRequest {
+    var request = URLRequest(url: origin.appendingPathComponent("nodes/enrollment-code"),
+                             cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+    request.httpMethod = "POST"
+    request.httpBody = Data(#"{"platform":"mobile"}"#.utf8)
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    if let ownerToken, !ownerToken.isEmpty {
+      request.setValue("Bearer \(ownerToken)", forHTTPHeaderField: "Authorization")
+    } else {
+      let matching = cookies.filter {
+        $0.name == "openagi_token" && $0.domain.lowercased() == origin.host?.lowercased()
+          && $0.path == "/" && (!$0.isSecure || origin.scheme == "https")
+          && ($0.expiresDate == nil || $0.expiresDate! > Date())
+      }
+      for (key, value) in HTTPCookie.requestHeaderFields(with: matching) {
+        request.setValue(value, forHTTPHeaderField: key)
+      }
+    }
+    return request
+  }
+}
+
+enum PhonePairingError: LocalizedError {
+  case invalidServer, invalidCode, loopbackAddress, unauthorized, oldServer, refused
+  var errorDescription: String? {
+    switch self {
+    case .invalidServer: return "The saved main-server address is invalid. Check this Mac’s server connection."
+    case .invalidCode: return "The server returned an invalid or expired code. Try again."
+    case .loopbackAddress: return "Your phone needs a Wi-Fi or Tailscale server address. Set the main server’s public URL, then try again."
+    case .unauthorized: return "Authorize this Mac on the main server once. Its sign-in session is remembered for future pairing."
+    case .oldServer: return "Update OpenAGI on your main server to enable phone pairing."
+    case .refused: return "The server could not create a phone code. Check that this Mac is connected to the main server."
+    }
+  }
+}
+
+struct PhonePairingCode {
+  let code: String
+  let server: URL
+  let expiresAt: Date
+
+  static func decode(_ data: Data, connection: PhonePairingConnection, now: Date = Date()) throws -> Self {
+    struct Response: Decodable { let code: String; let publicUrl: String?; let expiresAt: String }
+    let response = try JSONDecoder().decode(Response.self, from: data)
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let fractional = formatter.date(from: response.expiresAt)
+    formatter.formatOptions = [.withInternetDateTime]
+    guard response.code.range(of: #"^\d{6}$"#, options: .regularExpression) != nil,
+          let expiry = fractional ?? formatter.date(from: response.expiresAt), expiry > now else {
+      throw PhonePairingError.invalidCode
+    }
+    func reachable(_ url: URL) -> Bool { !["localhost", "127.0.0.1", "::1", "[::1]"].contains(url.host ?? "") }
+    let advertised = response.publicUrl.flatMap(PhonePairingConnection.origin)
+    let server = advertised.flatMap { reachable($0) ? $0 : nil } ?? connection.origin
+    guard reachable(server) else { throw PhonePairingError.loopbackAddress }
+    return Self(code: response.code, server: server, expiresAt: expiry)
+  }
+}
+
+/// Never let URLSession replay an owner credential to a redirect destination.
+private final class PhonePairingTransport: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+  func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                  newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+    completionHandler(nil)
+  }
+}
+
 @MainActor
-final class PhonePairingWindowController: NSObject, WKNavigationDelegate, WKUIDelegate {
+private final class PhonePairingModel: ObservableObject {
+  @Published var code: PhonePairingCode?
+  @Published var loading = false
+  @Published var error: String?
+  @Published var needsSignIn = false
+  var connection: PhonePairingConnection?
+  let cookies = WKWebsiteDataStore.default().httpCookieStore
+
+  func generate() async {
+    guard !loading, let connection else { return }
+    loading = true; code = nil; error = nil
+    defer { loading = false }
+    do {
+      // A remembered main login takes precedence over a stale saved bearer.
+      // Never delete or overwrite the existing worker pairing.
+      let savedCookies = await cookies.allCookies()
+      let cookieRequest = PhonePairingConnection(origin: connection.origin, ownerToken: nil)
+        .request(cookies: savedCookies)
+      let hasSession = cookieRequest.value(forHTTPHeaderField: "Cookie") != nil
+      let config = URLSessionConfiguration.ephemeral
+      config.httpCookieStorage = nil
+      let session = URLSession(configuration: config, delegate: PhonePairingTransport(), delegateQueue: nil)
+      defer { session.invalidateAndCancel() }
+      var (data, response) = try await session.data(for: hasSession ? cookieRequest : connection.request())
+      if hasSession, let rejected = response as? HTTPURLResponse,
+         [401, 403].contains(rejected.statusCode), connection.ownerToken?.isEmpty == false {
+        (data, response) = try await session.data(for: connection.request())
+      }
+      guard let http = response as? HTTPURLResponse else { throw PhonePairingError.refused }
+      if http.statusCode == 401 || http.statusCode == 403 {
+        needsSignIn = true
+        throw PhonePairingError.unauthorized
+      }
+      if http.statusCode == 404 { throw PhonePairingError.oldServer }
+      guard http.statusCode == 200 else { throw PhonePairingError.refused }
+      code = try PhonePairingCode.decode(data, connection: connection)
+      needsSignIn = false
+    } catch let failure as PhonePairingError { error = failure.localizedDescription }
+    catch { self.error = "Couldn’t reach your main server. Check Wi-Fi or Tailscale, then try again." }
+  }
+}
+
+private struct PhonePairingView: View {
+  @ObservedObject var model: PhonePairingModel
+  let signIn: () -> Void
+  var body: some View {
+    VStack(alignment: .leading, spacing: 18) {
+      Label("Connect a phone", systemImage: "iphone.and.arrow.forward").font(.title2.bold())
+      Text("On your iPhone or Android phone, choose Connect to a server.")
+        .foregroundStyle(.secondary)
+      if model.loading { ProgressView("Creating a pairing code on your main server…") }
+      if let code = model.code {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+          if context.date < code.expiresAt {
+            Text(code.code).font(.system(size: 48, weight: .medium, design: .monospaced))
+              .textSelection(.enabled).accessibilityLabel("Pairing code \(code.code)")
+            Text(code.server.absoluteString).textSelection(.enabled)
+            Text("Single use · expires at \(code.expiresAt.formatted(date: .omitted, time: .shortened))")
+              .font(.caption).foregroundStyle(.secondary)
+            Button("Copy code") {
+              NSPasteboard.general.clearContents()
+              NSPasteboard.general.setString(code.code, forType: .string)
+            }
+          } else { Text("This code expired. Generate a new code to continue.") }
+        }
+      }
+      if let error = model.error { Text(error).foregroundStyle(.secondary) }
+      HStack {
+        if model.needsSignIn { Button("Sign in to main server", action: signIn) }
+        Button(model.code == nil ? "Try again" : "Generate another code") { Task { await model.generate() } }
+          .disabled(model.loading)
+      }
+      Text("Each code connects one phone. Your phone remembers its connection after pairing.")
+        .font(.caption).foregroundStyle(.secondary)
+    }.padding(28).frame(width: 460, alignment: .leading)
+  }
+}
+
+@MainActor
+final class PhonePairingWindowController: NSObject, WKNavigationDelegate {
   static let shared = PhonePairingWindowController()
   private var window: NSWindow?
-  private var webView: WKWebView?
+  private var signInWindow: NSWindow?
+  private let model = PhonePairingModel()
 
   func show(state: AppState) {
     if let window, window.isVisible {
@@ -16,119 +193,57 @@ final class PhonePairingWindowController: NSObject, WKNavigationDelegate, WKUIDe
       return
     }
     if window == nil {
-      let web = WKWebView(frame: .zero)
-      web.navigationDelegate = self
-      web.uiDelegate = self
-      let back = NSButton(title: "Back", target: self, action: #selector(goBack))
-      let restart = NSButton(title: "Start over", target: self, action: #selector(startOver))
-      let controls = NSStackView(views: [back, restart])
-      controls.spacing = 8
-      controls.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-      let content = NSStackView(views: [controls, web])
-      content.orientation = .vertical
-      content.alignment = .leading
-      web.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
-      let controller = NSViewController()
-      controller.view = content
+      let controller = NSHostingController(rootView: PhonePairingView(model: model, signIn: { [weak self] in self?.signIn() }))
       let win = NSWindow(contentViewController: controller)
       win.title = "OpenAGI · Connect a phone"
-      win.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-      win.setContentSize(NSSize(width: 540, height: 620))
-      win.minSize = NSSize(width: 400, height: 420)
-      win.center()
+      win.styleMask = [.titled, .closable, .miniaturizable]
       win.isReleasedWhenClosed = false
+      win.center()
       window = win
-      webView = web
     }
-    // Always authenticate only to the fixed loopback origin. A worker's
-    // pairing page links to main without forwarding its local owner token.
-    let request = Self.localRequest(ownerToken: state.authToken())
-    if let cookie = Self.localCookie(ownerToken: state.authToken()), let webView {
-      webView.configuration.websiteDataStore.httpCookieStore.setCookie(cookie) {
-        webView.load(request)
-      }
-    } else {
-      webView?.load(request)
+    do {
+      let path = AppState.dataDir().appendingPathComponent("node.json")
+      let data = FileManager.default.fileExists(atPath: path.path) ? try Data(contentsOf: path) : nil
+      model.connection = try PhonePairingConnection.resolve(localOwnerToken: state.authToken(), nodeConfig: data,
+        savedMainURL: state.outreachRemoteURL, savedMainToken: state.outreachToken)
+      model.needsSignIn = false
+      Task { await model.generate() }
+    } catch {
+      model.connection = nil; model.code = nil
+      model.error = PhonePairingError.invalidServer.localizedDescription
     }
     window?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
 
-  @objc private func goBack() { webView?.goBack() }
-  @objc private func startOver() {
-    webView?.load(URLRequest(url: URL(string: "http://127.0.0.1:43210/phone-pairing")!))
+  private func signIn() {
+    guard let connection = model.connection else { return }
+    let web = WKWebView()
+    web.navigationDelegate = self
+    let controller = NSViewController(); controller.view = web
+    let win = NSWindow(contentViewController: controller)
+    win.title = "Sign in · \(connection.origin.host ?? "main server")"
+    win.setContentSize(NSSize(width: 520, height: 620))
+    win.styleMask = [.titled, .closable, .resizable]
+    win.isReleasedWhenClosed = false
+    signInWindow?.close(); signInWindow = win
+    // No local bearer, operational token, or query credential goes to main.
+    web.load(URLRequest(url: connection.origin.appendingPathComponent("/")))
+    win.center(); win.makeKeyAndOrderFront(nil)
   }
 
-  func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
-               decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-    if navigationResponse.isForMainFrame,
-       let response = navigationResponse.response as? HTTPURLResponse,
-       response.statusCode == 404, response.url?.path == "/phone-pairing" {
-      decisionHandler(.cancel)
-      let alert = NSAlert()
-      alert.messageText = "Update OpenAGI on your main server"
-      alert.informativeText = "This server has an older dashboard without the phone-pairing screen. Update OpenAGI there, then choose Start over. You can also run openagi pair-phone --platform ios (or android) in a terminal on that main server."
-      alert.addButton(withTitle: "OK")
-      if let window { alert.beginSheetModal(for: window) }
-      return
-    }
-    decisionHandler(.allow)
-  }
-
-  nonisolated static func localRequest(ownerToken: String?) -> URLRequest {
-    var request = URLRequest(url: URL(string: "http://127.0.0.1:43210/phone-pairing")!)
-    if let ownerToken, !ownerToken.isEmpty {
-      request.setValue("Bearer \(ownerToken)", forHTTPHeaderField: "Authorization")
-    }
-    return request
-  }
-
-  nonisolated static func localCookie(ownerToken: String?) -> HTTPCookie? {
-    guard let ownerToken, !ownerToken.isEmpty else { return nil }
-    let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()")
-    guard let encoded = ownerToken.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
-    return HTTPCookie(properties: [
-      .domain: "127.0.0.1", .path: "/", .name: "openagi_token", .value: encoded,
-      .expires: Date(timeIntervalSinceNow: 30 * 24 * 60 * 60),
-      HTTPCookiePropertyKey("HttpOnly"): "TRUE", HTTPCookiePropertyKey("SameSite"): "Strict"
-    ])
-  }
-
-  /// Rebuild navigations to another origin rather than carrying the local
-  /// request's Authorization header across a link or redirect.
-  nonisolated static func cleanNavigation(_ request: URLRequest) -> URLRequest? {
-    guard let url = request.url, ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-          var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
-    if url.scheme == "http", url.host == "127.0.0.1", url.port == 43210 { return request }
-    components.user = nil
-    components.password = nil
-    guard let cleanURL = components.url else { return nil }
-    var clean = request
-    clean.url = cleanURL
-    clean.setValue(nil, forHTTPHeaderField: "Authorization")
-    return clean
-  }
-
-  func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+  func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-    guard let clean = Self.cleanNavigation(navigationAction.request) else {
-      decisionHandler(.cancel)
-      return
-    }
-    if clean != navigationAction.request || navigationAction.targetFrame == nil {
-      decisionHandler(.cancel)
-      webView.load(clean)
-      return
-    }
+    guard let url = action.request.url, let main = model.connection?.origin,
+          url.scheme == main.scheme, url.host == main.host, url.port == main.port,
+          url.user == nil, url.password == nil else { decisionHandler(.cancel); return }
     decisionHandler(.allow)
   }
 
-  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-    guard (error as NSError).code != NSURLErrorCancelled else { return }
-    let alert = NSAlert()
-    alert.messageText = "Could not open phone pairing"
-    alert.informativeText = "Check that OpenAGI is running and that your main server is reachable over Wi-Fi or Tailscale, then reopen Connect a phone."
-    alert.addButton(withTitle: "OK")
-    if let window { alert.beginSheetModal(for: window) }
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    Task {
+      await model.generate()
+      if model.code != nil { signInWindow?.close(); signInWindow = nil }
+    }
   }
 }
