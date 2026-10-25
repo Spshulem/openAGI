@@ -69,19 +69,30 @@ final class AppModeTests: XCTestCase {
         let server = Credentials(server: URL(string: "https://daemon.example.com")!, nodeID: "mobile:server", token: "synthetic-token")
         try server.save()
         AppMode.current = .server
+        let queue = OutboundQueue(directory: directory)
+        let parked = OutboundQueue.parkedForServer(directory: directory)
+        let pending = PendingOp(kind: .completeTask("server-offline-task"), createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        try queue.enqueue(pending)
         let session = AppSession()
         session.restartOnboarding()
-        session.choosePhone()
+        session.choosePhone(queue: queue, parkedQueue: parked)
         XCTAssertEqual(session.phase, .phoneSetup)
         XCTAssertEqual(Credentials.load(from: .server), server)
+        XCTAssertTrue(queue.all().isEmpty)
+        XCTAssertEqual(parked.all(), [pending])
         // Phone startup temporarily activates a local credential.
         let local = Credentials(server: URL(string: "http://127.0.0.1:12345")!, nodeID: "mobile:local", token: "synthetic-token")
         try local.save()
         AppMode.current = .onPhone
-        session.goBack(queue: OutboundQueue(directory: directory), parkedQueue: .parkedForServer(directory: directory))
+        XCTAssertEqual(AppSession().phase, .phoneStarting)
+        XCTAssertTrue(queue.all().isEmpty, "A relaunched local session must not send the server's completions")
+        XCTAssertEqual(parked.all(), [pending])
+        session.goBack(queue: queue, parkedQueue: parked)
         XCTAssertEqual(Credentials.load(), server)
         XCTAssertEqual(AppMode.current, .server)
         XCTAssertEqual(AppSession().phase, .ready(server))
+        XCTAssertEqual(queue.all(), [pending])
+        XCTAssertTrue(parked.all().isEmpty)
     }
 
     @MainActor

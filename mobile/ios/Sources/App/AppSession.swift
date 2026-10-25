@@ -57,14 +57,20 @@ final class AppSession {
         phase = .welcome
     }
 
-    func choosePhone() {
+    func choosePhone(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
         setupError = nil
         // Phone setup activates a local credential. Keep the current server
         // first, including when setup was replayed from a paired phone.
         if let current = Credentials.load(), !current.isEmbedded {
-            do { try current.save(to: .server) }
+            do {
+                try current.save(to: .server)
+                // Startup persists the local credential before the wizard
+                // finishes. Background refresh/relaunch must not drain the
+                // server's completions into that temporary local session.
+                try queue.move(to: parkedQueue)
+            }
             catch {
-                setupError = "Couldn't save your server pairing securely. Try again before setting up the phone agent."
+                setupError = "Couldn't save your server pairing and pending work safely. Try again before setting up the phone agent."
                 return
             }
         }
