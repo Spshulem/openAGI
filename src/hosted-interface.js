@@ -7989,7 +7989,7 @@ function pendingActionCardHtml(action) {
   const details = coding
     ? '<p>' + escapeHtml(action.args?.provider || '') + ' · ' + escapeHtml(action.args?.project || 'Coding session')
       + '<br>Session: ' + escapeHtml(action.args?.sessionId || '')
-      + (action.toolName === 'start_coding_agent' ? '<br>Model: ' + escapeHtml(action.args?.model || 'Provider default') + ' · Effort: ' + escapeHtml(action.args?.effort || 'Provider default') + '<br>Codex: read-only. Claude: manual permissions. No automatic permission approvals.' : '')
+      + (action.toolName === 'start_coding_agent' ? '<br>Model: ' + escapeHtml(action.args?.model || 'Provider default') + ' · Effort: ' + escapeHtml(action.args?.effort || 'Provider default') + '<br>Codex: read-only. Claude: manual permissions. Copilot: read-only. No automatic permission approvals.' : '')
       + '</p><pre style="white-space:pre-wrap; overflow-wrap:anywhere;">'
       + escapeHtml(action.args?.message || '') + '</pre><p class="muted">Provider usage may be charged. CLI usage is not capped by the OpenAGI chat budget. Later provider permission requests need a separate decision.</p>'
     : '<details open style="margin-top:6px;"><summary class="muted" style="font-size:11px;">args</summary><pre style="font-size:11px; margin-top:4px; white-space:pre-wrap; overflow-wrap:anywhere;">'

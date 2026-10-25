@@ -125,7 +125,7 @@ async function renderCodingSetup(panel) {
     details.append(off);
     if (!(setup.providers || []).some(p => p.installed) || !saved.length) {
       const blocked = document.createElement('p'); blocked.setAttribute('role', 'status');
-      blocked.textContent = !saved.length ? 'Choose a Git project folder before starting an agent.' : 'No provider CLI found. Install Claude Code or Codex, sign in on the supervisor computer, then Refresh. No agent can start yet.';
+      blocked.textContent = !saved.length ? 'Choose a Git project folder before starting an agent.' : 'No provider CLI found. Install Claude Code, Codex or GitHub Copilot CLI, sign in on the supervisor computer, then Refresh. No agent can start yet.';
       panel.append(blocked); return;
     }
     const form = document.createElement('section');

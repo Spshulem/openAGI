@@ -1,14 +1,14 @@
 # Coding Agents
 
 OpenAGI is the conversation and approval surface. Its built-in supervisor starts
-and tracks Claude Code or Codex CLI sessions. No G2 hardware, private supervisor
+and tracks Claude Code, Codex or GitHub Copilot CLI sessions. No G2 hardware, private supervisor
 repository, shared account, or second reasoning agent is required. An existing
 supervisor remains an optional compatibility adapter.
 
 ## Fresh-install setup (macOS and Linux)
 
-1. Install OpenAGI and the official Claude Code or Codex CLI. Use your own
-   provider account: `claude auth login` or `codex login`. OpenAGI finds executables
+1. Install OpenAGI and the official Claude Code, Codex or GitHub Copilot CLI (`npm i -g @github/copilot`). Use your own
+   provider account: `claude auth login`, `codex login` or `copilot login`. OpenAGI finds executables
    on its absolute PATH entries and standard user/package-manager locations.
    A CLI being found does not prove authentication; the first approved run does.
 2. Open **More → Coding Agents → Setup and provider requirements**. Enter the
@@ -43,7 +43,9 @@ successful work. If a run fails, check provider sign-in, CLI compatibility and
 usage limits on the supervisor computer. This does not grant computer-control
 permissions or configure email/iMessage accounts.
 
-The initial built-in execution profile is deliberately restricted: Codex runs
+The initial built-in execution profile is deliberately restricted: Copilot may only read
+(write and shell tools denied, no questions, no built-in MCP servers; in trusted workspaces it may
+also write and run git, gh, node and npm), Codex runs
 read-only with user execution configuration ignored; Claude keeps manual
 permission checks, does not auto-answer permission prompts, and disables project
 settings/hooks and MCP servers. This is **not unrestricted autonomous coding**.
