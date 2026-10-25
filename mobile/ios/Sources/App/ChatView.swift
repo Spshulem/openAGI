@@ -81,12 +81,6 @@ struct ChatView: View {
             ChatConversationView(conversation: conversation, title: thread == .agent ? "Chat" : "Supervisor chat",
                                  scrollToMessageID: selectedMessage)
                 .toolbar {
-                    if let onClose {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("Close chat", systemImage: "xmark", action: onClose)
-                                .accessibilityIdentifier("close-chat-pane")
-                        }
-                    }
                     ToolbarItemGroup(placement: .primaryAction) {
                         Button("Model", systemImage: "cpu") { destination = .model }
                             .accessibilityIdentifier("chat-model")
@@ -102,6 +96,10 @@ struct ChatView: View {
                                 Button("Chat without server", systemImage: "network.slash") { destination = .fallback }
                             }
                         } label: { Label("Chat options", systemImage: "ellipsis") }
+                        if let onClose {
+                            Button("Close chat", systemImage: "xmark", action: onClose)
+                                .accessibilityIdentifier("close-chat-pane")
+                        }
                     }
                 }
         }
