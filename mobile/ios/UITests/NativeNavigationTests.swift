@@ -97,10 +97,14 @@ final class NativeNavigationTests: XCTestCase {
             toggle.tap()
             let close = app.buttons["close-chat-pane"]
             XCTAssertTrue(close.waitForExistence(timeout: 5))
+            XCTAssertTrue(close.isHittable, "Supporting chat must keep its Close button visible")
             tab(app, "Tasks")
             XCTAssertTrue(close.waitForExistence(timeout: 5), "Pinned chat stays open while navigating")
+            XCTAssertTrue(close.isHittable, "Close must stay accessible after switching tabs")
+            capture("native-supporting-chat", app: app)
             close.tap()
             XCTAssertFalse(close.exists)
+            capture("native-supporting-chat-closed", app: app)
         }
         tab(app, "Chat")
         XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))

@@ -22,6 +22,29 @@ struct ChatView: View {
     }
 
     var body: some View {
+        Group {
+            if onClose != nil {
+                // A supporting pane already shares the workspace's width.
+                // A nested split view can cover its detail and Close button.
+                conversationNavigation
+            } else {
+                conversationSplitView
+            }
+        }
+        .sheet(item: $destination) { sheet in
+            switch sheet {
+            case .model:
+                NavigationStack {
+                    ModelSettingsView()
+                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                }
+            case .settings: SettingsView(onRevoked: { AppSession.shared.revoked() })
+            case .fallback: FallbackChatView()
+            }
+        }
+    }
+
+    private var conversationSplitView: some View {
         NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
             List {
                 Section("Your conversations") {
@@ -49,39 +72,38 @@ struct ChatView: View {
             .navigationTitle("Conversations")
             .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 320)
         } detail: {
-            NavigationStack {
-                ChatConversationView(conversation: conversation, title: thread == .agent ? "Chat" : "Supervisor chat",
-                                     scrollToMessageID: selectedMessage)
-                    .toolbar {
-                        if let onClose {
-                            ToolbarItem(placement: .cancellationAction) {
-                                Button("Close chat", systemImage: "xmark", action: onClose)
-                                    .accessibilityIdentifier("close-chat-pane")
-                            }
-                        }
-                        ToolbarItemGroup(placement: .primaryAction) {
-                            Button("Model", systemImage: "cpu") { destination = .model }
-                                .accessibilityIdentifier("chat-model")
-                            Menu {
-                                Button("Settings", systemImage: "gearshape") { destination = .settings }
-                                if !model.isOnPhone {
-                                    Button("Chat without server", systemImage: "network.slash") { destination = .fallback }
-                                }
-                            } label: { Label("Chat options", systemImage: "ellipsis") }
+            conversationNavigation
+        }
+    }
+
+    private var conversationNavigation: some View {
+        NavigationStack {
+            ChatConversationView(conversation: conversation, title: thread == .agent ? "Chat" : "Supervisor chat",
+                                 scrollToMessageID: selectedMessage)
+                .toolbar {
+                    if let onClose {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Close chat", systemImage: "xmark", action: onClose)
+                                .accessibilityIdentifier("close-chat-pane")
                         }
                     }
-            }
-        }
-        .sheet(item: $destination) { sheet in
-            switch sheet {
-            case .model:
-                NavigationStack {
-                    ModelSettingsView()
-                        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                    ToolbarItemGroup(placement: .primaryAction) {
+                        Button("Model", systemImage: "cpu") { destination = .model }
+                            .accessibilityIdentifier("chat-model")
+                        Menu {
+                            if onClose != nil {
+                                Picker("Conversation", selection: $thread) {
+                                    Text("Agent").tag(ConversationThread.agent)
+                                    Text("Supervisor").tag(ConversationThread.supervisor)
+                                }
+                            }
+                            Button("Settings", systemImage: "gearshape") { destination = .settings }
+                            if !model.isOnPhone {
+                                Button("Chat without server", systemImage: "network.slash") { destination = .fallback }
+                            }
+                        } label: { Label("Chat options", systemImage: "ellipsis") }
+                    }
                 }
-            case .settings: SettingsView(onRevoked: { AppSession.shared.revoked() })
-            case .fallback: FallbackChatView()
-            }
         }
     }
 
