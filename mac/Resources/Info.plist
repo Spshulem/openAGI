@@ -48,6 +48,30 @@
   <dict>
     <key>NSAllowsLocalNetworking</key>
     <true/>
+    <!-- macOS 14+ requires explicit IP exceptions even with local networking
+         enabled. Only loopback, private LAN, link-local, and Tailscale/CGNAT
+         ranges may use HTTP; public hosts retain the default ATS policy. -->
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>127.0.0.1</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>10.0.0.0/8</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>172.16.0.0/12</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>192.168.0.0/16</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>169.254.0.0/16</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>100.64.0.0/10</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>::1</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>fc00::/7</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+      <key>fe80::/10</key>
+      <dict><key>NSExceptionAllowsInsecureHTTPLoads</key><true/></dict>
+    </dict>
   </dict>
   <key>NSLocalNetworkUsageDescription</key>
   <string>OpenAGI connects to your local agent and the servers you choose over Wi-Fi or Tailscale to pair phones and sync your workspace.</string>

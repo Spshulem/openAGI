@@ -1,7 +1,31 @@
 import XCTest
+import AppKit
 @testable import OpenAGI
 
 final class PhonePairingTests: XCTestCase {
+  @MainActor
+  func testPairingWindowLaysOutLoadingCodeAndLongErrorAtSmallSize() async {
+    _ = NSApplication.shared
+    let model = PhonePairingModel()
+    let window = PhonePairingWindowController.makeWindow(model: model, signIn: {})
+    defer { window.close() }
+    window.orderFront(nil)
+    for state in 0..<3 {
+      model.loading = state == 0
+      model.code = state == 1 ? PhonePairingCode(code: "123456",
+        server: URL(string: "https://main.example:8443")!, expiresAt: Date().addingTimeInterval(60)) : nil
+      model.error = state == 2 ? PhonePairingError.message(for: URLError(.cannotConnectToHost)) : nil
+      window.setContentSize(NSSize(width: state == 2 ? 360 : 520, height: 320))
+      // Let the hosting view commit each published state, then exercise the
+      // same AppKit constraint/display cycle that crashed the installed app.
+      try? await Task.sleep(nanoseconds: 100_000_000)
+      window.contentView?.layoutSubtreeIfNeeded()
+      window.displayIfNeeded()
+      XCTAssertTrue(window.isVisible)
+      XCTAssertTrue(window.contentView?.frame.height.isFinite == true)
+    }
+  }
+
   func testBundleAllowsLocalDaemonAndPairedIPConnectionsWithoutDisablingATS() throws {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
       .deletingLastPathComponent().deletingLastPathComponent()
@@ -12,6 +36,13 @@ final class PhonePairingTests: XCTestCase {
     XCTAssertNotEqual(ats["NSAllowsArbitraryLoads"] as? Bool, true)
     XCTAssertNotEqual(ats["NSAllowsArbitraryLoadsInWebContent"] as? Bool, true)
     XCTAssertFalse((info["NSLocalNetworkUsageDescription"] as? String ?? "").isEmpty)
+    let domains = try XCTUnwrap(ats["NSExceptionDomains"] as? [String: [String: Any]])
+    XCTAssertEqual(Set(domains.keys), Set(["127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12",
+      "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10"]))
+    for policy in domains.values {
+      XCTAssertEqual(policy["NSExceptionAllowsInsecureHTTPLoads"] as? Bool, true)
+      XCTAssertEqual(Set(policy.keys), ["NSExceptionAllowsInsecureHTTPLoads"])
+    }
   }
 
   func testTransportAndResponseFailuresHaveDistinctRecoveryMessages() {
