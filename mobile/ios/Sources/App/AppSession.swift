@@ -28,13 +28,17 @@ final class AppSession {
     private(set) var initialTab: AppTab = .today
     @ObservationIgnored private var onboardingSource: AppModel?
 
-    init() {
+    init(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
         let credentials = Credentials.load()
         let mode = AppMode.resolved(credentials: credentials)
         self.mode = mode
         switch mode {
         case .onPhone?: phase = .phoneStarting
-        case .server?: phase = credentials.map(Phase.ready) ?? .pairing
+        case .server?:
+            // Setup can be closed before local startup activates its own
+            // credential. Resume the still-active server's parked work.
+            if credentials != nil { try? parkedQueue.move(to: queue) }
+            phase = credentials.map(Phase.ready) ?? .pairing
         case nil: phase = .welcome
         }
     }

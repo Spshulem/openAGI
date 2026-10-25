@@ -80,6 +80,12 @@ final class AppModeTests: XCTestCase {
         XCTAssertEqual(Credentials.load(from: .server), server)
         XCTAssertTrue(queue.all().isEmpty)
         XCTAssertEqual(parked.all(), [pending])
+        // Closing at the first setup screen still leaves the server active.
+        // Relaunch must restore its queue even before Cancel can be tapped.
+        XCTAssertEqual(AppSession(queue: queue, parkedQueue: parked).phase, .ready(server))
+        XCTAssertEqual(queue.all(), [pending])
+        XCTAssertTrue(parked.all().isEmpty)
+        session.choosePhone(queue: queue, parkedQueue: parked)
         // Phone startup temporarily activates a local credential.
         let local = Credentials(server: URL(string: "http://127.0.0.1:12345")!, nodeID: "mobile:local", token: "synthetic-token")
         try local.save()
