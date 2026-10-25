@@ -1,3 +1,4 @@
+import { renderPhonePairingPage } from "./phone-pairing-page.js";
 import { renderLoginPage } from "./dashboard-login.js";
 import { navigation, shellStyles } from "./app-shell.js";
 import http from "node:http";
@@ -1298,6 +1299,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
           return sendJson(res, 400, { error: error.message });
         }
+      }
+      if (method === "GET" && pathname === "/phone-pairing") {
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        return sendHtml(res, 200, renderPhonePairingPage({ remote: readNodeConfig(dataDir)?.remote ?? null }));
       }
       if (method === "POST" && pathname === "/nodes/enrollment-code") {
         // The body is read before the remote check so the 409 can speak the
@@ -7382,7 +7388,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
   if (showLoading) {
     main.innerHTML = \`
       <div class="pane" aria-busy="true">
-        <h2>Nodes</h2>
+        <h2>Devices</h2>
         <div class="card"><div class="name">Loading nodes…</div><div class="desc">Checking this machine, paired installs, and connected services.</div></div>
       </div>
     \`;
@@ -7401,7 +7407,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     if (state.tab !== "nodes") return;
     main.innerHTML = \`
       <div class="pane">
-        <h2>Nodes</h2>
+        <h2>Devices</h2>
         <div class="card">
           <div class="name err">Couldn't load nodes</div>
           <div class="desc">\${escapeHtml(error?.message ?? String(error))}</div>
@@ -7564,16 +7570,12 @@ async function renderNodesOnce({ showLoading = true } = {}) {
         <div class="desc" id="g2DirectTokenOut" style="margin-top:8px;"></div>
       </div>\`;
 
-  const phoneEnrollmentCard = isNode
-    ? \`<div class="card" id="phone-pairing"><div class="name">Connect a phone</div>
-       <div class="desc">Pair phones with your main server, not this worker. Open your main's dashboard, choose Nodes, then Connect a phone. No auth-token copying is needed.</div></div>\`
-    : \`<div class="card" id="phone-pairing"><div class="name">Connect a phone</div>
-       <div class="desc">Generate one code per phone. Codes last 30 minutes and work once. On iOS or Android, choose Connect to a server and enter this address and code.</div>
-       <button class="ui-btn ui-btn-sm" id="phoneEnrollBtn">Generate phone pairing code</button>
-       <div class="desc" id="phoneEnrollOut" style="margin-top:8px;"></div></div>\`;
+  const phoneEnrollmentCard = \`<div class="card" id="phone-pairing"><div class="name">Connect a phone</div>
+       <div class="desc">\${isNode ? "Open phone pairing on your main server to share its chat, Today, Tasks, and Inbox." : "Connect iPhone or Android with a one-time code. Your phone remembers the connection."}</div>
+       <a class="ui-btn ui-btn-sm" href="/phone-pairing" target="openagi-phone-pairing" rel="noopener">\${isNode ? "Open phone pairing on main" : "Show phone pairing code…"}</a></div>\`;
   main.innerHTML = \`
     <div class="pane">
-      <h2>Nodes</h2>
+      <h2>Devices</h2>
       <div class="card">
         <div class="name">\${escapeHtml(self.name ?? "this machine")} <span class="badge">this machine</span> <span class="badge">\${isNode ? "node" : "main"}</span></div>
         <div class="desc">\${isNode
@@ -7619,21 +7621,6 @@ async function renderNodesOnce({ showLoading = true } = {}) {
     c.style.verticalAlign = "top";
   });
   document.getElementById("nodesRefresh")?.addEventListener("click", () => renderNodes({ showLoading: false }));
-  document.getElementById("phoneEnrollBtn")?.addEventListener("click", async () => {
-    const button = document.getElementById("phoneEnrollBtn");
-    const out = document.getElementById("phoneEnrollOut");
-    button.disabled = true;
-    try {
-      const response = await fetch("/nodes/enrollment-code", {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ platform: "mobile" })
-      });
-      const enrollment = await response.json();
-      if (!response.ok) throw new Error(enrollment.error || "Could not create a phone pairing code.");
-      out.textContent = "Server: " + (enrollment.publicUrl || location.origin) + " · Code: " + enrollment.code
-        + " · Single use, expires " + new Date(enrollment.expiresAt).toLocaleTimeString();
-    } catch (error) { out.textContent = error.message || "Could not create a phone pairing code."; }
-    finally { button.disabled = false; }
-  });
   document.getElementById("g2NodeEnrollBtn")?.addEventListener("click", async () => {
     const out = document.getElementById("g2NodeEnrollOut");
     try {
