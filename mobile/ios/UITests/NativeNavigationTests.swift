@@ -209,6 +209,17 @@ final class NativeNavigationTests: XCTestCase {
         capture("native-chat", app: app)
     }
 
+    func testChatModelSheetDismissesBackToTheSameConversation() {
+        let app = launch()
+        tab(app, "Chat")
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+        tap(app, "chat-model")
+        XCTAssertTrue(app.navigationBars["Model"].waitForExistence(timeout: 5))
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].exists)
+    }
+
     func testAnEmptyTodayDoesNotHideTheInboxLink() {
         let app = launch(["--ui-empty-today"])
         XCTAssertTrue(element(app, "today-empty").waitForExistence(timeout: 10))

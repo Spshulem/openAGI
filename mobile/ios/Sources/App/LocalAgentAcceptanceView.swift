@@ -10,8 +10,10 @@ struct LocalAgentAcceptanceView: View {
         var modelAnswered = false
         var taskToolWorked = false
         var historyWorked = false
+        var todayWorked = false
+        var inboxWorked = false
         var error: String?
-        var passed: Bool { modelAnswered && taskToolWorked && historyWorked && error == nil }
+        var passed: Bool { modelAnswered && taskToolWorked && historyWorked && todayWorked && inboxWorked && error == nil }
     }
 
     @State private var report: Report?
@@ -24,6 +26,8 @@ struct LocalAgentAcceptanceView: View {
                     LabeledContent("Local model response", value: report.modelAnswered ? "Passed" : "Failed")
                     LabeledContent("Local task tool", value: report.taskToolWorked ? "Passed" : "Failed")
                     LabeledContent("Shared local history", value: report.historyWorked ? "Passed" : "Failed")
+                    LabeledContent("Local Today", value: report.todayWorked ? "Passed" : "Failed")
+                    LabeledContent("Local Inbox", value: report.inboxWorked ? "Passed" : "Failed")
                     if let error = report.error { Text(error).foregroundStyle(.red) }
                 } else {
                     ProgressView("Checking the local agent…")
@@ -58,9 +62,16 @@ struct LocalAgentAcceptanceView: View {
             let created = tasks.first { $0.title.contains(marker) }
             createdTaskID = created?.id
             result.taskToolWorked = created != nil
+            if case .fresh(let summary, _) = try await local.summary(ifNoneMatch: nil) {
+                result.todayWorked = summary.today.contains { $0.id == createdTaskID }
+            }
+            _ = try await local.clarifications()
+            _ = try await local.pendingActions()
+            result.inboxWorked = true
             let history = try await local.conversationMessages(thread: .agent)
             result.historyWorked = history.messages.contains { $0.text.contains(marker) }
             if !result.taskToolWorked { result.error = "The local model replied but didn't create the requested task." }
+            else if !result.todayWorked { result.error = "The local task was created but didn't appear in Today." }
         } catch { result.error = error.localizedDescription }
         if let client {
             if let createdTaskID {

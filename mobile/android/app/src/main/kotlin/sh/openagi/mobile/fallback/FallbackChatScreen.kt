@@ -50,7 +50,7 @@ fun FallbackChatScreen(context: Context, localAgentMode: Boolean = false, onDism
     LaunchedEffect(Unit) {
         try {
             val loaded = withContext(Dispatchers.IO) { FallbackVault(context.applicationContext) }
-            provider = withContext(Dispatchers.IO) { loaded.provider() }
+            provider = if (localAgentMode) FallbackProvider.LOCAL else withContext(Dispatchers.IO) { loaded.provider() }
             vault = loaded
         }
         catch (_: Exception) { error = "Secure storage is unavailable. Close and reopen the app to try again; no API key or conversation has been stored." }
