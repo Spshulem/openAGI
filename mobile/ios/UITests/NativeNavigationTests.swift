@@ -246,7 +246,15 @@ final class NativeNavigationTests: XCTestCase {
         code.typeText("123456")
         XCTAssertEqual(code.value as? String, "123456")
         capture("native-discovery-selection", app: app)
-        tap(app, "pairing-cancel")
+        // Duo can expose the cancellation action through its native Back
+        // control, just like the other vertical-toolbar destinations above.
+        let cancel = element(app, "pairing-cancel")
+        if cancel.exists {
+            XCTAssertTrue(cancel.isHittable)
+            cancel.tap()
+        } else {
+            tap(app, "BackButton")
+        }
         XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 10))
     }
 
