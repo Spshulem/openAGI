@@ -593,3 +593,7 @@ without a bulk rewrite of existing data.
 
 No bulk migration runs automatically, and previously superseded memories are
 not restored.
+
+The iMessage self-chat importer opens the Messages SQLite database strictly read-only,
+with a bounded lock wait. It reads committed WAL messages without checkpointing or
+creating the source database. Cursor checkpoints stay in OpenAGI's own data directory.

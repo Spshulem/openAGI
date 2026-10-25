@@ -160,13 +160,13 @@ export class IMessagePollerSource {
 
     let db;
     try {
-      // Read-only open keeps us from racing Messages.app's writes. node:sqlite
-      // doesn't expose a `readOnly` flag explicitly so we open with the
-      // immutable URI parameter via setting the path; if that breaks across
-      // node versions, fall back to a regular open (Messages.app uses WAL,
-      // so concurrent reads should still work).
-      db = new sqlite.DatabaseSync(this.dbPath);
+      // Messages owns this live WAL database. Enforce read-only at open time:
+      // never acquire write authority or create a replacement if it disappears.
+      // Do not use immutable mode, which can miss uncheckpointed WAL messages.
+      db = new sqlite.DatabaseSync(this.dbPath, { readOnly: true });
+      db.exec("PRAGMA query_only = 1; PRAGMA busy_timeout = 2000;");
     } catch (err) {
+      try { db?.close(); } catch { /* ignore */ }
       this.lastError = err.code === "SQLITE_CANTOPEN" || /unable to open/i.test(err.message)
         ? "permission-denied — grant Full Disk Access in System Settings"
         : err.message;

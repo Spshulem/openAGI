@@ -84,3 +84,46 @@ test("explicit uninitialized state still bootstraps forward-only", async t => {
   assert.equal((await poller.sync()).imported, 0);
   assert.deepEqual(f.imported, []);
 });
+
+test("poller connection rejects writes while reading a live WAL database", async t => {
+  const f = fixture(t);
+  const poller = f.source();
+  const writer = new DatabaseSync(poller.dbPath);
+  t.after(() => writer.close());
+  writer.exec("PRAGMA journal_mode = WAL;");
+  const prepare = DatabaseSync.prototype.prepare;
+  let writeRejected = false;
+  let inspected = false;
+  const mock = t.mock.method(DatabaseSync.prototype, "prepare", function (...args) {
+    if (!inspected) {
+      inspected = true;
+      try { this.exec("CREATE TABLE unexpected_write (value TEXT)"); }
+      catch (error) { writeRejected = /readonly|read-only/i.test(error.message); }
+    }
+    return prepare.apply(this, args);
+  });
+  const result = await poller.sync();
+  mock.mock.restore();
+  assert.equal(result.imported, 0);
+  assert.equal(inspected, true);
+  assert.equal(writeRejected, true, "the importer must not hold write authority over Messages");
+  f.add("wal-message");
+  assert.equal((await poller.sync()).imported, 1, "reads include new WAL messages");
+});
+
+test("database removed between existence check and open is never recreated", async t => {
+  const f = fixture(t);
+  const poller = f.source();
+  const exists = fs.existsSync;
+  const mock = t.mock.method(fs, "existsSync", function (target) {
+    if (target === poller.dbPath) {
+      fs.unlinkSync(target);
+      return true;
+    }
+    return exists(target);
+  });
+  const result = await poller.sync();
+  mock.mock.restore();
+  assert.equal(result.skipped, true);
+  assert.equal(fs.existsSync(poller.dbPath), false, "read path must never create a replacement database");
+});
