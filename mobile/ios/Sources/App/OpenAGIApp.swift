@@ -83,7 +83,7 @@ struct OpenAGIApp: App {
             // new deep link arrives; SwiftUI would otherwise keep the
             // already-appeared view's state and ignore a later prefill.
             PairingView(
-                prefillServer: pendingPairing?.serverURL,
+                prefillServer: pendingPairing?.serverURL ?? session.pairingServer,
                 prefillCode: pendingPairing?.code,
                 onCancel: { session.goBack() },
                 onPaired: {
@@ -94,7 +94,7 @@ struct OpenAGIApp: App {
                     session.paired()
                 }
             )
-            .id(pendingPairing?.code ?? "")
+            .id(((pendingPairing?.serverURL ?? session.pairingServer)?.absoluteString ?? "") + "|" + (pendingPairing?.code ?? ""))
         case .ready(let credentials):
             RootTabView(
                 credentials: credentials,

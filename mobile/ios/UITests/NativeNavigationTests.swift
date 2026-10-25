@@ -225,6 +225,31 @@ final class NativeNavigationTests: XCTestCase {
         capture("native-connection-error", app: app)
     }
 
+    func testDiscoveredServerOpensPrefilledPairingAndSelectionFocusesCode() {
+        let app = launch()
+        tap(app, "open-settings")
+        tap(app, "settings-find-servers", in: "settings-form")
+        XCTAssertTrue(app.navigationBars["Find servers"].waitForExistence(timeout: 5))
+        tap(app, "discovery-search")
+        tap(app, "discovered-server-https://daemon.example.com")
+        let address = element(app, "pairing-server")
+        XCTAssertTrue(address.waitForExistence(timeout: 10), "Selecting a result must open connection setup")
+        XCTAssertEqual(address.value as? String, "https://daemon.example.com")
+        // Selecting a result inside setup must visibly advance to the code,
+        // rather than silently changing an address below the viewport.
+        tap(app, "pairing-find-servers")
+        tap(app, "pairing-discovered-server-https://daemon.example.com")
+        let code = element(app, "pairing-code")
+        XCTAssertTrue(code.waitForExistence(timeout: 5))
+        XCTAssertTrue(code.isHittable)
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        code.typeText("123456")
+        XCTAssertEqual(code.value as? String, "123456")
+        capture("native-discovery-selection", app: app)
+        tap(app, "pairing-cancel")
+        XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 10))
+    }
+
     func testSettingsAndComposerRemainUsableInDarkModeWithAccessibilityText() {
         let app = launch(["--ui-dark", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
         tap(app, "open-settings")
