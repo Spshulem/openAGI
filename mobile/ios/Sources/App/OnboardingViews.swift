@@ -14,6 +14,11 @@ struct WelcomeView: View {
             Form {
                 Section {
                     Text("Your personal agent for chat, tasks and memory.")
+                    Text("Choose where it runs, connect a model or server, then start chatting. No OpenAGI account is required.")
+                        .foregroundStyle(.secondary)
+                }
+                if let error = session.setupError {
+                    Section { Text(error).foregroundStyle(.red) }
                 }
                 Section {
                     Button("On this iPhone", systemImage: "iphone") { session.choosePhone() }
@@ -32,8 +37,28 @@ struct WelcomeView: View {
                 } footer: {
                     Text("Use an existing OpenAGI agent on your Mac or server. You can connect later in Settings.")
                 }
+                Section("Connecting your devices") {
+                    Label("On the same Wi-Fi, Find servers looks for an announcement from the updated desktop app or daemon. Update and restart it first.", systemImage: "wifi")
+                    Label("Over Tailscale, enter your main server's DNS name from the Tailscale device list. Wi-Fi announcements don't cross Tailscale.", systemImage: "network")
+                    Label("Get a one-time code from OpenAGI on your Mac: Connect a phone… Or use Nodes → Connect a phone on your main server's dashboard.", systemImage: "key")
+                }
+                if session.mode != nil {
+                    Section {
+                        Text("Your existing pairing, models and conversations stay saved while you run setup again.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
+            .accessibilityIdentifier("setup-welcome")
             .navigationTitle("OpenAGI")
+            .toolbar {
+                if session.mode != nil {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Return to app") { session.goBack() }
+                            .accessibilityIdentifier("setup-cancel")
+                    }
+                }
+            }
         }
     }
 }
@@ -80,9 +105,10 @@ struct PhoneSetupView: View {
                 if phase == .active { modelStatus = OnDeviceModelStatus.current() }
             }
             .toolbar {
-                if step == .model {
+                if step != .starting {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Back") { session.goBack() }
+                        Button(session.mode == nil ? "Back" : "Cancel setup") { session.goBack() }
+                            .disabled(isWorking)
                     }
                 }
             }

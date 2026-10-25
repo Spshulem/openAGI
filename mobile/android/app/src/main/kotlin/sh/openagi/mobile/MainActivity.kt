@@ -31,7 +31,7 @@ import sh.openagi.mobile.ui.ChatConversationState
 import sh.openagi.mobile.ui.SharedThreadSupport
 import sh.openagi.mobile.ui.InboxScreen
 import sh.openagi.mobile.ui.LifelogScreen
-import sh.openagi.mobile.ui.PairingScreen
+import sh.openagi.mobile.ui.OnboardingScreen
 import sh.openagi.mobile.ui.SettingsScreen
 import sh.openagi.mobile.ui.SupervisorFormat
 import sh.openagi.mobile.ui.SupervisorScreen
@@ -119,6 +119,7 @@ class MainActivity : ComponentActivity() {
             val supervisorChatOpen = rememberSaveable { mutableStateOf(false) }
             // Lifelog opens from Today; six tabs leave no room for a seventh.
             var lifelogOpen by rememberSaveable { mutableStateOf(false) }
+            var replaySetup by rememberSaveable { mutableStateOf(false) }
             val credentials = credentialsState.value
             val pendingPairing = pendingPairingState.value
             val resumeSignal = resumeSignalState.intValue
@@ -129,18 +130,20 @@ class MainActivity : ComponentActivity() {
             val switchScope = rememberCoroutineScope()
 
             FoldAwareApp(this) {
-                if (credentials == null) {
+                if (credentials == null || replaySetup) {
                     FoldSafeSinglePane {
-                        PairingScreen(
+                        OnboardingScreen(
                             context = this,
                             prefill = pendingPairing,
                             onPaired = {
                                 credentialsState.value = Credentials.load(this)
+                                replaySetup = false
                                 // Spent. Left set, it would reach the paired branch
                                 // below as an incoming link and immediately offer to
                                 // switch away from the pairing it just made.
                                 pendingPairingState.value = null
                             },
+                            onClose = if (credentials != null) ({ replaySetup = false }) else null,
                         )
                     }
                 } else {
@@ -259,6 +262,7 @@ class MainActivity : ComponentActivity() {
                                 context = this@MainActivity,
                                 credentials = credentials,
                                 onRevoked = { credentialsState.value = null },
+                                onRestartSetup = { replaySetup = true },
                             )
                         }
                     }

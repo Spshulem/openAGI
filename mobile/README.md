@@ -31,6 +31,26 @@ on the platform and configuration; they do not replace reachability for chat.
 
 ## Pairing a phone
 
+### Replay mobile setup
+
+On either platform, open **Settings → Run setup again** to return to the
+welcome screen. Use **Return to app** to leave it. This replays navigation;
+it does not revoke the phone, delete conversations, remove saved model keys,
+or clear queued work. You do not need to uninstall or erase app data.
+
+iOS offers the phone agent's model, name, and notification setup, or server
+pairing. Android offers Gemini Nano / hosted chat, or server pairing; its
+phone chat does not provide the server's tasks or integrations. Existing
+pairing links still open the server/code screen directly.
+
+For server discovery, update and restart the desktop app or daemon first.
+Wi-Fi discovery needs the same local network. Over Tailscale, enter the main
+server's DNS name from the Tailscale device list. Get a phone code from the
+Mac app's **Connect a phone…** menu or the main dashboard's
+**Nodes → Connect a phone** page.
+
+### Connect to main
+
 On the machine running the daemon, with the daemon already bound to an
 address the phone can reach (see **Reachability**, below):
 

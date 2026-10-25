@@ -3,6 +3,71 @@ import XCTest
 
 final class AppModeTests: XCTestCase {
     @MainActor
+    func testReplayingAndCancellingSetupKeepsTheAgentAndQueuedWork() throws {
+        let previous = Credentials.load()
+        let previousBackup = Credentials.load(from: .server)
+        let previousMode = AppMode.current
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            Credentials.clear(); Credentials.clear(.server)
+            try? previous?.save(); try? previousBackup?.save(to: .server)
+            AppMode.current = previousMode
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let queue = OutboundQueue(directory: directory)
+        let parked = OutboundQueue.parkedForServer(directory: directory)
+        let pending = PendingOp(kind: .completeTask("offline-task"), createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        try queue.enqueue(pending)
+        for (url, mode) in [("https://daemon.example.com", AppMode.server), ("http://127.0.0.1:12345", AppMode.onPhone)] {
+            let credentials = Credentials(server: URL(string: url)!, nodeID: "mobile:replay", token: "synthetic-token")
+            try credentials.save()
+            Credentials.clear(.server)
+            AppMode.current = mode
+            let session = AppSession()
+            session.restartOnboarding()
+            XCTAssertEqual(session.phase, .welcome)
+            XCTAssertEqual(Credentials.load(), credentials)
+            XCTAssertEqual(AppMode.current, mode)
+            session.goBack(queue: queue, parkedQueue: parked)
+            XCTAssertEqual(session.phase, .ready(credentials))
+            XCTAssertEqual(Credentials.load(), credentials)
+            XCTAssertEqual(queue.all(), [pending])
+        }
+    }
+
+    @MainActor
+    func testCancellingReplayedPhoneSetupRestoresServerAcrossRelaunch() throws {
+        let previous = Credentials.load()
+        let previousBackup = Credentials.load(from: .server)
+        let previousMode = AppMode.current
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            Credentials.clear(); Credentials.clear(.server)
+            try? previous?.save(); try? previousBackup?.save(to: .server)
+            AppMode.current = previousMode
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let server = Credentials(server: URL(string: "https://daemon.example.com")!, nodeID: "mobile:server", token: "synthetic-token")
+        try server.save()
+        AppMode.current = .server
+        let session = AppSession()
+        session.restartOnboarding()
+        session.choosePhone()
+        XCTAssertEqual(session.phase, .phoneSetup)
+        XCTAssertEqual(Credentials.load(from: .server), server)
+        // Phone startup temporarily activates a local credential.
+        let local = Credentials(server: URL(string: "http://127.0.0.1:12345")!, nodeID: "mobile:local", token: "synthetic-token")
+        try local.save()
+        AppMode.current = .onPhone
+        session.goBack(queue: OutboundQueue(directory: directory), parkedQueue: .parkedForServer(directory: directory))
+        XCTAssertEqual(Credentials.load(), server)
+        XCTAssertEqual(AppMode.current, .server)
+        XCTAssertEqual(AppSession().phase, .ready(server))
+    }
+
+    @MainActor
     func testCancellingServerPairingRestoresQueuedWork() throws {
         let previous = Credentials.load()
         let previousBackup = Credentials.load(from: .server)

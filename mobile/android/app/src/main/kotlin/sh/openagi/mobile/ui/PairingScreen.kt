@@ -1,6 +1,7 @@
 package sh.openagi.mobile.ui
 
 import android.content.Context
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.rememberScrollState
@@ -48,6 +49,7 @@ fun PairingScreen(
     context: Context,
     prefill: PairingPayload?,
     onPaired: () -> Unit,
+    onCancel: (() -> Unit)? = null,
 ) {
     val savedServer = remember { Credentials.load(context)?.server }
     var serverText by remember(prefill) { mutableStateOf(prefill?.serverUrl ?: savedServer ?: "") }
@@ -56,6 +58,7 @@ fun PairingScreen(
     // Hold a successful exchange so a storage retry never enrolls a new node.
     var awaitingSave by remember(prefill) { mutableStateOf<Credentials?>(null) }
     var isPairing by remember { mutableStateOf(false) }
+    BackHandler(enabled = onCancel != null) { if (!isPairing) onCancel?.invoke() }
     // Keyed on prefill like the fields: a fresh link is a fresh attempt, and
     // the last code's "That code didn't work" must not sit under a new one.
     var error by remember(prefill) { mutableStateOf<ErrorCopy.Message?>(null) }
@@ -67,6 +70,9 @@ fun PairingScreen(
         modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
+        if (onCancel != null) {
+            androidx.compose.material3.TextButton(onClick = onCancel, enabled = !isPairing) { Text("Back to setup") }
+        }
         Text("Pair with OpenAGI", style = OpenAGIType.screenTitle, color = MaterialTheme.colorScheme.onBackground)
         savedServer?.let { Text("Your saved server is $it. Opening this screen does not remove its pairing.", style = OpenAGIType.secondary) }
         OutlinedButton(onClick = { showingFallback = true }) { Text("Use a local or hosted model") }

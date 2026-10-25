@@ -23,6 +23,7 @@ final class AppSession {
 
     private(set) var phase: Phase
     private(set) var mode: AppMode?
+    private(set) var setupError: String?
     // The tab a freshly set-up agent opens on.
     private(set) var initialTab: AppTab = .today
 
@@ -46,17 +47,38 @@ final class AppSession {
     // The server credential kept aside while the app uses the iPhone agent.
     var serverBackup: Credentials? { Credentials.load(from: .server) }
 
-    func choosePhone() { phase = .phoneSetup }
-    func chooseServer() { phase = .pairing }
+    // Replay changes navigation only. Credentials, history and queued work
+    // stay in place; goBack returns to the existing agent.
+    func restartOnboarding() {
+        setupError = nil
+        phase = .welcome
+    }
+
+    func choosePhone() {
+        setupError = nil
+        // Phone setup activates a local credential. Keep the current server
+        // first, including when setup was replayed from a paired phone.
+        if let current = Credentials.load(), !current.isEmbedded {
+            do { try current.save(to: .server) }
+            catch {
+                setupError = "Couldn't save your server pairing securely. Try again before setting up the phone agent."
+                return
+            }
+        }
+        phase = .phoneSetup
+    }
+    func chooseServer() { setupError = nil; phase = .pairing }
 
     // Back from pairing or phone setup to wherever the person came from.
     func goBack(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
         if mode == .server, let backup = serverBackup {
             try? backup.save()
             try? parkedQueue.move(to: queue)
+            AppMode.current = .server
             phase = .ready(backup)
         } else if mode == .server, let credentials = Credentials.load() {
             try? parkedQueue.move(to: queue)
+            AppMode.current = .server
             phase = .ready(credentials)
         } else if mode == .onPhone, let credentials = Credentials.load(), credentials.isEmbedded {
             phase = .ready(credentials)

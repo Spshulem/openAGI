@@ -56,6 +56,7 @@ fun SettingsScreen(
     context: Context,
     credentials: Credentials,
     onRevoked: () -> Unit,
+    onRestartSetup: () -> Unit,
 ) {
     var isWorking by remember { mutableStateOf(false) }
     var connectionIssue by remember { mutableStateOf<String?>(null) }
@@ -147,6 +148,13 @@ fun SettingsScreen(
                 Text("Find servers / check network")
             }
             connectionIssue?.let { Text(it, style = OpenAGIType.caption) }
+
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                androidx.compose.material3.OutlinedButton(onClick = onRestartSetup, modifier = Modifier.fillMaxWidth()) {
+                    Text("Run setup again")
+                }
+                Text("Replay the welcome and setup screens. Your pairing, saved models and conversations are kept.", style = OpenAGIType.caption)
+            }
 
             RowGroup {
                 // Blocked notifications mean no pings whatever the pref says, so
