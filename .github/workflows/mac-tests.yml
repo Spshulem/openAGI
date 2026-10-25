@@ -4,6 +4,9 @@ on:
   pull_request:
     paths:
       - "mac/**"
+      - "src/phone-pairing-page.js"
+      - "src/hosted-interface.js"
+      - "test/phone-pairing-page.test.js"
       - ".github/workflows/mac-tests.yml"
 
 permissions:
@@ -16,4 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Mac app and run Fleet and privacy-link regressions
-        run: swift test --package-path mac --filter 'Fleet|AppLink'
+        run: swift test --package-path mac --filter 'Fleet|AppLink|PhonePairing'
+
+  phone-pairing-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node --test test/phone-pairing-page.test.js test/dashboard-login.test.js test/mobile-enrollment.test.js test/pair-phone.test.js

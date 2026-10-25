@@ -41,7 +41,7 @@ class GeminiNanoAcceptanceTest {
                 val request = Request.Builder().url(local.server + "/message")
                     .header("Authorization", "Bearer ${local.token}").header("X-OpenAGI-Node-ID", local.nodeId)
                     // A separate synthetic conversation, never the owner's chat.
-                    .post("""{"text":"Please reply with a short greeting.","from":"nano-acceptance","channel":"local"}""".toRequestBody("application/json".toMediaType())).build()
+                    .post("""{"text":"Please reply with a short greeting.","from":"nano-acceptance"}""".toRequestBody("application/json".toMediaType())).build()
                 http.newCall(request).execute().use { response ->
                     assertEquals("The local agent must answer through Gemini Nano; see the private daemon log for a failure", 200, response.code)
                     val body = Json.parseToJsonElement(response.body!!.string()).jsonObject

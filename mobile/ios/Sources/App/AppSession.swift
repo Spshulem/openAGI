@@ -23,16 +23,22 @@ final class AppSession {
 
     private(set) var phase: Phase
     private(set) var mode: AppMode?
+    private(set) var setupError: String?
     // The tab a freshly set-up agent opens on.
     private(set) var initialTab: AppTab = .today
+    @ObservationIgnored private var onboardingSource: AppModel?
 
-    init() {
+    init(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
         let credentials = Credentials.load()
         let mode = AppMode.resolved(credentials: credentials)
         self.mode = mode
         switch mode {
         case .onPhone?: phase = .phoneStarting
-        case .server?: phase = credentials.map(Phase.ready) ?? .pairing
+        case .server?:
+            // Setup can be closed before local startup activates its own
+            // credential. Resume the still-active server's parked work.
+            if credentials != nil { try? parkedQueue.move(to: queue) }
+            phase = credentials.map(Phase.ready) ?? .pairing
         case nil: phase = .welcome
         }
     }
@@ -46,17 +52,47 @@ final class AppSession {
     // The server credential kept aside while the app uses the iPhone agent.
     var serverBackup: Credentials? { Credentials.load(from: .server) }
 
-    func choosePhone() { phase = .phoneSetup }
-    func chooseServer() { phase = .pairing }
+    // Replay changes navigation only. Credentials, history and queued work
+    // stay in place; goBack returns to the existing agent.
+    func restartOnboarding(from model: AppModel? = nil) {
+        model?.suspendForOnboarding()
+        onboardingSource = model
+        setupError = nil
+        phase = .welcome
+    }
+
+    func choosePhone(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
+        setupError = nil
+        // Phone setup activates a local credential. Keep the current server
+        // first, including when setup was replayed from a paired phone.
+        if let current = Credentials.load(), !current.isEmbedded {
+            do {
+                try current.save(to: .server)
+                // Startup persists the local credential before the wizard
+                // finishes. Background refresh/relaunch must not drain the
+                // server's completions into that temporary local session.
+                try queue.move(to: parkedQueue)
+            }
+            catch {
+                setupError = "Couldn't save your server pairing and pending work safely. Try again before setting up the phone agent."
+                return
+            }
+        }
+        phase = .phoneSetup
+    }
+    func chooseServer() { setupError = nil; phase = .pairing }
 
     // Back from pairing or phone setup to wherever the person came from.
     func goBack(queue: OutboundQueue = OutboundQueue(), parkedQueue: OutboundQueue = .parkedForServer()) {
+        onboardingSource = nil
         if mode == .server, let backup = serverBackup {
             try? backup.save()
             try? parkedQueue.move(to: queue)
+            AppMode.current = .server
             phase = .ready(backup)
         } else if mode == .server, let credentials = Credentials.load() {
             try? parkedQueue.move(to: queue)
+            AppMode.current = .server
             phase = .ready(credentials)
         } else if mode == .onPhone, let credentials = Credentials.load(), credentials.isEmbedded {
             phase = .ready(credentials)
@@ -68,10 +104,23 @@ final class AppSession {
     }
 
     func finishPhoneSetup(_ credentials: Credentials) {
+        // Only a completed switch leaves the old daemon. Cancelling any
+        // earlier setup step keeps its offline snapshot, history and queue.
+        if let source = onboardingSource, !source.isOnPhone {
+            source.detach()
+        }
+        onboardingSource = nil
         AppMode.current = .onPhone
         mode = .onPhone
         initialTab = .chat
         phase = .ready(credentials)
+    }
+
+    // Enrollment has succeeded and the new credential is securely saved.
+    // Isolate the old stores before the new server's first queue drain.
+    func prepareForPairing() {
+        onboardingSource?.detach()
+        onboardingSource = nil
     }
 
     // From a server, Settings' "Try the agent on this iPhone": the server's

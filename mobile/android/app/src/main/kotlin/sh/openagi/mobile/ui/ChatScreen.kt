@@ -409,6 +409,7 @@ fun ChatScreen(
     var isStreaming by conversationState.isStreaming
     var nextId by conversationState.nextId
 
+    var userScrolledAway by remember { mutableStateOf(false) }
     if (showingHistory) {
         androidx.compose.material3.ModalBottomSheet(onDismissRequest = { showingHistory = false }) {
             Column(Modifier.fillMaxWidth().padding(24.dp)) {
@@ -426,7 +427,10 @@ fun ChatScreen(
                             modifier = Modifier.clickable {
                                 val index = messages.indexOfFirst { it.id == entry.id }
                                 showingHistory = false
-                                if (index >= 0) scope.launch { listState.scrollToItem(index) }
+                                if (index >= 0) {
+                                    userScrolledAway = true
+                                    scope.launch { listState.scrollToItem(index) }
+                                }
                             })
                     }
                 }
@@ -439,7 +443,6 @@ fun ChatScreen(
     // the person's own drags and flings decide that (see ChatScroll); the
     // list merely having more below it, as it does on first open or while a
     // reply grows, never counts as scrolling away.
-    var userScrolledAway by remember { mutableStateOf(false) }
     val userScroll = remember {
         object : NestedScrollConnection {
             // Programmatic scrolls (following, Jump to latest) bypass nested

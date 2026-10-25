@@ -1,6 +1,7 @@
 package sh.openagi.mobile.ui
 
 import android.content.Context
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.rememberScrollState
@@ -31,7 +32,7 @@ import sh.openagi.mobile.store.MobileNodeIdentity
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.sync.RefreshCoordinator
-import sh.openagi.mobile.sync.RefreshWorker
+import sh.openagi.mobile.sync.activateWorkspace
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.ui.components.PrimaryButton
@@ -48,6 +49,7 @@ fun PairingScreen(
     context: Context,
     prefill: PairingPayload?,
     onPaired: () -> Unit,
+    onCancel: (() -> Unit)? = null,
 ) {
     val savedServer = remember { Credentials.load(context)?.server }
     var serverText by remember(prefill) { mutableStateOf(prefill?.serverUrl ?: savedServer ?: "") }
@@ -56,6 +58,7 @@ fun PairingScreen(
     // Hold a successful exchange so a storage retry never enrolls a new node.
     var awaitingSave by remember(prefill) { mutableStateOf<Credentials?>(null) }
     var isPairing by remember { mutableStateOf(false) }
+    BackHandler(enabled = onCancel != null) { if (!isPairing) onCancel?.invoke() }
     // Keyed on prefill like the fields: a fresh link is a fresh attempt, and
     // the last code's "That code didn't work" must not sit under a new one.
     var error by remember(prefill) { mutableStateOf<ErrorCopy.Message?>(null) }
@@ -67,6 +70,9 @@ fun PairingScreen(
         modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
+        if (onCancel != null) {
+            androidx.compose.material3.TextButton(onClick = onCancel, enabled = !isPairing) { Text("Back to setup") }
+        }
         Text("Pair with OpenAGI", style = OpenAGIType.screenTitle, color = MaterialTheme.colorScheme.onBackground)
         savedServer?.let { Text("Your saved server is $it. Opening this screen does not remove its pairing.", style = OpenAGIType.secondary) }
         OutlinedButton(onClick = { showingFallback = true }) { Text("Use a local or hosted model") }
@@ -134,7 +140,7 @@ fun PairingScreen(
                             )
                             Credentials(server = serverText, nodeId = enrollment.node.id, token = enrollment.nodeToken)
                         }
-                        if (!Credentials.save(context, credentials)) {
+                        if (runCatching { activateWorkspace(context, credentials) }.isFailure) {
                             awaitingSave = credentials
                             error = ErrorCopy.Message(
                                 "Couldn't save the credential on this device.",
@@ -143,7 +149,6 @@ fun PairingScreen(
                             return@launch
                         }
                         awaitingSave = null
-                        RefreshWorker.schedule(context)
                         // Kick the first refresh so the day's tasks are already on
                         // disk by the time TodayScreen appears; failure here is
                         // not fatal to pairing itself, so it's not surfaced as a

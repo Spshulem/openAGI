@@ -11,6 +11,9 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import sh.openagi.mobile.store.Credentials
+import sh.openagi.mobile.sync.activateWorkspace
+import sh.openagi.mobile.sync.backgroundCredentials
+import sh.openagi.mobile.transport.EmbeddedLoopback
 
 @RunWith(AndroidJUnit4::class)
 class EmbeddedWorkspaceTest {
@@ -32,6 +35,19 @@ class EmbeddedWorkspaceTest {
         try {
             local = EmbeddedAgent.start(context, previous)
             assertTrue(local.isEmbedded)
+            // A worker can restore the loopback exception without an Activity.
+            EmbeddedLoopback.port = null
+            val background = backgroundCredentials(context, local.workspaceId)
+            assertEquals(local, background)
+            assertEquals(local.server.substringAfterLast(':').toInt(), EmbeddedLoopback.port)
+            assertNull(backgroundCredentials(context, "a-different-workspace"))
+
+            // Leaving for server setup must survive a background/relaunch load.
+            activateWorkspace(context, null)
+            assertNull(Credentials.load(context))
+            assertEquals(local, EmbeddedAgent.start(context, activate = false))
+            assertNull("A background start must not cancel server setup", Credentials.load(context))
+            activateWorkspace(context, local)
             id = request(local, "/tasks", """{"title":"Synthetic phone workspace test","bucket":"today"}""").jsonObject["id"]!!.jsonPrimitive.content
             assertTrue(request(local, "/tasks").jsonObject["tasks"]!!.jsonArray.any { it.jsonObject["id"]!!.jsonPrimitive.content == id })
             assertTrue(request(local, "/mobile/summary").jsonObject["today"]!!.jsonArray.any { it.jsonObject["id"]!!.jsonPrimitive.content == id })

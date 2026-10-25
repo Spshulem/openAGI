@@ -286,22 +286,7 @@ struct TrayMenu: View {
   }
 
   private func openPhonePairing() {
-    // A worker's owner token belongs only to this Mac. Open main without
-    // forwarding that credential; its browser session authenticates there.
-    let configURL = AppState.dataDir().appendingPathComponent("node.json")
-    if let data = try? Data(contentsOf: configURL),
-       let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-       let remote = config["remote"] as? String,
-       var components = URLComponents(string: remote),
-       let scheme = components.scheme, ["http", "https"].contains(scheme), components.host != nil {
-      components.user = nil
-      components.password = nil
-      components.path = "/"
-      components.queryItems = [URLQueryItem(name: "tab", value: "nodes")]
-      components.fragment = "phone-pairing"
-      if let url = components.url { NSWorkspace.shared.open(url); return }
-    }
-    state.openDashboard(path: "/?tab=nodes#phone-pairing")
+    PhonePairingWindowController.shared.show(state: state)
   }
 
   // Updates / quit

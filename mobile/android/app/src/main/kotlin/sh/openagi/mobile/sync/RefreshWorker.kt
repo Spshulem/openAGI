@@ -1,6 +1,7 @@
 package sh.openagi.mobile.sync
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import androidx.glance.appwidget.updateAll
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
@@ -18,7 +19,15 @@ import java.util.concurrent.TimeUnit
 
 class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        val credentials = Credentials.load(applicationContext) ?: return Result.success()
+        val credentials = try {
+            backgroundCredentials(applicationContext, null)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            return if (runAttemptCount < 2) Result.retry() else Result.failure()
+        } catch (_: LinkageError) {
+            return Result.failure()
+        } ?: return Result.success()
         val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
         val coordinator = RefreshCoordinator(
             client,
@@ -30,7 +39,7 @@ class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorke
         // Supervisor alerts' fallback for when SupervisorAlertService is not
         // running (switched off, or Android refused to start it). Harmless
         // alongside it: the check is serialized and only posts what is new.
-        checkSupervisorAlerts(applicationContext, client)
+        if (!credentials.isEmbedded) checkSupervisorAlerts(applicationContext, client)
         // An offline phone is the normal case off the tailnet, not a failure
         // worth exponential backoff on a 15-minute schedule, so every outcome
         // is success.
@@ -42,13 +51,17 @@ class RefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorke
 
         // 15 minutes is WorkManager's floor. Without a push channel this is the
         // honest ceiling on widget freshness, and the widget says so on screen.
-        fun schedule(context: Context) {
+        fun schedule(context: Context, credentials: Credentials? = Credentials.load(context)) {
             val request = PeriodicWorkRequestBuilder<RefreshWorker>(15, TimeUnit.MINUTES)
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                .setConstraints(refreshConstraints(credentials))
                 .build()
             WorkManager.getInstance(context)
-                .enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.KEEP, request)
+                .enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.UPDATE, request)
         }
+
+        internal fun refreshConstraints(credentials: Credentials?): Constraints = Constraints.Builder()
+            .setRequiredNetworkType(if (credentials?.isEmbedded == true) NetworkType.NOT_REQUIRED else NetworkType.CONNECTED)
+            .build()
 
         fun cancel(context: Context) {
             WorkManager.getInstance(context).cancelUniqueWork(NAME)

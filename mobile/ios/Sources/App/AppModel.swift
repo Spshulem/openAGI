@@ -216,6 +216,14 @@ final class AppModel {
 
     // MARK: - Revoke
 
+    // Setup replay pauses the old model without deleting offline work. A
+    // completed daemon switch still uses detach() to isolate its stores.
+    func suspendForOnboarding() {
+        invalidateRefresh()
+        agentChat.suspend()
+        supervisorChat.suspend()
+    }
+
     func revoke() async {
         invalidateRefresh()
         // Local push state goes first; best-effort relay cleanup runs apart

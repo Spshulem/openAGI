@@ -45,7 +45,7 @@ object EmbeddedAgent {
         Credentials(server, node, token)
     }
 
-    suspend fun start(context: Context, previous: Credentials? = null): Credentials = withContext(Dispatchers.IO) {
+    suspend fun start(context: Context, previous: Credentials? = null, activate: Boolean = true): Credentials = withContext(Dispatchers.IO) {
         mutex.withLock {
             check(exitCode == null) { "The phone agent stopped. Close and reopen OpenAGI to restart it." }
             val secrets = prefs(context)
@@ -53,8 +53,9 @@ object EmbeddedAgent {
                 check(secrets.edit().putString("server", previous.server).putString("serverNode", previous.nodeId)
                     .putString("serverToken", previous.token).commit()) { "Couldn't preserve your server pairing securely." }
             }
-            ready?.let {
-                check(Credentials.save(context, it)) { "Couldn't save the phone agent securely." }
+            ready?.takeIf { credentialWorks(it) }?.let {
+                EmbeddedLoopback.port = port
+                if (activate) check(Credentials.save(context, it)) { "Couldn't save the phone agent securely." }
                 bridge?.connect()
                 return@withLock it
             }
@@ -110,16 +111,23 @@ object EmbeddedAgent {
                     check(secrets.edit().putString("node", it.nodeId).putString("nodeToken", it.token).commit()) { "Couldn't save the local pairing." }
                 }
             }
+            bridge?.close()
             bridge = DeviceModelBridge(scope, port, owner).also { it.connect() }
             // An explicit local choice must not silently use a saved cloud key.
             post("/settings/models", buildJsonObject { put("preference", "on-device") })
-            check(Credentials.save(context, credential)) { "Couldn't save the phone agent securely." }
+            if (activate) check(Credentials.save(context, credential)) { "Couldn't save the phone agent securely." }
             ready = credential
             credential
         }
     }
 
     fun reconnect() { bridge?.connect() }
+
+    private fun credentialWorks(credentials: Credentials): Boolean = runCatching {
+        http.newCall(Request.Builder().url(credentials.server + "/tasks")
+            .header("Authorization", "Bearer ${credentials.token}").header("X-OpenAGI-Node-ID", credentials.nodeId).build())
+            .execute().use { it.isSuccessful }
+    }.getOrDefault(false)
 
     private fun post(path: String, body: JsonObject): JsonObject {
         val request = Request.Builder().url("http://127.0.0.1:$port$path").header("Authorization", "Bearer $owner")

@@ -222,6 +222,13 @@ final class ChatConversation {
         store.save(nodeID: nodeID, entries: messages.map(ChatHistoryCodec.saved))
     }
 
+    // Stop late replies/history refreshes from writing while setup is open,
+    // keeping the last saved conversation available if setup is cancelled.
+    func suspend() {
+        persist()
+        forgotten = true
+    }
+
     // On revoke: the cache belongs to the pairing being forgotten, and a
     // reply still streaming must not write it back afterwards.
     func forget() {

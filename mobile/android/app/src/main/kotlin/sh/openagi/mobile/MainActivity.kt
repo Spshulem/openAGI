@@ -36,7 +36,7 @@ import sh.openagi.mobile.ui.ChatConversationState
 import sh.openagi.mobile.ui.SharedThreadSupport
 import sh.openagi.mobile.ui.InboxScreen
 import sh.openagi.mobile.ui.LifelogScreen
-import sh.openagi.mobile.ui.PairingScreen
+import sh.openagi.mobile.ui.OnboardingScreen
 import sh.openagi.mobile.ui.SettingsScreen
 import sh.openagi.mobile.ui.SupervisorFormat
 import sh.openagi.mobile.ui.SupervisorScreen
@@ -126,6 +126,7 @@ class MainActivity : ComponentActivity() {
             val supervisorChatOpen = rememberSaveable { mutableStateOf(false) }
             // Lifelog opens from Today; six tabs leave no room for a seventh.
             var lifelogOpen by rememberSaveable { mutableStateOf(false) }
+            var replaySetup by rememberSaveable { mutableStateOf(false) }
             val credentials = credentialsState.value
             val pendingPairing = pendingPairingState.value
             val resumeSignal = resumeSignalState.intValue
@@ -141,9 +142,10 @@ class MainActivity : ComponentActivity() {
                 localError = null
                 switchScope.launch {
                     try {
-                        val local = EmbeddedAgent.start(this@MainActivity, credentialsState.value)
-                        SupervisorAlertService.stop(this@MainActivity)
+                        val local = EmbeddedAgent.start(this@MainActivity, credentialsState.value, activate = false)
+                        sh.openagi.mobile.sync.activateWorkspace(this@MainActivity, local)
                         credentialsState.value = local
+                        replaySetup = false
                         selectedTab = AppTab.CHAT
                     } catch (_: LinkageError) {
                         localError = "This build couldn't load the phone agent. Your server pairing and phone data are kept. Update OpenAGI and try again."
@@ -157,27 +159,24 @@ class MainActivity : ComponentActivity() {
             }
 
             FoldAwareApp(this) {
-                if (credentials == null) {
+                if (credentials == null || replaySetup) {
                     FoldSafeSinglePane {
-                        Column {
-                            Text("Your agent, on your phone", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(24.dp))
-                            Text("Tasks, Today, Inbox and conversations work without a server. Gemini Nano runs on supported phones; its download may be needed first.", modifier = Modifier.padding(horizontal = 24.dp))
-                            Button(onClick = { usePhone() }, enabled = !localStarting, modifier = Modifier.padding(24.dp)) {
-                                Text(if (localStarting) "Starting phone agent…" else "Use this phone")
-                            }
-                            localError?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp)) }
-                            Box(Modifier.weight(1f)) { PairingScreen(
+                        OnboardingScreen(
                             context = this@MainActivity,
                             prefill = pendingPairing,
                             onPaired = {
                                 credentialsState.value = Credentials.load(this@MainActivity)
+                                replaySetup = false
                                 // Spent. Left set, it would reach the paired branch
                                 // below as an incoming link and immediately offer to
                                 // switch away from the pairing it just made.
                                 pendingPairingState.value = null
                             },
-                        ) }
-                        }
+                            onClose = if (credentials != null) ({ replaySetup = false }) else null,
+                            onUsePhone = { usePhone() },
+                            localStarting = localStarting,
+                            localError = localError,
+                        )
                     }
                 } else {
                     val conversationScope = rememberCoroutineScope()
@@ -304,11 +303,16 @@ class MainActivity : ComponentActivity() {
                                 onUsePhone = { usePhone() },
                                 onUseServer = {
                                     switchScope.launch {
-                                        val backup = EmbeddedAgent.serverBackup(this@MainActivity)
-                                        if (backup != null && Credentials.save(this@MainActivity, backup)) credentialsState.value = backup
-                                        else credentialsState.value = null
+                                        try {
+                                            val backup = EmbeddedAgent.serverBackup(this@MainActivity)
+                                            sh.openagi.mobile.sync.activateWorkspace(this@MainActivity, backup)
+                                            credentialsState.value = backup
+                                        } catch (_: Exception) {
+                                            localError = "Couldn't switch workspaces. Try again when device storage is available."
+                                        }
                                     }
                                 },
+                                onRestartSetup = { replaySetup = true },
                             )
                         }
                     }

@@ -20,6 +20,13 @@ data class Credentials(val server: String, val nodeId: String, val token: String
 
     val isEmbedded: Boolean get() = server.startsWith("http://127.0.0.1:")
 
+    // Stable across a local daemon's port changes; contains no bearer token.
+    val workspaceId: String get() {
+        val origin = if (isEmbedded) "phone" else server.trimEnd('/')
+        return java.security.MessageDigest.getInstance("SHA-256")
+            .digest("$origin\n$nodeId".toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
     companion object {
         private const val FILE = "sh.openagi.mobile.credentials"
         private const val TAG = "Credentials"
@@ -76,11 +83,8 @@ data class Credentials(val server: String, val nodeId: String, val token: String
             }
         }
 
-        fun clear(context: Context) {
-            guarded(Unit, "clear failed") {
-                prefs(context)?.edit()?.clear()?.commit()
-                Unit
-            }
+        fun clear(context: Context): Boolean = guarded(false, "clear failed") {
+            prefs(context)?.edit()?.clear()?.commit() == true
         }
 
         // The seam: run a Keystore-touching block, and on any failure log a

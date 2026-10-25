@@ -17,6 +17,12 @@ import sh.openagi.mobile.sync.DrainWorker
 class CompleteTaskAction : ActionCallback {
     override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
         val taskId = parameters[taskIdKey] ?: return
+        val credentials = Credentials.load(context) ?: return
+        if (parameters[workspaceKey] != credentials.workspaceId) {
+            TodayWidget().updateAll(context)
+            return
+        }
+        val directory = Credentials.workspaceDirectory(context, credentials)
         // Hide it now, send it when we can. A tap that visibly does nothing for
         // fifteen minutes is worse than no widget at all — but a widget host
         // that crashes gets deprioritized by the OS, which silently kills the
@@ -25,8 +31,8 @@ class CompleteTaskAction : ActionCallback {
         // filesystem, so every write here is best-effort, same as iOS's
         // `try?` on the equivalent path.
         try {
-            SnapshotStore(Credentials.workspaceDirectory(context)).applyOptimisticCompletion(taskId)
-            OutboundQueue(Credentials.workspaceDirectory(context)).enqueue(PendingOp.completeTask(taskId))
+            SnapshotStore(directory).applyOptimisticCompletion(taskId)
+            OutboundQueue(directory).enqueue(PendingOp.completeTask(taskId))
         } catch (error: Exception) {
             Log.w("CompleteTaskAction", "optimistic completion write failed: ${error.javaClass.simpleName}")
         }
@@ -36,7 +42,7 @@ class CompleteTaskAction : ActionCallback {
             Log.w("CompleteTaskAction", "widget repaint failed: ${error.javaClass.simpleName}")
         }
         try {
-            WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<DrainWorker>().build())
+            WorkManager.getInstance(context).enqueue(OneTimeWorkRequestBuilder<DrainWorker>().setInputData(androidx.work.workDataOf(DrainWorker.WORKSPACE_ID to credentials.workspaceId)).build())
         } catch (error: Exception) {
             Log.w("CompleteTaskAction", "drain enqueue failed: ${error.javaClass.simpleName}")
         }
@@ -44,5 +50,6 @@ class CompleteTaskAction : ActionCallback {
 
     companion object {
         val taskIdKey = ActionParameters.Key<String>("taskId")
+        val workspaceKey = ActionParameters.Key<String>("workspaceId")
     }
 }

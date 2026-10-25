@@ -42,6 +42,16 @@
   <key>NSHumanReadableCopyright</key>
   <string>Licensed under the PolyForm Noncommercial License 1.0.0. Commercial use requires a separate license.</string>
 
+  <!-- The native client connects to its loopback daemon and explicitly
+       paired LAN/Tailscale IP addresses. Keep ATS enabled for other loads. -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>OpenAGI connects to your local agent and the servers you choose over Wi-Fi or Tailscale to pair phones and sync your workspace.</string>
+
   <!-- Capture permission usage strings. macOS shows these when prompting. -->
   <key>NSMicrophoneUsageDescription</key>
   <string>OpenAGI sends your speech to your paired hub when you use the voice mic button or hold-to-talk hotkey.</string>

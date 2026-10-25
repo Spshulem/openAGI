@@ -59,6 +59,18 @@ struct SettingsView: View {
                 WorkspaceSection()
 
                 Section {
+                    Button("Run setup again", systemImage: "arrow.counterclockwise") {
+                        dismiss()
+                        AppSession.shared.restartOnboarding(from: model)
+                    }
+                    .accessibilityIdentifier("settings-restart-setup")
+                } header: {
+                    Text("Setup")
+                } footer: {
+                    Text("Replay the welcome and setup screens. Your pairing, saved models and conversations are kept. Use Return to app to leave setup.")
+                }
+
+                Section {
                     Button("Chat without server", systemImage: "network.slash") { showingFallback = true }
                 } header: {
                     Text("Fallback")
