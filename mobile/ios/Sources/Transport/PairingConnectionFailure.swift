@@ -8,11 +8,7 @@ enum PairingConnectionFailure {
         parts?.user = nil; parts?.password = nil
         parts?.path = ""; parts?.query = nil; parts?.fragment = nil
         let address = parts?.url?.absoluteString ?? "the entered server"
-        let host = server.host?.lowercased() ?? ""
-        let tailnet = host.hasSuffix(".ts.net") || HostAllowlist.isBlockedByAppTransportSecurity(host)
-        let recovery = tailnet
-            ? "Open Tailscale on this phone, turn its connection on, and enable Tailscale DNS."
-            : "Check the Wi-Fi connection and allow OpenAGI in Settings → Privacy & Security → Local Network."
+        let recovery = ServerConnectionGuidance.recovery(for: server)
         guard let network = error as? URLError else { return "Could not reach \(address). \(recovery)" }
         switch network.code {
         case .cannotFindHost, .dnsLookupFailed:
