@@ -221,7 +221,9 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(bubble.exists)
         XCTAssertLessThan(bubble.frame.width, 120, "A short answer must use its natural bubble width")
         let text = "This synthetic list item explains the context of a decision in enough detail to wrap naturally across several lines on a phone, including a cover display or one page of a book layout. The entire explanation must remain readable before anyone makes a decision."
-        let bullet = app.staticTexts[text]
+        // XCTest's identifier subscript rejects strings over 128 characters.
+        // Match the full label without shortening the content under test.
+        let bullet = app.staticTexts.matching(NSPredicate(format: "label == %@", text)).firstMatch
         XCTAssertTrue(bullet.waitForExistence(timeout: 10))
         XCTAssertGreaterThan(bullet.frame.height, 50, "The long list item must wrap into multiple lines")
         XCTAssertTrue(app.staticTexts["The final synthetic paragraph remains readable."].exists)
