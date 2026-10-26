@@ -103,7 +103,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         case "/fleet/api/state":
             finish(object: ["mode": "observe", "enabled": false, "running": false,
                             "snapshot": ["at": Self.date, "threads": [["key": "codex:fixture", "title": "Synthetic review thread", "workspace": "Demo workspace", "state": "needs-human"]]],
-                            "questions": [["id": "context-fixture", "title": "Review the synthetic request", "body": "Read the recent activity before choosing a response.", "kind": "agent-card", "threadKey": "codex:fixture", "options": ["open thread"], "createdAt": Self.date]]])
+                            "questions": [["id": "context-fixture", "title": "Review the synthetic request", "body": "Read the recent activity before choosing a response.", "kind": "agent-ask", "threadKey": "codex:fixture", "options": ["yes", "no", "open thread"], "createdAt": Self.date]]])
         case "/fleet/api/threads/codex:fixture":
             finish(object: ["thread": ["key": "codex:fixture", "scannedAt": Self.date,
                                        "lastOwnerMessage": ["text": "Explain the synthetic change before I decide.", "at": Self.date],

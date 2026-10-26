@@ -565,7 +565,10 @@ private struct QuestionRow: View {
                 }
                 .buttonStyle(.borderless)
             }
-            let options = SupervisorFormat.answerOptions(question)
+            let answerOptions = SupervisorFormat.answerOptions(question)
+            // A compact preview is for navigation. Decisions about a thread
+            // belong after its full question and activity in the detail screen.
+            let options = keys.isEmpty ? answerOptions : []
             FlowLayout(spacing: Theme.Spacing.x2) {
                 ForEach(Array(options.enumerated()), id: \.offset) { index, option in
                     if index == 0 {
@@ -589,7 +592,9 @@ private struct QuestionRow: View {
             }
             if let note { NoteLine(note: note) }
             if question.kind == "agent-ask" || question.kind == "agent-card" {
-                Text(options.isEmpty ? "This request needs a response in the original app on your Mac. Read the thread activity for context." : "Your answer goes to the agent.")
+                Text(answerOptions.isEmpty
+                     ? "This request needs a response in the original app on your Mac. Read the thread activity for context."
+                     : keys.isEmpty ? "Your answer goes to the agent." : "Open thread activity to read the request and respond.")
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
             }

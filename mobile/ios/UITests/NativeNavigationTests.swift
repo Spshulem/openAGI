@@ -193,6 +193,10 @@ final class NativeNavigationTests: XCTestCase {
     func testQuestionOpensReadOnlyThreadActivityWithoutSubmittingAnAnswer() {
         let app = launch()
         tab(app, "Supervisor")
+        XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["yes"].exists, "Read the full context before a thread decision")
+        XCTAssertFalse(app.buttons["no"].exists)
+        XCTAssertFalse(app.buttons["open thread"].exists, "Opening a thread must be navigation")
         tap(app, "supervisor-question-context-context-fixture")
         XCTAssertTrue(app.navigationBars["Thread"].waitForExistence(timeout: 10))
         let message = app.staticTexts["The synthetic change is ready for your review. Nothing has been sent."]
