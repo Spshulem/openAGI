@@ -94,7 +94,7 @@ struct OpenAGIApp: App {
                     session.paired()
                 }
             )
-            .id(pendingPairing?.code ?? "")
+            .id(pendingPairing)
         case .ready(let credentials):
             RootTabView(
                 credentials: credentials,

@@ -41,6 +41,24 @@ final class ServerDiscoveryTests: XCTestCase {
                        "http://main.tail1234.ts.net:43210")
         XCTAssertEqual(TailscaleServerAddress.parse("https://main.tail1234.ts.net:443/setup")?.path, "")
         XCTAssertNil(TailscaleServerAddress.parse("http://user:password@main.tail1234.ts.net"))
+        XCTAssertEqual(TailscaleServerAddress.parse("https://main.tail1234.ts.net:8443")?.absoluteString,
+                       "https://main.tail1234.ts.net:8443")
+    }
+
+    func testPairingFailuresIdentifyTheAttemptedEndpointAndNetworkRecovery() {
+        let server = URL(string: "https://main.tail1234.ts.net:8443")!
+        let dns = PairingConnectionFailure.detail(for: URLError(.cannotFindHost), server: server)
+        XCTAssertTrue(dns.contains(server.absoluteString))
+        XCTAssertTrue(dns.contains("Tailscale DNS"))
+        let connection = PairingConnectionFailure.detail(for: URLError(.cannotConnectToHost), server: server)
+        XCTAssertTrue(connection.contains("scheme and port"))
+        XCTAssertTrue(connection.contains("turn its connection on"))
+        let tls = PairingConnectionFailure.detail(for: URLError(.serverCertificateUntrusted), server: server)
+        XCTAssertTrue(tls.contains("certificate"))
+        XCTAssertFalse(tls.contains("turn its connection on"))
+        let lan = PairingConnectionFailure.detail(for: URLError(.notConnectedToInternet), server: URL(string: "http://agent.local:43210")!)
+        XCTAssertTrue(lan.contains("Local Network"))
+        XCTAssertFalse(lan.contains("Tailscale"))
     }
 
     @MainActor
