@@ -200,7 +200,9 @@ final class NativeNavigationTests: XCTestCase {
                              "The composer belongs below history, not over its first message")
         composer.tap()
         composer.typeText("A synthetic message")
-        let send = element(app, "chat-send")
+        // Keep keyboard assertions scoped to the native control rather
+        // than enumerating every accessibility element in the workspace.
+        let send = app.buttons["chat-send"]
         XCTAssertTrue(send.isEnabled && send.isHittable)
         if app.keyboards.firstMatch.waitForExistence(timeout: 3) {
             XCTAssertLessThanOrEqual(send.frame.maxY, app.keyboards.firstMatch.frame.minY)
@@ -210,7 +212,7 @@ final class NativeNavigationTests: XCTestCase {
         tab(app, "Tasks")
         tab(app, "Chat")
         XCTAssertEqual(element(app, "chat-composer").value as? String, "A synthetic message")
-        tap(app, "chat-send")
+        send.tap()
         XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
         capture("native-chat", app: app)
     }
@@ -253,7 +255,7 @@ final class NativeNavigationTests: XCTestCase {
         tab(app, "Chat")
         tap(app, "chat-composer")
         element(app, "chat-composer").typeText("Large text")
-        XCTAssertTrue(element(app, "chat-send").isHittable)
+        XCTAssertTrue(app.buttons["chat-send"].isHittable)
         capture("native-chat-accessibility-dark", app: app)
     }
 }
