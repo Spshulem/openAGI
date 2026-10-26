@@ -62,7 +62,9 @@ final class SummaryDecodingTests: XCTestCase {
 
     func testOptionalTaskReviewDistinguishesSyncFromSuccessfulReview() throws {
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture("summary-populated")) as? [String: Any])
-        XCTAssertNil(try ProtocolDecoder.json.decode(MobileSummary.self, from: fixture("summary-populated")).taskReview)
+        object.removeValue(forKey: "taskReview")
+        let olderServer = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertNil(try ProtocolDecoder.json.decode(MobileSummary.self, from: olderServer).taskReview)
         object["taskReview"] = ["status": "failed", "attemptedAt": "2026-02-02T00:00:00Z", "lastReviewedAt": "2026-02-01T00:00:00Z"]
         let data = try JSONSerialization.data(withJSONObject: object)
         let summary = try ProtocolDecoder.json.decode(MobileSummary.self, from: data)
