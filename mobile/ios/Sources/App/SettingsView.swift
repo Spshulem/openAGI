@@ -24,6 +24,11 @@ struct SettingsView: View {
                                 .textSelection(.enabled)
                                 .multilineTextAlignment(.trailing)
                         }
+                        if case .offline = model.lastOutcome,
+                           ServerConnectionGuidance.requiresTailscale(model.credentials.server) {
+                            Label("Server unreachable. " + ServerConnectionGuidance.tailscaleRequirement, systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     LabeledContent("Data", value: model.dataStatus)
                         .accessibilityIdentifier("settings-data-status")

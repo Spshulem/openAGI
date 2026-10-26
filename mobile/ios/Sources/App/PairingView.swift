@@ -111,9 +111,18 @@ struct PairingView: View {
                                 .keyboardType(.URL)
                             Text("Use the complete address shown with your code. HTTP and HTTPS can use different ports.")
                                 .font(.footnote).foregroundStyle(.secondary)
+                            if let server = TailscaleServerAddress.parse(serverText),
+                               ServerConnectionGuidance.requiresTailscale(server) {
+                                Label(ServerConnectionGuidance.tailscaleRequirement, systemImage: "network")
+                                    .font(.footnote)
+                                    .accessibilityIdentifier("pairing-tailscale-required")
+                            }
                         }
                         .padding(Theme.Spacing.x4)
                     }
+
+                    Text("Tailscale is optional: use a local Wi-Fi address or your server’s public HTTPS address instead.")
+                        .font(.footnote).foregroundStyle(.secondary)
 
                     VStack(spacing: Theme.Spacing.x2) {
                         Text("Pairing code")

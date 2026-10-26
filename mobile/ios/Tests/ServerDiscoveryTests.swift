@@ -61,6 +61,25 @@ final class ServerDiscoveryTests: XCTestCase {
         XCTAssertFalse(lan.contains("Tailscale"))
     }
 
+    func testConnectionGuidanceMatchesTheSelectedNetwork() {
+        for address in ["https://main.tail1234.ts.net:8443", "http://MAIN.tail1234.ts.net.:43210", "http://100.64.0.10:43210"] {
+            let server = URL(string: address)!
+            XCTAssertTrue(ServerConnectionGuidance.requiresTailscale(server))
+            XCTAssertTrue(ServerConnectionGuidance.recovery(for: server).contains("connected on the server"))
+        }
+        for address in ["http://agent.local:43210", "https://192.168.1.20:8443"] {
+            let server = URL(string: address)!
+            XCTAssertFalse(ServerConnectionGuidance.requiresTailscale(server))
+            XCTAssertTrue(ServerConnectionGuidance.recovery(for: server).contains("Local Network"))
+        }
+        let publicServer = URL(string: "https://agent.example.com")!
+        XCTAssertFalse(ServerConnectionGuidance.requiresTailscale(publicServer))
+        let recovery = PairingConnectionFailure.detail(for: URLError(.cannotConnectToHost), server: publicServer)
+        XCTAssertTrue(recovery.contains("internet connection"))
+        XCTAssertTrue(recovery.contains("not required for a public HTTPS server"))
+        XCTAssertFalse(recovery.contains("Local Network"))
+    }
+
     @MainActor
     func testSavedTailscaleIPResolvesBeforeHealthCheckInsteadOfDisappearing() async {
         let raw = URL(string: "http://100.64.0.10:43210")!

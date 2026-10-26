@@ -40,6 +40,7 @@ struct WelcomeView: View {
                 Section("Connecting your devices") {
                     Label("On the same Wi-Fi, Find servers looks for an announcement from the updated desktop app or daemon. Update and restart it first.", systemImage: "wifi")
                     Label("Over Tailscale, enter your main server's DNS name from the Tailscale device list. Wi-Fi announcements don't cross Tailscale.", systemImage: "network")
+                    Label("A public HTTPS server address works over the internet without Tailscale.", systemImage: "globe")
                     Label("Get a one-time code from OpenAGI on your Mac: Connect a phone… Or use Nodes → Connect a phone on your main server's dashboard.", systemImage: "key")
                 }
                 if session.mode != nil {
