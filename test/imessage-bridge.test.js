@@ -431,3 +431,11 @@ test("searchMessages filters by handle and by days", async () => {
   assert.ok(recent.every((m) => !/taxes/.test(m.text)), "40-day-old message excluded by days=7");
   assert.ok(recent.length >= 2);
 });
+
+
+test("attributed text rejects truncated length headers and payloads", () => {
+  for (const suffix of [[0x81], [0x81, 1], [0x82], [0x82, 1, 0, 0], [5, 65, 66]]) {
+    const body = Buffer.concat([Buffer.from("NSString+"), Buffer.from(suffix)]);
+    assert.equal(extractAttributedText(body), "");
+  }
+});
