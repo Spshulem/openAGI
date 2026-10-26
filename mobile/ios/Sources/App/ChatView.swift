@@ -288,19 +288,21 @@ struct ChatConversationView: View {
     }
 
     private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
-        Button {
+        let button = Button {
             isPinnedToBottom = true
             scrollToLatest(proxy)
         } label: {
-            Text("Jump to latest")
-                .font(Theme.Typography.secondary.weight(.medium))
-                .foregroundStyle(.white)
-                .padding(.horizontal, Theme.Spacing.x4)
-                .padding(.vertical, Theme.Spacing.x2)
-                .background(Theme.live)
-                .clipShape(Capsule())
+            Image(systemName: "arrow.down")
+                .font(.body.weight(.semibold))
+                .frame(width: 44, height: 44)
         }
+        .buttonBorderShape(.circle)
+        .accessibilityLabel("Jump to latest")
         .padding(.bottom, Theme.Spacing.x3)
+        return Group {
+            if #available(iOS 26.0, *) { button.buttonStyle(.glass) }
+            else { button.buttonStyle(.bordered) }
+        }
     }
 
     // DESIGN.md: "Consecutive messages from the same speaker tighten to 2pt
@@ -473,7 +475,9 @@ private struct MessageBubbleRow: View {
     var body: some View {
         HStack {
             if message.role == .user { Spacer(minLength: Theme.Spacing.x8) }
-            bubble
+            IntrinsicBubbleLayout(maxWidth: max(0, maxContainerWidth - 2 * Theme.gutter) * (message.role == .user ? 0.78 : 0.92)) {
+                bubble
+            }
             if message.role == .assistant { Spacer(minLength: Theme.Spacing.x8) }
         }
     }
@@ -498,10 +502,14 @@ private struct MessageBubbleRow: View {
 
     private var bubble: some View {
         bubbleContent
+            .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, Theme.Spacing.x4)
             .padding(.vertical, Theme.Spacing.x3)
             .background(fill)
             .clipShape(bubbleShape)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("chat-bubble-\(message.role == .user ? "user" : "assistant")")
             .contextMenu {
                 Button {
                     UIPasteboard.general.string = message.text
@@ -538,5 +546,24 @@ private struct TypingIndicatorView: View {
             Circle().fill(Theme.muted.opacity(0.4)).frame(width: 6, height: 6)
         }
         .accessibilityLabel("OpenAGI is typing")
+    }
+}
+
+// Measure short replies at their natural width, then cap longer content at
+// the available column width. A maxWidth frame around Text can stretch a
+// one-word reply on an expanded display.
+private struct IntrinsicBubbleLayout: Layout {
+    var maxWidth: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let width = min(maxWidth, proposal.width ?? maxWidth, content.sizeThatFits(.unspecified).width)
+        let size = content.sizeThatFits(.init(width: width, height: nil))
+        return CGSize(width: width, height: size.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, anchor: .topLeading,
+                             proposal: .init(width: bounds.width, height: bounds.height))
     }
 }

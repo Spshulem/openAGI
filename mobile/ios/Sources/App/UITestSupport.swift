@@ -100,7 +100,25 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                                                "configured": saved, "apiKeySaved": saved]]])
         case "/workspace/integrations/linear/sync":
             finish(object: ["ok": true, "created": 1, "updated": 0, "completed": 0])
+        case "/fleet/api/state":
+            finish(object: ["mode": "observe", "enabled": false, "running": false,
+                            "snapshot": ["at": Self.date, "threads": [["key": "codex:fixture", "title": "Synthetic review thread", "workspace": "Demo workspace", "state": "needs-human"]]],
+                            "questions": [["id": "context-fixture", "title": "Review the synthetic request", "body": "Read the recent activity before choosing a response.", "kind": "agent-card", "threadKey": "codex:fixture", "options": ["open thread"], "createdAt": Self.date]]])
+        case "/fleet/api/threads/codex:fixture":
+            finish(object: ["thread": ["key": "codex:fixture", "scannedAt": Self.date,
+                                       "lastOwnerMessage": ["text": "Explain the synthetic change before I decide.", "at": Self.date],
+                                       "lastAgentMessage": ["text": "The synthetic change is ready for your review. Nothing has been sent.", "at": Self.date]]])
+        case let path where path.hasPrefix("/fleet/api/questions/"):
+            // Opening context is a read, never a submission of 'open thread'.
+            finish(status: 500, object: ["error": "Opening context must not submit an answer"])
         case let path where path.hasPrefix("/conversations/"):
+            if ProcessInfo.processInfo.arguments.contains("--ui-long-chat") {
+                finish(object: ["thread": "agent", "messages": [
+                    ["id": "history-one", "role": "user", "text": "yes", "at": Self.date],
+                    ["id": "history-two", "role": "assistant", "text": "## Synthetic review\n\n- " + Self.longBullet + "\n\nThe final synthetic paragraph remains readable.", "at": Self.date]
+                ]])
+                return
+            }
             finish(object: ["thread": "agent", "messages": [
                 ["id": "history-one", "role": "user", "text": "Earlier synthetic question", "at": Self.date],
                 ["id": "history-two", "role": "assistant", "text": "Earlier synthetic answer", "at": Self.date]
@@ -108,6 +126,8 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         default: finish(object: [:])
         }
     }
+
+    static let longBullet = "This synthetic list item explains the context of a decision in enough detail to wrap naturally across several lines on a phone, including a cover display or one page of a book layout. The entire explanation must remain readable before anyone makes a decision."
 
     private static func task(id: String, title: String, queue: String = "user") -> [String: Any] {
         ["id": id, "queue": queue, "title": title, "description": "Synthetic UI test task", "bucket": "today",

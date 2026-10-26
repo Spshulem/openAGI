@@ -29,6 +29,7 @@ struct SupervisorView: View {
     // another thread opened while a nudge relays, and the result is not theirs.
     @State private var actionNoteThread: String?
     @State private var openThread: FleetThread?
+    @State private var openQuestion: FleetQuestion?
     @State private var compactColumn = NavigationSplitViewColumn.sidebar
     // Responses can land out of order: a 30s poll sent while an answer was
     // relaying may return after it with the state from before. A poll is
@@ -133,7 +134,14 @@ struct SupervisorView: View {
                     ? SupervisorFormat.proposed(for: thread, in: state?.actions ?? []) : [],
                 busyActionID: busyActionID,
                 actionNote: actionNoteThread == thread.key ? actionNote : nil,
-                onSend: { action in Task { await send(action) } }
+                onSend: { action in Task { await send(action) } },
+                question: openQuestion,
+                questionIsOpen: state?.questions.contains(where: { $0.id == openQuestion?.id }) == true,
+                questionBusy: busyQuestionID != nil,
+                questionNote: questionNote?.id == openQuestion?.id ? questionNote?.note : nil,
+                onAnswer: { answer in
+                    if let question = openQuestion { Task { await decide(question, answer: answer) } }
+                }
             )
         }
         .alert("Turn on Auto?", isPresented: $confirmAuto) {
@@ -343,7 +351,12 @@ struct SupervisorView: View {
                             anyBusy: busyQuestionID != nil,
                             note: questionNote?.id == question.id ? questionNote?.note : nil,
                             onAnswer: { option in Task { await decide(question, answer: option) } },
-                            onDismiss: { Task { await decide(question, answer: nil) } }
+                            onDismiss: { Task { await decide(question, answer: nil) } },
+                            onOpen: { key in
+                                openQuestion = question
+                                openThread = threads.first(where: { $0.key == key }) ?? FleetThread(key: key)
+                                actionNote = nil
+                            }
                         )
                         if index < questions.count - 1 { RowHairline() }
                     }
@@ -369,6 +382,7 @@ struct SupervisorView: View {
                 RowGroup {
                     ForEach(Array(threads.enumerated()), id: \.element.key) { index, thread in
                         Button {
+                            openQuestion = nil
                             openThread = thread
                             actionNote = nil
                         } label: {
@@ -500,6 +514,7 @@ private struct QuestionRow: View {
     let note: SupervisorFormat.Note?
     let onAnswer: (String) -> Void
     let onDismiss: () -> Void
+    let onOpen: (String) -> Void
 
     private var context: [String] {
         let about: String?
@@ -514,22 +529,50 @@ private struct QuestionRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(question.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Question")
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.ink)
+            let keys = SupervisorFormat.threadKeys(question)
+            if let key = keys.first {
+                Button { onOpen(key) } label: {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(question.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Question")
+                            .font(.headline).multilineTextAlignment(.leading)
+                        Spacer(minLength: 8)
+                        Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.primary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("supervisor-question-context-\(question.id)")
+                .accessibilityHint("Read the question and recent thread activity before answering")
+            } else {
+                Text(question.title ?? "Question").font(.headline)
+            }
             if !context.isEmpty {
                 Text(context.joined(separator: " · "))
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
             }
             if let body = question.body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                MarkdownContent(blocks: MarkdownParser.parse(body))
+                Text(MarkdownParser.inline(body))
+                    .font(.body).lineLimit(keys.isEmpty ? nil : 3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            // "dismiss" can arrive as an option; it is the Dismiss button below.
-            let options = question.options.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && $0 != "dismiss" }
+            ForEach(keys, id: \.self) { key in
+                Button {
+                    onOpen(key)
+                } label: {
+                    Label(keys.count > 1 ? "Read \(threads.first(where: { $0.key == key }).map(SupervisorFormat.name) ?? key)" : "Read thread activity", systemImage: "text.bubble")
+                }
+                .buttonStyle(.borderless)
+            }
+            let options = SupervisorFormat.answerOptions(question)
             FlowLayout(spacing: Theme.Spacing.x2) {
                 ForEach(Array(options.enumerated()), id: \.offset) { index, option in
-                    CompactButton(title: option, filled: index == 0, enabled: !anyBusy) { onAnswer(option) }
+                    if index == 0 {
+                        Button(option) { onAnswer(option) }.buttonStyle(.borderedProminent).disabled(anyBusy)
+                    } else {
+                        Button(option) { onAnswer(option) }.buttonStyle(.bordered).disabled(anyBusy)
+                    }
                 }
                 Button("Dismiss", action: onDismiss)
                     .font(Theme.Typography.secondary)
@@ -545,8 +588,8 @@ private struct QuestionRow: View {
                     .foregroundStyle(Theme.muted)
             }
             if let note { NoteLine(note: note) }
-            if question.kind == "agent-ask" {
-                Text("Your answer goes to the agent.")
+            if question.kind == "agent-ask" || question.kind == "agent-card" {
+                Text(options.isEmpty ? "This request needs a response in the original app on your Mac. Read the thread activity for context." : "Your answer goes to the agent.")
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
             }
@@ -625,8 +668,18 @@ private struct ThreadDetailSheet: View {
     let busyActionID: String?
     let actionNote: (id: String, note: SupervisorFormat.Note)?
     let onSend: (FleetAction) -> Void
+    var question: FleetQuestion? = nil
+    var questionIsOpen = false
+    var questionBusy = false
+    var questionNote: SupervisorFormat.Note? = nil
+    var onAnswer: (String) -> Void = { _ in }
 
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @State private var activity: FleetThreadDetail?
+    @State private var activityError: String?
+    @State private var loadingActivity = false
 
     private struct Detail: Identifiable {
         let id: String
@@ -673,77 +726,121 @@ private struct ThreadDetailSheet: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Spacing.x4) {
-                VStack(alignment: .leading, spacing: Theme.Spacing.x1) {
-                    Text(SupervisorFormat.name(thread))
-                        .font(Theme.Typography.section)
-                        .foregroundStyle(Theme.ink)
-                    // Repo and branch are machine identifiers, so mono.
-                    if let repo = thread.repo, !repo.isEmpty {
-                        Text(repo).font(Theme.Typography.dataMono).foregroundStyle(Theme.muted)
-                    }
-                    if let branch = thread.branch, !branch.isEmpty {
-                        Text(branch).font(Theme.Typography.dataMono).foregroundStyle(Theme.muted)
-                    }
-                    HStack(spacing: 10) {
-                        HealthDot(health: FleetHealth.of(thread))
-                        HealthAndState(thread: thread, font: Theme.Typography.secondary)
-                    }
-                    .padding(.top, Theme.Spacing.x1)
+        NavigationStack {
+            List {
+                Section {
+                    Text(thread.title ?? SupervisorFormat.name(thread)).font(.headline)
+                    HealthAndState(thread: thread, font: .subheadline)
+                    if let repo = thread.repo { Text(repo).font(.caption).foregroundStyle(.secondary) }
+                    if let branch = thread.branch { Text(branch).font(.caption.monospaced()).foregroundStyle(.secondary) }
                 }
+                if let question {
+                    Section("Needs your decision") {
+                        Text(question.title ?? "Question").font(.headline)
+                        if let text = question.body { MarkdownContent(blocks: MarkdownParser.parse(text)) }
 
+                    }
+                }
+                Section("Recent thread activity") {
+                    if loadingActivity && activity == nil { ProgressView("Loading thread activity…") }
+                    if let activityError {
+                        Label(activityError, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
+                        Button("Retry") { Task { await loadActivity() } }
+                    }
+                    if let activity {
+                        if let at = activity.scannedAt {
+                            Text("From the latest scan · \(SupervisorFormat.agoPhrase(at))")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        if let owner = activity.lastOwnerMessage, let text = owner.text, !text.isEmpty {
+                            activityMessage("You", text: text, at: owner.at)
+                        } else if let at = activity.lastOwnerAt {
+                            Text("You last replied \(SupervisorFormat.agoPhrase(at)). The message text is unavailable.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                        if let agent = activity.lastAgentMessage, let text = agent.text, !text.isEmpty {
+                            activityMessage("Agent", text: text, at: agent.at)
+                        } else {
+                            Text("No agent message was available in this scan.").foregroundStyle(.secondary)
+                        }
+                        if activity.activityTruncated == true {
+                            Text("Showing the most recent part of a long message. Read the full conversation in the original app before deciding.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    } else if let text = thread.lastAgentText, !text.isEmpty {
+                        activityMessage("Saved scan excerpt", text: text, at: thread.lastActivityAt)
+                    }
+                }
+                if let question {
+                    Section("Your response") {
+                        if questionIsOpen {
+                            let options = SupervisorFormat.answerOptions(question)
+                            ForEach(options, id: \.self) { option in
+                                Button(option) { onAnswer(option) }.disabled(questionBusy)
+                            }
+                            if options.isEmpty {
+                                Label("Respond in the original app on your Mac. Reading this thread does not send an answer.", systemImage: "macbook")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Text("This question has been handled.").foregroundStyle(.secondary)
+                        }
+                        if let questionNote { NoteLine(note: questionNote) }
+                    }
+                }
                 if !details.isEmpty {
-                    RowGroup {
-                        ForEach(Array(details.enumerated()), id: \.element.id) { index, detail in
-                            detailRow(detail)
-                            if index < details.count - 1 { RowHairline() }
-                        }
+                    Section("Thread status") {
+                        ForEach(details) { detail in detailRow(detail) }
                     }
                 }
-
-                if let text = thread.lastAgentText, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Last agent message (unverified)")
-                            .font(Theme.Typography.caption)
-                            .foregroundStyle(Theme.muted)
-                        ScrollView {
-                            MarkdownContent(blocks: MarkdownParser.parse(text))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(10)
-                        }
-                        .frame(maxHeight: 360)
-                        .background(Theme.edge)
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                }
-
                 ForEach(proposed) { action in
-                    VStack(alignment: .leading, spacing: Theme.Spacing.x2) {
-                        Text("Proposed nudge")
-                            .font(Theme.Typography.section)
-                            .foregroundStyle(Theme.ink)
-                        if let message = action.message, !message.isEmpty {
-                            Text(message).font(Theme.Typography.body).foregroundStyle(Theme.ink)
-                        }
-                        if let why = [action.detail, action.reason].compactMap({ $0 }).first(where: { !$0.isEmpty }) {
-                            Text(why).font(Theme.Typography.secondary).foregroundStyle(Theme.muted)
-                        }
-                        PrimaryButton(title: "Send", isLoading: busyActionID == action.id) { onSend(action) }
-                            .disabled(busyActionID != nil)
+                    Section("Proposed nudge") {
+                        if let message = action.message { Text(message) }
+                        if let why = action.detail ?? action.reason { Text(why).foregroundStyle(.secondary) }
+                        Button("Send") { onSend(action) }.disabled(busyActionID != nil)
                         if let actionNote, actionNote.id == action.id { NoteLine(note: actionNote.note) }
                     }
                 }
-                // A sent nudge leaves the proposed list; its result still shows.
                 if let actionNote, !proposed.contains(where: { $0.id == actionNote.id }) {
                     NoteLine(note: actionNote.note)
                 }
             }
-            .padding(Theme.gutter)
+            .listStyle(.insetGrouped)
+            .navigationTitle("Thread")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .refreshable { await loadActivity() }
+            .task(id: thread.key) { await loadActivity() }
         }
-        .background(Theme.canvas)
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
+    }
+
+    private func activityMessage(_ speaker: String, text: String, at: Date?) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(speaker).font(.subheadline.weight(.semibold))
+                if let at { Text(SupervisorFormat.clockTime(at)).font(.caption).foregroundStyle(.secondary) }
+            }
+            MarkdownContent(blocks: MarkdownParser.parse(text)).textSelection(.enabled)
+        }
+        .accessibilityIdentifier("thread-activity-\(speaker.lowercased())")
+    }
+
+    private func loadActivity() async {
+        guard !loadingActivity else { return }
+        loadingActivity = true
+        defer { loadingActivity = false }
+        do {
+            activity = try await model.client.fleetThreadDetail(key: thread.key)
+            activityError = nil
+        } catch let error as DaemonError {
+            activityError = error == .notFound
+                ? "This thread is no longer in the latest scan. Its saved context is shown below."
+                : SupervisorFormat.errorCopy(error).detail
+        } catch {
+            activityError = "Couldn't load the thread activity. Your question has not been changed."
+        }
     }
 
     @ViewBuilder

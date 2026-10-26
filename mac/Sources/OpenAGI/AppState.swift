@@ -950,6 +950,7 @@ final class AppState: ObservableObject {
   nonisolated static func ensureOK(_ resp: URLResponse, _ data: Data) throws {
     guard let http = resp as? HTTPURLResponse else { return }
     guard (200..<300).contains(http.statusCode) else {
+      if let error = MainConnectionError.decode(statusCode: http.statusCode, data: data) { throw error }
       let snippet = String(data: data.prefix(300), encoding: .utf8) ?? ""
       throw NSError(domain: "OpenAGI", code: http.statusCode, userInfo: [
         NSLocalizedDescriptionKey: "HTTP \(http.statusCode)\(snippet.isEmpty ? "" : ": \(snippet)")"

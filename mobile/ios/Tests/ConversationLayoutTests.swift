@@ -2,14 +2,17 @@ import XCTest
 @testable import OpenAGI
 
 final class ConversationLayoutTests: XCTestCase {
-    func testBookKeepsComposerOnTrailingPageAndScrollingHistoryContinuous() {
+    func testBookKeepsMessagesAndComposerOnTheirOwnPages() {
         let fold = CGRect(x: 480, y: 0, width: 40, height: 800)
         let regions = ConversationRegions(size: .init(width: 1000, height: 800), division: fold)
         XCTAssertEqual(regions.input.minX, fold.maxX)
         XCTAssertEqual(regions.input.maxX, 1000)
-        XCTAssertNil(regions.historyHeight)
+        XCTAssertEqual(regions.history.maxX, fold.minX)
+        XCTAssertEqual(regions.historyHeight, 800)
+        XCTAssertFalse(regions.history.intersects(regions.input))
         let rtl = ConversationRegions(size: .init(width: 1000, height: 800), division: fold, rightToLeft: true)
         XCTAssertEqual(rtl.input.maxX, fold.minX)
+        XCTAssertEqual(rtl.history.minX, fold.maxX)
     }
 
     func testTabletopKeepsHistoryAboveFoldAndComposerBelow() {

@@ -431,7 +431,7 @@ function ownerSpokeAt(thread) {
 }
 
 // How much of the agent's last message a thread's detail shows.
-const DETAIL_EXCERPT_MAX = 1200;
+const DETAIL_EXCERPT_MAX = 12_000;
 // Options that only send the owner to the chat: a question with no other is
 // answered in the agent's app, never here.
 const APP_ONLY_OPTIONS = new Set(["open thread", "opened"]);
@@ -1612,6 +1612,10 @@ export class FleetSupervisor {
       reason: row.reason ?? null, blockers: row.blockers ?? [], error: row.error ?? null,
       lastAgentMessage: { text: clampTail(redactSecrets(reply.text), DETAIL_EXCERPT_MAX), at: reply.at ?? null },
       lastOwnerAt: thread ? ownerSpokeAt(thread) : (row.lastOwnerAt ?? null),
+      lastOwnerMessage: thread && ownerSpokeAt(thread)
+        ? { text: clampTail(redactSecrets(thread.lastUserText ?? ""), DETAIL_EXCERPT_MAX), at: ownerSpokeAt(thread) }
+        : null,
+      activityTruncated: reply.text.length > DETAIL_EXCERPT_MAX || (thread && ownerSpokeAt(thread) ? String(thread.lastUserText ?? "").length > DETAIL_EXCERPT_MAX : false),
       lastActivityAt: row.lastActivityAt ?? null,
       pr: row.pr ?? null,
       watch: row.watch ?? null,

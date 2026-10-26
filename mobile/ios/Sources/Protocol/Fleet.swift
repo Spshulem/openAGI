@@ -436,3 +436,18 @@ public enum FleetHealth: String, Sendable, CaseIterable {
         return .green
     }
 }
+
+// Read-only context from the most recent supervisor scan. Decoded separately
+// from FleetThread: the list intentionally carries a much shorter excerpt.
+public struct FleetThreadDetail: Decodable, Sendable {
+    public struct Message: Decodable, Sendable {
+        public let text: String?
+        public let at: Date?
+    }
+    public let key: String
+    public let lastAgentMessage: Message?
+    public let lastOwnerMessage: Message?
+    public let lastOwnerAt: Date?
+    public let scannedAt: Date?
+    public let activityTruncated: Bool?
+}

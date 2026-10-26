@@ -190,6 +190,40 @@ final class NativeNavigationTests: XCTestCase {
         back(app, from: "Clarification", to: "Inbox")
     }
 
+    func testQuestionOpensReadOnlyThreadActivityWithoutSubmittingAnAnswer() {
+        let app = launch()
+        tab(app, "Supervisor")
+        tap(app, "supervisor-question-context-context-fixture")
+        XCTAssertTrue(app.navigationBars["Thread"].waitForExistence(timeout: 10))
+        let message = app.staticTexts["The synthetic change is ready for your review. Nothing has been sent."]
+        for _ in 0..<4 {
+            if message.exists && message.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Explain the synthetic change before I decide."].exists)
+        XCTAssertFalse(app.staticTexts["Not sent. Couldn't reach the agent"].exists)
+        capture("native-thread-context", app: app)
+        app.buttons["Done"].tap()
+        XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 5))
+    }
+
+    func testShortBubblesStayCompactAndLongMarkdownWrapsWithoutClipping() {
+        let app = launch(["--ui-long-chat"])
+        tab(app, "Chat")
+        let yes = app.staticTexts["yes"]
+        XCTAssertTrue(yes.waitForExistence(timeout: 10))
+        let bubble = element(app, "chat-bubble-user")
+        XCTAssertTrue(bubble.exists)
+        XCTAssertLessThan(bubble.frame.width, 120, "A short answer must use its natural bubble width")
+        let text = "This synthetic list item explains the context of a decision in enough detail to wrap naturally across several lines on a phone, including a cover display or one page of a book layout. The entire explanation must remain readable before anyone makes a decision."
+        let bullet = app.staticTexts[text]
+        XCTAssertTrue(bullet.waitForExistence(timeout: 10))
+        XCTAssertGreaterThan(bullet.frame.height, 50, "The long list item must wrap into multiple lines")
+        XCTAssertTrue(app.staticTexts["The final synthetic paragraph remains readable."].exists)
+        capture("native-long-chat", app: app)
+    }
+
     func testNativeComposerHistoryKeyboardDraftContinuityAndSending() {
         let app = launch()
         tab(app, "Chat")
