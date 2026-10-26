@@ -22,7 +22,7 @@ struct WorkspaceCache: Sendable {
 
     func load() -> WorkspaceSnapshot {
         guard let data = try? Data(contentsOf: file),
-              let snapshot = try? ProtocolDecoder.json.decode(WorkspaceSnapshot.self, from: data) else {
+              let snapshot = try? JSONDecoder().decode(WorkspaceSnapshot.self, from: data) else {
             return WorkspaceSnapshot()
         }
         return snapshot
@@ -30,7 +30,10 @@ struct WorkspaceCache: Sendable {
 
     func save(_ snapshot: WorkspaceSnapshot) throws {
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try ProtocolDecoder.jsonEncoder.encode(snapshot).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        // This is a private cache format, not the daemon's wire format.
+        // Numeric dates preserve fractional seconds without expensive ISO
+        // formatter creation for every cached task during app startup.
+        try JSONEncoder().encode(snapshot).write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
 
     func delete() {
