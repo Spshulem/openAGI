@@ -35,6 +35,37 @@ test("Claude context displays text, excluding thinking, tool results and system 
   assert.deepEqual(messages.map((m) => m.text), ["Explain this task", "Here is the context."]);
 });
 
+test("Claude context attributes only owner prompts to the user", () => {
+  const nonOwnerRows = [
+    { isMeta: true },
+    { isCompactSummary: true },
+    { promptSource: "system" },
+    ...["task_notification", "peer", "system", "scheduled"].map((turnOrigin) => ({ turnOrigin })),
+    ...["task-notification", "peer"].map((kind) => ({ origin: { kind } })),
+  ].map((metadata) => ({ type: "user", message: { content: "Another Claude session sent a message: internal context" }, ...metadata }));
+  const messages = claudeConversation(lines([
+    { type: "user", promptSource: "typed", origin: { kind: "human" }, message: { content: "What needs review?" } },
+    ...nonOwnerRows,
+    { type: "user", promptSource: "sdk", message: { content: "[OpenAGI supervisor] Continue the task." } },
+    { type: "user", message: { content: "Show me the latest answer." } },
+  ]));
+  assert.deepEqual(messages.map((m) => m.text), ["What needs review?", "Show me the latest answer."]);
+});
+
+test("Claude history includes session-socket replies without exposing other tool inputs", () => {
+  const sent = (to, message) => ({ type: "tool_use", name: "SendMessage", input: { to, message } });
+  const messages = claudeConversation(lines([
+    { type: "user", message: { content: "What is the status?" } },
+    { type: "assistant", message: { content: [{ type: "text", text: "Earlier status." }] } },
+    { type: "assistant", message: { content: [sent("uds:/tmp/session.sock", "The fix is ready.")] } },
+    { type: "assistant", message: { content: [{ type: "text", text: "I'll send the update." }, sent("uds:/tmp/session.sock", "The tests passed.")] } },
+    { type: "assistant", message: { content: [sent("another-agent", "Private agent instructions")] } },
+    { type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "private command" } }] } },
+  ]));
+  assert.deepEqual(messages.map((m) => m.text), ["What is the status?", "Earlier status.", "The fix is ready.", "The tests passed."]);
+  assert.equal(messages.at(-1).role, "assistant");
+});
+
 test("conversation payloads have a bounded recent window and explicit truncation", () => {
   const messages = Array.from({ length: 100 }, (_, i) => ({ role: "user", text: `Message ${i}`, at }));
   const bounded = boundConversation(messages);
@@ -69,6 +100,29 @@ test("Conductor history is scoped to one session and excludes canceled/forwarded
     insert.run("chosen", "user", "Forwarded prompt", at, at, null, "other", null);
     const result = await readThreadConversation({ kind: "conductor", id: "chosen" }, { paths: { conductorDb: file } });
     assert.deepEqual(result.messages.map((m) => m.text), ["Explain the task", "The task needs review."]);
+    assert.equal(result.unavailableReason, null);
+  } finally { db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("Conductor history retains session-socket replies after earlier messages", async (t) => {
+  let DatabaseSync;
+  try { ({ DatabaseSync } = await import("node:sqlite")); } catch { t.skip("node:sqlite unavailable"); return; }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-conductor-relay-context-"));
+  const file = path.join(dir, "conductor.db");
+  const db = new DatabaseSync(file);
+  try {
+    db.exec("CREATE TABLE session_messages (session_id TEXT, role TEXT, content TEXT, created_at TEXT, sent_at TEXT, cancelled_at TEXT, sender_session_id TEXT, sender_api_key_name TEXT)");
+    const insert = db.prepare("INSERT INTO session_messages VALUES (?, 'assistant', ?, ?, ?, NULL, NULL, NULL)");
+    const add = (content, parent = null) => insert.run("chosen", JSON.stringify({ type: "assistant", parent_tool_use_id: parent, message: { content } }), at, at);
+    const sent = (to, message) => ({ type: "tool_use", name: "SendMessage", input: { to, message } });
+    add([{ type: "text", text: "Earlier status." }]);
+    add([sent("uds:/tmp/session.sock", "The fix is ready.")]);
+    add([{ type: "text", text: "I'll send the update." }, sent("uds:/tmp/session.sock", "The tests passed.")]);
+    add([sent("another-agent", "Private agent instructions")]);
+    add([sent("uds:/tmp/session.sock", "Nested agent reply")], "parent-tool");
+    const result = await readThreadConversation({ kind: "conductor", id: "chosen" }, { paths: { conductorDb: file } });
+    assert.deepEqual(result.messages.map((m) => m.text), ["Earlier status.", "The fix is ready.", "The tests passed."]);
+    assert.ok(result.messages.every((m) => m.role === "assistant"));
     assert.equal(result.unavailableReason, null);
   } finally { db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });

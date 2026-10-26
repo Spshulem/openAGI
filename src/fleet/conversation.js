@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { openReadOnlyDb, parseJsonLines, readTail, redactSecrets, toIso } from "./contracts.js";
 import { cleanCodexUserText } from "./sources/codex.js";
+import { isOwnerText } from "./sources/claude.js";
 
 const READ_BYTES = 1024 * 1024;
 const MAX_MESSAGES = 80;
@@ -15,6 +16,15 @@ function textOf(content) {
   if (!Array.isArray(content)) return "";
   return content.filter((part) => ["text", "Text", "output_text"].includes(part?.type) && typeof part.text === "string")
     .map((part) => part.text).join("\n");
+}
+
+function claudeAssistantText(content) {
+  const blocks = Array.isArray(content) ? content : [];
+  // Only a reply sent to a session socket is owner-visible. Other tool
+  // inputs, including messages to subagents, stay out of the conversation.
+  const relayed = blocks.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
+    && typeof block.input?.message === "string")?.input.message.trim();
+  return relayed || textOf(content);
 }
 
 function append(messages, role, text, at) {
@@ -59,10 +69,10 @@ export function codexConversation(text) {
 export function claudeConversation(text) {
   const messages = [];
   for (const row of parseJsonLines(text)) {
-    if (row.type === "assistant") append(messages, "assistant", textOf(row.message?.content), row.timestamp);
-    else if (row.type === "user" && !row.isMeta) {
+    if (row.type === "assistant") append(messages, "assistant", claudeAssistantText(row.message?.content), row.timestamp);
+    else if (row.type === "user" && !row.isMeta && !row.isCompactSummary) {
       const text = textOf(row.message?.content);
-      if (text && !/^(<|Caveat|\[Request interrupted)/.test(text)) append(messages, "user", text, row.timestamp);
+      if (text && isOwnerText(row, text)) append(messages, "user", text, row.timestamp);
     }
   }
   return messages;
@@ -110,7 +120,7 @@ export async function readThreadConversation(thread, config) {
           else if (row.role === "assistant") {
             try {
               const event = JSON.parse(row.content);
-              if (event.type === "assistant" && !event.parent_tool_use_id) append(messages, "assistant", textOf(event.message?.content), at);
+              if (event.type === "assistant" && !event.parent_tool_use_id) append(messages, "assistant", claudeAssistantText(event.message?.content), at);
             } catch { /* Tool and partial stream rows are not messages. */ }
           }
         }
