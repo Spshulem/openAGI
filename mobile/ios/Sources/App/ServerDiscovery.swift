@@ -181,10 +181,14 @@ struct ServerDiscoverySheet: View {
             Form {
                 Section("Saved server") {
                     Text(server.absoluteString).textSelection(.enabled)
+                    if ServerConnectionGuidance.requiresTailscale(server) {
+                        Label(ServerConnectionGuidance.tailscaleRequirement, systemImage: "network")
+                            .font(.footnote)
+                    }
                     Text("Your pairing stays saved. Searching does not switch servers or share any credentials.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-                Section("Tailscale or Wi-Fi address") {
+                Section("Server address") {
                     TextField("main.tail1234.ts.net:43210", text: $addressText)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -206,7 +210,7 @@ struct ServerDiscoverySheet: View {
                         }
                     }
                 } footer: {
-                    Text("Keep Tailscale and Use Tailscale DNS enabled on both devices. Discovery checks only saved or entered addresses and nearby announcements; it never shares your credentials. Pair a new server from Connection Settings using a one-time code.")
+                    Text("Use a local Wi-Fi address, a Tailscale address, or a public HTTPS address. Tailscale addresses require Tailscale and Tailscale DNS on both devices. Discovery checks only saved or entered addresses and nearby announcements; it never shares your credentials. Pair a new server from Connection Settings using a one-time code.")
                 }
             }
             .navigationTitle("Find servers")

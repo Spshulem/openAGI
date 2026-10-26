@@ -109,9 +109,20 @@ struct PairingView: View {
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .keyboardType(.URL)
+                            Text("Use the complete address shown with your code. HTTP and HTTPS can use different ports.")
+                                .font(.footnote).foregroundStyle(.secondary)
+                            if let server = TailscaleServerAddress.parse(serverText),
+                               ServerConnectionGuidance.requiresTailscale(server) {
+                                Label(ServerConnectionGuidance.tailscaleRequirement, systemImage: "network")
+                                    .font(.footnote)
+                                    .accessibilityIdentifier("pairing-tailscale-required")
+                            }
                         }
                         .padding(Theme.Spacing.x4)
                     }
+
+                    Text("Tailscale is optional: use a local Wi-Fi address or your server’s public HTTPS address instead.")
+                        .font(.footnote).foregroundStyle(.secondary)
 
                     VStack(spacing: Theme.Spacing.x2) {
                         Text("Pairing code")
@@ -190,7 +201,7 @@ struct PairingView: View {
             didPair = true
             onPaired()
         } catch let error as DaemonError {
-            (errorHeadline, errorDetail) = Self.message(for: error)
+            (errorHeadline, errorDetail) = Self.message(for: error, server: server)
         } catch {
             errorHeadline = "Pairing failed."
             errorDetail = error.localizedDescription
@@ -217,7 +228,7 @@ struct PairingView: View {
     }
 
     // DESIGN.md's copy rules, verbatim where they give exact wording.
-    private static func message(for error: DaemonError) -> (headline: String, detail: String) {
+    private static func message(for error: DaemonError, server: URL) -> (headline: String, detail: String) {
         switch error {
         case .unreachableHost(let host) where HostAllowlist.isBlockedByAppTransportSecurity(host):
             return ("That address can't be reached from a phone.",
@@ -229,8 +240,8 @@ struct PairingView: View {
             return ("That code didn't work.", "Codes last 30 minutes and work once. Run openagi pair-phone for a new one.")
         case .conflict:
             return ("This phone is already paired.", "Revoke it from Settings first, then pair again.")
-        case .transport:
-            return ("Can't reach OpenAGI.", "Check the address and that your phone can reach the daemon.")
+        case .transport(let cause):
+            return ("Can't reach OpenAGI.", PairingConnectionFailure.detail(for: cause, server: server))
         case .mainConnection(let issue):
             return ("Main connection needs attention", issue.message)
         case .notFound, .server, .malformedResponse, .agentHostDisabled:
