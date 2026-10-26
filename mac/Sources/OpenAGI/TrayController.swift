@@ -89,7 +89,7 @@ struct TrayMenu: View {
   // Proactive-outreach items needing the user. Count acts as the tray "badge";
   // opening it summons the Quick Ask overlay where the full list + buttons live.
   @ViewBuilder private var outreachSection: some View {
-    let count = outreach.items.count
+    let count = AttentionBadge.count(briefKeys: [], outreach: outreach.items, approvalIDs: [], fleetIDs: [])
     if count > 0 {
       Button("● \(count) need\(count == 1 ? "s" : "") you…") {
         // Supervisor when every item is a question that tab lists instead.

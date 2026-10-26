@@ -593,3 +593,14 @@ without a bulk rewrite of existing data.
 
 No bulk migration runs automatically, and previously superseded memories are
 not restored.
+
+### Quick Ask attention badge
+
+The floating badge counts current brief items, pending approvals, Supervisor
+questions, and decision notifications from the last seven days. Shared source
+references count once. Informational notifications and digest summaries remain
+in Notifications without inflating the badge. Old or undated notification-only
+decisions remain there for review; canonical current queues and coding approvals
+never expire from the badge. No stored tasks, notifications, or approvals are
+changed by this presentation policy. Counts above 99 display as `99+`; the
+accessibility label and tooltip retain the exact count.

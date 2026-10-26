@@ -14,6 +14,7 @@ struct OutreachItem: Identifiable, Decodable, Equatable {
   let needsDecision: Bool
   let actions: [String]
   let status: String
+  let createdAt: Date?
   /// Where the item came from, e.g. kind "fleet" and a supervisor question id.
   /// The Supervisor tab uses it to hide only the copies of its own questions.
   let sourceKind: String?
@@ -23,7 +24,7 @@ struct OutreachItem: Identifiable, Decodable, Equatable {
   // the Mac surfaces. Missing optional-ish fields decode to sane defaults so
   // a slightly newer/older server never breaks the client.
   enum CodingKeys: String, CodingKey {
-    case id, seq, type, title, summary, needsDecision, actions, status, sourceRef
+    case id, seq, type, title, summary, needsDecision, actions, status, sourceRef, createdAt
   }
 
   private struct SourceRef: Decodable {
@@ -49,6 +50,13 @@ struct OutreachItem: Identifiable, Decodable, Equatable {
     needsDecision = try c.decodeIfPresent(Bool.self, forKey: .needsDecision) ?? false
     actions = try c.decodeIfPresent([String].self, forKey: .actions) ?? []
     status = try c.decodeIfPresent(String.self, forKey: .status) ?? "unseen"
+    if let raw = try? c.decodeIfPresent(String.self, forKey: .createdAt) {
+      let fractional = ISO8601DateFormatter()
+      fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      createdAt = fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    } else {
+      createdAt = nil
+    }
     let source = try? c.decodeIfPresent(SourceRef.self, forKey: .sourceRef)
     sourceKind = source?.kind
     sourceId = source?.id
