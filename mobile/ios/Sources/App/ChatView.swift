@@ -150,19 +150,24 @@ struct ChatConversationView: View {
     private var messages: [ChatMessage] { conversation.messages }
 
     var body: some View {
-        GeometryReader { geometry in
-            ConversationLayout(division: division(in: geometry), rightToLeft: layoutDirection == .rightToLeft) {
-                VStack(spacing: 0) {
-                    header
-                    GeometryReader { messagesGeometry in
-                        messageScroll(width: messagesGeometry.size.width)
+        Group {
+            if #available(iOS 27.1, *) {
+                // Apple's arrangement owns book/tabletop displacement and
+                // keeps the composer reachable as the keyboard and hinge move.
+                ArrangementView {
+                    conversationContent
+                } secondary: {
+                    inputBar
+                }
+                .arrangementViewStyle(.overlay)
+            } else {
+                GeometryReader { geometry in
+                    ConversationLayout(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
+                                       rightToLeft: layoutDirection == .rightToLeft) {
+                        conversationContent
+                        inputBar
                     }
                 }
-                .frame(maxWidth: 600)
-                .frame(maxWidth: .infinity)
-                inputBar
-                    .frame(maxWidth: 600)
-                    .frame(maxWidth: .infinity)
             }
         }
         .background(Color(uiColor: .systemBackground))
@@ -175,18 +180,15 @@ struct ChatConversationView: View {
         }
     }
 
-    private func division(in geometry: GeometryProxy) -> CGRect? {
-        if #available(iOS 27.1, *) {
-            return geometry.reservedRegions(kind: .division, layoutDirectionBehavior: .fixed).first.map { region in
-                let frame = region.frame
-                let left = layoutDirection == .rightToLeft ? region.margins.trailing : region.margins.leading
-                return CGRect(x: frame.minX - left,
-                              y: frame.minY - region.margins.top,
-                              width: frame.width + region.margins.leading + region.margins.trailing,
-                              height: frame.height + region.margins.top + region.margins.bottom)
+    private var conversationContent: some View {
+        VStack(spacing: 0) {
+            header
+            GeometryReader { geometry in
+                messageScroll(width: geometry.size.width)
             }
         }
-        return nil
+        .frame(maxWidth: 600)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
@@ -370,27 +372,24 @@ struct ChatConversationView: View {
     @ViewBuilder
     private var inputBar: some View {
         if #available(iOS 26, *) {
-            composerContents
-                .padding(16)
-                .glassEffect(.regular, in: .rect(cornerRadius: 24))
-                .padding(.horizontal, 16).padding(.vertical, 8)
+            GlassEffectContainer(spacing: 12) {
+                HStack(alignment: .bottom, spacing: 12) {
+                    composerField
+                        .padding(.horizontal, 16).padding(.vertical, 12)
+                        .glassEffect(.regular, in: .capsule)
+                    sendButton
+                        .buttonStyle(.glassProminent)
+                        .buttonBorderShape(.circle)
+                        .controlSize(.large)
+                }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 8)
         } else {
-            composerContents.padding(16)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
-                .padding(.horizontal, 16).padding(.vertical, 8)
-        }
-    }
-
-    private var composerContents: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            composerField
-            HStack {
-                Label(model.isOnPhone ? "On this iPhone" : "Connected agent", systemImage: model.isOnPhone ? "iphone" : "server.rack")
-                    .font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                if conversation.isSending { ProgressView().accessibilityLabel("Agent is replying") }
+            HStack(alignment: .bottom, spacing: 12) {
+                composerField.textFieldStyle(.roundedBorder)
                 sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle)
             }
+            .padding(.horizontal, 16).padding(.vertical, 8)
         }
     }
 

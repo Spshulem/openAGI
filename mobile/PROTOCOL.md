@@ -440,6 +440,14 @@ whole protocol:
 - `brief.headline` is one human-readable sentence assembled server-side
   ("2 things today, 1 overdue, 3 waiting on you").
 
+`taskReview` is optional (older servers omit it). It reports the latest
+relevance sweep as `{status, attemptedAt, lastReviewedAt}`. Status is `reviewed`,
+`no_tasks`, `unavailable` (no configured model), or `failed`. `lastReviewedAt`
+advances only after a complete valid review, or a sweep with no active tasks;
+a failed attempt retains the prior successful timestamp. Fetching the summary
+only syncs saved work; it does not trigger a relevance review. Age alone is
+not evidence that an unfinished task should be removed.
+
 ### ETag / 304
 
 The response carries an `ETag` header computed over the **entire payload

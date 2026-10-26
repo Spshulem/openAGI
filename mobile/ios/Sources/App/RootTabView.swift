@@ -99,7 +99,7 @@ struct RootTabView: View {
         }
         .task {
             if runsBackgroundServices { model.startEventStream() }
-            await model.refreshInboxCounts()
+            await model.refreshData()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -150,25 +150,23 @@ struct RootTabView: View {
 
 private struct WorkspaceWithChat<Content: View>: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.layoutDirection) private var layoutDirection
     @Binding var chatPaneOpen: Bool
     let showsChatPane: Bool
     let content: Content
 
-    private var supportsChatPane: Bool {
-        horizontalSizeClass == .regular && verticalSizeClass != .compact
-    }
-
     var body: some View {
-        HStack(spacing: 0) {
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .environment(\.workspaceChatToggle, supportsChatPane ? $chatPaneOpen : nil)
-            if supportsChatPane && showsChatPane && chatPaneOpen {
-                Divider()
-                ChatView(onClose: { chatPaneOpen = false })
-                    .containerRelativeFrame(.horizontal) { width, _ in min(480, max(300, width * 0.4)) }
-                    .accessibilityIdentifier("supporting-chat-pane")
+        GeometryReader { geometry in
+            let division = DuoLayout.division(in: geometry, layoutDirection: layoutDirection)
+            let supportsChat = division != nil || (horizontalSizeClass == .regular && geometry.size.width >= 700)
+            WorkspaceLayout(division: division, rightToLeft: layoutDirection == .rightToLeft) {
+                content
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .environment(\.workspaceChatToggle, supportsChat ? $chatPaneOpen : nil)
+                if supportsChat && showsChatPane && chatPaneOpen {
+                    ChatView(onClose: { chatPaneOpen = false })
+                        .accessibilityIdentifier("supporting-chat-pane")
+                }
             }
         }
     }

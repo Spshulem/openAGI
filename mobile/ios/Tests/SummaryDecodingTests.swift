@@ -60,6 +60,16 @@ final class SummaryDecodingTests: XCTestCase {
         XCTAssertNoThrow(try ProtocolDecoder.json.decode(MobileSummary.self, from: data))
     }
 
+    func testOptionalTaskReviewDistinguishesSyncFromSuccessfulReview() throws {
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture("summary-populated")) as? [String: Any])
+        XCTAssertNil(try ProtocolDecoder.json.decode(MobileSummary.self, from: fixture("summary-populated")).taskReview)
+        object["taskReview"] = ["status": "failed", "attemptedAt": "2026-02-02T00:00:00Z", "lastReviewedAt": "2026-02-01T00:00:00Z"]
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let summary = try ProtocolDecoder.json.decode(MobileSummary.self, from: data)
+        XCTAssertEqual(summary.taskReview?.status, "failed")
+        XCTAssertLessThan(try XCTUnwrap(summary.taskReview?.lastReviewedAt), try XCTUnwrap(summary.taskReview?.attemptedAt))
+    }
+
     func testPairingURLParses() throws {
         let payload = try XCTUnwrap(
             PairingPayload(url: URL(string: "openagi://pair?url=http://mac.ts.net:43210&code=004221&platform=ios")!)

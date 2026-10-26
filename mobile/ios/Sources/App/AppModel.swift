@@ -31,6 +31,15 @@ final class AppModel {
     private(set) var snapshot: Snapshot?
     private(set) var lastOutcome: RefreshOutcome?
     private(set) var isRefreshingToday = false
+    private(set) var workspace: WorkspaceSnapshot
+    private(set) var tasksErrors: [String: String] = [:]
+    private(set) var loadingQueues: Set<String> = []
+    private(set) var pendingActionsError: String?
+    private(set) var clarificationsError: String?
+    private(set) var isRefreshingInbox = false
+    private let workspaceCache: WorkspaceCache
+    @ObservationIgnored private var taskRefreshes: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var inboxRefresh: Task<Void, Never>?
 
     // Plain UI state, not persisted -- which tab RootTabView's `TabView` is
     // showing. Any view behind the tab bar can set this directly.
@@ -61,6 +70,12 @@ final class AppModel {
         self.store = store
         self.queue = queue
         self.snapshot = store.load()
+        let workspaceCache = WorkspaceCache(credentials: credentials, directory: chatDirectory)
+        self.workspaceCache = workspaceCache
+        let cachedWorkspace = workspaceCache.load()
+        self.workspace = cachedWorkspace
+        self.pendingActionsCount = cachedWorkspace.pendingActions?.count ?? 0
+        self.clarificationsCount = cachedWorkspace.clarifications?.count ?? 0
         self.agentChat = ChatConversation(thread: .agent, client: client,
                                           store: ChatHistoryStore(thread: ConversationThread.agent.rawValue, directory: chatDirectory),
                                           nodeID: credentials.nodeID)
@@ -109,11 +124,15 @@ final class AppModel {
     // Resume and reconnect can follow missed events or failed initial loads.
     // Refresh the observable model as well as disk, and invalidate both lists.
     func refreshData() async {
-        tasksGeneration += 1
+        guard isActive else { return }
+        bumpTasksGeneration()
+        workspace.inboxFetchedAt = nil
         inboxGeneration += 1
-        async let inboxRefresh: Void = refreshInboxCounts()
+        async let inboxRefresh: Void = refreshInbox(force: true)
+        async let tasksRefresh: Void = refreshTasks(queue: .user, force: true)
+        async let agentTasksRefresh: Void = refreshTasks(queue: .agent, force: true)
         await refreshToday()
-        await inboxRefresh
+        _ = await (inboxRefresh, tasksRefresh, agentTasksRefresh)
     }
 
     func refreshToday() async {
@@ -151,22 +170,108 @@ final class AppModel {
         await coordinator.drainQueue()
         guard isActive, !Task.isCancelled else { return }
         snapshot = store.load()
+        bumpTasksGeneration()
         WidgetReload.reloadToday()
     }
 
     // MARK: - Inbox badge
 
-    func refreshInboxCounts() async {
-        async let actions = try? client.pendingActions(status: "pending")
-        async let clarifications = try? client.clarifications(status: "pending")
-        let (a, c) = await (actions, clarifications)
-        guard isActive, !Task.isCancelled else { return }
-        if let a { pendingActionsCount = a.count }
-        if let c { clarificationsCount = c.count }
+    func refreshInboxCounts() async { await refreshInbox() }
+
+    // Views read disk-backed state synchronously; requests refresh it in the
+    // background. Concurrent tab/foreground/SSE refreshes share one request.
+    func refreshTasks(queue: TaskQueue, force: Bool = false) async {
+        guard isActive else { return }
+        let key = queue.rawValue
+        if let running = taskRefreshes[key] { await running.value; return }
+        if !force, let fetchedAt = workspace.tasksFetchedAt[key],
+           Date().timeIntervalSince(fetchedAt) < 30 { return }
+        let running = Task {
+            loadingQueues.insert(key)
+            defer { loadingQueues.remove(key); taskRefreshes[key] = nil }
+            // If an event/mutation arrives during the request, fetch again
+            // before declaring this queue fresh. Callers still coalesce.
+            var generation: Int
+            repeat {
+                generation = tasksGeneration
+                do {
+                    let tasks = try await client.tasks(queue: key, limit: Int.max)
+                    guard isActive, !Task.isCancelled else { return }
+                    workspace.tasks[key] = tasks
+                    workspace.tasksFetchedAt[key] = generation == tasksGeneration ? Date() : nil
+                    tasksErrors[key] = nil
+                    try? workspaceCache.save(workspace)
+                } catch {
+                    guard isActive, !Task.isCancelled else { return }
+                    workspace.tasksFetchedAt[key] = nil
+                    tasksErrors[key] = InboxLoader.message(for: error)
+                }
+            } while isActive && !Task.isCancelled && generation != tasksGeneration
+        }
+        taskRefreshes[key] = running
+        await running.value
     }
 
-    func bumpTasksGeneration() { tasksGeneration += 1 }
-    func bumpInboxGeneration() { inboxGeneration += 1; Task { await refreshInboxCounts() } }
+    func refreshInbox(force: Bool = false) async {
+        guard isActive else { return }
+        if let running = inboxRefresh { await running.value; return }
+        if !force, let fetchedAt = workspace.inboxFetchedAt,
+           Date().timeIntervalSince(fetchedAt) < 30 { return }
+        let running = Task {
+            isRefreshingInbox = true
+            defer { isRefreshingInbox = false; inboxRefresh = nil }
+            var generation: Int
+            repeat {
+                generation = inboxGeneration
+                // A slow or failing section cannot hide the other section.
+                async let actions: Void = refreshPendingActions()
+                async let questions: Void = refreshClarifications()
+                _ = await (actions, questions)
+                guard isActive, !Task.isCancelled else { return }
+                workspace.inboxFetchedAt = pendingActionsError == nil && clarificationsError == nil
+                    && generation == inboxGeneration ? Date() : nil
+                try? workspaceCache.save(workspace)
+            } while isActive && !Task.isCancelled && generation != inboxGeneration
+        }
+        inboxRefresh = running
+        await running.value
+    }
+
+    private func refreshPendingActions() async {
+        do {
+            let actions = try await client.pendingActions(status: "pending")
+            guard isActive, !Task.isCancelled else { return }
+            workspace.pendingActions = actions
+            pendingActionsCount = actions.count
+            pendingActionsError = nil
+        } catch {
+            guard isActive, !Task.isCancelled else { return }
+            pendingActionsError = InboxLoader.message(for: error)
+        }
+    }
+
+    private func refreshClarifications() async {
+        do {
+            let questions = try await client.clarifications(status: "pending")
+            guard isActive, !Task.isCancelled else { return }
+            workspace.clarifications = questions
+            clarificationsCount = questions.count
+            clarificationsError = nil
+        } catch {
+            guard isActive, !Task.isCancelled else { return }
+            clarificationsError = InboxLoader.message(for: error)
+        }
+    }
+
+    func bumpTasksGeneration() {
+        workspace.tasksFetchedAt = [:]
+        tasksGeneration += 1
+    }
+    func bumpInboxGeneration() {
+        workspace.inboxFetchedAt = nil
+        inboxGeneration += 1
+        Task { await refreshInbox(force: true) }
+    }
 
     // MARK: - Live events
 
@@ -234,6 +339,7 @@ final class AppModel {
         agentChat.forget()
         supervisorChat.forget()
         Credentials.clear()
+        workspaceCache.delete()
         try? store.delete()
         try? queue.clear()
     }
@@ -261,6 +367,8 @@ final class AppModel {
     private func invalidateRefresh() {
         isActive = false
         todayRefresh?.cancel()
+        taskRefreshes.values.forEach { $0.cancel() }
+        inboxRefresh?.cancel()
         stopEventStream()
     }
 }
