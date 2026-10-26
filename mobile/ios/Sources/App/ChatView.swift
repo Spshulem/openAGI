@@ -150,24 +150,14 @@ struct ChatConversationView: View {
     private var messages: [ChatMessage] { conversation.messages }
 
     var body: some View {
-        Group {
-            if #available(iOS 27.1, *) {
-                // Apple's arrangement owns book/tabletop displacement and
-                // keeps the composer reachable as the keyboard and hinge move.
-                ArrangementView {
-                    conversationContent
-                } secondary: {
-                    inputBar
-                }
-                .arrangementViewStyle(.overlay)
-            } else {
-                GeometryReader { geometry in
-                    ConversationLayout(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
-                                       rightToLeft: layoutDirection == .rightToLeft) {
-                        conversationContent
-                        inputBar
-                    }
-                }
+        GeometryReader { geometry in
+            // Keep the composer below history in every pose. An overlay
+            // arrangement can put it behind the message scroll view, where
+            // it is visible but cannot receive taps or keyboard focus.
+            ConversationLayout(division: DuoLayout.division(in: geometry, layoutDirection: layoutDirection),
+                               rightToLeft: layoutDirection == .rightToLeft) {
+                conversationContent
+                inputBar
             }
         }
         .background(Color(uiColor: .systemBackground))

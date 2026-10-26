@@ -196,6 +196,8 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
         let composer = element(app, "chat-composer")
         XCTAssertTrue(composer.exists)
+        XCTAssertGreaterThan(composer.frame.minY, app.frame.midY,
+                             "The composer belongs below history, not over its first message")
         composer.tap()
         composer.typeText("A synthetic message")
         let send = element(app, "chat-send")

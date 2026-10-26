@@ -79,7 +79,7 @@ final class WorkspaceCacheTests: XCTestCase {
         let actions = try ProtocolDecoder.json.decode(PendingActionsResponse.self, from: body).actions
         try WorkspaceCache(credentials: credentials, directory: directory).save(
             WorkspaceSnapshot(pendingActions: actions, clarifications: []))
-        StubProtocol.handler = { request in
+        StubProtocol.handler = { @Sendable request in
             let failing = request.url?.path == "/pending-actions"
             let questions = Data(#"[{"id":"clar_workspace","taskId":"task_fixture","question":"A synthetic question?","context":"","proposedAction":"complete","confidence":null,"sources":[],"status":"pending","answer":null,"answeredAt":null,"createdAt":"2026-01-01T00:00:00Z"}]"#.utf8)
             return (HTTPURLResponse(url: request.url!, statusCode: failing ? 503 : 200, httpVersion: nil, headerFields: nil)!,
@@ -99,7 +99,9 @@ final class WorkspaceCacheTests: XCTestCase {
     func testConcurrentRefreshCoalescesAndQueueCachesStaySeparate() async throws {
         let body = try fixture("tasks-list")
         let count = OSAllocatedUnfairLock(initialState: 0)
-        StubProtocol.handler = { request in
+        // URLProtocol calls this on its own thread, not the test's main
+        // actor. Make nested predicates nonisolated as well.
+        StubProtocol.handler = { @Sendable request in
             count.withLock { $0 += 1 }
             let queue = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "queue" }?.value
             return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
@@ -125,7 +127,7 @@ final class WorkspaceCacheTests: XCTestCase {
         let started = expectation(description: "first request started")
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }
-        StubProtocol.handler = { request in
+        StubProtocol.handler = { @Sendable request in
             let n = count.withLock { $0 += 1; return $0 }
             if n == 1 { started.fulfill(); _ = release.wait(timeout: .now() + 5) }
             return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
@@ -149,7 +151,7 @@ final class WorkspaceCacheTests: XCTestCase {
         let started = expectation(description: "old request started")
         let release = DispatchSemaphore(value: 0)
         defer { release.signal() }
-        StubProtocol.handler = { request in
+        StubProtocol.handler = { @Sendable request in
             started.fulfill(); _ = release.wait(timeout: .now() + 5)
             return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, body)
         }
