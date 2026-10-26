@@ -597,3 +597,9 @@ not restored.
 The iMessage self-chat importer opens the Messages SQLite database strictly read-only,
 with a bounded lock wait. It reads committed WAL messages without checkpointing or
 creating the source database. Cursor checkpoints stay in OpenAGI's own data directory.
+
+The self-chat task importer supports both plain `text` and modern Messages
+`attributedBody` text, using the same decoder as the conversation bridge. Plain
+text takes precedence. Unreadable bodies and attachment-only rows advance the
+cursor without creating empty tasks; other chats remain excluded. First enable
+remains forward-only unless backfill is explicitly configured.
