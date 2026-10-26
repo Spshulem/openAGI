@@ -115,7 +115,7 @@ function isCiphertext(value) {
 // Who wrote a user message: a reply from a question card, the supervisor
 // (Desktop may wrap its text), a heartbeat automation, injected context, or
 // the owner.
-function userInputKind(raw) {
+export function userInputKind(raw) {
   const text = String(raw ?? "");
   if (parseCardReply(text)) return "reply";
   if (text.trimStart().startsWith(SUPERVISOR_PREFIX)) return "supervisor";

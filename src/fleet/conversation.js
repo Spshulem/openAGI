@@ -2,8 +2,8 @@
 // bounded and use source paths/IDs from the scan, never from the caller.
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { openReadOnlyDb, parseJsonLines, readTail, redactSecrets, toIso } from "./contracts.js";
-import { cleanCodexUserText } from "./sources/codex.js";
+import { SUPERVISOR_PREFIX, openReadOnlyDb, parseJsonLines, readTail, redactSecrets, toIso } from "./contracts.js";
+import { cleanCodexUserText, userInputKind } from "./sources/codex.js";
 import { isOwnerText } from "./sources/claude.js";
 
 const READ_BYTES = 1024 * 1024;
@@ -18,13 +18,26 @@ function textOf(content) {
     .map((part) => part.text).join("\n");
 }
 
+function questionText(input) {
+  const questions = Array.isArray(input?.questions) ? input.questions : [];
+  return questions.filter((q) => q && typeof (q.question ?? q.title) === "string").map((q) => [q.question ?? q.title,
+    ...(Array.isArray(q.options) ? q.options : []).map((o) => typeof o === "string" ? o : o?.label)
+      .filter((label) => typeof label === "string" && label.trim()).map((label) => `• ${label}`)]
+    .join("\n")).join("\n\n");
+}
+
+function claudeQuestionText(content) {
+  return (Array.isArray(content) ? content : []).filter((block) => block?.type === "tool_use" && /(?:^|__)AskUserQuestion$/.test(block.name ?? ""))
+    .map((block) => questionText(block.input)).filter(Boolean).join("\n\n");
+}
+
 function claudeAssistantText(content) {
   const blocks = Array.isArray(content) ? content : [];
   // Only a reply sent to a session socket is owner-visible. Other tool
   // inputs, including messages to subagents, stay out of the conversation.
   const relayed = blocks.find((block) => block?.type === "tool_use" && block.name === "SendMessage" && /^uds:/.test(String(block.input?.to ?? ""))
     && typeof block.input?.message === "string")?.input.message.trim();
-  return relayed || textOf(content);
+  return [relayed || textOf(content), claudeQuestionText(content)].filter(Boolean).join("\n\n");
 }
 
 function append(messages, role, text, at) {
@@ -37,18 +50,22 @@ function append(messages, role, text, at) {
   messages.push({ role, text: clean, at: toIso(at) });
 }
 
+function appendCodexUser(messages, text, at) {
+  if (["owner", "reply"].includes(userInputKind(text))) append(messages, "user", cleanCodexUserText(text), at);
+}
+
 export function codexConversation(text) {
   const messages = [];
   for (const row of parseJsonLines(text)) {
     const p = row.payload ?? {};
     if (row.type === "event_msg") {
-      if (p.type === "user_message") append(messages, "user", cleanCodexUserText(p.message), row.timestamp);
+      if (p.type === "user_message") appendCodexUser(messages, p.message, row.timestamp);
       else if (p.type === "agent_message" && p.delivery !== "async") append(messages, "assistant", p.message, row.timestamp);
       else if (p.type === "task_complete") append(messages, "assistant", p.last_agent_message, row.timestamp);
       else if (p.type === "item_completed") {
         const item = p.item ?? {};
         if (item.type === "AgentMessage" && item.delivery !== "async") append(messages, "assistant", textOf(item.content), row.timestamp);
-        else if (item.type === "UserMessage") append(messages, "user", cleanCodexUserText(textOf(item.content)), row.timestamp);
+        else if (item.type === "UserMessage") appendCodexUser(messages, textOf(item.content), row.timestamp);
       }
     } else if (row.type === "response_item") {
       // User response_items are injected system/environment context.
@@ -56,9 +73,7 @@ export function codexConversation(text) {
       else if (p.type === "function_call" && /(?:^|__)request_user_input(?:_async)?$/.test(p.name ?? "")) {
         try {
           const args = typeof p.arguments === "string" ? JSON.parse(p.arguments) : p.arguments;
-          const question = (args?.questions ?? []).map((q) => [q.question ?? q.title,
-            ...(q.options ?? []).map((o) => `• ${typeof o === "string" ? o : o.label}`)].filter(Boolean).join("\n")).join("\n\n");
-          append(messages, "assistant", question, row.timestamp);
+          append(messages, "assistant", questionText(args), row.timestamp);
         } catch { /* Incomplete tool arguments are not a message. */ }
       }
     }
@@ -71,7 +86,7 @@ export function claudeConversation(text) {
   for (const row of parseJsonLines(text)) {
     if (row.type === "assistant") append(messages, "assistant", claudeAssistantText(row.message?.content), row.timestamp);
     else if (row.type === "user" && !row.isMeta && !row.isCompactSummary) {
-      const text = textOf(row.message?.content);
+      const text = textOf(row.message?.content).trim();
       if (text && isOwnerText(row, text)) append(messages, "user", text, row.timestamp);
     }
   }
@@ -116,11 +131,15 @@ export async function readThreadConversation(thread, config) {
         for (const row of rows) {
           if (row.cancelled_at) continue;
           const at = row.sent_at ?? row.created_at;
-          if (row.role === "user" && !row.sender_session_id && !row.sender_api_key_name) append(messages, "user", row.content, at);
+          if (row.role === "user" && !row.sender_session_id && !row.sender_api_key_name) {
+            const text = String(row.content ?? "").trim();
+            if (!text.startsWith(SUPERVISOR_PREFIX)) append(messages, "user", text, at);
+          }
           else if (row.role === "assistant") {
             try {
               const event = JSON.parse(row.content);
-              if (event.type === "assistant" && !event.parent_tool_use_id) append(messages, "assistant", claudeAssistantText(event.message?.content), at);
+              if (event.type === "assistant") append(messages, "assistant", event.parent_tool_use_id
+                ? claudeQuestionText(event.message?.content) : claudeAssistantText(event.message?.content), at);
             } catch { /* Tool and partial stream rows are not messages. */ }
           }
         }

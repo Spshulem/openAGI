@@ -25,6 +25,17 @@ test("Codex context retains both sides and questions, without injected context o
   assert.ok(!JSON.stringify(messages).includes("SYSTEM CONTEXT"));
 });
 
+test("Codex history excludes supervisor and heartbeat prompts in both user event formats", () => {
+  const inputs = ["Explain the status", "[OpenAGI supervisor] Continue", "## My request:\n[OpenAGI supervisor] Check again",
+    "<heartbeat>Scheduled check</heartbeat>", "<automation_id>scheduled-check</automation_id> Continue", "Show the result"];
+  for (const itemFormat of [false, true]) {
+    const messages = codexConversation(lines(inputs.map((message) => ({ type: "event_msg", payload: itemFormat
+      ? { type: "item_completed", item: { type: "UserMessage", content: [{ type: "Text", text: message }] } }
+      : { type: "user_message", message } }))));
+    assert.deepEqual(messages.map((m) => m.text), ["Explain the status", "Show the result"]);
+  }
+});
+
 test("Claude context displays text, excluding thinking, tool results and system injections", () => {
   const messages = claudeConversation(lines([
     { type: "user", message: { content: "Explain this task" } },
@@ -66,6 +77,20 @@ test("Claude history includes session-socket replies without exposing other tool
   assert.equal(messages.at(-1).role, "assistant");
 });
 
+test("Claude history retains owner-visible question tools and their choices", () => {
+  const question = (name) => ({ type: "tool_use", name, input: { questions: [
+    { question: "Which implementation?", options: ["A", { label: "B", description: "Alternative" }] },
+    { question: "When should it ship?", options: ["Now", "Later"] },
+  ] } });
+  const messages = claudeConversation(lines([
+    { type: "assistant", message: { content: [{ type: "text", text: "Earlier discussion." }] } },
+    { type: "assistant", message: { content: [question("AskUserQuestion")] } },
+    { type: "assistant", message: { content: [{ type: "text", text: "One more decision." }, question("mcp__conductor__AskUserQuestion")] } },
+  ]));
+  assert.equal(messages[1].text, "Which implementation?\n• A\n• B\n\nWhen should it ship?\n• Now\n• Later");
+  assert.equal(messages[2].text, `One more decision.\n\n${messages[1].text}`);
+});
+
 test("conversation payloads have a bounded recent window and explicit truncation", () => {
   const messages = Array.from({ length: 100 }, (_, i) => ({ role: "user", text: `Message ${i}`, at }));
   const bounded = boundConversation(messages);
@@ -98,6 +123,7 @@ test("Conductor history is scoped to one session and excludes canceled/forwarded
     insert.run("other", "user", "Another thread", at, at, null, null, null);
     insert.run("chosen", "user", "Canceled prompt", at, at, at, null, null);
     insert.run("chosen", "user", "Forwarded prompt", at, at, null, "other", null);
+    insert.run("chosen", "user", "  [OpenAGI supervisor] Continue the task", at, at, null, null, null);
     const result = await readThreadConversation({ kind: "conductor", id: "chosen" }, { paths: { conductorDb: file } });
     assert.deepEqual(result.messages.map((m) => m.text), ["Explain the task", "The task needs review."]);
     assert.equal(result.unavailableReason, null);
@@ -120,8 +146,11 @@ test("Conductor history retains session-socket replies after earlier messages", 
     add([{ type: "text", text: "I'll send the update." }, sent("uds:/tmp/session.sock", "The tests passed.")]);
     add([sent("another-agent", "Private agent instructions")]);
     add([sent("uds:/tmp/session.sock", "Nested agent reply")], "parent-tool");
+    const question = { type: "tool_use", name: "mcp__conductor__AskUserQuestion", input: { questions: [{ question: "Ship it?", options: ["Ship", { label: "Hold" }] }] } };
+    add([question]);
+    add([{ type: "text", text: "Private nested discussion" }, { ...question, input: { questions: [{ question: "Which branch?", options: ["Main", "Feature"] }] } }], "parent-tool");
     const result = await readThreadConversation({ kind: "conductor", id: "chosen" }, { paths: { conductorDb: file } });
-    assert.deepEqual(result.messages.map((m) => m.text), ["Earlier status.", "The fix is ready.", "The tests passed."]);
+    assert.deepEqual(result.messages.map((m) => m.text), ["Earlier status.", "The fix is ready.", "The tests passed.", "Ship it?\n• Ship\n• Hold", "Which branch?\n• Main\n• Feature"]);
     assert.ok(result.messages.every((m) => m.role === "assistant"));
     assert.equal(result.unavailableReason, null);
   } finally { db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
