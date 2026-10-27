@@ -49,10 +49,13 @@ final class ChatSubmissionTests: XCTestCase {
             StubProtocol.handler = { request in
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
                 if request.url!.path == "/message" {
-                    let body = try Self.body(request)
+                    guard let body = try? Self.body(request),
+                          let attachments = body["attachments"] as? [[String: Any]] else {
+                        XCTFail("The chat request must contain its image attachments")
+                        return (response, Data())
+                    }
                     XCTAssertEqual(body["thread"] as? String, thread.rawValue)
                     XCTAssertEqual(body["text"] as? String, "Look at this")
-                    let attachments = try XCTUnwrap(body["attachments"] as? [[String: Any]])
                     XCTAssertEqual(attachments.first?["data"] as? String, prepared.data)
                     XCTAssertEqual(attachments.first?["mimeType"] as? String, "image/jpeg")
                     delivered.withLock { $0 += 1 }
