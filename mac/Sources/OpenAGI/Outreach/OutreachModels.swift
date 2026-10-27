@@ -20,6 +20,9 @@ struct OutreachItem: Identifiable, Decodable, Equatable {
   let sourceKind: String?
   let sourceId: String?
 
+  private static let fractionalDateStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+  private static let wholeDateStyle = Date.ISO8601FormatStyle()
+
   // The server item carries more fields (createdAt, …); we only decode what
   // the Mac surfaces. Missing optional-ish fields decode to sane defaults so
   // a slightly newer/older server never breaks the client.
@@ -51,9 +54,7 @@ struct OutreachItem: Identifiable, Decodable, Equatable {
     actions = try c.decodeIfPresent([String].self, forKey: .actions) ?? []
     status = try c.decodeIfPresent(String.self, forKey: .status) ?? "unseen"
     if let raw = try? c.decodeIfPresent(String.self, forKey: .createdAt) {
-      let fractional = ISO8601DateFormatter()
-      fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-      createdAt = fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+      createdAt = (try? Self.fractionalDateStyle.parse(raw)) ?? (try? Self.wholeDateStyle.parse(raw))
     } else {
       createdAt = nil
     }

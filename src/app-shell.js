@@ -50,20 +50,20 @@ export const navigation = `
   <nav id="nav" aria-label="Main navigation">
     <div class="nav-group">${item('chat','Chat','chat')}${item('get-started','Get started','start')}</div>
     <div class="nav-group"><p class="nav-label">Workspace</p>
-      ${item('coding-agents','Coding agents','agents')}${item('tasks','Tasks','tasks')}
-      ${item('review','Review','review')}${item('approvals','Approvals','review','id="approvalsNav"')}
+      ${item('supervisor','Supervisor','agents')}${item('tasks','Tasks','tasks')}
+      ${item('review','Inbox','review')}${item('approvals','Approvals','review','id="approvalsNav"')}
     </div>
     <div class="nav-group"><p class="nav-label">Your agent</p>
-      ${item('memory','Memory','memory')}${item('skills','Skills','start')}${item('integrations','Integrations','connect')}
-      ${item('nodes','Devices','devices')}${item('computer-use','Computer use','screen')}
+      ${item('memory','Memory','memory')}${item('skills','Skills','start')}${item('integrations','Connections','connect')}
+      ${item('activity','Computer history','screen')}${item('today','Today','review')}${item('computer-use','Computer use','screen')}
     </div>
-    <details class="nav-advanced"><summary>More tools</summary><div>
+    <details class="nav-advanced"><summary>Advanced</summary><div>
       ${item('suggestions','Suggestions','start')}${item('cron','Schedules','tasks')}
-      ${item('activity','Computer history','screen')}${item('today','Today','review')}
+      ${item('coding-agents','Coding setup','agents')}${item('nodes','Devices','devices')}
       ${item('mcp','MCP servers','connect')}${item('channels','Channels','chat')}${item('agents','Specialists','agents')}
-      <a href="/fleet">${icon('agents')}Fleet overview</a><a href="/g2/connect">${icon('devices')}Connect glasses</a>
+      <a href="/g2/connect">${icon('devices')}Connect glasses</a>
       ${item('budget','Usage & budget','review')}${item('health','System health','start')}
-      ${item('outcomes','Outcomes','tasks')}${item('scrutiny','Scrutiny','settings')}
+      ${item('outcomes','Background activity','tasks')}${item('scrutiny','Learning diagnostics','settings')}
     </div></details>
   </nav>
   <div class="nav-footer"><div id="providerSwitch" class="model-switch" hidden></div><button id="setupBtn" type="button">${icon('settings')}Model & settings</button>

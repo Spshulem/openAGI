@@ -3,7 +3,7 @@ export const codingSupervisorUi = String.raw`
 let codingRenderGeneration = 0;
 async function renderCodingAgents() {
   const generation = ++codingRenderGeneration;
-  main.innerHTML = '<div class="pane"><h2>Coding Agents</h2><p>Loading supervisor status…</p></div>';
+  main.innerHTML = '<div class="pane"><h2>Coding setup</h2><p>Loading coding tools…</p></div>';
   let snapshot;
   try {
     const response = await fetch('/coding-agents');
@@ -12,7 +12,7 @@ async function renderCodingAgents() {
   }
   catch { snapshot = { error: 'Could not reach the supervisor. No session was changed.', sessions: [] }; }
   if (generation !== codingRenderGeneration || state.tab !== 'coding-agents') return;
-  main.innerHTML = '<div class="pane"><div class="row between"><h2>Coding Agents</h2><button id="codingRefresh">Refresh</button></div><p>Talk to OpenAGI; it coordinates your existing coding sessions. Replies require approval. Reported activity is not proof of completion.</p><p id="codingStatus" role="status"></p><div class="grid" id="codingList"></div><section id="codingDetail"></section></div>';
+  main.innerHTML = '<div class="pane"><div class="row between"><h2>Coding setup</h2><button id="codingRefresh">Refresh</button></div><p>Configure coding tools here. For ongoing work, questions, and watched conversations, open Supervisor. Replies still require approval.</p><p id="codingStatus" role="status"></p><div class="grid" id="codingList"></div><section id="codingDetail"></section></div>';
   $('codingStatus').textContent = snapshot.error || snapshot.warning || (snapshot.configured ? 'Checked ' + new Date(snapshot.checkedAt).toLocaleTimeString() : 'Set up the built-in supervisor below. No separate supervisor or G2 installation is required.');
   $('codingRefresh').onclick = renderCodingAgents;
   const setupPanel = document.createElement('section');
@@ -128,18 +128,21 @@ async function renderCodingSetup(panel) {
       blocked.textContent = !saved.length ? 'Choose a Git project folder before starting an agent.' : 'No provider CLI found. Install Claude Code or Codex, sign in on the supervisor computer, then Refresh. No agent can start yet.';
       panel.append(blocked); return;
     }
-    const form = document.createElement('section');
-    const addSelect = (title, options) => {
+    const form = document.createElement('details');
+    const formTitle = document.createElement('summary'); formTitle.textContent = 'Start a coding session'; form.append(formTitle);
+    const advanced = document.createElement('details');
+    const advancedTitle = document.createElement('summary'); advancedTitle.textContent = 'Advanced options'; advanced.append(advancedTitle);
+    const addSelect = (title, options, parent = form) => {
       const label = document.createElement('label'); label.textContent = title + ' ';
       const select = document.createElement('select');
       for (const option of options) { const node = document.createElement('option'); node.value = option.value; node.textContent = option.label; select.append(node); }
-      label.append(select); form.append(label); return select;
+      label.append(select); parent.append(label); return select;
     };
-    const provider = addSelect('Provider', (setup.providers || []).filter(p => p.installed).map(p => ({ value: p.provider, label: p.provider })));
-    const workspace = addSelect('Workspace', saved.map(w => ({ value: w.id, label: w.label + ' (' + w.id.slice(0, 8) + ')' })));
-    const effort = addSelect('Reasoning effort', ['low', 'medium', 'high'].map(x => ({ value: x, label: x }))); effort.value = 'medium';
+    const provider = addSelect('Coding tool', (setup.providers || []).filter(p => p.installed).map(p => ({ value: p.provider, label: p.provider })), advanced);
+    const workspace = addSelect('Project', saved.map(w => ({ value: w.id, label: w.label })));
+    const effort = addSelect('Reasoning effort', ['low', 'medium', 'high'].map(x => ({ value: x, label: x })), advanced); effort.value = 'medium';
     const modelLabel = document.createElement('label'); modelLabel.textContent = 'Model (optional provider model ID)';
-    const model = document.createElement('input'); model.maxLength = 100; modelLabel.append(model); form.append(modelLabel);
+    const model = document.createElement('input'); model.maxLength = 100; modelLabel.append(model); advanced.append(modelLabel); form.append(advanced);
     const instructionLabel = document.createElement('label'); instructionLabel.textContent = 'Instruction for a new managed session';
     const instruction = document.createElement('textarea'); instruction.rows = 4; instruction.maxLength = 4000; instruction.style.width = '100%'; instructionLabel.append(instruction); form.append(instructionLabel);
     const start = document.createElement('button'); start.textContent = 'Review start approval'; start.disabled = !provider.value || !workspace.value;

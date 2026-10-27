@@ -614,3 +614,29 @@ The self-chat task importer supports both plain `text` and modern Messages
 text takes precedence. Unreadable bodies and attachment-only rows advance the
 cursor without creating empty tasks; other chats remain excluded. First enable
 remains forward-only unless backfill is explicitly configured.
+
+
+### Desktop workspace
+
+Supervisor opens the same ongoing-work and questions view used by the companion
+clients. Coding CLI configuration is separate under Advanced → Coding setup;
+provider, model, and reasoning controls stay inside Advanced options. Connections
+holds integration setup; device and glasses tools are optional advanced views.
+Get started links to model setup before the optional introductory chat.
+
+Tasks and Today preserve request failures instead of showing zero tasks. A paired
+worker forwards Inbox reads to its main; it never substitutes a local queue when
+main denies workspace access. The main retains authority over every request.
+Recovery links open the connected agent for sign-in; no token is passed in the URL
+and no enrollment is changed automatically.
+
+Inbox shows the latest completed cleanup report: reviewed, retired, and deferred
+counts. Cleanup concerns suggestions and drafts, not automatic completion of user
+tasks. Old age alone is not proof that a task is finished. Background activity
+shows scheduled-run receipts and explicitly distinguishes inferred scores from
+user feedback and delivered work.
+
+Computer history loads older rows automatically near the bottom, using bounded
+pages with a fixed upper timestamp, with Load more retained as a fallback.
+Computer Use has an explicit enable action and permission guidance; enabling tools
+does not grant operating-system permissions or approve a control session.

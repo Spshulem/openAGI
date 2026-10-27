@@ -45,6 +45,10 @@ final class AttentionBadgeTests: XCTestCase {
   }
 
   func testApprovalsAndCurrentQueuesNeverExpire() throws {
+    XCTAssertEqual(AttentionBadge.count(briefKeys: [], outreach: [], approvalIDs: ["approval-only"], fleetIDs: [], now: now), 1)
+    for date in ["2026-01-15T10:00:00Z", "2026-01-15T10:00:00.000Z", "2026-01-15T11:00:00+01:00"] {
+      XCTAssertNotNil(try item(decision: true, date: date).createdAt)
+    }
     let approval = try item(type: "coding-approval", decision: true, date: nil)
     XCTAssertTrue(AttentionBadge.needsAttention(approval, now: now))
     XCTAssertEqual(AttentionBadge.count(briefKeys: ["task:one"], outreach: [approval], approvalIDs: ["old"], fleetIDs: ["question"], now: now), 4)
