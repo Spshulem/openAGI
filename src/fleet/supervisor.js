@@ -25,6 +25,7 @@ import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } fr
 import { localDay } from "./diagnose.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
 import * as antigravity from "./sources/antigravity.js";
+import * as copilot from "./sources/copilot.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
 import * as codex from "./sources/codex.js";
@@ -1080,7 +1081,7 @@ export class FleetSupervisor {
       // infra:bb3 and infra:lb belong to their probes, not a thread source.
       const [kind, probe] = String(key).split(":");
       if (kind === "infra") return Boolean(sourceErrors[probe]);
-      const capped = threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads;
+      const capped = threads.filter((thread) => thread.kind === kind && ((kind !== "antigravity" && kind !== "copilot") || !thread.excluded)).length >= config.limits.maxThreads;
       return !seen.has(key) && (Boolean(sourceErrors[kind]) || capped);
     };
     for (const key of [...this.uiBlockedSince.keys()]) if (!now.has(key) && !hidden(key)) this.uiBlockedSince.delete(key);
@@ -1206,6 +1207,11 @@ export class FleetSupervisor {
     if (thread?.kind === "antigravity") {
       const read = Promise.resolve().then(() => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: this.now(), only: [thread.id] }));
       const fresh = await withTimeout(read, SOURCE_TIMEOUT_MS, "antigravity");
+      return (fresh ?? []).find((entry) => entry.key === thread.key) ?? null;
+    }
+    if (thread?.kind === "copilot") {
+      const read = Promise.resolve().then(() => (d.listCopilotThreads ?? copilot.listCopilotThreads)(config, { now: this.now(), only: [thread.id] }));
+      const fresh = await withTimeout(read, SOURCE_TIMEOUT_MS, "copilot");
       return (fresh ?? []).find((entry) => entry.key === thread.key) ?? null;
     }
     if (thread?.kind !== "conductor") return null;
@@ -1783,11 +1789,12 @@ export class FleetSupervisor {
     // The Codex keys whose open card this tick's scan settled (see act).
     const cardScanned = new Set();
     const storageOn = Boolean(this.config.storage?.enabled);
-    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
+    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, copilotThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
       guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
       guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
       guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
       guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
+      guard("copilot", () => (d.listCopilotThreads ?? copilot.listCopilotThreads)(config, { now: started }), []),
       guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
       guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
       this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
@@ -1797,7 +1804,7 @@ export class FleetSupervisor {
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
-    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [] }));
+    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], copilot: copilotThreads ?? [] }));
     const ownPaths = this.store.fixes().map((fix) => fix.worktree).filter(Boolean);
     const selfIds = new Set(config.selfSessionIds);
     for (const thread of threads) {
@@ -1944,7 +1951,7 @@ export class FleetSupervisor {
     const unknownKinds = new Set(THREAD_KINDS.filter((kind) => sourceErrors[kind]));
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
-    const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));
+    const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && ((kind !== "antigravity" && kind !== "copilot") || !thread.excluded)).length >= config.limits.maxThreads));
     // A failed disk read, or an SD card mounted but unreadable, is unknown.
     const storageUnknown = storageOn && (Boolean(sourceErrors.storage) || this.storage.sdUnknown);
     const attempted = await this.act(decisions, { mode, byKey, manager, started, config, items, prs, unreadPrs, unknownKinds, cappedKinds, cardScanned, deferUi, skipReview: reason === "owner-away", storageUnknown });

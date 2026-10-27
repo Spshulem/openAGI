@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity"]);
+export const THREAD_KINDS = Object.freeze(["codex", "claude", "conductor", "antigravity", "copilot"]);
 // The one list every thread-key matcher is built from (server routes, the
 // broker's and the phone's allowlists): "kind:id", the id as sources mint it.
 export const THREAD_KIND_PATTERN = THREAD_KINDS.join("|");
@@ -20,7 +20,7 @@ export function isThreadKey(key) {
 }
 
 // What the owner calls each kind's app in questions and labels.
-export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity" });
+export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity", copilot: "Copilot" });
 
 export function kindName(kind) {
   return KIND_NAMES[kind] ?? "Agent";
@@ -184,6 +184,8 @@ export function defaultPaths(home = os.homedir()) {
     home,
     codexHome: path.join(home, ".codex"),
     claudeHome: path.join(home, ".claude"),
+    // Copilot sessions: session-state/<id>/events.jsonl.
+    copilotHome: path.join(home, ".copilot"),
     conductorDb: path.join(home, "Library", "Application Support", "com.conductor.app", "conductor.db"),
     buzzEndpointFile: path.join(home, ".claude", "buzz", "endpoint"),
     codexLbEnvFile: path.join(home, ".codex", "codex-lb.env"),
@@ -386,6 +388,11 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     antigravity: {
       enabled: overrides.antigravity?.enabled ?? !envOff(env.OPENAGI_FLEET_ANTIGRAVITY)
     },
+    // GitHub Copilot sessions (VS Code agent host, Copilot CLI): read only,
+    // unless OPENAGI_FLEET_COPILOT=0.
+    copilot: {
+      enabled: overrides.copilot?.enabled ?? !envOff(env.OPENAGI_FLEET_COPILOT)
+    },
     limits: { ...DEFAULTS, ...(overrides.limits ?? {}) },
     paths: { ...defaultPaths(home), ...(overrides.paths ?? {}) },
     bins: { ...defaultBinaries(home), ocu: resolveOcuPath(env, { home }), ...(overrides.bins ?? {}) }
@@ -541,6 +548,7 @@ export function openChatFor(thread) {
   if (target?.app === "codex") return { app: "codex", url: target.deepLink, label: `${title || "untitled thread"} (Codex)`, note: null };
   const where = name(thread.workspace) || folder;
   if (thread.kind === "antigravity") return { app: "antigravity", url: null, label: `${[where, title && !sameName(title, where) ? title : ""].filter(Boolean).join(" · ") || "untitled conversation"} (Antigravity)`, note: "Antigravity has no link to one conversation: open it in Antigravity and pick it in the sidebar." };
+  if (thread.kind === "copilot") return { app: "copilot", url: null, label: `${[where, title && !sameName(title, where) ? title : ""].filter(Boolean).join(" · ") || "untitled chat"} (GitHub Copilot)`, note: "A GitHub Copilot session: open it in VS Code (Chat view) or run copilot --resume in its folder." };
   if (thread.kind === "conductor") return { app: "conductor", url: null, label: `${[where, title].filter(Boolean).join(" · ") || "untitled chat"} (Conductor)`, note: "Conductor gave no workspace or session id for this chat; open it from the sidebar." };
   if (thread.kind === "codex") {
     const inConductor = thread.meta?.originator === CONDUCTOR_CODEX_ORIGINATOR;
@@ -830,8 +838,8 @@ export async function openImmutableDb(filePath) {
 
 /**
  * @typedef {Object} FleetThread
- * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>" | "antigravity:<conversationId>"
- * @property {"codex"|"claude"|"conductor"|"antigravity"} kind
+ * @property {string} key                 "codex:<id>" | "claude:<sessionId>" | "conductor:<sessionId>" | "antigravity:<conversationId>" | "copilot:<sessionId>"
+ * @property {"codex"|"claude"|"conductor"|"antigravity"|"copilot"} kind
  * @property {string} id
  * @property {string} title
  * @property {string|null} cwd

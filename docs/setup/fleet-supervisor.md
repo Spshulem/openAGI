@@ -1,6 +1,6 @@
 # Fleet supervisor
 
-Watches every recent Codex, Claude Code, Conductor, and Antigravity coding thread on this Mac.
+Watches every recent Codex, Claude Code, Conductor, Antigravity, and GitHub Copilot coding thread on this Mac.
 Judges each PR from GitHub and BuildBot3, not from the agent's "done".
 Nudges stuck threads with your own wording. Asks you only for real decisions.
 
@@ -82,6 +82,7 @@ sent to that thread in every mode, when a route exists.
 | `OPENAGI_FLEET_JUDGE_MODEL` | unset (judge off) | Model for the judge, run with `codex exec` through codex-lb, e.g. `gpt-6.1-sol` |
 | `OPENAGI_FLEET_STORAGE` | on with the supervisor | `0` turns off the [storage manager](#storage) |
 | `OPENAGI_FLEET_ANTIGRAVITY` | on | `0` stops reading and messaging [Antigravity](#antigravity) conversations |
+| `OPENAGI_FLEET_COPILOT` | on | `0` stops reading [GitHub Copilot](#github-copilot) sessions |
 | `OPENAGI_FLEET_STORAGE_SD` | `/Volumes/Xtra` | The SD card the storage manager archives to |
 | `OPENAGI_FLEET_STORAGE_LOW_GB` | `100` | Mac free space below this starts safe cleanup and archiving |
 | `OPENAGI_FLEET_STORAGE_TARGET_GB` | `150` | Cleanup stops once the Mac has this much free |
@@ -177,6 +178,27 @@ not as your bubble. Nothing is typed, so it works in every delivery mode.
 
 **Open.** Antigravity has no link to one conversation (its `antigravity://`
 scheme only imports from AI Studio). Open the app and pick it in the sidebar.
+
+## GitHub Copilot
+
+Sessions of the VS Code Copilot agent host and the Copilot CLI show as
+`copilot:<session id>` threads. Observe only: there is no send route, so the
+supervisor never types into or resumes a Copilot session.
+
+**Read.** `~/.copilot/session-state/<id>/events.jsonl` (the tail) and
+`workspace.yaml` (name, git root). Nothing is written.
+
+- Running: a turn started and the log was written within the running window;
+  an old open turn is stalled.
+- Waiting on you: a permission request nobody answered yet. Answer it in
+  VS Code or the CLI.
+- Error: the log's last event is a session error. A session that ends
+  mid-turn is aborted.
+- Chats without a folder (under `~/.copilot/chats`) and temp folders are out of
+  scope (no repo).
+
+**Open.** There is no link to one session. Open it in VS Code (Chat view) or run
+`copilot --resume` in its folder.
 
 ## Storage
 

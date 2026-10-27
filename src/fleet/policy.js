@@ -83,6 +83,8 @@ export function chooseRoute(thread, mode, delivery = null) {
   // nothing is typed or forked, the app shows it in the conversation, so
   // every delivery mode may use it.
   if (thread.kind === "antigravity") return "antigravity-send";
+  // Copilot sessions are watched, never driven.
+  if (thread.kind === "copilot") return null;
   const ui = deliveryOf(delivery);
   if (ui.mode !== "cli") {
     const target = uiTargetFor(thread);

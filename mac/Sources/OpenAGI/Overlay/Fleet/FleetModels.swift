@@ -180,6 +180,7 @@ struct FleetOpenChat: Decodable, Equatable {
     case "codex": return "Codex"
     case "claude": return "Claude Code"
     case "antigravity": return "Antigravity"
+    case "copilot": return "GitHub Copilot"
     default: return nil
     }
   }

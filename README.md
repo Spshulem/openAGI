@@ -62,7 +62,7 @@ a restart. See [all install paths, Docker, updates, and troubleshooting](docs/IN
 | --- | --- | --- |
 | **Talk to one persistent agent** | Chat; connect only the integrations you need | The configured model answers and uses the tools actually connected |
 | **Remember preferences and corrections** | Memory, then Skills | Ask it to remember a non-sensitive preference, recall it in another chat, and correct it |
-| **Supervise a coding fleet** | [Supervisor / Fleet](#supervisor-keep-coding-work-moving); More → Coding Agents | Codex, Claude Code, Conductor and Antigravity sessions, open questions, PRs and verification evidence; begin in observe mode |
+| **Supervise a coding fleet** | [Supervisor / Fleet](#supervisor-keep-coding-work-moving); More → Coding Agents | Codex, Claude Code, Conductor, Antigravity and GitHub Copilot sessions, open questions, PRs and verification evidence; begin in observe mode |
 | **Talk to the Supervisor** | [Voice setup](docs/setup/fleet-supervisor.md#voice) on Mac, Android or Even G2 | Enable voice, start with a gesture, and confirm actions with the spoken approval code |
 | **Learn from routines** | Optional Mac Capture, Computer History, Skills suggestions | Review captured context and suggested workflows before adopting them |
 | **Watch a screen or take action** | More → Computer Use | A selected supported node, fresh readiness, required OS permissions, and your explicit session approval |

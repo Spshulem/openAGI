@@ -145,7 +145,7 @@ export function registerFleetTools(registry, supervisor) {
   registerVoiceTools(registry, supervisor);
   if (typeof supervisor?.getState !== "function") return;
   registry.register({ name: "fleet_status", source: SOURCE, sideEffects: false,
-    description: "Read the coding-agent fleet the supervisor watches (Codex, Claude, Conductor threads and Antigravity conversations): mode, last scan, counts, the owner's open questions, and up to 60 threads ordered red (stuck on the owner or an outage), yellow (needs a push), green (moving or done), gray (out of scope). Uses the last scan; does not scan, send, or answer anything.",
+    description: "Read the coding-agent fleet the supervisor watches (Codex, Claude, Conductor and GitHub Copilot threads and Antigravity conversations): mode, last scan, counts, the owner's open questions, and up to 60 threads ordered red (stuck on the owner or an outage), yellow (needs a push), green (moving or done), gray (out of scope). Uses the last scan; does not scan, send, or answer anything.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     handler: () => fleetStatus(supervisor) });
   // A scan is the supervisor's regular tick run early: in Auto it can send the

@@ -452,7 +452,7 @@ class DaemonClient(
     companion object {
         private val JSON = "application/json".toMediaType()
         // The fleet thread keys the daemon routes (src/mobile-node.js FLEET_THREAD).
-        private val THREAD_KEY = Regex("""^(codex|claude|conductor|antigravity):[A-Za-z0-9_.-]{1,120}$""")
+        private val THREAD_KEY = Regex("""^(codex|claude|conductor|antigravity|copilot):[A-Za-z0-9_.-]{1,120}$""")
 
         val defaultClient: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)

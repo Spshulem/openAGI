@@ -172,7 +172,7 @@ a.btn.primary{color:var(--ink)}
   var painters = new Map();
   var DETAIL_TTL_MS = 20000;
   var MUTE_HOURS = 24;
-  var APP_NAME = { conductor: 'Conductor', codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' };
+  var APP_NAME = { conductor: 'Conductor', codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity', copilot: 'GitHub Copilot' };
 
   function $(id) { return document.getElementById(id); }
 
