@@ -280,20 +280,11 @@ final class NativeNavigationTests: XCTestCase {
             XCTAssertLessThanOrEqual(send.frame.maxY, app.keyboards.firstMatch.frame.minY)
         }
         capture("native-chat-keyboard", app: app)
-        // Duo hides system navigation while the keyboard is open. Swipe
-        // inside the visible history, rather than the first workspace scroll
-        // view: its bounds can extend under the keyboard and tap a suggestion.
-        let history = element(app, "chat-history")
-        let visible = history.frame.intersection(app.frame)
+        // A short history may not scroll. Tapping a message must dismiss the
+        // keyboard without sending or changing the preserved draft.
         let keyboard = app.keyboards.firstMatch
         if keyboard.exists {
-            let bottom = min(visible.maxY, keyboard.frame.minY)
-            let top = visible.minY
-            XCTAssertGreaterThan(bottom - top, 40)
-            let origin = app.coordinate(withNormalizedOffset: .zero)
-            let start = origin.withOffset(CGVector(dx: visible.midX, dy: top + (bottom - top) * 0.2))
-            let end = origin.withOffset(CGVector(dx: visible.midX, dy: app.frame.maxY - 24))
-            start.press(forDuration: 0.1, thenDragTo: end)
+            app.staticTexts["Earlier synthetic answer"].tap()
             let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: keyboard)
             XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
         }

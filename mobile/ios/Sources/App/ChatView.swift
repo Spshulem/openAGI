@@ -204,6 +204,9 @@ struct ChatConversationView: View {
         }
         .frame(maxWidth: 600)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Short histories may not scroll far enough to dismiss the keyboard.
+        // A normal tap keeps the draft and restores the system navigation.
+        .simultaneousGesture(TapGesture().onEnded { composerFocused = false })
     }
 
     @ViewBuilder
