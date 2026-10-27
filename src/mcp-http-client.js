@@ -138,46 +138,53 @@ export class McpHttpClient {
       this.log("error", { method: message.method, error: error.message });
       throw error;
     }
-    clearTimeout(timer);
-    this.activeControllers.delete(controller);
+    try {
+      // Keep the deadline and disconnect handle until the body is consumed.
+      // Capture or update session id.
+      const sid = response.headers.get("mcp-session-id");
+      if (sid) this.sessionId = sid;
 
-    // Capture or update session id.
-    const sid = response.headers.get("mcp-session-id");
-    if (sid) this.sessionId = sid;
+      if (response.status === 401 && this.oauth && !retried) {
+        // Force a re-auth on next call.
+        const cache = this.oauth.loadCache();
+        if (cache) this.oauth.saveCache({ ...cache, access_token: null, expires_at: 0 });
+        await response.body?.cancel();
+        clearTimeout(timer);
+        this.activeControllers.delete(controller);
+        return this.send(message, { isNotification, timeoutMs, retried: true, interactive });
+      }
 
-    if (response.status === 401 && this.oauth && !retried) {
-      // Force a re-auth on next call.
-      const cache = this.oauth.loadCache();
-      if (cache) this.oauth.saveCache({ ...cache, access_token: null, expires_at: 0 });
-      return this.send(message, { isNotification, timeoutMs, retried: true, interactive });
+      if (response.status === 202) {
+        await response.body?.cancel();
+        // Notification accepted.
+        this.log("notify", { method: message.method });
+        return null;
+      }
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        this.log("error", { method: message.method, status: response.status, body: body.slice(0, 500) });
+        const err = new Error(`HTTP ${response.status} from ${this.name}: ${body.slice(0, 200) || response.statusText}`);
+        err.status = response.status;
+        throw err;
+      }
+
+      if (isNotification) {
+        // Drain body and return.
+        await response.text();
+        return null;
+      }
+
+      const ct = (response.headers.get("content-type") ?? "").toLowerCase();
+      if (ct.includes("text/event-stream")) {
+        return await this.readSseForResponse(response, message.id);
+      }
+      const json = await response.json();
+      return this.unwrap(json, message.id);
+    } finally {
+      clearTimeout(timer);
+      this.activeControllers.delete(controller);
     }
-
-    if (response.status === 202) {
-      // Notification accepted.
-      this.log("notify", { method: message.method });
-      return null;
-    }
-
-    if (!response.ok) {
-      const body = await response.text().catch(() => "");
-      this.log("error", { method: message.method, status: response.status, body: body.slice(0, 500) });
-      const err = new Error(`HTTP ${response.status} from ${this.name}: ${body.slice(0, 200) || response.statusText}`);
-      err.status = response.status;
-      throw err;
-    }
-
-    if (isNotification) {
-      // Drain body and return.
-      try { await response.text(); } catch { /* ignore */ }
-      return null;
-    }
-
-    const ct = (response.headers.get("content-type") ?? "").toLowerCase();
-    if (ct.includes("text/event-stream")) {
-      return this.readSseForResponse(response, message.id);
-    }
-    const json = await response.json().catch(() => ({}));
-    return this.unwrap(json, message.id);
   }
 
   /**
@@ -189,29 +196,35 @@ export class McpHttpClient {
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buffer.indexOf("\n\n")) >= 0) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const data = parseSseBlock(block);
-        if (!data) continue;
-        try {
-          const msg = JSON.parse(data);
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) >= 0) {
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const data = parseSseBlock(block);
+          if (!data) continue;
+          let msg;
+          try {
+            msg = JSON.parse(data);
+          } catch (err) {
+            this.log("error", { sseParse: err.message, raw: data.slice(0, 200) });
+            continue;
+          }
           if (msg.id != null && msg.id === expectedId) {
             return this.unwrap(msg, expectedId);
           }
-          // Any other message is a notification or unrelated response — log it.
           this.log("notify", { msg });
-        } catch (err) {
-          this.log("error", { sseParse: err.message, raw: data.slice(0, 200) });
         }
       }
+      throw new Error(`SSE stream ended without a response for request ${expectedId}`);
+    } finally {
+      try { await reader.cancel(); } catch { /* an aborted stream is already closed */ }
+      reader.releaseLock();
     }
-    throw new Error(`SSE stream ended without a response for request ${expectedId}`);
   }
 
   unwrap(json, expectedId) {

@@ -308,7 +308,7 @@ curl -s -X POST http://127.0.0.1:43210/mcp/connect/filesystem \
   -H "authorization: Bearer $OPENAGI_AUTH_TOKEN"
 ```
 
-On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly.
+On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly. HTTP request deadlines cover response bodies, including streaming responses; disconnecting cancels pending body reads. Matching streaming tool errors are returned immediately and completed response streams are released.
 
 ---
 
