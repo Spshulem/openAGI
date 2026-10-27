@@ -54,7 +54,7 @@ final class NativeNavigationTests: XCTestCase {
     private func back(_ app: XCUIApplication, from title: String, to parent: String) {
         // Duo places its native Back button in the vertical toolbar, outside
         // UINavigationBar. Ordinary iPhones can expose the parent title.
-        let native = element(app, "BackButton")
+        let native = app.buttons["BackButton"].firstMatch
         let target = native.exists ? native : app.navigationBars[title].buttons[parent]
         XCTAssertTrue(target.waitForExistence(timeout: 5), "Missing Back from \(title)")
         target.tap()
@@ -383,14 +383,20 @@ final class NativeNavigationTests: XCTestCase {
             }
             tap(app, "chat-attach")
             app.buttons["Photo Library"].tap()
-            // CI seeds exactly one generated red/blue photo. Select it through
-            // the actual system picker, without the app's injection shortcut.
-            let photo = app.collectionViews.cells.firstMatch
-            XCTAssertTrue(photo.waitForExistence(timeout: 15), "The system photo grid must load")
+            // The newly imported red/blue image precedes the simulator's stock
+            // photos. Photos exposes assets as Images, not collection cells.
+            let photo = app.images.matching(NSPredicate(format: "label BEGINSWITH %@", "Photo,")).firstMatch
             capture("native-system-photo-picker-\(thread)", app: app)
+            XCTAssertTrue(photo.waitForExistence(timeout: 15), "The system photo grid must load")
             photo.tap()
-            let add = app.buttons["Add"].firstMatch
-            if add.waitForExistence(timeout: 1) && add.isHittable { add.tap() }
+            capture("native-system-photo-selection-\(thread)", app: app)
+            // Duo uses a native Done control; ordinary iPhones can use Add.
+            let confirmations = app.buttons.matching(NSPredicate(format:
+                "label == 'Done' OR label == 'Add' OR label BEGINSWITH 'Add ('"))
+            XCTAssertTrue(confirmations.firstMatch.waitForExistence(timeout: 5))
+            let confirm = confirmations.allElementsBoundByIndex.first { $0.isEnabled && $0.isHittable }
+            XCTAssertNotNil(confirm, "The selected photo needs a usable native confirmation control")
+            confirm?.tap()
             XCTAssertTrue(element(app, "chat-draft-image").waitForExistence(timeout: 15))
             capture("native-selected-photo-\(thread)", app: app)
             tap(app, "chat-send")
