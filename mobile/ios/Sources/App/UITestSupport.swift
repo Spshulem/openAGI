@@ -82,8 +82,9 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             let reply = images.isEmpty ? "Synthetic reply" : "Synthetic image received in \(thread)"
             let at = ISO8601DateFormatter().string(from: Date())
             let previews = images.map { $0.filter { $0.key != "data" } }
+            let text = body["text"] as? String ?? ""
             Self.chats.withLock { chats in
-                chats[thread, default: []].append(ChatLine(id: UUID().uuidString, role: "user", text: body["text"] as? String ?? "", at: at, attachments: previews))
+                chats[thread, default: []].append(ChatLine(id: UUID().uuidString, role: "user", text: text, at: at, attachments: previews))
                 chats[thread, default: []].append(ChatLine(id: UUID().uuidString, role: "assistant", text: reply, at: at, attachments: []))
             }
             let delta = String(data: try! JSONSerialization.data(withJSONObject: ["text": reply, "reset": false]), encoding: .utf8)!
@@ -163,7 +164,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             finish(status: 500, object: ["error": "Opening context must not submit an answer"])
         case let path where path.hasPrefix("/conversations/"):
             let thread = path.contains("/supervisor/") ? "supervisor" : "agent"
-            let sent = Self.chats.withLock { $0[thread, default: []].map(\.json) }
+            let sent = Self.chats.withLock { $0[thread, default: []] }.map(\.json)
             if ProcessInfo.processInfo.arguments.contains("--ui-scroll-chat") {
                 let rows: [[String: Any]] = (0..<50).map { index in
                     ["id": "scroll-\(index)", "role": index % 2 == 0 ? "user" : "assistant",
