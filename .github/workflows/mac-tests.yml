@@ -6,7 +6,11 @@ on:
       - "mac/**"
       - "src/phone-pairing-page.js"
       - "src/hosted-interface.js"
+      - "src/chatgpt-auth.js"
+      - "src/model-setup-ui.js"
       - "test/phone-pairing-page.test.js"
+      - "test/chatgpt-auth.test.js"
+      - "test/model-setup.test.js"
       - ".github/workflows/mac-tests.yml"
 
 permissions:
@@ -21,7 +25,7 @@ jobs:
       - name: Build Mac app and run Fleet and privacy-link regressions
         run: swift test --package-path mac --filter 'Fleet|AppLink|PhonePairing'
 
-  phone-pairing-tests:
+  onboarding-and-pairing-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -30,4 +34,4 @@ jobs:
         with:
           node-version: '22'
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: node --test test/phone-pairing-page.test.js test/dashboard-login.test.js test/mobile-enrollment.test.js test/pair-phone.test.js
+      - run: node --test --test-concurrency=1 test/chatgpt-auth.test.js test/model-setup.test.js test/phone-pairing-page.test.js test/dashboard-login.test.js test/mobile-enrollment.test.js test/pair-phone.test.js

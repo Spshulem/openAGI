@@ -125,7 +125,8 @@ struct TrayMenu: View {
       case .configured:
         Text("Model: \(state.providerName)").disabled(true)
       case .needsSetup:
-        Button("⚠ Finish setup — agent has no model key") { state.openDashboard(path: "/setup") }
+        Button("Continue with ChatGPT…") { state.openDashboard(path: "/setup?provider=chatgpt") }
+        Button("Choose another model…") { state.openDashboard(path: "/setup") }
       case .unknown:
         Text("Model setup cannot be checked until the daemon responds").disabled(true)
       }
