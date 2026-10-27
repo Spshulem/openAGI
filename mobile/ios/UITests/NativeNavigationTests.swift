@@ -126,7 +126,9 @@ final class NativeNavigationTests: XCTestCase {
         app.launchArguments = ["--ui-testing", "--ui-guided-setup"]
         app.launch()
         XCTAssertTrue(app.navigationBars["Meet OpenAGI"].waitForExistence(timeout: 15))
+        capture("native-guided-setup-introduction", app: app)
         let input = element(app, "setup-chat-input")
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
         input.tap()
         input.typeText("Where do I get a pairing code?")
         tap(app, "setup-chat-send")

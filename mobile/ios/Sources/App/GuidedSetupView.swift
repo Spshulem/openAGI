@@ -126,7 +126,6 @@ struct WelcomeView: View {
                     ToolbarItem(placement: .cancellationAction) { Button("Return to app") { session.goBack() } }
                 }
             }
-            .accessibilityIdentifier("setup-guided-chat")
         }
     }
 
