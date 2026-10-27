@@ -222,7 +222,15 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(details.buttons["no"].isHittable)
         XCTAssertFalse(app.buttons["open thread"].exists)
         capture("native-thread-decision", app: app)
-        app.buttons["Done"].tap()
+        // Duo scrolls the sheet's native navigation controls with the list.
+        // Return to its toolbar after reading the activity and responses.
+        let done = app.buttons["Done"]
+        for _ in 0..<6 {
+            if done.exists && done.isHittable { break }
+            details.swipeDown()
+        }
+        XCTAssertTrue(done.exists && done.isHittable)
+        done.tap()
         XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 5))
     }
 
