@@ -108,6 +108,7 @@ jobs:
           xcrun simctl boot "$simulator_id"
           xcrun simctl bootstatus "$simulator_id" -b
           xcrun simctl status_bar "$simulator_id" override --time '9:41' --dataNetwork wifi --wifiMode active --wifiBars 3 --batteryState charged --batteryLevel 100
+          python3 scripts/seed-test-photo.py "$simulator_id"
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \
@@ -141,6 +142,7 @@ jobs:
           xcrun simctl boot "$simulator_id"
           xcrun simctl bootstatus "$simulator_id" -b
           xcrun simctl status_bar "$simulator_id" override --time '9:41' --dataNetwork wifi --wifiMode active --wifiBars 3 --batteryState charged --batteryLevel 100
+          python3 scripts/seed-test-photo.py "$simulator_id"
           xcodebuild test \
             -project OpenAGI.xcodeproj \
             -scheme OpenAGI \

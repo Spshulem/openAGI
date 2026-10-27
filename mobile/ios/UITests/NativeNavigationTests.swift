@@ -368,6 +368,42 @@ final class NativeNavigationTests: XCTestCase {
         }
     }
 
+    func testSystemPhotoPickerSendsSelectedPixelsInChatAndSupervisor() {
+        let app = launch()
+        tab(app, "Chat")
+        for thread in ["agent", "supervisor"] {
+            if thread == "supervisor" {
+                tab(app, "Supervisor")
+                let composer = element(app, "chat-composer")
+                if !composer.exists || !composer.isHittable {
+                    let ask = app.buttons["Ask supervisor"].firstMatch
+                    XCTAssertTrue(ask.waitForExistence(timeout: 10))
+                    ask.tap()
+                }
+            }
+            tap(app, "chat-attach")
+            app.buttons["Photo Library"].tap()
+            // CI seeds exactly one generated red/blue photo. Select it through
+            // the actual system picker, without the app's injection shortcut.
+            let photo = app.collectionViews.cells.firstMatch
+            XCTAssertTrue(photo.waitForExistence(timeout: 15), "The system photo grid must load")
+            capture("native-system-photo-picker-\(thread)", app: app)
+            photo.tap()
+            let add = app.buttons["Add"].firstMatch
+            if add.waitForExistence(timeout: 1) && add.isHittable { add.tap() }
+            XCTAssertTrue(element(app, "chat-draft-image").waitForExistence(timeout: 15))
+            capture("native-selected-photo-\(thread)", app: app)
+            tap(app, "chat-send")
+            // The transport fixture only acknowledges images with real JPEG
+            // bytes. Provider-level tests independently verify image perception.
+            XCTAssertTrue(app.staticTexts["Synthetic image received in \(thread)"].waitForExistence(timeout: 10))
+            XCTAssertFalse(element(app, "chat-draft-image").exists)
+            XCTAssertTrue(element(app, "chat-message-image").exists)
+            XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+            capture("native-system-photo-sent-\(thread)", app: app)
+        }
+    }
+
     func testChatModelSheetDismissesBackToTheSameConversation() {
         let app = launch()
         tab(app, "Chat")
