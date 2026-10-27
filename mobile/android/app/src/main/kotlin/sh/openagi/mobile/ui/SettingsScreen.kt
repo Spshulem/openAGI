@@ -209,9 +209,15 @@ fun SettingsScreen(
                     onClick = {
                         isWorking = true
                         scope.launch {
-                            forgetPairing(context, credentials)
-                            isWorking = false
-                            onRevoked()
+                            try {
+                                forgetPairing(context, credentials)
+                                onRevoked()
+                            } catch (error: Exception) {
+                                if (error is kotlinx.coroutines.CancellationException) throw error
+                                connectionIssue = "Couldn't forget this pairing securely. Please try again."
+                            } finally {
+                                isWorking = false
+                            }
                         }
                     },
                 )

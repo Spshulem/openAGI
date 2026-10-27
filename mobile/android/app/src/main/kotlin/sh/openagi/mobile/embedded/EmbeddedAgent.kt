@@ -45,6 +45,17 @@ object EmbeddedAgent {
         Credentials(server, node, token)
     }
 
+    suspend fun forgetServerBackup(context: Context, credentials: Credentials): Unit = withContext(Dispatchers.IO) {
+        if (credentials.isEmbedded) return@withContext
+        mutex.withLock {
+            if (serverBackup(context)?.workspaceId == credentials.workspaceId) {
+                check(prefs(context).edit().remove("server").remove("serverNode").remove("serverToken").commit()) {
+                    "Couldn't remove the saved server pairing securely. Please try again."
+                }
+            }
+        }
+    }
+
     suspend fun start(context: Context, previous: Credentials? = null, activate: Boolean = true): Credentials = withContext(Dispatchers.IO) {
         mutex.withLock {
             check(exitCode == null) { "The phone agent stopped. Close and reopen OpenAGI to restart it." }

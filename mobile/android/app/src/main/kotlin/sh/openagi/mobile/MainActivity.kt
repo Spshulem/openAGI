@@ -336,8 +336,15 @@ class MainActivity : ComponentActivity() {
                             incomingServer = pendingPairing.serverUrl,
                             onSwitch = {
                                 switchScope.launch {
-                                    forgetPairing(this@MainActivity, credentials)
-                                    credentialsState.value = null
+                                    try {
+                                        forgetPairing(this@MainActivity, credentials)
+                                        credentialsState.value = null
+                                    } catch (error: Exception) {
+                                        if (error is kotlinx.coroutines.CancellationException) throw error
+                                        android.widget.Toast.makeText(this@MainActivity,
+                                            "Couldn't forget the previous pairing securely. Please try again.",
+                                            android.widget.Toast.LENGTH_LONG).show()
+                                    }
                                 }
                             },
                             onCancel = { pendingPairingState.value = null },

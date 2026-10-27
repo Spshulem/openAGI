@@ -1,6 +1,7 @@
 package sh.openagi.mobile.sync
 
 import android.content.Context
+import sh.openagi.mobile.embedded.EmbeddedAgent
 import sh.openagi.mobile.store.ChatHistoryStore
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.store.NotifiedQuestionsStore
@@ -21,10 +22,13 @@ suspend fun forgetPairing(context: Context, credentials: Credentials) {
     } catch (error: Exception) {
         // Ignored: the local forget below still proceeds.
     }
+    // A mode switch may have preserved this pairing separately. Revoking must
+    // erase that copy too, including when the server could not be reached.
+    EmbeddedAgent.forgetServerBackup(context, credentials)
     // Under the alert lock: a check that fetched the old daemon's questions
     // must not post them after this clears the shade.
     withAlertLock {
-        Credentials.clear(context)
+        check(Credentials.clear(context)) { "Couldn't remove the active pairing securely. Please try again." }
         RefreshWorker.cancel(context)
         // Stop watching first; the service would otherwise go on posting the old
         // daemon's questions, which the forgotten credential can no longer answer.
