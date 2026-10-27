@@ -67,6 +67,7 @@ final class NativeNavigationTests: XCTestCase {
         let tab = app.tabBars.buttons[title]
         let target = tab.exists ? tab : app.buttons[title].firstMatch
         XCTAssertTrue(target.waitForExistence(timeout: 10), "Missing \(title) tab")
+        XCTAssertTrue(target.isHittable, "Not hittable: \(title) tab")
         target.tap()
     }
 
@@ -279,7 +280,23 @@ final class NativeNavigationTests: XCTestCase {
             XCTAssertLessThanOrEqual(send.frame.maxY, app.keyboards.firstMatch.frame.minY)
         }
         capture("native-chat-keyboard", app: app)
-        app.scrollViews.firstMatch.swipeDown()
+        // Duo hides system navigation while the keyboard is open. Swipe
+        // inside the visible history, rather than the first workspace scroll
+        // view: its bounds can extend under the keyboard and tap a suggestion.
+        let history = element(app, "chat-history")
+        let visible = history.frame.intersection(app.frame)
+        let keyboard = app.keyboards.firstMatch
+        if keyboard.exists {
+            let bottom = min(visible.maxY, keyboard.frame.minY)
+            let top = visible.minY
+            XCTAssertGreaterThan(bottom - top, 40)
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            let start = origin.withOffset(CGVector(dx: visible.midX, dy: top + (bottom - top) * 0.2))
+            let end = origin.withOffset(CGVector(dx: visible.midX, dy: app.frame.maxY - 24))
+            start.press(forDuration: 0.1, thenDragTo: end)
+            let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: keyboard)
+            XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
+        }
         tab(app, "Tasks")
         tab(app, "Chat")
         XCTAssertEqual(element(app, "chat-composer").value as? String, "A synthetic message")

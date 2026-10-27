@@ -156,14 +156,19 @@ jobs:
       - name: Verify simulator runtime was bundled
         run: test -f "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app/Frameworks/NodeMobile.framework/NodeMobile"
       - name: Package simulator app
+        if: ${{ !cancelled() }}
         run: |
+          # Preserve the compiled app for manual acceptance even if a UI test fails.
+          if [ ! -d "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app" ]; then exit 0; fi
           ditto -c -k --keepParent \
             "$RUNNER_TEMP/openagi-ios-simulator/Build/Products/Debug-iphonesimulator/OpenAGI.app" \
             "$RUNNER_TEMP/OpenAGI-simulator.zip"
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: OpenAGI-simulator-${{ github.event.pull_request.head.sha || github.sha }}
           path: ${{ runner.temp }}/OpenAGI-simulator.zip
+          if-no-files-found: ignore
           retention-days: 7
       - uses: actions/upload-artifact@v4
         if: always()
