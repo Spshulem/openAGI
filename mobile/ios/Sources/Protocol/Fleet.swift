@@ -106,6 +106,33 @@ public struct FleetSnapshot: Decodable, Sendable, Equatable {
     }
 }
 
+public struct FleetThreadDetailResponse: Decodable, Sendable {
+    public var thread: FleetThreadDetail
+}
+
+public struct FleetThreadDetail: Decodable, Sendable {
+    public var key: String
+    public var conversation: FleetConversation?
+    public var lastAgentMessage: FleetLastAgentMessage?
+}
+
+public struct FleetLastAgentMessage: Decodable, Sendable {
+    public var text: String
+}
+
+public struct FleetConversation: Decodable, Sendable {
+    public var messages: [FleetConversationMessage]
+    public var truncated: Bool
+    public var unavailableReason: String?
+}
+
+public struct FleetConversationMessage: Decodable, Sendable, Identifiable {
+    public var id: String
+    public var role: String
+    public var text: String
+    public var at: Date?
+}
+
 public struct FleetThread: Decodable, Sendable, Equatable, Identifiable {
     public var key: String
     public var kind: String?

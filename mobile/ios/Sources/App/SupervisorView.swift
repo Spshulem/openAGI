@@ -127,14 +127,16 @@ struct SupervisorView: View {
             // Follow the thread through refreshes; if a scan drops it,
             // keep showing what was last known rather than yanking it away.
             let thread = state?.snapshot?.threads.first(where: { $0.key == opened.key }) ?? opened
-            ThreadDetailSheet(
-                thread: thread,
-                proposed: state?.mode == FleetMode.propose.rawValue
-                    ? SupervisorFormat.proposed(for: thread, in: state?.actions ?? []) : [],
-                busyActionID: busyActionID,
-                actionNote: actionNoteThread == thread.key ? actionNote : nil,
-                onSend: { action in Task { await send(action) } }
-            )
+            NavigationStack {
+                ThreadDetailSheet(
+                    thread: thread,
+                    proposed: state?.mode == FleetMode.propose.rawValue
+                        ? SupervisorFormat.proposed(for: thread, in: state?.actions ?? []) : [],
+                    busyActionID: busyActionID,
+                    actionNote: actionNoteThread == thread.key ? actionNote : nil,
+                    onSend: { action in Task { await send(action) } }
+                )
+            }
         }
         .alert("Turn on Auto?", isPresented: $confirmAuto) {
             Button("Turn on Auto") { Task { await setMode(.auto) } }
@@ -627,6 +629,7 @@ private struct ThreadDetailSheet: View {
     let onSend: (FleetAction) -> Void
 
     @Environment(\.openURL) private var openURL
+    @Environment(\.dismiss) private var dismiss
 
     private struct Detail: Identifiable {
         let id: String
@@ -693,6 +696,16 @@ private struct ThreadDetailSheet: View {
                     .padding(.top, Theme.Spacing.x1)
                 }
 
+                NavigationLink {
+                    FleetConversationView(thread: thread)
+                } label: {
+                    Label("Read conversation", systemImage: "text.bubble")
+                        .font(Theme.Typography.body)
+                        .foregroundStyle(Theme.live)
+                        .frame(maxWidth: .infinity, minHeight: Theme.rowMinHeight, alignment: .leading)
+                }
+                .accessibilityIdentifier("supervisor-read-conversation")
+
                 if !details.isEmpty {
                     RowGroup {
                         ForEach(Array(details.enumerated()), id: \.element.id) { index, detail in
@@ -742,6 +755,9 @@ private struct ThreadDetailSheet: View {
             .padding(Theme.gutter)
         }
         .background(Theme.canvas)
+        .navigationTitle("Thread")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
     }
