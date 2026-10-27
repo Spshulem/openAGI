@@ -507,7 +507,7 @@ struct ChatGPTSignInSection: View {
                 Button("Use ChatGPT") { Task { await use() } }
                 Button("Sign out", role: .destructive) { Task { await signOut() } }
             } else {
-                Button("Sign in with ChatGPT") { Task { await signIn() } }
+                Button("Continue with ChatGPT") { Task { await signIn() } }
                     .disabled(isWorking)
             }
             if let errorText {
@@ -526,7 +526,7 @@ struct ChatGPTSignInSection: View {
         errorText = nil
         do {
             let url = try await model.client.startChatGPTSignIn()
-            let callback = try await WebSignIn.run(url: url, callbackScheme: "openagi")
+            let callback = try await WebSignIn.run(url: url)
             if let code = URLComponents(url: callback, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "error" })?.value {
                 errorText = "Sign-in didn't finish (\(code))."

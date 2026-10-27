@@ -388,7 +388,7 @@ test("provider is not configured when signed out", () => {
   assert.equal(provider.isConfigured(), false);
 });
 
-test("returnTo openagi: callback redirects to the app on success and failure", async () => {
+test("callbacks return to the native app or desktop setup on success and failure", async () => {
   const dataDir = tmpDir();
   const nonceRef = { value: null };
   const { fetchImpl } = fakeOpenAI({ nonceRef });
@@ -417,6 +417,22 @@ test("returnTo openagi: callback redirects to the app on success and failure", a
   const denied = await route("GET", `/auth/chatgpt/callback?error=access_denied&state=${q.get("state")}`);
   assert.equal(denied.status, 302);
   assert.equal(denied.headers.location, "openagi://chatgpt-signed-in?error=chatgpt-access-denied");
+
+  const desktop = await route("POST", "/auth/chatgpt/start", { returnTo: "setup" });
+  const desktopParams = new URL(desktop.json.authorizeUrl).searchParams;
+  nonceRef.value = desktopParams.get("nonce");
+  const desktopCallback = await route("GET", `/auth/callback?code=c2&state=${desktopParams.get("state")}&client_id=${ISSUED}`);
+  assert.equal(desktopCallback.status, 200, "commit a local page before resuming setup with its Strict cookie");
+  assert.equal(desktopCallback.headers.location, undefined);
+  assert.equal(desktopCallback.headers["cache-control"], "no-store");
+  assert.equal(desktopCallback.headers["referrer-policy"], "no-referrer");
+  assert.match(desktopCallback.body, /window\.location\.replace\("\/setup\?provider=chatgpt"\)/);
+
+  const desktopAgain = await route("POST", "/auth/chatgpt/start", { returnTo: "setup" });
+  const deniedState = new URL(desktopAgain.json.authorizeUrl).searchParams.get("state");
+  const desktopDenied = await route("GET", `/auth/callback?error=access_denied&state=${deniedState}`);
+  assert.equal(desktopDenied.status, 200);
+  assert.match(desktopDenied.body, /\/setup\?provider=chatgpt&error=chatgpt-access-denied/);
 
   const plain = await route("GET", "/auth/chatgpt/callback?code=c&state=unknown");
   assert.equal(plain.status, 400);
