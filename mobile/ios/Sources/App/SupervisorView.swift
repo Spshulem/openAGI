@@ -781,6 +781,12 @@ private struct ThreadDetailSheet: View {
                     } else if let text = thread.lastAgentText, !text.isEmpty {
                         activityMessage("Saved scan excerpt", text: text, at: thread.lastActivityAt)
                     }
+                    NavigationLink {
+                        FleetConversationView(thread: thread)
+                    } label: {
+                        Label("Read conversation", systemImage: "text.bubble")
+                    }
+                    .accessibilityIdentifier("supervisor-read-conversation")
                 }
                 if let question {
                     Section("Your response") {

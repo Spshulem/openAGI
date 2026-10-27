@@ -7,6 +7,7 @@
 // effects; hosted-interface calls start() on listen and stop() on close.
 
 import path from "node:path";
+import { readThreadConversation, unavailableConversation } from "./conversation.js";
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
@@ -1600,6 +1601,14 @@ export class FleetSupervisor {
   // step and why, its open questions, and what opens its chat. Built from
   // the last scan's row (kept across a restart), with this process's own
   // read of the chat when it has one. null: not in the last scan.
+  async threadConversation(threadKey) {
+    const thread = this.lastThreads.get(threadKey)
+      ?? this.getState().snapshot?.threads?.find((row) => row.key === threadKey);
+    if (!thread) return null;
+    try { return await readThreadConversation(thread, this.config); }
+    catch { return unavailableConversation(thread); }
+  }
+
   threadDetail(threadKey) {
     const state = this.getState();
     const row = (state.snapshot?.threads ?? []).find((entry) => entry?.key === threadKey);

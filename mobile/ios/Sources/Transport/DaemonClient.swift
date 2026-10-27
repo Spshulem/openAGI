@@ -387,16 +387,13 @@ public actor DaemonClient {
     // action a 404 means that one item is gone and 409 that it was already
     // closed elsewhere -- `.notFound` / `.conflict`, as everywhere else.
     public func fleetThreadDetail(key: String) async throws -> FleetThreadDetail {
-        // Encode a path segment, not an arbitrary URL. Never let a thread key
-        // inject a query or select another route.
-        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-:")
-        guard !key.isEmpty, key.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+        // One identity segment, never an arbitrary caller-supplied path.
+        guard key.range(of: #"^(codex|claude|conductor|antigravity):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
             throw DaemonError.malformedResponse
         }
         let request = try authorizedRequest(path: "/fleet/api/threads/\(key)", method: "GET")
         let (data, _) = try await perform(request)
-        struct Response: Decodable { let thread: FleetThreadDetail }
-        let detail = try Self.decodeJSON(Response.self, from: data).thread
+        let detail = try Self.decodeJSON(FleetThreadDetailResponse.self, from: data).thread
         guard detail.key == key else { throw DaemonError.malformedResponse }
         return detail
     }

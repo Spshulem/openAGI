@@ -107,7 +107,11 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         case "/fleet/api/threads/codex:fixture":
             finish(object: ["thread": ["key": "codex:fixture", "scannedAt": Self.date,
                                        "lastOwnerMessage": ["text": "Explain the synthetic change before I decide.", "at": Self.date],
-                                       "lastAgentMessage": ["text": "The synthetic change is ready for your review. Nothing has been sent.", "at": Self.date]]])
+                                       "lastAgentMessage": ["text": "The synthetic change is ready for your review. Nothing has been sent.", "at": Self.date],
+                                       "conversation": ["messages": [
+                                        ["id": "context-owner", "role": "user", "text": "Show the earlier synthetic request.", "at": Self.date],
+                                        ["id": "context-agent", "role": "assistant", "text": "Here is the earlier synthetic explanation.", "at": Self.date]
+                                       ], "truncated": false]]])
         case let path where path.hasPrefix("/fleet/api/questions/"):
             // Opening context is a read, never a submission of 'open thread'.
             finish(status: 500, object: ["error": "Opening context must not submit an answer"])

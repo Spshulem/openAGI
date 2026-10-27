@@ -253,7 +253,9 @@ export function createFleetRoute({ supervisor } = {}) {
           if (method !== "GET") return fail(405, "Use GET.");
           if (typeof supervisor.threadDetail !== "function") return fail(503, "Thread details are not available.");
           const thread = await supervisor.threadDetail(threadKey);
-          return thread ? ok({ thread }) : fail(404, "No thread with that key in the last scan.");
+          if (!thread) return fail(404, "No thread with that key in the last scan.");
+          const conversation = await supervisor.threadConversation?.(threadKey);
+          return ok({ thread: conversation ? { ...thread, conversation } : thread });
         }
         if (!THREAD_ACTIONS.has(parts[2])) return fail(404, "Unknown fleet route.");
         if (method !== "POST") return fail(405, "Use POST.");

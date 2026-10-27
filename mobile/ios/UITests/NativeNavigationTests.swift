@@ -213,6 +213,13 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(details.staticTexts["Explain the synthetic change before I decide."].exists)
         XCTAssertFalse(app.staticTexts["Not sent. Couldn't reach the agent"].exists)
         capture("native-thread-context", app: app)
+        tap(app, "supervisor-read-conversation", in: "supervisor-thread-details")
+        XCTAssertTrue(app.navigationBars["Conversation"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Show the earlier synthetic request."].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Here is the earlier synthetic explanation."].exists)
+        capture("native-thread-conversation", app: app)
+        back(app, from: "Conversation", to: "Thread")
+        XCTAssertTrue(question.exists, "Reading conversation history must retain the decision")
         let yes = details.buttons["yes"]
         for _ in 0..<6 {
             if yes.exists && yes.isHittable { break }
