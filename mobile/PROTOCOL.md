@@ -280,6 +280,25 @@ Supervisor chat is the ordinary `POST /message` with `"thread": "supervisor"`
 (§3.1). The agent has two read-only tools for it, `fleet_status` and
 `fleet_thread`.
 
+### Image attachments
+
+`POST /message` also accepts `attachments` in both `agent` and `supervisor`
+threads. Each item is `{id, name, mimeType, data, thumbnail?}`: `data` is base64
+JPEG, PNG or WebP, and `thumbnail` is an optional base64 JPEG preview. No URLs
+or filesystem paths are accepted. Up to four images, 1 MiB each and 3 MiB total,
+fit within the 5 MiB JSON request limit. An empty text plus images is a valid turn.
+
+The iOS Photos and Files pickers downsample images off the main thread, normalize
+orientation, remove source metadata, and show removable previews before sending.
+OpenAI/ChatGPT, Claude and compatible local vision models receive native image
+content blocks. Language-only on-device models explicitly report that a vision
+model is required. Old servers reject images with update guidance; the phone
+never retries an image turn as text alone.
+
+Full image data is retained in the agent session for subsequent model turns.
+Shared history returns only attachment identity/name and a bounded thumbnail;
+SSE does not echo the pixels. The phone caches only these small previews.
+
 ### 3.1 Chat threads
 
 Without `thread`, a phone message is node-scoped: the daemon ignores

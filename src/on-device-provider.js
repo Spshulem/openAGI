@@ -1,3 +1,4 @@
+import { unsupportedImageInput } from "./message-attachments.js";
 import { deviceModelHub } from "./device-model-relay.js";
 import { MOBILE_MODEL_TOOLS } from "./mobile-profile.js";
 
@@ -40,7 +41,7 @@ export class OnDeviceModelProvider {
     return this.hub.info?.model ?? "on-device";
   }
 
-  async generate({ input, turnContext, messages = [], memoryHits = [], agent, toolRegistry, context = {}, maxToolHops, onProgress, onTextDelta }) {
+  async generate({ input, attachments = [], turnContext, messages = [], memoryHits = [], agent, toolRegistry, context = {}, maxToolHops, onProgress, onTextDelta }) {
     const model = this.model;
     const hops = Math.max(1, Math.min(Number(maxToolHops) || this.maxToolHops, this.maxToolHops));
     const tools = (toolRegistry?.toAnthropicTools?.() ?? [])
@@ -48,6 +49,7 @@ export class OnDeviceModelProvider {
       .map((tool) => ({ name: tool.name, description: clip(tool.description, 300), parameters: tool.input_schema ?? { type: "object", properties: {} } }));
     const system = compactSystemPrompt(agent);
     const contextBlock = clip(turnContext ?? memoryBlock(memoryHits), TURN_CONTEXT_MAX_CHARS);
+    if (attachments.length) throw unsupportedImageInput();
     const latest = { role: "user", content: contextBlock ? `${contextBlock}\n\n${input}` : String(input ?? "") };
     const turn = [latest];
     const toolCalls = [];

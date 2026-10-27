@@ -25,14 +25,16 @@ public struct ConversationMessage: Codable, Sendable, Equatable, Identifiable {
     public let at: Date
     public let sourceNodeId: String?
     public let sourceName: String?
+    public let attachments: [ChatAttachment]?
 
-    public init(id: String, role: Role, text: String, at: Date, sourceNodeId: String? = nil, sourceName: String? = nil) {
+    public init(id: String, role: Role, text: String, at: Date, sourceNodeId: String? = nil, sourceName: String? = nil, attachments: [ChatAttachment]? = nil) {
         self.id = id
         self.role = role
         self.text = text
         self.at = at
         self.sourceNodeId = sourceNodeId
         self.sourceName = sourceName
+        self.attachments = attachments
     }
 }
 

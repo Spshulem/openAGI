@@ -30,6 +30,8 @@ final class ChatConversation {
     private(set) var isSending = false
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
+    var draftAttachments: [ChatAttachment] = []
+    private(set) var composerRevision = 0
     private(set) var historyStatus: HistoryStatus = .unknown
     private(set) var isRefreshingHistory = false
     private(set) var isLoadingOlder = false
@@ -61,17 +63,46 @@ final class ChatConversation {
 
     // MARK: - Sending
 
-    func send(_ rawText: String) async {
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending else { return }
-        isSending = true
-        defer { isSending = false }
+    var canSubmitDraft: Bool {
+        !isSending && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty)
+    }
 
-        messages.append(ChatMessage(role: .user, text: text))
+    // Reserve the turn and reset the native editor in the same main-actor
+    // transaction. Return-key and Send cannot race two unstructured tasks.
+    @discardableResult
+    func submitDraft() -> Bool {
+        guard canSubmitDraft else { return false }
+        let text = draft
+        let attachments = draftAttachments
+        guard let turn = beginSend(text, attachments: attachments) else { return false }
+        draft = ""
+        draftAttachments = []
+        composerRevision += 1
+        Task { await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID) }
+        return true
+    }
+
+    func send(_ rawText: String, attachments: [ChatAttachment] = []) async {
+        guard let turn = beginSend(rawText, attachments: attachments) else { return }
+        await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID)
+    }
+
+    private func beginSend(_ rawText: String, attachments: [ChatAttachment]) -> (text: String, replyID: UUID)? {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isSending, !forgotten, !trimmed.isEmpty || !attachments.isEmpty,
+              attachments.allSatisfy({ $0.data != nil }) else { return nil }
+        let text = trimmed.isEmpty ? "Please describe the attached images." : trimmed
+        isSending = true
+        messages.append(ChatMessage(role: .user, text: text, attachments: attachments))
         let reply = ChatMessage(role: .assistant, text: "", isStreaming: true)
         messages.append(reply)
         persist()
-        await streamReply(text: text, replyID: reply.id)
+        return (text, reply.id)
+    }
+
+    private func finishSend(text: String, attachments: [ChatAttachment], replyID: UUID) async {
+        defer { isSending = false }
+        await streamReply(text: text, attachments: attachments, replyID: replyID)
     }
 
     // Re-sends the user message that preceded a failed reply, replacing just
@@ -84,14 +115,14 @@ final class ChatConversation {
         let fresh = ChatMessage(role: .assistant, text: "", isStreaming: true)
         messages[target.index] = fresh
         persist()
-        await streamReply(text: target.userText, replyID: fresh.id)
+        await streamReply(text: target.userText, attachments: target.attachments, replyID: fresh.id)
     }
 
-    private func streamReply(text: String, replyID: UUID) async {
+    private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID) async {
         var sawTerminalFrame = false
         do {
             let stream = try await client.sendMessageStreaming(
-                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey
+                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey, attachments: attachments
             )
             for try await event in stream {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
@@ -126,7 +157,7 @@ final class ChatConversation {
             }
         } catch let error as DaemonError {
             if !sawTerminalFrame {
-                fail(replyID, text: error == .agentHostDisabled || error == .unauthorized
+                fail(replyID, text: error == .agentHostDisabled || error == .unauthorized || error == .imagesUnsupported
                      ? ChatErrorCopy.message(for: error)
                      : "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.",
                      retrySafe: error == .agentHostDisabled)
@@ -233,6 +264,8 @@ final class ChatConversation {
     // reply still streaming must not write it back afterwards.
     func forget() {
         draft = ""
+        draftAttachments = []
+        composerRevision += 1
         forgotten = true
         messages = []
         nextBefore = nil

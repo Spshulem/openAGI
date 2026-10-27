@@ -2,6 +2,7 @@ import { renderPhonePairingPage } from "./phone-pairing-page.js";
 import { renderLoginPage } from "./dashboard-login.js";
 import { navigation, shellStyles } from "./app-shell.js";
 import http from "node:http";
+import { normalizeMessageImages, MAX_IMAGE_MESSAGE_BODY } from "./message-attachments.js";
 import fsSync from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
@@ -2080,9 +2081,18 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
       if (method === "POST" && pathname === "/message") {
         if (!channels) return sendJson(res, 503, { error: "agent-host-disabled" });
-        let body = await readJsonLimited(req, requestNodeId ? 128 * 1024 : 2 * 1024 * 1024);
+        let body = await readJsonLimited(req, MAX_IMAGE_MESSAGE_BODY);
+        try {
+          if (body && typeof body === "object" && !Array.isArray(body)) {
+            const images = normalizeMessageImages(body.attachments);
+            if (images.length) {
+              body.attachments = images;
+              if (typeof body.text === "string" && !body.text.trim()) body.text = "Please describe the attached images.";
+            }
+          }
+        } catch (error) { return sendJson(res, 400, { error: "invalid_images", message: error.message }); }
         if (requestNodeId) {
-          const allowed = new Set(["text", "from", "sessionId", "thread"]);
+          const allowed = new Set(["text", "from", "sessionId", "thread", "attachments"]);
           if (!body || typeof body !== "object" || Array.isArray(body)
               || Object.keys(body).some((key) => !allowed.has(key))) {
             return sendJson(res, 400, { error: "node message contains unsupported fields" });
@@ -4029,6 +4039,7 @@ function bindSharedThreadMessage(body, requestNodeId, sourceName) {
   const conversationNamespace = createHash("sha256").update(`thread:${body.thread}`, "utf8").digest("base64url");
   return {
     text: body.text,
+    ...(body.attachments?.length ? { attachments: body.attachments } : {}),
     channel: "node",
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
@@ -4043,6 +4054,7 @@ function bindScopedNodeMessage(body, requestNodeId) {
   const conversationNamespace = createHash("sha256").update(conversation, "utf8").digest("base64url");
   return {
     text: body.text,
+    ...(body.attachments?.length ? { attachments: body.attachments } : {}),
     channel: "node",
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",

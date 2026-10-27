@@ -1,3 +1,4 @@
+import { normalizeMessageImages } from "./message-attachments.js";
 import { InMemoryAgentStore } from "./agent-store.js";
 import { createModelProvider } from "./model-provider.js";
 import { createId, nowIso } from "./utils.js";
@@ -54,13 +55,15 @@ export class AgentHost {
     const isolatedContext = options.isolatedContext === true;
     const from = input.from ?? "user";
     let agentId = input.agentId ?? "main";
-    const text = String(input.text ?? input.message ?? "").trim();
+    const attachments = normalizeMessageImages(input.attachments);
+    const text = String(input.text ?? input.message ?? "").trim() || (attachments.length ? "Please describe the attached images." : "");
     if (!text) throw new Error("Message text is required.");
     // A brief selection is a reference, not client-authored prompt text. Resolve
     // it against the live store before it reaches the model, and persist only
     // the normalized form so the dashboard handoff keeps the same context.
     const briefContext = isolatedContext ? null : resolveBriefContext(this.runtime, input.metadata?.briefContext);
     const metadata = { ...(input.metadata ?? {}) };
+    delete metadata.attachments;
     if (isolatedContext) delete metadata.screenContext;
     // A request id is transport correlation data, not arbitrary conversation
     // metadata. Bound and normalize it once so the user and terminal assistant
@@ -124,7 +127,7 @@ export class AgentHost {
           agentId,
           channel,
           from,
-          metadata
+          metadata: { ...metadata, ...(attachments.length ? { attachments } : {}) }
         });
 
     // This is the first durable milestone. Streaming clients receive the real
@@ -278,6 +281,7 @@ export class AgentHost {
     const computerUseToolHops = computerUseHopsNow();
     const modelResult = await this.modelProvider.generate({
       input: text,
+      attachments,
       agent,
       // Delivery channel is not provenance: scheduled work can deliver to
       // local/iMessage/G2 without becoming foreground chat on the main model.

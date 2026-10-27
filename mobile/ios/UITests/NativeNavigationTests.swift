@@ -283,7 +283,79 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertEqual(element(app, "chat-composer").value as? String, "A synthetic message")
         send.tap()
         XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+        XCTAssertNotEqual(element(app, "chat-composer").value as? String, "A synthetic message")
+        XCTAssertFalse(app.buttons["chat-send"].isEnabled, "Sending clears and resets the native editor")
         capture("native-chat", app: app)
+    }
+
+    func testModelLoadFailureExplainsMainUpdateAndRetryRestoresThePicker() {
+        let app = launch(["--ui-model-first-fails"])
+        tap(app, "open-settings")
+        tap(app, "settings-model", in: "settings-form")
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Update the main server")).firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["model-direct-chat"].exists, "Phone model choices remain available")
+        tap(app, "model-retry")
+        XCTAssertTrue(element(app, "model-provider").waitForExistence(timeout: 10))
+        capture("native-model-retry", app: app)
+    }
+
+    func testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend() {
+        let app = launch(["--ui-scroll-chat"])
+        tab(app, "Chat")
+        let latest = app.staticTexts["Latest synthetic message"]
+        XCTAssertTrue(latest.waitForExistence(timeout: 10))
+        let atBottom = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: latest)
+        XCTAssertEqual(XCTWaiter.wait(for: [atBottom], timeout: 10), .completed)
+        XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
+        let history = element(app, "chat-history")
+        history.swipeDown()
+        history.swipeDown()
+        XCTAssertTrue(app.buttons["chat-jump-latest"].waitForExistence(timeout: 5))
+        tap(app, "chat-jump-latest")
+        let jumpGone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.buttons["chat-jump-latest"])
+        XCTAssertEqual(XCTWaiter.wait(for: [jumpGone], timeout: 10), .completed)
+        tap(app, "chat-composer")
+        element(app, "chat-composer").typeText("Read the newest message")
+        tap(app, "chat-send")
+        let reply = app.staticTexts["Synthetic reply"]
+        XCTAssertTrue(reply.waitForExistence(timeout: 10))
+        let replyVisible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)
+        XCTAssertEqual(XCTWaiter.wait(for: [replyVisible], timeout: 10), .completed)
+        XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
+        XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+        capture("native-chat-follow-latest", app: app)
+    }
+
+    func testImagesCanBeRemovedAndSentWithTheirPixelsInChatAndSupervisor() {
+        let app = launch(["--ui-attachment-fixture"])
+        tab(app, "Chat")
+        for thread in ["agent", "supervisor"] {
+            if thread == "supervisor" {
+                tab(app, "Supervisor")
+                let composer = element(app, "chat-composer")
+                if !composer.exists || !composer.isHittable {
+                    let ask = app.buttons["Ask supervisor"].firstMatch
+                    XCTAssertTrue(ask.waitForExistence(timeout: 10))
+                    ask.tap()
+                }
+            }
+            tap(app, "chat-attach")
+            XCTAssertTrue(app.buttons["Photo Library"].exists)
+            XCTAssertTrue(app.buttons["Choose Image File"].exists)
+            app.buttons["Attach synthetic image"].tap()
+            XCTAssertTrue(element(app, "chat-draft-image").waitForExistence(timeout: 10))
+            tap(app, "chat-remove-image")
+            XCTAssertFalse(element(app, "chat-draft-image").exists)
+            tap(app, "chat-attach")
+            app.buttons["Attach synthetic image"].tap()
+            XCTAssertTrue(element(app, "chat-draft-image").waitForExistence(timeout: 10))
+            tap(app, "chat-send")
+            XCTAssertTrue(app.staticTexts["Synthetic image received in \(thread)"].waitForExistence(timeout: 10))
+            XCTAssertFalse(element(app, "chat-draft-image").exists)
+            XCTAssertTrue(element(app, "chat-message-image").exists)
+            XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+            capture("native-image-\(thread)", app: app)
+        }
     }
 
     func testChatModelSheetDismissesBackToTheSameConversation() {

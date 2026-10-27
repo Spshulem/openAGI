@@ -244,7 +244,7 @@ struct PairingView: View {
             return ("Can't reach OpenAGI.", PairingConnectionFailure.detail(for: cause, server: server))
         case .mainConnection(let issue):
             return ("Main connection needs attention", issue.message)
-        case .notFound, .server, .malformedResponse, .agentHostDisabled:
+        case .notFound, .server, .malformedResponse, .agentHostDisabled, .imagesUnsupported:
             return ("Pairing failed.", "Try again.")
         }
     }

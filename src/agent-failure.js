@@ -1,4 +1,5 @@
 const PUBLIC_FAILURES = Object.freeze({
+  "image-input-unsupported": "This model cannot view images. Choose a vision-capable model in Model settings, then send the images again.",
   budget: "Daily budget exceeded",
   "provider-auth": "The model provider needs attention. Check its API key in Settings.",
   "provider-config": "This key belongs to OpenRouter. Set a Responses-compatible base URL and its model in setup, or use an OpenAI API key.",
@@ -29,6 +30,7 @@ const loggedFailures = new WeakSet();
 // public taxonomy before they reach chat history, HTTP responses, or browser
 // events; the detailed diagnostic belongs only in the daemon's local log.
 export function classifyAgentFailure(error) {
+  if (error?.code === "IMAGE_INPUT_UNSUPPORTED") return { code: "image-input-unsupported", message: PUBLIC_FAILURES["image-input-unsupported"] };
   const code = safeErrorField(error, "code");
   const name = safeErrorField(error, "name");
   const message = safeErrorMessage(error);

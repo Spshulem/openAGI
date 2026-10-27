@@ -1,3 +1,4 @@
+import { imageHistoryPreview } from "./message-attachments.js";
 import { createHash } from "node:crypto";
 import { lifelogState, moments } from "./conversation-lifelog.js";
 
@@ -61,7 +62,8 @@ function projectMessage(m) {
   return {
     id: m.id, role: m.role, text: m.content.slice(0, 16000), at: m.createdAt,
     sourceNodeId: user && typeof m.metadata?.sourceNodeId === "string" ? m.metadata.sourceNodeId : null,
-    sourceName: user && typeof m.metadata?.sourceName === "string" ? m.metadata.sourceName : null
+    sourceName: user && typeof m.metadata?.sourceName === "string" ? m.metadata.sourceName : null,
+    ...(user && m.metadata?.attachments?.length ? { attachments: imageHistoryPreview(m.metadata.attachments) } : {})
   };
 }
 

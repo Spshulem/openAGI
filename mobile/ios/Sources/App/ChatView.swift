@@ -1,4 +1,6 @@
 import SwiftUI
+import PhotosUI
+import UniformTypeIdentifiers
 
 // Native SwiftUI navigation, text entry and controls. Conversation state stays
 // on AppModel so streaming replies and drafts survive tab and fold changes.
@@ -144,6 +146,13 @@ struct ChatConversationView: View {
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
 
     @State private var isPinnedToBottom = true
+    @State private var userIsScrolling = false
+    @State private var showingPhotos = false
+    @State private var showingFiles = false
+    @State private var selectedPhotos: [PhotosPickerItem] = []
+    @State private var isPreparingImages = false
+    @State private var attachmentError: String?
+    @State private var selectedAttachment: ChatAttachment?
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
 
@@ -161,6 +170,22 @@ struct ChatConversationView: View {
             }
         }
         .background(Color(uiColor: .systemBackground))
+        .photosPicker(isPresented: $showingPhotos, selection: $selectedPhotos,
+                      maxSelectionCount: max(1, ChatAttachment.maximumCount - conversation.draftAttachments.count), matching: .images)
+        .onChange(of: selectedPhotos) { _, photos in
+            guard !photos.isEmpty else { return }
+            Task { await importPhotos(photos) }
+        }
+        .fileImporter(isPresented: $showingFiles, allowedContentTypes: [.image], allowsMultipleSelection: true) { result in
+            Task { await importFiles(result) }
+        }
+        .sheet(item: $selectedAttachment) { attachment in
+            NavigationStack {
+                ChatAttachmentImage(attachment: attachment, fullSize: true).padding()
+                    .navigationTitle(attachment.name).navigationBarTitleDisplayMode(.inline)
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { selectedAttachment = nil } } }
+            }
+        }
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
@@ -234,11 +259,23 @@ struct ChatConversationView: View {
                         }
                     }
                     .padding(Theme.gutter)
+                    Color.clear.frame(height: 1).id("chat-bottom")
                 }
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - 60
-                } action: { _, atBottom in
-                    isPinnedToBottom = atBottom
+                .accessibilityIdentifier("chat-history")
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(.bottom, for: .alignment)
+                .onScrollPhaseChange { _, phase in
+                    userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
+                }
+                .onScrollGeometryChange(for: ChatScrollGeometry.self) { geometry in
+                    ChatScrollGeometry(contentHeight: geometry.contentSize.height,
+                                       viewportHeight: geometry.containerSize.height,
+                                       offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
+                } action: { _, geometry in
+                    // Loading history, streaming and keyboard resizing must
+                    // not turn a programmatic scroll into 'reading older'.
+                    if userIsScrolling { isPinnedToBottom = geometry.isAtBottom }
+                    else if isPinnedToBottom && !geometry.isAtBottom { scrollToLatest(proxy) }
                 }
                 .onChange(of: messages) { old, new in
                     if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
@@ -283,8 +320,7 @@ struct ChatConversationView: View {
     }
 
     private func scrollToLatest(_ proxy: ScrollViewProxy) {
-        guard let last = messages.last?.id else { return }
-        withAnimation(nil) { proxy.scrollTo(last, anchor: .bottom) }
+        withAnimation(nil) { proxy.scrollTo("chat-bottom", anchor: .bottom) }
     }
 
     private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
@@ -298,6 +334,7 @@ struct ChatConversationView: View {
         }
         .buttonBorderShape(.circle)
         .accessibilityLabel("Jump to latest")
+        .accessibilityIdentifier("chat-jump-latest")
         .padding(.bottom, Theme.Spacing.x3)
         return Group {
             if #available(iOS 26.0, *) { button.buttonStyle(.glass) }
@@ -323,6 +360,20 @@ struct ChatConversationView: View {
                 Text(source)
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.muted)
+            }
+            if !item.message.attachments.isEmpty {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 100))], spacing: 8) {
+                    ForEach(item.message.attachments) { attachment in
+                        Button { selectedAttachment = attachment } label: {
+                            ChatAttachmentImage(attachment: attachment)
+                                .frame(height: 120).frame(maxWidth: .infinity)
+                                .clipShape(.rect(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("chat-message-image")
+                    }
+                }
+                .frame(width: min(width * 0.78, 320))
             }
             MessageBubbleRow(message: item.message, maxContainerWidth: width)
             // Offer a resend only when the daemon rejected the turn before
@@ -363,9 +414,23 @@ struct ChatConversationView: View {
 
     @ViewBuilder
     private var inputBar: some View {
+        VStack(spacing: 8) {
+            if !conversation.draftAttachments.isEmpty { attachmentStrip }
+            if isPreparingImages { ProgressView("Preparing images…").font(.caption) }
+            if let attachmentError {
+                Text(attachmentError).font(.footnote).foregroundStyle(.red)
+                    .accessibilityIdentifier("chat-attachment-error")
+            }
+            composerBar
+        }
+    }
+
+    @ViewBuilder
+    private var composerBar: some View {
         if #available(iOS 26, *) {
             GlassEffectContainer(spacing: 12) {
                 HStack(alignment: .bottom, spacing: 12) {
+                    attachmentMenu.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.large)
                     composerField
                         .padding(.horizontal, 16).padding(.vertical, 12)
                         .glassEffect(.regular, in: .capsule)
@@ -378,6 +443,7 @@ struct ChatConversationView: View {
             .padding(.horizontal, 16).padding(.vertical, 8)
         } else {
             HStack(alignment: .bottom, spacing: 12) {
+                attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle)
                 composerField.textFieldStyle(.roundedBorder)
                 sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle)
             }
@@ -385,9 +451,97 @@ struct ChatConversationView: View {
         }
     }
 
+    private var attachmentMenu: some View {
+        Menu {
+            Button("Photo Library", systemImage: "photo.on.rectangle") { showingPhotos = true }
+            Button("Choose Image File", systemImage: "folder") { showingFiles = true }
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("--ui-attachment-fixture") {
+                Button("Attach synthetic image") {
+                    Task { await importSyntheticImage() }
+                }
+            }
+            #endif
+        } label: { Image(systemName: "plus").frame(width: 24, height: 24) }
+        .accessibilityLabel("Add images")
+        .accessibilityIdentifier("chat-attach")
+        .disabled(isPreparingImages || conversation.draftAttachments.count >= ChatAttachment.maximumCount)
+    }
+
+    private var attachmentStrip: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 12) {
+                ForEach(conversation.draftAttachments) { attachment in
+                    ZStack(alignment: .topTrailing) {
+                        ChatAttachmentImage(attachment: attachment)
+                            .frame(width: 80, height: 80).clipShape(.rect(cornerRadius: 12))
+                            .accessibilityIdentifier("chat-draft-image")
+                        Button("Remove image", systemImage: "xmark.circle.fill") {
+                            conversation.draftAttachments.removeAll { $0.id == attachment.id }
+                        }
+                        .labelStyle(.iconOnly).buttonStyle(.bordered).buttonBorderShape(.circle)
+                        .accessibilityIdentifier("chat-remove-image")
+                    }
+                }
+            }.padding(.horizontal)
+        }.fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func appendImages(_ images: [ChatAttachment]) {
+        guard conversation.draftAttachments.count + images.count <= ChatAttachment.maximumCount else {
+            attachmentError = "Attach up to four images per message."
+            return
+        }
+        conversation.draftAttachments.append(contentsOf: images)
+    }
+
+    private func importPhotos(_ photos: [PhotosPickerItem]) async {
+        guard !isPreparingImages else { return }
+        isPreparingImages = true
+        attachmentError = nil
+        defer { isPreparingImages = false; selectedPhotos = [] }
+        do {
+            var prepared: [ChatAttachment] = []
+            for photo in photos {
+                guard let data = try await photo.loadTransferable(type: Data.self) else { throw ChatAttachmentPreparation.Failure.unreadable }
+                prepared.append(try await ChatAttachmentPreparation.prepare(data, name: "Photo.jpg"))
+            }
+            appendImages(prepared)
+        } catch { attachmentError = error.localizedDescription }
+    }
+
+    private func importFiles(_ result: Result<[URL], Error>) async {
+        guard !isPreparingImages else { return }
+        isPreparingImages = true
+        attachmentError = nil
+        defer { isPreparingImages = false }
+        do {
+            let urls = try result.get()
+            guard urls.count + conversation.draftAttachments.count <= ChatAttachment.maximumCount else {
+                attachmentError = "Attach up to four images per message."
+                return
+            }
+            var prepared: [ChatAttachment] = []
+            for url in urls { prepared.append(try await ChatAttachmentPreparation.file(url)) }
+            appendImages(prepared)
+        } catch { attachmentError = error.localizedDescription }
+    }
+
+    #if DEBUG
+    private func importSyntheticImage() async {
+        isPreparingImages = true
+        defer { isPreparingImages = false }
+        do {
+            let data = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGPQKHgAAAI8AXnXjkfVAAAAAElFTkSuQmCC")!
+            appendImages([try await ChatAttachmentPreparation.prepare(data, name: "Synthetic image.png")])
+        } catch { attachmentError = error.localizedDescription }
+    }
+    #endif
+
     private var composerField: some View {
         @Bindable var conversation = conversation
         return TextField(placeholder, text: $conversation.draft, axis: .vertical)
+            .id(conversation.composerRevision)
             .focused($composerFocused)
             .font(.body)
             .lineLimit(1...5)
@@ -406,14 +560,11 @@ struct ChatConversationView: View {
 
     private func sendDraft() {
         guard canSend else { return }
-        let text = conversation.draft
-        conversation.draft = ""
-        isPinnedToBottom = true
-        Task { await conversation.send(text) }
+        if conversation.submitDraft() { isPinnedToBottom = true }
     }
 
     private var canSend: Bool {
-        !conversation.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !conversation.isSending
+        conversation.canSubmitDraft && !isPreparingImages
     }
 }
 
@@ -434,12 +585,14 @@ enum ChatSourceLabel {
 // same node session: duplicated user turns, repeated tool side effects, and
 // two streams writing one bubble. Now they share `send()`'s single-flight gate.
 enum ChatRetry {
-    static func target(failedID: UUID, in messages: [ChatMessage], isSending: Bool) -> (index: Int, userText: String)? {
+    static func target(failedID: UUID, in messages: [ChatMessage], isSending: Bool) -> (index: Int, userText: String, attachments: [ChatAttachment])? {
         guard !isSending,
               let index = messages.firstIndex(where: { $0.id == failedID }),
-              messages[index].isFailed && messages[index].retrySafe,              let userText = messages[..<index].last(where: { $0.role == .user })?.text
+              messages[index].isFailed && messages[index].retrySafe,
+              let user = messages[..<index].last(where: { $0.role == .user }),
+              user.attachments.allSatisfy({ $0.data != nil })
         else { return nil }
-        return (index, userText)
+        return (index, user.text, user.attachments)
     }
 }
 
@@ -451,6 +604,8 @@ enum ChatRetry {
 enum ChatErrorCopy {
     static func message(for error: DaemonError) -> String {
         switch error {
+        case .imagesUnsupported:
+            return "Update OpenAGI on your main server to send images. The images were not sent without their content."
         case .agentHostDisabled:
             return "OpenAGI can't reply -- no agent host is configured on this daemon. Open its dashboard and finish setup, then try again."
         case .unauthorized:
@@ -566,4 +721,14 @@ private struct IntrinsicBubbleLayout: Layout {
         subviews.first?.place(at: bounds.origin, anchor: .topLeading,
                              proposal: .init(width: bounds.width, height: bounds.height))
     }
+}
+
+
+struct ChatScrollGeometry: Equatable {
+    let contentHeight: CGFloat
+    let viewportHeight: CGFloat
+    let offset: CGFloat
+    let bottomInset: CGFloat
+
+    var isAtBottom: Bool { offset + viewportHeight >= contentHeight + bottomInset - 60 }
 }

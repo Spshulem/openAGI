@@ -31,6 +31,7 @@ public enum DaemonError: Error {
     // and it is not "the server broke" -- it is a legible, expected state
     // chat's UI must say plainly rather than showing a generic server error.
     case agentHostDisabled
+    case imagesUnsupported
     case mainConnection(MainConnectionIssue)
 }
 
@@ -49,7 +50,7 @@ extension DaemonError: Equatable {
         case let (.server(a), .server(b)): return a == b
         case (.malformedResponse, .malformedResponse): return true
         case (.transport, .transport): return true
-        case (.agentHostDisabled, .agentHostDisabled): return true
+        case (.agentHostDisabled, .agentHostDisabled), (.imagesUnsupported, .imagesUnsupported): return true
         case let (.mainConnection(a), .mainConnection(b)): return a == b
         default: return false
         }
@@ -270,8 +271,11 @@ public actor DaemonClient {
     // main that still keeps it apart from Chat, and on a newer one the
     // thread wins.
     public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
-                                     from: String? = nil, sessionId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+                                     from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = []) async throws -> AsyncThrowingStream<ChatEvent, Error> {
         var body: [String: Any] = ["text": text]
+        if !attachments.isEmpty {
+            body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
+        }
         if let from { body["from"] = from }
         if let sessionId { body["sessionId"] = sessionId }
         let bytes: URLSession.AsyncBytes
@@ -342,9 +346,13 @@ public actor DaemonClient {
             // src/hosted-interface.js before shared threads: "node message
             // contains unsupported fields". Only meaningful when `thread`
             // was sent; the caller retries once without it.
-            if http.statusCode == 400, body["thread"] != nil {
+            if http.statusCode == 413, body["attachments"] != nil { throw DaemonError.imagesUnsupported }
+            if http.statusCode == 400 {
                 let text = (try? await Self.collectText(bytes, byteLimit: 4096)) ?? ""
-                if text.contains("unsupported fields") { throw SharedThreadsRejected() }
+                if text.contains("unsupported fields") {
+                    if body["attachments"] != nil { throw DaemonError.imagesUnsupported }
+                    if body["thread"] != nil { throw SharedThreadsRejected() }
+                }
             }
             _ = try validate(response)
         }

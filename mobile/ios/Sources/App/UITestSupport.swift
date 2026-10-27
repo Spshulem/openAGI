@@ -22,6 +22,20 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
     }
     private static let preference = OSAllocatedUnfairLock(initialState: "auto")
     private static let integrationKeySaved = OSAllocatedUnfairLock(initialState: false)
+    private struct ChatLine: Sendable {
+        let id: String
+        let role: String
+        let text: String
+        let at: String
+        let attachments: [[String: String]]
+        var json: [String: Any] {
+            var result: [String: Any] = ["id": id, "role": role, "text": text, "at": at]
+            if !attachments.isEmpty { result["attachments"] = attachments }
+            return result
+        }
+    }
+    private static let chats = OSAllocatedUnfairLock(initialState: [String: [ChatLine]]())
+    private static let modelFailures = OSAllocatedUnfairLock(initialState: ProcessInfo.processInfo.arguments.contains("--ui-model-first-fails") ? 1 : 0)
     private static let date = "2026-10-18T12:00:00.000Z"
 
     @MainActor
@@ -51,7 +65,30 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             return
         }
         if url.path == "/message" {
-            let stream = "event: delta\ndata: {\"text\":\"Synthetic reply\",\"reset\":false}\n\nevent: final\ndata: {\"reply\":\"Synthetic reply\"}\n\n"
+            guard let data = Self.body(request), let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                finish(status: 400, object: ["error": "missing message body"])
+                return
+            }
+            let thread = body["thread"] as? String ?? "agent"
+            let images = body["attachments"] as? [[String: String]] ?? []
+            if images.contains(where: { image in
+                guard image["mimeType"] == "image/jpeg", let encoded = image["data"],
+                      let data = Data(base64Encoded: encoded) else { return true }
+                return !data.starts(with: [255, 216, 255])
+            }) {
+                finish(status: 400, object: ["error": "Image pixels must reach the transport"])
+                return
+            }
+            let reply = images.isEmpty ? "Synthetic reply" : "Synthetic image received in \(thread)"
+            let at = ISO8601DateFormatter().string(from: Date())
+            let previews = images.map { $0.filter { $0.key != "data" } }
+            Self.chats.withLock { chats in
+                chats[thread, default: []].append(ChatLine(id: UUID().uuidString, role: "user", text: body["text"] as? String ?? "", at: at, attachments: previews))
+                chats[thread, default: []].append(ChatLine(id: UUID().uuidString, role: "assistant", text: reply, at: at, attachments: []))
+            }
+            let delta = String(data: try! JSONSerialization.data(withJSONObject: ["text": reply, "reset": false]), encoding: .utf8)!
+            let final = String(data: try! JSONSerialization.data(withJSONObject: ["reply": reply]), encoding: .utf8)!
+            let stream = "event: delta\ndata: \(delta)\n\nevent: final\ndata: \(final)\n\n"
             deliver(status: 200, data: Data(stream.utf8), contentType: "text/event-stream")
             return
         }
@@ -76,6 +113,15 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                              "context": "A synthetic UI test", "proposedAction": "Confirm the demo", "sources": [],
                              "status": "pending", "createdAt": Self.date]])
         case "/settings/models":
+            let shouldFail = Self.modelFailures.withLock { remaining -> Bool in
+                guard remaining > 0 else { return false }
+                remaining -= 1
+                return true
+            }
+            if shouldFail {
+                finish(status: 404, object: ["error": "not found"])
+                return
+            }
             if request.httpMethod == "POST", let body = Self.body(request),
                let payload = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                let selected = payload["preference"] as? String {
@@ -116,6 +162,17 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             // Opening context is a read, never a submission of 'open thread'.
             finish(status: 500, object: ["error": "Opening context must not submit an answer"])
         case let path where path.hasPrefix("/conversations/"):
+            let thread = path.contains("/supervisor/") ? "supervisor" : "agent"
+            let sent = Self.chats.withLock { $0[thread, default: []].map(\.json) }
+            if ProcessInfo.processInfo.arguments.contains("--ui-scroll-chat") {
+                let rows: [[String: Any]] = (0..<50).map { index in
+                    ["id": "scroll-\(index)", "role": index % 2 == 0 ? "user" : "assistant",
+                     "text": index == 49 ? "Latest synthetic message" : "History item \(index). " + Self.longBullet,
+                     "at": Self.date]
+                }
+                finish(object: ["thread": thread, "messages": rows + sent])
+                return
+            }
             if ProcessInfo.processInfo.arguments.contains("--ui-long-chat") {
                 finish(object: ["thread": "agent", "messages": [
                     ["id": "history-one", "role": "user", "text": "yes", "at": Self.date],
@@ -126,7 +183,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             finish(object: ["thread": "agent", "messages": [
                 ["id": "history-one", "role": "user", "text": "Earlier synthetic question", "at": Self.date],
                 ["id": "history-two", "role": "assistant", "text": "Earlier synthetic answer", "at": Self.date]
-            ]])
+            ] + sent])
         default: finish(object: [:])
         }
     }
