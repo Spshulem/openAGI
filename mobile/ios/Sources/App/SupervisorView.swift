@@ -28,8 +28,12 @@ struct SupervisorView: View {
     // The thread whose sheet started the send: the sheet can be closed and
     // another thread opened while a nudge relays, and the result is not theirs.
     @State private var actionNoteThread: String?
-    @State private var openThread: FleetThread?
-    @State private var openQuestion: FleetQuestion?
+    private struct ThreadPresentation: Identifiable {
+        let thread: FleetThread
+        var question: FleetQuestion? = nil
+        var id: String { thread.key + (question.map { "#\($0.id)" } ?? "") }
+    }
+    @State private var openThread: ThreadPresentation?
     @State private var compactColumn = NavigationSplitViewColumn.sidebar
     // Responses can land out of order: a 30s poll sent while an answer was
     // relaying may return after it with the state from before. A poll is
@@ -127,7 +131,8 @@ struct SupervisorView: View {
         .sheet(item: $openThread) { opened in
             // Follow the thread through refreshes; if a scan drops it,
             // keep showing what was last known rather than yanking it away.
-            let thread = state?.snapshot?.threads.first(where: { $0.key == opened.key }) ?? opened
+            let thread = state?.snapshot?.threads.first(where: { $0.key == opened.thread.key }) ?? opened.thread
+            let question = opened.question
             ThreadDetailSheet(
                 thread: thread,
                 proposed: state?.mode == FleetMode.propose.rawValue
@@ -135,12 +140,12 @@ struct SupervisorView: View {
                 busyActionID: busyActionID,
                 actionNote: actionNoteThread == thread.key ? actionNote : nil,
                 onSend: { action in Task { await send(action) } },
-                question: openQuestion,
-                questionIsOpen: state?.questions.contains(where: { $0.id == openQuestion?.id }) == true,
+                question: question,
+                questionIsOpen: state?.questions.contains(where: { $0.id == question?.id }) == true,
                 questionBusy: busyQuestionID != nil,
-                questionNote: questionNote?.id == openQuestion?.id ? questionNote?.note : nil,
+                questionNote: questionNote?.id == question?.id ? questionNote?.note : nil,
                 onAnswer: { answer in
-                    if let question = openQuestion { Task { await decide(question, answer: answer) } }
+                    if let question { Task { await decide(question, answer: answer) } }
                 }
             )
         }
@@ -279,7 +284,7 @@ struct SupervisorView: View {
         guard busyActionID == nil else { return }
         busyActionID = action.id
         actionNote = nil
-        actionNoteThread = openThread?.key
+        actionNoteThread = openThread?.thread.key
         defer { busyActionID = nil }
         do {
             let result = try await model.client.fleetSendAction(id: action.id)
@@ -353,8 +358,10 @@ struct SupervisorView: View {
                             onAnswer: { option in Task { await decide(question, answer: option) } },
                             onDismiss: { Task { await decide(question, answer: nil) } },
                             onOpen: { key in
-                                openQuestion = question
-                                openThread = threads.first(where: { $0.key == key }) ?? FleetThread(key: key)
+                                openThread = ThreadPresentation(
+                                    thread: threads.first(where: { $0.key == key }) ?? FleetThread(key: key),
+                                    question: question
+                                )
                                 actionNote = nil
                             }
                         )
@@ -382,8 +389,7 @@ struct SupervisorView: View {
                 RowGroup {
                     ForEach(Array(threads.enumerated()), id: \.element.key) { index, thread in
                         Button {
-                            openQuestion = nil
-                            openThread = thread
+                            openThread = ThreadPresentation(thread: thread)
                             actionNote = nil
                         } label: {
                             ThreadRow(
@@ -810,6 +816,7 @@ private struct ThreadDetailSheet: View {
                     NoteLine(note: actionNote.note)
                 }
             }
+            .accessibilityIdentifier("supervisor-thread-details")
             .listStyle(.insetGrouped)
             .navigationTitle("Thread")
             .navigationBarTitleDisplayMode(.inline)
