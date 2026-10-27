@@ -9,18 +9,17 @@ struct ChatView: View {
     @State private var columns: NavigationSplitViewVisibility = .all
     @State private var compactColumn: NavigationSplitViewColumn = .detail
     @State private var thread: ConversationThread = .agent
-    @State private var search = ""
     @State private var destination: ChatSheet?
     @State private var selectedMessage: UUID?
     var onClose: (() -> Void)? = nil
 
     private enum ChatSheet: String, Identifiable {
-        case model, settings, fallback
+        case model, settings, fallback, conversations
         var id: String { rawValue }
     }
 
     private var conversation: ChatConversation {
-        thread == .agent ? model.agentChat : model.supervisorChat
+        model.conversations.selected(thread)
     }
 
     var body: some View {
@@ -42,36 +41,25 @@ struct ChatView: View {
                 }
             case .settings: SettingsView(onRevoked: { AppSession.shared.revoked() })
             case .fallback: FallbackChatView()
+            case .conversations:
+                NavigationStack {
+                    ConversationBrowser(thread: $thread) { message in
+                        selectedMessage = message
+                        destination = nil
+                    }
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { destination = nil } } }
+                }
             }
         }
+        .task { await model.conversations.refresh() }
     }
 
     private var conversationSplitView: some View {
         NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
-            List {
-                Section("Your conversations") {
-                    conversationRow("Agent", symbol: "bubble.left.and.bubble.right", chat: model.agentChat, thread: .agent)
-                    conversationRow("Supervisor", symbol: "binoculars", chat: model.supervisorChat, thread: .supervisor)
-                }
-                if !search.isEmpty {
-                    Section("Messages") {
-                        ForEach(conversation.messages.filter { $0.text.localizedCaseInsensitiveContains(search) }, id: \.id) { message in
-                            Button {
-                                selectedMessage = message.id
-                                compactColumn = .detail
-                            } label: {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(message.role == .user ? "You" : "OpenAGI").font(.caption).foregroundStyle(.secondary)
-                                    Text(message.text).lineLimit(3).foregroundStyle(.primary)
-                                }
-                            }
-                        }
-                    }
-                }
+            ConversationBrowser(thread: $thread) { message in
+                selectedMessage = message
+                compactColumn = .detail
             }
-            .listStyle(.sidebar)
-            .searchable(text: $search, prompt: "Search saved messages")
-            .navigationTitle("Conversations")
             .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 320)
         } detail: {
             conversationNavigation
@@ -82,8 +70,11 @@ struct ChatView: View {
         NavigationStack {
             ChatConversationView(conversation: conversation, title: thread == .agent ? "Chat" : "Supervisor chat",
                                  scrollToMessageID: selectedMessage)
+                .id(conversation.identity)
                 .toolbar {
                     ToolbarItemGroup(placement: .primaryAction) {
+                        Button("Conversations", systemImage: "text.bubble") { destination = .conversations }
+                            .accessibilityIdentifier("chat-conversations")
                         Button("Model", systemImage: "cpu") { destination = .model }
                             .accessibilityIdentifier("chat-model")
                         Menu {
@@ -105,25 +96,6 @@ struct ChatView: View {
                     }
                 }
         }
-    }
-
-    private func conversationRow(_ title: String, symbol: String, chat: ChatConversation, thread target: ConversationThread) -> some View {
-        Button {
-            thread = target
-            selectedMessage = nil
-            compactColumn = .detail
-        } label: {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: symbol).frame(width: 22)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.body.weight(.medium)).foregroundStyle(.primary)
-                    Text(chat.messages.last?.text ?? "Start a conversation")
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                }
-                if thread == target { Image(systemName: "checkmark").accessibilityLabel("Selected") }
-            }.padding(.vertical, 4)
-        }
-        .accessibilityIdentifier("conversation-\(target.rawValue)")
     }
 }
 
@@ -153,6 +125,7 @@ struct ChatConversationView: View {
     @State private var isPreparingImages = false
     @State private var attachmentError: String?
     @State private var selectedAttachment: ChatAttachment?
+    @State private var dictation = ChatDictation()
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
 
@@ -188,10 +161,19 @@ struct ChatConversationView: View {
         }
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
-        .onChange(of: composerFocused) { _, focused in onComposerFocusChanged(focused) }
-        .task(id: conversation.thread) { await conversation.refresh() }
+        .onChange(of: composerFocused) { _, focused in
+            if focused { dictation.stop() }
+            onComposerFocusChanged(focused)
+        }
+        .task(id: conversation.identity) { await conversation.refresh() }
+        .onDisappear { dictation.stop() }
+        .onChange(of: conversation.identity) { _, _ in dictation.stop() }
+        .onChange(of: conversation.isSending) { _, sending in
+            if !sending { Task { await model.conversations.refresh() } }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await conversation.refresh() } }
+            else { dictation.stop() }
         }
     }
 
@@ -418,13 +400,26 @@ struct ChatConversationView: View {
     @ViewBuilder
     private var inputBar: some View {
         VStack(spacing: 8) {
+            if conversation.isReadOnly {
+                Text("Web conversation · Continue in a new chat with its latest 50 messages.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                Button("Continue in new chat", systemImage: "square.and.pencil") {
+                    Task { await model.conversations.create(thread: conversation.thread, sourceID: conversation.conversationID) }
+                }
+                .disabled(model.conversations.isCreating)
+                .accessibilityIdentifier("chat-continue-web")
+                if let error = model.conversations.error { Text(error).font(.footnote).foregroundStyle(.red) }
+            } else {
             if !conversation.draftAttachments.isEmpty { attachmentStrip }
             if isPreparingImages { ProgressView("Preparing images…").font(.caption) }
             if let attachmentError {
                 Text(attachmentError).font(.footnote).foregroundStyle(.red)
                     .accessibilityIdentifier("chat-attachment-error")
             }
+            if dictation.isListening { Text("Listening… Tap Stop to finish, then Send.").font(.caption).foregroundStyle(.secondary) }
+            if let error = dictation.error { Text(error).font(.footnote).foregroundStyle(.red).accessibilityIdentifier("chat-dictation-error") }
             composerBar
+            }
         }
     }
 
@@ -437,6 +432,7 @@ struct ChatConversationView: View {
                     composerField
                         .padding(.horizontal, 16).padding(.vertical, 12)
                         .glassEffect(.regular, in: .capsule)
+                    dictationButton.buttonStyle(.glass).buttonBorderShape(.circle)
                     sendButton
                         .buttonStyle(.glassProminent)
                         .buttonBorderShape(.circle)
@@ -448,10 +444,25 @@ struct ChatConversationView: View {
             HStack(alignment: .bottom, spacing: 12) {
                 attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle)
                 composerField.textFieldStyle(.roundedBorder)
+                dictationButton.buttonStyle(.bordered).buttonBorderShape(.circle)
                 sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle)
             }
             .padding(.horizontal, 16).padding(.vertical, 8)
         }
+    }
+
+    private var dictationButton: some View {
+        Button(dictation.isListening ? "Stop dictation" : "Dictate message", systemImage: dictation.isListening ? "stop.fill" : "mic") {
+            if dictation.isListening || dictation.isStarting { dictation.stop() }
+            else {
+                composerFocused = false
+                Task { await dictation.start(draft: conversation.draft) { text in conversation.draft = text } }
+            }
+        }
+        .labelStyle(.iconOnly)
+        .frame(minWidth: 44, minHeight: 44)
+        .disabled(conversation.isSending)
+        .accessibilityIdentifier("chat-dictation")
     }
 
     private var attachmentMenu: some View {
@@ -563,6 +574,7 @@ struct ChatConversationView: View {
 
     private func sendDraft() {
         guard canSend else { return }
+        dictation.stop()
         if conversation.submitDraft() { isPinnedToBottom = true }
     }
 

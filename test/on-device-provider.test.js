@@ -72,7 +72,7 @@ test("text reply streams deltas and returns the device's text", async (t) => {
   assert.equal(result.model, "fake-device");
   assert.deepEqual(deltas.map((d) => [d.text, d.reset]), [["Hel", true]]);
   // Only the small-model tool set is advertised.
-  assert.deepEqual(device.seen[0].tools.map((tool) => tool.name), ["remember", "recall", "add_task"]);
+  assert.deepEqual(device.seen[0].tools.map((tool) => tool.name), ["remember", "recall"]);
   assert.match(device.seen[0].system, /You are Pip/);
 });
 
@@ -92,6 +92,38 @@ test("tool call runs in the daemon and its result goes back to the device", asyn
   assert.equal(second[0].toolCall.name, "remember");
   assert.equal(second[1].role, "tool");
   assert.match(second[1].content, /saved/);
+});
+
+test("the current user turn appears once and casual chat cannot invoke add_task", async t => {
+  const { hub, url } = await startRelay(t);
+  const device = await connectDevice(url, [
+    { toolCall: { name: "add_task", arguments: { content: "unrequested" } } },
+    { text: "Hello! How can I help?" }
+  ]);
+  t.after(() => device.socket.close());
+  await untilConnected(hub);
+  const calls = [];
+  const result = await new OnDeviceModelProvider({ hub }).generate({ input: "Hello there",
+    messages: [{ role: "user", content: "Earlier question" }, { role: "assistant", content: "Earlier answer" }, { role: "user", content: "Hello there" }],
+    turnContext: "[context]\n" + "reference ".repeat(250) + "\n[/context]", toolRegistry: fakeRegistry(calls) });
+  assert.equal(result.text, "Hello! How can I help?");
+  assert.equal(calls.length, 0);
+  assert.equal(device.seen[0].messages.filter(m => m.content.includes("Hello there")).length, 1);
+  assert.match(device.seen[0].messages.at(-1).content, /\[\/context\]\n\nHello there$/);
+  assert.match(device.seen[0].system, /Never claim a task was added/);
+});
+
+test("an explicit task request still invokes add_task and reports its actual result", async t => {
+  const { hub, url } = await startRelay(t);
+  const device = await connectDevice(url, [{ toolCall: { name: "add_task", arguments: { content: "Buy milk" } } }, { text: "Added Buy milk." }]);
+  t.after(() => device.socket.close());
+  await untilConnected(hub);
+  const calls = [];
+  const result = await new OnDeviceModelProvider({ hub }).generate({ input: "Add a task to buy milk", toolRegistry: fakeRegistry(calls) });
+  assert.deepEqual(calls, [{ name: "add_task", args: { content: "Buy milk" } }]);
+  assert.equal(result.text, "Added Buy milk.");
+  assert.ok(device.seen[0].tools.some(tool => tool.name === "add_task"));
+  assert.equal(device.seen[1].messages.at(-1).role, "tool");
 });
 
 test("hop limit forces a final answer without tools", async (t) => {

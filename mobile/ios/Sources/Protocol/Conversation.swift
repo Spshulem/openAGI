@@ -10,6 +10,21 @@ public enum ConversationThread: String, Codable, Sendable, CaseIterable {
     case supervisor
 }
 
+public struct ConversationSummary: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let thread: ConversationThread
+    public let title: String
+    public let preview: String
+    public let updatedAt: Date
+    public let messageCount: Int
+    public let readOnly: Bool
+    public var key: String { "\(thread.rawValue):\(id)" }
+}
+
+public struct ConversationCatalog: Codable, Sendable {
+    public let conversations: [ConversationSummary]
+}
+
 // One stored turn, user or assistant text only -- the daemon never sends
 // tool calls on this route. `sourceName` is the device that sent a user turn
 // ("Spencer's G2"), so the phone can say where a message came from when it

@@ -11,8 +11,12 @@ struct UITestRoot: View {
     @State private var model = UITestProtocol.makeModel()
 
     var body: some View {
-        RootTabView(testingModel: model)
-            .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--ui-dark") ? .dark : nil)
+        Group {
+            if ProcessInfo.processInfo.arguments.contains("--ui-guided-setup") {
+                WelcomeView(availability: .unsupported, prefersChat: true)
+            } else { RootTabView(testingModel: model) }
+        }
+        .preferredColorScheme(ProcessInfo.processInfo.arguments.contains("--ui-dark") ? .dark : nil)
     }
 }
 
@@ -35,6 +39,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         }
     }
     private static let chats = OSAllocatedUnfairLock(initialState: [String: [ChatLine]]())
+    private static let namedChats = OSAllocatedUnfairLock(initialState: [String: String]())
     private static let modelFailures = OSAllocatedUnfairLock(initialState: ProcessInfo.processInfo.arguments.contains("--ui-model-first-fails") ? 1 : 0)
     private static let date = "2026-10-18T12:00:00.000Z"
 
@@ -70,6 +75,8 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
                 return
             }
             let thread = body["thread"] as? String ?? "agent"
+            let conversationID = body["conversationId"] as? String ?? "main"
+            let key = conversationID == "main" ? thread : "\(thread):\(conversationID)"
             let images = body["attachments"] as? [[String: String]] ?? []
             if images.contains(where: { image in
                 guard image["mimeType"] == "image/jpeg", let encoded = image["data"],
@@ -84,8 +91,8 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             let previews = images.map { $0.filter { $0.key != "data" } }
             let text = body["text"] as? String ?? ""
             Self.chats.withLock { chats in
-                chats[thread, default: []].append(ChatLine(id: UUID().uuidString, role: "user", text: text, at: at, attachments: previews))
-                chats[thread, default: []].append(ChatLine(id: UUID().uuidString, role: "assistant", text: reply, at: at, attachments: []))
+                chats[key, default: []].append(ChatLine(id: UUID().uuidString, role: "user", text: text, at: at, attachments: previews))
+                chats[key, default: []].append(ChatLine(id: UUID().uuidString, role: "assistant", text: reply, at: at, attachments: []))
             }
             let delta = String(data: try! JSONSerialization.data(withJSONObject: ["text": reply, "reset": false]), encoding: .utf8)!
             let final = String(data: try! JSONSerialization.data(withJSONObject: ["reply": reply]), encoding: .utf8)!
@@ -97,6 +104,22 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         let tasks = [Self.task(id: "demo-one", title: "Plan a synthetic demo"),
                      Self.task(id: "demo-two", title: "Review a synthetic demo")]
         switch url.path {
+        case "/conversations":
+            if request.httpMethod == "POST" {
+                guard let body = Self.body(request), let payload = try? JSONSerialization.jsonObject(with: body) as? [String: String],
+                      let thread = payload["thread"], ["agent", "supervisor"].contains(thread) else {
+                    finish(status: 400, object: ["error": "invalid conversation"])
+                    return
+                }
+                let id = UUID().uuidString.lowercased()
+                Self.namedChats.withLock { $0[id] = thread }
+                finish(status: 201, object: Self.summary(id: id, thread: thread))
+            } else {
+                let defaults = ["agent", "supervisor"].map { Self.summary(id: "main", thread: $0) }
+                let named = Self.namedChats.withLock { $0 }.map { Self.summary(id: $0.key, thread: $0.value) }
+                let web: [String: Any] = ["id": "web-" + String(repeating: "a", count: 32), "thread": "agent", "title": "A synthetic web conversation", "preview": "Earlier work on the web", "updatedAt": Self.date, "messageCount": 2, "readOnly": true]
+                finish(object: ["conversations": defaults + named + [web]])
+            }
         case "/mobile/summary":
             finish(object: ["generatedAt": Self.date, "today": empty ? [] : tasks.map { $0.merging(["overdue": false]) { _, new in new } },
                             "counts": ["today": empty ? 0 : 2, "this_week": 0, "overdue": 0, "pendingActions": 2],
@@ -164,7 +187,13 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             finish(status: 500, object: ["error": "Opening context must not submit an answer"])
         case let path where path.hasPrefix("/conversations/"):
             let thread = path.contains("/supervisor/") ? "supervisor" : "agent"
-            let sent = Self.chats.withLock { $0[thread, default: []] }.map(\.json)
+            let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "conversationId" }?.value ?? "main"
+            let key = id == "main" ? thread : "\(thread):\(id)"
+            let sent = Self.chats.withLock { $0[key, default: []] }.map(\.json)
+            if id != "main" && !id.hasPrefix("web-") {
+                finish(object: ["thread": thread, "messages": sent])
+                return
+            }
             if ProcessInfo.processInfo.arguments.contains("--ui-scroll-chat") {
                 let rows: [[String: Any]] = (0..<50).map { index in
                     ["id": "scroll-\(index)", "role": index % 2 == 0 ? "user" : "assistant",
@@ -190,6 +219,14 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
     }
 
     static let longBullet = "This synthetic list item explains the context of a decision in enough detail to wrap naturally across several lines on a phone, including a cover display or one page of a book layout. The entire explanation must remain readable before anyone makes a decision."
+
+    private static func summary(id: String, thread: String) -> [String: Any] {
+        let key = id == "main" ? thread : "\(thread):\(id)"
+        let lines = chats.withLock { $0[key, default: []] }
+        return ["id": id, "thread": thread, "title": lines.first?.text ?? (id == "main" ? "Shared \(thread) chat" : "New chat"),
+                "preview": lines.last?.text ?? "Start a conversation", "updatedAt": lines.last?.at ?? date,
+                "messageCount": lines.count, "readOnly": false]
+    }
 
     private static func task(id: String, title: String, queue: String = "user") -> [String: Any] {
         ["id": id, "queue": queue, "title": title, "description": "Synthetic UI test task", "bucket": "today",

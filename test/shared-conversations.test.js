@@ -75,6 +75,61 @@ async function g2Submit(ctx, text, extra = {}) {
   throw new Error("G2 request never finished");
 }
 
+test("phones create independent Agent and Supervisor chats and share their named history", async t => {
+  const ctx = await boot(t);
+  for (const thread of ["agent", "supervisor"]) {
+    const created = await ctx.as(PHONE_A, "/conversations", { method: "POST", body: { thread } });
+    assert.equal(created.status, 201, await created.clone().text());
+    const chat = await created.json();
+    assert.equal(chat.thread, thread);
+    assert.match(chat.id, /^[a-f0-9-]{36}$/);
+    const sent = await ctx.as(PHONE_A, "/message", { method: "POST", body: { thread, conversationId: chat.id, text: `New ${thread} question`, sessionId: "local:browser-owner:main" } });
+    assert.equal(sent.status, 200, await sent.clone().text());
+    assert.equal((await sent.json()).session.id, `devices:${thread}:${chat.id}`);
+    const page = await ctx.as(PHONE_B, `/conversations/${thread}/messages?conversationId=${chat.id}`);
+    assert.deepEqual((await page.json()).messages.map(m => m.text), [`New ${thread} question`, `echo: New ${thread} question`]);
+    assert.equal((await (await ctx.as(PHONE_A, `/conversations/${thread}/messages`)).json()).messages.length, 0);
+  }
+  const catalog = await (await ctx.as(PHONE_B, "/conversations")).json();
+  assert.equal(catalog.conversations.length, 4);
+  assert.equal(ctx.store.getSession("local:browser-owner:main").messages.length, 0);
+});
+
+test("web chats are human-visible history; continuing copies text into an isolated session without tool authority", async t => {
+  const ctx = await boot(t);
+  const source = "local:browser-web-fixture:main";
+  ctx.store.appendMessage(source, { role: "user", content: "Web question", metadata: { authority: { kind: "owner" }, secret: "not-projected" } });
+  ctx.store.appendMessage(source, { role: "tool", content: "private-tool-result" });
+  ctx.store.appendMessage(source, { role: "assistant", content: "Web answer", metadata: { computerUse: "private-lease" } });
+  ctx.store.appendMessage("local:internal:main", { role: "user", content: "Not browser history" });
+  const catalog = await (await ctx.as(PHONE_A, "/conversations")).json();
+  const web = catalog.conversations.find(c => c.readOnly);
+  assert.equal(web.title, "Web question");
+  assert.equal(web.thread, "agent");
+  assert.equal(web.preview, "Web answer");
+  assert.equal(JSON.stringify(catalog).includes("not-projected"), false);
+  assert.equal(JSON.stringify(catalog).includes("Not browser history"), false);
+  const page = await (await ctx.as(PHONE_A, `/conversations/agent/messages?conversationId=${web.id}`)).json();
+  assert.deepEqual(page.messages.map(m => m.text), ["Web question", "Web answer"]);
+  assert.equal(JSON.stringify(page).includes("private-"), false);
+  const write = await ctx.as(PHONE_A, "/message", { method: "POST", body: { thread: "agent", conversationId: web.id, text: "Continue" } });
+  assert.equal(write.status, 400);
+  const fork = await ctx.as(PHONE_A, "/conversations", { method: "POST", body: { thread: "agent", sourceId: web.id } });
+  assert.equal(fork.status, 201, await fork.clone().text());
+  const id = (await fork.json()).id;
+  const session = ctx.store.getSession(`devices:agent:${id}`);
+  assert.deepEqual(session.messages.map(m => m.content), ["Web question", "Web answer"]);
+  assert.ok(session.messages.every(m => !m.metadata?.authority && !m.metadata?.computerUse));
+  assert.equal((await ctx.as(PHONE_A, "/message", { method: "POST", body: { thread: "agent", conversationId: id, text: "A follow-up" } })).status, 200);
+  assert.equal(ctx.store.getSession(source).messages.length, 3);
+  for (const node of [G2, GENERIC]) {
+    assert.ok([401, 403].includes((await ctx.as(node, "/conversations")).status));
+    assert.ok([401, 403].includes((await ctx.as(node, `/conversations/agent/messages?conversationId=${web.id}`)).status));
+  }
+  const invalid = await ctx.as(PHONE_A, "/conversations", { method: "POST", body: { thread: "agent", sourceId: source } });
+  assert.equal(invalid.status, 400);
+});
+
 test("two phones and a G2 land in the same shared agent session", async (t) => {
   const ctx = await boot(t);
   const first = await ctx.as(PHONE_A, "/message", { method: "POST", body: { text: "from the pixel", thread: "agent" } });
@@ -274,8 +329,8 @@ test("conversation.updated reaches /events after each stored message", async (t)
   await readUntil(2);
   const stored = ctx.store.getSession("devices:agent:main").messages;
   assert.deepEqual(frames, [
-    { thread: "agent", messageId: stored[0].id },
-    { thread: "agent", messageId: stored[1].id }
+    { thread: "agent", conversationId: "main", messageId: stored[0].id },
+    { thread: "agent", conversationId: "main", messageId: stored[1].id }
   ]);
 });
 
@@ -285,7 +340,7 @@ test("observeSharedThreads ignores other sessions and unwraps cleanly", () => {
   const unobserve = observeSharedThreads(store, (data) => seen.push(data));
   store.appendMessage("local:user:main", { role: "user", content: "owner" });
   const session = store.appendMessage("devices:supervisor:main", { role: "user", content: "shared" });
-  assert.deepEqual(seen, [{ thread: "supervisor", messageId: session.messages[0].id }]);
+  assert.deepEqual(seen, [{ thread: "supervisor", conversationId: "main", messageId: session.messages[0].id }]);
   unobserve();
   store.appendMessage("devices:supervisor:main", { role: "user", content: "after" });
   assert.equal(seen.length, 1);

@@ -26,6 +26,9 @@ final class ChatConversation {
     }
 
     let thread: ConversationThread
+    let conversationID: String
+    let isReadOnly: Bool
+    var identity: String { "\(thread.rawValue):\(conversationID)" }
     private(set) var messages: [ChatMessage]
     private(set) var isSending = false
     // Shared by compact and expanded presentations of this conversation.
@@ -50,8 +53,11 @@ final class ChatConversation {
     private var didLoadOlder = false
     private var forgotten = false
 
-    init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String) {
+    init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String,
+         conversationID: String = "main", isReadOnly: Bool = false) {
         self.thread = thread
+        self.conversationID = conversationID
+        self.isReadOnly = isReadOnly
         self.client = client
         self.store = store
         self.nodeID = nodeID
@@ -64,7 +70,7 @@ final class ChatConversation {
     // MARK: - Sending
 
     var canSubmitDraft: Bool {
-        !isSending && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty)
+        !isReadOnly && !isSending && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty)
     }
 
     // Reserve the turn and reset the native editor in the same main-actor
@@ -89,7 +95,7 @@ final class ChatConversation {
 
     private func beginSend(_ rawText: String, attachments: [ChatAttachment]) -> (text: String, replyID: UUID)? {
         let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isSending, !forgotten, !trimmed.isEmpty || !attachments.isEmpty,
+        guard !isReadOnly, !isSending, !forgotten, !trimmed.isEmpty || !attachments.isEmpty,
               attachments.allSatisfy({ $0.data != nil }) else { return nil }
         let text = trimmed.isEmpty ? "Please describe the attached images." : trimmed
         isSending = true
@@ -109,6 +115,7 @@ final class ChatConversation {
     // that failed bubble in place rather than appending a new one --
     // "stays in place", per DESIGN.md, not a fresh row at the bottom.
     func retry(_ failedMessage: ChatMessage) async {
+        guard !isReadOnly else { return }
         guard let target = ChatRetry.target(failedID: failedMessage.id, in: messages, isSending: isSending) else { return }
         isSending = true
         defer { isSending = false }
@@ -122,7 +129,7 @@ final class ChatConversation {
         var sawTerminalFrame = false
         do {
             let stream = try await client.sendMessageStreaming(
-                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey, attachments: attachments
+                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey, attachments: attachments, conversationId: conversationID
             )
             for try await event in stream {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
@@ -192,7 +199,7 @@ final class ChatConversation {
         refreshIssued += 1
         let sequence = refreshIssued
         do {
-            let page = try await client.conversationMessages(thread: thread)
+            let page = try await client.conversationMessages(thread: thread, conversationId: conversationID)
             guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .synced
@@ -232,7 +239,7 @@ final class ChatConversation {
         olderHistoryError = nil
         defer { isLoadingOlder = false }
         do {
-            let page = try await client.conversationMessages(thread: thread, before: cursor)
+            let page = try await client.conversationMessages(thread: thread, before: cursor, conversationId: conversationID)
             guard !forgotten, nextBefore == cursor else { return }
             messages = ChatHistoryMerge.prependOlder(local: messages, server: page.messages, before: cursor)
             nextBefore = page.nextBefore

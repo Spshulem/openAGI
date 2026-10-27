@@ -85,6 +85,8 @@ const EXACT = new Set([
   // phones may read the lifelog.
   "GET /conversations/agent/messages",
   "GET /conversations/supervisor/messages",
+  "GET /conversations",
+  "POST /conversations",
   "GET /lifelog/moments",
   // Phone workspace (docs/superpowers/specs/2026-10-16-openagi-phone-workspace-design.md).
   "GET /settings/models",

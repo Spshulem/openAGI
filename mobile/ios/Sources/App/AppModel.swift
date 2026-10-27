@@ -27,6 +27,7 @@ final class AppModel {
     // keeps streaming across tab switches and `/events` can refresh them.
     let agentChat: ChatConversation
     let supervisorChat: ChatConversation
+    let conversations: ConversationLibrary
 
     private(set) var snapshot: Snapshot?
     private(set) var lastOutcome: RefreshOutcome?
@@ -82,6 +83,8 @@ final class AppModel {
         self.supervisorChat = ChatConversation(thread: .supervisor, client: client,
                                                store: ChatHistoryStore(thread: ConversationThread.supervisor.rawValue, directory: chatDirectory),
                                                nodeID: credentials.nodeID)
+        self.conversations = ConversationLibrary(client: client, credentials: credentials, directory: chatDirectory,
+                                                 agent: agentChat, supervisor: supervisorChat)
     }
 
     @ObservationIgnored private lazy var coordinator = RefreshCoordinator(client: client, store: store, queue: queue)
@@ -303,17 +306,15 @@ final class AppModel {
             break
         case .pendingAction, .pendingActionResolved, .clarificationCreated:
             bumpInboxGeneration()
-        case .conversationUpdated(let thread):
+        case .conversationUpdated:
             // Another device (or this one) stored a turn in a shared thread.
-            if thread == nil || thread == ConversationThread.agent.rawValue { Task { await agentChat.refresh() } }
-            if thread == nil || thread == ConversationThread.supervisor.rawValue { Task { await supervisorChat.refresh() } }
+            Task { await conversations.refreshOpenChats() }
         case .fleet:
             fleetGeneration += 1
         case .hello:
             // A (re)connected stream may have missed updates while it was down.
             Task { await refreshData() }
-            Task { await agentChat.refresh() }
-            Task { await supervisorChat.refresh() }
+            Task { await conversations.refreshOpenChats() }
         case .unknown:
             break
         }
@@ -325,8 +326,7 @@ final class AppModel {
     // completed daemon switch still uses detach() to isolate its stores.
     func suspendForOnboarding() {
         invalidateRefresh()
-        agentChat.suspend()
-        supervisorChat.suspend()
+        conversations.suspend()
     }
 
     func revoke() async {
@@ -336,8 +336,7 @@ final class AppModel {
         await PushRegistrar.shared.forget(client: client)
         try? await client.revoke()
         stopEventStream()
-        agentChat.forget()
-        supervisorChat.forget()
+        conversations.forget()
         Credentials.clear()
         workspaceCache.delete()
         try? store.delete()
@@ -354,8 +353,7 @@ final class AppModel {
     func detach(parkedQueue: OutboundQueue = .parkedForServer()) {
         invalidateRefresh()
         stopEventStream()
-        agentChat.forget()
-        supervisorChat.forget()
+        conversations.forget()
         try? store.delete()
         if credentials.isEmbedded {
             try? queue.clear()

@@ -92,6 +92,53 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 5))
     }
 
+    func testNewAgentAndSupervisorChatsHaveSeparateHistoryAndAGroupedBrowser() {
+        let app = launch()
+        tab(app, "Chat")
+        for kind in ["agent", "supervisor"] {
+            tap(app, "chat-conversations")
+            XCTAssertTrue(app.navigationBars["Conversations"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["A synthetic web conversation"].waitForExistence(timeout: 5))
+            capture("native-conversation-library-\(kind)", app: app)
+            tap(app, "new-\(kind)-chat")
+            let composer = element(app, "chat-composer")
+            XCTAssertTrue(composer.waitForExistence(timeout: 10))
+            XCTAssertFalse(app.staticTexts["Earlier synthetic answer"].exists)
+            composer.tap()
+            composer.typeText("A new \(kind) conversation")
+            tap(app, "chat-send")
+            XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+            XCTAssertTrue(app.buttons["chat-dictation"].exists)
+            XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+            capture("native-new-conversation-\(kind)", app: app)
+        }
+        tap(app, "chat-conversations")
+        XCTAssertTrue(app.staticTexts["A new agent conversation"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["A new supervisor conversation"].exists)
+        tap(app, "conversation-agent")
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["A new supervisor conversation"].exists)
+    }
+
+    func testGuidedSetupExplainsPairingAndSupportsTheStepByStepAlternative() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-testing", "--ui-guided-setup"]
+        app.launch()
+        XCTAssertTrue(app.navigationBars["Meet OpenAGI"].waitForExistence(timeout: 15))
+        let input = element(app, "setup-chat-input")
+        input.tap()
+        input.typeText("Where do I get a pairing code?")
+        tap(app, "setup-chat-send")
+        let explanation = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Nodes → Connect a phone")).firstMatch
+        XCTAssertTrue(explanation.waitForExistence(timeout: 10))
+        capture("native-guided-setup", app: app)
+        tap(app, "setup-use-steps")
+        XCTAssertTrue(app.navigationBars["OpenAGI"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["setup-on-phone"].exists)
+        XCTAssertTrue(app.buttons["setup-server"].exists)
+    }
+
     func testNativeAdaptiveTabsAndOptionalChatPane() {
         let app = launch()
         XCTAssertFalse(element(app, "right-navigation").exists, "Use the system tab container in every pose")

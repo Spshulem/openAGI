@@ -271,13 +271,15 @@ public actor DaemonClient {
     // main that still keeps it apart from Chat, and on a newer one the
     // thread wins.
     public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
-                                     from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = []) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+                                     from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = [], conversationId: String = "main") async throws -> AsyncThrowingStream<ChatEvent, Error> {
         var body: [String: Any] = ["text": text]
         if !attachments.isEmpty {
             body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
         }
         if let from { body["from"] = from }
         if let sessionId { body["sessionId"] = sessionId }
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        if conversationId != "main" && sharedThreadsUnsupported { throw DaemonError.notFound }
         let bytes: URLSession.AsyncBytes
         if let thread, !sharedThreadsUnsupported {
             var threaded = body
@@ -285,6 +287,8 @@ public actor DaemonClient {
             do {
                 bytes = try await openMessageStream(body: threaded)
             } catch is SharedThreadsRejected {
+                // A named chat must never fall back into the default chat.
+                guard conversationId == "main" else { throw DaemonError.notFound }
                 // An older main's node-scoped `/message` allows only text,
                 // from, and sessionId, and 400s anything else during
                 // validation -- before the turn runs -- so resending
@@ -363,12 +367,29 @@ public actor DaemonClient {
     // user/assistant turns, oldest first. A main from before shared threads
     // answers 404 (`DaemonError.notFound`); callers keep their local cache
     // and say the main needs updating.
-    public func conversationMessages(thread: ConversationThread, before: String? = nil, limit: Int = 50) async throws -> ConversationPage {
+    public func conversationMessages(thread: ConversationThread, before: String? = nil, limit: Int = 50, conversationId: String = "main") async throws -> ConversationPage {
         var items = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 100)))]
+        if conversationId != "main" { items.append(URLQueryItem(name: "conversationId", value: conversationId)) }
         if let before { items.append(URLQueryItem(name: "before", value: before)) }
         let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/messages", method: "GET", queryItems: items)
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(ConversationPage.self, from: data)
+    }
+
+    public func conversations() async throws -> [ConversationSummary] {
+        let request = try authorizedRequest(path: "/conversations", method: "GET")
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(ConversationCatalog.self, from: data).conversations
+    }
+
+    public func createConversation(thread: ConversationThread, sourceId: String? = nil) async throws -> ConversationSummary {
+        var body = ["thread": thread.rawValue]
+        if let sourceId { body["sourceId"] = sourceId }
+        var request = try authorizedRequest(path: "/conversations", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, _) = try await perform(request)
+        return try Self.decodeJSON(ConversationSummary.self, from: data)
     }
 
     // MARK: - Lifelog

@@ -1,5 +1,5 @@
 import { imageHistoryPreview } from "./message-attachments.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lifelogState, moments } from "./conversation-lifelog.js";
 
 // One conversation per thread for every paired device (phones and G2s). The
@@ -7,7 +7,9 @@ import { lifelogState, moments } from "./conversation-lifelog.js";
 // device can join the shared thread but can never address the owner's own
 // dashboard chat or inherit a computer-use lease approved there.
 export const SHARED_THREADS = Object.freeze(["agent", "supervisor"]);
-const SESSION_IDS = new Map(SHARED_THREADS.map(thread => [`devices:${thread}:main`, thread]));
+const CONVERSATION_ID = /^(?:main|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
+const DEVICE_SESSION = /^devices:(agent|supervisor):(main|[0-9a-f-]{36})$/;
+const WEB_SESSION = /^local:browser(?:-[^:\x00]{1,180})?:main$/;
 const HISTORY_PATH = /^\/conversations\/(agent|supervisor)\/messages$/;
 const MESSAGE_ID = /^[\w-]{1,200}$/;
 
@@ -23,19 +25,68 @@ export class SharedConversationError extends Error {
 const fail = (code, status, message) => new SharedConversationError(code, status, message);
 
 export function isSharedThread(value) { return SHARED_THREADS.includes(value); }
-export function sharedSessionId(thread) {
+export function sharedSessionId(thread, conversationId = "main") {
   if (!isSharedThread(thread)) throw fail("invalid_thread", 400, "thread must be \"agent\" or \"supervisor\".");
-  return `devices:${thread}:main`;
+  if (!CONVERSATION_ID.test(conversationId)) throw fail("invalid_conversation", 400, "Choose a valid conversation.");
+  return `devices:${thread}:${conversationId}`;
 }
-export function sharedThreadForSession(sessionId) { return SESSION_IDS.get(sessionId) ?? null; }
+export function sharedThreadForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[1] ?? null; }
+export function sharedConversationForSession(sessionId) { return DEVICE_SESSION.exec(sessionId)?.[2] ?? null; }
 export function sharedHistoryThread(pathname) { return HISTORY_PATH.exec(String(pathname ?? ""))?.[1] ?? null; }
+
+// Paired owner phones can read human-visible web chat, but never address its
+// session on /message. Continuing makes a separate shared-device session;
+// authority, tool calls, approvals and computer-use leases are not copied.
+function webID(sessionId) { return `web-${createHash("sha256").update(sessionId).digest("hex").slice(0, 32)}`; }
+function webSessions(store) { return store.listSessions({ prefix: "local:browser", limit: 100 }).filter(s => WEB_SESSION.test(s.id)); }
+function visibleSessionID(store, thread, conversationId) {
+  if (typeof conversationId === "string" && /^web-[a-f0-9]{32}$/.test(conversationId) && thread === "agent") {
+    const found = webSessions(store).find(s => webID(s.id) === conversationId);
+    if (!found) throw fail("unknown_conversation", 404, "That conversation is no longer available.");
+    return found.id;
+  }
+  return sharedSessionId(thread, conversationId);
+}
+
+export function sharedConversations(store) {
+  const sessions = [
+    ...SHARED_THREADS.map(thread => ({ id: sharedSessionId(thread), thread, conversationId: "main" })),
+    ...store.listSessions({ prefix: "devices:", limit: 100 }).flatMap(s => {
+      const match = DEVICE_SESSION.exec(s.id);
+      return match && match[2] !== "main" && CONVERSATION_ID.test(match[2])
+        ? [{ id: s.id, thread: match[1], conversationId: match[2] }] : [];
+    }),
+    ...webSessions(store).map(s => ({ id: s.id, thread: "agent", conversationId: webID(s.id), readOnly: true }))
+  ];
+  return { conversations: sessions.map(item => {
+    const session = store.getSession(item.id);
+    const messages = session.messages.filter(m => ["user", "assistant"].includes(m.role) && typeof m.content === "string");
+    return { id: item.conversationId, thread: item.thread, readOnly: item.readOnly === true,
+      title: messages.find(m => m.role === "user")?.content.slice(0, 80) || (item.conversationId === "main" ? `Shared ${item.thread} chat` : "New chat"),
+      preview: messages.at(-1)?.content.slice(0, 180) || "Start a conversation",
+      updatedAt: session.updatedAt, messageCount: messages.length };
+  }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) };
+}
+
+export function createSharedConversation(store, { thread, sourceId } = {}) {
+  if (!isSharedThread(thread)) throw fail("invalid_thread", 400, "Choose Agent or Supervisor.");
+  const source = sourceId === undefined ? null : store.getSession(visibleSessionID(store, thread, sourceId));
+  const id = randomUUID();
+  const sessionId = sharedSessionId(thread, id);
+  store.saveSession({ id: sessionId, createdAt: new Date().toISOString(), messages: [], metadata: { thread } });
+  for (const message of (source?.messages ?? []).filter(m => ["user", "assistant"].includes(m.role) && typeof m.content === "string").slice(-50)) {
+    store.appendMessage(sessionId, { role: message.role, content: message.content,
+      metadata: { thread, ...(message.role === "user" && message.metadata?.attachments?.length ? { attachments: message.metadata.attachments } : {}) } });
+  }
+  return sharedConversations(store).conversations.find(c => c.id === id);
+}
 
 // Same projection as the G2 history view: user and assistant text only, never
 // tool calls, tool results or private metadata. Oldest-first; `before` pages
 // toward older messages and `nextBefore` is the cursor for the next page.
-export function sharedThreadHistory(store, thread, { before, limit } = {}) {
+export function sharedThreadHistory(store, thread, { before, limit, conversationId = "main" } = {}) {
   if (!store?.getSession) throw fail("history_unavailable", 503, "Main history is not configured.");
-  const sessionId = sharedSessionId(thread);
+  const sessionId = visibleSessionID(store, thread, conversationId);
   const size = limit === undefined || limit === null ? 50 : limit;
   if (!Number.isSafeInteger(size) || size < 1 || size > 100) throw fail("invalid_history", 400, "limit must be 1 to 100.");
   if (before !== undefined && before !== null && (typeof before !== "string" || !MESSAGE_ID.test(before)))
@@ -77,7 +128,7 @@ export function observeSharedThreads(store, onUpdate) {
     const session = original.call(this, sessionId, message);
     const thread = sharedThreadForSession(sessionId);
     if (thread) {
-      try { onUpdate({ thread, messageId: session?.messages?.at(-1)?.id ?? null }); } catch { /* a listener never fails a turn */ }
+      try { onUpdate({ thread, conversationId: sharedConversationForSession(sessionId), messageId: session?.messages?.at(-1)?.id ?? null }); } catch { /* a listener never fails a turn */ }
     }
     return session;
   };

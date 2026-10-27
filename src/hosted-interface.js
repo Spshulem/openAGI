@@ -101,7 +101,9 @@ import {
   sharedHistoryThread,
   sharedSessionId,
   sharedThreadForSession,
-  sharedThreadHistory
+  sharedThreadHistory,
+  sharedConversations,
+  createSharedConversation
 } from "./shared-conversations.js";
 
 export function createHostedInterface(runtime = createDefaultRuntime(), options = {}) {
@@ -1922,12 +1924,28 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (sharedHistoryRoute) {
         res.setHeader("Cache-Control", "no-store");
         if (requestNodeId && ![MOBILE_PLATFORM, EVEN_G2_PLATFORM].includes(requestEnrollment?.platform)) return sendJson(res, 403, { error: "forbidden_node" });
+        if (requestEnrollment?.platform === EVEN_G2_PLATFORM && url.searchParams.get("conversationId") && url.searchParams.get("conversationId") !== "main") return sendJson(res, 403, { error: "forbidden_node" });
         const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
         if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
         const rawLimit = url.searchParams.get("limit");
         const limit = rawLimit === null ? undefined : /^\d{1,3}$/.test(rawLimit) ? Number(rawLimit) : NaN;
         try {
-          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit }));
+          return sendJson(res, 200, sharedThreadHistory(store, sharedHistoryThread(pathname), { before: url.searchParams.get("before") || undefined, limit, conversationId: url.searchParams.get("conversationId") ?? "main" }));
+        } catch (error) {
+          if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+          throw error;
+        }
+      }
+      if (pathname === "/conversations" && ["GET", "POST"].includes(method)) {
+        res.setHeader("Cache-Control", "no-store");
+        if (requestNodeId && requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "forbidden_node" });
+        const store = runtime.agentHost?.store ?? channels?.agentHost?.store;
+        if (!store) return sendJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          if (method === "GET") return sendJson(res, 200, sharedConversations(store));
+          const body = await readJsonLimited(req, 1024);
+          if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(key => !["thread", "sourceId"].includes(key))) return sendJson(res, 400, { error: "invalid_conversation" });
+          return sendJson(res, 201, createSharedConversation(store, body));
         } catch (error) {
           if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
           throw error;
@@ -2092,7 +2110,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
           }
         } catch (error) { return sendJson(res, 400, { error: "invalid_images", message: error.message }); }
         if (requestNodeId) {
-          const allowed = new Set(["text", "from", "sessionId", "thread", "attachments"]);
+          const allowed = new Set(["text", "from", "sessionId", "thread", "conversationId", "attachments"]);
           if (!body || typeof body !== "object" || Array.isArray(body)
               || Object.keys(body).some((key) => !allowed.has(key))) {
             return sendJson(res, 400, { error: "node message contains unsupported fields" });
@@ -2124,8 +2142,13 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             // through /nodes/g2/experience). Generic nodes, such as the
             // iMessage bridge, stay in their own node-scoped conversations.
             if (requestEnrollment?.platform !== MOBILE_PLATFORM) return sendJson(res, 403, { error: "shared threads are for paired phones and G2" });
-            body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment.name));
+            try { body = bindSharedThreadMessage(body, requestNodeId, boundedMobileNodeName(requestEnrollment.name)); }
+            catch (error) {
+              if (error instanceof SharedConversationError) return sendJson(res, error.status, { error: error.code, message: error.message });
+              throw error;
+            }
           } else {
+            if (body.conversationId !== undefined) return sendJson(res, 400, { error: "conversationId requires a thread" });
             body = bindScopedNodeMessage(body, requestNodeId);
           }
         }
@@ -4043,7 +4066,7 @@ function bindSharedThreadMessage(body, requestNodeId, sourceName) {
     channel: "node",
     from: `node:${requestNodeId}:${conversationNamespace}`,
     agentId: "main",
-    sessionId: sharedSessionId(body.thread),
+    sessionId: sharedSessionId(body.thread, body.conversationId ?? "main"),
     metadata: { sourceNodeId: requestNodeId, sourceName, thread: body.thread }
   };
 }

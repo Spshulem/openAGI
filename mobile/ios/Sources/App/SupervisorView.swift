@@ -91,7 +91,7 @@ struct SupervisorView: View {
 
     private var supervisorConversation: some View {
         ChatConversationView(
-            conversation: model.supervisorChat,
+            conversation: model.conversations.selected(.supervisor),
             title: "Supervisor",
             starters: SupervisorFormat.starters,
             placeholder: "Ask the supervisor",
