@@ -604,3 +604,13 @@ decisions remain there for review; canonical current queues and coding approvals
 never expire from the badge. No stored tasks, notifications, or approvals are
 changed by this presentation policy. Counts above 99 display as `99+`; the
 accessibility label and tooltip retain the exact count.
+
+The iMessage self-chat importer opens the Messages SQLite database strictly read-only,
+with a bounded lock wait. It reads committed WAL messages without checkpointing or
+creating the source database. Cursor checkpoints stay in OpenAGI's own data directory.
+
+The self-chat task importer supports both plain `text` and modern Messages
+`attributedBody` text, using the same decoder as the conversation bridge. Plain
+text takes precedence. Unreadable bodies and attachment-only rows advance the
+cursor without creating empty tasks; other chats remain excluded. First enable
+remains forward-only unless backfill is explicitly configured.

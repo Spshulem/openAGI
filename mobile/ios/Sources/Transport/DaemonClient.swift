@@ -386,6 +386,18 @@ public actor DaemonClient {
     // state/scan/mode; the Supervisor screen maps both. On a question or an
     // action a 404 means that one item is gone and 409 that it was already
     // closed elsewhere -- `.notFound` / `.conflict`, as everywhere else.
+    public func fleetThreadDetail(key: String) async throws -> FleetThreadDetail {
+        // One identity segment, never an arbitrary caller-supplied path.
+        guard key.range(of: #"^(codex|claude|conductor|antigravity):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
+            throw DaemonError.malformedResponse
+        }
+        let request = try authorizedRequest(path: "/fleet/api/threads/\(key)", method: "GET")
+        let (data, _) = try await perform(request)
+        let detail = try Self.decodeJSON(FleetThreadDetailResponse.self, from: data).thread
+        guard detail.key == key else { throw DaemonError.malformedResponse }
+        return detail
+    }
+
     public func fleetState() async throws -> FleetState {
         let request = try authorizedRequest(path: "/fleet/api/state", method: "GET")
         let (data, _) = try await perform(request)
