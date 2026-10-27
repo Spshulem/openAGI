@@ -66,3 +66,21 @@ test("unfiltered Computer History merges focus activity with OCR-backed frames",
   assert.deepEqual(legacyDefault.map((row) => row.kind), ["activity"],
     "callers that omit kinds keep the existing activity-only contract");
 });
+
+
+test("bounded history pages exhaust more than 5000 rows without repeated pages or gaps", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-history-pages-"));
+  const store = new ObservationStore({ dir }); await store.ready;
+  t.after(() => { store.db?.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  await store.record(Array.from({ length: 5005 }, (_, i) => ({ kind: 'frame-summary', frameId: 'page-' + i,
+    at: '2026-01-01T12:00:00.000Z', app: 'fixture', window: 'Synthetic history', ocrText: 'search fixture' })));
+  for (const query of [undefined, 'search fixture']) {
+    const refs = [];
+    for (let offset = 0; offset < 5005; offset += 200) {
+      const page = await store.search({ kinds: ['frame'], query, limit: 200, offset });
+      refs.push(...page.map(row => row.ref));
+    }
+    assert.equal(refs.length, 5005);
+    assert.equal(new Set(refs).size, 5005);
+  }
+});

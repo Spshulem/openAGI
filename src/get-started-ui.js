@@ -80,6 +80,11 @@ function renderGettingStarted() {
     label.append(check, el("span", "I tried this guide"));
     details.append(label); body.append(details); card.append(body); return card;
   };
+  const setup = el("section", "", "guide-featured");
+  const intro = el("div");
+  intro.append(el("h3", "Set up your agent"), el("p", "Choose your model, connect the tools you use, and set your budget. Permissions and device connections stay under your control."));
+  const begin = el("a", "Start setup →", "ui-btn ui-btn-primary"); begin.href = "/setup";
+  intro.append(begin); setup.append(intro); page.append(setup);
   page.append(cardFor(GET_STARTED_FLOWS[0], true));
   page.append(el("h3", "Explore at your own pace", "section-label"));
   const grid = el("div", "", "guide-grid");

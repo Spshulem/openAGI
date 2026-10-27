@@ -206,8 +206,12 @@ struct OverlayView: View {
 
   // Combined attention count shown on the collapsed pill badge.
   private var pillBadgeCount: Int {
-    brief.items.count + visibleOutreach.count + approvals.items.count
-      + (fleet.available ? fleet.questions.count : 0)
+    AttentionBadge.count(
+      briefKeys: brief.items.map { item in
+        item.entityRef.map { "\($0.kind):\($0.id)" } ?? "brief:\(item.id)"
+      },
+      outreach: visibleOutreach, approvalIDs: approvals.items.map(\.id),
+      fleetIDs: fleet.available ? fleet.questions.map(\.id) : [])
   }
 
   private var askPlaceholder: String {
@@ -226,7 +230,9 @@ struct OverlayView: View {
     ZStack {
       Circle().fill(Color.accentColor).frame(width: 18, height: 18)
       if pillBadgeCount > 0 {
-        Text("\(pillBadgeCount)")
+        Text(AttentionBadge.label(pillBadgeCount))
+          .lineLimit(1)
+          .minimumScaleFactor(0.7)
           .font(.system(size: 9, weight: .bold)).foregroundColor(.white)
       }
     }
@@ -244,7 +250,7 @@ struct OverlayView: View {
         onHover: { pillHovered = $0 },
         onDragBegan: onDragBegan,
         onDragEnded: onDragEnded,
-        toolTip: "Quick Ask (⌥Space) · drag to move",
+        toolTip: "Quick Ask (⌥Space) · \(pillBadgeCount) current items need attention · drag to move",
         accessibilityButtonLabel: pillBadgeCount > 0 ? "Quick Ask, \(pillBadgeCount) waiting" : "Quick Ask")
     }
   }
@@ -458,7 +464,7 @@ struct OverlayView: View {
         let needsYou = visibleOutreach
         if !needsYou.isEmpty {
           Divider()
-          Text("Needs you").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+          Text("Notifications").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
           ScrollView {
             VStack(alignment: .leading, spacing: 8) {
               ForEach(needsYou.prefix(6)) { item in

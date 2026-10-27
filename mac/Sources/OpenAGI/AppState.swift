@@ -32,6 +32,8 @@ final class AppState: ObservableObject {
   @Published var findings: [Finding] = []
   @Published var recentSessions: [SessionSummary] = []
   @Published var topTasks: [TaskSummary] = []
+  @Published var tasksLoaded = false
+  @Published var tasksUnavailable = false
   @Published var paused: Bool = false
 
   // Remote "main" pointer for proactive outreach. When set, OutreachConsumer
@@ -321,8 +323,11 @@ final class AppState: ObservableObject {
     do {
       let r: TasksResponse = try await get("/tasks?queue=user&status=pending&limit=5")
       topTasks = Array((r.tasks ?? []).prefix(5))
+      tasksLoaded = true
+      tasksUnavailable = false
     } catch {
-      // Quietly skip; not critical.
+      tasksLoaded = true
+      tasksUnavailable = true
     }
     if status != .healthy { Task { await self.fetchAuditAndNotify() } }
   }
