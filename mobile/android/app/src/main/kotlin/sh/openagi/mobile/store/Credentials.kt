@@ -56,7 +56,33 @@ data class Credentials(val server: String, val nodeId: String, val token: String
         }
 
         fun workspaceDirectory(context: Context, credentials: Credentials? = load(context)): java.io.File =
-            if (credentials?.isEmbedded == true) java.io.File(context.filesDir, "phone-cache").apply { mkdirs() } else context.filesDir
+            workspaceDirectory(context.filesDir, credentials)
+
+        internal fun workspaceDirectory(root: java.io.File, credentials: Credentials?): java.io.File =
+            java.io.File(root, when {
+                credentials == null -> "unpaired-cache"
+                credentials.isEmbedded -> "phone-cache"
+                else -> "server-cache/${credentials.workspaceId}"
+            }).apply { mkdirs() }
+
+        // Only the credential already saved before an upgrade can claim the
+        // old shared directory. Never adopt it for a newly paired server.
+        internal fun migrateLegacyDirectory(root: java.io.File, owner: Credentials) {
+            if (owner.isEmbedded) return
+            synchronized(Credentials::class.java) {
+                val destination = workspaceDirectory(root, owner)
+                val marker = java.io.File(root, "server-cache/legacy-owner")
+                if (marker.exists() && marker.readText() != owner.workspaceId) return
+                if (!marker.exists()) marker.writeText(owner.workspaceId)
+                for (name in listOf("snapshot.json", "outbox.json", "chat-chat.json", "chat-supervisor.json")) {
+                    val source = java.io.File(root, name)
+                    val target = java.io.File(destination, name)
+                    if (source.isFile && !target.exists()) check(source.renameTo(target)) {
+                        "Couldn't preserve the previous server cache."
+                    }
+                }
+            }
+        }
 
         fun load(context: Context): Credentials? {
             val store = prefs(context) ?: return null
@@ -64,7 +90,7 @@ data class Credentials(val server: String, val nodeId: String, val token: String
                 val server = store.getString("server", null) ?: return@guarded null
                 val nodeId = store.getString("nodeId", null) ?: return@guarded null
                 val token = store.getString("token", null) ?: return@guarded null
-                Credentials(server, nodeId, token)
+                Credentials(server, nodeId, token).also { migrateLegacyDirectory(context.filesDir, it) }
             }
         }
 
@@ -75,6 +101,11 @@ data class Credentials(val server: String, val nodeId: String, val token: String
         fun save(context: Context, credentials: Credentials): Boolean {
             val store = prefs(context) ?: return false
             return guarded(false, "write failed") {
+                val previousServer = store.getString("server", null)
+                val previousNode = store.getString("nodeId", null)
+                if (previousServer != null && previousNode != null) {
+                    migrateLegacyDirectory(context.filesDir, Credentials(previousServer, previousNode, ""))
+                }
                 store.edit()
                     .putString("server", credentials.server)
                     .putString("nodeId", credentials.nodeId)

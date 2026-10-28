@@ -16,6 +16,9 @@ import sh.openagi.mobile.widget.TodayWidget
 suspend fun activateWorkspace(context: Context, credentials: Credentials?) = withContext(Dispatchers.IO) {
     withAlertLock {
         val previous = Credentials.load(context)
+        if (previous?.isEmbedded == true) {
+            EmbeddedAgent.serverBackup(context)?.let { Credentials.migrateLegacyDirectory(context.filesDir, it) }
+        }
         check(if (credentials == null) Credentials.clear(context) else Credentials.save(context, credentials)) {
             "Couldn't save the active workspace securely."
         }

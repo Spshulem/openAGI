@@ -71,6 +71,17 @@ enum ChatHistoryCodec {
         message.retrySafe = entry.retrySafe ?? !entry.failed
         return message
     }
+
+    static func restored(_ entries: [SavedChatEntry]) -> [ChatMessage] {
+        var messages = entries.map(message)
+        for index in messages.indices where messages[index].role == .assistant && messages[index].isFailed && messages[index].retrySafe {
+            guard let user = messages[..<index].last(where: { $0.role == .user }),
+                  user.attachments.contains(where: { $0.data == nil }) else { continue }
+            messages[index].retrySafe = false
+            messages[index].text += "\n\nReattach the images to try again; saved previews can't be sent to the model."
+        }
+        return messages
+    }
 }
 
 // Folds one page of the daemon's shared thread (`GET /conversations/:thread/

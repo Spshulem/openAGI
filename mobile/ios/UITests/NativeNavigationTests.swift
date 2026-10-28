@@ -319,6 +319,16 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(composer.exists)
         XCTAssertGreaterThan(composer.frame.minY, app.frame.midY,
                              "The composer belongs below history, not over its first message")
+        let controls = [app.buttons["chat-attach"], app.buttons["chat-dictation"], app.buttons["chat-send"]]
+        for control in controls {
+            XCTAssertTrue(control.exists)
+            XCTAssertGreaterThanOrEqual(control.frame.height, 44, "Composer controls need native touch targets")
+            XCTAssertEqual(control.frame.height, controls[0].frame.height, accuracy: 2,
+                           "Attachment, microphone and Send should have matching visual size")
+            XCTAssertEqual(control.frame.width, control.frame.height, accuracy: 2)
+        }
+        XCTAssertGreaterThanOrEqual(composer.frame.width, 120, "Controls must leave room to write")
+        capture("native-composer-controls", app: app)
         composer.tap()
         composer.typeText("A synthetic message")
         // Keep keyboard assertions scoped to the native control rather

@@ -91,4 +91,25 @@ final class ChatHistoryStoreTests: XCTestCase {
         XCTAssertTrue(ChatHistoryCodec.message(store.load(nodeID: "n")[0]).retrySafe)
     }
 
+    func testRestoredImageFailureRequiresReattachingOriginalPixels() {
+        let user = ChatMessage(role: .user, text: "What's in this photo?", attachments: [
+            ChatAttachment(name: "Synthetic.jpg", data: "original-pixels", thumbnail: "preview")
+        ])
+        let failed = ChatMessage(role: .assistant, text: "Agent not enabled.", isFailed: true)
+        let restored = ChatHistoryCodec.restored([user, failed].map(ChatHistoryCodec.saved))
+        XCTAssertNil(restored[0].attachments.first?.data)
+        XCTAssertFalse(restored[1].retrySafe)
+        XCTAssertTrue(restored[1].text.contains("Reattach the images"))
+        XCTAssertNil(ChatRetry.target(failedID: restored[1].id, in: restored, isSending: false))
+    }
+
+    func testRestoredTextRetryIsNotAffectedByAnEarlierImageTurn() {
+        let image = ChatMessage(role: .user, text: "Photo", attachments: [ChatAttachment(name: "Synthetic.jpg", data: "pixels")])
+        let text = ChatMessage(role: .user, text: "Another question")
+        let failed = ChatMessage(role: .assistant, text: "Agent not enabled.", isFailed: true)
+        let restored = ChatHistoryCodec.restored([image, ChatMessage(role: .assistant, text: "Seen"), text, failed].map(ChatHistoryCodec.saved))
+        XCTAssertTrue(restored.last!.retrySafe)
+        XCTAssertEqual(ChatRetry.target(failedID: restored.last!.id, in: restored, isSending: false)?.userText, text.text)
+    }
+
 }

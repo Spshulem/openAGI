@@ -64,7 +64,7 @@ final class ChatConversation {
         // See DaemonClient.sendMessageStreaming: keeps an older main from
         // putting the supervisor chat in the same session as Chat.
         self.legacyConversationKey = thread == .supervisor ? "mobile-supervisor" : nil
-        self.messages = store.load(nodeID: nodeID).map(ChatHistoryCodec.message)
+        self.messages = ChatHistoryCodec.restored(store.load(nodeID: nodeID))
     }
 
     // MARK: - Sending

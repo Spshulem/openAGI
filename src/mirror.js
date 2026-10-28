@@ -25,6 +25,7 @@ const OFFLINE_ORIGIN = "phone-offline";
 
 const LIMITS = Object.freeze({
   messagesPerThread: 2000,
+  conversations: 200,
   memories: 5000,
   tasks: 2000,
   skills: 200,
@@ -44,6 +45,7 @@ const LIMITS = Object.freeze({
 const OFFLINE_LIMITS = Object.freeze({ messagesPerThread: 500, tasks: 500, memories: 2000 });
 
 const MESSAGE_ID = /^[\w-]{1,200}$/; // same as shared-conversations
+const NAMED_THREAD = /^(agent|supervisor):([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/;
 const ITEM_ID = /^[\w.:-]{1,200}$/;
 const NODE_ID = /^[\w.:-]{1,200}$/;
 const SKILL_NAME = /^[A-Za-z0-9][\w.-]{0,79}$/;
@@ -108,6 +110,25 @@ function requireDataDir(dataDir) {
   return dataDir;
 }
 
+// Legacy keys remain agent/supervisor. Named device chats add a validated
+// UUID suffix; owner web sessions and arbitrary session IDs are never imported.
+const isThreadKey = key => SHARED_THREADS.includes(key) || NAMED_THREAD.test(key);
+function sessionForThread(key) {
+  const [thread, id = "main"] = key.split(":");
+  return sharedSessionId(thread, id);
+}
+function threadKeys(store) {
+  return [...new Set([...SHARED_THREADS, ...store.listSessions({ prefix: "devices:" }).map(session => {
+    const key = session.id.slice("devices:".length);
+    return key.endsWith(":main") ? key.slice(0, -5) : key;
+  }).filter(isThreadKey)])];
+}
+function threadMessages(store, key) {
+  const id = sessionForThread(key), session = store.getSession(id);
+  const archived = session.metadata?.historyArchived && typeof store.archivedMessages === "function" ? store.archivedMessages(id) : [];
+  return [...new Map([...archived, ...session.messages].filter(isVisibleMessage).map(m => [m.id, m])).values()];
+}
+
 function statePath(dataDir) { return path.join(dataDir, "mirror", "state.json"); }
 function skillsDir(dataDir) { return path.join(dataDir, "skills"); }
 
@@ -130,7 +151,8 @@ function readState(dataDir) {
     importedAt: typeof raw.importedAt === "string" ? raw.importedAt : null,
     cursor: typeof raw.cursor === "string" ? raw.cursor : null,
     baseline: {
-      threadMessageIds: Object.fromEntries(SHARED_THREADS.map(t => [t, ids(raw.baseline?.threadMessageIds?.[t])])),
+      threadMessageIds: { ...base.baseline.threadMessageIds, ...Object.fromEntries(
+        Object.entries(raw.baseline?.threadMessageIds ?? {}).filter(([key]) => isThreadKey(key)).map(([key, value]) => [key, ids(value)])) },
       memoryIds: ids(raw.baseline?.memoryIds),
       taskIds: ids(raw.baseline?.taskIds)
     },
@@ -262,8 +284,8 @@ export function buildMirrorSnapshot(runtime, { dataDir, maxMessages = 500, maxMe
   let messageCap = Math.max(0, Math.min(Math.floor(maxMessages), LIMITS.messagesPerThread));
   let memoryCap = Math.max(0, Math.min(Math.floor(maxMemories), LIMITS.memories));
 
-  const threadsAll = Object.fromEntries(SHARED_THREADS.map(thread => [
-    thread, store.getSession(sharedSessionId(thread)).messages.filter(isVisibleMessage).map(projectMessage)
+  const threadsAll = Object.fromEntries(threadKeys(store).slice(0, LIMITS.conversations + SHARED_THREADS.length).map(key => [
+    key, threadMessages(store, key).map(projectMessage)
   ]));
   const memoriesAll = allMemories(runtime)
     .filter(item => typeof item?.id === "string" && ITEM_ID.test(item.id) && MEMORY_TIERS.has(item.tier) && typeof item.content === "string")
@@ -284,7 +306,7 @@ export function buildMirrorSnapshot(runtime, { dataDir, maxMessages = 500, maxMe
       persona, skills,
       memories: memoriesAll.slice(0, memoryCap),
       tasks,
-      threads: Object.fromEntries(SHARED_THREADS.map(t => [t, messageCap ? threadsAll[t].slice(-messageCap) : []]))
+      threads: Object.fromEntries(Object.entries(threadsAll).map(([key, messages]) => [key, messageCap ? messages.slice(-messageCap) : []]))
     };
     const cursor = sha(JSON.stringify(body)).slice(0, 32);
     const snapshot = { version: MIRROR_VERSION, source: { createdAt: nowIso(), cursor }, ...body };
@@ -371,8 +393,10 @@ function checkTask(task, label) {
 
 function checkThreads(threads, perThread, label) {
   if (!isPlainObject(threads)) throw bad(`${label} must be an object.`);
-  checkKeys(threads, SHARED_THREADS, label);
-  for (const thread of SHARED_THREADS) {
+  const keys = Object.keys(threads);
+  if (keys.length > LIMITS.conversations + SHARED_THREADS.length) throw fail("mirror_too_large", 413, "Too many conversations in one page.");
+  if (!keys.every(isThreadKey)) throw bad(`${label} contains an invalid device conversation.`);
+  for (const thread of keys) {
     const list = threads[thread] ?? [];
     checkArray(list, perThread, `${label}.${thread}`);
     list.forEach((m, i) => checkMessage(m, `${label}.${thread}[${i}]`));
@@ -435,11 +459,16 @@ function collectOffline(runtime, state, { limits = null } = {}) {
     if (limits && list.length > max) { truncated = true; return list.slice(0, max); }
     return list;
   };
-  const messages = {};
-  for (const thread of SHARED_THREADS) {
-    const baseline = new Set(state.baseline.threadMessageIds[thread]);
-    const list = store.getSession(sharedSessionId(thread)).messages
-      .filter(m => isVisibleMessage(m) && !baseline.has(m.id) && !sentMessages.has(m.id));
+  const messages = { agent: [], supervisor: [] };
+  let namedCount = 0;
+  for (const thread of threadKeys(store)) {
+    const baseline = new Set(state.baseline.threadMessageIds[thread] ?? []);
+    const list = threadMessages(store, thread).filter(m => !baseline.has(m.id) && !sentMessages.has(m.id));
+    if (!SHARED_THREADS.includes(thread)) {
+      if (!list.length) continue;
+      if (limits && namedCount >= LIMITS.conversations) { truncated = true; continue; }
+      namedCount += 1;
+    }
     messages[thread] = cap(list, OFFLINE_LIMITS.messagesPerThread);
   }
   const taskBaseline = new Set(state.baseline.taskIds), taskSent = new Set(state.sent.taskIds);
@@ -465,14 +494,14 @@ export function listOfflineWork(runtime, { dataDir } = {}) {
   const work = {
     version: MIRROR_VERSION,
     since: state.importedAt,
-    messages: Object.fromEntries(SHARED_THREADS.map(t => [t, raw.messages[t].map(projectMessage)])),
+    messages: Object.fromEntries(Object.entries(raw.messages).map(([key, messages]) => [key, messages.map(projectMessage)])),
     tasks: raw.tasks.map(projectTask),
     memories: raw.memories.map(item => projectMemory(item, { redact: false })),
     truncated: raw.truncated
   };
   // Shed the newest items until the page fits what the Mac will accept.
   while (byteLength(work) > MIRROR_MAX_BYTES) {
-    const longest = [work.messages.agent, work.messages.supervisor, work.tasks, work.memories].sort((a, b) => b.length - a.length)[0];
+    const longest = [...Object.values(work.messages), work.tasks, work.memories].sort((a, b) => b.length - a.length)[0];
     if (!longest.length) break;
     longest.length = Math.floor(longest.length / 2);
     work.truncated = true;
@@ -486,7 +515,7 @@ export function markOfflineWorkSent(runtime, { dataDir, work } = {}) {
   const state = readState(dataDir);
   const sent = { messageIds: new Set(state.sent.messageIds), taskIds: new Set(state.sent.taskIds), memoryIds: new Set(state.sent.memoryIds) };
   const before = sent.messageIds.size + sent.taskIds.size + sent.memoryIds.size;
-  for (const thread of SHARED_THREADS) for (const m of work.messages[thread] ?? []) sent.messageIds.add(m.id);
+  for (const messages of Object.values(work.messages)) for (const m of messages) sent.messageIds.add(m.id);
   for (const t of work.tasks) sent.taskIds.add(t.id);
   for (const m of work.memories) sent.memoryIds.add(m.id);
   const next = { ...state, sent: { messageIds: [...sent.messageIds], taskIds: [...sent.taskIds], memoryIds: [...sent.memoryIds] } };
@@ -545,11 +574,12 @@ export function importMirrorSnapshot(runtime, snapshot, { dataDir } = {}) {
 
   // Threads: snapshot history, then this phone's unsent messages.
   const threadMessageIds = {};
-  for (const thread of SHARED_THREADS) {
-    const sessionId = sharedSessionId(thread);
+  const keys = [...new Set([...SHARED_THREADS, ...Object.keys(snapshot.threads), ...Object.keys(state.baseline.threadMessageIds), ...Object.keys(offline.messages)])];
+  for (const thread of keys) {
+    const sessionId = sessionForThread(thread);
     const incoming = snapshot.threads[thread] ?? [];
     const ids = new Set(incoming.map(m => m.id));
-    const kept = offline.messages[thread].filter(m => !ids.has(m.id));
+    const kept = (offline.messages[thread] ?? []).filter(m => !ids.has(m.id));
     const mirrored = incoming.map(m => ({ ...projectMessage(m), content: m.content }));
     const session = store.getSession(sessionId);
     store.saveSession({
@@ -607,10 +637,10 @@ export function importMirrorSnapshot(runtime, snapshot, { dataDir } = {}) {
 
   return {
     cursor: snapshot.source.cursor, importedAt,
-    threads: Object.fromEntries(SHARED_THREADS.map(t => [t, threadMessageIds[t].length])),
+    threads: Object.fromEntries(Object.entries(threadMessageIds).map(([key, ids]) => [key, ids.length])),
     memories: memoryIds.length, tasks: taskIds.length, skills: snapshot.skills.length, persona: snapshot.persona !== null,
     kept: {
-      messages: SHARED_THREADS.reduce((n, t) => n + offline.messages[t].filter(m => !threadMessageIds[t].includes(m.id)).length, 0),
+      messages: Object.entries(offline.messages).reduce((n, [key, messages]) => n + messages.filter(m => !threadMessageIds[key].includes(m.id)).length, 0),
       tasks: keptTasks, memories: keptMemories
     }
   };
@@ -638,11 +668,12 @@ export function importOfflineWork(runtime, work, { dataDir, fromNodeId } = {}) {
   const origin = { origin: OFFLINE_ORIGIN, fromNodeId };
   const result = { added: { messages: 0, tasks: 0, memories: 0 }, skipped: { messages: 0, tasks: 0, memories: 0 } };
 
-  for (const thread of SHARED_THREADS) {
-    const sessionId = sharedSessionId(thread);
+  for (const key of Object.keys(work.messages)) {
+    const sessionId = sessionForThread(key);
+    const thread = key.split(":")[0];
     const seen = existingMessageIds(store, sessionId);
     const appended = [];
-    for (const m of [...(work.messages[thread] ?? [])].sort(byCreated)) {
+    for (const m of [...(work.messages[key] ?? [])].sort(byCreated)) {
       if (seen.has(m.id)) { result.skipped.messages += 1; continue; }
       seen.add(m.id);
       const message = {

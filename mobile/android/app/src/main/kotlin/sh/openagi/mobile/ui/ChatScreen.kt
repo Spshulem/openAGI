@@ -429,7 +429,7 @@ fun ChatScreen(
                                 showingHistory = false
                                 if (index >= 0) {
                                     userScrolledAway = true
-                                    scope.launch { listState.scrollToItem(index) }
+                                    scope.launch { listState.scrollToItem(index + if (showLoadOlder) 1 else 0) }
                                 }
                             })
                     }

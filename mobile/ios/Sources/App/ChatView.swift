@@ -69,7 +69,7 @@ struct ChatView: View {
     private var conversationNavigation: some View {
         NavigationStack {
             ChatConversationView(conversation: conversation, title: thread == .agent ? "Chat" : "Supervisor chat",
-                                 scrollToMessageID: selectedMessage)
+                                 scrollToMessageID: selectedMessage, onHistorySelectionConsumed: { selectedMessage = nil })
                 .id(conversation.identity)
                 .toolbar {
                     ToolbarItemGroup(placement: .primaryAction) {
@@ -116,6 +116,7 @@ struct ChatConversationView: View {
     var placeholder = "Message OpenAGI"
     var emptyDetail = "OpenAGI reads this the same way it reads everything else you tell it."
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
+    var onHistorySelectionConsumed: () -> Void = {}
 
     @State private var isPinnedToBottom = true
     @State private var userIsScrolling = false
@@ -269,11 +270,18 @@ struct ChatConversationView: View {
                         proxy.scrollTo(first, anchor: .top)
                     } else if isPinnedToBottom { scrollToLatest(proxy) }
                 }
-                .onAppear { scrollToLatest(proxy) }
+                .onAppear {
+                    if let id = scrollToMessageID {
+                        isPinnedToBottom = false
+                        proxy.scrollTo(id, anchor: .center)
+                        onHistorySelectionConsumed()
+                    } else { scrollToLatest(proxy) }
+                }
                 .onChange(of: scrollToMessageID) { _, id in
                     if let id {
                         isPinnedToBottom = false
                         proxy.scrollTo(id, anchor: .center)
+                        onHistorySelectionConsumed()
                     }
                 }
                 .scrollDismissesKeyboard(.interactively)
@@ -426,41 +434,40 @@ struct ChatConversationView: View {
     @ViewBuilder
     private var composerBar: some View {
         if #available(iOS 26, *) {
-            GlassEffectContainer(spacing: 12) {
-                HStack(alignment: .bottom, spacing: 12) {
+            GlassEffectContainer(spacing: 8) {
+                HStack(alignment: .bottom, spacing: 8) {
                     attachmentMenu.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.large)
                     composerField
                         .padding(.horizontal, 16).padding(.vertical, 12)
                         .glassEffect(.regular, in: .capsule)
-                    dictationButton.buttonStyle(.glass).buttonBorderShape(.circle)
+                    dictationButton.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.large)
                     sendButton
                         .buttonStyle(.glassProminent)
                         .buttonBorderShape(.circle)
                         .controlSize(.large)
                 }
             }
-            .padding(.horizontal, 16).padding(.vertical, 8)
+            .padding(.horizontal, 12).padding(.vertical, 8)
         } else {
-            HStack(alignment: .bottom, spacing: 12) {
-                attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle)
+            HStack(alignment: .bottom, spacing: 8) {
+                attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.large)
                 composerField.textFieldStyle(.roundedBorder)
-                dictationButton.buttonStyle(.bordered).buttonBorderShape(.circle)
-                sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle)
+                dictationButton.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.large)
+                sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle).controlSize(.large)
             }
-            .padding(.horizontal, 16).padding(.vertical, 8)
+            .padding(.horizontal, 12).padding(.vertical, 8)
         }
     }
 
     private var dictationButton: some View {
-        Button(dictation.isListening ? "Stop dictation" : "Dictate message", systemImage: dictation.isListening ? "stop.fill" : "mic") {
+        Button {
             if dictation.isListening || dictation.isStarting { dictation.stop() }
             else {
                 composerFocused = false
                 Task { await dictation.start(draft: conversation.draft) { text in conversation.draft = text } }
             }
-        }
-        .labelStyle(.iconOnly)
-        .frame(minWidth: 44, minHeight: 44)
+        } label: { composerIcon(dictation.isListening ? "stop.fill" : "mic") }
+        .accessibilityLabel(dictation.isListening ? "Stop dictation" : "Dictate message")
         .disabled(conversation.isSending)
         .accessibilityIdentifier("chat-dictation")
     }
@@ -476,8 +483,9 @@ struct ChatConversationView: View {
                 }
             }
             #endif
-        } label: { Image(systemName: "plus").frame(width: 24, height: 24) }
+        } label: { composerIcon("plus") }
         .accessibilityLabel("Add images")
+        .menuIndicator(.hidden)
         .accessibilityIdentifier("chat-attach")
         .disabled(isPreparingImages || conversation.draftAttachments.count >= ChatAttachment.maximumCount)
     }
@@ -566,10 +574,16 @@ struct ChatConversationView: View {
     }
 
     private var sendButton: some View {
-        Button("Send", systemImage: "arrow.up", action: sendDraft)
-            .labelStyle(.iconOnly)
+        Button(action: sendDraft) { composerIcon("arrow.up") }
+            .accessibilityLabel("Send")
             .disabled(!canSend)
             .accessibilityIdentifier("chat-send")
+    }
+
+    private func composerIcon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 20, weight: .medium))
+            .frame(width: 24, height: 24)
     }
 
     private func sendDraft() {
