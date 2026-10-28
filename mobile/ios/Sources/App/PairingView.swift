@@ -27,7 +27,7 @@ struct PairingView: View {
         let candidate = backup ?? Credentials.load()
         let savedServer = candidate.flatMap { $0.isEmbedded ? nil : $0.server }
         self.savedServer = savedServer
-        self.canResumeServer = backup != nil && prefillServer == nil
+        self.canResumeServer = savedServer != nil && prefillServer == nil
         _serverText = State(initialValue: (prefillServer ?? savedServer)?.absoluteString ?? "")
         _codeText = State(initialValue: prefillCode ?? "")
         self.onCancel = onCancel
@@ -48,7 +48,7 @@ struct PairingView: View {
                     }
 
                     if let savedServer {
-                        Text("Your saved server is \(savedServer.absoluteString). Opening this screen does not remove its pairing.")
+                        Text("Your saved server is \(savedServer.absoluteString). Reconnect with the saved pairing; you don't need a new code after a disconnection.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     if canResumeServer {
@@ -57,11 +57,11 @@ struct PairingView: View {
                                 isPairing = true
                                 defer { isPairing = false }
                                 do {
-                                    _ = try await AppSession.shared.switchBackToServer()
+                                    try await AppSession.shared.switchBackToServer()
                                     onPaired()
                                 } catch {
                                     errorHeadline = "Can't return to the saved server yet."
-                                    errorDetail = "Your pairing is still saved. Check Tailscale and the server connection, then try again."
+                                    if let savedServer { errorDetail = ServerConnectionGuidance.savedPairingFailure(error, server: savedServer) }
                                 }
                             }
                         }
@@ -81,7 +81,7 @@ struct PairingView: View {
                                 VStack(alignment: .leading) {
                                     Text(server.name)
                                     Text(server.address.absoluteString).font(.caption)
-                                    Text(server.reachable.map { $0 ? "OpenAGI is responding" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
+                                    Text(server.reachable.map { $0 ? "Server reachable · pairing not checked" : "Not reachable · check server and network" } ?? "Nearby announcement or connection check pending")
                                         .font(.caption).foregroundStyle(.secondary)
                                 }
                             }

@@ -14,6 +14,7 @@ final class ConversationLibrary {
     private var chats: [String: ChatConversation]
     private let client: DaemonClient
     private let nodeID: String
+    private let server: URL
     private let directory: URL
     private let catalogFile: URL
     private var active = true
@@ -23,6 +24,7 @@ final class ConversationLibrary {
          agent: ChatConversation, supervisor: ChatConversation) {
         self.client = client
         self.nodeID = credentials.nodeID
+        self.server = credentials.server
         self.directory = directory
         let scope = Self.digest(credentials.server.absoluteString + "|" + credentials.nodeID)
         self.catalogFile = directory.appending(path: "conversations-\(scope).json")
@@ -60,9 +62,14 @@ final class ConversationLibrary {
             save()
         } catch {
             guard active, issued == generation else { return }
-            self.error = error as? DaemonError == .notFound
-                ? "Update OpenAGI on your server to create chats and load the full conversation list. Your saved shared chats are still available."
-                : "Couldn't refresh conversations. Saved chats are still available. Try again."
+            switch error as? DaemonError {
+            case .notFound:
+                self.error = "Update OpenAGI on your server to create chats and load the full conversation list. Your saved shared chats and pairing are still available; no new code is needed."
+            case .malformedResponse:
+                self.error = "The server responded with unexpected conversation data. Update OpenAGI on the server, then retry. Your saved chats and pairing have been kept."
+            default:
+                self.error = "Couldn't refresh conversations. " + ServerConnectionGuidance.savedPairingFailure(error, server: server)
+            }
         }
     }
 

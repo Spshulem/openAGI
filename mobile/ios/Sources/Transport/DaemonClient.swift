@@ -378,7 +378,8 @@ public actor DaemonClient {
 
     public func conversations() async throws -> [ConversationSummary] {
         let request = try authorizedRequest(path: "/conversations", method: "GET")
-        let (data, _) = try await perform(request)
+        let (data, http) = try await perform(request)
+        try Self.requireConversationJSON(data: data, response: http)
         return try Self.decodeJSON(ConversationCatalog.self, from: data).conversations
     }
 
@@ -388,8 +389,19 @@ public actor DaemonClient {
         var request = try authorizedRequest(path: "/conversations", method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, _) = try await perform(request)
+        let (data, http) = try await perform(request)
+        try Self.requireConversationJSON(data: data, response: http)
         return try Self.decodeJSON(ConversationSummary.self, from: data)
+    }
+
+    private static func requireConversationJSON(data: Data, response: HTTPURLResponse) throws {
+        // Older dashboards return their HTML app shell with 200 for unknown
+        // GET routes. That is an unsupported catalog, not a lost pairing.
+        let type = response.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        let prefix = String(decoding: data.prefix(128), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if type.contains("text/html") || prefix.hasPrefix("<!doctype html") || prefix.hasPrefix("<html") {
+            throw DaemonError.notFound
+        }
     }
 
     // MARK: - Lifelog

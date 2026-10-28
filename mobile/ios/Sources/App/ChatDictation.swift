@@ -29,9 +29,7 @@ final class ChatDictation {
             error = "On-device dictation isn't available for this language. Try the microphone on the iOS keyboard."
             return
         }
-        let authorization = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
-        }
+        let authorization = await Self.speechAuthorization()
         guard self.generation == generation else { return }
         guard authorization == .authorized else {
             error = "Allow Speech Recognition for OpenAGI in iPhone Settings to dictate."
@@ -107,5 +105,17 @@ final class ChatDictation {
     static func merging(draft: String, transcript: String) -> String {
         guard !draft.isEmpty, !transcript.isEmpty else { return draft + transcript }
         return draft + (draft.last?.isWhitespace == true ? "" : " ") + transcript
+    }
+
+    // TCC calls back on a background queue. An implicitly MainActor-isolated
+    // callback traps under Swift 6 before it can resume the continuation.
+    static func speechAuthorization(
+        request: (@escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void) -> Void = {
+            SFSpeechRecognizer.requestAuthorization($0)
+        }
+    ) async -> SFSpeechRecognizerAuthorizationStatus {
+        await withCheckedContinuation { continuation in
+            request { @Sendable status in continuation.resume(returning: status) }
+        }
     }
 }
