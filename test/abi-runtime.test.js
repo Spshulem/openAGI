@@ -1092,15 +1092,10 @@ test("HTTP MCP client speaks Streamable HTTP with bearer auth (mocked fetch)", a
   globalThis.fetch = async (url, opts) => {
     calls.push({ url, headers: opts.headers, body: JSON.parse(opts.body) });
     const next = responseQueue.shift();
-    return {
-      ok: next.status < 400,
+    return new Response(typeof next.body === "string" ? next.body : JSON.stringify(next.body), {
       status: next.status,
-      statusText: "OK",
-      headers: { get: (k) => next.headers[k.toLowerCase()] ?? null },
-      json: async () => typeof next.body === "string" ? {} : next.body,
-      text: async () => typeof next.body === "string" ? next.body : JSON.stringify(next.body),
-      body: { getReader: () => ({ read: async () => ({ done: true, value: null }) }) }
-    };
+      headers: next.headers
+    });
   };
   try {
     const client = new McpHttpClient({
@@ -1132,27 +1127,9 @@ test("HTTP MCP client parses SSE response body for matching id", async () => {
     "",
     ""
   ].join("\n");
-  const encoded = new TextEncoder().encode(sseBody);
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({
-    ok: true,
-    status: 200,
-    statusText: "OK",
-    headers: { get: (k) => k === "content-type" ? "text/event-stream" : null },
-    json: async () => ({}),
-    text: async () => sseBody,
-    body: {
-      getReader() {
-        let sent = false;
-        return {
-          async read() {
-            if (sent) return { done: true, value: null };
-            sent = true;
-            return { done: false, value: encoded };
-          }
-        };
-      }
-    }
+  globalThis.fetch = async () => new Response(sseBody, {
+    headers: { "content-type": "text/event-stream" }
   });
   try {
     const client = new McpHttpClient({ name: "sse", url: "https://x.example/mcp" });
