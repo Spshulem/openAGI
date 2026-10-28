@@ -186,7 +186,18 @@ class SupervisorAlertService : Service() {
     }
 
     private fun updateNotification() {
-        runCatching { NotificationManagerCompat.from(this).notify(ONGOING_ID, ongoingNotification()) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            stopSelf()
+            return
+        }
+        try {
+            NotificationManagerCompat.from(this).notify(ONGOING_ID, ongoingNotification())
+        } catch (denied: SecurityException) {
+            // Permission can be revoked between the check and the post.
+            stopSelf()
+        }
     }
 
     private fun ongoingNotification(): Notification {
