@@ -24,9 +24,10 @@ data class SessionOverview(
         waiting.takeIf { it > 0 }?.let { "$it waiting" },
     ).joinToString(" · ").ifEmpty { "No active sessions" }
     val chip: String get() = when {
-        needsYou > 0 -> "$needsYou need you"
-        blocked > 0 -> "$blocked blocked"
-        else -> "$working active"
+        needsYou > 0 -> "$needsYou need"
+        blocked > 0 -> "$blocked held"
+        working > 0 -> "$working run"
+        else -> "$waiting wait"
     }
     val detail: String? get() = first?.let { thread ->
         val title = thread.title?.trim().takeUnless { it.isNullOrEmpty() } ?: thread.key

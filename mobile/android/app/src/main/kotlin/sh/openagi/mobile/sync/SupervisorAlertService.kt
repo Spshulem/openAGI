@@ -198,7 +198,7 @@ class SupervisorAlertService : Service() {
         val unpin = PendingIntent.getService(this, 1002,
             Intent(this, SupervisorAlertService::class.java).setAction(ACTION_STOP_MONITORING),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val notification = NotificationCompat.Builder(this, SupervisorNotifier.CHANNEL_SESSIONS)
+        val builder = NotificationCompat.Builder(this, SupervisorNotifier.CHANNEL_SESSIONS)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(title)
             .setContentText(body)
@@ -216,17 +216,16 @@ class SupervisorAlertService : Service() {
                 .setContentText("Unlock to review your agents.").build())
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
-            .build()
         // The system/OEM may decline promotion. The same native card remains
         // useful as an ordinary ongoing notification, including on foldables.
-        return if (Build.VERSION.SDK_INT >= 36 && AlertPrefs.pinSessions(this) &&
+        if (Build.VERSION.SDK_INT >= 36 && AlertPrefs.pinSessions(this) &&
             summary != null && summary.active && !summary.stale(now) && !offline
         ) {
-            Notification.Builder.recoverBuilder(this, notification)
+            builder
                 .setRequestPromotedOngoing(true)
                 .setShortCriticalText(summary.chip)
-                .build()
-        } else notification
+        }
+        return builder.build()
     }
 
     companion object {
