@@ -86,3 +86,33 @@ test("OAuth retry cancels the rejected body and retains per-request interactivit
   assert.deepEqual(interactive, [false, false]);
   assert.equal(client.activeControllers.size, 0);
 });
+
+for (const ending of ["\n", "\r\n", "\r"]) {
+  test(`SSE accepts ${JSON.stringify(ending)} line endings across byte chunks`, async () => {
+    const client = new McpHttpClient({ url: "https://mcp.example.invalid" });
+    const wire = `: heartbeat${ending}${ending}data: {"method":"notice"}${ending}${ending}data: {"id":7,${ending}data: "result":{"ok":true}}${ending}${ending}`;
+    let cancelled = false;
+    let deadline;
+    let streamController;
+    const bytes = new TextEncoder().encode(wire);
+    const body = new ReadableStream({
+      start(controller) { streamController = controller; for (const byte of bytes) controller.enqueue(Uint8Array.of(byte)); },
+      cancel() { cancelled = true; }
+    });
+    try {
+      // Leave the connection open, as real SSE servers do. A missing frame
+      // delimiter must fail promptly rather than hanging the test runner.
+      const result = await Promise.race([
+        client.readSseForResponse(new Response(body), 7),
+        new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("reply was not parsed")), 500); })
+      ]);
+      assert.deepEqual(result, { ok: true });
+      assert.equal(cancelled, true);
+      assert.equal(body.locked, false);
+    } finally {
+      clearTimeout(deadline);
+      try { streamController.error(new Error("fixture cleanup")); } catch {}
+      if (!body.locked) await body.cancel().catch(() => {});
+    }
+  });
+}

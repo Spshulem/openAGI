@@ -196,11 +196,21 @@ export class McpHttpClient {
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
+    let previousCR = false;
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        // SSE permits LF, CRLF, and bare CR. Normalize only decoded
+        // line endings, remembering a CR at a transport chunk boundary
+        // so the following LF cannot become a spurious blank event.
+        let chunk = decoder.decode(value, { stream: true });
+        if (chunk) {
+          const endsWithCR = chunk.endsWith("\r");
+          if (previousCR && chunk.startsWith("\n")) chunk = chunk.slice(1);
+          previousCR = endsWithCR;
+          buffer += chunk.replace(/\r\n|\r/g, "\n");
+        }
         let idx;
         while ((idx = buffer.indexOf("\n\n")) >= 0) {
           const block = buffer.slice(0, idx);
