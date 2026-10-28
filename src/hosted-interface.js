@@ -11,6 +11,7 @@ import { attachVoiceRelay } from "./voice/relay.js";
 import { createVoiceSessionFactory, voiceEnabled } from "./voice/broker.js";
 import { G2Proactive } from "./g2-proactive.js";
 import { G2Requests } from "./g2-requests.js";
+import { EvenAIAgent, G2LiveCues } from "./integrations/g2-agent.js";
 import { g2ConnectPage } from "./g2-connect-page.js";
 import { g2ProactivePage } from "./g2-proactive-page.js";
 import { lifelogPage } from "./lifelog-page.js";
@@ -249,6 +250,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
 
   const events = new EventEmitter();
   const g2Proactive = new G2Proactive({ dir: path.join(dataDir, "g2-proactive"), runtime });
+  const evenAIAgent = channels?.g2 ? new EvenAIAgent(channels.g2) : null;
+  const g2LiveCues = channels?.g2 ? new G2LiveCues({ channel: channels.g2, runtime }) : null;
   let g2Requests = null;
   try { g2Requests = channels?.g2 ? new G2Requests({ channel: channels.g2, dir: path.join(dataDir, "g2-requests"),
     onCancel: async record => {
@@ -937,7 +940,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       const method = req.method;
       const nodeScopedRoute = method === "POST" && [
         "/nodes/heartbeat", "/nodes/control/poll", "/nodes/control/result", "/nodes/revoke",
-        "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
+        "/nodes/capture-memory", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"
       ].includes(pathname);
       const sharedHistoryRoute = method === "GET" && sharedHistoryThread(pathname) !== null;
       const nodeClientRoute = (method === "GET" && ["/nodes", "/tasks", "/integrations/status"].includes(pathname))
@@ -953,14 +956,14 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // the G2 voice routes; all generic node/control routes still require
       // the explicit X-OpenAGI-Node-ID header.
       const tokenOnlyG2Enrollment = !headerNodeId
-        && ["/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        && ["/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         ? nodeRegistry.enrollmentForToken(scopedBearer)
         : null;
       const requestNodeId = headerNodeId ?? tokenOnlyG2Enrollment?.nodeId ?? null;
       const requestEnrollment = tokenOnlyG2Enrollment
         ?? (requestNodeId ? nodeRegistry.enrollment(requestNodeId) : null);
       const g2NodeRouteAllowed = requestEnrollment?.platform !== EVEN_G2_PLATFORM
-        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
+        || ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname)
         || sharedHistoryRoute;
       // A mobile credential is accepted on its enumerated allowlist and
       // nowhere else. Same shape as g2NodeRouteAllowed: platforms other than
@@ -984,7 +987,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // normal auth gate below still runs; this does not make the route public.
       const authenticatedG2CrossOrigin = requestEnrollment?.platform === EVEN_G2_PLATFORM
         && nodeScopedAuth
-        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
+        && ["/nodes/heartbeat", "/nodes/revoke", "/nodes/g2/experience", "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask", "/nodes/g2/listen", "/nodes/g2/speech-token", "/nodes/g2/proactive"].includes(pathname);
 
       // Setup wizard. Available always (so you can re-run /setup to change keys),
       // but on first run it bypasses the auth gate since no token exists yet.
@@ -1202,6 +1205,11 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // i.e. it is the constant false on exactly the exposed installs this is
       // protecting. The Mac tray reads provider/memory out of `status` and DOES
       // send its bearer token (AppState.get), so it keeps the full body.
+      if (method === "GET" && pathname === "/health" && url.searchParams.get("client") === "g2") {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Cache-Control", "no-store");
+        return sendJson(res, 200, { service: "openagi", pairing: "even_g2", role: pairing?.remote ? "node" : "main" });
+      }
       if (method === "GET" && pathname === "/health") {
         const probe = { ok: true, firstRun: isFirstRun() };
         if (checkAuth(req, url, getAuthToken()).ok) probe.status = runtime.status();
@@ -1368,6 +1376,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         res.setHeader("cache-control", "no-store");
         return sendJson(res, 201, {
           agentUrl,
+          evenAiUrl: new URL("/nodes/g2/chat/completions", agentUrl).href,
           token: nodeToken,
           node: {
             id: nodeId,
@@ -2008,6 +2017,22 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             return sendG2NodeJson(res, 202, g2Requests.submit(requestNodeId, body.id, question));
           }
           return sendG2NodeJson(res, 200, g2Requests[body.op](requestNodeId, body.id));
+        } catch (error) { return sendG2NodeError(res, error); }
+      }
+      if (method === "POST" && ["/nodes/g2/chat/completions", "/nodes/g2/cues"].includes(pathname)) {
+        if (!nodeScopedAuth || requestEnrollment?.platform !== EVEN_G2_PLATFORM) return sendG2NodeJson(res, 403, { error: "forbidden_node" });
+        if (!evenAIAgent) return sendG2NodeJson(res, 503, { error: "agent-host-disabled" });
+        try {
+          const body = await readJsonLimited(req, 24 * 1024);
+          if (pathname.endsWith("/chat/completions")) return sendG2NodeJson(res, 200, await evenAIAgent.complete(body, requestNodeId));
+          const consent = g2Proactive.dispatch(requestNodeId, { op: "settings" }).consent;
+          if (!consent || consent.id !== body?.consentId) return sendG2NodeJson(res, 403, { error: "Start consented lifelog before live cues" });
+          const controller = new AbortController();
+          res.once("close", () => { if (!res.writableEnded) controller.abort(); });
+          const result = await g2LiveCues.suggest(body, requestNodeId, AbortSignal.any([controller.signal, AbortSignal.timeout(25_000)]));
+          const current = g2Proactive.dispatch(requestNodeId, { op: "settings" }).consent;
+          if (!nodeRegistry.authenticate(requestNodeId, scopedBearer) || current?.id !== consent.id) return sendG2NodeJson(res, 403, { error: "Live cue consent ended" });
+          return sendG2NodeJson(res, 200, result);
         } catch (error) { return sendG2NodeError(res, error); }
       }
       if (method === "POST" && pathname === "/nodes/g2/ask") {
@@ -4269,7 +4294,7 @@ function isG2NodeCorsRoute(pathname) {
     "/nodes/enroll/exchange",
     "/nodes/heartbeat",
     "/nodes/revoke",
-    "/nodes/g2/ask",
+    "/nodes/g2/chat/completions", "/nodes/g2/cues", "/nodes/g2/ask",
     "/nodes/g2/experience",
     "/nodes/g2/listen",
     "/nodes/g2/speech-token",

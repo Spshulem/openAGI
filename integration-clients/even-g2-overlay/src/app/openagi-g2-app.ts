@@ -1,3 +1,4 @@
+import { LiveCueContext, type LiveCue } from '../openagi/live-cues'
 import type { AudioSource } from '../even/audio-source'
 import { QuestionAudioBuffer } from '../buildbetter/question-audio'
 import { paginateText } from '../state/ask-state-machine'
@@ -14,7 +15,7 @@ import { G2ProactiveClient, type InboxItem, type MainConsent } from '../openagi/
 import type { SharedThreadMessage } from '../openagi/experience-client'
 import { G2VoiceSession, supervisorVoiceFocus, type VoiceCallbacks } from '../openagi/voice-session'
 
-type Mode = 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
+type Mode = 'cue' | 'unpaired' | 'pairing' | 'home' | 'recent' | 'status' | 'inbox' | 'inbox-detail' | 'inbox-action' | 'inbox-confirm' | 'ambient' | 'reconnecting' | 'listening' | 'review' | 'thinking' | 'answer' | 'message'
 interface RecentEntry { question: string; reply: string; local?: number }
 
 const CONSENT_NEEDED = 'Lifelog needs your recording consent once. Check the consent box on this page; it stays on until you uncheck it.'
@@ -26,6 +27,53 @@ const CONSENT_NEEDED = 'Lifelog needs your recording consent once. Check the con
 // - Supervisor: the fleet supervisor's questions, thread status and chat.
 export class OpenAGIG2App {
   readonly proactive: G2ProactiveClient
+  private readonly cueContext = new LiveCueContext()
+  private cueController: AbortController | null = null
+  private activeCue: LiveCue | null = null
+  private cueTimer: ReturnType<typeof setTimeout> | null = null
+  private clearCue(): void {
+    this.activeCue = null
+    if (this.cueTimer) clearTimeout(this.cueTimer)
+    this.cueTimer = null
+  }
+  private stopCues(): void { this.cueController?.abort(); this.cueController = null; this.cueContext.clear(); this.clearCue() }
+  async toggleTranscript(): Promise<void> {
+    const visible = !this.store.snapshot().transcriptVisible
+    await this.store.update({ transcriptVisible: visible })
+    this.renderer.transcriptVisible?.(visible); this.phone.transcriptVisible?.(visible)
+    if (this.mode === 'ambient' && !this.activeCue) this.listeningPulse(true)
+    this.phone.activity?.(visible ? 'Transcript shown on glasses. Listening unchanged.' : 'Transcript hidden on glasses. Listening unchanged.')
+  }
+  async configureLiveCues(enabled: boolean): Promise<void> {
+    await this.store.update({ liveCuesEnabled: enabled }); this.phone.liveCuesEnabled?.(enabled)
+    if (!enabled) { this.stopCues(); if (this.mode === 'cue') this.showHome(); else this.listeningPulse(true) }
+    this.phone.activity?.(enabled ? 'Live cues enabled. Start consented lifelog to get brief answers and context. Cues use your main model and read-only connected data; tasks remain suggestions.' : 'Live cues off.')
+  }
+  private async requestLiveCue(text: string): Promise<void> {
+    const consentId = this.proactive.consentId
+    if (!this.store.snapshot().liveCuesEnabled || !consentId || this.cueController || !this.ambientRunning || this.requestController
+      || this.mode !== 'ambient' || !this.foregroundActive || document.visibilityState === 'hidden' || this.exited || this.displaySleeping || this.noticeTimer) return
+    const context = this.cueContext.add(text); if (!context) return
+    const controller = new AbortController(); this.cueController = controller
+    if (!this.activeCue) this.renderer.checkingCue?.()
+    this.phone.cueStatus?.('Checking for a useful cue…')
+    try {
+      const result = await this.api.liveCue(context, consentId, AbortSignal.any([controller.signal, AbortSignal.timeout(28_000)]))
+      if (controller.signal.aborted || !this.store.snapshot().liveCuesEnabled || this.proactive.consentId !== consentId
+        || !this.foregroundActive || document.hidden || this.exited || this.mode !== 'ambient' || this.requestController) return
+      if (result.cue) {
+        const cue = result.cue; this.clearCue(); this.activeCue = cue
+        this.phone.cue?.(cue); this.renderer.cue?.(plainAnswer(cue.title), plainAnswer(cue.brief))
+        this.cueTimer = setTimeout(() => { this.cueTimer = null; this.activeCue = null; if (this.mode === 'ambient') this.listeningPulse(true) }, 30_000)
+      }
+      this.phone.cueStatus?.(result.cue ? 'New cue · tap to expand. Tasks are suggestions.' : 'Listening · no new cue needed.')
+    } catch (error) { if (!controller.signal.aborted) this.phone.cueStatus?.(`Cue unavailable: ${safeOpenAGIError(error)} Ask directly to retry.`) }
+    finally {
+      if (this.cueController === controller) this.cueController = null
+      if (this.mode === 'ambient' && !this.activeCue) this.listeningPulse(true)
+    }
+  }
+  private showCuePage(): void { this.renderer.cueDetail?.(this.pages[this.page] ?? '', this.page, this.pages.length) }
   private inboxIndex = 0
   private inboxItems: InboxItem[] = []
   private noticeTimer: ReturnType<typeof setTimeout> | null = null
@@ -146,6 +194,7 @@ export class OpenAGIG2App {
     else if (this.lifelogState === 'waiting') this.kickLifelog()
   }
   setForeground(active: boolean): void {
+    if (!active) this.stopCues()
     if (this.exited) return
     if (active) {
       const returning = !this.foregroundActive
@@ -478,7 +527,7 @@ export class OpenAGIG2App {
     } catch (error) { if (request === this.lifelogRequest) this.phone.lifelogStatus?.(`Could not load lifelog: ${safeOpenAGIError(error)}`) }
   }
   private listeningPulse(force = false): void {
-    if (this.mode !== 'ambient' || this.noticeTimer || this.displaySleeping || this.requestController || !this.ambientRunning) return
+    if (this.mode !== 'ambient' || this.noticeTimer || this.activeCue || this.cueController || this.displaySleeping || this.requestController || !this.ambientRunning) return
     if (!force && Date.now() - this.lastListeningPulse < 2000) return
     this.lastListeningPulse = Date.now()
     this.renderer.passive?.(this.proactive.capturing)
@@ -488,6 +537,10 @@ export class OpenAGIG2App {
     document.addEventListener('visibilitychange', this.onVisibility)
     if (document.visibilityState === 'hidden') this.startAudioWatch()
     const stored = await this.store.load()
+    this.renderer.transcriptVisible?.(stored.transcriptVisible)
+    this.phone.transcriptVisible?.(stored.transcriptVisible)
+    this.phone.liveCuesEnabled?.(stored.liveCuesEnabled)
+    this.phone.savedServer?.(stored.agentOrigin ?? stored.lastAgentOrigin)
     this.phone.interfaceStyle?.(stored.interfaceStyle)
     this.phone.homeMode?.(stored.homeMode)
     this.phone.recordingConsent?.(stored.recordingConsent)
@@ -539,6 +592,9 @@ export class OpenAGIG2App {
     // Talk and Lifelog recordings follow the review setting.
     if (!this.askStarting && !this.microphoneOpening && this.mode !== 'listening') this.cancelHold()
     this.clearNotice()
+    if (this.mode === 'ambient' && this.activeCue) {
+      const cue = this.activeCue; this.clearCue(); this.mode = 'cue'; this.pages = paginateText(plainAnswer(`${cue.title}\n\n${cue.detail}`), 260); this.page = 0; this.showCuePage(); return
+    }
     if (this.requestController) {
       if (this.cancelConfirmation) this.cancelRequest()
       else if (!this.preparingDraft) { this.activityView = !this.activityView; this.renderActiveProgress?.() }
@@ -595,7 +651,8 @@ export class OpenAGIG2App {
     if (this.exited || this.displaySleeping) return
     if (this.navigationBusy) { this.flash('One moment', 'Finishing the last action…'); return }
     this.clearNotice()
-    if (this.mode === 'inbox') { this.inboxIndex = Math.max(0, Math.min(this.inboxItems.length - 1, this.inboxIndex - direction)); this.showInboxItem() }
+    if (this.mode === 'cue') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showCuePage() }
+    else if (this.mode === 'inbox') { this.inboxIndex = Math.max(0, Math.min(this.inboxItems.length - 1, this.inboxIndex - direction)); this.showInboxItem() }
     else if (this.mode === 'inbox-detail') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showInboxPage() }
     else if (this.mode === 'inbox-action') { this.actionIndex = Math.max(0, Math.min(this.inboxActions().length - 1, this.actionIndex - direction)); this.showInboxAction() }
     else if (this.mode === 'review') { this.page = Math.max(0, Math.min(this.pages.length - 1, this.page + direction)); this.showDraftPage() }
@@ -655,6 +712,7 @@ export class OpenAGIG2App {
   private showDraftPage(): void { this.renderer.review?.(this.pages[this.page] ?? '', this.page, this.pages.length, this.draftRecovery) }
   async recentAnswer(): Promise<void> { await this.selectAnswer(this.store.snapshot().history.length - 1) }
   doubleTap(): void {
+    if (this.mode === 'cue') { this.clearCue(); this.showHome(); return }
     if (this.exited) return
     // These are the same root screen in different connection/listening states.
     // Do not tear down on dialog-open: only SYSTEM_EXIT/ABNORMAL_EXIT confirms exit.
@@ -739,6 +797,7 @@ export class OpenAGIG2App {
     this.pages = paginateText(plainAnswer(entry.reply || 'No answer yet.'), 260); this.phone.preview?.(plainAnswer(entry.reply)); this.showAnswer(0)
   }
   async systemExit(): Promise<void> {
+    this.stopCues()
     this.stopAudioWatch()
     this.cancelSpeechRecovery()
     this.clearNotice()
@@ -871,6 +930,7 @@ export class OpenAGIG2App {
     await this.resumeListening()
   }
   async startAsk(): Promise<void> {
+    this.stopCues()
     if (this.askStarting) { this.flash('Microphone opening', 'One moment…'); return }
     this.askStarting = true
     try { await this.beginAsk() } finally { this.askStarting = false }
@@ -1049,6 +1109,7 @@ export class OpenAGIG2App {
     try { await this.store.update({ savedDraft: '' }) }
     catch (error) { this.phone.set('Question not sent', `Could not save delivery state: ${safeOpenAGIError(error)}`); return }
     if (this.requestController || this.exited) return
+    this.stopCues()
     const originalInput = input
     const target = this.voiceTarget; this.voiceTarget = null
     if (target && typeof input === 'string') {
@@ -1209,6 +1270,7 @@ export class OpenAGIG2App {
     } finally { this.microphoneOpening = false }
   }
   private async stopAmbient(reason?: string): Promise<void> {
+    this.stopCues()
     this.ambientEpoch++
     this.proactive.suspendMemory(reason)
     this.stopLiveSpeech()
@@ -1261,6 +1323,7 @@ export class OpenAGIG2App {
         if (this.liveSpeech !== speech || this.exited) return
         if (ambient) this.lastAmbientSpeechAt = Date.now()
         this.phone.transcript?.(text)
+        if (ambient) this.renderer.liveTranscript?.(text)
         this.phone.speechTiming?.(`${final ? 'Final segment' : 'Live words'} · audio backlog ~${lagMs}ms`)
         if (firstTranscript) { firstTranscript = false; this.phone.activity?.(`First speech text ${(Date.now() - started) / 1000}s after connecting`) }
         // Bound native display writes; don't steal pages from an answer or request.
@@ -1275,7 +1338,7 @@ export class OpenAGIG2App {
       },
       // Lifelog never turns overheard speech into a question: talking to the
       // agent is always an explicit tap.
-      utterance: () => undefined,
+      utterance: text => { if (ambient && this.ambientRunning && this.liveSpeech === speech && !this.exited) void this.requestLiveCue(text) },
       error: error => {
         if (this.liveSpeech !== speech || this.exited) return
         if (ambient && this.recoveringSpeech) { this.recoveryFailure = error; return }
@@ -1356,6 +1419,8 @@ export class OpenAGIG2App {
         this.phone.transcript?.(result.question)
         this.lastAmbientSpeechAt = Date.now()
         this.proactive.capture(result.question)
+        this.renderer.liveTranscript?.(result.question)
+        void this.requestLiveCue(result.question)
         this.listeningPulse()
       }
     } catch (error) { await this.pauseAmbientWithError(error) }

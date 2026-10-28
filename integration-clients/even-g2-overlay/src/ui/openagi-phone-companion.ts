@@ -1,3 +1,5 @@
+import { checkServers } from '../openagi/server-discovery'
+import type { LiveCue } from '../openagi/live-cues'
 import type { SpeechModel } from '../openagi/live-speech'
 import type { HomeMode } from '../openagi/store'
 import type { LifelogHomeState } from './openagi-glasses-renderer'
@@ -10,6 +12,8 @@ export type PhoneInteraction = 'idle' | 'recording' | 'review' | 'working' | 'un
 
 export interface OpenAGIPhoneActions {
   pair(code: string, origin: string): void
+  toggleTranscript?(): void
+  configureLiveCues?(enabled: boolean): void
   ask(): void
   newConversation(): void
   unlink(): void
@@ -73,11 +77,13 @@ export class OpenAGIPhoneCompanion {
         <section class="card" role="status" aria-live="polite"><h1 id="status">Starting…</h1><p id="detail">Connecting to your agent.</p></section>
         <section id="pair" class="pair">
           <h2>Connect to your OpenAGI main</h2>
+          <ol class="setup-steps"><li><strong>Install your main.</strong> Open <a href="https://github.com/Spshulem/openAGI#readme" target="_blank" rel="noopener noreferrer">the computer setup guide</a> on your Mac or server, then finish model setup.</li><li><strong>Connect your phone.</strong> Use the same Wi-Fi, or turn on Tailscale on both devices and HTTPS Serve on your main.</li><li><strong>Pair once.</strong> Open Connect glasses on your computer. Paste its card, or check its address below and enter the six-digit code.</li></ol>
           <p>Already have OpenAGI? On your main computer, open <strong>Connect glasses</strong> at /g2/connect. Paste its connection card below.</p>
           <label for="connection-card">Connection card</label><textarea id="connection-card" autocomplete="off" placeholder="Paste your connection card"></textarea><button id="read-connection-card">Review connection</button><p id="card-status" role="status"></p>
           <details><summary>New to OpenAGI?</summary><p>Install OpenAGI on a computer, select your model, then connect these glasses. Your computer stays in control; G2 does not need a separate agent subscription.</p><a href="https://github.com/Spshulem/openAGI#readme" target="_blank" rel="noopener noreferrer">Computer installation guide</a><p>You can preview the layout below without a microphone or agent connection.</p><button id="preview-interface">Preview interface · no recording</button></details>
           <label for="agent-origin">Main server URL</label>
           <input id="agent-origin" type="url" autocomplete="off" placeholder="https://your-main.example.com" value="${escapeHtml(allowedOrigins[0] ?? '')}">
+          <button id="find-server">Find / check my main</button><p id="server-status" role="status">Checks saved or entered HTTPS addresses without credentials. Even Hub does not expose nearby Wi-Fi or Tailscale peer browsing; paste your main’s address or connection card.</p><div id="server-results"></div>
           <p>Use the machine that hosts your main, not another node. G2 will connect as a node. Choose ONE method below.</p>
           <h2>Option 1: Pair with a code</h2>
           <label for="pair-code">Pairing code</label>
@@ -95,6 +101,7 @@ export class OpenAGIPhoneCompanion {
           <button id="cancel-request" hidden>Cancel request</button>
           <section id="pending-question" class="ambient" hidden><h2>Saved question</h2><p id="pending-detail">Check the same request without starting it twice.</p><button id="resume-request">Check / send saved question</button><button id="dismiss-request">Clear after checking History</button></section>
           <section id="draft-review" class="ambient" hidden><h2>Review question · not sent</h2><p id="draft-text"></p><button id="send-draft">Send question</button><button id="rerecord-draft">Re-record</button><button id="discard-draft">Discard</button></section>
+          <section id="cue-panel" class="ambient" data-page="listen"><h2>Live cues</h2><button id="toggle-transcript" aria-pressed="false">Show transcript on glasses</button><label><input id="live-cues-enabled" type="checkbox"> Offer brief answers and context while I listen</label><p>Requires consented lifelog. Uses your main model and read-only connected data, at most 20 checks per hour. Suggested tasks need confirmation. Transcript visibility does not change recording.</p><p id="cue-status" role="status">Live cues off.</p><div id="live-cues"></div></section>
           <button id="last-answer">Last answer</button>
           <button id="previous-page">Previous page</button><button id="next-page">Next page</button>
           <button id="blank-display">Blank glasses display</button>
@@ -168,6 +175,9 @@ export class OpenAGIPhoneCompanion {
       this.actionsSection.hidden = false; this.interaction('unavailable')
       this.set('Interface preview', 'No microphone, pairing, or model is active. Connect above when you are ready.')
     })
+    root.querySelector('#toggle-transcript')?.addEventListener('click', () => actions.toggleTranscript?.())
+    root.querySelector('#live-cues-enabled')?.addEventListener('change', () => actions.configureLiveCues?.(root.querySelector<HTMLInputElement>('#live-cues-enabled')!.checked))
+    root.querySelector('#find-server')?.addEventListener('click', () => { void this.findServers(allowedOrigins) })
     root.querySelector('#pause-lifelog')?.addEventListener('click', () => { if (this.currentLifelog === 'listening' || this.currentLifelog === 'starting') actions.pauseLifelog?.(); else actions.resumeLifelog?.() })
     root.querySelector('#resume-request')?.addEventListener('click', () => actions.resumeRequest?.())
     root.querySelector('#dismiss-request')?.addEventListener('click', () => { if (window.confirm('Have you checked History? Clearing this local reminder does not cancel main work or undo completed actions.')) actions.dismissRequest?.() })
@@ -295,7 +305,34 @@ export class OpenAGIPhoneCompanion {
     this.historyStatus(page.archivedOnMain ? 'Earlier archived messages remain on main.' : root.childElementCount ? 'Saved on your main · only this G2’s conversations' : 'No conversations found on main.')
   }
   historyStatus(text: string): void { this.actionsSection.querySelector<HTMLElement>('#history-status')!.textContent = text }
-  paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value; if (!value) this.lifelogStatus('') }
+  paired(value: boolean): void { this.pairSection.hidden = value; this.actionsSection.hidden = !value; if (!value) { this.lifelogStatus(''); this.actionsSection.querySelector('#live-cues')?.replaceChildren() } }
+  savedServer(origin: string | null): void { if (origin) this.pairSection.querySelector<HTMLInputElement>('#agent-origin')!.value = origin }
+  private async findServers(allowed: string[]): Promise<void> {
+    const button = this.pairSection.querySelector<HTMLButtonElement>('#find-server')!, status = this.pairSection.querySelector<HTMLElement>('#server-status')!, root = this.pairSection.querySelector<HTMLElement>('#server-results')!
+    const input = this.pairSection.querySelector<HTMLInputElement>('#agent-origin')!
+    button.disabled = true; root.replaceChildren(); status.textContent = 'Checking your main…'
+    try {
+      const addresses = input.value.trim() ? [input.value.trim()] : allowed
+      if (!addresses.length) { status.textContent = 'Paste your computer’s HTTPS / Tailscale address or connection card first. In Even Hub, the app cannot browse nearby computers.'; return }
+      const servers = await checkServers(addresses)
+      status.textContent = servers.length ? 'Choose your main, then enter its one-time pairing code.' : 'No main responded. Keep OpenAGI running; check HTTPS Serve and that both devices use the same Wi-Fi or Tailscale network.'
+      for (const server of servers) {
+        const choose = document.createElement('button'); choose.textContent = `${server.name} · OpenAGI responding`
+        choose.onclick = () => { input.value = server.origin; this.pairSection.querySelector<HTMLInputElement>('#pair-code')!.focus(); status.textContent = 'Main selected. Enter the code from Connect glasses on that computer.' }
+        root.append(choose)
+      }
+    } catch (error) { status.textContent = error instanceof Error ? error.message : 'Check your main’s HTTPS address.' }
+    finally { button.disabled = false }
+  }
+  transcriptVisible(visible: boolean): void { const b = this.actionsSection.querySelector<HTMLButtonElement>('#toggle-transcript')!; b.textContent = visible ? 'Hide transcript on glasses' : 'Show transcript on glasses'; b.setAttribute('aria-pressed', String(visible)) }
+  liveCuesEnabled(enabled: boolean): void { this.actionsSection.querySelector<HTMLInputElement>('#live-cues-enabled')!.checked = enabled; this.cueStatus(enabled ? 'Start consented lifelog for live cues.' : 'Live cues off.') }
+  cueStatus(text: string): void { this.actionsSection.querySelector<HTMLElement>('#cue-status')!.textContent = text }
+  cue(cue: LiveCue): void {
+    const root = this.actionsSection.querySelector<HTMLElement>('#live-cues')!, card = document.createElement('details'), title = document.createElement('summary'), brief = document.createElement('p'), detail = document.createElement('p')
+    title.textContent = `${cue.kind === 'task' ? 'Suggested task · ' : ''}${cue.title}`; brief.textContent = cue.brief; detail.textContent = cue.detail
+    card.append(title, brief, detail); root.prepend(card)
+    while (root.childElementCount > 30) root.lastElementChild?.remove()
+  }
   lifelogStatus(message: string): void {
     const status = this.actionsSection.querySelector('#lifelog-status'); if (status) status.textContent = message
     this.actionsSection.querySelector('#lifelog-moments')?.replaceChildren()

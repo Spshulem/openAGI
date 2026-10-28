@@ -30,6 +30,8 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
   }, globalThis.fetch, () => store.snapshot().agentOrigin ?? config.origin)
   let app!: OpenAGIG2App
   const phone = new OpenAGIPhoneCompanion({
+    toggleTranscript: () => { void app.toggleTranscript() },
+    configureLiveCues: enabled => { void app.configureLiveCues(enabled) },
     pair: (code, origin) => { void app.pair(code, origin) },
     ask: () => { void app.startAsk() },
     configureInterface: style => { void app.configureInterface(style) },
