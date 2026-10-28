@@ -36,7 +36,7 @@ export class OpenAGIG2App {
     if (this.cueTimer) clearTimeout(this.cueTimer)
     this.cueTimer = null
   }
-  private stopCues(): void { this.cueController?.abort(); this.cueController = null; this.cueContext.clear(); this.clearCue() }
+  private stopCues(): void { this.cueController?.abort(); this.cueController = null; this.cueContext.clear(); this.renderer.liveTranscript?.(''); this.clearCue() }
   async toggleTranscript(): Promise<void> {
     const visible = !this.store.snapshot().transcriptVisible
     await this.store.update({ transcriptVisible: visible })

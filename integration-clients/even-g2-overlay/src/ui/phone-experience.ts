@@ -30,6 +30,8 @@ export class PhoneExperience {
       node.dataset.controlLabel = id; move(`[data-control-label="${id}"]`, destination)
     }
     for (const selector of ['[data-action="ask"]', '#cancel-request', '#pending-question', '#draft-review', '#cue-panel', '[data-action="newConversation"]']) move(selector, '#talk-primary')
+    const cues = focused.querySelector<HTMLElement>('#cue-panel')
+    if (cues) { delete cues.dataset.page; cues.hidden = false; this.restores.push(() => { cues.dataset.page = 'listen' }) }
     for (const selector of ['#live-transcript', '#speech-timing', '#answer-preview', '#previous-page', '#next-page']) move(selector, '#talk-result')
     move('#activity-log', '#talk-activity')
     move('#mode-picker', '#mode-slot')

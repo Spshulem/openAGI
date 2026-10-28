@@ -47,7 +47,7 @@ export class G2LiveCues {
     catch { throw new G2ChannelError("invalid_timezone", 400, "Use a valid timezone."); }
     const previous = this.limits.get(nodeId);
     if (previous && (previous.busy || this.now() - previous.at < 30_000 || (previous.hour === Math.floor(this.now() / 3600_000) && previous.count >= 20)))
-      throw new G2ChannelError("cue_rate_limit", 429, "Live cues are limited to one check per 30 seconds.");
+      throw new G2ChannelError("cue_rate_limit", 429, "Live cues allow at most 20 checks per hour, at least 30 seconds apart.");
     for (const [id, r] of this.limits) if (!r.busy && this.now() - r.at > 3600_000) this.limits.delete(id);
     if (this.limits.size >= 64 && !this.limits.has(nodeId)) throw new G2ChannelError("cue_busy", 429, "Live cues are busy.");
     const provider = this.channel.agentHost?.modelProvider;

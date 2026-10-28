@@ -1,7 +1,7 @@
 import { CreateStartUpPageContainer, StartUpPageCreateResult, TextContainerProperty, TextContainerUpgrade, type EvenAppBridge } from '@evenrealities/even_hub_sdk'
 import type { DisplaySurface } from '../even/display-controller'
 
-export type G2DisplayPhase = 'listening' | 'thinking' | 'checking' | 'paused'
+export type G2DisplayPhase = 'idle' | 'listening' | 'thinking' | 'checking' | 'paused'
 export interface AgentsDisplaySurface extends DisplaySurface {
   show(content: string, immediate?: boolean, phase?: boolean | G2DisplayPhase): void
   requestExit(): Promise<boolean>
@@ -43,7 +43,7 @@ export class AgentsDisplayController implements AgentsDisplaySurface {
   }
 
   show(content: string, immediate = false, phase: boolean | G2DisplayPhase = false): void {
-    this.pending = { content: content.slice(0, 500), phase: phase === true ? 'listening' : phase || null }
+    this.pending = { content: content.slice(0, 500), phase: phase === true ? 'listening' : phase || (content.trim() ? 'idle' : null) }
     if (!this.initialized) return
     if (immediate) {
       if (this.timer !== null) clearTimeout(this.timer)
@@ -52,6 +52,12 @@ export class AgentsDisplayController implements AgentsDisplaySurface {
     } else if (this.timer === null && !this.rendering) {
       this.timer = setTimeout(() => { this.timer = null; void this.render() }, this.debounceMs)
     }
+  }
+
+  // The host ticks while the glasses app is foregrounded, including quiet
+  // answers and in-flight cue checks where the body has no new content.
+  refreshStatus(): void {
+    if (this.initialized && this.pending.phase) void this.render()
   }
 
   private async update(id: number, name: string, content: string): Promise<boolean> {
@@ -78,8 +84,8 @@ export class AgentsDisplayController implements AgentsDisplaySurface {
         if (target !== this.pending) continue
         if (target.phase) {
           const time = this.now().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })
-          const label = { listening: 'Listening', thinking: 'Thinking', checking: 'Checking', paused: 'Paused' }[target.phase]
-          const indicator = `${time}  ${label}${target.phase === 'paused' ? '' : '.'.repeat(this.pulse++ % 3 + 1)}`
+          const label = { idle: '', listening: 'Listening', thinking: 'Thinking', checking: 'Checking', paused: 'Paused' }[target.phase]
+          const indicator = `${time}${label ? `  ${label}` : ''}${['idle', 'paused'].includes(target.phase) ? '' : '.'.repeat(this.pulse++ % 3 + 1)}`
           if (indicator !== this.lastIndicator) {
             if (!await this.update(2, 'status', indicator)) return
             this.lastIndicator = indicator

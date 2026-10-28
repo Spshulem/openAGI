@@ -1208,7 +1208,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       if (method === "GET" && pathname === "/health" && url.searchParams.get("client") === "g2") {
         res.setHeader("Access-Control-Allow-Origin", "*");
         res.setHeader("Cache-Control", "no-store");
-        return sendJson(res, 200, { service: "openagi", pairing: "even_g2", role: pairing?.remote ? "node" : "main" });
+        return sendJson(res, 200, { service: "openagi", pairing: "even_g2", role: readNodeConfig(dataDir)?.remote ? "node" : "main" });
       }
       if (method === "GET" && pathname === "/health") {
         const probe = { ok: true, firstRun: isFirstRun() };
@@ -1962,7 +1962,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, lifelogPage);
       }
       if (method === "GET" && pathname === "/g2/connect") {
-        res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ConnectPage);
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        return sendHtml(res, 200, g2ConnectPage);
       }
       if (method === "GET" && pathname === "/g2/proactive") {
         res.setHeader("Cache-Control", "no-store"); return sendHtml(res, 200, g2ProactivePage);
@@ -7590,6 +7592,7 @@ async function renderNodesOnce({ showLoading = true } = {}) {
       <div class="card">
         <div class="name">Add an Even Realities G2 node</div>
         <div class="desc">The glasses receive their own revocable node identity with voice-input and text-display capabilities only.</div>
+        <div class="desc"><a href="/g2/connect">Use OpenAGI with “Hey Even” in native Even AI →</a></div>
         <div class="row" style="margin-top:10px; gap:8px;">
           <button class="ui-btn ui-btn-sm" id="g2NodeEnrollBtn">Generate pairing code</button>
           <button class="ui-btn ui-btn-sm" id="g2DirectTokenBtn">Generate agent URL + token</button>

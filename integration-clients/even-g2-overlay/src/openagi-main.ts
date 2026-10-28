@@ -68,9 +68,11 @@ async function launchOpenAGI(bridge: EvenAppBridge): Promise<void> {
     connectAgent: (origin, token) => { void app.connectAgent(origin, token) },
   }, config.allowedOrigins)
   app = new OpenAGIG2App(api, store, new SerializedAudioSource(bridge), renderer, phone, config.allowedOrigins)
-  const input = new AgentsInputController(bridge, { input: () => app.glassesInput(), tap: () => app.tap(), holdStart: () => app.holdStart(), holdRelease: () => app.holdRelease(), holdCancel: () => app.cancelHold(), scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), foreground: active => app.setForeground(active), systemExit: () => { void app.systemExit() } })
+  let glassesForeground = true
+  const statusTimer = setInterval(() => { if (glassesForeground) display.refreshStatus() }, 1000)
+  const input = new AgentsInputController(bridge, { input: () => { glassesForeground = true; app.glassesInput() }, tap: () => app.tap(), holdStart: () => app.holdStart(), holdRelease: () => app.holdRelease(), holdCancel: () => app.cancelHold(), scrollUp: () => app.scrollUp(), scrollDown: () => app.scrollDown(), doubleTap: () => app.doubleTap(), foreground: active => { glassesForeground = active; app.setForeground(active) }, systemExit: () => { clearInterval(statusTimer); void app.systemExit() } })
   input.start()
   try { await app.boot() }
   catch (error) { renderer.message('OpenAGI could not start', safeOpenAGIError(error)); phone.set('Startup failed', safeOpenAGIError(error)) }
-  window.addEventListener('beforeunload', () => { input.stop(); void app.systemExit() })
+  window.addEventListener('beforeunload', () => { clearInterval(statusTimer); input.stop(); void app.systemExit() })
 }

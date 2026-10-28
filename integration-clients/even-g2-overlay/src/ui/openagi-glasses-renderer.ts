@@ -70,7 +70,7 @@ export class OpenAGIGlassesRenderer {
   notice(label: string, title: string): void { this.show(`${label}\n\n${title.slice(0, 150)}`, false) }
   inboxAction(label: string, title: string, confirming = false): void { this.show(`${confirming ? 'Confirm: ' : ''}${label}\n\n${title.slice(0, 160)}\n\n${confirming ? 'Tap: confirm · Double-tap: cancel' : 'Swipe: choose · Tap: select\nDouble-tap: back'}`, true) }
   listening(): void { this.liveWords = ''; this.show(`${this.who}\n\n${this.stopHint()}\nMaximum 30 seconds.`, true, 'listening') }
-  thinking(question?: string): void { this.show(`${this.who}\n\n${question ? tail(question, 300) : 'Transcribing your question…'}\n\nThinking…`, true) }
+  thinking(question?: string): void { this.show(`${this.who}\n\n${question ? tail(question, 300) : 'Transcribing your question…'}\n\nThinking…`, true, 'thinking') }
   review(text: string, page: number, pages: number, recovery?: 'speech' | 'delivery'): void {
     const title = recovery === 'delivery' ? 'Delivery uncertain · may repeat actions' : recovery === 'speech' ? 'Recovered · check missing words · not sent' : 'Review question · not sent'
     this.show(`${title}\n\n${text}\n\n${page + 1}/${pages} · Swipe to read\nTap: ${recovery === 'delivery' ? 'send again' : 'send'} · Double-tap: back (keeps draft)`, true)

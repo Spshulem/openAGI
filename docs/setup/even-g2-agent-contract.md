@@ -10,6 +10,32 @@ return JSON, refuse redirects, and support cross-origin `OPTIONS` requests from
 the Even Hub phone webview. Tokens should be independently revocable and grant
 no authority beyond this voice contract.
 
+## Optional native Even AI and contextual cues
+
+Native Even AI can use `POST /nodes/g2/chat/completions` with the same scoped
+bearer credential. Configure the complete endpoint URL in Even's Agent
+Configuration, rather than the companion's base origin. The adapter accepts
+`{ "model": "openagi", "messages": [{ "role": "user", "content": "Question" }] }`
+and returns an OpenAI-compatible non-streaming `chat.completion` with one
+assistant choice. The model name is ignored; main chooses its own model. Only
+one user message is accepted. Caller-selected sessions, system messages and
+streaming are rejected. Concurrent duplicate utterances and immediate retries
+share one receipt to avoid duplicate actions.
+
+The companion optionally calls `POST /nodes/g2/cues` with
+`{ "text": "Recent conversation", "timeZone": "Europe/Paris", "consentId": "<active grant>" }`.
+It requires a currently valid Lifelog recording-consent grant for the same node.
+The server returns `{ "cue": null }` or a cue with `id`, `kind`
+(`answer`, `context`, or `task`), `title`, `brief`, `detail`, and `at` (epoch
+milliseconds). It accepts at most 3000 characters and enforces 30 seconds
+between checks and 20 checks per hour per node. Cue generation has read-only
+tool authority and creates no normal agent turn, tasks, sessions or memories.
+Revoked credentials or withdrawn consent invalidate in-flight responses.
+
+Unauthenticated `GET /health?client=g2` exposes only `service: "openagi"`,
+`pairing: "even_g2"`, and `role: "main" | "node"` for credential-free address
+verification. It never returns the full health payload to discovery clients.
+
 ### `POST /nodes/g2/ask`
 
 Request:
