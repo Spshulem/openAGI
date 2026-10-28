@@ -39,6 +39,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
                                                  defaultActionIdentifier: UNNotificationDefaultActionIdentifier,
                                                  userInfo: response.notification.request.content.userInfo)
         let notificationID = response.notification.request.identifier
+        let threadKey = response.notification.request.content.userInfo[SupervisorPushContent.threadKeyKey] as? String
         let digestTab = DailyDigestNotifier.tab(for: response.notification.request.content.userInfo)
         let done = UncheckedSendableBox(value: completionHandler)
         Task { @MainActor in
@@ -50,7 +51,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             }
             switch action {
             case .open?:
-                PushRouter.shared.openSupervisor()
+                PushRouter.shared.openSupervisor(threadKey: threadKey)
             case let action?:
                 await SupervisorAnswerSender.send(action, notificationID: notificationID)
             case nil:
@@ -68,8 +69,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 final class PushRouter {
     static let shared = PushRouter()
     var wantsSupervisor = false
+    var threadKey: String?
+    var supervisorRequest = 0
     // Any other tab a notification tap asks for.
     var wantsTab: AppTab?
 
-    func openSupervisor() { wantsSupervisor = true }
+    func openSupervisor(threadKey: String? = nil) {
+        self.threadKey = threadKey
+        supervisorRequest += 1
+        wantsSupervisor = true
+    }
 }

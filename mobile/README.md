@@ -377,3 +377,21 @@ finger on a literal home screen:
       never exercises — a from-scratch pairing on real hardware, with a
       real Team ID, is the one check this whole automated pass cannot
       stand in for.
+
+### Session progress overview
+
+The iOS Supervisor Live Activity and Android ongoing notification show unique
+working, blocked, waiting, and needs-you session counts. **Review** opens the
+most relevant session; individual iOS activity rows open that exact session.
+On iOS, **Review agent sessions** is also available in Shortcuts/Siri.
+
+Android Settings → **Pin session progress** requests a native Live Update
+while active sessions have fresh data (Android 16+, subject to system/OEM
+eligibility). Otherwise the ordinary ongoing notification remains available.
+**Stop monitoring**, or dismissing the card, disables live monitoring until
+you turn it back on; the regular background question check remains.
+
+The overview shows the last source scan and marks data older than 30 minutes
+as paused. Android marks failed server checks as last-known information.
+See [scope and device acceptance](../docs/scopes/2026-10-28-mobile-session-progress.md)
+for boundaries and the physical verification checklist.

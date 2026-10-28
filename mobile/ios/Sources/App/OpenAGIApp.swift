@@ -44,7 +44,7 @@ struct OpenAGIApp: App {
                 if WebSignIn.handleCallback(url) { return }
                 // The Live Activity's tap target.
                 if url.scheme == "openagi", url.host == "supervisor" {
-                    PushRouter.shared.openSupervisor()
+                    PushRouter.shared.openSupervisor(threadKey: SupervisorLink.threadKey(in: url))
                     return
                 }
                 guard let payload = PairingPayload(url: url) else { return }

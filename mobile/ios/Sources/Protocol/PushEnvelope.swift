@@ -79,27 +79,30 @@ public struct SupervisorActivityPlaintext: Codable, Sendable, Equatable {
         public var you: Int
         public var working: Int
         public var waiting: Int
+        public var blocked: Int
 
-        public init(you: Int = 0, working: Int = 0, waiting: Int = 0) {
+        public init(you: Int = 0, working: Int = 0, waiting: Int = 0, blocked: Int = 0) {
             self.you = you
             self.working = working
             self.waiting = waiting
+            self.blocked = blocked
         }
 
-        private enum CodingKeys: String, CodingKey { case you, working, waiting }
+        private enum CodingKeys: String, CodingKey { case you, working, waiting, blocked }
 
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             you = (try? c.decodeIfPresent(Int.self, forKey: .you)) ?? 0
             working = (try? c.decodeIfPresent(Int.self, forKey: .working)) ?? 0
             waiting = (try? c.decodeIfPresent(Int.self, forKey: .waiting)) ?? 0
+            blocked = (try? c.decodeIfPresent(Int.self, forKey: .blocked)) ?? 0
         }
     }
 
     public struct Row: Codable, Sendable, Equatable, Identifiable {
         public var key: String
         public var title: String
-        // `you` | `working` | `waiting`.
+        // `you` | `blocked` | `working` | `waiting`.
         public var group: String
         public var waitingOn: String?
         public var since: String?
@@ -119,22 +122,31 @@ public struct SupervisorActivityPlaintext: Codable, Sendable, Equatable {
     public var at: String?
     public var counts: Counts
     public var rows: [Row]
+    public var observedAt: String?
+    public var partial: Bool
 
     public var atDate: Date? { at.flatMap(PushDates.parse) }
+    public var observedDate: Date? { observedAt.flatMap(PushDates.parse) }
 
-    public init(at: String? = nil, counts: Counts = Counts(), rows: [Row] = []) {
+    public init(at: String? = nil, counts: Counts = Counts(), rows: [Row] = [], observedAt: String? = nil, partial: Bool = false) {
         self.at = at
         self.counts = counts
         self.rows = rows
+        self.observedAt = observedAt ?? at
+        self.partial = partial
     }
 
-    private enum CodingKeys: String, CodingKey { case at, counts, rows }
+    private enum CodingKeys: String, CodingKey { case at, counts, rows, observedAt, partial }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         at = try? c.decodeIfPresent(String.self, forKey: .at)
         counts = (try? c.decodeIfPresent(Counts.self, forKey: .counts)) ?? Counts()
         rows = Array(((try? c.decodeIfPresent([Row].self, forKey: .rows)) ?? []).prefix(3))
+        // Old daemons sent only `at`. An explicit null from a new daemon
+        // means no source scan exists, rather than a fresh observation.
+        observedAt = c.contains(.observedAt) ? (try? c.decodeIfPresent(String.self, forKey: .observedAt)) : at
+        partial = (try? c.decodeIfPresent(Bool.self, forKey: .partial)) ?? false
     }
 }
 
@@ -152,10 +164,16 @@ extension SupervisorActivityPlaintext {
     public var countsLine: String {
         let parts = [
             counts.you > 0 ? "\(counts.you) needs you" : nil,
+            counts.blocked > 0 ? "\(counts.blocked) blocked" : nil,
             counts.working > 0 ? "\(counts.working) working" : nil,
             counts.waiting > 0 ? "\(counts.waiting) waiting" : nil
         ].compactMap { $0 }
         return parts.isEmpty ? "Nothing running" : parts.joined(separator: " · ")
+    }
+
+    public func isOutdated(now: Date = Date()) -> Bool {
+        guard let observedDate else { return true }
+        return now.timeIntervalSince(observedDate) >= 30 * 60
     }
 }
 

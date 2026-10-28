@@ -194,7 +194,7 @@ test("a registration with an active fleet starts a sealed Live Activity at the r
   assert.equal(relayed[0].pass, REGISTRATION.pass);
   assert.match(relayed[0].url, /\/v1\/send$/);
   const activity = JSON.parse(openPushEnvelope(KEY, "activity", relayed[0].sealed));
-  assert.deepEqual(activity.counts, { you: 0, working: 1, waiting: 0 });
+  assert.deepEqual(activity.counts, { you: 0, working: 1, waiting: 0, blocked: 0 });
   assert.equal(activity.rows[0].title, "Fix login");
 });
 

@@ -19,6 +19,7 @@ data class FleetState(
     val mode: String? = null,
     val enabled: Boolean = false,
     val running: Boolean = false,
+    val questionsAuthoritative: Boolean = true,
     @Serializable(with = OptionalInstantSerializer::class) val lastTickAt: Instant? = null,
     // A string today; the dashboard also accepts { message }. Read loosely.
     val lastError: JsonElement? = null,
