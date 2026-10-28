@@ -93,6 +93,7 @@ class MainActivity : ComponentActivity() {
     // the same reason as pendingPairingState: with the app already open, the
     // tap arrives via onNewIntent, outside any composition.
     private val pendingTabState = mutableStateOf<AppTab?>(null)
+    private val pendingThreadState = mutableStateOf<String?>(null)
 
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) SupervisorAlertService.startIfEnabled(this, paired = credentialsState.value != null)
@@ -257,6 +258,8 @@ class MainActivity : ComponentActivity() {
                                 chatConversationState = supervisorConversation,
                                 chatOpenState = supervisorChatOpen,
                                 showChatInline = false,
+                                requestedThreadKey = pendingThreadState.value,
+                                onThreadRequestConsumed = { pendingThreadState.value = null },
                             )
                             AppTab.SETTINGS -> SettingsScreen(
                                 context = this@MainActivity,
@@ -324,12 +327,14 @@ class MainActivity : ComponentActivity() {
     private fun takeAlertTab(intent: Intent?) {
         if (intent == null) return
         if (intent.getStringExtra(SupervisorNotifier.EXTRA_TAB) == SupervisorNotifier.TAB_SUPERVISOR ||
-            intent.hasExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+            intent.hasExtra(SupervisorNotifier.EXTRA_QUESTION_ID) || intent.hasExtra(SupervisorNotifier.EXTRA_THREAD_KEY)
         ) {
             pendingTabState.value = AppTab.SUPERVISOR
+            pendingThreadState.value = intent.getStringExtra(SupervisorNotifier.EXTRA_THREAD_KEY)
         }
         intent.removeExtra(SupervisorNotifier.EXTRA_TAB)
         intent.removeExtra(SupervisorNotifier.EXTRA_QUESTION_ID)
+        intent.removeExtra(SupervisorNotifier.EXTRA_THREAD_KEY)
     }
 
     // Asks for the notification permission once, ever: someone who said no is

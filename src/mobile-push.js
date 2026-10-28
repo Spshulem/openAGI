@@ -25,7 +25,8 @@ export const PUSH_TIMING = Object.freeze({
 });
 
 const EVENTS = ["fleet", "outreach", "outreach-resolved"];
-const GROUPS = ["you", "working", "waiting"];
+// Attention first; a blocked session must not disappear from the overview.
+const GROUPS = ["you", "blocked", "working", "waiting"];
 const ROWS_MAX = 3;
 const ROW_TITLE_MAX = 60;
 const WAITING_ON_MAX = 40;
@@ -62,18 +63,22 @@ const isoOrNull = (value) => (typeof value === "string" && Number.isFinite(Date.
 const sinceMs = (row) => (row.since ? Date.parse(row.since) : -Infinity);
 
 /// The activity plaintext (kind "activity") from FleetSupervisor.getState().
-/// Active means a thread whose watch group is you, working or waiting.
+/// Counts are disjoint session counts, not a count of questions.
 export function buildActivity(state, now = new Date()) {
   const threads = Array.isArray(state?.snapshot?.threads) ? state.snapshot.threads : [];
-  const counts = { you: 0, working: 0, waiting: 0 };
+  const counts = { you: 0, working: 0, waiting: 0, blocked: 0 };
   const rows = [];
+  const seen = new Set();
   for (const thread of threads) {
     const group = thread?.watch?.group;
     if (!GROUPS.includes(group)) continue;
-    counts[group] += 1;
     const key = typeof thread.key === "string" ? thread.key : "";
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    counts[group] += 1;
     const title = (typeof thread.title === "string" ? thread.title.trim() : "") || key || "Untitled";
-    const waitingOn = typeof thread.watch.waitingOn === "string" ? thread.watch.waitingOn.trim() : "";
+    const reason = thread.watch.waitingOn || (group === "blocked" ? thread.reason || thread.blockers?.[0] : null);
+    const waitingOn = typeof reason === "string" ? reason.trim() : "";
     rows.push({
       key,
       title: capText(title, ROW_TITLE_MAX),
@@ -89,7 +94,12 @@ export function buildActivity(state, now = new Date()) {
     const y = sinceMs(b);
     return x === y ? 0 : y > x ? 1 : -1;
   });
-  return { at: now.toISOString(), counts, rows: rows.slice(0, ROWS_MAX) };
+  return {
+    at: now.toISOString(), counts, rows: rows.slice(0, ROWS_MAX),
+    // Sending a push does not mean the underlying scan is fresh.
+    observedAt: isoOrNull(state?.snapshot?.at) ?? isoOrNull(state?.lastTickAt),
+    partial: Boolean(state?.lastError) || Object.values(state?.snapshot?.sourceErrors ?? {}).some(Boolean)
+  };
 }
 
 export function alertOptions(options) {
@@ -113,10 +123,11 @@ export function buildAlert(question) {
   };
 }
 
-// What decides "content changed": everything but the timestamp.
+// A new scan refreshes the stale deadline even if no session changed group.
+// The delivery timestamp alone never causes another push.
 const contentHash = (activity) =>
-  crypto.createHash("sha256").update(JSON.stringify({ counts: activity.counts, rows: activity.rows })).digest("hex");
-const activeCount = (activity) => activity.counts.you + activity.counts.working + activity.counts.waiting;
+  crypto.createHash("sha256").update(JSON.stringify({ counts: activity.counts, rows: activity.rows, observedAt: activity.observedAt, partial: activity.partial })).digest("hex");
+const activeCount = (activity) => Object.values(activity.counts).reduce((sum, count) => sum + count, 0);
 
 export class MobilePush {
   constructor({
@@ -362,10 +373,12 @@ export class MobilePush {
     }
     const active = activeCount(activity);
     const hash = contentHash(activity);
+    const observedAt = Date.parse(activity.observedAt ?? "");
+    const staleAt = this.epoch(Number.isFinite(observedAt) ? observedAt + t.staleAfterMs : now);
 
     if (!live) {
       if (active === 0) return null;
-      const result = await this.sendActivity(registration, "activity-start", activity, { staleAt: this.epoch(now + t.staleAfterMs) });
+      const result = await this.sendActivity(registration, "activity-start", activity, { staleAt });
       if (!isCurrent()) return null;
       if (result !== "ok") return result === "error" ? now + RETRY_MS : null;
       this.live.set(nodeId, { pass: registration.pass, startedAt: now, lastHash: hash, lastSentAt: now, lastYou: activity.counts.you, idleSince: null });
@@ -402,7 +415,7 @@ export class MobilePush {
       if (now >= nextAllowed) {
         const rose = activity.counts.you > live.lastYou;
         const result = await this.sendActivity(registration, "activity-update", activity, {
-          staleAt: this.epoch(now + t.staleAfterMs),
+          staleAt,
           ...(rose ? { priority: 10 } : {})
         });
         if (!isCurrent()) return null;

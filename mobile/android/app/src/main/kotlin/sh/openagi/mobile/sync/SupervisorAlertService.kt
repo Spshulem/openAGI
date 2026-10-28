@@ -3,6 +3,7 @@ package sh.openagi.mobile.sync
 import android.Manifest
 import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -26,6 +27,7 @@ import sh.openagi.mobile.store.AlertPrefs
 import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.EventStream
+import java.time.Instant
 
 // Frames on GET /events after which the supervisor's open questions may have
 // changed. `fleet` is every supervisor tick; `outreach`/`outreach-resolved` is
@@ -74,6 +76,8 @@ class SupervisorAlertService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var watchJob: Job? = null
     private var watching: Credentials? = null
+    @Volatile private var overview: SessionOverview? = null
+    @Volatile private var offline = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -91,6 +95,13 @@ class SupervisorAlertService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        if (intent?.action == ACTION_STOP_MONITORING) {
+            AlertPrefs.setPinSessions(this, false)
+            AlertPrefs.setLiveAlertsEnabled(this, false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val credentials = Credentials.load(this)
         if (credentials == null || !AlertPrefs.liveAlertsEnabled(this)) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -102,6 +113,8 @@ class SupervisorAlertService : Service() {
         // when the phone has been paired to a different daemon since.
         if (watchJob?.isActive != true || watching != credentials) {
             watchJob?.cancel()
+            overview = null
+            offline = false
             watching = credentials
             watchJob = scope.launch { watchFleet(credentials) }
         }
@@ -117,7 +130,12 @@ class SupervisorAlertService : Service() {
     private suspend fun watchFleet(credentials: Credentials) = coroutineScope {
         val client = DaemonClient(credentials.server, credentials.nodeId, credentials.token)
         val coalescer = CheckCoalescer(DEBOUNCE_MILLIS) {
-            when (checkSupervisorAlerts(applicationContext, client)) {
+            val result = checkSupervisorAlerts(applicationContext, client) { state ->
+                if (watching == credentials) overview = SessionOverview.from(state)
+            }
+            offline = result == AlertCheckResult.Offline
+            updateNotification()
+            when (result) {
                 // No supervisor on this daemon, or it refused the phone: an
                 // SSE stream kept open forever would only spend battery. The
                 // 15-minute worker keeps checking; the next app open restarts
@@ -127,6 +145,13 @@ class SupervisorAlertService : Service() {
             }
         }
         launch { coalescer.run() }
+        // Refresh the local age label without making another network request.
+        launch {
+            while (true) {
+                delay(60_000L)
+                updateNotification()
+            }
+        }
         // One check on start, then a slow poll: a stream that looks attached
         // but has silently stopped delivering must not hide a question for
         // longer than this.
@@ -160,21 +185,63 @@ class SupervisorAlertService : Service() {
         false
     }
 
-    private fun ongoingNotification(): Notification =
-        NotificationCompat.Builder(this, SupervisorNotifier.CHANNEL_LIVE)
+    private fun updateNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            stopSelf()
+            return
+        }
+        try {
+            NotificationManagerCompat.from(this).notify(ONGOING_ID, ongoingNotification())
+        } catch (denied: SecurityException) {
+            // Permission can be revoked between the check and the post.
+            stopSelf()
+        }
+    }
+
+    private fun ongoingNotification(): Notification {
+        val summary = overview
+        val now = Instant.now()
+        val title = summary?.title(now, offline) ?: if (offline) "Can't reach server" else "Connecting to supervisor…"
+        val body = summary?.body(now, offline) ?: "Session counts appear after the first check."
+        val open = SupervisorNotifier.openSupervisorIntent(this, threadKey = summary?.first?.key)
+        val unpin = PendingIntent.getService(this, 1002,
+            Intent(this, SupervisorAlertService::class.java).setAction(ACTION_STOP_MONITORING),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val builder = NotificationCompat.Builder(this, SupervisorNotifier.CHANNEL_SESSIONS)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Watching your agents")
-            .setContentText("You'll get a notification when one needs you.")
-            .setContentIntent(SupervisorNotifier.openSupervisorIntent(this))
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentIntent(open)
+            .setDeleteIntent(unpin)
+            .addAction(0, if ((summary?.needsYou ?: 0) + (summary?.blocked ?: 0) > 0) "Review" else "Open sessions", open)
+            .addAction(0, "Stop monitoring", unpin)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(NotificationCompat.Builder(this, SupervisorNotifier.CHANNEL_SESSIONS)
+                .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Agent sessions")
+                .setContentText("Unlock to review your agents.").build())
             .setOnlyAlertOnce(true)
             .setShowWhen(false)
-            .build()
+        // The system/OEM may decline promotion. The same native card remains
+        // useful as an ordinary ongoing notification, including on foldables.
+        if (Build.VERSION.SDK_INT >= 36 && AlertPrefs.pinSessions(this) &&
+            summary != null && summary.active && !summary.stale(now) && !offline
+        ) {
+            builder
+                .setRequestPromotedOngoing(true)
+                .setShortCriticalText(summary.chip)
+        }
+        return builder.build()
+    }
 
     companion object {
         const val ONGOING_ID = 1001
+        private const val ACTION_STOP_MONITORING = "sh.openagi.mobile.STOP_SESSION_MONITORING"
         private const val DEBOUNCE_MILLIS = 3_000L
         private const val FALLBACK_MILLIS = 5 * 60_000L
 

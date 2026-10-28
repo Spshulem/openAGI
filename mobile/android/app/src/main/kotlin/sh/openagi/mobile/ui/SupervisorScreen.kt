@@ -132,6 +132,8 @@ fun SupervisorScreen(
     // to the open supervisor conversation rather than the dashboard.
     chatOpenState: MutableState<Boolean> = remember { mutableStateOf(false) },
     showChatInline: Boolean = false,
+    requestedThreadKey: String? = null,
+    onThreadRequestConsumed: () -> Unit = {},
 ) {
     val client = remember { DaemonClient(credentials.server, credentials.nodeId, credentials.token) }
     val scope = rememberCoroutineScope()
@@ -387,6 +389,17 @@ fun SupervisorScreen(
         voiceAction = null
         actionNote = null
         threadNote = null
+    }
+
+    LaunchedEffect(requestedThreadKey, lastSyncedAt) {
+        val key = requestedThreadKey ?: return@LaunchedEffect
+        val fresh = state ?: return@LaunchedEffect
+        chatOpen = false
+        openThread = null
+        fresh.snapshot?.threads?.firstOrNull { it.key == key }?.let { openSheet(it) }
+        // A session removed since the notification was posted opens the
+        // overview, never a different session or an automatic reply.
+        onThreadRequestConsumed()
     }
 
     LaunchedEffect(resumeSignal, chatOpen, showChatInline) {

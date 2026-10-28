@@ -92,6 +92,7 @@ fun SettingsScreen(
     var connection by remember { mutableStateOf(connectionState()) }
     var statusLine by remember { mutableStateOf(store.load()?.ageInMinutes()?.let(RelativeTime::updated) ?: "Not synced yet") }
     var liveAlerts by remember { mutableStateOf(AlertPrefs.liveAlertsEnabled(context)) }
+    var pinSessions by remember { mutableStateOf(AlertPrefs.pinSessions(context)) }
 
     fun refreshDisplayedState() {
         connection = connectionState()
@@ -163,7 +164,7 @@ fun SettingsScreen(
                 SwitchRow(
                     label = "Live supervisor alerts",
                     help = if (permitted) {
-                        "Pings you when an agent needs you. Keeps a quiet notification while on."
+                        "Shows running, blocked and needs-you sessions. Pings you for new questions."
                     } else {
                         "Notifications are blocked. Tap to allow them."
                     },
@@ -186,6 +187,24 @@ fun SettingsScreen(
                         } else {
                             SupervisorAlertService.stop(context)
                         }
+                    },
+                )
+                SwitchRow(
+                    label = "Pin session progress",
+                    help = "Monitor active sessions with Android Live Updates where supported. Stop monitoring from the notification.",
+                    checked = pinSessions && liveAlerts && permitted,
+                    onCheckedChange = { on ->
+                        pinSessions = on
+                        AlertPrefs.setPinSessions(context, on)
+                        if (on) {
+                            liveAlerts = true
+                            AlertPrefs.setLiveAlertsEnabled(context, true)
+                        }
+                        // Restart only this app's optional monitoring service
+                        // so its existing card picks up the explicit choice.
+                        SupervisorAlertService.stop(context)
+                        if (liveAlerts && permitted) SupervisorAlertService.startIfEnabled(context, paired = true)
+                        if (on && !permitted) openNotificationSettings(context)
                     },
                 )
             }

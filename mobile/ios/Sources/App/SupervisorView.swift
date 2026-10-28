@@ -111,6 +111,13 @@ struct SupervisorView: View {
         .toolbar { WorkspaceChatToolbar() }
         .refreshable { await refresh() }
         .task(id: model.fleetGeneration) { await refresh() }
+        .onChange(of: PushRouter.shared.supervisorRequest, initial: true) { _, request in
+            guard request > 0 else { return }
+            compactColumn = .sidebar
+            openThread = nil
+            openLinkedThread()
+        }
+        .onChange(of: state) { _, _ in openLinkedThread() }
         // Every 30s while this screen is showing; every 5s while the
         // daemon reports a scan running, so "Scanning…" clears soon after
         // it finishes. Cancelled with the view (another tab, or the
@@ -149,6 +156,14 @@ struct SupervisorView: View {
     private var syncedAgeMinutes: Int {
         guard let lastSyncedAt else { return 0 }
         return max(0, Int(Date().timeIntervalSince(lastSyncedAt) / 60))
+    }
+
+    private func openLinkedThread() {
+        guard let key = PushRouter.shared.threadKey, let state else { return }
+        // A vanished session leaves the current overview visible. Never
+        // substitute some other session for the one the person tapped.
+        openThread = state.snapshot?.threads.first(where: { $0.key == key })
+        PushRouter.shared.threadKey = nil
     }
 
     @ViewBuilder

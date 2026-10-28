@@ -8,6 +8,7 @@ import sh.openagi.mobile.store.Credentials
 import sh.openagi.mobile.store.NotifiedQuestionsStore
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
+import sh.openagi.mobile.protocol.FleetState
 
 // Process-wide, not per caller: the live-alerts service and RefreshWorker can
 // both decide to check in the same second, and two overlapping syncs would
@@ -31,8 +32,9 @@ suspend fun <T> withAlertLock(block: suspend () -> T): T = checkLock.withLock { 
 // without a supervisor (Unavailable) or a refused credential (Unauthorized)
 // says nothing about which questions closed, so taking notifications down
 // then would wrongly clear pings the owner has not acted on yet.
-suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient): AlertCheckResult = checkLock.withLock {
+suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient, onState: (FleetState) -> Unit = {}): AlertCheckResult = checkLock.withLock {
     val app = context.applicationContext
+    val paired = Credentials.load(app) ?: return@withLock AlertCheckResult.Unauthorized
     val state = try {
         client.fleetState()
     } catch (cancellation: CancellationException) {
@@ -47,9 +49,13 @@ suspend fun checkSupervisorAlerts(context: Context, client: DaemonClient): Alert
     // The fetch can take seconds. A pairing forgotten meanwhile has already
     // cleared its notifications; posting this old daemon's questions now
     // would bring them back under nobody's credential.
-    if (Credentials.load(app) == null) return@withLock AlertCheckResult.Unauthorized
+    if (Credentials.load(app) != paired) return@withLock AlertCheckResult.Unauthorized
+    // The main may answer with a placeholder while its coding node is down.
+    // It is reachable, but these are not new counts or resolved questions.
+    if (!state.questionsAuthoritative) return@withLock AlertCheckResult.Offline
     try {
         SupervisorNotifier.sync(app, state, NotifiedQuestionsStore(app.filesDir))
+        onState(state)
         AlertCheckResult.Checked
     } catch (error: Exception) {
         // A notification-manager hiccup is not worth crashing the service or

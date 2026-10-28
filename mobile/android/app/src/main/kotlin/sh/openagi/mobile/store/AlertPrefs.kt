@@ -12,6 +12,7 @@ object AlertPrefs {
     private const val FILE = "openagi-alerts"
     private const val KEY_LIVE_ALERTS = "liveAlertsEnabled"
     private const val KEY_PERMISSION_ASKED = "notificationPermissionAsked"
+    private const val KEY_PIN_SESSIONS = "pinSessions"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
@@ -22,6 +23,13 @@ object AlertPrefs {
 
     fun setLiveAlertsEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_LIVE_ALERTS, enabled).apply()
+    }
+
+    // Explicit opt-in: promoted progress must be monitoring the owner asked
+    // to start, rather than ambient activity from other agents.
+    fun pinSessions(context: Context): Boolean = prefs(context).getBoolean(KEY_PIN_SESSIONS, false)
+    fun setPinSessions(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_PIN_SESSIONS, enabled).apply()
     }
 
     // Android shows the POST_NOTIFICATIONS prompt only a couple of times before
