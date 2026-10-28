@@ -409,6 +409,11 @@ fun ChatScreen(
     var isStreaming by conversationState.isStreaming
     var nextId by conversationState.nextId
 
+    // Both the history picker and the message list need the same row offset.
+    val olderExhausted by conversationState.olderExhausted
+    val loadingOlder by conversationState.loadingOlder
+    val showLoadOlder = conversationState.sharedThread != null && !olderExhausted && messages.any { it.serverId != null }
+
     var userScrolledAway by remember { mutableStateOf(false) }
     if (showingHistory) {
         androidx.compose.material3.ModalBottomSheet(onDismissRequest = { showingHistory = false }) {
@@ -573,12 +578,6 @@ fun ChatScreen(
     LaunchedEffect(conversationState) {
         conversationState.requestRefresh(client)
     }
-
-    // "Load earlier messages" sits above the oldest line while the shared
-    // thread may have more (PROTOCOL.md §3.1's before cursor).
-    val olderExhausted by conversationState.olderExhausted
-    val loadingOlder by conversationState.loadingOlder
-    val showLoadOlder = conversationState.sharedThread != null && !olderExhausted && messages.any { it.serverId != null }
 
     // Opening a chat, or coming back to one, shows the newest message: once
     // the list has laid out anything, go to the very end. After that, keep
