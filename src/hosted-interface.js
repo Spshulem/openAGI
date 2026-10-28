@@ -37,6 +37,7 @@ import {
   buildSetCookie,
   checkAuth,
   checkOrigin,
+  checkRequestHost,
   isPublicRoute,
   verifyTelegramSecret,
   verifyBuildBetterWebhook
@@ -928,6 +929,8 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       reason: res.writableFinished ? "finished" : "disconnected"
     }, "debug"));
     try {
+      const requestHost = checkRequestHost(req, getAuthToken());
+      if (!requestHost.ok) return sendJson(res, 403, { error: "forbidden", reason: requestHost.reason });
       const url = new URL(req.url, `http://${req.headers.host ?? `${host}:${port}`}`);
       const pathname = url.pathname;
       if (["/message", "/events", "/health", "/setup/test"].includes(pathname)) logRoute = pathname;

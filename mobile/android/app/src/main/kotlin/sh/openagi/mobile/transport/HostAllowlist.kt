@@ -33,7 +33,11 @@ object HostAllowlist {
     }
 
     private fun isPrivateOrTailscale(host: String): Boolean {
-        val parts = host.split(".").mapNotNull { it.toIntOrNull() }
+        // Keep every label: dropping text can turn a public hostname such as
+        // 10.0.0.5.attacker.example into a seemingly private IPv4 address.
+        val labels = host.split(".")
+        if (labels.size != 4 || labels.any { it.isEmpty() || it.any { c -> c !in '0'..'9' } }) return false
+        val parts = labels.map { it.toIntOrNull() ?: return false }
         if (parts.size != 4 || parts.any { it !in 0..255 }) return false
         val (a, b) = parts
         return when {
