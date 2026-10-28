@@ -24,6 +24,9 @@ const StateSchema = z.object({
   recordingConsent: z.boolean().default(false),
   // Main's grant for that consent. Persistent; main revokes only on request.
   lifelogConsent: ConsentSchema.nullable().default(null),
+  transcriptVisible: z.boolean().default(false),
+  liveCuesEnabled: z.boolean().default(false),
+  lastAgentOrigin: z.string().url().nullable().default(null),
   wakePhrase: z.string().trim().min(1).max(40).default('open agi'),
   speechModel: z.enum(['openai-buffered', 'nova-3', 'nova-2']).default('openai-buffered'),
   speechTransport: z.enum(['relay', 'direct']).default('relay'),
@@ -49,8 +52,9 @@ export function migrateState(raw: unknown): unknown {
   return { ...old, homeMode, recordingConsent: homeMode === 'lifelog' && Boolean(old.lifelogConsent), lifelogConsent: null }
 }
 
-function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'homeMode' | 'wakePhrase' | 'speechModel' | 'speechTransport' | 'autoSend'>): OpenAGIState {
+function empty(nodeId: string = crypto.randomUUID(), preferences?: Pick<OpenAGIState, 'homeMode' | 'wakePhrase' | 'speechModel' | 'speechTransport' | 'autoSend' | 'transcriptVisible' | 'lastAgentOrigin'>): OpenAGIState {
   return {
+    transcriptVisible: preferences?.transcriptVisible ?? false, liveCuesEnabled: false, lastAgentOrigin: preferences?.lastAgentOrigin ?? null,
     version: 2, nodeId, nodeToken: null, node: null, conversationId: null,
     continuation: null, interfaceStyle: 'focused', savedDraft: '', pendingRequest: null,
     homeMode: preferences?.homeMode ?? 'talk', recordingConsent: false, lifelogConsent: null,
@@ -86,7 +90,7 @@ export class OpenAGIStore {
   private async persistUpdate(patch: Partial<Omit<OpenAGIState, 'version'>>): Promise<OpenAGIState> {
     const changedMain = patch.agentOrigin !== undefined && patch.agentOrigin !== this.state.agentOrigin
     const changedCredential = patch.nodeToken !== undefined && patch.nodeToken !== this.state.nodeToken
-    const next = StateSchema.parse({ ...this.state, ...patch, ...(changedMain || changedCredential ? { history: [], continuation: null, pendingRequest: null, savedDraft: '', lifelogConsent: null } : {}), version: 2 })
+    const next = StateSchema.parse({ ...this.state, ...patch, ...(patch.agentOrigin ? { lastAgentOrigin: patch.agentOrigin } : {}), ...(changedMain || changedCredential ? { liveCuesEnabled: false, history: [], continuation: null, pendingRequest: null, savedDraft: '', lifelogConsent: null } : {}), version: 2 })
     await this.storage.set(KEY, JSON.stringify(next))
     this.state = next
     return this.snapshot()
