@@ -638,11 +638,19 @@ enum ChatErrorCopy {
         case .agentHostDisabled:
             return "OpenAGI can't reply -- no agent host is configured on this daemon. Open its dashboard and finish setup, then try again."
         case .unauthorized:
-            return "Needs re-pairing -- revoke and pair again in Settings."
+            return "The server didn't authorize this chat. Your saved connection was kept. Check the enrollment and server version in Connection Settings."
         case .mainConnection(let issue):
             return issue.message
-        case .notFound, .conflict, .malformedResponse, .server, .unreachableHost, .transport:
-            return "Can't reach OpenAGI. Check your connection and try again."
+        case .notFound:
+            return "This chat feature isn't available on the server. Check its OpenAGI version, then refresh. Your saved connection was kept."
+        case .conflict:
+            return "The server couldn't accept this turn yet. Refresh the conversation before sending again."
+        case .server(let status):
+            return "The server returned error \(status). Check the conversation before sending again."
+        case .malformedResponse:
+            return "The server returned an unexpected chat response. Check its OpenAGI version, then refresh the conversation."
+        case .unreachableHost, .transport:
+            return "Couldn't confirm delivery. Check your connection and refresh the conversation before sending again."
         }
     }
 }

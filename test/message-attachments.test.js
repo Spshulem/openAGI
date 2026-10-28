@@ -107,6 +107,11 @@ for (const thread of ["agent", "supervisor"]) {
     });
     const { url } = await app.listen();
     const headers = { authorization: `Bearer ${phone.token}`, "x-openagi-node-id": phone.id, "content-type": "application/json" };
+    const capabilities = await fetch(url + "/mobile/capabilities", { headers });
+    assert.equal(capabilities.status, 200);
+    assert.equal((await capabilities.json()).imageAttachments, true);
+    assert.equal((await fetch(url + "/mobile/capabilities")).status, 401, "Capabilities remain authenticated");
+    assert.equal((await fetch(url + "/mobile/capabilities", { headers: { ...headers, authorization: "Bearer invalid" } })).status, 401);
     const attachment = image();
     const response = await fetch(url + "/message", { method: "POST", headers: { ...headers, accept: "text/event-stream" },
       body: JSON.stringify({ text: "", thread, attachments: [attachment] }) });

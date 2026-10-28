@@ -1846,6 +1846,10 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
         // renew: the relay refused this same pass; the phone should mint a new one.
         return sendJson(res, 200, { ok: true, renew: record.renew === true });
       }
+      if (method === "GET" && pathname === "/mobile/capabilities") {
+        res.setHeader("Cache-Control", "no-store");
+        return sendJson(res, 200, { protocol: 1, imageAttachments: true, conversationCatalog: true });
+      }
       if (method === "GET" && pathname === "/brief/today") {
         const rawLimit = Number.parseInt(url.searchParams.get("limit") ?? "5", 10);
         const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(10, rawLimit)) : 5;

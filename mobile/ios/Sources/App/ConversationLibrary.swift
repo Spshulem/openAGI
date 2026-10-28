@@ -64,7 +64,7 @@ final class ConversationLibrary {
             guard active, issued == generation else { return }
             switch error as? DaemonError {
             case .notFound:
-                self.error = "Update OpenAGI on your server to create chats and load the full conversation list. Your saved shared chats and pairing are still available; no new code is needed."
+                self.error = "The server isn't allowing the conversation list. Check its OpenAGI version and phone access. Your saved chats and pairing are kept; no new code is needed."
             case .malformedResponse:
                 self.error = "The server responded with unexpected conversation data. Update OpenAGI on the server, then retry. Your saved chats and pairing have been kept."
             default:

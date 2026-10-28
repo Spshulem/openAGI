@@ -127,10 +127,12 @@ final class ChatConversation {
 
     private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID) async {
         var sawTerminalFrame = false
+        var openedStream = false
         do {
             let stream = try await client.sendMessageStreaming(
                 text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey, attachments: attachments, conversationId: conversationID
             )
+            openedStream = true
             for try await event in stream {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
@@ -164,10 +166,10 @@ final class ChatConversation {
             }
         } catch let error as DaemonError {
             if !sawTerminalFrame {
-                fail(replyID, text: error == .agentHostDisabled || error == .unauthorized || error == .imagesUnsupported
+                fail(replyID, text: !openedStream
                      ? ChatErrorCopy.message(for: error)
                      : "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.",
-                     retrySafe: error == .agentHostDisabled)
+                     retrySafe: error == .agentHostDisabled || error == .imagesUnsupported)
             }
         } catch {
             if !sawTerminalFrame {

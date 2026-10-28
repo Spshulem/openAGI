@@ -251,34 +251,40 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertFalse(app.buttons["open thread"].exists, "Opening a thread must be navigation")
         tap(app, "supervisor-question-context-context-fixture")
         XCTAssertTrue(app.navigationBars["Thread"].waitForExistence(timeout: 10))
-        let details = element(app, "supervisor-thread-details")
-        XCTAssertTrue(details.waitForExistence(timeout: 5))
-        let question = details.staticTexts["Read the recent activity before choosing a response."]
+        // Duo can stall resolving descendants of an Any-typed List query.
+        // Query the native labels directly after verifying the sheet title.
+        let question = app.staticTexts["Read the recent activity before choosing a response."].firstMatch
         XCTAssertTrue(question.waitForExistence(timeout: 5))
         XCTAssertTrue(question.isHittable, "The sheet must receive its full question on first presentation")
-        let message = details.staticTexts["The synthetic change is ready for your review. Nothing has been sent."]
+        let message = app.staticTexts["The synthetic change is ready for your review. Nothing has been sent."].firstMatch
         for _ in 0..<4 {
             if message.exists && message.isHittable { break }
             app.swipeUp()
         }
         XCTAssertTrue(message.waitForExistence(timeout: 10))
-        XCTAssertTrue(details.staticTexts["Explain the synthetic change before I decide."].exists)
+        XCTAssertTrue(app.staticTexts["Explain the synthetic change before I decide."].firstMatch.exists)
         XCTAssertFalse(app.staticTexts["Not sent. Couldn't reach the agent"].exists)
         capture("native-thread-context", app: app)
-        tap(app, "supervisor-read-conversation", in: "supervisor-thread-details")
+        let readConversation = app.buttons["supervisor-read-conversation"].firstMatch
+        for _ in 0..<4 {
+            if readConversation.exists && readConversation.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(readConversation.exists && readConversation.isHittable)
+        readConversation.tap()
         XCTAssertTrue(app.navigationBars["Conversation"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["Show the earlier synthetic request."].waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Here is the earlier synthetic explanation."].exists)
         capture("native-thread-conversation", app: app)
         back(app, from: "Conversation", to: "Thread")
         XCTAssertTrue(question.exists, "Reading conversation history must retain the decision")
-        let yes = details.buttons["yes"]
+        let yes = app.buttons["yes"].firstMatch
         for _ in 0..<6 {
             if yes.exists && yes.isHittable { break }
-            details.swipeUp()
+            app.swipeUp()
         }
         XCTAssertTrue(yes.exists && yes.isHittable, "A thread decision must remain answerable after reading its activity")
-        XCTAssertTrue(details.buttons["no"].isHittable)
+        XCTAssertTrue(app.buttons["no"].firstMatch.isHittable)
         XCTAssertFalse(app.buttons["open thread"].exists)
         capture("native-thread-decision", app: app)
         // Duo scrolls the sheet's native navigation controls with the list.
@@ -286,7 +292,7 @@ final class NativeNavigationTests: XCTestCase {
         let done = app.buttons["Done"]
         for _ in 0..<6 {
             if done.exists && done.isHittable { break }
-            details.swipeDown()
+            app.swipeDown()
         }
         XCTAssertTrue(done.exists && done.isHittable)
         done.tap()

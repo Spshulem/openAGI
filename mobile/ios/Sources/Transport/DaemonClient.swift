@@ -272,6 +272,9 @@ public actor DaemonClient {
     // thread wins.
     public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
                                      from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = [], conversationId: String = "main") async throws -> AsyncThrowingStream<ChatEvent, Error> {
+        // Check before uploading pixels. Older mains can reject a large body
+        // before returning a useful error; that is not a dropped agent turn.
+        if !attachments.isEmpty { try await requireImageSupport() }
         var body: [String: Any] = ["text": text]
         if !attachments.isEmpty {
             body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
@@ -320,6 +323,38 @@ public actor DaemonClient {
     }
 
     private struct SharedThreadsRejected: Error {}
+
+    private struct MessageCapabilities: Decodable { let imageAttachments: Bool }
+
+    private func requireImageSupport() async throws {
+        let request = try authorizedRequest(path: "/mobile/capabilities", method: "GET")
+        do {
+            let (data, http) = try await perform(request)
+            try Self.requireConversationJSON(data: data, response: http)
+            guard try Self.decodeJSON(MessageCapabilities.self, from: data).imageAttachments else {
+                throw DaemonError.imagesUnsupported
+            }
+        } catch DaemonError.unauthorized {
+            // A legacy route can be owner-only even though this enrollment
+            // is valid. Prove that separately; never replace its credential.
+            try await heartbeat()
+            throw DaemonError.imagesUnsupported
+        } catch DaemonError.notFound {
+            throw DaemonError.imagesUnsupported
+        } catch DaemonError.malformedResponse {
+            throw DaemonError.imagesUnsupported
+        }
+    }
+
+    private func performConversationRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        do { return try await perform(request) }
+        catch DaemonError.unauthorized {
+            // A valid heartbeat plus a rejected catalog means this feature
+            // is unavailable, not that the saved enrollment has expired.
+            try await heartbeat()
+            throw DaemonError.notFound
+        }
+    }
 
     private func openMessageStream(body: [String: Any]) async throws -> URLSession.AsyncBytes {
         var request = try authorizedRequest(path: "/message", method: "POST")
@@ -378,7 +413,7 @@ public actor DaemonClient {
 
     public func conversations() async throws -> [ConversationSummary] {
         let request = try authorizedRequest(path: "/conversations", method: "GET")
-        let (data, http) = try await perform(request)
+        let (data, http) = try await performConversationRequest(request)
         try Self.requireConversationJSON(data: data, response: http)
         return try Self.decodeJSON(ConversationCatalog.self, from: data).conversations
     }
@@ -389,7 +424,7 @@ public actor DaemonClient {
         var request = try authorizedRequest(path: "/conversations", method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, http) = try await perform(request)
+        let (data, http) = try await performConversationRequest(request)
         try Self.requireConversationJSON(data: data, response: http)
         return try Self.decodeJSON(ConversationSummary.self, from: data)
     }

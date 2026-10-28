@@ -80,4 +80,15 @@ final class ConnectionRecoveryTests: XCTestCase {
         XCTAssertTrue(offline.contains("resolve"))
         XCTAssertTrue(offline.contains("No new code"))
     }
+
+    func testCatalogRejectionWithAcceptedHeartbeatDoesNotDeclareThePairingExpired() async {
+        for accepted in [true, false] {
+            StubProtocol.handler = { request in
+                let status = accepted && request.url!.path == "/nodes/heartbeat" ? 200 : 401
+                return (HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
+            }
+            do { _ = try await client().conversations(); XCTFail("Rejected catalog must not load") }
+            catch { XCTAssertEqual(error as? DaemonError, accepted ? .notFound : .unauthorized) }
+        }
+    }
 }

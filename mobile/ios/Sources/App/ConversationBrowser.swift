@@ -10,7 +10,9 @@ struct ConversationBrowser: View {
         List {
             if let error = model.conversations.error {
                 Section {
-                    Text(error).font(.footnote)
+                    DisclosureGroup("Conversation list unavailable") {
+                        Text(error).font(.footnote)
+                    }
                     Button("Retry") { Task { await model.conversations.refresh() } }
                 }
             }

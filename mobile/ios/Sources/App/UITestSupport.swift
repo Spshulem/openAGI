@@ -104,6 +104,8 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         let tasks = [Self.task(id: "demo-one", title: "Plan a synthetic demo"),
                      Self.task(id: "demo-two", title: "Review a synthetic demo")]
         switch url.path {
+        case "/mobile/capabilities":
+            finish(object: ["protocol": 1, "imageAttachments": true, "conversationCatalog": true])
         case "/conversations":
             if request.httpMethod == "POST" {
                 guard let body = Self.body(request), let payload = try? JSONSerialization.jsonObject(with: body) as? [String: String],

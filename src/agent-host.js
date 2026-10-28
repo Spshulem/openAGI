@@ -249,7 +249,7 @@ export class AgentHost {
     // iMessages and other chats), on-screen OCR, the overlay's window text, a
     // brief, or earlier messages in this chat that were not the owner's own
     // clean turns (a shared thread holds wake-word turns and tool reads).
-    const contextUntrusted = Boolean(memoryHitsForModel.length || intuitions.length
+    const contextUntrusted = Boolean(attachments.length || memoryHitsForModel.length || intuitions.length
       || ambientContext?.snippets?.length || metadata.screenContext || briefContext)
       || !cleanOwnerHistory(sessionBefore.messages.slice(0, -1));
     const turnState = principal ? { untrusted: contextUntrusted, intent: ownerIntentText(text) } : null;
@@ -643,6 +643,7 @@ Your job is to help through the ABI loop:
 3. Propagate bounded specialists only when repeated or novel high-risk work justifies it.
 
 Answer the user plainly. If a specialist was created, mention its name and scope.
+For coding-thread handoffs, report the exact target, route and delivery status from the tool receipt. Read fleet_thread's recentDeliveries when asked about a previous handoff. Missing evidence means delivery is unverified, not that it failed or succeeded. A changed app, remembered claim, or success on another route is not a delivery receipt. A blocked route applies only to that target and route; never infer that all coding apps are inaccessible.
 ${computerUseGuidance}
 ${GET_STARTED_GUIDANCE}
 

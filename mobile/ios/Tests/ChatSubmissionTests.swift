@@ -48,6 +48,9 @@ final class ChatSubmissionTests: XCTestCase {
             let delivered = OSAllocatedUnfairLock(initialState: 0)
             StubProtocol.handler = { request in
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                if request.url!.path == "/mobile/capabilities" {
+                    return (response, Data(#"{"imageAttachments":true}"#.utf8))
+                }
                 if request.url!.path == "/message" {
                     guard let body = try? Self.body(request),
                           let attachments = body["attachments"] as? [[String: Any]] else {
@@ -103,6 +106,10 @@ final class ChatSubmissionTests: XCTestCase {
     func testOlderMainNeverRetriesAnImageRequestWithoutItsPixels() async throws {
         nonisolated(unsafe) var count = 0
         StubProtocol.handler = { request in
+            if request.url!.path == "/mobile/capabilities" {
+                return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                        Data(#"{"imageAttachments":true}"#.utf8))
+            }
             count += 1
             return (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
                     Data("{\"error\":\"node message contains unsupported fields\"}".utf8))
@@ -113,6 +120,40 @@ final class ChatSubmissionTests: XCTestCase {
             XCTFail("An old server must explicitly reject image upload")
         } catch let error as DaemonError { XCTAssertEqual(error, .imagesUnsupported) }
         XCTAssertEqual(count, 1, "Never retry with only text or silently discard the attachment")
+    }
+
+    func testImagePreflightNeverUploadsToALegacyMainThatRejectsOnlyTheCapabilityRoute() async {
+        nonisolated(unsafe) var paths: [String] = []
+        StubProtocol.handler = { request in
+            let path = request.url!.path
+            paths.append(path)
+            XCTAssertNotEqual(path, "/message", "Unsupported uploads must never start a turn")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-OpenAGI-Node-ID"), "mobile:test")
+            let status = path == "/nodes/heartbeat" ? 200 : 401
+            return (HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
+        }
+        do {
+            _ = try await client().sendMessageStreaming(text: "Look", thread: .agent,
+                attachments: [ChatAttachment(name: "Synthetic", mimeType: "image/png", data: Self.png)])
+            XCTFail("The upload must stop before posting pixels")
+        } catch { XCTAssertEqual(error as? DaemonError, .imagesUnsupported) }
+        XCTAssertEqual(paths, ["/mobile/capabilities", "/nodes/heartbeat"])
+    }
+
+    @MainActor func testRejectedChatRequestIsNotReportedAsADroppedStream() async throws {
+        StubProtocol.handler = { request in
+            let status = request.url!.path == "/message" ? 413 : 404
+            return (HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
+        }
+        let conversation = ChatConversation(thread: .agent, client: client(),
+            store: ChatHistoryStore(thread: "rejected-turn", directory: directory), nodeID: "mobile:test")
+        conversation.draft = "Synthetic request"
+        XCTAssertTrue(conversation.submitDraft())
+        for _ in 0..<100 where conversation.isSending { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(conversation.isSending)
+        XCTAssertTrue(conversation.messages.last?.text.contains("error 413") == true)
+        XCTAssertFalse(conversation.messages.last?.text.contains("Connection lost") == true)
+        XCTAssertFalse(conversation.messages.last?.retrySafe == true)
     }
 
     func testUnreadableImageGivesAnActionableError() async {

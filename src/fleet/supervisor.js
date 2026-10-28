@@ -1583,7 +1583,11 @@ export class FleetSupervisor {
     const thread = this.lastThreads.get(threadKey);
     const deliveryState = thread ? await this.probeDelivery({ deadlineAt }) : null;
     const route = thread ? chooseRoute(thread, this.mode === "auto" ? "auto" : "propose", deliveryState) : null;
-    if (!thread || !route) return { delivery: { status: "blocked", route: null, detail: this.noRouteDetail(thread, deliveryState) } };
+    if (!thread || !route) {
+      const detail = this.noRouteDetail(thread, deliveryState);
+      const action = this.store.recordAction({ threadKey, playbook: "owner-message", status: "blocked", route: null, detail });
+      return { delivery: { status: "blocked", route: null, detail, actionId: action.id } };
+    }
     // The owner is speaking to this thread: a judged or planned nudge in
     // flight for it is dropped, as for an owner answer.
     this.ownerAnsweredAt.set(thread.key, this.now());
@@ -1593,7 +1597,9 @@ export class FleetSupervisor {
     // A card in the way comes back with the block: the owner can answer it
     // (fleet_click) and send again.
     const card = delivery.status === "sent" ? null : delivery.prompt ?? this.livePrompt(thread);
-    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null, ...(card ? { prompt: card } : {}) } };
+    return { delivery: { status: delivery.status, route: delivery.route ?? route, detail: delivery.detail ?? null,
+      ...(delivery.actionId ? { actionId: delivery.actionId } : {}),
+      ...(delivery.unconfirmed === true ? { unconfirmed: true } : {}), ...(card ? { prompt: card } : {}) } };
   }
 
   // One thread, expanded for the owner: the agent's last message and when,
