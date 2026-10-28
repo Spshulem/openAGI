@@ -6,6 +6,7 @@ import { nowIso } from "./utils.js";
 import { personaPath, applyPersona } from "./persona.js";
 import { SHARED_THREADS, sharedSessionId } from "./shared-conversations.js";
 import { BUCKETS, QUEUES, STATUSES } from "./task-store.js";
+import { normalizeMessageImages } from "./message-attachments.js";
 
 // Offline copy of the Mac agent (spec 2026-10-16 section 3).
 //
@@ -20,6 +21,9 @@ import { BUCKETS, QUEUES, STATUSES } from "./task-store.js";
 // not in the baseline and not yet marked sent is offline work.
 
 export const MIRROR_VERSION = 1;
+// Legacy readers drop attachment fields. Photo pages must fail their version
+// check before they can acknowledge a text-only import and discard originals.
+export const MIRROR_IMAGE_VERSION = 2;
 export const MIRROR_MAX_BYTES = 5 * 1024 * 1024;
 const OFFLINE_ORIGIN = "phone-offline";
 
@@ -180,14 +184,27 @@ function isVisibleMessage(m) {
 
 // Native FileBackedAgentStore message shape with private metadata dropped.
 function projectMessage(m) {
+  const attachments = m.role === "user" ? normalizeMessageImages(m.attachments ?? m.metadata?.attachments) : [];
   return {
     id: m.id, role: m.role, content: clip(redactSecrets(m.content), LIMITS.messageContent),
     agentId: shortOr(m.agentId, LIMITS.shortString * 2) ?? "main",
     channel: shortOr(m.channel, LIMITS.shortString * 2),
     from: shortOr(m.from, LIMITS.shortString * 2),
     createdAt: shortOr(m.createdAt, LIMITS.isoString) ?? nowIso(),
-    metadata: pickMessageMetadata(m.metadata)
+    metadata: pickMessageMetadata(m.metadata),
+    ...(attachments.length ? { attachments } : {})
   };
+}
+
+function messageForStore(m) {
+  const { attachments, ...message } = projectMessage(m);
+  if (attachments?.length) message.metadata.attachments = attachments;
+  return message;
+}
+
+function versionForMessages(threads) {
+  return Object.values(threads).some(messages => messages.some(m => m.attachments?.length))
+    ? MIRROR_IMAGE_VERSION : MIRROR_VERSION;
 }
 
 const MEMORY_STRING_FIELDS = ["rawContentHash", "source", "scope", "kind", "fidelity", "createdAt", "lastAccessedAt", "lastObservedAt", "lastDecayedAt"];
@@ -309,7 +326,7 @@ export function buildMirrorSnapshot(runtime, { dataDir, maxMessages = 500, maxMe
       threads: Object.fromEntries(Object.entries(threadsAll).map(([key, messages]) => [key, messageCap ? messages.slice(-messageCap) : []]))
     };
     const cursor = sha(JSON.stringify(body)).slice(0, 32);
-    const snapshot = { version: MIRROR_VERSION, source: { createdAt: nowIso(), cursor }, ...body };
+    const snapshot = { version: versionForMessages(body.threads), source: { createdAt: nowIso(), cursor }, ...body };
     if (byteLength(snapshot) <= MIRROR_MAX_BYTES) return snapshot;
     messageCap = Math.floor(messageCap / 2);
     memoryCap = Math.floor(memoryCap / 2);
@@ -353,6 +370,11 @@ function checkMessage(m, label) {
   checkString(m.createdAt, LIMITS.isoString, `${label}.createdAt`, { optional: true });
   for (const key of ["agentId", "channel", "from"]) checkString(m[key], LIMITS.shortString * 2, `${label}.${key}`, { optional: true, nullable: true });
   checkMetadata(m.metadata, `${label}.metadata`);
+  if (m.attachments !== undefined) {
+    if (m.role !== "user") throw bad(`${label}.attachments require a user message.`);
+    try { normalizeMessageImages(m.attachments); }
+    catch (error) { throw bad(`${label}.attachments: ${error.message}`); }
+  }
 }
 
 function checkMemory(item, label) {
@@ -405,7 +427,12 @@ function checkThreads(threads, perThread, label) {
 
 function checkVersion(input, label) {
   if (!isPlainObject(input)) throw bad(`${label} must be an object.`);
-  if (input.version !== MIRROR_VERSION) throw fail("unsupported_version", 400, `Unsupported ${label} version.`);
+  if (![MIRROR_VERSION, MIRROR_IMAGE_VERSION].includes(input.version)) throw fail("unsupported_version", 400, `Unsupported ${label} version.`);
+  const threads = input.messages ?? input.threads;
+  if (input.version === MIRROR_VERSION && isPlainObject(threads)
+      && Object.values(threads).some(messages => Array.isArray(messages) && messages.some(m => m?.attachments?.length))) {
+    throw bad("Image messages require mirror version 2.");
+  }
 }
 
 export function validateMirrorSnapshot(snapshot) {
@@ -506,6 +533,7 @@ export function listOfflineWork(runtime, { dataDir } = {}) {
     longest.length = Math.floor(longest.length / 2);
     work.truncated = true;
   }
+  work.version = versionForMessages(work.messages);
   return work;
 }
 
@@ -580,7 +608,7 @@ export function importMirrorSnapshot(runtime, snapshot, { dataDir } = {}) {
     const incoming = snapshot.threads[thread] ?? [];
     const ids = new Set(incoming.map(m => m.id));
     const kept = (offline.messages[thread] ?? []).filter(m => !ids.has(m.id));
-    const mirrored = incoming.map(m => ({ ...projectMessage(m), content: m.content }));
+    const mirrored = incoming.map(m => ({ ...messageForStore(m), content: m.content }));
     const session = store.getSession(sessionId);
     store.saveSession({
       ...session,
@@ -680,7 +708,8 @@ export function importOfflineWork(runtime, work, { dataDir, fromNodeId } = {}) {
         id: m.id, role: m.role, content: m.content, agentId: "main", channel: "node",
         from: m.role === "user" ? `node:${fromNodeId}:offline` : "openagi",
         createdAt: typeof m.createdAt === "string" ? m.createdAt : nowIso(),
-        metadata: { ...origin, thread, ...(m.role === "user" ? { sourceNodeId: fromNodeId } : {}) }
+        metadata: { ...origin, thread, ...(m.role === "user" ? { sourceNodeId: fromNodeId } : {}),
+          ...(m.attachments?.length ? { attachments: normalizeMessageImages(m.attachments) } : {}) }
       };
       store.appendMessage(sessionId, message);
       appended.push(message);

@@ -213,6 +213,7 @@ this table, if the two ever disagree — but as of `136c15b` it allows exactly:
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/mobile/summary` | §4 |
+| GET | `/mobile/capabilities` | authenticated image-upload support preflight |
 | POST | `/mobile/push` | iOS push registration, §7.1 |
 | DELETE | `/mobile/push` | remove it, §7.1 |
 | GET | `/tasks` | list, with `?queue=&bucket=&status=&limit=` |
@@ -290,6 +291,9 @@ fit within the 5 MiB JSON request limit. An empty text plus images is a valid tu
 
 The iOS Photos and Files pickers downsample images off the main thread, normalize
 orientation, remove source metadata, and show removable previews before sending.
+Before uploading, iOS checks the authenticated `/mobile/capabilities` response
+for image support. A missing or unsupported endpoint shows update guidance and
+keeps the draft and its attachments available for retry.
 OpenAI/ChatGPT, Claude and compatible local vision models receive native image
 content blocks. Language-only on-device models explicitly report that a vision
 model is required. Old servers reject images with update guidance; the phone
@@ -298,6 +302,14 @@ never retries an image turn as text alone.
 Full image data is retained in the agent session for subsequent model turns.
 Shared history returns only attachment identity/name and a bounded thumbnail;
 SSE does not echo the pixels. The phone caches only these small previews.
+
+Offline conversation mirrors carry validated full image attachments separately
+from bounded public message metadata. Pages and snapshots containing photos use
+mirror version 2; text-only payloads remain version 1. New readers accept both.
+Legacy readers reject version 2 before acknowledging an upload, so the phone
+retains unsent originals rather than replacing them with a text-only snapshot.
+Both import paths restore the validated pixels to message attachments without
+importing owner-authority metadata.
 
 ### 3.1 Chat threads
 

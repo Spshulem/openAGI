@@ -46,7 +46,7 @@ export class OnDeviceModelProvider {
     const hops = Math.max(1, Math.min(Number(maxToolHops) || this.maxToolHops, this.maxToolHops));
     const tools = (toolRegistry?.toAnthropicTools?.() ?? [])
       .filter((tool) => this.allowedTools.has(tool.name))
-      .filter((tool) => tool.name !== "add_task" || requestsTaskCreation(input))
+      .filter((tool) => tool.name !== "add_task" || requestsTaskCreation(input, messages))
       .map((tool) => ({ name: tool.name, description: clip(tool.description, 300), parameters: tool.input_schema ?? { type: "object", properties: {} } }));
     const system = compactSystemPrompt(agent);
     const contextBlock = clip(turnContext ?? memoryBlock(memoryHits), TURN_CONTEXT_MAX_CHARS).replace(/^\[context\]\s*/, "").replace(/\s*\[\/context\]$/, "");
@@ -132,11 +132,39 @@ export function compactSystemPrompt(agent) {
   ].filter(Boolean).join("\n\n");
 }
 
-export function requestsTaskCreation(input) {
+export function requestsTaskCreation(input, messages = []) {
   const text = String(input ?? "");
-  if (/\b(?:do not|don't|never|without)\s+(?:add|create|make|save|track)\b/i.test(text)) return false;
-  return /\b(?:add|create|make|put|save|track)\b[^.!?\n]{0,100}\b(?:task|todo|to-do|reminder|list)\b/i.test(text)
-    || /\b(?:remind me|remember to|i (?:need|have) to)\b|\b(?:todo|to-do|task)\s*:/i.test(text);
+  if (cancelsTaskRequest(text)) return false;
+  if (explicitTaskRequest(text)) return true;
+  if (newTopic(text)) return false;
+  const history = [...messages];
+  if (history.at(-1)?.role === "user" && history.at(-1)?.content === text) history.pop();
+  // Carry intent only through a short, uninterrupted clarification exchange,
+  // stopping at a completed tool call, topic change or non-question reply.
+  for (let i = history.length - 1, turns = 0; i >= 0 && turns < 8; i -= 1, turns += 1) {
+    const message = history[i];
+    if (turns % 2 === 0) {
+      if (message.role !== "assistant" || !/[?？]/.test(message.content ?? "")
+          || message.metadata?.toolCalls?.some(call => call.name === "add_task" && call.ok === true)) return false;
+    } else {
+      if (message.role !== "user" || cancelsTaskRequest(message.content)) return false;
+      if (explicitTaskRequest(message.content)) return true;
+      if (newTopic(message.content)) return false;
+    }
+  }
+  return false;
+}
+
+function cancelsTaskRequest(text) {
+  return /\b(?:do not|don't|never|without)\s+(?:add|create|make|save|track)\b|^\s*(?:cancel|nevermind|never mind|forget (?:it|that))\b/i.test(String(text ?? ""));
+}
+function explicitTaskRequest(text) {
+  return /\b(?:add|create|make|put|save|track)\b[^.!?\n]{0,100}\b(?:task|todo|to-do|reminder|list)\b/i.test(String(text ?? ""))
+    || /\b(?:remind me|remember to|i (?:need|have) to)\b|\b(?:todo|to-do|task)\s*:/i.test(String(text ?? ""));
+}
+function newTopic(text) {
+  return /^\s*(?:hi|hello|hey|thanks|thank you|what|why|how|who|where|when|tell me|explain|summarize|switch topics)\b/i.test(String(text ?? ""))
+    || /[?？]\s*$/.test(String(text ?? ""));
 }
 
 function memoryBlock(memoryHits) {
