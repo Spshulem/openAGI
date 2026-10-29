@@ -410,7 +410,15 @@ final class NativeNavigationTests: XCTestCase {
         // Expanded layouts also show this text in the sidebar preview.
         // Verify the actual message in history, not that second label.
         let reply = history.staticTexts["Synthetic reply"]
-        XCTAssertTrue(reply.waitForExistence(timeout: 10))
+        let replyExists = reply.waitForExistence(timeout: 10)
+        if !replyExists {
+            capture("native-chat-reply-missing", app: app)
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "native-chat-reply-missing-hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+        }
+        XCTAssertTrue(replyExists)
         let replyVisible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)
         let visibilityResult = XCTWaiter.wait(for: [replyVisible], timeout: 10)
         if visibilityResult != .completed {

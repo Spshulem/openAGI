@@ -262,9 +262,6 @@ struct ChatConversationView: View {
             .scrollPosition($scrollPosition)
             .defaultScrollAnchor(.bottom, for: .initialOffset)
             .defaultScrollAnchor(.bottom, for: .alignment)
-            // Sending replaces the editor and can dismiss the keyboard after
-            // the reply arrives. Keep following across that later resize too.
-            .defaultScrollAnchor(isPinnedToBottom ? .bottom : nil, for: .sizeChanges)
             .onScrollPhaseChange { _, phase in
                 userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
             }
@@ -272,8 +269,15 @@ struct ChatConversationView: View {
                 ChatScrollGeometry(contentHeight: geometry.contentSize.height,
                                    viewportHeight: geometry.containerSize.height,
                                    offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
-            } action: { _, geometry in
+            } action: { previous, geometry in
                 hasContentBelow = !geometry.isAtBottom
+                // Keyboard dismissal and fold changes resize the viewport
+                // after Send has already moved to the reply. Resolve the
+                // message again at that size, rather than retaining a lazy
+                // stack's estimated bottom offset.
+                if previous.viewportHeight != geometry.viewportHeight && isPinnedToBottom && !userIsScrolling {
+                    scrollToLatest()
+                }
                 // Loading history, streaming and keyboard resizing must
                 // not turn a programmatic scroll into 'reading older'.
                 // The final bottom update can arrive after the gesture
@@ -332,7 +336,16 @@ struct ChatConversationView: View {
     }
 
     private func scrollToLatest() {
-        withAnimation(nil) { scrollPosition.scrollTo(edge: .bottom) }
+        withAnimation(nil) {
+            if let latest = messages.last?.id {
+                // An edge scroll can land in unmaterialized space when the
+                // lazy history and keyboard change size in the same turn.
+                // A real message ID gives SwiftUI a row to resolve and show.
+                scrollPosition.scrollTo(id: latest, anchor: .bottom)
+            } else {
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
     }
 
     private func jumpToLatestButton() -> some View {
