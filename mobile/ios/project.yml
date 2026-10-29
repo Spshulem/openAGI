@@ -8,7 +8,7 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "2125"
+    CURRENT_PROJECT_VERSION: "2126"
     DEVELOPMENT_TEAM: ""
     # Ad-hoc signing ("-" needs no Apple Developer Team, certificate, or
     # provisioning profile — it works on any Mac, headless or not) rather

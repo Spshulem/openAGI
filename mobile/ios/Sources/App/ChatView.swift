@@ -617,7 +617,9 @@ struct ChatConversationView: View {
     private func composerIcon(_ name: String) -> some View {
         Image(systemName: name)
             .font(.system(size: 18, weight: .medium))
-            .frame(width: 24, height: 24)
+            // Regular native glass adds seven points per side. Size the
+            // label so the button itself, not just its wrapper, is 44 points.
+            .frame(width: 30, height: 30)
     }
 
     private func sendDraft() {
