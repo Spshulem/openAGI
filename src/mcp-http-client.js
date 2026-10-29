@@ -1,3 +1,4 @@
+import { collectMcpTools } from "./mcp-tool-list.js";
 // HTTP MCP client. Implements the Streamable HTTP transport (MCP spec
 // 2025-03-26): single endpoint, JSON-RPC over POST, response is either
 // application/json (single message) or text/event-stream (one or more
@@ -71,8 +72,7 @@ export class McpHttpClient {
       );
       // notifications/initialized has no response.
       await this.notify("notifications/initialized", {}, { interactive });
-      const list = await this.request("tools/list", {}, { interactive });
-      this.tools = list?.tools ?? [];
+      this.tools = await collectMcpTools((method, params) => this.request(method, params, { interactive }));
       this.connected = true;
       this.lastError = null;
       return { tools: this.tools, serverInfo: this.serverInfo };
@@ -84,8 +84,7 @@ export class McpHttpClient {
 
   async listTools() {
     if (!this.connected) await this.connect();
-    const list = await this.request("tools/list", {});
-    this.tools = list?.tools ?? this.tools;
+    this.tools = await collectMcpTools((method, params) => this.request(method, params));
     return this.tools;
   }
 
