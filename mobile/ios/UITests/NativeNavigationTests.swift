@@ -410,7 +410,16 @@ final class NativeNavigationTests: XCTestCase {
         let reply = app.staticTexts["Synthetic reply"]
         XCTAssertTrue(reply.waitForExistence(timeout: 10))
         let replyVisible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)
-        XCTAssertEqual(XCTWaiter.wait(for: [replyVisible], timeout: 10), .completed)
+        let visibilityResult = XCTWaiter.wait(for: [replyVisible], timeout: 10)
+        if visibilityResult != .completed {
+            capture("native-chat-reply-visibility-failure", app: app)
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "native-chat-reply-visibility-hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+            print("Reply frame: \(reply.frame); history frame: \(history.frame)")
+        }
+        XCTAssertEqual(visibilityResult, .completed)
         XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
         XCTAssertFalse(app.buttons["chat-send"].isEnabled)
         capture("native-chat-follow-latest", app: app)

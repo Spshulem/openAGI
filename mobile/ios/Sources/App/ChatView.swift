@@ -118,7 +118,7 @@ struct ChatConversationView: View {
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
     var onHistorySelectionConsumed: () -> Void = {}
 
-    @State private var scrollPosition = ScrollPosition(idType: String.self)
+    @State private var scrollPosition = ScrollPosition(idType: UUID.self)
     @State private var isPinnedToBottom = true
     @State private var hasContentBelow = false
     @State private var isBottomVisible = false
@@ -261,6 +261,9 @@ struct ChatConversationView: View {
             .scrollPosition($scrollPosition)
             .defaultScrollAnchor(.bottom, for: .initialOffset)
             .defaultScrollAnchor(.bottom, for: .alignment)
+            // Sending replaces the editor and can dismiss the keyboard after
+            // the reply arrives. Keep following across that later resize too.
+            .defaultScrollAnchor(isPinnedToBottom ? .bottom : nil, for: .sizeChanges)
             .onScrollPhaseChange { _, phase in
                 userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
             }
