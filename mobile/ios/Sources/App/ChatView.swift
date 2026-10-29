@@ -246,13 +246,15 @@ struct ChatConversationView: View {
                             messageItemView(item, width: width)
                         }
                         Color.clear.frame(height: 1)
-                            .id("chat-bottom")
                             .onScrollVisibilityChange(threshold: 0.01) { visible in
                                 isBottomVisible = visible
                                 if visible { isPinnedToBottom = true }
                             }
                     }
                     .padding(Theme.gutter)
+                    // Keep the programmatic target outside the lazy stack:
+                    // inserting messages must not shift a virtualized anchor.
+                    Color.clear.frame(height: 1).id("chat-bottom")
                 }
                 .accessibilityIdentifier("chat-history")
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
