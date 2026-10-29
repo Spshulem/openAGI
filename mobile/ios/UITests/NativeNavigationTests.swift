@@ -386,11 +386,15 @@ final class NativeNavigationTests: XCTestCase {
         history.swipeDown()
         history.swipeDown()
         XCTAssertTrue(app.buttons["chat-jump-latest"].waitForExistence(timeout: 5))
+        // A partially visible message can already be hittable. Keep swiping
+        // through the end rather than mistaking that for the bottom.
         for _ in 0..<6 {
-            if latest.isHittable { break }
             history.swipeUp()
         }
         XCTAssertTrue(latest.isHittable, "Manually scrolling to the end must reveal the latest message")
+        XCTAssertLessThanOrEqual(latest.frame.maxY, history.frame.maxY + 1,
+                                 "The whole latest message must be inside the chat viewport")
+        capture("native-chat-manual-bottom", app: app)
         let manuallyAtBottom = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.buttons["chat-jump-latest"])
         XCTAssertEqual(XCTWaiter.wait(for: [manuallyAtBottom], timeout: 10), .completed,
                        "The arrow must disappear after scrolling to the bottom without tapping it")
