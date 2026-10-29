@@ -87,6 +87,8 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/openagi-ios-simulator" \
             -resultBundlePath "$RUNNER_TEMP/OpenAGI-expanded-UI.xcresult" \
             -only-testing:OpenAGIUITests/NativeNavigationTests/testNativeAdaptiveTabsAndOptionalChatPane \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testComputerApprovalWrapsAndFailedExecutionRemovesConsumedControls \
+            -only-testing:OpenAGIUITests/NativeNavigationTests/testLongLiveDictationStaysInBoundedEditorWithAccessibleControls \
             -only-testing:OpenAGIUITests/NativeNavigationTests/testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend \
             -only-testing:OpenAGIUITests/NativeNavigationTests/testSelectingVisibleHistoryDoesNotOfferJumpToLatest \
             -parallel-testing-enabled NO \

@@ -24,6 +24,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
     static var isEnabled: Bool {
         ProcessInfo.processInfo.arguments.contains("--ui-testing") || StoreScreenshotProtocol.isEnabled
     }
+    private static let decidedActions = OSAllocatedUnfairLock(initialState: Set<String>())
     private static let preference = OSAllocatedUnfairLock(initialState: "auto")
     private static let integrationKeySaved = OSAllocatedUnfairLock(initialState: false)
     private struct ChatLine: Sendable {
@@ -124,7 +125,7 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             }
         case "/mobile/summary":
             finish(object: ["generatedAt": Self.date, "today": empty ? [] : tasks.map { $0.merging(["overdue": false]) { _, new in new } },
-                            "counts": ["today": empty ? 0 : 2, "this_week": 0, "overdue": 0, "pendingActions": 2],
+                            "counts": ["today": empty ? 0 : 2, "this_week": 0, "overdue": 0, "pendingActions": Self.pendingActions.count],
                             "pendingActions": [], "brief": ["headline": empty ? "" : "Two tasks for your demo"]])
         case "/tasks":
             let queue = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "queue" }?.value
@@ -132,8 +133,10 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
         case "/tasks/demo-one", "/tasks/demo-two":
             finish(object: tasks.first { $0["id"] as? String == url.lastPathComponent } ?? tasks[0])
         case "/pending-actions":
-            finish(object: ["actions": [Self.action(id: "approval-one", title: "Approve the first synthetic action"),
-                                        Self.action(id: "approval-two", title: "Approve the second synthetic action")]])
+            finish(object: ["actions": Self.pendingActions])
+        case "/pending-actions/computer-access/approve":
+            Self.decidedActions.withLock { _ = $0.insert("computer-access") }
+            finish(status: 400, object: ["ok": false, "error": "The computer-use node approved by the user is no longer online and control-ready."])
         case "/tasks/clarifications":
             finish(object: [["id": "question-one", "taskId": "demo-one", "question": "Is the synthetic demo ready?",
                              "context": "A synthetic UI test", "proposedAction": "Confirm the demo", "sources": [],
@@ -218,6 +221,23 @@ final class UITestProtocol: URLProtocol, @unchecked Sendable {
             ] + sent])
         default: finish(object: [:])
         }
+    }
+
+    static let dictationTranscript = String(repeating: "This synthetic dictated draft stays inside its native editor while the user reviews it. ", count: 12) + "End of synthetic dictation."
+
+    private static var pendingActions: [[String: Any]] {
+        var actions = [action(id: "approval-one", title: "Approve the first synthetic action"),
+                       action(id: "approval-two", title: "Approve the second synthetic action")]
+        if ProcessInfo.processInfo.arguments.contains("--ui-computer-approval") {
+            actions.insert(["id": "computer-access", "toolName": "start_computer_use_session",
+                            "summary": "Review the synthetic computer request",
+                            "args": ["goal": "Read the synthetic project notes and prepare a draft for review. Keep all changes in the demo workspace until the owner reviews them. The final synthetic instruction must remain readable.",
+                                     "nodeName": "Demo computer", "nodeId": "synthetic-computer"],
+                            "reason": "Computer access is required to review the demo workspace.",
+                            "status": "pending", "createdAt": date], at: 0)
+        }
+        let decided = decidedActions.withLock { $0 }
+        return actions.filter { !decided.contains($0["id"] as? String ?? "") }
     }
 
     static let longBullet = "This synthetic list item explains the context of a decision in enough detail to wrap naturally across several lines on a phone, including a cover display or one page of a book layout. The entire explanation must remain readable before anyone makes a decision."

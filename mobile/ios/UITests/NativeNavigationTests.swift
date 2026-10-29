@@ -559,6 +559,59 @@ final class NativeNavigationTests: XCTestCase {
         capture("native-connection-error", app: app)
     }
 
+    func testComputerApprovalWrapsAndFailedExecutionRemovesConsumedControls() {
+        let app = launch(["--ui-computer-approval", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
+        tab(app, "Inbox")
+        tap(app, "inbox-approval-computer-access")
+        XCTAssertTrue(app.navigationBars["Approval"].waitForExistence(timeout: 5))
+        let request = app.staticTexts["approval-request"]
+        XCTAssertTrue(request.waitForExistence(timeout: 5))
+        XCTAssertTrue(request.label.hasSuffix("The final synthetic instruction must remain readable."))
+        XCTAssertGreaterThan(request.frame.minX, app.frame.minX + 8, "Approval text needs a native leading gutter")
+        XCTAssertLessThan(request.frame.maxX, app.frame.maxX - 8, "Long requests must wrap inside the page")
+        capture("native-approval-accessibility", app: app)
+        tap(app, "approval-approve", in: "approval-form")
+        let result = app.staticTexts["approval-result"]
+        XCTAssertTrue(result.waitForExistence(timeout: 10))
+        XCTAssertTrue(result.label.contains("selected computer is unavailable"))
+        XCTAssertFalse(app.buttons["approval-approve"].exists, "A consumed approval cannot be replayed after its tool fails")
+        XCTAssertFalse(app.buttons["approval-deny"].exists)
+        capture("native-approval-computer-unavailable", app: app)
+        back(app, from: "Approval", to: "Inbox")
+        XCTAssertFalse(element(app, "inbox-approval-computer-access").exists)
+        XCTAssertTrue(app.staticTexts["Approve the first synthetic action"].waitForExistence(timeout: 5))
+    }
+
+    func testLongLiveDictationStaysInBoundedEditorWithAccessibleControls() {
+        let app = launch(["--ui-dictation-fixture", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let transcript = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "End of synthetic dictation."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [transcript], timeout: 5), .completed)
+        XCTAssertEqual(mic.label, "Stop dictation")
+        XCTAssertGreaterThanOrEqual(field.frame.width, 200, "Large text gets a full-width editing row")
+        XCTAssertGreaterThanOrEqual(field.frame.minX, app.frame.minX)
+        XCTAssertLessThanOrEqual(field.frame.maxX, app.frame.maxX)
+        XCTAssertLessThan(field.frame.height, app.frame.height * 0.45, "Long dictation must scroll within the editor")
+        let controls = [app.buttons["chat-attach"], mic, app.buttons["chat-send"]]
+        for control in controls {
+            XCTAssertEqual(control.frame.height, 44, accuracy: 2)
+            XCTAssertGreaterThanOrEqual(control.frame.minY, field.frame.maxY, "Controls belong below the large-text editor")
+            XCTAssertLessThanOrEqual(control.frame.maxY, app.frame.maxY)
+        }
+        XCTAssertFalse(app.staticTexts["Listening… Tap Stop to finish, then Send."].exists)
+        capture("native-dictation-accessibility", app: app)
+        mic.tap()
+        XCTAssertEqual(mic.label, "Dictate message")
+        XCTAssertTrue((field.value as? String)?.hasSuffix("End of synthetic dictation.") == true)
+        tap(app, "chat-send")
+        XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+    }
+
     func testSettingsAndComposerRemainUsableInDarkModeWithAccessibilityText() {
         let app = launch(["--ui-dark", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
         tap(app, "open-settings")

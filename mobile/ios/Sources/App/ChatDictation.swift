@@ -25,6 +25,19 @@ final class ChatDictation {
         isStarting = true
         error = nil
         defer { if self.generation == generation { isStarting = false } }
+        #if DEBUG
+        if UITestProtocol.isEnabled && ProcessInfo.processInfo.arguments.contains("--ui-dictation-fixture") {
+            self.updateDraft = update
+            isListening = true
+            Task {
+                for text in ["A partial synthetic sentence.", UITestProtocol.dictationTranscript] {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    receive(transcript: text, draft: draft, generation: generation)
+                }
+            }
+            return
+        }
+        #endif
         guard let recognizer = SFSpeechRecognizer(locale: .current), recognizer.supportsOnDeviceRecognition else {
             error = "On-device dictation isn't available for this language. Try the microphone on the iOS keyboard."
             return
@@ -67,7 +80,7 @@ final class ChatDictation {
                 let failed = failure != nil
                 Task { @MainActor [weak self] in
                     guard let self, self.generation == generation else { return }
-                    if let text { self.updateDraft?(Self.merging(draft: draft, transcript: text)) }
+                    if let text { self.receive(transcript: text, draft: draft, generation: generation) }
                     if failed || finished {
                         self.stop()
                         if failed && text == nil { self.error = "Dictation stopped. Your draft is saved; tap the microphone to try again." }
@@ -81,6 +94,11 @@ final class ChatDictation {
             stop()
             self.error = "Couldn't start dictation. Check microphone access and try again."
         }
+    }
+
+    private func receive(transcript: String, draft: String, generation: UUID) {
+        guard self.generation == generation else { return }
+        updateDraft?(Self.merging(draft: draft, transcript: transcript))
     }
 
     func stop() {

@@ -132,6 +132,7 @@ struct ChatConversationView: View {
     @State private var dictation = ChatDictation()
     @FocusState private var composerFocused: Bool
     @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var messages: [ChatMessage] { conversation.messages }
 
@@ -442,7 +443,6 @@ struct ChatConversationView: View {
                 Text(attachmentError).font(.footnote).foregroundStyle(.red)
                     .accessibilityIdentifier("chat-attachment-error")
             }
-            if dictation.isListening { Text("Listening… Tap Stop to finish, then Send.").font(.caption).foregroundStyle(.secondary) }
             if let error = dictation.error { Text(error).font(.footnote).foregroundStyle(.red).accessibilityIdentifier("chat-dictation-error") }
             composerBar
             }
@@ -453,28 +453,38 @@ struct ChatConversationView: View {
     private var composerBar: some View {
         if #available(iOS 26, *) {
             GlassEffectContainer(spacing: 8) {
-                HStack(alignment: .bottom, spacing: 8) {
-                    attachmentMenu.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.large)
+                composerLayout {
+                    attachmentMenu.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.regular)
+                        .frame(width: 44, height: 44)
                     composerField
-                        .padding(.horizontal, 16).padding(.vertical, 12)
-                        .glassEffect(.regular, in: .capsule)
-                    dictationButton.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.large)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 22))
+                    dictationButton.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.regular)
+                        .frame(width: 44, height: 44)
                     sendButton
                         .buttonStyle(.glassProminent)
                         .buttonBorderShape(.circle)
-                        .controlSize(.large)
+                        .controlSize(.regular)
+                        .frame(width: 44, height: 44)
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
         } else {
-            HStack(alignment: .bottom, spacing: 8) {
-                attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.large)
-                composerField.textFieldStyle(.roundedBorder)
-                dictationButton.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.large)
-                sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle).controlSize(.large)
+            composerLayout {
+                attachmentMenu.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.regular)
+                    .frame(width: 44, height: 44)
+                composerField.background(.background.secondary, in: .rect(cornerRadius: 22))
+                dictationButton.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.regular)
+                    .frame(width: 44, height: 44)
+                sendButton.buttonStyle(.borderedProminent).buttonBorderShape(.circle).controlSize(.regular)
+                    .frame(width: 44, height: 44)
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
         }
+    }
+
+    private var composerLayout: ComposerLayout {
+        ComposerLayout(prefersSeparateControls: dynamicTypeSize >= .xxLarge,
+                       rightToLeft: layoutDirection == .rightToLeft)
     }
 
     private var dictationButton: some View {
@@ -485,7 +495,9 @@ struct ChatConversationView: View {
                 Task { await dictation.start(draft: conversation.draft) { text in conversation.draft = text } }
             }
         } label: { composerIcon(dictation.isListening ? "stop.fill" : "mic") }
-        .accessibilityLabel(dictation.isListening ? "Stop dictation" : "Dictate message")
+        .accessibilityLabel(dictation.isListening || dictation.isStarting ? "Stop dictation" : "Dictate message")
+        .accessibilityValue(dictation.isListening ? "Listening" : "")
+        .accessibilityHint("Dictation appears in the message field. Review it before sending.")
         .disabled(conversation.isSending)
         .accessibilityIdentifier("chat-dictation")
     }
@@ -584,9 +596,13 @@ struct ChatConversationView: View {
             .id(conversation.composerRevision)
             .focused($composerFocused)
             .font(.body)
-            .lineLimit(1...5)
+            .textFieldStyle(.plain)
+            .lineLimit(1...(dynamicTypeSize.isAccessibilitySize ? 3 : 5))
             .submitLabel(.send)
             .onSubmit { sendDraft() }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .frame(minWidth: 0, maxWidth: .infinity, minHeight: 44)
+            .clipShape(.rect(cornerRadius: 22))
             .accessibilityLabel(placeholder)
             .accessibilityIdentifier("chat-composer")
     }
@@ -600,7 +616,7 @@ struct ChatConversationView: View {
 
     private func composerIcon(_ name: String) -> some View {
         Image(systemName: name)
-            .font(.system(size: 20, weight: .medium))
+            .font(.system(size: 18, weight: .medium))
             .frame(width: 24, height: 24)
     }
 
