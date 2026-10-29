@@ -118,6 +118,7 @@ struct ChatConversationView: View {
     var onComposerFocusChanged: (Bool) -> Void = { _ in }
     var onHistorySelectionConsumed: () -> Void = {}
 
+    @State private var scrollPosition = ScrollPosition(idType: String.self)
     @State private var isPinnedToBottom = true
     @State private var hasContentBelow = false
     @State private var isBottomVisible = false
@@ -165,7 +166,10 @@ struct ChatConversationView: View {
         .navigationTitle(showsTitle ? title : "")
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: composerFocused) { _, focused in
-            if focused { dictation.stop() }
+            if focused {
+                dictation.stop()
+                if isPinnedToBottom || isBottomVisible { scrollToLatest() }
+            }
             onComposerFocusChanged(focused)
         }
         .task(id: conversation.identity) { await conversation.refresh() }
@@ -216,94 +220,90 @@ struct ChatConversationView: View {
     }
 
     private func messageScroll(width: CGFloat) -> some View {
-        ScrollViewReader { proxy in
-            ZStack(alignment: .bottom) {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        if conversation.nextBefore != nil {
-                            VStack(spacing: 8) {
-                                Button("Load earlier messages") {
-                                    Task { await conversation.loadOlder() }
-                                }
-                                .disabled(conversation.isLoadingOlder)
-                                if conversation.isLoadingOlder { ProgressView("Loading earlier messages…") }
-                                if let error = conversation.olderHistoryError {
-                                    Text(error).font(.caption).foregroundStyle(.secondary)
-                                }
+        ZStack(alignment: .bottom) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if conversation.nextBefore != nil {
+                        VStack(spacing: 8) {
+                            Button("Load earlier messages") {
+                                Task { await conversation.loadOlder() }
                             }
+                            .disabled(conversation.isLoadingOlder)
+                            if conversation.isLoadingOlder { ProgressView("Loading earlier messages…") }
+                            if let error = conversation.olderHistoryError {
+                                Text(error).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.bottom)
+                    }
+                    if messages.isEmpty && conversation.historyStatus == .unknown {
+                        ProgressView("Loading chat history…")
                             .frame(maxWidth: .infinity)
-                            .padding(.bottom)
-                        }
-                        if messages.isEmpty && conversation.historyStatus == .unknown {
-                            ProgressView("Loading chat history…")
-                                .frame(maxWidth: .infinity)
-                                .padding(.top, Theme.Spacing.x8)
-                        } else if messages.isEmpty && (conversation.historyStatus == .synced || conversation.historyStatus == .needsUpdate) {
-                            chatHome
-                            if !starters.isEmpty { starterButtons }
-                        }
-                        ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
-                            messageItemView(item, width: width)
-                        }
-                        Color.clear.frame(height: 1)
-                            .onScrollVisibilityChange(threshold: 0.01) { visible in
-                                isBottomVisible = visible
-                                if visible { isPinnedToBottom = true }
-                            }
+                            .padding(.top, Theme.Spacing.x8)
+                    } else if messages.isEmpty && (conversation.historyStatus == .synced || conversation.historyStatus == .needsUpdate) {
+                        chatHome
+                        if !starters.isEmpty { starterButtons }
                     }
-                    .padding(Theme.gutter)
-                    // Keep the programmatic target outside the lazy stack:
-                    // inserting messages must not shift a virtualized anchor.
-                    Color.clear.frame(height: 1).id("chat-bottom")
-                }
-                .accessibilityIdentifier("chat-history")
-                .defaultScrollAnchor(.bottom, for: .initialOffset)
-                .defaultScrollAnchor(.bottom, for: .alignment)
-                .onScrollPhaseChange { _, phase in
-                    userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
-                }
-                .onScrollGeometryChange(for: ChatScrollGeometry.self) { geometry in
-                    ChatScrollGeometry(contentHeight: geometry.contentSize.height,
-                                       viewportHeight: geometry.containerSize.height,
-                                       offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
-                } action: { _, geometry in
-                    hasContentBelow = !geometry.isAtBottom
-                    // Loading history, streaming and keyboard resizing must
-                    // not turn a programmatic scroll into 'reading older'.
-                    // The final bottom update can arrive after the gesture
-                    // becomes idle, or when a wider layout fits the history.
-                    if geometry.isAtBottom { isPinnedToBottom = true }
-                    else if userIsScrolling { isPinnedToBottom = false }
-                    else if isPinnedToBottom { scrollToLatest(proxy) }
-                }
-                .onChange(of: messages) { old, new in
-                    if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
-                        // Keep the message the reader was looking at in place
-                        // when an earlier page is inserted above it.
-                        proxy.scrollTo(first, anchor: .top)
-                    } else if isPinnedToBottom || isBottomVisible { scrollToLatest(proxy) }
-                }
-                .onAppear {
-                    if let id = scrollToMessageID {
-                        isPinnedToBottom = false
-                        proxy.scrollTo(id, anchor: .center)
-                        onHistorySelectionConsumed()
-                    } else { scrollToLatest(proxy) }
-                }
-                .onChange(of: scrollToMessageID) { _, id in
-                    if let id {
-                        isPinnedToBottom = false
-                        proxy.scrollTo(id, anchor: .center)
-                        onHistorySelectionConsumed()
+                    ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
+                        messageItemView(item, width: width)
                     }
+                    Color.clear.frame(height: 1)
+                        .onScrollVisibilityChange(threshold: 0.01) { visible in
+                            isBottomVisible = visible
+                            if visible { isPinnedToBottom = true }
+                        }
                 }
-                .scrollDismissesKeyboard(.interactively)
+                .scrollTargetLayout()
+                .padding(Theme.gutter)
+            }
+            .accessibilityIdentifier("chat-history")
+            .scrollPosition($scrollPosition)
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .alignment)
+            .onScrollPhaseChange { _, phase in
+                userIsScrolling = phase == .tracking || phase == .interacting || phase == .decelerating
+            }
+            .onScrollGeometryChange(for: ChatScrollGeometry.self) { geometry in
+                ChatScrollGeometry(contentHeight: geometry.contentSize.height,
+                                   viewportHeight: geometry.containerSize.height,
+                                   offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
+            } action: { _, geometry in
+                hasContentBelow = !geometry.isAtBottom
+                // Loading history, streaming and keyboard resizing must
+                // not turn a programmatic scroll into 'reading older'.
+                // The final bottom update can arrive after the gesture
+                // becomes idle, or when a wider layout fits the history.
+                if geometry.isAtBottom { isPinnedToBottom = true }
+                else if userIsScrolling { isPinnedToBottom = false }
+            }
+            .onChange(of: messages) { old, new in
+                if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
+                    // Keep the message the reader was looking at in place
+                    // when an earlier page is inserted above it.
+                    scrollPosition.scrollTo(id: first, anchor: .top)
+                } else if isPinnedToBottom || isBottomVisible { scrollToLatest() }
+            }
+            .onAppear {
+                if let id = scrollToMessageID {
+                    isPinnedToBottom = false
+                    scrollPosition.scrollTo(id: id, anchor: .center)
+                    onHistorySelectionConsumed()
+                } else { scrollToLatest() }
+            }
+            .onChange(of: scrollToMessageID) { _, id in
+                if let id {
+                    isPinnedToBottom = false
+                    scrollPosition.scrollTo(id: id, anchor: .center)
+                    onHistorySelectionConsumed()
+                }
+            }
+            .scrollDismissesKeyboard(.interactively)
 
-                // A lazy stack's estimated height can still report more
-                // content after its actual end has become visible.
-                if !isPinnedToBottom && hasContentBelow && !isBottomVisible && !messages.isEmpty {
-                    jumpToLatestButton(proxy)
-                }
+            // A lazy stack's estimated height can still report more
+            // content after its actual end has become visible.
+            if !isPinnedToBottom && hasContentBelow && !isBottomVisible && !messages.isEmpty {
+                jumpToLatestButton()
             }
         }
     }
@@ -327,14 +327,14 @@ struct ChatConversationView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func scrollToLatest(_ proxy: ScrollViewProxy) {
-        withAnimation(nil) { proxy.scrollTo("chat-bottom", anchor: .bottom) }
+    private func scrollToLatest() {
+        withAnimation(nil) { scrollPosition.scrollTo(edge: .bottom) }
     }
 
-    private func jumpToLatestButton(_ proxy: ScrollViewProxy) -> some View {
+    private func jumpToLatestButton() -> some View {
         let button = Button {
             isPinnedToBottom = true
-            scrollToLatest(proxy)
+            scrollToLatest()
         } label: {
             Image(systemName: "arrow.down")
                 .font(.body.weight(.semibold))
