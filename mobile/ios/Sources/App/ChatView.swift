@@ -120,6 +120,7 @@ struct ChatConversationView: View {
 
     @State private var isPinnedToBottom = true
     @State private var hasContentBelow = false
+    @State private var isBottomVisible = false
     @State private var userIsScrolling = false
     @State private var showingPhotos = false
     @State private var showingFiles = false
@@ -244,9 +245,14 @@ struct ChatConversationView: View {
                         ForEach(MessageGrouping.displayItems(for: messages), id: \.message.id) { item in
                             messageItemView(item, width: width)
                         }
+                        Color.clear.frame(height: 1)
+                            .id("chat-bottom")
+                            .onScrollVisibilityChange(threshold: 0.01) { visible in
+                                isBottomVisible = visible
+                                if visible { isPinnedToBottom = true }
+                            }
                     }
                     .padding(Theme.gutter)
-                    Color.clear.frame(height: 1).id("chat-bottom")
                 }
                 .accessibilityIdentifier("chat-history")
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
@@ -273,7 +279,7 @@ struct ChatConversationView: View {
                         // Keep the message the reader was looking at in place
                         // when an earlier page is inserted above it.
                         proxy.scrollTo(first, anchor: .top)
-                    } else if isPinnedToBottom { scrollToLatest(proxy) }
+                    } else if isPinnedToBottom || isBottomVisible { scrollToLatest(proxy) }
                 }
                 .onAppear {
                     if let id = scrollToMessageID {
@@ -291,7 +297,9 @@ struct ChatConversationView: View {
                 }
                 .scrollDismissesKeyboard(.interactively)
 
-                if !isPinnedToBottom && hasContentBelow && !messages.isEmpty {
+                // A lazy stack's estimated height can still report more
+                // content after its actual end has become visible.
+                if !isPinnedToBottom && hasContentBelow && !isBottomVisible && !messages.isEmpty {
                     jumpToLatestButton(proxy)
                 }
             }
