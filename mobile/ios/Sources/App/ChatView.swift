@@ -119,6 +119,7 @@ struct ChatConversationView: View {
     var onHistorySelectionConsumed: () -> Void = {}
 
     @State private var isPinnedToBottom = true
+    @State private var hasContentBelow = false
     @State private var userIsScrolling = false
     @State private var showingPhotos = false
     @State private var showingFiles = false
@@ -258,10 +259,14 @@ struct ChatConversationView: View {
                                        viewportHeight: geometry.containerSize.height,
                                        offset: geometry.contentOffset.y, bottomInset: geometry.contentInsets.bottom)
                 } action: { _, geometry in
+                    hasContentBelow = !geometry.isAtBottom
                     // Loading history, streaming and keyboard resizing must
                     // not turn a programmatic scroll into 'reading older'.
-                    if userIsScrolling { isPinnedToBottom = geometry.isAtBottom }
-                    else if isPinnedToBottom && !geometry.isAtBottom { scrollToLatest(proxy) }
+                    // The final bottom update can arrive after the gesture
+                    // becomes idle, or when a wider layout fits the history.
+                    if geometry.isAtBottom { isPinnedToBottom = true }
+                    else if userIsScrolling { isPinnedToBottom = false }
+                    else if isPinnedToBottom { scrollToLatest(proxy) }
                 }
                 .onChange(of: messages) { old, new in
                     if let first = old.first?.id, first != new.first?.id, old.last?.id == new.last?.id {
@@ -286,7 +291,7 @@ struct ChatConversationView: View {
                 }
                 .scrollDismissesKeyboard(.interactively)
 
-                if !isPinnedToBottom && !messages.isEmpty {
+                if !isPinnedToBottom && hasContentBelow && !messages.isEmpty {
                     jumpToLatestButton(proxy)
                 }
             }
@@ -767,5 +772,10 @@ struct ChatScrollGeometry: Equatable {
     let offset: CGFloat
     let bottomInset: CGFloat
 
-    var isAtBottom: Bool { offset + viewportHeight >= contentHeight + bottomInset - 60 }
+    var isAtBottom: Bool {
+        let maximumOffset = max(0, contentHeight + bottomInset - viewportHeight)
+        // Bottom alignment and rubber-banding can produce negative offsets
+        // even when the entire conversation fits in the visible viewport.
+        return maximumOffset == 0 || offset >= maximumOffset - 60
+    }
 }

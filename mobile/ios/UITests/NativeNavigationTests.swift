@@ -386,6 +386,17 @@ final class NativeNavigationTests: XCTestCase {
         history.swipeDown()
         history.swipeDown()
         XCTAssertTrue(app.buttons["chat-jump-latest"].waitForExistence(timeout: 5))
+        for _ in 0..<6 {
+            if latest.isHittable { break }
+            history.swipeUp()
+        }
+        XCTAssertTrue(latest.isHittable, "Manually scrolling to the end must reveal the latest message")
+        let manuallyAtBottom = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.buttons["chat-jump-latest"])
+        XCTAssertEqual(XCTWaiter.wait(for: [manuallyAtBottom], timeout: 10), .completed,
+                       "The arrow must disappear after scrolling to the bottom without tapping it")
+        history.swipeDown()
+        history.swipeDown()
+        XCTAssertTrue(app.buttons["chat-jump-latest"].waitForExistence(timeout: 5))
         tap(app, "chat-jump-latest")
         let jumpGone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.buttons["chat-jump-latest"])
         XCTAssertEqual(XCTWaiter.wait(for: [jumpGone], timeout: 10), .completed)
@@ -399,6 +410,37 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
         XCTAssertFalse(app.buttons["chat-send"].isEnabled)
         capture("native-chat-follow-latest", app: app)
+    }
+
+    func testSelectingVisibleHistoryDoesNotOfferJumpToLatest() {
+        let app = launch()
+        tab(app, "Chat")
+        for kind in ["agent", "supervisor"] {
+            tap(app, "chat-conversations")
+            tap(app, "conversation-\(kind)")
+            XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+            XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
+
+            tap(app, "chat-conversations")
+            let search = app.searchFields.firstMatch
+            if !search.exists || !search.isHittable {
+                let searchButton = app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", "Search")).firstMatch
+                if searchButton.exists { searchButton.tap() }
+            }
+            XCTAssertTrue(search.waitForExistence(timeout: 5))
+            search.tap()
+            search.typeText("Earlier synthetic answer")
+            let result = app.buttons["Earlier synthetic answer"].firstMatch
+            XCTAssertTrue(result.waitForExistence(timeout: 5))
+            result.tap()
+            let title = kind == "agent" ? "Chat" : "Supervisor chat"
+            XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["Earlier synthetic question"].isHittable)
+            XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].isHittable)
+            XCTAssertFalse(app.buttons["chat-jump-latest"].exists,
+                           "Selecting an already-visible result must not create a redundant jump button")
+            capture("native-short-history-no-jump-\(kind)", app: app)
+        }
     }
 
     func testImagesCanBeRemovedAndSentWithTheirPixelsInChatAndSupervisor() {

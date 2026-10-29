@@ -174,4 +174,15 @@ final class ChatSubmissionTests: XCTestCase {
         XCTAssertFalse(ChatScrollGeometry(contentHeight: 1200, viewportHeight: 500, offset: 300, bottomInset: 40).isAtBottom)
         XCTAssertTrue(ChatScrollGeometry(contentHeight: 200, viewportHeight: 500, offset: 0, bottomInset: 40).isAtBottom)
     }
+
+    func testShortHistoryHasNoHiddenContentDespiteBottomAlignmentOrOverscroll() {
+        XCTAssertTrue(ChatScrollGeometry(contentHeight: 200, viewportHeight: 500, offset: -340, bottomInset: 40).isAtBottom)
+        XCTAssertTrue(ChatScrollGeometry(contentHeight: 500, viewportHeight: 500, offset: -100, bottomInset: 0).isAtBottom)
+        XCTAssertTrue(ChatScrollGeometry(contentHeight: 0, viewportHeight: 500, offset: -100, bottomInset: 40).isAtBottom)
+    }
+
+    func testExpandingTheViewportRemovesTheNeedToJump() {
+        XCTAssertFalse(ChatScrollGeometry(contentHeight: 700, viewportHeight: 300, offset: -100, bottomInset: 40).isAtBottom)
+        XCTAssertTrue(ChatScrollGeometry(contentHeight: 700, viewportHeight: 900, offset: -100, bottomInset: 40).isAtBottom)
+    }
 }
