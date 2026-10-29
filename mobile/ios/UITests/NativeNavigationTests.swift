@@ -407,7 +407,9 @@ final class NativeNavigationTests: XCTestCase {
         tap(app, "chat-composer")
         element(app, "chat-composer").typeText("Read the newest message")
         tap(app, "chat-send")
-        let reply = app.staticTexts["Synthetic reply"]
+        // Expanded layouts also show this text in the sidebar preview.
+        // Verify the actual message in history, not that second label.
+        let reply = history.staticTexts["Synthetic reply"]
         XCTAssertTrue(reply.waitForExistence(timeout: 10))
         let replyVisible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)
         let visibilityResult = XCTWaiter.wait(for: [replyVisible], timeout: 10)
