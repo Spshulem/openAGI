@@ -605,3 +605,11 @@ The self-chat task importer supports both plain `text` and modern Messages
 text takes precedence. Unreadable bodies and attachment-only rows advance the
 cursor without creating empty tasks; other chats remain excluded. First enable
 remains forward-only unless backfill is explicitly configured.
+
+### Task lifecycle and computer approvals
+
+Tasks are one-off work records; recurring jobs live separately under Cron. The agent pulse claims eligible agent work, prepares draft-only tasks for review, and waits on approvals or blockers rather than treating every visible row as executable. Backlog triage reviews suggestions and drafts; the task sweep handles task deduplication, routing and relevance.
+
+Task relevance checks include the current clock and each task's creation/due/scheduled dates, status and bounded description. Age alone does not prove completion. Sweep receipts distinguish full, partial, failed and unavailable model review from deterministic cleanup. Completion scans use existing activity evidence, check both pending and in-progress user tasks, and rotate bounded 30-task batches across the user queue so agent work and an unchanged first page cannot starve older tasks. Without evidence, the scan skips; it does not claim the work is finished.
+
+Computer approval grants permission for the displayed goal on one specific node. Readiness is refreshed at approval time before resolving that same node. A genuinely unavailable or permission-blocked node still fails closed; approval never switches computers or grants system permissions.
