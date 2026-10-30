@@ -582,6 +582,7 @@ final class NativeNavigationTests: XCTestCase {
         tap(app, "approval-approve", in: "approval-form")
         let result = app.staticTexts["approval-result"]
         XCTAssertTrue(result.waitForExistence(timeout: 10))
+        XCTAssertTrue(result.isHittable, "A decision must bring its status into view without another scroll")
         XCTAssertTrue(result.label.contains("selected computer is unavailable"))
         XCTAssertFalse(app.buttons["approval-approve"].exists, "A consumed approval cannot be replayed after its tool fails")
         XCTAssertFalse(app.buttons["approval-deny"].exists)

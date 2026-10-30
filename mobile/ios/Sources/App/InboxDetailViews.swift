@@ -19,6 +19,7 @@ struct ApprovalDetailView: View {
     @State private var resultMessage: String?
     @State private var technicalError: String?
     @State private var resultIsError = false
+    @AccessibilityFocusState private var resultFocused: Bool
 
     private var isComputerRequest: Bool { action.toolName == "start_computer_use_session" }
     private func argument(_ key: String) -> String? {
@@ -31,6 +32,23 @@ struct ApprovalDetailView: View {
     }
 
     var body: some View {
+        ScrollViewReader { scroll in
+            approvalForm
+                .onChange(of: resultMessage) { _, message in
+                    guard message != nil else { return }
+                    // Removing the decision row can leave a small or large-
+                    // text form above the new status. Show the outcome without
+                    // making the person hunt for it after pressing Approve.
+                    withAnimation { scroll.scrollTo("approval-result", anchor: .top) }
+                    resultFocused = true
+                }
+        }
+        .navigationTitle("Approval")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { if action.status == "pending" { await checkStatus() } else { isChecking = false } }
+    }
+
+    private var approvalForm: some View {
         Form {
             Section(isComputerRequest ? "Computer access" : "Request") {
                 Text(isComputerRequest ? (argument("goal") ?? action.summary) : action.summary)
@@ -54,6 +72,8 @@ struct ApprovalDetailView: View {
                     Text(message)
                         .foregroundStyle(resultIsError || action.error != nil ? Color.red : .primary)
                         .fixedSize(horizontal: false, vertical: true)
+                        .id("approval-result")
+                        .accessibilityFocused($resultFocused)
                         .accessibilityIdentifier("approval-result")
                     if needsStatusCheck {
                         Button("Check request status") { Task { await checkStatus() } }
@@ -101,9 +121,6 @@ struct ApprovalDetailView: View {
             }
         }
         .accessibilityIdentifier("approval-form")
-        .navigationTitle("Approval")
-        .navigationBarTitleDisplayMode(.inline)
-        .task { if action.status == "pending" { await checkStatus() } else { isChecking = false } }
     }
 
     private func detailRow(label: String, value: String) -> some View {
