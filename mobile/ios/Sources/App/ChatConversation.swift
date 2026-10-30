@@ -26,10 +26,15 @@ final class ChatConversation {
     }
 
     let thread: ConversationThread
+    let conversationID: String
+    let isReadOnly: Bool
+    var identity: String { "\(thread.rawValue):\(conversationID)" }
     private(set) var messages: [ChatMessage]
     private(set) var isSending = false
     // Shared by compact and expanded presentations of this conversation.
     var draft = ""
+    var draftAttachments: [ChatAttachment] = []
+    private(set) var composerRevision = 0
     private(set) var historyStatus: HistoryStatus = .unknown
     private(set) var isRefreshingHistory = false
     private(set) var isLoadingOlder = false
@@ -48,51 +53,86 @@ final class ChatConversation {
     private var didLoadOlder = false
     private var forgotten = false
 
-    init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String) {
+    init(thread: ConversationThread, client: DaemonClient, store: ChatHistoryStore, nodeID: String,
+         conversationID: String = "main", isReadOnly: Bool = false) {
         self.thread = thread
+        self.conversationID = conversationID
+        self.isReadOnly = isReadOnly
         self.client = client
         self.store = store
         self.nodeID = nodeID
         // See DaemonClient.sendMessageStreaming: keeps an older main from
         // putting the supervisor chat in the same session as Chat.
         self.legacyConversationKey = thread == .supervisor ? "mobile-supervisor" : nil
-        self.messages = store.load(nodeID: nodeID).map(ChatHistoryCodec.message)
+        self.messages = ChatHistoryCodec.restored(store.load(nodeID: nodeID))
     }
 
     // MARK: - Sending
 
-    func send(_ rawText: String) async {
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending else { return }
-        isSending = true
-        defer { isSending = false }
+    var canSubmitDraft: Bool {
+        !isReadOnly && !isSending && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draftAttachments.isEmpty)
+    }
 
-        messages.append(ChatMessage(role: .user, text: text))
+    // Reserve the turn and reset the native editor in the same main-actor
+    // transaction. Return-key and Send cannot race two unstructured tasks.
+    @discardableResult
+    func submitDraft() -> Bool {
+        guard canSubmitDraft else { return false }
+        let text = draft
+        let attachments = draftAttachments
+        guard let turn = beginSend(text, attachments: attachments) else { return false }
+        draft = ""
+        draftAttachments = []
+        composerRevision += 1
+        Task { await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID) }
+        return true
+    }
+
+    func send(_ rawText: String, attachments: [ChatAttachment] = []) async {
+        guard let turn = beginSend(rawText, attachments: attachments) else { return }
+        await finishSend(text: turn.text, attachments: attachments, replyID: turn.replyID)
+    }
+
+    private func beginSend(_ rawText: String, attachments: [ChatAttachment]) -> (text: String, replyID: UUID)? {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isReadOnly, !isSending, !forgotten, !trimmed.isEmpty || !attachments.isEmpty,
+              attachments.allSatisfy({ $0.data != nil }) else { return nil }
+        let text = trimmed.isEmpty ? "Please describe the attached images." : trimmed
+        isSending = true
+        messages.append(ChatMessage(role: .user, text: text, attachments: attachments))
         let reply = ChatMessage(role: .assistant, text: "", isStreaming: true)
         messages.append(reply)
         persist()
-        await streamReply(text: text, replyID: reply.id)
+        return (text, reply.id)
+    }
+
+    private func finishSend(text: String, attachments: [ChatAttachment], replyID: UUID) async {
+        defer { isSending = false }
+        await streamReply(text: text, attachments: attachments, replyID: replyID)
     }
 
     // Re-sends the user message that preceded a failed reply, replacing just
     // that failed bubble in place rather than appending a new one --
     // "stays in place", per DESIGN.md, not a fresh row at the bottom.
     func retry(_ failedMessage: ChatMessage) async {
+        guard !isReadOnly else { return }
         guard let target = ChatRetry.target(failedID: failedMessage.id, in: messages, isSending: isSending) else { return }
         isSending = true
         defer { isSending = false }
         let fresh = ChatMessage(role: .assistant, text: "", isStreaming: true)
         messages[target.index] = fresh
         persist()
-        await streamReply(text: target.userText, replyID: fresh.id)
+        await streamReply(text: target.userText, attachments: target.attachments, replyID: fresh.id)
     }
 
-    private func streamReply(text: String, replyID: UUID) async {
+    private func streamReply(text: String, attachments: [ChatAttachment], replyID: UUID) async {
         var sawTerminalFrame = false
+        var openedStream = false
         do {
             let stream = try await client.sendMessageStreaming(
-                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey
+                text: text, thread: thread, from: legacyConversationKey, sessionId: legacyConversationKey, attachments: attachments, conversationId: conversationID
             )
+            openedStream = true
             for try await event in stream {
                 guard let index = messages.firstIndex(where: { $0.id == replyID }) else { continue }
                 switch event {
@@ -126,10 +166,10 @@ final class ChatConversation {
             }
         } catch let error as DaemonError {
             if !sawTerminalFrame {
-                fail(replyID, text: error == .agentHostDisabled || error == .unauthorized
+                fail(replyID, text: !openedStream
                      ? ChatErrorCopy.message(for: error)
                      : "Connection lost. This turn may still be running or may have finished. Check the conversation before sending again.",
-                     retrySafe: error == .agentHostDisabled)
+                     retrySafe: error == .agentHostDisabled || error == .imagesUnsupported)
             }
         } catch {
             if !sawTerminalFrame {
@@ -161,7 +201,7 @@ final class ChatConversation {
         refreshIssued += 1
         let sequence = refreshIssued
         do {
-            let page = try await client.conversationMessages(thread: thread)
+            let page = try await client.conversationMessages(thread: thread, conversationId: conversationID)
             guard sequence > refreshApplied, !forgotten else { return }
             refreshApplied = sequence
             historyStatus = .synced
@@ -201,7 +241,7 @@ final class ChatConversation {
         olderHistoryError = nil
         defer { isLoadingOlder = false }
         do {
-            let page = try await client.conversationMessages(thread: thread, before: cursor)
+            let page = try await client.conversationMessages(thread: thread, before: cursor, conversationId: conversationID)
             guard !forgotten, nextBefore == cursor else { return }
             messages = ChatHistoryMerge.prependOlder(local: messages, server: page.messages, before: cursor)
             nextBefore = page.nextBefore
@@ -233,6 +273,8 @@ final class ChatConversation {
     // reply still streaming must not write it back afterwards.
     func forget() {
         draft = ""
+        draftAttachments = []
+        composerRevision += 1
         forgotten = true
         messages = []
         nextBefore = nil

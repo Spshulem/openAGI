@@ -4444,6 +4444,8 @@ test("a thread's detail: last agent message, owner's last word, PR, watch, next 
   assert.equal(detail.key, "codex:t1");
   assert.deepEqual(detail.lastAgentMessage, { text: "Pushed.", at: thread.lastAgentAt });
   assert.equal(detail.lastOwnerAt, ago(90 * MIN));
+  assert.deepEqual(detail.lastOwnerMessage, { text: "please fix the tests", at: ago(90 * MIN) });
+  assert.equal(detail.activityTruncated, false);
   assert.equal(detail.pr.ref, "acme/app#7");
   assert.equal(detail.pr.url, "https://github.com/acme/app/pull/7");
   assert.equal(detail.pr.ci.state, "FAILURE");
@@ -4461,6 +4463,21 @@ test("a thread's detail: last agent message, owner's last word, PR, watch, next 
   const own = fixture(t, { threads: [makeThread({ lastUserText: "[OpenAGI supervisor] CI is green", lastUserAt: ago(5 * MIN) })] }).supervisor;
   await own.tick({ reason: "test" });
   assert.equal(own.threadDetail("codex:t1").lastOwnerAt, null);
+  assert.equal(own.threadDetail("codex:t1").lastOwnerMessage, null);
+});
+
+test("thread activity keeps long context bounded and redacts both speakers", async (t) => {
+  const text = "Context. ".repeat(2000) + " sk-" + "a".repeat(48);
+  const thread = makeThread({ lastAgentText: text, lastUserText: text, lastUserAt: ago(MIN) });
+  const { supervisor } = fixture(t, { threads: [thread] });
+  await supervisor.tick();
+  const detail = supervisor.threadDetail(thread.key);
+  for (const message of [detail.lastAgentMessage, detail.lastOwnerMessage]) {
+    assert.ok(message.text.length <= 12_000);
+    assert.ok(message.text.length > 1200, "detail must provide more than the list excerpt");
+    assert.ok(!message.text.includes("sk-" + "a".repeat(48)));
+  }
+  assert.equal(detail.activityTruncated, true);
 });
 
 test("Push now previews a paced row and sends exactly those words once in observe", async (t) => {

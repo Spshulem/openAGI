@@ -47,6 +47,8 @@ struct WorkspaceSection: View {
 struct ModelSettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var settings: ModelSettings?
+    @State private var isLoading = false
+    @State private var showingDirectChat = false
     @State private var anthropicKey = ""
     @State private var openaiKey = ""
     @State private var anthropicModel = ""
@@ -119,10 +121,23 @@ struct ModelSettingsView: View {
                             .foregroundStyle(status.isError ? Theme.alert : Theme.live)
                     }
                 }
-            } else if let status {
-                Text(status.text).foregroundStyle(Theme.alert)
+            } else if let status, !isLoading {
+                ContentUnavailableView {
+                    Label("Model settings unavailable", systemImage: "cpu")
+                } description: {
+                    Text(status.text)
+                } actions: {
+                    Button("Retry") { Task { await reload() } }
+                        .accessibilityIdentifier("model-retry")
+                }
             } else {
-                ProgressView()
+                ProgressView("Loading models…")
+            }
+            Section {
+                Button("Chat without server", systemImage: "iphone") { showingDirectChat = true }
+                    .accessibilityIdentifier("model-direct-chat")
+            } footer: {
+                Text("Use Apple Intelligence or a provider key saved on this iPhone in a separate chat. Your paired agent and its model stay saved.")
             }
         }
         .accessibilityIdentifier("model-form")
@@ -130,6 +145,8 @@ struct ModelSettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .disabled(isWorking)
         .task { await reload() }
+        .refreshable { await reload() }
+        .sheet(isPresented: $showingDirectChat) { FallbackChatView() }
     }
 
     @ViewBuilder
@@ -150,8 +167,7 @@ struct ModelSettingsView: View {
                 if !trimmedKey.isEmpty { keyField == "anthropicKey" ? (update.anthropicKey = trimmedKey) : (update.openaiKey = trimmedKey) }
                 if !trimmedModel.isEmpty { modelField == "anthropicModel" ? (update.anthropicModel = trimmedModel) : (update.openaiModel = trimmedModel) }
                 Task {
-                    await save(update)
-                    key.wrappedValue = ""
+                    if await save(update) { key.wrappedValue = "" }
                 }
             }
             .disabled(key.wrappedValue.isEmpty && modelName.wrappedValue.isEmpty)
@@ -182,21 +198,30 @@ struct ModelSettingsView: View {
     }
 
     private func reload() async {
+        guard !isLoading else { return }
+        isLoading = true
+        status = nil
+        defer { isLoading = false }
         do {
             settings = try await model.client.modelSettings()
+        } catch is CancellationError {
+            return
         } catch {
-            status = ("Couldn't load model settings.", true)
+            status = (ModelSettingsErrorCopy.message(for: error), true)
         }
     }
 
-    private func save(_ update: ModelSettingsUpdate) async {
+    @discardableResult
+    private func save(_ update: ModelSettingsUpdate) async -> Bool {
         isWorking = true
         defer { isWorking = false }
         do {
             settings = try await model.client.updateModelSettings(update)
             status = ("Saved.", false)
+            return true
         } catch {
-            status = ("Couldn't save that. Check the key and try again.", true)
+            status = (ModelSettingsErrorCopy.message(for: error), true)
+            return false
         }
     }
 
@@ -210,7 +235,23 @@ struct ModelSettingsView: View {
                 ? ("Works. \(result.model ?? "The model") answered.", false)
                 : (result.message ?? "The model didn't answer.", true)
         } catch {
-            status = ("Couldn't reach OpenAGI.", true)
+            status = (ModelSettingsErrorCopy.message(for: error), true)
+        }
+    }
+}
+
+enum ModelSettingsErrorCopy {
+    static func message(for error: Error) -> String {
+        guard let error = error as? DaemonError else { return "Couldn't reach your agent. Check its connection, then retry." }
+        switch error {
+        case .notFound:
+            return "Your server needs an OpenAGI update to load and select models here. Update the main server, then retry. Your pairing is saved."
+        case .mainConnection(let issue): return issue.message
+        case .unauthorized:
+            return "Your server didn't authorize model settings. Check its version and this phone's access in Connection Settings, then retry."
+        case .malformedResponse:
+            return "Your server returned model settings this app couldn't read. Update OpenAGI on the main server, then retry."
+        default: return "Couldn't reach your agent. Check its connection, then retry."
         }
     }
 }

@@ -39,6 +39,9 @@ fun OnboardingScreen(
     prefill: PairingPayload?,
     onPaired: () -> Unit,
     onClose: (() -> Unit)? = null,
+    onUsePhone: (() -> Unit)? = null,
+    localStarting: Boolean = false,
+    localError: String? = null,
 ) {
     var connecting by rememberSaveable(prefill?.code) { mutableStateOf(prefill != null) }
     var showingLocalChat by rememberSaveable { mutableStateOf(false) }
@@ -70,11 +73,13 @@ fun OnboardingScreen(
                 Text("Choose where to chat, connect a model or server, then send your first message. No OpenAGI account is required.")
 
                 Text("On this phone", style = MaterialTheme.typography.titleLarge)
-                Text("Chat with Gemini Nano on supported Android phones, or use your own OpenAI or Claude key. The model screen checks support and shows download progress.")
-                Button(onClick = { showingLocalChat = true }, modifier = Modifier.fillMaxWidth()) {
-                    Text("Chat on this phone")
+                Text("Tasks, Today, Inbox and conversations work on this phone without a server. Gemini Nano runs on supported phones; model setup checks support and shows download progress.")
+                Button(onClick = { onUsePhone?.invoke() ?: run { showingLocalChat = true } },
+                    enabled = !localStarting, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (localStarting) "Starting phone agent…" else "Chat on this phone")
                 }
-                Text("Local chat is separate from your server. Server tasks, integrations and shared history need a server connection.", style = MaterialTheme.typography.bodySmall)
+                localError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                Text("Your phone workspace is separate from your server. Connect a server for its tasks, integrations and shared history.", style = MaterialTheme.typography.bodySmall)
 
                 Text("Use your existing agent", style = MaterialTheme.typography.titleLarge)
                 Text("Connect to OpenAGI on your Mac or main server for shared chat, Tasks, Inbox, Today and Supervisor.")

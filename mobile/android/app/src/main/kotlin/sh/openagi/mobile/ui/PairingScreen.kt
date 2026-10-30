@@ -32,7 +32,7 @@ import sh.openagi.mobile.store.MobileNodeIdentity
 import sh.openagi.mobile.store.OutboundQueue
 import sh.openagi.mobile.store.SnapshotStore
 import sh.openagi.mobile.sync.RefreshCoordinator
-import sh.openagi.mobile.sync.RefreshWorker
+import sh.openagi.mobile.sync.activateWorkspace
 import sh.openagi.mobile.transport.DaemonClient
 import sh.openagi.mobile.transport.DaemonException
 import sh.openagi.mobile.ui.components.PrimaryButton
@@ -140,7 +140,7 @@ fun PairingScreen(
                             )
                             Credentials(server = serverText, nodeId = enrollment.node.id, token = enrollment.nodeToken)
                         }
-                        if (!Credentials.save(context, credentials)) {
+                        if (runCatching { activateWorkspace(context, credentials) }.isFailure) {
                             awaitingSave = credentials
                             error = ErrorCopy.Message(
                                 "Couldn't save the credential on this device.",
@@ -149,7 +149,6 @@ fun PairingScreen(
                             return@launch
                         }
                         awaitingSave = null
-                        RefreshWorker.schedule(context)
                         // Kick the first refresh so the day's tasks are already on
                         // disk by the time TodayScreen appears; failure here is
                         // not fatal to pairing itself, so it's not surfaced as a

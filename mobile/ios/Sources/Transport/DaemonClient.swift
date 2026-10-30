@@ -31,6 +31,7 @@ public enum DaemonError: Error {
     // and it is not "the server broke" -- it is a legible, expected state
     // chat's UI must say plainly rather than showing a generic server error.
     case agentHostDisabled
+    case imagesUnsupported
     case mainConnection(MainConnectionIssue)
 }
 
@@ -49,7 +50,7 @@ extension DaemonError: Equatable {
         case let (.server(a), .server(b)): return a == b
         case (.malformedResponse, .malformedResponse): return true
         case (.transport, .transport): return true
-        case (.agentHostDisabled, .agentHostDisabled): return true
+        case (.agentHostDisabled, .agentHostDisabled), (.imagesUnsupported, .imagesUnsupported): return true
         case let (.mainConnection(a), .mainConnection(b)): return a == b
         default: return false
         }
@@ -270,10 +271,18 @@ public actor DaemonClient {
     // main that still keeps it apart from Chat, and on a newer one the
     // thread wins.
     public func sendMessageStreaming(text: String, thread: ConversationThread? = nil,
-                                     from: String? = nil, sessionId: String? = nil) async throws -> AsyncThrowingStream<ChatEvent, Error> {
+                                     from: String? = nil, sessionId: String? = nil, attachments: [ChatAttachment] = [], conversationId: String = "main") async throws -> AsyncThrowingStream<ChatEvent, Error> {
+        // Check before uploading pixels. Older mains can reject a large body
+        // before returning a useful error; that is not a dropped agent turn.
+        if !attachments.isEmpty { try await requireImageSupport() }
         var body: [String: Any] = ["text": text]
+        if !attachments.isEmpty {
+            body["attachments"] = try JSONSerialization.jsonObject(with: ProtocolDecoder.jsonEncoder.encode(attachments))
+        }
         if let from { body["from"] = from }
         if let sessionId { body["sessionId"] = sessionId }
+        if conversationId != "main" { body["conversationId"] = conversationId }
+        if conversationId != "main" && sharedThreadsUnsupported { throw DaemonError.notFound }
         let bytes: URLSession.AsyncBytes
         if let thread, !sharedThreadsUnsupported {
             var threaded = body
@@ -281,6 +290,8 @@ public actor DaemonClient {
             do {
                 bytes = try await openMessageStream(body: threaded)
             } catch is SharedThreadsRejected {
+                // A named chat must never fall back into the default chat.
+                guard conversationId == "main" else { throw DaemonError.notFound }
                 // An older main's node-scoped `/message` allows only text,
                 // from, and sessionId, and 400s anything else during
                 // validation -- before the turn runs -- so resending
@@ -313,6 +324,38 @@ public actor DaemonClient {
 
     private struct SharedThreadsRejected: Error {}
 
+    private struct MessageCapabilities: Decodable { let imageAttachments: Bool }
+
+    private func requireImageSupport() async throws {
+        let request = try authorizedRequest(path: "/mobile/capabilities", method: "GET")
+        do {
+            let (data, http) = try await perform(request)
+            try Self.requireConversationJSON(data: data, response: http)
+            guard try Self.decodeJSON(MessageCapabilities.self, from: data).imageAttachments else {
+                throw DaemonError.imagesUnsupported
+            }
+        } catch DaemonError.unauthorized {
+            // A legacy route can be owner-only even though this enrollment
+            // is valid. Prove that separately; never replace its credential.
+            try await heartbeat()
+            throw DaemonError.imagesUnsupported
+        } catch DaemonError.notFound {
+            throw DaemonError.imagesUnsupported
+        } catch DaemonError.malformedResponse {
+            throw DaemonError.imagesUnsupported
+        }
+    }
+
+    private func performConversationRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        do { return try await perform(request) }
+        catch DaemonError.unauthorized {
+            // A valid heartbeat plus a rejected catalog means this feature
+            // is unavailable, not that the saved enrollment has expired.
+            try await heartbeat()
+            throw DaemonError.notFound
+        }
+    }
+
     private func openMessageStream(body: [String: Any]) async throws -> URLSession.AsyncBytes {
         var request = try authorizedRequest(path: "/message", method: "POST")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -342,9 +385,13 @@ public actor DaemonClient {
             // src/hosted-interface.js before shared threads: "node message
             // contains unsupported fields". Only meaningful when `thread`
             // was sent; the caller retries once without it.
-            if http.statusCode == 400, body["thread"] != nil {
+            if http.statusCode == 413, body["attachments"] != nil { throw DaemonError.imagesUnsupported }
+            if http.statusCode == 400 {
                 let text = (try? await Self.collectText(bytes, byteLimit: 4096)) ?? ""
-                if text.contains("unsupported fields") { throw SharedThreadsRejected() }
+                if text.contains("unsupported fields") {
+                    if body["attachments"] != nil { throw DaemonError.imagesUnsupported }
+                    if body["thread"] != nil { throw SharedThreadsRejected() }
+                }
             }
             _ = try validate(response)
         }
@@ -355,12 +402,41 @@ public actor DaemonClient {
     // user/assistant turns, oldest first. A main from before shared threads
     // answers 404 (`DaemonError.notFound`); callers keep their local cache
     // and say the main needs updating.
-    public func conversationMessages(thread: ConversationThread, before: String? = nil, limit: Int = 50) async throws -> ConversationPage {
+    public func conversationMessages(thread: ConversationThread, before: String? = nil, limit: Int = 50, conversationId: String = "main") async throws -> ConversationPage {
         var items = [URLQueryItem(name: "limit", value: String(min(max(limit, 1), 100)))]
+        if conversationId != "main" { items.append(URLQueryItem(name: "conversationId", value: conversationId)) }
         if let before { items.append(URLQueryItem(name: "before", value: before)) }
         let request = try authorizedRequest(path: "/conversations/\(thread.rawValue)/messages", method: "GET", queryItems: items)
         let (data, _) = try await perform(request)
         return try Self.decodeJSON(ConversationPage.self, from: data)
+    }
+
+    public func conversations() async throws -> [ConversationSummary] {
+        let request = try authorizedRequest(path: "/conversations", method: "GET")
+        let (data, http) = try await performConversationRequest(request)
+        try Self.requireConversationJSON(data: data, response: http)
+        return try Self.decodeJSON(ConversationCatalog.self, from: data).conversations
+    }
+
+    public func createConversation(thread: ConversationThread, sourceId: String? = nil) async throws -> ConversationSummary {
+        var body = ["thread": thread.rawValue]
+        if let sourceId { body["sourceId"] = sourceId }
+        var request = try authorizedRequest(path: "/conversations", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, http) = try await performConversationRequest(request)
+        try Self.requireConversationJSON(data: data, response: http)
+        return try Self.decodeJSON(ConversationSummary.self, from: data)
+    }
+
+    private static func requireConversationJSON(data: Data, response: HTTPURLResponse) throws {
+        // Older dashboards return their HTML app shell with 200 for unknown
+        // GET routes. That is an unsupported catalog, not a lost pairing.
+        let type = response.value(forHTTPHeaderField: "Content-Type")?.lowercased() ?? ""
+        let prefix = String(decoding: data.prefix(128), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if type.contains("text/html") || prefix.hasPrefix("<!doctype html") || prefix.hasPrefix("<html") {
+            throw DaemonError.notFound
+        }
     }
 
     // MARK: - Lifelog

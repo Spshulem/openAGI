@@ -4,6 +4,7 @@ import com.google.mlkit.genai.common.DownloadStatus
 import com.google.mlkit.genai.common.FeatureStatus
 import com.google.mlkit.genai.prompt.Generation
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -18,6 +19,7 @@ object LocalChat {
     suspend fun status(): Int = runner.status()
     fun download(): Flow<LocalModelProgress> = runner.download()
     suspend fun reply(lines: List<FallbackLine>): String = runner.reply(lines)
+    suspend fun generate(prompt: String): String = runner.generate(prompt)
 }
 
 internal interface LocalGenerationClient : AutoCloseable {
@@ -68,14 +70,19 @@ internal class LocalChatRunner(
         } finally { model.close() }
     }.flowOn(dispatcher) // Collectors update Compose state on their own context.
 
-    suspend fun reply(lines: List<FallbackLine>): String = withContext(dispatcher) {
+    suspend fun generate(prompt: String): String = withContext(dispatcher) {
         val model = createClient()
         try {
-            if (model.status() != FeatureStatus.AVAILABLE) throw FallbackException("Gemini Nano isn't ready on this phone. Open Chat options to check or download it, or choose a hosted provider.")
-            val prompt = FallbackTransport.INSTRUCTIONS + "\n\n" + lines.takeLast(8).joinToString("\n") { "${it.role}: ${it.text.takeLast(1200)}" } + "\nassistant:"
-            val result = model.generate(prompt)
-            if (result.isBlank()) throw FallbackException("The local model returned no text. Try a shorter message.")
-            result
-        } finally { model.close() }
+            val status = model.status()
+            if (status != FeatureStatus.AVAILABLE) throw modelNotReady(status)
+            model.generate(prompt).also { if (it.isBlank()) throw FallbackException("The local model returned no text.") }
+        } catch (error: CancellationException) { throw error }
+        catch (error: Exception) { throw localModelFailure(error) }
+        finally { model.close() }
+    }
+
+    suspend fun reply(lines: List<FallbackLine>): String {
+        val prompt = FallbackTransport.INSTRUCTIONS + "\n\n" + lines.takeLast(8).joinToString("\n") { "${it.role}: ${it.text.takeLast(1200)}" } + "\nassistant:"
+        return generate(prompt)
     }
 }

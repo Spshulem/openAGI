@@ -111,7 +111,7 @@ coding thread and says which ones need you. This tab is its phone view.
   buttons: **Scan now** (a scan can take up to ~100s) and **Ask supervisor**.
 - **Needs you:** each open question with its title, body, the thread and PR
   it is about, and one button per option plus Dismiss. The result shows
-  inline: "Sent to the agent.", or "Saved. Couldn't reach the agent: …" when
+  inline: "Sent to the agent.", or "Not sent. Couldn't reach the agent: …" when
   the answer was kept but the relay failed. An answer can take up to ~190s.
 - **Watching** (Android; iOS still shows **Threads** by health): every
   thread grouped by what the supervisor watches it for, in this order:

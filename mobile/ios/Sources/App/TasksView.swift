@@ -3,10 +3,14 @@ import SwiftUI
 struct TasksView: View {
     @Environment(AppModel.self) private var model
     @State private var queue: TaskQueue = .user
-    @State private var tasksByBucket: [TaskBucket: [TaskRecord]] = [:]
-    @State private var isLoading = false
-    @State private var hasLoaded = false
-    @State private var errorHeadline: String?
+    private var tasksByBucket: [TaskBucket: [TaskRecord]] {
+        Dictionary(grouping: model.workspace.tasks[queue.rawValue] ?? []) { TaskBucket(rawValue: $0.bucket) ?? .someday }
+            .mapValues { $0.sorted { $0.priority > $1.priority } }
+    }
+    private var isLoading: Bool { model.loadingQueues.contains(queue.rawValue) }
+    private var hasLoaded: Bool { model.workspace.tasks[queue.rawValue] != nil }
+    private var errorHeadline: String? { actionError ?? model.tasksErrors[queue.rawValue] }
+    @State private var actionError: String?
     @State private var showingNewTask = false
 
     var body: some View {
@@ -24,7 +28,7 @@ struct TasksView: View {
                     Section {
                         Label(errorHeadline, systemImage: "exclamationmark.triangle")
                             .foregroundStyle(.red)
-                        Button("Retry") { Task { await load() } }
+                        Button("Retry") { Task { await load(force: true) } }
                     }
                 }
                 if tasksByBucket.values.allSatisfy(\.isEmpty) && errorHeadline == nil {
@@ -44,8 +48,8 @@ struct TasksView: View {
                             ForEach(tasks) { task in
                                 NavigationLink {
                                     TaskDetailView(task: task, onChanged: {
-                                        await load()
                                         model.bumpTasksGeneration()
+                                        await load()
                                     })
                                 } label: {
                                     VStack(alignment: .leading, spacing: 4) {
@@ -71,7 +75,7 @@ struct TasksView: View {
             }
             .accessibilityIdentifier("tasks-list")
             .navigationTitle("Tasks")
-            .refreshable { await load() }
+            .refreshable { await load(force: true) }
             .task(id: "\(queue.rawValue)-\(model.tasksGeneration)") { await load() }
             .toolbar {
                 WorkspaceChatToolbar()
@@ -82,8 +86,8 @@ struct TasksView: View {
             .sheet(isPresented: $showingNewTask) {
                 NewTaskSheet { input in
                     try await model.client.createTask(input)
-                    await load()
                     model.bumpTasksGeneration()
+                    await load()
                 }
             }
         }
@@ -98,32 +102,15 @@ struct TasksView: View {
         do {
             try await model.client.complete(taskID: task.id)
             WidgetReload.reloadToday()
-            await load()
             model.bumpTasksGeneration()
+            await load()
         } catch {
-            errorHeadline = "Couldn't complete that task. Try again."
+            actionError = "Couldn't complete that task. Try again."
         }
     }
 
-    private func load() async {
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            let tasks = try await model.client.tasks(queue: queue.rawValue, limit: Int.max)
-            guard !Task.isCancelled else { return }
-            tasksByBucket = Dictionary(grouping: tasks) { TaskBucket(rawValue: $0.bucket) ?? .someday }
-                .mapValues { $0.sorted { $0.priority > $1.priority } }
-            errorHeadline = nil
-            hasLoaded = true
-        } catch {
-            guard !Task.isCancelled else { return }
-            if case DaemonError.mainConnection(let issue) = error {
-                errorHeadline = issue.message
-                return
-            }
-            errorHeadline = (error as? DaemonError) == .unauthorized
-                ? "Pairing needs attention. Connect to your agent again in Settings."
-                : "Couldn't load tasks from this server."
-        }
+    private func load(force: Bool = false) async {
+        actionError = nil
+        await model.refreshTasks(queue: queue, force: force)
     }
 }

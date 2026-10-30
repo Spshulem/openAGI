@@ -95,6 +95,9 @@ class DaemonClient(
     private val client: OkHttpClient = defaultClient,
     private val enforceAllowlist: Boolean = true,
 ) {
+    internal fun belongsTo(credentials: sh.openagi.mobile.store.Credentials): Boolean =
+        server == credentials.server && nodeId == credentials.nodeId && token == credentials.token
+
     // SSE reads can legitimately go 15+ seconds between bytes — PROTOCOL.md
     // §7's own ": ping" cadence is every 15s, and a chat reply can think for
     // longer than that between deltas. `client`'s ordinary read timeout

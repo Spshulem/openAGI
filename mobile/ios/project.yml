@@ -8,7 +8,7 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "2113"
+    CURRENT_PROJECT_VERSION: "2128"
     DEVELOPMENT_TEAM: ""
     # Ad-hoc signing ("-" needs no Apple Developer Team, certificate, or
     # provisioning profile — it works on any Mac, headless or not) rather
@@ -78,6 +78,8 @@ targets:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: true
         NSLocalNetworkUsageDescription: OpenAGI finds and connects to your OpenAGI servers on your local network.
+        NSMicrophoneUsageDescription: OpenAGI uses your microphone when you tap Dictate to write a message. You review it before sending.
+        NSSpeechRecognitionUsageDescription: OpenAGI transcribes your dictated messages on this iPhone. Audio is not sent to your agent or a cloud transcription service.
         NSBonjourServices: ["_openagi._tcp"]
         BGTaskSchedulerPermittedIdentifiers: [sh.openagi.refresh]
         UIBackgroundModes: [fetch, remote-notification]

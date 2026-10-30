@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ToolRegistry } from "../src/tool-registry.js";
-import { fleetScan, fleetStatus, registerFleetTools } from "../src/fleet/tools.js";
+import { fleetScan, fleetStatus, fleetThread, registerFleetTools } from "../src/fleet/tools.js";
 import { createDefaultRuntime } from "../src/index.js";
 
 function row(overrides = {}) {
@@ -33,6 +33,36 @@ function registry(supervisor) {
   registerFleetTools(tools, supervisor);
   return tools;
 }
+
+test("past handoffs use target-specific journal evidence, including uncertain deliveries", () => {
+  const target = row();
+  const actions = [
+    { id: "other", threadKey: "antigravity:other", status: "sent", route: "agentapi" },
+    { id: "uncertain", threadKey: target.key, status: "blocked", route: "computer-use", unconfirmed: true, detail: "Inspect the original conversation" },
+    { id: "unavailable", threadKey: target.key, status: "blocked", route: null, playbook: "owner-message", detail: "No route available" },
+    { id: "sent", threadKey: target.key, status: "sent", route: "computer-use", detail: "Confirmed in transcript", finishedAt: "2026-10-01T10:00:00Z" }
+  ];
+  const supervisor = fakeSupervisor({ snapshot: { threads: [target] }, actions });
+  const result = fleetThread(supervisor, { key: target.key });
+  assert.deepEqual(result.recentDeliveries.map(item => item.actionId), ["uncertain", "unavailable", "sent"]);
+  assert.equal(result.recentDeliveries[0].unconfirmed, true);
+  assert.equal(result.recentDeliveries[1].route, null);
+  assert.equal(result.recentDeliveries[2].at, "2026-10-01T10:00:00Z");
+  assert.match(result.deliveryEvidence, /empty list means delivery is unverified/);
+  assert.deepEqual(fleetThread(fakeSupervisor({ snapshot: { threads: [target] } }), { key: target.key }).recentDeliveries, []);
+});
+
+test("a missing or uncertain delivery receipt cannot be reported as confirmed sent", async () => {
+  let delivery = null;
+  const supervisor = { ...fakeSupervisor({ snapshot: { threads: [row()] } }), sendOwnerMessage: async () => ({ delivery }) };
+  const send = registry(supervisor).get("fleet_send_message");
+  const target = send.prepareApprovalArgs({ key: "codex:t1", message: "Synthetic test message" });
+  await assert.rejects(send.handler(target, { __confirmed: true }), /Delivery unconfirmed/);
+  delivery = { status: "sent", unconfirmed: true, route: "agentapi" };
+  await assert.rejects(send.handler(target, { __confirmed: true }), /Delivery unconfirmed/);
+  delivery = { status: "sent", actionId: "receipt-1", route: "agentapi" };
+  assert.equal((await send.handler(target, { __confirmed: true })).actionId, "receipt-1");
+});
 
 test("fleet_status says how current each question is, and fleet_scan rescans first", async () => {
   const now = Date.parse("2026-09-29T23:30:00.000Z");

@@ -33,3 +33,26 @@ test('archive write failure leaves active history unchanged',t=>{
   assert.throws(()=>s.appendMessage('fixture',{role:'assistant',content:'not committed'}));
   assert.equal(fs.readFileSync(s.sessionPath('fixture'),'utf8'),original);
 });
+
+test('repeated maximum photo turns rotate by bytes and keep all original pixels readable', t => {
+  const s = fixture(t, { maxActiveMessages: 2000, retainedMessages: 1000 });
+  const data = Buffer.alloc(768 * 1024, 1).toString('base64');
+  for (let turn = 0; turn < 4; turn++) {
+    s.appendMessage('photos', { role: 'user', content: `Photo turn ${turn}`, metadata: {
+      attachments: Array.from({ length: 4 }, (_, i) => ({ id: `photo-${turn}-${i}`, mimeType: 'image/jpeg', name: 'Synthetic.jpg', data }))
+    } });
+    s.appendMessage('photos', { role: 'assistant', content: `Reply ${turn}` });
+  }
+  const active = s.getSession('photos');
+  assert.equal(active.metadata.historyArchived, true);
+  assert.ok(fs.statSync(s.sessionPath('photos')).size <= s.maxSessionBytes);
+  const history = [...s.archivedMessages('photos'), ...active.messages];
+  assert.equal(history.length, 8);
+  assert.deepEqual(history.map(m => m.content), Array.from({ length: 4 }, (_, i) => [`Photo turn ${i}`, `Reply ${i}`]).flat());
+  for (const message of history.filter(m => m.role === 'user')) {
+    assert.equal(message.metadata.attachments.length, 4);
+    assert.ok(message.metadata.attachments.every(image => image.data === data));
+  }
+  s.appendMessage('photos', { role: 'user', content: 'A later text request still works' });
+  assert.equal(s.getSession('photos').messages.at(-1).content, 'A later text request still works');
+});

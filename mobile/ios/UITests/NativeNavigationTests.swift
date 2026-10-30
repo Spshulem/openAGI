@@ -16,7 +16,10 @@ final class NativeNavigationTests: XCTestCase {
     }
 
     private func tap(_ app: XCUIApplication, _ id: String, in listID: String? = nil) {
-        let target = element(app, id)
+        // Walking every accessibility type can stall while resolving system
+        // toolbar snapshots, even for a fully visible native navigation row.
+        let isNativeButton = id == "open-settings" || id.hasPrefix("inbox-approval-")
+        let target = isNativeButton ? app.buttons[id] : element(app, id)
         if let listID {
             let list = element(app, listID)
             XCTAssertTrue(list.waitForExistence(timeout: 5), "Missing list \(listID)")
@@ -52,7 +55,7 @@ final class NativeNavigationTests: XCTestCase {
     private func back(_ app: XCUIApplication, from title: String, to parent: String) {
         // Duo places its native Back button in the vertical toolbar, outside
         // UINavigationBar. Ordinary iPhones can expose the parent title.
-        let native = element(app, "BackButton")
+        let native = app.buttons["BackButton"].firstMatch
         let target = native.exists ? native : app.navigationBars[title].buttons[parent]
         XCTAssertTrue(target.waitForExistence(timeout: 5), "Missing Back from \(title)")
         target.tap()
@@ -65,6 +68,7 @@ final class NativeNavigationTests: XCTestCase {
         let tab = app.tabBars.buttons[title]
         let target = tab.exists ? tab : app.buttons[title].firstMatch
         XCTAssertTrue(target.waitForExistence(timeout: 10), "Missing \(title) tab")
+        XCTAssertTrue(target.isHittable, "Not hittable: \(title) tab")
         target.tap()
     }
 
@@ -89,6 +93,55 @@ final class NativeNavigationTests: XCTestCase {
         XCTAssertTrue(app.navigationBars["Today"].waitForExistence(timeout: 5))
     }
 
+    func testNewAgentAndSupervisorChatsHaveSeparateHistoryAndAGroupedBrowser() {
+        let app = launch()
+        tab(app, "Chat")
+        for kind in ["agent", "supervisor"] {
+            tap(app, "chat-conversations")
+            XCTAssertTrue(app.navigationBars["Conversations"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["A synthetic web conversation"].waitForExistence(timeout: 5))
+            capture("native-conversation-library-\(kind)", app: app)
+            tap(app, "new-\(kind)-chat")
+            let composer = element(app, "chat-composer")
+            XCTAssertTrue(composer.waitForExistence(timeout: 10))
+            XCTAssertFalse(app.staticTexts["Earlier synthetic answer"].exists)
+            composer.tap()
+            composer.typeText("A new \(kind) conversation")
+            tap(app, "chat-send")
+            XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+            XCTAssertTrue(app.buttons["chat-dictation"].exists)
+            XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+            capture("native-new-conversation-\(kind)", app: app)
+        }
+        tap(app, "chat-conversations")
+        XCTAssertTrue(app.staticTexts["A new agent conversation"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["A new supervisor conversation"].exists)
+        tap(app, "conversation-agent")
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["A new supervisor conversation"].exists)
+    }
+
+    func testGuidedSetupExplainsPairingAndSupportsTheStepByStepAlternative() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--ui-testing", "--ui-guided-setup"]
+        app.launch()
+        XCTAssertTrue(app.navigationBars["Meet OpenAGI"].waitForExistence(timeout: 15))
+        capture("native-guided-setup-introduction", app: app)
+        let input = element(app, "setup-chat-input")
+        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        input.tap()
+        input.typeText("Where do I get a pairing code?")
+        tap(app, "setup-chat-send")
+        let explanation = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "Nodes → Connect a phone")).firstMatch
+        XCTAssertTrue(explanation.waitForExistence(timeout: 10))
+        capture("native-guided-setup", app: app)
+        tap(app, "setup-use-steps")
+        XCTAssertTrue(app.navigationBars["OpenAGI"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["setup-on-phone"].exists)
+        XCTAssertTrue(app.buttons["setup-server"].exists)
+    }
+
     func testNativeAdaptiveTabsAndOptionalChatPane() {
         let app = launch()
         XCTAssertFalse(element(app, "right-navigation").exists, "Use the system tab container in every pose")
@@ -97,10 +150,14 @@ final class NativeNavigationTests: XCTestCase {
             toggle.tap()
             let close = app.buttons["close-chat-pane"]
             XCTAssertTrue(close.waitForExistence(timeout: 5))
+            XCTAssertTrue(close.isHittable, "Supporting chat must keep its Close button visible")
             tab(app, "Tasks")
             XCTAssertTrue(close.waitForExistence(timeout: 5), "Pinned chat stays open while navigating")
+            XCTAssertTrue(close.isHittable, "Close must stay accessible after switching tabs")
+            capture("native-supporting-chat", app: app)
             close.tap()
             XCTAssertFalse(close.exists)
+            capture("native-supporting-chat-closed", app: app)
         }
         tab(app, "Chat")
         XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
@@ -186,27 +243,313 @@ final class NativeNavigationTests: XCTestCase {
         back(app, from: "Clarification", to: "Inbox")
     }
 
+    func testQuestionOpensReadOnlyThreadActivityWithoutSubmittingAnAnswer() {
+        let app = launch()
+        tab(app, "Supervisor")
+        XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["yes"].exists, "Read the full context before a thread decision")
+        XCTAssertFalse(app.buttons["no"].exists)
+        XCTAssertFalse(app.buttons["open thread"].exists, "Opening a thread must be navigation")
+        tap(app, "supervisor-question-context-context-fixture")
+        XCTAssertTrue(app.navigationBars["Thread"].waitForExistence(timeout: 10))
+        // Duo can stall resolving descendants of an Any-typed List query.
+        // Query the native labels directly after verifying the sheet title.
+        let question = app.staticTexts["Read the recent activity before choosing a response."].firstMatch
+        XCTAssertTrue(question.waitForExistence(timeout: 5))
+        XCTAssertTrue(question.isHittable, "The sheet must receive its full question on first presentation")
+        let message = app.staticTexts["The synthetic change is ready for your review. Nothing has been sent."].firstMatch
+        for _ in 0..<4 {
+            if message.exists && message.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(message.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Explain the synthetic change before I decide."].firstMatch.exists)
+        XCTAssertFalse(app.staticTexts["Not sent. Couldn't reach the agent"].exists)
+        capture("native-thread-context", app: app)
+        let readConversation = app.buttons["supervisor-read-conversation"].firstMatch
+        for _ in 0..<4 {
+            if readConversation.exists && readConversation.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(readConversation.exists && readConversation.isHittable)
+        readConversation.tap()
+        XCTAssertTrue(app.navigationBars["Conversation"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Show the earlier synthetic request."].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Here is the earlier synthetic explanation."].exists)
+        capture("native-thread-conversation", app: app)
+        back(app, from: "Conversation", to: "Thread")
+        XCTAssertTrue(question.exists, "Reading conversation history must retain the decision")
+        let yes = app.buttons["yes"].firstMatch
+        for _ in 0..<6 {
+            if yes.exists && yes.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(yes.exists && yes.isHittable, "A thread decision must remain answerable after reading its activity")
+        XCTAssertTrue(app.buttons["no"].firstMatch.isHittable)
+        XCTAssertFalse(app.buttons["open thread"].exists)
+        capture("native-thread-decision", app: app)
+        // Duo scrolls the sheet's native navigation controls with the list.
+        // Return to its toolbar after reading the activity and responses.
+        let done = app.buttons["Done"]
+        for _ in 0..<6 {
+            if done.exists && done.isHittable { break }
+            app.swipeDown()
+        }
+        XCTAssertTrue(done.exists && done.isHittable)
+        done.tap()
+        XCTAssertTrue(element(app, "supervisor-question-context-context-fixture").waitForExistence(timeout: 5))
+    }
+
+    func testShortBubblesStayCompactAndLongMarkdownWrapsWithoutClipping() {
+        let app = launch(["--ui-long-chat"])
+        tab(app, "Chat")
+        let yes = app.staticTexts["yes"]
+        XCTAssertTrue(yes.waitForExistence(timeout: 10))
+        let bubble = element(app, "chat-bubble-user")
+        XCTAssertTrue(bubble.exists)
+        XCTAssertLessThan(bubble.frame.width, 120, "A short answer must use its natural bubble width")
+        let text = "This synthetic list item explains the context of a decision in enough detail to wrap naturally across several lines on a phone, including a cover display or one page of a book layout. The entire explanation must remain readable before anyone makes a decision."
+        // XCTest's identifier subscript rejects strings over 128 characters.
+        // Match the full label without shortening the content under test.
+        let bullet = app.staticTexts.matching(NSPredicate(format: "label == %@", text)).firstMatch
+        XCTAssertTrue(bullet.waitForExistence(timeout: 10))
+        XCTAssertGreaterThan(bullet.frame.height, 50, "The long list item must wrap into multiple lines")
+        XCTAssertTrue(app.staticTexts["The final synthetic paragraph remains readable."].exists)
+        capture("native-long-chat", app: app)
+    }
+
     func testNativeComposerHistoryKeyboardDraftContinuityAndSending() {
         let app = launch()
         tab(app, "Chat")
         XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
         let composer = element(app, "chat-composer")
         XCTAssertTrue(composer.exists)
+        XCTAssertGreaterThan(composer.frame.minY, app.frame.midY,
+                             "The composer belongs below history, not over its first message")
+        let controls = [app.buttons["chat-attach"], app.buttons["chat-dictation"], app.buttons["chat-send"]]
+        for control in controls {
+            XCTAssertTrue(control.exists)
+            XCTAssertGreaterThanOrEqual(control.frame.height, 44, "Composer controls need native touch targets")
+            XCTAssertEqual(control.frame.height, controls[0].frame.height, accuracy: 2,
+                           "Attachment, microphone and Send should have matching visual size")
+            XCTAssertEqual(control.frame.width, control.frame.height, accuracy: 2)
+        }
+        XCTAssertGreaterThanOrEqual(composer.frame.width, 120, "Controls must leave room to write")
+        capture("native-composer-controls", app: app)
         composer.tap()
         composer.typeText("A synthetic message")
-        let send = element(app, "chat-send")
+        // Keep keyboard assertions scoped to the native control rather
+        // than enumerating every accessibility element in the workspace.
+        let send = app.buttons["chat-send"]
         XCTAssertTrue(send.isEnabled && send.isHittable)
         if app.keyboards.firstMatch.waitForExistence(timeout: 3) {
             XCTAssertLessThanOrEqual(send.frame.maxY, app.keyboards.firstMatch.frame.minY)
         }
         capture("native-chat-keyboard", app: app)
-        app.scrollViews.firstMatch.swipeDown()
+        // A short history may not scroll. Tapping a message must dismiss the
+        // keyboard without sending or changing the preserved draft.
+        let keyboard = app.keyboards.firstMatch
+        if keyboard.exists {
+            app.staticTexts["Earlier synthetic answer"].tap()
+            let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: keyboard)
+            XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 5), .completed)
+        }
         tab(app, "Tasks")
         tab(app, "Chat")
         XCTAssertEqual(element(app, "chat-composer").value as? String, "A synthetic message")
-        tap(app, "chat-send")
+        send.tap()
         XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+        XCTAssertNotEqual(element(app, "chat-composer").value as? String, "A synthetic message")
+        XCTAssertFalse(app.buttons["chat-send"].isEnabled, "Sending clears and resets the native editor")
         capture("native-chat", app: app)
+    }
+
+    func testModelLoadFailureExplainsMainUpdateAndRetryRestoresThePicker() {
+        let app = launch(["--ui-model-first-fails"])
+        tap(app, "open-settings")
+        tap(app, "settings-model", in: "settings-form")
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Update the main server")).firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["model-direct-chat"].exists, "Phone model choices remain available")
+        tap(app, "model-retry")
+        XCTAssertTrue(element(app, "model-provider").waitForExistence(timeout: 10))
+        capture("native-model-retry", app: app)
+    }
+
+    func testHistoryOpensAtBottomAndJumpToLatestDisappearsAfterUseAndSend() {
+        let app = launch(["--ui-scroll-chat"])
+        tab(app, "Chat")
+        let latest = app.staticTexts["Latest synthetic message"]
+        XCTAssertTrue(latest.waitForExistence(timeout: 10))
+        let atBottom = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: latest)
+        XCTAssertEqual(XCTWaiter.wait(for: [atBottom], timeout: 10), .completed)
+        XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
+        let history = element(app, "chat-history")
+        history.swipeDown()
+        history.swipeDown()
+        XCTAssertTrue(app.buttons["chat-jump-latest"].waitForExistence(timeout: 5))
+        // A partially visible message can already be hittable. Keep swiping
+        // through the end rather than mistaking that for the bottom.
+        for _ in 0..<6 {
+            history.swipeUp()
+        }
+        XCTAssertTrue(latest.isHittable, "Manually scrolling to the end must reveal the latest message")
+        XCTAssertLessThanOrEqual(latest.frame.maxY, history.frame.maxY + 1,
+                                 "The whole latest message must be inside the chat viewport")
+        capture("native-chat-manual-bottom", app: app)
+        let manuallyAtBottom = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.buttons["chat-jump-latest"])
+        XCTAssertEqual(XCTWaiter.wait(for: [manuallyAtBottom], timeout: 10), .completed,
+                       "The arrow must disappear after scrolling to the bottom without tapping it")
+        history.swipeDown()
+        history.swipeDown()
+        XCTAssertTrue(app.buttons["chat-jump-latest"].waitForExistence(timeout: 5))
+        tap(app, "chat-jump-latest")
+        let jumpGone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: app.buttons["chat-jump-latest"])
+        XCTAssertEqual(XCTWaiter.wait(for: [jumpGone], timeout: 10), .completed)
+        tap(app, "chat-composer")
+        element(app, "chat-composer").typeText("Read the newest message")
+        tap(app, "chat-send")
+        // Expanded layouts also show this text in the sidebar preview.
+        // Verify the actual message in history, not that second label.
+        let reply = history.staticTexts["Synthetic reply"]
+        let replyExists = reply.waitForExistence(timeout: 10)
+        if !replyExists {
+            capture("native-chat-reply-missing", app: app)
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "native-chat-reply-missing-hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+        }
+        XCTAssertTrue(replyExists)
+        let replyVisible = XCTNSPredicateExpectation(predicate: NSPredicate(format: "hittable == true"), object: reply)
+        let visibilityResult = XCTWaiter.wait(for: [replyVisible], timeout: 10)
+        if visibilityResult != .completed {
+            capture("native-chat-reply-visibility-failure", app: app)
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "native-chat-reply-visibility-hierarchy"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+            print("Reply frame: \(reply.frame); history frame: \(history.frame)")
+        }
+        XCTAssertEqual(visibilityResult, .completed)
+        XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
+        XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+        capture("native-chat-follow-latest", app: app)
+    }
+
+    func testSelectingVisibleHistoryDoesNotOfferJumpToLatest() {
+        let app = launch()
+        tab(app, "Chat")
+        for kind in ["agent", "supervisor"] {
+            tap(app, "chat-conversations")
+            tap(app, "conversation-\(kind)")
+            XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+            XCTAssertFalse(app.buttons["chat-jump-latest"].exists)
+
+            tap(app, "chat-conversations")
+            let search = app.searchFields.firstMatch
+            if !search.exists || !search.isHittable {
+                let searchButton = app.buttons.matching(NSPredicate(format: "label BEGINSWITH[c] %@", "Search")).firstMatch
+                if searchButton.exists { searchButton.tap() }
+            }
+            XCTAssertTrue(search.waitForExistence(timeout: 5))
+            search.tap()
+            search.typeText("Earlier synthetic answer")
+            let result = app.buttons["Earlier synthetic answer"].firstMatch
+            XCTAssertTrue(result.waitForExistence(timeout: 5))
+            result.tap()
+            let title = kind == "agent" ? "Chat" : "Supervisor chat"
+            XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.staticTexts["Earlier synthetic question"].isHittable)
+            XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].isHittable)
+            XCTAssertFalse(app.buttons["chat-jump-latest"].exists,
+                           "Selecting an already-visible result must not create a redundant jump button")
+            capture("native-short-history-no-jump-\(kind)", app: app)
+        }
+    }
+
+    func testImagesCanBeRemovedAndSentWithTheirPixelsInChatAndSupervisor() {
+        let app = launch(["--ui-attachment-fixture"])
+        tab(app, "Chat")
+        for thread in ["agent", "supervisor"] {
+            if thread == "supervisor" {
+                tab(app, "Supervisor")
+                let composer = element(app, "chat-composer")
+                if !composer.exists || !composer.isHittable {
+                    let ask = app.buttons["Ask supervisor"].firstMatch
+                    XCTAssertTrue(ask.waitForExistence(timeout: 10))
+                    ask.tap()
+                }
+            }
+            tap(app, "chat-attach")
+            XCTAssertTrue(app.buttons["Photo Library"].exists)
+            XCTAssertTrue(app.buttons["Choose Image File"].exists)
+            app.buttons["Attach synthetic image"].tap()
+            XCTAssertTrue(element(app, "chat-draft-image").waitForExistence(timeout: 10))
+            tap(app, "chat-remove-image")
+            XCTAssertFalse(element(app, "chat-draft-image").exists)
+            tap(app, "chat-attach")
+            app.buttons["Attach synthetic image"].tap()
+            XCTAssertTrue(element(app, "chat-draft-image").waitForExistence(timeout: 10))
+            tap(app, "chat-send")
+            XCTAssertTrue(app.staticTexts["Synthetic image received in \(thread)"].waitForExistence(timeout: 10))
+            XCTAssertFalse(element(app, "chat-draft-image").exists)
+            XCTAssertTrue(element(app, "chat-message-image").exists)
+            XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+            capture("native-image-\(thread)", app: app)
+        }
+    }
+
+    func testSystemPhotoPickerSendsSelectedPixelsInChatAndSupervisor() {
+        let app = launch()
+        tab(app, "Chat")
+        for thread in ["agent", "supervisor"] {
+            if thread == "supervisor" {
+                tab(app, "Supervisor")
+                let composer = element(app, "chat-composer")
+                if !composer.exists || !composer.isHittable {
+                    let ask = app.buttons["Ask supervisor"].firstMatch
+                    XCTAssertTrue(ask.waitForExistence(timeout: 10))
+                    ask.tap()
+                }
+            }
+            tap(app, "chat-attach")
+            app.buttons["Photo Library"].tap()
+            // The newly imported red/blue image precedes the simulator's stock
+            // photos. Photos exposes assets as Images, not collection cells.
+            let photo = app.images.matching(NSPredicate(format: "label BEGINSWITH %@", "Photo,")).firstMatch
+            capture("native-system-photo-picker-\(thread)", app: app)
+            XCTAssertTrue(photo.waitForExistence(timeout: 15), "The system photo grid must load")
+            photo.tap()
+            capture("native-system-photo-selection-\(thread)", app: app)
+            // Duo uses a native Done control; ordinary iPhones can use Add.
+            let confirmations = app.buttons.matching(NSPredicate(format:
+                "label == 'Done' OR label == 'Add' OR label BEGINSWITH 'Add ('"))
+            XCTAssertTrue(confirmations.firstMatch.waitForExistence(timeout: 5))
+            let confirm = confirmations.allElementsBoundByIndex.first { $0.isEnabled && $0.isHittable }
+            XCTAssertNotNil(confirm, "The selected photo needs a usable native confirmation control")
+            confirm?.tap()
+            XCTAssertTrue(element(app, "chat-draft-image").waitForExistence(timeout: 15))
+            capture("native-selected-photo-\(thread)", app: app)
+            tap(app, "chat-send")
+            // The transport fixture only acknowledges images with real JPEG
+            // bytes. Provider-level tests independently verify image perception.
+            XCTAssertTrue(app.staticTexts["Synthetic image received in \(thread)"].waitForExistence(timeout: 10))
+            XCTAssertFalse(element(app, "chat-draft-image").exists)
+            XCTAssertTrue(element(app, "chat-message-image").exists)
+            XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+            capture("native-system-photo-sent-\(thread)", app: app)
+        }
+    }
+
+    func testChatModelSheetDismissesBackToTheSameConversation() {
+        let app = launch()
+        tab(app, "Chat")
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].waitForExistence(timeout: 10))
+        tap(app, "chat-model")
+        XCTAssertTrue(app.navigationBars["Model"].waitForExistence(timeout: 5))
+        app.buttons["Done"].tap()
+        XCTAssertTrue(app.navigationBars["Chat"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Earlier synthetic answer"].exists)
     }
 
     func testAnEmptyTodayDoesNotHideTheInboxLink() {
@@ -225,6 +568,60 @@ final class NativeNavigationTests: XCTestCase {
         capture("native-connection-error", app: app)
     }
 
+    func testComputerApprovalWrapsAndFailedExecutionRemovesConsumedControls() {
+        let app = launch(["--ui-computer-approval", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
+        tab(app, "Inbox")
+        tap(app, "inbox-approval-computer-access")
+        XCTAssertTrue(app.navigationBars["Approval"].waitForExistence(timeout: 5))
+        let request = app.staticTexts["approval-request"]
+        XCTAssertTrue(request.waitForExistence(timeout: 5))
+        XCTAssertTrue(request.label.hasSuffix("The final synthetic instruction must remain readable."))
+        XCTAssertGreaterThan(request.frame.minX, app.frame.minX + 8, "Approval text needs a native leading gutter")
+        XCTAssertLessThan(request.frame.maxX, app.frame.maxX - 8, "Long requests must wrap inside the page")
+        capture("native-approval-accessibility", app: app)
+        tap(app, "approval-approve", in: "approval-form")
+        let result = app.staticTexts["approval-result"]
+        XCTAssertTrue(result.waitForExistence(timeout: 10))
+        XCTAssertTrue(result.isHittable, "A decision must bring its status into view without another scroll")
+        XCTAssertTrue(result.label.contains("selected computer is unavailable"))
+        XCTAssertFalse(app.buttons["approval-approve"].exists, "A consumed approval cannot be replayed after its tool fails")
+        XCTAssertFalse(app.buttons["approval-deny"].exists)
+        capture("native-approval-computer-unavailable", app: app)
+        back(app, from: "Approval", to: "Inbox")
+        XCTAssertFalse(element(app, "inbox-approval-computer-access").exists)
+        XCTAssertTrue(app.staticTexts["Approve the first synthetic action"].waitForExistence(timeout: 5))
+    }
+
+    func testLongLiveDictationStaysInBoundedEditorWithAccessibleControls() {
+        let app = launch(["--ui-dictation-fixture", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
+        tab(app, "Chat")
+        let field = element(app, "chat-composer")
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        let mic = app.buttons["chat-dictation"]
+        mic.tap()
+        let transcript = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value ENDSWITH %@", "End of synthetic dictation."), object: field)
+        XCTAssertEqual(XCTWaiter.wait(for: [transcript], timeout: 5), .completed)
+        XCTAssertEqual(mic.label, "Stop dictation")
+        XCTAssertGreaterThanOrEqual(field.frame.width, 200, "Large text gets a full-width editing row")
+        XCTAssertGreaterThanOrEqual(field.frame.minX, app.frame.minX)
+        XCTAssertLessThanOrEqual(field.frame.maxX, app.frame.maxX)
+        XCTAssertLessThan(field.frame.height, app.frame.height * 0.45, "Long dictation must scroll within the editor")
+        let controls = [app.buttons["chat-attach"], mic, app.buttons["chat-send"]]
+        for control in controls {
+            XCTAssertEqual(control.frame.height, 44, accuracy: 2)
+            XCTAssertGreaterThanOrEqual(control.frame.minY, field.frame.maxY, "Controls belong below the large-text editor")
+            XCTAssertLessThanOrEqual(control.frame.maxY, app.frame.maxY)
+        }
+        XCTAssertFalse(app.staticTexts["Listening… Tap Stop to finish, then Send."].exists)
+        capture("native-dictation-accessibility", app: app)
+        mic.tap()
+        XCTAssertEqual(mic.label, "Dictate message")
+        XCTAssertTrue((field.value as? String)?.hasSuffix("End of synthetic dictation.") == true)
+        tap(app, "chat-send")
+        XCTAssertTrue(app.staticTexts["Synthetic reply"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["chat-send"].isEnabled)
+    }
+
     func testSettingsAndComposerRemainUsableInDarkModeWithAccessibilityText() {
         let app = launch(["--ui-dark", "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"])
         tap(app, "open-settings")
@@ -236,7 +633,7 @@ final class NativeNavigationTests: XCTestCase {
         tab(app, "Chat")
         tap(app, "chat-composer")
         element(app, "chat-composer").typeText("Large text")
-        XCTAssertTrue(element(app, "chat-send").isHittable)
+        XCTAssertTrue(app.buttons["chat-send"].isHittable)
         capture("native-chat-accessibility-dark", app: app)
     }
 }

@@ -35,6 +35,9 @@ struct SettingsView: View {
                     if let issue = model.mainConnectionIssue {
                         Text(issue.message).foregroundStyle(.secondary)
                     }
+                    if let issue = OfflineCopy.shared.syncIssue {
+                        Text(issue).font(.footnote).foregroundStyle(.secondary)
+                    }
                     if let fetchedAt = model.snapshot?.fetchedAt {
                         LabeledContent("Last synced") {
                             Text(fetchedAt, style: .relative)
@@ -181,9 +184,9 @@ struct SettingsView: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            _ = try await AppSession.shared.switchBackToServer(detaching: model)
+            try await AppSession.shared.switchBackToServer(detaching: model)
         } catch {
-            switchError = "Can't reach your server yet. Your work stays on this iPhone until it can."
+            switchError = ServerConnectionGuidance.savedPairingFailure(error, server: AppSession.shared.serverBackup?.server ?? model.credentials.server)
         }
     }
 

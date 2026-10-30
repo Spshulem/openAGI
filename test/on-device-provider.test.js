@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import WebSocket from "ws";
 import { DeviceModelHub, attachDeviceModelRelay, DEVICE_MODEL_UNAVAILABLE } from "../src/device-model-relay.js";
-import { OnDeviceModelProvider, fitHistory, compactSystemPrompt } from "../src/on-device-provider.js";
+import { OnDeviceModelProvider, fitHistory, compactSystemPrompt, requestsTaskCreation } from "../src/on-device-provider.js";
 import { createModelProvider } from "../src/model-provider.js";
 
 const TOKEN = "owner-token-for-tests";
@@ -72,7 +72,7 @@ test("text reply streams deltas and returns the device's text", async (t) => {
   assert.equal(result.model, "fake-device");
   assert.deepEqual(deltas.map((d) => [d.text, d.reset]), [["Hel", true]]);
   // Only the small-model tool set is advertised.
-  assert.deepEqual(device.seen[0].tools.map((tool) => tool.name), ["remember", "recall", "add_task"]);
+  assert.deepEqual(device.seen[0].tools.map((tool) => tool.name), ["remember", "recall"]);
   assert.match(device.seen[0].system, /You are Pip/);
 });
 
@@ -92,6 +92,64 @@ test("tool call runs in the daemon and its result goes back to the device", asyn
   assert.equal(second[0].toolCall.name, "remember");
   assert.equal(second[1].role, "tool");
   assert.match(second[1].content, /saved/);
+});
+
+test("the current user turn appears once and casual chat cannot invoke add_task", async t => {
+  const { hub, url } = await startRelay(t);
+  const device = await connectDevice(url, [
+    { toolCall: { name: "add_task", arguments: { content: "unrequested" } } },
+    { text: "Hello! How can I help?" }
+  ]);
+  t.after(() => device.socket.close());
+  await untilConnected(hub);
+  const calls = [];
+  const result = await new OnDeviceModelProvider({ hub }).generate({ input: "Hello there",
+    messages: [{ role: "user", content: "Earlier question" }, { role: "assistant", content: "Earlier answer" }, { role: "user", content: "Hello there" }],
+    turnContext: "[context]\n" + "reference ".repeat(250) + "\n[/context]", toolRegistry: fakeRegistry(calls) });
+  assert.equal(result.text, "Hello! How can I help?");
+  assert.equal(calls.length, 0);
+  assert.equal(device.seen[0].messages.filter(m => m.content.includes("Hello there")).length, 1);
+  assert.match(device.seen[0].messages.at(-1).content, /\[\/context\]\n\nHello there$/);
+  assert.match(device.seen[0].system, /Never claim a task was added/);
+});
+
+test("an explicit task request still invokes add_task and reports its actual result", async t => {
+  const { hub, url } = await startRelay(t);
+  const device = await connectDevice(url, [{ toolCall: { name: "add_task", arguments: { content: "Buy milk" } } }, { text: "Added Buy milk." }]);
+  t.after(() => device.socket.close());
+  await untilConnected(hub);
+  const calls = [];
+  const result = await new OnDeviceModelProvider({ hub }).generate({ input: "Add a task to buy milk", toolRegistry: fakeRegistry(calls) });
+  assert.deepEqual(calls, [{ name: "add_task", args: { content: "Buy milk" } }]);
+  assert.equal(result.text, "Added Buy milk.");
+  assert.ok(device.seen[0].tools.some(tool => tool.name === "add_task"));
+  assert.equal(device.seen[1].messages.at(-1).role, "tool");
+});
+
+test("a requested task can be created from its clarification answer over the real device bridge", async t => {
+  const { hub, url } = await startRelay(t);
+  const device = await connectDevice(url, [{ toolCall: { name: "add_task", arguments: { content: "Buy milk" } } }, { text: "Added Buy milk." }]);
+  t.after(() => device.socket.close());
+  await untilConnected(hub);
+  const calls = [];
+  const result = await new OnDeviceModelProvider({ hub }).generate({ input: "Buy milk", toolRegistry: fakeRegistry(calls),
+    messages: [{ role: "user", content: "Add a task" }, { role: "assistant", content: "What should the task be?" }, { role: "user", content: "Buy milk" }] });
+  assert.equal(result.text, "Added Buy milk.");
+  assert.deepEqual(calls, [{ name: "add_task", args: { content: "Buy milk" } }]);
+  assert.ok(device.seen[0].tools.some(tool => tool.name === "add_task"));
+});
+
+test("pending task intent survives clarification but ends on completion, cancellation or a new topic", () => {
+  const pending = [{ role: "user", content: "Add a task" }, { role: "assistant", content: "What should the task be?" }];
+  assert.equal(requestsTaskCreation("Buy milk", pending), true);
+  assert.equal(requestsTaskCreation("Tomorrow", [...pending, { role: "user", content: "Buy milk" }, { role: "assistant", content: "When should it be due?" }]), true);
+  for (const input of ["Never mind", "Cancel that", "Don't add a task", "Hello", "Tell me a joke", "What is an atom?"]) {
+    assert.equal(requestsTaskCreation(input, pending), false, input);
+  }
+  assert.equal(requestsTaskCreation("Buy bread", [{ role: "user", content: "Add a task" },
+    { role: "assistant", content: "Added it. What else?", metadata: { toolCalls: [{ name: "add_task", ok: true }] } }]), false);
+  assert.equal(requestsTaskCreation("Buy milk", [{ role: "user", content: "Hello" }, { role: "assistant", content: "What should the task be?" }]), false);
+  assert.equal(requestsTaskCreation("Add a task called Never forget the milk"), true);
 });
 
 test("hop limit forces a final answer without tools", async (t) => {
@@ -161,7 +219,8 @@ test("history is trimmed newest-first to the context budget", () => {
 test("compact system prompt keeps the persona and drops the desktop catalog", () => {
   const prompt = compactSystemPrompt({ name: "Pip", systemPrompt: "# Pip\nHelps with groceries." });
   assert.match(prompt, /Helps with groceries/);
-  assert.match(prompt, /onboarding.*one small step/);
+  assert.match(prompt, /current request/);
+  assert.match(prompt, /do not restart onboarding/);
   assert.match(prompt, /Keep keys in Settings, never chat/);
   assert.match(prompt, /normal approval gates/);
   assert.doesNotMatch(prompt, /run_mcp_tool|ABI loop/);

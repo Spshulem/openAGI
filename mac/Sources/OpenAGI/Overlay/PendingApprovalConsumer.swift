@@ -116,13 +116,14 @@ final class PendingApprovalConsumer: ObservableObject {
     req.timeoutInterval = 4
     do {
       let (data, response) = try await URLSession.shared.data(for: req)
-      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-        throw URLError(.badServerResponse)
-      }
+      try AppState.ensureOK(response, data)
       let decoded = try JSONDecoder().decode(PendingApprovalsResponse.self, from: data)
       guard generation == refreshGeneration else { return }
       items = decoded.actions.filter { $0.status == "pending" }
       lastError = nil
+    } catch let error as MainConnectionError {
+      guard generation == refreshGeneration else { return }
+      lastError = error.localizedDescription
     } catch {
       guard generation == refreshGeneration else { return }
       lastError = "Couldn't refresh approvals."
@@ -169,7 +170,7 @@ final class PendingApprovalConsumer: ObservableObject {
           lastError = terminalError
           return
         }
-        throw URLError(.badServerResponse)
+        try AppState.ensureOK(response, data)
       }
       items.removeAll { $0.id == id }
       let decoded = try? JSONDecoder().decode(PendingApprovalDecisionResponse.self, from: data)
@@ -191,6 +192,8 @@ final class PendingApprovalConsumer: ObservableObject {
       }
       lastError = nil
       await refresh()
+    } catch let error as MainConnectionError {
+      lastError = error.localizedDescription
     } catch {
       lastError = decision == "approve" ? "Approval failed. Try again." : "Couldn't deny the request."
     }

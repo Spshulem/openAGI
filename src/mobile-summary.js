@@ -22,6 +22,7 @@ export function buildMobileSummary(runtime, { now = new Date(), taskLimit = MOBI
 
   return {
     generatedAt: now.toISOString(),
+    taskReview: runtime.taskSweep?.reviewStatus ?? null,
     today: ordered.slice(0, limit).map((t) => ({
       id: t.id,
       title: t.title,

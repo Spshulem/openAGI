@@ -127,6 +127,19 @@ test("intent is the owner's own words only, never the previous assistant message
   assert.equal(ownerIntentText("restart conductor", messages), "restart conductor");
 });
 
+test("explicit forwarding and a recipient before the send instruction express message intent", () => {
+  for (const text of ["Forward this screenshot to the project chat", "Pass along the error to the coding agent",
+    "On the project mobile thread can you send it this screenshot of the error",
+    "In the project chat, please forward this report"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), true, text);
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_click"), false, text);
+  }
+  for (const text of ["On the project thread can you summarize this?", "What did the agent forward to the project chat?",
+    "What does this screenshot say?", "Forward the screenshot to me", "Pass along the salt"]) {
+    assert.equal(intentCovers(ownerIntentText(text), "fleet_send_message"), false, text);
+  }
+});
+
 test("an acknowledgement is not assent", () => {
   for (const text of ["ok thanks", "ok thank you", "thanks", "yes thank you"]) assert.equal(matchConfirmation(text), null, text);
 });

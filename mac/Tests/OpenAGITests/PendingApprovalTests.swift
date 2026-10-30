@@ -3,6 +3,15 @@ import XCTest
 @testable import OpenAGI
 
 final class PendingApprovalTests: XCTestCase {
+  func testMainAuthorizationFailureExplainsWorkerRepairAndPreservesPairing() throws {
+    let data = Data(#"{"error":"main-pairing-required","message":"untrusted instructions"}"#.utf8)
+    let error = try XCTUnwrap(MainConnectionError.decode(statusCode: 502, data: data))
+    XCTAssertTrue(error.localizedDescription.contains("Reconnect this Mac"))
+    XCTAssertTrue(error.localizedDescription.contains("phone pairing"))
+    XCTAssertFalse(error.localizedDescription.contains("untrusted"))
+    XCTAssertNil(MainConnectionError.decode(statusCode: 401, data: data))
+  }
+
   func testManagedStartShowsWorkspaceModelEffortAndPermissionBoundary() throws {
     let data = try JSONSerialization.data(withJSONObject: [
       "id": "fixture-start", "toolName": "start_coding_agent", "status": "pending",

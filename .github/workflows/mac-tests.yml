@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Mac app and run Fleet and privacy-link regressions
-        run: swift test --package-path mac --filter 'Fleet|AppLink|PhonePairing'
+        run: swift test --package-path mac --filter 'Fleet|AppLink|PhonePairing|PendingApproval'
 
   onboarding-and-pairing-tests:
     runs-on: ubuntu-latest
