@@ -16,9 +16,10 @@ final class NativeNavigationTests: XCTestCase {
     }
 
     private func tap(_ app: XCUIApplication, _ id: String, in listID: String? = nil) {
-        // On Duo, walking every accessibility type can stall while resolving
-        // system toolbar snapshots. Settings is a native button; query it as one.
-        let target = id == "open-settings" ? app.buttons[id] : element(app, id)
+        // Walking every accessibility type can stall while resolving system
+        // toolbar snapshots, even for a fully visible native navigation row.
+        let isNativeButton = id == "open-settings" || id.hasPrefix("inbox-approval-")
+        let target = isNativeButton ? app.buttons[id] : element(app, id)
         if let listID {
             let list = element(app, listID)
             XCTAssertTrue(list.waitForExistence(timeout: 5), "Missing list \(listID)")
