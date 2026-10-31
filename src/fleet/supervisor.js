@@ -1383,7 +1383,10 @@ export class FleetSupervisor {
   async approveCodexCards(inScope, threads, started) {
     const driver = this.uiDriver;
     if (typeof driver?.attention !== "function" || typeof driver?.clickLabel !== "function") return;
-    const codex = inScope.filter((thread) => uiTargetFor(thread)?.app === "codex" && !thread.archived);
+    // Only while Auto holds and the thread is not muted, checked again before
+    // each read and click: the owner can switch mode or mute mid-pass.
+    const allowed = (thread) => this.mode === "auto" && !this.store.mutedKeys().has(thread.key);
+    const codex = inScope.filter((thread) => uiTargetFor(thread)?.app === "codex" && !thread.archived && allowed(thread));
     if (!codex.length) return;
     let rows = [];
     try {
@@ -1393,13 +1396,14 @@ export class FleetSupervisor {
     const marked = new Set(rows.map(identityToken).filter(Boolean));
     const waiting = codex.filter((thread) => this.livePrompt(thread) || marked.has(identityToken(uiTargetFor(thread).title)));
     for (const thread of waiting.slice(0, AUTO_APPROVE_MAX_THREADS)) {
+      if (!allowed(thread)) continue;
       if (!this.livePrompt(thread)) {
         try { await this.screenThread(thread.key, { thread, threads, navigate: true }); } catch { continue; }
       }
       for (let clicks = 0; clicks < AUTO_APPROVE_MAX_CARDS; clicks += 1) {
         const card = this.livePrompt(thread);
         const label = card ? autoApproveLabel(card.buttons) : null;
-        if (!label) break;
+        if (!label || !allowed(thread)) break;
         const clicked = await this.clickThread(thread.key, label, { stateId: card.stateId, thread, auto: true });
         if (clicked.delivery.status !== "sent") break;
         if (!clicked.prompt) this.prompts.delete(thread.key);

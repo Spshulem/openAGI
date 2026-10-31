@@ -2890,6 +2890,16 @@ test("auto-approve: a Codex chat the sidebar marks awaiting approval gets Allow 
   assert.equal(clicks[0].stateId, "0123456789abcdef");
   assert.ok(supervisor.getState().actions.some((action) => action.playbook === "auto-approve" && action.status === "sent"));
   assert.equal(supervisor.getState().questions.filter((q) => q.kind === "prompt").length, 0);
+  // A muted thread is never approved, nor one after the owner leaves Auto.
+  clicks.length = 0;
+  const muted = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" }, deps: { uiDriver: driver } });
+  muted.supervisor.muteThread(thread.key);
+  await muted.supervisor.tick();
+  assert.equal(clicks.length, 0, "muted");
+  const switching = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" },
+    deps: { uiDriver: { ...driver, attention: async () => { switching.supervisor.setMode("observe"); return { status: "read", rows: ["Fix billing"] }; } } } });
+  await switching.supervisor.tick();
+  assert.equal(clicks.length, 0, "mode left Auto mid-pass");
   // Off unless listed, and never outside Auto.
   for (const [mode, env] of [["auto", {}], ["propose", { OPENAGI_FLEET_AUTO_APPROVE: "codex" }]]) {
     const off = { ...driver, attention: async () => { throw new Error("read"); }, clickLabel: async (request) => { clicks.push(request); return { status: "sent" }; } };
