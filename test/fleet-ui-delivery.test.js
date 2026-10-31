@@ -6,7 +6,7 @@ import path from "node:path";
 import { DEFAULTS, uiTargetFor } from "../src/fleet/contracts.js";
 import {
   screenSummary, composerEmpty, createInputLatch, createPresenceProbe, createUiDriver, createUiLock, findComposer, findSendButton, placeholderJunk, transcriptCount, flattenMessage, looksLikeOurs, parseAppState, parseBundleIdLine,
-  conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController
+  conductorIds, parseConsoleSession, parseFrontAsn, parseIdleMs, uiIdentity, verifyIdentity, hasPermissionPrompt, promptButtons, createAppController, approvalRows
 } from "../src/fleet/ui-delivery.js";
 
 const PNG = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489", "hex").toString("base64");
@@ -2378,4 +2378,40 @@ test("a Conductor draft equal to its placeholder remains a draft", () => {
     assert.equal(composerEmpty(composer), false);
     assert.equal(screenSummary(state).draft, true);
   }
+});
+
+test("approvalRows lists the Codex sidebar chats awaiting approval, by title", () => {
+  const state = stateOf([
+    "App=com.openai.codex (pid 1)",
+    'Window: "Luma", App: ChatGPT.',
+    "0 standard window Luma",
+    "\t1 content list",
+    "\t\t2 button Luma",
+    "\t\t\t3 text Luma",
+    "\t\t\t4 container Working",
+    "\t\t5 button Fix uploads +12 -3",
+    "\t\t\t6 text Unread",
+    "\t\t\t7 text Fix uploads +12 -3",
+    "\t\t\t8 container Awaiting approval",
+    "\t\t9 button Billing",
+    "\t\t\t10 text Billing",
+    "\t\t\t11 container Needs approval"
+  ].join("\n"));
+  assert.deepEqual(approvalRows(state), ["Fix uploads", "Billing"]);
+  assert.deepEqual(approvalRows({ ...state, bundleId: "com.conductor.app" }), [], "Codex only");
+});
+
+test("a Codex card with Allow this conversation is a permission prompt", () => {
+  const state = stateOf([
+    "App=com.openai.codex (pid 1)",
+    'Window: "Luma", App: ChatGPT.',
+    "0 standard window Luma",
+    "\t1 HTML content Luma, URL: app://-/index.html",
+    "\t\t2 container",
+    "\t\t\t3 text Run pnpm test?",
+    "\t\t\t4 button Allow once",
+    "\t\t\t5 button Allow this conversation",
+    "\t\t\t6 button Deny"
+  ].join("\n"));
+  assert.deepEqual(promptButtons(state, "com.openai.codex").buttons, ["Allow once", "Allow this conversation", "Deny"]);
 });

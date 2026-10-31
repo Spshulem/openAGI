@@ -131,7 +131,7 @@ const STOP_LABEL = /^(stop|stop generating|stop response|stop agent|interrupt|ca
 // A permission or approval card: at least two of these exact labels side by
 // side, one of them positive. "Approve for me" (Codex's permission-mode
 // menu) and a lone "Run" in a transcript are not one.
-const POSITIVE_PROMPT_BUTTONS = new Set(["allow", "allow once", "always allow", "allow for this session", "allow for session", "yes, allow",
+const POSITIVE_PROMPT_BUTTONS = new Set(["allow", "allow once", "always allow", "allow this conversation", "allow for this session", "allow for session", "yes, allow",
   "approve", "approve once", "approve and run", "always approve", "accept", "yes", "run"]);
 const PROMPT_BUTTONS = new Set([...POSITIVE_PROMPT_BUTTONS, "deny", "don't allow", "do not allow", "reject", "decline", "no"]);
 // The guard that stops typing is wider: any one of these on its own, as a
@@ -333,6 +333,23 @@ function ownPlainButtons(state, bundleId) {
 function cardOf(element) {
   for (let node = element.parent; node; node = node.parent) if (!BUTTON_ROLE.test(node.role)) return node;
   return null;
+}
+
+// The status Codex's sidebar puts on a chat waiting on an approval card.
+const AWAITING_APPROVAL = /^(?:awaiting approval|needs approval)$/i;
+
+// The titles of the sidebar chats Codex marks as waiting on an approval.
+export function approvalRows(state, bundleId = state?.bundleId) {
+  if (bundleId !== "com.openai.codex") return [];
+  const titles = new Set();
+  for (const element of state?.elements ?? []) {
+    if (!BUTTON_ROLE.test(element.role)) continue;
+    const inner = descendants(state, element);
+    if (!inner.some((child) => AWAITING_APPROVAL.test(normalizeUiText(child.label)))) continue;
+    const title = inner.map((child) => (child.role === "text" ? normalizeUiText(child.label) : "")).find((text) => text && !/^unread$/i.test(text));
+    if (title) titles.add(title.replace(ROW_STATS, ""));
+  }
+  return [...titles];
 }
 
 // Every element under node, in tree order (OCU prints depth-first).
@@ -1629,6 +1646,28 @@ export function createUiDriver({
     }));
   }
 
+  // The chats Codex's sidebar marks as waiting on an approval, by title: one
+  // read of whatever the app shows, with no link and no input.
+  async function attention(request = {}) {
+    return locked(() => runRequest(request, async (ctx, signal) => {
+      const target = request.target;
+      if (target?.bundleId !== "com.openai.codex") return outcome(ctx, "blocked", "only Codex marks chats awaiting approval");
+      const ready = await readiness();
+      if (!ready.ready) return outcome(ctx, "blocked", `computer use not ready: ${ready.detail}`);
+      const running = await probeNow(ctx, "appRunning", target.bundleId);
+      if (!running) return outcome(ctx, "blocked", running === null ? `could not tell whether ${target.name} is running` : `${target.name} is not running`);
+      const front = await probeNow(ctx, "frontApp");
+      if (front === null) return outcome(ctx, "blocked", "front app unknown");
+      if (SCREEN_SAVER_APPS.has(front)) return outcome(ctx, "blocked", "screen saver on");
+      ctx.frontBefore = front;
+      ctx.transport = makeTransport({ timeoutMs: limits.uiStepTimeoutMs });
+      // A read can bring the app forward: the owner's app goes back after.
+      ctx.activated = true;
+      const state = await readState(ctx, signal);
+      return outcome(ctx, "read", `read ${target.name}`, { rows: approvalRows(state, target.bundleId) });
+    }));
+  }
+
   // Which element a label names on this screen: a button of the current
   // permission card (its stateId, when given, must still match), or the one
   // Resume goal / Retry / Resume button. Anything else is refused with the
@@ -1695,5 +1734,5 @@ export function createUiDriver({
 
   // One ioreg read for the idle watcher: never readiness, never OCU.
   const idleMs = () => presence.idleMs();
-  return { readiness, deliver, inspect, clickLabel, appRunning, idleMs };
+  return { readiness, deliver, inspect, clickLabel, attention, appRunning, idleMs };
 }
