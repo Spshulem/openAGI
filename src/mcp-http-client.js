@@ -37,6 +37,7 @@ export class McpHttpClient {
     this.serverInfo = null;
     this.tools = [];
     this.connected = false;
+    this.connectPromise = null;
     this.lastError = null;
     this.activeControllers = new Set();
   }
@@ -57,6 +58,20 @@ export class McpHttpClient {
 
   async connect({ interactive = true } = {}) {
     if (this.connected) return { tools: this.tools, serverInfo: this.serverInfo };
+    if (this.connectPromise) return this.connectPromise;
+    // Publish the in-flight promise before OAuth or transport work starts.
+    // Concurrent first-use callers must share the entire handshake, including
+    // initialization notification and paginated tool discovery.
+    this.connectPromise = Promise.resolve().then(() => this.initializeConnection({ interactive }));
+    try {
+      return await this.connectPromise;
+    } finally {
+      // Rejections must not permanently latch a failed connection attempt.
+      this.connectPromise = null;
+    }
+  }
+
+  async initializeConnection({ interactive }) {
     if (this.logDir) ensureDir(this.logDir);
     try {
       // `interactive` is threaded per-request (not latched on the instance) so

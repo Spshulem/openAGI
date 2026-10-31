@@ -310,7 +310,7 @@ curl -s -X POST http://127.0.0.1:43210/mcp/connect/filesystem \
 
 Tool discovery follows opaque `tools/list` continuation cursors over both HTTP and stdio, including empty intermediate pages. Refresh replaces the inventory only after all pages succeed; invalid or repeated cursors and listings exceeding 100 pages fail explicitly instead of publishing a partial inventory. Silent HTTP connection attempts remain non-interactive on every page.
 
-On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly. HTTP request deadlines cover response bodies, including streaming responses; disconnecting cancels pending body reads. Streaming replies accept LF, CRLF, and CR line endings, including line endings split across transport chunks. Matching streaming tool errors are returned immediately and completed response streams are released.
+On connect, each MCP tool becomes a first-class agent tool (`mcp_filesystem_read_file`, etc.) and the model can call it directly. Concurrent first-use HTTP calls share one initialization and tool-discovery handshake; a failed handshake rejects its waiting callers and a later call can retry. HTTP request deadlines cover response bodies, including streaming responses; disconnecting cancels pending body reads. Streaming replies accept LF, CRLF, and CR line endings, including line endings split across transport chunks. Matching streaming tool errors are returned immediately and completed response streams are released.
 
 ---
 
