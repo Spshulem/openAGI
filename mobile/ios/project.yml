@@ -68,6 +68,11 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         OpenAGIAppGroup: $(OPENAGI_APP_GROUP)
         UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         CFBundleURLTypes:
           - CFBundleURLName: sh.openagi.pair
             CFBundleURLSchemes: [openagi]
