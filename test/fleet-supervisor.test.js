@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULTS, resolveFleetConfig, shortHash } from "../src/fleet/contracts.js";
-import { FleetSupervisor, groupQuestions, judgeAskKey, judgeCacheKey } from "../src/fleet/supervisor.js";
+import { FleetSupervisor, autoApproveLabel, groupQuestions, judgeAskKey, judgeCacheKey } from "../src/fleet/supervisor.js";
 import { createFleetCapability } from "../src/fleet/remote.js";
 import { createFleetRoute } from "../src/fleet/routes.js";
 import { DEADLINE_MARGIN_MS, restartMaxMs } from "../src/fleet/ui-delivery.js";
@@ -2868,6 +2868,53 @@ test("a thread waiting on a permission card: one screen read, its buttons as opt
   assert.equal(clicks[0].stateId, "0123456789abcdef");
   assert.ok(supervisor.getState().actions.some((action) => action.kind === "click" && action.status === "sent"));
   assert.equal(supervisor.livePrompt(waiting), null, "the clicked card is forgotten");
+});
+
+test("auto-approve: a Codex chat the sidebar marks awaiting approval gets Allow clicked, no question", async (t) => {
+  const card = { text: "Run pnpm test?", buttons: ["Allow once", "Allow this conversation", "Always allow", "Deny"], stateId: "0123456789abcdef" };
+  const reads = [];
+  const clicks = [];
+  const driver = {
+    readiness: async () => ({ ready: true, detail: null }),
+    attention: async () => ({ status: "read", rows: ["Fix billing", "Something else"] }),
+    inspect: async (request) => { reads.push(request); return { status: "read", detail: "read Codex", screen: { prompt: card, running: true, resume: [], draft: false, text: "" } }; },
+    clickLabel: async (request) => { clicks.push(request); return { status: "sent", detail: "clicked Allow this conversation in Codex" }; }
+  };
+  const thread = makeThread({ agentStatus: "running", prRefs: [], meta: { originator: "Codex Desktop" } });
+  const { supervisor } = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" }, deps: { uiDriver: driver } });
+  await supervisor.tick();
+  assert.equal(reads.length, 1);
+  assert.equal(reads[0].navigate, true);
+  assert.equal(clicks.length, 1);
+  assert.equal(clicks[0].label, "Allow this conversation");
+  assert.equal(clicks[0].stateId, "0123456789abcdef");
+  assert.ok(supervisor.getState().actions.some((action) => action.playbook === "auto-approve" && action.status === "sent"));
+  assert.equal(supervisor.getState().questions.filter((q) => q.kind === "prompt").length, 0);
+  // A muted thread is never approved, nor one after the owner leaves Auto.
+  clicks.length = 0;
+  const muted = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" }, deps: { uiDriver: driver } });
+  muted.supervisor.muteThread(thread.key);
+  await muted.supervisor.tick();
+  assert.equal(clicks.length, 0, "muted");
+  const switching = fixture(t, { threads: [thread], prs: new Map(), mode: "auto", delivery: "computer-use", env: { OPENAGI_FLEET_AUTO_APPROVE: "codex" },
+    deps: { uiDriver: { ...driver, attention: async () => { switching.supervisor.setMode("observe"); return { status: "read", rows: ["Fix billing"] }; } } } });
+  await switching.supervisor.tick();
+  assert.equal(clicks.length, 0, "mode left Auto mid-pass");
+  // Off unless listed, and never outside Auto.
+  for (const [mode, env] of [["auto", {}], ["propose", { OPENAGI_FLEET_AUTO_APPROVE: "codex" }]]) {
+    const off = { ...driver, attention: async () => { throw new Error("read"); }, clickLabel: async (request) => { clicks.push(request); return { status: "sent" }; } };
+    clicks.length = 0;
+    const other = fixture(t, { threads: [thread], prs: new Map(), mode, delivery: "computer-use", env, deps: { uiDriver: off } });
+    await other.supervisor.tick();
+    assert.equal(clicks.length, 0, `${mode} ${JSON.stringify(env)}`);
+  }
+});
+
+test("autoApproveLabel picks the narrowest grant and never Always allow", () => {
+  assert.equal(autoApproveLabel(["Allow once", "Allow this conversation", "Always allow", "Deny"]), "Allow this conversation");
+  assert.equal(autoApproveLabel(["Allow once", "Deny"]), "Allow once");
+  assert.equal(autoApproveLabel(["Always allow", "Deny"]), null);
+  assert.equal(autoApproveLabel(["Approve", "Decline"]), "Approve");
 });
 
 test("a click the app refuses leaves the prompt question open", async (t) => {

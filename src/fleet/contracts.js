@@ -273,6 +273,14 @@ export function parseBackgroundRoutes(value) {
   return [...new Set(names.filter((name) => BACKGROUND_ROUTES.includes(name)))];
 }
 
+// Apps whose approval cards the supervisor may approve by itself.
+export const AUTO_APPROVE_APPS = Object.freeze(["codex"]);
+
+export function parseAutoApprove(value) {
+  const names = String(value ?? "").split(/[\s,]+/).map((part) => part.trim().toLowerCase()).filter(Boolean);
+  return [...new Set(names.filter((name) => AUTO_APPROVE_APPS.includes(name)))];
+}
+
 export function parseDeliveryMode(value) {
   const text = String(value ?? "").trim().toLowerCase();
   return DELIVERY_MODES.includes(text) ? text : "cli";
@@ -342,6 +350,9 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     delivery: DELIVERY_MODES.includes(overrides.delivery) ? overrides.delivery : parseDeliveryMode(env.OPENAGI_FLEET_DELIVERY),
     // Off unless listed: OPENAGI_FLEET_BACKGROUND_ROUTES=codex-exec,peer-relay.
     backgroundRoutes: Array.isArray(overrides.backgroundRoutes) ? parseBackgroundRoutes(overrides.backgroundRoutes.join(",")) : parseBackgroundRoutes(env.OPENAGI_FLEET_BACKGROUND_ROUTES),
+    // Off unless listed: OPENAGI_FLEET_AUTO_APPROVE=codex clicks Allow on the
+    // approval cards Codex raises (in Auto mode), instead of asking the owner.
+    autoApprove: Array.isArray(overrides.autoApprove) ? parseAutoApprove(overrides.autoApprove.join(",")) : parseAutoApprove(env.OPENAGI_FLEET_AUTO_APPROVE),
     // The watcher that sends app deliveries soon after the owner steps away,
     // instead of at the next scheduled scan. On unless OPENAGI_FLEET_IDLE_DRAIN=0.
     idleDrain: {
