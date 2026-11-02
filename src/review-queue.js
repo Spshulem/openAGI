@@ -4,6 +4,7 @@
 // through listReviewEntities() rather than asking the brief composer to score
 // and build actions for the whole backlog on every page request.
 
+import { readLatestTriageReport } from "./backlog-triage.js";
 import { composeBrief, listReviewEntities } from "./daily-brief.js";
 
 const REVIEW_KINDS = new Set(["task", "draft", "clarification", "suggestion"]);
@@ -61,7 +62,16 @@ export function queryReviewQueue(runtime, options = {}) {
     return { ...publicRow, shownInQuickAsk: quickAskIds.has(entityKey(row.kind, row.id)) };
   });
 
+  const report = readLatestTriageReport(runtime, { dataDir: options.dataDir });
+  const maintenance = report ? {
+    finishedAt: report.finishedAt ?? null, dryRun: report.dryRun === true,
+    scanned: Number(report.scanned?.suggestions ?? 0) + Number(report.scanned?.drafts ?? 0),
+    retired: report.dryRun ? 0 : Number(report.applied?.suggestions ?? 0) + Number(report.applied?.drafts ?? 0),
+    deferred: Number(report.applied?.deferralsAnnotated ?? 0),
+    degraded: (report.degraded?.length ?? 0) > 0
+  } : null;
   return {
+    maintenance,
     items,
     total: matchingTotal,
     byKind: matchingByKind,

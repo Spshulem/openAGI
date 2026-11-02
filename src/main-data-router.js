@@ -8,6 +8,10 @@ import { isMobileRouteAllowed } from "./mobile-node.js";
 // unchanged: the main, not the worker, decides what that client may access.
 export function isMainDataRoute(method, pathname) {
   if (method === "POST" && pathname === "/nodes/enroll/exchange") return true;
+  // The desktop Inbox must not mix a worker's local suggestions/drafts with
+  // main-backed Tasks. Forwarding adds no authority: main still checks the
+  // saved credential and may refuse this owner-only endpoint.
+  if (method === "GET" && pathname === "/review-queue") return true;
   // Main authenticates the phone and selects the configured fleet computer.
   // Hardware capabilities still belong to this worker.
   return isMobileRouteAllowed(method, pathname)

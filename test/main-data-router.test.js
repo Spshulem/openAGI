@@ -247,3 +247,20 @@ test("forwarded fleet and transcript operations outlive the workspace read timeo
   }
   assert.equal((await fetch(proxy.url + "/tasks", { headers: auth(PHONE) })).status, 502, "ordinary reads remain bounded");
 });
+
+test("desktop Inbox reads main with owner authority and never substitutes local review items", async t => {
+  const { main, worker } = await pair(t);
+  main.runtime.tasks.add({ queue: "user", title: "Main inbox task", bucket: "today" });
+  worker.runtime.tasks.add({ queue: "user", title: "Decoy worker task", bucket: "today" });
+  writeNodeConfig({ remote: main.url, token: OWNER }, worker.dataDir);
+  const response = await fetch(worker.url + '/review-queue', { headers: { authorization: `Bearer ${OWNER}` } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('x-openagi-data-source'), 'main');
+  const page = await response.json();
+  assert.ok(page.items.some(x => x.title === 'Main inbox task'));
+  assert.ok(!page.items.some(x => x.title === 'Decoy worker task'));
+  writeNodeConfig({ remote: main.url, token: null }, worker.dataDir);
+  const denied = await fetch(worker.url + '/review-queue', { headers: { authorization: `Bearer ${OWNER}` } });
+  assert.equal(denied.status, 502);
+  assert.equal((await denied.json()).error, 'main-pairing-required');
+});
