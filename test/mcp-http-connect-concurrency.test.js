@@ -61,3 +61,83 @@ test('shared silent initialization does not latch interactivity on later tool ca
   await client.callTool('fixture_tool', { value: 'later' });
   assert.equal(flags.at(-1), true);
 });
+
+test('closing before deferred initialization prevents transport and permits reconnect', async t => {
+  const f = fixture(t);
+  const client = new McpHttpClient({ url: 'https://example.invalid/mcp' });
+  const pending = client.connect();
+  await client.close();
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(f.calls.length, 0);
+  assert.equal(client.connected, false);
+  await client.connect();
+  assert.equal(f.initializes(), 1);
+});
+
+test('interactive tool callers retry a shared silent authorization failure once', async t => {
+  const f = fixture(t);
+  const flags = [];
+  const client = new McpHttpClient({ url: 'https://example.invalid/mcp', oauth: {
+    ensureToken: async ({ interactive }) => {
+      flags.push(interactive);
+      if (!interactive) throw Object.assign(new Error('authorization required'), { code: 'OAUTH_INTERACTIVE_REQUIRED' });
+      return 'fixture';
+    }
+  } });
+  const silent = client.connect({ interactive: false });
+  const calls = Array.from({ length: 4 }, (_, i) => client.callTool('fixture_tool', { value: String(i) }));
+  await assert.rejects(silent, { code: 'OAUTH_INTERACTIVE_REQUIRED' });
+  const results = await Promise.all(calls);
+  assert.equal(flags.filter(v => !v).length, 1);
+  assert.equal(f.initializes(), 1);
+  assert.equal(f.calls.filter(c => c.method === 'tools/call').length, 4);
+  assert.deepEqual(results.map(r => r.content[0].text), ['0', '1', '2', '3']);
+});
+
+test('closing while OAuth is pending prevents a late token from starting transport', async t => {
+  const f = fixture(t);
+  let finishToken;
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  const client = new McpHttpClient({ url: 'https://example.invalid/mcp', oauth: {
+    ensureToken: () => { started(); return new Promise(resolve => { finishToken = resolve; }); },
+    cancelAuthorization() {}
+  } });
+  const pending = client.connect();
+  await ready;
+  await client.close();
+  finishToken('fixture');
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.equal(f.calls.length, 0);
+  assert.equal(client.connected, false);
+});
+
+test('a cancelled attempt cannot clear a reconnect latch or replace its state', async t => {
+  const f = fixture(t);
+  let finishToken;
+  let started;
+  let first = true;
+  const ready = new Promise(resolve => { started = resolve; });
+  const client = new McpHttpClient({ url: 'https://example.invalid/mcp', oauth: {
+    ensureToken: async () => {
+      if (!first) return 'fixture';
+      first = false;
+      started();
+      return new Promise(resolve => { finishToken = resolve; });
+    },
+    cancelAuthorization() {}
+  } });
+  const old = client.connect();
+  await ready;
+  await client.close();
+  const current = client.connect();
+  const latch = client.connectPromise;
+  finishToken('fixture');
+  await assert.rejects(old, { name: 'AbortError' });
+  assert.equal(client.connectPromise, latch);
+  await Promise.all([current, client.connect()]);
+  assert.equal(f.initializes(), 1);
+  assert.equal(client.connected, true);
+  assert.equal(client.lastError, null);
+  assert.equal(client.sessionId, 'fixture-session-1');
+});

@@ -38,6 +38,8 @@ export class McpHttpClient {
     this.tools = [];
     this.connected = false;
     this.connectPromise = null;
+    this.connectionGeneration = 0;
+    this.connectInteractive = null;
     this.lastError = null;
     this.activeControllers = new Set();
   }
@@ -58,25 +60,49 @@ export class McpHttpClient {
 
   async connect({ interactive = true } = {}) {
     if (this.connected) return { tools: this.tools, serverInfo: this.serverInfo };
-    if (this.connectPromise) return this.connectPromise;
-    // Publish the in-flight promise before OAuth or transport work starts.
-    // Concurrent first-use callers must share the entire handshake, including
-    // initialization notification and paginated tool discovery.
-    this.connectPromise = Promise.resolve().then(() => this.initializeConnection({ interactive }));
+    const generation = this.connectionGeneration;
+    if (this.connectPromise) {
+      const pending = this.connectPromise;
+      const mayAuthorize = interactive && !this.connectInteractive;
+      try {
+        return await pending;
+      } catch (error) {
+        this.assertConnectionGeneration(generation);
+        // Upgrade only a silent authorization failure. No tool request has
+        // been issued yet, and all interactive waiters share the retry.
+        if (mayAuthorize && error.code === "OAUTH_INTERACTIVE_REQUIRED") {
+          return this.connect({ interactive: true });
+        }
+        throw error;
+      }
+    }
+    this.connectInteractive = interactive;
+    const pending = Promise.resolve().then(() => {
+      this.assertConnectionGeneration(generation);
+      return this.initializeConnection({ interactive, generation });
+    });
+    this.connectPromise = pending;
     try {
-      return await this.connectPromise;
+      return await pending;
     } finally {
-      // Rejections must not permanently latch a failed connection attempt.
-      this.connectPromise = null;
+      // An older cancelled attempt must not clear a newer connection latch.
+      if (this.connectPromise === pending) {
+        this.connectPromise = null;
+        this.connectInteractive = null;
+      }
     }
   }
 
-  async initializeConnection({ interactive }) {
+  assertConnectionGeneration(generation) {
+    if (generation !== this.connectionGeneration) {
+      throw Object.assign(new Error("MCP connection closed"), { name: "AbortError" });
+    }
+  }
+
+  async initializeConnection({ interactive, generation }) {
     if (this.logDir) ensureDir(this.logDir);
     try {
-      // `interactive` is threaded per-request (not latched on the instance) so
-      // a silent boot connect can't leave later tool calls unable to re-auth.
-      this.serverInfo = await this.request(
+      const serverInfo = await this.request(
         "initialize",
         {
           protocolVersion: PROTOCOL_VERSION,
@@ -85,14 +111,18 @@ export class McpHttpClient {
         },
         { timeoutMs: this.initializeTimeoutMs, interactive }
       );
-      // notifications/initialized has no response.
+      this.assertConnectionGeneration(generation);
       await this.notify("notifications/initialized", {}, { interactive });
-      this.tools = await collectMcpTools((method, params) => this.request(method, params, { interactive }));
+      this.assertConnectionGeneration(generation);
+      const tools = await collectMcpTools((method, params) => this.request(method, params, { interactive }));
+      this.assertConnectionGeneration(generation);
+      this.serverInfo = serverInfo;
+      this.tools = tools;
       this.connected = true;
       this.lastError = null;
       return { tools: this.tools, serverInfo: this.serverInfo };
     } catch (error) {
-      this.lastError = error.message;
+      if (generation === this.connectionGeneration) this.lastError = error.message;
       throw error;
     }
   }
@@ -123,6 +153,7 @@ export class McpHttpClient {
    * On 401 with an oauth client: refresh once, retry once.
    */
   async send(message, { isNotification = false, timeoutMs = this.timeoutMs, retried = false, interactive = true } = {}) {
+    const generation = this.connectionGeneration;
     const headers = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
@@ -133,6 +164,7 @@ export class McpHttpClient {
       const token = await this.oauth.ensureToken({ interactive });
       headers.authorization = `Bearer ${token}`;
     }
+    this.assertConnectionGeneration(generation);
     if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
 
     const controller = new AbortController();
@@ -153,6 +185,7 @@ export class McpHttpClient {
       throw error;
     }
     try {
+      this.assertConnectionGeneration(generation);
       // Keep the deadline and disconnect handle until the body is consumed.
       // Capture or update session id.
       const sid = response.headers.get("mcp-session-id");
@@ -270,6 +303,10 @@ export class McpHttpClient {
   }
 
   async close() {
+    this.connectionGeneration++;
+    this.connectPromise = null;
+    this.connectInteractive = null;
+    this.sessionId = null;
     this.connected = false;
     this.oauth?.cancelAuthorization?.();
     for (const controller of this.activeControllers) controller.abort();
