@@ -27,6 +27,43 @@ function fixture(t) {
   return { dir, state, runtime, remote, capability, calls };
 }
 
+test('main never invents a mode: the last one the fleet computer reported survives a restart', async t => {
+  const { dir, state, runtime } = fixture(t);
+  state.mode = 'auto';
+  const first = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  assert.equal(first.getState().mode, null, 'nothing reported yet');
+  assert.equal(first.getState().modeConfirmed, false);
+  await first.refresh();
+  assert.equal(first.getState().mode, 'auto');
+  assert.equal(first.getState().modeConfirmed, true);
+  // Restarted with the Mac out of reach: the last report, marked unconfirmed.
+  const offline = { ...runtime, nodeCapabilities: { dispatch: async () => { throw new Error('offline'); } } };
+  const restarted = new RemoteFleetSupervisor({ runtime: offline, nodeId: 'selected-mac', dataDir: dir });
+  await assert.rejects(restarted.refresh());
+  assert.equal(restarted.getState().mode, 'auto');
+  assert.equal(restarted.getState().modeConfirmed, false);
+  // A new report replaces it.
+  state.mode = 'propose';
+  const next = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  await next.refresh();
+  assert.equal(new RemoteFleetSupervisor({ runtime: offline, nodeId: 'selected-mac', dataDir: dir }).getState().mode, 'propose');
+  // Another computer starts unknown: this report was not its own.
+  assert.equal(new RemoteFleetSupervisor({ runtime: offline, nodeId: 'other-mac', dataDir: dir }).getState().mode, null);
+});
+
+test('a mode report that could not be saved is written by the next one', async t => {
+  const { dir, state, runtime } = fixture(t);
+  state.mode = 'auto';
+  const remote = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  // A non-empty directory in its place makes the write fail.
+  fs.mkdirSync(path.join(remote.modeFile, 'blocked'), { recursive: true });
+  await remote.refresh();
+  assert.equal(remote.getState().mode, 'auto', 'still shown live');
+  fs.rmSync(remote.modeFile, { recursive: true, force: true });
+  await remote.refresh();
+  assert.equal(new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir }).getState().mode, 'auto');
+});
+
 test('main routes fleet reads and mode changes only to the selected enrolled node', async t => {
   const { remote, state, calls } = fixture(t);
   const route = createFleetRoute({ supervisor: remote });
