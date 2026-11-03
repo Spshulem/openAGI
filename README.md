@@ -605,3 +605,13 @@ The self-chat task importer supports both plain `text` and modern Messages
 text takes precedence. Unreadable bodies and attachment-only rows advance the
 cursor without creating empty tasks; other chats remain excluded. First enable
 remains forward-only unless backfill is explicitly configured.
+
+### Agent task recovery
+
+Agent claims expire rather than reserving work forever. Deferred claims retain
+their attempt count; manually resuming one does not create a new timed lease.
+After the stale-work grace period, the queue recovers agent work with a missing
+or invalid lease expiry, preserving the retry budget and parking exhausted
+work as blocked. Fresh work, valid live leases, and tasks awaiting draft review
+remain protected. User-owned tasks retain their status. Recovery happens during
+normal queue sweeps, not when opening the store.
