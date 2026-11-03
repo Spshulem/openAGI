@@ -84,7 +84,9 @@ function statusFrom(state, now, { midScan = false } = {}) {
   const byHealth = { red: 0, yellow: 0, green: 0, gray: 0 };
   for (const row of rows) byHealth[row.health] = (byHealth[row.health] ?? 0) + 1;
   return {
-    mode: state.mode,
+    mode: state.mode ?? "unknown",
+    // A main the fleet computer has not answered since it started.
+    ...(state.modeConfirmed === false ? { modeUnconfirmed: true } : {}),
     enabled: Boolean(state.enabled),
     running: Boolean(state.running),
     lastTickAt: state.lastTickAt ?? null,

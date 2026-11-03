@@ -27,6 +27,28 @@ function fixture(t) {
   return { dir, state, runtime, remote, capability, calls };
 }
 
+test('main never invents a mode: the last one the fleet computer reported survives a restart', async t => {
+  const { dir, state, runtime } = fixture(t);
+  state.mode = 'auto';
+  const first = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  assert.equal(first.getState().mode, null, 'nothing reported yet');
+  assert.equal(first.getState().modeConfirmed, false);
+  await first.refresh();
+  assert.equal(first.getState().mode, 'auto');
+  assert.equal(first.getState().modeConfirmed, true);
+  // Restarted with the Mac out of reach: the last report, marked unconfirmed.
+  const offline = { ...runtime, nodeCapabilities: { dispatch: async () => { throw new Error('offline'); } } };
+  const restarted = new RemoteFleetSupervisor({ runtime: offline, nodeId: 'selected-mac', dataDir: dir });
+  await assert.rejects(restarted.refresh());
+  assert.equal(restarted.getState().mode, 'auto');
+  assert.equal(restarted.getState().modeConfirmed, false);
+  // A new report replaces it.
+  state.mode = 'propose';
+  const next = new RemoteFleetSupervisor({ runtime, nodeId: 'selected-mac', dataDir: dir });
+  await next.refresh();
+  assert.equal(new RemoteFleetSupervisor({ runtime: offline, nodeId: 'selected-mac', dataDir: dir }).getState().mode, 'propose');
+});
+
 test('main routes fleet reads and mode changes only to the selected enrolled node', async t => {
   const { remote, state, calls } = fixture(t);
   const route = createFleetRoute({ supervisor: remote });

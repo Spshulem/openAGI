@@ -2,7 +2,8 @@
 // enrolled-node control channel; no owner token, shell, or arbitrary URL crosses it.
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { resolveFleetConfig } from "./contracts.js";
+import { readJsonFile, writeJsonAtomic } from "../file-utils.js";
+import { MODES, resolveFleetConfig } from "./contracts.js";
 import { fixRevision } from "./feedback.js";
 import { FleetStore } from "./store.js";
 import { THREAD_KIND_PATTERN } from './contracts.js';
@@ -56,7 +57,11 @@ export class RemoteFleetSupervisor {
     this.nodeId = nodeId;
     this.intervalMs = intervalMs;
     this.selfFixHub = dataDir ? new SelfFixHub({ runtime, store: new FleetStore({ dir: path.join(dataDir, "fleet-self-fix") }) }) : null;
-    this.state = { mode: 'observe', enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
+    this.modeFile = dataDir ? path.join(dataDir, "fleet-remote-mode.json") : null;
+    // Only the fleet computer knows its mode. Until it answers, this is the
+    // last mode it reported (kept across restarts), or none: never a guess.
+    this.reportedMode = this.lastReportedMode();
+    this.state = { mode: this.reportedMode, enabled: true, running: false, lastTickAt: null, lastError: 'Waiting for the fleet computer', snapshot: null, questions: [], actions: [], settings: { remoteNode: nodeId } };
     this.refreshing = null;
     this.questionsAuthoritative = false;
     this.timer = null;
@@ -65,9 +70,25 @@ export class RemoteFleetSupervisor {
     this.pendingDismissals = new Set();
     this.lastEmitted = null;
   }
+  lastReportedMode() {
+    if (!this.modeFile) return null;
+    try {
+      const mode = readJsonFile(this.modeFile, null)?.mode;
+      return MODES.includes(mode) ? mode : null;
+    } catch {
+      return null;
+    }
+  }
+  noteReportedMode(mode) {
+    if (mode === this.reportedMode || !MODES.includes(mode)) return;
+    this.reportedMode = mode;
+    if (!this.modeFile) return;
+    try { writeJsonAtomic(this.modeFile, { mode }); } catch { /* the next report writes it */ }
+  }
   getState() {
     const state = structuredClone(this.state);
     state.questionsAuthoritative = this.questionsAuthoritative;
+    state.modeConfirmed = this.questionsAuthoritative;
     if (this.selfFixHub) {
       state.fixes = this.selfFixHub.store.fixes();
       state.questions = [...state.questions, ...this.selfFixHub.store.openQuestions()];
@@ -91,6 +112,7 @@ export class RemoteFleetSupervisor {
       reached = true;
       this.state = { ...result.state, settings: { ...result.state.settings, remoteNode: this.nodeId } };
       this.questionsAuthoritative = true;
+      this.noteReportedMode(this.state.mode);
       this.mirrorQuestions();
       status = result.response?.status ?? null;
       if (status !== 200) throw new Error(result.response?.body?.error || 'Fleet request failed');
