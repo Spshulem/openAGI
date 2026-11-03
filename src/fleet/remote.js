@@ -73,17 +73,19 @@ export class RemoteFleetSupervisor {
   lastReportedMode() {
     if (!this.modeFile) return null;
     try {
-      const mode = readJsonFile(this.modeFile, null)?.mode;
-      return MODES.includes(mode) ? mode : null;
+      const saved = readJsonFile(this.modeFile, null);
+      // Another computer's report says nothing about this one.
+      return saved?.nodeId === this.nodeId && MODES.includes(saved.mode) ? saved.mode : null;
     } catch {
       return null;
     }
   }
   noteReportedMode(mode) {
     if (mode === this.reportedMode || !MODES.includes(mode)) return;
-    this.reportedMode = mode;
-    if (!this.modeFile) return;
-    try { writeJsonAtomic(this.modeFile, { mode }); } catch { /* the next report writes it */ }
+    try {
+      if (this.modeFile) writeJsonAtomic(this.modeFile, { nodeId: this.nodeId, mode });
+      this.reportedMode = mode;
+    } catch { /* unsaved: the next report writes it */ }
   }
   getState() {
     const state = structuredClone(this.state);
