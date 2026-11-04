@@ -600,3 +600,36 @@ commands, notifications, pushes and delivery are disabled. A target metric
 must improve and untouched playbooks may not increase questions or sends by
 more than 10%. An unknown metric fails closed. P4's richer diagnostic metrics
 can extend this replay contract later.
+
+### Paseo discovery (opt-in)
+
+`OPENAGI_FLEET_PASEO=1` discovers existing Paseo chats through the public
+`@getpaseo/client` SDK. It includes background workspaces, preserves host and
+agent identity, and never imports, reloads, or resumes original provider sessions.
+`OPENAGI_FLEET_PASEO_ONLY=1` additionally skips legacy session, process, LB,
+BuildBot3, and computer-use readiness probes. Both flags are needed for exclusive
+Paseo discovery. Existing observe/propose/auto settings are unchanged.
+
+The default endpoint is `ws://127.0.0.1:6767/ws`. Set `OPENAGI_PASEO_URL` for a
+different endpoint, `OPENAGI_PASEO_PASSWORD` in the local secret environment if
+required, and `OPENAGI_PASEO_SERVER_IDS` to comma-separated registered destination
+IDs. Remote endpoints require WSS; URL credentials are rejected. Remote hosts
+must already be enabled and online. This integration does not register hosts or
+change trust settings.
+
+Inventory is paginated, including closed chats for exclusion. At most twelve
+changed chat histories are read per scan, four at a time; subsequent scans work
+through the remaining histories. Unknown or failed histories cannot produce
+nudges. Snapshot `paseo.discovered` and `paseo.historyPending` expose coverage;
+normal fleet scope limits still apply. Only bounded message text is retained,
+not tool output or images. Paseo workspaces are never probed through local git
+or filesystem scans. Migration aliases suppress duplicate legacy supervision.
+
+**Automatic sending is blocked in this version.** Paseo 0.15 offers interrupt
+or steer, and steering may fall back to interruption. Refreshing an idle chat
+before sending cannot prevent an active-turn race. Safe unattended delivery
+requires an atomic idle-only send precondition in the public Paseo API, followed
+by persisted intent and correlated message/turn-start confirmation. A dispatch
+acknowledgement alone is not progress. Use the existing Paseo chat for manual
+follow-up; do not restart an original provider session. This discovery integration
+does not repair stalled provider startup or claim successful nudges.

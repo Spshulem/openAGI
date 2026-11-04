@@ -212,7 +212,7 @@ export function threadHealth(state, error = null) {
 // A Claude transcript and a Conductor session are the same agent when the
 // Conductor row points at the transcript's session id. Conductor owns status.
 // Antigravity conversations stand alone.
-export function mergeThreads({ codex = [], claude = [], conductor = [], antigravity = [] } = {}) {
+export function mergeThreads({ codex = [], claude = [], conductor = [], antigravity = [], paseo = [] } = {}) {
   const merged = conductor.filter(Boolean).map((thread) => ({ ...thread }));
   const byClaudeId = new Map();
   for (const thread of merged) if (thread.claudeSessionId) byClaudeId.set(thread.claudeSessionId, thread);
@@ -222,7 +222,10 @@ export function mergeThreads({ codex = [], claude = [], conductor = [], antigrav
     if (target) foldClaudeInto(target, thread);
     else loose.push({ ...thread });
   }
-  return [...codex.filter(Boolean).map((thread) => ({ ...thread })), ...merged, ...loose, ...antigravity.filter(Boolean).map((thread) => ({ ...thread }))];
+  const migrated = new Set(paseo.flatMap(t => t.meta?.aliases ?? []));
+  const legacy = [...codex.filter(Boolean).map(t => ({ ...t })), ...merged, ...loose, ...antigravity.filter(Boolean).map(t => ({ ...t }))];
+  for (const t of legacy) if (migrated.has(t.key) || migrated.has(`claude:${t.claudeSessionId}`)) t.excluded = "paseo-migrated";
+  return [...legacy, ...paseo];
 }
 
 function foldClaudeInto(target, claude) {
@@ -462,6 +465,7 @@ function exclusionReason(thread, { pr, localGit, config }) {
   if (thread.archived) return "archived";
   const self = config?.selfSessionIds ?? [];
   if (self.includes(thread.id) || (thread.claudeSessionId && self.includes(thread.claudeSessionId))) return "self";
+  if (thread.kind === "paseo") return null; // Existing Paseo chats include non-repository work.
   const hasRepo = thread.repo || localGit?.remote || pr?.repo;
   if (!hasRepo && !thread.branch && !thread.prRefs?.length) return "no-repo";
   return null;

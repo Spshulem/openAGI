@@ -4709,3 +4709,24 @@ test("Push now shares the automatic-send lock through recording its receipt", as
   try { assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /already being sent/); }
   finally { release(); await tick; }
 });
+
+test("Paseo-only scan skips legacy sources, processes, LB and UI probes", async (t) => {
+  let legacyCalls = 0;
+  const forbidden = () => { legacyCalls++; throw new Error("legacy probe must not run"); };
+  const { supervisor } = fixture(t, {
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: {
+      readLivePeers: forbidden, listCodexThreads: forbidden, listClaudeThreads: forbidden,
+      listConductorThreads: forbidden, listAntigravityThreads: forbidden,
+      readCodexLbErrors: forbidden, findLocalHeavyVerification: forbidden,
+      probeBuildBot3: forbidden, checkLb: forbidden, findManagerSession: forbidden,
+      listPaseoThreads: async () => [makeThread({ kind: "paseo", key: "paseo:host.chat", id: "chat", cwd: null, repo: null, branch: null, prRefs: [], meta: { serverId: "host", historyKnown: true } })]
+    }
+  });
+  supervisor._uiDriver = { readiness: forbidden };
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(legacyCalls, 0);
+  assert.equal(snapshot.paseo.discovered, 1);
+  assert.equal(snapshot.paseo.deliveryReady, false);
+  assert.equal(snapshot.threads[0].openChat.app, "paseo");
+});

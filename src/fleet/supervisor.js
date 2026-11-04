@@ -24,6 +24,7 @@ import { FleetStore } from "./store.js";
 import { SuggestionManager, createDiagnoseModels, diagnoseDue, runDiagnosis } from "./suggestions.js";
 import { localDay } from "./diagnose.js";
 import { DEADLINE_MARGIN_MS, UI_INPUT_LATCH, createAppController, createUiDriver, restartMaxMs, uiIdentity } from "./ui-delivery.js";
+import { createPaseoSource } from "./sources/paseo.js";
 import * as antigravity from "./sources/antigravity.js";
 import * as buildbot3 from "./sources/buildbot3.js";
 import * as claude from "./sources/claude.js";
@@ -645,6 +646,9 @@ export class FleetSupervisor {
   // deadlineAt: a remote caller's. Its probes end before it, and a request
   // with no time left reports computer use not ready (the send waits).
   async probeDelivery({ deadlineAt = null } = {}) {
+    if (this.config.paseo?.enabled && this.config.paseo.only) {
+      return this.lastDelivery = { mode: "paseo", ready: false, detail: "Paseo discovery only: atomic idle-only delivery unavailable", checkedAt: new Date(this.now()).toISOString() };
+    }
     const mode = this.config.delivery ?? "cli";
     let state = { mode, ready: null, detail: null };
     const driver = mode === "cli" ? null : this.uiDriver;
@@ -838,6 +842,7 @@ export class FleetSupervisor {
         push: this.config.push ?? null,
         relayModel: this.config.relayModel,
         managerRef: this.config.managerRef,
+        paseo: { enabled: Boolean(this.config.paseo?.enabled), only: Boolean(this.config.paseo?.only) },
         delivery: this.lastDelivery.mode,
         deliveryReady: this.lastDelivery.ready,
         deliveryDetail: this.lastDelivery.detail,
@@ -1777,27 +1782,30 @@ export class FleetSupervisor {
         return fallback;
       });
 
+    const paseoOnly = config.paseo?.enabled && config.paseo.only;
     let peers = new Map();
-    try { peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch (error) { sourceErrors.peers = clampText(error?.message, 200); }
+    try { if (!paseoOnly) peers = (d.readLivePeers ?? claude.readLivePeers)(config) ?? new Map(); } catch (error) { sourceErrors.peers = clampText(error?.message, 200); }
 
     // The Codex keys whose open card this tick's scan settled (see act).
     const cardScanned = new Set();
     const storageOn = Boolean(this.config.storage?.enabled);
-    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
-      guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
-      guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
-      guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
-      guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
-      guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
-      guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
-      this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
-      guard("lb", () => (d.checkLb ?? buildbot3.checkLb)(config, { fetchImpl: d.fetchImpl, now: started }), null),
+    const [codexThreads, claudeThreads, conductorThreads, antigravityThreads, paseoThreads, lbErrors, localVerify, bb3, lb] = await Promise.all([
+      paseoOnly ? [] : guard("codex", () => (d.listCodexThreads ?? codex.listCodexThreads)(config, { now: started, run, cardScanned }), []),
+      paseoOnly ? [] : guard("claude", () => (d.listClaudeThreads ?? claude.listClaudeThreads)(config, { now: started, peers }), []),
+      paseoOnly ? [] : guard("conductor", () => (d.listConductorThreads ?? conductor.listConductorThreads)(config, { now: started, peers }), []),
+      paseoOnly ? [] : guard("antigravity", () => (d.listAntigravityThreads ?? antigravity.listAntigravityThreads)(config, { now: started, run, fetchImpl: d.fetchImpl }), []),
+      guard("paseo", () => (d.listPaseoThreads ?? (this.paseoSource ??= createPaseoSource()))(config), []),
+      paseoOnly ? [] : guard("lbErrors", () => (d.readCodexLbErrors ?? codex.readCodexLbErrors)(config, { now: started }), []),
+      paseoOnly ? [] : guard("processes", () => (d.findLocalHeavyVerification ?? processes.findLocalHeavyVerification)(config, { run }), []),
+      paseoOnly || this.skip.bb3 ? null : guard("bb3", () => (d.probeBuildBot3 ?? buildbot3.probeBuildBot3)(config, { run, now: started, previous: previous?.infra?.bb3 ?? null }), null),
+      paseoOnly ? null : guard("lb", () => (d.checkLb ?? buildbot3.checkLb)(config, { fetchImpl: d.fetchImpl, now: started }), null),
       // Free space only (statfs); a failed read keeps the last one.
       storageOn ? guard("storage", () => this.storage.refreshVolumes(), null) : null
     ]);
 
     // Conductor-hosted Codex threads learn which Conductor session shows them.
-    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [] }));
+    const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
+    if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
     const ownPaths = this.store.fixes().map((fix) => fix.worktree).filter(Boolean);
     const selfIds = new Set(config.selfSessionIds);
     for (const thread of threads) {
@@ -1805,7 +1813,7 @@ export class FleetSupervisor {
           || ownPaths.some((cwd) => thread.cwd === cwd || thread.cwd?.startsWith(cwd + path.sep))
           || thread.cwd?.startsWith(path.join(this.config.paths.home ?? os.homedir(), "Dev/openagi-fixes") + path.sep)) thread.excluded = "self";
     }
-    const manager = (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
+    const manager = paseoOnly ? null : (d.findManagerSession ?? conductor.findManagerSession)(config, threads) ?? null;
     const hasCard = (thread) => thread.meta?.pendingCard?.items?.length > 0;
     const ranked = threads
       .filter((thread) => !thread.excluded)
@@ -1829,8 +1837,8 @@ export class FleetSupervisor {
     const prs = this.withSettledPrs(await this.fetchPrs(inScope, config, run, sourceErrors, unreadPrs, askedPrs), unreadPrs);
 
     const infra = {
-      bb3: bb3 ?? { ...emptyBb3(), error: this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
-      lb: { healthy: lb?.healthy ?? null, detail: lb?.detail ?? null, watchLine: lb?.watchLine ?? null, recentErrors: lbErrors ?? [], errorsUnknown: Boolean(sourceErrors.lbErrors) },
+      bb3: bb3 ?? { ...emptyBb3(), error: paseoOnly || this.skip.bb3 ? "skipped" : (sourceErrors.bb3 ?? null) },
+      lb: { healthy: lb?.healthy ?? null, detail: lb?.detail ?? null, watchLine: lb?.watchLine ?? null, recentErrors: lbErrors ?? [], errorsUnknown: paseoOnly || Boolean(sourceErrors.lbErrors) },
       localVerify: (localVerify ?? []).map((row) => ({ ...row, threadKey: processes.matchThreadByCwd(row.cwd, inScope) }))
     };
 
@@ -2794,6 +2802,7 @@ export class FleetSupervisor {
       infra,
       infraDecisions,
       storage,
+      paseo: this.config.paseo?.enabled ? { discovered: threads.filter(t => t.kind === "paseo").length, historyPending: threads.filter(t => t.kind === "paseo" && t.excluded === "history-unavailable").length, deliveryReady: false } : null,
       sourceErrors
     };
   }
