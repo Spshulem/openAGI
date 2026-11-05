@@ -105,7 +105,12 @@ export function createPaseoSource({ factory } = {}) {
           const { api, agent: a, key } = row;
           cache.set(key, { attempted: Date.now() });
           try {
-            const history = await api.agents.ref(a.id).timeline.refetch({ direction: "tail", limit: 12 });
+            // A single slow imported history must not discard the entire fleet.
+            let historyTimer;
+            const history = await Promise.race([
+              api.agents.ref(a.id).timeline.refetch({ direction: "tail", limit: 12 }),
+              new Promise((_, reject) => { historyTimer = setTimeout(() => reject(new Error("History timed out")), config.paseo.historyTimeoutMs ?? 3000); })
+            ]).finally(() => clearTimeout(historyTimer));
             signal.throwIfAborted();
             row.agent = history.agent ?? a;
             // Cache only bounded text messages, not code, tool output or images.

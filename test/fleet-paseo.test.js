@@ -99,3 +99,10 @@ test("Paseo histories retain explicit PR links for live CI and review lookup", (
   assert.equal(row.repo, "example/project");
   assert.equal(row.cwd, null);
 });
+
+test("one slow history preserves inventory and other histories", async () => {
+ const m=mock([agent("slow"),agent("ready")]);const original=m.client.agents.ref;
+ m.client.agents.ref=id=>id==='slow'?{timeline:{refetch:()=>new Promise(()=>{})}}:original(id);
+ const rows=await createPaseoSource(m)({paseo:{enabled:true,historyTimeoutMs:5}});
+ assert.equal(rows.length,2);assert.equal(rows[0].excluded,'history-unavailable');assert.equal(rows[1].excluded,null);
+});
