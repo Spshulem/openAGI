@@ -1,0 +1,49 @@
+name: iOS App Store archive
+on:
+  pull_request:
+    paths:
+      - .github/workflows/ios-store-archive.yml
+permissions:
+  contents: read
+jobs:
+  archive:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Release source is the verified main commit, not the workflow PR.
+          ref: 7a4eb21920239a00d8288b2a267aec437e226673
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '27.2'
+      - name: Verify release toolchain
+        run: |
+          xcodebuild -version
+          xcodebuild -version | grep -Fx 'Build version 27B52'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.1'
+      - run: mobile/ios/scripts/fetch-node-runtime.sh
+      - name: Generate project
+        run: |
+          command -v xcodegen || brew install xcodegen
+          cd mobile/ios
+          xcodegen generate
+      - name: Archive release for distribution signing
+        working-directory: mobile/ios
+        run: |
+          xcodebuild archive -project OpenAGI.xcodeproj -scheme OpenAGI \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/OpenAGI.xcarchive" \
+            CURRENT_PROJECT_VERSION=2129 DEVELOPMENT_TEAM=38HE3W7T5K \
+            OPENAGI_BUNDLE_ID=com.spencershulem.openagi \
+            OPENAGI_APP_GROUP=group.com.spencershulem.openagi \
+            CODE_SIGNING_ALLOWED=NO
+          test -f "$RUNNER_TEMP/OpenAGI.xcarchive/Products/Applications/OpenAGI.app/Frameworks/NodeMobile.framework/NodeMobile"
+          ditto -c -k --keepParent "$RUNNER_TEMP/OpenAGI.xcarchive" "$RUNNER_TEMP/OpenAGI-2129-archive.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenAGI-2129-archive
+          path: ${{ runner.temp }}/OpenAGI-2129-archive.zip
+          retention-days: 7
