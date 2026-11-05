@@ -633,3 +633,34 @@ by persisted intent and correlated message/turn-start confirmation. A dispatch
 acknowledgement alone is not progress. Use the existing Paseo chat for manual
 follow-up; do not restart an original provider session. This discovery integration
 does not repair stalled provider startup or claim successful nudges.
+
+### Confirmed mode changes and conversation review
+
+A successful mode response now means the selected fleet computer saved and
+confirmed that mode. Disk-write failures return an error and retain the previous
+mode. An older remote refresh cannot overwrite a newer acknowledged response.
+Changing a selector on a disconnected client is not confirmation; check the
+returned mode and connection error before relying on unattended operation.
+
+The nudge judge reads a bounded recent conversation, including owner instructions,
+instead of only the final assistant reply. New owner instructions invalidate the
+cached verdict. Missing history is labelled as incomplete. The judge also runs in
+Propose mode, producing contextual drafts without sending them. Observe still
+sends nothing. Existing approval, scope, cooldown and delivery checks remain.
+
+For a Claude/Sonnet judge, set `OPENAGI_FLEET_JUDGE_PROVIDER=claude`,
+`OPENAGI_FLEET_JUDGE_MODEL` to a model supported by the configured Claude CLI, and
+`OPENAGI_FLEET_JUDGE=1`. It uses the existing tool-free, safe-mode, nonpersistent
+structured-review runner. Codex remains the default provider; changing the
+question-review model alone does not change the nudge judge.
+
+Paseo-only discovery scans every 30 seconds by default; `OPENAGI_PASEO_POLL_MS`
+sets a different interval with a 15-second minimum. Scans share the supervisor's
+existing in-flight guard and retain bounded history/model budgets. Explicit
+GitHub PR links in the recent conversation feed the existing CI and review
+lookup without probing remote workspaces locally. This is bounded polling,
+not event-driven completion tracking. Large backlogs still require several scans.
+
+These changes do not enable the integration, change an installed mode, or remove
+the automatic-delivery limitation above. Installing them and selecting a mode are
+separate from verifying a real message started and completed an agent turn.

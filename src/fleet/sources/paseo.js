@@ -1,6 +1,6 @@
 // Native Paseo reads. Never creates/imports/reloads an agent or changes its mode.
 import { createPaseoClient } from "@getpaseo/client";
-import { SUPERVISOR_PREFIX, clampText, redactSecrets } from "../contracts.js";
+import { SUPERVISOR_PREFIX, clampText, redactSecrets, parsePrRef } from "../contracts.js";
 
 export async function withPaseo(config, operation, factory = createPaseoClient) {
   const settings = config.paseo ?? {};
@@ -37,12 +37,15 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
   const nativeId = agent.persistence?.sessionId ?? agent.runtimeInfo?.sessionId;
   if (["codex", "claude"].includes(agent.provider) && nativeId) aliases.push(`${agent.provider}:${nativeId}`);
   const text = redactSecrets(assistant?.item.text ?? "").slice(-8000);
+  const prRefs = [...new Set(messages.slice().reverse().flatMap(e =>
+    [...String(e.item.text ?? "").matchAll(/https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/g)].map(m => `${m[1]}#${m[2]}`)
+  ))].slice(0, 8);
   return {
     key: `paseo:${serverId}.${agent.id}`, kind: "paseo", id: agent.id,
     title: clampText(redactSecrets(agent.title ?? "Paseo chat"), 100),
     // Paseo owns its workspace. No local git/stat probes of its paths: a
     // registered host may use the same path for a different repository.
-    cwd: null, workspace: agent.workspaceId, repo: null, branch: null,
+    cwd: null, workspace: agent.workspaceId, repo: parsePrRef(prRefs[0])?.repo ?? null, branch: null,
     agentStatus: agent.pendingPermissions?.length ? "waiting" : agent.activeTurn || agent.status === "initializing" ? "running"
       : ["running", "idle", "error"].includes(agent.status) ? agent.status : "unknown",
     archived: Boolean(agent.archivedAt),
@@ -50,7 +53,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
     lastActivityAt: agent.updatedAt, lastUserAt: owner?.timestamp ?? agent.lastUserMessageAt ?? null,
     lastUserText: redactSecrets(owner?.item.text ?? "").slice(-8000), lastAgentAt: assistant?.timestamp ?? null,
     lastAgentText: text.slice(-600), lastAgentTail: text, lastAgentFull: text,
-    error: null, openTasks: [], prRefs: [], live: null, writerLocked: false,
+    error: null, openTasks: [], prRefs, live: null, writerLocked: false,
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
       aliases, updatedAt: agent.updatedAt, blockedOnOwner: Boolean(agent.pendingPermissions?.length),
       lastSupervisorAt: supervisor?.timestamp ?? null, historyKnown,

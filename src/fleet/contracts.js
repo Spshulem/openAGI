@@ -363,6 +363,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     // The nudge judge (judge.js): a model reads the chat before an automatic
     // nudge. Off unless OPENAGI_FLEET_JUDGE=1 and a model is named.
     judge: {
+      provider: overrides.judge?.provider ?? parseReviewProvider(env.OPENAGI_FLEET_JUDGE_PROVIDER) ?? "codex",
       enabled: Boolean(overrides.judge?.enabled ?? envFlag(env.OPENAGI_FLEET_JUDGE)) && Boolean(overrides.judge?.model ?? String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim()),
       model: overrides.judge?.model ?? (String(env.OPENAGI_FLEET_JUDGE_MODEL ?? "").trim() || null),
       timeoutMs: overrides.judge?.timeoutMs ?? 40_000
@@ -386,6 +387,7 @@ export function resolveFleetConfig(env = process.env, overrides = {}) {
     paseo: {
       enabled: overrides.paseo?.enabled ?? envFlag(env.OPENAGI_FLEET_PASEO),
       only: overrides.paseo?.only ?? envFlag(env.OPENAGI_FLEET_PASEO_ONLY),
+      pollMs: Math.max(15000, envNumber(env.OPENAGI_PASEO_POLL_MS, 30000)),
       url: env.OPENAGI_PASEO_URL || "ws://127.0.0.1:6767/ws",
       password: env.OPENAGI_PASEO_PASSWORD,
       serverIds: String(env.OPENAGI_PASEO_SERVER_IDS ?? "").split(/[,\s]+/).filter(Boolean),

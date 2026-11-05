@@ -89,3 +89,13 @@ test("timeout aborts late history work and closes only the owned client", async 
   resolveHistory({ agent: agent("a"), entries: [] });
   await new Promise(resolve => setImmediate(resolve));
 });
+
+test("Paseo histories retain explicit PR links for live CI and review lookup", () => {
+  const row = paseoThread(agent("a"), "local", [
+    { item: { type: "user_message", text: "Finish https://github.com/example/project/pull/12" } },
+    { item: { type: "assistant_message", text: "Follow-up https://github.com/example/project/pull/13. Previous: https://github.com/example/project/pull/12" } }
+  ]);
+  assert.deepEqual(row.prRefs, ["example/project#13", "example/project#12"]);
+  assert.equal(row.repo, "example/project");
+  assert.equal(row.cwd, null);
+});

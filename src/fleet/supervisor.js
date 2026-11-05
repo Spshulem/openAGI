@@ -247,7 +247,7 @@ function judgeFacts(pr, classified, decision = null) {
 // nudges the prompt shows (nudgeHistory), so a nudge sent since is read again.
 export function judgeCacheKey(thread, decision, pr = null, classified = null, nudges = []) {
   const shown = (nudges ?? []).map((nudge) => [nudge.at ?? null, nudge.playbook ?? null, nudge.message ?? null]);
-  return [thread.key, replyMark(thread), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision)), shortHash(JSON.stringify(shown))].join("|");
+  return [thread.key, replyMark(thread), shortHash(JSON.stringify([thread.lastUserAt, thread.lastUserText, thread.lastActivityAt, thread.meta?.conversation])), decision.playbook, decision.factsKey ?? "", shortHash(judgeFacts(pr, classified, decision)), shortHash(JSON.stringify(shown))].join("|");
 }
 
 // Which agent message a verdict was read from.
@@ -721,14 +721,18 @@ export class FleetSupervisor {
     return this._playbooks;
   }
 
+  get scanIntervalMs() {
+    return this.config.paseo?.enabled && this.config.paseo.only ? Math.max(15000, this.config.paseo.pollMs ?? 30000) : this.config.tickMs;
+  }
+
   start() {
     if (!this.config.enabled || this.timer) return false;
     const fire = (reason) => this.tick({ reason }).catch(() => { /* recorded in lastError */ });
-    this.timer = setInterval(() => fire("interval"), this.config.tickMs);
+    this.timer = setInterval(() => fire("interval"), this.scanIntervalMs);
     this.timer.unref?.();
     this.kickTimer = setTimeout(() => fire("start"), START_DELAY_MS);
     this.kickTimer.unref?.();
-    if (this.config.idleDrain?.enabled && (this.config.delivery ?? "cli") !== "cli") {
+    if (!(this.config.paseo?.enabled && this.config.paseo.only) && this.config.idleDrain?.enabled && (this.config.delivery ?? "cli") !== "cli") {
       this.idleTimer = setInterval(() => { this.idleCheck().catch(() => { /* next poll */ }); }, this.config.idleDrain.pollMs ?? 15_000);
       this.idleTimer.unref?.();
     }
@@ -837,7 +841,8 @@ export class FleetSupervisor {
       suggestions: store.suggestions(),
       diagnosis: structuredClone(store.state.diagnosis),
       settings: {
-        tickMinutes: Math.round(this.config.tickMs / MIN),
+        tickMinutes: Math.ceil(this.scanIntervalMs / MIN),
+        tickSeconds: this.scanIntervalMs / 1000,
         lookbackHours: this.config.lookbackHours,
         push: this.config.push ?? null,
         relayModel: this.config.relayModel,
@@ -917,13 +922,14 @@ export class FleetSupervisor {
 
   setMode(mode) {
     if (!MODES.includes(mode)) return null;
+    const saved = this.store.setMode(mode);
     if (mode !== "propose") {
       for (const action of this.store.actions(this.config.limits.maxActionsKept)) {
         if (action.status === "proposed") this.store.updateAction(action.id, { status: "stale", detail: "mode changed" });
       }
     }
     if (mode === "observe") this.selfFixHub.stop("all").catch(() => {});
-    return this.store.setMode(mode);
+    return saved;
   }
 
   dismissQuestion(id) {
@@ -1976,7 +1982,7 @@ export class FleetSupervisor {
   // replaced in place.
   async judgeNudges(items, { started }) {
     const judge = this.nudgeJudge;
-    if (!judge?.enabled || typeof judge.judge !== "function" || this.mode !== "auto") return;
+    if (!judge?.enabled || typeof judge.judge !== "function" || this.mode === "observe") return;
     for (const [key, entry] of this.judgeCache) if (started - entry.at >= JUDGE_CACHE_MS) this.judgeCache.delete(key);
     for (const [key, at] of this.judgeTriedAt) if (started - at >= JUDGE_CACHE_MS) this.judgeTriedAt.delete(key);
     // Only answers given since this scan began count (ownerAnswerThreads).
@@ -2013,12 +2019,15 @@ export class FleetSupervisor {
     // time left ends sooner is only read next scan.
     const fullMs = Math.min(JUDGE_CALL_MS, this.config.judge?.timeoutMs ?? JUDGE_CALL_MS);
     const results = await mapLimit(now, JUDGE_CONCURRENCY, async ({ item }) => {
+      let conversation;
+      try { conversation = await readThreadConversation(item.thread, this.config); }
+      catch { return { error: "conversation unavailable" }; }
       const left = JUDGE_TICK_MS - (this.now() - judgeStart);
       if (left < JUDGE_MIN_CALL_MS) return { later: true };
       const capMs = Math.min(JUDGE_CALL_MS, left);
       try {
         const verdict = await withTimeout(Promise.resolve(judge.judge({
-          thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started, timeoutMs: capMs
+          conversation, thread: item.thread, decision: item.decision, classified: item.classified, pr: item.pr, nudges: history.get(item.thread.key) ?? [], now: started, timeoutMs: capMs
         })), capMs, "judge");
         return { verdict };
       } catch (error) {

@@ -3785,11 +3785,13 @@ test("an owner answer during the review holds a judged nudge already decided", a
   assert.match(judgeRow(supervisor).reason, /held: owner answered$/);
 });
 
-test("a switch to Auto mid-scan sends no nudge the judge never read", async (t) => {
+test("enabling the judge and Auto mid-scan sends no unread nudge", async (t) => {
   const judge = fakeJudge({ action: "send", reason: "r", message: "judged words" });
+  judge.enabled = false;
   const { supervisor, delivered } = fixture(t, { mode: "propose", deps: { judge } });
   const review = supervisor.reviewOpenQuestions.bind(supervisor);
   supervisor.reviewOpenQuestions = async (args) => {
+    judge.enabled = true;
     supervisor.setMode("auto");
     return review(args);
   };
@@ -4729,4 +4731,30 @@ test("Paseo-only scan skips legacy sources, processes, LB and UI probes", async 
   assert.equal(snapshot.paseo.discovered, 1);
   assert.equal(snapshot.paseo.deliveryReady, false);
   assert.equal(snapshot.threads[0].openChat.app, "paseo");
+});
+
+test("new owner scope invalidates a cached nudge even without an assistant reply", () => {
+  const thread = makeThread(), decision = { playbook: "idle-report" };
+  const before = judgeCacheKey(thread, decision);
+  assert.notEqual(judgeCacheKey({ ...thread, lastUserText: "Stop here; do not merge." }, decision), before);
+  assert.notEqual(judgeCacheKey({ ...thread, meta: { conversation: [{ role: "user", text: "Finish review only" }] } }, decision), before);
+});
+
+test("Propose reads conversation and saves the judged draft without sending", async t => {
+  let input;
+  const judge = { enabled: true, judge: async args => { input = args; return { action: "send", reason: "Finish authorized review", message: "Address the remaining review comment and verify the existing PR." }; } };
+  const { supervisor, delivered } = fixture(t, { mode: "propose", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.ok(input.conversation.messages.some(m => m.role === "user"));
+  assert.equal(delivered.length, 0);
+  assert.ok(supervisor.getState().actions.some(a => a.status === "proposed" && a.message === "Address the remaining review comment and verify the existing PR."));
+});
+
+test("Paseo-only cadence is bounded and retains integer mobile settings", t => {
+  const { supervisor } = fixture(t, { env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" } });
+  assert.equal(supervisor.scanIntervalMs, 30000);
+  assert.equal(supervisor.getState().settings.tickSeconds, 30);
+  assert.equal(supervisor.getState().settings.tickMinutes, 1);
+  supervisor.config.paseo.pollMs = 1;
+  assert.equal(supervisor.scanIntervalMs, 15000);
 });
