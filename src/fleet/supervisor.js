@@ -647,7 +647,7 @@ export class FleetSupervisor {
   // with no time left reports computer use not ready (the send waits).
   async probeDelivery({ deadlineAt = null } = {}) {
     if (this.config.paseo?.enabled && this.config.paseo.only) {
-      return this.lastDelivery = { mode: "paseo", ready: false, detail: "Paseo discovery only: atomic idle-only delivery unavailable", checkedAt: new Date(this.now()).toISOString() };
+      return this.lastDelivery = { mode: "paseo", ready: null, detail: "Paseo native delivery checks each chat before sending", checkedAt: new Date(this.now()).toISOString() };
     }
     const mode = this.config.delivery ?? "cli";
     let state = { mode, ready: null, detail: null };
@@ -2811,7 +2811,7 @@ export class FleetSupervisor {
       infra,
       infraDecisions,
       storage,
-      paseo: this.config.paseo?.enabled ? { discovered: threads.filter(t => t.kind === "paseo").length, historyPending: threads.filter(t => t.kind === "paseo" && t.excluded === "history-unavailable").length, deliveryReady: false } : null,
+      paseo: this.config.paseo?.enabled ? { discovered: threads.filter(t => t.kind === "paseo").length, historyPending: threads.filter(t => t.kind === "paseo" && t.excluded === "history-unavailable").length, deliveryReady: null } : null,
       sourceErrors
     };
   }

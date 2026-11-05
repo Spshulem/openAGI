@@ -540,7 +540,7 @@ export function openChatFor(thread) {
   if (!thread?.kind) return null;
   const name = (value) => clampText(value, CHAT_NAME_MAX);
   const title = name(thread.title);
-  if (thread.kind === "paseo") return { app: "paseo", url: null, label: `${title || "untitled chat"} (Paseo)`, serverId: thread.meta?.serverId, agentId: thread.id, note: "Open this existing chat on its Paseo host. Automatic delivery awaits an atomic idle-only send API." };
+  if (thread.kind === "paseo") return { app: "paseo", url: null, label: `${title || "untitled chat"} (Paseo)`, serverId: thread.meta?.serverId, agentId: thread.id, note: "Open this existing chat on its Paseo host." };
   const folder = name(String(thread.cwd ?? "").split("/").filter(Boolean).at(-1) ?? "");
   const target = uiTargetFor(thread);
   if (target?.app === "conductor") {

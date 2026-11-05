@@ -68,10 +68,10 @@ test("unsafe endpoint is rejected before connecting; concurrent scans do not ove
   finish(); await one;
   assert.equal(m.closes(), 1);
 });
-test("automatic delivery cannot send, interrupt, resume or mutate any existing chat", async () => {
+test("disabled delivery cannot mutate an existing chat", async () => {
   const result = await deliverPaseo({ actionId: "action", factory: () => { throw Error("must not connect"); } });
   assert.equal(result.status, "blocked");
-  assert.match(result.detail, /atomic idle-only/);
+  assert.match(result.detail, /not enabled/);
 });
 test("incomplete pagination fails closed", async () => {
   const m = mock([]);

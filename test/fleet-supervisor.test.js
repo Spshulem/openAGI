@@ -4729,7 +4729,7 @@ test("Paseo-only scan skips legacy sources, processes, LB and UI probes", async 
   const snapshot = await supervisor.tick({ reason: "test" });
   assert.equal(legacyCalls, 0);
   assert.equal(snapshot.paseo.discovered, 1);
-  assert.equal(snapshot.paseo.deliveryReady, false);
+  assert.equal(snapshot.paseo.deliveryReady, null);
   assert.equal(snapshot.threads[0].openChat.app, "paseo");
 });
 

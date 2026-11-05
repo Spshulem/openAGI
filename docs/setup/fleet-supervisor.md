@@ -625,14 +625,18 @@ normal fleet scope limits still apply. Only bounded message text is retained,
 not tool output or images. Paseo workspaces are never probed through local git
 or filesystem scans. Migration aliases suppress duplicate legacy supervision.
 
-**Automatic sending is blocked in this version.** Paseo 0.15 offers interrupt
-or steer, and steering may fall back to interruption. Refreshing an idle chat
-before sending cannot prevent an active-turn race. Safe unattended delivery
-requires an atomic idle-only send precondition in the public Paseo API, followed
-by persisted intent and correlated message/turn-start confirmation. A dispatch
-acknowledgement alone is not progress. Use the existing Paseo chat for manual
-follow-up; do not restart an original provider session. This discovery integration
-does not repair stalled provider startup or claim successful nudges.
+Native sends refresh the exact host and agent before dispatch. Running, closed,
+archived, permission-blocked, changed-workspace and changed-revision chats are
+held. Each attempt first records a durable message ID; a failed or uncertain
+send is never automatically repeated. Acknowledgement alone is not success:
+the correlated message must have turn-start or subsequent assistant evidence.
+No provider import, reload, settings change or legacy-session fallback is used.
+
+Dispatch uses Paseo's `steer` behavior as protection against a racing turn. The
+current public API has no atomic idle-only send precondition, and Paseo can fall
+back to interruption if steering is unsupported. The preflight checks reduce
+this race; they do not provide an atomic guarantee. Pending uncertain deliveries
+remain held for inspection/reconciliation instead of prompting repeatedly.
 
 ### Confirmed mode changes and conversation review
 
@@ -661,6 +665,6 @@ GitHub PR links in the recent conversation feed the existing CI and review
 lookup without probing remote workspaces locally. This is bounded polling,
 not event-driven completion tracking. Large backlogs still require several scans.
 
-These changes do not enable the integration, change an installed mode, or remove
-the automatic-delivery limitation above. Installing them and selecting a mode are
+These changes do not enable the integration, change an installed mode, or bypass
+the per-chat delivery checks above. Installing them and selecting a mode are
 separate from verifying a real message started and completed an agent turn.
