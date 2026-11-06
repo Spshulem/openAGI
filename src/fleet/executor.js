@@ -271,7 +271,7 @@ function antigravityBusy(thread) {
 
 function checkPreconditions(thread, route, message, config, fallback = false) {
   if (!thread?.key) return "no thread";
-  if (thread.excluded === "paseo-migrated" || (config?.paseo?.enabled && config.paseo.only && thread.kind !== "paseo")) return "chat is supervised through Paseo only";
+  if (["paseo-migrated", "paseo-discovery-unavailable"].includes(thread.excluded) || (config?.paseo?.enabled && config.paseo.only && thread.kind !== "paseo")) return "chat is supervised through Paseo only";
   if (thread.kind === "paseo" && route !== "paseo-send") return "Paseo chats must use their native host and agent";
   if (!ROUTES.includes(route)) return "no delivery route";
   if (!String(message ?? "").trim()) return "empty message";

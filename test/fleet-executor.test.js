@@ -1167,3 +1167,14 @@ test("native Paseo results finalize proposed actions in the fleet journal", asyn
     assert.ok(saved.finishedAt);
   }
 });
+
+test("existing legacy proposals cannot bypass the Paseo discovery hold", async t => {
+  const { cwd, executor, calls, store } = setup(t);
+  const thread = codexThread(cwd, { excluded: "paseo-discovery-unavailable" });
+  const action = store.recordAction({ threadKey: thread.key, route: "codex-exec", status: "proposed" });
+  const result = await executor.deliver({ thread, route: "codex-exec", message: "continue", actionId: action.id });
+  assert.equal(result.status, "blocked");
+  assert.match(result.detail, /Paseo only/);
+  assert.deepEqual(calls, []);
+  assert.equal(store.actions().find(a => a.id === action.id).status, "blocked");
+});
