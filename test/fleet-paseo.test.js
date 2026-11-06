@@ -130,3 +130,14 @@ test("embedded daemon can load disabled Paseo without its desktop SDK", () => {
   ], { encoding: "utf8", timeout: 10000 });
   assert.equal(result.status, 0, result.stderr || result.error?.message);
 });
+
+test("supervisor nudges never become owner instructions in judge context", () => {
+  const entries = [
+    { item: { type: "user_message", text: "Review only" } },
+    { item: { type: "user_message", text: "[OpenAGI supervisor] Continue" } },
+    { item: { type: "assistant_message", text: "Reviewed" } }
+  ];
+  const row = paseoThread(agent("a"), "host", entries);
+  assert.equal(row.lastUserText, "Review only");
+  assert.deepEqual(row.meta.conversation.map(m => m.text), ["Review only", "Reviewed"]);
+});

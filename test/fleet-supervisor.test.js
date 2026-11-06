@@ -4772,3 +4772,18 @@ test("Paseo self aliases are excluded before scan enrichment and delivery", asyn
   assert.deepEqual(snapshot.threads, []);
   assert.deepEqual(delivered, []);
 });
+
+test("failed Paseo discovery holds legacy sessions until migration discovery recovers", async (t) => {
+  let failed = true;
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", env: { OPENAGI_FLEET_PASEO: "1" },
+    deps: { listPaseoThreads: async () => { if (failed) throw Error("disconnected"); return []; } }
+  });
+  const held = await supervisor.tick({ reason: "test" });
+  assert.ok(held.sourceErrors.paseo);
+  assert.deepEqual(held.threads, []);
+  assert.deepEqual(delivered, []);
+  failed = false;
+  const recovered = await supervisor.tick({ reason: "test" });
+  assert.equal(recovered.threads.length, 1);
+});

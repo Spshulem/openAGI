@@ -1812,6 +1812,10 @@ export class FleetSupervisor {
     // Conductor-hosted Codex threads learn which Conductor session shows them.
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
     if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
+    // With migration discovery unavailable, legacy identities are not safe to resume.
+    if (config.paseo?.enabled && sourceErrors.paseo) {
+      for (const thread of threads) if (thread.kind !== "paseo") thread.excluded = "paseo-discovery-unavailable";
+    }
     const ownPaths = this.store.fixes().map((fix) => fix.worktree).filter(Boolean);
     for (const thread of threads) {
       if (isSelfThread(thread, config) || thread.branch?.startsWith("selffix/")
@@ -1955,6 +1959,7 @@ export class FleetSupervisor {
     // A thread source that failed this tick is unknown, not empty: its
     // actions and questions wait for a tick that can see it.
     const unknownKinds = new Set(THREAD_KINDS.filter((kind) => sourceErrors[kind]));
+    if (config.paseo?.enabled && sourceErrors.paseo) for (const kind of THREAD_KINDS) unknownKinds.add(kind);
     // A source that returned a full page may have evicted older live threads,
     // so a missing thread of that kind is not proof it is gone.
     const cappedKinds = new Set(THREAD_KINDS.filter((kind) => threads.filter((thread) => thread.kind === kind && (kind !== "antigravity" || !thread.excluded)).length >= config.limits.maxThreads));

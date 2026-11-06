@@ -319,7 +319,7 @@ function checkPreconditions(thread, route, message, config, fallback = false) {
 // background route after a presence block needs it for Conductor chats, and
 // an Antigravity send for its conversation. findLanguageServer: the running
 // Antigravity server ({ address } and its csrf token) agentapi talks to.
-export function createExecutor({ config, run, store = null, logDir, spawnBackground, readLivePeers = null, refreshThread = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK, detachedReleaseMs = DETACHED_RELEASE_MS, findLanguageServer = findAntigravityServer } = {}) {
+export function createExecutor({ config, run, paseoDelivery = deliverPaseo, store = null, logDir, spawnBackground, readLivePeers = null, refreshThread = null, ui = null, knownThreads = () => [], uiLock = UI_LOCK, detachedReleaseMs = DETACHED_RELEASE_MS, findLanguageServer = findAntigravityServer } = {}) {
   const runner = run ?? runCommand;
   // An injected run (tests, dry harnesses) also serves the background routes.
   const background = spawnBackground ?? (run ? run : spawnWithTail);
@@ -743,7 +743,11 @@ export function createExecutor({ config, run, store = null, logDir, spawnBackgro
     if (step.paseo) {
       if (Number.isFinite(deadlineAt) && deadlineAt - Date.now() < 25000) return blocked("Not enough time to confirm Paseo delivery");
       active.add(thread.key);
-      try { return await deliverPaseo({ config, thread, text, store, actionId, base }); }
+      try {
+        const result = await paseoDelivery({ config, thread, text, store, actionId, base });
+        const id = journal(actionId, { ...base, status: result.status, detail: result.detail, finishedAt: new Date().toISOString() });
+        return { ...result, actionId: id };
+      }
       finally { active.delete(thread.key); }
     }
     if (step.ui) {

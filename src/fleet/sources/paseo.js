@@ -59,7 +59,7 @@ export function paseoThread(agent, serverId, entries = [], historyKnown = true) 
     meta: { serverId, workspaceId: agent.workspaceId, paseoCwd: agent.cwd, provider: agent.provider,
       aliases, updatedAt: agent.updatedAt, blockedOnOwner: Boolean(agent.pendingPermissions?.length),
       lastSupervisorAt: supervisor?.timestamp ?? null, historyKnown,
-      conversation: messages.map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp })) }
+      conversation: messages.filter(e => e.item.type !== "user_message" || !e.item.text?.startsWith(SUPERVISOR_PREFIX)).map(e => ({ role: e.item.type === "user_message" ? "user" : "assistant", text: redactSecrets(e.item.text ?? "").slice(-8000), at: e.timestamp })) }
   };
 }
 

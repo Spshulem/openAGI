@@ -1152,3 +1152,18 @@ test("Paseo aliases cannot bypass the send-time self guard", async (t) => {
     assert.match(result.detail, /own session/);
   }
 });
+
+test("native Paseo results finalize proposed actions in the fleet journal", async t => {
+  const { cwd, config, store } = setup(t);
+  const thread = { ...codexThread(cwd), kind: "paseo", key: "paseo:host.agent", id: "agent" };
+  for (const status of ["sent", "blocked"]) {
+    const action = store.recordAction({ threadKey: thread.key, route: "paseo-send", status: "proposed" });
+    const executor = createExecutor({ config, store, paseoDelivery: async () => ({ status, detail: "native result", route: "paseo-send" }) });
+    const result = await executor.deliver({ thread, message: "continue", route: "paseo-send", actionId: action.id });
+    assert.equal(result.status, status);
+    const saved = store.actions().find(a => a.id === action.id);
+    assert.equal(saved.status, status);
+    assert.equal(saved.detail, "native result");
+    assert.ok(saved.finishedAt);
+  }
+});
