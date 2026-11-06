@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createPaseoSource, paseoThread, hostApi, withPaseo } from "../src/fleet/sources/paseo.js";
 import { deliverPaseo } from "../src/fleet/paseo-delivery.js";
 import { mergeThreads } from "../src/fleet/classify.js";
@@ -105,4 +106,27 @@ test("one slow history preserves inventory and other histories", async () => {
  m.client.agents.ref=id=>id==='slow'?{timeline:{refetch:()=>new Promise(()=>{})}}:original(id);
  const rows=await createPaseoSource(m)({paseo:{enabled:true,historyTimeoutMs:5}});
  assert.equal(rows.length,2);assert.equal(rows[0].excluded,'history-unavailable');assert.equal(rows[1].excluded,null);
+});
+
+
+test("embedded daemon can load disabled Paseo without its desktop SDK", () => {
+  const loader = `export async function resolve(specifier, context, next) {
+    if (specifier === "@getpaseo/client") throw new Error("Paseo SDK omitted from embedded bundle");
+    return next(specifier, context);
+  }`;
+  const source = new URL("../src/fleet/sources/paseo.js", import.meta.url).href;
+  const delivery = new URL("../src/fleet/paseo-delivery.js", import.meta.url).href;
+  const script = `
+    import assert from "node:assert/strict";
+    const { createPaseoSource } = await import(${JSON.stringify(source)});
+    await import(${JSON.stringify(delivery)});
+    const scan = createPaseoSource();
+    assert.deepEqual(await scan({ paseo: { enabled: false } }), []);
+    await assert.rejects(scan({ paseo: { enabled: true } }), /SDK omitted/);
+  `;
+  const result = spawnSync(process.execPath, [
+    "--experimental-loader", `data:text/javascript,${encodeURIComponent(loader)}`,
+    "--input-type=module", "--eval", script
+  ], { encoding: "utf8", timeout: 10000 });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
 });

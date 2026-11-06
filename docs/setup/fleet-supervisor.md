@@ -668,3 +668,7 @@ not event-driven completion tracking. Large backlogs still require several scans
 These changes do not enable the integration, change an installed mode, or bypass
 the per-chat delivery checks above. Installing them and selecting a mode are
 separate from verifying a real message started and completed an agent turn.
+
+The Paseo SDK loads only when a Paseo operation runs. Embedded mobile bundles
+can omit this desktop dependency while Paseo is disabled without preventing
+the daemon from starting. Enabling Paseo requires the SDK to be installed.

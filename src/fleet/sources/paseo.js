@@ -1,12 +1,14 @@
 // Native Paseo reads. Never creates/imports/reloads an agent or changes its mode.
-import { createPaseoClient } from "@getpaseo/client";
 import { SUPERVISOR_PREFIX, clampText, redactSecrets, parsePrRef } from "../contracts.js";
 
-export async function withPaseo(config, operation, factory = createPaseoClient) {
+export async function withPaseo(config, operation, factory) {
   const settings = config.paseo ?? {};
   const url = new URL(settings.url ?? "ws://127.0.0.1:6767/ws");
   if (!["ws:", "wss:"].includes(url.protocol) || url.username || url.password) throw new Error("Invalid Paseo endpoint");
   if (url.protocol === "ws:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) throw new Error("Remote Paseo endpoints require wss");
+  // The embedded mobile daemon omits desktop integrations. Load the SDK only
+  // when Paseo is actually used, so disabled integrations cannot break boot.
+  factory ??= (await import("@getpaseo/client")).createPaseoClient;
   const client = factory({ url: url.href, password: settings.password, reconnect: { enabled: false }, connectTimeoutMs: 5000 });
   const abort = new AbortController();
   let timer;
