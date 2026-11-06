@@ -11,7 +11,7 @@ import { readThreadConversation, unavailableConversation } from "./conversation.
 import os from "node:os";
 import { SelfFixHub } from "./remote.js";
 import { resolveDataDir } from "../data-dir.js";
-import { CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, MODES, SUPERVISOR_PREFIX, THREAD_KINDS, UI_APPS, clampTail, clampText, linkUiHosts, openChatFor, parsePrRef, redactSecrets, resolveFleetConfig, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { WATCH_GROUPS, classifyThread, liveWatch, mergeThreads, prReadiness, threadHealth, watchOf } from "./classify.js";
 import { createExecutor, isPresenceBlock } from "./executor.js";
 import { JUDGED_PLAYBOOKS, agentReply, createNudgeJudge } from "./judge.js";
@@ -1813,9 +1813,8 @@ export class FleetSupervisor {
     const threads = linkUiHosts(mergeThreads({ codex: codexThreads ?? [], claude: claudeThreads ?? [], conductor: conductorThreads ?? [], antigravity: antigravityThreads ?? [], paseo: paseoThreads ?? [] }));
     if (config.paseo?.enabled && config.paseo.only) for (const t of threads) if (t.kind !== "paseo") t.excluded = "paseo-migrated";
     const ownPaths = this.store.fixes().map((fix) => fix.worktree).filter(Boolean);
-    const selfIds = new Set(config.selfSessionIds);
     for (const thread of threads) {
-      if (selfIds.has(thread.id) || selfIds.has(thread.claudeSessionId) || thread.branch?.startsWith("selffix/")
+      if (isSelfThread(thread, config) || thread.branch?.startsWith("selffix/")
           || ownPaths.some((cwd) => thread.cwd === cwd || thread.cwd?.startsWith(cwd + path.sep))
           || thread.cwd?.startsWith(path.join(this.config.paths.home ?? os.homedir(), "Dev/openagi-fixes") + path.sep)) thread.excluded = "self";
     }

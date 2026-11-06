@@ -1141,3 +1141,14 @@ test("agentapi accepts exit zero without depending on one JSON success shape", a
     assert.equal((await setup.executor.deliver({ thread: antigravityThread(), message: "resume", route: "antigravity-send" })).status, "sent");
   }
 });
+
+test("Paseo aliases cannot bypass the send-time self guard", async (t) => {
+  const { cwd, config, store } = setup(t);
+  const executor = createExecutor({ config: { ...config, selfSessionIds: ["native-self"] }, store });
+  for (const provider of ["codex", "claude", "conductor", "antigravity"]) {
+    const thread = { ...codexThread(cwd), kind: "paseo", id: "agent", key: "paseo:host.agent", meta: { aliases: [`${provider}:native-self`] } };
+    const result = await executor.deliver({ thread, message: "continue", route: "paseo-send" });
+    assert.equal(result.status, "blocked");
+    assert.match(result.detail, /own session/);
+  }
+});

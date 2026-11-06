@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir } from "../file-utils.js";
-import { CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
+import { isSelfThread, CONDUCTOR_CODEX_ORIGINATOR, DEFAULTS, DEFAULT_RELAY_MODEL, ROUTES, SUPERVISOR_PREFIX, clampText, codexAppOwned, codexExecBarred, isPidAlive, parseEnvText, redactSecrets, runCommand, shortHash, uiTargetFor } from "./contracts.js";
 import { runStatusOf, findLanguageServer as findAntigravityServer } from "./sources/antigravity.js";
 import { readWriterLocks } from "./sources/codex.js";
 import { classifyErrorText } from "./errors.js";
@@ -216,8 +216,7 @@ export function spawnWithTail(cmd, args = [], { cwd, env, timeoutMs = BACKGROUND
 }
 
 function isSelf(thread, config) {
-  const self = config?.selfSessionIds ?? [];
-  return [thread.id, thread.claudeSessionId].some((id) => id && self.includes(id));
+  return isSelfThread(thread, config);
 }
 
 // An app send blocked only because the owner is at the Mac. A send that left

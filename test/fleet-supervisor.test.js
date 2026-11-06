@@ -4758,3 +4758,17 @@ test("Paseo-only cadence is bounded and retains integer mobile settings", t => {
   supervisor.config.paseo.pollMs = 1;
   assert.equal(supervisor.scanIntervalMs, 15000);
 });
+
+test("Paseo self aliases are excluded before scan enrichment and delivery", async (t) => {
+  const thread = makeThread({ kind: "paseo", key: "paseo:host.agent", id: "agent", meta: { aliases: ["codex:native-self"], historyKnown: true } });
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto",
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  supervisor.config.selfSessionIds = ["native-self"];
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(thread.excluded, "self");
+  assert.deepEqual(snapshot.threads, []);
+  assert.deepEqual(delivered, []);
+});

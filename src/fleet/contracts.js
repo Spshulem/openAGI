@@ -19,6 +19,20 @@ export function isThreadKey(key) {
   return typeof key === "string" && THREAD_KEY_PATTERN.test(key);
 }
 
+// Preserve self-exclusion when a native session is represented by a Paseo agent.
+export function isSelfThread(thread, config) {
+  const self = new Set(config?.selfSessionIds ?? []);
+  const identities = [thread.id, thread.claudeSessionId, thread.key];
+  if (thread.kind === "paseo") {
+    for (const alias of thread.meta?.aliases ?? []) {
+      if (typeof alias !== "string") continue;
+      const match = /^(?:codex|claude|conductor|antigravity):(.+)$/.exec(alias);
+      if (match) identities.push(alias, match[1]);
+    }
+  }
+  return identities.some(id => typeof id === "string" && id.length > 0 && self.has(id));
+}
+
 // What the owner calls each kind's app in questions and labels.
 export const KIND_NAMES = Object.freeze({ codex: "Codex", claude: "Claude", conductor: "Conductor", antigravity: "Antigravity", paseo: "Paseo" });
 

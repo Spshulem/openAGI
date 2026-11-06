@@ -2,7 +2,7 @@
 // No I/O. Agent text is only matched against patterns here; nothing from it
 // is copied into anything another agent will read.
 
-import { CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
+import { isSelfThread, CARD_EXCLUSIONS, DEFAULTS, ERROR_KINDS, SUPERVISOR_PREFIX, clampText, liveCardItems, msSince, shortHash } from "./contracts.js";
 
 const DELIBERATE_STOP_MS = 60_000;
 
@@ -434,8 +434,7 @@ function cardAsk(thread, excluded, config, now) {
   const card = thread.meta?.pendingCard;
   if (!liveCardItems(card, now).length) return null;
   if (excluded && !CARD_EXCLUSIONS.has(excluded)) return null;
-  const self = config?.selfSessionIds ?? [];
-  if (thread.archived || self.includes(thread.id) || (thread.claudeSessionId && self.includes(thread.claudeSessionId))) return null;
+  if (thread.archived || isSelfThread(thread, config)) return null;
   return { topic: "decision", card };
 }
 
@@ -463,8 +462,7 @@ function structuredAskAt(thread) {
 function exclusionReason(thread, { pr, localGit, config }) {
   if (thread.excluded) return thread.excluded;
   if (thread.archived) return "archived";
-  const self = config?.selfSessionIds ?? [];
-  if (self.includes(thread.id) || (thread.claudeSessionId && self.includes(thread.claudeSessionId))) return "self";
+  if (isSelfThread(thread, config)) return "self";
   if (thread.kind === "paseo") return null; // Existing Paseo chats include non-repository work.
   const hasRepo = thread.repo || localGit?.remote || pr?.repo;
   if (!hasRepo && !thread.branch && !thread.prRefs?.length) return "no-repo";
