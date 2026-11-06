@@ -3785,11 +3785,13 @@ test("an owner answer during the review holds a judged nudge already decided", a
   assert.match(judgeRow(supervisor).reason, /held: owner answered$/);
 });
 
-test("a switch to Auto mid-scan sends no nudge the judge never read", async (t) => {
+test("enabling the judge and Auto mid-scan sends no unread nudge", async (t) => {
   const judge = fakeJudge({ action: "send", reason: "r", message: "judged words" });
+  judge.enabled = false;
   const { supervisor, delivered } = fixture(t, { mode: "propose", deps: { judge } });
   const review = supervisor.reviewOpenQuestions.bind(supervisor);
   supervisor.reviewOpenQuestions = async (args) => {
+    judge.enabled = true;
     supervisor.setMode("auto");
     return review(args);
   };
@@ -4708,4 +4710,80 @@ test("Push now shares the automatic-send lock through recording its receipt", as
   await started;
   try { assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /already being sent/); }
   finally { release(); await tick; }
+});
+
+test("Paseo-only scan skips legacy sources, processes, LB and UI probes", async (t) => {
+  let legacyCalls = 0;
+  const forbidden = () => { legacyCalls++; throw new Error("legacy probe must not run"); };
+  const { supervisor } = fixture(t, {
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: {
+      readLivePeers: forbidden, listCodexThreads: forbidden, listClaudeThreads: forbidden,
+      listConductorThreads: forbidden, listAntigravityThreads: forbidden,
+      readCodexLbErrors: forbidden, findLocalHeavyVerification: forbidden,
+      probeBuildBot3: forbidden, checkLb: forbidden, findManagerSession: forbidden,
+      listPaseoThreads: async () => [makeThread({ kind: "paseo", key: "paseo:host.chat", id: "chat", cwd: null, repo: null, branch: null, prRefs: [], meta: { serverId: "host", historyKnown: true } })]
+    }
+  });
+  supervisor._uiDriver = { readiness: forbidden };
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(legacyCalls, 0);
+  assert.equal(snapshot.paseo.discovered, 1);
+  assert.equal(snapshot.paseo.deliveryReady, null);
+  assert.equal(snapshot.threads[0].openChat.app, "paseo");
+});
+
+test("new owner scope invalidates a cached nudge even without an assistant reply", () => {
+  const thread = makeThread(), decision = { playbook: "idle-report" };
+  const before = judgeCacheKey(thread, decision);
+  assert.notEqual(judgeCacheKey({ ...thread, lastUserText: "Stop here; do not merge." }, decision), before);
+  assert.notEqual(judgeCacheKey({ ...thread, meta: { conversation: [{ role: "user", text: "Finish review only" }] } }, decision), before);
+});
+
+test("Propose reads conversation and saves the judged draft without sending", async t => {
+  let input;
+  const judge = { enabled: true, judge: async args => { input = args; return { action: "send", reason: "Finish authorized review", message: "Address the remaining review comment and verify the existing PR." }; } };
+  const { supervisor, delivered } = fixture(t, { mode: "propose", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.ok(input.conversation.messages.some(m => m.role === "user"));
+  assert.equal(delivered.length, 0);
+  assert.ok(supervisor.getState().actions.some(a => a.status === "proposed" && a.message === "Address the remaining review comment and verify the existing PR."));
+});
+
+test("Paseo-only cadence is bounded and retains integer mobile settings", t => {
+  const { supervisor } = fixture(t, { env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" } });
+  assert.equal(supervisor.scanIntervalMs, 30000);
+  assert.equal(supervisor.getState().settings.tickSeconds, 30);
+  assert.equal(supervisor.getState().settings.tickMinutes, 1);
+  supervisor.config.paseo.pollMs = 1;
+  assert.equal(supervisor.scanIntervalMs, 15000);
+});
+
+test("Paseo self aliases are excluded before scan enrichment and delivery", async (t) => {
+  const thread = makeThread({ kind: "paseo", key: "paseo:host.agent", id: "agent", meta: { aliases: ["codex:native-self"], historyKnown: true } });
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto",
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  supervisor.config.selfSessionIds = ["native-self"];
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(thread.excluded, "self");
+  assert.deepEqual(snapshot.threads, []);
+  assert.deepEqual(delivered, []);
+});
+
+test("failed Paseo discovery holds legacy sessions until migration discovery recovers", async (t) => {
+  let failed = true;
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", env: { OPENAGI_FLEET_PASEO: "1" },
+    deps: { listPaseoThreads: async () => { if (failed) throw Error("disconnected"); return []; } }
+  });
+  const held = await supervisor.tick({ reason: "test" });
+  assert.ok(held.sourceErrors.paseo);
+  assert.deepEqual(held.threads, []);
+  assert.deepEqual(delivered, []);
+  failed = false;
+  const recovered = await supervisor.tick({ reason: "test" });
+  assert.equal(recovered.threads.length, 1);
 });

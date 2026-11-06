@@ -388,7 +388,7 @@ public actor DaemonClient {
     // closed elsewhere -- `.notFound` / `.conflict`, as everywhere else.
     public func fleetThreadDetail(key: String) async throws -> FleetThreadDetail {
         // One identity segment, never an arbitrary caller-supplied path.
-        guard key.range(of: #"^(codex|claude|conductor|antigravity):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
+        guard key.range(of: #"^(codex|claude|conductor|antigravity|paseo):[A-Za-z0-9_.-]{1,120}$"#, options: .regularExpression) != nil else {
             throw DaemonError.malformedResponse
         }
         let request = try authorizedRequest(path: "/fleet/api/threads/\(key)", method: "GET")
