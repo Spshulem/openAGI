@@ -219,7 +219,7 @@ function pausedDeliveryDecision(delivery, blockedSince, now) {
 // An automatic nudge the judge reads first. A resume after a limit reset or
 // an error retry stays mechanical.
 function judgeable(decision, thread) {
-  if (decision?.action !== "nudge" || !decision.message || !decision.route || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
+  if (decision?.action !== "nudge" || !decision.message || (!decision.route && !decision.requiresJudge) || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
   if (decision.playbook !== "resume") return true;
   return decision.state !== "infra-blocked" && !thread?.error && thread?.agentStatus !== "error";
 }
@@ -2091,6 +2091,8 @@ export class FleetSupervisor {
     const { decision, thread } = item;
     if (verdict.action === "wait") return judgeWait(decision, `judge: ${verdict.reason}`, false);
     if (verdict.action === "send") {
+      // Establish unfinished work before surfacing an unavailable route.
+      if (decision.deferredRouteDecision) return { ...decision.deferredRouteDecision, judged: true, reason: `${decision.deferredRouteDecision.reason}; judge: ${verdict.reason}` };
       const messageHash = shortHash(verdict.message);
       // The same words as the last send, with no reply since, is noise.
       const repeat = repeatsLastSend(thread, item.ledger, messageHash);
@@ -2354,7 +2356,9 @@ export class FleetSupervisor {
     const since = !SETTLED_PR_STATES.has(pr?.state);
     const about = PR_PLAYBOOKS.has(decision.playbook)
       || (!NOT_ABOUT_PR_PLAYBOOKS.has(decision.playbook) && new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? "")));
-    if (!since && !about) return null;
+    const reviewedPostMerge = decision.playbook === "idle-report" && decision.requiresJudge === true
+      && decision.judged === true && pr?.state === "MERGED" && fresh.state === "MERGED";
+    if (!since && (!about || reviewedPostMerge)) return null;
     return `#${parsed.number} ${fresh.state.toLowerCase()}${since ? " since the scan" : ""}`;
   }
 

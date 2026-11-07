@@ -4797,7 +4797,7 @@ for (const merged of [false, true]) {
       lastUserAt: ago(9 * 60 * MIN), lastUserText: "Finish the authorized staging work.",
       lastAgentText: "Your approval covers this. The PR merged. Staging remains unfinished; the worker was building."
     });
-    const judge = fakeJudge({ action: "send", reason: "Check the existing worker before continuing", message: "Inspect the existing worker's result and continue the already-authorized staging work; do not start another worker." });
+    const judge = fakeJudge({ action: "send", reason: "Check the existing worker before continuing", message: "Inspect the existing worker's result for #7 and continue the already-authorized staging work; do not start another worker." });
     const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(merged ? [["acme/app#7", makePr({ state: "MERGED" })]] : []), deps: { judge } });
     await supervisor.tick({ reason: "test" });
     assert.equal(judge.calls.length, 1);
@@ -4851,3 +4851,27 @@ for (const guard of ["muted", "running", "observe"]) {
     assert.equal(delivered.length, 0);
   });
 }
+
+for (const action of ["wait", "send"]) {
+  test(`contextual route escalation waits for judge verdict: ${action}`, async t => {
+    const thread = makeThread({ kind: "conductor", key: "conductor:idle", prRefs: [], branch: null,
+      lastActivityAt: ago(8 * 60 * MIN), lastAgentAt: ago(8 * 60 * MIN), lastUserAt: ago(9 * 60 * MIN),
+      lastAgentText: "All requested work is complete. Your report is ready." });
+    const judge = fakeJudge({ action, reason: action === "wait" ? "Work complete" : "Authorized work remains", message: "Finish the outstanding work." });
+    const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(), deps: { judge } });
+    await supervisor.tick({ reason: "test" });
+    assert.equal(judge.calls.length, 1);
+    assert.equal(delivered.length, 0);
+    assert.equal(supervisor.getState().questions.filter(q => q.status === "open").length, action === "wait" ? 0 : 1);
+  });
+}
+
+test("contextual post-merge exception still rejects a PR settled since review", async t => {
+  const thread = makeThread();
+  const merged = makePr({ state: "MERGED" });
+  const { supervisor } = fixture(t, { deps: { fetchPrStateLite: async () => new Map([[merged.ref, merged]]) } });
+  const decision = { playbook: "idle-report", requiresJudge: true, judged: true, message: "Finish follow-up for #7." };
+  assert.equal(await supervisor.prSettledBeforeSend(thread, makePr(), decision), "#7 merged since the scan");
+  assert.equal(await supervisor.prSettledBeforeSend(thread, merged, { ...decision, judged: false }), "#7 merged");
+  assert.equal(await supervisor.prSettledBeforeSend(thread, merged, decision), null);
+});

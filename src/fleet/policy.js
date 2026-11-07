@@ -679,7 +679,13 @@ function resolveNudge(ctx, intent, base) {
     // computer-use-first too for a thread no CLI may reach (the Codex app's).
     const waitUi = uiWaitReason(thread, ctx.delivery) ?? (codexExecBarred(thread) ? uiBlockedReason(thread, ctx.delivery) : null);
     if (waitUi) return { ...decision, action: "wait", reason: `${waitUi}; ${decision.reason}`, uiBlocked };
-    return { ...unreachableDecision(ctx, decision), uiBlocked };
+    const unavailable = { ...unreachableDecision(ctx, decision), uiBlocked };
+    if (intent.requiresJudge) return {
+      ...decision, action: "nudge", route: null,
+      message: "Review whether this idle conversation has unfinished authorized work before asking the owner to restore access.",
+      deferredRouteDecision: unavailable
+    };
+    return unavailable;
   }
   const message = `${reply.prefix}${renderTemplate(playbook.body, vars)}`;
   const messageHash = shortHash(message);
