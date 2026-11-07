@@ -471,7 +471,13 @@ export class TaskStore {
         ? Number.isFinite(Date.parse(lease.expiresAt)) && now >= Date.parse(lease.expiresAt)
         : false;
 
-      if (attempts >= this.maxAttempts && (task.status === "pending" || leaseExpired)) {
+      // A deferred claim keeps its attempt count but drops expiresAt. If
+      // resumed manually, it has no timed reservation; recover it after the
+      // same grace period as unleased work rather than wedging it forever.
+      const staleUnreserved = task.status === "in_progress"
+        && !Number.isFinite(Date.parse(lease?.expiresAt ?? ""))
+        && this._isStale(task, now);
+      if (attempts >= this.maxAttempts && (task.status === "pending" || leaseExpired || staleUnreserved)) {
         this._stall(task, attempts, now);
         report.stalled.push(task.id);
         continue;
@@ -482,11 +488,10 @@ export class TaskStore {
         report.requeued.push(task.id);
         continue;
       }
-      // No lease at all + long dead: pre-lease wreckage or an observer
-      // guess nobody acted on. Reclaim it — with attempts reset, since the
-      // queue never actually got a turn at it.
-      if (!lease && this._isStale(task, now)) {
-        this._requeue(task, "stale-in-progress", now, { resetAttempts: true });
+      // No valid reservation + long dead: recover abandoned work. Preserve
+      // recorded attempts; only pre-lease tasks get a fresh attempt budget.
+      if (staleUnreserved) {
+        this._requeue(task, "stale-in-progress", now, { resetAttempts: !lease });
         report.requeued.push(task.id);
       }
     }

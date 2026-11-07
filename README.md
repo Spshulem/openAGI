@@ -613,3 +613,12 @@ Tasks are one-off work records; recurring jobs live separately under Cron. The a
 Task relevance checks include the current clock and each task's creation/due/scheduled dates, status and bounded description. Age alone does not prove completion. Sweep receipts distinguish full, partial, failed and unavailable model review from deterministic cleanup. Completion scans use existing activity evidence, check both pending and in-progress user tasks, and rotate bounded 30-task batches across the user queue so agent work and an unchanged first page cannot starve older tasks. Without evidence, the scan skips; it does not claim the work is finished.
 
 Computer approval grants permission for the displayed goal on one specific node. Readiness is refreshed at approval time before resolving that same node. A genuinely unavailable or permission-blocked node still fails closed; approval never switches computers or grants system permissions.
+### Agent task recovery
+
+Agent claims expire rather than reserving work forever. Deferred claims retain
+their attempt count; manually resuming one does not create a new timed lease.
+After the stale-work grace period, the queue recovers agent work with a missing
+or invalid lease expiry, preserving the retry budget and parking exhausted
+work as blocked. Fresh work, valid live leases, and tasks awaiting draft review
+remain protected. User-owned tasks retain their status. Recovery happens during
+normal queue sweeps, not when opening the store.
