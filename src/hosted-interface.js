@@ -8582,7 +8582,7 @@ async function renderTasks() {
     \`;
   };
 
-  const inBucket = (t) => filterB === "done" ? ["completed", "cancelled"].includes(t.status) : !["completed", "cancelled"].includes(t.status) && (filterB === "all" || t.bucket === filterB);
+  const inBucket = (t) => t.id === targetTaskId || (filterB === "done" ? ["completed", "cancelled"].includes(t.status) : !["completed", "cancelled"].includes(t.status) && (filterB === "all" || t.bucket === filterB));
   const userTasks = tasks.filter((t) => t.queue === "user" && inBucket(t));
   const agentTasks = tasks.filter((t) => t.queue === "agent" && inBucket(t));
   const userTotal = stats.user?.active ?? 0;

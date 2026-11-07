@@ -127,3 +127,15 @@ for (const output of ["not json", "[]"]) {
     assert.equal(store.list({ queue, status: "terminal", limit: 100 }).length, 36);
   }
 });
+
+test("task history remains visible through a direct link without filling the active view", () => {
+  const source = fs.readFileSync(new URL("../src/hosted-interface.js", import.meta.url), "utf8");
+  const expression = source.match(/const inBucket = (.+);/)[1];
+  const filter = new Function("filterB", "targetTaskId", `return (${expression});`);
+  const done = { id: "linked", status: "completed", bucket: "done" };
+  const retired = { id: "retired", status: "cancelled", bucket: "today" };
+  assert.equal(filter("all", "linked")(done), true);
+  assert.equal(filter("all", "linked")(retired), false);
+  assert.equal(filter("done", null)(retired), true);
+  assert.equal(filter("today", null)({ id: "open", status: "pending", bucket: "today" }), true);
+});
