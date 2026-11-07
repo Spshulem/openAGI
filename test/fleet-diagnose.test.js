@@ -220,9 +220,9 @@ test("supervisor daily diagnosis is once across reloads, hourly checks persist, 
   const reload = new FleetSupervisor({ dataDir, config, deps });
   await reload.diagnoseTick(); assert.equal(calls, 1);
   const before = fs.readFileSync(supervisor.store.statePath, "utf8");
-  await supervisor.diagnose({ window: "7d" }); // fixture evidence is older than the default 24-hour window
+  await supervisor.diagnose({ window: "7d", area: "review" }); // existing review finding is already covered
   assert.equal(fs.readFileSync(supervisor.store.statePath, "utf8"), before);
-  assert.equal(calls, 2);
+  assert.equal(calls, 1, "on-demand diagnosis does not re-propose an already open review finding");
 });
 
 test("diagnose models share the locked-down judge, exact models, schemas and fail-closed probe", async (t) => {
