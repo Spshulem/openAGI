@@ -17,7 +17,11 @@ struct SettingsView: View {
         NavigationStack(path: $path) {
             Form {
                 Section("App") {
-                    NavigationLink("Appearance", systemImage: "paintpalette") { AppearanceView() }
+                    NavigationLink {
+                        AppearanceView()
+                    } label: {
+                        Label("Appearance", systemImage: "paintpalette")
+                    }
                 }
                 Section {
                     LabeledContent("Runs on", value: model.isOnPhone ? "This iPhone" : "Server")
