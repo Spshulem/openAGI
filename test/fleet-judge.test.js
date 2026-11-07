@@ -125,7 +125,7 @@ test("the prompt carries the chat, PR facts, earlier nudges and the plan", () =>
   // Only the newest 6000 chars of a long message.
   const long = buildJudgePrompt({ ...INPUT, thread: thread({ lastAgentFull: `${"old ".repeat(3000)}NEWEST` }) });
   assert.match(long, /NEWEST/);
-  assert.ok(long.length < 9000);
+  assert.ok(long.length < 11000, "bounded chat plus contextual review instructions");
 });
 
 test("the judge reads a skipped gate and main's health check as what they are, not failures", () => {

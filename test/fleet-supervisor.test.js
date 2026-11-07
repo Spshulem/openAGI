@@ -4787,3 +4787,67 @@ test("failed Paseo discovery holds legacy sessions until migration discovery rec
   const recovered = await supervisor.tick({ reason: "test" });
   assert.equal(recovered.threads.length, 1);
 });
+
+// Idle eligibility must not depend on a promise regex or a linked PR.
+for (const merged of [false, true]) {
+  test(`contextual idle review reads ${merged ? "merged" : "unlinked"} work older than six hours`, async t => {
+    const thread = makeThread({
+      prRefs: merged ? ["acme/app#7"] : [], branch: null,
+      lastActivityAt: ago(8 * 60 * MIN), lastAgentAt: ago(8 * 60 * MIN),
+      lastUserAt: ago(9 * 60 * MIN), lastUserText: "Finish the authorized staging work.",
+      lastAgentText: "Your approval covers this. The PR merged. Staging remains unfinished; the worker was building."
+    });
+    const judge = fakeJudge({ action: "send", reason: "Check the existing worker before continuing", message: "Inspect the existing worker's result and continue the already-authorized staging work; do not start another worker." });
+    const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(merged ? [["acme/app#7", makePr({ state: "MERGED" })]] : []), deps: { judge } });
+    await supervisor.tick({ reason: "test" });
+    assert.equal(judge.calls.length, 1);
+    assert.equal(judge.calls[0].decision.requiresJudge, true);
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0].message, /existing worker/);
+  });
+}
+
+for (const verdict of ["wait", "ask-owner", "failure", "disabled"]) {
+  test(`contextual idle review ${verdict} never sends a blind continuation`, async t => {
+    const thread = makeThread({ prRefs: [], branch: null, lastAgentText: "Work complete. Your report is ready." });
+    const judge = fakeJudge(verdict === "ask-owner"
+      ? { action: "ask-owner", reason: "A decision is missing", question: { title: "Choose the target", body: "Which target is authorized?", options: ["staging", "stop"] } }
+      : { action: "wait", reason: "Requested work is complete" }, { enabled: verdict !== "disabled" });
+    if (verdict === "failure") judge.judge = async () => { throw new Error("review unavailable"); };
+    const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(), deps: { judge } });
+    await supervisor.tick({ reason: "test" });
+    assert.equal(delivered.length, 0);
+    if (verdict === "wait") {
+      assert.equal(judge.calls.length, 1);
+      await supervisor.tick({ reason: "unchanged" });
+      assert.equal(judge.calls.length, 1, "unchanged completed work reuses the verdict");
+    }
+    if (verdict === "ask-owner") assert.ok(supervisor.getState().questions.some(q => q.askedBy === "judge"));
+  });
+}
+
+test("contextual idle review revisits passive waits after ten minutes without chat changes", async t => {
+  let clock = NOW;
+  const thread = makeThread({ prRefs: [], branch: null, lastAgentText: "The worker was building the artifact." });
+  const judge = fakeJudge({ action: "wait", reason: "Worker result not due yet" });
+  const { supervisor } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(), now: () => clock, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  clock += 9 * MIN;
+  await supervisor.tick({ reason: "cached" });
+  assert.equal(judge.calls.length, 1);
+  clock += 2 * MIN;
+  await supervisor.tick({ reason: "recheck dependency" });
+  assert.equal(judge.calls.length, 2);
+});
+
+for (const guard of ["muted", "running", "observe"]) {
+  test(`contextual idle review preserves ${guard} guard`, async t => {
+    const thread = makeThread({ prRefs: [], branch: null, lastAgentText: "Your requested work has more steps.", ...(guard === "running" ? { agentStatus: "running" } : {}) });
+    const judge = fakeJudge({ action: "send", reason: "continue", message: "Continue the authorized work." });
+    const { supervisor, delivered } = fixture(t, { mode: guard === "observe" ? "observe" : "auto", threads: [thread], prs: new Map(), deps: { judge } });
+    if (guard === "muted") supervisor.muteThread(thread.key);
+    await supervisor.tick({ reason: "test" });
+    assert.equal(judge.calls.length, 0);
+    assert.equal(delivered.length, 0);
+  });
+}

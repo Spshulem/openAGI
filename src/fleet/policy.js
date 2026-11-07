@@ -188,6 +188,7 @@ function makeContext(classified, thread, options) {
   const delivery = options.delivery ?? config?.delivery ?? null;
   return {
     classified, thread, pr, infra, manager, playbooks, limits, now, mode, escalationLedger, delivery, config,
+    contextualIdleReview: options.contextualIdleReview === true,
     // The owner's own Push now (supervisor pushNow): see resolveNudge.
     ownerPush: options.ownerPush === true,
     mutedKeys: keySet(options.mutedKeys),
@@ -223,17 +224,19 @@ function intentFor(ctx) {
 
 function idleIntent(ctx) {
   const { classified, thread, ledger, limits, now } = ctx;
-  if (!classified.idle?.promised) return { type: "none", reason: classified.reason };
-  // Fresh stops only: an old thread's last words are history. Measured from
-  // the words, not activity (a delivered nudge is activity too).
+  const contextual = ctx.contextualIdleReview && thread.agentStatus === "idle"
+    && Boolean(thread.lastAgentFull || thread.lastAgentText || thread.lastUserText);
+  if (!contextual && !classified.idle?.promised) return { type: "none", reason: classified.reason };
+  // The mechanical fallback only handles fresh promises. A contextual review
+  // can assess old work instead of discarding it solely because of age.
   const quietMs = msSince(thread.lastAgentAt, now);
-  if (quietMs === null || quietMs > limits.idleReportMaxAgeMs) return { type: "none", reason: classified.reason };
+  if (!contextual && (quietMs === null || quietMs > limits.idleReportMaxAgeMs)) return { type: "none", reason: classified.reason };
   // A daily cap, whatever its progress mark says: a shared checkout's head
   // moves with other agents' commits.
   // Deliveries only: a send blocked while the owner types is no nudge.
   const sentToday = (ledger.nudges ?? []).filter((entry) => entry?.playbook === "idle-report" && entry.status === "sent" && now - Date.parse(entry.at) < DAY_MS).length;
   if (sentToday >= IDLE_REPORT_DAILY_MAX) return { type: "none", reason: `${classified.reason}; idle-report sent ${sentToday} times today` };
-  return nudge("idle-report", "said it would keep going, then stopped");
+  return nudge("idle-report", contextual ? "idle conversation needs contextual review" : "said it would keep going, then stopped", { requiresJudge: contextual });
 }
 
 function nudge(playbook, reason, extra = {}) {
@@ -617,7 +620,7 @@ function resolveIntent(ctx, intent) {
 
 function resolveNudge(ctx, intent, base) {
   const { thread, limits, now, ledger } = ctx;
-  const decision = { ...base, playbook: intent.playbook, reason: intent.reason };
+  const decision = { ...base, playbook: intent.playbook, reason: intent.reason, ...(intent.requiresJudge ? { requiresJudge: true } : {}) };
   const playbook = ctx.playbooks.get(intent.playbook);
   if (!playbook) return { ...decision, reason: `playbook missing: ${intent.playbook}` };
   if (ctx.ownerPush) return pushedNudge(ctx, intent, decision, playbook);
