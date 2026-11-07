@@ -8883,7 +8883,7 @@ async function renderToday() {
     fetchJson("/tasks/clarifications?status=pending").catch(() => []),
     isTodayView ? fetchJson("/plan/daily").catch(() => null) : Promise.resolve(null),
     isTodayView ? fetchJson("/drafts?status=pending").catch(() => []) : Promise.resolve([]),
-    isTodayView ? fetchJson("/channels").catch(() => null) : Promise.resolve(null)
+    isTodayView ? fetchJson("/channels?source=main").catch(() => null) : Promise.resolve(null)
   ]);
   // Which real outbound transports exist? Only offer "Send" for these;
   // email has no native channel (the user copies it into their mail client).

@@ -350,3 +350,29 @@ test("Inbox forwarding is restricted to supported routes and methods", () => {
   ]) assert.equal(isMainDataRoute(method, route), false, `${method} ${route}`);
   assert.equal(isMainDataRoute("GET", "/cron/runs/run-1", new URLSearchParams("source=main")), true);
 });
+
+test("draft delivery capabilities come from main while channel setup stays local", async t => {
+  const previous = process.env.OPENAGI_AUTH_TOKEN;
+  process.env.OPENAGI_AUTH_TOKEN = OWNER;
+  t.after(() => {
+    if (previous === undefined) delete process.env.OPENAGI_AUTH_TOKEN;
+    else process.env.OPENAGI_AUTH_TOKEN = previous;
+  });
+  const { main, worker, request } = await pair(t);
+  writeNodeConfig({ remote: main.url, token: OWNER }, worker.dataDir);
+  main.runtime.channels.telegram.status = () => ({ configured: true });
+  worker.runtime.channels.telegram.status = () => ({ configured: false });
+  const headers = { authorization: `Bearer ${OWNER}` };
+  const remote = await fetch(worker.url + "/channels?source=main", { headers });
+  assert.equal(remote.status, 200);
+  assert.equal(remote.headers.get("x-openagi-data-source"), "main");
+  assert.equal((await remote.json()).telegram.configured, true);
+  const local = await fetch(worker.url + "/channels", { headers });
+  assert.equal((await local.json()).telegram.configured, false);
+  assert.equal((await request("/channels?source=main", {}, WORKER)).status, 502,
+    "routing never grants worker credentials owner channel access");
+  const dashboard = await fetch(worker.url + "/", { headers });
+  assert.match(await dashboard.text(), /isTodayView \? fetchJson\("\/channels\?source=main"\)/);
+  assert.equal(isMainDataRoute("POST", "/channels", new URLSearchParams("source=main")), false);
+  assert.equal(isMainDataRoute("GET", "/channels/telegram/pairing-code", new URLSearchParams("source=main")), false);
+});

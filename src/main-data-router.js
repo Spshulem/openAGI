@@ -12,6 +12,7 @@ export function isMainDataRoute(method, pathname, searchParams = null) {
   // This is routing only: main still checks the unchanged credential and may
   // refuse these owner-only endpoints. Other cron jobs stay worker-local.
   if (method === "GET" && (["/review-queue", "/drafts", "/proactive/suggestions"].includes(pathname)
+    || (pathname === "/channels" && searchParams?.get("source") === "main")
     || /^\/proactive\/suggestions\/[^/]+\/outcome$/.test(pathname)
     || (searchParams?.get("source") === "main" && /^\/cron\/runs\/[^/]+$/.test(pathname)))) return true;
   if (method === "PATCH" && /^\/drafts\/[^/]+$/.test(pathname)) return true;
