@@ -3785,11 +3785,13 @@ test("an owner answer during the review holds a judged nudge already decided", a
   assert.match(judgeRow(supervisor).reason, /held: owner answered$/);
 });
 
-test("a switch to Auto mid-scan sends no nudge the judge never read", async (t) => {
+test("enabling the judge and Auto mid-scan sends no unread nudge", async (t) => {
   const judge = fakeJudge({ action: "send", reason: "r", message: "judged words" });
+  judge.enabled = false;
   const { supervisor, delivered } = fixture(t, { mode: "propose", deps: { judge } });
   const review = supervisor.reviewOpenQuestions.bind(supervisor);
   supervisor.reviewOpenQuestions = async (args) => {
+    judge.enabled = true;
     supervisor.setMode("auto");
     return review(args);
   };
@@ -4708,4 +4710,168 @@ test("Push now shares the automatic-send lock through recording its receipt", as
   await started;
   try { assert.match((await supervisor.pushNow("codex:t1")).delivery.detail, /already being sent/); }
   finally { release(); await tick; }
+});
+
+test("Paseo-only scan skips legacy sources, processes, LB and UI probes", async (t) => {
+  let legacyCalls = 0;
+  const forbidden = () => { legacyCalls++; throw new Error("legacy probe must not run"); };
+  const { supervisor } = fixture(t, {
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: {
+      readLivePeers: forbidden, listCodexThreads: forbidden, listClaudeThreads: forbidden,
+      listConductorThreads: forbidden, listAntigravityThreads: forbidden,
+      readCodexLbErrors: forbidden, findLocalHeavyVerification: forbidden,
+      probeBuildBot3: forbidden, checkLb: forbidden, findManagerSession: forbidden,
+      listPaseoThreads: async () => [makeThread({ kind: "paseo", key: "paseo:host.chat", id: "chat", cwd: null, repo: null, branch: null, prRefs: [], meta: { serverId: "host", historyKnown: true } })]
+    }
+  });
+  supervisor._uiDriver = { readiness: forbidden };
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(legacyCalls, 0);
+  assert.equal(snapshot.paseo.discovered, 1);
+  assert.equal(snapshot.paseo.deliveryReady, null);
+  assert.equal(snapshot.threads[0].openChat.app, "paseo");
+});
+
+test("new owner scope invalidates a cached nudge even without an assistant reply", () => {
+  const thread = makeThread(), decision = { playbook: "idle-report" };
+  const before = judgeCacheKey(thread, decision);
+  assert.notEqual(judgeCacheKey({ ...thread, lastUserText: "Stop here; do not merge." }, decision), before);
+  assert.notEqual(judgeCacheKey({ ...thread, meta: { conversation: [{ role: "user", text: "Finish review only" }] } }, decision), before);
+});
+
+test("Propose reads conversation and saves the judged draft without sending", async t => {
+  let input;
+  const judge = { enabled: true, judge: async args => { input = args; return { action: "send", reason: "Finish authorized review", message: "Address the remaining review comment and verify the existing PR." }; } };
+  const { supervisor, delivered } = fixture(t, { mode: "propose", deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  assert.ok(input.conversation.messages.some(m => m.role === "user"));
+  assert.equal(delivered.length, 0);
+  assert.ok(supervisor.getState().actions.some(a => a.status === "proposed" && a.message === "Address the remaining review comment and verify the existing PR."));
+});
+
+test("Paseo-only cadence is bounded and retains integer mobile settings", t => {
+  const { supervisor } = fixture(t, { env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" } });
+  assert.equal(supervisor.scanIntervalMs, 30000);
+  assert.equal(supervisor.getState().settings.tickSeconds, 30);
+  assert.equal(supervisor.getState().settings.tickMinutes, 1);
+  supervisor.config.paseo.pollMs = 1;
+  assert.equal(supervisor.scanIntervalMs, 15000);
+});
+
+test("Paseo self aliases are excluded before scan enrichment and delivery", async (t) => {
+  const thread = makeThread({ kind: "paseo", key: "paseo:host.agent", id: "agent", meta: { aliases: ["codex:native-self"], historyKnown: true } });
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto",
+    env: { OPENAGI_FLEET_PASEO: "1", OPENAGI_FLEET_PASEO_ONLY: "1" },
+    deps: { listPaseoThreads: async () => [thread] }
+  });
+  supervisor.config.selfSessionIds = ["native-self"];
+  const snapshot = await supervisor.tick({ reason: "test" });
+  assert.equal(thread.excluded, "self");
+  assert.deepEqual(snapshot.threads, []);
+  assert.deepEqual(delivered, []);
+});
+
+test("failed Paseo discovery holds legacy sessions until migration discovery recovers", async (t) => {
+  let failed = true;
+  const { supervisor, delivered } = fixture(t, {
+    mode: "auto", env: { OPENAGI_FLEET_PASEO: "1" },
+    deps: { listPaseoThreads: async () => { if (failed) throw Error("disconnected"); return []; } }
+  });
+  const held = await supervisor.tick({ reason: "test" });
+  assert.ok(held.sourceErrors.paseo);
+  assert.deepEqual(held.threads, []);
+  assert.deepEqual(delivered, []);
+  failed = false;
+  const recovered = await supervisor.tick({ reason: "test" });
+  assert.equal(recovered.threads.length, 1);
+});
+
+// Idle eligibility must not depend on a promise regex or a linked PR.
+for (const merged of [false, true]) {
+  test(`contextual idle review reads ${merged ? "merged" : "unlinked"} work older than six hours`, async t => {
+    const thread = makeThread({
+      prRefs: merged ? ["acme/app#7"] : [], branch: null,
+      lastActivityAt: ago(8 * 60 * MIN), lastAgentAt: ago(8 * 60 * MIN),
+      lastUserAt: ago(9 * 60 * MIN), lastUserText: "Finish the authorized staging work.",
+      lastAgentText: "Your approval covers this. The PR merged. Staging remains unfinished; the worker was building."
+    });
+    const judge = fakeJudge({ action: "send", reason: "Check the existing worker before continuing", message: "Inspect the existing worker's result for #7 and continue the already-authorized staging work; do not start another worker." });
+    const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(merged ? [["acme/app#7", makePr({ state: "MERGED" })]] : []), deps: { judge } });
+    await supervisor.tick({ reason: "test" });
+    assert.equal(judge.calls.length, 1);
+    assert.equal(judge.calls[0].decision.requiresJudge, true);
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0].message, /existing worker/);
+  });
+}
+
+for (const verdict of ["wait", "ask-owner", "failure", "disabled"]) {
+  test(`contextual idle review ${verdict} never sends a blind continuation`, async t => {
+    const thread = makeThread({ prRefs: [], branch: null, lastAgentText: "Work complete. Your report is ready." });
+    const judge = fakeJudge(verdict === "ask-owner"
+      ? { action: "ask-owner", reason: "A decision is missing", question: { title: "Choose the target", body: "Which target is authorized?", options: ["staging", "stop"] } }
+      : { action: "wait", reason: "Requested work is complete" }, { enabled: verdict !== "disabled" });
+    if (verdict === "failure") judge.judge = async () => { throw new Error("review unavailable"); };
+    const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(), deps: { judge } });
+    await supervisor.tick({ reason: "test" });
+    assert.equal(delivered.length, 0);
+    if (verdict === "wait") {
+      assert.equal(judge.calls.length, 1);
+      await supervisor.tick({ reason: "unchanged" });
+      assert.equal(judge.calls.length, 1, "unchanged completed work reuses the verdict");
+    }
+    if (verdict === "ask-owner") assert.ok(supervisor.getState().questions.some(q => q.askedBy === "judge"));
+  });
+}
+
+test("contextual idle review revisits passive waits after ten minutes without chat changes", async t => {
+  let clock = NOW;
+  const thread = makeThread({ prRefs: [], branch: null, lastAgentText: "The worker was building the artifact." });
+  const judge = fakeJudge({ action: "wait", reason: "Worker result not due yet" });
+  const { supervisor } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(), now: () => clock, deps: { judge } });
+  await supervisor.tick({ reason: "test" });
+  clock += 9 * MIN;
+  await supervisor.tick({ reason: "cached" });
+  assert.equal(judge.calls.length, 1);
+  clock += 2 * MIN;
+  await supervisor.tick({ reason: "recheck dependency" });
+  assert.equal(judge.calls.length, 2);
+});
+
+for (const guard of ["muted", "running", "observe"]) {
+  test(`contextual idle review preserves ${guard} guard`, async t => {
+    const thread = makeThread({ prRefs: [], branch: null, lastAgentText: "Your requested work has more steps.", ...(guard === "running" ? { agentStatus: "running" } : {}) });
+    const judge = fakeJudge({ action: "send", reason: "continue", message: "Continue the authorized work." });
+    const { supervisor, delivered } = fixture(t, { mode: guard === "observe" ? "observe" : "auto", threads: [thread], prs: new Map(), deps: { judge } });
+    if (guard === "muted") supervisor.muteThread(thread.key);
+    await supervisor.tick({ reason: "test" });
+    assert.equal(judge.calls.length, 0);
+    assert.equal(delivered.length, 0);
+  });
+}
+
+for (const action of ["wait", "send"]) {
+  test(`contextual route escalation waits for judge verdict: ${action}`, async t => {
+    const thread = makeThread({ kind: "conductor", key: "conductor:idle", prRefs: [], branch: null,
+      lastActivityAt: ago(8 * 60 * MIN), lastAgentAt: ago(8 * 60 * MIN), lastUserAt: ago(9 * 60 * MIN),
+      lastAgentText: "All requested work is complete. Your report is ready." });
+    const judge = fakeJudge({ action, reason: action === "wait" ? "Work complete" : "Authorized work remains", message: "Finish the outstanding work." });
+    const { supervisor, delivered } = fixture(t, { mode: "auto", threads: [thread], prs: new Map(), deps: { judge } });
+    await supervisor.tick({ reason: "test" });
+    assert.equal(judge.calls.length, 1);
+    assert.equal(delivered.length, 0);
+    assert.equal(supervisor.getState().questions.filter(q => q.status === "open").length, action === "wait" ? 0 : 1);
+  });
+}
+
+test("contextual post-merge exception still rejects a PR settled since review", async t => {
+  const thread = makeThread();
+  const merged = makePr({ state: "MERGED" });
+  const { supervisor } = fixture(t, { deps: { fetchPrStateLite: async () => new Map([[merged.ref, merged]]) } });
+  const decision = { playbook: "idle-report", requiresJudge: true, judged: true, message: "Finish follow-up for #7." };
+  assert.equal(await supervisor.prSettledBeforeSend(thread, makePr(), decision), "#7 merged since the scan");
+  assert.equal(await supervisor.prSettledBeforeSend(thread, merged, { ...decision, judged: false }), "#7 merged");
+  assert.equal(await supervisor.prSettledBeforeSend(thread, merged, decision), null);
 });

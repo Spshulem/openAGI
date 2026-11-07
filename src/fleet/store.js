@@ -1,7 +1,8 @@
 // Owner-only persistent state for the fleet supervisor: mode, last snapshot,
 // per-thread nudge ledger, needs-you questions, escalations, and the action
 // log. One JSON file (0600) plus an append-only actions.jsonl journal.
-// Methods never throw on disk errors; the last one is kept in lastWriteError.
+// Ordinary writes retain disk errors in lastWriteError. Mode changes throw
+// and roll back on failure: an unsaved Auto choice must never be acknowledged.
 
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -218,8 +219,13 @@ export class FleetStore {
 
   setMode(mode) {
     if (!MODES.includes(mode)) return null;
+    const previous = this.state.mode;
     this.state.mode = mode;
     this._save();
+    if (this.lastWriteError) {
+      this.state.mode = previous;
+      throw new Error("Supervisor mode could not be saved. Check available disk space and retry.");
+    }
     return mode;
   }
 

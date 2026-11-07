@@ -2,6 +2,17 @@ import XCTest
 @testable import OpenAGI
 
 final class PhoneModelSetupTests: XCTestCase {
+    private var previousEmbeddedPort: Int?
+
+    override func setUp() {
+        super.setUp()
+        previousEmbeddedPort = EmbeddedLoopback.port
+        // Model an active embedded daemon; URLProtocol still handles all I/O.
+        EmbeddedLoopback.port = 43210
+        StubProtocol.handler = nil
+        StubProtocol.failure = nil
+    }
+
     private func client() -> DaemonClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubProtocol.self]
@@ -10,6 +21,7 @@ final class PhoneModelSetupTests: XCTestCase {
     }
 
     override func tearDown() {
+        EmbeddedLoopback.port = previousEmbeddedPort
         StubProtocol.handler = nil
         StubProtocol.failure = nil
         super.tearDown()
