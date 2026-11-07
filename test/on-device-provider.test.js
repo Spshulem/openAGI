@@ -119,7 +119,7 @@ test("an explicit task request still invokes add_task and reports its actual res
   t.after(() => device.socket.close());
   await untilConnected(hub);
   const calls = [];
-  const result = await new OnDeviceModelProvider({ hub }).generate({ input: "Add a task to buy milk", toolRegistry: fakeRegistry(calls) });
+  const result = await new OnDeviceModelProvider({ hub }).generate({ input: "Add buy milk to my tasks", toolRegistry: fakeRegistry(calls) });
   assert.deepEqual(calls, [{ name: "add_task", args: { content: "Buy milk" } }]);
   assert.equal(result.text, "Added Buy milk.");
   assert.ok(device.seen[0].tools.some(tool => tool.name === "add_task"));
@@ -228,4 +228,15 @@ test("compact system prompt keeps the persona and drops the desktop catalog", ()
 
 test("OPENAGI_PROVIDER=on-device selects the on-device provider", () => {
   assert.ok(createModelProvider({ preferred: "on-device" }) instanceof OnDeviceModelProvider);
+});
+
+
+test("plural task requests retain creation intent without enabling casual chat", () => {
+  for (const input of ["Create two tasks: buy milk and call mom", "Add buy milk to my tasks",
+    "Create reminders for tomorrow", "Tasks: buy milk", "Add two to-dos"]) {
+    assert.equal(requestsTaskCreation(input), true, input);
+  }
+  for (const input of ["What are my tasks?", "How do reminders work?", "Don't create tasks"]) {
+    assert.equal(requestsTaskCreation(input), false, input);
+  }
 });

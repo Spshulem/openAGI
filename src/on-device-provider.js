@@ -159,8 +159,8 @@ function cancelsTaskRequest(text) {
   return /\b(?:do not|don't|never|without)\s+(?:add|create|make|save|track)\b|^\s*(?:cancel|nevermind|never mind|forget (?:it|that))\b/i.test(String(text ?? ""));
 }
 function explicitTaskRequest(text) {
-  return /\b(?:add|create|make|put|save|track)\b[^.!?\n]{0,100}\b(?:task|todo|to-do|reminder|list)\b/i.test(String(text ?? ""))
-    || /\b(?:remind me|remember to|i (?:need|have) to)\b|\b(?:todo|to-do|task)\s*:/i.test(String(text ?? ""));
+  return /\b(?:add|create|make|put|save|track)\b[^.!?\n]{0,100}\b(?:tasks?|todos?|to-dos?|reminders?|lists?)\b/i.test(String(text ?? ""))
+    || /\b(?:remind me|remember to|i (?:need|have) to)\b|\b(?:todos?|to-dos?|tasks?)\s*:/i.test(String(text ?? ""));
 }
 function newTopic(text) {
   return /^\s*(?:hi|hello|hey|thanks|thank you|what|why|how|who|where|when|tell me|explain|summarize|switch topics)\b/i.test(String(text ?? ""))

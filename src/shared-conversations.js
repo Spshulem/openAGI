@@ -38,7 +38,7 @@ export function sharedHistoryThread(pathname) { return HISTORY_PATH.exec(String(
 // session on /message. Continuing makes a separate shared-device session;
 // authority, tool calls, approvals and computer-use leases are not copied.
 function webID(sessionId) { return `web-${createHash("sha256").update(sessionId).digest("hex").slice(0, 32)}`; }
-function webSessions(store) { return store.listSessions({ prefix: "local:browser", limit: 100 }).filter(s => WEB_SESSION.test(s.id)); }
+function webSessions(store) { return store.listSessions({ prefix: "local:browser" }).filter(s => WEB_SESSION.test(s.id)); }
 function visibleSessionID(store, thread, conversationId) {
   if (typeof conversationId === "string" && /^web-[a-f0-9]{32}$/.test(conversationId) && thread === "agent") {
     const found = webSessions(store).find(s => webID(s.id) === conversationId);
@@ -51,7 +51,7 @@ function visibleSessionID(store, thread, conversationId) {
 export function sharedConversations(store) {
   const sessions = [
     ...SHARED_THREADS.map(thread => ({ id: sharedSessionId(thread), thread, conversationId: "main" })),
-    ...store.listSessions({ prefix: "devices:", limit: 100 }).flatMap(s => {
+    ...store.listSessions({ prefix: "devices:" }).flatMap(s => {
       const match = DEVICE_SESSION.exec(s.id);
       return match && match[2] !== "main" && CONVERSATION_ID.test(match[2])
         ? [{ id: s.id, thread: match[1], conversationId: match[2] }] : [];

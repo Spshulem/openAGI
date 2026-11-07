@@ -10,7 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createDurableRuntime, createHostedInterface } from "../src/index.js";
 import { NodeRegistry } from "../src/node-registry.js";
 import { FileBackedAgentStore, InMemoryAgentStore } from "../src/agent-store.js";
-import { lifelogMoments, observeSharedThreads, sharedThreadHistory } from "../src/shared-conversations.js";
+import { lifelogMoments, observeSharedThreads, sharedThreadHistory, sharedConversations } from "../src/shared-conversations.js";
 
 const OWNER = "shared-owner-token";
 const PHONE_A = { id: `mobile:${randomUUID()}`, token: "a".repeat(43), name: "Pixel" };
@@ -440,4 +440,23 @@ test("search_conversation_lifelog answers in shared threads and nowhere new", as
     assert.deepEqual(result.moments.map((m) => m.id), ["seg-old-1"], JSON.stringify(context));
   }
   await assert.rejects(async () => tool.handler({ query: "widget" }, { channel: "node", sessionId: "node:abc:def:main" }), /Lifelog recall requires/);
+});
+
+
+test("catalog and history retain access beyond 100 device and web conversations", () => {
+  const store = new InMemoryAgentStore();
+  let oldestDevice, oldestWeb;
+  for (let i = 0; i < 105; i++) {
+    const id = randomUUID();
+    store.appendMessage(`devices:agent:${id}`, { role: "user", content: `Device chat ${i}` });
+    store.appendMessage(`local:browser-test-${i}:main`, { role: "user", content: `Web chat ${i}` });
+    if (i === 0) oldestDevice = id;
+  }
+  const catalog = sharedConversations(store).conversations;
+  assert.equal(catalog.length, 212);
+  assert.ok(catalog.some(c => c.id === oldestDevice));
+  oldestWeb = catalog.find(c => c.title === "Web chat 0");
+  assert.ok(oldestWeb?.readOnly);
+  assert.equal(sharedThreadHistory(store, "agent", { conversationId: oldestDevice }).messages[0].text, "Device chat 0");
+  assert.equal(sharedThreadHistory(store, "agent", { conversationId: oldestWeb.id }).messages[0].text, "Web chat 0");
 });

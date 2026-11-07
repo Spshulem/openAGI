@@ -277,3 +277,31 @@ test("imports reject malformed, oversized and unknown-version input", async () =
   assert.deepEqual(importOfflineWork(mac.runtime, work, { dataDir: mac.dir, fromNodeId: "phone-1" }).added, { messages: 0, tasks: 0, memories: 0 });
   await settle(mac.runtime, phone.runtime);
 });
+
+
+test("snapshot replacement and later rotation do not resend acknowledged or baseline archives", async () => {
+  const mac = makeRuntime("archive-main"), phone = makeRuntime("archive-phone", { OPENAGI_PROFILE: "mobile" });
+  await settle(mac.runtime, phone.runtime);
+  const store = phone.runtime.agentHost.store;
+  store.maxActiveMessages = 4;
+  store.retainedMessages = 2;
+  mac.runtime.agentHost.store.appendMessage(AGENT, { role: "user", content: "Already on the server" });
+  importMirrorSnapshot(phone.runtime, buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir }), { dataDir: phone.dir });
+  for (let i = 0; i < 6; i++) store.appendMessage(AGENT, { role: "user", content: `Delivered offline ${i}` });
+  const work = listOfflineWork(phone.runtime, { dataDir: phone.dir });
+  assert.equal(work.messages.agent.length, 6);
+  markOfflineWorkSent(phone.runtime, { dataDir: phone.dir, work });
+  const bounded = buildMirrorSnapshot(mac.runtime, { dataDir: mac.dir });
+  bounded.threads.agent = [];
+  importMirrorSnapshot(phone.runtime, bounded, { dataDir: phone.dir });
+  assert.deepEqual(listOfflineWork(phone.runtime, { dataDir: phone.dir }).messages.agent, []);
+  const fresh = [];
+  for (let i = 0; i < 6; i++) {
+    fresh.push(store.appendMessage(AGENT, { role: "user", content: `New offline ${i}` }).messages.at(-1).id);
+  }
+  assert.equal(store.getSession(AGENT).metadata.historyArchived, true);
+  assert.deepEqual(new Set(listOfflineWork(phone.runtime, { dataDir: phone.dir }).messages.agent.map(m => m.id)), new Set(fresh));
+  importMirrorSnapshot(phone.runtime, bounded, { dataDir: phone.dir });
+  assert.deepEqual(new Set(listOfflineWork(phone.runtime, { dataDir: phone.dir }).messages.agent.map(m => m.id)), new Set(fresh));
+  await settle(mac.runtime, phone.runtime);
+});

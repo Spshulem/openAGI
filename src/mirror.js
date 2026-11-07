@@ -657,8 +657,11 @@ export function importMirrorSnapshot(runtime, snapshot, { dataDir } = {}) {
   writeState(dataDir, {
     version: MIRROR_VERSION, importedAt, cursor: snapshot.source.cursor,
     baseline: { threadMessageIds, memoryIds, taskIds },
-    // Sent items not in this snapshot were just replaced; nothing left to track.
-    sent: { messageIds: [], memoryIds: [], taskIds: [] },
+    // Immutable archive chunks survive snapshot replacement. Retain both
+    // acknowledgments and previous baselines so a later rotation cannot
+    // mistake those delivered messages for new offline work.
+    sent: { messageIds: [...new Set([...state.sent.messageIds,
+      ...Object.values(state.baseline.threadMessageIds).flat()])], memoryIds: [], taskIds: [] },
     skills: snapshot.skills.map(s => s.name),
     personaHash
   });
