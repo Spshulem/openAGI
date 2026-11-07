@@ -253,12 +253,12 @@ test("fleet events reach SSE clients", async (t) => {
   controller.abort();
 });
 
-test("dashboard navigation links to the fleet overview", async (t) => {
+test("dashboard navigation exposes the Supervisor entry point", async (t) => {
   const previous = process.env.OPENAGI_AUTH_TOKEN;
   process.env.OPENAGI_AUTH_TOKEN = TOKEN;
   t.after(() => { if (previous === undefined) delete process.env.OPENAGI_AUTH_TOKEN; else process.env.OPENAGI_AUTH_TOKEN = previous; });
   const { url } = await boot(t);
   const res = await fetch(url + "/", { headers: { Authorization: "Bearer " + TOKEN, accept: "text/html" } });
   assert.equal(res.status, 200);
-  assert.match(await res.text(), /<a href="\/fleet">(?:(?!<\/a>)[\s\S])*Fleet overview<\/a>/);
+  assert.match(await res.text(), /<button\b[^>]*data-tab="supervisor"[^>]*>(?:(?!<\/button>)[\s\S])*<span>Supervisor<\/span><\/button>/);
 });
