@@ -342,7 +342,9 @@ export class TaskStore {
     let out = [...this.tasks.values()];
     if (queue) out = out.filter((t) => t.queue === queue);
     if (bucket) out = out.filter((t) => t.bucket === bucket);
-    if (status) out = out.filter((t) => t.status === status);
+    if (status === "active") out = out.filter((t) => !["completed", "cancelled"].includes(t.status));
+    else if (status === "terminal") out = out.filter((t) => ["completed", "cancelled"].includes(t.status));
+    else if (status) out = out.filter((t) => t.status === status);
     out.sort((a, b) => {
       // Sort by bucket order, then priority desc, then createdAt asc
       const ba = BUCKETS.indexOf(a.bucket);
@@ -620,14 +622,19 @@ export class TaskStore {
   // Roll up summary stats for dashboards / health.
   stats() {
     const out = {
-      user: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 },
-      agent: { total: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 }
+      user: { total: 0, active: 0, cancelled: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 },
+      agent: { total: 0, active: 0, cancelled: 0, today: 0, this_week: 0, this_month: 0, this_quarter: 0, this_year: 0, someday: 0, done: 0, pending: 0, completed: 0 }
     };
     for (const t of this.tasks.values()) {
       const slot = out[t.queue];
       if (!slot) continue;
       slot.total += 1;
-      if (slot[t.bucket] !== undefined) slot[t.bucket] += 1;
+      const terminal = ["completed", "cancelled"].includes(t.status);
+      if (!terminal) {
+        slot.active += 1;
+        if (t.bucket !== "done" && slot[t.bucket] !== undefined) slot[t.bucket] += 1;
+      } else if (t.status === "completed") slot.done += 1;
+      else slot.cancelled += 1;
       if (t.status === "pending") slot.pending += 1;
       if (t.status === "completed") slot.completed += 1;
     }

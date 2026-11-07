@@ -108,3 +108,22 @@ for (const output of ["not json", "[]"]) {
     assert.deepEqual(runtime.tasks.list()[0].tags, ["plan-action"]);
   });
 }
+
+ test("cancelled history does not inflate Today or crowd active task pages", t => {
+  const { runtime } = fixture(t);
+  const store = runtime.tasks;
+  for (const queue of ["user", "agent"]) {
+    for (let i = 0; i < 35; i++) store.add({ title: `Retired ${i}`, status: "cancelled", bucket: "today", priority: 100 }, { queue });
+    const open = store.add({ title: "Current work", bucket: "today", priority: 1 }, { queue });
+    const done = store.add({ title: "Finished work", bucket: "today" }, { queue });
+    store.complete(done.id);
+    const stats = store.stats()[queue];
+    assert.equal(stats.today, 1);
+    assert.equal(stats.active, 1);
+    assert.equal(stats.cancelled, 35);
+    assert.equal(stats.done, 1);
+    assert.equal(stats.total, 37, "history remains available");
+    assert.deepEqual(store.list({ queue, status: "active", limit: 1 }).map(t => t.id), [open.id]);
+    assert.equal(store.list({ queue, status: "terminal", limit: 100 }).length, 36);
+  }
+});

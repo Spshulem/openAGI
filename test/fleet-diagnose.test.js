@@ -220,7 +220,7 @@ test("supervisor daily diagnosis is once across reloads, hourly checks persist, 
   const reload = new FleetSupervisor({ dataDir, config, deps });
   await reload.diagnoseTick(); assert.equal(calls, 1);
   const before = fs.readFileSync(supervisor.store.statePath, "utf8");
-  await supervisor.diagnose();
+  await supervisor.diagnose({ window: "7d" }); // fixture evidence is older than the default 24-hour window
   assert.equal(fs.readFileSync(supervisor.store.statePath, "utf8"), before);
   assert.equal(calls, 2);
 });
