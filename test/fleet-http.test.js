@@ -253,7 +253,7 @@ test("fleet events reach SSE clients", async (t) => {
   controller.abort();
 });
 
-test("dashboard Supervisor navigation opens the fleet overview", async (t) => {
+test("dashboard navigation exposes the Supervisor entry point", async (t) => {
   const previous = process.env.OPENAGI_AUTH_TOKEN;
   process.env.OPENAGI_AUTH_TOKEN = TOKEN;
   t.after(() => { if (previous === undefined) delete process.env.OPENAGI_AUTH_TOKEN; else process.env.OPENAGI_AUTH_TOKEN = previous; });
