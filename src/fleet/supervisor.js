@@ -95,6 +95,9 @@ const REVIEW_BACKOFF_MAX = 2;
 const JUDGE_MAX_PER_TICK = 6;
 const JUDGE_CONCURRENCY = 3;
 const JUDGE_CACHE_MS = 2 * 60 * MIN;
+// Idle dependencies can finish without a new chat message. Reassess them
+// periodically instead of treating an old worker report as current for hours.
+const IDLE_JUDGE_CACHE_MS = 10 * MIN;
 const JUDGE_DOWN_MS = 5 * MIN;
 const JUDGE_CALL_MS = 45_000;
 // All judge calls in one scan end by then (a call reads in ~10-20 s): each
@@ -216,7 +219,7 @@ function pausedDeliveryDecision(delivery, blockedSince, now) {
 // An automatic nudge the judge reads first. A resume after a limit reset or
 // an error retry stays mechanical.
 function judgeable(decision, thread) {
-  if (decision?.action !== "nudge" || !decision.message || !decision.route || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
+  if (decision?.action !== "nudge" || !decision.message || (!decision.route && !decision.requiresJudge) || !JUDGED_PLAYBOOKS.has(decision.playbook)) return false;
   if (decision.playbook !== "resume") return true;
   return decision.state !== "infra-blocked" && !thread?.error && thread?.agentStatus !== "error";
 }
@@ -1899,7 +1902,7 @@ export class FleetSupervisor {
       if (mutedKeys.has(thread.key)) {
         decision = { threadKey: thread.key, state: classified.state, action: "none", playbook: null, message: null, reason: "muted by owner", blockers: [], question: null, route: null, notBefore: store.mutedUntil(thread.key), targetKey: thread.key, progressMark: null };
       } else {
-        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery });
+        decision = decideThread(classified, thread, { ledger: store.ledgerFor(thread.key), escalationLedger: store, mutedKeys, playbooks, config, now: started, pr, mode, infra, manager, delivery, contextualIdleReview: this.nudgeJudge?.enabled === true });
       }
       items.push({ thread, classified, pr, ledger: store.ledgerFor(thread.key), decision, gitUnreadable, prUnreadable });
     }
@@ -2004,7 +2007,7 @@ export class FleetSupervisor {
       if (decision.notBefore && Date.parse(decision.notBefore) > started) continue;
       const key = judgeCacheKey(thread, decision, item.pr, item.classified, history.get(thread.key) ?? []);
       const cached = this.judgeCache.get(key);
-      if (cached) item.decision = this.applyJudgeVerdict(item, cached.verdict);
+      if (cached && started - cached.at < (decision.requiresJudge ? IDLE_JUDGE_CACHE_MS : JUDGE_CACHE_MS)) item.decision = this.applyJudgeVerdict(item, cached.verdict);
       else due.push({ item, key });
     }
     if (!due.length) return;
@@ -2088,6 +2091,8 @@ export class FleetSupervisor {
     const { decision, thread } = item;
     if (verdict.action === "wait") return judgeWait(decision, `judge: ${verdict.reason}`, false);
     if (verdict.action === "send") {
+      // Establish unfinished work before surfacing an unavailable route.
+      if (decision.deferredRouteDecision) return { ...decision.deferredRouteDecision, judged: true, reason: `${decision.deferredRouteDecision.reason}; judge: ${verdict.reason}` };
       const messageHash = shortHash(verdict.message);
       // The same words as the last send, with no reply since, is noise.
       const repeat = repeatsLastSend(thread, item.ledger, messageHash);
@@ -2351,7 +2356,9 @@ export class FleetSupervisor {
     const since = !SETTLED_PR_STATES.has(pr?.state);
     const about = PR_PLAYBOOKS.has(decision.playbook)
       || (!NOT_ABOUT_PR_PLAYBOOKS.has(decision.playbook) && new RegExp(`#${parsed.number}\\b`).test(String(decision.message ?? "")));
-    if (!since && !about) return null;
+    const reviewedPostMerge = decision.playbook === "idle-report" && decision.requiresJudge === true
+      && decision.judged === true && pr?.state === "MERGED" && fresh.state === "MERGED";
+    if (!since && (!about || reviewedPostMerge)) return null;
     return `#${parsed.number} ${fresh.state.toLowerCase()}${since ? " since the scan" : ""}`;
   }
 
@@ -2526,7 +2533,7 @@ export class FleetSupervisor {
       // The judge reads every automatic nudge first: one this scan did not
       // judge (the owner switched to Auto after judgeNudges ran) waits for
       // the next scan instead of going out unread.
-      if (judgeOn && !decision.judged && judgeable(decision, target)) {
+      if (!decision.judged && (decision.requiresJudge || (judgeOn && judgeable(decision, target)))) {
         decision.reason = `${decision.reason}; held: not judged this scan`;
         continue;
       }

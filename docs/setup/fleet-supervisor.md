@@ -480,10 +480,23 @@ stops sending the same note to every thread.
   **wait** (the agent already answered, or waits on CI, a queued run, a
   reviewer, a limit), or **ask you** (it needs your decision, approval or a
   credential). Your answer goes to the agent like any agent question.
-- Only in Auto, only for merge-ready, ci-finished, status-check,
+- In Auto and Propose (Propose saves drafts without sending), for merge-ready, ci-finished, status-check,
   idle-report, bb3-slow-agent and resume. A resume after a limit reset or an
   error stays automatic. Your answers and messages are never judged.
-- At most 6 calls per scan, 3 at once. A verdict holds 2 hours while the
+- With the judge enabled, idle conversations with no linked PR or a merged PR
+  are also reviewed, including ones older than six hours. Eligibility does not
+  depend on promise keywords: mentions of the owner, releases, or deployment
+  reach the contextual reviewer. It checks the requested outcome, prior scope,
+  unfinished work and stale background-worker claims. Completed work stays
+  quiet; missing authorization becomes an owner question. An overdue worker
+  can prompt inspection of the existing job, never a duplicate job.
+- Idle-review verdicts expire after 10 minutes so dependencies can be checked
+  again even without a new chat message. Reviews remain bounded and fair across
+  scans; this is not a guarantee that every discovered chat is read each scan.
+  Muting, deliberate stops, recent owner activity, delivery receipts, cooldowns
+  and send caps remain enforced. Disabling or failing the judge never sends an
+  unreviewed contextual continuation.
+- At most 6 calls per scan, 3 at once. Other verdicts hold 2 hours while the
   chat, playbook and PR facts are the same. Cooldowns and the same-message
   guard still apply to its sends.
 - A failure or timeout (90 s) waits; nothing is sent blind. A scan where

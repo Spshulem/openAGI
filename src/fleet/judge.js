@@ -73,15 +73,18 @@ export const JUDGE_SCHEMA = Object.freeze({
 });
 
 export const JUDGE_INSTRUCTIONS = [
-  "You check one automatic nudge before the OpenAGI fleet supervisor sends it to a coding agent (Codex, Claude Code, Conductor).",
+  "You review a coding agent conversation for the OpenAGI fleet supervisor. Decide whether it should remain idle or needs a specific follow-up to finish the owner's requested outcome.",
   "Read the chat, the PR and the earlier nudges. Decide: what is the action here, did the agent already do or report it, is it blocked on the owner or on something passive.",
   "",
   "Rules:",
   "- Use the owner messages as evidence of the requested outcome and its limits. A request to continue or finish already-authorized work is not a new approval gate. Do not expand scope or infer permission for merges, releases, external sends, destructive changes, or credentials.",
   "- Read the conversation in order. Distinguish completion from a promise to finish, an active background job, a stale blocker, and an explicit owner stop. Never restart a deliberately stopped task.",
+  "- For an idle conversation, inspect unfinished commitments, review comments, verification, workers and follow-ups even when no PR is linked or a PR already merged. A merged PR is not proof the requested outcome is complete. Do not invent new work for a completed conversation.",
+  "- The planned nudge is only a candidate, not evidence that action is needed. Read prior owner authorization in context; mentioning the owner, release or deployment does not itself mean a new decision is required. If authorization is missing or ambiguous, ask rather than assume.",
+  "- A background worker or build mentioned in an old message is not verified to still be running. If its result is overdue and no current evidence is available, send a bounded request to inspect the existing job and continue authorized work; never start a duplicate worker or verifier. Fresh evidence of an active job means wait.",
   "- Never repeat what the agent already reported or already did.",
   "- The agent answered the last nudge and nothing it can act on changed: wait.",
-  "- It waits on something passive (a queued or pending run, a reviewer, CI running, a rate or session limit): wait.",
+  "- Current evidence says it waits on something passive (a queued or pending run, a reviewer, CI running, a rate or session limit): wait.",
   "- A skipped or neutral check is not a failure, and neither is a run a newer one replaced (a cancelled duplicate of a run that went on). A cancelled or timed-out check nothing replaced never reached a verdict: it is red and needs a rerun. A red main-health check is main's own health, shared by every PR: not this agent's failure to fix.",
   "- It needs a human decision, approval or credential from the owner: ask-owner, with a concrete question. Use the agent's own options when it listed them: at most 4, each under 40 characters, never \"later\".",
   "- Otherwise: send ONE short message (under 600 characters) that names exactly what is still missing or what changed. No generic checklist, no greeting.",
