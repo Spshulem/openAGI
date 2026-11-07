@@ -67,7 +67,10 @@ export function queryReviewQueue(runtime, options = {}) {
     finishedAt: report.finishedAt ?? null, dryRun: report.dryRun === true,
     scanned: Number(report.scanned?.suggestions ?? 0) + Number(report.scanned?.drafts ?? 0),
     retired: report.dryRun ? 0 : Number(report.applied?.suggestions ?? 0) + Number(report.applied?.drafts ?? 0),
-    deferred: Number(report.applied?.deferralsAnnotated ?? 0),
+    deferred: Number(report.llm?.deferred ?? 0),
+    // Missing verdicts can be both unjudged and annotated. Keep the counts
+    // separate rather than double-counting those rows as postponed reviews.
+    deferralsAnnotated: Number(report.applied?.deferralsAnnotated ?? 0),
     degraded: (report.degraded?.length ?? 0) > 0
   } : null;
   return {

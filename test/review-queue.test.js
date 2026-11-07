@@ -7,6 +7,25 @@ import { queryReviewQueue, ReviewQueueQueryError } from "../src/review-queue.js"
 
 const NOW = new Date("2026-08-09T17:00:00.000Z");
 
+test("maintenance exposes postponed model reviews separately from annotated deferrals", t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "openagi-review-maintenance-"));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dataDir, "backlog-triage"));
+  for (const llm of [
+    { skipped: "cadence", deferred: 7 }, { skipped: "no-provider", deferred: 1 },
+    { skipped: "budget-exhausted", deferred: 3 }, { deferred: 4, itemsJudged: 2 },
+    { deferred: 2, verdicts: { missing: 2 } }
+  ]) {
+    fs.writeFileSync(path.join(dataDir, "backlog-triage", "latest.json"), JSON.stringify({
+      llm, applied: { deferralsAnnotated: 2 }, degraded: []
+    }));
+    const { maintenance } = queryReviewQueue(runtime(), { dataDir, now: NOW });
+    assert.equal(maintenance.deferred, llm.deferred);
+    assert.equal(maintenance.deferralsAnnotated, 2, "annotations may overlap unjudged rows, so are not added to the total");
+    assert.equal(maintenance.degraded, false, "postponement is visible without inventing a failed check");
+  }
+});
+
 function runtime({ tasks = [], drafts = [], suggestions = [], clarifications = [] } = {}) {
   return {
     tasks: {

@@ -2600,6 +2600,9 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
       // at a button that did nothing, forever, with no feedback.
       if (method === "POST" && pathname.match(/^\/cron\/[^/]+\/run$/)) {
         const id = decodeURIComponent(pathname.split("/")[2]);
+        // Inbox cleanup is main-backed on workers; ordinary cron runs are local.
+        const pollPath = (runId) => `/cron/runs/${encodeURIComponent(runId)}`
+          + (id === "backlog-triage" ? "?source=main" : "");
         const job = runtime.cron.listJobs().find((j) => j.id === id);
         if (!job) return sendJson(res, 404, { error: "unknown-job" });
 
@@ -2631,7 +2634,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
               runId: started.running?.runId ?? null,
               startedAt: started.running?.startedAt ?? null,
               source: started.running?.source ?? null,
-              poll: started.running?.runId ? `/cron/runs/${encodeURIComponent(started.running.runId)}` : null,
+              poll: started.running?.runId ? pollPath(started.running.runId) : null,
               message: "This job is already running. Wait for it to finish — running it twice concurrently is not safe."
             });
           }
@@ -2654,7 +2657,7 @@ export function createHostedInterface(runtime = createDefaultRuntime(), options 
             runId: started.runId,
             startedAt: pending?.startedAt ?? null,
             timeoutMs: pending?.timeoutMs ?? null,
-            poll: `/cron/runs/${encodeURIComponent(started.runId)}`,
+            poll: pollPath(started.runId),
             message: `Still running after ${graceMs}ms — poll the run for the outcome.`
           });
         }
@@ -8773,7 +8776,7 @@ async function renderReview({ append = false } = {}) {
       </div>
 
       <p class="ui-meta" role="status">\${maintenance?.finishedAt
-        ? "Last cleanup " + escapeHtml(new Date(maintenance.finishedAt).toLocaleString()) + ": " + maintenance.scanned + " reviewed, " + maintenance.retired + " retired, " + maintenance.deferred + " deferred." + (maintenance.dryRun ? " Preview only; nothing changed." : "") + (maintenance.degraded ? " Some checks could not finish." : "")
+        ? "Last cleanup " + escapeHtml(new Date(maintenance.finishedAt).toLocaleString()) + ": " + maintenance.scanned + " reviewed, " + maintenance.retired + " retired, " + maintenance.deferred + " awaiting model review. " + (maintenance.deferralsAnnotated ?? 0) + " inconclusive reviews annotated (may overlap)." + (maintenance.dryRun ? " Preview only; nothing changed." : "") + (maintenance.degraded ? " Some checks could not finish." : "")
         : "No completed cleanup report yet."} Cleanup checks suggestions and drafts; it does not complete your tasks or remove work just because it is old.</p>
       <form id="reviewSearchForm" class="ui-row" style="margin:var(--space-4) 0 var(--space-3); gap:var(--space-2); align-items:center;">
         <input class="ui-input ui-grow" id="reviewSearch" type="search" maxlength="300" value="\${escapeHtml(review.q)}" placeholder="Search titles, descriptions, sources, and draft text…">

@@ -625,13 +625,16 @@ holds integration setup; device and glasses tools are optional advanced views.
 Get started links to model setup before the optional introductory chat.
 
 Tasks and Today preserve request failures instead of showing zero tasks. A paired
-worker forwards Inbox reads to its main; it never substitutes a local queue when
+worker forwards Inbox reads, draft and suggestion actions, and backlog cleanup
+with its run-status polling to its main; it never substitutes a local queue when
 main denies workspace access. The main retains authority over every request.
 Recovery links open the connected agent for sign-in; no token is passed in the URL
 and no enrollment is changed automatically.
 
-Inbox shows the latest completed cleanup report: reviewed, retired, and deferred
-counts. Cleanup concerns suggestions and drafts, not automatic completion of user
+Inbox shows the latest completed cleanup report: reviewed, retired, and awaiting
+model review counts, including reviews postponed by cadence, provider availability,
+budget, or the item cap. Inconclusive review annotations are shown separately
+because they can overlap unjudged items. Cleanup concerns suggestions and drafts, not automatic completion of user
 tasks. Old age alone is not proof that a task is finished. Background activity
 shows scheduled-run receipts and explicitly distinguishes inferred scores from
 user feedback and delivered work.
