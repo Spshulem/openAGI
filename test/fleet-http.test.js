@@ -253,12 +253,21 @@ test("fleet events reach SSE clients", async (t) => {
   controller.abort();
 });
 
-test("dashboard navigation links to the fleet overview", async (t) => {
+test("dashboard Supervisor navigation opens the fleet overview", async (t) => {
   const previous = process.env.OPENAGI_AUTH_TOKEN;
   process.env.OPENAGI_AUTH_TOKEN = TOKEN;
   t.after(() => { if (previous === undefined) delete process.env.OPENAGI_AUTH_TOKEN; else process.env.OPENAGI_AUTH_TOKEN = previous; });
   const { url } = await boot(t);
   const res = await fetch(url + "/", { headers: { Authorization: "Bearer " + TOKEN, accept: "text/html" } });
   assert.equal(res.status, 200);
-  assert.match(await res.text(), /<a href="\/fleet">(?:(?!<\/a>)[\s\S])*Fleet overview<\/a>/);
+  const html = await res.text();
+  const navigation = html.match(/<nav id="nav"[\s\S]*?<\/nav>/)?.[0];
+  assert.ok(navigation, "dashboard includes its main navigation");
+  assert.match(navigation, /<button\b[^>]*data-tab="supervisor"[^>]*>(?:(?!<\/button>)[\s\S])*<span>Supervisor<\/span><\/button>/);
+  assert.ok(navigation.indexOf('data-tab="supervisor"') < navigation.indexOf('nav-advanced'),
+    "Supervisor remains a primary destination");
+  assert.doesNotMatch(navigation, /Fleet overview/);
+  const overview = await fetch(url + "/fleet", { headers: { Authorization: "Bearer " + TOKEN, accept: "text/html" } });
+  assert.equal(overview.status, 200, "Supervisor's destination remains available");
+  assert.match(await overview.text(), /Supervisor/);
 });
